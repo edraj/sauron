@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = sauron_db::build_pool(&cfg.database_url, pool_size)?;
 
     let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("Sauron-Monitor/1.0")
         .build()?;
 
@@ -97,9 +97,11 @@ fn spec_of(m: &Monitor) -> ProbeSpec {
         body: cfg.get("body").and_then(|b| b.as_str()).map(|s| s.to_string()),
         expected_status: cfg.get("expected_status").and_then(|s| s.as_str()).unwrap_or("200-399").to_string(),
         body_assertion: cfg.get("body_assertion").and_then(|s| s.as_str()).map(|s| s.to_string()),
-        // Carried for forward-compat; NOT enforced per-monitor in the MVP. The shared
-        // `http` client applies a fixed `Policy::limited(10)`, and per-request redirect
-        // overrides aren't supported yet.
+        // Carried for forward-compat; NOT enforced per-monitor in the MVP. For SSRF
+        // safety the prober does not follow redirects at all: the shared `http`
+        // client uses `Policy::none()`, so a redirect response is simply recorded
+        // as the probe result rather than followed. This field is retained but not
+        // honored.
         follow_redirects: cfg.get("follow_redirects").and_then(|b| b.as_bool()).unwrap_or(true),
         timeout: Duration::from_millis(m.timeout_ms.max(1) as u64),
     }
@@ -160,7 +162,7 @@ async fn process_monitor(
 
     if changed {
         if let Some(url) = &m.webhook_url {
-            fire_webhook(http, url, m, status_str(cur), status_str(outcome.new_status), incident_id, result.error.as_deref()).await;
+            fire_webhook(http, url, m, status_str(cur), status_str(outcome.new_status), incident_id, result.error.as_deref(), allow_private).await;
         }
     }
     Ok(())
@@ -175,7 +177,21 @@ async fn fire_webhook(
     status: &str,
     incident_id: Option<uuid::Uuid>,
     cause: Option<&str>,
+    allow_private: bool,
 ) {
+    let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_string()));
+    let host = match host {
+        Some(h) => h,
+        None => {
+            warn!("webhook url has no host, skipping");
+            return;
+        }
+    };
+    if let Err(e) = sauron_monitor_core::ssrf::guard_target(&host, allow_private).await {
+        warn!(error = %e, "webhook target blocked by SSRF guard, skipping");
+        return;
+    }
+
     let payload = WebhookPayload {
         monitor_id: m.id,
         name: &m.name,
