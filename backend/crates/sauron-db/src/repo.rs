@@ -7,7 +7,7 @@ use diesel::sql_types::{
     BigInt, Bool, Double, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
 };
 use diesel::upsert::excluded;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -2704,11 +2704,15 @@ pub async fn detach_and_drop_partition(
     table: &str,
     child: &str,
 ) -> QueryResult<()> {
+    // Multiple statements in one command require the SIMPLE query protocol.
+    // diesel-async's `sql_query(...).execute()` uses the EXTENDED protocol, which
+    // rejects "cannot insert multiple commands into a prepared statement".
+    // `batch_execute` (SimpleAsyncConnection) sends the BEGIN/DETACH/DROP/COMMIT
+    // block via the simple protocol; the explicit transaction keeps it atomic.
     let sql = format!(
         "BEGIN; ALTER TABLE {table} DETACH PARTITION {child}; DROP TABLE {child}; COMMIT;"
     );
-    diesel::sql_query(sql).execute(conn).await?;
-    Ok(())
+    conn.batch_execute(&sql).await
 }
 
 // ===========================================================================
