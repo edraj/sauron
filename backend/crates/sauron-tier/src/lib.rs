@@ -2,7 +2,7 @@
 //! embedded DuckDB engine for reading and writing Parquet cold storage. No
 //! diesel here; the `sauron-tier` binary glues this to `sauron-db`.
 
-// pub mod duck;
+pub mod duck;
 pub mod layout;
 pub mod merge;
 pub mod plan;

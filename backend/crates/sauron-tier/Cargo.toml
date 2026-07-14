@@ -10,4 +10,4 @@ uuid.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-duckdb = { version = "1", features = ["bundled"] }
+duckdb = { version = "1", features = ["bundled", "chrono"] }
