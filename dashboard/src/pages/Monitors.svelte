@@ -45,7 +45,7 @@
     finally { saving = false; }
   }
 
-  $effect(() => { void projectId; load(); });
+  $effect(() => { if (projectId) void load(); });
 </script>
 
 <AppShell>
