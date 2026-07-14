@@ -45,6 +45,14 @@ async fn tier_table(pool: &PgPool, cfg: &Config, gran: Granularity, t: &TieredTa
     let now = Utc::now();
     let mut c = conn(pool).await?;
 
+    // Snapshot the watermark BEFORE this cycle's exports advance it. Step 4 gates
+    // the drop on THIS value, so a partition exported in this cycle is not dropped
+    // until a LATER cycle — a real grace window (>= one tick) during which the
+    // partition is durable in BOTH tiers. This closes the cross-tier read race
+    // where a reader holding a slightly stale watermark would otherwise miss rows
+    // in a just-exported-and-dropped partition.
+    let wm_at_cycle_start = repo::get_watermark(&mut c, t.name).await?;
+
     // 1. Pre-create partitions for now .. now + partition_ahead buckets.
     let mut b = bucket_bounds(now, gran);
     for _ in 0..cfg.tier_partition_ahead {
@@ -122,9 +130,10 @@ async fn tier_table(pool: &PgPool, cfg: &Config, gran: Granularity, t: &TieredTa
         }
     }
 
-    // 4. Drop partitions strictly below the watermark AND past the drop lag.
-    let wm = repo::get_watermark(&mut c, t.name).await?;
-    if let Some(w) = wm {
+    // 4. Drop partitions at/below the PRE-CYCLE watermark AND past the drop lag.
+    //    Using wm_at_cycle_start (not a fresh read) guarantees a partition exported
+    //    THIS cycle waits until a later cycle to be dropped (the grace window).
+    if let Some(w) = wm_at_cycle_start {
         let lag = chrono::Duration::hours(cfg.tier_drop_lag_hours);
         for child in repo::list_child_partitions(&mut c, t.name).await? {
             let Some(start) = parse_suffix_start(&child, t.name) else { continue };

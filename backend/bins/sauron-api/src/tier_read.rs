@@ -34,21 +34,29 @@ pub async fn error_counts_by_day(
 
     let split = plan(watermark, from, to);
 
-    // HOT branch: Postgres via diesel (async).
+    // PG branch: the HOT half (explicit partitions, occurred_at >= watermark) plus,
+    // for the COLD half, late-arriving rows in the _default partition (their
+    // explicit partition was already tiered+dropped, so they're NOT in Parquet).
+    // Both run on one pooled connection (peak one PG conn per request).
     let pool = state.pool.clone();
-    let hot = async move {
-        if let Some(r) = split.hot {
-            let mut c = conn(&pool).await?;
-            let rows = repo::error_counts_by_day_hot(&mut c, app_id, r.start, r.end).await?;
-            Ok::<_, anyhow::Error>(rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect())
+    let pg = async move {
+        let mut c = conn(&pool).await?;
+        let hot_rows = if let Some(r) = split.hot {
+            repo::error_counts_by_day_hot(&mut c, app_id, r.start, r.end).await?
         } else {
-            Ok(Vec::new())
-        }
+            Vec::new()
+        };
+        let cold_default_rows = if let Some(r) = split.cold {
+            repo::default_partition_counts_by_day(&mut c, "error_events_default", app_id, r.start, r.end).await?
+        } else {
+            Vec::new()
+        };
+        Ok::<_, anyhow::Error>((hot_rows, cold_default_rows))
     };
 
-    // COLD branch: DuckDB is blocking → spawn_blocking, runs concurrently.
+    // COLD Parquet branch: DuckDB is blocking → spawn_blocking, runs concurrently.
     let cold_path = state.cfg.tier_cold_path.clone();
-    let cold = async move {
+    let cold_parquet = async move {
         if let Some(r) = split.cold {
             let glob = cold_partition_glob(&cold_path, "error_events", app_id);
             tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<DayCount>> {
@@ -61,8 +69,16 @@ pub async fn error_counts_by_day(
         }
     };
 
-    let (hot_rows, cold_rows) = tokio::join!(hot, cold);
-    Ok(merge_day_counts(hot_rows?, cold_rows?))
+    let (pg_res, parquet_res) = tokio::join!(pg, cold_parquet);
+    let (hot_rows, cold_default_rows) = pg_res?;
+    let parquet_rows = parquet_res?;
+    let to_dc = |rows: Vec<repo::DayCountRow>| -> Vec<DayCount> {
+        rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect()
+    };
+    // COLD = Parquet (exported) + _default (late arrivals); then + HOT. All additive,
+    // and the three sets are disjoint (a row is in exactly one of: parquet, _default, hot).
+    let cold = merge_day_counts(parquet_rows, to_dc(cold_default_rows));
+    Ok(merge_day_counts(to_dc(hot_rows), cold))
 }
 
 /// Analytics-event counts per day for `[from, to)`, spanning hot + cold as needed.
@@ -88,21 +104,29 @@ pub async fn event_counts_by_day(
 
     let split = plan(watermark, from, to);
 
-    // HOT branch: Postgres via diesel (async).
+    // PG branch: the HOT half (explicit partitions, occurred_at >= watermark) plus,
+    // for the COLD half, late-arriving rows in the _default partition (their
+    // explicit partition was already tiered+dropped, so they're NOT in Parquet).
+    // Both run on one pooled connection (peak one PG conn per request).
     let pool = state.pool.clone();
-    let hot = async move {
-        if let Some(r) = split.hot {
-            let mut c = conn(&pool).await?;
-            let rows = repo::event_counts_by_day_hot(&mut c, app_id, r.start, r.end).await?;
-            Ok::<_, anyhow::Error>(rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect())
+    let pg = async move {
+        let mut c = conn(&pool).await?;
+        let hot_rows = if let Some(r) = split.hot {
+            repo::event_counts_by_day_hot(&mut c, app_id, r.start, r.end).await?
         } else {
-            Ok(Vec::new())
-        }
+            Vec::new()
+        };
+        let cold_default_rows = if let Some(r) = split.cold {
+            repo::default_partition_counts_by_day(&mut c, "analytics_events_default", app_id, r.start, r.end).await?
+        } else {
+            Vec::new()
+        };
+        Ok::<_, anyhow::Error>((hot_rows, cold_default_rows))
     };
 
-    // COLD branch: DuckDB is blocking → spawn_blocking, runs concurrently.
+    // COLD Parquet branch: DuckDB is blocking → spawn_blocking, runs concurrently.
     let cold_path = state.cfg.tier_cold_path.clone();
-    let cold = async move {
+    let cold_parquet = async move {
         if let Some(r) = split.cold {
             let glob = cold_partition_glob(&cold_path, "analytics_events", app_id);
             tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<DayCount>> {
@@ -115,8 +139,16 @@ pub async fn event_counts_by_day(
         }
     };
 
-    let (hot_rows, cold_rows) = tokio::join!(hot, cold);
-    Ok(merge_day_counts(hot_rows?, cold_rows?))
+    let (pg_res, parquet_res) = tokio::join!(pg, cold_parquet);
+    let (hot_rows, cold_default_rows) = pg_res?;
+    let parquet_rows = parquet_res?;
+    let to_dc = |rows: Vec<repo::DayCountRow>| -> Vec<DayCount> {
+        rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect()
+    };
+    // COLD = Parquet (exported) + _default (late arrivals); then + HOT. All additive,
+    // and the three sets are disjoint (a row is in exactly one of: parquet, _default, hot).
+    let cold = merge_day_counts(parquet_rows, to_dc(cold_default_rows));
+    Ok(merge_day_counts(to_dc(hot_rows), cold))
 }
 
 /// Transaction counts (throughput) per day for `[from, to)`, spanning hot + cold
@@ -145,21 +177,29 @@ pub async fn transaction_counts_by_day(
 
     let split = plan(watermark, from, to);
 
-    // HOT branch: Postgres via diesel (async).
+    // PG branch: the HOT half (explicit partitions, occurred_at >= watermark) plus,
+    // for the COLD half, late-arriving rows in the _default partition (their
+    // explicit partition was already tiered+dropped, so they're NOT in Parquet).
+    // Both run on one pooled connection (peak one PG conn per request).
     let pool = state.pool.clone();
-    let hot = async move {
-        if let Some(r) = split.hot {
-            let mut c = conn(&pool).await?;
-            let rows = repo::transaction_counts_by_day_hot(&mut c, app_id, r.start, r.end).await?;
-            Ok::<_, anyhow::Error>(rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect())
+    let pg = async move {
+        let mut c = conn(&pool).await?;
+        let hot_rows = if let Some(r) = split.hot {
+            repo::transaction_counts_by_day_hot(&mut c, app_id, r.start, r.end).await?
         } else {
-            Ok(Vec::new())
-        }
+            Vec::new()
+        };
+        let cold_default_rows = if let Some(r) = split.cold {
+            repo::default_partition_counts_by_day(&mut c, "transactions_default", app_id, r.start, r.end).await?
+        } else {
+            Vec::new()
+        };
+        Ok::<_, anyhow::Error>((hot_rows, cold_default_rows))
     };
 
-    // COLD branch: DuckDB is blocking → spawn_blocking, runs concurrently.
+    // COLD Parquet branch: DuckDB is blocking → spawn_blocking, runs concurrently.
     let cold_path = state.cfg.tier_cold_path.clone();
-    let cold = async move {
+    let cold_parquet = async move {
         if let Some(r) = split.cold {
             let glob = cold_partition_glob(&cold_path, "transactions", app_id);
             tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<DayCount>> {
@@ -172,6 +212,14 @@ pub async fn transaction_counts_by_day(
         }
     };
 
-    let (hot_rows, cold_rows) = tokio::join!(hot, cold);
-    Ok(merge_day_counts(hot_rows?, cold_rows?))
+    let (pg_res, parquet_res) = tokio::join!(pg, cold_parquet);
+    let (hot_rows, cold_default_rows) = pg_res?;
+    let parquet_rows = parquet_res?;
+    let to_dc = |rows: Vec<repo::DayCountRow>| -> Vec<DayCount> {
+        rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect()
+    };
+    // COLD = Parquet (exported) + _default (late arrivals); then + HOT. All additive,
+    // and the three sets are disjoint (a row is in exactly one of: parquet, _default, hot).
+    let cold = merge_day_counts(parquet_rows, to_dc(cold_default_rows));
+    Ok(merge_day_counts(to_dc(hot_rows), cold))
 }

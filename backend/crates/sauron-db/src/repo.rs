@@ -2747,6 +2747,31 @@ pub async fn error_counts_by_day_hot(
     .await
 }
 
+/// Per-day counts from ONLY a table's DEFAULT partition, for `[from, to)`.
+/// Late-arriving events whose explicit partition was already tiered+dropped land
+/// in `<table>_default` (never exported to Parquet). The cross-tier reader adds
+/// these to the COLD half so they aren't lost. `default_table` is an INTERNAL
+/// identifier (e.g. "error_events_default"), never user input.
+pub async fn default_partition_counts_by_day(
+    conn: &mut AsyncPgConnection,
+    default_table: &str,
+    app_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> QueryResult<Vec<DayCountRow>> {
+    diesel::sql_query(format!(
+        "SELECT (occurred_at AT TIME ZONE 'UTC')::date AS day, count(*)::bigint AS count \
+         FROM {default_table} \
+         WHERE app_id = $1 AND occurred_at >= $2 AND occurred_at < $3 \
+         GROUP BY 1 ORDER BY 1"
+    ))
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .load(conn)
+    .await
+}
+
 /// Per-day analytics-event counts from the HOT (Postgres) tier for `[from, to)`.
 pub async fn event_counts_by_day_hot(
     conn: &mut AsyncPgConnection,

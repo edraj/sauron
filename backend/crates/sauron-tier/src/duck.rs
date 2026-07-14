@@ -19,7 +19,9 @@ impl DuckEngine {
     pub fn open() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory().context("open duckdb")?;
         // Bound memory so many concurrent cold reads can't OOM the process.
-        conn.execute_batch("SET memory_limit='512MB'; SET threads=4;")?;
+        // Pin UTC so `CAST(occurred_at AS DATE)` day-bucketing matches the hot side's
+        // `(occurred_at AT TIME ZONE 'UTC')::date`.
+        conn.execute_batch("SET memory_limit='512MB'; SET threads=4; SET TimeZone='UTC';")?;
         Ok(Self { conn })
     }
 
