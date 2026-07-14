@@ -16,6 +16,7 @@ sauron-redis = { path = "crates/sauron-redis" }
 sauron-auth = { path = "crates/sauron-auth" }
 sauron-pipeline = { path = "crates/sauron-pipeline" }
 sauron-telemetry = { path = "crates/sauron-telemetry" }
+sauron-monitor-core = { path = "crates/sauron-monitor-core" }
 
 # --- async runtime / http ---
 tokio = { version = "1", features = ["full"] }
@@ -30,6 +31,7 @@ tower-http = { version = "0.7", features = [
     "timeout",
     "decompression-full",
 ] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 
 # --- database ---
 # `postgres_backend` (not `postgres`) gives the Pg query builder + types WITHOUT
