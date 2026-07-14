@@ -304,6 +304,37 @@ pub async fn sessions_summary(
     Ok(Json(SessionsAnalytics { stats, duration_series, duration_histogram }))
 }
 
+// ---------------------------------------------------------------------------
+// Cross-tier errors timeseries — GET /errors/timeseries.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct TimeseriesQuery {
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+pub struct DayCountOut {
+    pub day: chrono::NaiveDate,
+    pub count: i64,
+}
+
+pub async fn error_timeseries(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<DayCountOut>>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
+    drop(conn); // release the pooled conn before the router checks out its own
+    let series = crate::tier_read::error_counts_by_day(&state, app_id, q.from, q.to).await?;
+    Ok(Json(
+        series.into_iter().map(|d| DayCountOut { day: d.day, count: d.count }).collect(),
+    ))
+}
+
 #[cfg(test)]
 mod stickiness_tests {
     use super::stickiness;

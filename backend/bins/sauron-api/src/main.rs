@@ -6,6 +6,7 @@
 
 mod error;
 mod routes;
+mod tier_read;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -168,6 +169,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/apps/{app_id}/users/summary",
             get(routes::analytics::users_summary),
+        )
+        .route(
+            "/v1/apps/{app_id}/errors/timeseries",
+            get(routes::analytics::error_timeseries),
         )
         // --- exceptions dashboard ---
         .route(

@@ -2710,3 +2710,35 @@ pub async fn detach_and_drop_partition(
     diesel::sql_query(sql).execute(conn).await?;
     Ok(())
 }
+
+// ===========================================================================
+// Cross-tier reads (hot side)
+// ===========================================================================
+
+#[derive(diesel::QueryableByName)]
+pub struct DayCountRow {
+    #[diesel(sql_type = diesel::sql_types::Date)]
+    pub day: chrono::NaiveDate,
+    #[diesel(sql_type = BigInt)]
+    pub count: i64,
+}
+
+/// Per-day error counts from the HOT (Postgres) tier for `[from, to)`.
+pub async fn error_counts_by_day_hot(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> QueryResult<Vec<DayCountRow>> {
+    diesel::sql_query(
+        "SELECT (occurred_at AT TIME ZONE 'UTC')::date AS day, count(*)::bigint AS count \
+         FROM error_events \
+         WHERE app_id = $1 AND occurred_at >= $2 AND occurred_at < $3 \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .load(conn)
+    .await
+}
