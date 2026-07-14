@@ -2289,6 +2289,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sauron-monitor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "reqwest",
+ "sauron-core",
+ "sauron-db",
+ "sauron-monitor-core",
+ "sauron-telemetry",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "sauron-monitor-core"
 version = "0.1.0"
 dependencies = [
