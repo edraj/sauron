@@ -310,6 +310,15 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    tiering_state (table_name) {
+        table_name -> Text,
+        watermark -> Timestamptz,
+        dropped_thru -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(analytics_events -> apps (app_id));
 diesel::joinable!(analytics_events -> environments (environment_id));
 diesel::joinable!(sessions -> apps (app_id));
@@ -355,4 +364,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     monitors,
     monitor_checks,
     monitor_incidents,
+    tiering_state,
 );

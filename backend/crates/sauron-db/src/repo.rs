@@ -2564,3 +2564,70 @@ pub async fn update_monitor(
     .await
     .optional()
 }
+
+// ===========================================================================
+// Tiering (hot/cold watermark)
+// ===========================================================================
+
+pub async fn get_watermark(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+) -> QueryResult<Option<DateTime<Utc>>> {
+    tiering_state::table
+        .find(table)
+        .select(tiering_state::watermark)
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Upsert the watermark; never moves it backward.
+pub async fn advance_watermark(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    wm: DateTime<Utc>,
+) -> QueryResult<()> {
+    diesel::insert_into(tiering_state::table)
+        .values((
+            tiering_state::table_name.eq(table),
+            tiering_state::watermark.eq(wm),
+            tiering_state::updated_at.eq(Utc::now()),
+        ))
+        .on_conflict(tiering_state::table_name)
+        .do_update()
+        .set((
+            tiering_state::watermark.eq(diesel::dsl::sql::<Timestamptz>("GREATEST(tiering_state.watermark, EXCLUDED.watermark)")),
+            tiering_state::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_dropped_thru(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+) -> QueryResult<Option<DateTime<Utc>>> {
+    tiering_state::table
+        .find(table)
+        .select(tiering_state::dropped_thru)
+        .first::<Option<DateTime<Utc>>>(conn)
+        .await
+        .optional()
+        .map(|o| o.flatten())
+}
+
+pub async fn set_dropped_thru(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    t: DateTime<Utc>,
+) -> QueryResult<()> {
+    diesel::update(tiering_state::table.find(table))
+        .set((
+            tiering_state::dropped_thru.eq(Some(t)),
+            tiering_state::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
