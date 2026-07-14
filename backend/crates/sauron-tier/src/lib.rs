@@ -3,11 +3,11 @@
 //! diesel here; the `sauron-tier` binary glues this to `sauron-db`.
 
 // pub mod duck;
-// pub mod layout;
+pub mod layout;
 // pub mod merge;
 pub mod plan;
 
-// pub use layout::{bucket_bounds, cold_copy_dir, cold_partition_glob, partition_suffix, Granularity};
+pub use layout::{bucket_bounds, cold_copy_dir, cold_partition_glob, partition_suffix, Granularity};
 // pub use merge::{merge_day_counts, DayCount};
 pub use plan::{plan, TierPlan, TimeRange};
 
