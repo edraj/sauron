@@ -19,6 +19,12 @@ pub struct Config {
     pub cors_allowed_origins: Vec<String>,
     pub ingest_rate_limit_per_min: u32,
     pub ingest_max_body_bytes: usize,
+    pub monitor_tick_ms: u64,
+    pub monitor_batch: i64,
+    pub monitor_max_concurrency: usize,
+    pub monitor_check_retention_days: i64,
+    pub monitor_min_interval_secs: i64,
+    pub monitor_ssrf_allow_private: bool,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -60,6 +66,14 @@ impl Config {
             cors_allowed_origins,
             ingest_rate_limit_per_min: parse("INGEST_RATE_LIMIT_PER_MIN", 6000),
             ingest_max_body_bytes: parse("INGEST_MAX_BODY_BYTES", 1_048_576),
+            monitor_tick_ms: parse("MONITOR_TICK_MS", 1000),
+            monitor_batch: parse("MONITOR_BATCH", 100),
+            monitor_max_concurrency: parse("MONITOR_MAX_CONCURRENCY", 50),
+            monitor_check_retention_days: parse("MONITOR_CHECK_RETENTION_DAYS", 30),
+            monitor_min_interval_secs: parse("MONITOR_MIN_INTERVAL_SECS", 30),
+            monitor_ssrf_allow_private: var("MONITOR_SSRF_ALLOW_PRIVATE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         })
     }
 }
