@@ -35,18 +35,22 @@ CREATE TABLE error_events (
     PRIMARY KEY (id, occurred_at)
 ) PARTITION BY RANGE (occurred_at);
 
--- Indexes mirror the originals (defined on the parent → propagate to partitions).
-CREATE INDEX error_events_issue_idx      ON error_events (issue_id, occurred_at DESC);
-CREATE INDEX error_events_project_idx    ON error_events (app_id, occurred_at DESC);
-CREATE INDEX error_events_distinct_idx   ON error_events (app_id, distinct_id, occurred_at DESC);
-CREATE INDEX error_events_app_session_idx ON error_events (app_id, session_id);
-CREATE INDEX error_events_app_device_idx  ON error_events (app_id, device_key);
-CREATE INDEX error_events_app_screen_idx  ON error_events (app_id, screen);
-
 -- Safety net: catches any row not covered by an explicit range partition.
 CREATE TABLE error_events_default PARTITION OF error_events DEFAULT;
 
 -- Move existing rows across (column order matches the old table exactly).
 INSERT INTO error_events SELECT * FROM error_events_old;
 
+-- Drop the old table BEFORE recreating the indexes: RENAME kept the old
+-- indexes' original names, so they must be gone before we create identically
+-- named ones on the new parent.
 DROP TABLE error_events_old;
+
+-- Indexes mirror the originals, defined on the partitioned parent so they
+-- propagate to every partition (default + future range partitions).
+CREATE INDEX error_events_issue_idx      ON error_events (issue_id, occurred_at DESC);
+CREATE INDEX error_events_project_idx    ON error_events (app_id, occurred_at DESC);
+CREATE INDEX error_events_distinct_idx   ON error_events (app_id, distinct_id, occurred_at DESC);
+CREATE INDEX error_events_app_session_idx ON error_events (app_id, session_id);
+CREATE INDEX error_events_app_device_idx  ON error_events (app_id, device_key);
+CREATE INDEX error_events_app_screen_idx  ON error_events (app_id, screen);
