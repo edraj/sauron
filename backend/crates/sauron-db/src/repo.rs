@@ -2373,7 +2373,7 @@ pub async fn list_monitors_for_project(
              WHERE c.monitor_id = m.id ORDER BY c.checked_at DESC LIMIT 1 \
          ) lc ON TRUE \
          LEFT JOIN LATERAL ( \
-             SELECT 100.0 * avg(CASE WHEN c.up THEN 1 ELSE 0 END) AS pct \
+             SELECT (100.0 * avg(CASE WHEN c.up THEN 1 ELSE 0 END))::double precision AS pct \
              FROM monitor_checks c \
              WHERE c.monitor_id = m.id AND c.checked_at >= now() - interval '24 hours' \
          ) up ON TRUE \
@@ -2394,7 +2394,7 @@ pub async fn uptime_pct(
     since_hours: i64,
 ) -> QueryResult<Option<f64>> {
     let row: PctRow = diesel::sql_query(
-        "SELECT 100.0 * avg(CASE WHEN up THEN 1 ELSE 0 END) AS pct FROM monitor_checks \
+        "SELECT (100.0 * avg(CASE WHEN up THEN 1 ELSE 0 END))::double precision AS pct FROM monitor_checks \
          WHERE monitor_id = $1 AND checked_at >= now() - ($2 || ' hours')::interval",
     )
     .bind::<SqlUuid, _>(monitor_id)
