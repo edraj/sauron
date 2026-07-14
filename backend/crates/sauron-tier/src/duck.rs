@@ -23,8 +23,21 @@ impl DuckEngine {
         Ok(Self { conn })
     }
 
+    /// True if at least one file matches `glob`. DuckDB's `read_parquet` errors
+    /// when a glob matches zero files, so read methods guard on this first and
+    /// return an empty result instead of failing. `glob()` never errors on an
+    /// empty match — it just returns zero rows.
+    fn any_files_match(&self, glob: &str) -> anyhow::Result<bool> {
+        let mut stmt = self.conn.prepare("SELECT count(*) FROM glob(?)")?;
+        let n: i64 = stmt.query_row([glob], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
     /// Total rows across the Parquet matched by `glob`. Returns 0 if no files match.
     pub fn count_parquet_rows(&self, glob: &str) -> anyhow::Result<i64> {
+        if !self.any_files_match(glob)? {
+            return Ok(0);
+        }
         // `union_by_name` + `hive_partitioning` tolerate schema evolution and
         // read the app_id/year/month partition columns from the paths.
         let sql = "SELECT count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true)";
@@ -47,6 +60,9 @@ impl DuckEngine {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> anyhow::Result<Vec<DayCount>> {
+        if !self.any_files_match(glob)? {
+            return Ok(Vec::new());
+        }
         let sql = "\
             SELECT CAST(occurred_at AS DATE) AS day, count(*) AS cnt \
             FROM read_parquet(?, hive_partitioning=true, union_by_name=true) \
@@ -110,5 +126,27 @@ mod tests {
 
     fn cold_glob(base: &str, app: Uuid) -> String {
         crate::layout::cold_partition_glob(base, "error_events", app)
+    }
+
+    #[test]
+    fn count_parquet_rows_is_zero_when_no_files_match() {
+        let eng = DuckEngine::open().unwrap();
+        // Glob under a directory that does not exist → zero matches, not an error.
+        let glob = crate::layout::cold_partition_glob(
+            "/nonexistent-sauron-tier-cold",
+            "error_events",
+            Uuid::new_v4(),
+        );
+        assert_eq!(eng.count_parquet_rows(&glob).unwrap(), 0);
+    }
+
+    #[test]
+    fn error_counts_by_day_is_empty_when_no_files_match() {
+        let eng = DuckEngine::open().unwrap();
+        let app = Uuid::new_v4();
+        let glob = crate::layout::cold_partition_glob("/nonexistent-sauron-tier-cold", "error_events", app);
+        let from = "2026-05-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let to = "2026-06-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert!(eng.error_counts_by_day(&glob, app, from, to).unwrap().is_empty());
     }
 }
