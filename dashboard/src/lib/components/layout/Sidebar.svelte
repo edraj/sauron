@@ -27,6 +27,13 @@
       ],
     },
     {
+      label: 'Uptime',
+      items: [
+        { href: '#/monitors', label: 'Monitors', icon: 'life-buoy', match: (p) => p.startsWith('/monitors'),
+          show: () => sessionStore.can('monitor:read') },
+      ],
+    },
+    {
       label: 'Explore',
       items: [
         { href: '#/events', label: 'Events', icon: 'diamond', match: (p) => p.startsWith('/events') },

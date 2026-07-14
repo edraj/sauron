@@ -20,6 +20,7 @@ import ScreensList from './pages/ScreensList.svelte';
 import ScreenDetail from './pages/ScreenDetail.svelte';
 import FunnelBuilder from './pages/FunnelBuilder.svelte';
 import JourneyExplorer from './pages/JourneyExplorer.svelte';
+import Monitors from './pages/Monitors.svelte';
 import Projects from './pages/Projects.svelte';
 import Members from './pages/Members.svelte';
 import SettingsApp from './pages/SettingsApp.svelte';
@@ -59,6 +60,9 @@ export const routes = {
   // Analyze
   '/funnels': guarded(FunnelBuilder as Component<never>),
   '/journeys': guarded(JourneyExplorer as Component<never>),
+
+  // Uptime
+  '/monitors': guarded(Monitors as Component<never>),
 
   // Settings
   '/projects': guarded(Projects as Component<never>),
