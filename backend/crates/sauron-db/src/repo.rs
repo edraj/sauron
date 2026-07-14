@@ -3,7 +3,9 @@
 
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Double, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid};
+use diesel::sql_types::{
+    BigInt, Bool, Double, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+};
 use diesel::upsert::excluded;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde_json::Value;
@@ -2278,4 +2280,287 @@ mod avg_dwell_tests {
     fn zero_views_is_zero() {
         assert_eq!(avg_dwell(9000.0, 0), 0.0);
     }
+}
+
+// ===========================================================================
+// Monitors (uptime checks, keyed by project_id)
+// ===========================================================================
+
+#[derive(QueryableByName, serde::Serialize)]
+pub struct MonitorListRow {
+    #[diesel(sql_type = SqlUuid)]
+    pub id: Uuid,
+    #[diesel(sql_type = Text)]
+    pub name: String,
+    #[diesel(sql_type = Text)]
+    pub kind: String,
+    #[diesel(sql_type = Text)]
+    pub target: String,
+    #[diesel(sql_type = Text)]
+    pub status: String,
+    #[diesel(sql_type = Bool)]
+    pub enabled: bool,
+    #[diesel(sql_type = Nullable<Integer>)]
+    pub last_response_time_ms: Option<i32>,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    pub last_checked_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = Nullable<Double>)]
+    pub uptime_24h: Option<f64>,
+}
+
+#[derive(QueryableByName, serde::Serialize)]
+pub struct CheckPoint {
+    #[diesel(sql_type = Timestamptz)]
+    pub checked_at: DateTime<Utc>,
+    #[diesel(sql_type = Bool)]
+    pub up: bool,
+    #[diesel(sql_type = Nullable<Integer>)]
+    pub response_time_ms: Option<i32>,
+    #[diesel(sql_type = Nullable<Integer>)]
+    pub status_code: Option<i32>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub error: Option<String>,
+}
+
+pub async fn create_monitor(
+    conn: &mut AsyncPgConnection,
+    m: NewMonitor<'_>,
+) -> QueryResult<Monitor> {
+    diesel::insert_into(monitors::table)
+        .values(m)
+        .returning(Monitor::as_returning())
+        .get_result(conn)
+        .await
+}
+
+pub async fn get_monitor(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<Option<Monitor>> {
+    monitors::table.find(id).select(Monitor::as_select()).first(conn).await.optional()
+}
+
+pub async fn monitor_project(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<Option<Uuid>> {
+    monitors::table.find(id).select(monitors::project_id).first(conn).await.optional()
+}
+
+pub async fn delete_monitor(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
+    diesel::delete(monitors::table.find(id)).execute(conn).await
+}
+
+pub async fn list_incidents(
+    conn: &mut AsyncPgConnection,
+    monitor_id: Uuid,
+    limit: i64,
+) -> QueryResult<Vec<MonitorIncidentRow>> {
+    monitor_incidents::table
+        .filter(monitor_incidents::monitor_id.eq(monitor_id))
+        .select(MonitorIncidentRow::as_select())
+        .order(monitor_incidents::started_at.desc())
+        .limit(limit)
+        .load(conn)
+        .await
+}
+
+pub async fn list_monitors_for_project(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+) -> QueryResult<Vec<MonitorListRow>> {
+    diesel::sql_query(
+        "SELECT m.id, m.name, m.kind, m.target, m.status, m.enabled, \
+                lc.response_time_ms AS last_response_time_ms, m.last_checked_at, \
+                up.pct AS uptime_24h \
+         FROM monitors m \
+         LEFT JOIN LATERAL ( \
+             SELECT response_time_ms FROM monitor_checks c \
+             WHERE c.monitor_id = m.id ORDER BY c.checked_at DESC LIMIT 1 \
+         ) lc ON TRUE \
+         LEFT JOIN LATERAL ( \
+             SELECT 100.0 * avg(CASE WHEN c.up THEN 1 ELSE 0 END) AS pct \
+             FROM monitor_checks c \
+             WHERE c.monitor_id = m.id AND c.checked_at >= now() - interval '24 hours' \
+         ) up ON TRUE \
+         WHERE m.project_id = $1 \
+         ORDER BY m.created_at ASC",
+    )
+    .bind::<SqlUuid, _>(project_id)
+    .get_results(conn)
+    .await
+}
+
+#[derive(QueryableByName)]
+struct PctRow { #[diesel(sql_type = Nullable<Double>)] pct: Option<f64> }
+
+pub async fn uptime_pct(
+    conn: &mut AsyncPgConnection,
+    monitor_id: Uuid,
+    since_hours: i64,
+) -> QueryResult<Option<f64>> {
+    let row: PctRow = diesel::sql_query(
+        "SELECT 100.0 * avg(CASE WHEN up THEN 1 ELSE 0 END) AS pct FROM monitor_checks \
+         WHERE monitor_id = $1 AND checked_at >= now() - ($2 || ' hours')::interval",
+    )
+    .bind::<SqlUuid, _>(monitor_id)
+    .bind::<Text, _>(since_hours.to_string())
+    .get_result(conn)
+    .await?;
+    Ok(row.pct)
+}
+
+pub async fn latency_series(
+    conn: &mut AsyncPgConnection,
+    monitor_id: Uuid,
+    since_hours: i64,
+) -> QueryResult<Vec<CheckPoint>> {
+    diesel::sql_query(
+        "SELECT checked_at, up, response_time_ms, status_code, error FROM monitor_checks \
+         WHERE monitor_id = $1 AND checked_at >= now() - ($2 || ' hours')::interval \
+         ORDER BY checked_at ASC",
+    )
+    .bind::<SqlUuid, _>(monitor_id)
+    .bind::<Text, _>(since_hours.to_string())
+    .get_results(conn)
+    .await
+}
+
+pub async fn prune_checks(conn: &mut AsyncPgConnection, older_than_days: i64) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM monitor_checks WHERE checked_at < now() - ($1 || ' days')::interval",
+    )
+    .bind::<Text, _>(older_than_days.to_string())
+    .execute(conn)
+    .await
+}
+
+/// Atomically claim due monitors and push their next_check_at forward so no
+/// other prober picks the same rows. Returns the claimed rows to probe.
+pub async fn claim_due_monitors(
+    conn: &mut AsyncPgConnection,
+    batch: i64,
+) -> QueryResult<Vec<Monitor>> {
+    diesel::sql_query(
+        "UPDATE monitors SET next_check_at = now() + make_interval(secs => interval_seconds), \
+                last_checked_at = now() \
+         WHERE id IN ( \
+             SELECT id FROM monitors \
+             WHERE enabled AND status <> 'paused' AND next_check_at <= now() \
+             ORDER BY next_check_at FOR UPDATE SKIP LOCKED LIMIT $1 \
+         ) RETURNING *",
+    )
+    .bind::<BigInt, _>(batch)
+    .get_results(conn)
+    .await
+}
+
+/// Persist one probe result: insert the check row and update the monitor's
+/// counters + status. `new_status` is the state machine's decision.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_check_and_state(
+    conn: &mut AsyncPgConnection,
+    monitor_id: Uuid,
+    up: bool,
+    status_code: Option<i32>,
+    response_time_ms: Option<i32>,
+    error: Option<&str>,
+    new_status: &str,
+    consecutive_failures: i32,
+    consecutive_successes: i32,
+    status_changed: bool,
+) -> QueryResult<()> {
+    diesel::sql_query(
+        "INSERT INTO monitor_checks (monitor_id, up, status_code, response_time_ms, error) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind::<SqlUuid, _>(monitor_id)
+    .bind::<Bool, _>(up)
+    .bind::<Nullable<Integer>, _>(status_code)
+    .bind::<Nullable<Integer>, _>(response_time_ms)
+    .bind::<Nullable<Text>, _>(error)
+    .execute(conn)
+    .await?;
+
+    diesel::sql_query(
+        "UPDATE monitors SET status = $2, consecutive_failures = $3, consecutive_successes = $4, \
+                updated_at = now(), \
+                last_status_changed_at = CASE WHEN $5 THEN now() ELSE last_status_changed_at END \
+         WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(monitor_id)
+    .bind::<Text, _>(new_status)
+    .bind::<Integer, _>(consecutive_failures)
+    .bind::<Integer, _>(consecutive_successes)
+    .bind::<Bool, _>(status_changed)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+#[derive(QueryableByName)]
+struct IdRow { #[diesel(sql_type = SqlUuid)] id: Uuid }
+
+pub async fn open_incident(
+    conn: &mut AsyncPgConnection,
+    monitor_id: Uuid,
+    cause: &str,
+    last_error: Option<&str>,
+) -> QueryResult<Uuid> {
+    // ON CONFLICT on the partial unique index: if an incident is already open,
+    // keep it and just refresh last_error.
+    let row: IdRow = diesel::sql_query(
+        "INSERT INTO monitor_incidents (monitor_id, cause, last_error) VALUES ($1, $2, $3) \
+         ON CONFLICT (monitor_id) WHERE resolved_at IS NULL \
+         DO UPDATE SET last_error = EXCLUDED.last_error RETURNING id",
+    )
+    .bind::<SqlUuid, _>(monitor_id)
+    .bind::<Text, _>(cause)
+    .bind::<Nullable<Text>, _>(last_error)
+    .get_result(conn)
+    .await?;
+    Ok(row.id)
+}
+
+pub async fn resolve_incident(conn: &mut AsyncPgConnection, monitor_id: Uuid) -> QueryResult<()> {
+    diesel::sql_query(
+        "UPDATE monitor_incidents SET resolved_at = now() \
+         WHERE monitor_id = $1 AND resolved_at IS NULL",
+    )
+    .bind::<SqlUuid, _>(monitor_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_monitor(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    name: Option<&str>,
+    enabled: Option<bool>,
+    status: Option<&str>,
+    interval_seconds: Option<i32>,
+    webhook_url: Option<Option<&str>>, // outer None = leave; inner None = set NULL
+) -> QueryResult<Option<Monitor>> {
+    // webhook: encode "leave" as a sentinel by splitting into two binds.
+    let (set_webhook, webhook_val) = match webhook_url {
+        None => (false, None),
+        Some(v) => (true, v),
+    };
+    diesel::sql_query(
+        "UPDATE monitors SET \
+            name = COALESCE($2, name), \
+            enabled = COALESCE($3, enabled), \
+            status = COALESCE($4, status), \
+            interval_seconds = COALESCE($5, interval_seconds), \
+            webhook_url = CASE WHEN $6 THEN $7 ELSE webhook_url END, \
+            next_check_at = CASE WHEN $4 = 'unknown' THEN now() ELSE next_check_at END, \
+            updated_at = now() \
+         WHERE id = $1 RETURNING *",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Nullable<Text>, _>(name)
+    .bind::<Nullable<Bool>, _>(enabled)
+    .bind::<Nullable<Text>, _>(status)
+    .bind::<Nullable<Integer>, _>(interval_seconds)
+    .bind::<Bool, _>(set_webhook)
+    .bind::<Nullable<Text>, _>(webhook_val)
+    .get_result(conn)
+    .await
+    .optional()
 }

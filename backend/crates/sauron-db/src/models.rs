@@ -446,3 +446,64 @@ pub struct NewTransaction {
     pub ip_address: Option<String>,
     pub occurred_at: DateTime<Utc>,
 }
+
+// ---------------------------------------------------------------------------
+// Monitors (uptime checks, keyed by project_id)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize)]
+#[diesel(table_name = monitors)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct Monitor {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub target: String,
+    pub method: String,
+    pub config: serde_json::Value,
+    pub interval_seconds: i32,
+    pub timeout_ms: i32,
+    pub failure_threshold: i32,
+    pub recovery_threshold: i32,
+    pub webhook_url: Option<String>,
+    pub enabled: bool,
+    pub status: String,
+    pub consecutive_failures: i32,
+    pub consecutive_successes: i32,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    pub next_check_at: DateTime<Utc>,
+    pub last_status_changed_at: Option<DateTime<Utc>>,
+    pub created_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = monitors)]
+pub struct NewMonitor<'a> {
+    pub project_id: Uuid,
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub target: &'a str,
+    pub method: &'a str,
+    pub config: &'a serde_json::Value,
+    pub interval_seconds: i32,
+    pub timeout_ms: i32,
+    pub failure_threshold: i32,
+    pub recovery_threshold: i32,
+    pub webhook_url: Option<&'a str>,
+    pub created_by: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = monitor_incidents)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct MonitorIncidentRow {
+    pub id: Uuid,
+    pub monitor_id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub cause: String,
+    pub last_error: Option<String>,
+}
