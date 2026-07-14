@@ -2631,3 +2631,82 @@ pub async fn set_dropped_thru(
         .await?;
     Ok(())
 }
+
+// ===========================================================================
+// Partition maintenance
+// ===========================================================================
+
+/// Create a range partition if it does not already exist. `table`/`suffix` are
+/// internal identifiers (never user input); timestamps are formatted as ISO
+/// literals because partition bounds cannot be bound parameters in DDL.
+pub async fn create_range_partition(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    suffix: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> QueryResult<()> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {table}_{suffix} PARTITION OF {table} \
+         FOR VALUES FROM ('{start}') TO ('{end}')",
+        table = table,
+        suffix = suffix,
+        start = start.to_rfc3339(),
+        end = end.to_rfc3339(),
+    );
+    diesel::sql_query(sql).execute(conn).await?;
+    Ok(())
+}
+
+#[derive(diesel::QueryableByName)]
+struct ChildName {
+    #[diesel(sql_type = Text)]
+    child: String,
+}
+
+/// Child partition relation names for `table`, excluding the DEFAULT partition.
+pub async fn list_child_partitions(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+) -> QueryResult<Vec<String>> {
+    let rows: Vec<ChildName> = diesel::sql_query(
+        "SELECT c.relname AS child \
+         FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         JOIN pg_class p ON p.oid = i.inhparent \
+         WHERE p.relname = $1 AND c.relname <> ($1 || '_default') \
+         ORDER BY c.relname",
+    )
+    .bind::<Text, _>(table)
+    .load(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.child).collect())
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+pub async fn count_child_rows(conn: &mut AsyncPgConnection, child: &str) -> QueryResult<i64> {
+    // `child` is an internal relation name derived from our own suffix, not user input.
+    let row: CountRow = diesel::sql_query(format!("SELECT count(*)::bigint AS n FROM {child}"))
+        .get_result(conn)
+        .await?;
+    Ok(row.n)
+}
+
+/// Detach then drop a partition in one transaction. Detach first so the parent
+/// is never briefly missing the range.
+pub async fn detach_and_drop_partition(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    child: &str,
+) -> QueryResult<()> {
+    let sql = format!(
+        "BEGIN; ALTER TABLE {table} DETACH PARTITION {child}; DROP TABLE {child}; COMMIT;"
+    );
+    diesel::sql_query(sql).execute(conn).await?;
+    Ok(())
+}
