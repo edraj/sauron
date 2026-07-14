@@ -630,3 +630,64 @@ export interface ScreenDetail {
   recent_events: AnalyticsEvent[];
   recent_exceptions: ErrorEvent[];
 }
+
+// ---------------------------------------------------------------------------
+// Uptime Monitoring
+// ---------------------------------------------------------------------------
+
+export type MonitorStatus = 'unknown' | 'up' | 'down' | 'paused';
+
+export interface MonitorListItem {
+  id: string;
+  name: string;
+  kind: 'http' | 'tcp';
+  target: string;
+  status: MonitorStatus;
+  enabled: boolean;
+  last_response_time_ms: number | null;
+  last_checked_at: string | null;
+  uptime_24h: number | null;
+}
+
+export interface Monitor {
+  id: string;
+  project_id: string;
+  name: string;
+  kind: 'http' | 'tcp';
+  target: string;
+  method: string;
+  config: Record<string, unknown>;
+  interval_seconds: number;
+  timeout_ms: number;
+  failure_threshold: number;
+  recovery_threshold: number;
+  webhook_url: string | null;
+  enabled: boolean;
+  status: MonitorStatus;
+  last_checked_at: string | null;
+  next_check_at: string;
+  created_at: string;
+}
+
+export interface MonitorIncident {
+  id: string;
+  monitor_id: string;
+  started_at: string;
+  resolved_at: string | null;
+  cause: string;
+  last_error: string | null;
+}
+
+export interface MonitorDetail {
+  monitor: Monitor;
+  uptime: { h24: number | null; d7: number | null; d30: number | null };
+  incidents: MonitorIncident[];
+}
+
+export interface MonitorCheck {
+  checked_at: string;
+  up: boolean;
+  response_time_ms: number | null;
+  status_code: number | null;
+  error: string | null;
+}
