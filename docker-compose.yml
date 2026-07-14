@@ -98,13 +98,38 @@ services:
       API_PORT: "8080"
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:10002}
       MONITOR_MIN_INTERVAL_SECS: ${MONITOR_MIN_INTERVAL_SECS:-30}
+      TIER_COLD_PATH: /cold
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     ports:
       - "10000:8080"
+    volumes:
+      - colddata:/cold:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+
+  tier:
+    build:
+      context: ./backend
+      args:
+        BIN: sauron-tier
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
+      TIER_HOT_DAYS: ${TIER_HOT_DAYS:-30}
+      TIER_GRANULARITY: ${TIER_GRANULARITY:-day}
+      TIER_COLD_PATH: /cold
+      TIER_DROP_LAG_HOURS: ${TIER_DROP_LAG_HOURS:-24}
+      TIER_TICK_SECS: ${TIER_TICK_SECS:-3600}
+      TIER_PARTITION_AHEAD: ${TIER_PARTITION_AHEAD:-7}
+      RUST_LOG: ${RUST_LOG:-info,sauron=debug}
+    volumes:
+      - colddata:/cold
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
         condition: service_healthy
 
   dashboard:
@@ -123,3 +148,4 @@ services:
 volumes:
   pgdata: {}
   redisdata: {}
+  colddata: {}
