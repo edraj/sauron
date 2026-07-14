@@ -18,8 +18,9 @@ pub struct TieredTable {
     pub time_col: &'static str,
 }
 
-/// Tables tiered out to Parquet. `error_events` first; more added in Task 10.
-pub const TIERED_TABLES: &[TieredTable] = &[TieredTable {
-    name: "error_events",
-    time_col: "occurred_at",
-}];
+/// Tables tiered out to Parquet.
+pub const TIERED_TABLES: &[TieredTable] = &[
+    TieredTable { name: "error_events", time_col: "occurred_at" },
+    TieredTable { name: "analytics_events", time_col: "occurred_at" },
+    TieredTable { name: "transactions", time_col: "occurred_at" },
+];
