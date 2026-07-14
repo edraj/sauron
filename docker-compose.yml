@@ -64,6 +64,26 @@ services:
       redis:
         condition: service_healthy
 
+  monitor:
+    build:
+      context: ./backend
+      args:
+        BIN: sauron-monitor
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
+      MONITOR_TICK_MS: ${MONITOR_TICK_MS:-1000}
+      MONITOR_BATCH: ${MONITOR_BATCH:-100}
+      MONITOR_MAX_CONCURRENCY: ${MONITOR_MAX_CONCURRENCY:-50}
+      MONITOR_CHECK_RETENTION_DAYS: ${MONITOR_CHECK_RETENTION_DAYS:-30}
+      MONITOR_MIN_INTERVAL_SECS: ${MONITOR_MIN_INTERVAL_SECS:-30}
+      MONITOR_SSRF_ALLOW_PRIVATE: ${MONITOR_SSRF_ALLOW_PRIVATE:-false}
+      RUST_LOG: ${RUST_LOG:-info,sauron=debug}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
   api:
     build:
       context: ./backend
@@ -77,6 +97,7 @@ services:
       JWT_REFRESH_TTL_SECS: "2592000"
       API_PORT: "8080"
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:10002}
+      MONITOR_MIN_INTERVAL_SECS: ${MONITOR_MIN_INTERVAL_SECS:-30}
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     ports:
       - "10000:8080"
