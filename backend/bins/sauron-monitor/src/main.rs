@@ -22,7 +22,11 @@ use sauron_monitor_core::{
 async fn main() -> anyhow::Result<()> {
     sauron_telemetry::init("sauron-monitor");
     let cfg = Arc::new(Config::from_env()?);
-    let pool = sauron_db::build_pool(&cfg.database_url, 8)?;
+    // Up to `monitor_max_concurrency` probe tasks each check out a connection to
+    // persist results; size the pool to match, with headroom for the claim/prune
+    // connection used on the main loop.
+    let pool_size = cfg.monitor_max_concurrency + 4; // build_pool's max_size is `usize`
+    let pool = sauron_db::build_pool(&cfg.database_url, pool_size)?;
 
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
@@ -73,7 +77,9 @@ async fn tick(pool: &PgPool, http: &reqwest::Client, cfg: &Config) -> anyhow::Re
         }));
     }
     for h in handles {
-        let _ = h.await;
+        if let Err(e) = h.await {
+            warn!(error = %e, "monitor task panicked");
+        }
     }
     Ok(())
 }
@@ -91,6 +97,9 @@ fn spec_of(m: &Monitor) -> ProbeSpec {
         body: cfg.get("body").and_then(|b| b.as_str()).map(|s| s.to_string()),
         expected_status: cfg.get("expected_status").and_then(|s| s.as_str()).unwrap_or("200-399").to_string(),
         body_assertion: cfg.get("body_assertion").and_then(|s| s.as_str()).map(|s| s.to_string()),
+        // Carried for forward-compat; NOT enforced per-monitor in the MVP. The shared
+        // `http` client applies a fixed `Policy::limited(10)`, and per-request redirect
+        // overrides aren't supported yet.
         follow_redirects: cfg.get("follow_redirects").and_then(|b| b.as_bool()).unwrap_or(true),
         timeout: Duration::from_millis(m.timeout_ms.max(1) as u64),
     }
