@@ -7,6 +7,7 @@ pub mod devices;
 pub mod funnels;
 pub mod issues;
 pub mod journeys;
+pub mod monitors;
 pub mod orgs;
 pub mod performance;
 pub mod projects;

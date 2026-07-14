@@ -207,6 +207,25 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/journeys",
             get(routes::journeys::explore),
         )
+        // --- uptime monitors (project-scoped) ---
+        .route(
+            "/v1/projects/{project_id}/monitors",
+            get(routes::monitors::list).post(routes::monitors::create),
+        )
+        .route(
+            "/v1/monitors/{monitor_id}",
+            get(routes::monitors::detail)
+                .patch(routes::monitors::update)
+                .delete(routes::monitors::delete),
+        )
+        .route(
+            "/v1/monitors/{monitor_id}/checks",
+            get(routes::monitors::checks),
+        )
+        .route(
+            "/v1/monitors/{monitor_id}/incidents",
+            get(routes::monitors::incidents),
+        )
         // --- performance (app-scoped) ---
         .route(
             "/v1/apps/{app_id}/performance/summary",
