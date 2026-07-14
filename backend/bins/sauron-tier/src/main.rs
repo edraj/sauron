@@ -79,19 +79,47 @@ async fn tier_table(pool: &PgPool, cfg: &Config, gran: Granularity, t: &TieredTa
         let cold_dir_c = cold_dir.clone();
         let base_glob_c = base_glob.clone();
         let (rs, re) = (range.start, range.end);
-        let cold_rows = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
-            let eng = DuckEngine::open()?;
-            eng.export_from_postgres(&pg_url, &table, rs, re, &cold_dir_c)?;
-            eng.count_range(&base_glob_c, rs, re)
-        })
-        .await??;
+        let pg_rows_c = pg_rows;
+        // Idempotency pre-check: only export when cold has NOTHING for this range.
+        // `APPEND` is not idempotent, so re-exporting a range that already has data
+        // would duplicate rows. `already`: rows already in cold for [rs, re).
+        //   already == pg_rows  → already exported (a prior watermark-advance didn't
+        //                         stick); skip export, just advance.
+        //   already == 0        → fresh export, then verify.
+        //   0 < already != pg   → partial/corrupt cold data; do NOT append more.
+        let (already, exported_cold) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(i64, Option<i64>)> {
+                let eng = DuckEngine::open()?;
+                let already = eng.count_range(&base_glob_c, rs, re)?;
+                if already != 0 || pg_rows_c == 0 {
+                    // Already present, partial, or nothing to export — decided by caller.
+                    return Ok((already, None));
+                }
+                eng.export_from_postgres(&pg_url, &table, rs, re, &cold_dir_c)?;
+                let cold = eng.count_range(&base_glob_c, rs, re)?;
+                Ok((already, Some(cold)))
+            })
+            .await??;
 
-        if cold_rows != pg_rows {
-            warn!(child = %child, pg_rows, cold_rows, "count mismatch; leaving partition for retry");
-            break;
+        match exported_cold {
+            Some(cold_rows) => {
+                if cold_rows != pg_rows {
+                    warn!(child = %child, pg_rows, cold_rows, "count mismatch after export; leaving partition for retry");
+                    break;
+                }
+                repo::advance_watermark(&mut c, t.name, range.end).await?;
+                info!(child = %child, rows = pg_rows, "exported partition to Parquet");
+            }
+            None if already == pg_rows => {
+                // Rows already durable in cold from a prior attempt — idempotent advance.
+                repo::advance_watermark(&mut c, t.name, range.end).await?;
+                info!(child = %child, rows = pg_rows, "partition already in cold; advanced watermark");
+            }
+            None => {
+                warn!(child = %child, pg_rows, already, "partial cold data for range; skipping re-export (manual clear needed)");
+                break;
+            }
         }
-        repo::advance_watermark(&mut c, t.name, range.end).await?;
-        info!(child = %child, rows = pg_rows, "exported partition to Parquet");
     }
 
     // 4. Drop partitions strictly below the watermark AND past the drop lag.
