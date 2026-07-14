@@ -1,6 +1,13 @@
 //! SSRF guard: reject probing loopback / private / link-local / metadata
 //! targets by default. The classifier is pure and unit-tested; `guard_target`
-//! resolves DNS and checks every resolved address (defends against rebinding).
+//! resolves DNS and rejects the host if any address it resolves to *at probe
+//! time* is blocked. This is a point-in-time check, not a binding one: the
+//! resolved addresses are not carried forward, so the caller's subsequent
+//! connection re-resolves the host independently. A low-TTL DNS answer can
+//! therefore still change between the guard check and the connect (DNS
+//! rebinding / TOCTOU) and bypass this guard. Full IP-pinning — resolving
+//! once and connecting to that pinned address — would close this gap and is
+//! a tracked follow-up, not implemented here.
 
 use std::net::IpAddr;
 
