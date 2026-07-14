@@ -139,6 +139,23 @@ async fn tier_table(pool: &PgPool, cfg: &Config, gran: Granularity, t: &TieredTa
             let Some(start) = parse_suffix_start(&child, t.name) else { continue };
             let range = bucket_bounds(start, gran);
             if range.end <= w && (now - range.end) >= lag {
+                // Late-write safety: a client-supplied occurred_at can route a NEW
+                // row into this already-exported-but-not-yet-dropped partition (the
+                // grace window). Such a row is NOT in Parquet, so dropping would lose
+                // it. Re-count the partition against its cold copy; if it grew, retain
+                // the partition instead of deleting un-exported data ("never delete").
+                let pg_now = repo::count_child_rows(&mut c, &child).await?;
+                let (rs, re) = (range.start, range.end);
+                let base_glob_c = base_glob.clone();
+                let cold_now = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+                    let eng = DuckEngine::open()?;
+                    eng.count_range(&base_glob_c, rs, re)
+                })
+                .await??;
+                if pg_now > cold_now {
+                    warn!(child = %child, pg_now, cold_now, "partition grew after export (late arrivals); retaining to avoid data loss");
+                    continue;
+                }
                 repo::detach_and_drop_partition(&mut c, t.name, &child).await?;
                 repo::set_dropped_thru(&mut c, t.name, range.end).await?;
                 info!(child = %child, "dropped Postgres partition (now cold-only)");
