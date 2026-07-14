@@ -1,0 +1,79 @@
+# ─────────────────────────────────────────────────────────────
+# Sauron — polyglot monorepo .gitignore
+# Patterns are recursive (no leading slash) so they match the same
+# artifact under backend/, dashboard/, sdks/*, and examples/*.
+# ─────────────────────────────────────────────────────────────
+
+# ── Rust (backend) ──────────────────────────────────────────
+target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock is committed intentionally (binary/app).
+
+# ── Node / TypeScript (dashboard, sdks/js, sdks/node, examples) ─
+node_modules/
+dist/
+dist-ssr/
+build/
+coverage/
+.vite/
+.svelte-kit/
+*.tsbuildinfo
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+# package-lock.json is committed intentionally (apps).
+
+# ── Flutter / Dart (sdks/flutter, examples/flutter-app) ─────
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+*.iml
+pubspec.lock
+
+# ── .NET / C# (sdks/csharp, examples/csharp-server) ─────────
+bin/
+obj/
+*.user
+*.suo
+
+# ── Python (sdks/python, examples/python-server) ────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+env/
+
+# ── Environment / secrets ───────────────────────────────────
+.env
+.env.*
+!.env.example
+*.local
+
+# ── AI / agent tooling scratch (not part of the product) ────
+.claude/
+.superpowers/
+
+# ── Editor / IDE / OS ───────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Misc ────────────────────────────────────────────────────
+*.tmp
+.cache/

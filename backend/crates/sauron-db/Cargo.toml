@@ -1,0 +1,21 @@
+[package]
+name = "sauron-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sauron-core.workspace = true
+diesel.workspace = true
+diesel-async.workspace = true
+diesel_migrations.workspace = true
+scoped-futures.workspace = true
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+percent-encoding.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

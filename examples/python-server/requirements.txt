@@ -1,0 +1,6 @@
+# The Sauron Python SDK is stdlib-only (no runtime dependencies).
+# Install it in editable mode from this repo:
+#   pip install -e ../../sdks/python
+#
+# Then run:
+#   SAURON_DSN="https://pk_live_xxx@ingest.sauron.example/1" python main.py

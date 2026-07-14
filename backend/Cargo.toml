@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.82"
+
+[workspace.dependencies]
+# --- internal crates ---
+sauron-core = { path = "crates/sauron-core" }
+sauron-db = { path = "crates/sauron-db" }
+sauron-redis = { path = "crates/sauron-redis" }
+sauron-auth = { path = "crates/sauron-auth" }
+sauron-pipeline = { path = "crates/sauron-pipeline" }
+sauron-telemetry = { path = "crates/sauron-telemetry" }
+
+# --- async runtime / http ---
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["typed-header", "query"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = [
+    "trace",
+    "cors",
+    "limit",
+    "request-id",
+    "timeout",
+    "decompression-full",
+] }
+
+# --- database ---
+# `postgres_backend` (not `postgres`) gives the Pg query builder + types WITHOUT
+# the libpq-linked sync connection; all I/O goes through diesel-async instead.
+diesel = { version = "2.3", features = ["postgres_backend", "chrono", "uuid", "serde_json"] }
+diesel-async = { version = "0.9", features = ["postgres", "deadpool", "async-connection-wrapper"] }
+diesel_migrations = "2.3"
+scoped-futures = "0.1"
+
+# --- redis ---
+redis = { version = "1", features = ["tokio-comp", "connection-manager", "streams"] }
+
+# --- auth / crypto ---
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+argon2 = { version = "0.5", features = ["std"] }
+getrandom = "0.3"
+sha2 = "0.11"
+hex = "0.4"
+
+# --- serialization / validation / ids / time ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+validator = { version = "0.20", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+percent-encoding = "2"
+
+# --- enrichment ---
+woothee = "0.13"
+
+# --- observability / errors / config ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+anyhow = "1"

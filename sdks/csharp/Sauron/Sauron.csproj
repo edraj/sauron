@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Sauron</RootNamespace>
+    <AssemblyName>Sauron</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Version>0.1.0</Version>
+    <PackageId>Sauron</PackageId>
+    <Description>Server-side .NET SDK for the Sauron observability + analytics ingest gateway.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Sauron.Tests" />
+  </ItemGroup>
+
+</Project>

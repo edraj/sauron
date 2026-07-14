@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS refresh_tokens;
+DROP TABLE IF EXISTS identities;
+DROP TABLE IF EXISTS event_users;
+DROP TABLE IF EXISTS analytics_events;
+DROP TABLE IF EXISTS error_events;
+DROP TABLE IF EXISTS issues;
+DROP TABLE IF EXISTS environments;
+DROP TABLE IF EXISTS projects;
+DROP TABLE IF EXISTS org_members;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS organizations;

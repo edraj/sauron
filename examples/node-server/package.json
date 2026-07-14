@@ -1,0 +1,22 @@
+{
+  "name": "@sauron/example-node-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal server-side example for the @sauron/node SDK.",
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sauron/node": "file:../../sdks/node"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

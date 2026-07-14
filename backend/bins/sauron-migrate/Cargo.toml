@@ -1,0 +1,16 @@
+[package]
+name = "sauron-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sauron-migrate"
+path = "src/main.rs"
+
+[dependencies]
+sauron-db.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

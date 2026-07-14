@@ -1,0 +1,173 @@
+/* ==========================================================================
+   Sauron Web SDK Demo — design tokens & global styles.
+   Dark-first, aligned with the Sauron dashboard palette. Light theme applies
+   automatically via prefers-color-scheme.
+   ========================================================================== */
+
+:root {
+  /* Brand */
+  --primary: #6e7bf2;
+  --primary-hover: #8089f6;
+  --primary-active: #5c69e6;
+  --primary-contrast: #ffffff;
+  --primary-soft: rgba(110, 123, 242, 0.16);
+  --primary-border: rgba(110, 123, 242, 0.4);
+
+  /* Surfaces (dark) */
+  --bg: #0a0c10;
+  --bg-gradient: radial-gradient(1200px 620px at 82% -12%, rgba(110, 123, 242, 0.1), transparent 60%),
+    radial-gradient(900px 500px at 0% 0%, rgba(240, 97, 109, 0.06), transparent 55%);
+  --surface: #12151b;
+  --surface-2: #171b22;
+  --surface-3: #1d222b;
+
+  /* Lines */
+  --border: #262c37;
+  --border-strong: #343c49;
+
+  /* Text */
+  --text: #e7eaef;
+  --text-muted: #98a2b1;
+  --text-faint: #626c7a;
+
+  /* Semantic */
+  --error: #f0616d;
+  --error-soft: rgba(240, 97, 109, 0.15);
+  --warning: #f0a850;
+  --warning-soft: rgba(240, 168, 80, 0.16);
+  --info: #5cb0e6;
+  --info-soft: rgba(92, 176, 230, 0.15);
+  --success: #43c06d;
+  --success-soft: rgba(67, 192, 109, 0.15);
+  --neutral: #828d9d;
+  --neutral-soft: rgba(130, 141, 157, 0.15);
+
+  /* Focus */
+  --focus-ring: rgba(110, 123, 242, 0.5);
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.5);
+
+  /* Typography */
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code',
+    Menlo, Consolas, monospace;
+
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --primary: #5460e6;
+    --primary-hover: #4954d8;
+    --primary-active: #3e49c9;
+    --primary-contrast: #ffffff;
+    --primary-soft: rgba(84, 96, 230, 0.1);
+    --primary-border: rgba(84, 96, 230, 0.28);
+
+    --bg: #f5f6f9;
+    --bg-gradient: radial-gradient(1200px 620px at 82% -12%, rgba(84, 96, 230, 0.09), transparent 60%),
+      radial-gradient(900px 500px at 0% 0%, rgba(216, 58, 74, 0.05), transparent 55%);
+    --surface: #ffffff;
+    --surface-2: #f4f6f9;
+    --surface-3: #eaedf3;
+
+    --border: #e3e7ee;
+    --border-strong: #ccd3de;
+
+    --text: #171b23;
+    --text-muted: #59616f;
+    --text-faint: #8b93a1;
+
+    --error: #d83a4a;
+    --error-soft: rgba(216, 58, 74, 0.1);
+    --warning: #c9820f;
+    --warning-soft: rgba(201, 130, 15, 0.12);
+    --info: #2f86c4;
+    --info-soft: rgba(47, 134, 196, 0.1);
+    --success: #1f9d54;
+    --success-soft: rgba(31, 157, 84, 0.12);
+    --neutral: #6b7482;
+    --neutral-soft: rgba(107, 116, 130, 0.12);
+
+    --focus-ring: rgba(84, 96, 230, 0.4);
+
+    --shadow-sm: 0 1px 2px rgba(20, 24, 34, 0.06);
+    --shadow: 0 8px 24px rgba(20, 24, 34, 0.08);
+    --shadow-lg: 0 18px 50px rgba(20, 24, 34, 0.14);
+
+    color-scheme: light;
+  }
+}
+
+/* --- reset ---------------------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  background-color: var(--bg);
+  background-image: var(--bg-gradient);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+#app {
+  min-height: 100%;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+}
+
+input,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+code,
+kbd {
+  font-family: var(--font-mono);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--primary-soft);
+}

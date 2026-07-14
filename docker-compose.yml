@@ -1,0 +1,104 @@
+# Sauron — full stack: Postgres + Redis + migrate (one-shot) + ingest + api + dashboard.
+#
+#   cp .env.example .env      # then edit JWT_SECRET
+#   docker compose up --build
+#
+# Dashboard → http://localhost:3000   API → http://localhost:8080   Ingest → http://localhost:8081
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sauron}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sauron}
+      POSTGRES_DB: ${POSTGRES_DB:-sauron}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-sauron}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # One-shot: applies migrations then exits. Others wait for it to complete.
+  migrate:
+    build:
+      context: ./backend
+      args:
+        BIN: sauron-migrate
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  ingest:
+    build:
+      context: ./backend
+      args:
+        BIN: sauron-ingest
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
+      REDIS_URL: redis://redis:6379
+      INGEST_PORT: "8081"
+      WORKER_CONCURRENCY: "4"
+      INGEST_RATE_LIMIT_PER_MIN: "6000"
+      RUST_LOG: ${RUST_LOG:-info,sauron=debug}
+    ports:
+      - "10001:8081"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./backend
+      args:
+        BIN: sauron-api
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      JWT_ACCESS_TTL_SECS: "900"
+      JWT_REFRESH_TTL_SECS: "2592000"
+      API_PORT: "8080"
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:10002}
+      RUST_LOG: ${RUST_LOG:-info,sauron=debug}
+    ports:
+      - "10000:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: ./dashboard
+    environment:
+      # The browser reaches the API/ingest via the host-published ports, not the
+      # compose network. Injected into config.js at container start.
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:10000}
+      INGEST_BASE_URL: ${INGEST_BASE_URL:-http://localhost:10001}
+    ports:
+      - "10002:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata: {}
+  redisdata: {}

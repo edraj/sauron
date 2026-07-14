@@ -1,0 +1,18 @@
+[package]
+name = "sauron-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sauron-core.workspace = true
+sauron-db.workspace = true
+sauron-redis.workspace = true
+woothee.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

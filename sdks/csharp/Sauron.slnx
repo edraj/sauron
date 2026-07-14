@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Sauron.Tests/Sauron.Tests.csproj" />
+  <Project Path="Sauron/Sauron.csproj" />
+</Solution>

@@ -1,0 +1,23 @@
+[package]
+name = "sauron-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sauron-core.workspace = true
+sauron-db.workspace = true
+argon2.workspace = true
+jsonwebtoken.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+hex.workspace = true
+axum.workspace = true
+axum-extra.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
