@@ -4,5 +4,7 @@
 //! `state`, `ssrf`, `webhook`, and `probe` modules alongside `status`.
 
 pub mod status;
+pub mod state;
 
 pub use status::{evaluate_http, status_matches};
+pub use state::{apply, status_str, MonitorState, Outcome, ProbeResult, Status, TransitionKind};
