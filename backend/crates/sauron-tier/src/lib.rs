@@ -4,11 +4,11 @@
 
 // pub mod duck;
 pub mod layout;
-// pub mod merge;
+pub mod merge;
 pub mod plan;
 
 pub use layout::{bucket_bounds, cold_copy_dir, cold_partition_glob, partition_suffix, Granularity};
-// pub use merge::{merge_day_counts, DayCount};
+pub use merge::{merge_day_counts, DayCount};
 pub use plan::{plan, TierPlan, TimeRange};
 
 /// A table that participates in tiering, keyed on its time column.
