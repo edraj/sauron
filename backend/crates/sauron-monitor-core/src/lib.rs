@@ -6,6 +6,8 @@
 pub mod status;
 pub mod state;
 pub mod ssrf;
+pub mod webhook;
 
 pub use status::{evaluate_http, status_matches};
 pub use state::{apply, status_str, MonitorState, Outcome, ProbeResult, Status, TransitionKind};
+pub use webhook::WebhookPayload;
