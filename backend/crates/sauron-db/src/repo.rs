@@ -2746,3 +2746,47 @@ pub async fn error_counts_by_day_hot(
     .load(conn)
     .await
 }
+
+/// Per-day analytics-event counts from the HOT (Postgres) tier for `[from, to)`.
+pub async fn event_counts_by_day_hot(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> QueryResult<Vec<DayCountRow>> {
+    diesel::sql_query(
+        "SELECT (occurred_at AT TIME ZONE 'UTC')::date AS day, count(*)::bigint AS count \
+         FROM analytics_events \
+         WHERE app_id = $1 AND occurred_at >= $2 AND occurred_at < $3 \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .load(conn)
+    .await
+}
+
+/// Per-day transaction THROUGHPUT (count) from the HOT (Postgres) tier for `[from, to)`.
+/// ADDITIVE metric only — safe to sum across tiers. Transaction PERCENTILES
+/// (p50/p95 of duration_ms) are HOLISTIC and are NOT merged across tiers; those
+/// endpoints stay hot-only (Postgres). Do not add percentiles to the cold path
+/// without mergeable sketches (t-digest/DDSketch).
+pub async fn transaction_counts_by_day_hot(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> QueryResult<Vec<DayCountRow>> {
+    diesel::sql_query(
+        "SELECT (occurred_at AT TIME ZONE 'UTC')::date AS day, count(*)::bigint AS count \
+         FROM transactions \
+         WHERE app_id = $1 AND occurred_at >= $2 AND occurred_at < $3 \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .load(conn)
+    .await
+}

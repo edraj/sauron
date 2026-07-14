@@ -52,8 +52,12 @@ impl DuckEngine {
         Ok(n)
     }
 
-    /// Per-day error counts for one app in `[from, to)` read from cold Parquet.
-    pub fn error_counts_by_day(
+    /// Per-day row counts for one app in `[from, to)` read from cold Parquet.
+    /// Table-agnostic: reads `occurred_at` + `app_id` from whatever
+    /// hive-partitioned Parquet dataset `glob` points at (error_events,
+    /// analytics_events, transactions, ...). Callers select the table by
+    /// building `glob` with the appropriate table name.
+    pub fn counts_by_day(
         &self,
         glob: &str,
         app_id: Uuid,
@@ -166,7 +170,7 @@ mod tests {
 
         let from = "2026-05-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let to = "2026-06-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let series = eng.error_counts_by_day(&glob, app, from, to).unwrap();
+        let series = eng.counts_by_day(&glob, app, from, to).unwrap();
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].count, 2); // 2026-05-01
         assert_eq!(series[1].count, 1); // 2026-05-02
@@ -191,12 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn error_counts_by_day_is_empty_when_no_files_match() {
+    fn counts_by_day_is_empty_when_no_files_match() {
         let eng = DuckEngine::open().unwrap();
         let app = Uuid::new_v4();
         let glob = crate::layout::cold_partition_glob("/nonexistent-sauron-tier-cold", "error_events", app);
         let from = "2026-05-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let to = "2026-06-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert!(eng.error_counts_by_day(&glob, app, from, to).unwrap().is_empty());
+        assert!(eng.counts_by_day(&glob, app, from, to).unwrap().is_empty());
     }
 }

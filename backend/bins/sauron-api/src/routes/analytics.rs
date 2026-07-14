@@ -335,6 +335,46 @@ pub async fn error_timeseries(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Cross-tier analytics-events timeseries — GET /events/timeseries.
+// ---------------------------------------------------------------------------
+
+pub async fn event_timeseries(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<DayCountOut>>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    drop(conn); // release the pooled conn before the router checks out its own
+    let series = crate::tier_read::event_counts_by_day(&state, app_id, q.from, q.to).await?;
+    Ok(Json(
+        series.into_iter().map(|d| DayCountOut { day: d.day, count: d.count }).collect(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-tier transactions timeseries — GET /transactions/timeseries.
+// ADDITIVE (count/throughput) only; percentiles are holistic and served
+// hot-only (Postgres) — see repo::transaction_counts_by_day_hot.
+// ---------------------------------------------------------------------------
+
+pub async fn transaction_timeseries(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<TimeseriesQuery>,
+) -> Result<Json<Vec<DayCountOut>>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    drop(conn); // release the pooled conn before the router checks out its own
+    let series = crate::tier_read::transaction_counts_by_day(&state, app_id, q.from, q.to).await?;
+    Ok(Json(
+        series.into_iter().map(|d| DayCountOut { day: d.day, count: d.count }).collect(),
+    ))
+}
+
 #[cfg(test)]
 mod stickiness_tests {
     use super::stickiness;

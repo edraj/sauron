@@ -174,6 +174,14 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/errors/timeseries",
             get(routes::analytics::error_timeseries),
         )
+        .route(
+            "/v1/apps/{app_id}/events/timeseries",
+            get(routes::analytics::event_timeseries),
+        )
+        .route(
+            "/v1/apps/{app_id}/transactions/timeseries",
+            get(routes::analytics::transaction_timeseries),
+        )
         // --- exceptions dashboard ---
         .route(
             "/v1/apps/{app_id}/issues/stats",
