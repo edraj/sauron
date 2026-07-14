@@ -83,6 +83,56 @@ impl DuckEngine {
         }
         Ok(out)
     }
+
+    /// Copy `[start, end)` of a Postgres table into hive-partitioned Parquet
+    /// under `cold_dir`, appending to existing month directories. Uses DuckDB's
+    /// postgres extension (needs libpq available at runtime).
+    pub fn export_from_postgres(
+        &self,
+        pg_url: &str,
+        table: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        cold_dir: &str,
+    ) -> anyhow::Result<()> {
+        self.conn.execute_batch("INSTALL postgres; LOAD postgres;")?;
+        // ATTACH is idempotent-ish within a connection; detach if re-run.
+        let _ = self.conn.execute_batch("DETACH DATABASE IF EXISTS pg;");
+        self.conn
+            .execute_batch(&format!("ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY);"))?;
+        let sql = format!(
+            "COPY (SELECT *, year(occurred_at) AS year, month(occurred_at) AS month \
+                   FROM pg.{table} \
+                   WHERE occurred_at >= TIMESTAMPTZ '{start}' AND occurred_at < TIMESTAMPTZ '{end}') \
+             TO '{cold_dir}' (FORMAT PARQUET, PARTITION_BY (app_id, year, month), APPEND);",
+            table = table,
+            start = start.to_rfc3339(),
+            end = end.to_rfc3339(),
+            cold_dir = cold_dir,
+        );
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Count cold rows in `[start, end)` across all apps (verification helper).
+    pub fn count_range(
+        &self,
+        glob: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<i64> {
+        if !self.any_files_match(glob)? {
+            return Ok(0);
+        }
+        let sql = "SELECT count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true) \
+                   WHERE occurred_at >= ? AND occurred_at < ?";
+        let mut stmt = self.conn.prepare(sql)?;
+        let n: i64 = stmt.query_row(
+            duckdb::params![glob, start.to_rfc3339(), end.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]

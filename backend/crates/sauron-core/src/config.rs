@@ -25,6 +25,12 @@ pub struct Config {
     pub monitor_check_retention_days: i64,
     pub monitor_min_interval_secs: i64,
     pub monitor_ssrf_allow_private: bool,
+    pub tier_hot_days: i64,
+    pub tier_granularity: String,
+    pub tier_cold_path: String,
+    pub tier_drop_lag_hours: i64,
+    pub tier_tick_secs: u64,
+    pub tier_partition_ahead: i64,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -74,6 +80,12 @@ impl Config {
             monitor_ssrf_allow_private: var("MONITOR_SSRF_ALLOW_PRIVATE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            tier_hot_days: parse("TIER_HOT_DAYS", 30),
+            tier_granularity: var("TIER_GRANULARITY").unwrap_or_else(|| "day".to_string()),
+            tier_cold_path: var("TIER_COLD_PATH").unwrap_or_else(|| "/var/lib/sauron/cold".to_string()),
+            tier_drop_lag_hours: parse("TIER_DROP_LAG_HOURS", 24),
+            tier_tick_secs: parse("TIER_TICK_SECS", 3600),
+            tier_partition_ahead: parse("TIER_PARTITION_AHEAD", 7),
         })
     }
 }

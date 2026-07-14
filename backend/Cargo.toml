@@ -17,6 +17,7 @@ sauron-auth = { path = "crates/sauron-auth" }
 sauron-pipeline = { path = "crates/sauron-pipeline" }
 sauron-telemetry = { path = "crates/sauron-telemetry" }
 sauron-monitor-core = { path = "crates/sauron-monitor-core" }
+sauron-tier = { path = "crates/sauron-tier" }
 
 # --- async runtime / http ---
 tokio = { version = "1", features = ["full"] }
