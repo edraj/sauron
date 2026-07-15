@@ -39,3 +39,85 @@ pub async fn run_pending_migrations(database_url: &str) -> anyhow::Result<()> {
     .await??;
     Ok(())
 }
+
+// ===========================================================================
+// Admin DDL — create/drop whole databases (used by the crebain benchmark to
+// spin up and tear down an isolated ephemeral database).
+// ===========================================================================
+
+/// Create a database by `db_name` on the server addressed by `maintenance_url`.
+/// `maintenance_url` must point at any *existing* database on the same server
+/// other than the one being created (e.g. the app's own database).
+///
+/// `CREATE DATABASE` cannot run inside a transaction and cannot be parameterized,
+/// so it is issued through the simple query protocol (`batch_execute`) and the
+/// identifier is validated rather than bound.
+pub async fn create_database(maintenance_url: &str, db_name: &str) -> anyhow::Result<()> {
+    run_admin_ddl(maintenance_url, db_name, &format!("CREATE DATABASE \"{db_name}\"")).await
+}
+
+/// Drop `db_name` if it exists, terminating any other sessions still connected
+/// (`WITH (FORCE)`, Postgres 13+). Idempotent. `maintenance_url` must not point
+/// at the database being dropped.
+pub async fn drop_database(maintenance_url: &str, db_name: &str) -> anyhow::Result<()> {
+    run_admin_ddl(
+        maintenance_url,
+        db_name,
+        &format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"),
+    )
+    .await
+}
+
+/// Guard against SQL injection through an un-bindable identifier: only a plain,
+/// lowercase Postgres identifier (letters/digits/underscore, not starting with a
+/// digit, ≤ 63 bytes) is allowed.
+fn validate_db_ident(name: &str) -> anyhow::Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!("unsafe database identifier: {name:?}")
+    }
+}
+
+async fn run_admin_ddl(maintenance_url: &str, db_name: &str, sql: &str) -> anyhow::Result<()> {
+    use diesel_async::{AsyncConnection, SimpleAsyncConnection};
+    validate_db_ident(db_name)?;
+    let mut conn = AsyncPgConnection::establish(maintenance_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect maintenance db: {e}"))?;
+    conn.batch_execute(sql)
+        .await
+        .map_err(|e| anyhow::anyhow!("admin ddl `{sql}` failed: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::validate_db_ident;
+
+    #[test]
+    fn accepts_safe_bench_names() {
+        assert!(validate_db_ident("crebain_bench_0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_db_ident("sauron").is_ok());
+        assert!(validate_db_ident("_x").is_ok());
+    }
+
+    #[test]
+    fn rejects_unsafe_names() {
+        assert!(validate_db_ident("").is_err());
+        assert!(validate_db_ident("has space").is_err());
+        assert!(validate_db_ident("drop\";--").is_err());
+        assert!(validate_db_ident("1leading_digit").is_err());
+        assert!(validate_db_ident("UpperCase").is_err());
+        assert!(validate_db_ident(&"x".repeat(64)).is_err());
+    }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "crebain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "crebain"
+path = "src/main.rs"
+
+[dependencies]
+sauron-core = { workspace = true }
+sauron-db = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+redis = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+flate2 = { workspace = true }
