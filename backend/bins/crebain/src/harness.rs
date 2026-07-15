@@ -26,19 +26,22 @@ pub struct HarnessGuard {
     torn_down: bool,
 }
 
-/// Provision the isolated stack. On any failure after the database is created,
-/// the partial stack is torn down before the error is returned.
-pub async fn setup(icfg: &IsolatedConfig) -> anyhow::Result<(Target, HarnessGuard)> {
+/// The bench names/URLs, computed up front.
+pub struct Prepared {
+    pub bench_db: String,
+    pub bench_pg_url: String,
+    pub bench_redis_url: String,
+}
+
+/// Compute names/URLs and construct the (empty) guard — pure, no I/O. The guard
+/// is created BEFORE any database exists so the caller can tear down from any
+/// interruption point, including a Ctrl-C mid-[`provision`] or even during
+/// `CREATE DATABASE` (teardown drops `IF EXISTS`, so it is safe either way).
+pub fn prepare(icfg: &IsolatedConfig) -> anyhow::Result<(Prepared, HarnessGuard)> {
     let bench_db = bench_db_name();
     let bench_pg_url = swap_database(&icfg.admin_database_url, &bench_db)?;
     let bench_redis_url = swap_redis_db(&icfg.redis_url, icfg.redis_bench_db)?;
-
-    // CREATE DATABASE first — if this fails there is nothing to clean up.
-    eprintln!("crebain: creating bench database {bench_db}");
-    sauron_db::create_database(&icfg.admin_database_url, &bench_db).await?;
-
-    // Everything past this point must drop the database on failure.
-    let mut guard = HarnessGuard {
+    let guard = HarnessGuard {
         admin_url: icfg.admin_database_url.clone(),
         bench_db: bench_db.clone(),
         bench_redis_url: bench_redis_url.clone(),
@@ -46,35 +49,60 @@ pub async fn setup(icfg: &IsolatedConfig) -> anyhow::Result<(Target, HarnessGuar
         keep: icfg.keep,
         torn_down: false,
     };
-
-    match setup_inner(icfg, &bench_pg_url, &bench_redis_url, &mut guard).await {
-        Ok(target) => Ok((target, guard)),
-        Err(e) => {
-            guard.teardown().await;
-            Err(e)
-        }
-    }
+    Ok((
+        Prepared {
+            bench_db,
+            bench_pg_url,
+            bench_redis_url,
+        },
+        guard,
+    ))
 }
 
-async fn setup_inner(
+/// Create + migrate + seed the database, spawn the ingest, wait for it to be
+/// ready. The guard is mutated as resources come up (the child is stored the
+/// instant it spawns), so the caller's `teardown` covers a failure at ANY step.
+///
+/// Cancellation is cooperative, NOT via future-drop: each step runs to
+/// completion and the `cancel` flag is checked only *between* steps. This is
+/// deliberate — dropping a mid-flight `CREATE DATABASE` future can leave Postgres
+/// committing the database *after* teardown's `DROP … IF EXISTS` already ran,
+/// leaking it. Running the statement to completion guarantees teardown sees and
+/// drops it. Returns `Ok(None)` if cancelled at a checkpoint.
+pub async fn provision(
     icfg: &IsolatedConfig,
-    bench_pg_url: &str,
-    bench_redis_url: &str,
+    prepared: &Prepared,
     guard: &mut HarnessGuard,
-) -> anyhow::Result<Target> {
-    // Migrate.
-    eprintln!("crebain: applying migrations");
-    sauron_db::run_pending_migrations(bench_pg_url).await?;
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<Target>> {
+    macro_rules! bail_if_cancelled {
+        () => {
+            if *cancel.borrow() {
+                return Ok(None);
+            }
+        };
+    }
 
+    bail_if_cancelled!();
+    eprintln!("crebain: creating bench database {}", prepared.bench_db);
+    sauron_db::create_database(&icfg.admin_database_url, &prepared.bench_db).await?;
+
+    bail_if_cancelled!();
+    eprintln!("crebain: applying migrations");
+    sauron_db::run_pending_migrations(&prepared.bench_pg_url).await?;
+
+    bail_if_cancelled!();
     // Seed org → project → app, minting a public key we control.
     let public_key = format!("pk_crebain_{}", uuid::Uuid::new_v4().simple());
-    let app_id = seed(bench_pg_url, &public_key).await?;
+    let app_id = seed(&prepared.bench_pg_url, &public_key).await?;
 
+    bail_if_cancelled!();
     // Isolate + clean the bench Redis index.
-    flush_redis(bench_redis_url)
+    flush_redis(&prepared.bench_redis_url)
         .await
-        .map_err(|e| anyhow::anyhow!("flush bench redis {bench_redis_url}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("flush bench redis {}: {e}", prepared.bench_redis_url))?;
 
+    bail_if_cancelled!();
     // Spawn the dedicated ingest.
     let bin = locate_ingest(&icfg.ingest_bin)?;
     eprintln!(
@@ -82,18 +110,25 @@ async fn setup_inner(
         bin.display(),
         icfg.ingest_port
     );
-    guard.child = Some(spawn_ingest(&bin, icfg, bench_pg_url, bench_redis_url)?);
+    guard.child = Some(spawn_ingest(
+        &bin,
+        icfg,
+        &prepared.bench_pg_url,
+        &prepared.bench_redis_url,
+    )?);
 
-    // Wait for it to accept traffic.
+    // Wait for it to accept traffic (interruptible each poll).
     let base_url = format!("http://127.0.0.1:{}", icfg.ingest_port);
-    wait_ready(&base_url, guard).await?;
+    if !wait_ready(&base_url, guard, cancel).await? {
+        return Ok(None);
+    }
     eprintln!("crebain: ingest ready; bench app {app_id} seeded");
 
-    Ok(Target {
+    Ok(Some(Target {
         base_url,
         app_id: app_id.to_string(),
         public_key,
-    })
+    }))
 }
 
 /// Insert one org → project → app and return the app id.
@@ -161,13 +196,24 @@ fn locate_ingest(explicit: &Option<String>) -> anyhow::Result<PathBuf> {
     )
 }
 
-async fn wait_ready(base_url: &str, guard: &mut HarnessGuard) -> anyhow::Result<()> {
+/// Poll `/ready` until the ingest accepts traffic. `Ok(true)` = ready,
+/// `Ok(false)` = cancelled while waiting, `Err` = child died or 30s timeout.
+async fn wait_ready(
+    base_url: &str,
+    guard: &mut HarnessGuard,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<bool> {
     let url = format!("{base_url}/ready");
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
+        // The target is our own loopback ingest; never route it via an ambient proxy.
+        .no_proxy()
         .build()?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        if *cancel.borrow() {
+            return Ok(false);
+        }
         // If the ingest died during startup, fail fast rather than poll for 30s.
         if let Some(child) = guard.child.as_mut() {
             if let Ok(Some(status)) = child.try_wait() {
@@ -176,7 +222,7 @@ async fn wait_ready(base_url: &str, guard: &mut HarnessGuard) -> anyhow::Result<
         }
         if let Ok(resp) = http.get(&url).send().await {
             if resp.status().is_success() {
-                return Ok(());
+                return Ok(true);
             }
         }
         if Instant::now() >= deadline {

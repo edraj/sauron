@@ -63,6 +63,9 @@ struct Metrics {
     accepted_items: Sums,
     latencies_us: Vec<u64>,
     latency_total: u64,
+    /// True max over ALL requests, tracked exactly even past the reservoir cap
+    /// (the slowest requests often arrive last and would be dropped otherwise).
+    latency_max_us: u64,
     latency_truncated: bool,
 }
 
@@ -110,6 +113,7 @@ impl Metrics {
             accepted_items: Sums::default(),
             latencies_us: Vec::new(),
             latency_total: 0,
+            latency_max_us: 0,
             latency_truncated: false,
         }
     }
@@ -130,9 +134,11 @@ impl Metrics {
             *self.status_counts.entry(code).or_insert(0) += 1;
         }
         // Latency retained for every completed request (incl. non-2xx / timeouts).
+        let latency_us = s.outcome.latency.as_micros() as u64;
         self.latency_total += 1;
+        self.latency_max_us = self.latency_max_us.max(latency_us);
         if self.latencies_us.len() < LATENCY_CAP {
-            self.latencies_us.push(s.outcome.latency.as_micros() as u64);
+            self.latencies_us.push(latency_us);
         } else {
             self.latency_truncated = true;
         }
@@ -172,7 +178,7 @@ impl Metrics {
             p50_us: p(50.0),
             p90_us: p(90.0),
             p99_us: p(99.0),
-            max_us: self.latencies_us.last().copied().unwrap_or(0),
+            max_us: self.latency_max_us,
             latency_samples: self.latency_total,
             latency_truncated: self.latency_truncated,
             attempted: self.attempted.into_counts(),

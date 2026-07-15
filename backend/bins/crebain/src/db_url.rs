@@ -25,13 +25,42 @@ pub fn swap_database(url: &str, new_db: &str) -> anyhow::Result<String> {
     Ok(format!("{scheme}://{authority}/{new_db}{query}"))
 }
 
-/// Return `url` with its Redis database index set to `index`, preserving scheme
-/// and authority. `redis://h:6379` → `redis://h:6379/15`.
+/// Return `url` with its Redis database index set to `index`, preserving scheme,
+/// authority, and any `?query` (e.g. `?protocol=resp3`).
+///
+/// - TCP: `redis://h:6379?x=1` → `redis://h:6379/15?x=1` (db is the path segment).
+/// - Unix socket: `redis+unix:///run/redis.sock` → `redis+unix:///run/redis.sock?db=15`
+///   (the path is the socket; the db is selected via `?db=N`).
 pub fn swap_redis_db(url: &str, index: u8) -> anyhow::Result<String> {
     let (scheme, rest) = split_scheme(url)?;
-    let auth_end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let authority = &rest[..auth_end];
-    Ok(format!("{scheme}://{authority}/{index}"))
+    let (before_q, query) = match rest.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (rest, None),
+    };
+
+    if scheme.contains("unix") {
+        // Preserve the socket path; select the db via the query string.
+        let merged = merge_query(query, "db", &index.to_string());
+        return Ok(format!("{scheme}://{before_q}?{merged}"));
+    }
+
+    // TCP: authority runs to the first '/', the db is the path segment.
+    let auth_end = before_q.find('/').unwrap_or(before_q.len());
+    let authority = &before_q[..auth_end];
+    let tail = query.map(|q| format!("?{q}")).unwrap_or_default();
+    Ok(format!("{scheme}://{authority}/{index}{tail}"))
+}
+
+/// Set/replace `key=value` in a (possibly empty) `&`-joined query string.
+fn merge_query(query: Option<&str>, key: &str, value: &str) -> String {
+    let mut parts: Vec<String> = query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .filter(|p| !p.is_empty() && p.split('=').next() != Some(key))
+        .map(str::to_string)
+        .collect();
+    parts.push(format!("{key}={value}"));
+    parts.join("&")
 }
 
 /// Split `scheme://rest` into `(scheme, rest)`.
@@ -93,6 +122,27 @@ mod tests {
         assert_eq!(
             swap_redis_db("rediss://host", 3).unwrap(),
             "rediss://host/3"
+        );
+    }
+
+    #[test]
+    fn swaps_redis_index_preserving_query() {
+        assert_eq!(
+            swap_redis_db("redis://host:6379/0?protocol=resp3", 15).unwrap(),
+            "redis://host:6379/15?protocol=resp3"
+        );
+    }
+
+    #[test]
+    fn swaps_redis_index_for_unix_socket() {
+        assert_eq!(
+            swap_redis_db("redis+unix:///run/redis.sock", 15).unwrap(),
+            "redis+unix:///run/redis.sock?db=15"
+        );
+        // an existing db= is replaced, other params kept
+        assert_eq!(
+            swap_redis_db("unix:///run/r.sock?db=0&protocol=resp3", 9).unwrap(),
+            "unix:///run/r.sock?protocol=resp3&db=9"
         );
     }
 

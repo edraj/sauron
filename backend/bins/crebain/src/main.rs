@@ -46,13 +46,50 @@ async fn run() -> Result<ExitCode> {
             print_target(&target);
             finish(run_with_signals(engine::run(&cfg, &target)).await, &cfg)
         }
-        Mode::Isolated(icfg) => {
-            let (target, mut guard) = harness::setup(&icfg).await?;
+        Mode::Isolated(icfg) => run_isolated(&cfg, &icfg).await,
+    }
+}
+
+/// Isolated mode: provision an ephemeral stack, run the load, tear it all down.
+///
+/// A background task turns Ctrl-C/SIGTERM into a `cancel` flag installed BEFORE
+/// any I/O, so provisioning is never hit by the default-SIGINT process kill.
+/// Provisioning is cancelled only *between* steps (never mid-`CREATE DATABASE`),
+/// and `teardown` runs on every path — completion, error, or interrupt — so the
+/// bench database is always dropped.
+async fn run_isolated(cfg: &RunConfig, icfg: &cli::IsolatedConfig) -> Result<ExitCode> {
+    let (prepared, mut guard) = harness::prepare(icfg)?;
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let watcher = tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = cancel_tx.send(true);
+    });
+
+    let ran = isolated_body(cfg, icfg, &prepared, &mut guard, cancel_rx).await;
+
+    watcher.abort();
+    guard.teardown().await;
+    finish(ran, cfg)
+}
+
+async fn isolated_body(
+    cfg: &RunConfig,
+    icfg: &cli::IsolatedConfig,
+    prepared: &harness::Prepared,
+    guard: &mut harness::HarnessGuard,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Option<Result<Summary>> {
+    match harness::provision(icfg, prepared, guard, &cancel).await {
+        Err(e) => Some(Err(e)),
+        Ok(None) => None, // interrupted during provisioning
+        Ok(Some(target)) => {
             print_target(&target);
-            let ran = run_with_signals(engine::run(&cfg, &target)).await;
-            // Teardown runs in EVERY path: completion, engine error, and interrupt.
-            guard.teardown().await;
-            finish(ran, &cfg)
+            // engine::run is safe to cancel mid-flight (it just aborts user tasks).
+            tokio::select! {
+                r = engine::run(cfg, &target) => Some(r),
+                _ = cancel.changed() => None,
+            }
         }
     }
 }

@@ -47,6 +47,9 @@ impl IngestClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(usize::MAX)
+            // A benchmark measures the edge directly; never route through an
+            // ambient HTTP(S)_PROXY / ALL_PROXY that would skew or break requests.
+            .no_proxy()
             .build()?;
         Ok(IngestClient {
             http,
