@@ -40,7 +40,13 @@ void main() {
       (WidgetTester tester) async {
     await pumpDemo(tester);
 
-    expect(find.text('No actions yet — tap a button above.'), findsOneWidget);
+    // The demo declares its initial screen on startup (screen-level
+    // analytics), so the activity log is seeded with that entry and the
+    // empty-state placeholder is never shown.
+    expect(find.text('setScreen("Home") — screen tracking active'),
+        findsOneWidget);
+    expect(find.text('No actions yet — tap a button above.'), findsNothing);
+    expect(find.text('track("screen_viewed")'), findsNothing);
 
     // Tap "track: screen_viewed" (a no-op without an initialized SDK, but it
     // still records an activity-log entry). It is the second "Track" button.
@@ -48,6 +54,5 @@ void main() {
     await tester.pump();
 
     expect(find.text('track("screen_viewed")'), findsOneWidget);
-    expect(find.text('No actions yet — tap a button above.'), findsNothing);
   });
 }

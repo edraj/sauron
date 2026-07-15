@@ -96,7 +96,7 @@ pub async fn login(
     let user = repo::find_user_by_email(&mut conn, &req.email)
         .await?
         .filter(|u| verify_password(&req.password, &u.password_hash))
-        .ok_or(ApiError::Auth(AuthError::InvalidToken))?;
+        .ok_or(ApiError::Auth(AuthError::InvalidCredentials))?;
 
     let _ = repo::touch_last_login(&mut conn, user.id).await;
     let tokens = issue_tokens(&state, &mut conn, user.id, None).await?;

@@ -17,6 +17,11 @@ use crate::jwt::{Claims, JwtKeys};
 pub enum AuthError {
     MissingToken,
     InvalidToken,
+    /// Wrong email/password at login. Kept distinct from `InvalidToken` so the
+    /// client sees an accurate "invalid email or password" instead of a
+    /// misleading "invalid or expired token". Deliberately does not reveal
+    /// whether the email exists (no user-enumeration).
+    InvalidCredentials,
     Forbidden,
     NotFound,
     Internal,
@@ -34,6 +39,11 @@ impl AuthError {
                 StatusCode::UNAUTHORIZED,
                 "invalid_token",
                 "invalid or expired token",
+            ),
+            AuthError::InvalidCredentials => (
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "invalid email or password",
             ),
             AuthError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "you do not have access"),
             AuthError::NotFound => (StatusCode::NOT_FOUND, "not_found", "resource not found"),
@@ -88,5 +98,27 @@ where
             .map_err(|_| AuthError::InvalidToken)?;
         let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AuthError::InvalidToken)?;
         Ok(AuthUser { user_id, claims })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_credentials_maps_to_401_with_accurate_message() {
+        let (status, code, message) = AuthError::InvalidCredentials.parts();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(code, "invalid_credentials");
+        assert_eq!(message, "invalid email or password");
+    }
+
+    #[test]
+    fn credentials_and_token_errors_are_distinct() {
+        // A login failure must not masquerade as a token problem.
+        assert_ne!(
+            AuthError::InvalidCredentials.parts().1,
+            AuthError::InvalidToken.parts().1
+        );
     }
 }

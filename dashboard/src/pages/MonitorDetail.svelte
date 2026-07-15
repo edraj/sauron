@@ -5,6 +5,18 @@
   import type { MonitorDetail, MonitorCheck } from '../lib/models';
   import { sessionStore } from '../lib/stores/session.svelte';
   import StatusPill from '../lib/components/ui/StatusPill.svelte';
+  import Button from '../lib/components/ui/Button.svelte';
+  import Card from '../lib/components/ui/Card.svelte';
+  import DataTable from '../lib/components/DataTable.svelte';
+  import StatTiles from '../lib/components/StatTiles.svelte';
+  import StatTile from '../lib/components/StatTile.svelte';
+  import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Icon from '../lib/components/ui/Icon.svelte';
+  import CopyButton from '../lib/components/ui/CopyButton.svelte';
+  import LatencyBadge from '../lib/components/LatencyBadge.svelte';
+  import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
+  import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
 
   let { params }: { params: { id: string } } = $props();
 
@@ -12,10 +24,22 @@
   let checks = $state<MonitorCheck[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  let confirmOpen = $state(false);
+  let deleting = $state(false);
+  let pausing = $state(false);
 
   const canWrite = $derived(
     sessionStore.can('monitor:write', { project: detail?.monitor.project_id }),
   );
+
+  // Sort by timestamp ourselves rather than trusting the API's order: the newest-
+  // first log and the (chronological) availability strip stay correct even if the
+  // endpoint's ORDER BY ever changes.
+  const checksAsc = $derived(
+    checks.slice().sort((a, b) => new Date(a.checked_at).getTime() - new Date(b.checked_at).getTime()),
+  );
+  const recentChecks = $derived(checksAsc.slice().reverse().slice(0, 100));
+  const barChecks = $derived(checksAsc.slice(-60));
 
   async function load() {
     loading = true; error = null;
@@ -28,19 +52,33 @@
 
   async function togglePause() {
     if (!detail) return;
-    const nextEnabled = detail.monitor.status === 'paused';
-    await updateMonitor(params.id, { enabled: nextEnabled });
-    await load();
+    pausing = true; error = null;
+    try {
+      await updateMonitor(params.id, { enabled: detail.monitor.status === 'paused' });
+      await load();
+    } catch (e) { error = (e as Error).message; }
+    finally { pausing = false; }
   }
 
   async function remove() {
-    if (!detail) return;
-    if (!confirm(`Delete monitor "${detail.monitor.name}"?`)) return;
-    await deleteMonitor(params.id);
-    push('/monitors');
+    deleting = true; error = null;
+    try {
+      await deleteMonitor(params.id);
+      push('/monitors');
+    } catch (e) {
+      error = (e as Error).message;
+      deleting = false;
+      confirmOpen = false;
+    }
   }
 
   const fmtPct = (v: number | null | undefined) => (v == null ? '—' : `${v.toFixed(2)}%`);
+  function pctTone(v: number | null): 'neutral' | 'success' | 'warning' | 'error' {
+    if (v == null) return 'neutral';
+    if (v >= 99) return 'success';
+    if (v >= 95) return 'warning';
+    return 'error';
+  }
 
   $effect(() => {
     if (params.id) void load();
@@ -48,83 +86,327 @@
 </script>
 
 <AppShell>
+  <button class="back" onclick={() => push('/monitors')}>
+    <Icon name="arrow-left" size={14} />
+    Uptime
+  </button>
+
   {#if loading}
-    <p class="p">Loading…</p>
-  {:else if error}
-    <p class="p err">{error}</p>
+    <div class="center"><Spinner size={26} /></div>
+  {:else if error && !detail}
+    <EmptyState title="Monitor not found" description={error} icon="triangle-alert">
+      {#snippet action()}
+        <Button variant="secondary" onclick={() => push('/monitors')}>Back to Uptime</Button>
+      {/snippet}
+    </EmptyState>
   {:else if detail}
-    <div class="p">
-      <a href="#/monitors" class="back">← Uptime</a>
-      <header>
-        <div>
-          <h1>{detail.monitor.name} <StatusPill status={detail.monitor.status} /></h1>
-          <p class="mono">{detail.monitor.kind.toUpperCase()} · {detail.monitor.target}</p>
+    {@const incidents = detail.incidents}
+    <header class="detail-head">
+      <div class="head-main">
+        <h1 class="mon-title">{detail.monitor.name} <StatusPill status={detail.monitor.status} /></h1>
+        <div class="key-row">
+          <span class="kindtag">{detail.monitor.kind}</span>
+          <span class="key mono">{detail.monitor.target}</span>
+          <CopyButton value={detail.monitor.target} size="sm" />
         </div>
-        {#if canWrite}
-          <div class="actions">
-            <button onclick={togglePause}>{detail.monitor.status === 'paused' ? 'Resume' : 'Pause'}</button>
-            <button class="danger" onclick={remove}>Delete</button>
-          </div>
-        {/if}
-      </header>
-
-      <div class="tiles">
-        <div class="tile"><span>Uptime 24h</span><strong>{fmtPct(detail.uptime.h24)}</strong></div>
-        <div class="tile"><span>Uptime 7d</span><strong>{fmtPct(detail.uptime.d7)}</strong></div>
-        <div class="tile"><span>Uptime 30d</span><strong>{fmtPct(detail.uptime.d30)}</strong></div>
-        <div class="tile"><span>Interval</span><strong>{detail.monitor.interval_seconds}s</strong></div>
       </div>
-
-      <h2>Recent checks</h2>
-      <table>
-        <thead><tr><th>Time</th><th>Result</th><th>Code</th><th>Latency</th><th>Error</th></tr></thead>
-        <tbody>
-          {#each checks.slice().reverse().slice(0, 50) as c (c.checked_at)}
-            <tr>
-              <td>{new Date(c.checked_at).toLocaleString()}</td>
-              <td class={c.up ? 'ok' : 'bad'}>{c.up ? 'up' : 'down'}</td>
-              <td>{c.status_code ?? '—'}</td>
-              <td>{c.response_time_ms == null ? '—' : `${c.response_time_ms} ms`}</td>
-              <td class="mono">{c.error ?? ''}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-
-      <h2>Incidents</h2>
-      {#if detail.incidents.length === 0}
-        <p class="empty">No incidents recorded.</p>
-      {:else}
-        <table>
-          <thead><tr><th>Started</th><th>Resolved</th><th>Cause</th></tr></thead>
-          <tbody>
-            {#each detail.incidents as i (i.id)}
-              <tr>
-                <td>{new Date(i.started_at).toLocaleString()}</td>
-                <td>{i.resolved_at ? new Date(i.resolved_at).toLocaleString() : 'ongoing'}</td>
-                <td>{i.cause}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
+      {#if canWrite}
+        <div class="actions">
+          <Button variant="secondary" loading={pausing} onclick={togglePause}>
+            {detail.monitor.status === 'paused' ? 'Resume' : 'Pause'}
+          </Button>
+          <Button variant="danger" onclick={() => (confirmOpen = true)}>Delete</Button>
+        </div>
       {/if}
+    </header>
+
+    {#if error}
+      <div class="err-banner" role="alert">
+        <Icon name="triangle-alert" size={15} />
+        <span>{error}</span>
+      </div>
+    {/if}
+
+    <StatTiles min={150}>
+      <StatTile label="Uptime 24h" value={fmtPct(detail.uptime.h24)} tone={pctTone(detail.uptime.h24)} />
+      <StatTile label="Uptime 7d" value={fmtPct(detail.uptime.d7)} tone={pctTone(detail.uptime.d7)} />
+      <StatTile label="Uptime 30d" value={fmtPct(detail.uptime.d30)} tone={pctTone(detail.uptime.d30)} />
+      <StatTile label="Interval" value={`${detail.monitor.interval_seconds}s`} />
+    </StatTiles>
+
+    <div class="section">
+      <Card title="Recent checks" padding="none">
+        {#if checks.length === 0}
+          <EmptyState
+            title="No checks yet"
+            description="This monitor hasn't run a check yet. Results appear here once the prober reports in."
+            icon="clock"
+          />
+        {:else}
+          <div class="bar-wrap">
+            <div class="uptime-bar" aria-hidden="true">
+              {#each barChecks as c (c.checked_at)}
+                <span
+                  class="bar"
+                  class:down={!c.up}
+                  title={`${formatDateTime(c.checked_at)} · ${c.up ? 'up' : 'down'}${c.response_time_ms != null ? ' · ' + c.response_time_ms + ' ms' : ''}`}
+                ></span>
+              {/each}
+            </div>
+            <div class="bar-legend">
+              <span>Oldest</span>
+              <span>{barChecks.length} checks</span>
+              <span>Newest</span>
+            </div>
+          </div>
+
+          <DataTable>
+            {#snippet head()}
+              <tr>
+                <th>Time</th>
+                <th>Result</th>
+                <th class="num">Code</th>
+                <th class="num">Latency</th>
+                <th>Error</th>
+              </tr>
+            {/snippet}
+            {#snippet children()}
+              {#each recentChecks as c (c.checked_at)}
+                <tr>
+                  <td>{formatDateTime(c.checked_at)}</td>
+                  <td>
+                    <span class="result" class:up={c.up} class:down={!c.up}>
+                      <span class="dot"></span>{c.up ? 'Up' : 'Down'}
+                    </span>
+                  </td>
+                  <td class="num">
+                    {#if c.status_code == null}<span class="faint">—</span>{:else}{c.status_code}{/if}
+                  </td>
+                  <td class="num">
+                    {#if c.response_time_ms == null}<span class="faint">—</span>{:else}<LatencyBadge ms={c.response_time_ms} dot={false} size="sm" />{/if}
+                  </td>
+                  <td>
+                    {#if c.error}<span class="cell-mono cell-muted errtext" title={c.error}>{c.error}</span>{:else}<span class="faint">—</span>{/if}
+                  </td>
+                </tr>
+              {/each}
+            {/snippet}
+          </DataTable>
+        {/if}
+      </Card>
+    </div>
+
+    <div class="section">
+      <Card title="Incidents" padding="none">
+        {#if incidents.length === 0}
+          <EmptyState
+            title="No incidents"
+            description="No downtime has been recorded for this monitor."
+            icon="circle-check"
+          />
+        {:else}
+          <DataTable>
+            {#snippet head()}
+              <tr>
+                <th>Started</th>
+                <th>Resolved</th>
+                <th class="num">Duration</th>
+                <th>Cause</th>
+              </tr>
+            {/snippet}
+            {#snippet children()}
+              {#each incidents as i (i.id)}
+                <tr>
+                  <td>{formatDateTime(i.started_at)}</td>
+                  <td>
+                    {#if i.resolved_at}{formatDateTime(i.resolved_at)}{:else}<span class="ongoing">Ongoing</span>{/if}
+                  </td>
+                  <td class="num">
+                    {#if i.resolved_at}{formatDuration(durationBetween(i.started_at, i.resolved_at))}{:else}<span class="faint">—</span>{/if}
+                  </td>
+                  <td>
+                    <span class="cause">{i.cause}</span>
+                    {#if i.last_error}<span class="cell-mono cell-muted errtext" title={i.last_error}>{i.last_error}</span>{/if}
+                  </td>
+                </tr>
+              {/each}
+            {/snippet}
+          </DataTable>
+        {/if}
+      </Card>
     </div>
   {/if}
 </AppShell>
 
+<ConfirmDialog
+  bind:open={confirmOpen}
+  title="Delete monitor"
+  message={detail ? `Delete “${detail.monitor.name}”? Its check history and incidents will be removed. This can't be undone.` : ''}
+  confirmLabel="Delete monitor"
+  danger
+  loading={deleting}
+  onconfirm={remove}
+  oncancel={() => (confirmOpen = false)}
+/>
+
 <style>
-  .p { padding: 20px; }
-  .back { color: var(--text-muted); font-size: 13px; }
-  header { display: flex; justify-content: space-between; align-items: flex-start; margin: 8px 0 18px; }
-  .mono { font-family: ui-monospace, monospace; color: var(--text-muted); font-size: 13px; }
-  .actions { display: flex; gap: 8px; }
-  .danger { color: #b42318; }
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
-  .tile { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
-  .tile span { font-size: 12px; color: var(--text-faint); }
-  .tile strong { font-size: 20px; }
-  table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
-  .ok { color: #16794a; } .bad { color: #b42318; }
-  .err { color: #b42318; } .empty { color: var(--text-faint); }
+  .back {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 13px;
+    padding: 0;
+    margin-bottom: 16px;
+  }
+  .back:hover {
+    color: var(--text);
+  }
+  .center {
+    display: grid;
+    place-items: center;
+    padding: 80px;
+  }
+
+  /* --- header --------------------------------------------------------------- */
+  .detail-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+  }
+  .mon-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    font-size: 22px;
+    font-weight: 660;
+    line-height: 1.3;
+    word-break: break-word;
+  }
+  .key-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+  }
+  .kindtag {
+    font-size: 10px;
+    font-weight: 620;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 1px 6px;
+  }
+  .key {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    word-break: break-all;
+  }
+  .actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  /* --- error banner --------------------------------------------------------- */
+  .err-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    margin-bottom: 18px;
+    font-size: 13px;
+    color: var(--error);
+    background: var(--error-soft);
+    border: 1px solid color-mix(in srgb, var(--error) 38%, transparent);
+    border-radius: var(--radius);
+  }
+
+  .section {
+    margin-top: 18px;
+  }
+
+  /* --- availability strip (signature) --------------------------------------- */
+  .bar-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .uptime-bar {
+    display: flex;
+    gap: 3px;
+    align-items: stretch;
+    height: 34px;
+  }
+  .uptime-bar .bar {
+    flex: 1 1 0;
+    min-width: 2px;
+    border-radius: 3px;
+    background: var(--success);
+    opacity: 0.8;
+    transition: opacity 0.1s ease;
+  }
+  .uptime-bar .bar.down {
+    background: var(--error);
+  }
+  .uptime-bar .bar:hover {
+    opacity: 1;
+  }
+  .bar-legend {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+
+  /* --- table cells ---------------------------------------------------------- */
+  .result {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 560;
+    font-size: 12.5px;
+  }
+  .result.up { color: var(--success); }
+  .result.down { color: var(--error); }
+  .result .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+  .errtext {
+    display: inline-block;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+  .cause {
+    font-weight: 550;
+    margin-right: 8px;
+  }
+  .ongoing {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 9px;
+    border-radius: var(--radius-pill);
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--warning);
+    background: var(--warning-soft);
+  }
 </style>
