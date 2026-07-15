@@ -1,7 +1,7 @@
 # Browser SDK — `@sauron/browser`
 
 Error reporting **+** product analytics **+** performance for the browser, from one
-SDK. Source: [`sdks/js`](../sdks/js). SDK header name: `sauron.javascript`.
+SDK (**v0.3.0**). Source: [`sdks/js`](../sdks/js). SDK header name: `sauron.javascript`.
 
 See also: **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
 **[Examples](Examples.md)** · the runnable demo:
@@ -12,6 +12,14 @@ See also: **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
 ```bash
 npm install @sauron/browser
 ```
+
+## What's new in 0.3.0
+
+- **Error items carry more attribution.** An `ErrorItem` now emits `event_id`,
+  `message`, `tags`, and `user` when present (all optional — omitted keys are defaulted
+  by the backend, so this is additive and non-breaking).
+- **`beforeSend` runs on every item.** It is invoked for **every** outgoing item type
+  (`error | event | identify | transaction | breadcrumb_batch`), not errors only.
 
 ## Init
 
@@ -38,7 +46,7 @@ functions.
 | `release` | `string` | — | e.g. `web@1.4.2` |
 | `sampleRate` | `number` | `1` | error sample rate in `[0,1]` |
 | `maxBreadcrumbs` | `number` | `50` | breadcrumb ring size |
-| `beforeSend` | `(item, hint?) => item \| null` | — | drop/mutate items |
+| `beforeSend` | `(item, hint?) => item \| null` | — | drop/mutate any outgoing item |
 | `beforeBreadcrumb` | `(crumb, hint?) => crumb \| null` | — | drop/mutate breadcrumbs |
 | `transport` | `{ flushIntervalMs?, maxBatch?, maxQueueBytes? }` | `5000` / `30` / `1 MiB` | transport tuning |
 | `performance` | `boolean` | `false` | auto-capture navigation/fetch/route transactions |
@@ -83,8 +91,9 @@ try {
 }
 ```
 
-Uncaught errors and unhandled promise rejections are captured automatically once
-`init` runs. `captureMessage('cache warmed', 'info')` sends a bare message.
+Uncaught errors and unhandled promise rejections are captured **automatically** once
+`init` runs (this is default-on in the browser — no opt-in flag). `captureMessage('cache
+warmed', 'info')` sends a bare message.
 
 ### Identify a user
 
@@ -92,6 +101,38 @@ Uncaught errors and unhandled promise rejections are captured automatically once
 Sauron.identify('u_123', { plan: 'pro' });
 // or set the current user on the scope:
 Sauron.setUser({ id: 'u_123', email: 'ada@example.com' });
+```
+
+The scope's user (from `setUser`) and its tags are stamped onto captured errors (via the
+new `user`/`tags` error-item fields). To set a scope tag, reach the client's scope:
+
+```ts
+Sauron.getClient()?.getScope().setTag('checkout_step', 'payment');
+```
+
+### Breadcrumbs
+
+```ts
+Sauron.addBreadcrumb({ type: 'navigation', category: 'route', message: '/settings' });
+```
+
+`BreadcrumbInput` fills defaults and stamps a timestamp; crumbs ring-buffer at
+`maxBreadcrumbs` (default 50) and attach to errors captured afterwards. A
+`beforeBreadcrumb` hook runs first — return `null` to drop the crumb.
+
+### `beforeSend` (any item)
+
+`beforeSend` runs on every outgoing item — scrub PII or drop items. Return the item to
+send it, or `null` to drop it:
+
+```ts
+Sauron.init({
+  dsn,
+  beforeSend: (item) => {
+    if (item.type === 'event') delete item.properties.email;
+    return item; // return null to drop
+  },
+});
 ```
 
 ### Screen tracking
@@ -116,7 +157,16 @@ Sauron.trackTransaction({
 });
 ```
 
-### Flush
+### Transport: gzip, retry & offline queue
+
+The browser transport handles delivery robustly without extra configuration: large
+bodies are gzipped automatically (native `CompressionStream`, falling back to `fflate`)
+with `Content-Encoding: gzip`; transient failures (408/429/5xx, network) retry with
+backoff and honor `Retry-After`; and pending batches are held in an offline
+`localStorage` queue capped by `transport.maxQueueBytes` (default 1 MiB). A `sendBeacon`
+path drains the queue on page unload.
+
+### Flush / close
 
 ```ts
 await Sauron.flush();   // resolves false if the (optional) timeout elapses first

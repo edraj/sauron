@@ -4,14 +4,16 @@
 //! API, and product-analytics queries. Every data route is scoped to the
 //! caller's org/project membership.
 
+mod admin_storage;
 mod error;
 mod routes;
+mod symbolicate;
 mod tier_read;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::FromRef;
+use axum::extract::{DefaultBodyLimit, FromRef};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderValue, Method};
 use axum::routing::{delete, get, patch, post};
@@ -23,7 +25,7 @@ use tracing::info;
 use sauron_auth::JwtKeys;
 use sauron_core::Config;
 use sauron_db::PgPool;
-use sauron_redis::RedisStore;
+use sauron_redis::{RedisStore, SymbolBlobCache};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,6 +33,10 @@ pub struct AppState {
     pub redis: RedisStore,
     pub keys: JwtKeys,
     pub cfg: Arc<Config>,
+    /// Isolated warm-blob cache for symbol artifacts (no-op when unconfigured).
+    pub symbols: SymbolBlobCache,
+    /// Shared symbolication engine (holds the in-process parsed-map cache).
+    pub symbolicator: Arc<sauron_symbols::Symbolicator>,
 }
 
 impl FromRef<AppState> for JwtKeys {
@@ -47,6 +53,16 @@ async fn main() -> anyhow::Result<()> {
     let pool = sauron_db::build_pool(&cfg.database_url, 16)?;
     let redis = RedisStore::connect(&cfg.redis_url).await?;
     let keys = JwtKeys::new(&cfg.jwt_secret, cfg.jwt_access_ttl_secs);
+    let symbols = SymbolBlobCache::connect(
+        cfg.symbols_redis_url.as_deref(),
+        cfg.symbols_redis_max_blob_mb * 1024 * 1024,
+    )
+    .await;
+    let symbolicator = Arc::new(sauron_symbols::Symbolicator::new(
+        cfg.symbols_cache_mb * 1024 * 1024,
+    ));
+    // Allow artifact uploads well above axum's 2 MB default body limit.
+    let artifact_body_limit = (cfg.symbols_max_artifact_mb + 8) * 1024 * 1024;
 
     // Keep the seeded preset roles in sync with code.
     {
@@ -66,7 +82,22 @@ async fn main() -> anyhow::Result<()> {
         redis,
         keys,
         cfg: Arc::new(cfg),
+        symbols,
+        symbolicator,
     };
+
+    // Symbol-artifact routes carry large binary uploads, so they get their own
+    // raised body limit (merged separately from the JSON API).
+    let artifact_routes = Router::new()
+        .route(
+            "/v1/apps/{app_id}/artifacts",
+            post(routes::artifacts::upload).get(routes::artifacts::list),
+        )
+        .route(
+            "/v1/apps/{app_id}/artifacts/{artifact_id}",
+            delete(routes::artifacts::delete),
+        )
+        .layer(DefaultBodyLimit::max(artifact_body_limit));
 
     let cors = CorsLayer::new()
         .allow_origin(origins)
@@ -248,6 +279,9 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/performance/series",
             get(routes::performance::series),
         )
+        // --- storage & records (any authenticated user) ---
+        .route("/v1/admin/storage", get(routes::admin::storage))
+        .merge(artifact_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

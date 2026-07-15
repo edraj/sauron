@@ -19,6 +19,7 @@ import type {
   Breadcrumb,
   Envelope,
   EnvelopeItem,
+  ErrorItem,
   Hint,
   InitOptions,
   ResolvedOptions,
@@ -153,15 +154,42 @@ export class SauronClient {
   }
 
   /**
+   * Reconcile an error item to the shared wire shape by filling the optional
+   * `event_id`/`message`/`tags`/`user` fields from the current scope and hint.
+   * Each field is left untouched when the item already sets it, and omitted
+   * entirely when there is nothing to attach (the backend defaults it) — only
+   * `event_id` is always minted so callers can correlate the report.
+   */
+  private enrichErrorItem(item: ErrorItem, hint?: Hint): void {
+    if (item.event_id === undefined) {
+      const hinted = hint?.event_id;
+      item.event_id = typeof hinted === 'string' ? hinted : uuidv4();
+    }
+    if (item.message === undefined && typeof hint?.message === 'string') {
+      item.message = hint.message;
+    }
+    if (item.tags === undefined) {
+      const tags = this.scope.tags;
+      if (Object.keys(tags).length > 0) item.tags = { ...tags };
+    }
+    if (item.user === undefined && this.scope.hasUser()) {
+      item.user = this.scope.getUser();
+    }
+  }
+
+  /**
    * Run an item through sampling (errors only) and `beforeSend`, then hand it to
    * the transport. Returns silently when dropped.
    */
   captureItem(item: EnvelopeItem, hint?: Hint): void {
     if (!this.enabled) return;
 
-    if (item.type === 'error' && Math.random() >= this.options.sampleRate) {
-      this.logger.log('dropped error by sampleRate');
-      return;
+    if (item.type === 'error') {
+      if (Math.random() >= this.options.sampleRate) {
+        this.logger.log('dropped error by sampleRate');
+        return;
+      }
+      this.enrichErrorItem(item, hint);
     }
 
     let processed: EnvelopeItem | null = item;

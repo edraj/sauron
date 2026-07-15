@@ -73,6 +73,57 @@ pub fn cold_partition_glob(base: &str, table: &str, app_id: Uuid) -> String {
     )
 }
 
+/// The (table, app_id) a cold Parquet file belongs to, parsed from its hive path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdFileKey {
+    pub table: String,
+    pub app_id: Uuid,
+}
+
+/// Parse a cold-storage path RELATIVE to the base dir, e.g.
+/// `error_events/app_id=<uuid>/year=2026/month=5/data_0.parquet` → the table
+/// (first segment) and the `app_id=` hive value. Returns None if either is absent
+/// or the uuid is unparseable.
+pub fn parse_cold_path(rel: &str) -> Option<ColdFileKey> {
+    let rel = rel.trim_start_matches('/');
+    let table = rel.split('/').next()?.to_string();
+    if table.is_empty() {
+        return None;
+    }
+    let app_seg = rel.split('/').find(|s| s.starts_with("app_id="))?;
+    let app_id = Uuid::parse_str(app_seg.strip_prefix("app_id=")?).ok()?;
+    Some(ColdFileKey { table, app_id })
+}
+
+#[cfg(test)]
+mod cold_path_tests {
+    use super::*;
+
+    #[test]
+    fn parses_table_and_app_id() {
+        let app = Uuid::new_v4();
+        let rel = format!("error_events/app_id={app}/year=2026/month=5/data_0.parquet");
+        assert_eq!(
+            parse_cold_path(&rel),
+            Some(ColdFileKey { table: "error_events".to_string(), app_id: app })
+        );
+    }
+
+    #[test]
+    fn leading_slash_is_tolerated() {
+        let app = Uuid::new_v4();
+        let rel = format!("/transactions/app_id={app}/year=2026/month=1/x.parquet");
+        assert_eq!(parse_cold_path(&rel).unwrap().table, "transactions");
+    }
+
+    #[test]
+    fn rejects_missing_app_id_or_empty() {
+        assert_eq!(parse_cold_path("error_events/year=2026/month=5/x.parquet"), None);
+        assert_eq!(parse_cold_path(""), None);
+        assert_eq!(parse_cold_path("error_events/app_id=not-a-uuid/x.parquet"), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

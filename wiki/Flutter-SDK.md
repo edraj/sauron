@@ -1,13 +1,22 @@
 # Flutter SDK — `sauron_flutter`
 
-Error reporting **+** product analytics for Flutter, from one SDK. It binds four
-uncaught-error capture layers (`FlutterError.onError`, `PlatformDispatcher.onError`,
+Error reporting **+** product analytics for Flutter, from one SDK (**v0.3.0**). It binds
+four uncaught-error capture layers (`FlutterError.onError`, `PlatformDispatcher.onError`,
 `Isolate.addErrorListener`, and a guarding zone) plus manual capture, analytics,
 screens, and breadcrumbs. Source: [`sdks/flutter`](../sdks/flutter).
 
 See also: **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
 **[Examples](Examples.md)** · the runnable demo:
 [`examples/flutter-app`](../examples/flutter-app).
+
+## What's new in 0.3.0
+
+- **`beforeSend` now runs on every item** — previously errors only. It is invoked for
+  **every** outgoing item (error, event, identify, transaction, breadcrumb batch) just
+  before it is enqueued. `BeforeSendCallback` widened from `ErrorItem? Function(ErrorItem)`
+  to **`Object? Function(Object item)`**. Existing error-only logic keeps working (an
+  error is still passed through as an item); guard on the runtime type if you only want a
+  subset, e.g. `if (item is! ErrorItem) return item;`. See `CHANGELOG.md`.
 
 ## Install
 
@@ -43,6 +52,7 @@ Future<void> main() async {
 ```
 
 Without `appRunner`, integrations are still installed but you call `runApp` yourself.
+Uncaught errors are captured automatically via the four layers bound at init.
 
 ### `SauronOptions`
 
@@ -54,7 +64,7 @@ Without `appRunner`, integrations are still installed but you call `runApp` your
 | `screen` | `String?` | — (seed the initial screen) |
 | `sampleRate` | `double` | `1.0` (errors only) |
 | `maxBreadcrumbs` | `int` | `100` |
-| `beforeSend` | `ErrorItem? Function(ErrorItem)` | — |
+| `beforeSend` | `Object? Function(Object item)` | — (any-item; return `null` to drop) |
 | `flushInterval` | `Duration` | `5 s` |
 | `maxBatchItems` | `int` | `30` |
 | `maxQueueBytes` | `int` | `5 MiB` (offline queue) |
@@ -99,14 +109,43 @@ try {
 }
 ```
 
-Uncaught errors are captured automatically via the four layers bound at init.
-
 ### Identify a user
 
 ```dart
 Sauron.identify('u_123', traits: {'plan': 'pro'});
 // or set the full user:
 Sauron.setUser(const SauronUser(id: 'u_123', email: 'ada@example.com'));
+```
+
+### Breadcrumbs
+
+```dart
+Sauron.addBreadcrumb(Breadcrumb(
+  type: 'db', category: 'query', message: 'SELECT users',
+  level: SauronLevel.info, data: {'ms': 4},
+));
+// or the convenience constructors:
+Sauron.addBreadcrumb(Breadcrumb.navigation('/settings'));
+Sauron.addBreadcrumb(Breadcrumb.ui('tapped checkout'));
+Sauron.addBreadcrumb(Breadcrumb.log('cache warmed'));
+```
+
+Crumbs ring-buffer at `maxBreadcrumbs` (default 100) and attach to errors captured
+afterwards. `Breadcrumb.navigation`/`ui`/`log` are shorthand factories.
+
+### `beforeSend` (any item)
+
+`beforeSend` runs on **every** outgoing item just before it is enqueued (0.3.0 behavioral
+change — see above). Return the item to send it, or `null` to drop it:
+
+```dart
+await Sauron.init((o) {
+  o.dsn = dsn;
+  o.beforeSend = (item) {
+    if (item is EventItem) return null; // drop analytics events
+    return item;                        // send everything else (incl. errors)
+  };
+});
 ```
 
 ### Screen tracking
@@ -131,7 +170,14 @@ Sauron.trackTransaction(
 );
 ```
 
-### Flush
+### Transport: gzip & offline queue
+
+Batches auto-flush every `flushInterval` (or at `maxBatchItems`). Payloads at or above
+`gzipThresholdBytes` (default 1024) are gzipped where gzip is available. Pending
+envelopes are held in a durable offline JSONL queue capped by `maxQueueBytes` (default
+5 MiB, oldest evicted FIFO) and replayed on the next launch.
+
+### Flush / close
 
 ```dart
 await Sauron.flush(); // drains batched + persisted envelopes

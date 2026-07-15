@@ -124,6 +124,27 @@ pub struct ErrorItem {
     /// Current screen/route the SDK was on when the error was captured.
     #[serde(default)]
     pub screen: Option<String>,
+    /// Verbatim platform stack trace for server-side symbolication that the
+    /// neutral [`Frame`] model can't carry — notably Dart AOT PC-offset traces.
+    #[serde(default)]
+    pub raw_stacktrace: Option<String>,
+    /// Debug metadata for matching symbol artifacts (Dart build-id, load base,
+    /// arch, os).
+    #[serde(default)]
+    pub debug_meta: Option<DebugMeta>,
+}
+
+/// Symbol-matching metadata shipped alongside a `raw_stacktrace`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DebugMeta {
+    #[serde(default)]
+    pub build_id: Option<String>,
+    #[serde(default)]
+    pub isolate_dso_base: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -36,6 +36,56 @@ sauron.capture_message("worker started", level="info")
 sauron.close()
 ```
 
+## Scope, breadcrumbs & transactions
+
+Per-request isolation is built on `contextvars`, so concurrent requests never
+leak each other's user/tags/breadcrumbs:
+
+```python
+import sauron
+
+# Global defaults (process-wide).
+sauron.set_tag("service", "checkout")
+
+# Per-request scope — auto-popped on exit.
+with sauron.scope():
+    sauron.set_user({"id": "u_123", "email": "a@b.co"})
+    sauron.set_tag("request_id", "req_42")
+    sauron.add_breadcrumb(category="http", message="GET /cart", level="info")
+
+    try:
+        do_work()
+    except Exception as exc:
+        # Captured errors carry the scope's user, tags and breadcrumbs, plus an
+        # optional fingerprint grouping override.
+        sauron.capture_exception(exc, fingerprint=["checkout", "timeout"])
+
+    # Manual performance transaction.
+    sauron.track_transaction(
+        "GET /cart", op="http", duration_ms=128.4, http_status=200
+    )
+```
+
+Other hooks: `before_send=fn(item, hint)` (runs on **every** item — the PII
+scrubbing seam), `before_breadcrumb=fn(crumb)`, `max_breadcrumbs` (default 100),
+`gzip_threshold_bytes`, `max_queue_bytes`, and opt-in `offline_path` disk
+persistence.
+
+## Auto uncaught-capture & graceful shutdown
+
+Opt in to reporting uncaught exceptions. Off by default because top-level hooks
+that alter exit behavior are risky on a server; when enabled the SDK captures
+with `mechanism.handled=false`, flushes, then **delegates to the previous hook**
+so the interpreter's default crash/exit behavior is preserved:
+
+```python
+sauron.init(dsn=..., auto_capture_unhandled=True)
+```
+
+`init` also registers an `atexit` flush so buffered signals are sent at
+interpreter shutdown; `flush()` / `close()` remain available for explicit
+control in short-lived processes.
+
 ## Design
 
 - **Transport:** an in-memory buffer drained by a daemon thread every

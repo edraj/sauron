@@ -2,11 +2,12 @@ import { describe, it, expect } from 'vitest';
 
 import { init, track, captureMessage, flush, close, getClient } from '../src/index.js';
 import type { Envelope, FetchLike } from '../src/types.js';
+import { bodyToString } from './helpers.js';
 
 function makeFakeFetch() {
   const bodies: Envelope[] = [];
   const fetchImpl: FetchLike = async (_url, init) => {
-    bodies.push(JSON.parse(init.body) as Envelope);
+    bodies.push(JSON.parse(bodyToString(init)) as Envelope);
     return { status: 200, ok: true };
   };
   return { fetchImpl, bodies };

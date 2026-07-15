@@ -23,7 +23,6 @@ pub struct Config {
     pub monitor_batch: i64,
     pub monitor_max_concurrency: usize,
     pub monitor_check_retention_days: i64,
-    pub monitor_min_interval_secs: i64,
     pub monitor_ssrf_allow_private: bool,
     pub tier_hot_days: i64,
     pub tier_granularity: String,
@@ -31,6 +30,23 @@ pub struct Config {
     pub tier_drop_lag_hours: i64,
     pub tier_tick_secs: u64,
     pub tier_partition_ahead: i64,
+    // --- symbolication / source maps ---
+    /// In-process parsed-index LRU byte budget (megabytes).
+    pub symbols_cache_mb: usize,
+    /// Warm-blob Redis for symbol artifacts; `None` disables the tier (in-proc
+    /// cache only). For true isolation point this at a SEPARATE Redis INSTANCE:
+    /// `maxmemory` is instance-wide, so a different DB index on the ingest Redis
+    /// would still let symbol blobs evict stream state. The per-blob size cap
+    /// (`symbols_redis_max_blob_mb`) is the backstop when isolation isn't used.
+    pub symbols_redis_url: Option<String>,
+    /// Blobs larger than this are never cached in Redis (in-proc only).
+    pub symbols_redis_max_blob_mb: usize,
+    /// Reject uploads whose raw file exceeds this size.
+    pub symbols_max_artifact_mb: usize,
+    /// Decompression-bomb guard: cap on a blob's uncompressed size.
+    pub symbols_max_uncompressed_mb: usize,
+    /// Ingest-path symbolication time box; on timeout store raw + `pending`.
+    pub symbols_ingest_timeout_ms: u64,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -76,7 +92,6 @@ impl Config {
             monitor_batch: parse("MONITOR_BATCH", 100),
             monitor_max_concurrency: parse("MONITOR_MAX_CONCURRENCY", 50),
             monitor_check_retention_days: parse("MONITOR_CHECK_RETENTION_DAYS", 30),
-            monitor_min_interval_secs: parse("MONITOR_MIN_INTERVAL_SECS", 30),
             monitor_ssrf_allow_private: var("MONITOR_SSRF_ALLOW_PRIVATE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -86,6 +101,12 @@ impl Config {
             tier_drop_lag_hours: parse("TIER_DROP_LAG_HOURS", 24),
             tier_tick_secs: parse("TIER_TICK_SECS", 3600),
             tier_partition_ahead: parse("TIER_PARTITION_AHEAD", 7),
+            symbols_cache_mb: parse("SYMBOLS_CACHE_MB", 256),
+            symbols_redis_url: var("SYMBOLS_REDIS_URL"),
+            symbols_redis_max_blob_mb: parse("SYMBOLS_REDIS_MAX_BLOB_MB", 8),
+            symbols_max_artifact_mb: parse("SYMBOLS_MAX_ARTIFACT_MB", 128),
+            symbols_max_uncompressed_mb: parse("SYMBOLS_MAX_UNCOMPRESSED_MB", 512),
+            symbols_ingest_timeout_ms: parse("SYMBOLS_INGEST_TIMEOUT_MS", 150),
         })
     }
 }

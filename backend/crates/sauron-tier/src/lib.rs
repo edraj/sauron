@@ -7,7 +7,10 @@ pub mod layout;
 pub mod merge;
 pub mod plan;
 
-pub use layout::{bucket_bounds, cold_copy_dir, cold_partition_glob, partition_suffix, Granularity};
+pub use layout::{
+    bucket_bounds, cold_copy_dir, cold_partition_glob, parse_cold_path, partition_suffix,
+    ColdFileKey, Granularity,
+};
 pub use merge::{merge_day_counts, DayCount};
 pub use plan::{plan, TierPlan, TimeRange};
 

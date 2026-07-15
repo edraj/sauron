@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import { SauronClient } from '../src/client.js';
 import type { Envelope, FetchLike } from '../src/types.js';
+import { bodyToString } from './helpers.js';
 
 interface Captured {
   url: string;
@@ -18,7 +19,7 @@ function makeFakeFetch(status = 200) {
       url,
       method: init.method,
       headers: init.headers,
-      envelope: JSON.parse(init.body) as Envelope,
+      envelope: JSON.parse(bodyToString(init)) as Envelope,
     });
     return { status, ok: status >= 200 && status < 300 };
   };
@@ -63,7 +64,7 @@ describe('transport POST', () => {
     await client.flush();
 
     const { header, context } = fake.calls[0].envelope;
-    expect(header.sdk).toEqual({ name: 'sauron-node', version: '0.1.0' });
+    expect(header.sdk).toEqual({ name: 'sauron-node', version: '0.3.0' });
     expect(header.dsn).toBe(DSN);
     expect(header.environment).toBe('staging');
     expect(header.release).toBe('1.2.3');

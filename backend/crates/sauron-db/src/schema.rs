@@ -68,6 +68,38 @@ diesel::table! {
         session_id -> Nullable<Text>,
         device_key -> Nullable<Text>,
         screen -> Nullable<Text>,
+        stacktrace_symbolicated -> Nullable<Jsonb>,
+        symbolication_status -> Text,
+        debug_meta -> Nullable<Jsonb>,
+    }
+}
+
+diesel::table! {
+    symbol_blobs (sha256) {
+        sha256 -> Bytea,
+        content -> Bytea,
+        uncompressed_size -> Int8,
+        compressed_size -> Int8,
+        refcount -> Int4,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    symbol_artifacts (id) {
+        id -> Uuid,
+        app_id -> Uuid,
+        kind -> Text,
+        platform -> Text,
+        arch -> Nullable<Text>,
+        release -> Nullable<Text>,
+        dist -> Nullable<Text>,
+        name -> Nullable<Text>,
+        debug_id -> Nullable<Text>,
+        blob_sha256 -> Bytea,
+        prebuilt_index_sha256 -> Nullable<Bytea>,
+        uploaded_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
     }
 }
 
@@ -342,6 +374,7 @@ diesel::joinable!(roles -> organizations (org_id));
 diesel::joinable!(monitors -> projects (project_id));
 diesel::joinable!(monitor_checks -> monitors (monitor_id));
 diesel::joinable!(monitor_incidents -> monitors (monitor_id));
+diesel::joinable!(symbol_artifacts -> apps (app_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
@@ -365,4 +398,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     monitor_checks,
     monitor_incidents,
     tiering_state,
+    symbol_blobs,
+    symbol_artifacts,
 );

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+- **Breaking / behavioral change — `beforeSend` now runs on every item.**
+  Previously `beforeSend` was invoked for errors only; analytics events,
+  identifies, and transactions bypassed it. It now runs on **every** outgoing
+  item just before it is enqueued for delivery, so you can redact, mutate, or
+  drop any item type (return the item to send it, `null` to drop it).
+  - `BeforeSendCallback` widened from `ErrorItem? Function(ErrorItem)` to
+    `Object? Function(Object item)`. Update your hook's signature to accept
+    `Object` and guard on the runtime type if you only want to act on errors,
+    e.g. `if (item is! ErrorItem) return item;`. Existing error-only logic keeps
+    working — an error is still passed through as an item.
+
 ## 0.1.0
 
 Initial release.

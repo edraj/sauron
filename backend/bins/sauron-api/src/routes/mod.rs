@@ -1,7 +1,9 @@
 //! HTTP route handlers, grouped by domain, plus shared helpers.
 
+pub mod admin;
 pub mod analytics;
 pub mod apps;
+pub mod artifacts;
 pub mod auth;
 pub mod devices;
 pub mod funnels;

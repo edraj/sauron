@@ -2,10 +2,16 @@ import 'package:http/http.dart' as http;
 
 import 'envelope.dart';
 
-/// Hook invoked before an [ErrorItem] is queued for delivery.
+/// Hook invoked before an [EnvelopeItem] is queued for delivery.
 ///
-/// Return the (possibly mutated) item to send it, or `null` to drop it.
-typedef BeforeSendCallback = ErrorItem? Function(ErrorItem event);
+/// Receives the outgoing item — an [ErrorItem], [EventItem], [IdentifyItem],
+/// [TransactionItem], or [BreadcrumbBatchItem]. Return the (possibly mutated or
+/// replaced) item to send it, or `null` to drop it.
+///
+/// > Behavioral change in 0.3.0: this previously ran on errors only. It now
+/// > runs on EVERY outgoing item. Guard on the runtime type if you only want to
+/// > act on a subset, e.g. `if (item is! ErrorItem) return item;`.
+typedef BeforeSendCallback = Object? Function(Object item);
 
 /// Configuration for the Sauron SDK. Populated via the builder passed to
 /// [Sauron.init].
@@ -30,7 +36,8 @@ class SauronOptions {
   /// Maximum breadcrumbs retained per scope.
   int maxBreadcrumbs = 100;
 
-  /// Called before each error is enqueued; return `null` to drop.
+  /// Called before every item (error, event, identify, transaction) is
+  /// enqueued; return the item to send it or `null` to drop it.
   BeforeSendCallback? beforeSend;
 
   /// How often the transport auto-flushes batched items.

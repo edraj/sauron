@@ -144,8 +144,39 @@
             {/snippet}
             <div class="event-body">
               <div class="section">
-                <span class="section-label">Stacktrace</span>
-                <StacktraceView frames={latestEvent.stacktrace ?? []} />
+                <div class="section-head">
+                  <span class="section-label">Stacktrace</span>
+                  {#if latestEvent.symbolication_status}
+                    {@const s = latestEvent.symbolication_status}
+                    {@const isDart = latestEvent.debug_meta?.raw_stacktrace != null}
+                    <span
+                      class="sym-badge"
+                      class:ok={s === 'symbolicated'}
+                      class:partial={s === 'partial'}
+                      class:none={s === 'no_artifacts'}
+                      title={s === 'no_artifacts'
+                        ? `Upload ${isDart ? 'debug symbols' : 'source maps'} for this release to see original frames`
+                        : ''}
+                    >
+                      {s === 'symbolicated'
+                        ? 'Symbolicated'
+                        : s === 'partial'
+                          ? 'Partially symbolicated'
+                          : s === 'no_artifacts'
+                            ? isDart
+                              ? 'No symbols'
+                              : 'No source maps'
+                            : s === 'pending'
+                              ? 'Pending'
+                              : 'Not applicable'}
+                    </span>
+                  {/if}
+                </div>
+                <StacktraceView
+                  frames={latestEvent.stacktrace ?? []}
+                  symbolicated={latestEvent.stacktrace_symbolicated}
+                  rawTrace={latestEvent.debug_meta?.raw_stacktrace}
+                />
               </div>
               <div class="section">
                 <span class="section-label">Breadcrumbs</span>
@@ -340,6 +371,36 @@
     display: flex;
     flex-direction: column;
     gap: 9px;
+  }
+  .section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .sym-badge {
+    font-size: 10px;
+    font-weight: 650;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: var(--radius-pill);
+    color: var(--text-muted);
+    background: var(--surface-2, var(--surface));
+    border: 1px solid var(--border);
+  }
+  .sym-badge.ok {
+    color: var(--success, #30a46c);
+    background: color-mix(in srgb, var(--success, #30a46c) 14%, transparent);
+    border-color: transparent;
+  }
+  .sym-badge.partial {
+    color: var(--warning, #f5a623);
+    background: color-mix(in srgb, var(--warning, #f5a623) 16%, transparent);
+    border-color: transparent;
+  }
+  .sym-badge.none {
+    cursor: help;
   }
   .side-dl {
     display: flex;

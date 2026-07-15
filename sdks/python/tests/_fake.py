@@ -3,6 +3,7 @@ touching the network."""
 
 from __future__ import annotations
 
+import gzip
 import json
 import threading
 from typing import Any, Dict, List
@@ -21,13 +22,18 @@ class FakeSender:
         self._lock = threading.Lock()
 
     def __call__(self, url: str, headers: Dict[str, str], body: bytes) -> int:
+        # Transparently decode a gzipped body so ``.json`` works regardless of
+        # whether the transport compressed the payload.
+        raw = body
+        if str(headers.get("Content-Encoding", "")).lower() == "gzip":
+            raw = gzip.decompress(body)
         with self._lock:
             self.calls.append(
                 {
                     "url": url,
                     "headers": headers,
                     "body": body,
-                    "json": json.loads(body.decode("utf-8")),
+                    "json": json.loads(raw.decode("utf-8")),
                 }
             )
         return self.status

@@ -103,7 +103,13 @@ fn spec_of(m: &Monitor) -> ProbeSpec {
         // as the probe result rather than followed. This field is retained but not
         // honored.
         follow_redirects: cfg.get("follow_redirects").and_then(|b| b.as_bool()).unwrap_or(true),
-        timeout: Duration::from_millis(m.timeout_ms.max(1) as u64),
+        // Never let a probe outlive its own cadence: a 1s monitor with the
+        // default 10s timeout would otherwise stack ~10 overlapping in-flight
+        // probes (the claim advances next_check_at by the interval before a slow
+        // probe returns). Cap the effective timeout at the interval.
+        timeout: Duration::from_millis(
+            m.timeout_ms.min(m.interval_seconds.saturating_mul(1000)).max(1) as u64,
+        ),
     }
 }
 

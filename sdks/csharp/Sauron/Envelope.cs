@@ -35,10 +35,17 @@ internal sealed class EnvelopeHeader
     public string? Release { get; set; }
 }
 
+/// <summary>Single source of truth for the SDK identity carried in every envelope header.</summary>
+internal static class SauronSdkMeta
+{
+    public const string Name = "sauron-dotnet";
+    public const string Version = "0.3.0";
+}
+
 internal sealed class SdkInfo
 {
-    public string Name { get; set; } = "sauron-dotnet";
-    public string Version { get; set; } = "0.1.0";
+    public string Name { get; set; } = SauronSdkMeta.Name;
+    public string Version { get; set; } = SauronSdkMeta.Version;
 }
 
 internal sealed class EnvelopeContext
@@ -90,7 +97,10 @@ internal sealed class ErrorItem
     public string? Message { get; set; }
     public List<object> Breadcrumbs { get; set; } = new();
     public Dictionary<string, object?> Tags { get; set; } = new();
-    public string? Fingerprint { get; set; }
+
+    /// <summary>Client-supplied grouping override — honored verbatim by the backend when present.
+    /// Matches the wire contract's <c>Option&lt;Vec&lt;String&gt;&gt;</c> (an array of strings, or null).</summary>
+    public List<string>? Fingerprint { get; set; }
     public UserInfo? User { get; set; }
     public string? SessionId { get; set; }
     public string? Screen { get; set; }
@@ -108,6 +118,17 @@ internal sealed class MechanismInfo
 {
     public string Type { get; set; } = "generic";
     public bool Handled { get; set; } = true;
+}
+
+/// <summary>Wire DTO for a breadcrumb attached to an error item. Snake_case: type/category/message/level/timestamp/data.</summary>
+internal sealed class BreadcrumbWire
+{
+    public string Type { get; set; } = "default";
+    public string? Category { get; set; }
+    public string? Message { get; set; }
+    public string? Level { get; set; }
+    public string Timestamp { get; set; } = string.Empty;
+    public Dictionary<string, object?> Data { get; set; } = new();
 }
 
 internal sealed class UserInfo

@@ -6,7 +6,9 @@
 
 pub mod enrich;
 pub mod process;
+pub mod symbolize;
 pub mod worker;
 
 pub use process::process_job;
+pub use symbolize::SymbolizeCtx;
 pub use worker::spawn_workers;

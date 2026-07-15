@@ -13,6 +13,7 @@ sauron-core.workspace = true
 sauron-db.workspace = true
 sauron-redis.workspace = true
 sauron-pipeline.workspace = true
+sauron-symbols.workspace = true
 sauron-telemetry.workspace = true
 tokio.workspace = true
 axum.workspace = true

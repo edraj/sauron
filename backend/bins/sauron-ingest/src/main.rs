@@ -58,9 +58,29 @@ async fn main() -> anyhow::Result<()> {
     let pool = sauron_db::build_pool(&cfg.database_url, 8)?;
     let redis = RedisStore::connect(&cfg.redis_url).await?;
 
+    // Shared symbolication resources for the hybrid write path (isolated cache +
+    // in-process parsed-map LRU).
+    let sym = sauron_pipeline::SymbolizeCtx::new(
+        std::sync::Arc::new(sauron_symbols::Symbolicator::new(
+            cfg.symbols_cache_mb * 1024 * 1024,
+        )),
+        sauron_redis::SymbolBlobCache::connect(
+            cfg.symbols_redis_url.as_deref(),
+            cfg.symbols_redis_max_blob_mb * 1024 * 1024,
+        )
+        .await,
+        cfg.symbols_ingest_timeout_ms,
+        cfg.symbols_max_uncompressed_mb * 1024 * 1024,
+    );
+
     // Spawn the co-located worker pool.
-    let _workers =
-        sauron_pipeline::spawn_workers(pool.clone(), redis.clone(), cfg.worker_concurrency).await?;
+    let _workers = sauron_pipeline::spawn_workers(
+        pool.clone(),
+        redis.clone(),
+        cfg.worker_concurrency,
+        sym,
+    )
+    .await?;
 
     let port = cfg.ingest_port;
     let max_body = cfg.ingest_max_body_bytes;

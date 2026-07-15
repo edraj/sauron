@@ -41,6 +41,44 @@ export interface ErrorUser {
   username: string | null;
 }
 
+/** Scope user input — a superset of {@link ErrorUser} accepted by `setUser`. */
+export interface User {
+  id?: string | null;
+  email?: string | null;
+  username?: string | null;
+}
+
+/**
+ * A stored breadcrumb, matching `envelope.rs::Breadcrumb`. Attached to captured
+ * errors from the active scope's ring buffer.
+ */
+export interface Breadcrumb {
+  type: string;
+  category: string | null;
+  message: string | null;
+  level: string | null;
+  timestamp: string;
+  data: Record<string, unknown>;
+}
+
+/** Caller-supplied breadcrumb; missing fields are defaulted, `timestamp` stamped. */
+export interface BreadcrumbInput {
+  type?: string;
+  category?: string;
+  message?: string;
+  level?: Level;
+  data?: Record<string, unknown>;
+}
+
+/** The mutable state carried by a {@link Scope}. */
+export interface ScopeData {
+  user: User | null;
+  tags: Record<string, string>;
+  contexts: Record<string, unknown>;
+  extra: Record<string, unknown>;
+  breadcrumbs: Breadcrumb[];
+}
+
 /** An error item (manual `captureException` / `captureMessage`). */
 export interface ErrorItem {
   type: 'error';
@@ -49,7 +87,7 @@ export interface ErrorItem {
   timestamp: string;
   exception: ExceptionValue;
   message: string | null;
-  breadcrumbs: unknown[];
+  breadcrumbs: Breadcrumb[];
   tags: Record<string, string>;
   fingerprint: string[] | null;
   user: ErrorUser | null;
@@ -77,8 +115,46 @@ export interface IdentifyItem {
   timestamp: string;
 }
 
+/**
+ * A performance transaction — one timed operation. Matches
+ * `envelope.rs::TransactionItem`. Optional fields are omitted from the wire
+ * JSON when absent (never serialized as `null`).
+ */
+export interface TransactionItem {
+  type: 'transaction';
+  name: string;
+  op: string;
+  duration_ms: number;
+  status?: string;
+  http_method?: string;
+  http_status?: number;
+  url?: string;
+  distinct_id?: string;
+  timestamp: string;
+}
+
+/** Caller input for {@link TransactionItem} via `trackTransaction`. */
+export interface TransactionInput {
+  name: string;
+  /** Operation class: `navigation | http | resource | screen_load | custom`. Default `custom`. */
+  op?: string;
+  duration_ms: number;
+  status?: string;
+  http_method?: string;
+  http_status?: number;
+  url?: string;
+  /** Falls back to the scoped user's id when omitted. */
+  distinct_id?: string;
+}
+
 /** Any item that can appear in an envelope's `items` array. */
-export type EnvelopeItem = ErrorItem | EventItem | IdentifyItem;
+export type EnvelopeItem = ErrorItem | EventItem | IdentifyItem | TransactionItem;
+
+/** A hook run on every outgoing item; return `null` to drop it. */
+export type BeforeSend = (item: EnvelopeItem, hint?: unknown) => EnvelopeItem | null;
+
+/** A hook run on every breadcrumb; return `null` to drop it. */
+export type BeforeBreadcrumb = (crumb: Breadcrumb, hint?: unknown) => Breadcrumb | null;
 
 /* ------------------------------------------------------------------ context */
 
@@ -128,15 +204,45 @@ export interface Envelope {
 
 /* -------------------------------------------------------------------- input */
 
-/** A subset of the DOM `fetch` used by the transport. Injectable for tests. */
+/** A minimal `Headers`-like view over a response (for reading `Retry-After`). */
+export interface ResponseHeadersLike {
+  get(name: string): string | null;
+}
+
+/** The subset of a `fetch` `Response` the transport inspects. */
+export interface FetchResponse {
+  status: number;
+  ok?: boolean;
+  headers?: ResponseHeadersLike;
+}
+
+/**
+ * A subset of the DOM `fetch` used by the transport. Injectable for tests.
+ * The body may be a gzip `Uint8Array`/`Buffer` when compression kicks in.
+ */
 export type FetchLike = (
   url: string,
   init: {
     method: string;
     headers: Record<string, string>;
-    body: string;
+    body: string | Uint8Array;
   },
-) => Promise<{ status: number; ok?: boolean }>;
+) => Promise<FetchResponse>;
+
+/** Optional deterministic sleep seam (defaults to a real `setTimeout` promise). */
+export type SleepFn = (ms: number) => Promise<void>;
+
+/**
+ * The subset of Node's `process` the opt-in auto-capture / shutdown hooks touch.
+ * Injectable so tests can drive the handlers without registering real
+ * process-level listeners or terminating the test runner.
+ */
+export interface ProcessLike {
+  on(event: string, listener: (...args: any[]) => void): unknown;
+  removeListener(event: string, listener: (...args: any[]) => void): unknown;
+  listeners(event: string): Array<(...args: any[]) => void>;
+  exit(code?: number): void;
+}
 
 /** Transport tuning knobs. */
 export interface TransportOptions {
@@ -160,6 +266,31 @@ export interface InitOptions {
   flushInterval?: number;
   /** Max items per envelope before an eager flush. Default 30. */
   maxBatch?: number;
+  /** Breadcrumb ring-buffer size on the global scope. Default 100. */
+  maxBreadcrumbs?: number;
+  /** Gzip the request body once it exceeds this many bytes. Default 1024. */
+  gzipThresholdBytes?: number;
+  /** Drop-oldest byte cap for the in-memory send buffer. Default 1 MiB. */
+  maxQueueBytes?: number;
+  /** Opt-in directory for FIFO disk persistence of pending envelopes. Default off. */
+  offlineDir?: string;
+  /** Max retries after the first attempt for transient failures. Default 3. */
+  maxRetries?: number;
+  /**
+   * Opt-in: capture uncaught exceptions / unhandled rejections with
+   * `mechanism.handled = false`. Default `false`. Never swallows the crash —
+   * the process's default exit behavior is preserved after flushing.
+   */
+  autoCaptureUnhandled?: boolean;
+  /**
+   * Opt-in: wire `beforeExit`/`SIGTERM`/`SIGINT` to `close()` for a graceful
+   * flush on shutdown. Default `false`. Explicit `close()` still works.
+   */
+  autoShutdown?: boolean;
+  /** Runs on every outgoing item just before enqueue; return `null` to drop it. */
+  beforeSend?: BeforeSend;
+  /** Runs on every breadcrumb before it is stored; return `null` to drop it. */
+  beforeBreadcrumb?: BeforeBreadcrumb;
   /** Injected HTTP sender (for tests). Defaults to global `fetch`. */
   fetchImpl?: FetchLike;
   debug?: boolean;
@@ -173,6 +304,15 @@ export interface ResolvedOptions {
   sampleRate: number;
   flushInterval: number;
   maxBatch: number;
+  maxBreadcrumbs: number;
+  gzipThresholdBytes: number;
+  maxQueueBytes: number;
+  offlineDir: string | null;
+  maxRetries: number;
+  autoCaptureUnhandled: boolean;
+  autoShutdown: boolean;
+  beforeSend?: BeforeSend;
+  beforeBreadcrumb?: BeforeBreadcrumb;
   fetchImpl?: FetchLike;
   debug: boolean;
 }
@@ -183,4 +323,6 @@ export interface CaptureExceptionOptions {
   level?: Level;
   tags?: Record<string, string>;
   handled?: boolean;
+  /** Client-supplied fingerprint override (honored verbatim by the backend). */
+  fingerprint?: string[] | null;
 }

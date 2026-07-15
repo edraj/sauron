@@ -31,6 +31,7 @@ export 'src/types.dart'
     show
         AppDescriptor,
         Breadcrumb,
+        DebugMeta,
         DeviceDescriptor,
         Mechanism,
         OsDescriptor,
@@ -39,4 +40,5 @@ export 'src/types.dart'
         SauronLevel,
         SauronUser,
         StackFrame,
+        isObfuscatedDartTrace,
         sauronIso;

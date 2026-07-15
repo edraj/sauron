@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { buildEnvelope } from '../src/envelope';
 import { buildTransactionItem } from '../src/api/product';
 import { parseDsn } from '../src/dsn';
-import type { Envelope, TransactionItem } from '../src/types';
+import { getClient, init } from '../src/client';
+import { captureException } from '../src/api/capture';
+import type { Envelope, ErrorItem, TransactionItem } from '../src/types';
 
 /**
  * Golden envelope from the LOCKED wire contract. The Rust ingest gateway and the
@@ -112,6 +114,103 @@ describe('buildEnvelope', () => {
     const event = built.items.find((i) => i.type === 'event');
     expect(error && 'session_id' in error && error.session_id).toBe('sess_abc123');
     expect(event && 'session_id' in event && event.session_id).toBe('sess_abc123');
+  });
+});
+
+describe('error item reconciliation (event_id/message/tags/user)', () => {
+  it('serializes the optional event_id/message/tags/user keys on an error item', () => {
+    const error: ErrorItem = {
+      type: 'error',
+      event_id: 'evt_9f8e7d6c',
+      timestamp: '2026-07-12T10:29:58.900Z',
+      level: 'error',
+      exception: {
+        type: 'TypeError',
+        value: 'x is not a function',
+        mechanism: { type: 'generic', handled: true },
+        stacktrace: [],
+      },
+      message: 'x is not a function',
+      breadcrumbs: [],
+      fingerprint: null,
+      tags: { env: 'prod', req: '42' },
+      user: { id: 'u_123', email: null, traits: { plan: 'pro' } },
+      session_id: 'sess_abc123',
+    };
+
+    const built = buildEnvelope(GOLDEN.header, GOLDEN.context, [error]);
+    const roundTripped = JSON.parse(JSON.stringify(built));
+    const item = roundTripped.items[0];
+    expect(item.type).toBe('error');
+    expect(item.event_id).toBe('evt_9f8e7d6c');
+    expect(item.message).toBe('x is not a function');
+    expect(item.tags).toEqual({ env: 'prod', req: '42' });
+    expect(item.user).toEqual({ id: 'u_123', email: null, traits: { plan: 'pro' } });
+  });
+
+  it('omits the optional keys entirely when absent (backend defaults them)', () => {
+    const minimal: ErrorItem = {
+      type: 'error',
+      timestamp: '2026-07-12T10:29:58.900Z',
+      level: 'error',
+      exception: {
+        type: 'TypeError',
+        value: 'boom',
+        mechanism: { type: 'generic', handled: true },
+        stacktrace: [],
+      },
+      breadcrumbs: [],
+      fingerprint: null,
+    };
+
+    const roundTripped = JSON.parse(
+      JSON.stringify(buildEnvelope(GOLDEN.header, GOLDEN.context, [minimal])),
+    );
+    const keys = Object.keys(roundTripped.items[0]);
+    expect(keys).not.toContain('event_id');
+    expect(keys).not.toContain('message');
+    expect(keys).not.toContain('tags');
+    expect(keys).not.toContain('user');
+  });
+
+  describe('client populates them from scope/hint', () => {
+    let items: ErrorItem[];
+    beforeEach(() => {
+      items = [];
+      init({
+        dsn: 'https://pk_test@localhost:9/1',
+        beforeSend: (i) => {
+          if (i.type === 'error') items.push(i);
+          return null;
+        },
+      });
+    });
+
+    it('stamps event_id and lifts scope tags + user onto a captured error', () => {
+      const scope = getClient()!.getScope();
+      scope.setTag('env', 'prod');
+      scope.setTag('req', '42');
+      scope.setUser({ id: 'u_123', email: 'a@b.co' });
+
+      captureException(new TypeError('x is not a function'));
+
+      expect(items).toHaveLength(1);
+      const err = items[0];
+      expect(typeof err.event_id).toBe('string');
+      expect(err.event_id!.length).toBeGreaterThan(0);
+      expect(err.tags).toEqual({ env: 'prod', req: '42' });
+      expect(err.user).toEqual({ id: 'u_123', email: 'a@b.co', traits: {} });
+    });
+
+    it('omits tags/user when the scope carries none', () => {
+      captureException(new Error('bare'));
+      expect(items).toHaveLength(1);
+      const err = items[0];
+      expect('tags' in err).toBe(false);
+      expect('user' in err).toBe(false);
+      // event_id is always stamped so callers can correlate the report.
+      expect(typeof err.event_id).toBe('string');
+    });
   });
 });
 

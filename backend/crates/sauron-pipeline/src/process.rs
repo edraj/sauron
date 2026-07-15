@@ -15,7 +15,12 @@ use sauron_redis::{keys, RedisStore};
 use crate::enrich::enrich_context;
 
 /// Process one job end to end: resolve the environment, then dispatch by type.
-pub async fn process_job(pool: &PgPool, redis: &RedisStore, job: IngestJob) -> anyhow::Result<()> {
+pub async fn process_job(
+    pool: &PgPool,
+    redis: &RedisStore,
+    sym: &crate::symbolize::SymbolizeCtx,
+    job: IngestJob,
+) -> anyhow::Result<()> {
     let mut conn = sauron_db::conn(pool).await?;
 
     let environment_id = match &job.environment {
@@ -31,7 +36,7 @@ pub async fn process_job(pool: &PgPool, redis: &RedisStore, job: IngestJob) -> a
 
     match job.item.clone() {
         sauron_core::EnvelopeItem::Error(e) => {
-            process_error(&mut conn, redis, &job, environment_id, context, *e).await
+            process_error(&mut conn, redis, pool, sym, &job, environment_id, context, *e).await
         }
         sauron_core::EnvelopeItem::Event(ev) => {
             process_event(&mut conn, &job, environment_id, context, ev).await
@@ -101,9 +106,12 @@ async fn rollup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_error(
     conn: &mut AsyncPgConnection,
     redis: &RedisStore,
+    pool: &PgPool,
+    sym: &crate::symbolize::SymbolizeCtx,
     job: &IngestJob,
     environment_id: Option<Uuid>,
     context: Value,
@@ -145,6 +153,35 @@ async fn process_error(
         .map(|x| serde_json::to_value(&x.stacktrace).unwrap_or_else(|_| json!([])))
         .unwrap_or_else(|| json!([]));
 
+    // Hybrid write path: pre-symbolicate when symbols are already uploaded.
+    // Strictly time-boxed and non-fatal — misses/timeouts fall to on-read. Dart
+    // AOT traces (raw_stacktrace) go through the ELF/DWARF path; everything else
+    // through JS source maps.
+    let (stacktrace_symbolicated, symbolication_status, debug_meta) =
+        if let Some(raw_trace) = e.raw_stacktrace.as_deref() {
+            let dm = crate::symbolize::build_debug_meta(e.debug_meta.as_ref(), raw_trace);
+            let (frames, status) = crate::symbolize::symbolicate_ingest_dart(
+                pool,
+                sym,
+                job.app_id,
+                raw_trace,
+                e.debug_meta.as_ref(),
+            )
+            .await;
+            (frames, status, Some(dm))
+        } else {
+            let raw_frames = exc.map(|x| x.stacktrace.as_slice()).unwrap_or(&[]);
+            let (frames, status) = crate::symbolize::symbolicate_ingest(
+                pool,
+                sym,
+                job.app_id,
+                job.release.as_deref(),
+                raw_frames,
+            )
+            .await;
+            (frames, status, None)
+        };
+
     repo::insert_error_event(
         conn,
         NewErrorEvent {
@@ -174,6 +211,9 @@ async fn process_error(
             session_id: e.session_id.clone(),
             device_key,
             screen: e.screen.clone(),
+            stacktrace_symbolicated,
+            symbolication_status,
+            debug_meta,
         },
     )
     .await?;

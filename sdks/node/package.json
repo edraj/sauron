@@ -1,6 +1,6 @@
 {
   "name": "@sauron/node",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Sauron server-side Node/TypeScript SDK: product-analytics events + exception capture for Node backends.",
   "type": "module",
   "main": "./dist/index.js",
@@ -14,7 +14,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

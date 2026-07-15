@@ -2,7 +2,11 @@
 
 **Unified error reporting + product analytics** — Sentry-style crash/error grouping and PostHog-style product events in one platform, on one timeline. When an error fires you can see the same person's events; when you look at a person you see their errors. One SDK emits both signals.
 
-📖 Documentation: see the [wiki](wiki/Home.md).
+📖 Documentation: see the [wiki](wiki/Home.md). Jump to:
+
+- [Getting Started](wiki/Getting-Started.md) · [Ingest Wire Contract](wiki/Ingest-Wire-Contract.md) · [Capabilities](wiki/Capabilities.md) — the SDK feature-parity matrix (v0.3.0)
+- SDKs: [Browser](wiki/Browser-SDK.md) · [Flutter](wiki/Flutter-SDK.md) · [Node](wiki/Node-SDK.md) · [Python](wiki/Python-SDK.md) · [C#](wiki/CSharp-SDK.md)
+- Guides: [Framework Integrations](wiki/Framework-Integrations.md) · [Best Practices](wiki/Best-Practices.md) · [Troubleshooting](wiki/Troubleshooting.md)
 
 This repository is a working MVP: a client SDK emits an error or event → the backend ingests, groups, and enriches it → the dashboard shows the grouped issue and the analytics. Session replay/video, ClickHouse/Kafka/object storage, SSO, and billing are intentionally out of scope for this cut (see [`plan.md`](plan.md) for the full product vision).
 

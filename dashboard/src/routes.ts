@@ -22,6 +22,8 @@ import FunnelBuilder from './pages/FunnelBuilder.svelte';
 import JourneyExplorer from './pages/JourneyExplorer.svelte';
 import Monitors from './pages/Monitors.svelte';
 import MonitorDetail from './pages/MonitorDetail.svelte';
+import Storage from './pages/Storage.svelte';
+import SourceMaps from './pages/SourceMaps.svelte';
 import Projects from './pages/Projects.svelte';
 import Members from './pages/Members.svelte';
 import SettingsApp from './pages/SettingsApp.svelte';
@@ -70,6 +72,10 @@ export const routes = {
   '/projects': guarded(Projects as Component<never>),
   '/members': guarded(Members as Component<never>),
   '/settings': guarded(SettingsApp as Component<never>),
+  '/source-maps': guarded(SourceMaps as Component<never>),
+
+  // Admin (global-admin gated in the Sidebar; the endpoint itself 403s non-admins)
+  '/storage': guarded(Storage as Component<never>),
 
   // Docs / integration guides
   '/docs': guarded(Docs as Component<never>),

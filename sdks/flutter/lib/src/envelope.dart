@@ -6,7 +6,7 @@ import 'types.dart';
 const String kSauronSdkName = 'sauron.flutter';
 
 /// SDK version — keep in sync with `pubspec.yaml`.
-const String kSauronSdkVersion = '0.2.0';
+const String kSauronSdkVersion = '0.3.0';
 
 /// The envelope header: routing + provenance metadata.
 class EnvelopeHeader {
@@ -110,6 +110,8 @@ class ErrorItem extends EnvelopeItem {
     this.fingerprint,
     this.sessionId,
     this.screen,
+    this.rawStacktrace,
+    this.debugMeta,
   });
 
   final SauronException exception;
@@ -126,21 +128,36 @@ class ErrorItem extends EnvelopeItem {
   /// The screen/route this error occurred on, if known.
   final String? screen;
 
+  /// Verbatim obfuscated Dart (AOT) trace, for server-side symbolication.
+  final String? rawStacktrace;
+
+  /// Symbol-matching metadata for [rawStacktrace] (build-id, load base, os).
+  final DebugMeta? debugMeta;
+
   @override
   String get type => 'error';
 
   @override
-  Map<String, Object?> toJson() => <String, Object?>{
-        'type': type,
-        'timestamp': sauronIso(timestamp),
-        'level': level.name,
-        'exception': exception.toJson(),
-        'breadcrumbs':
-            breadcrumbs.map((Breadcrumb crumb) => crumb.toJson()).toList(),
-        'fingerprint': fingerprint,
-        'session_id': sessionId,
-        'screen': screen,
-      };
+  Map<String, Object?> toJson() {
+    final Map<String, Object?> json = <String, Object?>{
+      'type': type,
+      'timestamp': sauronIso(timestamp),
+      'level': level.name,
+      'exception': exception.toJson(),
+      'breadcrumbs':
+          breadcrumbs.map((Breadcrumb crumb) => crumb.toJson()).toList(),
+      'fingerprint': fingerprint,
+      'session_id': sessionId,
+      'screen': screen,
+    };
+    // Only present for obfuscated Dart errors — keeps the common shape identical
+    // across SDKs (the server defaults both fields).
+    if (rawStacktrace != null) {
+      json['raw_stacktrace'] = rawStacktrace;
+      json['debug_meta'] = debugMeta?.toJson();
+    }
+    return json;
+  }
 }
 
 /// A product-analytics event item (from `track`).

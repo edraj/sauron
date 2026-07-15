@@ -27,6 +27,10 @@ pub mod perm {
     pub const ISSUE_WRITE: &str = "issue:write";
     pub const EVENT_READ: &str = "event:read";
     pub const FUNNEL_WRITE: &str = "funnel:write";
+    pub const ARTIFACT_WRITE: &str = "artifact:write";
+    /// View de-obfuscated **source code** (symbolication context lines). Symbol
+    /// names / file / line are visible with `issue:read`; this gates the code.
+    pub const SOURCE_READ: &str = "source:read";
     pub const MONITOR_READ: &str = "monitor:read";
     pub const MONITOR_WRITE: &str = "monitor:write";
     pub const APP_READ: &str = "app:read";
@@ -44,11 +48,13 @@ pub mod perm {
     pub const ORG_MANAGE: &str = "org:manage";
 
     /// Every permission, in canonical order.
-    pub const ALL: [&str; 19] = [
+    pub const ALL: [&str; 21] = [
         ISSUE_READ,
         ISSUE_WRITE,
         EVENT_READ,
         FUNNEL_WRITE,
+        ARTIFACT_WRITE,
+        SOURCE_READ,
         MONITOR_READ,
         MONITOR_WRITE,
         APP_READ,
@@ -88,6 +94,8 @@ pub const ADMIN: PresetRole = PresetRole {
         perm::ISSUE_WRITE,
         perm::EVENT_READ,
         perm::FUNNEL_WRITE,
+        perm::ARTIFACT_WRITE,
+        perm::SOURCE_READ,
         perm::MONITOR_READ,
         perm::MONITOR_WRITE,
         perm::APP_READ,
@@ -113,6 +121,8 @@ pub const DEVELOPER: PresetRole = PresetRole {
         perm::ISSUE_WRITE,
         perm::EVENT_READ,
         perm::FUNNEL_WRITE,
+        perm::ARTIFACT_WRITE,
+        perm::SOURCE_READ,
         perm::MONITOR_READ,
         perm::MONITOR_WRITE,
         perm::APP_READ,
@@ -384,13 +394,13 @@ mod tests {
         for p in perm::ALL {
             assert!(OWNER.permissions.contains(&p), "Owner missing {p}");
         }
-        assert_eq!(OWNER.permissions.len(), 19);
+        assert_eq!(OWNER.permissions.len(), 21);
     }
 
     #[test]
     fn admin_is_all_except_org_manage() {
         assert!(!ADMIN.permissions.contains(&perm::ORG_MANAGE));
-        assert_eq!(ADMIN.permissions.len(), 18);
+        assert_eq!(ADMIN.permissions.len(), 20);
         for p in perm::ALL {
             if p != perm::ORG_MANAGE {
                 assert!(ADMIN.permissions.contains(&p), "Admin missing {p}");
@@ -406,7 +416,9 @@ mod tests {
         assert!(!DEVELOPER.permissions.contains(&perm::PROJECT_DELETE));
         assert!(!DEVELOPER.permissions.contains(&perm::ROLE_MANAGE));
         assert!(DEVELOPER.permissions.contains(&perm::FUNNEL_WRITE));
-        assert_eq!(DEVELOPER.permissions.len(), 12);
+        assert!(DEVELOPER.permissions.contains(&perm::ARTIFACT_WRITE));
+        assert!(DEVELOPER.permissions.contains(&perm::SOURCE_READ));
+        assert_eq!(DEVELOPER.permissions.len(), 14);
     }
 
     #[test]
@@ -435,7 +447,7 @@ mod tests {
     fn all_permissions_are_unique() {
         let set: HashSet<_> = perm::ALL.iter().collect();
         assert_eq!(set.len(), perm::ALL.len(), "duplicate in perm::ALL");
-        assert_eq!(perm::ALL.len(), 19);
+        assert_eq!(perm::ALL.len(), 21);
     }
 
     #[test]

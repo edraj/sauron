@@ -139,6 +139,30 @@ impl DuckEngine {
         )?;
         Ok(n)
     }
+
+    /// Per-app row counts across the Parquet matched by `glob` (all apps in one
+    /// query). `app_id` is read from the hive path as text, so we parse it back to
+    /// Uuid. Returns empty when no files match.
+    pub fn counts_by_app(&self, glob: &str) -> anyhow::Result<Vec<(Uuid, i64)>> {
+        if !self.any_files_match(glob)? {
+            return Ok(Vec::new());
+        }
+        let sql = "SELECT app_id, count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true) GROUP BY app_id";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([glob], |r| {
+            let app: String = r.get(0)?;
+            let n: i64 = r.get(1)?;
+            Ok((app, n))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (app, n) = row?;
+            if let Ok(id) = Uuid::parse_str(&app) {
+                out.push((id, n));
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +228,32 @@ mod tests {
         let from = "2026-05-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let to = "2026-06-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         assert!(eng.counts_by_day(&glob, app, from, to).unwrap().is_empty());
+    }
+
+    #[test]
+    fn counts_by_app_groups_two_apps() {
+        let dir = std::env::temp_dir().join(format!("sauron-tier-cba-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let eng = DuckEngine::open().unwrap();
+        let copy = format!(
+            "COPY (SELECT app_id, occurred_at, year(occurred_at) AS year, month(occurred_at) AS month FROM (VALUES \
+               ('{a1}'::UUID, TIMESTAMPTZ '2026-05-01 10:00:00+00'), \
+               ('{a1}'::UUID, TIMESTAMPTZ '2026-05-02 10:00:00+00'), \
+               ('{a2}'::UUID, TIMESTAMPTZ '2026-05-01 11:00:00+00') \
+             ) AS v(app_id, occurred_at)) \
+             TO '{d}/error_events' (FORMAT PARQUET, PARTITION_BY (app_id, year, month), APPEND)",
+            a1 = a1, a2 = a2, d = dir.display()
+        );
+        eng.conn.execute_batch(&copy).unwrap();
+        let glob = format!("{}/error_events/**/*.parquet", dir.display());
+        let mut counts = eng.counts_by_app(&glob).unwrap();
+        counts.sort_by_key(|(_, n)| *n);
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts.iter().map(|(_, n)| *n).sum::<i64>(), 3);
+        assert!(counts.iter().any(|(id, n)| *id == a1 && *n == 2));
+        assert!(counts.iter().any(|(id, n)| *id == a2 && *n == 1));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

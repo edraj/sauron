@@ -103,6 +103,45 @@ class SauronException {
       };
 }
 
+/// Debug metadata for server-side symbolication of an obfuscated Dart (AOT)
+/// stack trace: the build-id and load base the matching `--split-debug-info`
+/// ELF is keyed by. Only attached when the captured trace is obfuscated.
+class DebugMeta {
+  const DebugMeta({this.buildId, this.isolateDsoBase, this.arch, this.os});
+
+  final String? buildId;
+  final String? isolateDsoBase;
+  final String? arch;
+  final String? os;
+
+  /// Pull `build_id` and `isolate_dso_base` out of a raw Dart trace header.
+  factory DebugMeta.fromTrace(String raw, {String? os}) {
+    String? buildId;
+    String? dsoBase;
+    for (final String line in raw.split('\n')) {
+      final String l = line.trim();
+      if (l.startsWith('build_id:')) {
+        buildId = l.substring('build_id:'.length).trim().replaceAll(RegExp('["\']'), '');
+      } else if (l.startsWith('isolate_dso_base:')) {
+        dsoBase = l.substring('isolate_dso_base:'.length).trim();
+      }
+    }
+    return DebugMeta(buildId: buildId, isolateDsoBase: dsoBase, os: os);
+  }
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'build_id': buildId,
+        'isolate_dso_base': isolateDsoBase,
+        'arch': arch,
+        'os': os,
+      };
+}
+
+/// Whether a raw Dart stack trace is obfuscated AOT output (PC offsets) rather
+/// than a readable JIT trace — the marker the SDK keys symbolication capture on.
+bool isObfuscatedDartTrace(String raw) =>
+    raw.contains('isolate_dso_base') || raw.contains('build_id:');
+
 /// A breadcrumb: a lightweight event leading up to an error.
 class Breadcrumb {
   Breadcrumb({

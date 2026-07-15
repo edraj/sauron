@@ -1,14 +1,22 @@
 import type { Dsn } from './dsn.js';
+import { maybeGzip } from './gzip.js';
+import { BoundedQueue } from './queue.js';
 import type {
   Context,
   Envelope,
   EnvelopeHeader,
   EnvelopeItem,
   FetchLike,
+  SleepFn,
 } from './types.js';
 
 const SDK_NAME = 'sauron-node';
-const SDK_VERSION = '0.1.0';
+const SDK_VERSION = '0.3.0';
+
+/** Default exponential-backoff base (ms) for the first retry. */
+const DEFAULT_RETRY_BASE_MS = 200;
+/** Hard cap on any single backoff delay (ms). */
+const RETRY_CAP_MS = 30_000;
 
 export interface TransportConfig {
   dsn: Dsn;
@@ -19,27 +27,73 @@ export interface TransportConfig {
   maxBatch: number;
   fetchImpl?: FetchLike;
   debug: boolean;
+  /** Gzip the body once it exceeds this many bytes. Default 1024. */
+  gzipThresholdBytes?: number;
+  /** Drop-oldest byte cap for the in-memory buffer. Default 1 MiB. */
+  maxQueueBytes?: number;
+  /** Opt-in directory for FIFO disk persistence. Default off. */
+  offlineDir?: string | null;
+  /** Max retries after the first attempt. Default 3. */
+  maxRetries?: number;
+  /** Backoff base (ms). Default 200. */
+  retryBaseMs?: number;
+  /** Deterministic sleep seam (tests). Defaults to a real timer. */
+  sleep?: SleepFn;
+  /** Jitter source (tests). Defaults to `Math.random`. */
+  random?: () => number;
 }
+
+/** Statuses that are worth retrying (plus any 5xx and network errors). */
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 413 || status === 429 || status >= 500;
+}
+
+/**
+ * Parse a `Retry-After` header (delta-seconds or an HTTP-date) into a delay in
+ * ms, clamped to non-negative. Returns `null` when absent/unparseable.
+ */
+export function parseRetryAfter(value: string | null | undefined, nowMs: number): number | null {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  const secs = Number(trimmed);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - nowMs);
+  return null;
+}
+
+const realSleep: SleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Buffered background transport.
  *
- * Items accumulate in an in-memory queue; a `setInterval` timer (unref'd, so it
- * never keeps the event loop alive) flushes every `flushInterval` ms, and an
- * eager flush fires once the queue reaches `maxBatch`. Each flush drains the
- * queue into a single envelope and POSTs it.
+ * Items accumulate in a byte-bounded {@link BoundedQueue} (optionally persisted
+ * to disk). A `setInterval` timer (unref'd, so it never keeps the event loop
+ * alive) flushes every `flushInterval` ms, and an eager flush fires once the
+ * queue reaches `maxBatch`. Each flush drains a batch into one envelope, gzips
+ * it when large, and POSTs it with an exponential-backoff retry policy:
  *
- * On a hard auth failure (401/403) the transport disables itself and stops
- * sending. Transient failures (network error, 429/5xx) drop the current batch
- * after logging (v0.1: no offline queue, bounded/no retry).
+ * - retry 408/413/429/5xx and network errors (honoring `Retry-After` on 429),
+ * - drop (no retry) on 400/401/403/404 — 401/403 also disable the SDK,
+ * - after `maxRetries` transient failures, the batch is re-buffered (kept for a
+ *   later flush / next process start) rather than lost.
+ *
+ * Flushes are serialized through a promise chain so a batch is never drained by
+ * two overlapping flushes.
  */
 export class Transport {
-  private queue: EnvelopeItem[] = [];
+  private readonly buffer: BoundedQueue;
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly fetchImpl: FetchLike;
   private disabled = false;
-  /** Tracks in-flight sends so `flush()`/`close()` can await them. */
-  private pending: Set<Promise<void>> = new Set();
+  private readonly gzipThreshold: number;
+  private readonly maxRetries: number;
+  private readonly retryBaseMs: number;
+  private readonly sleep: SleepFn;
+  private readonly random: () => number;
+  /** Serializes flushes so a batch is drained/committed atomically. */
+  private flushChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: TransportConfig) {
     const injected = config.fetchImpl;
@@ -53,6 +107,15 @@ export class Transport {
       );
     }
     this.fetchImpl = chosen;
+    this.gzipThreshold = config.gzipThresholdBytes ?? 1024;
+    this.maxRetries = Math.max(0, config.maxRetries ?? 3);
+    this.retryBaseMs = config.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
+    this.sleep = config.sleep ?? realSleep;
+    this.random = config.random ?? Math.random;
+    this.buffer = new BoundedQueue({
+      maxBytes: config.maxQueueBytes ?? 1_048_576,
+      offlineDir: config.offlineDir ?? null,
+    });
     this.startTimer();
   }
 
@@ -68,8 +131,8 @@ export class Transport {
   /** Enqueue an item; triggers an eager flush at `maxBatch`. */
   enqueue(item: EnvelopeItem): void {
     if (this.disabled) return;
-    this.queue.push(item);
-    if (this.queue.length >= this.config.maxBatch) {
+    this.buffer.push(item);
+    if (this.buffer.size >= this.config.maxBatch) {
       void this.flush();
     }
   }
@@ -85,49 +148,90 @@ export class Transport {
     return { header, context: this.config.context, items };
   }
 
-  /** Drain the queue and send it immediately; awaits the network round-trip. */
-  async flush(): Promise<void> {
+  /**
+   * Drain a batch and send it. Serialized through {@link flushChain} so
+   * overlapping calls (eager + timer + manual) never race the queue.
+   */
+  flush(): Promise<void> {
+    const next = this.flushChain.then(() => this.drainAndSend());
+    // Swallow rejections on the chain so one failure can't poison later flushes.
+    this.flushChain = next.catch(() => undefined);
+    return this.flushChain;
+  }
+
+  private async drainAndSend(): Promise<void> {
     if (this.disabled) return;
-    if (this.queue.length === 0) {
-      // Still await any already in-flight sends.
-      await Promise.all([...this.pending]);
+    const items = this.buffer.drain();
+    if (items.length === 0) {
+      this.buffer.commit();
       return;
     }
-    const items = this.queue;
-    this.queue = [];
-    const envelope = this.buildEnvelope(items);
-    const send = this.send(envelope);
-    this.pending.add(send);
-    try {
-      await send;
-    } finally {
-      this.pending.delete(send);
-    }
+    await this.send(this.buildEnvelope(items));
   }
 
   private async send(envelope: Envelope): Promise<void> {
     const { dsn } = this.config;
-    try {
-      const res = await this.fetchImpl(dsn.envelopeUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Sauron-Key': dsn.publicKey,
-        },
-        body: JSON.stringify(envelope),
-      });
-      const status = res.status;
-      if (status === 401 || status === 403) {
-        this.disabled = true;
-        this.log(`auth failed (${status}); disabling SDK`);
+    const raw = JSON.stringify(envelope);
+    const { body, headers: encodingHeaders } = maybeGzip(raw, this.gzipThreshold);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Sauron-Key': dsn.publicKey,
+      ...encodingHeaders,
+    };
+
+    let attempt = 0;
+    for (;;) {
+      let retryAfterMs: number | null = null;
+      try {
+        const res = await this.fetchImpl(dsn.envelopeUrl, {
+          method: 'POST',
+          headers,
+          body,
+        });
+        const status = res.status;
+        if (status >= 200 && status < 300) {
+          this.buffer.commit();
+          return;
+        }
+        if (status === 401 || status === 403) {
+          this.disabled = true;
+          this.log(`auth failed (${status}); disabling SDK`);
+          this.buffer.commit();
+          return;
+        }
+        if (!isRetryableStatus(status)) {
+          this.log(`ingest returned ${status}; dropping ${envelope.items.length} item(s)`);
+          this.buffer.commit();
+          return;
+        }
+        // Retryable HTTP status.
+        if (status === 429) {
+          retryAfterMs = parseRetryAfter(res.headers?.get('retry-after'), Date.now());
+        }
+        this.log(`ingest returned ${status}; will retry (attempt ${attempt + 1})`);
+      } catch (err) {
+        // Network-level failure — retryable.
+        this.log(`transport error: ${String(err)} (attempt ${attempt + 1})`);
+      }
+
+      if (attempt >= this.maxRetries) {
+        // Out of retries: keep the batch buffered for a later flush / restart
+        // rather than dropping it on the floor.
+        this.buffer.restore();
+        this.log(`giving up after ${attempt + 1} attempt(s); re-buffering batch`);
         return;
       }
-      if (status >= 400) {
-        this.log(`ingest returned ${status}; dropping ${envelope.items.length} item(s)`);
-      }
-    } catch (err) {
-      this.log(`transport error: ${String(err)}`);
+      const delay = retryAfterMs ?? this.backoffDelay(attempt);
+      await this.sleep(Math.min(delay, RETRY_CAP_MS));
+      attempt += 1;
     }
+  }
+
+  /** Exponential backoff with equal-jitter, capped at {@link RETRY_CAP_MS}. */
+  private backoffDelay(attempt: number): number {
+    const exp = Math.min(RETRY_CAP_MS, this.retryBaseMs * 2 ** attempt);
+    const half = exp / 2;
+    return Math.min(RETRY_CAP_MS, half + this.random() * half);
   }
 
   /** Flush then stop the timer. After close the transport still accepts a
@@ -138,7 +242,7 @@ export class Transport {
       clearInterval(this.timer);
       this.timer = null;
     }
-    await Promise.all([...this.pending]);
+    await this.flushChain;
   }
 
   private log(message: string): void {

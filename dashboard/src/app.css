@@ -167,6 +167,16 @@ textarea {
   font-size: inherit;
 }
 
+/* Native <select> popup options. Some browsers render the popup with a light
+   system background even under color-scheme: dark when the control itself has a
+   transparent background — leaving the inherited light `--text` unreadable.
+   Force a solid, theme-appropriate background + text so options stay legible in
+   both themes. */
+option {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
 :focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;

@@ -3,6 +3,7 @@
 - [Home](Home.md)
 - [Getting Started](Getting-Started.md)
 - [Ingest Wire Contract](Ingest-Wire-Contract.md)
+- [Capabilities](Capabilities.md)
 
 **SDKs**
 
@@ -11,6 +12,12 @@
 - [Python SDK](Python-SDK.md)
 - [Node SDK](Node-SDK.md)
 - [C# SDK](CSharp-SDK.md)
+
+**Guides**
+
+- [Framework Integrations](Framework-Integrations.md)
+- [Best Practices](Best-Practices.md)
+- [Troubleshooting](Troubleshooting.md)
 
 **Reference**
 

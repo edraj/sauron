@@ -8,10 +8,11 @@ import 'package:sauron_flutter/sauron_flutter.dart';
 
 class _MockClient extends Mock implements http.Client {}
 
-/// The Flutter SDK only runs `beforeSend` on errors; analytics events flow
-/// through the transport untouched. To assert what `track`/`setScreen` put on
-/// the wire we capture the posted envelope bodies via a mock HTTP client and
-/// decode their `items`.
+/// These tests leave `beforeSend` unset, so analytics events flow through the
+/// transport untouched. To assert what `track`/`setScreen` put on the wire we
+/// capture the posted envelope bodies via a mock HTTP client and decode their
+/// `items`. (`beforeSend`, when configured, now runs on every item — see
+/// `before_send_test.dart`.)
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 

@@ -51,11 +51,28 @@ export interface Breadcrumb {
 /** An error item (uncaught error, rejection, or manual capture). */
 export interface ErrorItem {
   type: 'error';
+  /**
+   * Stable id the SDK mints for this report so callers can correlate it. Wire
+   * field `event_id`. Optional — the backend defaults one when omitted.
+   */
+  event_id?: string;
   timestamp: string;
   level: Level;
   exception: ExceptionValue;
+  /** Optional human-readable summary alongside the exception. */
+  message?: string;
   breadcrumbs: Breadcrumb[];
   fingerprint: string[] | null;
+  /**
+   * Free-form indexed tags lifted from the current scope. Optional — omitted
+   * when the scope carries none (the backend defaults to `{}`).
+   */
+  tags?: Record<string, unknown>;
+  /**
+   * Per-item user override (falls back to the envelope-context user). Optional
+   * — omitted when no identity is set on the scope.
+   */
+  user?: UserContext | null;
   session_id?: string | null;
   screen?: string | null;
 }

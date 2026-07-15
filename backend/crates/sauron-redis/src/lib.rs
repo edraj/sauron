@@ -248,3 +248,88 @@ impl RedisStore {
         Ok(())
     }
 }
+
+/// Isolated warm-blob cache for symbol artifacts.
+///
+/// Runs against a **dedicated** Redis (its own `maxmemory`/eviction policy) so
+/// cached symbol blobs can never evict ingest-stream state. Disabled — every op
+/// a no-op — when no URL is configured. Blobs larger than `max_blob_bytes` are
+/// never cached (they stay in the in-process parsed-index tier only). All errors
+/// are swallowed: the cache is strictly best-effort and never fails a caller.
+#[derive(Clone)]
+pub struct SymbolBlobCache {
+    conn: Option<ConnectionManager>,
+    max_blob_bytes: usize,
+}
+
+impl SymbolBlobCache {
+    /// Connect to the isolated cache, or return a disabled cache when `url` is
+    /// `None` (or the connection can't be established).
+    pub async fn connect(url: Option<&str>, max_blob_bytes: usize) -> Self {
+        let conn = match url {
+            Some(u) => match redis::Client::open(u) {
+                Ok(client) => {
+                    let config = ConnectionManagerConfig::new().set_response_timeout(None);
+                    match ConnectionManager::new_with_config(client, config).await {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "symbol blob cache disabled: connect failed");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "symbol blob cache disabled: bad url");
+                    None
+                }
+            },
+            None => None,
+        };
+        Self {
+            conn,
+            max_blob_bytes,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.conn.is_some()
+    }
+
+    fn key(sha_hex: &str) -> String {
+        format!("sauron:sym:{sha_hex}")
+    }
+
+    /// Fetch compressed blob bytes; any error (or disabled cache) is a miss.
+    pub async fn get(&self, sha_hex: &str) -> Option<Vec<u8>> {
+        let mut c = self.conn.clone()?;
+        match redis::cmd("GET")
+            .arg(Self::key(sha_hex))
+            .query_async::<Option<Vec<u8>>>(&mut c)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "symbol blob cache get failed");
+                None
+            }
+        }
+    }
+
+    /// Store compressed blob bytes, skipping blobs over the size cap.
+    pub async fn put(&self, sha_hex: &str, compressed: &[u8]) {
+        if compressed.len() > self.max_blob_bytes {
+            return;
+        }
+        let Some(mut c) = self.conn.clone() else {
+            return;
+        };
+        if let Err(e) = redis::cmd("SET")
+            .arg(Self::key(sha_hex))
+            .arg(compressed)
+            .query_async::<()>(&mut c)
+            .await
+        {
+            tracing::debug!(error = %e, "symbol blob cache put failed");
+        }
+    }
+}

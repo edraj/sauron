@@ -8,6 +8,7 @@ license.workspace = true
 sauron-core.workspace = true
 sauron-db.workspace = true
 sauron-redis.workspace = true
+sauron-symbols.workspace = true
 woothee.workspace = true
 serde.workspace = true
 serde_json.workspace = true

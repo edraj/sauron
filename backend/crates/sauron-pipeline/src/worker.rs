@@ -9,6 +9,7 @@ use sauron_db::PgPool;
 use sauron_redis::RedisStore;
 
 use crate::process::process_job;
+use crate::symbolize::SymbolizeCtx;
 
 /// Spawn `concurrency` worker tasks. Returns their handles; the caller keeps
 /// them alive for the process lifetime.
@@ -16,20 +17,22 @@ pub async fn spawn_workers(
     pool: PgPool,
     redis: RedisStore,
     concurrency: usize,
+    sym: SymbolizeCtx,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     redis.ensure_group().await?;
     let mut handles = Vec::with_capacity(concurrency);
     for i in 0..concurrency.max(1) {
         let pool = pool.clone();
         let redis = redis.clone();
+        let sym = sym.clone();
         let consumer = format!("worker-{i}");
         info!(consumer, "starting ingest worker");
-        handles.push(tokio::spawn(worker_loop(pool, redis, consumer)));
+        handles.push(tokio::spawn(worker_loop(pool, redis, sym, consumer)));
     }
     Ok(handles)
 }
 
-async fn worker_loop(pool: PgPool, redis: RedisStore, consumer: String) {
+async fn worker_loop(pool: PgPool, redis: RedisStore, sym: SymbolizeCtx, consumer: String) {
     // Each worker owns a dedicated blocking connection so its BLOCK read never
     // stalls the shared command path.
     let mut blocking = match redis.blocking_connection().await {
@@ -52,7 +55,7 @@ async fn worker_loop(pool: PgPool, redis: RedisStore, consumer: String) {
 
         for (id, payload) in entries {
             match serde_json::from_str::<IngestJob>(&payload) {
-                Ok(job) => match process_job(&pool, &redis, job).await {
+                Ok(job) => match process_job(&pool, &redis, &sym, job).await {
                     Ok(()) => {
                         let _ = redis.ack(&id).await;
                     }

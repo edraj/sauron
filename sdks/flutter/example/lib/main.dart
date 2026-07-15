@@ -15,7 +15,9 @@ Future<void> main() async {
       o.maxBreadcrumbs = 100;
       o.debug = true;
       o.flushInterval = const Duration(seconds: 5);
-      o.beforeSend = (ErrorItem event) => event;
+      // Runs on every outgoing item (error / event / identify / transaction).
+      // Return the item to send it, or null to drop it.
+      o.beforeSend = (Object item) => item;
     },
     appRunner: () => runApp(const SauronExampleApp()),
   );

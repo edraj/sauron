@@ -9,7 +9,11 @@
     "noEmit": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "@sauron/node": ["../../sdks/node/src/index.ts"]
+    }
   },
   "include": ["index.ts"]
 }

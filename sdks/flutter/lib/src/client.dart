@@ -145,23 +145,21 @@ class SauronClient {
       mechanism: mechanism ?? const Mechanism(type: 'manual', handled: true),
       stacktrace: _parser.parse(stack),
     );
-    ErrorItem item = ErrorItem(
+    // Obfuscated AOT traces are PC offsets the neutral frame model can't carry;
+    // ship the verbatim trace + build-id so the server can symbolicate.
+    final String? rawTrace = stack?.toString();
+    final bool obfuscated = rawTrace != null && isObfuscatedDartTrace(rawTrace);
+    final ErrorItem item = ErrorItem(
       exception: exception,
       timestamp: DateTime.now().toUtc(),
       level: level,
       breadcrumbs: _scope.breadcrumbs,
       sessionId: sessionId,
       screen: screen ?? _currentScreen,
+      rawStacktrace: obfuscated ? rawTrace : null,
+      debugMeta: obfuscated ? DebugMeta.fromTrace(rawTrace) : null,
     );
-    final BeforeSendCallback? beforeSend = options.beforeSend;
-    if (beforeSend != null) {
-      final ErrorItem? processed = beforeSend(item);
-      if (processed == null) {
-        _log('event dropped by beforeSend.');
-        return;
-      }
-      item = processed;
-    }
+    // `beforeSend` is applied uniformly for every item in [_dispatch].
     _dispatch(item);
     // Errors are worth an eager flush attempt.
     _transport?.flush();
@@ -270,11 +268,22 @@ class SauronClient {
   // ---- internals -------------------------------------------------------------
 
   void _dispatch(EnvelopeItem item) {
+    EnvelopeItem outgoing = item;
+    final BeforeSendCallback? beforeSend = options.beforeSend;
+    if (beforeSend != null) {
+      final Object? processed = beforeSend(item);
+      if (processed == null) {
+        _log('${item.type} dropped by beforeSend.');
+        return;
+      }
+      // The hook may return a mutated or replacement item.
+      outgoing = processed as EnvelopeItem;
+    }
     final SauronTransport? transport = _transport;
     if (transport != null) {
-      transport.capture(item);
+      transport.capture(outgoing);
     } else {
-      _pending.add(item);
+      _pending.add(outgoing);
     }
   }
 

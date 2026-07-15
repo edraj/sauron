@@ -69,13 +69,25 @@ pub async fn detail(
 ) -> Result<Json<IssueDetail>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
+    // Viewing de-obfuscated source code needs source:read; symbol/file/line don't.
+    let include_source = authorize_app(&mut conn, auth.user_id, app_id, perm::SOURCE_READ)
+        .await
+        .is_ok();
 
     let issue = repo::get_issue(&mut conn, app_id, issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let latest_event = repo::latest_error_event(&mut conn, issue_id).await?;
+    let mut latest_event = repo::latest_error_event(&mut conn, issue_id).await?;
     let since = Utc::now() - Duration::days(30);
     let series = repo::issue_occurrence_series(&mut conn, issue_id, since).await?;
+    drop(conn); // release the pooled conn; symbolication checks out its own
+
+    if let Some(ev) = latest_event.as_mut() {
+        crate::symbolicate::symbolicate_event(&state, app_id, ev).await;
+        if !include_source {
+            crate::symbolicate::strip_source_context(ev);
+        }
+    }
 
     Ok(Json(IssueDetail {
         issue,
@@ -126,15 +138,24 @@ pub async fn events(
 ) -> Result<Json<Vec<ErrorEvent>>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
+    let include_source = authorize_app(&mut conn, auth.user_id, app_id, perm::SOURCE_READ)
+        .await
+        .is_ok();
     // Confirm the issue belongs to this app before returning its events (prevents
     // reading another app's events by passing a foreign issue_id).
     repo::get_issue(&mut conn, app_id, issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     let limit = q.limit.clamp(1, 100);
-    Ok(Json(
-        repo::list_error_events_for_issue(&mut conn, issue_id, limit).await?,
-    ))
+    let mut events = repo::list_error_events_for_issue(&mut conn, issue_id, limit).await?;
+    drop(conn); // release before per-event symbolication (checks out its own)
+    for ev in events.iter_mut() {
+        crate::symbolicate::symbolicate_event(&state, app_id, ev).await;
+        if !include_source {
+            crate::symbolicate::strip_source_context(ev);
+        }
+    }
+    Ok(Json(events))
 }
 
 // ---------------------------------------------------------------------------

@@ -35,6 +35,14 @@ Headers:
 A `sendBeacon` fallback (used by the browser SDK) targets the same URL with the key in
 the query string: `.../envelope?k=<public_key>`.
 
+### Compression
+
+The body may be gzip-compressed. **Every SDK** (as of **v0.3.0**) gzips the JSON body once
+it exceeds a threshold (`gzipThresholdBytes`, default 1024) and sets
+`Content-Encoding: gzip`; smaller bodies go out uncompressed and omit the header. The
+ingest gateway transparently decompresses when the header is present, so compression is
+purely a transport optimization — the decoded JSON is identical either way.
+
 ### Responses
 
 - **2xx** — accepted (fire-and-forget).
@@ -69,7 +77,9 @@ default to now.
 ```
 
 - **`header.sdk.name`** identifies the emitting SDK: `sauron.javascript` (browser),
-  `sauron-node`, `sauron-python`, `sauron-dotnet`. `header.sdk.version` is `0.1.0`.
+  `sauron-node`, `sauron-python`, `sauron-dotnet`. `header.sdk.version` is the SDK's own
+  release — all five ship as `0.3.0` (the `0.1.0` in the example above mirrors the golden
+  parity fixture).
 - **`context`** blocks (`device`, `os`, `app`, `runtime`) are free-form JSON so SDKs
   stay unopinionated about platform fields. Only `user` is typed (id / email /
   username / ip_address / traits) because the backend resolves it to an identity.
@@ -113,6 +123,12 @@ Each item is tagged by a `type` discriminant (`snake_case`).
 - `level` ∈ `debug | info | warning | error | fatal` (default `error`).
 - **Stack frames are ordered call-site → crash — the crashing frame is LAST.**
 - `fingerprint` (optional) overrides server-side grouping when present.
+- **`breadcrumbs`, `tags`, `user`, and `fingerprint` are populated by every SDK** (as of
+  **v0.3.0**) from the active [scope](Capabilities.md): the SDK merges the scope's recent
+  breadcrumb ring, its tags, and its user onto each captured error, and honors a
+  client-supplied `fingerprint` verbatim. All four are optional — omitted keys fall back to
+  server-side defaults (empty ring, `{}` tags, the envelope `context.user`, backend
+  grouping).
 
 ### `identify` — attach traits to a person
 
@@ -137,6 +153,11 @@ known one.
 `navigation | http | resource | screen_load | custom`. Aggregated server-side into
 p50/p95/etc.
 
+**Every SDK emits transactions** via `trackTransaction` (as of **v0.3.0**) — the browser
+and Flutter can also auto-capture navigation/HTTP/route timings, while the server SDKs
+(Node, Python, C#) record them manually (e.g. per request handler). Wire fields are
+snake_case (`duration_ms`, `http_method`, `http_status`, `distinct_id`).
+
 ### `breadcrumb_batch` — a standalone trail of breadcrumbs
 
 ```json
@@ -154,8 +175,12 @@ a later crash for the same person.
 | `event` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `error` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `identify` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `transaction` | ✅ | ✅ | — | — | — |
+| `transaction` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `breadcrumb_batch` | ✅ | ✅ | — | — | — |
 
-The server-side SDKs (Node, Python, C#) ship the core dispatch items only — no
-auto-instrumentation, no breadcrumb ring, no transactions in v0.1.
+As of **v0.3.0** the server-side SDKs (Node, Python, C#) reach parity on the dispatch
+surface: they emit `transaction` items and carry a breadcrumb ring, tags, and user on
+their `error` items. They still do **not** upload a standalone `breadcrumb_batch` — the
+browser and Flutter use that to pre-stage a person's recent activity, whereas the server
+SDKs attach breadcrumbs directly onto the error item. See the full
+[Capabilities](Capabilities.md) matrix.

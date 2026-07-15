@@ -3,7 +3,7 @@
 This walks you from nothing to your first signal landing in the dashboard.
 
 See also: **[Home](Home.md)** · **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
-**[Examples](Examples.md)**
+**[Capabilities](Capabilities.md)** · **[Examples](Examples.md)**
 
 ## 1. Create an app and get its DSN
 
@@ -43,9 +43,12 @@ types:
 ## 3. Send your first event
 
 Each SDK exposes the same core surface: **init**, **track**, **captureException**,
-**identify**, **flush/close**. Below is the shortest path per SDK; all read the DSN
-however is idiomatic for that platform (client SDKs take it in `init`, the example
-servers read it from a `SAURON_DSN` env var).
+**identify**, **flush/close** — plus **scope** (user/tags/context), **breadcrumbs**,
+**transactions** (`trackTransaction`), and a **`beforeSend`** hook, all reconciled across
+the five SDKs in **v0.3.0**. See **[Capabilities](Capabilities.md)** for the full parity
+matrix. Below is the shortest path per SDK; all read the DSN however is idiomatic for that
+platform (client SDKs take it in `init`, the example servers read it from a `SAURON_DSN`
+env var).
 
 ### Browser (`@sauron/browser`)
 
@@ -102,9 +105,14 @@ SauronSdk.Track("order_completed", "user-42", new Dictionary<string, object?> { 
 Client SDKs (browser, Flutter) flush in the background. Short-lived server processes
 should flush and close so the buffer drains before the process exits:
 
-- Node: `await close();`
-- Python: `sauron.flush(); sauron.close()`
+- Node: `await close();` — or pass `autoShutdown: true` to `init` to wire
+  `beforeExit`/`SIGTERM`/`SIGINT` to `close()` automatically.
+- Python: `sauron.flush(); sauron.close()` — `init` also registers an `atexit` flush, so a
+  short-lived script drains on exit even without an explicit `close()`.
 - C#: `SauronSdk.Flush(); SauronSdk.Close();`
+
+For long-running services, prefer per-request scope isolation over global state — see
+**[Best Practices](Best-Practices.md)** and **[Framework Integrations](Framework-Integrations.md)**.
 
 ## 5. Watch it land
 
@@ -114,4 +122,8 @@ errors under **Exceptions**, and identified people under **Users**.
 ## Next steps
 
 - Full wire details: **[Ingest Wire Contract](Ingest-Wire-Contract.md)**.
+- SDK feature-parity matrix: **[Capabilities](Capabilities.md)**.
+- Copy-paste framework recipes: **[Framework Integrations](Framework-Integrations.md)**.
+- Naming, PII scrubbing, sampling, flush/shutdown: **[Best Practices](Best-Practices.md)**.
+- When nothing shows up: **[Troubleshooting](Troubleshooting.md)**.
 - Runnable end-to-end apps: **[Examples](Examples.md)**.

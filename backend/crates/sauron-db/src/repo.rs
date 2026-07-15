@@ -2549,7 +2549,10 @@ pub async fn update_monitor(
             status = COALESCE($4, status), \
             interval_seconds = COALESCE($5, interval_seconds), \
             webhook_url = CASE WHEN $6 THEN $7 ELSE webhook_url END, \
-            next_check_at = CASE WHEN $4 = 'unknown' THEN now() ELSE next_check_at END, \
+            next_check_at = CASE \
+                WHEN $4 = 'unknown' THEN now() \
+                WHEN $5 IS NOT NULL THEN now() + make_interval(secs => $5) \
+                ELSE next_check_at END, \
             updated_at = now() \
          WHERE id = $1 RETURNING *",
     )
@@ -2814,4 +2817,327 @@ pub async fn transaction_counts_by_day_hot(
     .bind::<Timestamptz, _>(to)
     .load(conn)
     .await
+}
+
+// ===========================================================================
+// Storage (admin) — sizes and per-app row counts. `table` args are internal
+// identifiers from sauron_tier::TIERED_TABLES, never user input.
+// ===========================================================================
+
+#[derive(diesel::QueryableByName)]
+struct BytesRow {
+    #[diesel(sql_type = BigInt)]
+    bytes: i64,
+}
+
+pub async fn db_total_bytes(conn: &mut AsyncPgConnection) -> QueryResult<i64> {
+    let row: BytesRow = diesel::sql_query(
+        "SELECT pg_database_size(current_database())::bigint AS bytes",
+    )
+    .get_result(conn)
+    .await?;
+    Ok(row.bytes)
+}
+
+pub async fn table_total_bytes(conn: &mut AsyncPgConnection, table: &str) -> QueryResult<i64> {
+    // A partitioned parent has no storage of its own; sum the whole partition
+    // tree (parent + children). Works for a non-partitioned table too (tree = self).
+    let row: BytesRow = diesel::sql_query(format!(
+        "SELECT COALESCE(sum(pg_total_relation_size(relid)), 0)::bigint AS bytes \
+         FROM pg_partition_tree('{table}'::regclass)"
+    ))
+    .get_result(conn)
+    .await?;
+    Ok(row.bytes)
+}
+
+pub async fn table_avg_row_width(conn: &mut AsyncPgConnection, table: &str) -> QueryResult<i64> {
+    // pg_stats for a partitioned PARENT is empty until inherited stats exist, so
+    // read the whole partition tree. avg_width is per-column; take one representative
+    // width per column (max across partitions) then sum → estimated bytes/row.
+    let row: BytesRow = diesel::sql_query(
+        "SELECT COALESCE(sum(w), 0)::bigint AS bytes FROM ( \
+           SELECT s.attname, max(s.avg_width) AS w \
+           FROM pg_partition_tree($1::regclass) t \
+           JOIN pg_class c ON c.oid = t.relid \
+           JOIN pg_namespace n ON n.oid = c.relnamespace \
+           JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname \
+           GROUP BY s.attname \
+         ) x",
+    )
+    .bind::<Text, _>(table)
+    .get_result(conn)
+    .await?;
+    Ok(row.bytes)
+}
+
+#[derive(diesel::QueryableByName)]
+pub struct AppCountRow {
+    #[diesel(sql_type = SqlUuid)]
+    pub app_id: Uuid,
+    #[diesel(sql_type = BigInt)]
+    pub n: i64,
+}
+
+pub async fn hot_rows_by_app(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+) -> QueryResult<Vec<AppCountRow>> {
+    diesel::sql_query(format!(
+        "SELECT app_id, count(*)::bigint AS n FROM {table} GROUP BY app_id"
+    ))
+    .load(conn)
+    .await
+}
+
+#[derive(diesel::QueryableByName)]
+pub struct AppOrgRow {
+    #[diesel(sql_type = SqlUuid)]
+    pub app_id: Uuid,
+    #[diesel(sql_type = Text)]
+    pub app_name: String,
+    #[diesel(sql_type = Text)]
+    pub org_name: String,
+}
+
+pub async fn list_apps_with_org(conn: &mut AsyncPgConnection) -> QueryResult<Vec<AppOrgRow>> {
+    diesel::sql_query(
+        "SELECT a.id AS app_id, a.name AS app_name, o.name AS org_name \
+         FROM apps a JOIN projects p ON a.project_id = p.id \
+         JOIN organizations o ON p.org_id = o.id \
+         ORDER BY o.name, a.name",
+    )
+    .load(conn)
+    .await
+}
+
+// ===========================================================================
+// Symbol artifacts (source maps / Dart debug-info), content-addressed
+// ===========================================================================
+
+/// Insert a content-addressed blob, or bump its refcount if it already exists.
+pub async fn put_blob(
+    conn: &mut AsyncPgConnection,
+    sha: &[u8],
+    compressed: &[u8],
+    uncompressed_size: i64,
+    compressed_size: i64,
+) -> QueryResult<()> {
+    diesel::insert_into(symbol_blobs::table)
+        .values(NewSymbolBlob {
+            sha256: sha,
+            content: compressed,
+            uncompressed_size,
+            compressed_size,
+            refcount: 1,
+        })
+        .on_conflict(symbol_blobs::sha256)
+        .do_update()
+        .set(symbol_blobs::refcount.eq(symbol_blobs::refcount + 1))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Cheap indexed check: does this app have ANY symbol artifacts uploaded? Lets
+/// the ingest path skip a per-error artifact lookup for apps that use no symbols.
+pub async fn app_has_symbol_artifacts(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<bool> {
+    diesel::select(diesel::dsl::exists(
+        symbol_artifacts::table.filter(symbol_artifacts::app_id.eq(app_id)),
+    ))
+    .get_result(conn)
+    .await
+}
+
+/// Fetch the compressed bytes of a blob by content hash.
+pub async fn get_blob(conn: &mut AsyncPgConnection, sha: &[u8]) -> QueryResult<Option<Vec<u8>>> {
+    symbol_blobs::table
+        .filter(symbol_blobs::sha256.eq(sha))
+        .select(symbol_blobs::content)
+        .first::<Vec<u8>>(conn)
+        .await
+        .optional()
+}
+
+/// Persist symbolicated frames + status onto an error event (by its composite
+/// PK: id + occurred_at). Used by the on-read backfill for hot partitions.
+pub async fn update_event_symbolication(
+    conn: &mut AsyncPgConnection,
+    event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+    frames: Value,
+    status: &str,
+) -> QueryResult<usize> {
+    diesel::update(
+        error_events::table
+            .filter(error_events::id.eq(event_id))
+            .filter(error_events::occurred_at.eq(occurred_at)),
+    )
+    .set((
+        error_events::stacktrace_symbolicated.eq(Some(frames)),
+        error_events::symbolication_status.eq(status.to_string()),
+    ))
+    .execute(conn)
+    .await
+}
+
+pub async fn insert_symbol_artifact(
+    conn: &mut AsyncPgConnection,
+    art: NewSymbolArtifact,
+) -> QueryResult<SymbolArtifact> {
+    diesel::insert_into(symbol_artifacts::table)
+        .values(&art)
+        .returning(SymbolArtifact::as_returning())
+        .get_result(conn)
+        .await
+}
+
+pub async fn list_symbol_artifacts(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Vec<SymbolArtifact>> {
+    symbol_artifacts::table
+        .filter(symbol_artifacts::app_id.eq(app_id))
+        .select(SymbolArtifact::as_select())
+        .order(symbol_artifacts::created_at.desc())
+        .load(conn)
+        .await
+}
+
+/// List artifacts for an app joined to their blob sizes (uncompressed, compressed).
+pub async fn list_artifacts_with_sizes(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Vec<(SymbolArtifact, i64, i64)>> {
+    symbol_artifacts::table
+        .inner_join(
+            symbol_blobs::table.on(symbol_artifacts::blob_sha256.eq(symbol_blobs::sha256)),
+        )
+        .filter(symbol_artifacts::app_id.eq(app_id))
+        .select((
+            SymbolArtifact::as_select(),
+            symbol_blobs::uncompressed_size,
+            symbol_blobs::compressed_size,
+        ))
+        .order(symbol_artifacts::created_at.desc())
+        .load(conn)
+        .await
+}
+
+pub async fn get_symbol_artifact(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    id: Uuid,
+) -> QueryResult<Option<SymbolArtifact>> {
+    symbol_artifacts::table
+        .filter(symbol_artifacts::app_id.eq(app_id))
+        .filter(symbol_artifacts::id.eq(id))
+        .select(SymbolArtifact::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Idempotency lookup by Dart build-id.
+pub async fn find_artifact_by_debug_id(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    debug_id: &str,
+) -> QueryResult<Option<SymbolArtifact>> {
+    symbol_artifacts::table
+        .filter(symbol_artifacts::app_id.eq(app_id))
+        .filter(symbol_artifacts::debug_id.eq(debug_id))
+        .select(SymbolArtifact::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Idempotency lookup by (release, name, blob) for JS uploads.
+pub async fn find_artifact_by_release_name(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    release: Option<&str>,
+    name: Option<&str>,
+    blob_sha: &[u8],
+) -> QueryResult<Option<SymbolArtifact>> {
+    let mut q = symbol_artifacts::table
+        .filter(symbol_artifacts::app_id.eq(app_id))
+        .filter(symbol_artifacts::blob_sha256.eq(blob_sha.to_vec()))
+        .into_boxed();
+    q = match release {
+        Some(r) => q.filter(symbol_artifacts::release.eq(r.to_string())),
+        None => q.filter(symbol_artifacts::release.is_null()),
+    };
+    q = match name {
+        Some(n) => q.filter(symbol_artifacts::name.eq(n.to_string())),
+        None => q.filter(symbol_artifacts::name.is_null()),
+    };
+    q.select(SymbolArtifact::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// All artifacts uploaded for a release (used by the JS matcher). Newest first,
+/// so re-uploads with the same (release, name) win deterministically.
+pub async fn find_artifacts_for_release(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    release: &str,
+) -> QueryResult<Vec<SymbolArtifact>> {
+    symbol_artifacts::table
+        .filter(symbol_artifacts::app_id.eq(app_id))
+        .filter(symbol_artifacts::release.eq(release))
+        .select(SymbolArtifact::as_select())
+        .order(symbol_artifacts::created_at.desc())
+        .load(conn)
+        .await
+}
+
+/// Delete an artifact (scoped to `app_id`), decrement referenced blob refcounts,
+/// and GC any blob that reaches zero. Returns false if the artifact wasn't found.
+///
+/// Not wrapped in a transaction: a crash mid-way can leave a blob with a stale
+/// refcount (orphaned, harmless) — acceptable for the MVP artifact store.
+pub async fn delete_symbol_artifact(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    id: Uuid,
+) -> QueryResult<bool> {
+    let art = match get_symbol_artifact(conn, app_id, id).await? {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+    diesel::delete(
+        symbol_artifacts::table
+            .filter(symbol_artifacts::app_id.eq(app_id))
+            .filter(symbol_artifacts::id.eq(id)),
+    )
+    .execute(conn)
+    .await?;
+
+    let mut hashes = vec![art.blob_sha256];
+    if let Some(idx) = art.prebuilt_index_sha256 {
+        if !hashes.contains(&idx) {
+            hashes.push(idx);
+        }
+    }
+    for h in hashes {
+        diesel::update(symbol_blobs::table.filter(symbol_blobs::sha256.eq(&h)))
+            .set(symbol_blobs::refcount.eq(symbol_blobs::refcount - 1))
+            .execute(conn)
+            .await?;
+        diesel::delete(
+            symbol_blobs::table
+                .filter(symbol_blobs::sha256.eq(&h))
+                .filter(symbol_blobs::refcount.le(0)),
+        )
+        .execute(conn)
+        .await?;
+    }
+    Ok(true)
 }

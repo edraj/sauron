@@ -2,6 +2,7 @@
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { getMonitor, getMonitorChecks, updateMonitor, deleteMonitor } from '../lib/api/monitors';
+  import { MONITOR_INTERVALS, formatInterval } from '../lib/constants/monitorIntervals';
   import type { MonitorDetail, MonitorCheck } from '../lib/models';
   import { sessionStore } from '../lib/stores/session.svelte';
   import StatusPill from '../lib/components/ui/StatusPill.svelte';
@@ -27,6 +28,7 @@
   let confirmOpen = $state(false);
   let deleting = $state(false);
   let pausing = $state(false);
+  let savingInterval = $state(false);
 
   const canWrite = $derived(
     sessionStore.can('monitor:write', { project: detail?.monitor.project_id }),
@@ -58,6 +60,20 @@
       await load();
     } catch (e) { error = (e as Error).message; }
     finally { pausing = false; }
+  }
+
+  async function changeInterval(e: Event) {
+    const seconds = Number((e.currentTarget as HTMLSelectElement).value);
+    if (!detail || seconds === detail.monitor.interval_seconds) return;
+    savingInterval = true; error = null;
+    try {
+      await updateMonitor(params.id, { interval_seconds: seconds });
+      await load();
+    } catch (err) {
+      error = (err as Error).message;
+    } finally {
+      savingInterval = false;
+    }
   }
 
   async function remove() {
@@ -131,7 +147,32 @@
       <StatTile label="Uptime 24h" value={fmtPct(detail.uptime.h24)} tone={pctTone(detail.uptime.h24)} />
       <StatTile label="Uptime 7d" value={fmtPct(detail.uptime.d7)} tone={pctTone(detail.uptime.d7)} />
       <StatTile label="Uptime 30d" value={fmtPct(detail.uptime.d30)} tone={pctTone(detail.uptime.d30)} />
-      <StatTile label="Interval" value={`${detail.monitor.interval_seconds}s`} />
+      {#if canWrite}
+        <div class="interval-tile">
+          <span class="it-label">Interval</span>
+          <div class="control select" class:busy={savingInterval}>
+            <select
+              aria-label="Check interval"
+              value={detail.monitor.interval_seconds}
+              disabled={savingInterval}
+              onchange={changeInterval}
+            >
+              {#each MONITOR_INTERVALS as opt (opt.seconds)}
+                <option value={opt.seconds}>{opt.label}</option>
+              {/each}
+            </select>
+            <span class="affix">
+              {#if savingInterval}
+                <Spinner size={14} />
+              {:else}
+                <Icon name="chevron-down" size={15} />
+              {/if}
+            </span>
+          </div>
+        </div>
+      {:else}
+        <StatTile label="Interval" value={formatInterval(detail.monitor.interval_seconds)} />
+      {/if}
     </StatTiles>
 
     <div class="section">
@@ -250,6 +291,66 @@
 />
 
 <style>
+  /* Editable interval tile — matches StatTile's frame with an inline select. */
+  .interval-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 14px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    min-width: 0;
+  }
+  .it-label {
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+  }
+  .interval-tile .control {
+    position: relative;
+    display: flex;
+    align-items: center;
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    transition: border-color 0.14s ease, box-shadow 0.14s ease;
+  }
+  .interval-tile .control:focus-within {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-soft);
+  }
+  .interval-tile .control.busy {
+    opacity: 0.7;
+  }
+  .interval-tile select {
+    flex: 1;
+    width: 100%;
+    min-width: 0;
+    appearance: none;
+    padding: 9px 34px 9px 12px;
+    font-size: 15px;
+    font-weight: 560;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    outline: none;
+    cursor: pointer;
+  }
+  .interval-tile select:disabled {
+    cursor: progress;
+  }
+  .interval-tile .affix {
+    position: absolute;
+    right: 11px;
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-faint);
+    pointer-events: none;
+  }
+
   .back {
     display: inline-flex;
     align-items: center;

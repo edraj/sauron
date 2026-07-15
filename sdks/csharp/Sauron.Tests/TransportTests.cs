@@ -61,7 +61,7 @@ public class TransportTests
 
         var sdk = root.GetProperty("header").GetProperty("sdk");
         Assert.Equal("sauron-dotnet", sdk.GetProperty("name").GetString());
-        Assert.Equal("0.1.0", sdk.GetProperty("version").GetString());
+        Assert.Equal("0.3.0", sdk.GetProperty("version").GetString());
 
         Assert.Equal("production", root.GetProperty("header").GetProperty("environment").GetString());
         Assert.False(string.IsNullOrEmpty(root.GetProperty("header").GetProperty("sent_at").GetString()));

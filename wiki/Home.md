@@ -37,6 +37,9 @@ scope and resolved as a union down the tree.
 - **[Ingest Wire Contract](Ingest-Wire-Contract.md)** — the DSN format, the
   `POST /api/{project_id}/envelope` endpoint, the `X-Sauron-Key` header, and every
   envelope / item JSON shape. This is what all SDKs emit.
+- **[Capabilities](Capabilities.md)** — the SDK feature-parity matrix (scope,
+  breadcrumbs, transactions, `beforeSend`, gzip, retry, queue, auto-capture) across all
+  five SDKs, as of **v0.3.0**.
 
 ### SDKs
 
@@ -47,6 +50,16 @@ scope and resolved as a union down the tree.
 - **[Python SDK](Python-SDK.md)** — `sauron-sdk` (server-side dispatch).
 - **[Node SDK](Node-SDK.md)** — `@sauron/node` (server-side dispatch).
 - **[C# SDK](CSharp-SDK.md)** — `Sauron` / `sauron-dotnet` (server-side dispatch).
+
+### Guides
+
+- **[Framework Integrations](Framework-Integrations.md)** — copy-paste recipes for
+  Express/Fastify/Koa, Flask/FastAPI/Django, ASP.NET Core, and React/Vue/Svelte.
+- **[Best Practices](Best-Practices.md)** — event naming, PII scrubbing via `beforeSend`,
+  sampling, tags vs context, `distinct_id`/identify, and flush/shutdown for short-lived
+  processes.
+- **[Troubleshooting](Troubleshooting.md)** — nothing showing up, disabled no-op mode,
+  gzip/retry/queue behavior, scope-leak pitfalls, and the version check.
 
 ### Reference
 

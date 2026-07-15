@@ -8,14 +8,20 @@ import random
 import sys
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from ._autocapture import install_excepthook
 from ._dsn import Dsn, parse_dsn
+from ._scope import (
+    build_breadcrumb,
+    get_current_scope,
+    set_max_breadcrumbs,
+)
 from ._stacktrace import exception_type_name, extract_stacktrace
 from ._transport import Sender, Transport
 
 SDK_NAME = "sauron-python"
-SDK_VERSION = "0.1.0"
+SDK_VERSION = "0.3.0"
 
 _VALID_LEVELS = frozenset({"debug", "info", "warning", "error", "fatal"})
 
@@ -45,6 +51,15 @@ class Client:
         sample_rate: float = 1.0,
         flush_interval: float = 5.0,
         max_batch: int = 30,
+        max_breadcrumbs: int = 100,
+        gzip_threshold_bytes: int = 1024,
+        max_queue_bytes: int = 1_048_576,
+        offline_path: Optional[str] = None,
+        before_send: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
+        before_breadcrumb: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
+        auto_capture_unhandled: bool = False,
         debug: bool = False,
         sender: Optional[Sender] = None,
     ) -> None:
@@ -53,7 +68,14 @@ class Client:
         self.environment = environment
         self.release = release
         self.sample_rate = sample_rate
+        self._before_send = before_send
+        self._before_breadcrumb = before_breadcrumb
         self.enabled = True
+        # Uninstaller for the opt-in uncaught-exception hooks (``None`` = off).
+        self._uninstall_autocapture: Optional[Callable[[], None]] = None
+
+        # The active breadcrumb ring size lives on the scope; clones inherit it.
+        set_max_breadcrumbs(max_breadcrumbs)
 
         # A stable per-process id for this server instance.
         self._device_id = str(uuid.uuid4())
@@ -66,8 +88,18 @@ class Client:
             max_batch=max_batch,
             logger=self._log,
             on_disable=self._on_disable,
+            gzip_threshold_bytes=gzip_threshold_bytes,
+            max_queue_bytes=max_queue_bytes,
+            offline_path=offline_path,
         )
         self._transport.start()
+
+        # Opt-in: capture uncaught exceptions with ``mechanism.handled=False``,
+        # chaining (never replacing) the prior hooks so default crash/exit
+        # behavior is preserved.
+        if auto_capture_unhandled:
+            self._uninstall_autocapture = install_excepthook(self)
+
         self._log(
             "initialized", self.dsn.host, "project", self.dsn.project_id
         )
@@ -95,6 +127,61 @@ class Client:
         self.enabled = False
         self._log("client disabled")
 
+    def _dispatch(
+        self, item: Dict[str, Any], hint: Optional[Any] = None
+    ) -> None:
+        """The single outbound chokepoint: run ``before_send`` then enqueue.
+
+        Applies to every item type (error/event/identify/transaction). A hook
+        returning ``None`` drops the item; a returned object replaces it. A
+        hook that raises drops the item rather than crashing the caller.
+        """
+        if self._before_send is not None:
+            try:
+                item = self._before_send(item, hint)
+            except Exception as exc:
+                self._log("before_send raised, dropping item", exc)
+                return
+            if item is None:
+                return
+        self._transport.capture(item)
+
+    # -- scope / breadcrumbs ----------------------------------------------
+
+    def add_breadcrumb(
+        self,
+        *,
+        type: Optional[str] = None,
+        category: Optional[str] = None,
+        message: Optional[str] = None,
+        level: Optional[str] = None,
+        data: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Record a breadcrumb on the active scope (bounded ring).
+
+        Runs the ``before_breadcrumb`` hook first (if configured); a ``None``
+        return drops the crumb.
+        """
+        if not self.enabled:
+            return
+        crumb = build_breadcrumb(
+            type=type,
+            category=category,
+            message=message,
+            level=level,
+            data=data,
+        )
+        if self._before_breadcrumb is not None:
+            try:
+                result = self._before_breadcrumb(crumb)
+            except Exception as exc:  # a hook must never crash the caller
+                self._log("before_breadcrumb raised, dropping crumb", exc)
+                return
+            if result is None:
+                return
+            crumb = result
+        get_current_scope().add_breadcrumb(crumb)
+
     # -- public API --------------------------------------------------------
 
     def track(
@@ -117,7 +204,7 @@ class Client:
             "session_id": None,
             "screen": None,
         }
-        self._transport.capture(item)
+        self._dispatch(item)
 
     def capture_exception(
         self,
@@ -126,7 +213,16 @@ class Client:
         user: Optional[Mapping[str, Any]] = None,
         level: str = "error",
         tags: Optional[Mapping[str, Any]] = None,
+        fingerprint: Optional[Sequence[str]] = None,
+        mechanism: Optional[Mapping[str, Any]] = None,
     ) -> Optional[str]:
+        """Capture an exception as a wire-contract error item.
+
+        ``fingerprint`` is an optional client-supplied grouping override (a list
+        of strings, honored verbatim by the backend). ``mechanism`` overrides the
+        default ``{"type": "generic", "handled": True}`` — the auto-capture hooks
+        pass ``handled=False`` for uncaught crashes.
+        """
         if not self.enabled:
             return None
 
@@ -151,18 +247,23 @@ class Client:
             "exception": {
                 "type": exception_type_name(error),
                 "value": str(error) if str(error) else None,
-                "mechanism": {"type": "generic", "handled": True},
+                "mechanism": dict(mechanism)
+                if mechanism
+                else {"type": "generic", "handled": True},
                 "stacktrace": extract_stacktrace(error),
             },
             "message": None,
             "breadcrumbs": [],
             "tags": dict(tags) if tags else {},
-            "fingerprint": None,
+            "fingerprint": list(fingerprint) if fingerprint else None,
             "user": self._normalize_user(user),
             "session_id": None,
             "screen": None,
         }
-        self._transport.capture(item)
+        # Merge the active scope (breadcrumbs/tags/user/contexts); per-call
+        # user and tags already on the item take precedence.
+        get_current_scope().apply_to_error(item)
+        self._dispatch(item)
         return event_id
 
     def capture_message(
@@ -186,7 +287,8 @@ class Client:
             "session_id": None,
             "screen": None,
         }
-        self._transport.capture(item)
+        get_current_scope().apply_to_error(item)
+        self._dispatch(item)
         return event_id
 
     def identify(
@@ -206,12 +308,53 @@ class Client:
             "traits": dict(traits) if traits else {},
             "timestamp": _now_iso(),
         }
-        self._transport.capture(item)
+        self._dispatch(item)
+
+    def track_transaction(
+        self,
+        name: str,
+        *,
+        op: str = "custom",
+        duration_ms: float,
+        status: Optional[str] = None,
+        http_method: Optional[str] = None,
+        http_status: Optional[int] = None,
+        url: Optional[str] = None,
+        distinct_id: Optional[str] = None,
+    ) -> None:
+        """Emit a performance transaction (one timed operation).
+
+        ``op`` defaults to ``"custom"``. ``distinct_id`` falls back to the
+        active scope's user id when omitted.
+        """
+        if not self.enabled:
+            return
+        if distinct_id is None:
+            user = get_current_scope().user
+            if user:
+                distinct_id = user.get("id")
+        item = {
+            "type": "transaction",
+            "name": name,
+            "op": op or "custom",
+            "duration_ms": float(duration_ms),
+            "status": status,
+            "http_method": http_method,
+            "http_status": http_status,
+            "url": url,
+            "distinct_id": distinct_id,
+            "session_id": None,
+            "timestamp": _now_iso(),
+        }
+        self._dispatch(item)
 
     def flush(self, timeout: Optional[float] = None) -> bool:
         return self._transport.flush(timeout)
 
     def close(self, timeout: Optional[float] = None) -> None:
+        if self._uninstall_autocapture is not None:
+            self._uninstall_autocapture()
+            self._uninstall_autocapture = None
         self._transport.close(timeout)
         self.enabled = False
 

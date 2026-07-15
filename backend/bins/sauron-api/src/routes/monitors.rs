@@ -16,6 +16,16 @@ use crate::AppState;
 
 const KINDS: [&str; 2] = ["http", "tcp"];
 
+/// Error message for an interval outside the allowed preset set.
+fn invalid_interval_msg() -> String {
+    let allowed = sauron_core::MONITOR_INTERVAL_PRESETS
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("interval_seconds must be one of (seconds): {allowed}")
+}
+
 #[derive(Deserialize)]
 pub struct RangeQuery {
     pub hours: Option<i64>,
@@ -68,8 +78,10 @@ pub async fn create(
     if req.target.trim().is_empty() {
         return Err(ApiError::BadRequest("target is required".into()));
     }
-    let min = state.cfg.monitor_min_interval_secs as i32;
-    let interval = req.interval_seconds.unwrap_or(60).max(min);
+    let interval = req.interval_seconds.unwrap_or(60);
+    if !sauron_core::is_valid_monitor_interval(interval) {
+        return Err(ApiError::BadRequest(invalid_interval_msg()));
+    }
 
     let mut conn = db(&state).await?;
     authorize_project(&mut conn, auth.user_id, project_id, perm::MONITOR_WRITE).await?;
@@ -139,12 +151,16 @@ pub async fn update(
     Path(monitor_id): Path<Uuid>,
     Json(req): Json<UpdateMonitorReq>,
 ) -> Result<Json<Monitor>, ApiError> {
+    if let Some(i) = req.interval_seconds {
+        if !sauron_core::is_valid_monitor_interval(i) {
+            return Err(ApiError::BadRequest(invalid_interval_msg()));
+        }
+    }
     let _ = load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
     let mut conn = db(&state).await?;
     // Pausing/enabling flips status too.
     let status = req.enabled.map(|e| if e { "unknown" } else { "paused" });
-    let min = state.cfg.monitor_min_interval_secs as i32;
-    let interval = req.interval_seconds.map(|i| i.max(min));
+    let interval = req.interval_seconds;
     let webhook = req.webhook_url.map(|w| w.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string()));
     let webhook_ref = webhook.as_ref().map(|w| w.as_deref());
     let m = repo::update_monitor(

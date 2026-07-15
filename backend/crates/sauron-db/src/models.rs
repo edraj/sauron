@@ -241,6 +241,12 @@ pub struct ErrorEvent {
     pub session_id: Option<String>,
     pub device_key: Option<String>,
     pub screen: Option<String>,
+    /// Server-symbolicated frames (no source-context lines); null until resolved.
+    pub stacktrace_symbolicated: Option<Value>,
+    /// pending | symbolicated | partial | no_artifacts | not_applicable | failed.
+    pub symbolication_status: String,
+    /// Dart debug header (`build_id`, `dso_base`, `arch`, `os`, `raw_stacktrace`).
+    pub debug_meta: Option<Value>,
 }
 
 #[derive(Debug, Insertable)]
@@ -268,6 +274,12 @@ pub struct NewErrorEvent {
     pub session_id: Option<String>,
     pub device_key: Option<String>,
     pub screen: Option<String>,
+    /// Ingest-time pre-symbolication (lean, no context); null when unresolved.
+    pub stacktrace_symbolicated: Option<Value>,
+    /// pending | symbolicated | partial | no_artifacts | not_applicable.
+    pub symbolication_status: String,
+    /// Dart debug header + verbatim trace (`{build_id,isolate_dso_base,arch,os,raw_stacktrace}`).
+    pub debug_meta: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -506,4 +518,54 @@ pub struct MonitorIncidentRow {
     pub resolved_at: Option<DateTime<Utc>>,
     pub cause: String,
     pub last_error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Symbol artifacts (source maps / Dart debug-info), content-addressed
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = symbol_blobs)]
+pub struct NewSymbolBlob<'a> {
+    pub sha256: &'a [u8],
+    pub content: &'a [u8],
+    pub uncompressed_size: i64,
+    pub compressed_size: i64,
+    /// Set to 1 on first insert; `put_blob` bumps on conflict.
+    pub refcount: i32,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = symbol_artifacts)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct SymbolArtifact {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub kind: String,
+    pub platform: String,
+    pub arch: Option<String>,
+    pub release: Option<String>,
+    pub dist: Option<String>,
+    pub name: Option<String>,
+    pub debug_id: Option<String>,
+    pub blob_sha256: Vec<u8>,
+    pub prebuilt_index_sha256: Option<Vec<u8>>,
+    pub uploaded_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = symbol_artifacts)]
+pub struct NewSymbolArtifact {
+    pub app_id: Uuid,
+    pub kind: String,
+    pub platform: String,
+    pub arch: Option<String>,
+    pub release: Option<String>,
+    pub dist: Option<String>,
+    pub name: Option<String>,
+    pub debug_id: Option<String>,
+    pub blob_sha256: Vec<u8>,
+    pub prebuilt_index_sha256: Option<Vec<u8>>,
+    pub uploaded_by: Option<Uuid>,
 }

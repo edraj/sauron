@@ -3,6 +3,7 @@
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listMonitors, createMonitor } from '../lib/api/monitors';
+  import { MONITOR_INTERVALS } from '../lib/constants/monitorIntervals';
   import type { MonitorListItem } from '../lib/models';
   import StatusPill from '../lib/components/ui/StatusPill.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -127,9 +128,13 @@
 
           <div class="field">
             <label class="lbl" for="mon-interval">Interval</label>
-            <div class="control suffix">
-              <input id="mon-interval" type="number" min="30" bind:value={interval} />
-              <span class="affix unit">sec</span>
+            <div class="control select">
+              <select id="mon-interval" bind:value={interval}>
+                {#each MONITOR_INTERVALS as opt (opt.seconds)}
+                  <option value={opt.seconds}>{opt.label}</option>
+                {/each}
+              </select>
+              <span class="affix"><Icon name="chevron-down" size={15} /></span>
             </div>
           </div>
 
@@ -279,8 +284,7 @@
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-soft);
   }
-  .control select,
-  .control input {
+  .control select {
     flex: 1;
     width: 100%;
     min-width: 0;
@@ -295,9 +299,6 @@
     padding-right: 34px;
     cursor: pointer;
   }
-  .control.suffix input {
-    padding-right: 6px;
-  }
   .affix {
     display: inline-flex;
     align-items: center;
@@ -307,10 +308,6 @@
   .control.select .affix {
     position: absolute;
     right: 11px;
-  }
-  .unit {
-    padding-right: 12px;
-    font-size: 13px;
   }
 
   /* --- table cells ---------------------------------------------------------- */

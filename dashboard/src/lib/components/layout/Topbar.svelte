@@ -5,6 +5,7 @@
   import { themeStore } from '../../stores/theme.svelte';
   import { initials, appTypeIcon } from '../../utils/format';
   import Icon from '../ui/Icon.svelte';
+  import SwitcherMenu from './SwitcherMenu.svelte';
 
   async function logout() {
     await authStore.logout();
@@ -12,67 +13,60 @@
     push('/login');
   }
 
-  function onOrgChange(event: Event) {
-    void sessionStore.setOrg((event.target as HTMLSelectElement).value);
-  }
-  function onProjectChange(event: Event) {
-    void sessionStore.setProject((event.target as HTMLSelectElement).value);
-  }
-  function onAppChange(event: Event) {
-    sessionStore.setApp((event.target as HTMLSelectElement).value);
-  }
+  // Menu items for each breadcrumb segment.
+  const orgItems = $derived(sessionStore.orgs.map((o) => ({ id: o.id, name: o.name })));
+  const projectItems = $derived(sessionStore.projects.map((p) => ({ id: p.id, name: p.name })));
+  const appItems = $derived(
+    sessionStore.apps.map((a) => ({ id: a.id, name: a.name, icon: appTypeIcon(a.app_type) })),
+  );
+
+  // The current app's icon (falls back to a generic glyph before apps resolve).
+  const currentAppIcon = $derived(appTypeIcon(sessionStore.currentApp?.app_type ?? ''));
+
+  // "+ New …" affordances mirror the Projects page, where creation actually happens.
+  const canCreateProject = $derived(sessionStore.can('project:create'));
+  const canCreateApp = $derived(sessionStore.can('app:create'));
 </script>
 
 <header class="topbar">
   <div class="left">
-    <!-- Org switcher (usually a single org → shown as a static label). -->
-    {#if sessionStore.orgs.length > 0}
-      <div class="switcher">
-        <span class="sw-kind">Org</span>
-        {#if sessionStore.orgs.length > 1}
-          <select aria-label="Select organization" value={sessionStore.currentOrgId} onchange={onOrgChange}>
-            {#each sessionStore.orgs as org (org.id)}
-              <option value={org.id}>{org.name}</option>
-            {/each}
-          </select>
-        {:else}
-          <span class="sw-name">{sessionStore.currentOrg?.name}</span>
-        {/if}
-      </div>
+    <!-- Org switcher -->
+    {#if orgItems.length > 0}
+      <SwitcherMenu
+        label="Org"
+        items={orgItems}
+        currentId={sessionStore.currentOrgId}
+        onSelect={(id) => void sessionStore.setOrg(id)}
+        ariaLabel="Switch organization"
+      />
     {/if}
 
     <!-- Project switcher -->
-    {#if sessionStore.projects.length > 0}
+    {#if projectItems.length > 0}
       <span class="sep" aria-hidden="true">/</span>
-      <div class="switcher">
-        <span class="sw-kind">Project</span>
-        {#if sessionStore.projects.length > 1}
-          <select aria-label="Select project" value={sessionStore.currentProjectId} onchange={onProjectChange}>
-            {#each sessionStore.projects as project (project.id)}
-              <option value={project.id}>{project.name}</option>
-            {/each}
-          </select>
-        {:else}
-          <span class="sw-name">{sessionStore.currentProject?.name}</span>
-        {/if}
-      </div>
+      <SwitcherMenu
+        label="Project"
+        items={projectItems}
+        currentId={sessionStore.currentProjectId}
+        onSelect={(id) => void sessionStore.setProject(id)}
+        createLabel={canCreateProject ? 'New project' : undefined}
+        onCreate={canCreateProject ? () => push('/projects') : undefined}
+        ariaLabel="Switch project"
+      />
     {/if}
 
     <!-- App switcher -->
-    {#if sessionStore.apps.length > 0}
+    {#if appItems.length > 0}
       <span class="sep" aria-hidden="true">/</span>
-      <div class="switcher app-switcher">
-        <span class="app-icon" aria-hidden="true"><Icon name={appTypeIcon(sessionStore.currentApp?.app_type ?? '')} size={15} /></span>
-        {#if sessionStore.apps.length > 1}
-          <select aria-label="Select app" value={sessionStore.currentAppId} onchange={onAppChange}>
-            {#each sessionStore.apps as app (app.id)}
-              <option value={app.id}>{app.name}</option>
-            {/each}
-          </select>
-        {:else}
-          <span class="sw-name">{sessionStore.currentApp?.name}</span>
-        {/if}
-      </div>
+      <SwitcherMenu
+        triggerIcon={currentAppIcon}
+        items={appItems}
+        currentId={sessionStore.currentAppId}
+        onSelect={(id) => sessionStore.setApp(id)}
+        createLabel={canCreateApp ? 'New app' : undefined}
+        onCreate={canCreateApp ? () => push('/projects') : undefined}
+        ariaLabel="Switch app"
+      />
     {/if}
   </div>
 
@@ -132,52 +126,9 @@
     align-items: center;
     gap: 12px;
   }
-  .switcher {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 12px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    min-width: 0;
-  }
-  .sw-kind {
-    font-size: 10px;
-    font-weight: 650;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-  }
-  .app-icon {
-    font-size: 13px;
-    line-height: 1;
-  }
   .sep {
     color: var(--text-faint);
     font-size: 13px;
-  }
-  .sw-name {
-    font-weight: 600;
-    font-size: 13.5px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 180px;
-  }
-  select {
-    background: transparent;
-    border: none;
-    color: var(--text);
-    font-weight: 600;
-    font-size: 13.5px;
-    outline: none;
-    cursor: pointer;
-    max-width: 200px;
-  }
-  select option {
-    background: var(--surface);
-    color: var(--text);
   }
   .icon-btn {
     width: 36px;
@@ -241,24 +192,12 @@
     border-color: var(--text-faint);
   }
 
-  @media (max-width: 860px) {
-    .sw-kind {
-      display: none;
-    }
-    .switcher {
-      padding: 6px 10px;
-    }
-  }
   @media (max-width: 640px) {
     .user-meta {
       display: none;
     }
     .topbar {
       padding: 0 14px;
-    }
-    .sw-name,
-    select {
-      max-width: 110px;
     }
   }
 </style>

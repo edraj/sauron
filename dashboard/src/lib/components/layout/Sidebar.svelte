@@ -56,6 +56,8 @@
         { href: '#/projects', label: 'Projects', icon: 'folders', match: (p) => p.startsWith('/projects') || p.startsWith('/apps') },
         { href: '#/members', label: 'Members', icon: 'key-round', match: (p) => p.startsWith('/members'), show: () => sessionStore.can('member:read') },
         { href: '#/settings', label: 'App settings', icon: 'settings', match: (p) => p.startsWith('/settings') },
+        { href: '#/source-maps', label: 'Source Maps', icon: 'braces', match: (p) => p.startsWith('/source-maps'), show: () => sessionStore.can('artifact:write') },
+        { href: '#/storage', label: 'Storage', icon: 'server', match: (p) => p.startsWith('/storage') },
       ],
     },
   ];

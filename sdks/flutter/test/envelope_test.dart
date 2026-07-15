@@ -16,7 +16,7 @@ const String _golden = '''
 {
   "header": {
     "dsn": "https://pk_test@localhost:8081/1",
-    "sdk": { "name": "sauron.flutter", "version": "0.2.0" },
+    "sdk": { "name": "sauron.flutter", "version": "0.3.0" },
     "sent_at": "2026-07-12T10:30:00.123Z",
     "environment": "production",
     "release": "app@1.4.2+1402"

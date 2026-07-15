@@ -214,6 +214,24 @@ export interface Frame {
   in_app?: boolean | null;
 }
 
+// A frame after server-side symbolication: original file/function/line plus
+// optional source context. Extends Frame so it renders through the same view.
+export interface SymbolicatedFrame extends Frame {
+  symbolicated: boolean;
+  context_line?: string | null;
+  pre_context?: string[];
+  post_context?: string[];
+  context_start_line?: number | null;
+}
+
+export type SymbolicationStatus =
+  | 'pending'
+  | 'symbolicated'
+  | 'partial'
+  | 'no_artifacts'
+  | 'not_applicable'
+  | 'failed';
+
 export interface Breadcrumb {
   type: string;
   category?: string | null;
@@ -254,6 +272,19 @@ export interface ErrorEvent {
   screen?: string | null;
   occurred_at: string;
   received_at: string;
+  stacktrace_symbolicated?: SymbolicatedFrame[] | null;
+  symbolication_status?: SymbolicationStatus | null;
+  debug_meta?: DartDebugMeta | null;
+}
+
+// Dart (Flutter AOT) debug header stored on the event; carries the verbatim
+// obfuscated trace for display when no symbols are uploaded yet.
+export interface DartDebugMeta {
+  build_id?: string | null;
+  isolate_dso_base?: string | null;
+  arch?: string | null;
+  os?: string | null;
+  raw_stacktrace?: string | null;
 }
 
 export interface SeriesPoint {
