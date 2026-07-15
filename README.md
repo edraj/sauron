@@ -58,6 +58,7 @@ backend/          Rust Cargo workspace
     sauron-ingest     SDK edge + co-located worker pool
     sauron-api        JWT dashboard API
     sauron-migrate    one-shot migration runner
+    crebain           load/benchmark generator (isolated ephemeral stack)
 dashboard/        Vite + Svelte 5 (runes) + TypeScript + axios SPA
 sdks/
   js/             @sauron/browser (TypeScript, tsup)
