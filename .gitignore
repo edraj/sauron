@@ -3,7 +3,7 @@
 # Patterns are recursive (no leading slash) so they match the same
 # artifact under backend/, dashboard/, sdks/*, and examples/*.
 # ─────────────────────────────────────────────────────────────
-
+tmp/
 # ── Rust (backend) ──────────────────────────────────────────
 target/
 **/*.rs.bk
