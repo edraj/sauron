@@ -109,12 +109,12 @@ fn item_row(label: &str, accepted: u64, attempted: u64) {
     println!("    {label:<14} {:>12} / {:<12}", group(accepted), group(attempted));
 }
 
-fn total(c: &ItemCounts) -> u64 {
+pub(crate) fn total(c: &ItemCounts) -> u64 {
     c.errors + c.events + c.identifies + c.transactions + c.breadcrumbs
 }
 
 /// Group a number: 1234567 → "1,234,567".
-fn group(n: u64) -> String {
+pub(crate) fn group(n: u64) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -128,7 +128,7 @@ fn group(n: u64) -> String {
 }
 
 /// Format a microsecond latency compactly.
-fn fmt_us(us: u64) -> String {
+pub(crate) fn fmt_us(us: u64) -> String {
     if us < 1000 {
         format!("{us}us")
     } else {

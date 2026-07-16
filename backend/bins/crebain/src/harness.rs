@@ -240,6 +240,12 @@ async fn flush_redis(url: &str) -> anyhow::Result<()> {
 }
 
 impl HarnessGuard {
+    /// PID of the spawned ingest child, if it is running. Used to sample the
+    /// server's CPU/RAM during the run. `None` before spawn or after teardown.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|c| c.id())
+    }
+
     /// Kill the ingest, drop the database, flush Redis. Idempotent.
     pub async fn teardown(&mut self) {
         if self.torn_down {

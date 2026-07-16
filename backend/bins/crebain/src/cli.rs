@@ -43,6 +43,10 @@ pub struct Args {
     #[arg(long)]
     pub no_gzip: bool,
 
+    /// Write a self-contained HTML benchmark report to this path.
+    #[arg(long)]
+    pub report: Option<std::path::PathBuf>,
+
     // --- isolated-mode options ---
     /// Postgres admin URL for CREATE/DROP DATABASE (needs CREATEDB). Env: DATABASE_URL.
     #[arg(long)]
@@ -84,6 +88,7 @@ pub struct RunConfig {
     pub gzip: bool,
     pub events_per_min: u32,
     pub issues_per_min: u32,
+    pub report_path: Option<std::path::PathBuf>,
 }
 
 /// Where the load is sent.
@@ -181,6 +186,7 @@ impl Args {
             gzip: !self.no_gzip,
             events_per_min: self.events_per_min,
             issues_per_min: self.issues_per_min,
+            report_path: self.report,
         };
         Ok((cfg, mode))
     }
@@ -211,8 +217,29 @@ mod tests {
             gzip: true,
             events_per_min: 10,
             issues_per_min: 10,
+            report_path: None,
         };
         // identifies 1000 + events 10000 + errors 10000 = 21000 requests
         assert_eq!(cfg.expected().requests.round() as u64, 21_000);
+    }
+
+    #[test]
+    fn report_path_flows_into_runconfig() {
+        let args = Args::try_parse_from([
+            "crebain", "--isolated", "--database-url", "postgres://x/y", "--report", "out.html",
+        ])
+        .unwrap();
+        let (cfg, _mode) = args.resolve().unwrap();
+        assert_eq!(cfg.report_path, Some(std::path::PathBuf::from("out.html")));
+    }
+
+    #[test]
+    fn report_path_defaults_to_none() {
+        let args = Args::try_parse_from([
+            "crebain", "--isolated", "--database-url", "postgres://x/y",
+        ])
+        .unwrap();
+        let (cfg, _mode) = args.resolve().unwrap();
+        assert_eq!(cfg.report_path, None);
     }
 }

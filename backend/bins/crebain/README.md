@@ -70,6 +70,21 @@ per-signal item counts (accepted / attempted), HTTP status breakdown
 `--redis-bench-db` (15) · `--ingest-port` (8091) · `--ingest-bin` ·
 `--rate-limit` (high) · `--keep`.
 
+## HTML report
+
+Pass `--report <path>` to write a self-contained HTML report (opens offline, no
+network) alongside the text summary:
+
+```
+crebain --isolated --database-url "$DATABASE_URL" --duration 60 --report bench.html
+```
+
+The report charts requests/sec and success/fail records (cumulative and
+per-second) over the run. In `--isolated` mode it also charts the ingest
+server's CPU (in cores) and RSS memory over time, sampled once per second from
+`/proc`. In `--dsn` mode there is no server process to sample, so the CPU/RAM
+charts are omitted.
+
 ## Design
 
 See [`docs/superpowers/specs/2026-07-15-crebain-benchmark-design.md`](../../../docs/superpowers/specs/2026-07-15-crebain-benchmark-design.md).

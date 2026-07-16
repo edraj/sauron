@@ -12,7 +12,9 @@ mod engine;
 mod generator;
 mod harness;
 mod metrics;
+mod procstat;
 mod report;
+mod report_html;
 mod user;
 
 use std::future::Future;
@@ -24,6 +26,7 @@ use clap::Parser;
 use cli::{Args, Mode, RunConfig};
 use dsn::Target;
 use metrics::Summary;
+use report_html::ReportMeta;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -44,7 +47,11 @@ async fn run() -> Result<ExitCode> {
         Mode::Direct { dsn } => {
             let target = dsn::parse_dsn(&dsn)?;
             print_target(&target);
-            finish(run_with_signals(engine::run(&cfg, &target)).await, &cfg)
+            finish(
+                run_with_signals(engine::run(&cfg, &target, None)).await,
+                &cfg,
+                "direct",
+            )
         }
         Mode::Isolated(icfg) => run_isolated(&cfg, &icfg).await,
     }
@@ -70,7 +77,7 @@ async fn run_isolated(cfg: &RunConfig, icfg: &cli::IsolatedConfig) -> Result<Exi
 
     watcher.abort();
     guard.teardown().await;
-    finish(ran, cfg)
+    finish(ran, cfg, "isolated (ephemeral, self-cleaning)")
 }
 
 async fn isolated_body(
@@ -85,9 +92,10 @@ async fn isolated_body(
         Ok(None) => None, // interrupted during provisioning
         Ok(Some(target)) => {
             print_target(&target);
+            let target_pid = guard.child_pid();
             // engine::run is safe to cancel mid-flight (it just aborts user tasks).
             tokio::select! {
-                r = engine::run(cfg, &target) => Some(r),
+                r = engine::run(cfg, &target, target_pid) => Some(r),
                 _ = cancel.changed() => None,
             }
         }
@@ -96,10 +104,26 @@ async fn isolated_body(
 
 /// Turn the outcome of a run into an exit code. `None` means the run was
 /// interrupted (Ctrl-C / SIGTERM) before it produced a summary.
-fn finish(ran: Option<Result<Summary>>, cfg: &RunConfig) -> Result<ExitCode> {
+fn finish(ran: Option<Result<Summary>>, cfg: &RunConfig, mode_label: &str) -> Result<ExitCode> {
     match ran {
         Some(Ok(summary)) => {
             report::print_summary(&summary, &cfg.expected());
+            if let Some(path) = &cfg.report_path {
+                let meta = ReportMeta {
+                    mode_label: mode_label.to_string(),
+                    users: cfg.users,
+                    duration_secs: cfg.duration.as_secs(),
+                    events_per_min: cfg.events_per_min,
+                    issues_per_min: cfg.issues_per_min,
+                    gzip: cfg.gzip,
+                    generated_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                    ncpus: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+                };
+                match report_html::write(path, &summary, &cfg.expected(), &meta) {
+                    Ok(()) => eprintln!("crebain: wrote report to {}", path.display()),
+                    Err(e) => eprintln!("crebain: WARNING failed to write report: {e:#}"),
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Some(Err(e)) => Err(e),

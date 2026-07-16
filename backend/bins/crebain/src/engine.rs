@@ -18,12 +18,16 @@ use crate::metrics::{self, Sample, Summary};
 use crate::user::VirtualUser;
 
 /// Run the load to completion and return the aggregated [`Summary`].
-pub async fn run(cfg: &RunConfig, target: &Target) -> anyhow::Result<Summary> {
+pub async fn run(
+    cfg: &RunConfig,
+    target: &Target,
+    target_pid: Option<u32>,
+) -> anyhow::Result<Summary> {
     let client = IngestClient::new(target, cfg.gzip)?;
     let (tx, rx) = mpsc::unbounded_channel::<Sample>();
 
     let start = Instant::now();
-    let aggregator = tokio::spawn(metrics::aggregate(rx, cfg.users, start));
+    let aggregator = tokio::spawn(metrics::aggregate(rx, cfg.users, start, target_pid));
 
     let deadline = tokio::time::Instant::now() + cfg.duration;
     let mut users = JoinSet::new();
