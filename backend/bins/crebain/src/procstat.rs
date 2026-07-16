@@ -44,11 +44,23 @@ pub fn cores_from_deltas(dproc: u64, dtotal: u64, ncpus: f64) -> f64 {
     }
 }
 
+/// Count open file descriptors for `pid` via `/proc/<pid>/fd`. Used as a proxy
+/// for server-held sockets (peak concurrent connections). `None` if the
+/// directory cannot be read (process gone, non-Linux, permission denied).
+pub fn count_fds(pid: u32) -> Option<usize> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()
+        .map(|it| it.count())
+}
+
 /// One raw reading of the target process and the system CPU counter.
 pub struct RawSample {
     pub proc_jiffies: u64,
     pub total_jiffies: u64,
     pub rss_bytes: u64,
+    /// Open file descriptor count for the target process (proxy for held
+    /// sockets). `None` if `/proc/<pid>/fd` could not be read.
+    pub open_fds: Option<usize>,
 }
 
 /// Reads `/proc` for a fixed pid. Holds the (fixed) core count so callers can
@@ -80,6 +92,7 @@ impl Sampler {
             proc_jiffies: parse_pid_stat_cpu_jiffies(&stat)?,
             total_jiffies: parse_stat_total_jiffies(&total)?,
             rss_bytes: parse_status_vmrss_bytes(&status)?,
+            open_fds: count_fds(self.pid),
         })
     }
 }
@@ -100,6 +113,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)]
     fn parses_total_jiffies_from_cpu_line() {
         let stat = "cpu  100 20 30 400 5 0 6 0 0 0\ncpu0 50 10 15 200 2 0 3 0 0 0\n";
         assert_eq!(parse_stat_total_jiffies(stat), Some(100 + 20 + 30 + 400 + 5 + 0 + 6));
@@ -125,5 +139,11 @@ mod tests {
         assert!((cores_from_deltas(400, 4000, 8.0) - 0.8).abs() < 1e-9);
         // zero elapsed total → 0, never a divide-by-zero.
         assert_eq!(cores_from_deltas(5, 0, 8.0), 0.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn counts_own_fds() {
+        assert!(count_fds(std::process::id()).unwrap() >= 3);
     }
 }

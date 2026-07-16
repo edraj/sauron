@@ -5,6 +5,7 @@ RBAC. Its left sidebar is organized into four groups plus a Docs link. Everythin
 scoped to the currently-selected **App** (see the tenancy model in **[Home](Home.md)**).
 
 See also: **[Getting Started](Getting-Started.md)** ·
+**[Architecture](Architecture.md)** (the queries behind these screens) ·
 **[Ingest Wire Contract](Ingest-Wire-Contract.md)**.
 
 ## Monitor

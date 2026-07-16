@@ -1,0 +1,30 @@
+[Unit]
+Description=Sauron uptime monitor
+Documentation=file:///usr/share/doc/sauron-server/SETUP.md
+After=network-online.target sauron-migrate.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=sauron
+Group=sauron
+EnvironmentFile=/etc/sauron/sauron.env
+EnvironmentFile=-/etc/sauron/monitor.env
+ExecStart=/usr/bin/sauron-monitor
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StateDirectory=sauron
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

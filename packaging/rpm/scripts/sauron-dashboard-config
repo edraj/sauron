@@ -1,0 +1,35 @@
+#!/bin/sh
+# Regenerate the dashboard's runtime config.js from /etc/sauron/dashboard.env.
+# Run after editing dashboard.env, then: systemctl reload nginx
+set -eu
+
+ENV_FILE="${SAURON_DASHBOARD_ENV:-/etc/sauron/dashboard.env}"
+WEBROOT="${SAURON_DASHBOARD_ROOT:-/usr/share/sauron/dashboard}"
+TEMPLATE="$WEBROOT/config.template.js"
+OUTPUT="$WEBROOT/config.js"
+
+# shellcheck disable=SC1090
+[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+: "${API_BASE_URL:=http://localhost:8080}"
+: "${INGEST_BASE_URL:=http://localhost:8081}"
+
+if [ ! -f "$TEMPLATE" ]; then
+    echo "sauron-dashboard-config: template not found: $TEMPLATE" >&2
+    exit 1
+fi
+
+# Escape sed replacement metacharacters (backslash, ampersand, and the '|'
+# delimiter) so unusual URL values cannot corrupt the substitution.
+esc() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/&/\\&/g' -e 's/|/\\|/g'
+}
+api_esc="$(esc "$API_BASE_URL")"
+ingest_esc="$(esc "$INGEST_BASE_URL")"
+
+tmp="$(mktemp "${OUTPUT}.XXXXXX")"
+sed -e "s|\${API_BASE_URL}|${api_esc}|g" \
+    -e "s|\${INGEST_BASE_URL}|${ingest_esc}|g" \
+    "$TEMPLATE" > "$tmp"
+chmod 0644 "$tmp"
+mv -f "$tmp" "$OUTPUT"
+echo "sauron-dashboard-config: wrote $OUTPUT (API_BASE_URL=$API_BASE_URL INGEST_BASE_URL=$INGEST_BASE_URL)"

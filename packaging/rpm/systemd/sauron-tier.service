@@ -1,0 +1,31 @@
+[Unit]
+Description=Sauron hot/cold tiering worker
+Documentation=file:///usr/share/doc/sauron-server/SETUP.md
+After=network-online.target sauron-migrate.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=sauron
+Group=sauron
+EnvironmentFile=/etc/sauron/sauron.env
+EnvironmentFile=-/etc/sauron/tier.env
+ExecStart=/usr/bin/sauron-tier
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StateDirectory=sauron
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/sauron
+
+[Install]
+WantedBy=multi-user.target

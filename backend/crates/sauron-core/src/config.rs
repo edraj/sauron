@@ -19,6 +19,11 @@ pub struct Config {
     pub cors_allowed_origins: Vec<String>,
     pub ingest_rate_limit_per_min: u32,
     pub ingest_max_body_bytes: usize,
+    /// Optional Unix-domain-socket path to listen on instead of TCP. When
+    /// unset, `sauron-ingest` binds `ingest_port` on TCP as before.
+    pub ingest_uds_path: Option<String>,
+    /// TCP `listen()` backlog (ignored when `ingest_uds_path` is set).
+    pub ingest_backlog: u32,
     pub monitor_tick_ms: u64,
     pub monitor_batch: i64,
     pub monitor_max_concurrency: usize,
@@ -88,6 +93,8 @@ impl Config {
             cors_allowed_origins,
             ingest_rate_limit_per_min: parse("INGEST_RATE_LIMIT_PER_MIN", 6000),
             ingest_max_body_bytes: parse("INGEST_MAX_BODY_BYTES", 1_048_576),
+            ingest_uds_path: var("INGEST_UDS_PATH"),
+            ingest_backlog: parse("INGEST_BACKLOG", 4096),
             monitor_tick_ms: parse("MONITOR_TICK_MS", 1000),
             monitor_batch: parse("MONITOR_BATCH", 100),
             monitor_max_concurrency: parse("MONITOR_MAX_CONCURRENCY", 50),

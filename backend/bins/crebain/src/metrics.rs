@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::client::{OutcomeKind, SendOutcome};
+use crate::transport::{OutcomeKind, SendOutcome};
 use crate::generator::ItemCounts;
 use crate::procstat::{self, RawSample, Sampler};
 
@@ -18,6 +18,10 @@ pub const LATENCY_CAP: usize = 1_000_000;
 pub struct Sample {
     pub outcome: SendOutcome,
     pub counts: ItemCounts,
+    /// Request latency measured from its SCHEDULED send time (coordinated-
+    /// omission corrected), supplied by the engine. This is the metric of
+    /// record for the latency reservoir.
+    pub latency: Duration,
 }
 
 /// A point-in-time view for the live progress line.
@@ -64,6 +68,20 @@ pub struct Summary {
     pub latency_samples: u64,
     pub latency_truncated: bool,
     pub timeline: Vec<TimePoint>,
+    /// Load-shed requests: offered but never attempted (semaphore had no permit).
+    pub behind: u64,
+    /// Peak concurrent in-flight requests observed during the run.
+    pub peak_inflight: usize,
+    /// Total items offered to the scheduler (`requests + behind`).
+    pub offered: u64,
+    /// Semaphore-bounded concurrency ceiling the engine ran with (plan.effective).
+    pub effective_concurrency: usize,
+    /// Number of distinct loopback source IPs the engine fanned out across.
+    pub source_ips: usize,
+    /// Peak open file-descriptor count observed on the target process over the
+    /// run — a proxy for the most concurrent sockets it actually held. `0` when
+    /// no target PID was sampled.
+    pub peak_connections: usize,
 }
 
 struct Metrics {
@@ -83,6 +101,9 @@ struct Metrics {
     /// (the slowest requests often arrive last and would be dropped otherwise).
     latency_max_us: u64,
     latency_truncated: bool,
+    behind: u64,
+    peak_inflight: usize,
+    peak_connections: usize,
 }
 
 /// Mutable running sums of per-type item counts.
@@ -131,7 +152,26 @@ impl Metrics {
             latency_total: 0,
             latency_max_us: 0,
             latency_truncated: false,
+            behind: 0,
+            peak_inflight: 0,
+            peak_connections: 0,
         }
+    }
+
+    /// Record load-shed requests (offered but never attempted).
+    pub fn record_behind(&mut self, n: u64) {
+        self.behind += n;
+    }
+
+    /// Track peak concurrent in-flight requests.
+    pub fn set_inflight(&mut self, n: usize) {
+        self.peak_inflight = self.peak_inflight.max(n);
+    }
+
+    /// Track peak open file-descriptor count on the target process (proxy for
+    /// the most concurrent sockets the server actually held).
+    pub fn set_connections(&mut self, n: usize) {
+        self.peak_connections = self.peak_connections.max(n);
     }
 
     fn record(&mut self, s: Sample) {
@@ -150,7 +190,7 @@ impl Metrics {
             *self.status_counts.entry(code).or_insert(0) += 1;
         }
         // Latency retained for every completed request (incl. non-2xx / timeouts).
-        let latency_us = s.outcome.latency.as_micros() as u64;
+        let latency_us = s.latency.as_micros() as u64;
         self.latency_total += 1;
         self.latency_max_us = self.latency_max_us.max(latency_us);
         if self.latencies_us.len() < LATENCY_CAP {
@@ -200,6 +240,13 @@ impl Metrics {
             attempted: self.attempted.into_counts(),
             accepted_items: self.accepted_items.into_counts(),
             timeline,
+            behind: self.behind,
+            peak_inflight: self.peak_inflight,
+            offered: self.requests + self.behind,
+            peak_connections: self.peak_connections,
+            // The engine overwrites these after aggregate returns.
+            effective_concurrency: 0,
+            source_ips: 0,
         }
     }
 }
@@ -288,6 +335,8 @@ pub async fn aggregate(
     users: usize,
     start: Instant,
     target_pid: Option<u32>,
+    behind: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    peak_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Summary {
     let interval_dur = Duration::from_secs(1);
     let mut metrics = Metrics::new(users, start);
@@ -305,7 +354,13 @@ pub async fn aggregate(
         tokio::select! {
             maybe = rx.recv() => match maybe {
                 Some(sample) => metrics.record(sample),
-                None => break, // all user tasks finished
+                None => {
+                    // All senders dropped: fold in the engine's final shed count
+                    // and observed peak in-flight before producing the summary.
+                    metrics.record_behind(behind.load(std::sync::atomic::Ordering::Relaxed));
+                    metrics.set_inflight(peak_inflight.load(std::sync::atomic::Ordering::Relaxed));
+                    break;
+                }
             },
             _ = ticker.tick() => {
                 let snap = metrics.snapshot(prev_requests, interval_dur);
@@ -314,10 +369,15 @@ pub async fn aggregate(
                 // Resolve this tick's resource sample (best-effort). CPU differencing
                 // lives in CpuTracker; RSS is a direct read of the sample.
                 let (cpu_cores, rss_bytes) = match sampler.as_ref().and_then(|s| s.sample()) {
-                    Some(raw) => (
-                        cpu.as_mut().and_then(|t| t.update(&raw)),
-                        Some(raw.rss_bytes),
-                    ),
+                    Some(raw) => {
+                        if let Some(fds) = raw.open_fds {
+                            metrics.set_connections(fds);
+                        }
+                        (
+                            cpu.as_mut().and_then(|t| t.update(&raw)),
+                            Some(raw.rss_bytes),
+                        )
+                    }
                     None => (None, None),
                 };
 
@@ -355,16 +415,13 @@ mod tests {
     fn records_outcomes_and_items() {
         let mut m = Metrics::new(4, Instant::now());
         let sample = |kind, status| Sample {
-            outcome: SendOutcome {
-                kind,
-                status,
-                latency: Duration::from_millis(5),
-            },
+            outcome: SendOutcome { kind, status },
             counts: ItemCounts {
                 events: 1,
                 transactions: 1,
                 ..Default::default()
             },
+            latency: Duration::from_millis(5),
         };
         m.record(sample(OutcomeKind::Accepted, Some(202)));
         m.record(sample(OutcomeKind::RateLimited, Some(429)));
@@ -377,6 +434,18 @@ mod tests {
         assert_eq!(s.attempted.events, 3);
         assert_eq!(s.accepted_items.events, 1); // only the accepted one counts
         assert_eq!(s.status_counts, vec![(202, 1), (429, 1)]);
+    }
+
+    #[test]
+    fn records_behind_and_offered_and_peak_inflight() {
+        let mut m = Metrics::new(4, Instant::now());
+        m.record_behind(7);
+        m.set_inflight(3);
+        m.set_inflight(9);
+        m.set_inflight(5);
+        let s = m.finalize(vec![]);
+        assert_eq!(s.behind, 7);
+        assert_eq!(s.peak_inflight, 9);
     }
 
     #[test]
@@ -415,6 +484,7 @@ mod tests {
             proc_jiffies: proc,
             total_jiffies: total,
             rss_bytes: 0,
+            open_fds: None,
         };
         let mut t = CpuTracker::new(8.0);
         // First sample: no prior to difference against.
@@ -426,20 +496,39 @@ mod tests {
         assert_eq!(t.update(&raw(1400, 108_000)), Some(0.0));
     }
 
+    #[test]
+    fn set_connections_tracks_max() {
+        // Exercises the real code path used by `aggregate`: each observed fd
+        // count folds into a running max, surfaced on the Summary. Would fail if
+        // `set_connections` were `= n` instead of `.max(n)`.
+        let mut m = Metrics::new(1, Instant::now());
+        m.set_connections(4);
+        m.set_connections(9);
+        m.set_connections(2);
+        assert_eq!(m.finalize(vec![]).peak_connections, 9);
+    }
+
     // Real-time integration smoke test of the async loop against a live `/proc`:
     // samples THIS test process, so it only runs where `/proc` exists.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn aggregate_samples_real_process_and_builds_timeline() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Sample>();
-        let handle = tokio::spawn(aggregate(rx, 2, Instant::now(), Some(std::process::id())));
+        let handle = tokio::spawn(aggregate(
+            rx,
+            2,
+            Instant::now(),
+            Some(std::process::id()),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ));
         let mk = || Sample {
             outcome: SendOutcome {
                 kind: OutcomeKind::Accepted,
                 status: Some(202),
-                latency: Duration::from_millis(2),
             },
             counts: ItemCounts { events: 1, ..Default::default() },
+            latency: Duration::from_millis(2),
         };
         for _ in 0..3 {
             tx.send(mk()).unwrap();
@@ -454,5 +543,8 @@ mod tests {
         // RSS is available from the very first tick; CPU has no prior sample yet.
         assert!(s.timeline[0].rss_bytes.is_some(), "RSS should sample from self");
         assert!(s.timeline[0].cpu_cores.is_none(), "first tick has no prior CPU sample");
+        // This test process has at least stdio fds open, so the peak should
+        // reflect a real, non-zero fd count sampled from self.
+        assert!(s.peak_connections >= 3, "expected peak_connections >= 3, got {}", s.peak_connections);
     }
 }

@@ -1,0 +1,19 @@
+[Unit]
+Description=Sauron database migrations (one-shot)
+Documentation=file:///usr/share/doc/sauron-server/SETUP.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sauron
+Group=sauron
+EnvironmentFile=/etc/sauron/sauron.env
+ExecStart=/usr/bin/sauron-migrate
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+# No [Install] section — run on demand: systemctl start sauron-migrate

@@ -79,6 +79,29 @@ pub fn print_summary(s: &Summary, expected: &Expected) {
         println!("    status codes    {codes}");
     }
 
+    let elapsed = s.elapsed.as_secs_f64().max(1e-9);
+    println!("\n  concurrency");
+    println!(
+        "    effective       {:>12}    source IPs   {}",
+        group(s.effective_concurrency as u64),
+        s.source_ips,
+    );
+    println!("    peak in-flight  {:>12}", group(s.peak_inflight as u64));
+    println!(
+        "    peak connections {:>11}   (server-held sockets)",
+        group(s.peak_connections as u64)
+    );
+    println!(
+        "    offered/sec     {:>12.0}    accepted/sec {:>10.0}",
+        s.offered as f64 / elapsed,
+        s.accepted as f64 / elapsed,
+    );
+    println!(
+        "    shed (behind)   {:>12}   {}",
+        group(s.behind),
+        pct(s.behind, s.offered)
+    );
+
     println!("\n  items  accepted / attempted  (by signal type)");
     item_row("errors", s.accepted_items.errors, s.attempted.errors);
     item_row("events", s.accepted_items.events, s.attempted.events);

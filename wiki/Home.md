@@ -37,6 +37,9 @@ scope and resolved as a union down the tree.
 - **[Ingest Wire Contract](Ingest-Wire-Contract.md)** — the DSN format, the
   `POST /api/{project_id}/envelope` endpoint, the `X-Sauron-Key` header, and every
   envelope / item JSON shape. This is what all SDKs emit.
+- **[Architecture](Architecture.md)** — how it works under the hood: the
+  ingest pipeline, error grouping & symbolication, the SQL behind the analytics, data
+  tiering, uptime probing, and RBAC.
 - **[Capabilities](Capabilities.md)** — the SDK feature-parity matrix (scope,
   breadcrumbs, transactions, `beforeSend`, gzip, retry, queue, auto-capture) across all
   five SDKs, as of **v0.3.0**.

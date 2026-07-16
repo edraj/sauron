@@ -278,6 +278,12 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
     cards.push_str(&stat_card("latency p90", &fmt_us(s.p90_us)));
     cards.push_str(&stat_card("latency p99", &fmt_us(s.p99_us)));
     cards.push_str(&stat_card("latency max", &fmt_us(s.max_us)));
+    cards.push_str(&stat_card("peak in-flight", &group(s.peak_inflight as u64)));
+    cards.push_str(&stat_card("peak connections", &group(s.peak_connections as u64)));
+    cards.push_str(&stat_card("effective concurrency", &group(s.effective_concurrency as u64)));
+    cards.push_str(&stat_card("source IPs", &group(s.source_ips as u64)));
+    cards.push_str(&stat_card("offered", &group(s.offered)));
+    cards.push_str(&stat_card("shed (behind)", &group(s.behind)));
     if has_resources {
         cards.push_str(&stat_card(
             "peak CPU",
@@ -425,6 +431,8 @@ mod tests {
             accepted_items: ItemCounts { events: 490, errors: 390, ..Default::default() },
             p50_us: 1200, p90_us: 4500, p99_us: 9000, max_us: 25000,
             latency_samples: 900, latency_truncated: false, timeline,
+            behind: 0, peak_inflight: 12, offered: 900,
+            effective_concurrency: 10, source_ips: 1, peak_connections: 42,
         }
     }
 

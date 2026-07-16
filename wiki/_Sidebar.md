@@ -2,6 +2,8 @@
 
 - [Home](Home.md)
 - [Getting Started](Getting-Started.md)
+- [Install via RPM](RPM-Install.md)
+- [Architecture](Architecture.md)
 - [Ingest Wire Contract](Ingest-Wire-Contract.md)
 - [Capabilities](Capabilities.md)
 

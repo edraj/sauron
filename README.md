@@ -4,7 +4,7 @@
 
 📖 Documentation: see the [wiki](wiki/Home.md). Jump to:
 
-- [Getting Started](wiki/Getting-Started.md) · [Ingest Wire Contract](wiki/Ingest-Wire-Contract.md) · [Capabilities](wiki/Capabilities.md) — the SDK feature-parity matrix (v0.3.0)
+- [Getting Started](wiki/Getting-Started.md) · [Architecture](wiki/Architecture.md) — how it works under the hood · [Ingest Wire Contract](wiki/Ingest-Wire-Contract.md) · [Capabilities](wiki/Capabilities.md) — the SDK feature-parity matrix (v0.3.0)
 - SDKs: [Browser](wiki/Browser-SDK.md) · [Flutter](wiki/Flutter-SDK.md) · [Node](wiki/Node-SDK.md) · [Python](wiki/Python-SDK.md) · [C#](wiki/CSharp-SDK.md)
 - Guides: [Framework Integrations](wiki/Framework-Integrations.md) · [Best Practices](wiki/Best-Practices.md) · [Troubleshooting](wiki/Troubleshooting.md)
 
@@ -87,6 +87,21 @@ docker compose up --build
 Register in the dashboard, create a project → an app, copy that app's DSN into an SDK, and watch the first event land.
 
 > First build compiles the Rust workspace three times (one per service image); subsequent builds are cached.
+
+## Install via RPM (Fedora / RHEL)
+
+For a Docker-less deployment on Fedora/RHEL-family systems, Sauron ships as four
+RPMs (`sauron`, `sauron-server`, `sauron-dashboard`, `sauron-cli`) driven by
+systemd. Postgres and Redis/Valkey are external.
+
+```bash
+./packaging/rpm/build-rpm.sh                 # build the RPMs (needs rust, cargo, node, rpm-build)
+sudo dnf install ~/rpmbuild/RPMS/$(uname -m)/sauron-*.rpm
+```
+
+Full instructions: **[packaging/rpm/INSTALL.md](packaging/rpm/INSTALL.md)** (build & install)
+and **[packaging/rpm/SETUP.md](packaging/rpm/SETUP.md)** (configure DB/Redis, migrate,
+enable services, dashboard).
 
 ## Local development (without full compose)
 

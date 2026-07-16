@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
 
-use crate::cli::IsolatedConfig;
+use crate::cli::{IsolatedConfig, Transport};
 use crate::db_url::{bench_db_name, swap_database, swap_redis_db};
 use crate::dsn::Target;
 
@@ -24,6 +24,7 @@ pub struct HarnessGuard {
     child: Option<Child>,
     keep: bool,
     torn_down: bool,
+    uds_path: Option<PathBuf>,
 }
 
 /// The bench names/URLs, computed up front.
@@ -48,6 +49,7 @@ pub fn prepare(icfg: &IsolatedConfig) -> anyhow::Result<(Prepared, HarnessGuard)
         child: None,
         keep: icfg.keep,
         torn_down: false,
+        uds_path: icfg.uds_path.clone(),
     };
     Ok((
         Prepared {
@@ -117,9 +119,21 @@ pub async fn provision(
         &prepared.bench_redis_url,
     )?);
 
-    // Wait for it to accept traffic (interruptible each poll).
+    // Wait for it to accept traffic (interruptible each poll). `base_url` stays
+    // the loopback form even in UDS mode — it's a harmless placeholder here;
+    // the engine (a later task) sends over `icfg.uds_path` for UDS instead.
     let base_url = format!("http://127.0.0.1:{}", icfg.ingest_port);
-    if !wait_ready(&base_url, guard, cancel).await? {
+    let ready = match icfg.transport {
+        Transport::Tcp => wait_ready(&base_url, guard, cancel).await?,
+        Transport::Uds => {
+            let path = icfg
+                .uds_path
+                .as_ref()
+                .expect("resolve() guarantees uds_path is Some for isolated + Transport::Uds");
+            wait_ready_uds(path, guard, cancel).await?
+        }
+    };
+    if !ready {
         return Ok(None);
     }
     eprintln!("crebain: ingest ready; bench app {app_id} seeded");
@@ -156,9 +170,11 @@ fn spawn_ingest(
     bench_pg_url: &str,
     bench_redis_url: &str,
 ) -> anyhow::Result<Child> {
-    Command::new(bin)
-        .env("DATABASE_URL", bench_pg_url)
+    let mut cmd = Command::new(bin);
+    cmd.env("DATABASE_URL", bench_pg_url)
         .env("REDIS_URL", bench_redis_url)
+        // Harmless in UDS mode too — the ingest only binds a TCP listener when
+        // INGEST_UDS_PATH is unset.
         .env("INGEST_PORT", icfg.ingest_port.to_string())
         .env("INGEST_RATE_LIMIT_PER_MIN", icfg.rate_limit.to_string())
         .env("WORKER_CONCURRENCY", "8")
@@ -168,8 +184,15 @@ fn spawn_ingest(
         )
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    if icfg.transport == Transport::Uds {
+        let path = icfg
+            .uds_path
+            .as_ref()
+            .expect("resolve() guarantees uds_path is Some for isolated + Transport::Uds");
+        cmd.env("INGEST_UDS_PATH", path);
+    }
+    cmd.spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn ingest {}: {e}", bin.display()))
 }
 
@@ -232,6 +255,64 @@ async fn wait_ready(
     }
 }
 
+/// Poll `/ready` over a Unix-domain socket until the ingest accepts traffic.
+/// Mirrors [`wait_ready`]'s poll loop (same cancel check, child-died check,
+/// 30s deadline, 250ms sleep) but probes via a raw UDS connection instead of
+/// reqwest, which has no UDS connector.
+async fn wait_ready_uds(
+    path: &std::path::Path,
+    guard: &mut HarnessGuard,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<bool> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if *cancel.borrow() {
+            return Ok(false);
+        }
+        // If the ingest died during startup, fail fast rather than poll for 30s.
+        if let Some(child) = guard.child.as_mut() {
+            if let Ok(Some(status)) = child.try_wait() {
+                anyhow::bail!("ingest exited during startup ({status})");
+            }
+        }
+        if uds_probe(path).await {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "ingest did not become ready within 30s over uds {}",
+                path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// One readiness probe over a Unix-domain socket: connect, send a minimal
+/// `GET /ready` and check the response contains "200". Any error (socket not
+/// yet created, connection refused, etc.) just means "not ready yet".
+async fn uds_probe(path: &std::path::Path) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(mut stream) = tokio::net::UnixStream::connect(path).await else {
+        return false;
+    };
+    if stream
+        .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nconnection: close\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let Ok(n) = stream.read(&mut buf).await else {
+        return false;
+    };
+    std::str::from_utf8(&buf[..n])
+        .map(|s| s.contains("200"))
+        .unwrap_or(false)
+}
+
 async fn flush_redis(url: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(url)?;
     let mut con = client.get_multiplexed_async_connection().await?;
@@ -255,6 +336,10 @@ impl HarnessGuard {
 
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
+        }
+
+        if let Some(p) = &self.uds_path {
+            let _ = std::fs::remove_file(p);
         }
 
         if self.keep {

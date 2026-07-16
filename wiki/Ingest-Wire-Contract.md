@@ -5,7 +5,8 @@ is defined authoritatively in
 [`backend/crates/sauron-core/src/envelope.rs`](../backend/crates/sauron-core/src/envelope.rs);
 a golden fixture in that file and in the SDK test suites guards parity.
 
-See also: **[Home](Home.md)** · **[Getting Started](Getting-Started.md)**.
+See also: **[Home](Home.md)** · **[Getting Started](Getting-Started.md)** ·
+**[Architecture](Architecture.md)** (what the backend does with your envelope).
 
 ## DSN
 

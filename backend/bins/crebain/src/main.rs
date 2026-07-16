@@ -5,16 +5,18 @@
 //! an already-running edge. Both exercise all five envelope signal types.
 
 mod cli;
-mod client;
 mod db_url;
 mod dsn;
 mod engine;
 mod generator;
 mod harness;
 mod metrics;
+mod netlimit;
 mod procstat;
 mod report;
 mod report_html;
+mod schedule;
+mod transport;
 mod user;
 
 use std::future::Future;
@@ -47,8 +49,25 @@ async fn run() -> Result<ExitCode> {
         Mode::Direct { dsn } => {
             let target = dsn::parse_dsn(&dsn)?;
             print_target(&target);
+            let plan = if matches!(cfg.transport, cli::Transport::Uds) {
+                // UDS has no ephemeral-port wall to fan out across; concurrency
+                // is fd-bound, not port-bound, so just hand back the requested
+                // ceiling as-is.
+                netlimit::FanoutPlan {
+                    source_ips: Vec::new(),
+                    effective: cfg.max_inflight,
+                    warning: None,
+                }
+            } else {
+                build_plan(&cfg, netlimit::is_loopback_host(host_of(&target)))
+            };
+            let fd = netlimit::raise_nofile(plan.effective as u64 + 1024);
+            print_concurrency(cfg.max_inflight, &plan, &fd);
+            if let Some(w) = &plan.warning {
+                eprintln!("crebain: WARNING {w}");
+            }
             finish(
-                run_with_signals(engine::run(&cfg, &target, None)).await,
+                run_with_signals(engine::run(&cfg, &target, None, &plan)).await,
                 &cfg,
                 "direct",
             )
@@ -67,13 +86,33 @@ async fn run() -> Result<ExitCode> {
 async fn run_isolated(cfg: &RunConfig, icfg: &cli::IsolatedConfig) -> Result<ExitCode> {
     let (prepared, mut guard) = harness::prepare(icfg)?;
 
+    // Isolated targets are always loopback (127.0.0.1): compute the fan-out plan
+    // and raise the fd limit BEFORE `provision` spawns the ingest child, so the
+    // child inherits the raised limit.
+    let plan = if matches!(cfg.transport, cli::Transport::Uds) {
+        // UDS has no ephemeral-port wall to fan out across; concurrency is
+        // fd-bound, not port-bound, so just hand back the requested ceiling.
+        netlimit::FanoutPlan {
+            source_ips: Vec::new(),
+            effective: cfg.max_inflight,
+            warning: None,
+        }
+    } else {
+        build_plan(cfg, true)
+    };
+    let fd = netlimit::raise_nofile(plan.effective as u64 + 1024);
+    print_concurrency(cfg.max_inflight, &plan, &fd);
+    if let Some(w) = &plan.warning {
+        eprintln!("crebain: WARNING {w}");
+    }
+
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let watcher = tokio::spawn(async move {
         shutdown_signal().await;
         let _ = cancel_tx.send(true);
     });
 
-    let ran = isolated_body(cfg, icfg, &prepared, &mut guard, cancel_rx).await;
+    let ran = isolated_body(cfg, icfg, &prepared, &mut guard, cancel_rx, &plan).await;
 
     watcher.abort();
     guard.teardown().await;
@@ -86,6 +125,7 @@ async fn isolated_body(
     prepared: &harness::Prepared,
     guard: &mut harness::HarnessGuard,
     mut cancel: tokio::sync::watch::Receiver<bool>,
+    plan: &netlimit::FanoutPlan,
 ) -> Option<Result<Summary>> {
     match harness::provision(icfg, prepared, guard, &cancel).await {
         Err(e) => Some(Err(e)),
@@ -95,7 +135,7 @@ async fn isolated_body(
             let target_pid = guard.child_pid();
             // engine::run is safe to cancel mid-flight (it just aborts user tasks).
             tokio::select! {
-                r = engine::run(cfg, &target, target_pid) => Some(r),
+                r = engine::run(cfg, &target, target_pid, plan) => Some(r),
                 _ = cancel.changed() => None,
             }
         }
@@ -108,6 +148,9 @@ fn finish(ran: Option<Result<Summary>>, cfg: &RunConfig, mode_label: &str) -> Re
     match ran {
         Some(Ok(summary)) => {
             report::print_summary(&summary, &cfg.expected());
+            if cfg.live_sockets {
+                eprintln!("crebain: --live-sockets: this run is a connection-capacity demo — read PEAK CONNECTIONS, not req/s.");
+            }
             if let Some(path) = &cfg.report_path {
                 let meta = ReportMeta {
                     mode_label: mode_label.to_string(),
@@ -183,4 +226,45 @@ fn print_target(t: &Target) {
     eprintln!("  target       {}", t.dsn());
     eprintln!("  endpoint     {}", t.envelope_url());
     eprintln!();
+}
+
+/// Build the fan-out plan for a run: how many loopback source IPs to bind and
+/// the concurrency ceiling the ephemeral-port budget actually allows.
+fn build_plan(cfg: &RunConfig, loopback: bool) -> netlimit::FanoutPlan {
+    netlimit::plan_fanout(
+        cfg.max_inflight,
+        loopback,
+        netlimit::ephemeral_port_budget(),
+        512,
+        cfg.source_ips,
+    )
+}
+
+/// Extract the bare host from a `scheme://host:port` base URL (no port, no scheme).
+fn host_of(t: &Target) -> &str {
+    t.base_url
+        .split("://")
+        .nth(1)
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("")
+}
+
+/// Print the resolved concurrency plan and fd-limit status, matching the
+/// banner's style.
+fn print_concurrency(requested: usize, plan: &netlimit::FanoutPlan, fd: &netlimit::NofileStatus) {
+    eprintln!(
+        "  concurrency  requested {}  effective {}",
+        requested, plan.effective
+    );
+    eprintln!("  source IPs   {}", plan.source_ips.len());
+    eprintln!(
+        "  fd limit     soft {} / hard {}{}",
+        fd.soft,
+        fd.hard,
+        if fd.capped {
+            "  (CAPPED — raise the hard limit via ulimit/limits.conf for higher concurrency)"
+        } else {
+            ""
+        }
+    );
 }

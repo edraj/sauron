@@ -21,3 +21,4 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 flate2 = { workspace = true }
+libc = "0.2"

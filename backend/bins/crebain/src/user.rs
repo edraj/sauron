@@ -18,8 +18,6 @@ pub struct VirtualUser {
     /// Current screen — advances as the user "navigates" between events.
     pub screen: &'static str,
     pub traits: serde_json::Value,
-    pub events_sent: u64,
-    pub issues_sent: u64,
 }
 
 impl VirtualUser {
@@ -37,8 +35,6 @@ impl VirtualUser {
                 "synthetic": true,
                 "cohort": index % 20,
             }),
-            events_sent: 0,
-            issues_sent: 0,
         }
     }
 

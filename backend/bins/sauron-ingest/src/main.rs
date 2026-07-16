@@ -50,9 +50,26 @@ struct IngestQuery {
     k: Option<String>,
 }
 
+/// Best-effort raise of the process's open-file-descriptor soft limit to the
+/// hard limit. A large connect burst (e.g. crebain hammering over UDS) can
+/// otherwise exhaust the default 1024-fd soft limit well before any real
+/// resource pressure. Failure here is non-fatal; we just keep the inherited
+/// limit.
+fn raise_nofile() {
+    #[cfg(unix)]
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+            let new = libc::rlimit { rlim_cur: lim.rlim_max, rlim_max: lim.rlim_max };
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &new);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     sauron_telemetry::init("sauron-ingest");
+    raise_nofile();
     let cfg = Config::from_env()?;
 
     let pool = sauron_db::build_pool(&cfg.database_url, 8)?;
@@ -84,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
 
     let port = cfg.ingest_port;
     let max_body = cfg.ingest_max_body_bytes;
+    let uds_path = cfg.ingest_uds_path.clone();
+    let backlog = cfg.ingest_backlog;
     let state = AppState {
         pool,
         redis,
@@ -105,10 +124,20 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!(%addr, "sauron-ingest listening");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    if let Some(path) = uds_path {
+        let _ = std::fs::remove_file(&path); // clear a stale socket file
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        info!(path = %path, "sauron-ingest listening on UDS");
+        axum::serve(listener, app).await?;
+    } else {
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.set_reuseaddr(true)?;
+        socket.bind(addr)?;
+        let listener = socket.listen(backlog)?;
+        info!(%addr, "sauron-ingest listening");
+        axum::serve(listener, app).await?;
+    }
     Ok(())
 }
 
@@ -267,4 +296,40 @@ fn error(status: StatusCode, code: &str, message: &str) -> axum::response::Respo
         Json(json!({ "error": { "code": code, "message": message } })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
+
+    /// Proves axum can serve a router over a Unix-domain socket in this axum
+    /// version, independent of the full `AppState` (no PG/Redis needed).
+    #[tokio::test]
+    async fn serves_health_over_uds() {
+        let path = std::env::temp_dir().join(format!("sauron-ingest-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let router = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.contains("200"), "response was: {response}");
+        assert!(response.contains("ok"), "response was: {response}");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
