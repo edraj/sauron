@@ -35,6 +35,10 @@ tower-http = { version = "0.7", features = [
 ] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 
+# --- cli / benchmarking (crebain) ---
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+
 # --- database ---
 # `postgres_backend` (not `postgres`) gives the Pg query builder + types WITHOUT
 # the libpq-linked sync connection; all I/O goes through diesel-async instead.
