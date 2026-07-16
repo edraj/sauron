@@ -22,6 +22,13 @@ Artifacts land in `~/rpmbuild/RPMS/<arch>/` and `~/rpmbuild/SRPMS/`. The first b
 compiles the Rust workspace (including a bundled DuckDB) and the dashboard — expect
 several minutes. Use `./packaging/rpm/build-rpm.sh --srpm` to produce just the source RPM.
 
+> **Using rustup / nvm** instead of the Fedora `rust`/`cargo`/`nodejs`/`npm` packages?
+> `rpmbuild` resolves `BuildRequires` against the RPM database, not `$PATH`, so it reports
+> `cargo >= 1.82 is needed` even though `cargo` works in your shell. `build-rpm.sh`
+> auto-detects this (cargo on `$PATH` but no `cargo` RPM) and adds `--nodeps` for you — your
+> toolchain still does the build. Force it with `./packaging/rpm/build-rpm.sh --nodeps`, or
+> install the distro toolchain to satisfy the check natively.
+
 ## 2. Install
 
 Pick what a given host needs. On an all-in-one box:

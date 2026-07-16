@@ -10,16 +10,24 @@ package under `/usr/share/doc/sauron-server/` ([INSTALL.md](https://github.com/s
 > packages do not install or configure them (they are declared only as weak `Recommends`).
 > Provision them on this host or a remote one (steps 3–4 below) before starting the services.
 
-## At a glance
+## The artifacts
 
-Sauron ships four RPMs from one spec — install only what a given host needs:
+One `rpmbuild` run (step 1) emits **four binary RPMs** — one per component — plus a **source
+RPM**, all named `<name>-0.1.0-1.fc44.<arch>`. Binary RPMs land in `~/rpmbuild/RPMS/<arch>/`
+and the source RPM in `~/rpmbuild/SRPMS/`. Install only the binary RPMs a given host needs;
+`dnf` pulls in the shared `sauron` base package automatically.
 
-| Package | Role |
-|---|---|
-| `sauron` | shared `sauron` user, `/var/lib/sauron`, `/etc/sauron/sauron.env` (pulled in automatically) |
-| `sauron-server` | API (:8080), ingest (:8081), monitor, tier, migrate + systemd units |
-| `sauron-dashboard` | static SPA + nginx vhost (requires `nginx`) |
-| `sauron-cli` | `crebain` load generator, `sauron-symcli` |
+| Artifact | ~Size | What it is |
+|---|---|---|
+| `sauron-*.rpm` | ~25 KB | **Base** — the shared `sauron` system user, `/var/lib/sauron` data dir, and `/etc/sauron/sauron.env`. Auto-pulled as a dependency of server & dashboard. |
+| `sauron-server-*.rpm` | ~31 MB | **Backend** — the `sauron-api` (:8080), `sauron-ingest` (:8081), `sauron-monitor`, `sauron-tier`, and `sauron-migrate` binaries + their systemd units. Large because DuckDB is compiled in statically (no external lib). |
+| `sauron-dashboard-*.rpm` | ~130 KB | **Web UI** — the built Svelte SPA under `/usr/share/sauron/dashboard`, an nginx vhost, and the runtime-config generator. Requires `nginx`. |
+| `sauron-cli-*.rpm` | ~2.6 MB | **Tools** — the `crebain` load/benchmark generator and the `sauron-symcli` symbolication utility. Standalone, no dependencies. |
+| `sauron-*.src.rpm` | ~390 KB | **Source RPM** — bundles the spec + sources; rebuild on any Fedora/RHEL host with `rpmbuild --rebuild sauron-*.src.rpm`. |
+
+Runtime footprint is lean: the binaries link only glibc/libstdc++ — **no libpq, OpenSSL, or
+DuckDB shared libraries** (Postgres uses the pure-Rust diesel query builder, TLS is rustls,
+DuckDB is static). The only external package dependency is `nginx`, for the dashboard.
 
 ## 1. Build the RPMs
 
@@ -34,6 +42,13 @@ git clone <repo> sauron && cd sauron
 Artifacts land in `~/rpmbuild/RPMS/<arch>/` and `~/rpmbuild/SRPMS/`. The first build
 compiles the Rust workspace (including a bundled DuckDB) and the dashboard — expect
 several minutes. Use `./packaging/rpm/build-rpm.sh --srpm` to produce just the source RPM.
+
+> **Using rustup / nvm** instead of the Fedora `rust`/`cargo`/`nodejs`/`npm` packages?
+> `rpmbuild` resolves `BuildRequires` against the RPM database, not `$PATH`, so it reports
+> `cargo >= 1.82 is needed` even though `cargo` works in your shell. `build-rpm.sh`
+> auto-detects this and adds `--nodeps` for you (your toolchain still does the build); force
+> it with `./packaging/rpm/build-rpm.sh --nodeps`, or install the distro toolchain to satisfy
+> the check natively.
 
 ## 2. Install
 
