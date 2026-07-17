@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI only reads the repo.
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend — fmt · clippy · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain deps (cmake for rustls/aws-lc, g++ for bundled DuckDB)
+        run: sudo apt-get update -q && sudo apt-get install -y -q cmake
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+      # fmt + clippy are report-only for now (lenient). Remove the
+      # continue-on-error lines to make them hard gates once the tree is
+      # fmt-clean (`cd backend && cargo fmt --all`) and clippy-clean.
+      - name: cargo fmt (report-only)
+        continue-on-error: true
+        run: cargo fmt --all --check
+      - name: cargo clippy (report-only)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --all-features
+      - name: cargo test
+        run: cargo test --workspace
+
+  dashboard:
+    name: dashboard — build · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run build          # svelte-check + vite build
+      - run: npm test               # vitest
+
+  sdk-js:
+    name: web SDK — test · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdks/js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/js/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: typecheck (report-only)
+        continue-on-error: true
+        run: npm run typecheck
+
+  sdk-flutter:
+    name: flutter SDK — analyze · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdks/flutter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - name: flutter analyze (report-only)
+        continue-on-error: true
+        run: flutter analyze
+      - run: flutter test
+
+  packaging:
+    name: packaging — spec lint · source RPM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: fedora:44
+    steps:
+      - name: Install rpm tooling
+        run: dnf install -y rpm-build rpmlint systemd-rpm-macros git tar gzip gawk
+      - uses: actions/checkout@v4
+      - name: Trust the workspace (container git)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Spec parses
+        run: rpmspec -P packaging/rpm/sauron.spec >/dev/null && echo "spec OK"
+      - name: rpmlint (report-only)
+        continue-on-error: true
+        run: rpmlint packaging/rpm/sauron.spec
+      - name: Source RPM builds (validates SourceN staging + tarball)
+        run: ./packaging/rpm/build-rpm.sh --srpm

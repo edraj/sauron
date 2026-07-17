@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # dry run: builds the RPMs as workflow artifacts, creates no release
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rpm:
+    name: rpm (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: fedora
+            image: fedora:44
+          - target: el9
+            image: almalinux:9
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install build toolchain
+        # BuildRequires are satisfied out-of-band: system C/C++ + rpm tooling via
+        # dnf, Rust via rustup, Node via the distro/NodeSource. build-rpm.sh then
+        # auto-detects the non-RPM cargo and adds --nodeps.
+        run: |
+          dnf install -y \
+            gcc gcc-c++ cmake clang perl-interpreter \
+            rpm-build systemd-rpm-macros \
+            git tar gzip gawk findutils curl
+
+      - name: Install Rust (rustup — uniform across distros)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Node 22
+        run: |
+          . /etc/os-release
+          case "$ID" in
+            fedora) dnf install -y nodejs npm ;;
+            *)      curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+                    dnf install -y nodejs ;;
+          esac
+          node --version && npm --version
+
+      - uses: actions/checkout@v4
+
+      - name: Trust the workspace (container git)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Tag must match the spec Version
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          SPEC_VERSION=$(rpmspec -q --srpm --qf '%{version}' packaging/rpm/sauron.spec)
+          if [ "${TAG#v}" != "$SPEC_VERSION" ]; then
+            echo "::error::tag $TAG does not match spec Version $SPEC_VERSION — bump packaging/rpm/sauron.spec (Version + %changelog) first"
+            exit 1
+          fi
+
+      - name: Build RPMs
+        env:
+          RPMBUILD_TOPDIR: ${{ github.workspace }}/rpmbuild
+        run: ./packaging/rpm/build-rpm.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms-${{ matrix.target }}
+          path: |
+            rpmbuild/RPMS/**/*.rpm
+            rpmbuild/SRPMS/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: [rpm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release and attach RPMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          mapfile -t FILES < <(find dist -name '*.rpm' | sort)
+          printf 'asset: %s\n' "${FILES[@]}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$REPO" --clobber "${FILES[@]}"
+          else
+            gh release create "$TAG" --repo "$REPO" --verify-tag \
+              --title "Sauron $TAG" --generate-notes "${FILES[@]}"
+          fi

@@ -1,5 +1,8 @@
 # Sauron 👁️
 
+[![CI](https://github.com/splimter/sauron/actions/workflows/ci.yml/badge.svg)](https://github.com/splimter/sauron/actions/workflows/ci.yml)
+[![Release](https://github.com/splimter/sauron/actions/workflows/release.yml/badge.svg)](https://github.com/splimter/sauron/actions/workflows/release.yml)
+
 **Unified error reporting + product analytics** — Sentry-style crash/error grouping and PostHog-style product events in one platform, on one timeline. When an error fires you can see the same person's events; when you look at a person you see their errors. One SDK emits both signals.
 
 📖 Documentation: see the [wiki](wiki/Home.md). Jump to:
