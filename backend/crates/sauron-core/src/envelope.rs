@@ -111,6 +111,13 @@ pub struct ErrorItem {
     pub breadcrumbs: Vec<Breadcrumb>,
     #[serde(default)]
     pub tags: serde_json::Value,
+    /// Dev-supplied structured context blocks (e.g. {"order":{"id":7}}). DISTINCT
+    /// from the envelope-wide machine `context` — never conflate the two.
+    #[serde(default)]
+    pub contexts: serde_json::Value,
+    /// Dev-supplied freeform JSON attached to this error.
+    #[serde(default)]
+    pub extra: serde_json::Value,
     /// Client-supplied fingerprint override (honored verbatim when present).
     #[serde(default)]
     pub fingerprint: Option<Vec<String>>,
@@ -218,6 +225,15 @@ pub struct AnalyticsItem {
     /// Current screen/route the SDK was on when the event was tracked.
     #[serde(default)]
     pub screen: Option<String>,
+    /// Dev-supplied flat string tags for this track() event.
+    #[serde(default)]
+    pub tags: serde_json::Value,
+    /// Dev-supplied structured context blocks (DISTINCT from machine `context`).
+    #[serde(default)]
+    pub contexts: serde_json::Value,
+    /// Dev-supplied freeform JSON attached to this event.
+    #[serde(default)]
+    pub extra: serde_json::Value,
 }
 
 /// A performance transaction: one timed operation (page/screen load, HTTP call,
@@ -445,6 +461,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_error_and_event_scopes() {
+        // New dev-owned scopes: tags/contexts/extra parse on BOTH errors and events.
+        let json = r#"{
+            "header": { "sdk": { "name": "t", "version": "0" } },
+            "items": [
+                { "type": "error", "timestamp": "2026-07-20T10:00:00Z",
+                  "exception": { "type": "X" },
+                  "tags": { "region": "eu" },
+                  "contexts": { "order": { "id": 7 } },
+                  "extra": { "cart": [1, 2] } },
+                { "type": "event", "name": "checkout", "distinct_id": "u1",
+                  "tags": { "plan": "pro" },
+                  "contexts": { "trip": { "n": 1 } },
+                  "extra": { "note": "x" } }
+            ]
+        }"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        match &env.items[0] {
+            EnvelopeItem::Error(e) => {
+                assert_eq!(e.tags["region"], "eu");
+                assert_eq!(e.contexts["order"]["id"], 7);
+                assert_eq!(e.extra["cart"][1], 2);
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+        match &env.items[1] {
+            EnvelopeItem::Event(ev) => {
+                assert_eq!(ev.tags["plan"], "pro");
+                assert_eq!(ev.contexts["trip"]["n"], 1);
+                assert_eq!(ev.extra["note"], "x");
+            }
+            other => panic!("expected event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn roundtrips_item_tag() {
         let item = EnvelopeItem::Event(AnalyticsItem {
             name: "signed_up".into(),
@@ -453,10 +505,20 @@ mod tests {
             timestamp: Utc::now(),
             session_id: None,
             screen: None,
+            tags: serde_json::json!({ "tier": "gold" }),
+            contexts: serde_json::json!({ "order": { "id": 7 } }),
+            extra: serde_json::json!({ "trace": "abc" }),
         });
         let s = serde_json::to_string(&item).unwrap();
         assert!(s.contains("\"type\":\"event\""));
         let back: EnvelopeItem = serde_json::from_str(&s).unwrap();
-        matches!(back, EnvelopeItem::Event(_));
+        match back {
+            EnvelopeItem::Event(ev) => {
+                assert_eq!(ev.tags["tier"], "gold");
+                assert_eq!(ev.contexts["order"]["id"], 7);
+                assert_eq!(ev.extra["trace"], "abc");
+            }
+            other => panic!("expected event, got {other:?}"),
+        }
     }
 }

@@ -36,6 +36,17 @@ class SauronOptions {
   /// Maximum breadcrumbs retained per scope.
   int maxBreadcrumbs = 100;
 
+  /// Default tags (string->string) seeded into the client's global scope at
+  /// init. Per-call tags override these by key on each capture.
+  Map<String, String> tags = <String, String>{};
+
+  /// Default contexts (name -> structured block) seeded into the global scope.
+  /// Distinct from the machine-owned device/os/app/runtime `context`.
+  Map<String, Map<String, Object?>> contexts = <String, Map<String, Object?>>{};
+
+  /// Default extra (freeform JSON) seeded into the global scope.
+  Map<String, Object?> extra = <String, Object?>{};
+
   /// Called before every item (error, event, identify, transaction) is
   /// enqueued; return the item to send it or `null` to drop it.
   BeforeSendCallback? beforeSend;

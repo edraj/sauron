@@ -12,6 +12,7 @@
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatusBadge from '../lib/components/StatusBadge.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { ISSUE_FIELDS, encodeFilters, parseFilters, type Filter } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listIssues, getIssueStats } from '../lib/api/issues';
@@ -55,6 +56,8 @@
   let stats = $state<IssueStats | null>(null);
   let loadingStats = $state(true);
 
+  let refreshing = $state(false);
+
   const isUnresolvedDefault = $derived(
     !search &&
       filters.length === 1 &&
@@ -89,6 +92,17 @@
       stats = null;
     } finally {
       loadingStats = false;
+    }
+  }
+
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([load(aid, appliedSearch), loadStats(aid, sinceDays)]);
+    } finally {
+      refreshing = false;
     }
   }
 
@@ -136,6 +150,9 @@
       <h1 class="page-title">Exceptions</h1>
       <p class="muted sub">Grouped errors across your app, most recent first.</p>
     </div>
+    <div class="controls">
+      <RefreshButton onclick={refresh} loading={refreshing} />
+    </div>
   </div>
 
   {#if stats}
@@ -158,6 +175,7 @@
     <div class="center-sm"><Spinner size={22} /></div>
   {/if}
 
+  <p class="filter-hint">Filter by <code>Tag</code> (key = value); the search box also matches tag &amp; payload content.</p>
   <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:sinceDays ranges={ISSUE_RANGES} />
 
   <Card padding="none">
@@ -222,6 +240,11 @@
 </AppShell>
 
 <style>
+  .filter-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: -4px 0 8px;
+  }
   .head {
     display: flex;
     align-items: flex-start;
@@ -233,6 +256,12 @@
   .sub {
     font-size: 13.5px;
     margin-top: 3px;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
   }
   .occ {
     margin: 14px 0 18px;

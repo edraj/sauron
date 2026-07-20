@@ -2,7 +2,7 @@
   import Icon from '../ui/Icon.svelte';
   import SearchInput from '../SearchInput.svelte';
   import DateRange from '../DateRange.svelte';
-  import { OP_LABEL, type FieldDef, type Filter, type Op } from './filters';
+  import { OP_LABEL, composeTag, type FieldDef, type Filter, type Op } from './filters';
 
   interface Props {
     fields: FieldDef[];
@@ -24,6 +24,8 @@
   let draftField = $state<string>('');
   let draftOp = $state<Op>('eq');
   let draftValue = $state('');
+  let draftTagKey = $state('');
+  let draftTagVal = $state('');
 
   const fieldDef = $derived(fields.find((f) => f.key === draftField));
 
@@ -32,13 +34,23 @@
     draftField = fields[0]?.key ?? '';
     draftOp = fields[0]?.ops[0] ?? 'eq';
     draftValue = fields[0]?.type === 'enum' ? (fields[0]?.options?.[0] ?? '') : '';
+    draftTagKey = '';
+    draftTagVal = '';
   }
   function onFieldChange() {
     const def = fields.find((f) => f.key === draftField);
     draftOp = def?.ops[0] ?? 'eq';
     draftValue = def?.type === 'enum' ? (def?.options?.[0] ?? '') : '';
+    draftTagKey = '';
+    draftTagVal = '';
   }
   function commit() {
+    if (fieldDef?.type === 'tag') {
+      if (!draftTagKey.trim() || !draftTagVal.trim()) return;
+      filters = [...filters, { field: draftField, op: draftOp, value: composeTag(draftTagKey.trim(), draftTagVal.trim()) }];
+      adding = false;
+      return;
+    }
     if (!draftField || draftValue === '') return;
     filters = [...filters, { field: draftField, op: draftOp, value: draftValue }];
     adding = false;
@@ -72,7 +84,11 @@
         <select bind:value={draftOp} aria-label="Operator">
           {#each fieldDef?.ops ?? [] as op (op)}<option value={op}>{OP_LABEL[op]}</option>{/each}
         </select>
-        {#if fieldDef?.type === 'enum'}
+        {#if fieldDef?.type === 'tag'}
+          <input type="text" bind:value={draftTagKey} placeholder="key" aria-label="Tag key" class="tag-key" />
+          <span class="tag-eq">=</span>
+          <input type="text" bind:value={draftTagVal} placeholder="value" aria-label="Tag value" class="tag-val" />
+        {:else if fieldDef?.type === 'enum'}
           <select bind:value={draftValue} aria-label="Value">
             {#each fieldDef?.options ?? [] as opt (opt)}<option value={opt}>{opt}</option>{/each}
           </select>
@@ -131,6 +147,9 @@
     padding: 4px 6px; font-size: 12.5px;
   }
   .draft input { width: 130px; }
+  .draft input.tag-key { width: 90px; }
+  .draft input.tag-val { width: 110px; }
+  .tag-eq { opacity: 0.6; }
   .d-ok, .add {
     background: var(--surface-2); border: 1px solid var(--border);
     border-radius: var(--radius-sm); color: var(--text-muted);

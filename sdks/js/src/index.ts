@@ -22,7 +22,7 @@ import {
 } from './api/product.js';
 import { getClient, init as initClient, SauronClient } from './client.js';
 import { getScreen as getScreenApi } from './screen.js';
-import type { Hint, InitOptions, Level, UserInput } from './types.js';
+import type { Hint, InitOptions, Level, TrackOptions, UserInput } from './types.js';
 
 /** Initialize the SDK. See {@link InitOptions}. */
 export function init(options: InitOptions): SauronClient {
@@ -39,9 +39,13 @@ export function captureMessage(message: string, level: Level = 'info', hint?: Hi
   captureMessageApi(message, level, hint);
 }
 
-/** Record a product-analytics event. */
-export function track(name: string, properties?: Record<string, unknown>): void {
-  trackApi(name, properties);
+/** Record a product-analytics event, optionally with per-call tags/contexts/extra. */
+export function track(
+  name: string,
+  properties?: Record<string, unknown>,
+  options?: TrackOptions,
+): void {
+  trackApi(name, properties, options);
 }
 
 /** Associate the session with a known user. */
@@ -74,6 +78,26 @@ export function setUser(user: UserInput): void {
   getClient()?.getScope().setUser(user);
 }
 
+/** Set a single scope tag (lifted onto later errors/events). */
+export function setTag(key: string, value: string): void {
+  getClient()?.getScope().setTag(key, value);
+}
+
+/** Merge a batch of scope tags (last-write-wins per key). */
+export function setTags(tags: Record<string, string>): void {
+  getClient()?.getScope().setTags(tags);
+}
+
+/** Set (replace) a named scope context block. */
+export function setContext(name: string, block: Record<string, unknown>): void {
+  getClient()?.getScope().setContext(name, block);
+}
+
+/** Set a single freeform scope extra value. */
+export function setExtra(key: string, value: unknown): void {
+  getClient()?.getScope().setExtra(key, value);
+}
+
 /** Flush pending events. Resolves `false` if `timeoutMs` elapses first. */
 export function flush(timeoutMs?: number): Promise<boolean> {
   const client = getClient();
@@ -99,6 +123,10 @@ export const Sauron = {
   identify,
   addBreadcrumb,
   setUser,
+  setTag,
+  setTags,
+  setContext,
+  setExtra,
   setScreen,
   getScreen,
   flush,
@@ -147,5 +175,7 @@ export type {
   BeforeBreadcrumb,
   TransportOptions,
   InitOptions,
+  CaptureOptions,
+  TrackOptions,
   ResolvedOptions,
 } from './types.js';

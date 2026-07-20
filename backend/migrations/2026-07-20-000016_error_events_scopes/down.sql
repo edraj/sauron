@@ -1,0 +1,2 @@
+ALTER TABLE error_events DROP COLUMN IF EXISTS extra;
+ALTER TABLE error_events DROP COLUMN IF EXISTS contexts;

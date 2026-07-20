@@ -97,4 +97,44 @@ public class ScopeTests
         var results = await Task.WhenAll(Task.Run(() => Run("A")), Task.Run(() => Run("B")));
         Assert.Equal(new[] { "A", "B" }, results.OrderBy(x => x).ToArray());
     }
+
+    [Fact]
+    public void ScopeContextsAndExtra_ApplyToError()
+    {
+        ScopeManager.Global.SetContext("order", new Dictionary<string, object?> { ["id"] = 7 });
+        ScopeManager.Global.SetExtra("trace", "abc");
+
+        var item = new ErrorItem();
+        ScopeManager.Current.ApplyToError(item);
+
+        Assert.NotNull(item.Contexts);
+        var order = Assert.IsType<Dictionary<string, object?>>(item.Contexts!["order"]);
+        Assert.Equal(7, order["id"]);
+        Assert.Equal("abc", item.Extra!["trace"]);
+    }
+
+    [Fact]
+    public void EmptyScope_LeavesContextsExtraNull_ForOmission()
+    {
+        var item = new ErrorItem();
+        ScopeManager.Current.ApplyToError(item);
+
+        Assert.Null(item.Contexts);
+        Assert.Null(item.Extra);
+    }
+
+    [Fact]
+    public void PerCallContextBlock_WinsOverScope_ByBlockName()
+    {
+        ScopeManager.Global.SetContext("order", new Dictionary<string, object?> { ["id"] = 1 });
+
+        var item = new ErrorItem
+        {
+            Contexts = new Dictionary<string, object?> { ["order"] = new Dictionary<string, object?> { ["id"] = 99 } },
+        };
+        ScopeManager.Current.ApplyToError(item);
+
+        var order = Assert.IsType<Dictionary<string, object?>>(item.Contexts!["order"]);
+        Assert.Equal(99, order["id"]); // per-call block replaces the same-named scope block
+    }
 }

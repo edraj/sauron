@@ -6,6 +6,19 @@ export function emptyUser(): UserContext {
 }
 
 /**
+ * Shallow-merge a per-call override map over a base map. The override wins per
+ * top-level key — tags/extra merge by key, contexts merge by block name (a
+ * per-call block replaces the same-named base block). Returns a fresh object;
+ * callers OMIT the field entirely when the result is empty (emit convention).
+ */
+export function mergeMeta(
+  base: Record<string, unknown>,
+  override?: Record<string, unknown>,
+): Record<string, unknown> {
+  return override ? { ...base, ...override } : { ...base };
+}
+
+/**
  * Mutable per-client state: the current user, a ring buffer of breadcrumbs and
  * free-form tags. The breadcrumb buffer is capped at `maxBreadcrumbs`; the
  * oldest entries fall off the front (FIFO).
@@ -15,6 +28,8 @@ export class Scope {
   private breadcrumbs: Breadcrumb[] = [];
   private maxBreadcrumbs: number;
   readonly tags: Record<string, string> = {};
+  readonly contexts: Record<string, unknown> = {};
+  readonly extra: Record<string, unknown> = {};
 
   constructor(maxBreadcrumbs = 50) {
     this.maxBreadcrumbs = Math.max(0, maxBreadcrumbs);
@@ -49,6 +64,21 @@ export class Scope {
 
   setTag(key: string, value: string): void {
     this.tags[key] = value;
+  }
+
+  /** Merge a batch of tags into the scope (last-write-wins per key). */
+  setTags(tags: Record<string, string>): void {
+    Object.assign(this.tags, tags);
+  }
+
+  /** Set (replace) a named context block on the scope. */
+  setContext(name: string, block: Record<string, unknown>): void {
+    this.contexts[name] = block;
+  }
+
+  /** Set a single freeform extra value on the scope. */
+  setExtra(key: string, value: unknown): void {
+    this.extra[key] = value;
   }
 
   addBreadcrumb(breadcrumb: Breadcrumb): void {

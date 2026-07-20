@@ -7,6 +7,13 @@ import { nowIso, safeStringify } from '../utils.js';
 
 const DEFAULT_MECHANISM: Mechanism = { type: 'generic', handled: true };
 
+/** Copy any NON-EMPTY per-call tags/contexts/extra off the hint onto the item. */
+function attachCallMeta(item: ErrorItem, hint?: Hint): void {
+  if (hint?.tags && Object.keys(hint.tags).length > 0) item.tags = { ...hint.tags };
+  if (hint?.contexts && Object.keys(hint.contexts).length > 0) item.contexts = { ...hint.contexts };
+  if (hint?.extra && Object.keys(hint.extra).length > 0) item.extra = { ...hint.extra };
+}
+
 interface ExtractedError {
   type: string | null;
   value: string | null;
@@ -62,7 +69,7 @@ export function buildErrorItem(err: unknown, breadcrumbs: Breadcrumb[], hint?: H
     stacktrace: extracted.stacktrace,
   };
 
-  return {
+  const item: ErrorItem = {
     type: 'error',
     timestamp: nowIso(),
     level,
@@ -72,6 +79,8 @@ export function buildErrorItem(err: unknown, breadcrumbs: Breadcrumb[], hint?: H
     session_id: getSessionId(),
     screen: (hint?.screen as string | undefined) ?? getScreen(),
   };
+  attachCallMeta(item, hint);
+  return item;
 }
 
 /** Capture an exception (or any thrown value) as an error item. */
@@ -104,5 +113,6 @@ export function captureMessage(message: string, level: Level = 'info', hint?: Hi
     session_id: getSessionId(),
     screen: getScreen(),
   };
+  attachCallMeta(item, hint);
   client.captureItem(item, hint);
 }

@@ -57,16 +57,38 @@ class Sauron {
     Object error, {
     StackTrace? stackTrace,
     Mechanism? mechanism,
+    SauronLevel level = SauronLevel.error,
+    String? screen,
+    Map<String, String>? tags,
+    Map<String, Map<String, Object?>>? contexts,
+    Map<String, Object?>? extra,
   }) =>
       _client?.captureException(
         error,
         stackTrace: stackTrace,
         mechanism: mechanism,
+        level: level,
+        screen: screen,
+        tags: tags,
+        contexts: contexts,
+        extra: extra,
       );
 
   /// Records a product-analytics event.
-  static void track(String name, {Map<String, Object?>? properties}) =>
-      _client?.track(name, properties: properties);
+  static void track(
+    String name, {
+    Map<String, Object?>? properties,
+    Map<String, String>? tags,
+    Map<String, Map<String, Object?>>? contexts,
+    Map<String, Object?>? extra,
+  }) =>
+      _client?.track(
+        name,
+        properties: properties,
+        tags: tags,
+        contexts: contexts,
+        extra: extra,
+      );
 
   /// Sets the current screen (emits a `$screen` view on change).
   static void setScreen(String name) => _client?.setScreen(name);
@@ -116,6 +138,22 @@ class Sauron {
 
   /// Sets (or clears) the current user.
   static void setUser(SauronUser? user) => _client?.setUser(user);
+
+  /// Sets a single scope tag (last-write-wins by key).
+  static void setTag(String key, String value) =>
+      _client?.setTag(key, value);
+
+  /// Merges scope tags (last-write-wins by key).
+  static void setTags(Map<String, String> values) =>
+      _client?.setTags(values);
+
+  /// Sets (replaces) a named scope context block.
+  static void setContext(String name, Map<String, Object?> block) =>
+      _client?.setContext(name, block);
+
+  /// Sets a single scope extra value (last-write-wins by key).
+  static void setExtra(String key, Object? value) =>
+      _client?.setExtra(key, value);
 
   /// Flushes buffered + persisted data.
   static Future<void> flush() async => _client?.flush();

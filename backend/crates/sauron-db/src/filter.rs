@@ -21,7 +21,7 @@ impl Op {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldType { Str, Enum, Num }
+pub enum FieldType { Str, Enum, Num, Tag }
 
 pub struct FieldSpec {
     pub key: &'static str,
@@ -97,6 +97,13 @@ pub fn parse_filters(raw: &[String], allow: &[FieldSpec]) -> Result<Vec<ParsedFi
                 }
             }
             FieldType::Str => {}
+            FieldType::Tag => {
+                // Value is `key=value`; split on the FIRST '=' and require both sides.
+                match value.split_once('=') {
+                    Some((k, v)) if !k.is_empty() && !v.is_empty() => {}
+                    _ => return Err(FilterError::BadValue { field: field.to_string() }),
+                }
+            }
         }
         out.push(ParsedFilter { field: spec.key, op, value });
     }
@@ -106,6 +113,7 @@ pub fn parse_filters(raw: &[String], allow: &[FieldSpec]) -> Result<Vec<ParsedFi
 const OPS_STR: &[Op] = &[Op::Eq, Op::Neq, Op::Contains];
 const OPS_ENUM: &[Op] = &[Op::Eq, Op::Neq];
 const OPS_NUM: &[Op] = &[Op::Eq, Op::Gt, Op::Lt];
+const OPS_TAG: &[Op] = &[Op::Eq, Op::Contains];
 const NO_OPTS: &[&str] = &[];
 
 pub const ISSUE_FILTERS: &[FieldSpec] = &[
@@ -115,6 +123,7 @@ pub const ISSUE_FILTERS: &[FieldSpec] = &[
     FieldSpec { key: "culprit", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
     FieldSpec { key: "times_seen", ty: FieldType::Num, ops: OPS_NUM, options: NO_OPTS },
     FieldSpec { key: "users_seen", ty: FieldType::Num, ops: OPS_NUM, options: NO_OPTS },
+    FieldSpec { key: "tag", ty: FieldType::Tag, ops: OPS_TAG, options: NO_OPTS },
 ];
 
 // `environment` is validated as a free string here (valid values are per-app and
@@ -125,6 +134,14 @@ pub const EVENT_FILTERS: &[FieldSpec] = &[
     FieldSpec { key: "session_id", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
     FieldSpec { key: "environment", ty: FieldType::Str, ops: OPS_ENUM, options: NO_OPTS },
     FieldSpec { key: "release", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
+    FieldSpec { key: "tag", ty: FieldType::Tag, ops: OPS_TAG, options: NO_OPTS },
+];
+
+// Per-error-event occurrences (issue detail). Only the developer `tag` is
+// filterable per-occurrence; issue-group fields (level/status/...) live on the
+// issue, not the individual event.
+pub const ERROR_EVENT_FILTERS: &[FieldSpec] = &[
+    FieldSpec { key: "tag", ty: FieldType::Tag, ops: OPS_TAG, options: NO_OPTS },
 ];
 
 #[cfg(test)]
@@ -202,5 +219,50 @@ mod tests {
             parse_filters(&["level=error".to_string()], ISSUE_FILTERS),
             Err(FilterError::Malformed)
         );
+    }
+
+    #[test]
+    fn parses_tag_filter() {
+        let got = parse_filters(&["tag:eq:region=eu".to_string()], ISSUE_FILTERS).unwrap();
+        assert_eq!(got, vec![ParsedFilter { field: "tag", op: Op::Eq, value: "region=eu".into() }]);
+        let got2 = parse_filters(&["tag:contains:feature=check".to_string()], EVENT_FILTERS).unwrap();
+        assert_eq!(got2[0].field, "tag");
+        assert_eq!(got2[0].op, Op::Contains);
+        assert_eq!(got2[0].value, "feature=check");
+    }
+
+    #[test]
+    fn tag_value_keeps_extra_equals() {
+        // Only the FIRST '=' splits key/value; the rest belongs to the value.
+        let got = parse_filters(&["tag:eq:expr=a=b".to_string()], ISSUE_FILTERS).unwrap();
+        assert_eq!(got[0].value, "expr=a=b");
+    }
+
+    #[test]
+    fn rejects_tag_without_equals() {
+        assert!(matches!(
+            parse_filters(&["tag:eq:region".to_string()], ISSUE_FILTERS),
+            Err(FilterError::BadValue { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_tag_empty_key_or_value() {
+        assert!(matches!(
+            parse_filters(&["tag:eq:=eu".to_string()], ISSUE_FILTERS),
+            Err(FilterError::BadValue { .. })
+        ));
+        assert!(matches!(
+            parse_filters(&["tag:eq:region=".to_string()], ISSUE_FILTERS),
+            Err(FilterError::BadValue { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_tag_disallowed_op() {
+        assert!(matches!(
+            parse_filters(&["tag:gt:region=eu".to_string()], ISSUE_FILTERS),
+            Err(FilterError::BadOp { .. })
+        ));
     }
 }

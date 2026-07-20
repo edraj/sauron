@@ -11,6 +11,7 @@
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import FunnelChart from '../lib/components/FunnelChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { toastStore } from '../lib/stores/toast.svelte';
@@ -36,6 +37,7 @@
   let loadingEvents = $state(true);
   let computing = $state(false);
   let error = $state<string | null>(null);
+  let refreshing = $state(false);
 
   let saved = $state<SavedFunnel[]>([]);
   let loadedId = $state<string | null>(null);
@@ -242,6 +244,17 @@
     if (aid) void loadEvents(aid);
   }
 
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([loadEvents(aid), loadSaved(aid)]);
+    } finally {
+      refreshing = false;
+    }
+  }
+
   const overallConv = $derived(result ? (result.steps.at(-1)?.conv_from_start ?? 0) : 0);
 </script>
 
@@ -251,7 +264,10 @@
       <h1 class="page-title">Funnels</h1>
       <p class="muted sub">Define an ordered set of events and track conversion & drop-off between steps.</p>
     </div>
-    <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
+    <div class="controls">
+      <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
+      <RefreshButton onclick={refresh} loading={refreshing} />
+    </div>
   </div>
 
   {#if loadingEvents}
@@ -432,6 +448,12 @@
     justify-content: space-between;
     gap: 16px;
     margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     flex-wrap: wrap;
   }
   .sub {

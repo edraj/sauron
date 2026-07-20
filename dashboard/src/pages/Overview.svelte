@@ -7,6 +7,7 @@
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import BarList from '../lib/components/BarList.svelte';
   import LevelBadge from '../lib/components/LevelBadge.svelte';
@@ -25,6 +26,7 @@
   let sinceDays = $state(30);
   let overview = $state<Overview | null>(null);
   let loading = $state(true);
+  let refreshing = $state(false);
   let error = $state<string | null>(null);
 
   async function load(appId: string, days: number) {
@@ -49,6 +51,17 @@
   function retry() {
     const aid = sessionStore.currentAppId;
     if (aid) void load(aid, sinceDays);
+  }
+
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([load(aid, sinceDays)]);
+    } finally {
+      refreshing = false;
+    }
   }
 
   // Tone helpers — severity-driven coloring for the KPI row.
@@ -81,7 +94,10 @@
       <h1 class="page-title">Overview</h1>
       <p class="muted sub">Health and activity at a glance for the last {sinceDays} days.</p>
     </div>
-    <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} ranges={RANGES} />
+    <div class="controls">
+      <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} ranges={RANGES} />
+      <RefreshButton onclick={refresh} loading={refreshing} />
+    </div>
   </div>
 
   {#if loading && !overview}
@@ -190,6 +206,12 @@
     justify-content: space-between;
     gap: 16px;
     margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     flex-wrap: wrap;
   }
   .sub {

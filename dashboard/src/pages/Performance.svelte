@@ -6,6 +6,7 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
@@ -27,6 +28,7 @@
   let rows = $state<PerfSummaryRow[]>([]);
   let series = $state<PerfSeriesPoint[]>([]);
   let loading = $state(true);
+  let refreshing = $state(false);
   let error = $state<string | null>(null);
 
   async function load(appId: string, days: number, opv: string) {
@@ -96,6 +98,17 @@
     const aid = sessionStore.currentAppId;
     if (aid) void load(aid, sinceDays, op);
   }
+
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([load(aid, sinceDays, op)]);
+    } finally {
+      refreshing = false;
+    }
+  }
 </script>
 
 <AppShell requireApp>
@@ -122,6 +135,7 @@
         {/each}
       </div>
       <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
+      <RefreshButton onclick={refresh} loading={refreshing} />
     </div>
   </div>
 

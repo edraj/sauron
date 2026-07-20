@@ -11,6 +11,7 @@
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import UserActivityChart from '../lib/components/UserActivityChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listPersons } from '../lib/api/persons';
@@ -42,6 +43,19 @@
   let sinceDays = $state(30);
   let analytics = $state<UsersAnalytics | null>(null);
   let analyticsError = $state<string | null>(null);
+
+  let refreshing = $state(false);
+
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([load(aid, query, offset), loadAnalytics(aid, sinceDays)]);
+    } finally {
+      refreshing = false;
+    }
+  }
 
   async function loadAnalytics(appId: string, days: number) {
     analyticsError = null;
@@ -117,7 +131,10 @@
       <h1 class="page-title">Users</h1>
       <p class="muted sub">Identified &amp; anonymous people seen by this app — search by distinct ID or trait.</p>
     </div>
-    <SearchInput bind:value={searchTerm} oninput={onSearch} placeholder="Search users…" width="300px" />
+    <div class="controls">
+      <SearchInput bind:value={searchTerm} oninput={onSearch} placeholder="Search users…" width="300px" />
+      <RefreshButton onclick={refresh} loading={refreshing} />
+    </div>
   </div>
 
   <div class="analytics-head">
@@ -247,6 +264,12 @@
   .sub {
     font-size: 13.5px;
     margin-top: 3px;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
   }
   .analytics-head {
     display: flex;

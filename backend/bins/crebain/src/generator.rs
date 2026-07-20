@@ -137,6 +137,9 @@ pub fn event_envelope(user: &VirtualUser, seq: u64) -> Envelope {
         timestamp: Utc::now(),
         session_id: Some(user.session_id.clone()),
         screen: Some(user.screen.to_string()),
+        tags: json!({ "screen": user.screen }),
+        contexts: json!({ "session": { "seq": seq } }),
+        extra: json!({ "value": pick % 100 }),
     });
     let txn = EnvelopeItem::Transaction(TransactionItem {
         name: txn_name.to_string(),
@@ -204,6 +207,8 @@ pub fn issue_envelope(user: &VirtualUser, seq: u64) -> Envelope {
         message: None,
         breadcrumbs: breadcrumbs(user, 2),
         tags: json!({ "screen": user.screen }),
+        contexts: json!({ "issue": { "seq": seq } }),
+        extra: json!({ "lineno": lineno }),
         fingerprint: None,
         user: None,
         session_id: Some(user.session_id.clone()),

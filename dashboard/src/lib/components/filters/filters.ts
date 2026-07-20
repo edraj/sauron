@@ -1,5 +1,5 @@
 export type Op = 'eq' | 'neq' | 'contains' | 'gt' | 'lt';
-export type FieldType = 'enum' | 'string' | 'number';
+export type FieldType = 'enum' | 'string' | 'number' | 'tag';
 
 export interface FieldDef {
   key: string;
@@ -42,9 +42,25 @@ export function parseFilters(raw: string[], fields: FieldDef[]): Filter[] {
   return out;
 }
 
+/** Compose a tag key + value into the single `key=value` filter value slot. */
+export function composeTag(key: string, value: string): string {
+  return `${key}=${value}`;
+}
+
+/** Split a `key=value` tag filter value on the first `=` (inverse of composeTag). */
+export function splitTag(v: string): { key: string; value: string } {
+  const i = v.indexOf('=');
+  if (i <= 0 || i === v.length - 1) return { key: '', value: '' };
+  return { key: v.slice(0, i), value: v.slice(i + 1) };
+}
+
 const OPS_STR: Op[] = ['eq', 'neq', 'contains'];
 const OPS_ENUM: Op[] = ['eq', 'neq'];
 const OPS_NUM: Op[] = ['eq', 'gt', 'lt'];
+// `contains` is first so it's the default op the FilterBar selects: "search by
+// tag" is expected to be a forgiving, case-insensitive substring match. `eq`
+// (exact JSONB containment) stays available for precise filtering.
+const OPS_TAG: Op[] = ['contains', 'eq'];
 
 export const ISSUE_FIELDS: FieldDef[] = [
   { key: 'level', label: 'Level', type: 'enum', ops: OPS_ENUM, options: ['debug', 'info', 'warning', 'error', 'fatal'] },
@@ -53,6 +69,7 @@ export const ISSUE_FIELDS: FieldDef[] = [
   { key: 'culprit', label: 'Culprit', type: 'string', ops: OPS_STR },
   { key: 'times_seen', label: 'Events', type: 'number', ops: OPS_NUM },
   { key: 'users_seen', label: 'Users', type: 'number', ops: OPS_NUM },
+  { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
 ];
 
 // `environment` options are injected at runtime (loaded from the environments API).
@@ -62,4 +79,10 @@ export const EVENT_FIELDS: FieldDef[] = [
   { key: 'session_id', label: 'Session', type: 'string', ops: OPS_STR },
   { key: 'environment', label: 'Environment', type: 'enum', ops: OPS_ENUM, options: [] },
   { key: 'release', label: 'Release', type: 'string', ops: OPS_STR },
+  { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
+];
+
+// Issue-detail occurrences: only the per-event `tag` is filterable.
+export const OCCURRENCE_FIELDS: FieldDef[] = [
+  { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
 ];

@@ -112,6 +112,9 @@ class ErrorItem extends EnvelopeItem {
     this.screen,
     this.rawStacktrace,
     this.debugMeta,
+    this.tags = const <String, String>{},
+    this.contexts = const <String, Map<String, Object?>>{},
+    this.extra = const <String, Object?>{},
   });
 
   final SauronException exception;
@@ -133,6 +136,16 @@ class ErrorItem extends EnvelopeItem {
 
   /// Symbol-matching metadata for [rawStacktrace] (build-id, load base, os).
   final DebugMeta? debugMeta;
+
+  /// Developer-attached flat tags (string->string). Omitted from the wire when
+  /// empty. Distinct from breadcrumbs and the machine-owned `context`.
+  final Map<String, String> tags;
+
+  /// Developer-attached structured contexts (name -> block). Omitted when empty.
+  final Map<String, Map<String, Object?>> contexts;
+
+  /// Developer-attached freeform extra (JSON). Omitted when empty.
+  final Map<String, Object?> extra;
 
   @override
   String get type => 'error';
@@ -156,6 +169,15 @@ class ErrorItem extends EnvelopeItem {
       json['raw_stacktrace'] = rawStacktrace;
       json['debug_meta'] = debugMeta?.toJson();
     }
+    if (tags.isNotEmpty) {
+      json['tags'] = tags;
+    }
+    if (contexts.isNotEmpty) {
+      json['contexts'] = contexts;
+    }
+    if (extra.isNotEmpty) {
+      json['extra'] = extra;
+    }
     return json;
   }
 }
@@ -169,7 +191,13 @@ class EventItem extends EnvelopeItem {
     this.sessionId,
     this.screen,
     Map<String, Object?>? properties,
-  }) : properties = properties ?? const <String, Object?>{};
+    Map<String, String>? tags,
+    Map<String, Map<String, Object?>>? contexts,
+    Map<String, Object?>? extra,
+  })  : properties = properties ?? const <String, Object?>{},
+        tags = tags ?? const <String, String>{},
+        contexts = contexts ?? const <String, Map<String, Object?>>{},
+        extra = extra ?? const <String, Object?>{};
 
   final String name;
   final DateTime timestamp;
@@ -182,19 +210,40 @@ class EventItem extends EnvelopeItem {
   final String? screen;
   final Map<String, Object?> properties;
 
+  /// Developer-attached flat tags (string->string). Omitted when empty.
+  final Map<String, String> tags;
+
+  /// Developer-attached structured contexts (name -> block). Omitted when empty.
+  final Map<String, Map<String, Object?>> contexts;
+
+  /// Developer-attached freeform extra (JSON). Omitted when empty.
+  final Map<String, Object?> extra;
+
   @override
   String get type => 'event';
 
   @override
-  Map<String, Object?> toJson() => <String, Object?>{
-        'type': type,
-        'name': name,
-        'distinct_id': distinctId,
-        'timestamp': sauronIso(timestamp),
-        'properties': properties,
-        'session_id': sessionId,
-        'screen': screen,
-      };
+  Map<String, Object?> toJson() {
+    final Map<String, Object?> json = <String, Object?>{
+      'type': type,
+      'name': name,
+      'distinct_id': distinctId,
+      'timestamp': sauronIso(timestamp),
+      'properties': properties,
+      'session_id': sessionId,
+      'screen': screen,
+    };
+    if (tags.isNotEmpty) {
+      json['tags'] = tags;
+    }
+    if (contexts.isNotEmpty) {
+      json['contexts'] = contexts;
+    }
+    if (extra.isNotEmpty) {
+      json['extra'] = extra;
+    }
+    return json;
+  }
 }
 
 /// A user-identification item (from `identify`).

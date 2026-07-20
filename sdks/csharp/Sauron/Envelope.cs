@@ -85,6 +85,17 @@ internal sealed class EventItem
     public string Timestamp { get; set; } = string.Empty;
     public string? SessionId { get; set; }
     public string? Screen { get; set; }
+
+    // Dev-owned metadata scopes. Omitted from the wire when null (empty) despite the
+    // global JsonIgnoreCondition.Never — the per-property attribute wins.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, object?>? Tags { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, object?>? Contexts { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, object?>? Extra { get; set; }
 }
 
 internal sealed class ErrorItem
@@ -97,6 +108,15 @@ internal sealed class ErrorItem
     public string? Message { get; set; }
     public List<object> Breadcrumbs { get; set; } = new();
     public Dictionary<string, object?> Tags { get; set; } = new();
+
+    /// <summary>Dev-owned structured context blocks (name -> block). DISTINCT from the machine
+    /// envelope <c>context</c>. Omitted when null (empty).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, object?>? Contexts { get; set; }
+
+    /// <summary>Dev-owned freeform extra (key -> any). Omitted when null (empty).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, object?>? Extra { get; set; }
 
     /// <summary>Client-supplied grouping override — honored verbatim by the backend when present.
     /// Matches the wire contract's <c>Option&lt;Vec&lt;String&gt;&gt;</c> (an array of strings, or null).</summary>

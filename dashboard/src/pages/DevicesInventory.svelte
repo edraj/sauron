@@ -9,6 +9,7 @@
   import DateRange from '../lib/components/DateRange.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listDevices } from '../lib/api/devices';
   import { errorMessage } from '../lib/api/client';
@@ -25,6 +26,7 @@
 
   let devices = $state<DeviceRow[]>([]);
   let loading = $state(true);
+  let refreshing = $state(false);
   let error = $state<string | null>(null);
 
   let debounce: ReturnType<typeof setTimeout> | undefined;
@@ -68,6 +70,17 @@
     if (aid) void load(aid, days, s, off);
   });
 
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([load(aid, sinceDays, search, offset)]);
+    } finally {
+      refreshing = false;
+    }
+  }
+
   function deviceName(d: DeviceRow): string {
     const label = [d.family, d.model].filter(Boolean).join(' ');
     return label.trim();
@@ -93,6 +106,7 @@
         placeholder="Search devices…"
         width="240px"
       />
+      <RefreshButton onclick={refresh} loading={refreshing} />
     </div>
   </div>
 

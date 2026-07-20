@@ -17,6 +17,16 @@ public sealed class SauronOptions
     /// <summary>Optional release identifier.</summary>
     public string? Release { get; set; }
 
+    /// <summary>Default tags seeded into the global scope at init (string -> string). Optional.</summary>
+    public IReadOnlyDictionary<string, string>? Tags { get; set; }
+
+    /// <summary>Default context blocks seeded into the global scope at init (name -> block). Optional.
+    /// DISTINCT from the machine envelope <c>context</c>.</summary>
+    public IReadOnlyDictionary<string, object?>? Contexts { get; set; }
+
+    /// <summary>Default extra values seeded into the global scope at init (key -> any). Optional.</summary>
+    public IReadOnlyDictionary<string, object?>? Extra { get; set; }
+
     /// <summary>Error sample rate in [0, 1]. Default 1.0.</summary>
     public double SampleRate { get; set; } = 1.0;
 
@@ -142,6 +152,17 @@ public sealed class SauronClient : IDisposable
         _transport = new Transport(dsn, options, http, ownsHttp);
         _enabled = true;
 
+        // Seed init-default metadata scopes into the process-wide global scope.
+        if (options.Tags is not null)
+            foreach (var kv in options.Tags)
+                ScopeManager.Global.SetTag(kv.Key, kv.Value);
+        if (options.Contexts is not null)
+            foreach (var kv in options.Contexts)
+                ScopeManager.Global.SetContext(kv.Key, kv.Value);
+        if (options.Extra is not null)
+            foreach (var kv in options.Extra)
+                ScopeManager.Global.SetExtra(kv.Key, kv.Value);
+
         // Opt-in only, and only for an enabled client — never wire global handlers in no-op mode.
         if (options.AutoCaptureUnhandled)
             _autoCapture = AutoCapture.Install(this);
@@ -157,7 +178,13 @@ public sealed class SauronClient : IDisposable
     internal AutoCapture? AutoCapture => _autoCapture;
 
     /// <summary>Track a product-analytics event. <paramref name="distinctId"/> is required by the wire contract.</summary>
-    public void Track(string @event, string distinctId, IReadOnlyDictionary<string, object?>? properties = null)
+    public void Track(
+        string @event,
+        string distinctId,
+        IReadOnlyDictionary<string, object?>? properties = null,
+        IReadOnlyDictionary<string, object?>? tags = null,
+        IReadOnlyDictionary<string, object?>? contexts = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
     {
         if (!_enabled || _transport is null)
             return;
@@ -172,7 +199,11 @@ public sealed class SauronClient : IDisposable
             DistinctId = distinctId,
             Properties = properties is null ? new() : new Dictionary<string, object?>(properties),
             Timestamp = Transport.Iso8601Now(),
+            Tags = tags is null || tags.Count == 0 ? null : new Dictionary<string, object?>(tags),
+            Contexts = contexts is null || contexts.Count == 0 ? null : new Dictionary<string, object?>(contexts),
+            Extra = extra is null || extra.Count == 0 ? null : new Dictionary<string, object?>(extra),
         };
+        ScopeManager.Current.ApplyToEvent(item);
         Dispatch(item);
     }
 
@@ -277,7 +308,9 @@ public sealed class SauronClient : IDisposable
         SauronUser? user = null,
         string level = "error",
         IReadOnlyDictionary<string, object?>? tags = null,
-        IReadOnlyList<string>? fingerprint = null)
+        IReadOnlyList<string>? fingerprint = null,
+        IReadOnlyDictionary<string, object?>? contexts = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
     {
         if (!_enabled || _transport is null)
             return;
@@ -285,7 +318,7 @@ public sealed class SauronClient : IDisposable
             throw new ArgumentNullException(nameof(exception));
 
         CaptureExceptionCore(
-            exception, user, level, tags, fingerprint,
+            exception, user, level, tags, fingerprint, contexts, extra,
             mechanismType: "generic", handled: true, applySampling: true);
     }
 
@@ -300,6 +333,7 @@ public sealed class SauronClient : IDisposable
 
         CaptureExceptionCore(
             exception, user: null, level: "error", tags: null, fingerprint: null,
+            contexts: null, extra: null,
             mechanismType: mechanismType, handled: false, applySampling: false);
     }
 
@@ -309,6 +343,8 @@ public sealed class SauronClient : IDisposable
         string level,
         IReadOnlyDictionary<string, object?>? tags,
         IReadOnlyList<string>? fingerprint,
+        IReadOnlyDictionary<string, object?>? contexts,
+        IReadOnlyDictionary<string, object?>? extra,
         string mechanismType,
         bool handled,
         bool applySampling)
@@ -339,10 +375,12 @@ public sealed class SauronClient : IDisposable
                 Stacktrace = StackTraceExtractor.Extract(exception, _options.InAppInclude),
             },
             Tags = tags is null ? new() : new Dictionary<string, object?>(tags),
+            Contexts = contexts is null || contexts.Count == 0 ? null : new Dictionary<string, object?>(contexts),
+            Extra = extra is null || extra.Count == 0 ? null : new Dictionary<string, object?>(extra),
             Fingerprint = fingerprint is null ? null : new List<string>(fingerprint),
             User = user is null ? null : new UserInfo { Id = user.Id, Email = user.Email, Username = user.Username },
         };
-        // Merge the active scope (tags/user under any per-call overrides, plus breadcrumbs).
+        // Merge the active scope (tags/contexts/extra/user under any per-call overrides, plus breadcrumbs).
         ScopeManager.Current.ApplyToError(item);
         Dispatch(item);
     }
@@ -351,7 +389,13 @@ public sealed class SauronClient : IDisposable
     /// Capture a plain message as an error item (default level <c>info</c>).
     /// <paramref name="fingerprint"/> is an optional grouping override.
     /// </summary>
-    public void CaptureMessage(string message, string level = "info", IReadOnlyList<string>? fingerprint = null)
+    public void CaptureMessage(
+        string message,
+        string level = "info",
+        IReadOnlyList<string>? fingerprint = null,
+        IReadOnlyDictionary<string, object?>? tags = null,
+        IReadOnlyDictionary<string, object?>? contexts = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
     {
         if (!_enabled || _transport is null)
             return;
@@ -365,6 +409,9 @@ public sealed class SauronClient : IDisposable
             Timestamp = Transport.Iso8601Now(),
             Exception = null,
             Message = message,
+            Tags = tags is null ? new() : new Dictionary<string, object?>(tags),
+            Contexts = contexts is null || contexts.Count == 0 ? null : new Dictionary<string, object?>(contexts),
+            Extra = extra is null || extra.Count == 0 ? null : new Dictionary<string, object?>(extra),
             Fingerprint = fingerprint is null ? null : new List<string>(fingerprint),
         };
         ScopeManager.Current.ApplyToError(item);

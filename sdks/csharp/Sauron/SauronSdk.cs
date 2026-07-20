@@ -37,8 +37,14 @@ public static class SauronSdk
     }
 
     /// <summary>Track a product-analytics event. <paramref name="distinctId"/> is required.</summary>
-    public static void Track(string @event, string distinctId, IReadOnlyDictionary<string, object?>? properties = null)
-        => Current?.Track(@event, distinctId, properties);
+    public static void Track(
+        string @event,
+        string distinctId,
+        IReadOnlyDictionary<string, object?>? properties = null,
+        IReadOnlyDictionary<string, object?>? tags = null,
+        IReadOnlyDictionary<string, object?>? contexts = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
+        => Current?.Track(@event, distinctId, properties, tags, contexts, extra);
 
     /// <summary>Capture a native exception. <paramref name="fingerprint"/> is an optional grouping override.</summary>
     public static void CaptureException(
@@ -46,12 +52,20 @@ public static class SauronSdk
         SauronUser? user = null,
         string level = "error",
         IReadOnlyDictionary<string, object?>? tags = null,
-        IReadOnlyList<string>? fingerprint = null)
-        => Current?.CaptureException(exception, user, level, tags, fingerprint);
+        IReadOnlyList<string>? fingerprint = null,
+        IReadOnlyDictionary<string, object?>? contexts = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
+        => Current?.CaptureException(exception, user, level, tags, fingerprint, contexts, extra);
 
     /// <summary>Capture a plain message (default level <c>info</c>). <paramref name="fingerprint"/> is an optional grouping override.</summary>
-    public static void CaptureMessage(string message, string level = "info", IReadOnlyList<string>? fingerprint = null)
-        => Current?.CaptureMessage(message, level, fingerprint);
+    public static void CaptureMessage(
+        string message,
+        string level = "info",
+        IReadOnlyList<string>? fingerprint = null,
+        IReadOnlyDictionary<string, object?>? tags = null,
+        IReadOnlyDictionary<string, object?>? contexts = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
+        => Current?.CaptureMessage(message, level, fingerprint, tags, contexts, extra);
 
     /// <summary>Identify a user with traits.</summary>
     public static void Identify(string distinctId, IReadOnlyDictionary<string, object?>? traits = null)

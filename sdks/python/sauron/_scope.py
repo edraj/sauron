@@ -160,6 +160,35 @@ class Scope:
             merged_extra.update(item.get("extra") or {})
             item["extra"] = merged_extra
 
+    def apply_to_event(self, item: Dict[str, Any]) -> None:
+        """Stamp scope tags/contexts/extra onto an analytics event item in place.
+
+        Mirrors the tags/contexts/extra half of :meth:`apply_to_error` (no user,
+        breadcrumbs, or fingerprint): scope values first, per-call values already
+        on ``item`` override (tags/extra by key, contexts by block name). Empty
+        results are omitted rather than emitted as ``{}``.
+        """
+        merged_tags: Dict[str, Any] = dict(self.tags)
+        merged_tags.update(item.get("tags") or {})
+        if merged_tags:
+            item["tags"] = merged_tags
+        else:
+            item.pop("tags", None)
+
+        merged_ctx: Dict[str, Any] = dict(self.contexts)
+        merged_ctx.update(item.get("contexts") or {})
+        if merged_ctx:
+            item["contexts"] = merged_ctx
+        else:
+            item.pop("contexts", None)
+
+        merged_extra: Dict[str, Any] = dict(self.extra)
+        merged_extra.update(item.get("extra") or {})
+        if merged_extra:
+            item["extra"] = merged_extra
+        else:
+            item.pop("extra", None)
+
 
 # -- module-level scope hub ------------------------------------------------
 

@@ -2,6 +2,7 @@
 //! `QueryResult`. Grouped by domain.
 
 use chrono::{DateTime, Utc};
+use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::sql_types::{
     BigInt, Bool, Double, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
@@ -580,15 +581,51 @@ pub async fn list_issues(
             ("users_seen", Op::Eq) => query.filter(issues::users_seen.eq(as_i64(&f.value))),
             ("users_seen", Op::Gt) => query.filter(issues::users_seen.gt(as_i64(&f.value))),
             ("users_seen", Op::Lt) => query.filter(issues::users_seen.lt(as_i64(&f.value))),
+            ("tag", Op::Eq) => {
+                let (k, v) = tag_kv(&f.value);
+                query.filter(
+                    sql::<Bool>(
+                        "EXISTS (SELECT 1 FROM error_events e \
+                         WHERE e.issue_id = issues.id AND e.app_id = issues.app_id AND e.tags @> ",
+                    )
+                    .bind::<Jsonb, _>(tag_object(k, v))
+                    .sql(")"),
+                )
+            }
+            ("tag", Op::Contains) => {
+                let (k, v) = tag_kv(&f.value);
+                query.filter(
+                    sql::<Bool>(
+                        "EXISTS (SELECT 1 FROM error_events e \
+                         WHERE e.issue_id = issues.id AND e.app_id = issues.app_id AND e.tags ->> ",
+                    )
+                    .bind::<Text, _>(k)
+                    .sql(" ILIKE ")
+                    .bind::<Text, _>(like_contains(&v))
+                    .sql(")"),
+                )
+            }
             _ => query, // unreachable: Task 1 whitelists field+op
         };
     }
     if let Some(term) = q {
         let p = like_contains(term);
         query = query.filter(
-            issues::title.ilike(p.clone())
+            issues::title
+                .ilike(p.clone())
                 .or(issues::type_.ilike(p.clone()))
-                .or(issues::culprit.ilike(p)),
+                .or(issues::culprit.ilike(p.clone()))
+                .or(sql::<Bool>(
+                    "EXISTS (SELECT 1 FROM error_events e \
+                     WHERE e.issue_id = issues.id AND e.app_id = issues.app_id \
+                     AND (e.contexts::text ILIKE ",
+                )
+                .bind::<Text, _>(p.clone())
+                .sql(" OR e.extra::text ILIKE ")
+                .bind::<Text, _>(p.clone())
+                .sql(" OR e.tags::text ILIKE ")
+                .bind::<Text, _>(p)
+                .sql("))")),
         );
     }
     query
@@ -649,10 +686,48 @@ pub async fn set_issue_users_seen(
 pub async fn list_error_events_for_issue(
     conn: &mut AsyncPgConnection,
     issue_id: Uuid,
+    filters: &[ParsedFilter],
+    q: Option<&str>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
     limit: i64,
 ) -> QueryResult<Vec<ErrorEvent>> {
-    error_events::table
+    let mut query = error_events::table
         .filter(error_events::issue_id.eq(issue_id))
+        .into_boxed();
+    if let Some(s) = since {
+        query = query.filter(error_events::occurred_at.ge(s));
+    }
+    for f in filters {
+        query = match (f.field, f.op) {
+            ("tag", Op::Eq) => {
+                let (k, v) = tag_kv(&f.value);
+                query.filter(sql::<Bool>("error_events.tags @> ").bind::<Jsonb, _>(tag_object(k, v)))
+            }
+            ("tag", Op::Contains) => {
+                let (k, v) = tag_kv(&f.value);
+                query.filter(
+                    sql::<Bool>("error_events.tags ->> ")
+                        .bind::<Text, _>(k)
+                        .sql(" ILIKE ")
+                        .bind::<Text, _>(like_contains(&v)),
+                )
+            }
+            _ => query,
+        };
+    }
+    if let Some(term) = q {
+        let p = like_contains(term);
+        query = query.filter(
+            error_events::message
+                .ilike(p.clone())
+                .or(error_events::exception_value.ilike(p.clone()))
+                .or(error_events::exception_type.ilike(p.clone()))
+                .or(sql::<Bool>("error_events.contexts::text ILIKE ").bind::<Text, _>(p.clone()))
+                .or(sql::<Bool>("error_events.extra::text ILIKE ").bind::<Text, _>(p.clone()))
+                .or(sql::<Bool>("error_events.tags::text ILIKE ").bind::<Text, _>(p)),
+        );
+    }
+    query
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)
@@ -1436,6 +1511,23 @@ pub async fn issue_stats(
 // Event Explorer (raw analytics event stream with filters)
 // ===========================================================================
 
+/// Split a `parse_filters`-validated tag value (`key=value`) on the first `=`.
+/// The value slot always contains exactly one leading `key=`, guaranteed by
+/// `FieldType::Tag` validation, so the `None` arm is defensive only.
+fn tag_kv(value: &str) -> (String, String) {
+    match value.split_once('=') {
+        Some((k, v)) => (k.to_string(), v.to_string()),
+        None => (value.to_string(), String::new()),
+    }
+}
+
+/// A single-key JSONB object `{key: value}` for a `tags @> …` containment bind.
+fn tag_object(key: String, value: String) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert(key, serde_json::Value::String(value));
+    serde_json::Value::Object(m)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn list_analytics_events(
     conn: &mut AsyncPgConnection,
@@ -1478,6 +1570,19 @@ pub async fn list_analytics_events(
             ("release", Op::Eq) => query.filter(analytics_events::release.eq(f.value.clone())),
             ("release", Op::Neq) => query.filter(analytics_events::release.ne(f.value.clone())),
             ("release", Op::Contains) => query.filter(analytics_events::release.ilike(like_contains(&f.value))),
+            ("tag", Op::Eq) => {
+                let (k, v) = tag_kv(&f.value);
+                query.filter(sql::<Bool>("analytics_events.tags @> ").bind::<Jsonb, _>(tag_object(k, v)))
+            }
+            ("tag", Op::Contains) => {
+                let (k, v) = tag_kv(&f.value);
+                query.filter(
+                    sql::<Bool>("analytics_events.tags ->> ")
+                        .bind::<Text, _>(k)
+                        .sql(" ILIKE ")
+                        .bind::<Text, _>(like_contains(&v)),
+                )
+            }
             _ => query, // environment handled below; others unreachable
         };
     }
@@ -1495,8 +1600,13 @@ pub async fn list_analytics_events(
     if let Some(term) = q {
         let p = like_contains(term);
         query = query.filter(
-            analytics_events::name.ilike(p.clone())
-                .or(analytics_events::distinct_id.ilike(p)),
+            analytics_events::name
+                .ilike(p.clone())
+                .or(analytics_events::distinct_id.ilike(p.clone()))
+                .or(sql::<Bool>("analytics_events.contexts::text ILIKE ").bind::<Text, _>(p.clone()))
+                .or(sql::<Bool>("analytics_events.extra::text ILIKE ").bind::<Text, _>(p.clone()))
+                .or(sql::<Bool>("analytics_events.properties::text ILIKE ").bind::<Text, _>(p.clone()))
+                .or(sql::<Bool>("analytics_events.tags::text ILIKE ").bind::<Text, _>(p)),
         );
     }
     query

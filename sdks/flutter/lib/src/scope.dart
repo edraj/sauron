@@ -35,4 +35,29 @@ class Scope {
 
   /// Clears all breadcrumbs.
   void clearBreadcrumbs() => _breadcrumbs.clear();
+
+  /// Developer-attached flat tags (string->string), seeded from init options
+  /// and mutated by [setTag]/[setTags]. Merged under per-call tags on capture.
+  final Map<String, String> tags = <String, String>{};
+
+  /// Developer-attached structured contexts (name -> block). Distinct from the
+  /// machine-owned device/os/app/runtime context.
+  final Map<String, Map<String, Object?>> contexts =
+      <String, Map<String, Object?>>{};
+
+  /// Developer-attached freeform extra (JSON).
+  final Map<String, Object?> extra = <String, Object?>{};
+
+  /// Sets a single tag (last-write-wins by key).
+  void setTag(String key, String value) => tags[key] = value;
+
+  /// Merges the given tags into the scope (last-write-wins by key).
+  void setTags(Map<String, String> values) => tags.addAll(values);
+
+  /// Sets (replaces) a named context block.
+  void setContext(String name, Map<String, Object?> block) =>
+      contexts[name] = block;
+
+  /// Sets a single extra value (last-write-wins by key).
+  void setExtra(String key, Object? value) => extra[key] = value;
 }

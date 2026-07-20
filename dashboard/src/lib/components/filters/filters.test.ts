@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { encodeFilters, parseFilters, ISSUE_FIELDS, EVENT_FIELDS, type Filter } from './filters';
+import {
+  encodeFilters, parseFilters, ISSUE_FIELDS, EVENT_FIELDS, composeTag, splitTag, type Filter,
+} from './filters';
 
 describe('filters codec', () => {
   const f: Filter[] = [
@@ -32,5 +34,31 @@ describe('filters codec', () => {
   it('round-trips EVENT_FIELDS', () => {
     const ef: Filter[] = [{ field: 'name', op: 'contains', value: 'checkout' }];
     expect(parseFilters(encodeFilters(ef), EVENT_FIELDS)).toEqual(ef);
+  });
+});
+
+describe('tag filter', () => {
+  it('round-trips a tag filter through encode/parse', () => {
+    const f = [{ field: 'tag', op: 'eq' as const, value: 'region=eu' }];
+    const enc = encodeFilters(f);
+    expect(enc).toEqual(['tag:eq:region%3Deu']);
+    expect(parseFilters(enc, ISSUE_FIELDS)).toEqual(f);
+    expect(parseFilters(enc, EVENT_FIELDS)).toEqual(f);
+  });
+
+  it('composeTag/splitTag are inverse', () => {
+    expect(composeTag('region', 'eu')).toBe('region=eu');
+    expect(splitTag('region=eu')).toEqual({ key: 'region', value: 'eu' });
+    expect(splitTag('expr=a=b')).toEqual({ key: 'expr', value: 'a=b' });
+    expect(splitTag('nope')).toEqual({ key: '', value: '' });
+  });
+
+  it('both registries expose a tag field defaulting to contains, with eq available', () => {
+    for (const reg of [ISSUE_FIELDS, EVENT_FIELDS]) {
+      const tag = reg.find((d) => d.key === 'tag');
+      expect(tag?.type).toBe('tag');
+      // `contains` is first → it's the default op the FilterBar picks.
+      expect(tag?.ops).toEqual(['contains', 'eq']);
+    }
   });
 });

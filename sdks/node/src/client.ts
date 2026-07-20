@@ -21,6 +21,7 @@ import type {
   IdentifyItem,
   InitOptions,
   Level,
+  MetadataOptions,
   ResolvedOptions,
   TransactionInput,
   TransactionItem,
@@ -49,6 +50,9 @@ function resolveOptions(options: InitOptions): ResolvedOptions {
     dsn: options.dsn,
     environment: options.environment ?? DEFAULTS.environment,
     release: options.release ?? DEFAULTS.release,
+    tags: options.tags ?? {},
+    contexts: options.contexts ?? {},
+    extra: options.extra ?? {},
     sampleRate: Math.min(1, Math.max(0, sampleRate)),
     flushInterval:
       typeof options.flushInterval === 'number'
@@ -116,7 +120,15 @@ export class SauronClient {
   constructor(options: InitOptions) {
     this.options = resolveOptions(options);
     const dsn = parseDsn(this.options.dsn);
-    getGlobalScope().setMaxBreadcrumbs(this.options.maxBreadcrumbs);
+    const globalScope = getGlobalScope();
+    globalScope.setMaxBreadcrumbs(this.options.maxBreadcrumbs);
+    globalScope.setTags(this.options.tags);
+    for (const [name, block] of Object.entries(this.options.contexts)) {
+      globalScope.setContext(name, block);
+    }
+    for (const [key, value] of Object.entries(this.options.extra)) {
+      globalScope.setExtra(key, value);
+    }
     this.transport = new Transport({
       dsn,
       environment: this.options.environment,
@@ -191,7 +203,12 @@ export class SauronClient {
   }
 
   /** Capture a product-analytics event. `distinctId` is required. */
-  track(event: string, distinctId: string, properties?: Record<string, unknown>): void {
+  track(
+    event: string,
+    distinctId: string,
+    properties?: Record<string, unknown>,
+    options: MetadataOptions = {},
+  ): void {
     if (typeof event !== 'string' || event.length === 0) return;
     if (typeof distinctId !== 'string' || distinctId.length === 0) return;
     const item: EventItem = {
@@ -202,6 +219,7 @@ export class SauronClient {
       timestamp: isoNow(),
       session_id: null,
       screen: null,
+      ...getCurrentScope().mergeMetadata(options),
     };
     this.dispatch(item);
   }
@@ -226,6 +244,8 @@ export class SauronClient {
       message: null,
       breadcrumbs: [],
       tags: options.tags ?? {},
+      contexts: options.contexts ?? {},
+      extra: options.extra ?? {},
       fingerprint: options.fingerprint ?? null,
       user: normalizeUser(options.user),
       session_id: null,
@@ -236,7 +256,7 @@ export class SauronClient {
   }
 
   /** Capture a bare message as an error item (no exception payload). */
-  captureMessage(message: string, level: Level = 'info'): void {
+  captureMessage(message: string, level: Level = 'info', options: MetadataOptions = {}): void {
     const item: ErrorItem = {
       type: 'error',
       event_id: randomUUID(),
@@ -250,7 +270,9 @@ export class SauronClient {
       },
       message,
       breadcrumbs: [],
-      tags: {},
+      tags: options.tags ?? {},
+      contexts: options.contexts ?? {},
+      extra: options.extra ?? {},
       fingerprint: null,
       user: null,
       session_id: null,

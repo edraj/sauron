@@ -57,6 +57,45 @@ describe('scope', () => {
     expect(item.breadcrumbs).toHaveLength(1);
     expect(item.breadcrumbs[0].message).toBe('clicked');
   });
+
+  it('merges scope contexts/extra under per-call on an error item, omitting empties', () => {
+    const s = new Scope();
+    s.setContext('order', { id: 7 });
+    s.setExtra('trace_id', 'abc');
+    const item: any = {
+      type: 'error',
+      tags: {},
+      contexts: { order: { id: 99 }, cart: { size: 2 } },
+    };
+    s.applyToErrorItem(item);
+    // per-call 'order' block REPLACES the scope's same-named block; per-call 'cart' is kept
+    expect(item.contexts).toEqual({ order: { id: 99 }, cart: { size: 2 } });
+    // scope-only extra flows through
+    expect(item.extra).toEqual({ trace_id: 'abc' });
+  });
+
+  it('omits contexts/extra entirely when both scope and per-call are empty', () => {
+    const s = new Scope();
+    const item: any = { type: 'error', tags: {} };
+    s.applyToErrorItem(item);
+    expect('contexts' in item).toBe(false);
+    expect('extra' in item).toBe(false);
+    // tags stays present ({}) per the existing Node convention
+    expect(item.tags).toEqual({});
+  });
+
+  it('mergeMetadata layers per-call over scope and omits empty maps', () => {
+    const s = new Scope();
+    s.setTag('env', 'prod');
+    s.setContext('order', { id: 7 });
+    const merged = s.mergeMetadata({ tags: { req: '42' }, contexts: { order: { id: 9 } } });
+    expect(merged).toEqual({ tags: { env: 'prod', req: '42' }, contexts: { order: { id: 9 } } });
+    expect('extra' in merged).toBe(false);
+  });
+
+  it('mergeMetadata returns an empty object when nothing is set', () => {
+    expect(new Scope().mergeMetadata()).toEqual({});
+  });
 });
 
 const tick = () => new Promise((r) => setTimeout(r, 5));

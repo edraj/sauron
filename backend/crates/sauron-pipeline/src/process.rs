@@ -197,11 +197,9 @@ async fn process_error(
             stacktrace,
             breadcrumbs: serde_json::to_value(&e.breadcrumbs).unwrap_or_else(|_| json!([])),
             context: context.clone(),
-            tags: if e.tags.is_null() {
-                json!({})
-            } else {
-                e.tags.clone()
-            },
+            tags: object_or_empty(e.tags.clone()),
+            contexts: object_or_empty(e.contexts.clone()),
+            extra: object_or_empty(e.extra.clone()),
             release: job.release.clone(),
             distinct_id: distinct.clone(),
             event_user,
@@ -265,11 +263,7 @@ async fn process_event(
             environment_id,
             name: ev.name,
             distinct_id: ev.distinct_id.clone(),
-            properties: if ev.properties.is_null() {
-                json!({})
-            } else {
-                ev.properties
-            },
+            properties: object_or_empty(ev.properties),
             context: context.clone(),
             session_id: ev.session_id,
             release: job.release.clone(),
@@ -277,6 +271,9 @@ async fn process_event(
             occurred_at: ev.timestamp,
             device_key: info.device_key.clone(),
             screen: ev.screen.clone(),
+            tags: object_or_empty(ev.tags),
+            contexts: object_or_empty(ev.contexts),
+            extra: object_or_empty(ev.extra),
         },
     )
     .await?;
@@ -305,11 +302,7 @@ async fn process_identify(
     job: &IngestJob,
     id: IdentifyItem,
 ) -> anyhow::Result<()> {
-    let traits = if id.traits.is_null() {
-        json!({})
-    } else {
-        id.traits
-    };
+    let traits = object_or_empty(id.traits);
     repo::upsert_event_user(conn, job.app_id, &id.distinct_id, &traits).await?;
     if let Some(anon) = id.anonymous_id {
         if !anon.is_empty() {
@@ -390,6 +383,18 @@ fn distinct_id(user: Option<&EventUser>) -> Option<String> {
     user.and_then(|u| u.id.clone()).filter(|s| !s.is_empty())
 }
 
+/// Normalize a dev-supplied scope map for JSONB storage: `null` (the serde
+/// default for an omitted key) becomes an empty object so the column is never
+/// NULL; any other value passes through verbatim. The backend does not merge —
+/// the SDK ships the already-merged effective scope.
+fn object_or_empty(v: Value) -> Value {
+    if v.is_null() {
+        json!({})
+    } else {
+        v
+    }
+}
+
 fn build_title(exc: Option<&ExceptionInfo>, message: Option<&str>) -> String {
     match exc {
         Some(x) => {
@@ -431,5 +436,25 @@ fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((idx, _)) => &s[..idx],
         None => s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::object_or_empty;
+    use serde_json::json;
+
+    #[test]
+    fn object_or_empty_maps_null_to_empty_object() {
+        assert_eq!(object_or_empty(serde_json::Value::Null), json!({}));
+    }
+
+    #[test]
+    fn object_or_empty_preserves_non_empty_maps() {
+        assert_eq!(object_or_empty(json!({ "region": "eu" })), json!({ "region": "eu" }));
+        assert_eq!(
+            object_or_empty(json!({ "order": { "id": 7 } })),
+            json!({ "order": { "id": 7 } })
+        );
     }
 }

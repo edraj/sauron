@@ -109,12 +109,47 @@ export class Scope {
    */
   applyToErrorItem(item: {
     tags?: Record<string, string>;
+    contexts?: Record<string, unknown>;
+    extra?: Record<string, unknown>;
     user?: ErrorUser | null;
     breadcrumbs?: Breadcrumb[];
   }): void {
     item.tags = { ...this.data.tags, ...(item.tags ?? {}) };
+    const contexts = { ...this.data.contexts, ...(item.contexts ?? {}) };
+    if (Object.keys(contexts).length > 0) item.contexts = contexts;
+    else delete item.contexts;
+    const extra = { ...this.data.extra, ...(item.extra ?? {}) };
+    if (Object.keys(extra).length > 0) item.extra = extra;
+    else delete item.extra;
     if (item.user == null) item.user = toErrorUser(this.data.user);
     item.breadcrumbs = this.data.breadcrumbs.slice();
+  }
+
+  /**
+   * Merge this scope's metadata *under* per-call overrides for non-error items
+   * (analytics `track`). tags & extra merge by shallow key; contexts merge by
+   * block name (a per-call block replaces the same-named scope block). Empty
+   * maps are omitted from the result per the emit convention.
+   */
+  mergeMetadata(
+    overrides: {
+      tags?: Record<string, string>;
+      contexts?: Record<string, unknown>;
+      extra?: Record<string, unknown>;
+    } = {},
+  ): { tags?: Record<string, string>; contexts?: Record<string, unknown>; extra?: Record<string, unknown> } {
+    const out: {
+      tags?: Record<string, string>;
+      contexts?: Record<string, unknown>;
+      extra?: Record<string, unknown>;
+    } = {};
+    const tags = { ...this.data.tags, ...(overrides.tags ?? {}) };
+    if (Object.keys(tags).length > 0) out.tags = tags;
+    const contexts = { ...this.data.contexts, ...(overrides.contexts ?? {}) };
+    if (Object.keys(contexts).length > 0) out.contexts = contexts;
+    const extra = { ...this.data.extra, ...(overrides.extra ?? {}) };
+    if (Object.keys(extra).length > 0) out.extra = extra;
+    return out;
   }
 }
 

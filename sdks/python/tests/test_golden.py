@@ -74,6 +74,8 @@ GOLDEN_ERROR = {
     "user": {"id": "u_123", "email": "a@b.co"},
     "session_id": None,
     "screen": None,
+    "contexts": {"order": {"id": 7}},
+    "extra": {"build": "abc123"},
 }
 
 GOLDEN_EVENT = {
@@ -84,6 +86,9 @@ GOLDEN_EVENT = {
     "timestamp": TS,
     "session_id": None,
     "screen": None,
+    "tags": {"area": "billing", "tier": "pro"},
+    "contexts": {"order": {"id": 7}},
+    "extra": {"build": "abc123"},
 }
 
 GOLDEN_IDENTIFY = {
@@ -201,6 +206,8 @@ class TestGoldenClientEmitsShape(unittest.TestCase):
         get_current_scope().set_user({"id": "u_123", "email": "a@b.co"})
         get_current_scope().set_tag("area", "billing")
         get_current_scope().set_tags({"tier": "pro"})
+        get_current_scope().set_context("order", {"id": 7})
+        get_current_scope().set_extra("build", "abc123")
         client.add_breadcrumb(
             type="navigation",
             category="history",
@@ -262,6 +269,17 @@ class TestGoldenClientEmitsShape(unittest.TestCase):
         self.assertEqual(error["tags"], {"area": "billing", "tier": "pro"})
         self.assertEqual(error["user"], {"id": "u_123", "email": "a@b.co"})
         self.assertEqual(error["fingerprint"], ["billing", "TypeError"])
+
+    def test_metadata_scopes_present_on_error_and_event(self):
+        items = self._emit_golden()
+        error, event = items[0], items[1]
+        # Dev metadata scopes flow from the scope onto both signal types,
+        # distinct from the machine-owned envelope "context" block.
+        self.assertEqual(error["contexts"], {"order": {"id": 7}})
+        self.assertEqual(error["extra"], {"build": "abc123"})
+        self.assertEqual(event["tags"], {"area": "billing", "tier": "pro"})
+        self.assertEqual(event["contexts"], {"order": {"id": 7}})
+        self.assertEqual(event["extra"], {"build": "abc123"})
 
 
 if __name__ == "__main__":

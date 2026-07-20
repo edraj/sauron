@@ -9,6 +9,7 @@
   import DateRange from '../lib/components/DateRange.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
@@ -38,6 +39,8 @@
   let analytics = $state<SessionsAnalytics | null>(null);
   let analyticsError = $state<string | null>(null);
 
+  let refreshing = $state(false);
+
   // TimeSeriesChart consumes {bucket, count}; map avg_ms → count and format as duration.
   const durationSeries = $derived<SeriesPoint[]>(
     (analytics?.duration_series ?? []).map((p) => ({ bucket: p.bucket, count: p.avg_ms })),
@@ -63,6 +66,17 @@
       sessions = [];
     } finally {
       loading = false;
+    }
+  }
+
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([load(aid, sinceDays, offset), loadAnalytics(aid, sinceDays)]);
+    } finally {
+      refreshing = false;
     }
   }
 
@@ -111,6 +125,7 @@
     <div class="controls">
       <SearchInput bind:value={search} placeholder="Filter session / user / device…" width="280px" />
       <DateRange value={sinceDays} onchange={onRange} />
+      <RefreshButton onclick={refresh} loading={refreshing} />
     </div>
   </div>
 

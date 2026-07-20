@@ -57,6 +57,8 @@ const GOLDEN_ERROR: ErrorItem = {
     },
   ],
   tags: { env: 'prod', req: '42' },
+  contexts: { order: { id: 7 } },
+  extra: { trace_id: 'abc123' },
   fingerprint: ['checkout-failure'],
   user: { id: 'u_123', email: null, username: null },
   session_id: null,
@@ -71,6 +73,9 @@ const GOLDEN_EVENT: EventItem = {
   timestamp: '2026-07-15T10:29:40.000Z',
   session_id: null,
   screen: null,
+  tags: { env: 'prod', req: '42' },
+  contexts: { order: { id: 7 } },
+  extra: { trace_id: 'abc123' },
 };
 
 const GOLDEN_IDENTIFY: IdentifyItem = {
@@ -181,6 +186,8 @@ describe('client emits the reconciled golden shape', () => {
     await withScope(async (scope) => {
       scope.setUser({ id: 'u_123' });
       scope.setTags({ env: 'prod', req: '42' });
+      scope.setContext('order', { id: 7 });
+      scope.setExtra('trace_id', 'abc123');
       client.addBreadcrumb({
         type: 'navigation',
         category: 'history',
@@ -244,5 +251,17 @@ describe('client emits the reconciled golden shape', () => {
     expect('status' in item).toBe(false);
     expect('url' in item).toBe(false);
     expect('distinct_id' in item).toBe(false);
+  });
+
+  it('omits contexts/extra on an error captured with no metadata set', async () => {
+    const client = newClient(fake.fetchImpl);
+    client.captureException(new Error('bare'));
+    await client.flush();
+
+    const item = fake.envelopes[0].items[0] as unknown as Record<string, unknown>;
+    expect(item.type).toBe('error');
+    expect('contexts' in item).toBe(false);
+    expect('extra' in item).toBe(false);
+    expect(item.tags).toEqual({}); // tags stays present per the existing Node convention
   });
 });

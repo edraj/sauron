@@ -65,11 +65,57 @@ internal sealed class Scope
         foreach (var kv in Tags)
             item.Tags.TryAdd(kv.Key, kv.Value);
 
+        if (Contexts.Count > 0)
+        {
+            item.Contexts ??= new Dictionary<string, object?>();
+            foreach (var kv in Contexts)
+                item.Contexts.TryAdd(kv.Key, kv.Value); // per-call block name wins
+        }
+        if (item.Contexts is { Count: 0 })
+            item.Contexts = null; // omit-when-empty
+
+        if (Extra.Count > 0)
+        {
+            item.Extra ??= new Dictionary<string, object?>();
+            foreach (var kv in Extra)
+                item.Extra.TryAdd(kv.Key, kv.Value); // per-call key wins
+        }
+        if (item.Extra is { Count: 0 })
+            item.Extra = null; // omit-when-empty
+
         if (User is not null && item.User is null)
             item.User = new UserInfo { Id = User.Id, Email = User.Email, Username = User.Username };
 
         foreach (var crumb in Breadcrumbs)
             item.Breadcrumbs.Add(ToWire(crumb));
+    }
+
+    /// <summary>Merge this scope's tags/contexts/extra onto an outgoing analytics event.
+    /// Per-call values already on the item win (tags/extra by key, contexts by block name).
+    /// Empty results are normalized to null so they are omitted from the wire.</summary>
+    public void ApplyToEvent(EventItem item)
+    {
+        if (Tags.Count > 0)
+        {
+            item.Tags ??= new Dictionary<string, object?>();
+            foreach (var kv in Tags)
+                item.Tags.TryAdd(kv.Key, kv.Value);
+        }
+        if (Contexts.Count > 0)
+        {
+            item.Contexts ??= new Dictionary<string, object?>();
+            foreach (var kv in Contexts)
+                item.Contexts.TryAdd(kv.Key, kv.Value);
+        }
+        if (Extra.Count > 0)
+        {
+            item.Extra ??= new Dictionary<string, object?>();
+            foreach (var kv in Extra)
+                item.Extra.TryAdd(kv.Key, kv.Value);
+        }
+        if (item.Tags is { Count: 0 }) item.Tags = null;
+        if (item.Contexts is { Count: 0 }) item.Contexts = null;
+        if (item.Extra is { Count: 0 }) item.Extra = null;
     }
 
     private static BreadcrumbWire ToWire(Breadcrumb b) => new()

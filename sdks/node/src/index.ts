@@ -13,6 +13,7 @@ import type {
   CaptureExceptionOptions,
   InitOptions,
   Level,
+  MetadataOptions,
   TransactionInput,
   User,
 } from './types.js';
@@ -55,8 +56,9 @@ export function track(
   event: string,
   distinctId: string,
   properties?: Record<string, unknown>,
+  options?: MetadataOptions,
 ): void {
-  activeClient?.track(event, distinctId, properties);
+  activeClient?.track(event, distinctId, properties, options);
 }
 
 /** Capture a native `Error`. No-op if the SDK is not initialized. */
@@ -65,8 +67,8 @@ export function captureException(error: unknown, options?: CaptureExceptionOptio
 }
 
 /** Capture a bare message. No-op if the SDK is not initialized. */
-export function captureMessage(message: string, level?: Level): void {
-  activeClient?.captureMessage(message, level);
+export function captureMessage(message: string, level?: Level, options?: MetadataOptions): void {
+  activeClient?.captureMessage(message, level, options);
 }
 
 /** Associate traits with a distinct id. No-op if the SDK is not initialized. */

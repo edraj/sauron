@@ -44,6 +44,9 @@ functions.
 | `dsn` | `string` | *(required)* | `https://<public_key>@<host>/<project_id>` |
 | `environment` | `string` | — | e.g. `production` |
 | `release` | `string` | — | e.g. `web@1.4.2` |
+| `tags` | `Record<string, string>` | — | default scope tags (see [Tags, contexts & extra](#tags-contexts--extra)) |
+| `contexts` | `Record<string, Record<string, unknown>>` | — | default scope context blocks |
+| `extra` | `Record<string, unknown>` | — | default freeform extra |
 | `sampleRate` | `number` | `1` | error sample rate in `[0,1]` |
 | `maxBreadcrumbs` | `number` | `50` | breadcrumb ring size |
 | `beforeSend` | `(item, hint?) => item \| null` | — | drop/mutate any outgoing item |
@@ -66,6 +69,9 @@ before init).
 | `captureMessage` | `captureMessage(message: string, level?: Level, hint?: Hint): void` — default level `info` |
 | `identify` | `identify(id: string, traits?: Record<string, unknown>): void` |
 | `setUser` | `setUser(user: UserInput): void` — pass `null` to clear |
+| `setTag` / `setTags` | `setTag(key: string, value: string): void` · `setTags(tags: Record<string, string>): void` |
+| `setContext` | `setContext(name: string, block: Record<string, unknown>): void` — replace a named block |
+| `setExtra` | `setExtra(key: string, value: unknown): void` |
 | `trackTransaction` | `trackTransaction(input: TransactionInput): void` |
 | `setScreen` | `setScreen(name: string): void` — emits a `$screen` view on change |
 | `getScreen` | `getScreen(): string \| null` |
@@ -103,12 +109,37 @@ Sauron.identify('u_123', { plan: 'pro' });
 Sauron.setUser({ id: 'u_123', email: 'ada@example.com' });
 ```
 
-The scope's user (from `setUser`) and its tags are stamped onto captured errors (via the
-new `user`/`tags` error-item fields). To set a scope tag, reach the client's scope:
+The scope's user (from `setUser`) and its tags are stamped onto captured errors and
+events (via the `user`/`tags` item fields).
+
+### Tags, contexts & extra
+
+Attach your own metadata directly from the top-level API — no need to reach into the
+client scope:
 
 ```ts
-Sauron.getClient()?.getScope().setTag('checkout_step', 'payment');
+Sauron.setTag('checkout_step', 'payment');          // one filterable tag
+Sauron.setTags({ region: 'eu-central', tier: 'pro' });
+Sauron.setContext('cart', { item_count: 3, total: 42.5 }); // a named structured block
+Sauron.setExtra('experiment_bucket', 'B');          // a loose one-off value
 ```
+
+A value set on the scope is lifted onto **every later error/event**. You can also seed
+defaults at `init` (`tags` / `contexts` / `extra`), or pass them for a single call:
+
+```ts
+Sauron.captureException(err, {
+  tags: { severity: 'high' },
+  contexts: { order: { id: 'ord_1001', items: 3 } },
+});
+```
+
+**Tags** are a flat `key → value` map (indexed for filtering); **contexts** are named
+structured blocks; **extra** is loose values — all developer-set, and distinct from the
+SDK's machine-collected `context` (device/OS/browser). See
+**[Best Practices §4](Best-Practices.md)** for when to use which, the
+**[Dashboard](Dashboard.md)** for where they appear, and **[Search](Search.md)** to
+filter by them.
 
 ### Breadcrumbs
 

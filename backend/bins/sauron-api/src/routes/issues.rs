@@ -122,12 +122,20 @@ pub async fn update(
 
 #[derive(Deserialize)]
 pub struct EventsQuery {
+    #[serde(default)]
+    pub filter: Vec<String>,
+    pub q: Option<String>,
+    #[serde(default = "default_events_since_days")]
+    pub since_days: i64,
     #[serde(default = "default_events_limit")]
     pub limit: i64,
 }
 
 fn default_events_limit() -> i64 {
     30
+}
+fn default_events_since_days() -> i64 {
+    3650
 }
 
 pub async fn events(
@@ -146,8 +154,12 @@ pub async fn events(
     repo::get_issue(&mut conn, app_id, issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    let filters = sauron_db::filter::parse_filters(&q.filter, sauron_db::filter::ERROR_EVENT_FILTERS)?;
+    let search = q.q.as_deref().filter(|s| !s.is_empty());
+    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 3650));
     let limit = q.limit.clamp(1, 100);
-    let mut events = repo::list_error_events_for_issue(&mut conn, issue_id, limit).await?;
+    let mut events =
+        repo::list_error_events_for_issue(&mut conn, issue_id, &filters, search, Some(since), limit).await?;
     drop(conn); // release before per-event symbolication (checks out its own)
     for ev in events.iter_mut() {
         crate::symbolicate::symbolicate_event(&state, app_id, ev).await;

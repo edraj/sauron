@@ -8,6 +8,7 @@
   import BarList from '../lib/components/BarList.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SankeyChart from '../lib/components/SankeyChart.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { getJourney } from '../lib/api/journeys';
   import { errorMessage } from '../lib/api/client';
@@ -21,6 +22,7 @@
   let journey = $state<Journey | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  let refreshing = $state(false);
 
   async function load(appId: string, days: number, d: number) {
     loading = true;
@@ -59,6 +61,17 @@
     const aid = sessionStore.currentAppId;
     if (aid) void load(aid, sinceDays, depth);
   }
+
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([load(aid, sinceDays, depth)]);
+    } finally {
+      refreshing = false;
+    }
+  }
 </script>
 
 <AppShell requireApp>
@@ -89,6 +102,7 @@
           {/each}
         </div>
       </div>
+      <RefreshButton onclick={refresh} loading={refreshing} />
     </div>
   </div>
 

@@ -16,6 +16,9 @@ diesel::table! {
         received_at -> Timestamptz,
         device_key -> Nullable<Text>,
         screen -> Nullable<Text>,
+        tags -> Jsonb,
+        contexts -> Jsonb,
+        extra -> Jsonb,
     }
 }
 
@@ -71,6 +74,8 @@ diesel::table! {
         stacktrace_symbolicated -> Nullable<Jsonb>,
         symbolication_status -> Text,
         debug_meta -> Nullable<Jsonb>,
+        contexts -> Jsonb,
+        extra -> Jsonb,
     }
 }
 

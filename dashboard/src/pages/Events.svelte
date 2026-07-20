@@ -11,6 +11,7 @@
   import Pagination from '../lib/components/Pagination.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import {
     EVENT_FIELDS,
@@ -55,6 +56,7 @@
   let loadingTop = $state(true);
   let loadingSeries = $state(true);
   let error = $state<string | null>(null);
+  let refreshing = $state(false);
 
   // Raw event stream state.
   let streamOffset = $state(0);
@@ -126,6 +128,23 @@
       streamEvents = [];
     } finally {
       loadingStream = false;
+    }
+  }
+
+  // Re-fetch all page data with the current state (filters, search, date
+  // range and pagination) left intact. Reuses the existing loaders.
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([
+        loadTop(aid, sinceDays),
+        loadSeries(aid, sinceDays, selectedTopEvent),
+        loadStream(aid, encodeFilters(filters), appliedSearch, sinceDays, streamOffset),
+      ]);
+    } finally {
+      refreshing = false;
     }
   }
 
@@ -218,8 +237,12 @@
       <h1 class="page-title">Events</h1>
       <p class="muted sub">Product analytics — event volume, top events and raw stream.</p>
     </div>
+    <div class="controls">
+      <RefreshButton onclick={refresh} loading={refreshing} />
+    </div>
   </div>
 
+  <p class="hint muted">Filter by <code>Tag</code> (key = value); the search box also matches tag &amp; payload content.</p>
   <FilterBar fields={eventFields} bind:filters bind:search bind:sinceDays />
 
   {#if error && top.length === 0 && series.length === 0}
@@ -362,6 +385,15 @@
                     {:else}
                       <span class="faint">No properties on this event.</span>
                     {/if}
+                    {#if ev.tags && Object.keys(ev.tags).length > 0}
+                      <JsonTree value={ev.tags} name="tags" expandTo={2} />
+                    {/if}
+                    {#if ev.contexts && Object.keys(ev.contexts).length > 0}
+                      <JsonTree value={ev.contexts} name="contexts" expandTo={2} />
+                    {/if}
+                    {#if ev.extra && Object.keys(ev.extra).length > 0}
+                      <JsonTree value={ev.extra} name="extra" expandTo={2} />
+                    {/if}
                   </td>
                 </tr>
               {/if}
@@ -396,6 +428,12 @@
   .sub {
     font-size: 13.5px;
     margin-top: 3px;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
   }
   .grid {
     display: grid;

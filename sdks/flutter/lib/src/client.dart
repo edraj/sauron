@@ -28,6 +28,9 @@ class SauronClient {
       : _scope = Scope(maxBreadcrumbs: options.maxBreadcrumbs),
         sessionId = generateUuidV4() {
     _currentScreen = options.screen;
+    _scope.setTags(options.tags);
+    _scope.contexts.addAll(options.contexts);
+    _scope.extra.addAll(options.extra);
     if (options.isConfigured) {
       try {
         _dsn = Dsn.parse(options.dsn!);
@@ -129,6 +132,9 @@ class SauronClient {
     Mechanism? mechanism,
     SauronLevel level = SauronLevel.error,
     String? screen,
+    Map<String, String>? tags,
+    Map<String, Map<String, Object?>>? contexts,
+    Map<String, Object?>? extra,
   }) {
     if (!isEnabled) {
       return;
@@ -158,6 +164,9 @@ class SauronClient {
       screen: screen ?? _currentScreen,
       rawStacktrace: obfuscated ? rawTrace : null,
       debugMeta: obfuscated ? DebugMeta.fromTrace(rawTrace) : null,
+      tags: _mergeTags(tags),
+      contexts: _mergeContexts(contexts),
+      extra: _mergeExtra(extra),
     );
     // `beforeSend` is applied uniformly for every item in [_dispatch].
     _dispatch(item);
@@ -166,7 +175,14 @@ class SauronClient {
   }
 
   /// Records a product-analytics event.
-  void track(String name, {Map<String, Object?>? properties, String? screen}) {
+  void track(
+    String name, {
+    Map<String, Object?>? properties,
+    String? screen,
+    Map<String, String>? tags,
+    Map<String, Map<String, Object?>>? contexts,
+    Map<String, Object?>? extra,
+  }) {
     if (!isEnabled) {
       return;
     }
@@ -178,6 +194,9 @@ class SauronClient {
         sessionId: sessionId,
         screen: screen ?? _currentScreen,
         properties: properties,
+        tags: _mergeTags(tags),
+        contexts: _mergeContexts(contexts),
+        extra: _mergeExtra(extra),
       ),
     );
   }
@@ -248,6 +267,19 @@ class SauronClient {
   /// Sets (or clears) the current user.
   void setUser(SauronUser? user) => _scope.user = user;
 
+  /// Sets a single scope tag (last-write-wins by key).
+  void setTag(String key, String value) => _scope.setTag(key, value);
+
+  /// Merges scope tags (last-write-wins by key).
+  void setTags(Map<String, String> values) => _scope.setTags(values);
+
+  /// Sets (replaces) a named scope context block.
+  void setContext(String name, Map<String, Object?> block) =>
+      _scope.setContext(name, block);
+
+  /// Sets a single scope extra value (last-write-wins by key).
+  void setExtra(String key, Object? value) => _scope.setExtra(key, value);
+
   /// Flushes buffered + persisted envelopes.
   Future<void> flush() async => _transport?.flush();
 
@@ -266,6 +298,24 @@ class SauronClient {
   }
 
   // ---- internals -------------------------------------------------------------
+
+  /// Effective tags = scope (init defaults + runtime setters) then per-call,
+  /// last-write-wins by key. Empty result is omitted on the wire.
+  Map<String, String> _mergeTags(Map<String, String>? call) =>
+      <String, String>{..._scope.tags, if (call != null) ...call};
+
+  /// Effective contexts merge by BLOCK NAME — a per-call block replaces the
+  /// same-named scope block.
+  Map<String, Map<String, Object?>> _mergeContexts(
+          Map<String, Map<String, Object?>>? call) =>
+      <String, Map<String, Object?>>{
+        ..._scope.contexts,
+        if (call != null) ...call,
+      };
+
+  /// Effective extra = scope then per-call, shallow last-write-wins by key.
+  Map<String, Object?> _mergeExtra(Map<String, Object?>? call) =>
+      <String, Object?>{..._scope.extra, if (call != null) ...call};
 
   void _dispatch(EnvelopeItem item) {
     EnvelopeItem outgoing = item;

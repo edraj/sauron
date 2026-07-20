@@ -25,3 +25,4 @@
 
 - [Examples](Examples.md)
 - [Dashboard](Dashboard.md)
+- [Search & Filtering](Search.md)

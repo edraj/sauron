@@ -7,10 +7,31 @@
 import { Sauron } from '@sauron/browser';
 import { activity, config, initStatus } from './store.svelte';
 import type { ShowcaseSink } from './showcase';
+import type { SeedingSink } from './seeding';
 
 /** True once the SDK has an active client. */
 export function isConnected(): boolean {
   return Sauron.getClient() !== null;
+}
+
+/**
+ * Capture one hand-crafted error that exercises the metadata scopes E2E: a
+ * scope-level context/extra (via setContext/setExtra) PLUS per-call overrides on
+ * the capture itself — proving the SDK merges scope ⊕ call before send. The
+ * per-call `order` block replaces the same-named scope block; `feature` tag and
+ * `attempt` extra are per-call-only.
+ */
+export function captureExampleError(): void {
+  if (!isConnected()) return;
+  Sauron.setContext('order', { id: 4242, total: 99.5, currency: 'USD' });
+  Sauron.setExtra('cart_size', 3);
+  Sauron.captureException(new Error('Checkout failed at payment step'), {
+    level: 'error',
+    tags: { feature: 'checkout' },
+    contexts: { order: { id: 4242, step: 'payment' } },
+    extra: { attempt: 2, gateway: 'stripe' },
+  });
+  activity.push('error', 'captureException()', 'order+extra scopes attached (scope ⊕ per-call override)');
 }
 
 /**
@@ -41,6 +62,56 @@ export function sauronSink(): ShowcaseSink {
 }
 
 /**
+ * A {@link SeedingSink} backed by the live `@sauron/browser` client. Errors and
+ * events are the focus, so this sink additionally drives per-signal **tags**
+ * (lifted onto errors) and the **breadcrumb** trail via the client's `Scope` —
+ * exactly where the SDK reads them from at capture time.
+ */
+export function seedingSink(): SeedingSink {
+  const scope = () => Sauron.getClient()?.getScope() ?? null;
+  return {
+    setUser(user) {
+      Sauron.setUser(user);
+    },
+    setScreen(name) {
+      Sauron.setScreen(name);
+    },
+    setTags(tags) {
+      const s = scope();
+      if (!s) return;
+      // Replace the scope's tags wholesale so "some errors carry tags, some
+      // don't" is honored per capture.
+      for (const key of Object.keys(s.tags)) delete s.tags[key];
+      if (tags) for (const [key, value] of Object.entries(tags)) s.setTag(key, value);
+    },
+    setContext(name, block) {
+      scope()?.setContext(name, block);
+    },
+    setExtra(key, value) {
+      scope()?.setExtra(key, value);
+    },
+    addBreadcrumb(crumb) {
+      Sauron.addBreadcrumb(crumb);
+    },
+    clearBreadcrumbs() {
+      scope()?.clearBreadcrumbs();
+    },
+    captureException(error, hint) {
+      Sauron.captureException(error, hint);
+    },
+    captureMessage(message, level, hint) {
+      Sauron.captureMessage(message, level, hint);
+    },
+    track(name, properties, meta) {
+      Sauron.track(name, properties, meta);
+    },
+    async flush() {
+      await Sauron.flush(6000);
+    },
+  };
+}
+
+/**
  * (Re)initialize the SDK from the current config. Idempotent-safe: if a client
  * already exists we flush + tear it down first so a brand-new DSN takes effect.
  */
@@ -66,6 +137,11 @@ export async function connect(): Promise<void> {
       // Flush a little more eagerly than the 5s default so freshly-clicked
       // actions show up in the dashboard within a couple of seconds.
       transport: { flushIntervalMs: 3000 },
+      // Default metadata scopes — seeded into the global scope, lifted onto
+      // every error / message / track() from here on.
+      tags: { app: 'svelte-web', surface: 'demo' },
+      contexts: { app: { name: 'sauron-web-demo', framework: 'svelte' } },
+      extra: { initialized_at: new Date().toISOString() },
     });
 
     config.persist();

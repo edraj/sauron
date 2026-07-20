@@ -56,11 +56,15 @@ export async function updateIssueStatus(
 export async function listIssueEvents(
   appId: string,
   issueId: string,
-  limit = 20,
+  opts: { filters?: string[]; q?: string; sinceDays?: number; limit?: number } = {},
 ): Promise<ErrorEvent[]> {
+  const p = new URLSearchParams();
+  for (const f of opts.filters ?? []) p.append('filter', f);
+  if (opts.q) p.set('q', opts.q);
+  if (opts.sinceDays != null) p.set('since_days', String(opts.sinceDays));
+  p.set('limit', String(opts.limit ?? 50));
   const { data } = await api.get<ErrorEvent[]>(
-    `/v1/apps/${appId}/issues/${issueId}/events`,
-    { params: { limit } },
+    `/v1/apps/${appId}/issues/${issueId}/events?${p.toString()}`,
   );
   return data;
 }

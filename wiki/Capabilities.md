@@ -18,7 +18,7 @@ See also: **[Home](Home.md)** · **[Ingest Wire Contract](Ingest-Wire-Contract.m
 | **captureException** | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **captureMessage** | ✅ | —¹ | ✅ | ✅ | ✅ |
 | **identify** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **scope** (user/tags/context) | ✅² | ◑³ | ✅ | ✅ | ✅ |
+| **scope** (user/tags/context) | ✅² | ✅³ | ✅ | ✅ | ✅ |
 | **breadcrumbs** | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **transactions** (`trackTransaction`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **auto-capture** (uncaught) | ✅⁴ | ✅⁴ | ✅⁵ | ✅⁵ | ✅⁵ |
@@ -32,11 +32,12 @@ See also: **[Home](Home.md)** · **[Ingest Wire Contract](Ingest-Wire-Contract.m
 1. Flutter ships no `captureMessage` helper — capture a string with
    `Sauron.captureException(...)`, and note that uncaught errors already flow through the
    four auto-capture layers.
-2. Browser scope: `setUser(...)` at the top level plus `getClient().getScope().setTag(...)`
-   / `.setContext(...)`. The runtime is single-threaded, so no async-isolation primitive is
-   needed; scope user + tags are stamped onto captured errors.
-3. Flutter exposes `setUser(...)` on the single client scope (plus the breadcrumb ring). It
-   has no per-tag/context setters and no scope-isolation block.
+2. Browser scope: `setUser`, `setTag`/`setTags`, `setContext`, and `setExtra` are all
+   top-level functions. The runtime is single-threaded, so no async-isolation primitive is
+   needed; scope user + tags are stamped onto captured errors and events.
+3. Flutter exposes `setUser`, `setTag`/`setTags`, `setContext`, and `setExtra` on the
+   single global client scope (plus the breadcrumb ring). Like the browser it has one
+   global scope — no async scope-isolation block.
 4. **Default-on.** Uncaught errors and unhandled rejections (Browser) and the four Flutter
    layers (`FlutterError.onError`, `PlatformDispatcher.onError`, isolate errors, guarding
    zone) capture automatically — no flag.

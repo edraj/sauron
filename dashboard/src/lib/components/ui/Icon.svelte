@@ -40,6 +40,7 @@
   import MonitorSmartphone from '@lucide/svelte/icons/monitor-smartphone';
   import Moon from '@lucide/svelte/icons/moon';
   import Package from '@lucide/svelte/icons/package';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Search from '@lucide/svelte/icons/search';
   import Server from '@lucide/svelte/icons/server';
   import Settings from '@lucide/svelte/icons/settings';
@@ -86,6 +87,7 @@
     'monitor-smartphone': MonitorSmartphone,
     moon: Moon,
     package: Package,
+    refresh: RefreshCw,
     search: Search,
     server: Server,
     settings: Settings,

@@ -264,6 +264,10 @@ export interface ErrorEvent {
   breadcrumbs: Breadcrumb[];
   context: Record<string, unknown> | null;
   tags: Record<string, unknown> | null;
+  // Developer-attached scopes (distinct from the machine-owned `context` above).
+  // Omitted by SDKs when empty, so treat as optional on the wire.
+  contexts?: Record<string, unknown> | null;
+  extra?: Record<string, unknown> | null;
   release: string | null;
   distinct_id: string | null;
   event_user: EventUser | null;
@@ -325,6 +329,11 @@ export interface AnalyticsEvent {
   name: string;
   distinct_id: string;
   properties: Record<string, unknown> | null;
+  // Developer-attached scopes (distinct from the machine-owned `context` below).
+  // Omitted by SDKs when empty, so treat as optional on the wire.
+  tags?: Record<string, unknown> | null;
+  contexts?: Record<string, unknown> | null;
+  extra?: Record<string, unknown> | null;
   context?: Record<string, unknown> | null;
   session_id?: string | null;
   release?: string | null;

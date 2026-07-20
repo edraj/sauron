@@ -62,6 +62,9 @@ Uncaught errors are captured automatically via the four layers bound at init.
 | `environment` | `String` | `'production'` |
 | `release` | `String?` | — |
 | `screen` | `String?` | — (seed the initial screen) |
+| `tags` | `Map<String, String>` | `{}` — default scope tags |
+| `contexts` | `Map<String, Map<String, Object?>>` | `{}` — default scope context blocks |
+| `extra` | `Map<String, Object?>` | `{}` — default freeform extra |
 | `sampleRate` | `double` | `1.0` (errors only) |
 | `maxBreadcrumbs` | `int` | `100` |
 | `beforeSend` | `Object? Function(Object item)` | — (any-item; return `null` to drop) |
@@ -79,9 +82,12 @@ The public entry point is the static `Sauron` class:
 | Method | Signature |
 | --- | --- |
 | `track` | `Sauron.track(String name, {Map<String, Object?>? properties})` |
-| `captureException` | `Sauron.captureException(Object error, {StackTrace? stackTrace, Mechanism? mechanism})` |
+| `captureException` | `Sauron.captureException(Object error, {StackTrace? stackTrace, Mechanism? mechanism, SauronLevel level, String? screen, Map<String, String>? tags, Map<String, Map<String, Object?>>? contexts, Map<String, Object?>? extra})` |
 | `identify` | `Sauron.identify(String distinctId, {Map<String, Object?>? traits})` |
 | `setUser` | `Sauron.setUser(SauronUser? user)` — pass `null` to clear |
+| `setTag` / `setTags` | `Sauron.setTag(String key, String value)` · `Sauron.setTags(Map<String, String> values)` |
+| `setContext` | `Sauron.setContext(String name, Map<String, Object?> block)` |
+| `setExtra` | `Sauron.setExtra(String key, Object? value)` |
 | `trackTransaction` | `Sauron.trackTransaction({required String name, required Duration duration, String op = 'custom', String? status, String? httpMethod, int? httpStatus, String? url})` |
 | `setScreen` | `Sauron.setScreen(String name)` — emits a `$screen` view on change |
 | `screen` | `Sauron.screen` → `String?` (getter) |
@@ -116,6 +122,28 @@ Sauron.identify('u_123', traits: {'plan': 'pro'});
 // or set the full user:
 Sauron.setUser(const SauronUser(id: 'u_123', email: 'ada@example.com'));
 ```
+
+### Tags, contexts & extra
+
+Attach your own metadata to errors and events. A scope setter lifts a value onto every
+later capture; `init` options seed defaults; per-call args merge on top:
+
+```dart
+Sauron.setTag('checkout_step', 'payment');          // one filterable tag
+Sauron.setTags({'region': 'eu-central', 'tier': 'pro'});
+Sauron.setContext('cart', {'item_count': 3, 'total': 42.5}); // a named structured block
+Sauron.setExtra('experiment_bucket', 'B');          // a loose one-off value
+
+// or scoped to a single capture:
+Sauron.captureException(e, stackTrace: st, tags: {'severity': 'high'});
+```
+
+**Tags** are a flat `key → value` map (indexed for filtering); **contexts** are named
+structured blocks; **extra** is loose values — all developer-set, and distinct from the
+SDK's machine-collected `context` (device/OS/platform). See
+**[Best Practices §4](Best-Practices.md)** for when to use which, the
+**[Dashboard](Dashboard.md)** for where they appear, and **[Search](Search.md)** to
+filter by them.
 
 ### Breadcrumbs
 

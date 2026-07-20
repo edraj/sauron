@@ -9,6 +9,7 @@
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listScreens } from '../lib/api/screens';
   import { errorMessage } from '../lib/api/client';
@@ -25,6 +26,7 @@
 
   let rows = $state<ScreenRow[]>([]);
   let loading = $state(true);
+  let refreshing = $state(false);
   let error = $state<string | null>(null);
 
   let debounce: ReturnType<typeof setTimeout> | undefined;
@@ -60,6 +62,17 @@
     }
   }
 
+  async function refresh() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    refreshing = true;
+    try {
+      await Promise.all([load(aid, sinceDays, search, offset)]);
+    } finally {
+      refreshing = false;
+    }
+  }
+
   $effect(() => {
     const aid = sessionStore.currentAppId;
     const days = sinceDays;
@@ -78,6 +91,7 @@
     <div class="controls">
       <DateRange value={sinceDays} onchange={onRange} />
       <SearchInput bind:value={query} oninput={onSearch} placeholder="Search screens…" width="240px" />
+      <RefreshButton onclick={refresh} loading={refreshing} />
     </div>
   </div>
 

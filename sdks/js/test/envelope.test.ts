@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { buildEnvelope } from '../src/envelope';
-import { buildTransactionItem } from '../src/api/product';
+import { buildTransactionItem, track } from '../src/api/product';
 import { parseDsn } from '../src/dsn';
 import { getClient, init } from '../src/client';
 import { captureException } from '../src/api/capture';
-import type { Envelope, ErrorItem, TransactionItem } from '../src/types';
+import type { Envelope, EnvelopeItem, ErrorItem, EventItem, TransactionItem } from '../src/types';
 
 /**
  * Golden envelope from the LOCKED wire contract. The Rust ingest gateway and the
@@ -57,6 +57,8 @@ const GOLDEN: Envelope = {
         },
       ],
       fingerprint: null,
+      contexts: { order: { id: 7 } },
+      extra: { build: 'ci-42' },
       session_id: 'sess_abc123',
     },
     {
@@ -66,6 +68,9 @@ const GOLDEN: Envelope = {
       session_id: 'sess_abc123',
       timestamp: '2026-07-12T10:29:40.000Z',
       properties: { cart_value: 42.5 },
+      tags: { plan: 'pro' },
+      contexts: { experiment: { bucket: 'b' } },
+      extra: { referrer: 'email' },
     },
     {
       type: 'identify',
@@ -134,6 +139,8 @@ describe('error item reconciliation (event_id/message/tags/user)', () => {
       breadcrumbs: [],
       fingerprint: null,
       tags: { env: 'prod', req: '42' },
+      contexts: { order: { id: 7 } },
+      extra: { build: 'ci-42' },
       user: { id: 'u_123', email: null, traits: { plan: 'pro' } },
       session_id: 'sess_abc123',
     };
@@ -145,6 +152,8 @@ describe('error item reconciliation (event_id/message/tags/user)', () => {
     expect(item.event_id).toBe('evt_9f8e7d6c');
     expect(item.message).toBe('x is not a function');
     expect(item.tags).toEqual({ env: 'prod', req: '42' });
+    expect(item.contexts).toEqual({ order: { id: 7 } });
+    expect(item.extra).toEqual({ build: 'ci-42' });
     expect(item.user).toEqual({ id: 'u_123', email: null, traits: { plan: 'pro' } });
   });
 
@@ -170,6 +179,8 @@ describe('error item reconciliation (event_id/message/tags/user)', () => {
     expect(keys).not.toContain('event_id');
     expect(keys).not.toContain('message');
     expect(keys).not.toContain('tags');
+    expect(keys).not.toContain('contexts');
+    expect(keys).not.toContain('extra');
     expect(keys).not.toContain('user');
   });
 
@@ -210,6 +221,44 @@ describe('error item reconciliation (event_id/message/tags/user)', () => {
       expect('user' in err).toBe(false);
       // event_id is always stamped so callers can correlate the report.
       expect(typeof err.event_id).toBe('string');
+    });
+
+    it('seeds init-default contexts/extra into the scope and lifts them onto errors', () => {
+      init({
+        dsn: 'https://pk_test@localhost:9/1',
+        tags: { app: 'web' },
+        contexts: { release_ctx: { channel: 'beta' } },
+        extra: { build: 'ci-42' },
+        beforeSend: (i) => {
+          if (i.type === 'error') items.push(i);
+          return null;
+        },
+      });
+      getClient()!.getScope().setContext('order', { id: 7 });
+
+      captureException(new Error('boom'));
+
+      expect(items).toHaveLength(1);
+      const err = items[0];
+      expect(err.tags).toEqual({ app: 'web' });
+      expect(err.contexts).toEqual({ release_ctx: { channel: 'beta' }, order: { id: 7 } });
+      expect(err.extra).toEqual({ build: 'ci-42' });
+    });
+
+    it('per-call contexts/extra override the same-named scope block (per-call wins)', () => {
+      const scope = getClient()!.getScope();
+      scope.setContext('order', { id: 1, source: 'scope' });
+      scope.setExtra('build', 'scope');
+
+      captureException(new Error('boom'), {
+        contexts: { order: { id: 2 } },
+        extra: { build: 'call', attempt: 3 },
+      });
+
+      expect(items).toHaveLength(1);
+      const err = items[0];
+      expect(err.contexts).toEqual({ order: { id: 2 } });
+      expect(err.extra).toEqual({ build: 'call', attempt: 3 });
     });
   });
 });
@@ -305,5 +354,47 @@ describe('parseDsn', () => {
 
   it('rejects a DSN without a project id', () => {
     expect(() => parseDsn('https://pk_test@localhost:8081/')).toThrow();
+  });
+});
+
+describe('event item metadata (track tags/contexts/extra)', () => {
+  let events: EventItem[];
+  const capture = () => (i: EnvelopeItem) => {
+    if (i.type === 'event') events.push(i as EventItem);
+    return null;
+  };
+  beforeEach(() => {
+    events = [];
+  });
+
+  it('attaches scope + per-call meta, per-call wins per top-level key', () => {
+    init({
+      dsn: 'https://pk_test@localhost:9/1',
+      tags: { app: 'web' },
+      contexts: { app_ctx: { version: '1.0' } },
+      beforeSend: capture(),
+    });
+    getClient()!.getScope().setTag('req', '42');
+
+    track('checkout', { total: 9 }, {
+      tags: { req: '99' },
+      contexts: { order: { id: 7 } },
+      extra: { attempt: 2 },
+    });
+
+    expect(events).toHaveLength(1);
+    const e = events[0];
+    expect(e.tags).toEqual({ app: 'web', req: '99' });
+    expect(e.contexts).toEqual({ app_ctx: { version: '1.0' }, order: { id: 7 } });
+    expect(e.extra).toEqual({ attempt: 2 });
+  });
+
+  it('omits tags/contexts/extra when scope and call carry none', () => {
+    init({ dsn: 'https://pk_test@localhost:9/1', beforeSend: capture() });
+    track('ping', {});
+    const e = events[0];
+    expect('tags' in e).toBe(false);
+    expect('contexts' in e).toBe(false);
+    expect('extra' in e).toBe(false);
   });
 });

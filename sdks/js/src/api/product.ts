@@ -1,7 +1,8 @@
 import { getClient } from '../client.js';
 import { getSessionId } from '../identity.js';
 import { getScreen, setScreenState } from '../screen.js';
-import type { EventItem, IdentifyItem, TransactionItem, TransactionOp } from '../types.js';
+import { mergeMeta } from '../scope.js';
+import type { EventItem, IdentifyItem, TrackOptions, TransactionItem, TransactionOp } from '../types.js';
 import { nowIso } from '../utils.js';
 
 /**
@@ -11,19 +12,26 @@ import { nowIso } from '../utils.js';
 export function track(
   name: string,
   properties: Record<string, unknown> = {},
-  screen?: string,
+  options: TrackOptions = {},
 ): void {
   const client = getClient();
   if (!client) return;
+  const scope = client.getScope();
   const item: EventItem = {
     type: 'event',
     name,
     distinct_id: client.getDistinctId(),
     session_id: getSessionId(),
-    screen: screen ?? getScreen(),
+    screen: options.screen ?? getScreen(),
     timestamp: nowIso(),
     properties: properties ?? {},
   };
+  const tags = mergeMeta(scope.tags, options.tags);
+  if (Object.keys(tags).length > 0) item.tags = tags;
+  const contexts = mergeMeta(scope.contexts, options.contexts);
+  if (Object.keys(contexts).length > 0) item.contexts = contexts;
+  const extra = mergeMeta(scope.extra, options.extra);
+  if (Object.keys(extra).length > 0) item.extra = extra;
   client.captureItem(item);
 }
 

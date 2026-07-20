@@ -71,6 +71,9 @@ scope and resolved as a union down the tree.
 - **[Dashboard](Dashboard.md)** — a tour of the dashboard sections: Overview,
   Exceptions, Performance, Events, Sessions, Users, Devices, Screens, Funnels,
   Journeys, and the Manage section.
+- **[Search & Filtering](Search.md)** — the free-text search boxes and the
+  structured `field · op · value` filters on each list, which columns each one
+  matches, and how it works (case-insensitive `ILIKE`, no full-text engine).
 
 ---
 

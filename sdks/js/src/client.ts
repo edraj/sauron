@@ -11,7 +11,7 @@ import * as instrument from './integrations/instrument.js';
 import { installPerformance } from './integrations/performance.js';
 import { installXhr } from './integrations/xhr.js';
 import { setScreen } from './api/product.js';
-import { Scope } from './scope.js';
+import { Scope, mergeMeta } from './scope.js';
 import { resetScreen, setScreenState } from './screen.js';
 import { installBeacon } from './transport/beacon.js';
 import { Transport } from './transport/transport.js';
@@ -51,6 +51,15 @@ export class SauronClient {
     this.dsn = parseDsn(options.dsn);
     this.logger = makeLogger(options.debug);
     this.scope = new Scope(options.maxBreadcrumbs);
+    // Seed init-default metadata into the global scope so every later signal
+    // inherits it; runtime setters still last-write-win over these.
+    this.scope.setTags(options.tags);
+    for (const [name, block] of Object.entries(options.contexts)) {
+      this.scope.setContext(name, block);
+    }
+    for (const [key, value] of Object.entries(options.extra)) {
+      this.scope.setExtra(key, value);
+    }
 
     // Capture the NATIVE fetch before any integration wraps it, so the
     // transport's own requests never hit our instrumentation.
@@ -168,10 +177,12 @@ export class SauronClient {
     if (item.message === undefined && typeof hint?.message === 'string') {
       item.message = hint.message;
     }
-    if (item.tags === undefined) {
-      const tags = this.scope.tags;
-      if (Object.keys(tags).length > 0) item.tags = { ...tags };
-    }
+    const tags = mergeMeta(this.scope.tags, item.tags);
+    if (Object.keys(tags).length > 0) item.tags = tags;
+    const contexts = mergeMeta(this.scope.contexts, item.contexts);
+    if (Object.keys(contexts).length > 0) item.contexts = contexts;
+    const extra = mergeMeta(this.scope.extra, item.extra);
+    if (Object.keys(extra).length > 0) item.extra = extra;
     if (item.user === undefined && this.scope.hasUser()) {
       item.user = this.scope.getUser();
     }
@@ -265,6 +276,9 @@ function resolveOptions(options: InitOptions): ResolvedOptions {
     release: options.release ?? null,
     sampleRate: clamp(options.sampleRate ?? 1, 0, 1),
     maxBreadcrumbs: options.maxBreadcrumbs ?? 50,
+    tags: options.tags ?? {},
+    contexts: options.contexts ?? {},
+    extra: options.extra ?? {},
     beforeSend: options.beforeSend,
     beforeBreadcrumb: options.beforeBreadcrumb,
     transport: {

@@ -19,10 +19,53 @@ so no publish/registry step is needed.
   `init` (in `src/lib/sauron.ts`), and the **setScreen (navigate)** action card
   toggles `Home ⇄ Checkout`. Each change emits a `$screen` view and tags
   subsequent events/errors with the active screen (see `Sauron.getScreen()`).
+- A one-click **Seed demo data** button (see below) that bulk-fills the
+  observability + analytics screens with a *mixed* stream of errors and events.
 - A one-click **cohort simulator** (see below) that lights up the analytics
   screens.
 - A client-side **activity log** echoing each call (the SDK batches/gzips and
   delivers envelopes in the background — this panel is local feedback only).
+
+## Seed demo data (bulk errors + events)
+
+The single-event buttons fire one signal at a time — fine for a first look, but
+a real dashboard has *volume and variety*. The **Seed demo data** panel (top of
+the page) fills it in one click: it drives the SDK through a bulk, deliberately
+**mixed** stream of **errors and events** across many synthetic users and
+screens. Pick a volume — **Small / Medium / Large** (≈12 / 60 / 220 synthetic
+visitors) — and hit **Seed**.
+
+The mix is the point:
+
+- **Errors** across every level (`debug · info · warning · error · fatal`), from
+  a catalog of realistic archetypes (`TypeError`, `NetworkError`,
+  `ChunkLoadError`, `PaymentDeclinedError`, `TimeoutError`, …). Grouping is
+  controlled: most archetypes share a **stable fingerprint** → a few high-count
+  issues; a few use a **unique fingerprint** per occurrence → a long tail of
+  one-offs. Some carry **tags** (`feature`, `browser`, `region`, `customer_tier`)
+  and some a **big payload** (a multi-KB `state_snapshot` tag plus a rich
+  breadcrumb trail); others are bare.
+- **Events** from a catalog of ~18 product events, ~30% with a **big** property
+  payload (cart, experiment variants, metadata) and the rest small, all with
+  categorical props (`plan`, `source`, `region`, `ab_variant`).
+
+After a run the panel summarizes what it sent (errors, distinct issues, events,
+tagged, big payloads, and a per-level breakdown). Open the **dashboard → Web Demo
+app**:
+
+- **Issues** — grouped errors with a realistic count distribution; filter by
+  level/tag, and open one to see its breadcrumb trail + tags.
+- **Events** — the raw stream; search by name or `distinct_id`.
+- **Users** — the synthetic visitors the signals are attributed to.
+- **Screens** — activity split across `Home / Product / Cart / Checkout / …`.
+
+Errors are grouped by fingerprint, so **re-running grows the existing issues'
+counts** (and adds fresh one-offs). Like the cohort simulator, the engine is pure
+logic + an injected sink (`src/lib/seeding.ts`), unit tested with Node's runner:
+
+```bash
+node --test src/lib/seeding.test.ts
+```
 
 ## Showcase funnels, journeys & performance
 

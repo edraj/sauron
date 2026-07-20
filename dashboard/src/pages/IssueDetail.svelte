@@ -12,12 +12,15 @@
   import StacktraceView from '../lib/components/StacktraceView.svelte';
   import BreadcrumbTrail from '../lib/components/BreadcrumbTrail.svelte';
   import KeyValueList from '../lib/components/KeyValueList.svelte';
+  import JsonTree from '../lib/components/JsonTree.svelte';
+  import FilterBar from '../lib/components/filters/FilterBar.svelte';
+  import { OCCURRENCE_FIELDS, encodeFilters, type Filter } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import { getIssue, updateIssueStatus } from '../lib/api/issues';
+  import { getIssue, updateIssueStatus, listIssueEvents } from '../lib/api/issues';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { relativeTime, formatDateTime } from '../lib/utils/format';
-  import type { IssueDetail, IssueStatus } from '../lib/models';
+  import type { IssueDetail, IssueStatus, ErrorEvent } from '../lib/models';
 
   interface Props {
     params?: { id?: string };
@@ -49,6 +52,41 @@
     const aid = sessionStore.currentAppId;
     const id = issueId;
     if (aid && id) void load(aid, id);
+  });
+
+  let occurrences = $state<ErrorEvent[]>([]);
+  let occLoading = $state(false);
+  let occFilters = $state<Filter[]>([]);
+  let occSearch = $state('');
+  let occSince = $state(3650);
+  let occTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function loadOccurrences(appId: string, id: string, enc: string[], term: string, since: number) {
+    occLoading = true;
+    try {
+      occurrences = await listIssueEvents(appId, id, {
+        filters: enc,
+        q: term || undefined,
+        sinceDays: since,
+        limit: 50,
+      });
+    } catch {
+      occurrences = [];
+    } finally {
+      occLoading = false;
+    }
+  }
+
+  $effect(() => {
+    const aid = sessionStore.currentAppId;
+    const id = issueId;
+    const enc = encodeFilters(occFilters);
+    const term = occSearch;
+    const since = occSince;
+    if (!aid || !id) return;
+    clearTimeout(occTimer);
+    occTimer = setTimeout(() => void loadOccurrences(aid, id, enc, term, since), 250);
+    return () => clearTimeout(occTimer);
   });
 
   async function setStatus(next: IssueStatus) {
@@ -193,6 +231,59 @@
             <p class="muted">No event payload available for this issue.</p>
           </Card>
         {/if}
+
+        {#if latestEvent}
+          <Card title="Tags">
+            <KeyValueList data={latestEvent.tags} emptyLabel="No tags" />
+          </Card>
+
+          <div class="data-row">
+            <Card title="Contexts">
+              {#if latestEvent.contexts && Object.keys(latestEvent.contexts).length > 0}
+                <JsonTree value={latestEvent.contexts} name="contexts" expandTo={2} />
+              {:else}
+                <span class="faint">No contexts</span>
+              {/if}
+            </Card>
+
+            <Card title="Additional data">
+              {#if latestEvent.extra && Object.keys(latestEvent.extra).length > 0}
+                <JsonTree value={latestEvent.extra} name="extra" expandTo={2} />
+              {:else}
+                <span class="faint">No additional data</span>
+              {/if}
+            </Card>
+          </div>
+        {/if}
+
+        <Card title="Occurrences">
+          <FilterBar
+            fields={OCCURRENCE_FIELDS}
+            bind:filters={occFilters}
+            bind:search={occSearch}
+            bind:sinceDays={occSince}
+          />
+          {#if occLoading}
+            <div class="center"><Spinner size={20} /></div>
+          {:else if occurrences.length === 0}
+            <p class="faint">No occurrences match this filter.</p>
+          {:else}
+            <ul class="occ-list">
+              {#each occurrences as ev (ev.id)}
+                <li class="occ">
+                  <LevelBadge level={ev.level} />
+                  <span class="occ-time">{relativeTime(ev.occurred_at)}</span>
+                  <span class="occ-msg mono">{ev.message ?? ev.exception_value ?? ''}</span>
+                  {#if ev.tags && Object.keys(ev.tags).length > 0}
+                    <span class="occ-tags mono">
+                      {Object.entries(ev.tags).map(([k, v]) => `${k}=${v}`).join(' · ')}
+                    </span>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </Card>
       </div>
 
       <aside class="rail">
@@ -244,12 +335,6 @@
             </div>
           </dl>
         </Card>
-
-        {#if latestEvent}
-          <Card title="Tags">
-            <KeyValueList data={latestEvent.tags} emptyLabel="No tags" />
-          </Card>
-        {/if}
 
         {#if distinctId}
           <Card title="Affected user">
@@ -338,6 +423,18 @@
     flex-direction: column;
     gap: 18px;
     min-width: 0;
+  }
+  /* Contexts + Additional data sit side by side under the full-width Tags card. */
+  .data-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 18px;
+    align-items: start;
+  }
+  @media (max-width: 640px) {
+    .data-row {
+      grid-template-columns: 1fr;
+    }
   }
   .rail {
     display: flex;
@@ -493,4 +590,11 @@
       grid-template-columns: 1fr;
     }
   }
+
+  .occ-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .occ { display: flex; align-items: center; gap: 10px; font-size: 12.5px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--surface-2); }
+  .occ-time { color: var(--text-muted); white-space: nowrap; }
+  .occ-msg { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .occ-tags { color: var(--primary); white-space: nowrap; }
+  .faint { color: var(--text-muted); font-size: 12.5px; }
 </style>

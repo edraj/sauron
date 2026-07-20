@@ -34,8 +34,10 @@ const String _golden = '''
         "mechanism": { "type": "PlatformDispatcher.onError", "handled": false },
         "stacktrace": [ { "function": "loadUser", "filename": "package:app/main.dart", "lineno": 42, "colno": 13, "in_app": true } ] },
       "breadcrumbs": [ { "type": "navigation", "category": "route", "message": "/settings", "level": "info", "timestamp": "2026-07-12T10:29:50.000Z", "data": {} } ],
-      "fingerprint": null, "session_id": "$_sessionId", "screen": null },
-    { "type": "event", "name": "checkout_completed", "distinct_id": "u_123", "timestamp": "2026-07-12T10:29:40.000Z", "properties": { "cart_value": 42.5 }, "session_id": "$_sessionId", "screen": null },
+      "fingerprint": null, "session_id": "$_sessionId", "screen": null,
+      "tags": { "feature": "checkout" }, "contexts": { "order": { "id": 7 } }, "extra": { "attempt": 2 } },
+    { "type": "event", "name": "checkout_completed", "distinct_id": "u_123", "timestamp": "2026-07-12T10:29:40.000Z", "properties": { "cart_value": 42.5 }, "session_id": "$_sessionId", "screen": null,
+      "tags": { "plan": "pro" }, "contexts": { "cart": { "items": 3 } }, "extra": { "coupon": "SAVE10" } },
     { "type": "identify", "distinct_id": "u_123", "anonymous_id": null, "traits": { "plan": "pro" } },
     { "type": "transaction", "name": "GET /users", "op": "http", "duration_ms": 128.5, "status": "ok",
       "http_method": "GET", "http_status": 200, "url": "https://api.example.com/users",
@@ -80,6 +82,11 @@ void main() {
           ),
         ],
         sessionId: _sessionId,
+        tags: const <String, String>{'feature': 'checkout'},
+        contexts: const <String, Map<String, Object?>>{
+          'order': <String, Object?>{'id': 7},
+        },
+        extra: const <String, Object?>{'attempt': 2},
       );
 
       final EventItem event = EventItem(
@@ -88,6 +95,11 @@ void main() {
         timestamp: DateTime.utc(2026, 7, 12, 10, 29, 40),
         properties: const <String, Object?>{'cart_value': 42.5},
         sessionId: _sessionId,
+        tags: const <String, String>{'plan': 'pro'},
+        contexts: const <String, Map<String, Object?>>{
+          'cart': <String, Object?>{'items': 3},
+        },
+        extra: const <String, Object?>{'coupon': 'SAVE10'},
       );
 
       final IdentifyItem identify = IdentifyItem(
@@ -202,6 +214,30 @@ void main() {
         'session_id': _sessionId,
         'timestamp': '2026-07-12T10:29:45.000Z',
       });
+    });
+
+    test('error/event omit tags/contexts/extra when the maps are empty', () {
+      final ErrorItem error = ErrorItem(
+        timestamp: DateTime.utc(2026, 7, 12, 10, 29, 58, 900),
+        exception: const SauronException(
+          type: 'StateError',
+          value: 'boom',
+          mechanism: Mechanism(type: 'manual', handled: true),
+          stacktrace: <StackFrame>[],
+        ),
+      );
+      final EventItem event = EventItem(
+        name: 'tapped',
+        timestamp: DateTime.utc(2026, 7, 12, 10, 29, 40),
+      );
+      final Map<String, dynamic> errJson =
+          jsonDecode(jsonEncode(error.toJson())) as Map<String, dynamic>;
+      final Map<String, dynamic> evtJson =
+          jsonDecode(jsonEncode(event.toJson())) as Map<String, dynamic>;
+      for (final String key in <String>['tags', 'contexts', 'extra']) {
+        expect(errJson.containsKey(key), isFalse, reason: 'error.$key');
+        expect(evtJson.containsKey(key), isFalse, reason: 'event.$key');
+      }
     });
 
     test('trackTransaction maps a Duration to fractional milliseconds', () {

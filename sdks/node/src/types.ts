@@ -89,6 +89,8 @@ export interface ErrorItem {
   message: string | null;
   breadcrumbs: Breadcrumb[];
   tags: Record<string, string>;
+  contexts?: Record<string, unknown>;
+  extra?: Record<string, unknown>;
   fingerprint: string[] | null;
   user: ErrorUser | null;
   session_id: string | null;
@@ -104,6 +106,9 @@ export interface EventItem {
   timestamp: string;
   session_id: string | null;
   screen: string | null;
+  tags?: Record<string, string>;
+  contexts?: Record<string, unknown>;
+  extra?: Record<string, unknown>;
 }
 
 /** An identity association (PostHog-style `identify`). */
@@ -260,6 +265,12 @@ export interface InitOptions {
   dsn: string;
   environment?: string;
   release?: string | null;
+  /** Default tags seeded into the global scope at init. */
+  tags?: Record<string, string>;
+  /** Default named dev context blocks seeded into the global scope at init. Distinct from the machine `context`. */
+  contexts?: Record<string, unknown>;
+  /** Default freeform extra values seeded into the global scope at init. */
+  extra?: Record<string, unknown>;
   /** Error sample rate in [0, 1]. Default 1 (send everything). */
   sampleRate?: number;
   /** How often the pending batch is flushed, in ms. Default 5000. */
@@ -301,6 +312,9 @@ export interface ResolvedOptions {
   dsn: string;
   environment: string;
   release: string | null;
+  tags: Record<string, string>;
+  contexts: Record<string, unknown>;
+  extra: Record<string, unknown>;
   sampleRate: number;
   flushInterval: number;
   maxBatch: number;
@@ -317,11 +331,21 @@ export interface ResolvedOptions {
   debug: boolean;
 }
 
+/**
+ * Per-capture metadata overrides shared by `captureMessage` and `track`, and the
+ * metadata subset of {@link CaptureExceptionOptions}. Empty maps are omitted on
+ * the wire per the emit convention.
+ */
+export interface MetadataOptions {
+  tags?: Record<string, string>;
+  contexts?: Record<string, unknown>;
+  extra?: Record<string, unknown>;
+}
+
 /** Extra attribution for `captureException`. */
-export interface CaptureExceptionOptions {
+export interface CaptureExceptionOptions extends MetadataOptions {
   user?: Partial<ErrorUser> | null;
   level?: Level;
-  tags?: Record<string, string>;
   handled?: boolean;
   /** Client-supplied fingerprint override (honored verbatim by the backend). */
   fingerprint?: string[] | null;

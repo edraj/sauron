@@ -69,6 +69,14 @@ export interface ErrorItem {
    */
   tags?: Record<string, unknown>;
   /**
+   * Dev-owned structured context blocks (e.g. `{ order: { id: 7 } }`). DISTINCT
+   * from the machine-owned `context` on the envelope — never overwrites it.
+   * Optional — omitted when empty (the backend defaults to `{}`).
+   */
+  contexts?: Record<string, unknown>;
+  /** Freeform JSON bag. Optional — omitted when empty (backend defaults `{}`). */
+  extra?: Record<string, unknown>;
+  /**
    * Per-item user override (falls back to the envelope-context user). Optional
    * — omitted when no identity is set on the scope.
    */
@@ -86,6 +94,12 @@ export interface EventItem {
   screen?: string | null;
   timestamp: string;
   properties: Record<string, unknown>;
+  /** Scope+call tags lifted onto the event. Optional — omitted when empty. */
+  tags?: Record<string, unknown>;
+  /** Scope+call named context blocks. Optional — omitted when empty. */
+  contexts?: Record<string, unknown>;
+  /** Scope+call freeform JSON. Optional — omitted when empty. */
+  extra?: Record<string, unknown>;
 }
 
 /**
@@ -196,7 +210,23 @@ export interface Envelope {
 export type Hint = Record<string, unknown> & {
   originalException?: unknown;
   event?: unknown;
+  /** Per-call metadata overrides, merged over the current scope before send. */
+  tags?: Record<string, string>;
+  contexts?: Record<string, Record<string, unknown>>;
+  extra?: Record<string, unknown>;
 };
+
+/** Per-call metadata overrides accepted by captureException/captureMessage/track. */
+export interface CaptureOptions {
+  tags?: Record<string, string>;
+  contexts?: Record<string, Record<string, unknown>>;
+  extra?: Record<string, unknown>;
+}
+
+/** Options accepted by `track` — {@link CaptureOptions} plus a screen override. */
+export interface TrackOptions extends CaptureOptions {
+  screen?: string;
+}
 
 /** Value accepted by `setUser` — normalized into a `UserContext`. */
 export type UserInput =
@@ -245,6 +275,12 @@ export interface InitOptions {
    * route hook). Opt-in — default `false`. `setScreen()` works regardless.
    */
   screenTracking?: boolean;
+  /** Default tags seeded into the global scope (string→string). */
+  tags?: Record<string, string>;
+  /** Default named context blocks seeded into the global scope. */
+  contexts?: Record<string, Record<string, unknown>>;
+  /** Default freeform extra seeded into the global scope. */
+  extra?: Record<string, unknown>;
   debug?: boolean;
 }
 
@@ -261,5 +297,8 @@ export interface ResolvedOptions {
   performance: boolean;
   screen?: string;
   screenTracking: boolean;
+  tags: Record<string, string>;
+  contexts: Record<string, Record<string, unknown>>;
+  extra: Record<string, unknown>;
   debug: boolean;
 }

@@ -86,6 +86,9 @@ def init(
     flush_interval: float = 5.0,
     max_batch: int = 30,
     max_breadcrumbs: int = 100,
+    tags: Optional[Mapping[str, Any]] = None,
+    contexts: Optional[Mapping[str, Any]] = None,
+    extra: Optional[Mapping[str, Any]] = None,
     gzip_threshold_bytes: int = 1024,
     max_queue_bytes: int = 1_048_576,
     offline_path: Optional[str] = None,
@@ -138,6 +141,9 @@ def init(
         flush_interval=flush_interval,
         max_batch=max_batch,
         max_breadcrumbs=max_breadcrumbs,
+        tags=tags,
+        contexts=contexts,
+        extra=extra,
         gzip_threshold_bytes=gzip_threshold_bytes,
         max_queue_bytes=max_queue_bytes,
         offline_path=offline_path,
@@ -163,9 +169,20 @@ def track(
     event: str,
     distinct_id: str,
     properties: Optional[Mapping[str, Any]] = None,
+    *,
+    tags: Optional[Mapping[str, Any]] = None,
+    contexts: Optional[Mapping[str, Any]] = None,
+    extra: Optional[Mapping[str, Any]] = None,
 ) -> None:
     if _client is not None:
-        _client.track(event, distinct_id, properties)
+        _client.track(
+            event,
+            distinct_id,
+            properties,
+            tags=tags,
+            contexts=contexts,
+            extra=extra,
+        )
 
 
 def capture_exception(
@@ -174,18 +191,35 @@ def capture_exception(
     user: Optional[Mapping[str, Any]] = None,
     level: str = "error",
     tags: Optional[Mapping[str, Any]] = None,
+    contexts: Optional[Mapping[str, Any]] = None,
+    extra: Optional[Mapping[str, Any]] = None,
     fingerprint: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
     if _client is not None:
         return _client.capture_exception(
-            error, user=user, level=level, tags=tags, fingerprint=fingerprint
+            error,
+            user=user,
+            level=level,
+            tags=tags,
+            contexts=contexts,
+            extra=extra,
+            fingerprint=fingerprint,
         )
     return None
 
 
-def capture_message(message: str, level: str = "info") -> Optional[str]:
+def capture_message(
+    message: str,
+    level: str = "info",
+    *,
+    tags: Optional[Mapping[str, Any]] = None,
+    contexts: Optional[Mapping[str, Any]] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
     if _client is not None:
-        return _client.capture_message(message, level)
+        return _client.capture_message(
+            message, level, tags=tags, contexts=contexts, extra=extra
+        )
     return None
 
 

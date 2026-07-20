@@ -56,6 +56,8 @@ public class EnvelopeGoldenTests
             { "type": "navigation", "category": "history", "message": null, "level": "info", "timestamp": "2026-07-12T10:29:50.000Z", "data": { "from": "/", "to": "/settings" } }
           ],
           "tags": { "env": "prod", "req": "42" },
+          "contexts": { "order": { "id": 7 } },
+          "extra": { "build": "1.4.2" },
           "fingerprint": ["custom-group"],
           "user": { "id": "u_123", "email": null, "username": null },
           "session_id": null,
@@ -143,6 +145,8 @@ public class EnvelopeGoldenTests
                     },
                 },
                 Tags = new Dictionary<string, object?> { ["env"] = "prod", ["req"] = "42" },
+                Contexts = new Dictionary<string, object?> { ["order"] = new Dictionary<string, object?> { ["id"] = 7 } },
+                Extra = new Dictionary<string, object?> { ["build"] = "1.4.2" },
                 Fingerprint = new List<string> { "custom-group" },
                 User = new UserInfo { Id = "u_123", Email = null, Username = null },
             },
@@ -278,6 +282,33 @@ public class EnvelopeGoldenTests
 
         var item = TestUtil.FirstItem(handler.LastBody!);
         Assert.Equal(JsonValueKind.Null, item.GetProperty("fingerprint").ValueKind);
+    }
+
+    [Fact]
+    public void EventItem_OmitsEmptyMetadata_ButEmitsWhenSet()
+    {
+        var empty = JsonSerializer.Serialize(
+            new EventItem { Name = "n", DistinctId = "d", Timestamp = "t" }, SauronJson.Options);
+        using (var d = JsonDocument.Parse(empty))
+        {
+            Assert.False(d.RootElement.TryGetProperty("tags", out _));
+            Assert.False(d.RootElement.TryGetProperty("contexts", out _));
+            Assert.False(d.RootElement.TryGetProperty("extra", out _));
+        }
+
+        var full = JsonSerializer.Serialize(new EventItem
+        {
+            Name = "n", DistinctId = "d", Timestamp = "t",
+            Tags = new Dictionary<string, object?> { ["env"] = "prod" },
+            Contexts = new Dictionary<string, object?> { ["order"] = new Dictionary<string, object?> { ["id"] = 7 } },
+            Extra = new Dictionary<string, object?> { ["build"] = "1" },
+        }, SauronJson.Options);
+        using (var d = JsonDocument.Parse(full))
+        {
+            Assert.Equal("prod", d.RootElement.GetProperty("tags").GetProperty("env").GetString());
+            Assert.Equal(7, d.RootElement.GetProperty("contexts").GetProperty("order").GetProperty("id").GetInt32());
+            Assert.Equal("1", d.RootElement.GetProperty("extra").GetProperty("build").GetString());
+        }
     }
 
     // ---- helpers ----------------------------------------------------------

@@ -247,6 +247,10 @@ pub struct ErrorEvent {
     pub symbolication_status: String,
     /// Dart debug header (`build_id`, `dso_base`, `arch`, `os`, `raw_stacktrace`).
     pub debug_meta: Option<Value>,
+    /// Dev-supplied structured context blocks (distinct from machine `context`).
+    pub contexts: Value,
+    /// Dev-supplied freeform JSON.
+    pub extra: Value,
 }
 
 #[derive(Debug, Insertable)]
@@ -280,6 +284,8 @@ pub struct NewErrorEvent {
     pub symbolication_status: String,
     /// Dart debug header + verbatim trace (`{build_id,isolate_dso_base,arch,os,raw_stacktrace}`).
     pub debug_meta: Option<Value>,
+    pub contexts: Value,
+    pub extra: Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +310,10 @@ pub struct AnalyticsEvent {
     pub received_at: DateTime<Utc>,
     pub device_key: Option<String>,
     pub screen: Option<String>,
+    pub tags: Value,
+    /// Dev-supplied structured context blocks (distinct from machine `context`).
+    pub contexts: Value,
+    pub extra: Value,
 }
 
 #[derive(Debug, Insertable)]
@@ -322,6 +332,9 @@ pub struct NewAnalyticsEvent {
     pub occurred_at: DateTime<Utc>,
     pub device_key: Option<String>,
     pub screen: Option<String>,
+    pub tags: Value,
+    pub contexts: Value,
+    pub extra: Value,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]

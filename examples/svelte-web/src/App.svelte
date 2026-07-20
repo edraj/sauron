@@ -4,6 +4,7 @@
   import ActionCard from './lib/components/ActionCard.svelte';
   import ActivityLog from './lib/components/ActivityLog.svelte';
   import Showcase from './lib/components/Showcase.svelte';
+  import Seeding from './lib/components/Seeding.svelte';
   import { actions } from './lib/actions';
   import { initStatus } from './lib/store.svelte';
   import { connect } from './lib/sauron';
@@ -18,6 +19,14 @@
 
 <main class="page">
   <Header />
+
+  <section class="showcase-section" class:locked={!ready}>
+    <div class="section-head">
+      <h2>Seed the dashboard with demo data</h2>
+      <p>One click fires a bulk, mixed stream of errors and events — every level, grouped &amp; one-off issues, some tagged, some with big payloads, across many users and screens.</p>
+    </div>
+    <Seeding disabled={!ready} />
+  </section>
 
   <section class="showcase-section" class:locked={!ready}>
     <div class="section-head">

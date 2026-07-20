@@ -13,11 +13,13 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
 
   let monitors = $state<MonitorListItem[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let showForm = $state(false);
+  let refreshing = $state(false);
 
   // create form
   let name = $state('');
@@ -37,6 +39,13 @@
     try { monitors = await listMonitors(projectId); }
     catch (e) { error = (e as Error).message; }
     finally { loading = false; }
+  }
+
+  async function refresh() {
+    if (!projectId) return;
+    refreshing = true;
+    try { await load(); }
+    finally { refreshing = false; }
   }
 
   function openForm() { error = null; showForm = true; }
@@ -79,9 +88,12 @@
         <h1 class="page-title">Uptime</h1>
         <p class="sub muted">Track availability and latency for your HTTP and TCP endpoints.</p>
       </div>
-      {#if canWrite && !showForm}
-        <Button variant="primary" onclick={openForm}>New monitor</Button>
-      {/if}
+      <div class="controls">
+        {#if canWrite && !showForm}
+          <Button variant="primary" onclick={openForm}>New monitor</Button>
+        {/if}
+        <RefreshButton onclick={refresh} loading={refreshing} />
+      </div>
     </header>
 
     {#if error}
@@ -224,6 +236,12 @@
     align-items: flex-start;
     justify-content: space-between;
     gap: 16px;
+    flex-wrap: wrap;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     flex-wrap: wrap;
   }
   .sub {
