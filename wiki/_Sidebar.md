@@ -1,6 +1,5 @@
 ### Sauron
 
-
 - [Home](Home.md)
 - [Getting Started](Getting-Started.md)
 - [Install via RPM](RPM-Install.md)

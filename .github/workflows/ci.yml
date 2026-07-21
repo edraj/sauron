@@ -25,14 +25,26 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain deps (cmake for rustls/aws-lc, g++ for bundled DuckDB)
-        run: sudo apt-get update -q && sudo apt-get install -y -q cmake
+      - name: Toolchain deps (pkg-config + libzstd for the system-zstd link)
+        run: sudo apt-get update -q && sudo apt-get install -y -q pkg-config libzstd-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend
+      - name: Cache libduckdb download
+        uses: actions/cache@v4
+        with:
+          path: .cache/duckdb
+          key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
+      - name: Fetch prebuilt libduckdb (DuckDB is linked unbundled)
+        # DUCKDB_LIB_DIR lets sauron-tier link the prebuilt lib; LD_LIBRARY_PATH
+        # lets the test binaries load it at runtime.
+        run: |
+          DIR=$(../packaging/rpm/fetch-libduckdb.sh)
+          echo "DUCKDB_LIB_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$DIR" >> "$GITHUB_ENV"
       # fmt and clippy are both hard gates: the tree is fmt-clean and
       # clippy-clean as of b78f2ae, so any new finding is a real regression.
       # clippy needs -D warnings — without it the command exits 0 on warnings
@@ -40,7 +52,9 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        # No --all-features: it would enable sauron-tier's `bundled` feature and
+        # recompile DuckDB from source (needs the C++ toolchain we no longer install).
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
 
@@ -109,7 +123,7 @@ jobs:
     container: fedora:44
     steps:
       - name: Install rpm tooling
-        run: dnf install -y rpm-build rpmlint systemd-rpm-macros git tar gzip gawk
+        run: dnf install -y rpm-build rpmlint systemd-rpm-macros git tar gzip gawk curl unzip findutils
       - uses: actions/checkout@v4
       - name: Trust the workspace (container git)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -118,5 +132,10 @@ jobs:
       - name: rpmlint (report-only)
         continue-on-error: true
         run: rpmlint packaging/rpm/sauron.spec
+      - name: Cache libduckdb download
+        uses: actions/cache@v4
+        with:
+          path: .cache/duckdb
+          key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
       - name: Source RPM builds (validates SourceN staging + tarball)
         run: ./packaging/rpm/build-rpm.sh --srpm

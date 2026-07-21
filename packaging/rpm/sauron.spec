@@ -1,9 +1,14 @@
 # Rust release binaries; skip the debuginfo subpackage for this build.
 %global debug_package %{nil}
 
+# Prebuilt mode (`rpmbuild --with prebuilt`, driven by build-rpm.sh --prebuilt):
+# %build is skipped and %install consumes binaries + dashboard/dist staged into
+# the source tree by CI, so packaging costs seconds instead of recompiling.
+%bcond_with prebuilt
+
 Name:           sauron
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
 License:        AGPL-3.0-only
@@ -26,14 +31,26 @@ Source34:       tier.env
 Source35:       dashboard.env
 Source40:       sauron-dashboard.conf
 Source41:       sauron-dashboard-config
+# Prebuilt libduckdb.so (DuckDB C library) matching the libduckdb-sys crate pin,
+# staged into SOURCES by packaging/rpm/build-rpm.sh via fetch-libduckdb.sh. The
+# workspace links this instead of compiling the DuckDB C++ amalgamation.
+Source50:       libduckdb.so
+%if %{with prebuilt}
+# Overlay tarball of precompiled binaries (backend/target/release/*) and dashboard
+# static assets (dashboard/dist/*), staged by build-rpm.sh --prebuilt and unpacked
+# in %prep so %build is a no-op. Present only in prebuilt mode.
+Source51:       sauron-prebuilt.tar.gz
+%endif
 
 BuildRequires:  cargo >= 1.82
 BuildRequires:  rust >= 1.82
+# Only a C compiler + perl remain (ring's C/asm). DuckDB is linked prebuilt (no
+# C++ amalgamation), reqwest uses the ring TLS backend (no aws-lc/cmake/clang), and
+# zstd links the system library via pkgconfig(libzstd) — so gcc-c++, cmake and
+# clang are no longer needed.
 BuildRequires:  gcc
-BuildRequires:  gcc-c++
-BuildRequires:  cmake
-BuildRequires:  clang
 BuildRequires:  perl-interpreter
+BuildRequires:  pkgconfig(libzstd)
 BuildRequires:  nodejs
 BuildRequires:  npm
 BuildRequires:  systemd-rpm-macros
@@ -74,12 +91,40 @@ Standalone Sauron command-line tools: 'crebain' load/benchmark generator and
 
 %prep
 %autosetup -n %{name}-%{version}
+%if %{with prebuilt}
+# Lay precompiled binaries + dashboard/dist into the tree so %build is a no-op and
+# %install finds artifacts at the same paths as a from-source build.
+tar xzf %{SOURCE51}
+%endif
 
 %build
-# Backend — all workspace binaries, release mode.
+%if %{without prebuilt}
+# Dashboard SPA and the Rust workspace are independent — overlap them so the
+# npm build hides under the (longer) cargo compile.
+(cd dashboard && npm ci && npm run build) &
+dashboard_build=$!
+
+# Link DuckDB against the prebuilt libduckdb (Source50) rather than compiling the
+# C++ amalgamation from source — the single slowest item in the workspace build.
+mkdir -p _libduckdb
+cp -p %{SOURCE50} _libduckdb/libduckdb.so
+export DUCKDB_LIB_DIR="$PWD/_libduckdb"
+
+# redhat-rpm-config injects RUSTFLAGS with -Cdebuginfo=2 -Ccodegen-units=1
+# -Cstrip=none: that generates debuginfo we discard (debug_package is %{nil}),
+# forces slow single-unit codegen, and defeats the release `strip`. Append
+# last-wins overrides to restore fast, stripped codegen while keeping the
+# hardening/link flags redhat-rpm-config also set.
+export RUSTFLAGS="${RUSTFLAGS:-} -Cdebuginfo=0 -Ccodegen-units=16 -Cstrip=symbols"
+
 (cd backend && cargo build --release --workspace)
-# Dashboard — static SPA.
-(cd dashboard && npm ci && npm run build)
+
+wait "$dashboard_build"
+%else
+# Prebuilt mode: binaries (backend/target/release) and dashboard/dist were staged
+# into the source tree by build-rpm.sh --prebuilt. Nothing to compile.
+:
+%endif
 
 %install
 # --- binaries ---
@@ -110,6 +155,13 @@ install -Dm0644 %{SOURCE35} %{buildroot}%{_sysconfdir}/sauron/dashboard.env
 install -dm0750 %{buildroot}%{_sharedstatedir}/sauron
 install -dm0750 %{buildroot}%{_sharedstatedir}/sauron/cold
 
+# --- vendored libduckdb (dynamically linked by sauron-tier) ---
+# Shipped in a private lib dir + an ld.so.conf.d drop-in so the loader resolves
+# it (ldconfig runs in %post server). No rpath is baked into the binary.
+install -Dm0755 %{SOURCE50} %{buildroot}%{_libdir}/sauron/libduckdb.so
+install -dm0755 %{buildroot}%{_sysconfdir}/ld.so.conf.d
+printf '%s\n' '%{_libdir}/sauron' > %{buildroot}%{_sysconfdir}/ld.so.conf.d/sauron.conf
+
 # --- dashboard static + generator + nginx vhost ---
 mkdir -p %{buildroot}%{_datadir}/sauron/dashboard
 cp -a dashboard/dist/. %{buildroot}%{_datadir}/sauron/dashboard/
@@ -126,6 +178,9 @@ install -Dm0755 %{SOURCE41} %{buildroot}%{_libexecdir}/sauron/sauron-dashboard-c
 
 %post server
 %systemd_post sauron-api.service sauron-ingest.service sauron-monitor.service sauron-tier.service sauron-migrate.service
+# Refresh the dynamic linker cache so sauron-tier finds the vendored
+# %{_libdir}/sauron/libduckdb.so via the ld.so.conf.d drop-in.
+/sbin/ldconfig
 # Generate a JWT secret on first install if none present.
 if [ "$1" -eq 1 ] && [ ! -s %{_sysconfdir}/sauron/secret.env ]; then
     umask 027
@@ -139,6 +194,8 @@ fi
 
 %postun server
 %systemd_postun_with_restart sauron-api.service sauron-ingest.service sauron-monitor.service sauron-tier.service
+# Rebuild the linker cache after the vendored libduckdb is added/removed.
+/sbin/ldconfig
 
 %post dashboard
 %{_libexecdir}/sauron/sauron-dashboard-config || :
@@ -170,6 +227,10 @@ fi
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/monitor.env
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/tier.env
 %ghost %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/secret.env
+# Vendored DuckDB C library (linked by sauron-tier) + loader path.
+%dir %{_libdir}/sauron
+%{_libdir}/sauron/libduckdb.so
+%config %{_sysconfdir}/ld.so.conf.d/sauron.conf
 
 %files dashboard
 %dir %{_datadir}/sauron
@@ -184,5 +245,11 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Tue Jul 21 2026 Soheyb Merah <merah.soheyb@gmail.com> - 0.1.0-2
+- Link DuckDB against a prebuilt libduckdb (vendored .so in sauron-server) instead
+  of compiling the bundled C++ amalgamation — large build-time reduction.
+- Strip release binaries; add `--with prebuilt` mode so CI can package precompiled
+  artifacts without recompiling.
+
 * Thu Jul 16 2026 Soheyb Merah <merah.soheyb@gmail.com> - 0.1.0-1
 - Initial RPM packaging: sauron (base), sauron-server, sauron-dashboard, sauron-cli.
