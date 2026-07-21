@@ -70,7 +70,9 @@ pub enum TimelineItem {
     },
     Error {
         at: DateTime<Utc>,
-        error: ErrorEvent,
+        // Boxed: an inline ErrorEvent is 716 bytes against 420 for the next
+        // largest variant, which would bloat every TimelineItem in the vec.
+        error: Box<ErrorEvent>,
     },
     Transaction {
         at: DateTime<Utc>,
@@ -121,7 +123,7 @@ pub async fn detail(
     for e in errors {
         timeline.push(TimelineItem::Error {
             at: e.occurred_at,
-            error: e,
+            error: Box::new(e),
         });
     }
     for t in txns {

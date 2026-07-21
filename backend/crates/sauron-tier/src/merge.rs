@@ -15,7 +15,7 @@ pub struct DayCount {
 /// Sum `hot` and `cold` per-day counts into one ascending-by-day series.
 pub fn merge_day_counts(hot: Vec<DayCount>, cold: Vec<DayCount>) -> Vec<DayCount> {
     let mut acc: BTreeMap<NaiveDate, i64> = BTreeMap::new();
-    for dc in hot.into_iter().chain(cold.into_iter()) {
+    for dc in hot.into_iter().chain(cold) {
         *acc.entry(dc.day).or_insert(0) += dc.count;
     }
     acc.into_iter()
