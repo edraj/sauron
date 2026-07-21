@@ -123,7 +123,7 @@ jobs:
     container: fedora:44
     steps:
       - name: Install rpm tooling
-        run: dnf install -y rpm-build rpmlint systemd-rpm-macros git tar gzip gawk curl unzip findutils
+        run: dnf install -y --allowerasing rpm-build rpmlint systemd-rpm-macros git tar gzip gawk curl unzip findutils
       - uses: actions/checkout@v4
       - name: Trust the workspace (container git)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
