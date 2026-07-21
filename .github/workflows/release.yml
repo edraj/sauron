@@ -14,10 +14,15 @@ permissions:
   contents: read
 
 jobs:
-  rpm:
-    name: rpm (${{ matrix.target }})
+  # ---------------------------------------------------------------------------
+  # Compile once per distro (native), with a shared sccache so the second distro
+  # leg reuses the first's compilation cache. Uploads the binaries + dashboard
+  # assets + the prebuilt libduckdb the binaries were linked against.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
@@ -29,16 +34,31 @@ jobs:
           - target: el9
             image: almalinux:9
     container: ${{ matrix.image }}
+    env:
+      # sccache-backed compilation cache, shared across matrix legs and runs.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Install build toolchain
-        # BuildRequires are satisfied out-of-band: system C/C++ + rpm tooling via
-        # dnf, Rust via rustup, Node via the distro/NodeSource. build-rpm.sh then
-        # auto-detects the non-RPM cargo and adds --nodeps.
+        # Native code left after the build optimizations is just ring's C/asm, so
+        # only a C compiler + perl are needed — no gcc-c++/cmake/clang (DuckDB is
+        # prebuilt, TLS is the ring backend, zstd links the system library). zstd
+        # needs pkgconfig(libzstd) → libzstd-devel (in CRB on EL9). lld = fast
+        # linker; curl+unzip drive the libduckdb fetch.
         run: |
+          . /etc/os-release
           dnf install -y \
-            gcc gcc-c++ cmake clang perl-interpreter \
-            rpm-build systemd-rpm-macros \
-            git tar gzip gawk findutils curl
+            gcc perl-interpreter lld pkgconf-pkg-config \
+            git tar gzip gawk findutils curl unzip
+          case "$ID" in
+            fedora)
+              dnf install -y libzstd-devel ;;
+            *)
+              dnf install -y 'dnf-command(config-manager)' || :
+              dnf config-manager --set-enabled crb 2>/dev/null \
+                || dnf config-manager --set-enabled powertools 2>/dev/null || :
+              dnf install -y libzstd-devel ;;
+          esac
 
       - name: Install Rust (rustup — uniform across distros)
         run: |
@@ -66,16 +86,99 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          SPEC_VERSION=$(rpmspec -q --srpm --qf '%{version}' packaging/rpm/sauron.spec)
+          SPEC_VERSION=$(rpmspec -q --srpm --qf '%{version}' packaging/rpm/sauron.spec 2>/dev/null \
+            || awk -F'"' '/^version *= *"/{print $2; exit}' backend/Cargo.toml)
           if [ "${TAG#v}" != "$SPEC_VERSION" ]; then
             echo "::error::tag $TAG does not match spec Version $SPEC_VERSION — bump packaging/rpm/sauron.spec (Version + %changelog) first"
             exit 1
           fi
 
-      - name: Build RPMs
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo registry (not target — sccache owns compiled objects)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-targets: "false"
+
+      - name: Cache libduckdb download
+        uses: actions/cache@v4
+        with:
+          path: .cache/duckdb
+          key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
+
+      - name: Fetch prebuilt libduckdb
+        run: echo "DUCKDB_LIB_DIR=$(packaging/rpm/fetch-libduckdb.sh)" >> "$GITHUB_ENV"
+
+      - name: Compile workspace + dashboard
+        run: |
+          # Fast linker for the many-binary final link — best-effort.
+          if command -v ld.lld >/dev/null 2>&1; then
+            export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+          fi
+          (cd dashboard && npm ci && npm run build) &
+          dashboard_build=$!
+          (cd backend && cargo build --release --workspace)
+          wait "$dashboard_build"
+
+      - name: sccache stats
+        run: sccache --show-stats || true
+
+      - name: Assemble prebuilt artifacts
+        run: |
+          mkdir -p prebuilt/bin prebuilt/dist
+          for b in sauron-api sauron-ingest sauron-monitor sauron-tier sauron-migrate sauron-symcli crebain; do
+            install -m0755 "backend/target/release/$b" "prebuilt/bin/$b"
+          done
+          cp -a dashboard/dist/. prebuilt/dist/
+          install -m0755 "$DUCKDB_LIB_DIR/libduckdb.so" prebuilt/libduckdb.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.target }}
+          path: prebuilt
+          if-no-files-found: error
+          retention-days: 3
+
+  # ---------------------------------------------------------------------------
+  # Package the precompiled artifacts. No toolchain here — just rpm-build, so it
+  # runs in seconds. Native per distro (dist tag + auto-deps computed correctly).
+  # ---------------------------------------------------------------------------
+  package:
+    name: package (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: fedora
+            image: fedora:44
+          - target: el9
+            image: almalinux:9
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install rpm tooling (no compiler toolchain)
+        run: dnf install -y rpm-build systemd-rpm-macros git tar gzip gawk findutils coreutils
+
+      - uses: actions/checkout@v4
+
+      - name: Trust the workspace (container git)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.target }}
+          path: prebuilt
+
+      - name: Package prebuilt RPMs
         env:
           RPMBUILD_TOPDIR: ${{ github.workspace }}/rpmbuild
-        run: ./packaging/rpm/build-rpm.sh
+        run: ./packaging/rpm/build-rpm.sh --prebuilt "$PWD/prebuilt"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -88,7 +191,7 @@ jobs:
   release:
     name: publish GitHub release
     if: github.ref_type == 'tag'
-    needs: [rpm]
+    needs: [package]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

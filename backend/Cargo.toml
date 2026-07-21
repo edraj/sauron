@@ -21,7 +21,20 @@ sauron-tier = { path = "crates/sauron-tier" }
 sauron-symbols = { path = "crates/sauron-symbols" }
 
 # --- async runtime / http ---
-tokio = { version = "1", features = ["full"] }
+# Scoped tokio features (was "full") — only what the workspace actually uses:
+# spawn/spawn_blocking/#[main] (rt-multi-thread), macros (main/test/select/join),
+# net (TcpListener/lookup_host), time, sync (watch/mpsc), signal (ctrl_c),
+# io-util (AsyncRead/Write), process (crebain harness). No fs/io-std.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "signal",
+    "io-util",
+    "process",
+] }
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["typed-header", "query"] }
 tower = "0.5"
@@ -56,7 +69,11 @@ argon2 = { version = "0.5", features = ["std"] }
 getrandom = "0.3"
 sha2 = "0.11"
 hex = "0.4"
-zstd = "0.13"
+# pkg-config: link the system libzstd instead of compiling the vendored C source
+# (the slowest compile unit at ~38s). libzstd is present on every Fedora/RHEL host;
+# needs libzstd-devel at build. Feature-unifies across the transitive zstd-sys pulled
+# by tower-http's decompression-full too.
+zstd = { version = "0.13", features = ["pkg-config"] }
 object = "0.36"
 addr2line = "0.24"
 gimli = "0.31"
@@ -77,3 +94,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
+
+[profile.release]
+# Strip symbol tables from release binaries → smaller binaries and RPMs.
+# (debuginfo is already suppressed by `%global debug_package %{nil}` in the spec,
+# and release builds carry no `-g` debug info, so nothing diagnostic is lost.)
+# Deliberately NOT setting `lto` or `codegen-units = 1`: those shave a little more
+# size but SLOW the compile substantially, which is the opposite of the goal here.
+strip = true

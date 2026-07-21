@@ -4,10 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Off by default: the release/packaged build links a prebuilt libduckdb (fetched
+# by packaging/rpm/fetch-libduckdb.sh) instead of compiling the DuckDB C++
+# amalgamation from source — the single slowest item in the workspace build.
+# Enable for a fully self-contained/offline build with no external libduckdb:
+#   cargo build -p sauron-tier --features bundled
+bundled = ["duckdb/bundled"]
+
 [dependencies]
 chrono.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-duckdb = { version = "1", features = ["bundled", "chrono"] }
+# Unbundled: links the system/vendored libduckdb (DUCKDB_LIB_DIR / ld.so path).
+# Parquet + the postgres scanner are provided by the official prebuilt lib at
+# runtime, so no duckdb crate feature (json/parquet) is needed here.
+duckdb = { version = "1", default-features = false, features = ["chrono"] }

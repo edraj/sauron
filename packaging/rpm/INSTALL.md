@@ -11,16 +11,29 @@ Sauron ships four RPMs from one spec:
 
 ## 1. Build the RPMs
 
-Requires the build toolchain (`sudo dnf install rust cargo gcc gcc-c++ cmake clang perl-interpreter nodejs npm rpm-build systemd-rpm-macros`):
+Requires the build toolchain (`sudo dnf install rust cargo gcc gcc-c++ cmake clang perl-interpreter nodejs npm rpm-build systemd-rpm-macros curl unzip`):
 
 ```bash
 git clone <repo> sauron && cd sauron
 ./packaging/rpm/build-rpm.sh
 ```
 
-Artifacts land in `~/rpmbuild/RPMS/<arch>/` and `~/rpmbuild/SRPMS/`. The first build
-compiles the Rust workspace (including a bundled DuckDB) and the dashboard — expect
-several minutes. Use `./packaging/rpm/build-rpm.sh --srpm` to produce just the source RPM.
+Artifacts land in `~/rpmbuild/RPMS/<arch>/` and `~/rpmbuild/SRPMS/`. The build compiles
+the Rust workspace and the dashboard, then packages them.
+
+DuckDB is **not** compiled from source. `build-rpm.sh` fetches a prebuilt `libduckdb`
+(version derived from the `libduckdb-sys` pin in `Cargo.lock`, via `fetch-libduckdb.sh`),
+links `sauron-tier` against it, and ships the `.so` inside `sauron-server`. This removes
+the slowest item in the build; it needs outbound network on the first build (the download
+is cached under `.cache/duckdb/`). For a fully self-contained/offline build that compiles
+DuckDB from source instead, build the workspace with `cargo build --release -p sauron-tier-bin --features bundled`.
+
+Other modes:
+
+- `./packaging/rpm/build-rpm.sh --srpm` — source RPM only (no compile).
+- `./packaging/rpm/build-rpm.sh --prebuilt DIR` — package precompiled binaries + dashboard
+  assets from `DIR` (`DIR/bin/*`, `DIR/dist/`, `DIR/libduckdb.so`) without recompiling. CI
+  uses this to split the slow compile from packaging — see `.github/workflows/release.yml`.
 
 > **Using rustup / nvm** instead of the Fedora `rust`/`cargo`/`nodejs`/`npm` packages?
 > `rpmbuild` resolves `BuildRequires` against the RPM database, not `$PATH`, so it reports
@@ -52,6 +65,8 @@ sudo dnf install ./sauron-0.1.0-*.rpm ./sauron-server-0.1.0-*.rpm
 ```
 /usr/bin/sauron-{api,ingest,monitor,tier,migrate,symcli}   /usr/bin/crebain
 /usr/lib/systemd/system/sauron-{api,ingest,monitor,tier,migrate}.service
+/usr/lib64/sauron/libduckdb.so  vendored DuckDB library (sauron-tier links it)
+/etc/ld.so.conf.d/sauron.conf   puts /usr/lib64/sauron on the loader path (ldconfig runs on install)
 /etc/sauron/sauron.env          shared: DATABASE_URL, REDIS_URL, RUST_LOG
 /etc/sauron/{api,ingest,monitor,tier,dashboard}.env
 /etc/sauron/secret.env          JWT_SECRET, auto-generated on first install (0640 root:sauron)
