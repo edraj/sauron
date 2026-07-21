@@ -2,12 +2,15 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
   # dry run: builds the RPMs as workflow artifacts, creates no release
   workflow_dispatch:
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Serialize releases so two quick merges can't compute the same version.
+  # A newer push replaces the queued run; the in-flight one finishes first,
+  # so the queued run sees its tag and bumps the patch off it.
+  group: release-main
   cancel-in-progress: false
 
 permissions:
@@ -15,9 +18,49 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Compute the next release version — the single source of truth for every
+  # downstream job. major.minor come from backend/Cargo.toml; the patch is the
+  # highest existing v<maj>.<min>.* tag + 1 (0 when none exists yet). Humans
+  # bump major/minor in Cargo.toml when they want; the patch auto-advances.
+  # ---------------------------------------------------------------------------
+  version:
+    name: compute version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full tag history for the patch scan
+
+      - id: compute
+        run: |
+          set -euo pipefail
+          mm=$(awk -F'"' '/^version *= *"/{split($2,a,"."); print a[1]"."a[2]; exit}' backend/Cargo.toml)
+          [ -n "$mm" ] || { echo "::error::could not read major.minor from backend/Cargo.toml"; exit 1; }
+          # v0.1.* matches v0.1.5 but not v0.11.0 (fnmatch '.' is literal); sort -V
+          # orders patches numerically so v0.1.10 beats v0.1.9.
+          latest=$(git tag -l "v${mm}.*" | sort -V | tail -n1)
+          if [ -z "$latest" ]; then
+            patch=0
+          else
+            patch=$(( ${latest##*.} + 1 ))
+          fi
+          version="${mm}.${patch}"
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}"         >> "$GITHUB_OUTPUT"
+          echo "Next release: ${tag} (previous v${mm}.* tag: ${latest:-none})"
+
+  # ---------------------------------------------------------------------------
   # Compile once per distro (native), with a shared sccache so the second distro
   # leg reuses the first's compilation cache. Uploads the binaries + dashboard
   # assets + the prebuilt libduckdb the binaries were linked against.
+  #
+  # Cargo.toml is left pristine here so the sccache / cargo-registry caches stay
+  # warm across releases — the release version is stamped in at package time.
   # ---------------------------------------------------------------------------
   build:
     name: build (${{ matrix.target }})
@@ -81,18 +124,6 @@ jobs:
       - name: Trust the workspace (container git)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Tag must match the spec Version
-        if: github.ref_type == 'tag'
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          SPEC_VERSION=$(rpmspec -q --srpm --qf '%{version}' packaging/rpm/sauron.spec 2>/dev/null \
-            || awk -F'"' '/^version *= *"/{print $2; exit}' backend/Cargo.toml)
-          if [ "${TAG#v}" != "$SPEC_VERSION" ]; then
-            echo "::error::tag $TAG does not match spec Version $SPEC_VERSION — bump packaging/rpm/sauron.spec (Version + %changelog) first"
-            exit 1
-          fi
-
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -144,10 +175,12 @@ jobs:
   # ---------------------------------------------------------------------------
   # Package the precompiled artifacts. No toolchain here — just rpm-build, so it
   # runs in seconds. Native per distro (dist tag + auto-deps computed correctly).
+  # The computed version is stamped into the spec + Cargo.toml (checkout only,
+  # never committed) so the RPM carries v<maj>.<min>.<patch>-1.
   # ---------------------------------------------------------------------------
   package:
     name: package (${{ matrix.target }})
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -163,7 +196,7 @@ jobs:
     container: ${{ matrix.image }}
     steps:
       - name: Install rpm tooling (no compiler toolchain)
-        run: dnf install -y rpm-build systemd-rpm-macros git tar gzip gawk findutils coreutils
+        run: dnf install -y rpm-build systemd-rpm-macros git tar gzip gawk findutils coreutils sed
 
       - uses: actions/checkout@v4
 
@@ -174,6 +207,19 @@ jobs:
         with:
           name: prebuilt-${{ matrix.target }}
           path: prebuilt
+
+      - name: Stamp computed version into spec + Cargo.toml
+        env:
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # First `version = "..."` line only — matches build-rpm.sh's reader.
+          sed -i '0,/^version = ".*"/s//version = "'"$V"'"/' backend/Cargo.toml
+          sed -i -E 's/^(Version:[[:space:]]*).*/\1'"$V"'/'    packaging/rpm/sauron.spec
+          sed -i -E 's/^(Release:[[:space:]]*).*/\11%{?dist}/' packaging/rpm/sauron.spec
+          echo ">> stamped:"
+          grep -E '^version = ' backend/Cargo.toml | head -n1
+          grep -E '^(Version|Release):' packaging/rpm/sauron.spec
 
       - name: Package prebuilt RPMs
         env:
@@ -190,8 +236,9 @@ jobs:
 
   release:
     name: publish GitHub release
-    if: github.ref_type == 'tag'
-    needs: [package]
+    # Real merges to main publish; workflow_dispatch is a build-only dry run.
+    if: github.event_name == 'push'
+    needs: [version, package]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -205,14 +252,19 @@ jobs:
       - name: Create release and attach RPMs
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           mapfile -t FILES < <(find dist -name '*.rpm' | sort)
+          [ "${#FILES[@]}" -gt 0 ] || { echo "::error::no RPMs found to release"; exit 1; }
           printf 'asset: %s\n' "${FILES[@]}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # Re-run against an existing release/tag: refresh the assets.
             gh release upload "$TAG" --repo "$REPO" --clobber "${FILES[@]}"
           else
-            gh release create "$TAG" --repo "$REPO" --verify-tag \
+            # Creates the v<version> tag at the merge commit, then the release.
+            gh release create "$TAG" --repo "$REPO" --target "$SHA" \
               --title "Sauron $TAG" --generate-notes "${FILES[@]}"
           fi
