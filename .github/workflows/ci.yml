@@ -33,11 +33,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend
-      # fmt + clippy are report-only for now (lenient). Remove the
-      # continue-on-error lines to make them hard gates once the tree is
-      # fmt-clean (`cd backend && cargo fmt --all`) and clippy-clean.
-      - name: cargo fmt (report-only)
-        continue-on-error: true
+      # fmt is a hard gate: the tree was formatted in full, so any drift is a
+      # real regression. clippy stays report-only until its warnings are fixed.
+      - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy (report-only)
         continue-on-error: true

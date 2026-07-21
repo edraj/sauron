@@ -145,7 +145,10 @@ pub async fn symbolicate_event(state: &AppState, app_id: Uuid, event: &mut Error
     // Persist a lean copy for hot partitions that were previously unresolved —
     // never write into cold/exported partitions (respects the tiering guard).
     let hot = event.occurred_at > Utc::now() - Duration::days(state.cfg.tier_hot_days);
-    let was_unresolved = matches!(event.symbolication_status.as_str(), "pending" | "no_artifacts");
+    let was_unresolved = matches!(
+        event.symbolication_status.as_str(),
+        "pending" | "no_artifacts"
+    );
     if hot && was_unresolved {
         // Persist WITH context so later views short-circuit to the stored frames.
         if let (Ok(frames_json), Ok(mut conn)) = (
@@ -163,7 +166,9 @@ pub async fn symbolicate_event(state: &AppState, app_id: Uuid, event: &mut Error
         }
     }
 
-    event.stacktrace_symbolicated = serde_json::to_value(&resolved).ok().filter(|v| !v.is_null());
+    event.stacktrace_symbolicated = serde_json::to_value(&resolved)
+        .ok()
+        .filter(|v| !v.is_null());
     if event.stacktrace_symbolicated.is_none() {
         event.stacktrace_symbolicated = Some(Value::Array(Vec::new()));
     }

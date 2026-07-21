@@ -72,7 +72,11 @@ fn line_chart(title: &str, x_max: f64, series: &[Series], fmt_y: &dyn Fn(f64) ->
         .iter()
         .flat_map(|s| s.points.iter().map(|&(_, v)| v))
         .fold(0.0_f64, f64::max);
-    let y_max = if y_max_raw <= 0.0 { 1.0 } else { y_max_raw * 1.1 };
+    let y_max = if y_max_raw <= 0.0 {
+        1.0
+    } else {
+        y_max_raw * 1.1
+    };
 
     let mut svg = String::new();
     svg.push_str(&format!(
@@ -161,7 +165,9 @@ fn esc(s: &str) -> String {
 }
 
 fn stat_card(label: &str, value: &str) -> String {
-    format!("<div class=\"card\"><div class=\"v\">{value}</div><div class=\"l\">{label}</div></div>")
+    format!(
+        "<div class=\"card\"><div class=\"v\">{value}</div><div class=\"l\">{label}</div></div>"
+    )
 }
 
 /// Build the complete HTML document.
@@ -177,13 +183,21 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
     };
     let failed = s.rate_limited + s.http_errors + s.transport;
 
-    let has_resources = s.timeline.iter().any(|t| t.cpu_cores.is_some() || t.rss_bytes.is_some());
+    let has_resources = s
+        .timeline
+        .iter()
+        .any(|t| t.cpu_cores.is_some() || t.rss_bytes.is_some());
     let peak_cpu = s
         .timeline
         .iter()
         .filter_map(|t| t.cpu_cores)
         .fold(0.0_f64, f64::max);
-    let peak_rss = s.timeline.iter().filter_map(|t| t.rss_bytes).max().unwrap_or(0);
+    let peak_rss = s
+        .timeline
+        .iter()
+        .filter_map(|t| t.rss_bytes)
+        .max()
+        .unwrap_or(0);
     let x_max = s.timeline.last().map(|t| t.t_secs).unwrap_or(0.0);
 
     // ---- charts ----
@@ -193,7 +207,11 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
         &[Series {
             name: "req/s",
             color: "#4f8cff",
-            points: s.timeline.iter().map(|t| (t.t_secs, t.interval_rate)).collect(),
+            points: s
+                .timeline
+                .iter()
+                .map(|t| (t.t_secs, t.interval_rate))
+                .collect(),
         }],
         &|v| format!("{v:.0}"),
     );
@@ -204,12 +222,20 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
             Series {
                 name: "accepted",
                 color: "#2ecc71",
-                points: s.timeline.iter().map(|t| (t.t_secs, t.cum_accepted as f64)).collect(),
+                points: s
+                    .timeline
+                    .iter()
+                    .map(|t| (t.t_secs, t.cum_accepted as f64))
+                    .collect(),
             },
             Series {
                 name: "failed",
                 color: "#e74c3c",
-                points: s.timeline.iter().map(|t| (t.t_secs, t.cum_failed as f64)).collect(),
+                points: s
+                    .timeline
+                    .iter()
+                    .map(|t| (t.t_secs, t.cum_failed as f64))
+                    .collect(),
             },
         ],
         &|v| group(v as u64),
@@ -221,12 +247,20 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
             Series {
                 name: "accepted/s",
                 color: "#2ecc71",
-                points: s.timeline.iter().map(|t| (t.t_secs, t.interval_accepted as f64)).collect(),
+                points: s
+                    .timeline
+                    .iter()
+                    .map(|t| (t.t_secs, t.interval_accepted as f64))
+                    .collect(),
             },
             Series {
                 name: "failed/s",
                 color: "#e74c3c",
-                points: s.timeline.iter().map(|t| (t.t_secs, t.interval_failed as f64)).collect(),
+                points: s
+                    .timeline
+                    .iter()
+                    .map(|t| (t.t_secs, t.interval_failed as f64))
+                    .collect(),
             },
         ],
         &|v| format!("{v:.0}"),
@@ -269,7 +303,11 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
     cards.push_str(&stat_card("total requests", &group(s.requests)));
     cards.push_str(&stat_card(
         "req/s achieved",
-        &format!("{}<span class=\"sub\"> / {} target</span>", group(achieved_rps.round() as u64), group(target_rps.round() as u64)),
+        &format!(
+            "{}<span class=\"sub\"> / {} target</span>",
+            group(achieved_rps.round() as u64),
+            group(target_rps.round() as u64)
+        ),
     ));
     cards.push_str(&stat_card("accepted", &group(s.accepted)));
     cards.push_str(&stat_card("failed", &group(failed)));
@@ -279,17 +317,29 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
     cards.push_str(&stat_card("latency p99", &fmt_us(s.p99_us)));
     cards.push_str(&stat_card("latency max", &fmt_us(s.max_us)));
     cards.push_str(&stat_card("peak in-flight", &group(s.peak_inflight as u64)));
-    cards.push_str(&stat_card("peak connections", &group(s.peak_connections as u64)));
-    cards.push_str(&stat_card("effective concurrency", &group(s.effective_concurrency as u64)));
+    cards.push_str(&stat_card(
+        "peak connections",
+        &group(s.peak_connections as u64),
+    ));
+    cards.push_str(&stat_card(
+        "effective concurrency",
+        &group(s.effective_concurrency as u64),
+    ));
     cards.push_str(&stat_card("source IPs", &group(s.source_ips as u64)));
     cards.push_str(&stat_card("offered", &group(s.offered)));
     cards.push_str(&stat_card("shed (behind)", &group(s.behind)));
     if has_resources {
         cards.push_str(&stat_card(
             "peak CPU",
-            &format!("{peak_cpu:.2}<span class=\"sub\"> / {} cores</span>", meta.ncpus),
+            &format!(
+                "{peak_cpu:.2}<span class=\"sub\"> / {} cores</span>",
+                meta.ncpus
+            ),
         ));
-        cards.push_str(&stat_card("peak RSS", &format!("{} MB", peak_rss / 1_048_576)));
+        cards.push_str(&stat_card(
+            "peak RSS",
+            &format!("{} MB", peak_rss / 1_048_576),
+        ));
     }
 
     // ---- tables ----
@@ -307,15 +357,24 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
          <tr><td>http errors</td><td>{}</td><td>{}</td></tr>\
          <tr><td>transport errors</td><td>{}</td><td>{}</td></tr>\
          </tbody></table>",
-        group(s.accepted), pct(s.accepted, s.requests),
-        group(s.rate_limited), pct(s.rate_limited, s.requests),
-        group(s.http_errors), pct(s.http_errors, s.requests),
-        group(s.transport), pct(s.transport, s.requests),
+        group(s.accepted),
+        pct(s.accepted, s.requests),
+        group(s.rate_limited),
+        pct(s.rate_limited, s.requests),
+        group(s.http_errors),
+        pct(s.http_errors, s.requests),
+        group(s.transport),
+        pct(s.transport, s.requests),
     );
     let item_row = |label: &str, a: u64, at: u64| {
-        format!("<tr><td>{label}</td><td>{}</td><td>{}</td></tr>", group(a), group(at))
+        format!(
+            "<tr><td>{label}</td><td>{}</td><td>{}</td></tr>",
+            group(a),
+            group(at)
+        )
     };
-    let items = format!(
+    let items =
+        format!(
         "<table><thead><tr><th>signal</th><th>accepted</th><th>attempted</th></tr></thead><tbody>\
          {}{}{}{}{}{}</tbody></table>",
         item_row("errors", s.accepted_items.errors, s.attempted.errors),
@@ -377,8 +436,7 @@ pub fn write(
     meta: &ReportMeta,
 ) -> anyhow::Result<()> {
     let html = render(summary, expected, meta);
-    std::fs::write(path, html)
-        .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))
+    std::fs::write(path, html).map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))
 }
 
 const CSS: &str = "\
@@ -416,31 +474,63 @@ mod tests {
 
     fn tp(t: f64, req: u64, ok: u64, fail: u64, cpu: Option<f64>, rss: Option<u64>) -> TimePoint {
         TimePoint {
-            t_secs: t, cum_accepted: ok, cum_failed: fail,
-            interval_rate: req as f64, interval_accepted: ok, interval_failed: fail,
-            cpu_cores: cpu, rss_bytes: rss,
+            t_secs: t,
+            cum_accepted: ok,
+            cum_failed: fail,
+            interval_rate: req as f64,
+            interval_accepted: ok,
+            interval_failed: fail,
+            cpu_cores: cpu,
+            rss_bytes: rss,
         }
     }
 
     fn summary(timeline: Vec<TimePoint>) -> Summary {
         Summary {
-            elapsed: Duration::from_secs(3), users: 10, requests: 900, accepted: 880,
-            rate_limited: 5, http_errors: 10, transport: 5,
+            elapsed: Duration::from_secs(3),
+            users: 10,
+            requests: 900,
+            accepted: 880,
+            rate_limited: 5,
+            http_errors: 10,
+            transport: 5,
             status_counts: vec![(202, 880), (429, 5)],
-            attempted: ItemCounts { events: 500, errors: 400, ..Default::default() },
-            accepted_items: ItemCounts { events: 490, errors: 390, ..Default::default() },
-            p50_us: 1200, p90_us: 4500, p99_us: 9000, max_us: 25000,
-            latency_samples: 900, latency_truncated: false, timeline,
-            behind: 0, peak_inflight: 12, offered: 900,
-            effective_concurrency: 10, source_ips: 1, peak_connections: 42,
+            attempted: ItemCounts {
+                events: 500,
+                errors: 400,
+                ..Default::default()
+            },
+            accepted_items: ItemCounts {
+                events: 490,
+                errors: 390,
+                ..Default::default()
+            },
+            p50_us: 1200,
+            p90_us: 4500,
+            p99_us: 9000,
+            max_us: 25000,
+            latency_samples: 900,
+            latency_truncated: false,
+            timeline,
+            behind: 0,
+            peak_inflight: 12,
+            offered: 900,
+            effective_concurrency: 10,
+            source_ips: 1,
+            peak_connections: 42,
         }
     }
 
     fn meta() -> ReportMeta {
         ReportMeta {
-            mode_label: "isolated".into(), users: 10, duration_secs: 3,
-            events_per_min: 10, issues_per_min: 10, gzip: true,
-            generated_at: "2026-07-15 00:00:00 UTC".into(), ncpus: 8,
+            mode_label: "isolated".into(),
+            users: 10,
+            duration_secs: 3,
+            events_per_min: 10,
+            issues_per_min: 10,
+            gzip: true,
+            generated_at: "2026-07-15 00:00:00 UTC".into(),
+            ncpus: 8,
         }
     }
 
@@ -464,7 +554,14 @@ mod tests {
             tp(2.0, 600, 585, 15, Some(0.9), Some(60 * 1024 * 1024)),
             tp(3.0, 900, 880, 20, Some(1.1), Some(64 * 1024 * 1024)),
         ]);
-        let html = render(&s, &crate::cli::Expected { requests: 1000.0, duration_secs: 3.0 }, &meta());
+        let html = render(
+            &s,
+            &crate::cli::Expected {
+                requests: 1000.0,
+                duration_secs: 3.0,
+            },
+            &meta(),
+        );
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("crebain"));
         assert!(html.contains("Requests / sec"));
@@ -480,7 +577,14 @@ mod tests {
             tp(1.0, 300, 295, 5, None, None),
             tp(2.0, 600, 590, 10, None, None),
         ]);
-        let html = render(&s, &crate::cli::Expected { requests: 1000.0, duration_secs: 3.0 }, &meta());
+        let html = render(
+            &s,
+            &crate::cli::Expected {
+                requests: 1000.0,
+                duration_secs: 3.0,
+            },
+            &meta(),
+        );
         assert!(html.contains("Requests / sec"));
         assert!(!html.contains("CPU (cores)"));
         assert!(!html.contains("Memory (RSS)"));
@@ -489,7 +593,14 @@ mod tests {
     #[test]
     fn empty_timeline_still_renders() {
         let s = summary(vec![]);
-        let html = render(&s, &crate::cli::Expected { requests: 0.0, duration_secs: 3.0 }, &meta());
+        let html = render(
+            &s,
+            &crate::cli::Expected {
+                requests: 0.0,
+                duration_secs: 3.0,
+            },
+            &meta(),
+        );
         assert!(html.contains("no data"));
         assert!(html.starts_with("<!doctype html>"));
     }

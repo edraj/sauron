@@ -73,7 +73,10 @@ mod tests {
             (false, Some("assertion 'OK' not found".to_string()))
         );
         // status ok and assertion present -> up
-        assert_eq!(evaluate_http(200, "all OK here", "200-399", Some("OK")), (true, None));
+        assert_eq!(
+            evaluate_http(200, "all OK here", "200-399", Some("OK")),
+            (true, None)
+        );
         // empty assertion is ignored
         assert_eq!(evaluate_http(200, "x", "200-399", Some("")), (true, None));
     }

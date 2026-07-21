@@ -260,7 +260,11 @@ impl Symbolicator {
         // artifacts ordered newest-first, this makes duplicate names deterministic.
         let art = artifacts
             .iter()
-            .find(|a| a.name.as_deref().is_some_and(|n| matcher::matches_exact(path, n)))
+            .find(|a| {
+                a.name
+                    .as_deref()
+                    .is_some_and(|n| matcher::matches_exact(path, n))
+            })
             .or_else(|| {
                 artifacts
                     .iter()
@@ -292,25 +296,25 @@ impl Symbolicator {
     }
 
     /// Get the parsed map for a blob, building (fetch + parse) once per key.
-    async fn load_map<F: BlobFetch + Sync>(
-        &self,
-        fetch: &F,
-        sha: Vec<u8>,
-    ) -> Arc<ParsedSourceMap> {
+    async fn load_map<F: BlobFetch + Sync>(&self, fetch: &F, sha: Vec<u8>) -> Arc<ParsedSourceMap> {
         let fetch_sha = sha.clone();
         self.cache
-            .get_or_insert(sha, |m| m.weight().max(1), || async move {
-                match fetch.blob(&fetch_sha).await {
-                    Some(bytes) => ParsedSourceMap::parse(&bytes).unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "source map parse failed; caching empty");
-                        ParsedSourceMap::empty()
-                    }),
-                    None => {
-                        tracing::debug!("source map blob missing; caching empty");
-                        ParsedSourceMap::empty()
+            .get_or_insert(
+                sha,
+                |m| m.weight().max(1),
+                || async move {
+                    match fetch.blob(&fetch_sha).await {
+                        Some(bytes) => ParsedSourceMap::parse(&bytes).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "source map parse failed; caching empty");
+                            ParsedSourceMap::empty()
+                        }),
+                        None => {
+                            tracing::debug!("source map blob missing; caching empty");
+                            ParsedSourceMap::empty()
+                        }
                     }
-                }
-            })
+                },
+            )
             .await
     }
 }
@@ -424,7 +428,10 @@ mod tests {
         assert_eq!(out[0].lineno, Some(1));
         assert_eq!(out[0].function.as_deref(), Some("greet"));
         assert!(out[0].symbolicated);
-        assert_eq!(out[0].context_line.as_deref(), Some("export function greet(){ return 1 }"));
+        assert_eq!(
+            out[0].context_line.as_deref(),
+            Some("export function greet(){ return 1 }")
+        );
         assert_eq!(status, Status::Symbolicated);
     }
 
@@ -450,9 +457,7 @@ mod tests {
             name: "n".into(),
             raw: vec![],
         };
-        let (_out, status) = s
-            .symbolicate_js(&fetch, None, &[frame("a", 1, 1)])
-            .await;
+        let (_out, status) = s.symbolicate_js(&fetch, None, &[frame("a", 1, 1)]).await;
         assert_eq!(status, Status::NotApplicable);
     }
 
@@ -491,7 +496,11 @@ isolate_dso_base: 0\n\
         let s = Symbolicator::new(4 << 20);
         let (out, status) = s.symbolicate_dart(&fetch, trace, Some("inl"), None).await;
         assert_eq!(status, Status::Symbolicated);
-        assert_eq!(out.len(), 2, "one physical frame should expand to 2 inlined");
+        assert_eq!(
+            out.len(),
+            2,
+            "one physical frame should expand to 2 inlined"
+        );
         let names: std::collections::HashSet<_> =
             out.iter().filter_map(|f| f.function.as_deref()).collect();
         assert!(names.contains("scale"));

@@ -68,7 +68,9 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
 
-    fn ip(s: &str) -> IpAddr { s.parse().unwrap() }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn blocks_private_and_local_v4() {
@@ -91,8 +93,8 @@ mod tests {
     #[test]
     fn blocks_local_v6_allows_public_v6() {
         assert!(is_blocked_ip(ip("::1")));
-        assert!(is_blocked_ip(ip("fc00::1")));   // unique local
-        assert!(is_blocked_ip(ip("fe80::1")));   // link local
+        assert!(is_blocked_ip(ip("fc00::1"))); // unique local
+        assert!(is_blocked_ip(ip("fe80::1"))); // link local
         assert!(is_blocked_ip(ip("::ffff:127.0.0.1"))); // v4-mapped loopback
         assert!(!is_blocked_ip(ip("2606:4700:4700::1111")));
     }

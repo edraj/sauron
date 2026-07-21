@@ -89,7 +89,11 @@ pub async fn collect_storage(state: &AppState) -> anyhow::Result<StorageReport> 
             let width = repo::table_avg_row_width(&mut c, t.name).await?;
             let rows = repo::hot_rows_by_app(&mut c, t.name).await?;
             let total_hot: i64 = rows.iter().map(|r| r.n).sum();
-            tables.push(TableSize { name: t.name.to_string(), total_bytes: size, hot_rows: total_hot });
+            tables.push(TableSize {
+                name: t.name.to_string(),
+                total_bytes: size,
+                hot_rows: total_hot,
+            });
             hot.insert(t.name, rows.into_iter().map(|r| (r.app_id, r.n)).collect());
             avg_width.insert(t.name, width);
         }
@@ -98,16 +102,22 @@ pub async fn collect_storage(state: &AppState) -> anyhow::Result<StorageReport> 
 
     // --- DuckDB branch (blocking): cold rows per (table, app_id) ---
     let cold_path_d = cold_path.clone();
-    let cold_counts = tokio::task::spawn_blocking(move || -> anyhow::Result<HashMap<&'static str, HashMap<Uuid, i64>>> {
-        let eng = DuckEngine::open()?;
-        let mut out: HashMap<&'static str, HashMap<Uuid, i64>> = HashMap::new();
-        for t in TIERED_TABLES {
-            let glob = format!("{}/{}/**/*.parquet", cold_path_d.trim_end_matches('/'), t.name);
-            let counts = eng.counts_by_app(&glob)?;
-            out.insert(t.name, counts.into_iter().collect());
-        }
-        Ok(out)
-    });
+    let cold_counts = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<HashMap<&'static str, HashMap<Uuid, i64>>> {
+            let eng = DuckEngine::open()?;
+            let mut out: HashMap<&'static str, HashMap<Uuid, i64>> = HashMap::new();
+            for t in TIERED_TABLES {
+                let glob = format!(
+                    "{}/{}/**/*.parquet",
+                    cold_path_d.trim_end_matches('/'),
+                    t.name
+                );
+                let counts = eng.counts_by_app(&glob)?;
+                out.insert(t.name, counts.into_iter().collect());
+            }
+            Ok(out)
+        },
+    );
 
     // --- Filesystem branch (blocking): cold files per (table, app_id) ---
     let cold_path_w = cold_path.clone();
@@ -127,7 +137,10 @@ pub async fn collect_storage(state: &AppState) -> anyhow::Result<StorageReport> 
         // Match the walked file's table string to a canonical TIERED_TABLES name.
         if let Some(t) = TIERED_TABLES.iter().find(|t| t.name == f.table) {
             *cold_bytes.entry((f.app_id, t.name)).or_insert(0) += f.bytes;
-            files_by_app.entry(f.app_id).or_default().push(ColdFile { path: f.path, bytes: f.bytes });
+            files_by_app.entry(f.app_id).or_default().push(ColdFile {
+                path: f.path,
+                bytes: f.bytes,
+            });
         }
     }
 
@@ -139,11 +152,22 @@ pub async fn collect_storage(state: &AppState) -> anyhow::Result<StorageReport> 
             let mut per_table = Vec::new();
             let (mut hr, mut cr, mut cb, mut ehb) = (0i64, 0i64, 0i64, 0i64);
             for t in TIERED_TABLES {
-                let hot_rows = hot.get(t.name).and_then(|m| m.get(&a.app_id)).copied().unwrap_or(0);
-                let cold_rows = cold_counts.get(t.name).and_then(|m| m.get(&a.app_id)).copied().unwrap_or(0);
+                let hot_rows = hot
+                    .get(t.name)
+                    .and_then(|m| m.get(&a.app_id))
+                    .copied()
+                    .unwrap_or(0);
+                let cold_rows = cold_counts
+                    .get(t.name)
+                    .and_then(|m| m.get(&a.app_id))
+                    .copied()
+                    .unwrap_or(0);
                 let cold_b = cold_bytes.get(&(a.app_id, t.name)).copied().unwrap_or(0);
                 let est = avg_width.get(t.name).copied().unwrap_or(0) * hot_rows;
-                hr += hot_rows; cr += cold_rows; cb += cold_b; ehb += est;
+                hr += hot_rows;
+                cr += cold_rows;
+                cb += cold_b;
+                ehb += est;
                 per_table.push(AppTableStorage {
                     name: t.name.to_string(),
                     hot_rows,
@@ -176,7 +200,12 @@ pub async fn collect_storage(state: &AppState) -> anyhow::Result<StorageReport> 
     for t in TIERED_TABLES {
         let cold_rows: i64 = cold_counts
             .get(t.name)
-            .map(|m| m.iter().filter(|(id, _)| !existing_ids.contains(id)).map(|(_, n)| *n).sum())
+            .map(|m| {
+                m.iter()
+                    .filter(|(id, _)| !existing_ids.contains(id))
+                    .map(|(_, n)| *n)
+                    .sum()
+            })
             .unwrap_or(0);
         let cold_b: i64 = cold_bytes
             .iter()
@@ -210,7 +239,10 @@ pub async fn collect_storage(state: &AppState) -> anyhow::Result<StorageReport> 
     }
 
     Ok(StorageReport {
-        database: DatabaseInfo { total_bytes, tables },
+        database: DatabaseInfo {
+            total_bytes,
+            tables,
+        },
         apps: apps_out,
     })
 }
@@ -234,10 +266,19 @@ fn walk_cold(base: &str) -> anyhow::Result<Vec<WalkedFile>> {
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
-                let rel = path.strip_prefix(base).ok().and_then(|p| p.to_str()).unwrap_or("");
+                let rel = path
+                    .strip_prefix(base)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
                 if let Some(key) = parse_cold_path(rel) {
                     let bytes = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
-                    out.push(WalkedFile { table: key.table, app_id: key.app_id, path: rel.to_string(), bytes });
+                    out.push(WalkedFile {
+                        table: key.table,
+                        app_id: key.app_id,
+                        path: rel.to_string(),
+                        bytes,
+                    });
                 }
             }
         }

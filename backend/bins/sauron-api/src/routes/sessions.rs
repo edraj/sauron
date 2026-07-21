@@ -110,15 +110,25 @@ pub async fn detail(
     let errors = repo::errors_for_session(&mut conn, app_id, &session_id, 500).await?;
     let txns = repo::transactions_for_session(&mut conn, app_id, &session_id, 500).await?;
 
-    let mut timeline: Vec<TimelineItem> = Vec::with_capacity(events.len() + errors.len() + txns.len());
+    let mut timeline: Vec<TimelineItem> =
+        Vec::with_capacity(events.len() + errors.len() + txns.len());
     for e in events {
-        timeline.push(TimelineItem::Event { at: e.occurred_at, event: e });
+        timeline.push(TimelineItem::Event {
+            at: e.occurred_at,
+            event: e,
+        });
     }
     for e in errors {
-        timeline.push(TimelineItem::Error { at: e.occurred_at, error: e });
+        timeline.push(TimelineItem::Error {
+            at: e.occurred_at,
+            error: e,
+        });
     }
     for t in txns {
-        timeline.push(TimelineItem::Transaction { at: t.occurred_at, transaction: t });
+        timeline.push(TimelineItem::Transaction {
+            at: t.occurred_at,
+            transaction: t,
+        });
     }
     timeline.sort_by_key(|i| i.at());
 

@@ -36,7 +36,17 @@ pub async fn process_job(
 
     match job.item.clone() {
         sauron_core::EnvelopeItem::Error(e) => {
-            process_error(&mut conn, redis, pool, sym, &job, environment_id, context, *e).await
+            process_error(
+                &mut conn,
+                redis,
+                pool,
+                sym,
+                &job,
+                environment_id,
+                context,
+                *e,
+            )
+            .await
         }
         sauron_core::EnvelopeItem::Event(ev) => {
             process_event(&mut conn, &job, environment_id, context, ev).await
@@ -451,7 +461,10 @@ mod tests {
 
     #[test]
     fn object_or_empty_preserves_non_empty_maps() {
-        assert_eq!(object_or_empty(json!({ "region": "eu" })), json!({ "region": "eu" }));
+        assert_eq!(
+            object_or_empty(json!({ "region": "eu" })),
+            json!({ "region": "eu" })
+        );
         assert_eq!(
             object_or_empty(json!({ "order": { "id": 7 } })),
             json!({ "order": { "id": 7 } })

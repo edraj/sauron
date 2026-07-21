@@ -129,8 +129,14 @@ pub async fn persons_list(
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let search = q.search.as_deref().filter(|s| !s.is_empty());
     Ok(Json(
-        repo::list_persons(&mut conn, app_id, search, q.limit.clamp(1, 200), q.offset.max(0))
-            .await?,
+        repo::list_persons(
+            &mut conn,
+            app_id,
+            search,
+            q.limit.clamp(1, 200),
+            q.offset.max(0),
+        )
+        .await?,
     ))
 }
 
@@ -273,7 +279,11 @@ pub async fn users_summary(
     let series = repo::active_user_series(&mut conn, app_id, since).await?;
     let stickiness = stickiness(stats.dau, stats.mau);
 
-    Ok(Json(UsersAnalytics { stats, stickiness, series }))
+    Ok(Json(UsersAnalytics {
+        stats,
+        stickiness,
+        series,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +311,11 @@ pub async fn sessions_summary(
     let duration_series = repo::session_duration_series(&mut conn, app_id, since).await?;
     let duration_histogram = repo::session_duration_histogram(&mut conn, app_id, since).await?;
 
-    Ok(Json(SessionsAnalytics { stats, duration_series, duration_histogram }))
+    Ok(Json(SessionsAnalytics {
+        stats,
+        duration_series,
+        duration_histogram,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +345,13 @@ pub async fn error_timeseries(
     drop(conn); // release the pooled conn before the router checks out its own
     let series = crate::tier_read::error_counts_by_day(&state, app_id, q.from, q.to).await?;
     Ok(Json(
-        series.into_iter().map(|d| DayCountOut { day: d.day, count: d.count }).collect(),
+        series
+            .into_iter()
+            .map(|d| DayCountOut {
+                day: d.day,
+                count: d.count,
+            })
+            .collect(),
     ))
 }
 
@@ -350,7 +370,13 @@ pub async fn event_timeseries(
     drop(conn); // release the pooled conn before the router checks out its own
     let series = crate::tier_read::event_counts_by_day(&state, app_id, q.from, q.to).await?;
     Ok(Json(
-        series.into_iter().map(|d| DayCountOut { day: d.day, count: d.count }).collect(),
+        series
+            .into_iter()
+            .map(|d| DayCountOut {
+                day: d.day,
+                count: d.count,
+            })
+            .collect(),
     ))
 }
 
@@ -371,7 +397,13 @@ pub async fn transaction_timeseries(
     drop(conn); // release the pooled conn before the router checks out its own
     let series = crate::tier_read::transaction_counts_by_day(&state, app_id, q.from, q.to).await?;
     Ok(Json(
-        series.into_iter().map(|d| DayCountOut { day: d.day, count: d.count }).collect(),
+        series
+            .into_iter()
+            .map(|d| DayCountOut {
+                day: d.day,
+                count: d.count,
+            })
+            .collect(),
     ))
 }
 

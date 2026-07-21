@@ -34,13 +34,20 @@ pub struct ProbeSpec {
 const MAX_BODY_BYTES: usize = 1_048_576;
 
 fn down(reason: impl Into<String>, ms: Option<i32>) -> ProbeResult {
-    ProbeResult { up: false, status_code: None, response_time_ms: ms, error: Some(reason.into()) }
+    ProbeResult {
+        up: false,
+        status_code: None,
+        response_time_ms: ms,
+        error: Some(reason.into()),
+    }
 }
 
 /// Strip a single leading `[` and matching trailing `]` from an IPv6 literal
 /// (`[::1]` -> `::1`), if present. Bare hosts pass through unchanged.
 fn strip_brackets(s: &str) -> &str {
-    s.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')).unwrap_or(s)
+    s.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(s)
 }
 
 /// Extract the bare host from an HTTP URL or a `host:port` string (for the SSRF guard).
@@ -54,7 +61,10 @@ pub(crate) fn host_of(spec: &ProbeSpec) -> Option<String> {
         Kind::Http => reqwest::Url::parse(&spec.target)
             .ok()
             .and_then(|u| u.host_str().map(|s| strip_brackets(s).to_string())),
-        Kind::Tcp => spec.target.rsplit_once(':').map(|(h, _)| strip_brackets(h).to_string()),
+        Kind::Tcp => spec
+            .target
+            .rsplit_once(':')
+            .map(|(h, _)| strip_brackets(h).to_string()),
     }
 }
 
@@ -88,8 +98,8 @@ pub async fn probe(spec: &ProbeSpec, client: &reqwest::Client, allow_private: bo
 }
 
 async fn probe_http(spec: &ProbeSpec, client: &reqwest::Client) -> ProbeResult {
-    let method = reqwest::Method::from_bytes(spec.method.as_bytes())
-        .unwrap_or(reqwest::Method::GET);
+    let method =
+        reqwest::Method::from_bytes(spec.method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut req = client.request(method, &spec.target).timeout(spec.timeout);
     for (k, v) in &spec.headers {
         req = req.header(k, v);
@@ -117,13 +127,32 @@ async fn probe_http(spec: &ProbeSpec, client: &reqwest::Client) -> ProbeResult {
             buf.truncate(MAX_BODY_BYTES);
             let body = String::from_utf8_lossy(&buf);
             let ms = start.elapsed().as_millis() as i32;
-            let (up, err) = evaluate_http(code, &body, &spec.expected_status, spec.body_assertion.as_deref());
-            ProbeResult { up, status_code: Some(code as i32), response_time_ms: Some(ms), error: err }
+            let (up, err) = evaluate_http(
+                code,
+                &body,
+                &spec.expected_status,
+                spec.body_assertion.as_deref(),
+            );
+            ProbeResult {
+                up,
+                status_code: Some(code as i32),
+                response_time_ms: Some(ms),
+                error: err,
+            }
         }
         Err(e) => {
             let ms = start.elapsed().as_millis() as i32;
-            let reason = if e.is_timeout() { "connection timeout".to_string() } else { format!("request failed: {e}") };
-            ProbeResult { up: false, status_code: None, response_time_ms: Some(ms), error: Some(reason) }
+            let reason = if e.is_timeout() {
+                "connection timeout".to_string()
+            } else {
+                format!("request failed: {e}")
+            };
+            ProbeResult {
+                up: false,
+                status_code: None,
+                response_time_ms: Some(ms),
+                error: Some(reason),
+            }
         }
     }
 }
@@ -133,10 +162,21 @@ async fn probe_tcp(spec: &ProbeSpec) -> ProbeResult {
     match tokio::time::timeout(spec.timeout, tokio::net::TcpStream::connect(&spec.target)).await {
         Ok(Ok(_stream)) => {
             let ms = start.elapsed().as_millis() as i32;
-            ProbeResult { up: true, status_code: None, response_time_ms: Some(ms), error: None }
+            ProbeResult {
+                up: true,
+                status_code: None,
+                response_time_ms: Some(ms),
+                error: None,
+            }
         }
-        Ok(Err(e)) => down(format!("TCP connect failed: {e}"), Some(start.elapsed().as_millis() as i32)),
-        Err(_) => down("connection timeout", Some(start.elapsed().as_millis() as i32)),
+        Ok(Err(e)) => down(
+            format!("TCP connect failed: {e}"),
+            Some(start.elapsed().as_millis() as i32),
+        ),
+        Err(_) => down(
+            "connection timeout",
+            Some(start.elapsed().as_millis() as i32),
+        ),
     }
 }
 
@@ -174,17 +214,26 @@ mod tests {
 
     #[test]
     fn host_of_http_plain_host() {
-        assert_eq!(host_of(&spec_http("https://example.com/health")), Some("example.com".to_string()));
+        assert_eq!(
+            host_of(&spec_http("https://example.com/health")),
+            Some("example.com".to_string())
+        );
     }
 
     #[test]
     fn host_of_http_ipv6_strips_brackets() {
-        assert_eq!(host_of(&spec_http("https://[::1]:8080/")), Some("::1".to_string()));
+        assert_eq!(
+            host_of(&spec_http("https://[::1]:8080/")),
+            Some("::1".to_string())
+        );
     }
 
     #[test]
     fn host_of_tcp_plain_host() {
-        assert_eq!(host_of(&spec_tcp("db.example.com:5432")), Some("db.example.com".to_string()));
+        assert_eq!(
+            host_of(&spec_tcp("db.example.com:5432")),
+            Some("db.example.com".to_string())
+        );
     }
 
     #[test]

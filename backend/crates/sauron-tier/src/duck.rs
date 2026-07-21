@@ -42,7 +42,8 @@ impl DuckEngine {
         }
         // `union_by_name` + `hive_partitioning` tolerate schema evolution and
         // read the app_id/year/month partition columns from the paths.
-        let sql = "SELECT count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true)";
+        let sql =
+            "SELECT count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true)";
         let mut stmt = self.conn.prepare(sql)?;
         let n: i64 = stmt
             .query_row([glob], |r| r.get(0))
@@ -101,11 +102,13 @@ impl DuckEngine {
         end: DateTime<Utc>,
         cold_dir: &str,
     ) -> anyhow::Result<()> {
-        self.conn.execute_batch("INSTALL postgres; LOAD postgres;")?;
+        self.conn
+            .execute_batch("INSTALL postgres; LOAD postgres;")?;
         // ATTACH is idempotent-ish within a connection; detach if re-run.
         let _ = self.conn.execute_batch("DETACH DATABASE IF EXISTS pg;");
-        self.conn
-            .execute_batch(&format!("ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY);"))?;
+        self.conn.execute_batch(&format!(
+            "ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY);"
+        ))?;
         let sql = format!(
             "COPY (SELECT *, year(occurred_at) AS year, month(occurred_at) AS month \
                    FROM pg.{table} \
@@ -130,7 +133,8 @@ impl DuckEngine {
         if !self.any_files_match(glob)? {
             return Ok(0);
         }
-        let sql = "SELECT count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true) \
+        let sql =
+            "SELECT count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true) \
                    WHERE occurred_at >= ? AND occurred_at < ?";
         let mut stmt = self.conn.prepare(sql)?;
         let n: i64 = stmt.query_row(
@@ -224,7 +228,11 @@ mod tests {
     fn counts_by_day_is_empty_when_no_files_match() {
         let eng = DuckEngine::open().unwrap();
         let app = Uuid::new_v4();
-        let glob = crate::layout::cold_partition_glob("/nonexistent-sauron-tier-cold", "error_events", app);
+        let glob = crate::layout::cold_partition_glob(
+            "/nonexistent-sauron-tier-cold",
+            "error_events",
+            app,
+        );
         let from = "2026-05-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let to = "2026-06-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         assert!(eng.counts_by_day(&glob, app, from, to).unwrap().is_empty());

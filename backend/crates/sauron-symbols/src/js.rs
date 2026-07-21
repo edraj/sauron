@@ -109,7 +109,9 @@ impl ParsedSourceMap {
             serde_json::from_slice(bytes).map_err(|e| SymbolError::Corrupt(e.to_string()))?;
 
         if v.get("version").and_then(|x| x.as_i64()) != Some(3) {
-            return Err(SymbolError::Corrupt("unsupported source map version".into()));
+            return Err(SymbolError::Corrupt(
+                "unsupported source map version".into(),
+            ));
         }
 
         let source_root = v
@@ -136,12 +138,20 @@ impl ParsedSourceMap {
         let names: Vec<String> = v
             .get("names")
             .and_then(|x| x.as_array())
-            .map(|a| a.iter().map(|s| s.as_str().unwrap_or("").to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|s| s.as_str().unwrap_or("").to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         let sources_content: Vec<Option<String>> = v
             .get("sourcesContent")
             .and_then(|x| x.as_array())
-            .map(|a| a.iter().map(|s| s.as_str().map(|t| t.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|s| s.as_str().map(|t| t.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mappings = v

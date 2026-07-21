@@ -104,7 +104,8 @@ impl Config {
                 .unwrap_or(false),
             tier_hot_days: parse("TIER_HOT_DAYS", 30),
             tier_granularity: var("TIER_GRANULARITY").unwrap_or_else(|| "day".to_string()),
-            tier_cold_path: var("TIER_COLD_PATH").unwrap_or_else(|| "/var/lib/sauron/cold".to_string()),
+            tier_cold_path: var("TIER_COLD_PATH")
+                .unwrap_or_else(|| "/var/lib/sauron/cold".to_string()),
             tier_drop_lag_hours: parse("TIER_DROP_LAG_HOURS", 24),
             tier_tick_secs: parse("TIER_TICK_SECS", 3600),
             tier_partition_ahead: parse("TIER_PARTITION_AHEAD", 7),

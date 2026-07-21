@@ -116,7 +116,10 @@ mod tests {
     #[allow(clippy::identity_op)]
     fn parses_total_jiffies_from_cpu_line() {
         let stat = "cpu  100 20 30 400 5 0 6 0 0 0\ncpu0 50 10 15 200 2 0 3 0 0 0\n";
-        assert_eq!(parse_stat_total_jiffies(stat), Some(100 + 20 + 30 + 400 + 5 + 0 + 6));
+        assert_eq!(
+            parse_stat_total_jiffies(stat),
+            Some(100 + 20 + 30 + 400 + 5 + 0 + 6)
+        );
     }
 
     #[test]

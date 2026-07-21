@@ -23,7 +23,16 @@ pub struct TieredTable {
 
 /// Tables tiered out to Parquet.
 pub const TIERED_TABLES: &[TieredTable] = &[
-    TieredTable { name: "error_events", time_col: "occurred_at" },
-    TieredTable { name: "analytics_events", time_col: "occurred_at" },
-    TieredTable { name: "transactions", time_col: "occurred_at" },
+    TieredTable {
+        name: "error_events",
+        time_col: "occurred_at",
+    },
+    TieredTable {
+        name: "analytics_events",
+        time_col: "occurred_at",
+    },
+    TieredTable {
+        name: "transactions",
+        time_col: "occurred_at",
+    },
 ];

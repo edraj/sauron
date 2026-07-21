@@ -116,7 +116,9 @@ async fn load_authorized(
         .await?
         .ok_or(ApiError::NotFound)?;
     authorize_project(&mut conn, user_id, project_id, perm).await?;
-    let m = repo::get_monitor(&mut conn, monitor_id).await?.ok_or(ApiError::NotFound)?;
+    let m = repo::get_monitor(&mut conn, monitor_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     Ok((conn, m))
 }
 
@@ -125,7 +127,8 @@ pub async fn detail(
     State(state): State<AppState>,
     Path(monitor_id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    let (mut conn, m) = load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
+    let (mut conn, m) =
+        load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
     let uptime_24h = repo::uptime_pct(&mut conn, monitor_id, 24).await?;
     let uptime_7d = repo::uptime_pct(&mut conn, monitor_id, 24 * 7).await?;
     let uptime_30d = repo::uptime_pct(&mut conn, monitor_id, 24 * 30).await?;
@@ -161,7 +164,11 @@ pub async fn update(
     // Pausing/enabling flips status too.
     let status = req.enabled.map(|e| if e { "unknown" } else { "paused" });
     let interval = req.interval_seconds;
-    let webhook = req.webhook_url.map(|w| w.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string()));
+    let webhook = req.webhook_url.map(|w| {
+        w.as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    });
     let webhook_ref = webhook.as_ref().map(|w| w.as_deref());
     let m = repo::update_monitor(
         &mut conn,
@@ -194,7 +201,8 @@ pub async fn checks(
     Path(monitor_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let (mut conn, _m) = load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
+    let (mut conn, _m) =
+        load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
     let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
     let series = repo::latency_series(&mut conn, monitor_id, hours).await?;
     Ok(Json(json!(series)))
@@ -205,7 +213,8 @@ pub async fn incidents(
     State(state): State<AppState>,
     Path(monitor_id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    let (mut conn, _m) = load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
+    let (mut conn, _m) =
+        load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
     let rows = repo::list_incidents(&mut conn, monitor_id, 50).await?;
     Ok(Json(json!(rows)))
 }

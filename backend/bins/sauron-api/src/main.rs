@@ -196,7 +196,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/persons/{distinct_id}",
             get(routes::analytics::person),
         )
-        .route("/v1/apps/{app_id}/overview", get(routes::analytics::overview))
+        .route(
+            "/v1/apps/{app_id}/overview",
+            get(routes::analytics::overview),
+        )
         .route(
             "/v1/apps/{app_id}/users/summary",
             get(routes::analytics::users_summary),
@@ -214,10 +217,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::analytics::transaction_timeseries),
         )
         // --- exceptions dashboard ---
-        .route(
-            "/v1/apps/{app_id}/issues/stats",
-            get(routes::issues::stats),
-        )
+        .route("/v1/apps/{app_id}/issues/stats", get(routes::issues::stats))
         // --- sessions (app-scoped) ---
         .route("/v1/apps/{app_id}/sessions", get(routes::sessions::list))
         .route(
@@ -247,10 +247,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/funnels/{funnel_id}",
             patch(routes::funnels::update_saved).delete(routes::funnels::delete_saved),
         )
-        .route(
-            "/v1/apps/{app_id}/journeys",
-            get(routes::journeys::explore),
-        )
+        .route("/v1/apps/{app_id}/journeys", get(routes::journeys::explore))
         // --- uptime monitors (project-scoped) ---
         .route(
             "/v1/projects/{project_id}/monitors",

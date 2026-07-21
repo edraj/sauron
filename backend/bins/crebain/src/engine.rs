@@ -431,10 +431,9 @@ async fn run_live_sockets(
             Factory::Tcp(addr)
         }
         cli::Transport::Uds => {
-            let path = cfg
-                .uds_path
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("uds transport requires a uds path for live-sockets"))?;
+            let path = cfg.uds_path.clone().ok_or_else(|| {
+                anyhow::anyhow!("uds transport requires a uds path for live-sockets")
+            })?;
             Factory::Uds(path)
         }
     };
@@ -583,7 +582,13 @@ mod tests {
             public_key: "k".into(),
         };
 
-        let plan = crate::netlimit::plan_fanout(4, true, crate::netlimit::ephemeral_port_budget(), 512, None);
+        let plan = crate::netlimit::plan_fanout(
+            4,
+            true,
+            crate::netlimit::ephemeral_port_budget(),
+            512,
+            None,
+        );
         let s = run(&cfg, &target, None, &plan).await.unwrap();
 
         assert!(s.requests > 0, "expected some requests, got {}", s.requests);

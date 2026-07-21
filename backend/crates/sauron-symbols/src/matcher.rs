@@ -9,11 +9,7 @@
 /// Canonicalize a path/URL to a `~/path` form: strip scheme+host, query, and
 /// fragment. Already-normalized `~/…` values pass through unchanged.
 pub fn normalize(abs_path: &str) -> String {
-    let p = abs_path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(abs_path)
-        .trim();
+    let p = abs_path.split(['?', '#']).next().unwrap_or(abs_path).trim();
 
     if let Some(rest) = p.strip_prefix("~/") {
         return format!("~/{}", rest.trim_start_matches('/'));
@@ -66,10 +62,7 @@ mod tests {
         assert_eq!(normalize("/static/app.min.js"), "~/static/app.min.js");
         assert_eq!(normalize("app.min.js"), "~/app.min.js");
         assert_eq!(normalize("~/static/app.min.js"), "~/static/app.min.js");
-        assert_eq!(
-            normalize("https://x.io/a/b.js#frag"),
-            "~/a/b.js"
-        );
+        assert_eq!(normalize("https://x.io/a/b.js#frag"), "~/a/b.js");
     }
 
     #[test]
