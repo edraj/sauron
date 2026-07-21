@@ -234,8 +234,7 @@ where
             content_length = body.len(),
         );
 
-        if stream.write_all(head.as_bytes()).await.is_err()
-            || stream.write_all(body).await.is_err()
+        if stream.write_all(head.as_bytes()).await.is_err() || stream.write_all(body).await.is_err()
         {
             return SendOutcome {
                 kind: OutcomeKind::Transport,

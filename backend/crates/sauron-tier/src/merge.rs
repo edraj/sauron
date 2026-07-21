@@ -15,10 +15,12 @@ pub struct DayCount {
 /// Sum `hot` and `cold` per-day counts into one ascending-by-day series.
 pub fn merge_day_counts(hot: Vec<DayCount>, cold: Vec<DayCount>) -> Vec<DayCount> {
     let mut acc: BTreeMap<NaiveDate, i64> = BTreeMap::new();
-    for dc in hot.into_iter().chain(cold.into_iter()) {
+    for dc in hot.into_iter().chain(cold) {
         *acc.entry(dc.day).or_insert(0) += dc.count;
     }
-    acc.into_iter().map(|(day, count)| DayCount { day, count }).collect()
+    acc.into_iter()
+        .map(|(day, count)| DayCount { day, count })
+        .collect()
 }
 
 #[cfg(test)]
@@ -31,30 +33,66 @@ mod tests {
 
     #[test]
     fn disjoint_days_concatenate_sorted() {
-        let hot = vec![DayCount { day: d(2026, 6, 2), count: 5 }, DayCount { day: d(2026, 6, 1), count: 3 }];
-        let cold = vec![DayCount { day: d(2026, 5, 30), count: 9 }];
+        let hot = vec![
+            DayCount {
+                day: d(2026, 6, 2),
+                count: 5,
+            },
+            DayCount {
+                day: d(2026, 6, 1),
+                count: 3,
+            },
+        ];
+        let cold = vec![DayCount {
+            day: d(2026, 5, 30),
+            count: 9,
+        }];
         let out = merge_day_counts(hot, cold);
         assert_eq!(
             out,
             vec![
-                DayCount { day: d(2026, 5, 30), count: 9 },
-                DayCount { day: d(2026, 6, 1), count: 3 },
-                DayCount { day: d(2026, 6, 2), count: 5 },
+                DayCount {
+                    day: d(2026, 5, 30),
+                    count: 9
+                },
+                DayCount {
+                    day: d(2026, 6, 1),
+                    count: 3
+                },
+                DayCount {
+                    day: d(2026, 6, 2),
+                    count: 5
+                },
             ]
         );
     }
 
     #[test]
     fn same_day_in_both_tiers_is_summed() {
-        let hot = vec![DayCount { day: d(2026, 6, 1), count: 4 }];
-        let cold = vec![DayCount { day: d(2026, 6, 1), count: 6 }];
-        assert_eq!(merge_day_counts(hot, cold), vec![DayCount { day: d(2026, 6, 1), count: 10 }]);
+        let hot = vec![DayCount {
+            day: d(2026, 6, 1),
+            count: 4,
+        }];
+        let cold = vec![DayCount {
+            day: d(2026, 6, 1),
+            count: 6,
+        }];
+        assert_eq!(
+            merge_day_counts(hot, cold),
+            vec![DayCount {
+                day: d(2026, 6, 1),
+                count: 10
+            }]
+        );
     }
 
     #[test]
     fn empty_sides() {
         assert_eq!(merge_day_counts(vec![], vec![]), vec![]);
-        let only = vec![DayCount { day: d(2026, 6, 1), count: 1 }];
+        let only = vec![DayCount {
+            day: d(2026, 6, 1),
+            count: 1,
+        }];
         assert_eq!(merge_day_counts(only.clone(), vec![]), only);
     }
 }

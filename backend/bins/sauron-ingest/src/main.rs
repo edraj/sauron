@@ -58,9 +58,15 @@ struct IngestQuery {
 fn raise_nofile() {
     #[cfg(unix)]
     unsafe {
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
-            let new = libc::rlimit { rlim_cur: lim.rlim_max, rlim_max: lim.rlim_max };
+            let new = libc::rlimit {
+                rlim_cur: lim.rlim_max,
+                rlim_max: lim.rlim_max,
+            };
             let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &new);
         }
     }
@@ -91,13 +97,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Spawn the co-located worker pool.
-    let _workers = sauron_pipeline::spawn_workers(
-        pool.clone(),
-        redis.clone(),
-        cfg.worker_concurrency,
-        sym,
-    )
-    .await?;
+    let _workers =
+        sauron_pipeline::spawn_workers(pool.clone(), redis.clone(), cfg.worker_concurrency, sym)
+            .await?;
 
     let port = cfg.ingest_port;
     let max_body = cfg.ingest_max_body_bytes;
@@ -308,7 +310,8 @@ mod tests {
     /// version, independent of the full `AppState` (no PG/Redis needed).
     #[tokio::test]
     async fn serves_health_over_uds() {
-        let path = std::env::temp_dir().join(format!("sauron-ingest-test-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("sauron-ingest-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let router = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));

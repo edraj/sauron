@@ -5,7 +5,13 @@
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Op { Eq, Neq, Contains, Gt, Lt }
+pub enum Op {
+    Eq,
+    Neq,
+    Contains,
+    Gt,
+    Lt,
+}
 
 impl Op {
     pub fn parse(s: &str) -> Option<Op> {
@@ -21,7 +27,12 @@ impl Op {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldType { Str, Enum, Num, Tag }
+pub enum FieldType {
+    Str,
+    Enum,
+    Num,
+    Tag,
+}
 
 pub struct FieldSpec {
     pub key: &'static str,
@@ -50,7 +61,9 @@ impl fmt::Display for FilterError {
         match self {
             FilterError::Malformed => write!(f, "filter must be field:op:value"),
             FilterError::UnknownField(x) => write!(f, "unknown filter field: {x}"),
-            FilterError::BadOp { field, op } => write!(f, "operator {op} not allowed for field {field}"),
+            FilterError::BadOp { field, op } => {
+                write!(f, "operator {op} not allowed for field {field}")
+            }
             FilterError::BadValue { field } => write!(f, "invalid value for filter field {field}"),
         }
     }
@@ -59,7 +72,10 @@ impl fmt::Display for FilterError {
 /// Parse + validate raw `field:op:value` strings against `allow`. Splits on the
 /// first two ':' only (values may contain ':'). Rejects unknown fields,
 /// disallowed operators, out-of-range enum values, and non-numeric numbers.
-pub fn parse_filters(raw: &[String], allow: &[FieldSpec]) -> Result<Vec<ParsedFilter>, FilterError> {
+pub fn parse_filters(
+    raw: &[String],
+    allow: &[FieldSpec],
+) -> Result<Vec<ParsedFilter>, FilterError> {
     let mut out = Vec::with_capacity(raw.len());
     for item in raw {
         let mut parts = item.splitn(3, ':');
@@ -85,15 +101,22 @@ pub fn parse_filters(raw: &[String], allow: &[FieldSpec]) -> Result<Vec<ParsedFi
             op: op_s.to_string(),
         })?;
         if !spec.ops.contains(&op) {
-            return Err(FilterError::BadOp { field: field.to_string(), op: op_s.to_string() });
+            return Err(FilterError::BadOp {
+                field: field.to_string(),
+                op: op_s.to_string(),
+            });
         }
         match spec.ty {
             FieldType::Num => {
-                value.parse::<i64>().map_err(|_| FilterError::BadValue { field: field.to_string() })?;
+                value.parse::<i64>().map_err(|_| FilterError::BadValue {
+                    field: field.to_string(),
+                })?;
             }
             FieldType::Enum => {
                 if !spec.options.contains(&value.as_str()) {
-                    return Err(FilterError::BadValue { field: field.to_string() });
+                    return Err(FilterError::BadValue {
+                        field: field.to_string(),
+                    });
                 }
             }
             FieldType::Str => {}
@@ -101,11 +124,19 @@ pub fn parse_filters(raw: &[String], allow: &[FieldSpec]) -> Result<Vec<ParsedFi
                 // Value is `key=value`; split on the FIRST '=' and require both sides.
                 match value.split_once('=') {
                     Some((k, v)) if !k.is_empty() && !v.is_empty() => {}
-                    _ => return Err(FilterError::BadValue { field: field.to_string() }),
+                    _ => {
+                        return Err(FilterError::BadValue {
+                            field: field.to_string(),
+                        })
+                    }
                 }
             }
         }
-        out.push(ParsedFilter { field: spec.key, op, value });
+        out.push(ParsedFilter {
+            field: spec.key,
+            op,
+            value,
+        });
     }
     Ok(out)
 }
@@ -117,32 +148,100 @@ const OPS_TAG: &[Op] = &[Op::Eq, Op::Contains];
 const NO_OPTS: &[&str] = &[];
 
 pub const ISSUE_FILTERS: &[FieldSpec] = &[
-    FieldSpec { key: "level", ty: FieldType::Enum, ops: OPS_ENUM, options: &["debug", "info", "warning", "error", "fatal"] },
-    FieldSpec { key: "status", ty: FieldType::Enum, ops: OPS_ENUM, options: &["unresolved", "resolved", "ignored"] },
-    FieldSpec { key: "type", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
-    FieldSpec { key: "culprit", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
-    FieldSpec { key: "times_seen", ty: FieldType::Num, ops: OPS_NUM, options: NO_OPTS },
-    FieldSpec { key: "users_seen", ty: FieldType::Num, ops: OPS_NUM, options: NO_OPTS },
-    FieldSpec { key: "tag", ty: FieldType::Tag, ops: OPS_TAG, options: NO_OPTS },
+    FieldSpec {
+        key: "level",
+        ty: FieldType::Enum,
+        ops: OPS_ENUM,
+        options: &["debug", "info", "warning", "error", "fatal"],
+    },
+    FieldSpec {
+        key: "status",
+        ty: FieldType::Enum,
+        ops: OPS_ENUM,
+        options: &["unresolved", "resolved", "ignored"],
+    },
+    FieldSpec {
+        key: "type",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "culprit",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "times_seen",
+        ty: FieldType::Num,
+        ops: OPS_NUM,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "users_seen",
+        ty: FieldType::Num,
+        ops: OPS_NUM,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "tag",
+        ty: FieldType::Tag,
+        ops: OPS_TAG,
+        options: NO_OPTS,
+    },
 ];
 
 // `environment` is validated as a free string here (valid values are per-app and
 // dynamic); the repo resolves the name to an environment_id at query time.
 pub const EVENT_FILTERS: &[FieldSpec] = &[
-    FieldSpec { key: "name", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
-    FieldSpec { key: "distinct_id", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
-    FieldSpec { key: "session_id", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
-    FieldSpec { key: "environment", ty: FieldType::Str, ops: OPS_ENUM, options: NO_OPTS },
-    FieldSpec { key: "release", ty: FieldType::Str, ops: OPS_STR, options: NO_OPTS },
-    FieldSpec { key: "tag", ty: FieldType::Tag, ops: OPS_TAG, options: NO_OPTS },
+    FieldSpec {
+        key: "name",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "distinct_id",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "session_id",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "environment",
+        ty: FieldType::Str,
+        ops: OPS_ENUM,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "release",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "tag",
+        ty: FieldType::Tag,
+        ops: OPS_TAG,
+        options: NO_OPTS,
+    },
 ];
 
 // Per-error-event occurrences (issue detail). Only the developer `tag` is
 // filterable per-occurrence; issue-group fields (level/status/...) live on the
 // issue, not the individual event.
-pub const ERROR_EVENT_FILTERS: &[FieldSpec] = &[
-    FieldSpec { key: "tag", ty: FieldType::Tag, ops: OPS_TAG, options: NO_OPTS },
-];
+pub const ERROR_EVENT_FILTERS: &[FieldSpec] = &[FieldSpec {
+    key: "tag",
+    ty: FieldType::Tag,
+    ops: OPS_TAG,
+    options: NO_OPTS,
+}];
 
 #[cfg(test)]
 mod tests {
@@ -150,12 +249,26 @@ mod tests {
 
     #[test]
     fn parses_valid_filters() {
-        let raw = vec!["level:eq:error".to_string(), "times_seen:gt:100".to_string()];
+        let raw = vec![
+            "level:eq:error".to_string(),
+            "times_seen:gt:100".to_string(),
+        ];
         let got = parse_filters(&raw, ISSUE_FILTERS).unwrap();
-        assert_eq!(got, vec![
-            ParsedFilter { field: "level", op: Op::Eq, value: "error".into() },
-            ParsedFilter { field: "times_seen", op: Op::Gt, value: "100".into() },
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                ParsedFilter {
+                    field: "level",
+                    op: Op::Eq,
+                    value: "error".into()
+                },
+                ParsedFilter {
+                    field: "times_seen",
+                    op: Op::Gt,
+                    value: "100".into()
+                },
+            ]
+        );
     }
 
     #[test]
@@ -166,7 +279,8 @@ mod tests {
 
     #[test]
     fn percent_decodes_encoded_slash() {
-        let got = parse_filters(&["culprit:contains:foo%2Fbar".to_string()], ISSUE_FILTERS).unwrap();
+        let got =
+            parse_filters(&["culprit:contains:foo%2Fbar".to_string()], ISSUE_FILTERS).unwrap();
         assert_eq!(got[0].value, "foo/bar");
     }
 
@@ -224,8 +338,16 @@ mod tests {
     #[test]
     fn parses_tag_filter() {
         let got = parse_filters(&["tag:eq:region=eu".to_string()], ISSUE_FILTERS).unwrap();
-        assert_eq!(got, vec![ParsedFilter { field: "tag", op: Op::Eq, value: "region=eu".into() }]);
-        let got2 = parse_filters(&["tag:contains:feature=check".to_string()], EVENT_FILTERS).unwrap();
+        assert_eq!(
+            got,
+            vec![ParsedFilter {
+                field: "tag",
+                op: Op::Eq,
+                value: "region=eu".into()
+            }]
+        );
+        let got2 =
+            parse_filters(&["tag:contains:feature=check".to_string()], EVENT_FILTERS).unwrap();
         assert_eq!(got2[0].field, "tag");
         assert_eq!(got2[0].op, Op::Contains);
         assert_eq!(got2[0].value, "feature=check");

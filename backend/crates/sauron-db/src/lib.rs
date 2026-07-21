@@ -53,7 +53,12 @@ pub async fn run_pending_migrations(database_url: &str) -> anyhow::Result<()> {
 /// so it is issued through the simple query protocol (`batch_execute`) and the
 /// identifier is validated rather than bound.
 pub async fn create_database(maintenance_url: &str, db_name: &str) -> anyhow::Result<()> {
-    run_admin_ddl(maintenance_url, db_name, &format!("CREATE DATABASE \"{db_name}\"")).await
+    run_admin_ddl(
+        maintenance_url,
+        db_name,
+        &format!("CREATE DATABASE \"{db_name}\""),
+    )
+    .await
 }
 
 /// Drop `db_name` if it exists, terminating any other sessions still connected

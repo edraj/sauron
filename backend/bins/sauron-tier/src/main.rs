@@ -13,8 +13,10 @@ use tracing::{info, warn};
 
 use sauron_core::Config;
 use sauron_db::{conn, repo, PgPool};
-use sauron_tier::{bucket_bounds, cold_copy_dir, partition_suffix, Granularity, TieredTable, TIERED_TABLES};
 use sauron_tier::duck::DuckEngine;
+use sauron_tier::{
+    bucket_bounds, cold_copy_dir, partition_suffix, Granularity, TieredTable, TIERED_TABLES,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,7 +43,12 @@ async fn cycle(pool: &PgPool, cfg: &Config, gran: Granularity) -> anyhow::Result
     Ok(())
 }
 
-async fn tier_table(pool: &PgPool, cfg: &Config, gran: Granularity, t: &TieredTable) -> anyhow::Result<()> {
+async fn tier_table(
+    pool: &PgPool,
+    cfg: &Config,
+    gran: Granularity,
+    t: &TieredTable,
+) -> anyhow::Result<()> {
     let now = Utc::now();
     let mut c = conn(pool).await?;
 
@@ -56,7 +63,8 @@ async fn tier_table(pool: &PgPool, cfg: &Config, gran: Granularity, t: &TieredTa
     // 1. Pre-create partitions for now .. now + partition_ahead buckets.
     let mut b = bucket_bounds(now, gran);
     for _ in 0..cfg.tier_partition_ahead {
-        repo::create_range_partition(&mut c, t.name, &partition_suffix(b.start), b.start, b.end).await?;
+        repo::create_range_partition(&mut c, t.name, &partition_suffix(b.start), b.start, b.end)
+            .await?;
         b = bucket_bounds(b.end, gran);
     }
 
@@ -69,7 +77,9 @@ async fn tier_table(pool: &PgPool, cfg: &Config, gran: Granularity, t: &TieredTa
     //    the watermark never skips a gap.
     let children = repo::list_child_partitions(&mut c, t.name).await?;
     for child in children {
-        let Some(start) = parse_suffix_start(&child, t.name) else { continue };
+        let Some(start) = parse_suffix_start(&child, t.name) else {
+            continue;
+        };
         let range = bucket_bounds(start, gran);
         if range.end > cutoff {
             continue; // still hot
@@ -136,7 +146,9 @@ async fn tier_table(pool: &PgPool, cfg: &Config, gran: Granularity, t: &TieredTa
     if let Some(w) = wm_at_cycle_start {
         let lag = chrono::Duration::hours(cfg.tier_drop_lag_hours);
         for child in repo::list_child_partitions(&mut c, t.name).await? {
-            let Some(start) = parse_suffix_start(&child, t.name) else { continue };
+            let Some(start) = parse_suffix_start(&child, t.name) else {
+                continue;
+            };
             let range = bucket_bounds(start, gran);
             if range.end <= w && (now - range.end) >= lag {
                 // Late-write safety: a client-supplied occurred_at can route a NEW
@@ -172,6 +184,10 @@ fn parse_suffix_start(child: &str, table: &str) -> Option<DateTime<Utc>> {
     if parts.len() != 3 {
         return None;
     }
-    let (y, m, d) = (parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?);
+    let (y, m, d) = (
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    );
     chrono::TimeZone::with_ymd_and_hms(&Utc, y, m, d, 0, 0, 0).single()
 }

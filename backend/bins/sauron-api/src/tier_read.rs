@@ -28,7 +28,13 @@ pub async fn error_counts_by_day(
         None => {
             let mut c = conn(&state.pool).await?;
             let rows = repo::error_counts_by_day_hot(&mut c, app_id, from, to).await?;
-            return Ok(rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect());
+            return Ok(rows
+                .into_iter()
+                .map(|r| DayCount {
+                    day: r.day,
+                    count: r.count,
+                })
+                .collect());
         }
     };
 
@@ -47,7 +53,14 @@ pub async fn error_counts_by_day(
             Vec::new()
         };
         let cold_default_rows = if let Some(r) = split.cold {
-            repo::default_partition_counts_by_day(&mut c, "error_events_default", app_id, r.start, r.end).await?
+            repo::default_partition_counts_by_day(
+                &mut c,
+                "error_events_default",
+                app_id,
+                r.start,
+                r.end,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -73,7 +86,12 @@ pub async fn error_counts_by_day(
     let (hot_rows, cold_default_rows) = pg_res?;
     let parquet_rows = parquet_res?;
     let to_dc = |rows: Vec<repo::DayCountRow>| -> Vec<DayCount> {
-        rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect()
+        rows.into_iter()
+            .map(|r| DayCount {
+                day: r.day,
+                count: r.count,
+            })
+            .collect()
     };
     // COLD = Parquet (exported) + _default (late arrivals); then + HOT. All additive,
     // and the three sets are disjoint (a row is in exactly one of: parquet, _default, hot).
@@ -98,7 +116,13 @@ pub async fn event_counts_by_day(
         None => {
             let mut c = conn(&state.pool).await?;
             let rows = repo::event_counts_by_day_hot(&mut c, app_id, from, to).await?;
-            return Ok(rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect());
+            return Ok(rows
+                .into_iter()
+                .map(|r| DayCount {
+                    day: r.day,
+                    count: r.count,
+                })
+                .collect());
         }
     };
 
@@ -117,7 +141,14 @@ pub async fn event_counts_by_day(
             Vec::new()
         };
         let cold_default_rows = if let Some(r) = split.cold {
-            repo::default_partition_counts_by_day(&mut c, "analytics_events_default", app_id, r.start, r.end).await?
+            repo::default_partition_counts_by_day(
+                &mut c,
+                "analytics_events_default",
+                app_id,
+                r.start,
+                r.end,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -143,7 +174,12 @@ pub async fn event_counts_by_day(
     let (hot_rows, cold_default_rows) = pg_res?;
     let parquet_rows = parquet_res?;
     let to_dc = |rows: Vec<repo::DayCountRow>| -> Vec<DayCount> {
-        rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect()
+        rows.into_iter()
+            .map(|r| DayCount {
+                day: r.day,
+                count: r.count,
+            })
+            .collect()
     };
     // COLD = Parquet (exported) + _default (late arrivals); then + HOT. All additive,
     // and the three sets are disjoint (a row is in exactly one of: parquet, _default, hot).
@@ -171,7 +207,13 @@ pub async fn transaction_counts_by_day(
         None => {
             let mut c = conn(&state.pool).await?;
             let rows = repo::transaction_counts_by_day_hot(&mut c, app_id, from, to).await?;
-            return Ok(rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect());
+            return Ok(rows
+                .into_iter()
+                .map(|r| DayCount {
+                    day: r.day,
+                    count: r.count,
+                })
+                .collect());
         }
     };
 
@@ -190,7 +232,14 @@ pub async fn transaction_counts_by_day(
             Vec::new()
         };
         let cold_default_rows = if let Some(r) = split.cold {
-            repo::default_partition_counts_by_day(&mut c, "transactions_default", app_id, r.start, r.end).await?
+            repo::default_partition_counts_by_day(
+                &mut c,
+                "transactions_default",
+                app_id,
+                r.start,
+                r.end,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -216,7 +265,12 @@ pub async fn transaction_counts_by_day(
     let (hot_rows, cold_default_rows) = pg_res?;
     let parquet_rows = parquet_res?;
     let to_dc = |rows: Vec<repo::DayCountRow>| -> Vec<DayCount> {
-        rows.into_iter().map(|r| DayCount { day: r.day, count: r.count }).collect()
+        rows.into_iter()
+            .map(|r| DayCount {
+                day: r.day,
+                count: r.count,
+            })
+            .collect()
     };
     // COLD = Parquet (exported) + _default (late arrivals); then + HOT. All additive,
     // and the three sets are disjoint (a row is in exactly one of: parquet, _default, hot).

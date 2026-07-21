@@ -103,8 +103,7 @@ async fn upload(
         .or(platform_default)
         .ok_or_else(|| anyhow::anyhow!("missing required --platform"))?;
 
-    let bytes = std::fs::read(&file)
-        .map_err(|e| anyhow::anyhow!("cannot read '{file}': {e}"))?;
+    let bytes = std::fs::read(&file).map_err(|e| anyhow::anyhow!("cannot read '{file}': {e}"))?;
 
     // Build query params from the flags that were provided.
     let mut query: Vec<(&str, String)> = vec![

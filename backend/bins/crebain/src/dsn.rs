@@ -74,8 +74,8 @@ mod tests {
 
     #[test]
     fn parses_a_full_dsn() {
-        let t = parse_dsn("http://pk_abc@localhost:8081/11111111-2222-3333-4444-555555555555")
-            .unwrap();
+        let t =
+            parse_dsn("http://pk_abc@localhost:8081/11111111-2222-3333-4444-555555555555").unwrap();
         assert_eq!(t.base_url, "http://localhost:8081");
         assert_eq!(t.public_key, "pk_abc");
         assert_eq!(t.app_id, "11111111-2222-3333-4444-555555555555");

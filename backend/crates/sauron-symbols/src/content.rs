@@ -40,8 +40,8 @@ pub fn compress(raw: &[u8]) -> Vec<u8> {
 /// Streaming decompress that aborts once `max_uncompressed` bytes are produced.
 pub fn decompress(comp: &[u8], max_uncompressed: usize) -> Result<Vec<u8>, SymbolError> {
     use std::io::Read;
-    let mut dec =
-        zstd::stream::read::Decoder::new(comp).map_err(|e| SymbolError::Decompress(e.to_string()))?;
+    let mut dec = zstd::stream::read::Decoder::new(comp)
+        .map_err(|e| SymbolError::Decompress(e.to_string()))?;
     let mut out = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     loop {

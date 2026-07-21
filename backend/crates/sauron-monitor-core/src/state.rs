@@ -106,11 +106,30 @@ mod tests {
     use super::*;
 
     fn st(status: Status, cf: i32, cs: i32) -> MonitorState {
-        MonitorState { status, consecutive_failures: cf, consecutive_successes: cs,
-            failure_threshold: 2, recovery_threshold: 1 }
+        MonitorState {
+            status,
+            consecutive_failures: cf,
+            consecutive_successes: cs,
+            failure_threshold: 2,
+            recovery_threshold: 1,
+        }
     }
-    fn up() -> ProbeResult { ProbeResult { up: true, status_code: Some(200), response_time_ms: Some(5), error: None } }
-    fn down() -> ProbeResult { ProbeResult { up: false, status_code: None, response_time_ms: None, error: Some("timeout".into()) } }
+    fn up() -> ProbeResult {
+        ProbeResult {
+            up: true,
+            status_code: Some(200),
+            response_time_ms: Some(5),
+            error: None,
+        }
+    }
+    fn down() -> ProbeResult {
+        ProbeResult {
+            up: false,
+            status_code: None,
+            response_time_ms: None,
+            error: Some("timeout".into()),
+        }
+    }
 
     #[test]
     fn single_failure_does_not_trip_when_threshold_is_two() {

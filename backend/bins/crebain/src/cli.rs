@@ -314,7 +314,12 @@ mod tests {
     #[test]
     fn report_path_flows_into_runconfig() {
         let args = Args::try_parse_from([
-            "crebain", "--isolated", "--database-url", "postgres://x/y", "--report", "out.html",
+            "crebain",
+            "--isolated",
+            "--database-url",
+            "postgres://x/y",
+            "--report",
+            "out.html",
         ])
         .unwrap();
         let (cfg, _mode) = args.resolve().unwrap();
@@ -323,17 +328,18 @@ mod tests {
 
     #[test]
     fn report_path_defaults_to_none() {
-        let args = Args::try_parse_from([
-            "crebain", "--isolated", "--database-url", "postgres://x/y",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["crebain", "--isolated", "--database-url", "postgres://x/y"])
+                .unwrap();
         let (cfg, _mode) = args.resolve().unwrap();
         assert_eq!(cfg.report_path, None);
     }
 
     #[test]
     fn defaults_max_inflight_and_transport() {
-        let args = Args::try_parse_from(["crebain", "--isolated", "--database-url", "postgres://x/y"]).unwrap();
+        let args =
+            Args::try_parse_from(["crebain", "--isolated", "--database-url", "postgres://x/y"])
+                .unwrap();
         let (cfg, _m) = args.resolve().unwrap();
         assert_eq!(cfg.max_inflight, 8192);
         assert_eq!(cfg.transport, Transport::Tcp);
@@ -344,9 +350,19 @@ mod tests {
     #[test]
     fn parses_concurrency_and_uds() {
         let args = Args::try_parse_from([
-            "crebain", "--isolated", "--database-url", "postgres://x/y",
-            "--max-inflight", "50000", "--transport", "uds", "--live-sockets", "--ramp", "10",
-        ]).unwrap();
+            "crebain",
+            "--isolated",
+            "--database-url",
+            "postgres://x/y",
+            "--max-inflight",
+            "50000",
+            "--transport",
+            "uds",
+            "--live-sockets",
+            "--ramp",
+            "10",
+        ])
+        .unwrap();
         let (cfg, _m) = args.resolve().unwrap();
         assert_eq!(cfg.max_inflight, 50000);
         assert_eq!(cfg.transport, Transport::Uds);
@@ -390,8 +406,14 @@ mod tests {
     #[test]
     fn rejects_max_inflight_zero() {
         let args = Args::try_parse_from([
-            "crebain", "--isolated", "--database-url", "postgres://x/y", "--max-inflight", "0",
-        ]).unwrap();
+            "crebain",
+            "--isolated",
+            "--database-url",
+            "postgres://x/y",
+            "--max-inflight",
+            "0",
+        ])
+        .unwrap();
         assert!(args.resolve().is_err());
     }
 }

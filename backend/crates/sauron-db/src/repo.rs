@@ -574,7 +574,9 @@ pub async fn list_issues(
             ("type", Op::Contains) => query.filter(issues::type_.ilike(like_contains(&f.value))),
             ("culprit", Op::Eq) => query.filter(issues::culprit.eq(f.value.clone())),
             ("culprit", Op::Neq) => query.filter(issues::culprit.ne(f.value.clone())),
-            ("culprit", Op::Contains) => query.filter(issues::culprit.ilike(like_contains(&f.value))),
+            ("culprit", Op::Contains) => {
+                query.filter(issues::culprit.ilike(like_contains(&f.value)))
+            }
             ("times_seen", Op::Eq) => query.filter(issues::times_seen.eq(as_i64(&f.value))),
             ("times_seen", Op::Gt) => query.filter(issues::times_seen.gt(as_i64(&f.value))),
             ("times_seen", Op::Lt) => query.filter(issues::times_seen.lt(as_i64(&f.value))),
@@ -701,7 +703,8 @@ pub async fn list_error_events_for_issue(
         query = match (f.field, f.op) {
             ("tag", Op::Eq) => {
                 let (k, v) = tag_kv(&f.value);
-                query.filter(sql::<Bool>("error_events.tags @> ").bind::<Jsonb, _>(tag_object(k, v)))
+                query
+                    .filter(sql::<Bool>("error_events.tags @> ").bind::<Jsonb, _>(tag_object(k, v)))
             }
             ("tag", Op::Contains) => {
                 let (k, v) = tag_kv(&f.value);
@@ -784,8 +787,12 @@ fn escape_like(v: &str) -> String {
     out
 }
 
-pub fn like_contains(v: &str) -> String { format!("%{}%", escape_like(v)) }
-fn as_i64(v: &str) -> i64 { v.parse().unwrap_or_default() } // parser guarantees numeric
+pub fn like_contains(v: &str) -> String {
+    format!("%{}%", escape_like(v))
+}
+fn as_i64(v: &str) -> i64 {
+    v.parse().unwrap_or_default()
+} // parser guarantees numeric
 
 #[cfg(test)]
 mod like_contains_tests {
@@ -1487,10 +1494,7 @@ pub struct IssueStatsRow {
     pub info: i64,
 }
 
-pub async fn issue_stats(
-    conn: &mut AsyncPgConnection,
-    app_id: Uuid,
-) -> QueryResult<IssueStatsRow> {
+pub async fn issue_stats(conn: &mut AsyncPgConnection, app_id: Uuid) -> QueryResult<IssueStatsRow> {
     diesel::sql_query(
         "SELECT count(*)::bigint AS total, \
            count(*) FILTER (WHERE status='unresolved')::bigint AS unresolved, \
@@ -1539,12 +1543,16 @@ pub async fn list_analytics_events(
     offset: i64,
 ) -> QueryResult<Vec<AnalyticsEvent>> {
     // Environment filters need a name->id lookup before the query is built.
-    let mut env_eq: Option<Option<Uuid>> = None;   // Some(id) filter present
+    let mut env_eq: Option<Option<Uuid>> = None; // Some(id) filter present
     let mut env_neq: Option<Option<Uuid>> = None;
     for f in filters {
         if f.field == "environment" {
             let id = environment_id_by_name(conn, app_id, &f.value).await;
-            match f.op { Op::Eq => env_eq = Some(id), Op::Neq => env_neq = Some(id), _ => {} }
+            match f.op {
+                Op::Eq => env_eq = Some(id),
+                Op::Neq => env_neq = Some(id),
+                _ => {}
+            }
         }
     }
 
@@ -1560,19 +1568,37 @@ pub async fn list_analytics_events(
         query = match (f.field, f.op) {
             ("name", Op::Eq) => query.filter(analytics_events::name.eq(f.value.clone())),
             ("name", Op::Neq) => query.filter(analytics_events::name.ne(f.value.clone())),
-            ("name", Op::Contains) => query.filter(analytics_events::name.ilike(like_contains(&f.value))),
-            ("distinct_id", Op::Eq) => query.filter(analytics_events::distinct_id.eq(f.value.clone())),
-            ("distinct_id", Op::Neq) => query.filter(analytics_events::distinct_id.ne(f.value.clone())),
-            ("distinct_id", Op::Contains) => query.filter(analytics_events::distinct_id.ilike(like_contains(&f.value))),
-            ("session_id", Op::Eq) => query.filter(analytics_events::session_id.eq(f.value.clone())),
-            ("session_id", Op::Neq) => query.filter(analytics_events::session_id.ne(f.value.clone())),
-            ("session_id", Op::Contains) => query.filter(analytics_events::session_id.ilike(like_contains(&f.value))),
+            ("name", Op::Contains) => {
+                query.filter(analytics_events::name.ilike(like_contains(&f.value)))
+            }
+            ("distinct_id", Op::Eq) => {
+                query.filter(analytics_events::distinct_id.eq(f.value.clone()))
+            }
+            ("distinct_id", Op::Neq) => {
+                query.filter(analytics_events::distinct_id.ne(f.value.clone()))
+            }
+            ("distinct_id", Op::Contains) => {
+                query.filter(analytics_events::distinct_id.ilike(like_contains(&f.value)))
+            }
+            ("session_id", Op::Eq) => {
+                query.filter(analytics_events::session_id.eq(f.value.clone()))
+            }
+            ("session_id", Op::Neq) => {
+                query.filter(analytics_events::session_id.ne(f.value.clone()))
+            }
+            ("session_id", Op::Contains) => {
+                query.filter(analytics_events::session_id.ilike(like_contains(&f.value)))
+            }
             ("release", Op::Eq) => query.filter(analytics_events::release.eq(f.value.clone())),
             ("release", Op::Neq) => query.filter(analytics_events::release.ne(f.value.clone())),
-            ("release", Op::Contains) => query.filter(analytics_events::release.ilike(like_contains(&f.value))),
+            ("release", Op::Contains) => {
+                query.filter(analytics_events::release.ilike(like_contains(&f.value)))
+            }
             ("tag", Op::Eq) => {
                 let (k, v) = tag_kv(&f.value);
-                query.filter(sql::<Bool>("analytics_events.tags @> ").bind::<Jsonb, _>(tag_object(k, v)))
+                query.filter(
+                    sql::<Bool>("analytics_events.tags @> ").bind::<Jsonb, _>(tag_object(k, v)),
+                )
             }
             ("tag", Op::Contains) => {
                 let (k, v) = tag_kv(&f.value);
@@ -1603,9 +1629,11 @@ pub async fn list_analytics_events(
             analytics_events::name
                 .ilike(p.clone())
                 .or(analytics_events::distinct_id.ilike(p.clone()))
-                .or(sql::<Bool>("analytics_events.contexts::text ILIKE ").bind::<Text, _>(p.clone()))
+                .or(sql::<Bool>("analytics_events.contexts::text ILIKE ")
+                    .bind::<Text, _>(p.clone()))
                 .or(sql::<Bool>("analytics_events.extra::text ILIKE ").bind::<Text, _>(p.clone()))
-                .or(sql::<Bool>("analytics_events.properties::text ILIKE ").bind::<Text, _>(p.clone()))
+                .or(sql::<Bool>("analytics_events.properties::text ILIKE ")
+                    .bind::<Text, _>(p.clone()))
                 .or(sql::<Bool>("analytics_events.tags::text ILIKE ").bind::<Text, _>(p)),
         );
     }
@@ -1920,7 +1948,11 @@ pub fn merge_user_series(active: Vec<SeriesPoint>, new: Vec<SeriesPoint>) -> Vec
         map.entry(p.bucket).or_default().1 = p.count;
     }
     map.into_iter()
-        .map(|(bucket, (active, new_users))| UserSeriesPoint { bucket, active, new_users })
+        .map(|(bucket, (active, new_users))| UserSeriesPoint {
+            bucket,
+            active,
+            new_users,
+        })
         .collect()
 }
 
@@ -1996,8 +2028,15 @@ pub fn order_histogram(rows: Vec<HistoBucket>) -> Vec<HistoBucket> {
     DURATION_BUCKETS
         .iter()
         .map(|label| {
-            let count = rows.iter().find(|r| r.bucket == *label).map(|r| r.count).unwrap_or(0);
-            HistoBucket { bucket: (*label).to_string(), count }
+            let count = rows
+                .iter()
+                .find(|r| r.bucket == *label)
+                .map(|r| r.count)
+                .unwrap_or(0);
+            HistoBucket {
+                bucket: (*label).to_string(),
+                count,
+            }
         })
         .collect()
 }
@@ -2069,7 +2108,10 @@ mod user_series_tests {
     use chrono::{TimeZone, Utc};
 
     fn pt(day: u32, count: i64) -> SeriesPoint {
-        SeriesPoint { bucket: Utc.with_ymd_and_hms(2026, 7, day, 0, 0, 0).unwrap(), count }
+        SeriesPoint {
+            bucket: Utc.with_ymd_and_hms(2026, 7, day, 0, 0, 0).unwrap(),
+            count,
+        }
     }
 
     #[test]
@@ -2079,7 +2121,13 @@ mod user_series_tests {
         let out = merge_user_series(active, new);
         let got: Vec<(u32, i64, i64)> = out
             .iter()
-            .map(|p| (p.bucket.format("%d").to_string().parse().unwrap(), p.active, p.new_users))
+            .map(|p| {
+                (
+                    p.bucket.format("%d").to_string().parse().unwrap(),
+                    p.active,
+                    p.new_users,
+                )
+            })
             .collect();
         assert_eq!(got, vec![(1, 10, 0), (2, 8, 3), (3, 0, 5)]);
     }
@@ -2095,7 +2143,10 @@ mod histogram_tests {
     use super::{order_histogram, HistoBucket, DURATION_BUCKETS};
 
     fn b(bucket: &str, count: i64) -> HistoBucket {
-        HistoBucket { bucket: bucket.to_string(), count }
+        HistoBucket {
+            bucket: bucket.to_string(),
+            count,
+        }
     }
 
     #[test]
@@ -2105,7 +2156,13 @@ mod histogram_tests {
         let got: Vec<(&str, i64)> = out.iter().map(|h| (h.bucket.as_str(), h.count)).collect();
         assert_eq!(
             got,
-            vec![("<10s", 5), ("10-60s", 0), ("1-5m", 0), ("5-30m", 0), ("30m+", 2)]
+            vec![
+                ("<10s", 5),
+                ("10-60s", 0),
+                ("1-5m", 0),
+                ("5-30m", 0),
+                ("30m+", 2)
+            ]
         );
         assert_eq!(out.len(), DURATION_BUCKETS.len());
     }
@@ -2444,11 +2501,21 @@ pub async fn create_monitor(
 }
 
 pub async fn get_monitor(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<Option<Monitor>> {
-    monitors::table.find(id).select(Monitor::as_select()).first(conn).await.optional()
+    monitors::table
+        .find(id)
+        .select(Monitor::as_select())
+        .first(conn)
+        .await
+        .optional()
 }
 
 pub async fn monitor_project(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<Option<Uuid>> {
-    monitors::table.find(id).select(monitors::project_id).first(conn).await.optional()
+    monitors::table
+        .find(id)
+        .select(monitors::project_id)
+        .first(conn)
+        .await
+        .optional()
 }
 
 pub async fn delete_monitor(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
@@ -2496,7 +2563,10 @@ pub async fn list_monitors_for_project(
 }
 
 #[derive(QueryableByName)]
-struct PctRow { #[diesel(sql_type = Nullable<Double>)] pct: Option<f64> }
+struct PctRow {
+    #[diesel(sql_type = Nullable<Double>)]
+    pct: Option<f64>,
+}
 
 pub async fn uptime_pct(
     conn: &mut AsyncPgConnection,
@@ -2530,7 +2600,10 @@ pub async fn latency_series(
     .await
 }
 
-pub async fn prune_checks(conn: &mut AsyncPgConnection, older_than_days: i64) -> QueryResult<usize> {
+pub async fn prune_checks(
+    conn: &mut AsyncPgConnection,
+    older_than_days: i64,
+) -> QueryResult<usize> {
     diesel::sql_query(
         "DELETE FROM monitor_checks WHERE checked_at < now() - ($1 || ' days')::interval",
     )
@@ -2603,7 +2676,10 @@ pub async fn record_check_and_state(
 }
 
 #[derive(QueryableByName)]
-struct IdRow { #[diesel(sql_type = SqlUuid)] id: Uuid }
+struct IdRow {
+    #[diesel(sql_type = SqlUuid)]
+    id: Uuid,
+}
 
 pub async fn open_incident(
     conn: &mut AsyncPgConnection,
@@ -2709,7 +2785,9 @@ pub async fn advance_watermark(
         .on_conflict(tiering_state::table_name)
         .do_update()
         .set((
-            tiering_state::watermark.eq(diesel::dsl::sql::<Timestamptz>("GREATEST(tiering_state.watermark, EXCLUDED.watermark)")),
+            tiering_state::watermark.eq(diesel::dsl::sql::<Timestamptz>(
+                "GREATEST(tiering_state.watermark, EXCLUDED.watermark)",
+            )),
             tiering_state::updated_at.eq(Utc::now()),
         ))
         .execute(conn)
@@ -2822,9 +2900,8 @@ pub async fn detach_and_drop_partition(
     // rejects "cannot insert multiple commands into a prepared statement".
     // `batch_execute` (SimpleAsyncConnection) sends the BEGIN/DETACH/DROP/COMMIT
     // block via the simple protocol; the explicit transaction keeps it atomic.
-    let sql = format!(
-        "BEGIN; ALTER TABLE {table} DETACH PARTITION {child}; DROP TABLE {child}; COMMIT;"
-    );
+    let sql =
+        format!("BEGIN; ALTER TABLE {table} DETACH PARTITION {child}; DROP TABLE {child}; COMMIT;");
     conn.batch_execute(&sql).await
 }
 
@@ -2941,11 +3018,10 @@ struct BytesRow {
 }
 
 pub async fn db_total_bytes(conn: &mut AsyncPgConnection) -> QueryResult<i64> {
-    let row: BytesRow = diesel::sql_query(
-        "SELECT pg_database_size(current_database())::bigint AS bytes",
-    )
-    .get_result(conn)
-    .await?;
+    let row: BytesRow =
+        diesel::sql_query("SELECT pg_database_size(current_database())::bigint AS bytes")
+            .get_result(conn)
+            .await?;
     Ok(row.bytes)
 }
 
@@ -3123,9 +3199,7 @@ pub async fn list_artifacts_with_sizes(
     app_id: Uuid,
 ) -> QueryResult<Vec<(SymbolArtifact, i64, i64)>> {
     symbol_artifacts::table
-        .inner_join(
-            symbol_blobs::table.on(symbol_artifacts::blob_sha256.eq(symbol_blobs::sha256)),
-        )
+        .inner_join(symbol_blobs::table.on(symbol_artifacts::blob_sha256.eq(symbol_blobs::sha256)))
         .filter(symbol_artifacts::app_id.eq(app_id))
         .select((
             SymbolArtifact::as_select(),

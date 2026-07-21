@@ -159,8 +159,12 @@ fn finish(ran: Option<Result<Summary>>, cfg: &RunConfig, mode_label: &str) -> Re
                     events_per_min: cfg.events_per_min,
                     issues_per_min: cfg.issues_per_min,
                     gzip: cfg.gzip,
-                    generated_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-                    ncpus: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+                    generated_at: chrono::Utc::now()
+                        .format("%Y-%m-%d %H:%M:%S UTC")
+                        .to_string(),
+                    ncpus: std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1),
                 };
                 match report_html::write(path, &summary, &cfg.expected(), &meta) {
                     Ok(()) => eprintln!("crebain: wrote report to {}", path.display()),

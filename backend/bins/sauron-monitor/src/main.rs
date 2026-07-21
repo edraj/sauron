@@ -14,7 +14,7 @@ use sauron_core::Config;
 use sauron_db::models::Monitor;
 use sauron_db::{repo, PgPool};
 use sauron_monitor_core::{
-    apply, probe, status_str, Kind, MonitorState, ProbeSpec, ProbeResult, Status, TransitionKind,
+    apply, probe, status_str, Kind, MonitorState, ProbeResult, ProbeSpec, Status, TransitionKind,
     WebhookPayload,
 };
 
@@ -86,29 +86,54 @@ async fn tick(pool: &PgPool, http: &reqwest::Client, cfg: &Config) -> anyhow::Re
 
 fn spec_of(m: &Monitor) -> ProbeSpec {
     let cfg = &m.config;
-    let headers = cfg.get("headers").and_then(|h| h.as_object()).map(|o| {
-        o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()
-    }).unwrap_or_default();
+    let headers = cfg
+        .get("headers")
+        .and_then(|h| h.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     ProbeSpec {
-        kind: if m.kind == "tcp" { Kind::Tcp } else { Kind::Http },
+        kind: if m.kind == "tcp" {
+            Kind::Tcp
+        } else {
+            Kind::Http
+        },
         target: m.target.clone(),
         method: m.method.clone(),
         headers,
-        body: cfg.get("body").and_then(|b| b.as_str()).map(|s| s.to_string()),
-        expected_status: cfg.get("expected_status").and_then(|s| s.as_str()).unwrap_or("200-399").to_string(),
-        body_assertion: cfg.get("body_assertion").and_then(|s| s.as_str()).map(|s| s.to_string()),
+        body: cfg
+            .get("body")
+            .and_then(|b| b.as_str())
+            .map(|s| s.to_string()),
+        expected_status: cfg
+            .get("expected_status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("200-399")
+            .to_string(),
+        body_assertion: cfg
+            .get("body_assertion")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()),
         // Carried for forward-compat; NOT enforced per-monitor in the MVP. For SSRF
         // safety the prober does not follow redirects at all: the shared `http`
         // client uses `Policy::none()`, so a redirect response is simply recorded
         // as the probe result rather than followed. This field is retained but not
         // honored.
-        follow_redirects: cfg.get("follow_redirects").and_then(|b| b.as_bool()).unwrap_or(true),
+        follow_redirects: cfg
+            .get("follow_redirects")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true),
         // Never let a probe outlive its own cadence: a 1s monitor with the
         // default 10s timeout would otherwise stack ~10 overlapping in-flight
         // probes (the claim advances next_check_at by the interval before a slow
         // probe returns). Cap the effective timeout at the interval.
         timeout: Duration::from_millis(
-            m.timeout_ms.min(m.interval_seconds.saturating_mul(1000)).max(1) as u64,
+            m.timeout_ms
+                .min(m.interval_seconds.saturating_mul(1000))
+                .max(1) as u64,
         ),
     }
 }
@@ -156,8 +181,12 @@ async fn process_monitor(
     let mut incident_id = None;
     match outcome.transition {
         TransitionKind::WentDown => {
-            let cause = result.error.clone().unwrap_or_else(|| "check failed".into());
-            incident_id = Some(repo::open_incident(&mut conn, m.id, &cause, result.error.as_deref()).await?);
+            let cause = result
+                .error
+                .clone()
+                .unwrap_or_else(|| "check failed".into());
+            incident_id =
+                Some(repo::open_incident(&mut conn, m.id, &cause, result.error.as_deref()).await?);
         }
         TransitionKind::WentUp => {
             repo::resolve_incident(&mut conn, m.id).await?;
@@ -168,7 +197,17 @@ async fn process_monitor(
 
     if changed {
         if let Some(url) = &m.webhook_url {
-            fire_webhook(http, url, m, status_str(cur), status_str(outcome.new_status), incident_id, result.error.as_deref(), allow_private).await;
+            fire_webhook(
+                http,
+                url,
+                m,
+                status_str(cur),
+                status_str(outcome.new_status),
+                incident_id,
+                result.error.as_deref(),
+                allow_private,
+            )
+            .await;
         }
     }
     Ok(())
@@ -185,7 +224,9 @@ async fn fire_webhook(
     cause: Option<&str>,
     allow_private: bool,
 ) {
-    let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_string()));
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_string()));
     let host = match host {
         Some(h) => h,
         None => {
@@ -210,7 +251,12 @@ async fn fire_webhook(
         target: &m.target,
     };
     for attempt in 0..3 {
-        let res = http.post(url).timeout(Duration::from_secs(5)).json(&payload).send().await;
+        let res = http
+            .post(url)
+            .timeout(Duration::from_secs(5))
+            .json(&payload)
+            .send()
+            .await;
         match res {
             Ok(r) if r.status().is_success() => return,
             Ok(r) => warn!(status = %r.status(), "webhook non-2xx"),

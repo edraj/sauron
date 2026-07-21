@@ -27,7 +27,8 @@ impl Granularity {
 }
 
 fn start_of_day(ts: DateTime<Utc>) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), 0, 0, 0).unwrap()
+    Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), 0, 0, 0)
+        .unwrap()
 }
 
 /// The partition `[start, end)` that contains `ts` at the given granularity.
@@ -35,18 +36,30 @@ pub fn bucket_bounds(ts: DateTime<Utc>, g: Granularity) -> TimeRange {
     match g {
         Granularity::Day => {
             let start = start_of_day(ts);
-            TimeRange { start, end: start + Duration::days(1) }
+            TimeRange {
+                start,
+                end: start + Duration::days(1),
+            }
         }
         Granularity::Week => {
             // ISO week: Monday start.
             let sod = start_of_day(ts);
             let dow = sod.weekday().num_days_from_monday() as i64;
             let start = sod - Duration::days(dow);
-            TimeRange { start, end: start + Duration::days(7) }
+            TimeRange {
+                start,
+                end: start + Duration::days(7),
+            }
         }
         Granularity::Month => {
-            let start = Utc.with_ymd_and_hms(ts.year(), ts.month(), 1, 0, 0, 0).unwrap();
-            let (ny, nm) = if ts.month() == 12 { (ts.year() + 1, 1) } else { (ts.year(), ts.month() + 1) };
+            let start = Utc
+                .with_ymd_and_hms(ts.year(), ts.month(), 1, 0, 0, 0)
+                .unwrap();
+            let (ny, nm) = if ts.month() == 12 {
+                (ts.year() + 1, 1)
+            } else {
+                (ts.year(), ts.month() + 1)
+            };
             let end = Utc.with_ymd_and_hms(ny, nm, 1, 0, 0, 0).unwrap();
             TimeRange { start, end }
         }
@@ -55,7 +68,12 @@ pub fn bucket_bounds(ts: DateTime<Utc>, g: Granularity) -> TimeRange {
 
 /// PG child-partition name suffix, from the partition start. `2026-05-01` → `2026_05_01`.
 pub fn partition_suffix(start: DateTime<Utc>) -> String {
-    format!("{:04}_{:02}_{:02}", start.year(), start.month(), start.day())
+    format!(
+        "{:04}_{:02}_{:02}",
+        start.year(),
+        start.month(),
+        start.day()
+    )
 }
 
 /// Directory DuckDB writes the cold Parquet under (hive-partitioned inside).
@@ -105,7 +123,10 @@ mod cold_path_tests {
         let rel = format!("error_events/app_id={app}/year=2026/month=5/data_0.parquet");
         assert_eq!(
             parse_cold_path(&rel),
-            Some(ColdFileKey { table: "error_events".to_string(), app_id: app })
+            Some(ColdFileKey {
+                table: "error_events".to_string(),
+                app_id: app
+            })
         );
     }
 
@@ -118,9 +139,15 @@ mod cold_path_tests {
 
     #[test]
     fn rejects_missing_app_id_or_empty() {
-        assert_eq!(parse_cold_path("error_events/year=2026/month=5/x.parquet"), None);
+        assert_eq!(
+            parse_cold_path("error_events/year=2026/month=5/x.parquet"),
+            None
+        );
         assert_eq!(parse_cold_path(""), None);
-        assert_eq!(parse_cold_path("error_events/app_id=not-a-uuid/x.parquet"), None);
+        assert_eq!(
+            parse_cold_path("error_events/app_id=not-a-uuid/x.parquet"),
+            None
+        );
     }
 }
 
@@ -158,7 +185,10 @@ mod tests {
     fn suffix_and_paths() {
         let start = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
         assert_eq!(partition_suffix(start), "2026_05_01");
-        assert_eq!(cold_copy_dir("/cold/", "error_events"), "/cold/error_events");
+        assert_eq!(
+            cold_copy_dir("/cold/", "error_events"),
+            "/cold/error_events"
+        );
         let app = Uuid::nil();
         assert_eq!(
             cold_partition_glob("/cold", "error_events", app),
@@ -168,7 +198,13 @@ mod tests {
 
     #[test]
     fn granularity_parse() {
-        assert_eq!(Granularity::from_str_or("WEEK", Granularity::Day), Granularity::Week);
-        assert_eq!(Granularity::from_str_or("nonsense", Granularity::Day), Granularity::Day);
+        assert_eq!(
+            Granularity::from_str_or("WEEK", Granularity::Day),
+            Granularity::Week
+        );
+        assert_eq!(
+            Granularity::from_str_or("nonsense", Granularity::Day),
+            Granularity::Day
+        );
     }
 }

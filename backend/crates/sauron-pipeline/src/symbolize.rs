@@ -179,9 +179,10 @@ pub async fn symbolicate_ingest_dart(
         .symbolicate_dart(&fetch, raw_trace, debug_id, arch);
     match tokio::time::timeout(std::time::Duration::from_millis(sym.timeout_ms), fut).await {
         Ok((resolved, status)) => match status {
-            Status::Symbolicated | Status::Partial => {
-                (serde_json::to_value(&resolved).ok(), status.as_str().to_string())
-            }
+            Status::Symbolicated | Status::Partial => (
+                serde_json::to_value(&resolved).ok(),
+                status.as_str().to_string(),
+            ),
             other => (None, other.as_str().to_string()),
         },
         Err(_) => (None, "pending".to_string()),
@@ -218,9 +219,10 @@ pub async fn symbolicate_ingest(
         Ok((resolved, status)) => match status {
             // Store frames WITH source context so the API can serve them
             // straight from the row without re-symbolicating on every view.
-            Status::Symbolicated | Status::Partial => {
-                (serde_json::to_value(&resolved).ok(), status.as_str().to_string())
-            }
+            Status::Symbolicated | Status::Partial => (
+                serde_json::to_value(&resolved).ok(),
+                status.as_str().to_string(),
+            ),
             other => (None, other.as_str().to_string()),
         },
         // Timed out — leave it pending for the on-read path.

@@ -174,7 +174,11 @@ pub fn issue_envelope(user: &VirtualUser, seq: u64) -> Envelope {
     });
     let error = EnvelopeItem::Error(Box::new(ErrorItem {
         event_id: Uuid::new_v4(),
-        level: if seq % 7 == 0 { Level::Fatal } else { Level::Error },
+        level: if seq % 7 == 0 {
+            Level::Fatal
+        } else {
+            Level::Error
+        },
         timestamp: Utc::now(),
         exception: Some(ExceptionInfo {
             ty: ty.to_string(),

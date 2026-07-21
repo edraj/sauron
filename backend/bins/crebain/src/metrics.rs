@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::transport::{OutcomeKind, SendOutcome};
 use crate::generator::ItemCounts;
 use crate::procstat::{self, RawSample, Sampler};
+use crate::transport::{OutcomeKind, SendOutcome};
 
 /// Cap on retained latency samples, to bound memory on very large runs. Beyond
 /// this the summary flags that percentiles are computed from a prefix.
@@ -453,16 +453,20 @@ mod tests {
         // cumulative: 500 req / 480 ok / 20 fail; previous tick was 300/290/10.
         let tp = make_timepoint(
             Duration::from_secs(2),
-            500, 480, 20,
-            300, 290, 10,
+            500,
+            480,
+            20,
+            300,
+            290,
+            10,
             Duration::from_secs(1),
             Some(0.8),
             Some(64 * 1024 * 1024),
         );
         assert_eq!(tp.t_secs, 2.0);
-        assert_eq!(tp.interval_rate, 200.0);      // (500-300)/1s
-        assert_eq!(tp.interval_accepted, 190);    // 480-290
-        assert_eq!(tp.interval_failed, 10);       // 20-10
+        assert_eq!(tp.interval_rate, 200.0); // (500-300)/1s
+        assert_eq!(tp.interval_accepted, 190); // 480-290
+        assert_eq!(tp.interval_failed, 10); // 20-10
         assert_eq!(tp.cpu_cores, Some(0.8));
         assert_eq!(tp.rss_bytes, Some(64 * 1024 * 1024));
     }
@@ -470,8 +474,16 @@ mod tests {
     #[test]
     fn timepoint_without_resources_is_none() {
         let tp = make_timepoint(
-            Duration::from_secs(1), 100, 100, 0, 0, 0, 0,
-            Duration::from_secs(1), None, None,
+            Duration::from_secs(1),
+            100,
+            100,
+            0,
+            0,
+            0,
+            0,
+            Duration::from_secs(1),
+            None,
+            None,
         );
         assert_eq!(tp.cpu_cores, None);
         assert_eq!(tp.rss_bytes, None);
@@ -527,7 +539,10 @@ mod tests {
                 kind: OutcomeKind::Accepted,
                 status: Some(202),
             },
-            counts: ItemCounts { events: 1, ..Default::default() },
+            counts: ItemCounts {
+                events: 1,
+                ..Default::default()
+            },
             latency: Duration::from_millis(2),
         };
         for _ in 0..3 {
@@ -539,12 +554,25 @@ mod tests {
         let s = handle.await.unwrap();
 
         assert_eq!(s.requests, 3);
-        assert!(!s.timeline.is_empty(), "expected at least one timeline tick");
+        assert!(
+            !s.timeline.is_empty(),
+            "expected at least one timeline tick"
+        );
         // RSS is available from the very first tick; CPU has no prior sample yet.
-        assert!(s.timeline[0].rss_bytes.is_some(), "RSS should sample from self");
-        assert!(s.timeline[0].cpu_cores.is_none(), "first tick has no prior CPU sample");
+        assert!(
+            s.timeline[0].rss_bytes.is_some(),
+            "RSS should sample from self"
+        );
+        assert!(
+            s.timeline[0].cpu_cores.is_none(),
+            "first tick has no prior CPU sample"
+        );
         // This test process has at least stdio fds open, so the peak should
         // reflect a real, non-zero fd count sampled from self.
-        assert!(s.peak_connections >= 3, "expected peak_connections >= 3, got {}", s.peak_connections);
+        assert!(
+            s.peak_connections >= 3,
+            "expected peak_connections >= 3, got {}",
+            s.peak_connections
+        );
     }
 }

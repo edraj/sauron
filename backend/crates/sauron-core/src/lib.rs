@@ -13,9 +13,9 @@ pub mod ids;
 pub mod monitor;
 
 pub use config::Config;
-pub use monitor::{is_valid_monitor_interval, MONITOR_INTERVAL_PRESETS};
 pub use envelope::{
     AnalyticsItem, Breadcrumb, DebugMeta, Envelope, EnvelopeContext, EnvelopeHeader, EnvelopeItem,
     EventUser, ExceptionInfo, Frame, IdentifyItem, IngestJob, Level, Mechanism, SdkInfo,
 };
 pub use fingerprint::fingerprint;
+pub use monitor::{is_valid_monitor_interval, MONITOR_INTERVAL_PRESETS};

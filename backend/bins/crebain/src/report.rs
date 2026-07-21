@@ -65,10 +65,26 @@ pub fn print_summary(s: &Summary, expected: &Expected) {
     );
 
     println!("\n  outcomes ({} total requests)", group(s.requests));
-    println!("    accepted (2xx)  {:>12}   {}", group(s.accepted), pct(s.accepted, s.requests));
-    println!("    rate-limited    {:>12}   {}", group(s.rate_limited), pct(s.rate_limited, s.requests));
-    println!("    http errors     {:>12}   {}", group(s.http_errors), pct(s.http_errors, s.requests));
-    println!("    transport errs  {:>12}   {}", group(s.transport), pct(s.transport, s.requests));
+    println!(
+        "    accepted (2xx)  {:>12}   {}",
+        group(s.accepted),
+        pct(s.accepted, s.requests)
+    );
+    println!(
+        "    rate-limited    {:>12}   {}",
+        group(s.rate_limited),
+        pct(s.rate_limited, s.requests)
+    );
+    println!(
+        "    http errors     {:>12}   {}",
+        group(s.http_errors),
+        pct(s.http_errors, s.requests)
+    );
+    println!(
+        "    transport errs  {:>12}   {}",
+        group(s.transport),
+        pct(s.transport, s.requests)
+    );
     if !s.status_counts.is_empty() {
         let codes = s
             .status_counts
@@ -105,9 +121,21 @@ pub fn print_summary(s: &Summary, expected: &Expected) {
     println!("\n  items  accepted / attempted  (by signal type)");
     item_row("errors", s.accepted_items.errors, s.attempted.errors);
     item_row("events", s.accepted_items.events, s.attempted.events);
-    item_row("transactions", s.accepted_items.transactions, s.attempted.transactions);
-    item_row("identifies", s.accepted_items.identifies, s.attempted.identifies);
-    item_row("breadcrumbs", s.accepted_items.breadcrumbs, s.attempted.breadcrumbs);
+    item_row(
+        "transactions",
+        s.accepted_items.transactions,
+        s.attempted.transactions,
+    );
+    item_row(
+        "identifies",
+        s.accepted_items.identifies,
+        s.attempted.identifies,
+    );
+    item_row(
+        "breadcrumbs",
+        s.accepted_items.breadcrumbs,
+        s.attempted.breadcrumbs,
+    );
     item_row("total", total(&s.accepted_items), total(&s.attempted));
 
     println!("\n  latency  (per request, includes failures)");
@@ -129,7 +157,11 @@ pub fn print_summary(s: &Summary, expected: &Expected) {
 }
 
 fn item_row(label: &str, accepted: u64, attempted: u64) {
-    println!("    {label:<14} {:>12} / {:<12}", group(accepted), group(attempted));
+    println!(
+        "    {label:<14} {:>12} / {:<12}",
+        group(accepted),
+        group(attempted)
+    );
 }
 
 pub(crate) fn total(c: &ItemCounts) -> u64 {
