@@ -2,8 +2,9 @@
 %global debug_package %{nil}
 
 # Prebuilt mode (`rpmbuild --with prebuilt`, driven by build-rpm.sh --prebuilt):
-# %build is skipped and %install consumes binaries + dashboard/dist staged into
+# %%build is skipped and %%install consumes binaries + dashboard/dist staged into
 # the source tree by CI, so packaging costs seconds instead of recompiling.
+# (%% escapes the section names so el9's rpm 4.16 doesn't expand them in this comment.)
 %bcond_with prebuilt
 
 Name:           sauron
@@ -38,7 +39,7 @@ Source50:       libduckdb.so
 %if %{with prebuilt}
 # Overlay tarball of precompiled binaries (backend/target/release/*) and dashboard
 # static assets (dashboard/dist/*), staged by build-rpm.sh --prebuilt and unpacked
-# in %prep so %build is a no-op. Present only in prebuilt mode.
+# in %%prep so %%build is a no-op. Present only in prebuilt mode.
 Source51:       sauron-prebuilt.tar.gz
 %endif
 
@@ -92,8 +93,8 @@ Standalone Sauron command-line tools: 'crebain' load/benchmark generator and
 %prep
 %autosetup -n %{name}-%{version}
 %if %{with prebuilt}
-# Lay precompiled binaries + dashboard/dist into the tree so %build is a no-op and
-# %install finds artifacts at the same paths as a from-source build.
+# Lay precompiled binaries + dashboard/dist into the tree so %%build is a no-op and
+# %%install finds artifacts at the same paths as a from-source build.
 tar xzf %{SOURCE51}
 %endif
 
@@ -111,7 +112,7 @@ cp -p %{SOURCE50} _libduckdb/libduckdb.so
 export DUCKDB_LIB_DIR="$PWD/_libduckdb"
 
 # redhat-rpm-config injects RUSTFLAGS with -Cdebuginfo=2 -Ccodegen-units=1
-# -Cstrip=none: that generates debuginfo we discard (debug_package is %{nil}),
+# -Cstrip=none: that generates debuginfo we discard (debug_package is %%{nil}),
 # forces slow single-unit codegen, and defeats the release `strip`. Append
 # last-wins overrides to restore fast, stripped codegen while keeping the
 # hardening/link flags redhat-rpm-config also set.
@@ -157,7 +158,7 @@ install -dm0750 %{buildroot}%{_sharedstatedir}/sauron/cold
 
 # --- vendored libduckdb (dynamically linked by sauron-tier) ---
 # Shipped in a private lib dir + an ld.so.conf.d drop-in so the loader resolves
-# it (ldconfig runs in %post server). No rpath is baked into the binary.
+# it (ldconfig runs in %%post server). No rpath is baked into the binary.
 install -Dm0755 %{SOURCE50} %{buildroot}%{_libdir}/sauron/libduckdb.so
 install -dm0755 %{buildroot}%{_sysconfdir}/ld.so.conf.d
 printf '%s\n' '%{_libdir}/sauron' > %{buildroot}%{_sysconfdir}/ld.so.conf.d/sauron.conf
@@ -165,7 +166,7 @@ printf '%s\n' '%{_libdir}/sauron' > %{buildroot}%{_sysconfdir}/ld.so.conf.d/saur
 # --- dashboard static + generator + nginx vhost ---
 mkdir -p %{buildroot}%{_datadir}/sauron/dashboard
 cp -a dashboard/dist/. %{buildroot}%{_datadir}/sauron/dashboard/
-# config.js is generated per-host by %post; ship only the template.
+# config.js is generated per-host by %%post; ship only the template.
 rm -f %{buildroot}%{_datadir}/sauron/dashboard/config.js
 install -Dm0644 %{SOURCE40} %{buildroot}%{_sysconfdir}/nginx/conf.d/sauron-dashboard.conf
 install -Dm0755 %{SOURCE41} %{buildroot}%{_libexecdir}/sauron/sauron-dashboard-config
@@ -179,7 +180,7 @@ install -Dm0755 %{SOURCE41} %{buildroot}%{_libexecdir}/sauron/sauron-dashboard-c
 %post server
 %systemd_post sauron-api.service sauron-ingest.service sauron-monitor.service sauron-tier.service sauron-migrate.service
 # Refresh the dynamic linker cache so sauron-tier finds the vendored
-# %{_libdir}/sauron/libduckdb.so via the ld.so.conf.d drop-in.
+# %%{_libdir}/sauron/libduckdb.so via the ld.so.conf.d drop-in.
 /sbin/ldconfig
 # Generate a JWT secret on first install if none present.
 if [ "$1" -eq 1 ] && [ ! -s %{_sysconfdir}/sauron/secret.env ]; then
