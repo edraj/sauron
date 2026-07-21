@@ -199,7 +199,9 @@ jobs:
     container: ${{ matrix.image }}
     steps:
       - name: Install rpm tooling (no compiler toolchain)
-        run: dnf install -y rpm-build systemd-rpm-macros git tar gzip gawk findutils coreutils sed
+        # el9 minimal base ships coreutils-single, which conflicts with the full
+        # coreutils package; --allowerasing swaps it (same commands, no-op elsewhere).
+        run: dnf install -y --allowerasing rpm-build systemd-rpm-macros git tar gzip gawk findutils coreutils sed
 
       - uses: actions/checkout@v4
 
