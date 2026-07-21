@@ -90,7 +90,10 @@ jobs:
         # linker; curl+unzip drive the libduckdb fetch.
         run: |
           . /etc/os-release
-          dnf install -y \
+          # el9's minimal base ships curl-minimal, which conflicts with the full
+          # curl package; --allowerasing lets dnf swap it (a no-op on images that
+          # already carry full curl).
+          dnf install -y --allowerasing \
             gcc perl-interpreter lld pkgconf-pkg-config \
             git tar gzip gawk findutils curl unzip
           case "$ID" in
@@ -246,6 +249,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: rpms-*     # only the RPMs, not the prebuilt-* binary bundles
           path: dist
           merge-multiple: true
 
