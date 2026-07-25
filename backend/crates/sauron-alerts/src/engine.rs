@@ -107,7 +107,14 @@ impl AlertEngine {
                         {
                             Ok(true) => {
                                 self.log_event(
-                                    &mut conn, rule, None, ctx, dedup_key, "throttled", None, 0,
+                                    &mut conn,
+                                    rule,
+                                    None,
+                                    ctx,
+                                    dedup_key,
+                                    "throttled",
+                                    None,
+                                    0,
                                 )
                                 .await;
                                 return 0;

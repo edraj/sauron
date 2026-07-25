@@ -143,7 +143,11 @@ async fn rate_limit(state: &AppState, key: &str, limit: u32, window: u64) -> Res
         }
     };
 
-    match tokio::time::timeout(LIMITER_TIMEOUT, state.redis.rate_limit_ok(key, limit, window)).await
+    match tokio::time::timeout(
+        LIMITER_TIMEOUT,
+        state.redis.rate_limit_ok(key, limit, window),
+    )
+    .await
     {
         Ok(Ok(true)) => Ok(()),
         Ok(Ok(false)) => Err(ApiError::RateLimited),

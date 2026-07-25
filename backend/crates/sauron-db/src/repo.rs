@@ -3,7 +3,6 @@
 
 use chrono::{DateTime, Utc};
 use diesel::dsl::sql;
-use std::collections::HashMap;
 use diesel::prelude::*;
 use diesel::sql_types::{
     BigInt, Bool, Double, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
@@ -11,6 +10,7 @@ use diesel::sql_types::{
 use diesel::upsert::excluded;
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::Value;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::models::*;

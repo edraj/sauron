@@ -207,7 +207,9 @@ async fn evaluate_rule(
                 );
                 // Per-issue dedup: each distinct issue alerts once per throttle.
                 let dedup = format!("rule:{}:issue:{}", rule.id, issue.id);
-                engine.fire(pool, redis, &rule, &channels, &ctx, &dedup).await;
+                engine
+                    .fire(pool, redis, &rule, &channels, &ctx, &dedup)
+                    .await;
             }
         }
         TriggerType::ErrorThreshold => {
@@ -234,7 +236,9 @@ async fn evaluate_rule(
                     fmt_num(cond.threshold)
                 );
                 let dedup = format!("rule:{}:error_threshold", rule.id);
-                engine.fire(pool, redis, &rule, &channels, &ctx, &dedup).await;
+                engine
+                    .fire(pool, redis, &rule, &channels, &ctx, &dedup)
+                    .await;
             }
         }
         TriggerType::ErrorSpike => {
@@ -279,7 +283,9 @@ async fn evaluate_rule(
                      previous {mins} — a {factor:.1}× increase."
                 );
                 let dedup = format!("rule:{}:error_spike", rule.id);
-                engine.fire(pool, redis, &rule, &channels, &ctx, &dedup).await;
+                engine
+                    .fire(pool, redis, &rule, &channels, &ctx, &dedup)
+                    .await;
             }
         }
         TriggerType::EventThreshold => {
@@ -312,7 +318,9 @@ async fn evaluate_rule(
                     fmt_num(cond.threshold)
                 );
                 let dedup = format!("rule:{}:event_threshold", rule.id);
-                engine.fire(pool, redis, &rule, &channels, &ctx, &dedup).await;
+                engine
+                    .fire(pool, redis, &rule, &channels, &ctx, &dedup)
+                    .await;
             }
         }
         TriggerType::PerfDegradation => {
@@ -342,7 +350,9 @@ async fn evaluate_rule(
                         fmt_num(cond.threshold)
                     );
                     let dedup = format!("rule:{}:perf", rule.id);
-                    engine.fire(pool, redis, &rule, &channels, &ctx, &dedup).await;
+                    engine
+                        .fire(pool, redis, &rule, &channels, &ctx, &dedup)
+                        .await;
                 }
             }
         }

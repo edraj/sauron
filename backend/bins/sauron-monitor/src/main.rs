@@ -378,7 +378,14 @@ async fn notify_transition(
         };
         notifier
             .engine
-            .fire(&notifier.pool, &notifier.redis, &rule, &channels, &ctx, &dedup)
+            .fire(
+                &notifier.pool,
+                &notifier.redis,
+                &rule,
+                &channels,
+                &ctx,
+                &dedup,
+            )
             .await;
     }
 }
