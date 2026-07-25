@@ -49,7 +49,7 @@ pub async fn list(
         since,
         &pattern,
         q.limit.clamp(1, 200),
-        q.offset.max(0),
+        super::clamp_offset(q.offset),
     )
     .await?;
     Ok(Json(rows))

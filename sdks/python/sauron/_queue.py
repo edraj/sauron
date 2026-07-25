@@ -76,16 +76,26 @@ class BoundedQueue:
 
     # -- consumer ----------------------------------------------------------
 
-    def drain(self) -> List[QueueEntry]:
-        """Remove and return every pending entry (memory only).
+    def drain(self, max_items: Optional[int] = None) -> List[QueueEntry]:
+        """Remove and return up to ``max_items`` pending entries (memory only).
 
         On-disk files are retained until :meth:`confirm` — so a send that fails
         (or a crash mid-flight) leaves them for the next process to recover.
+
+        The cap keeps one envelope under the server's per-envelope item limit.
+        Draining everything meant a backlog recovered from disk after an outage
+        went out as a single oversized envelope, which the server rejects as
+        non-retryable — so it could never drain, on this run or any later one.
         """
         with self._lock:
-            entries = list(self._entries)
-            self._entries.clear()
-            self._bytes = 0
+            if max_items is None or max_items >= len(self._entries):
+                entries = list(self._entries)
+                self._entries.clear()
+                self._bytes = 0
+            else:
+                # `_entries` is a deque, so take from the left rather than slice.
+                entries = [self._entries.popleft() for _ in range(max_items)]
+                self._bytes -= sum(e.size for e in entries)
             return entries
 
     def confirm(self, entries: List[QueueEntry]) -> None:

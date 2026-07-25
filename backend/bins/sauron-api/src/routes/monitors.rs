@@ -86,6 +86,16 @@ pub async fn create(
     let mut conn = db(&state).await?;
     authorize_project(&mut conn, auth.user_id, project_id, perm::MONITOR_WRITE).await?;
 
+    // Bound sustained prober/DB load: monitors are polled forever once created.
+    if repo::count_monitors_for_project(&mut conn, project_id).await?
+        >= sauron_db::repo::MAX_MONITORS_PER_PROJECT
+    {
+        return Err(ApiError::Conflict(format!(
+            "project already has the maximum of {} monitors",
+            sauron_db::repo::MAX_MONITORS_PER_PROJECT
+        )));
+    }
+
     let config = req.config.unwrap_or_else(|| json!({}));
     let new = sauron_db::models::NewMonitor {
         project_id,
@@ -159,8 +169,10 @@ pub async fn update(
             return Err(ApiError::BadRequest(invalid_interval_msg()));
         }
     }
-    let _ = load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
-    let mut conn = db(&state).await?;
+    // Reuse the connection `load_authorized` already checked out rather than
+    // taking a second one from the pool for the same request.
+    let (mut conn, _m) =
+        load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
     // Pausing/enabling flips status too.
     let status = req.enabled.map(|e| if e { "unknown" } else { "paused" });
     let interval = req.interval_seconds;
@@ -189,8 +201,8 @@ pub async fn delete(
     State(state): State<AppState>,
     Path(monitor_id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
-    let mut conn = db(&state).await?;
+    let (mut conn, _m) =
+        load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
     repo::delete_monitor(&mut conn, monitor_id).await?;
     Ok(Json(json!({ "ok": true })))
 }

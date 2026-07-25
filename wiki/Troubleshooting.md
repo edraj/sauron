@@ -232,7 +232,8 @@ Understanding the policy explains most "some items arrived, some didn't" reports
 | Response | Behavior |
 | --- | --- |
 | **2xx** | delivered; the batch (and any persisted copies) are dropped. |
-| **408 / 413 / 429 / any 5xx** | **retried** with exponential backoff + jitter, capped at **30 s**. On **429** a `Retry-After` header (seconds or HTTP-date) is honored (also capped at 30 s). |
+| **408 / 429 / any 5xx** | **retried** with exponential backoff + jitter, capped at **30 s**. On **429** a `Retry-After` header (seconds or HTTP-date) is honored (also capped at 30 s). |
+| **413 (payload too large)** | **not** retried as-is — the body is what was rejected, so an identical retry fails identically. The envelope is split (or the batch re-buffered at a smaller size) and sent again; a single item that still will not fit is dropped. |
 | **network error / timeout** | retried (treated as transient). |
 | **400 / 404 and other non-retryable 4xx** | **dropped immediately** (no retry). |
 | **401 / 403** | SDK **disables** and stops — a bad key is never retried. |

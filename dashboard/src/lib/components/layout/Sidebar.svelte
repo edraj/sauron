@@ -31,6 +31,8 @@
       items: [
         { href: '#/monitors', label: 'Monitors', icon: 'life-buoy', match: (p) => p.startsWith('/monitors'),
           show: () => sessionStore.can('monitor:read') },
+        { href: '#/alerts', label: 'Alerts', icon: 'bell', match: (p) => p.startsWith('/alerts'),
+          show: () => sessionStore.can('alert:read') },
       ],
     },
     {
@@ -57,7 +59,7 @@
         { href: '#/members', label: 'Members', icon: 'key-round', match: (p) => p.startsWith('/members'), show: () => sessionStore.can('member:read') },
         { href: '#/settings', label: 'App settings', icon: 'settings', match: (p) => p.startsWith('/settings') },
         { href: '#/source-maps', label: 'Source Maps', icon: 'braces', match: (p) => p.startsWith('/source-maps'), show: () => sessionStore.can('artifact:write') },
-        { href: '#/storage', label: 'Storage', icon: 'server', match: (p) => p.startsWith('/storage') },
+        { href: '#/storage', label: 'Storage', icon: 'server', match: (p) => p.startsWith('/storage'), show: () => sessionStore.can('org:manage') },
       ],
     },
   ];

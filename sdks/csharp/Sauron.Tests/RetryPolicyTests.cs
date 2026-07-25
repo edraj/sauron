@@ -58,7 +58,6 @@ public class RetryPolicyTests
 
     [Theory]
     [InlineData(408)]
-    [InlineData(413)]
     [InlineData(429)]
     [InlineData(500)]
     [InlineData(503)]
@@ -68,6 +67,38 @@ public class RetryPolicyTests
         var client = NewClient(handler);
 
         client.Track("a", "u1");
+        client.Flush();
+
+        Assert.Equal(2, handler.RequestCount);
+    }
+
+    /// <summary>
+    /// 413 must not be retried: the body is what the server rejected, so an identical
+    /// retry fails identically — and because the queue is FIFO, retrying forever blocked
+    /// every later envelope behind it.
+    /// </summary>
+    [Fact]
+    public void PayloadTooLarge_DropsWithoutRetryingSameBody()
+    {
+        var handler = new ScriptedHandler(ScriptedHandler.Status(413), ScriptedHandler.Ok());
+        var client = NewClient(handler);
+
+        client.Track("a", "u1");
+        client.Flush();
+
+        Assert.Equal(1, handler.RequestCount);
+    }
+
+    /// <summary>A rejected envelope must not block the ones behind it.</summary>
+    [Fact]
+    public void PayloadTooLarge_DoesNotBlockLaterEnvelopes()
+    {
+        var handler = new ScriptedHandler(ScriptedHandler.Status(413), ScriptedHandler.Ok());
+        var client = NewClient(handler);
+
+        client.Track("a", "u1");
+        client.Flush();
+        client.Track("b", "u1");
         client.Flush();
 
         Assert.Equal(2, handler.RequestCount);

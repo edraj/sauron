@@ -111,9 +111,18 @@ internal sealed class Transport : IDisposable
 
         if (batch is not null)
         {
-            var envelope = BuildEnvelope(batch);
-            string json = JsonSerializer.Serialize(envelope, SauronJson.Options);
-            _queue.Push(Encoding.UTF8.GetBytes(json));
+            // Split into bounded envelopes. A single envelope carrying the whole
+            // buffer could exceed the server's per-envelope item limit, which is a
+            // non-retryable 400 — so a backlog built up during an outage would be
+            // discarded wholesale on the first flush after recovery.
+            int chunkSize = Math.Max(1, _options.MaxItemsPerEnvelope);
+            for (int i = 0; i < batch.Count; i += chunkSize)
+            {
+                var chunk = batch.GetRange(i, Math.Min(chunkSize, batch.Count - i));
+                var envelope = BuildEnvelope(chunk);
+                string json = JsonSerializer.Serialize(envelope, SauronJson.Options);
+                _queue.Push(Encoding.UTF8.GetBytes(json));
+            }
         }
 
         await DrainQueueAsync().ConfigureAwait(false);
@@ -198,6 +207,17 @@ internal sealed class Transport : IDisposable
                     return SendOutcome.Dropped;
                 }
 
+                if (status == 413)
+                {
+                    // The envelope is already serialized, so there is nothing left to
+                    // shrink here — and retrying the same bytes can only fail the same
+                    // way. Retrying instead head-of-line blocked the whole FIFO queue
+                    // forever, so drop this envelope and keep the rest moving.
+                    // Envelopes are item-capped at build time, so this is now rare.
+                    Log("envelope rejected as too large (413); dropping it.");
+                    return SendOutcome.Dropped;
+                }
+
                 if (!IsRetryable(status))
                 {
                     // Non-retryable client error (e.g. 400, 404): drop the envelope.
@@ -232,9 +252,12 @@ internal sealed class Transport : IDisposable
         return SendOutcome.Retry;
     }
 
-    /// <summary>Transient statuses worth retrying: request timeout, payload-too-large, rate-limit, and all 5xx.</summary>
+    /// <summary>
+    /// Transient statuses worth retrying: request timeout, rate-limit, and all 5xx.
+    /// 413 is excluded deliberately — see the explicit handling in <c>SendAsync</c>.
+    /// </summary>
     private static bool IsRetryable(int status)
-        => status == 408 || status == 413 || status == 429 || status >= 500;
+        => status == 408 || status == 429 || status >= 500;
 
     /// <summary>Parse a <c>Retry-After</c> header (delta seconds or HTTP-date), clamped to [0, 30s].</summary>
     private static TimeSpan? RetryAfterDelay(HttpResponseMessage response)

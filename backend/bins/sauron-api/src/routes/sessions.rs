@@ -51,7 +51,7 @@ pub async fn list(
             app_id,
             since,
             limit,
-            q.offset.max(0),
+            super::clamp_offset(q.offset),
             q.distinct_id.as_deref(),
             q.device_key.as_deref(),
         )

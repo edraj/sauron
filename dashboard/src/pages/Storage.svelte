@@ -48,7 +48,14 @@
     <header class="head">
       <div>
         <h1 class="page-title">Storage</h1>
-        <p class="sub muted">Deployment-wide database size and per-app hot/cold record storage.</p>
+        <!-- Scoped to the orgs you manage, and estimated (rows × avg width) —
+             not the physical database size, which would leak other tenants'
+             volume. The old "deployment-wide" wording described the pre-scoping
+             behaviour and made the smaller number look like data loss. -->
+        <p class="sub muted">
+          Estimated storage across the organisations you manage, with per-app hot/cold
+          record counts.
+        </p>
       </div>
     </header>
 
@@ -64,7 +71,11 @@
     {:else if report}
       {@const rep = report}
       <StatTiles min={180}>
-        <StatTile label="Database size" value={fmtBytes(rep.database.total_bytes)} tone="primary" />
+        <StatTile
+          label="Estimated size"
+          value={fmtBytes(rep.database.total_bytes)}
+          tone="primary"
+        />
         <StatTile label="Tables" value={rep.database.tables.length} />
         <StatTile label="Apps" value={rep.apps.length} />
       </StatTiles>
@@ -161,8 +172,11 @@
                             {/each}
                           </div>
 
-                          <h4 class="expand-title">Cold Parquet files ({a.cold_files.length})</h4>
-                          {#if a.cold_files.length === 0}
+                          <!-- Show the true total, not the page size: the API
+                               truncates the list, so `cold_files.length` caps
+                               out and silently reads as "that's all of them". -->
+                          <h4 class="expand-title">Cold Parquet files ({a.cold_files_total})</h4>
+                          {#if a.cold_files_total === 0}
                             <p class="faint">No cold files for this app.</p>
                           {:else}
                             <ul class="file-list">
@@ -173,6 +187,11 @@
                                 </li>
                               {/each}
                             </ul>
+                            {#if a.cold_files_total > a.cold_files.length}
+                              <p class="faint">
+                                Showing the first {a.cold_files.length} of {a.cold_files_total} files.
+                              </p>
+                            {/if}
                           {/if}
                         </div>
                       </td>

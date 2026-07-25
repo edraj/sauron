@@ -215,7 +215,11 @@ SauronSdk.TrackTransaction(
 
 - **Gzip** — the request body is gzipped once it exceeds `GzipThresholdBytes` (default
   1024), with `Content-Encoding: gzip`; smaller bodies go out uncompressed (`GZipStream`).
-- **Retry** — the transport retries transient failures (408/413/429/5xx and network
+- **Oversized payloads** — a **413** is dropped rather than retried: the envelope is already
+  serialized, and retrying it head-of-line blocked the whole FIFO queue. Envelopes are
+  capped at `MaxItemsPerEnvelope` (**1000**, matching the server); `MaxBatch` only *triggers*
+  a flush and does not bound the request.
+- **Retry** — the transport retries transient failures (408/429/5xx and network
   errors) with backoff, honoring `Retry-After` on 429; non-retryable 4xx drop the batch
   and 401/403 disable the SDK.
 - **Queue** — pending envelopes buffer in a byte-bounded queue (`MaxQueueBytes`, default

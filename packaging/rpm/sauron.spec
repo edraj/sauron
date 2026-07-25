@@ -22,6 +22,7 @@ Source11:       sauron-ingest.service
 Source12:       sauron-monitor.service
 Source13:       sauron-tier.service
 Source14:       sauron-migrate.service
+Source15:       sauron-alerts.service
 Source20:       sauron.sysusers
 Source21:       sauron.tmpfiles
 Source30:       sauron.env
@@ -30,6 +31,7 @@ Source32:       ingest.env
 Source33:       monitor.env
 Source34:       tier.env
 Source35:       dashboard.env
+Source36:       alerts.env
 Source40:       sauron-dashboard.conf
 Source41:       sauron-dashboard-config
 # Prebuilt libduckdb.so (DuckDB C library) matching the libduckdb-sys crate pin,
@@ -129,7 +131,7 @@ wait "$dashboard_build"
 
 %install
 # --- binaries ---
-for b in sauron-api sauron-ingest sauron-monitor sauron-tier sauron-migrate sauron-symcli crebain; do
+for b in sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier sauron-migrate sauron-symcli crebain; do
     install -Dm0755 backend/target/release/$b %{buildroot}%{_bindir}/$b
 done
 
@@ -139,6 +141,7 @@ install -Dm0644 %{SOURCE11} %{buildroot}%{_unitdir}/sauron-ingest.service
 install -Dm0644 %{SOURCE12} %{buildroot}%{_unitdir}/sauron-monitor.service
 install -Dm0644 %{SOURCE13} %{buildroot}%{_unitdir}/sauron-tier.service
 install -Dm0644 %{SOURCE14} %{buildroot}%{_unitdir}/sauron-migrate.service
+install -Dm0644 %{SOURCE15} %{buildroot}%{_unitdir}/sauron-alerts.service
 
 # --- sysusers / tmpfiles ---
 install -Dm0644 %{SOURCE20} %{buildroot}%{_sysusersdir}/sauron.conf
@@ -150,6 +153,7 @@ install -Dm0640 %{SOURCE31} %{buildroot}%{_sysconfdir}/sauron/api.env
 install -Dm0640 %{SOURCE32} %{buildroot}%{_sysconfdir}/sauron/ingest.env
 install -Dm0640 %{SOURCE33} %{buildroot}%{_sysconfdir}/sauron/monitor.env
 install -Dm0640 %{SOURCE34} %{buildroot}%{_sysconfdir}/sauron/tier.env
+install -Dm0640 %{SOURCE36} %{buildroot}%{_sysconfdir}/sauron/alerts.env
 install -Dm0644 %{SOURCE35} %{buildroot}%{_sysconfdir}/sauron/dashboard.env
 
 # --- data dirs (also created at runtime by tmpfiles) ---
@@ -178,7 +182,7 @@ install -Dm0755 %{SOURCE41} %{buildroot}%{_libexecdir}/sauron/sauron-dashboard-c
 %tmpfiles_create %{_tmpfilesdir}/sauron.conf
 
 %post server
-%systemd_post sauron-api.service sauron-ingest.service sauron-monitor.service sauron-tier.service sauron-migrate.service
+%systemd_post sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-migrate.service
 # Refresh the dynamic linker cache so sauron-tier finds the vendored
 # %%{_libdir}/sauron/libduckdb.so via the ld.so.conf.d drop-in.
 /sbin/ldconfig
@@ -191,10 +195,10 @@ if [ "$1" -eq 1 ] && [ ! -s %{_sysconfdir}/sauron/secret.env ]; then
 fi
 
 %preun server
-%systemd_preun sauron-api.service sauron-ingest.service sauron-monitor.service sauron-tier.service sauron-migrate.service
+%systemd_preun sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-migrate.service
 
 %postun server
-%systemd_postun_with_restart sauron-api.service sauron-ingest.service sauron-monitor.service sauron-tier.service
+%systemd_postun_with_restart sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service
 # Rebuild the linker cache after the vendored libduckdb is added/removed.
 /sbin/ldconfig
 
@@ -216,17 +220,20 @@ fi
 %{_bindir}/sauron-api
 %{_bindir}/sauron-ingest
 %{_bindir}/sauron-monitor
+%{_bindir}/sauron-alerts
 %{_bindir}/sauron-tier
 %{_bindir}/sauron-migrate
 %{_unitdir}/sauron-api.service
 %{_unitdir}/sauron-ingest.service
 %{_unitdir}/sauron-monitor.service
+%{_unitdir}/sauron-alerts.service
 %{_unitdir}/sauron-tier.service
 %{_unitdir}/sauron-migrate.service
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/api.env
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/ingest.env
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/monitor.env
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/tier.env
+%attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/alerts.env
 %ghost %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/secret.env
 # Vendored DuckDB C library (linked by sauron-tier) + loader path.
 %dir %{_libdir}/sauron

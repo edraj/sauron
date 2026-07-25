@@ -31,6 +31,11 @@ export interface TransportConfig {
   gzipThresholdBytes?: number;
   /** Drop-oldest byte cap for the in-memory buffer. Default 1 MiB. */
   maxQueueBytes?: number;
+  /**
+   * Hard cap on items per envelope. Default 1000, matching the server's limit —
+   * exceeding it is a non-retryable 400, which would discard the batch.
+   */
+  maxItemsPerEnvelope?: number;
   /** Opt-in directory for FIFO disk persistence. Default off. */
   offlineDir?: string | null;
   /** Max retries after the first attempt. Default 3. */
@@ -74,7 +79,8 @@ const realSleep: SleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, 
  * queue reaches `maxBatch`. Each flush drains a batch into one envelope, gzips
  * it when large, and POSTs it with an exponential-backoff retry policy:
  *
- * - retry 408/413/429/5xx and network errors (honoring `Retry-After` on 429),
+ * - retry 408/429/5xx and network errors (honoring `Retry-After` on 429),
+ * - shrink and re-buffer on 413 rather than retrying an identically-sized body,
  * - drop (no retry) on 400/401/403/404 — 401/403 also disable the SDK,
  * - after `maxRetries` transient failures, the batch is re-buffered (kept for a
  *   later flush / next process start) rather than lost.
@@ -92,6 +98,13 @@ export class Transport {
   private readonly retryBaseMs: number;
   private readonly sleep: SleepFn;
   private readonly random: () => number;
+  /** Configured ceiling on items per envelope. */
+  private readonly maxItemsPerEnvelope: number;
+  /**
+   * Working chunk size, halved whenever the server rejects an envelope as too
+   * large. Without this a 413 was retried with the identical body forever.
+   */
+  private chunkItems: number;
   /** Serializes flushes so a batch is drained/committed atomically. */
   private flushChain: Promise<void> = Promise.resolve();
 
@@ -110,6 +123,8 @@ export class Transport {
     this.gzipThreshold = config.gzipThresholdBytes ?? 1024;
     this.maxRetries = Math.max(0, config.maxRetries ?? 3);
     this.retryBaseMs = config.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
+    this.maxItemsPerEnvelope = Math.max(1, config.maxItemsPerEnvelope ?? 1000);
+    this.chunkItems = this.maxItemsPerEnvelope;
     this.sleep = config.sleep ?? realSleep;
     this.random = config.random ?? Math.random;
     this.buffer = new BoundedQueue({
@@ -161,12 +176,23 @@ export class Transport {
 
   private async drainAndSend(): Promise<void> {
     if (this.disabled) return;
-    const items = this.buffer.drain();
-    if (items.length === 0) {
-      this.buffer.commit();
-      return;
+    // Send in bounded chunks rather than one envelope per flush. A queue that
+    // filled during an outage would otherwise go out as a single oversized
+    // envelope and be rejected outright.
+    for (;;) {
+      const items = this.buffer.drain(this.chunkItems);
+      if (items.length === 0) {
+        this.buffer.commit();
+        return;
+      }
+      const before = this.buffer.pending;
+      await this.send(this.buildEnvelope(items));
+      if (this.disabled) return;
+      // Nothing left, or the send failed and re-buffered: stop rather than spin.
+      if (this.buffer.pending === 0 || this.buffer.pending >= before + items.length) {
+        return;
+      }
     }
-    await this.send(this.buildEnvelope(items));
   }
 
   private async send(envelope: Envelope): Promise<void> {
@@ -191,12 +217,31 @@ export class Transport {
         const status = res.status;
         if (status >= 200 && status < 300) {
           this.buffer.commit();
+          // A successful send means the shrunken chunk size did its job; go
+          // back to full-size envelopes rather than staying degraded forever.
+          this.chunkItems = this.maxItemsPerEnvelope;
           return;
         }
         if (status === 401 || status === 403) {
           this.disabled = true;
           this.log(`auth failed (${status}); disabling SDK`);
           this.buffer.commit();
+          return;
+        }
+        if (status === 413) {
+          // Retrying the identical body can only fail identically. Shrink the
+          // envelope and re-buffer so the next flush makes progress; retrying
+          // as-is wedged the transport permanently once the queue was full.
+          if (envelope.items.length > 1) {
+            this.chunkItems = Math.max(1, Math.floor(envelope.items.length / 2));
+            this.buffer.restore();
+            this.log(`ingest returned 413; halving envelope to ${this.chunkItems} item(s)`);
+            return;
+          }
+          // A single item that still doesn't fit never will.
+          this.log('ingest returned 413 for a single item; dropping it');
+          this.buffer.commit();
+          this.chunkItems = this.maxItemsPerEnvelope;
           return;
         }
         if (!isRetryableStatus(status)) {

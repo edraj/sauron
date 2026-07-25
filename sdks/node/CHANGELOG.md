@@ -2,6 +2,18 @@
 
 All notable changes to `@sauron/node` are documented here.
 
+## Unreleased
+
+- **Fixed: a full send queue could wedge the transport permanently.** The whole queue went
+  out as one envelope and `413` was treated as retryable, so once the buffer filled during
+  an outage every flush resent the same oversized body and failed identically — no event was
+  ever delivered again. A 413 now halves the envelope and re-buffers instead of retrying
+  unchanged, and a single item that still will not fit is dropped rather than looping.
+- **Fixed: an oversized envelope could delete the entire offline backlog.** Exceeding the
+  server's 1000-item limit is a non-retryable `400`, which committed the batch and unlinked
+  every persisted file. Envelopes are now capped at `maxItemsPerEnvelope` (default 1000) and
+  the queue drains in chunks.
+
 ## 0.3.0
 
 Parity release — brings the server SDK up to the Browser/Flutter feature bar and

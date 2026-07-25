@@ -8,6 +8,7 @@ license.workspace = true
 sauron-core.workspace = true
 diesel.workspace = true
 diesel-async.workspace = true
+deadpool.workspace = true
 diesel_migrations.workspace = true
 scoped-futures.workspace = true
 tokio = { workspace = true }

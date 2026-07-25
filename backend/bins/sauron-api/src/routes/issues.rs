@@ -57,7 +57,7 @@ pub async fn list(
             search,
             Some(since),
             limit,
-            q.offset.max(0),
+            super::clamp_offset(q.offset),
         )
         .await?,
     ))
@@ -77,11 +77,11 @@ pub async fn detail(
     Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<IssueDetail>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
+    // One ancestry+grant resolution covers both permission checks.
+    let perms =
+        super::authorize_app_perms(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
     // Viewing de-obfuscated source code needs source:read; symbol/file/line don't.
-    let include_source = authorize_app(&mut conn, auth.user_id, app_id, perm::SOURCE_READ)
-        .await
-        .is_ok();
+    let include_source = perms.contains(perm::SOURCE_READ);
 
     let issue = repo::get_issue(&mut conn, app_id, issue_id)
         .await?
@@ -154,10 +154,10 @@ pub async fn events(
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<Vec<ErrorEvent>>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
-    let include_source = authorize_app(&mut conn, auth.user_id, app_id, perm::SOURCE_READ)
-        .await
-        .is_ok();
+    // One ancestry+grant resolution covers both permission checks.
+    let perms =
+        super::authorize_app_perms(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
+    let include_source = perms.contains(perm::SOURCE_READ);
     // Confirm the issue belongs to this app before returning its events (prevents
     // reading another app's events by passing a foreign issue_id).
     repo::get_issue(&mut conn, app_id, issue_id)
@@ -178,9 +178,11 @@ pub async fn events(
     )
     .await?;
     drop(conn); // release before per-event symbolication (checks out its own)
-    for ev in events.iter_mut() {
-        crate::symbolicate::symbolicate_event(&state, app_id, ev).await;
-        if !include_source {
+                // One shared blob-fetcher for the whole page: the artifact lookup is
+                // memoized across events instead of repeated per event.
+    crate::symbolicate::symbolicate_events(&state, app_id, &mut events).await;
+    if !include_source {
+        for ev in events.iter_mut() {
             crate::symbolicate::strip_source_context(ev);
         }
     }

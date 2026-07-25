@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use diesel::dsl::sql;
+use std::collections::HashMap;
 use diesel::prelude::*;
 use diesel::sql_types::{
     BigInt, Bool, Double, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
@@ -98,14 +99,100 @@ pub async fn find_active_refresh_token(
         .optional()
 }
 
+/// Revoked because it was exchanged for a successor — the normal refresh path.
+/// Only this reason is eligible for the concurrent-refresh grace window.
+pub const REVOKE_ROTATED: &str = "rotated";
+/// Revoked by an explicit logout.
+pub const REVOKE_LOGOUT: &str = "logout";
+/// Revoked as part of a token-family kill after replay was detected.
+pub const REVOKE_REUSE: &str = "reuse";
+
 pub async fn revoke_refresh_token(
     conn: &mut AsyncPgConnection,
     token_hash: &str,
+    reason: &str,
 ) -> QueryResult<usize> {
     diesel::update(refresh_tokens::table.filter(refresh_tokens::token_hash.eq(token_hash)))
-        .set(refresh_tokens::revoked_at.eq(Utc::now()))
+        .set((
+            refresh_tokens::revoked_at.eq(Utc::now()),
+            refresh_tokens::revoked_reason.eq(reason),
+        ))
         .execute(conn)
         .await
+}
+
+/// Revocation metadata for a token hash, whatever its state.
+///
+/// Returns `(user_id, revoked_at, revoked_reason)`. The handler needs all three
+/// to tell a benign concurrent refresh from a genuine replay.
+pub async fn refresh_token_revocation(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+) -> QueryResult<Option<(Uuid, Option<DateTime<Utc>>, Option<String>)>> {
+    refresh_tokens::table
+        .filter(refresh_tokens::token_hash.eq(token_hash))
+        .select((
+            refresh_tokens::user_id,
+            refresh_tokens::revoked_at,
+            refresh_tokens::revoked_reason,
+        ))
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Whether the user still holds any usable refresh token.
+///
+/// After a family kill there are none, which is what stops the grace window
+/// from resurrecting a session that was just revoked for replay.
+pub async fn user_has_active_refresh_token(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> QueryResult<bool> {
+    use diesel::dsl::exists;
+    diesel::select(exists(
+        refresh_tokens::table
+            .filter(refresh_tokens::user_id.eq(user_id))
+            .filter(refresh_tokens::revoked_at.is_null())
+            .filter(refresh_tokens::expires_at.gt(Utc::now())),
+    ))
+    .get_result(conn)
+    .await
+}
+
+/// The owner of a refresh-token hash **regardless of revocation/expiry**.
+///
+/// Used to detect replay of an already-rotated token: `find_active_refresh_token`
+/// cannot distinguish "never existed" from "already used", but that difference
+/// is the whole theft signal in a rotating-refresh scheme.
+pub async fn refresh_token_owner(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+) -> QueryResult<Option<Uuid>> {
+    refresh_tokens::table
+        .filter(refresh_tokens::token_hash.eq(token_hash))
+        .select(refresh_tokens::user_id)
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Revoke every still-active refresh token for a user (token-family kill).
+pub async fn revoke_all_refresh_tokens_for_user(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::update(
+        refresh_tokens::table
+            .filter(refresh_tokens::user_id.eq(user_id))
+            .filter(refresh_tokens::revoked_at.is_null()),
+    )
+    .set((
+        refresh_tokens::revoked_at.eq(Utc::now()),
+        refresh_tokens::revoked_reason.eq(REVOKE_REUSE),
+    ))
+    .execute(conn)
+    .await
 }
 
 // ===========================================================================
@@ -269,6 +356,49 @@ pub async fn grant_org(conn: &mut AsyncPgConnection, grant_id: Uuid) -> QueryRes
         .first(conn)
         .await
         .optional()
+}
+
+/// The full grant row, so the caller can evaluate its role and scope before
+/// allowing a deletion.
+pub async fn get_grant(
+    conn: &mut AsyncPgConnection,
+    grant_id: Uuid,
+) -> QueryResult<Option<RoleGrant>> {
+    role_grants::table
+        .find(grant_id)
+        .select(RoleGrant::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// How many grants in `org_id` — other than `exclude_id` — confer `org:manage`.
+///
+/// Guards against deleting the last administrator: with no `org:manage` left,
+/// the anti-escalation rule in `create_grant` makes it impossible for anyone to
+/// grant it again.
+pub async fn count_org_manage_grants_excluding(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    exclude_id: Uuid,
+) -> QueryResult<i64> {
+    let row: GrantCountRow = diesel::sql_query(
+        "SELECT count(*)::bigint AS n \
+         FROM role_grants g JOIN roles r ON g.role_id = r.id \
+         WHERE g.org_id = $1 AND g.id <> $2 AND g.scope_type = 'org' \
+           AND r.permissions @> to_jsonb('org:manage'::text)",
+    )
+    .bind::<SqlUuid, _>(org_id)
+    .bind::<SqlUuid, _>(exclude_id)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
+#[derive(Debug, QueryableByName)]
+pub struct GrantCountRow {
+    #[diesel(sql_type = BigInt)]
+    pub n: i64,
 }
 
 /// All grants in an org with the user email/name and role name, for the
@@ -491,11 +621,31 @@ pub async fn app_ancestry(
 
 // --- environments -----------------------------------------------------------
 
+/// Resolve an environment by name, creating it if the app is under its cap.
+///
+/// `name` comes straight from the ingest envelope, so it is attacker-controlled:
+/// without a cap, a leaked (client-embedded, non-secret) ingest key lets anyone
+/// insert unbounded distinct environment rows. Once at the cap we return the
+/// existing row if there is one and otherwise `None`, so the event is still
+/// stored — just without an environment association.
 pub async fn upsert_environment(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
     name: &str,
-) -> QueryResult<Environment> {
+) -> QueryResult<Option<Environment>> {
+    let existing: Option<Environment> = environments::table
+        .filter(environments::app_id.eq(app_id))
+        .filter(environments::name.eq(name))
+        .select(Environment::as_select())
+        .first(conn)
+        .await
+        .optional()?;
+    if let Some(env) = existing {
+        return Ok(Some(env));
+    }
+    if count_environments(conn, app_id).await? >= MAX_ENVIRONMENTS_PER_APP {
+        return Ok(None);
+    }
     diesel::insert_into(environments::table)
         .values(NewEnvironment { app_id, name })
         .on_conflict((environments::app_id, environments::name))
@@ -504,7 +654,13 @@ pub async fn upsert_environment(
         .returning(Environment::as_returning())
         .get_result(conn)
         .await
+        .optional()
 }
+
+/// Cap on environments returned (and, below, on how many an app may create).
+/// The name is attacker-supplied via the ingest envelope, so the row count is
+/// not naturally bounded.
+pub const MAX_ENVIRONMENTS_PER_APP: i64 = 500;
 
 pub async fn list_environments(
     conn: &mut AsyncPgConnection,
@@ -514,7 +670,17 @@ pub async fn list_environments(
         .filter(environments::app_id.eq(app_id))
         .select(Environment::as_select())
         .order(environments::name.asc())
+        .limit(MAX_ENVIRONMENTS_PER_APP)
         .load(conn)
+        .await
+}
+
+/// How many environments an app already has.
+pub async fn count_environments(conn: &mut AsyncPgConnection, app_id: Uuid) -> QueryResult<i64> {
+    environments::table
+        .filter(environments::app_id.eq(app_id))
+        .count()
+        .get_result(conn)
         .await
 }
 
@@ -534,6 +700,12 @@ pub async fn upsert_issue(conn: &mut AsyncPgConnection, new: NewIssue<'_>) -> Qu
             issues::title.eq(excluded(issues::title)),
             issues::culprit.eq(excluded(issues::culprit)),
             issues::updated_at.eq(Utc::now()),
+            // Ingest-side watermark for the regression trigger. Set here and
+            // nowhere else: keying regression off `last_seen` (client clock)
+            // let a poll tick advance past a just-ingested event and drop the
+            // alert, and keying it off `updated_at` would fire a bogus
+            // "regressed" alert every time someone resolved an issue.
+            issues::last_event_at.eq(Utc::now()),
         ))
         .returning(issues::id)
         .get_result(conn)
@@ -549,6 +721,10 @@ pub async fn insert_error_event(
         .execute(conn)
         .await
 }
+
+/// Longest window a free-text payload search may scan. The jsonb→text cast is
+/// unindexable, so the window is the only bound on its cost.
+pub const MAX_PAYLOAD_SEARCH_DAYS: i64 = 90;
 
 pub async fn list_issues(
     conn: &mut AsyncPgConnection,
@@ -611,17 +787,29 @@ pub async fn list_issues(
         };
     }
     if let Some(term) = q {
+        // Cap how far back the (unindexable) payload scan may reach, even when
+        // the caller asked for an unbounded issue list.
+        let payload_since = since.unwrap_or_else(|| {
+            chrono::Utc::now() - chrono::Duration::days(MAX_PAYLOAD_SEARCH_DAYS)
+        });
         let p = like_contains(term);
         query = query.filter(
             issues::title
                 .ilike(p.clone())
                 .or(issues::type_.ilike(p.clone()))
                 .or(issues::culprit.ilike(p.clone()))
+                // Payload search casts jsonb to text, which no index can serve.
+                // Bounding the correlated scan by time is what keeps it viable:
+                // without it, an issue with no match forces a full scan of that
+                // issue's entire event history — for EVERY issue in the app.
+                // `payload_since` is the caller's window (defaulted, never open).
                 .or(sql::<Bool>(
                     "EXISTS (SELECT 1 FROM error_events e \
                      WHERE e.issue_id = issues.id AND e.app_id = issues.app_id \
-                     AND (e.contexts::text ILIKE ",
+                     AND e.occurred_at >= ",
                 )
+                .bind::<Timestamptz, _>(payload_since)
+                .sql(" AND (e.contexts::text ILIKE ")
                 .bind::<Text, _>(p.clone())
                 .sql(" OR e.extra::text ILIKE ")
                 .bind::<Text, _>(p.clone())
@@ -1132,21 +1320,26 @@ pub async fn insert_transaction(
 }
 
 /// `(error_event_count, analytics_event_count)` for an app — onboarding poll.
-pub async fn app_event_counts(
+/// Whether the app has received any error / analytics events yet.
+///
+/// Deliberately `EXISTS` rather than `count(*)`: the only consumer is the
+/// onboarding "have we seen your first event?" poll, which needs a boolean.
+/// Counting scanned every partition of the two largest tables on each poll.
+pub async fn app_has_events(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
-) -> QueryResult<(i64, i64)> {
-    let errors: i64 = error_events::table
-        .filter(error_events::app_id.eq(app_id))
-        .count()
-        .get_result(conn)
-        .await?;
-    let events: i64 = analytics_events::table
-        .filter(analytics_events::app_id.eq(app_id))
-        .count()
-        .get_result(conn)
-        .await?;
-    Ok((errors, events))
+) -> QueryResult<(bool, bool)> {
+    let has_errors: bool = diesel::select(diesel::dsl::exists(
+        error_events::table.filter(error_events::app_id.eq(app_id)),
+    ))
+    .get_result(conn)
+    .await?;
+    let has_events: bool = diesel::select(diesel::dsl::exists(
+        analytics_events::table.filter(analytics_events::app_id.eq(app_id)),
+    ))
+    .get_result(conn)
+    .await?;
+    Ok((has_errors, has_events))
 }
 
 pub async fn error_series(
@@ -1303,20 +1496,30 @@ pub async fn list_devices(
     offset: i64,
     search: Option<&str>,
 ) -> QueryResult<Vec<DeviceRow>> {
-    let pattern = search
-        .map(|s| format!("%{}%", s))
-        .unwrap_or_else(|| "%".to_string());
+    // Escape LIKE metacharacters: an unescaped `%`/`_` makes a literal search
+    // term match the wrong rows, and a pattern of many wildcards makes ILIKE
+    // matching super-linear per scanned row.
+    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+    // The session count is a LATERAL subquery per returned device rather than a
+    // grouped join over every session in the app: the old form aggregated the
+    // whole sessions table (unbounded by time) on each page load and then threw
+    // away all but the current page's rows.
     diesel::sql_query(
         "SELECT d.id, d.device_key, d.family, d.model, d.os_name, d.os_version, d.arch, \
                 d.browser, d.last_distinct_id, d.first_seen, d.last_seen, \
                 d.events_count, d.errors_count, COALESCE(s.cnt, 0)::bigint AS sessions_count \
-         FROM devices d \
-         LEFT JOIN (SELECT device_key, count(*) AS cnt FROM sessions WHERE app_id = $1 \
-                    GROUP BY device_key) s ON s.device_key = d.device_key \
-         WHERE d.app_id = $1 AND d.last_seen >= $2 \
-           AND (COALESCE(d.family,'') || ' ' || COALESCE(d.model,'') || ' ' || \
-                COALESCE(d.os_name,'') || ' ' || COALESCE(d.device_key,'')) ILIKE $3 \
-         ORDER BY d.last_seen DESC LIMIT $4 OFFSET $5",
+         FROM ( \
+             SELECT * FROM devices \
+             WHERE app_id = $1 AND last_seen >= $2 \
+               AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
+                    COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3 \
+             ORDER BY last_seen DESC LIMIT $4 OFFSET $5 \
+         ) d \
+         LEFT JOIN LATERAL ( \
+             SELECT count(*) AS cnt FROM sessions \
+             WHERE app_id = $1 AND device_key = d.device_key AND started_at >= $2 \
+         ) s ON TRUE \
+         ORDER BY d.last_seen DESC",
     )
     .bind::<SqlUuid, _>(app_id)
     .bind::<Timestamptz, _>(since)
@@ -1386,25 +1589,35 @@ pub async fn list_persons(
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<PersonRow>> {
-    let pattern = search
-        .map(|s| format!("%{}%", s))
-        .unwrap_or_else(|| "%".to_string());
+    // Escape LIKE metacharacters: an unescaped `%`/`_` makes a literal search
+    // term match the wrong rows, and a pattern of many wildcards makes ILIKE
+    // matching super-linear per scanned row.
+    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+    // Page FIRST, then count per returned person via LATERAL subqueries.
+    //
+    // The previous form used three grouped subqueries over analytics_events,
+    // error_events and sessions filtered only by app_id. Postgres cannot push
+    // the outer LIMIT into a GROUP BY subquery, so every page load aggregated
+    // the app's entire history across the two largest tables and then discarded
+    // all but ~50 rows. Counting per-page turns that into a handful of
+    // index lookups on (app_id, distinct_id).
     diesel::sql_query(
         "SELECT eu.distinct_id, eu.properties, eu.first_seen, eu.last_seen, \
                 COALESCE(ae.cnt,0)::bigint AS events_count, \
                 COALESCE(ee.cnt,0)::bigint AS errors_count, \
                 COALESCE(se.cnt,0)::bigint AS sessions_count \
-         FROM event_users eu \
-         LEFT JOIN (SELECT distinct_id, count(*) cnt FROM analytics_events \
-                    WHERE app_id=$1 GROUP BY distinct_id) ae ON ae.distinct_id = eu.distinct_id \
-         LEFT JOIN (SELECT distinct_id, count(*) cnt FROM error_events \
-                    WHERE app_id=$1 AND distinct_id IS NOT NULL GROUP BY distinct_id) ee \
-                    ON ee.distinct_id = eu.distinct_id \
-         LEFT JOIN (SELECT distinct_id, count(*) cnt FROM sessions \
-                    WHERE app_id=$1 AND distinct_id IS NOT NULL GROUP BY distinct_id) se \
-                    ON se.distinct_id = eu.distinct_id \
-         WHERE eu.app_id=$1 AND (eu.distinct_id ILIKE $2 OR eu.properties::text ILIKE $2) \
-         ORDER BY eu.last_seen DESC LIMIT $3 OFFSET $4",
+         FROM ( \
+             SELECT distinct_id, properties, first_seen, last_seen FROM event_users \
+             WHERE app_id=$1 AND (distinct_id ILIKE $2 OR properties::text ILIKE $2) \
+             ORDER BY last_seen DESC LIMIT $3 OFFSET $4 \
+         ) eu \
+         LEFT JOIN LATERAL (SELECT count(*) cnt FROM analytics_events \
+                    WHERE app_id=$1 AND distinct_id = eu.distinct_id) ae ON TRUE \
+         LEFT JOIN LATERAL (SELECT count(*) cnt FROM error_events \
+                    WHERE app_id=$1 AND distinct_id = eu.distinct_id) ee ON TRUE \
+         LEFT JOIN LATERAL (SELECT count(*) cnt FROM sessions \
+                    WHERE app_id=$1 AND distinct_id = eu.distinct_id) se ON TRUE \
+         ORDER BY eu.last_seen DESC",
     )
     .bind::<SqlUuid, _>(app_id)
     .bind::<Text, _>(pattern)
@@ -1709,7 +1922,7 @@ pub async fn funnel(
 // Journeys (step-indexed transition graph for a Sankey)
 // ===========================================================================
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, serde::Deserialize)]
 pub struct JourneyLink {
     #[diesel(sql_type = BigInt)]
     pub from_step: i64,
@@ -1721,7 +1934,7 @@ pub struct JourneyLink {
     pub count: i64,
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, serde::Deserialize)]
 pub struct JourneyNode {
     #[diesel(sql_type = BigInt)]
     pub step: i64,
@@ -1731,50 +1944,72 @@ pub struct JourneyNode {
     pub count: i64,
 }
 
-pub async fn journey_links(
-    conn: &mut AsyncPgConnection,
-    app_id: Uuid,
-    since: DateTime<Utc>,
-    depth: i64,
-) -> QueryResult<Vec<JourneyLink>> {
-    diesel::sql_query(
-        "WITH ordered AS ( \
-           SELECT distinct_id, name, \
-             (row_number() OVER (PARTITION BY distinct_id ORDER BY occurred_at) - 1) AS step \
-           FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2), \
-         capped AS (SELECT * FROM ordered WHERE step < $3) \
-         SELECT a.step AS from_step, a.name AS from_event, b.name AS to_event, \
-                count(*)::bigint AS count \
-         FROM capped a JOIN capped b ON b.distinct_id=a.distinct_id AND b.step=a.step+1 \
-         GROUP BY a.step, a.name, b.name ORDER BY a.step, count DESC",
-    )
-    .bind::<SqlUuid, _>(app_id)
-    .bind::<Timestamptz, _>(since)
-    .bind::<BigInt, _>(depth)
-    .get_results(conn)
-    .await
+/// Maximum node/link rows returned by a journey query.
+///
+/// Both result sets grow with event-name cardinality, which is caller-supplied
+/// (every distinct `name` an SDK ever sent). Without a cap a high-cardinality
+/// app produces an unbounded response.
+const JOURNEY_MAX_ROWS: i64 = 500;
+
+#[derive(Debug, QueryableByName)]
+struct JourneyGraphRow {
+    #[diesel(sql_type = Jsonb)]
+    data: Value,
 }
 
-pub async fn journey_nodes(
+/// Nodes + links for the journey Sankey, computed in ONE query.
+///
+/// The step-indexed CTE (`row_number() OVER (PARTITION BY distinct_id ORDER BY
+/// occurred_at)`) is the expensive part. Running separate node and link queries
+/// evaluated it twice per page load; because `capped` is referenced more than
+/// once here, Postgres materializes it and both aggregates read the same
+/// intermediate. The `(app_id, distinct_id, occurred_at)` index lets the window
+/// be satisfied by an ordered index scan rather than a full sort.
+pub async fn journey_graph(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
     since: DateTime<Utc>,
     depth: i64,
-) -> QueryResult<Vec<JourneyNode>> {
-    diesel::sql_query(
+) -> QueryResult<(Vec<JourneyNode>, Vec<JourneyLink>)> {
+    let row: JourneyGraphRow = diesel::sql_query(
         "WITH ordered AS ( \
            SELECT distinct_id, name, \
              (row_number() OVER (PARTITION BY distinct_id ORDER BY occurred_at) - 1) AS step \
            FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2), \
-         capped AS (SELECT * FROM ordered WHERE step < $3) \
-         SELECT step, name AS event, count(*)::bigint AS count \
-         FROM capped GROUP BY step, name ORDER BY step, count DESC",
+         capped AS (SELECT * FROM ordered WHERE step < $3), \
+         nodes AS ( \
+           SELECT step, name AS event, count(*)::bigint AS count \
+           FROM capped GROUP BY step, name ORDER BY step, count DESC LIMIT $4), \
+         links AS ( \
+           SELECT a.step AS from_step, a.name AS from_event, b.name AS to_event, \
+                  count(*)::bigint AS count \
+           FROM capped a JOIN capped b ON b.distinct_id=a.distinct_id AND b.step=a.step+1 \
+           GROUP BY a.step, a.name, b.name ORDER BY a.step, count DESC LIMIT $4) \
+         SELECT jsonb_build_object( \
+           'nodes', COALESCE((SELECT jsonb_agg(to_jsonb(n)) FROM nodes n), '[]'::jsonb), \
+           'links', COALESCE((SELECT jsonb_agg(to_jsonb(l)) FROM links l), '[]'::jsonb) \
+         ) AS data",
     )
     .bind::<SqlUuid, _>(app_id)
     .bind::<Timestamptz, _>(since)
     .bind::<BigInt, _>(depth)
-    .get_results(conn)
-    .await
+    .bind::<BigInt, _>(JOURNEY_MAX_ROWS)
+    .get_result(conn)
+    .await?;
+
+    let nodes = row
+        .data
+        .get("nodes")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let links = row
+        .data
+        .get("links")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    Ok((nodes, links))
 }
 
 // ===========================================================================
@@ -1820,13 +2055,14 @@ pub async fn performance_summary(
            (count(*) FILTER (WHERE status='error' OR http_status>=500))::float8 \
              / NULLIF(count(*),0) AS error_rate \
          FROM transactions \
-         WHERE app_id=$1 AND occurred_at>=$2 AND ($3='' OR op=$3) AND ($4='' OR device_key=$4) \
+         WHERE app_id=$1 AND occurred_at>=$2 \
+           AND ($3::text IS NULL OR op=$3) AND ($4::text IS NULL OR device_key=$4) \
          GROUP BY name, op ORDER BY count DESC LIMIT 100",
     )
     .bind::<SqlUuid, _>(app_id)
     .bind::<Timestamptz, _>(since)
-    .bind::<Text, _>(op.unwrap_or(""))
-    .bind::<Text, _>(device_key.unwrap_or(""))
+    .bind::<Nullable<Text>, _>(op)
+    .bind::<Nullable<Text>, _>(device_key)
     .get_results(conn)
     .await
 }
@@ -1856,13 +2092,14 @@ pub async fn performance_series(
            percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95, \
            count(*)::bigint AS throughput \
          FROM transactions \
-         WHERE app_id=$1 AND occurred_at>=$2 AND ($3='' OR name=$3) AND ($4='' OR op=$4) \
-         GROUP BY bucket ORDER BY bucket",
+         WHERE app_id=$1 AND occurred_at>=$2 \
+           AND ($3::text IS NULL OR name=$3) AND ($4::text IS NULL OR op=$4) \
+         GROUP BY bucket ORDER BY bucket LIMIT 5000",
     )
     .bind::<SqlUuid, _>(app_id)
     .bind::<Timestamptz, _>(since)
-    .bind::<Text, _>(name.unwrap_or(""))
-    .bind::<Text, _>(op.unwrap_or(""))
+    .bind::<Nullable<Text>, _>(name)
+    .bind::<Nullable<Text>, _>(op)
     .get_results(conn)
     .await
 }
@@ -2200,8 +2437,9 @@ pub async fn list_saved_funnels(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
 ) -> QueryResult<Vec<SavedFunnelRow>> {
+    // Bounded: saved funnels are user-created and otherwise unlimited.
     diesel::sql_query(format!(
-        "{SAVED_FUNNEL_SELECT} WHERE sf.app_id=$1 ORDER BY sf.updated_at DESC"
+        "{SAVED_FUNNEL_SELECT} WHERE sf.app_id=$1 ORDER BY sf.updated_at DESC LIMIT 500"
     ))
     .bind::<SqlUuid, _>(app_id)
     .get_results(conn)
@@ -2316,28 +2554,49 @@ pub fn avg_dwell(total_ms: f64, views: i64) -> f64 {
 }
 
 // Shared CTE fragment: per-screen views/events/users/exceptions/dwell. $1 app, $2 since.
-const SCREEN_CTES: &str = "\
-  WITH ev AS ( \
-    SELECT screen, \
-      count(*) FILTER (WHERE name='$screen')::bigint AS views, \
-      count(*) FILTER (WHERE name<>'$screen')::bigint AS events \
-    FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL GROUP BY screen), \
-  ex AS ( \
-    SELECT screen, count(*)::bigint AS exceptions \
-    FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL GROUP BY screen), \
-  us AS ( \
-    SELECT screen, count(DISTINCT distinct_id)::bigint AS users FROM ( \
-      SELECT screen, distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND distinct_id IS NOT NULL AND distinct_id<>'' \
-      UNION ALL \
-      SELECT screen, distinct_id FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND distinct_id IS NOT NULL AND distinct_id<>'' \
-    ) u GROUP BY screen), \
-  dw AS ( \
-    SELECT screen, sum(LEAST(raw_ms, 1800000))::double precision AS total_dwell_ms FROM ( \
-      SELECT screen, EXTRACT(EPOCH FROM ( \
-        LEAD(occurred_at) OVER (PARTITION BY session_id ORDER BY occurred_at) - occurred_at)) * 1000 AS raw_ms \
-      FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND session_id IS NOT NULL AND screen IS NOT NULL) g \
-    WHERE raw_ms IS NOT NULL AND raw_ms > 0 GROUP BY screen), \
-  keys AS (SELECT screen FROM ev UNION SELECT screen FROM ex) ";
+
+/// Build the screen CTEs with `pred` (a compile-time SQL fragment, never user
+/// data) narrowing which screens are aggregated.
+///
+/// `ev`/`ex`/`us` push the predicate into their own WHERE clauses. Previously
+/// both callers aggregated **every** screen in the app and filtered only in the
+/// outer query — so the single-screen detail view computed the whole app's
+/// stats to return one row, and the list paginated after full aggregation.
+///
+/// `dw` is deliberately NOT narrowed inside the window: dwell is measured to the
+/// next event in the session *whatever screen it is on*, so restricting the
+/// window input would compute the wrong gaps. The predicate is applied after
+/// `LEAD`, which preserves the value while still shrinking the grouping.
+fn screen_ctes(pred: &str) -> String {
+    format!(
+        "WITH ev AS ( \
+        SELECT screen, \
+          count(*) FILTER (WHERE name='$screen')::bigint AS views, \
+          count(*) FILTER (WHERE name<>'$screen')::bigint AS events \
+        FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred} GROUP BY screen), \
+      ex AS ( \
+        SELECT screen, count(*)::bigint AS exceptions \
+        FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred} GROUP BY screen), \
+      us AS ( \
+        SELECT screen, count(DISTINCT distinct_id)::bigint AS users FROM ( \
+          SELECT screen, distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred} AND distinct_id IS NOT NULL AND distinct_id<>'' \
+          UNION ALL \
+          SELECT screen, distinct_id FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred} AND distinct_id IS NOT NULL AND distinct_id<>'' \
+        ) u GROUP BY screen), \
+      dw AS ( \
+        SELECT screen, sum(LEAST(raw_ms, 1800000))::double precision AS total_dwell_ms FROM ( \
+          SELECT screen, EXTRACT(EPOCH FROM ( \
+            LEAD(occurred_at) OVER (PARTITION BY session_id ORDER BY occurred_at) - occurred_at)) * 1000 AS raw_ms \
+          FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND session_id IS NOT NULL AND screen IS NOT NULL) g \
+        WHERE raw_ms IS NOT NULL AND raw_ms > 0 AND {pred} GROUP BY screen), \
+      keys AS (SELECT screen FROM ev UNION SELECT screen FROM ex) "
+    )
+}
+
+/// Predicate for the single-screen detail view.
+const SCREEN_PRED_EXACT: &str = "screen = $3";
+/// Predicate for the paginated list (`$3` is an escaped ILIKE pattern).
+const SCREEN_PRED_LIKE: &str = "screen ILIKE $3";
 
 pub async fn screen_list(
     conn: &mut AsyncPgConnection,
@@ -2348,7 +2607,7 @@ pub async fn screen_list(
     offset: i64,
 ) -> QueryResult<Vec<ScreenRow>> {
     diesel::sql_query(format!(
-        "{SCREEN_CTES} \
+        "{} \
          SELECT k.screen, \
            COALESCE(ev.views,0)::bigint AS views, \
            COALESCE(ev.events,0)::bigint AS events, \
@@ -2358,8 +2617,8 @@ pub async fn screen_list(
          FROM keys k \
          LEFT JOIN ev ON ev.screen=k.screen LEFT JOIN ex ON ex.screen=k.screen \
          LEFT JOIN us ON us.screen=k.screen LEFT JOIN dw ON dw.screen=k.screen \
-         WHERE k.screen ILIKE $3 \
-         ORDER BY views DESC, k.screen ASC LIMIT $4 OFFSET $5"
+         ORDER BY views DESC, k.screen ASC LIMIT $4 OFFSET $5",
+        screen_ctes(SCREEN_PRED_LIKE)
     ))
     .bind::<SqlUuid, _>(app_id)
     .bind::<Timestamptz, _>(since)
@@ -2377,7 +2636,7 @@ pub async fn screen_stats(
     name: &str,
 ) -> QueryResult<ScreenStats> {
     diesel::sql_query(format!(
-        "{SCREEN_CTES} \
+        "{} \
          SELECT k.screen, \
            COALESCE(ev.views,0)::bigint AS views, \
            COALESCE(ev.events,0)::bigint AS events, \
@@ -2388,7 +2647,8 @@ pub async fn screen_stats(
          FROM keys k \
          LEFT JOIN ev ON ev.screen=k.screen LEFT JOIN ex ON ex.screen=k.screen \
          LEFT JOIN us ON us.screen=k.screen LEFT JOIN dw ON dw.screen=k.screen \
-         WHERE k.screen = $3"
+         WHERE k.screen = $3",
+        screen_ctes(SCREEN_PRED_EXACT)
     ))
     .bind::<SqlUuid, _>(app_id)
     .bind::<Timestamptz, _>(since)
@@ -2487,6 +2747,24 @@ pub struct CheckPoint {
     pub status_code: Option<i32>,
     #[diesel(sql_type = Nullable<Text>)]
     pub error: Option<String>,
+}
+
+/// How many monitors a single project may have.
+///
+/// Each enabled monitor is polled on its own interval by every prober, so the
+/// count directly sets sustained load on the prober fleet and the database.
+pub const MAX_MONITORS_PER_PROJECT: i64 = 100;
+
+/// Current monitor count for a project.
+pub async fn count_monitors_for_project(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+) -> QueryResult<i64> {
+    monitors::table
+        .filter(monitors::project_id.eq(project_id))
+        .count()
+        .get_result(conn)
+        .await
 }
 
 pub async fn create_monitor(
@@ -2606,6 +2884,24 @@ pub async fn prune_checks(
 ) -> QueryResult<usize> {
     diesel::sql_query(
         "DELETE FROM monitor_checks WHERE checked_at < now() - ($1 || ' days')::interval",
+    )
+    .bind::<Text, _>(older_than_days.to_string())
+    .execute(conn)
+    .await
+}
+
+/// Delete `alert_events` rows older than `older_than_days`.
+///
+/// This table is an audit log that grows on every *evaluation*, not just every
+/// delivery: a throttled rule writes a `throttled` row each tick it suppresses.
+/// A 30s tick on a handful of flapping rules is millions of rows a year, with
+/// nothing reclaiming them.
+pub async fn prune_alert_events(
+    conn: &mut AsyncPgConnection,
+    older_than_days: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM alert_events WHERE created_at < now() - ($1 || ' days')::interval",
     )
     .bind::<Text, _>(older_than_days.to_string())
     .execute(conn)
@@ -3097,6 +3393,66 @@ pub async fn list_apps_with_org(conn: &mut AsyncPgConnection) -> QueryResult<Vec
     .await
 }
 
+/// Apps belonging to `org_ids` only — the tenant-scoped form of
+/// [`list_apps_with_org`], used by the storage report so a caller never sees
+/// apps outside the orgs they administer.
+pub async fn list_apps_with_org_scoped(
+    conn: &mut AsyncPgConnection,
+    org_ids: &[Uuid],
+) -> QueryResult<Vec<AppOrgRow>> {
+    diesel::sql_query(
+        "SELECT a.id AS app_id, a.name AS app_name, o.name AS org_name \
+         FROM apps a JOIN projects p ON a.project_id = p.id \
+         JOIN organizations o ON p.org_id = o.id \
+         WHERE o.id = ANY($1) \
+         ORDER BY o.name, a.name",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(org_ids)
+    .load(conn)
+    .await
+}
+
+/// Per-app hot row counts restricted to `app_ids`.
+///
+/// The unscoped [`hot_rows_by_app`] scans every partition of the largest tables
+/// in the deployment; restricting by `app_id` lets the planner use the app-keyed
+/// indexes and bounds the work to the caller's own data.
+pub async fn hot_rows_by_app_scoped(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    app_ids: &[Uuid],
+) -> QueryResult<Vec<AppCountRow>> {
+    // `table` is never user input: callers pass a literal from TIERED_TABLES.
+    diesel::sql_query(format!(
+        "SELECT app_id, count(*)::bigint AS n FROM {table} WHERE app_id = ANY($1) GROUP BY app_id"
+    ))
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+    .load(conn)
+    .await
+}
+
+/// The orgs in which `user_id` holds an **org-scoped** grant carrying `permission`.
+///
+/// Used to scope deployment-wide reports to the tenants a caller actually
+/// administers.
+pub async fn orgs_with_permission(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    permission: &str,
+) -> QueryResult<Vec<Uuid>> {
+    diesel::sql_query(
+        "SELECT DISTINCT g.org_id AS id \
+         FROM role_grants g JOIN roles r ON g.role_id = r.id \
+         WHERE g.user_id = $1 AND g.scope_type = 'org' \
+           AND r.permissions @> to_jsonb($2::text)",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<Text, _>(permission)
+    .load::<IdRow>(conn)
+    .await
+    .map(|rows| rows.into_iter().map(|r| r.id).collect())
+}
+
 // ===========================================================================
 // Symbol artifacts (source maps / Dart debug-info), content-addressed
 // ===========================================================================
@@ -3324,4 +3680,579 @@ pub async fn delete_symbol_artifact(
         .await?;
     }
     Ok(true)
+}
+
+// ===========================================================================
+// Alerting: notification channels, rules, deliveries
+// ===========================================================================
+
+pub async fn create_channel(
+    conn: &mut AsyncPgConnection,
+    ch: NewNotificationChannel<'_>,
+) -> QueryResult<NotificationChannel> {
+    diesel::insert_into(notification_channels::table)
+        .values(ch)
+        .returning(NotificationChannel::as_returning())
+        .get_result(conn)
+        .await
+}
+
+pub async fn list_channels_for_org(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+) -> QueryResult<Vec<NotificationChannel>> {
+    notification_channels::table
+        .filter(notification_channels::org_id.eq(org_id))
+        .order(notification_channels::created_at.desc())
+        .limit(500)
+        .select(NotificationChannel::as_select())
+        .load(conn)
+        .await
+}
+
+pub async fn get_channel(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<NotificationChannel>> {
+    notification_channels::table
+        .filter(notification_channels::id.eq(id))
+        .select(NotificationChannel::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Update a channel's mutable fields. `secret_enc`: `None` = leave unchanged,
+/// `Some(None)` = clear, `Some(Some(blob))` = replace.
+pub async fn update_channel(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    name: Option<&str>,
+    config: Option<&Value>,
+    secret_enc: Option<Option<Vec<u8>>>,
+    enabled: Option<bool>,
+) -> QueryResult<Option<NotificationChannel>> {
+    let mut any = false;
+    if let Some(n) = name {
+        diesel::update(notification_channels::table.filter(notification_channels::id.eq(id)))
+            .set(notification_channels::name.eq(n))
+            .execute(conn)
+            .await?;
+        any = true;
+    }
+    if let Some(c) = config {
+        diesel::update(notification_channels::table.filter(notification_channels::id.eq(id)))
+            .set(notification_channels::config.eq(c))
+            .execute(conn)
+            .await?;
+        any = true;
+    }
+    if let Some(s) = secret_enc {
+        diesel::update(notification_channels::table.filter(notification_channels::id.eq(id)))
+            .set(notification_channels::secret_enc.eq(s))
+            .execute(conn)
+            .await?;
+        any = true;
+    }
+    if let Some(e) = enabled {
+        diesel::update(notification_channels::table.filter(notification_channels::id.eq(id)))
+            .set(notification_channels::enabled.eq(e))
+            .execute(conn)
+            .await?;
+        any = true;
+    }
+    if any {
+        diesel::update(notification_channels::table.filter(notification_channels::id.eq(id)))
+            .set(notification_channels::updated_at.eq(Utc::now()))
+            .execute(conn)
+            .await?;
+    }
+    get_channel(conn, id).await
+}
+
+pub async fn delete_channel(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
+    diesel::delete(notification_channels::table.filter(notification_channels::id.eq(id)))
+        .execute(conn)
+        .await
+}
+
+pub async fn create_alert_rule(
+    conn: &mut AsyncPgConnection,
+    rule: NewAlertRule<'_>,
+) -> QueryResult<AlertRule> {
+    diesel::insert_into(alert_rules::table)
+        .values(rule)
+        .returning(AlertRule::as_returning())
+        .get_result(conn)
+        .await
+}
+
+pub async fn list_alert_rules_for_org(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+) -> QueryResult<Vec<AlertRule>> {
+    alert_rules::table
+        .filter(alert_rules::org_id.eq(org_id))
+        .order(alert_rules::created_at.desc())
+        .limit(500)
+        .select(AlertRule::as_select())
+        .load(conn)
+        .await
+}
+
+pub async fn get_alert_rule(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<AlertRule>> {
+    alert_rules::table
+        .filter(alert_rules::id.eq(id))
+        .select(AlertRule::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_alert_rule(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    name: Option<&str>,
+    enabled: Option<bool>,
+    conditions: Option<&Value>,
+    severity: Option<&str>,
+    throttle_seconds: Option<i32>,
+    message_template: Option<Option<&str>>,
+) -> QueryResult<Option<AlertRule>> {
+    if let Some(n) = name {
+        diesel::update(alert_rules::table.filter(alert_rules::id.eq(id)))
+            .set(alert_rules::name.eq(n))
+            .execute(conn)
+            .await?;
+    }
+    if let Some(e) = enabled {
+        diesel::update(alert_rules::table.filter(alert_rules::id.eq(id)))
+            .set(alert_rules::enabled.eq(e))
+            .execute(conn)
+            .await?;
+    }
+    if let Some(c) = conditions {
+        diesel::update(alert_rules::table.filter(alert_rules::id.eq(id)))
+            .set(alert_rules::conditions.eq(c))
+            .execute(conn)
+            .await?;
+    }
+    if let Some(s) = severity {
+        diesel::update(alert_rules::table.filter(alert_rules::id.eq(id)))
+            .set(alert_rules::severity.eq(s))
+            .execute(conn)
+            .await?;
+    }
+    if let Some(t) = throttle_seconds {
+        diesel::update(alert_rules::table.filter(alert_rules::id.eq(id)))
+            .set(alert_rules::throttle_seconds.eq(t))
+            .execute(conn)
+            .await?;
+    }
+    if let Some(m) = message_template {
+        diesel::update(alert_rules::table.filter(alert_rules::id.eq(id)))
+            .set(alert_rules::message_template.eq(m))
+            .execute(conn)
+            .await?;
+    }
+    diesel::update(alert_rules::table.filter(alert_rules::id.eq(id)))
+        .set(alert_rules::updated_at.eq(Utc::now()))
+        .execute(conn)
+        .await?;
+    get_alert_rule(conn, id).await
+}
+
+pub async fn delete_alert_rule(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
+    diesel::delete(alert_rules::table.filter(alert_rules::id.eq(id)))
+        .execute(conn)
+        .await
+}
+
+/// Replace a rule's channel attachments with `channel_ids` (already validated
+/// as belonging to the rule's org by the route layer).
+pub async fn set_rule_channels(
+    conn: &mut AsyncPgConnection,
+    rule_id: Uuid,
+    channel_ids: &[Uuid],
+) -> QueryResult<()> {
+    diesel::delete(alert_rule_channels::table.filter(alert_rule_channels::rule_id.eq(rule_id)))
+        .execute(conn)
+        .await?;
+    for cid in channel_ids {
+        diesel::insert_into(alert_rule_channels::table)
+            .values((
+                alert_rule_channels::rule_id.eq(rule_id),
+                alert_rule_channels::channel_id.eq(*cid),
+            ))
+            .on_conflict_do_nothing()
+            .execute(conn)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn rule_channel_ids(
+    conn: &mut AsyncPgConnection,
+    rule_id: Uuid,
+) -> QueryResult<Vec<Uuid>> {
+    alert_rule_channels::table
+        .filter(alert_rule_channels::rule_id.eq(rule_id))
+        .select(alert_rule_channels::channel_id)
+        .load(conn)
+        .await
+}
+
+/// Channel ids for many rules at once, grouped by rule.
+///
+/// The rules list rendered one `rule_channel_ids` query per rule, so an org with
+/// 200 rules issued 201 queries per page load.
+pub async fn rule_channel_ids_for_rules(
+    conn: &mut AsyncPgConnection,
+    rule_ids: &[Uuid],
+) -> QueryResult<HashMap<Uuid, Vec<Uuid>>> {
+    let rows: Vec<(Uuid, Uuid)> = alert_rule_channels::table
+        .filter(alert_rule_channels::rule_id.eq_any(rule_ids))
+        .select((
+            alert_rule_channels::rule_id,
+            alert_rule_channels::channel_id,
+        ))
+        .load(conn)
+        .await?;
+    let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (rule_id, channel_id) in rows {
+        out.entry(rule_id).or_default().push(channel_id);
+    }
+    Ok(out)
+}
+
+/// The (enabled or not) channels attached to a rule.
+pub async fn channels_for_rule(
+    conn: &mut AsyncPgConnection,
+    rule_id: Uuid,
+) -> QueryResult<Vec<NotificationChannel>> {
+    alert_rule_channels::table
+        .inner_join(notification_channels::table)
+        .filter(alert_rule_channels::rule_id.eq(rule_id))
+        .select(NotificationChannel::as_select())
+        .load(conn)
+        .await
+}
+
+pub async fn insert_alert_event(
+    conn: &mut AsyncPgConnection,
+    ev: NewAlertEvent<'_>,
+) -> QueryResult<usize> {
+    diesel::insert_into(alert_events::table)
+        .values(ev)
+        .execute(conn)
+        .await
+}
+
+/// Durable throttle backstop: was an alert with this dedup key *sent* within
+/// the last `within_seconds`? (Used when Redis is unavailable.)
+pub async fn alert_recently_sent(
+    conn: &mut AsyncPgConnection,
+    dedup_key: &str,
+    within_seconds: i32,
+) -> QueryResult<bool> {
+    let cutoff = Utc::now() - chrono::Duration::seconds(within_seconds.max(0) as i64);
+    let n: i64 = alert_events::table
+        .filter(alert_events::dedup_key.eq(dedup_key))
+        .filter(alert_events::status.eq("sent"))
+        .filter(alert_events::created_at.gt(cutoff))
+        .count()
+        .get_result(conn)
+        .await?;
+    Ok(n > 0)
+}
+
+/// Paginated alert history for an org (bounded).
+pub async fn list_alert_events(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> QueryResult<Vec<AlertEventRow>> {
+    alert_events::table
+        .filter(alert_events::org_id.eq(org_id))
+        .order(alert_events::created_at.desc())
+        .limit(limit.clamp(1, 200))
+        .offset(offset.clamp(0, 100_000))
+        .select(AlertEventRow::as_select())
+        .load(conn)
+        .await
+}
+
+/// Enabled rules the evaluator polls (all metric trigger types).
+pub async fn enabled_metric_alert_rules(
+    conn: &mut AsyncPgConnection,
+) -> QueryResult<Vec<AlertRule>> {
+    alert_rules::table
+        .filter(alert_rules::enabled.eq(true))
+        .filter(alert_rules::trigger_type.ne_all(vec!["monitor_down", "monitor_up"]))
+        .select(AlertRule::as_select())
+        .load(conn)
+        .await
+}
+
+/// Enabled monitor-transition rules that apply to `project_id` (org-wide rules
+/// plus rules narrowed to exactly this project).
+pub async fn alert_rules_for_monitor(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+    trigger_type: &str,
+) -> QueryResult<Vec<AlertRule>> {
+    let org: Option<Uuid> = projects::table
+        .filter(projects::id.eq(project_id))
+        .select(projects::org_id)
+        .first(conn)
+        .await
+        .optional()?;
+    let Some(org_id) = org else {
+        return Ok(Vec::new());
+    };
+    alert_rules::table
+        .filter(alert_rules::enabled.eq(true))
+        .filter(alert_rules::trigger_type.eq(trigger_type))
+        .filter(alert_rules::org_id.eq(org_id))
+        .filter(
+            alert_rules::project_id
+                .is_null()
+                .or(alert_rules::project_id.eq(project_id)),
+        )
+        .select(AlertRule::as_select())
+        .load(conn)
+        .await
+}
+
+pub async fn touch_rule_evaluated(
+    conn: &mut AsyncPgConnection,
+    rule_id: Uuid,
+    at: DateTime<Utc>,
+) -> QueryResult<usize> {
+    diesel::update(alert_rules::table.filter(alert_rules::id.eq(rule_id)))
+        .set(alert_rules::last_evaluated_at.eq(at))
+        .execute(conn)
+        .await
+}
+
+/// The app ids a rule's scope covers (org-wide, project-narrowed, or one app).
+pub async fn apps_in_alert_scope(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    project_id: Option<Uuid>,
+    app_id: Option<Uuid>,
+) -> QueryResult<Vec<Uuid>> {
+    let mut q = apps::table
+        .inner_join(projects::table)
+        .filter(projects::org_id.eq(org_id))
+        .into_boxed();
+    if let Some(p) = project_id {
+        q = q.filter(apps::project_id.eq(p));
+    }
+    if let Some(a) = app_id {
+        q = q.filter(apps::id.eq(a));
+    }
+    q.select(apps::id).load(conn).await
+}
+
+#[derive(Debug, QueryableByName)]
+pub struct AlertCountRow {
+    #[diesel(sql_type = BigInt)]
+    pub n: i64,
+}
+
+#[derive(Debug, QueryableByName)]
+pub struct AlertValueRow {
+    #[diesel(sql_type = Nullable<Double>)]
+    pub v: Option<f64>,
+}
+
+/// Count error events across `app_ids` in `(from, to]`, with optional
+/// level/environment/tag filters. All values are bound parameters.
+pub async fn alert_count_errors(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    level: Option<&str>,
+    environment: Option<&str>,
+    tag: Option<&Value>,
+) -> QueryResult<i64> {
+    let row: AlertCountRow = diesel::sql_query(
+        "SELECT count(*) AS n FROM error_events \
+         WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
+           AND ($4::text IS NULL OR level = $4) \
+           AND ($5::text IS NULL OR environment_id IN (SELECT id FROM environments WHERE name = $5)) \
+           AND ($6::jsonb IS NULL OR tags @> $6)",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .bind::<Nullable<Text>, _>(level)
+    .bind::<Nullable<Text>, _>(environment)
+    .bind::<Nullable<Jsonb>, _>(tag)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
+/// Count analytics events across `app_ids` in `(from, to]`, with optional
+/// name/environment/tag filters.
+pub async fn alert_count_events(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    name: Option<&str>,
+    environment: Option<&str>,
+    tag: Option<&Value>,
+) -> QueryResult<i64> {
+    let row: AlertCountRow = diesel::sql_query(
+        "SELECT count(*) AS n FROM analytics_events \
+         WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
+           AND ($4::text IS NULL OR name = $4) \
+           AND ($5::text IS NULL OR environment_id IN (SELECT id FROM environments WHERE name = $5)) \
+           AND ($6::jsonb IS NULL OR tags @> $6)",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .bind::<Nullable<Text>, _>(name)
+    .bind::<Nullable<Text>, _>(environment)
+    .bind::<Nullable<Jsonb>, _>(tag)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
+/// A latency metric over transactions in the window. `percentile` is the
+/// fraction for percentile_cont; `None` means avg, `Some(-1.0)` means max
+/// (the caller maps the whitelisted metric string).
+pub async fn alert_latency_metric(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    percentile: Option<f64>,
+    op: Option<&str>,
+) -> QueryResult<Option<f64>> {
+    let row: AlertValueRow = match percentile {
+        Some(p) if p >= 0.0 => {
+            diesel::sql_query(
+                "SELECT percentile_cont($4) WITHIN GROUP (ORDER BY duration_ms)::double precision AS v \
+                 FROM transactions \
+                 WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
+                   AND ($5::text IS NULL OR op = $5)",
+            )
+            .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+            .bind::<Timestamptz, _>(from)
+            .bind::<Timestamptz, _>(to)
+            .bind::<Double, _>(p)
+            .bind::<Nullable<Text>, _>(op)
+            .get_result(conn)
+            .await?
+        }
+        Some(_) => {
+            diesel::sql_query(
+                "SELECT max(duration_ms)::double precision AS v FROM transactions \
+                 WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
+                   AND ($4::text IS NULL OR op = $4)",
+            )
+            .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+            .bind::<Timestamptz, _>(from)
+            .bind::<Timestamptz, _>(to)
+            .bind::<Nullable<Text>, _>(op)
+            .get_result(conn)
+            .await?
+        }
+        None => {
+            diesel::sql_query(
+                "SELECT avg(duration_ms)::double precision AS v FROM transactions \
+                 WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
+                   AND ($4::text IS NULL OR op = $4)",
+            )
+            .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+            .bind::<Timestamptz, _>(from)
+            .bind::<Timestamptz, _>(to)
+            .bind::<Nullable<Text>, _>(op)
+            .get_result(conn)
+            .await?
+        }
+    };
+    Ok(row.v)
+}
+
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct AlertIssueBrief {
+    #[diesel(sql_type = SqlUuid)]
+    pub id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    pub app_id: Uuid,
+    #[diesel(sql_type = Text)]
+    pub title: String,
+    #[diesel(sql_type = Text)]
+    pub level: String,
+    #[diesel(sql_type = BigInt)]
+    pub times_seen: i64,
+}
+
+/// Issues first seen in `(from, to]` (new-issue trigger). Bounded.
+pub async fn alert_new_issues(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    level: Option<&str>,
+) -> QueryResult<Vec<AlertIssueBrief>> {
+    diesel::sql_query(
+        // `created_at`, not `first_seen`: the latter is the SDK-supplied event
+        // timestamp, while the evaluator's watermark moves on its own clock and
+        // the row only lands after pipeline latency. A tick landing in that gap
+        // advanced the watermark past `first_seen` and the issue was never
+        // alerted; backdated/offline batches lost the same way. `created_at` is
+        // Postgres `now()` at INSERT, so it can never predate the watermark.
+        "SELECT id, app_id, title, level, times_seen FROM issues \
+         WHERE app_id = ANY($1) AND created_at > $2 AND created_at <= $3 \
+           AND ($4::text IS NULL OR level = $4) \
+         ORDER BY created_at DESC LIMIT 20",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .bind::<Nullable<Text>, _>(level)
+    .load(conn)
+    .await
+}
+
+/// Resolved/ignored issues that saw new events in `(from, to]` (regression
+/// trigger). `upsert_issue` advances `last_seen` without resetting `status`,
+/// so this catches the recurrence. Bounded.
+pub async fn alert_regressed_issues(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    level: Option<&str>,
+) -> QueryResult<Vec<AlertIssueBrief>> {
+    diesel::sql_query(
+        // `last_event_at` is the ingest-side twin of `last_seen`, advanced only
+        // by `upsert_issue`. See `alert_new_issues` for why the client-supplied
+        // column loses the race with the poll tick.
+        "SELECT id, app_id, title, level, times_seen FROM issues \
+         WHERE app_id = ANY($1) AND status IN ('resolved','ignored') \
+           AND last_event_at > $2 AND last_event_at <= $3 \
+           AND ($4::text IS NULL OR level = $4) \
+         ORDER BY last_event_at DESC LIMIT 20",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .bind::<Nullable<Text>, _>(level)
+    .load(conn)
+    .await
 }

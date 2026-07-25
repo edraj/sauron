@@ -21,6 +21,7 @@ import ScreenDetail from './pages/ScreenDetail.svelte';
 import FunnelBuilder from './pages/FunnelBuilder.svelte';
 import JourneyExplorer from './pages/JourneyExplorer.svelte';
 import Monitors from './pages/Monitors.svelte';
+import Alerts from './pages/Alerts.svelte';
 import MonitorDetail from './pages/MonitorDetail.svelte';
 import Storage from './pages/Storage.svelte';
 import SourceMaps from './pages/SourceMaps.svelte';
@@ -67,6 +68,9 @@ export const routes = {
   // Uptime
   '/monitors': guarded(Monitors as Component<never>),
   '/monitors/:id': guarded(MonitorDetail as Component<never>),
+
+  // Alerting
+  '/alerts': guarded(Alerts as Component<never>),
 
   // Settings
   '/projects': guarded(Projects as Component<never>),

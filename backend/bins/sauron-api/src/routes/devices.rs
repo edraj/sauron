@@ -46,7 +46,15 @@ pub async fn list(
     let limit = q.limit.clamp(1, 200);
     let search = q.search.as_deref().filter(|s| !s.is_empty());
     Ok(Json(
-        repo::list_devices(&mut conn, app_id, since, limit, q.offset.max(0), search).await?,
+        repo::list_devices(
+            &mut conn,
+            app_id,
+            since,
+            limit,
+            super::clamp_offset(q.offset),
+            search,
+        )
+        .await?,
     ))
 }
 

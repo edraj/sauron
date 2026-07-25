@@ -213,10 +213,16 @@ user's id when omitted.
 - **Gzip** — the request body is gzipped once it exceeds `gzipThresholdBytes` (default
   1024), with `Content-Encoding: gzip`; smaller bodies go out uncompressed. Uses Node's
   built-in `zlib` (no runtime dependency).
-- **Retry** — transient failures (408/413/429/5xx and network errors) retry with
+- **Retry** — transient failures (408/429/5xx and network errors) retry with
   exponential backoff + jitter (capped at 30 s), honoring `Retry-After` on 429, up to
   `maxRetries` (default 3); after that the batch is re-buffered for a later flush. 400/404
   drop the batch; **401/403 disable the SDK**. Non-retryable statuses never retry.
+- **Oversized payloads** — a **413** is not retried unchanged (the body is exactly what the
+  server rejected). The envelope size is halved and the items are re-buffered, so the next
+  flush is smaller; a lone item that still will not fit is dropped rather than looping.
+  Envelopes are also capped at `maxItemsPerEnvelope` items (default **1000**, matching the
+  server) — `maxBatch` only *triggers* a flush and does not bound the request, so a backlog
+  built up during an outage would otherwise be rejected as a non-retryable 400.
 - **Queue** — items buffer in a byte-bounded queue (`maxQueueBytes`, default 1 MiB,
   drop-oldest). Set `offlineDir` to persist pending envelopes FIFO to disk (reloaded on
   the next start, deleted on delivery) for at-least-once delivery across restarts.

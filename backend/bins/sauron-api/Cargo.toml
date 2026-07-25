@@ -16,6 +16,7 @@ sauron-auth.workspace = true
 sauron-telemetry.workspace = true
 sauron-tier.workspace = true
 sauron-symbols.workspace = true
+sauron-alerts.workspace = true
 diesel.workspace = true
 tokio.workspace = true
 axum.workspace = true

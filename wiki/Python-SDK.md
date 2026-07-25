@@ -197,7 +197,12 @@ sauron.track_transaction(
 - **Gzip** — the request body is gzipped once it exceeds `gzip_threshold_bytes` (default
   1024), with `Content-Encoding: gzip`; smaller bodies go out uncompressed (stdlib
   `gzip`).
-- **Retry** — the transport retries transient failures (408/413/429/5xx and network
+- **Oversized payloads** — a **413** is not retried unchanged; the envelope is split in
+  half and each half sent, and a lone item that still will not fit is dropped. Envelopes
+  are capped at `MAX_ITEMS_PER_ENVELOPE` (**1000**, matching the server): `max_batch` only
+  *triggers* a flush and does not bound the request. A rejected envelope now also has its
+  persisted copies deleted, so a poisoned payload cannot be replayed from disk forever.
+- **Retry** — the transport retries transient failures (408/429/5xx and network
   errors) with exponential backoff, honoring `Retry-After` on 429, then re-buffers the
   batch; non-retryable 4xx are dropped and 401/403 disable the SDK.
 - **Queue** — items buffer in a byte-bounded queue (`max_queue_bytes`, default 1 MiB,
