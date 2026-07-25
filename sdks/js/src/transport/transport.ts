@@ -8,6 +8,12 @@ import { defaultStorage, OfflineQueue } from './queue.js';
 /** `sendBeacon` / `keepalive` payloads are capped near 64 KiB by browsers. */
 export const BEACON_MAX_BYTES = 64 * 1024;
 
+/**
+ * Hard ceiling on items in one envelope, matching the server's own limit.
+ * Exceeding it is a non-retryable 400, so the batch would simply be lost.
+ */
+export const MAX_ITEMS_PER_ENVELOPE = 1000;
+
 /** Max delivery attempts before a batch is parked in the offline queue. */
 const MAX_RETRIES = 5;
 
@@ -99,7 +105,12 @@ export class Transport {
     this.logger = config.logger;
     this.onDisable = config.onDisable;
     this.flushIntervalMs = config.options.flushIntervalMs;
-    this.maxBatch = Math.max(1, config.options.maxBatch);
+    // Clamped to the server's per-envelope limit: a configured `maxBatch`
+    // above it would produce envelopes that are rejected outright.
+    this.maxBatch = Math.min(
+      MAX_ITEMS_PER_ENVELOPE,
+      Math.max(1, config.options.maxBatch),
+    );
     this.offline = new OfflineQueue(config.options.maxQueueBytes, defaultStorage());
   }
 
@@ -246,9 +257,19 @@ export class Transport {
   /** Best-effort synchronous-ish flush for page unload via `sendBeacon`. */
   flushToBeacon(): void {
     if (this.disabled) return;
-    const items = this.pending.splice(0, this.pending.length);
-    if (items.length === 0) return;
+    const all = this.pending.splice(0, this.pending.length);
+    if (all.length === 0) return;
 
+    // Chunk like the normal path already does. This one sent everything
+    // buffered as a single envelope, so unloading after a busy session could
+    // exceed the server's per-envelope item limit — a non-retryable 400, and
+    // there is no page left to retry from.
+    for (let i = 0; i < all.length; i += MAX_ITEMS_PER_ENVELOPE) {
+      this.beaconChunk(all.slice(i, i + MAX_ITEMS_PER_ENVELOPE));
+    }
+  }
+
+  private beaconChunk(items: EnvelopeItem[]): void {
     const json = safeStringify(this.makeEnvelope(items));
     const nav = (globalThis as { navigator?: Navigator }).navigator;
     const size = byteLength(json);

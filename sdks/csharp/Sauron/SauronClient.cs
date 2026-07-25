@@ -36,6 +36,13 @@ public sealed class SauronOptions
     /// <summary>Flush automatically once this many items are buffered. Default 30.</summary>
     public int MaxBatch { get; set; } = 30;
 
+    /// <summary>
+    /// Hard ceiling on items per envelope. Default 1000, matching the server's limit —
+    /// a larger envelope is rejected as a non-retryable 400 and its items are lost.
+    /// <see cref="MaxBatch"/> only triggers a flush; this is what bounds the request.
+    /// </summary>
+    public int MaxItemsPerEnvelope { get; set; } = 1000;
+
     /// <summary>Emit diagnostic logging to stderr. Default false.</summary>
     public bool Debug { get; set; } = false;
 

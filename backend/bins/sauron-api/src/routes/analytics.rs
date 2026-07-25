@@ -134,7 +134,7 @@ pub async fn persons_list(
             app_id,
             search,
             q.limit.clamp(1, 200),
-            q.offset.max(0),
+            super::clamp_offset(q.offset),
         )
         .await?,
     ))
@@ -174,7 +174,9 @@ pub async fn events_list(
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let filters = sauron_db::filter::parse_filters(&q.filter, sauron_db::filter::EVENT_FILTERS)?;
     let search = q.q.as_deref().filter(|s| !s.is_empty());
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 3650));
+    // Free-text search scans jsonb::text, which no index can serve; keep the
+    // window bounded rather than defaulting to effectively all history.
+    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
     Ok(Json(
         repo::list_analytics_events(
             &mut conn,
@@ -183,7 +185,7 @@ pub async fn events_list(
             search,
             Some(since),
             q.limit.clamp(1, 200),
-            q.offset.max(0),
+            super::clamp_offset(q.offset),
         )
         .await?,
     ))
@@ -328,6 +330,30 @@ pub struct TimeseriesQuery {
     pub to: chrono::DateTime<chrono::Utc>,
 }
 
+/// Longest span a cross-tier timeseries may cover.
+///
+/// These endpoints route across hot Postgres and cold Parquet; an unbounded
+/// `from`/`to` lets one request scan an app's entire cold dataset.
+const MAX_TIMESERIES_DAYS: i64 = 400;
+
+impl TimeseriesQuery {
+    /// Validate and clamp the requested window.
+    fn range(
+        &self,
+    ) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), ApiError> {
+        if self.to < self.from {
+            return Err(ApiError::BadRequest("`to` must not precede `from`".into()));
+        }
+        let max = Duration::days(MAX_TIMESERIES_DAYS);
+        if self.to - self.from > max {
+            return Err(ApiError::BadRequest(format!(
+                "time range must not exceed {MAX_TIMESERIES_DAYS} days"
+            )));
+        }
+        Ok((self.from, self.to))
+    }
+}
+
 #[derive(Serialize)]
 pub struct DayCountOut {
     pub day: chrono::NaiveDate,
@@ -343,7 +369,8 @@ pub async fn error_timeseries(
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
     drop(conn); // release the pooled conn before the router checks out its own
-    let series = crate::tier_read::error_counts_by_day(&state, app_id, q.from, q.to).await?;
+    let (from, to) = q.range()?;
+    let series = crate::tier_read::error_counts_by_day(&state, app_id, from, to).await?;
     Ok(Json(
         series
             .into_iter()
@@ -368,7 +395,8 @@ pub async fn event_timeseries(
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     drop(conn); // release the pooled conn before the router checks out its own
-    let series = crate::tier_read::event_counts_by_day(&state, app_id, q.from, q.to).await?;
+    let (from, to) = q.range()?;
+    let series = crate::tier_read::event_counts_by_day(&state, app_id, from, to).await?;
     Ok(Json(
         series
             .into_iter()
@@ -395,7 +423,8 @@ pub async fn transaction_timeseries(
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     drop(conn); // release the pooled conn before the router checks out its own
-    let series = crate::tier_read::transaction_counts_by_day(&state, app_id, q.from, q.to).await?;
+    let (from, to) = q.range()?;
+    let series = crate::tier_read::transaction_counts_by_day(&state, app_id, from, to).await?;
     Ok(Json(
         series
             .into_iter()

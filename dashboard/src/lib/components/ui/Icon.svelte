@@ -12,6 +12,7 @@
   import ArrowLeft from '@lucide/svelte/icons/arrow-left';
   import ArrowRight from '@lucide/svelte/icons/arrow-right';
   import ArrowUpRight from '@lucide/svelte/icons/arrow-up-right';
+  import Bell from '@lucide/svelte/icons/bell';
   import BookOpen from '@lucide/svelte/icons/book-open';
   import Braces from '@lucide/svelte/icons/braces';
   import ChartColumn from '@lucide/svelte/icons/chart-column';
@@ -59,6 +60,7 @@
     'arrow-left': ArrowLeft,
     'arrow-right': ArrowRight,
     'arrow-up-right': ArrowUpRight,
+    bell: Bell,
     'book-open': BookOpen,
     braces: Braces,
     'chart-column': ChartColumn,

@@ -135,8 +135,18 @@ class SauronTransport {
     }
     final List<EnvelopeItem> items = List<EnvelopeItem>.of(_buffer);
     _buffer.clear();
-    final Envelope envelope = _buildEnvelope(items);
-    await _queue.enqueue(envelope.encode());
+    // Split into bounded envelopes rather than emitting one for the whole
+    // buffer. `maxBatchItems` only triggers a flush, so a producer outpacing
+    // delivery (offline, or mid-retry) can grow the buffer past the server's
+    // per-envelope item limit — which is a non-retryable 400, and the 413
+    // halving below never sees it.
+    final int chunk =
+        _options.maxItemsPerEnvelope > 0 ? _options.maxItemsPerEnvelope : items.length;
+    for (int i = 0; i < items.length; i += chunk) {
+      final int end = (i + chunk < items.length) ? i + chunk : items.length;
+      final Envelope envelope = _buildEnvelope(items.sublist(i, end));
+      await _queue.enqueue(envelope.encode());
+    }
   }
 
   Envelope _buildEnvelope(List<EnvelopeItem> items) {

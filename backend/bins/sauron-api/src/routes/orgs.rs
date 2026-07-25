@@ -8,7 +8,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use sauron_auth::rbac::grants_from_rows;
-use sauron_auth::{authorize_org, effective_at_org, perm, AuthError, AuthUser};
+use sauron_auth::{authorize_org, perm, AuthError, AuthUser};
 use sauron_db::models::{NewRoleGrant, Organization, Role};
 use sauron_db::repo;
 
@@ -87,7 +87,16 @@ pub async fn access(
     if rows.is_empty() {
         return Err(ApiError::Auth(AuthError::Forbidden));
     }
-    let grants: Vec<GrantView> = grants_from_rows(rows)
+    // Parse once and derive both outputs locally. `effective_at_org` would
+    // re-query the identical grant rows, doubling DB round-trips on the endpoint
+    // the dashboard hits on every page load and org switch.
+    let parsed = grants_from_rows(rows);
+    let mut permissions: Vec<String> =
+        sauron_auth::rbac::effective_permissions(&parsed, org_id, None, None)
+            .into_iter()
+            .collect();
+    permissions.sort();
+    let grants: Vec<GrantView> = parsed
         .into_iter()
         .map(|g| {
             let (scope_type, scope_id) = match g.scope {
@@ -102,9 +111,6 @@ pub async fn access(
             }
         })
         .collect();
-    let org_perms = effective_at_org(&mut conn, auth.user_id, org_id).await?;
-    let mut permissions: Vec<String> = org_perms.into_iter().collect();
-    permissions.sort();
     Ok(Json(AccessResponse {
         permissions,
         grants,
@@ -258,10 +264,59 @@ pub async fn delete_grant(
     Path(grant_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut conn = db(&state).await?;
-    let org_id = repo::grant_org(&mut conn, grant_id)
+    let grant = repo::get_grant(&mut conn, grant_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    let org_id = grant.org_id;
     authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_MANAGE).await?;
+
+    let role = repo::get_role(&mut conn, grant.role_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let role_perms: Vec<String> = match &role.permissions {
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    // Symmetry with create_grant: you may not remove a grant conferring
+    // permissions you do not hold yourself at that scope. Without this, an Admin
+    // (member:manage but not org:manage) could delete the Owner's grant and
+    // evict them from their own org.
+    let (scope_project, scope_app): (Option<Uuid>, Option<Uuid>) = match grant.scope_type.as_str() {
+        "org" => (None, None),
+        "project" => (Some(grant.scope_id), None),
+        "app" => match repo::app_ancestry(&mut conn, grant.scope_id).await? {
+            Some((project_id, _)) => (Some(project_id), Some(grant.scope_id)),
+            None => (None, Some(grant.scope_id)),
+        },
+        _ => (None, None),
+    };
+    let remover =
+        sauron_auth::effective_at(&mut conn, auth.user_id, org_id, scope_project, scope_app)
+            .await?;
+    for p in &role_perms {
+        if !remover.contains(p) {
+            return Err(ApiError::Auth(AuthError::Forbidden));
+        }
+    }
+
+    // Never let the org lose its last administrator: once no grant confers
+    // org:manage, create_grant's own escalation check makes it impossible for
+    // anyone to ever re-create one, permanently orphaning the org.
+    if role_perms.iter().any(|p| p == perm::ORG_MANAGE) {
+        let remaining =
+            repo::count_org_manage_grants_excluding(&mut conn, org_id, grant_id).await?;
+        if remaining == 0 {
+            return Err(ApiError::Conflict(
+                "cannot remove the last grant with org:manage — assign it to another member first"
+                    .into(),
+            ));
+        }
+    }
+
     repo::delete_grant(&mut conn, org_id, grant_id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }

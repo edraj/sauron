@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: oversized envelopes.** `maxBatchItems` only *triggers* a flush; it does not bound
+  the request, so a producer outpacing delivery (offline, or mid-retry) could build an
+  envelope past the server's 1000-item limit and have it dropped as a non-retryable `400`.
+  The buffer is now packed into chunks of at most `maxItemsPerEnvelope` (default 1000).
+
 ## 0.3.0
 
 - **Breaking / behavioral change — `beforeSend` now runs on every item.**

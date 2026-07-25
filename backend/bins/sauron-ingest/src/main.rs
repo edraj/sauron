@@ -50,6 +50,11 @@ struct IngestQuery {
     k: Option<String>,
 }
 
+/// Maximum items accepted in a single envelope. The per-app rate limit counts
+/// requests, so an unbounded item list would let one request enqueue arbitrarily
+/// many jobs and bypass the quota.
+const MAX_ENVELOPE_ITEMS: usize = 1000;
+
 /// Best-effort raise of the process's open-file-descriptor soft limit to the
 /// hard limit. A large connect burst (e.g. crebain hammering over UDS) can
 /// otherwise exhaust the default 1024-fd soft limit well before any real
@@ -120,6 +125,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
         .route("/api/{project_id}/envelope", post(ingest))
+        // Layer order matters. `Router::layer` makes the LAST-added layer the
+        // outermost, so the limit must be added AFTER decompression to sit
+        // outside it... which would only bound the compressed bytes. Instead we
+        // apply a limit on both sides: the outer one bounds what we read off the
+        // wire, the inner one bounds what decompression can expand it into, so a
+        // zip bomb cannot inflate past the configured cap.
+        .layer(RequestBodyLimitLayer::new(max_body))
         .layer(RequestDecompressionLayer::new())
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(cors)
@@ -144,10 +156,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    match sauron_db::conn(&state.pool).await {
-        Ok(_) => (StatusCode::OK, "ready"),
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "db unavailable"),
+    if sauron_db::conn(&state.pool).await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "db unavailable");
     }
+    // Redis is not optional here: every accepted envelope is enqueued on the
+    // stream, so without it this instance 500s on every request. Reporting
+    // ready on the strength of Postgres alone kept load balancers sending
+    // traffic to an instance that could not ingest anything.
+    if state.redis.ping().await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "redis unavailable");
+    }
+    (StatusCode::OK, "ready")
 }
 
 async fn ingest(
@@ -167,7 +186,25 @@ async fn ingest(
         return error(StatusCode::UNAUTHORIZED, "missing_key", "no ingest key");
     };
 
-    // 2. Resolve the app (cache → Postgres).
+    // 2. Rate-limit the KEY before resolving it. An unknown key would otherwise
+    //    miss the DSN cache on every request and hit Postgres unauthenticated,
+    //    letting anyone drain the small ingest pool with garbage keys.
+    match state
+        .redis
+        .rate_limit_ok(
+            &keys::key_rate_limit(&key),
+            state.cfg.ingest_rate_limit_per_min,
+            60,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return rate_limited(),
+        Err(e) => warn!(error = %e, "key rate limit check failed; allowing"),
+    }
+
+    // 3. Resolve the app (cache → Postgres). Unknown keys are negatively cached
+    //    inside `resolve_app` so a repeat miss never reaches the database.
     let app = match resolve_app(&state, &key).await {
         Ok(Some(a)) if a.ingest_enabled => a,
         Ok(Some(_)) => return error(StatusCode::FORBIDDEN, "ingest_disabled", "ingest disabled"),
@@ -188,7 +225,7 @@ async fn ingest(
         }
     };
 
-    // 3. Rate limit (fixed 60s window, per app).
+    // 4. Rate limit (fixed 60s window, per app).
     let rl_key = keys::rate_limit(&app.app_id.to_string());
     match state
         .redis
@@ -196,25 +233,28 @@ async fn ingest(
         .await
     {
         Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "60")],
-                Json(json!({ "error": { "code": "rate_limited", "message": "quota exceeded" } })),
-            )
-                .into_response();
-        }
+        Ok(false) => return rate_limited(),
         Err(e) => warn!(error = %e, "rate limit check failed; allowing"),
     }
 
-    // 4. Parse the (already-decompressed) envelope.
+    // 5. Parse the (already-decompressed) envelope.
     let envelope: Envelope = match serde_json::from_slice(&body) {
         Ok(e) => e,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_envelope", &e.to_string()),
     };
+    // One request must not be able to enqueue an unbounded number of jobs: the
+    // rate limit counts REQUESTS, so without this a single body could fan out to
+    // tens of thousands of stream entries and bypass the quota entirely.
+    if envelope.items.len() > MAX_ENVELOPE_ITEMS {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "too_many_items",
+            &format!("envelope carries more than {MAX_ENVELOPE_ITEMS} items"),
+        );
+    }
 
-    // 5. Enqueue one job per item.
-    let ip = client_ip(&headers);
+    // 6. Enqueue one job per item.
+    let ip = client_ip(&headers, &state.cfg);
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -250,45 +290,89 @@ async fn ingest(
     (StatusCode::ACCEPTED, Json(json!({ "accepted": accepted }))).into_response()
 }
 
-/// Resolve an app by public key, caching the result in Redis for 5 minutes.
+/// Marker stored in the DSN cache for a key that resolved to nothing.
+const NEGATIVE_CACHE_MARKER: &str = "\u{0}none";
+
+/// Resolve an app by public key, caching the result in Redis.
+///
+/// Unknown keys are cached too (briefly). Without that, every request bearing a
+/// bogus key is a guaranteed cache miss and therefore a database round-trip on
+/// an unauthenticated path — a cheap way to exhaust the ingest pool.
 async fn resolve_app(state: &AppState, key: &str) -> anyhow::Result<Option<AppRef>> {
     let cache_key = keys::dsn_cache(key);
     if let Some(cached) = state.redis.get(&cache_key).await? {
+        if cached == NEGATIVE_CACHE_MARKER {
+            return Ok(None);
+        }
         if let Ok(a) = serde_json::from_str::<AppRef>(&cached) {
             return Ok(Some(a));
         }
     }
 
     let mut conn = sauron_db::conn(&state.pool).await?;
-    let Some(app) = sauron_db::repo::find_app_by_public_key(&mut conn, key).await? else {
-        return Ok(None);
-    };
-    let Some((project_id, org_id)) = sauron_db::repo::app_ancestry(&mut conn, app.id).await? else {
-        return Ok(None);
-    };
-    let aref = AppRef {
-        app_id: app.id,
-        project_id,
-        org_id,
-        ingest_enabled: app.ingest_enabled,
-    };
-    if let Ok(json) = serde_json::to_string(&aref) {
-        let _ = state.redis.set_ex(&cache_key, &json, 300).await;
+    let resolved =
+        match sauron_db::repo::find_app_by_public_key(&mut conn, key).await? {
+            Some(app) => sauron_db::repo::app_ancestry(&mut conn, app.id).await?.map(
+                |(project_id, org_id)| AppRef {
+                    app_id: app.id,
+                    project_id,
+                    org_id,
+                    ingest_enabled: app.ingest_enabled,
+                },
+            ),
+            None => None,
+        };
+    drop(conn);
+
+    match resolved {
+        Some(aref) => {
+            if let Ok(json) = serde_json::to_string(&aref) {
+                let _ = state.redis.set_ex(&cache_key, &json, 300).await;
+            }
+            Ok(Some(aref))
+        }
+        None => {
+            // Short TTL so a key that is created moments later still works.
+            let _ = state
+                .redis
+                .set_ex(&cache_key, NEGATIVE_CACHE_MARKER, 30)
+                .await;
+            Ok(None)
+        }
     }
-    Ok(Some(aref))
 }
 
-fn client_ip(headers: &HeaderMap) -> Option<String> {
+fn rate_limited() -> axum::response::Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("retry-after", "60")],
+        Json(json!({ "error": { "code": "rate_limited", "message": "quota exceeded" } })),
+    )
+        .into_response()
+}
+
+/// The client IP, honouring forwarding headers **only** when configured to.
+///
+/// `X-Forwarded-For` / `X-Real-IP` are trivially spoofable by any client. When
+/// the service is exposed directly, trusting them lets a caller attribute events
+/// to arbitrary addresses; `INGEST_TRUST_FORWARDED_HEADERS=1` is the operator's
+/// assertion that a trusted reverse proxy sets them.
+fn client_ip(headers: &HeaderMap, cfg: &Config) -> Option<String> {
+    if !cfg.ingest_trust_forwarded_headers {
+        return None;
+    }
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .or_else(|| {
             headers
                 .get("x-real-ip")
                 .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
         })
 }
 

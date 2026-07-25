@@ -12,6 +12,40 @@ use uuid::Uuid;
 
 use crate::schema::*;
 
+/// Serialize a client IP in coarsened form.
+///
+/// Raw end-user IPs are personal data, and every read endpoint that returns
+/// events/sessions is reachable with the ordinary `event:read` permission the
+/// preset Viewer role holds. Masking the host portion (IPv4 → /24, IPv6 → /48)
+/// keeps the network/geo signal a dashboard actually uses while removing the
+/// ability to harvest identifiable addresses at scale. Storage is unchanged —
+/// only what leaves the API is coarsened.
+pub fn serialize_masked_ip<S>(ip: &Option<String>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match ip.as_deref().map(mask_ip) {
+        Some(masked) => s.serialize_some(&masked),
+        None => s.serialize_none(),
+    }
+}
+
+/// Coarsen an IP literal; unparseable input becomes `None`-like `"invalid"`
+/// rather than being echoed back verbatim.
+fn mask_ip(raw: &str) -> String {
+    match raw.trim().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let seg = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", seg[0], seg[1], seg[2])
+        }
+        Err(_) => "invalid".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Organizations & users
 // ---------------------------------------------------------------------------
@@ -197,6 +231,14 @@ pub struct Issue {
     pub assignee_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Ingest-side clock, advanced only when a new event lands on this issue.
+    /// The regression trigger keys off this rather than `last_seen` (which is
+    /// client-supplied) or `updated_at` (which status changes also bump).
+    ///
+    /// Internal watermark — not part of the API contract, so it stays out of
+    /// the serialized issue the dashboard consumes.
+    #[serde(skip_serializing)]
+    pub last_event_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Insertable)]
@@ -235,6 +277,7 @@ pub struct ErrorEvent {
     pub distinct_id: Option<String>,
     pub event_user: Option<Value>,
     pub sdk: Option<Value>,
+    #[serde(serialize_with = "serialize_masked_ip")]
     pub ip_address: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
@@ -305,6 +348,7 @@ pub struct AnalyticsEvent {
     pub context: Value,
     pub session_id: Option<String>,
     pub release: Option<String>,
+    #[serde(serialize_with = "serialize_masked_ip")]
     pub ip_address: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
@@ -366,6 +410,8 @@ pub struct RefreshToken {
     pub revoked_at: Option<DateTime<Utc>>,
     pub user_agent: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Why this token was revoked — see [`crate::repo::REVOKE_ROTATED`].
+    pub revoked_reason: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -397,6 +443,7 @@ pub struct Session {
     pub context: Value,
     pub release: Option<String>,
     pub environment_id: Option<Uuid>,
+    #[serde(serialize_with = "serialize_masked_ip")]
     pub ip_address: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -446,6 +493,7 @@ pub struct Transaction {
     pub session_id: Option<String>,
     pub device_key: Option<String>,
     pub release: Option<String>,
+    #[serde(serialize_with = "serialize_masked_ip")]
     pub ip_address: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
@@ -581,4 +629,133 @@ pub struct NewSymbolArtifact {
     pub blob_sha256: Vec<u8>,
     pub prebuilt_index_sha256: Option<Vec<u8>>,
     pub uploaded_by: Option<Uuid>,
+}
+
+// ---------------------------------------------------------------------------
+// Alerting: notification channels, rules, deliveries
+// ---------------------------------------------------------------------------
+
+/// A configured delivery destination. `secret_enc` holds the AES-GCM ciphertext
+/// of the channel's secret bundle and is NEVER serialized to API clients.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = notification_channels)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct NotificationChannel {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub config: Value,
+    #[serde(skip_serializing)]
+    pub secret_enc: Option<Vec<u8>>,
+    pub enabled: bool,
+    pub created_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = notification_channels)]
+pub struct NewNotificationChannel<'a> {
+    pub org_id: Uuid,
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub config: &'a Value,
+    pub secret_enc: Option<Vec<u8>>,
+    pub created_by: Option<Uuid>,
+}
+
+/// An admin-defined trigger. `conditions` is a free-form bag interpreted per
+/// `trigger_type` (threshold / comparator / window / filters / spike factor…).
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = alert_rules)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AlertRule {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub app_id: Option<Uuid>,
+    pub name: String,
+    pub trigger_type: String,
+    pub enabled: bool,
+    pub conditions: Value,
+    pub severity: String,
+    pub throttle_seconds: i32,
+    pub message_template: Option<String>,
+    pub last_evaluated_at: Option<DateTime<Utc>>,
+    pub created_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = alert_rules)]
+pub struct NewAlertRule<'a> {
+    pub org_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub app_id: Option<Uuid>,
+    pub name: &'a str,
+    pub trigger_type: &'a str,
+    pub conditions: &'a Value,
+    pub severity: &'a str,
+    pub throttle_seconds: i32,
+    pub message_template: Option<&'a str>,
+    pub last_evaluated_at: Option<DateTime<Utc>>,
+    pub created_by: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = alert_events)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AlertEventRow {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub rule_id: Option<Uuid>,
+    pub channel_id: Option<Uuid>,
+    pub trigger_type: String,
+    pub dedup_key: String,
+    pub status: String,
+    pub title: String,
+    pub body: String,
+    pub error: Option<String>,
+    pub attempts: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = alert_events)]
+pub struct NewAlertEvent<'a> {
+    pub org_id: Uuid,
+    pub rule_id: Option<Uuid>,
+    pub channel_id: Option<Uuid>,
+    pub trigger_type: &'a str,
+    pub dedup_key: &'a str,
+    pub status: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub error: Option<&'a str>,
+    pub attempts: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_ip;
+
+    #[test]
+    fn masks_ipv4_to_slash_24() {
+        assert_eq!(mask_ip("203.0.113.42"), "203.0.113.0/24");
+        assert_eq!(mask_ip(" 8.8.8.8 "), "8.8.8.0/24");
+    }
+
+    #[test]
+    fn masks_ipv6_to_slash_48() {
+        assert_eq!(mask_ip("2606:4700:4700::1111"), "2606:4700:4700::/48");
+    }
+
+    #[test]
+    fn unparseable_is_not_echoed_back() {
+        // Never reflect arbitrary stored text into the response.
+        assert_eq!(mask_ip("not-an-ip"), "invalid");
+        assert_eq!(mask_ip("<script>"), "invalid");
+    }
 }

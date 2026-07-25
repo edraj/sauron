@@ -113,15 +113,26 @@ export class BoundedQueue {
   }
 
   /**
-   * Take the whole queued batch, moving it "in flight". The transport must
-   * later {@link commit} it (delivered/dropped) or {@link restore} it (failed).
+   * Take up to `maxItems` queued entries, moving them "in flight". The
+   * transport must later {@link commit} them (delivered/dropped) or
+   * {@link restore} them (failed).
+   *
+   * The cap matters. Draining everything put the whole queue in one envelope,
+   * so a backlog accumulated during an outage could exceed the server's
+   * per-envelope item limit and be rejected outright — and a non-retryable
+   * rejection commits, deleting every persisted file the backlog was made of.
    */
-  drain(): EnvelopeItem[] {
-    const batch = this.entries;
-    this.entries = [];
-    this.byteCount = 0;
+  drain(maxItems?: number): EnvelopeItem[] {
+    const limit = maxItems && maxItems > 0 ? maxItems : this.entries.length;
+    const batch = this.entries.splice(0, limit);
+    this.byteCount = this.entries.reduce((n, e) => n + e.size, 0);
     if (batch.length > 0) this.inflight.push(...batch);
     return batch.map((e) => e.item);
+  }
+
+  /** Entries still queued, excluding anything currently in flight. */
+  get pending(): number {
+    return this.entries.length;
   }
 
   /** Delivered (or intentionally dropped): forget the in-flight batch and delete its files. */

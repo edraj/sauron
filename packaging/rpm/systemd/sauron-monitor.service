@@ -10,6 +10,10 @@ User=sauron
 Group=sauron
 EnvironmentFile=/etc/sauron/sauron.env
 EnvironmentFile=-/etc/sauron/monitor.env
+# Monitor fires up/down alerts inline and derives the channel-secret key from
+# JWT_SECRET when NOTIFY_SECRET_KEY is unset, so it needs the same secret the
+# API uses — otherwise stored channel secrets will not decrypt.
+EnvironmentFile=/etc/sauron/secret.env
 ExecStart=/usr/bin/sauron-monitor
 Restart=on-failure
 RestartSec=2

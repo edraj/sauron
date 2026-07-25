@@ -8,7 +8,9 @@ pub mod rbac;
 
 pub use extractors::{AuthError, AuthUser};
 pub use jwt::{hash_token, Claims, JwtKeys};
-pub use password::{hash_password, verify_password};
+pub use password::{
+    hash_password, hash_password_async, spend_dummy_verify, verify_password, verify_password_async,
+};
 pub use rbac::{
     authorize_app, authorize_org, authorize_project, effective_at, effective_at_org,
     ensure_preset_roles, perm, require_permission,

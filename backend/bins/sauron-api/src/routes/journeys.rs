@@ -48,8 +48,9 @@ pub async fn explore(
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
     let depth = q.depth.clamp(2, 10);
 
-    let nodes = repo::journey_nodes(&mut conn, app_id, since, depth).await?;
-    let links = repo::journey_links(&mut conn, app_id, since, depth).await?;
+    // One query for both halves of the graph: the step-indexed window CTE is
+    // the expensive part and was previously evaluated once per result set.
+    let (nodes, links) = repo::journey_graph(&mut conn, app_id, since, depth).await?;
 
     Ok(Json(Journey {
         depth,

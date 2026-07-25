@@ -31,7 +31,20 @@ Sender = Callable[[str, Dict[str, str], bytes], Any]
 MAX_BACKOFF_SECONDS = 30.0
 
 # Non-2xx statuses we retry (in addition to network errors and any 5xx).
-_RETRYABLE_STATUSES = frozenset({408, 413, 429})
+# 413 is absent on purpose: the body is what the server rejected, so resending
+# it unchanged can only fail the same way. It is handled by shrinking instead.
+_RETRYABLE_STATUSES = frozenset({408, 429})
+
+# Ceiling on items per envelope, matching the server's own limit. Exceeding it
+# is a non-retryable 400, so an unbounded envelope could never be delivered.
+MAX_ITEMS_PER_ENVELOPE = 1000
+
+# Outcomes of one send attempt, which the caller needs to tell apart:
+# a rejected envelope must have its persisted copies deleted (they would poison
+# every future process), while a transient failure must keep them for retry.
+_DELIVERED = "delivered"
+_REJECTED = "rejected"
+_TRANSIENT = "transient"
 
 
 def urllib_sender(
@@ -218,35 +231,49 @@ class Transport:
 
     def _drain(self) -> List[QueueEntry]:
         with self._cond:
-            return self._queue.drain()
+            return self._queue.drain(MAX_ITEMS_PER_ENVELOPE)
 
     def _flush_once(self) -> None:
-        entries = self._drain()
-        if not entries:
+        # Loop so a backlog larger than one envelope still drains fully rather
+        # than trickling out one envelope per tick.
+        while True:
+            entries = self._drain()
+            if not entries:
+                return
+            outcome = self._send([e.item for e in entries])
+            if outcome == _DELIVERED:
+                # Delivered — drop the persisted copies (if any).
+                self._queue.confirm(entries)
+                continue
+            if outcome == _REJECTED:
+                # The server refused this envelope and would refuse it again;
+                # the payload itself is the problem. Delete the persisted copies
+                # too, otherwise every future process reloads the same poison
+                # from disk, resends it, and is rejected forever.
+                self._queue.confirm(entries)
+            # Transient: the in-memory copies are gone, but any persisted files
+            # remain so the next process can recover them (at-least-once).
             return
-        delivered = self._send([e.item for e in entries])
-        if delivered:
-            # Delivered — drop the persisted copies (if any).
-            self._queue.confirm(entries)
-        # On failure the in-memory copies are gone; any persisted files remain
-        # so the next process can recover and retry them (at-least-once).
 
     # -- send + retry ------------------------------------------------------
 
-    def _send(self, items: List[Dict[str, Any]]) -> bool:
+    def _send(self, items: List[Dict[str, Any]]) -> str:
         """POST one envelope, applying the shared retry policy.
 
-        Returns ``True`` when the batch was delivered (2xx), ``False`` when it
-        was dropped (non-retryable status, auth failure, or retries exhausted).
+        Returns one of :data:`_DELIVERED`, :data:`_REJECTED` (the server will
+        never accept this payload) or :data:`_TRANSIENT` (worth another try
+        later). The caller uses that to decide whether the persisted copies
+        should be deleted or kept.
         """
         if self._disabled:
-            return False
+            return _REJECTED
         envelope = self._make_envelope(items)
         try:
             body = json.dumps(envelope, default=str).encode("utf-8")
         except (TypeError, ValueError) as exc:
+            # Unserializable payload: retrying cannot help.
             self._log("failed to serialize envelope, dropping", exc)
-            return False
+            return _REJECTED
 
         body, gzip_headers = maybe_gzip(body, self._gzip_threshold)
 
@@ -268,13 +295,29 @@ class Transport:
 
             # Delivered.
             if status is not None and 200 <= status < 300:
-                return True
+                return _DELIVERED
 
             # Bad key — stop retrying and disable the client for good.
             if status in (401, 403):
                 self._log("auth rejected (status=%s), disabling" % status)
                 self.disable()
-                return False
+                return _REJECTED
+
+            # Too large. Resending the same bytes cannot succeed, so halve the
+            # envelope and hand the remainder back for a later, smaller flush.
+            if status == 413:
+                if len(items) > 1:
+                    half = max(1, len(items) // 2)
+                    self._log(
+                        "envelope too large (413); retrying with %d of %d item(s)"
+                        % (half, len(items))
+                    )
+                    first = self._send(items[:half])
+                    if first != _DELIVERED:
+                        return first
+                    return self._send(items[half:])
+                self._log("single item rejected as too large (413); dropping it")
+                return _REJECTED
 
             # Non-retryable (400/404 and other client errors): drop.
             if not _is_retryable(status):
@@ -282,15 +325,15 @@ class Transport:
                     "dropping %d item(s) on non-retryable status %s"
                     % (len(items), status)
                 )
-                return False
+                return _REJECTED
 
             # Transient: retry with backoff until we run out of retries.
             if attempt >= self._max_retries:
                 self._log(
-                    "dropping %d item(s) after %d attempts (last status=%s)"
+                    "giving up on %d item(s) after %d attempts (last status=%s)"
                     % (len(items), self._max_retries + 1, status)
                 )
-                return False
+                return _TRANSIENT
 
             self._sleep(self._backoff_delay(attempt, status, resp_headers))
             attempt += 1

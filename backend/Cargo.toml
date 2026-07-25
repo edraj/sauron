@@ -19,6 +19,7 @@ sauron-telemetry = { path = "crates/sauron-telemetry" }
 sauron-monitor-core = { path = "crates/sauron-monitor-core" }
 sauron-tier = { path = "crates/sauron-tier" }
 sauron-symbols = { path = "crates/sauron-symbols" }
+sauron-alerts = { path = "crates/sauron-alerts" }
 
 # --- async runtime / http ---
 # Scoped tokio features (was "full") — only what the workspace actually uses:
@@ -37,13 +38,14 @@ tokio = { version = "1", features = [
 ] }
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["typed-header", "query"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.7", features = [
     "trace",
     "cors",
     "limit",
     "request-id",
     "timeout",
+    "set-header",
     "decompression-full",
 ] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
@@ -58,6 +60,9 @@ flate2 = "1"
 diesel = { version = "2.3", features = ["postgres_backend", "chrono", "uuid", "serde_json"] }
 diesel-async = { version = "0.9", features = ["postgres", "deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2.3"
+# Direct dep so the pool can configure acquire/create/recycle timeouts, which
+# deadpool only honours when a runtime is also configured.
+deadpool = { version = "0.13", features = ["rt_tokio_1"] }
 scoped-futures = "0.1"
 
 # --- redis ---
@@ -69,6 +74,18 @@ argon2 = { version = "0.5", features = ["std"] }
 getrandom = "0.3"
 sha2 = "0.11"
 hex = "0.4"
+# AES-256-GCM for encrypting notification-channel secrets at rest.
+aes-gcm = "0.10"
+
+# --- notifications / email ---
+# rustls-only (matches reqwest's rustls-tls); no OpenSSL. Async SMTP over Tokio.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "tokio1-rustls-tls",
+    "builder",
+    "hostname",
+    "pool",
+] }
 # pkg-config: link the system libzstd instead of compiling the vendored C source
 # (the slowest compile unit at ~38s). libzstd is present on every Fedora/RHEL host;
 # needs libzstd-devel at build. Feature-unifies across the transitive zstd-sys pulled

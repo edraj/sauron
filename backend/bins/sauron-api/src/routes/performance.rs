@@ -34,6 +34,13 @@ fn default_days() -> i64 {
     7
 }
 
+/// Longest window a percentile query may span.
+///
+/// `percentile_cont` is an exact aggregate: it sorts every matching row, so cost
+/// grows linearly with the window while the answer barely changes past a few
+/// weeks. 365 days let one request sort an app's entire transaction history.
+const MAX_PERF_WINDOW_DAYS: i64 = 90;
+
 pub async fn summary(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -42,7 +49,7 @@ pub async fn summary(
 ) -> Result<Json<Vec<PerfSummaryRow>>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let since = Utc::now() - Duration::days(q.since_days.clamp(1, MAX_PERF_WINDOW_DAYS));
     let op = q.op.as_deref().filter(|s| !s.is_empty());
     Ok(Json(
         repo::performance_summary(&mut conn, app_id, since, op, None).await?,
@@ -57,7 +64,7 @@ pub async fn series(
 ) -> Result<Json<Vec<PerfSeriesPoint>>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let since = Utc::now() - Duration::days(q.since_days.clamp(1, MAX_PERF_WINDOW_DAYS));
     let name = q.name.as_deref().filter(|s| !s.is_empty());
     let op = q.op.as_deref().filter(|s| !s.is_empty());
     Ok(Json(

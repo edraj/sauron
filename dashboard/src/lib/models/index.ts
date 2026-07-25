@@ -97,8 +97,9 @@ export interface Environment {
 
 export interface FirstEventStatus {
   received: boolean;
-  errors: number;
-  events: number;
+  /** Presence flags, not counts — the API does an existence check only. */
+  errors: boolean;
+  events: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +128,8 @@ export type Permission =
   | 'member:manage'
   | 'role:manage'
   | 'org:manage'
+  | 'alert:read'
+  | 'alert:write'
   | (string & {});
 
 // One entry in the `grants` array of GET /v1/orgs/{org}/access — the scoped set
@@ -730,4 +733,94 @@ export interface MonitorCheck {
   response_time_ms: number | null;
   status_code: number | null;
   error: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Alerting: notification channels, rules, delivery history
+// ---------------------------------------------------------------------------
+
+export type ChannelKind = 'email' | 'slack' | 'discord' | 'matrix' | 'telegram' | 'webhook';
+
+export type TriggerType =
+  | 'monitor_down'
+  | 'monitor_up'
+  | 'issue_new'
+  | 'issue_regression'
+  | 'error_threshold'
+  | 'error_spike'
+  | 'event_threshold'
+  | 'perf_degradation';
+
+export type AlertSeverity = 'info' | 'warning' | 'critical';
+
+export interface NotificationChannel {
+  id: string;
+  org_id: string;
+  name: string;
+  kind: ChannelKind;
+  /** Non-secret settings (host/port/from/to, room id, chat id, headers…). */
+  config: Record<string, unknown>;
+  enabled: boolean;
+  /** Whether a secret bundle is stored. The secret itself is never returned. */
+  has_secret: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AlertRule {
+  id: string;
+  org_id: string;
+  project_id: string | null;
+  app_id: string | null;
+  name: string;
+  trigger_type: TriggerType;
+  enabled: boolean;
+  conditions: AlertConditions;
+  severity: AlertSeverity;
+  throttle_seconds: number;
+  message_template: string | null;
+  last_evaluated_at: string | null;
+  created_at: string;
+  updated_at: string;
+  channel_ids: string[];
+}
+
+export interface AlertConditions {
+  comparator?: 'gte' | 'gt' | 'lte' | 'lt' | 'eq';
+  threshold?: number;
+  window_seconds?: number;
+  spike_factor?: number;
+  metric?: string;
+  filters?: {
+    level?: string;
+    environment?: string;
+    event_name?: string;
+    tag_key?: string;
+    tag_value?: string;
+    op?: string;
+  };
+}
+
+export interface AlertEvent {
+  id: string;
+  org_id: string;
+  rule_id: string | null;
+  channel_id: string | null;
+  trigger_type: string;
+  dedup_key: string;
+  status: 'sent' | 'failed' | 'throttled' | 'skipped';
+  title: string;
+  body: string;
+  error: string | null;
+  attempts: number;
+  created_at: string;
+}
+
+export interface AlertMeta {
+  channel_kinds: ChannelKind[];
+  trigger_types: { key: TriggerType; metric: boolean }[];
+  comparators: string[];
+  severities: AlertSeverity[];
+  metrics: string[];
+  template_vars: Record<string, string[]>;
 }

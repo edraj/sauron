@@ -35,8 +35,18 @@ interface HeaderMap {
 /** Build a fetch that yields a queued sequence of responses. */
 function scriptedFetch(script: Array<number | { status: number; retryAfter?: string } | 'throw'>) {
   const statuses: number[] = [];
+  /** Items carried by each request, so tests can assert envelope sizes. */
+  const sizes: number[] = [];
   let i = 0;
-  const fetchImpl: FetchLike = async () => {
+  const fetchImpl: FetchLike = async (_url: string, init?: { body?: unknown }) => {
+    const body = init?.body;
+    if (typeof body === 'string') {
+      try {
+        sizes.push((JSON.parse(body).items as unknown[]).length);
+      } catch {
+        /* gzipped or unparseable — size assertions opt out via gzipThresholdBytes */
+      }
+    }
     const step = script[Math.min(i, script.length - 1)];
     i += 1;
     if (step === 'throw') {
@@ -53,7 +63,7 @@ function scriptedFetch(script: Array<number | { status: number; retryAfter?: str
       headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
     };
   };
-  return { fetchImpl, statuses, calls: () => i };
+  return { fetchImpl, statuses, sizes, calls: () => i };
 }
 
 function makeTransport(fetchImpl: FetchLike, sleeps: number[], overrides = {}) {
@@ -113,8 +123,8 @@ describe('retry policy', () => {
     expect(script.calls()).toBe(1);
   });
 
-  it('retries 408, 413 and 5xx', async () => {
-    for (const code of [408, 413, 500, 502, 503]) {
+  it('retries 408 and 5xx', async () => {
+    for (const code of [408, 500, 502, 503]) {
       const sleeps: number[] = [];
       const script = scriptedFetch([code, 200]);
       const t = makeTransport(script.fetchImpl, sleeps);
@@ -122,6 +132,34 @@ describe('retry policy', () => {
       await t.flush();
       expect(script.calls(), `status ${code} should retry`).toBe(2);
     }
+  });
+
+  // 413 is deliberately NOT retried as-is: the body is what the server
+  // rejected, so an identical retry can only fail identically. A full queue
+  // used to wedge the transport permanently that way.
+  it('shrinks and re-buffers on 413 instead of retrying the same body', async () => {
+    const sleeps: number[] = [];
+    const script = scriptedFetch([413, 200, 200]);
+    const t = makeTransport(script.fetchImpl, sleeps);
+    t.enqueue(evt());
+    t.enqueue(evt());
+    await t.flush();
+    // One rejected attempt, not two identical ones.
+    expect(script.calls(), '413 must not retry the same body').toBe(1);
+    // The items were kept, so a later flush delivers them.
+    await t.flush();
+    expect(script.calls()).toBeGreaterThan(1);
+  });
+
+  it('drops a single item that is too large, rather than looping forever', async () => {
+    const sleeps: number[] = [];
+    const script = scriptedFetch([413, 413, 413, 413]);
+    const t = makeTransport(script.fetchImpl, sleeps);
+    t.enqueue(evt());
+    await t.flush();
+    await t.flush();
+    // Second flush finds an empty queue: the unsendable item was discarded.
+    expect(script.calls()).toBe(1);
   });
 
   it('retries a network error then succeeds', async () => {
@@ -168,5 +206,40 @@ describe('retry policy', () => {
     t.enqueue(evt());
     await t.flush();
     expect(script.calls()).toBe(1);
+  });
+});
+
+// The server rejects an envelope carrying more than 1000 items with a
+// non-retryable 400, which commits the batch and unlinks its persisted files —
+// so an uncapped drain could destroy a whole offline backlog in one request.
+describe('envelope item cap', () => {
+  it('splits a backlog larger than the cap across several envelopes', async () => {
+    const sleeps: number[] = [];
+    const script = scriptedFetch([200]);
+    const t = makeTransport(script.fetchImpl, sleeps, {
+      maxQueueBytes: 64 * 1024 * 1024,
+      maxItemsPerEnvelope: 100,
+      gzipThresholdBytes: Number.MAX_SAFE_INTEGER,
+    });
+    for (let i = 0; i < 250; i += 1) t.enqueue(evt(`e${i}`));
+    await t.flush();
+    // 250 items at 100 per envelope → 3 requests, none oversized.
+    expect(script.calls()).toBe(3);
+    expect(script.sizes.every((n) => n <= 100)).toBe(true);
+    expect(script.sizes.reduce((a, b) => a + b, 0)).toBe(250);
+  });
+
+  it('never exceeds the cap even when maxBatch is larger', async () => {
+    const sleeps: number[] = [];
+    const script = scriptedFetch([200]);
+    const t = makeTransport(script.fetchImpl, sleeps, {
+      maxQueueBytes: 64 * 1024 * 1024,
+      maxBatch: 5000,
+      maxItemsPerEnvelope: 1000,
+      gzipThresholdBytes: Number.MAX_SAFE_INTEGER,
+    });
+    for (let i = 0; i < 1500; i += 1) t.enqueue(evt(`e${i}`));
+    await t.flush();
+    expect(Math.max(...script.sizes)).toBeLessThanOrEqual(1000);
   });
 });

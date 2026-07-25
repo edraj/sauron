@@ -13,12 +13,39 @@ use redis::{AsyncCommands, AsyncConnectionConfig};
 
 /// Redis key names / conventions in one place.
 pub mod keys {
+    use sha2::{Digest, Sha256};
+
     pub const INGEST_STREAM: &str = "sauron:ingest:stream";
     pub const INGEST_DLQ: &str = "sauron:ingest:dlq";
     pub const CONSUMER_GROUP: &str = "workers";
 
+    /// Truncated SHA-256 of a DSN public key, so the credential itself never
+    /// becomes a Redis key name (they show up in `KEYS`/`MONITOR` output and
+    /// slow-log entries).
+    ///
+    /// Callers should not need this directly — [`dsn_cache`] and
+    /// [`key_rate_limit`] apply it themselves. It is public only for callers
+    /// that must build a related key.
+    pub fn key_fingerprint(public_key: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(public_key.as_bytes());
+        hex::encode(&h.finalize()[..16])
+    }
+
+    /// Cache slot for a resolved DSN. Takes the **raw** public key and
+    /// fingerprints it internally.
+    ///
+    /// Hashing lives here rather than at the call site on purpose: when the
+    /// ingest edge hashed but the API's invalidation path did not, every
+    /// `DEL` silently missed and a rotated (revoked) key kept resolving for
+    /// the full positive-cache TTL. One caller cannot now disagree with
+    /// another about how the key is derived.
     pub fn dsn_cache(public_key: &str) -> String {
-        format!("sauron:dsn:{public_key}")
+        format!("sauron:dsn:{}", key_fingerprint(public_key))
+    }
+    /// Per-DSN-key ingest rate-limit counter. Takes the **raw** public key.
+    pub fn key_rate_limit(public_key: &str) -> String {
+        format!("sauron:rl:key:{}", key_fingerprint(public_key))
     }
     pub fn rate_limit(project_id: &str) -> String {
         format!("sauron:rl:{project_id}")
@@ -86,6 +113,35 @@ impl RedisStore {
         let mut c = self.conn.clone();
         redis::cmd("DEL").arg(key).query_async::<()>(&mut c).await?;
         Ok(())
+    }
+
+    /// Liveness check for readiness probes.
+    ///
+    /// Ingest cannot accept a single envelope without Redis — the stream is the
+    /// queue — so a readiness probe that only checks Postgres reports healthy
+    /// while every request fails, and an orchestrator keeps routing to it.
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        let mut c = self.conn.clone();
+        redis::cmd("PING").query_async::<()>(&mut c).await?;
+        Ok(())
+    }
+
+    /// `SET key value NX EX ttl` — atomically claim `key` for `ttl_secs` if it is
+    /// not already set. Returns `true` when the caller won the claim (key was
+    /// absent), `false` when it already existed. Used as a cross-process throttle
+    /// / dedup guard for alert delivery.
+    pub async fn set_nx_ex(&self, key: &str, value: &str, ttl_secs: u64) -> anyhow::Result<bool> {
+        let mut c = self.conn.clone();
+        // A successful SET NX replies +OK; a rejected one replies nil.
+        let res: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs.max(1))
+            .query_async(&mut c)
+            .await?;
+        Ok(res.is_some())
     }
 
     // --- rate limiting (fixed window) -------------------------------------
@@ -170,6 +226,42 @@ impl RedisStore {
                     let payload: String = redis::from_redis_value(v.clone()).unwrap_or_default();
                     out.push((entry.id, payload));
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Adopt entries that have sat unacknowledged in the consumer group's
+    /// pending-entries list for longer than `min_idle_ms`.
+    ///
+    /// `read_group` always reads with `>` (never-delivered entries only), so an
+    /// entry whose consumer died after delivery but before ack is never
+    /// redelivered on its own — it would be stranded in the PEL forever. This
+    /// `XAUTOCLAIM` sweep is what makes at-least-once delivery actually hold
+    /// across a worker crash.
+    pub async fn claim_stale(
+        &self,
+        consumer: &str,
+        min_idle_ms: usize,
+        count: usize,
+    ) -> anyhow::Result<Vec<StreamEntry>> {
+        let mut c = self.conn.clone();
+        let reply: redis::streams::StreamAutoClaimReply = redis::cmd("XAUTOCLAIM")
+            .arg(keys::INGEST_STREAM)
+            .arg(keys::CONSUMER_GROUP)
+            .arg(consumer)
+            .arg(min_idle_ms)
+            .arg("0-0")
+            .arg("COUNT")
+            .arg(count)
+            .query_async(&mut c)
+            .await?;
+
+        let mut out = Vec::new();
+        for entry in reply.claimed {
+            if let Some(v) = entry.map.get("d") {
+                let payload: String = redis::from_redis_value(v.clone()).unwrap_or_default();
+                out.push((entry.id, payload));
             }
         }
         Ok(out)

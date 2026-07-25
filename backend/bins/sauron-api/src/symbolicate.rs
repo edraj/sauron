@@ -2,8 +2,12 @@
 //! against uploaded source maps, attach source context to the response, and
 //! (for hot partitions) persist a lean symbolicated copy back.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use chrono::{Duration, Utc};
 use serde_json::Value;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use sauron_db::models::ErrorEvent;
@@ -13,43 +17,86 @@ use sauron_symbols::{ArtifactRef, BlobFetch, RawFrame, Status};
 
 use crate::AppState;
 
-/// A DB + isolated-Redis backed [`BlobFetch`]. Checks out a pooled connection
-/// per call so it composes cleanly inside async handlers.
+/// A DB + isolated-Redis backed [`BlobFetch`].
+///
+/// Artifact lookups are memoized for the lifetime of the instance. A single
+/// issue's event list is overwhelmingly one release (or one debug id), so
+/// without memoization symbolicating N unresolved events issued N identical
+/// artifact queries and checked out N pooled connections. Share one instance
+/// across a request (see [`symbolicate_events`]) and it becomes one query.
 pub struct SqlBlobFetch {
     pool: PgPool,
     app_id: Uuid,
     cache: SymbolBlobCache,
     max_uncompressed: usize,
+    js_memo: Mutex<HashMap<String, Vec<ArtifactRef>>>,
+    dart_memo: Mutex<HashMap<String, Vec<ArtifactRef>>>,
+}
+
+impl SqlBlobFetch {
+    fn new(state: &AppState, app_id: Uuid) -> Self {
+        Self {
+            pool: state.pool.clone(),
+            app_id,
+            cache: state.symbols.clone(),
+            max_uncompressed: state.cfg.symbols_max_uncompressed_mb * 1024 * 1024,
+            js_memo: Mutex::new(HashMap::new()),
+            dart_memo: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl BlobFetch for SqlBlobFetch {
     async fn js_artifacts(&self, release: &str) -> Vec<ArtifactRef> {
+        if let Some(hit) = self.js_memo.lock().await.get(release) {
+            return hit.clone();
+        }
         let Ok(mut conn) = sauron_db::conn(&self.pool).await else {
             return Vec::new();
         };
         let rows = sauron_db::repo::find_artifacts_for_release(&mut conn, self.app_id, release)
             .await
             .unwrap_or_default();
-        rows.into_iter()
+        let refs: Vec<ArtifactRef> = rows
+            .into_iter()
             .filter(|a| a.kind == "js_sourcemap")
             .map(|a| ArtifactRef {
                 name: a.name,
                 blob_sha256: a.blob_sha256,
             })
-            .collect()
+            .collect();
+        self.js_memo
+            .lock()
+            .await
+            .insert(release.to_string(), refs.clone());
+        refs
     }
 
     async fn dart_symbols(&self, debug_id: &str, _arch: Option<&str>) -> Vec<ArtifactRef> {
+        if let Some(hit) = self.dart_memo.lock().await.get(debug_id) {
+            return hit.clone();
+        }
         let Ok(mut conn) = sauron_db::conn(&self.pool).await else {
             return Vec::new();
         };
-        match sauron_db::repo::find_artifact_by_debug_id(&mut conn, self.app_id, debug_id).await {
+        let refs = match sauron_db::repo::find_artifact_by_debug_id(
+            &mut conn,
+            self.app_id,
+            debug_id,
+        )
+        .await
+        {
             Ok(Some(a)) if a.kind == "dart_symbols" => vec![ArtifactRef {
                 name: a.name,
                 blob_sha256: a.blob_sha256,
             }],
             _ => Vec::new(),
-        }
+        };
+        self.dart_memo
+            .lock()
+            .await
+            .insert(debug_id.to_string(), refs.clone());
+        refs
     }
 
     async fn blob(&self, sha: &[u8]) -> Option<Vec<u8>> {
@@ -87,6 +134,43 @@ pub fn strip_source_context(event: &mut ErrorEvent) {
 /// context) + `symbolication_status` on the response copy, and persists a copy
 /// for hot partitions that hadn't been symbolicated yet.
 pub async fn symbolicate_event(state: &AppState, app_id: Uuid, event: &mut ErrorEvent) {
+    let fetch = SqlBlobFetch::new(state, app_id);
+    symbolicate_with(state, &fetch, event).await;
+}
+
+/// Symbolicate a batch of events sharing one [`SqlBlobFetch`], so the artifact
+/// lookup runs once per distinct release/debug id rather than once per event.
+pub async fn symbolicate_events(state: &AppState, app_id: Uuid, events: &mut [ErrorEvent]) {
+    let fetch = SqlBlobFetch::new(state, app_id);
+    for ev in events.iter_mut() {
+        symbolicate_with(state, &fetch, ev).await;
+    }
+}
+
+/// Concurrency ceiling for on-read symbolication.
+///
+/// Resolving an unsymbolicated event decompresses a blob and parses a source map
+/// (or walks DWARF via addr2line) — hundreds of milliseconds of CPU on input the
+/// uploader controls. Nothing else bounds how many of these run at once, so a
+/// handful of concurrent requests over unsymbolicated events could occupy every
+/// runtime thread. A small permit pool keeps that work from starving unrelated
+/// requests; waiters queue instead of piling onto the executor.
+static SYMBOLICATION_SLOTS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+fn symbolication_permits() -> &'static tokio::sync::Semaphore {
+    SYMBOLICATION_SLOTS.get_or_init(|| {
+        // Leave headroom for request handling; symbolication is a background-ish
+        // concern even when it happens on a read.
+        let n = (std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            / 2)
+        .max(1);
+        tokio::sync::Semaphore::new(n)
+    })
+}
+
+async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut ErrorEvent) {
     // Fast path: already fully symbolicated (at ingest or a prior read) and the
     // frames are stored with context — serve them as-is. This keeps issue/event
     // views cheap: no per-event artifact query, no re-parse (crucial for Dart,
@@ -101,12 +185,9 @@ pub async fn symbolicate_event(state: &AppState, app_id: Uuid, event: &mut Error
         return;
     }
 
-    let fetch = SqlBlobFetch {
-        pool: state.pool.clone(),
-        app_id,
-        cache: state.symbols.clone(),
-        max_uncompressed: state.cfg.symbols_max_uncompressed_mb * 1024 * 1024,
-    };
+    // Past the fast path, this event needs real work — take a permit so the
+    // number of concurrent decompress/parse/DWARF walks stays bounded.
+    let permit = symbolication_permits().acquire().await;
 
     // Dart AOT trace (in debug_meta.raw_stacktrace) → ELF/DWARF path; otherwise
     // the JS source-map path over the raw frames.
@@ -117,7 +198,7 @@ pub async fn symbolicate_event(state: &AppState, app_id: Uuid, event: &mut Error
                 let arch = dm.get("arch").and_then(|v| v.as_str());
                 state
                     .symbolicator
-                    .symbolicate_dart(&fetch, rt, build_id, arch)
+                    .symbolicate_dart(fetch, rt, build_id, arch)
                     .await
             }
             _ => return,
@@ -132,9 +213,15 @@ pub async fn symbolicate_event(state: &AppState, app_id: Uuid, event: &mut Error
         }
         state
             .symbolicator
-            .symbolicate_js(&fetch, event.release.as_deref(), &frames)
+            .symbolicate_js(fetch, event.release.as_deref(), &frames)
             .await
     };
+
+    // The CPU-bound work is done. Release the permit before the write-back
+    // below: the pool exists to bound parallel parsing, and holding it across a
+    // pool checkout plus an UPDATE made the effective concurrency limit far
+    // lower than the intended cores/2.
+    drop(permit);
 
     // Only override the response when we actually resolved something; otherwise
     // keep whatever was stored (e.g. an ingest-time pre-symbolication).

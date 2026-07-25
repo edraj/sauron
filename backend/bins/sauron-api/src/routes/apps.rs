@@ -95,8 +95,9 @@ pub async fn list_environments(
 #[derive(Serialize)]
 pub struct FirstEventResp {
     pub received: bool,
-    pub errors: i64,
-    pub events: i64,
+    /// Presence flags, not counts — the onboarding poll only needs "yet?".
+    pub errors: bool,
+    pub events: bool,
 }
 
 pub async fn first_event(
@@ -106,10 +107,12 @@ pub async fn first_event(
 ) -> Result<Json<FirstEventResp>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::APP_READ).await?;
-    let (errors, events) = repo::app_event_counts(&mut conn, app_id).await?;
+    // Existence check only — this is polled every few seconds during onboarding,
+    // and counting would scan every partition of the two largest tables.
+    let (has_errors, has_events) = repo::app_has_events(&mut conn, app_id).await?;
     Ok(Json(FirstEventResp {
-        received: errors + events > 0,
-        errors,
-        events,
+        received: has_errors || has_events,
+        errors: has_errors,
+        events: has_events,
     }))
 }

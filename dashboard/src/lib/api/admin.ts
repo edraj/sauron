@@ -27,7 +27,9 @@ export interface AppStorage {
   cold_rows_total: number;
   cold_bytes_total: number;
   estimated_hot_bytes_total: number;
+  /** Truncated by the API; `cold_files_total` is the untruncated count. */
   cold_files: ColdFile[];
+  cold_files_total: number;
 }
 
 export interface TableSize {

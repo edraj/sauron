@@ -1,7 +1,9 @@
 """Retry / backoff policy alignment (task B6).
 
 Shared policy table:
-- retry on 408 / 413 / 429 / 5xx and network errors
+- retry on 408 / 429 / 5xx and network errors
+- 413 is NOT retried unchanged: the envelope is split, and a lone item that
+  still will not fit is dropped
 - honor ``Retry-After`` on 429
 - DROP (no retry) on 400 / 401 / 403 / 404
 - give up after ``max_retries`` retries (default 3) and drop the batch
@@ -103,11 +105,19 @@ def test_network_error_retries_then_succeeds():
     assert sender.calls == 2
 
 
-def test_408_413_429_are_retryable():
-    for status in (408, 413, 429):
+def test_408_429_are_retryable():
+    for status in (408, 429):
         sender = ScriptedSender([status, 200])
         _drive(sender, max_retries=3)
         assert sender.calls == 2, status
+
+
+def test_413_is_not_retried_with_the_same_body():
+    # The body is exactly what the server rejected, so an identical retry can
+    # only fail identically. A lone item that doesn't fit is dropped instead.
+    sender = ScriptedSender([413, 200])
+    _drive(sender, max_retries=3)
+    assert sender.calls == 1
 
 
 # -- drop set -------------------------------------------------------------
@@ -162,3 +172,45 @@ def test_backoff_is_capped_at_30s():
     t = _drive(sender, max_retries=3, retry_base=1000.0)
     assert sender.calls == 4
     assert all(d <= 30.0 for d in t._slept)
+
+
+# -- envelope item cap ----------------------------------------------------
+# More than 1000 items in one envelope is a non-retryable 400 server-side, and
+# a rejection deletes the persisted copies — so an uncapped drain could destroy
+# a whole offline backlog in a single request.
+
+
+class SizeRecordingSender(ScriptedSender):
+    """Records how many items each request carried."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.sizes = []
+
+    def __call__(self, url, headers, body):
+        import gzip
+        import json
+
+        raw = body
+        if isinstance(raw, (bytes, bytearray)) and raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        try:
+            self.sizes.append(len(json.loads(raw)["items"]))
+        except Exception:
+            pass
+        return super().__call__(url, headers, body)
+
+
+def test_backlog_larger_than_cap_is_split_across_envelopes():
+    from sauron import _transport as tmod
+
+    sender = SizeRecordingSender([200])
+    t = _transport(sender, max_batch=100_000, max_queue_bytes=64 * 1024 * 1024)
+    for i in range(2500):
+        t.capture({"type": "event", "name": "e%d" % i, "distinct_id": "u"})
+    t.flush()
+    t.close(timeout=5)
+
+    assert sender.sizes, "no request was made"
+    assert max(sender.sizes) <= tmod.MAX_ITEMS_PER_ENVELOPE
+    assert sum(sender.sizes) == 2500

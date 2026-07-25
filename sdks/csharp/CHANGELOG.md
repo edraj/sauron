@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: a `413` head-of-line blocked the whole delivery queue.** The queue is FIFO and a
+  payload-too-large envelope was retried forever, so nothing behind it could ever be sent.
+  Such an envelope is now dropped with a log line instead.
+- **Fixed: oversized envelopes.** The whole buffer became one envelope, which could exceed
+  the server's 1000-item limit and be dropped as a non-retryable `400`. Envelopes are now
+  capped at `MaxItemsPerEnvelope` (default 1000).
+
 ## 0.3.0
 
 Parity release — the .NET SDK reaches the Browser/Flutter feature bar and converges on

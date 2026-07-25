@@ -105,6 +105,14 @@ fn ratio(num: i64, den: i64) -> f64 {
 // Saved funnel templates (CRUD)
 // ---------------------------------------------------------------------------
 
+/// Longest accepted event name in a funnel step. Steps are matched against
+/// `analytics_events.name`, so a longer value can never match anything real —
+/// it only bloats the stored definition and the query text.
+pub const MAX_STEP_LEN: usize = 200;
+/// Bounds on a saved funnel's own metadata.
+pub const MAX_FUNNEL_NAME_LEN: usize = 120;
+pub const MAX_FUNNEL_DESCRIPTION_LEN: usize = 1000;
+
 /// Shared 2..=10 step-count validation (matches `compute`).
 pub fn validate_steps(steps: &[String]) -> Result<(), String> {
     if steps.len() < 2 {
@@ -115,6 +123,29 @@ pub fn validate_steps(steps: &[String]) -> Result<(), String> {
     }
     if steps.iter().any(|s| s.trim().is_empty()) {
         return Err("steps cannot be empty".into());
+    }
+    if steps.iter().any(|s| s.len() > MAX_STEP_LEN) {
+        return Err(format!(
+            "a step name may be at most {MAX_STEP_LEN} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a saved funnel's name/description lengths.
+pub fn validate_metadata(name: &str, description: Option<&str>) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("a funnel name is required".into());
+    }
+    if name.len() > MAX_FUNNEL_NAME_LEN {
+        return Err(format!(
+            "name may be at most {MAX_FUNNEL_NAME_LEN} characters"
+        ));
+    }
+    if description.is_some_and(|d| d.len() > MAX_FUNNEL_DESCRIPTION_LEN) {
+        return Err(format!(
+            "description may be at most {MAX_FUNNEL_DESCRIPTION_LEN} characters"
+        ));
     }
     Ok(())
 }
@@ -147,6 +178,7 @@ pub async fn create_saved(
         return Err(ApiError::BadRequest("name is required".into()));
     }
     validate_steps(&req.steps).map_err(ApiError::BadRequest)?;
+    validate_metadata(&req.name, req.description.as_deref()).map_err(ApiError::BadRequest)?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::FUNNEL_WRITE).await?;
     let steps = serde_json::json!(req.steps);
@@ -172,6 +204,7 @@ pub async fn update_saved(
         return Err(ApiError::BadRequest("name is required".into()));
     }
     validate_steps(&req.steps).map_err(ApiError::BadRequest)?;
+    validate_metadata(&req.name, req.description.as_deref()).map_err(ApiError::BadRequest)?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::FUNNEL_WRITE).await?;
     let steps = serde_json::json!(req.steps);
@@ -206,7 +239,7 @@ pub async fn delete_saved(
 
 #[cfg(test)]
 mod validate_steps_tests {
-    use super::validate_steps;
+    use super::*;
 
     #[test]
     fn rejects_too_few() {
@@ -222,5 +255,17 @@ mod validate_steps_tests {
     #[test]
     fn accepts_two_to_ten() {
         assert!(validate_steps(&["a".into(), "b".into()]).is_ok());
+    }
+
+    #[test]
+    fn rejects_overlong_step_and_metadata() {
+        let long = "x".repeat(MAX_STEP_LEN + 1);
+        assert!(validate_steps(&["a".into(), long]).is_err());
+        assert!(validate_metadata("", None).is_err());
+        assert!(validate_metadata(&"n".repeat(MAX_FUNNEL_NAME_LEN + 1), None).is_err());
+        assert!(
+            validate_metadata("ok", Some(&"d".repeat(MAX_FUNNEL_DESCRIPTION_LEN + 1))).is_err()
+        );
+        assert!(validate_metadata("ok", Some("fine")).is_ok());
     }
 }

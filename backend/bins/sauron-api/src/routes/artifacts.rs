@@ -83,7 +83,16 @@ pub async fn upload(
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ARTIFACT_WRITE).await?;
 
-    let sha = sauron_symbols::sha256(&body);
+    // SHA-256 over up to `symbols_max_artifact_mb` of data is CPU-bound; running
+    // it inline parks a Tokio worker for the whole hash. Offload it (and the
+    // much heavier zstd compression below) to the blocking pool so uploads never
+    // stall unrelated request handling.
+    let sha = {
+        let body = body.clone();
+        tokio::task::spawn_blocking(move || sauron_symbols::sha256(&body))
+            .await
+            .map_err(|e| ApiError::Internal(format!("hash task failed: {e}")))?
+    };
     let sha_hex = sauron_symbols::hex(&sha);
 
     // Idempotency: by debug-id (Dart) or (release, name, content) for JS.
@@ -111,7 +120,15 @@ pub async fn upload(
         ));
     }
 
-    let compressed = sauron_symbols::compress(&body);
+    // zstd level 19 on a 128 MB artifact is seconds of CPU — by far the most
+    // expensive thing this handler does, and the reason it must not run on the
+    // async executor.
+    let compressed = {
+        let body = body.clone();
+        tokio::task::spawn_blocking(move || sauron_symbols::compress(&body))
+            .await
+            .map_err(|e| ApiError::Internal(format!("compress task failed: {e}")))?
+    };
     repo::put_blob(
         &mut conn,
         &sha,

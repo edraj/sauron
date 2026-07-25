@@ -73,7 +73,7 @@ See also: **[Home](Home.md)** · **[Ingest Wire Contract](Ingest-Wire-Contract.m
 - **gzip** compresses the request body once it exceeds `gzipThresholdBytes` (default 1024)
   and sets `Content-Encoding: gzip`; smaller bodies go out uncompressed. Node uses `zlib`,
   Python `gzip`, C# `GZipStream`, the browser native `CompressionStream` (fflate fallback).
-- **retry** follows a shared policy: retry transient failures (408/413/429/5xx and network
+- **retry** follows a shared policy: retry transient failures (408/429/5xx and network
   errors) with exponential backoff + jitter (cap 30 s), honor `Retry-After` on 429, drop on
   non-retryable 4xx, and **disable** the SDK on 401/403.
 - **No-op discipline** — every dispatch call is a no-op before `init` and when the DSN is

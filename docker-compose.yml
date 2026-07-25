@@ -55,6 +55,10 @@ services:
       INGEST_PORT: "8081"
       WORKER_CONCURRENCY: "4"
       INGEST_RATE_LIMIT_PER_MIN: "6000"
+      # Off by default: the published port is reached directly, so the header
+      # would be caller-controlled. While off, client IPs are stored as NULL.
+      # Set to true only behind a proxy you control.
+      INGEST_TRUST_FORWARDED_HEADERS: ${INGEST_TRUST_FORWARDED_HEADERS:-false}
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     ports:
       - "10001:8081"
@@ -76,11 +80,40 @@ services:
       MONITOR_MAX_CONCURRENCY: ${MONITOR_MAX_CONCURRENCY:-50}
       MONITOR_CHECK_RETENTION_DAYS: ${MONITOR_CHECK_RETENTION_DAYS:-30}
       MONITOR_SSRF_ALLOW_PRIVATE: ${MONITOR_SSRF_ALLOW_PRIVATE:-false}
+      # Monitor fires up/down alerts inline, so it needs the channel-secret key.
+      # When NOTIFY_SECRET_KEY is unset it is derived from JWT_SECRET, which must
+      # therefore match the API's — otherwise stored channel secrets won't decrypt.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      NOTIFY_SECRET_KEY: ${NOTIFY_SECRET_KEY:-}
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     depends_on:
       migrate:
         condition: service_completed_successfully
       postgres:
+        condition: service_healthy
+
+  # Polling evaluator for metric-based alert rules (error spike/threshold, event
+  # threshold, latency). Monitor up/down fires inline from `monitor` instead, so
+  # without this service those metric rules are created in the UI but never
+  # evaluate.
+  alerts:
+    build:
+      context: ./backend
+      args:
+        BIN: sauron-alerts
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      NOTIFY_SECRET_KEY: ${NOTIFY_SECRET_KEY:-}
+      ALERTS_TICK_SECS: ${ALERTS_TICK_SECS:-30}
+      ALERTS_DELIVER_TIMEOUT_MS: ${ALERTS_DELIVER_TIMEOUT_MS:-10000}
+      ALERTS_ALLOW_PRIVATE: ${ALERTS_ALLOW_PRIVATE:-false}
+      RUST_LOG: ${RUST_LOG:-info,sauron=debug}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
         condition: service_healthy
 
   api:
@@ -96,6 +129,9 @@ services:
       JWT_REFRESH_TTL_SECS: "2592000"
       API_PORT: "8080"
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:10002}
+      # Off by default (port published directly). Behind a reverse proxy set
+      # this to true, or the per-IP auth limits apply deployment-wide.
+      API_TRUST_FORWARDED_HEADERS: ${API_TRUST_FORWARDED_HEADERS:-false}
       TIER_COLD_PATH: /cold
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     ports:

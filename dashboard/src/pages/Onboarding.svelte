@@ -28,7 +28,7 @@
   let creatingApp = $state(false);
   let appError = $state<string | null>(null);
 
-  let firstEvent = $state<FirstEventStatus>({ received: false, errors: 0, events: 0 });
+  let firstEvent = $state<FirstEventStatus>({ received: false, errors: false, events: false });
   let pollTimer: ReturnType<typeof setInterval> | undefined;
 
   const dsn = $derived(app ? buildDsn(app.public_key, app.id) : '');
@@ -196,9 +196,16 @@
           <div class="w-icon done-icon"><Icon name="check" size={16} /></div>
           <div class="w-text">
             <strong>First event received!</strong>
+            <!-- Presence flags, not counts: the API does an existence check so
+                 polling this every few seconds need not scan every partition. -->
             <span class="muted">
-              {firstEvent.errors} error{firstEvent.errors === 1 ? '' : 's'} ·
-              {firstEvent.events} event{firstEvent.events === 1 ? '' : 's'} ingested.
+              {#if firstEvent.errors && firstEvent.events}
+                Errors and analytics events are arriving.
+              {:else if firstEvent.errors}
+                Errors are arriving.
+              {:else}
+                Analytics events are arriving.
+              {/if}
             </span>
           </div>
           <Button variant="primary" onclick={() => push('/issues')}>

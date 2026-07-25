@@ -2,6 +2,17 @@
 
 All notable changes to the Sauron Python SDK are documented here.
 
+## Unreleased
+
+- **Fixed: a rejected envelope was replayed from disk forever.** Persisted files were only
+  deleted on success, so a payload the server permanently refuses (e.g. a `400`) was reloaded
+  and re-sent on every process start. Rejections now delete their persisted copies; transient
+  failures still keep them for retry.
+- **Fixed: oversized envelopes.** The whole queue went out as one envelope, so a recovered
+  backlog could exceed the server's 1000-item limit and be dropped as a non-retryable `400`.
+  Envelopes are now capped at `MAX_ITEMS_PER_ENVELOPE` (1000) and the queue drains in chunks.
+- `413` is no longer retried unchanged — the envelope is split in half and each half sent.
+
 ## 0.3.0
 
 The **parity release** — brings the Python SDK up to the Browser/Flutter feature

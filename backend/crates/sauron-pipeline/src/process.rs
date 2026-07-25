@@ -23,12 +23,16 @@ pub async fn process_job(
 ) -> anyhow::Result<()> {
     let mut conn = sauron_db::conn(pool).await?;
 
+    // `upsert_environment` returns None once the app hits its environment cap
+    // (the name is attacker-controlled via the envelope). The event is still
+    // stored, just without an environment association.
     let environment_id = match &job.environment {
-        Some(name) if !name.is_empty() => Some(
+        Some(name) if !name.is_empty() => {
+            let name = truncate(name, MAX_ENVIRONMENT_NAME_LEN);
             repo::upsert_environment(&mut conn, job.app_id, name)
                 .await?
-                .id,
-        ),
+                .map(|e| e.id)
+        }
         _ => None,
     };
 
@@ -36,17 +40,12 @@ pub async fn process_job(
 
     match job.item.clone() {
         sauron_core::EnvelopeItem::Error(e) => {
-            process_error(
-                &mut conn,
-                redis,
-                pool,
-                sym,
-                &job,
-                environment_id,
-                context,
-                *e,
-            )
-            .await
+            // Hand the connection over rather than dropping and re-acquiring:
+            // `process_error` still needs one for the issue upsert, and it
+            // releases it before symbolication — which checks out its OWN
+            // connections, so holding one across it would let a handful of
+            // concurrent errors exhaust the (small) ingest pool.
+            process_error(redis, pool, sym, conn, &job, environment_id, context, *e).await
         }
         sauron_core::EnvelopeItem::Event(ev) => {
             process_event(&mut conn, &job, environment_id, context, ev).await
@@ -116,12 +115,23 @@ async fn rollup(
     }
 }
 
+/// Persist one error event.
+///
+/// Owns its connection lifetime in two phases with symbolication in between, so
+/// no pooled connection is ever held across the symbolication path (which checks
+/// out its own).
+///
+/// `conn` is the caller's connection, already checked out for the environment
+/// upsert. It is reused for the issue grouping and released before
+/// symbolication rather than being dropped and immediately re-acquired — the
+/// pool recycles with a liveness check, so each extra checkout costs a
+/// round-trip as well as a pool slot.
 #[allow(clippy::too_many_arguments)]
 async fn process_error(
-    conn: &mut AsyncPgConnection,
     redis: &RedisStore,
     pool: &PgPool,
     sym: &crate::symbolize::SymbolizeCtx,
+    mut conn: sauron_db::PgConn,
     job: &IngestJob,
     environment_id: Option<Uuid>,
     context: Value,
@@ -140,8 +150,9 @@ async fn process_error(
     let now = e.timestamp;
     let device_key = crate::enrich::device_info(&context).device_key;
 
+    // --- phase 1: group the error into an issue, then release the connection.
     let issue_id = repo::upsert_issue(
-        conn,
+        &mut conn,
         NewIssue {
             app_id: job.app_id,
             fingerprint: &fp,
@@ -155,6 +166,7 @@ async fn process_error(
         },
     )
     .await?;
+    drop(conn);
 
     let user = e.user.as_ref().or(job.context.user.as_ref());
     let distinct = distinct_id(user);
@@ -192,8 +204,10 @@ async fn process_error(
             (frames, status, None)
         };
 
+    // --- phase 2: symbolication is done; take a connection again for the writes.
+    let mut conn = sauron_db::conn(pool).await?;
     repo::insert_error_event(
-        conn,
+        &mut conn,
         NewErrorEvent {
             id: ids::uuid_v7(),
             app_id: job.app_id,
@@ -227,7 +241,7 @@ async fn process_error(
     .await?;
 
     rollup(
-        conn,
+        &mut conn,
         job,
         environment_id,
         &context,
@@ -244,10 +258,10 @@ async fn process_error(
         let key = keys::issue_users(&issue_id.to_string());
         if redis.pf_add(&key, &did).await.is_ok() {
             if let Ok(count) = redis.pf_count(&key).await {
-                let _ = repo::set_issue_users_seen(conn, issue_id, count).await;
+                let _ = repo::set_issue_users_seen(&mut conn, issue_id, count).await;
             }
         }
-        let _ = repo::touch_event_user(conn, job.app_id, &did).await;
+        let _ = repo::touch_event_user(&mut conn, job.app_id, &did).await;
     }
 
     Ok(())
@@ -441,6 +455,10 @@ fn build_culprit(exc: Option<&ExceptionInfo>) -> String {
         None => String::new(),
     }
 }
+
+/// Cap on a stored environment name. The value arrives from the SDK envelope,
+/// so an unbounded string would be stored verbatim on every event.
+const MAX_ENVIRONMENT_NAME_LEN: usize = 64;
 
 fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {

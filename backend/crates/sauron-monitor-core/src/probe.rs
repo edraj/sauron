@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::ssrf::guard_target;
+use crate::ssrf::resolve_checked;
 use crate::state::ProbeResult;
 use crate::status::evaluate_http;
 
@@ -70,30 +70,33 @@ pub(crate) fn host_of(spec: &ProbeSpec) -> Option<String> {
 
 /// Run one probe: SSRF-guard the target, then dispatch HTTP or TCP.
 ///
-/// Known limitation (MVP): `guard_target` resolves DNS and validates the
-/// resolved addresses, but those addresses are then discarded — the actual
-/// HTTP/TCP call below re-resolves the host independently. A low-TTL DNS
-/// answer that points at a public IP during the guard check and a
-/// blocked/private IP moments later (DNS rebinding, TOCTOU) can therefore
-/// still slip through. Full IP-pinning (guard and connect using the same
-/// resolved address) is a tracked follow-up, not implemented here.
+/// SSRF enforcement is IP-pinned, so DNS rebinding cannot slip a private
+/// address past the check:
+/// - **HTTP** — `client` must be built with
+///   [`ssrf::guarded_client_builder`](crate::ssrf::guarded_client_builder), whose
+///   resolver validates addresses *inside* the resolution hyper connects with.
+///   The explicit check below still runs so IP-literal targets (which hyper
+///   resolves internally, never calling the resolver) are rejected too, and so a
+///   bad target fails fast without opening a connection.
+/// - **TCP** — [`probe_tcp`] connects to the exact `SocketAddr` that was
+///   validated, never re-resolving the hostname.
 pub async fn probe(spec: &ProbeSpec, client: &reqwest::Client, allow_private: bool) -> ProbeResult {
     // SSRF guard first, bounded by the probe's own timeout — an unbounded
     // guard call would let a slow/unresponsive resolver make a single probe
     // run far longer than `spec.timeout`.
-    if let Some(host) = host_of(spec) {
-        match tokio::time::timeout(spec.timeout, guard_target(&host, allow_private)).await {
-            Ok(Ok(())) => {}
+    let Some(host) = host_of(spec) else {
+        return down("invalid target", None);
+    };
+    let pinned =
+        match tokio::time::timeout(spec.timeout, resolve_checked(&host, allow_private)).await {
+            Ok(Ok(addrs)) => addrs,
             Ok(Err(e)) => return down(e, None),
             Err(_) => return down("DNS resolution timeout", None),
-        }
-    } else {
-        return down("invalid target", None);
-    }
+        };
 
     match spec.kind {
         Kind::Http => probe_http(spec, client).await,
-        Kind::Tcp => probe_tcp(spec).await,
+        Kind::Tcp => probe_tcp(spec, &pinned).await,
     }
 }
 
@@ -157,9 +160,43 @@ async fn probe_http(spec: &ProbeSpec, client: &reqwest::Client) -> ProbeResult {
     }
 }
 
-async fn probe_tcp(spec: &ProbeSpec) -> ProbeResult {
+/// Connect to a **pinned**, already-validated address. `pinned` carries the
+/// addresses `resolve_checked` approved (with port 0); the port comes from the
+/// target string, so no second resolution can substitute a different host.
+async fn probe_tcp(spec: &ProbeSpec, pinned: &[std::net::SocketAddr]) -> ProbeResult {
     let start = Instant::now();
-    match tokio::time::timeout(spec.timeout, tokio::net::TcpStream::connect(&spec.target)).await {
+    let Some(port) = spec
+        .target
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+    else {
+        return down("invalid target: expected host:port", None);
+    };
+    if pinned.is_empty() {
+        return down("target did not resolve", None);
+    }
+    // Try every resolved address, not just the first. Passing a `host:port`
+    // string to `TcpStream::connect` used to make tokio walk the whole list, so
+    // narrowing to `pinned.first()` for SSRF pinning quietly turned a host with
+    // several A records into a single-address probe: one drained node behind a
+    // failover pair, or an AAAA sorted first on a v4-only prober, and the
+    // monitor reports DOWN while the service is up. The timeout is the budget
+    // for the attempts as a whole, so a long list cannot extend the probe.
+    let addrs: Vec<std::net::SocketAddr> = pinned
+        .iter()
+        .map(|a| std::net::SocketAddr::new(a.ip(), port))
+        .collect();
+    let connect_any = async {
+        let mut last_err = None;
+        for addr in &addrs {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.expect("addrs is non-empty"))
+    };
+    match tokio::time::timeout(spec.timeout, connect_any).await {
         Ok(Ok(_stream)) => {
             let ms = start.elapsed().as_millis() as i32;
             ProbeResult {

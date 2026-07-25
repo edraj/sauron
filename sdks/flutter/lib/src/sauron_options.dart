@@ -57,6 +57,14 @@ class SauronOptions {
   /// Flush eagerly once this many items have been buffered.
   int maxBatchItems = 30;
 
+  /// Hard ceiling on items in a single envelope, matching the server's limit.
+  ///
+  /// [maxBatchItems] only *triggers* a flush; it does not bound the request. If
+  /// events are produced faster than flushes complete — offline, or mid-retry —
+  /// the buffer keeps growing and would otherwise go out as one oversized
+  /// envelope, which the server rejects with a non-retryable 400.
+  int maxItemsPerEnvelope = 1000;
+
   /// Hard cap on the on-disk offline queue (bytes). Oldest envelopes are
   /// evicted FIFO once exceeded.
   int maxQueueBytes = 5 * 1024 * 1024;
