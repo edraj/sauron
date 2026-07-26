@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
@@ -27,15 +28,21 @@
   /** Set once the account exists. The dialog switches to the reveal panel. */
   let tempPassword = $state<string | null>(null);
 
-  // Repopulate whenever the dialog opens fresh.
+  // Repopulate on the false -> true transition only. `roles`/`scopeOptions`
+  // are read inside `untrack` so a parent-triggered reload (which replaces
+  // those arrays with new references while the dialog is still open, e.g.
+  // right after a successful create) does not re-run this effect and wipe
+  // the one-time temp-password reveal panel underneath the admin.
   $effect(() => {
     if (!open) return;
-    email = '';
-    name = '';
-    roleId = roles[0]?.id ?? '';
-    scopeKey = scopeOptions[0]?.key ?? '';
-    tempPassword = null;
-    error = null;
+    untrack(() => {
+      email = '';
+      name = '';
+      roleId = roles[0]?.id ?? '';
+      scopeKey = scopeOptions[0]?.key ?? '';
+      tempPassword = null;
+      error = null;
+    });
   });
 
   const canSubmit = $derived(
