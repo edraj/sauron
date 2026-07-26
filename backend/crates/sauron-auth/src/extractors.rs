@@ -23,6 +23,12 @@ pub enum AuthError {
     /// whether the email exists (no user-enumeration).
     InvalidCredentials,
     Forbidden,
+    /// The account exists and the password was correct, but an admin disabled
+    /// it. Only ever returned *after* a successful password verification.
+    AccountDeactivated,
+    /// The caller holds a temp password and must replace it before doing
+    /// anything else.
+    PasswordChangeRequired,
     NotFound,
     Internal,
 }
@@ -46,6 +52,16 @@ impl AuthError {
                 "invalid email or password",
             ),
             AuthError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "you do not have access"),
+            AuthError::AccountDeactivated => (
+                StatusCode::FORBIDDEN,
+                "account_deactivated",
+                "this account has been deactivated",
+            ),
+            AuthError::PasswordChangeRequired => (
+                StatusCode::FORBIDDEN,
+                "password_change_required",
+                "you must change your password before continuing",
+            ),
             AuthError::NotFound => (StatusCode::NOT_FOUND, "not_found", "resource not found"),
             AuthError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -97,6 +113,31 @@ where
             .decode_access(token)
             .map_err(|_| AuthError::InvalidToken)?;
         let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AuthError::InvalidToken)?;
+
+        // A temp password may do exactly one thing: become a real one.
+        // Enforcing this in the extractor rather than in the dashboard is the
+        // point — a UI redirect is bypassable with curl, which would leave the
+        // admin who generated the password holding a working credential for
+        // somebody else's account.
+        //
+        // The allowlist is matched on the exact path. If the API is ever mounted
+        // under a prefix, this has to become a suffix match; noted rather than
+        // generalised now.
+        //
+        // `/v1/auth/logout` is listed defensively only: it currently takes the
+        // refresh token in the body and no `AuthUser`, so it never reaches this
+        // gate. Listing it means it stays reachable if it later gains the
+        // extractor. `/v1/auth/refresh` is deliberately absent for the same
+        // reason inverted — it is likewise unauthenticated, and listing it would
+        // wrongly suggest a temp-password holder can rotate into a clean token.
+        if claims.must_change_password {
+            let path = parts.uri.path();
+            let allowed = matches!(path, "/v1/auth/password" | "/v1/auth/logout");
+            if !allowed {
+                return Err(AuthError::PasswordChangeRequired);
+            }
+        }
+
         Ok(AuthUser { user_id, claims })
     }
 }
@@ -120,5 +161,34 @@ mod tests {
             AuthError::InvalidCredentials.parts().1,
             AuthError::InvalidToken.parts().1
         );
+    }
+
+    #[test]
+    fn password_change_allowlist_is_exactly_two_paths() {
+        let allowed = |p: &str| matches!(p, "/v1/auth/password" | "/v1/auth/logout");
+        assert!(allowed("/v1/auth/password"));
+        assert!(allowed("/v1/auth/logout"));
+        // Everything a temp-password holder might otherwise reach.
+        for p in [
+            "/v1/orgs",
+            "/v1/auth/refresh",
+            "/v1/projects",
+            "/v1/admin/storage",
+            "/v1/auth/passwordx",
+        ] {
+            assert!(!allowed(p), "{p} must not be reachable");
+        }
+    }
+
+    #[test]
+    fn deactivated_and_change_required_are_distinct_forbidden_codes() {
+        let (s1, c1, _) = AuthError::AccountDeactivated.parts();
+        let (s2, c2, _) = AuthError::PasswordChangeRequired.parts();
+        assert_eq!(s1, StatusCode::FORBIDDEN);
+        assert_eq!(s2, StatusCode::FORBIDDEN);
+        assert_ne!(c1, c2);
+        // The dashboard routes on these codes; a rename is a breaking change.
+        assert_eq!(c1, "account_deactivated");
+        assert_eq!(c2, "password_change_required");
     }
 }

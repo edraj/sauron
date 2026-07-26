@@ -150,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/login", post(routes::auth::login))
         .route("/v1/auth/refresh", post(routes::auth::refresh))
         .route("/v1/auth/logout", post(routes::auth::logout))
+        // Path must match the extractor's forced-change allowlist exactly.
+        .route("/v1/auth/password", post(routes::auth::change_password))
         .route("/v1/me", get(routes::auth::me))
         // --- orgs, members, grants, roles ---
         .route(

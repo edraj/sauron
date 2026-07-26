@@ -202,6 +202,8 @@ pub const REVOKE_REUSE: &str = "reuse";
 /// from `REVOKE_REUSE` so the rotation grace window (which exists to survive
 /// two dashboard tabs racing) can never resurrect a deactivated session.
 pub const REVOKE_DEACTIVATED: &str = "deactivated";
+/// Refresh tokens rotated out because the user changed their own password.
+pub const REVOKE_PASSWORD_CHANGED: &str = "password_changed";
 
 pub async fn revoke_refresh_token(
     conn: &mut AsyncPgConnection,
