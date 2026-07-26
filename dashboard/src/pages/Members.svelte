@@ -6,14 +6,17 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
+  import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
+  import CreateMemberDialog from '../lib/components/members/CreateMemberDialog.svelte';
+  import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import { listMembers, listRoles, createGrant, deleteGrant } from '../lib/api/orgs';
+  import { listMembers, listRoles, createGrant, deleteGrant, setMemberActive } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { initials } from '../lib/utils/format';
-  import type { App, MemberGrant, Role, ScopeOption, ScopeType } from '../lib/models';
+  import { groupMembers, type App, type Member, type MemberGrant, type Role, type ScopeOption, type ScopeType } from '../lib/models';
 
   let members = $state<MemberGrant[]>([]);
   let roles = $state<Role[]>([]);
@@ -21,16 +24,36 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
 
-  // Invite / grant form
-  let inviteEmail = $state('');
-  let inviteRoleId = $state('');
-  let inviteScopeKey = $state(''); // `${scope_type}:${scope_id}`
-  let inviting = $state(false);
+  // Grant access form — grants a scoped role to someone who already has an
+  // account (possibly in another org). This is distinct from "Create member"
+  // below, which provisions a brand-new account. There is no invitation flow.
+  let grantEmail = $state('');
+  let grantRoleId = $state('');
+  let grantScopeKey = $state(''); // `${scope_type}:${scope_id}`
+  let granting = $state(false);
   let removingId = $state<string | null>(null);
 
   // Role editor dialog (create + edit + read-only view of system presets)
   let roleDialogOpen = $state(false);
   let editingRole = $state<Role | null>(null);
+
+  // Create / edit member dialogs.
+  let createOpen = $state(false);
+  let editingMemberId = $state<string | null>(null);
+  let togglingUserId = $state<string | null>(null);
+  let deactivateTarget = $state<Member | null>(null);
+
+  // One row per person: this recomputes fresh Member/grant objects every time
+  // `members` is reloaded, so anything derived from it (below) is never a
+  // stale reference held across a save.
+  const grouped = $derived(groupMembers(members));
+
+  // Re-derived (not captured at click time) so that after a save triggers
+  // load() -> members update -> grouped recomputes, EditMemberDialog receives
+  // a brand-new Member object and its internal dirty-tracking clears.
+  const editingMember = $derived(
+    editingMemberId ? (grouped.find((m) => m.user_id === editingMemberId) ?? null) : null,
+  );
 
   const roleMemberCounts = $derived.by(() => {
     const counts: Record<string, number> = {};
@@ -85,7 +108,7 @@
       const [mem, rls] = await Promise.all([listMembers(orgId), listRoles(orgId)]);
       members = mem;
       roles = rls;
-      if (rls.length && !inviteRoleId) inviteRoleId = rls[0].id;
+      if (rls.length && !grantRoleId) grantRoleId = rls[0].id;
       // Resolve app names across every project so app-scoped grants read nicely.
       const appLists = await Promise.all(
         sessionStore.projects.map((p) => listApps(p.id).catch(() => [] as App[])),
@@ -106,28 +129,28 @@
     else if (org) loading = false;
   });
 
-  async function submitInvite(event: SubmitEvent) {
+  async function submitGrant(event: SubmitEvent) {
     event.preventDefault();
     const org = sessionStore.currentOrgId;
-    if (!org || inviting || !inviteEmail.trim() || !inviteRoleId || !inviteScopeKey) return;
-    const opt = scopeOptions.find((o) => o.key === inviteScopeKey);
+    if (!org || granting || !grantEmail.trim() || !grantRoleId || !grantScopeKey) return;
+    const opt = scopeOptions.find((o) => o.key === grantScopeKey);
     if (!opt) return;
-    inviting = true;
+    granting = true;
     try {
       await createGrant(org, {
-        email: inviteEmail.trim(),
-        role_id: inviteRoleId,
+        email: grantEmail.trim(),
+        role_id: grantRoleId,
         scope_type: opt.scope_type,
         scope_id: opt.scope_id,
       });
-      inviteEmail = '';
-      inviteScopeKey = '';
+      grantEmail = '';
+      grantScopeKey = '';
       await load(org);
       toastStore.success('Access granted.');
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
-      inviting = false;
+      granting = false;
     }
   }
 
@@ -161,6 +184,43 @@
     else roles = [...roles, saved];
     toastStore.success(`Role "${saved.name}" saved.`);
   }
+
+  async function toggleActive(member: Member) {
+    const org = sessionStore.currentOrg;
+    if (!org) return;
+    togglingUserId = member.user_id;
+    try {
+      await setMemberActive(org.id, member.user_id, !member.is_active);
+      toastStore.success(
+        member.is_active
+          ? `${member.email} can no longer sign in.`
+          : `${member.email} can sign in again.`,
+      );
+      await load(org.id);
+    } catch (err) {
+      // The backend's 409s carry the actionable text (last owner, cross-org,
+      // self) — surface it verbatim rather than a generic failure.
+      toastStore.error(errorMessage(err));
+    } finally {
+      togglingUserId = null;
+    }
+  }
+
+  function requestToggle(member: Member) {
+    // Deactivation signs the person out of every device, so it is confirmed.
+    // Reactivation is reversible and low-stakes, so it fires immediately.
+    if (member.is_active) {
+      deactivateTarget = member;
+    } else {
+      void toggleActive(member);
+    }
+  }
+
+  async function confirmDeactivate() {
+    const member = deactivateTarget;
+    deactivateTarget = null;
+    if (member) await toggleActive(member);
+  }
 </script>
 
 <AppShell requireProject={false}>
@@ -185,14 +245,26 @@
     <Card><p class="err-msg">{error}</p></Card>
   {:else}
     {#if canManage}
-      <Card title="Grant access" class="grant-card">
-        <form class="grant-form" onsubmit={submitInvite}>
+      <Card class="grant-card">
+        {#snippet header()}
+          <div class="grant-head">
+            <div>
+              <h3 class="card-title-inline">Grant access</h3>
+              <p class="muted grant-sub">
+                For someone who already has an account — in this org or another. To provision a
+                brand-new account instead, use Create member.
+              </p>
+            </div>
+            <Button variant="primary" onclick={() => (createOpen = true)}>Create member</Button>
+          </div>
+        {/snippet}
+        <form class="grant-form" onsubmit={submitGrant}>
           <div class="gf-field">
-            <Input label="Email" type="email" bind:value={inviteEmail} placeholder="teammate@company.com" required />
+            <Input label="Email" type="email" bind:value={grantEmail} placeholder="teammate@company.com" required />
           </div>
           <div class="gf-field">
             <span class="lbl">Role</span>
-            <select class="sel" bind:value={inviteRoleId} aria-label="Role">
+            <select class="sel" bind:value={grantRoleId} aria-label="Role">
               {#each roles as role (role.id)}
                 <option value={role.id}>{role.name}</option>
               {/each}
@@ -200,14 +272,14 @@
           </div>
           <div class="gf-field">
             <span class="lbl">Scope</span>
-            <select class="sel" bind:value={inviteScopeKey} aria-label="Scope">
+            <select class="sel" bind:value={grantScopeKey} aria-label="Scope">
               <option value="" disabled>Select scope…</option>
               {#each scopeOptions as opt (opt.key)}
                 <option value={opt.key}>{opt.label}</option>
               {/each}
             </select>
           </div>
-          <Button type="submit" variant="primary" loading={inviting}>Grant</Button>
+          <Button type="submit" variant="primary" loading={granting}>Grant</Button>
         </form>
       </Card>
     {/if}
@@ -224,31 +296,63 @@
             </tr>
           </thead>
           <tbody>
-            {#each members as m (m.id)}
-              <tr>
+            {#each grouped as member (member.user_id)}
+              <tr class:inactive={!member.is_active}>
                 <td>
                   <div class="member-cell">
-                    <span class="m-avatar">{initials(m.name || m.email)}</span>
+                    <span class="m-avatar">{initials(member.name || member.email)}</span>
                     <div class="m-meta">
-                      <span class="m-name">{m.name || m.email}</span>
-                      {#if m.name}<span class="m-email">{m.email}</span>{/if}
+                      <span class="m-name-row">
+                        <span class="m-name">{member.name || member.email}</span>
+                        {#if !member.is_active}<Badge tone="warning" size="sm">Deactivated</Badge>{/if}
+                      </span>
+                      {#if member.name}<span class="m-email">{member.email}</span>{/if}
                     </div>
                   </div>
                 </td>
-                <td><span class="role-tag">{m.role_name}</span></td>
                 <td>
-                  <Badge tone={scopeTone(m.scope_type)} size="sm">{scopeLabel(m)}</Badge>
+                  <div class="chip-list">
+                    {#each member.grants as grant (grant.id)}
+                      <Badge size="sm">{grant.role_name}</Badge>
+                    {/each}
+                  </div>
+                </td>
+                <td>
+                  <div class="chip-list">
+                    {#each member.grants as grant (grant.id)}
+                      <span class="scope-chip">
+                        <Badge tone={scopeTone(grant.scope_type)} size="sm">{scopeLabel(grant)}</Badge>
+                        {#if canManage}
+                          <button
+                            type="button"
+                            class="chip-remove"
+                            aria-label={`Remove ${scopeLabel(grant)} access`}
+                            title="Remove access"
+                            disabled={removingId === grant.id}
+                            onclick={() => removeGrant(grant.id)}
+                          >
+                            ×
+                          </button>
+                        {/if}
+                      </span>
+                    {/each}
+                  </div>
                 </td>
                 {#if canManage}
                   <td class="col-act">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      loading={removingId === m.id}
-                      onclick={() => removeGrant(m.id)}
-                    >
-                      Remove
-                    </Button>
+                    <div class="row-actions">
+                      <Button variant="ghost" size="sm" onclick={() => (editingMemberId = member.user_id)}>
+                        Edit
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        loading={togglingUserId === member.user_id}
+                        onclick={() => requestToggle(member)}
+                      >
+                        {member.is_active ? 'Deactivate' : 'Reactivate'}
+                      </Button>
+                    </div>
                   </td>
                 {/if}
               </tr>
@@ -302,6 +406,35 @@
       onclose={() => (roleDialogOpen = false)}
       onsaved={onRoleSaved}
     />
+    <CreateMemberDialog
+      open={createOpen}
+      orgId={sessionStore.currentOrg.id}
+      {roles}
+      {scopeOptions}
+      onclose={() => (createOpen = false)}
+      oncreated={() => load(sessionStore.currentOrg!.id)}
+    />
+    <EditMemberDialog
+      open={editingMemberId !== null}
+      orgId={sessionStore.currentOrg.id}
+      member={editingMember}
+      {roles}
+      {scopeOptions}
+      onclose={() => (editingMemberId = null)}
+      onchanged={() => load(sessionStore.currentOrg!.id)}
+    />
+  {/if}
+
+  {#if deactivateTarget}
+    <ConfirmDialog
+      open
+      title="Deactivate member?"
+      message={`${deactivateTarget.email} will be signed out of every device and won't be able to sign in until reactivated. Their access grants are kept.`}
+      confirmLabel="Deactivate"
+      danger
+      onconfirm={confirmDeactivate}
+      oncancel={() => (deactivateTarget = null)}
+    />
   {/if}
 </AppShell>
 
@@ -321,6 +454,18 @@
   :global(.grant-card),
   :global(.roles-card) {
     margin-bottom: 16px;
+  }
+  .grant-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    width: 100%;
+    gap: 16px;
+  }
+  .grant-sub {
+    font-size: 12.5px;
+    margin-top: 3px;
+    max-width: 46ch;
   }
   .grant-form {
     display: flex;
@@ -381,10 +526,19 @@
   tbody tr:last-child td {
     border-bottom: none;
   }
+  tr.inactive {
+    opacity: 0.58;
+  }
   .col-act {
     text-align: right;
     width: 1%;
     white-space: nowrap;
+  }
+  .row-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
   }
   .member-cell {
     display: flex;
@@ -407,6 +561,12 @@
     display: flex;
     flex-direction: column;
     line-height: 1.3;
+    gap: 2px;
+  }
+  .m-name-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .m-name {
     font-weight: 560;
@@ -415,9 +575,38 @@
     font-size: 11.5px;
     color: var(--text-faint);
   }
-  .role-tag {
-    font-weight: 560;
-    color: var(--text);
+  .chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  .scope-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .chip-remove {
+    display: inline-grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-faint);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .chip-remove:hover:not(:disabled) {
+    background: var(--surface-3);
+    color: var(--error);
+  }
+  .chip-remove:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
   }
   .card-title-inline {
     font-size: 14.5px;
