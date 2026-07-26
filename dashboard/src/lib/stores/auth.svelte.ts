@@ -11,7 +11,7 @@ export type AuthStatus =
 const REFRESH_KEY = 'sauron.refresh_token';
 
 /** True for the API's 403 password_change_required. */
-function isPasswordChangeRequired(err: unknown): boolean {
+export function isPasswordChangeRequired(err: unknown): boolean {
   return isNormalizedError(err) && err.status === 403 && err.code === 'password_change_required';
 }
 
@@ -136,6 +136,7 @@ class AuthStore {
     }
     try {
       this.user = await authApi.getMe();
+      this.mustChangePassword = this.user.must_change_password;
       this.status = 'authenticated';
     } catch (err) {
       // A pending password change blocks /v1/me along with everything else.
