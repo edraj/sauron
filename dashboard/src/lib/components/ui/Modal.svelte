@@ -6,6 +6,9 @@
     open: boolean;
     title?: string;
     size?: 'sm' | 'md';
+    /** When false, the header X, Escape, and backdrop click are all
+        disabled — the caller must close via its own footer action. */
+    dismissible?: boolean;
     onclose?: () => void;
     children: Snippet;
     footer?: Snippet;
@@ -15,6 +18,7 @@
     open = $bindable(false),
     title,
     size = 'md',
+    dismissible = true,
     onclose,
     children,
     footer,
@@ -46,13 +50,17 @@
   }
 
   // Escape fires `cancel` then would auto-close; intercept so we own the path.
+  // preventDefault is required even when not dismissible — otherwise the
+  // browser closes the native <dialog> regardless of our own state.
   function onCancel(e: Event) {
     e.preventDefault();
+    if (!dismissible) return;
     requestClose();
   }
 
   // A click landing on ::backdrop reports the <dialog> itself as the target.
   function onBackdropClick(e: MouseEvent) {
+    if (!dismissible) return;
     if (e.target === dialog) requestClose();
   }
 </script>
@@ -67,9 +75,11 @@
   <div class="panel">
     <header class="m-head">
       {#if title}<h2 id={titleId} class="m-title">{title}</h2>{/if}
-      <button class="m-close" type="button" aria-label="Close" onclick={requestClose}>
-        <Icon name="x" size={16} />
-      </button>
+      {#if dismissible}
+        <button class="m-close" type="button" aria-label="Close" onclick={requestClose}>
+          <Icon name="x" size={16} />
+        </button>
+      {/if}
     </header>
     <div class="m-body">
       {@render children()}

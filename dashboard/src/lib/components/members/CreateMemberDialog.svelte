@@ -67,7 +67,12 @@
   }
 </script>
 
-<Modal {open} title={tempPassword ? 'Member created' : 'Create member'} onclose={onclose}>
+<Modal
+  {open}
+  title={tempPassword ? 'Member created' : 'Create member'}
+  dismissible={tempPassword === null}
+  onclose={onclose}
+>
   {#if tempPassword}
     <p class="lede">
       Give <strong>{email}</strong> this temporary password. They must change it the first time

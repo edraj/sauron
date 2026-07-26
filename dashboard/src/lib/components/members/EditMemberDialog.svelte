@@ -33,6 +33,8 @@
   let addError = $state<string | null>(null);
 
   // Repopulate whenever the dialog opens on a (possibly different) member.
+  // Every grant gets an entry here so the template never needs to seed one
+  // itself as a side effect of rendering.
   $effect(() => {
     if (!open || !member) return;
     const next: Record<string, { roleId: string; scopeKey: string }> = {};
@@ -105,12 +107,7 @@
   {#if member}
     <div class="grants">
       {#each member.grants as grant (grant.id)}
-        {@const e =
-          edits[grant.id] ??
-          (edits[grant.id] = {
-            roleId: grant.role_id,
-            scopeKey: `${grant.scope_type}:${grant.scope_id}`,
-          })}
+        {@const e = edits[grant.id] ?? { roleId: grant.role_id, scopeKey: `${grant.scope_type}:${grant.scope_id}` }}
         <div class="grant-row">
           <div class="gf-field">
             <span class="lbl">Role</span>
