@@ -150,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/login", post(routes::auth::login))
         .route("/v1/auth/refresh", post(routes::auth::refresh))
         .route("/v1/auth/logout", post(routes::auth::logout))
+        // Path must match the extractor's forced-change allowlist exactly.
+        .route("/v1/auth/password", post(routes::auth::change_password))
         .route("/v1/me", get(routes::auth::me))
         // --- orgs, members, grants, roles ---
         .route(
@@ -157,12 +159,26 @@ async fn main() -> anyhow::Result<()> {
             get(routes::orgs::list_orgs).post(routes::orgs::create_org),
         )
         .route("/v1/orgs/{org_id}/access", get(routes::orgs::access))
-        .route("/v1/orgs/{org_id}/members", get(routes::orgs::list_members))
+        .route(
+            "/v1/orgs/{org_id}/members",
+            get(routes::orgs::list_members).post(routes::orgs::create_member),
+        )
+        .route(
+            "/v1/orgs/{org_id}/members/{user_id}",
+            patch(routes::orgs::set_member_active),
+        )
         .route("/v1/orgs/{org_id}/grants", post(routes::orgs::create_grant))
-        .route("/v1/grants/{grant_id}", delete(routes::orgs::delete_grant))
+        .route(
+            "/v1/grants/{grant_id}",
+            delete(routes::orgs::delete_grant).patch(routes::orgs::update_grant_handler),
+        )
         .route(
             "/v1/orgs/{org_id}/roles",
             get(routes::orgs::list_roles).post(routes::orgs::create_role),
+        )
+        .route(
+            "/v1/orgs/{org_id}/roles/{role_id}",
+            patch(routes::orgs::update_role_handler),
         )
         // --- projects (grouping) ---
         .route(

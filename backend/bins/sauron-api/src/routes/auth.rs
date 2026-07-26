@@ -1,4 +1,5 @@
-//! Authentication: register, login, refresh (rotating), logout, and `/me`.
+//! Authentication: register, login, refresh (rotating), logout, self-service
+//! password change, and `/me`.
 
 use axum::extract::{ConnectInfo, State};
 use axum::Json;
@@ -238,7 +239,8 @@ pub async fn register(
     )
     .await?;
 
-    let tokens = issue_tokens(&state, &mut conn, user.id, None).await?;
+    // The user chose their own password, so nothing is owed.
+    let tokens = issue_tokens(&state, &mut conn, user.id, None, false).await?;
     Ok(Json(AuthResponse { tokens, user }))
 }
 
@@ -298,8 +300,17 @@ pub async fn login(
         }
     };
 
+    // Checked here, not earlier: an is_active branch before the password
+    // verification would answer in microseconds for a deactivated account and
+    // tens of milliseconds for an active one, reintroducing exactly the
+    // user-enumeration oracle the dummy-verify above exists to close. Someone
+    // who does not know the password learns nothing.
+    if !user.is_active {
+        return Err(ApiError::Auth(AuthError::AccountDeactivated));
+    }
+
     let _ = repo::touch_last_login(&mut conn, user.id).await;
-    let tokens = issue_tokens(&state, &mut conn, user.id, None).await?;
+    let tokens = issue_tokens(&state, &mut conn, user.id, None, user.must_change_password).await?;
     Ok(Json(AuthResponse { tokens, user }))
 }
 
@@ -357,8 +368,46 @@ pub async fn refresh(
                     "concurrent refresh of a just-rotated token; re-issuing instead of \
                      revoking the family"
                 );
-                let tokens = issue_tokens(&state, &mut conn, user_id, None).await?;
+                // Load the user for the forced-change flag, and refuse a
+                // deactivated account here too: otherwise a member an admin just
+                // disabled keeps minting fresh access tokens from the refresh
+                // token still sitting in localStorage, and the deactivation
+                // never takes effect.
+                let user = repo::get_user(&mut conn, user_id)
+                    .await?
+                    .ok_or(ApiError::Auth(AuthError::InvalidToken))?;
+                if !user.is_active {
+                    return Err(ApiError::Auth(AuthError::AccountDeactivated));
+                }
+                let tokens =
+                    issue_tokens(&state, &mut conn, user_id, None, user.must_change_password)
+                        .await?;
                 return Ok(Json(tokens));
+            }
+
+            // A deactivated account's tokens are mass-revoked with
+            // REVOKE_DEACTIVATED (see set_active in orgs.rs), so a routine
+            // deactivation lands here too: the reason is not REVOKE_ROTATED,
+            // so `raced` is false above, and without this check a disabled
+            // user presenting their old refresh token would trip the "reuse
+            // detected" WARN below. That signal exists to flag actual token
+            // theft; poisoning it with routine deactivations makes it
+            // unreliable exactly when it matters. Report the mundane cause
+            // and skip the alarm.
+            if reason.as_deref() == Some(repo::REVOKE_DEACTIVATED) {
+                // The reason reflects the revocation at the time it happened,
+                // not whether the account is still deactivated: an admin may
+                // have reactivated it since without touching this already-
+                // revoked row. Re-check the user's current state so a
+                // reactivated user falls through to the ordinary
+                // reuse-detection path below instead of being told their
+                // (now-active) account is deactivated.
+                let user = repo::get_user(&mut conn, user_id)
+                    .await?
+                    .ok_or(ApiError::Auth(AuthError::InvalidToken))?;
+                if !user.is_active {
+                    return Err(ApiError::Auth(AuthError::AccountDeactivated));
+                }
             }
 
             let revoked = repo::revoke_all_refresh_tokens_for_user(&mut conn, user_id).await?;
@@ -372,9 +421,24 @@ pub async fn refresh(
         return Err(ApiError::Auth(AuthError::InvalidToken));
     };
 
-    // Rotate: revoke the presented token, issue a fresh pair.
+    // Rotate: revoke the presented token, issue a fresh pair. Same reasoning as
+    // the race path above — a deactivated account must not be able to refresh
+    // its way to a live session.
+    let user = repo::get_user(&mut conn, token.user_id)
+        .await?
+        .ok_or(ApiError::Auth(AuthError::InvalidToken))?;
+    if !user.is_active {
+        return Err(ApiError::Auth(AuthError::AccountDeactivated));
+    }
     repo::revoke_refresh_token(&mut conn, &hash, repo::REVOKE_ROTATED).await?;
-    let tokens = issue_tokens(&state, &mut conn, token.user_id, None).await?;
+    let tokens = issue_tokens(
+        &state,
+        &mut conn,
+        token.user_id,
+        None,
+        user.must_change_password,
+    )
+    .await?;
     Ok(Json(tokens))
 }
 
@@ -391,6 +455,104 @@ pub async fn logout(
     let mut conn = db(&state).await?;
     repo::revoke_refresh_token(&mut conn, &hash, repo::REVOKE_LOGOUT).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordReq {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// Self-service password change. The only endpoint a temp-password holder can
+/// reach.
+pub async fn change_password(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<ChangePasswordReq>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    // Throttle before any hashing: this handler runs a verify plus a fresh
+    // hash (two ~19 MiB Argon2 ops) per call, and it is the one endpoint
+    // deliberately left reachable by a temp-password holder — the least-
+    // trusted principal in this feature. Keyed per user id rather than per
+    // IP since the caller is already authenticated; same budget as login,
+    // since both gate an Argon2 verify against a caller-supplied guess.
+    rate_limit(
+        &state,
+        &format!("sauron:auth:password:{}", auth.user_id),
+        LOGIN_ATTEMPTS_PER_MIN,
+        60,
+    )
+    .await?;
+
+    if req.current_password.len() > MAX_PASSWORD_LEN {
+        return Err(ApiError::Auth(AuthError::InvalidCredentials));
+    }
+    if req.new_password.len() < 8 {
+        return Err(ApiError::BadRequest(
+            "password must be at least 8 characters".into(),
+        ));
+    }
+    if req.new_password.len() > MAX_PASSWORD_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "password must be at most {MAX_PASSWORD_LEN} characters"
+        )));
+    }
+    if req.new_password == req.current_password {
+        return Err(ApiError::BadRequest(
+            "the new password must be different from the current one".into(),
+        ));
+    }
+
+    let mut conn = db(&state).await?;
+    let user = repo::get_user(&mut conn, auth.user_id)
+        .await?
+        .ok_or(ApiError::Auth(AuthError::InvalidToken))?;
+    if !user.is_active {
+        return Err(ApiError::Auth(AuthError::AccountDeactivated));
+    }
+    if !verify_password_async(req.current_password.clone(), user.password_hash.clone()).await {
+        return Err(ApiError::Auth(AuthError::InvalidCredentials));
+    }
+
+    let hash = hash_password_async(req.new_password.clone())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Revoke everything, including the caller's own session, before setting the
+    // new password. Keeping the current session would not work anyway: its
+    // access token still carries must_change_password, so the extractor gate
+    // would keep rejecting the user until it expired — immediately after they
+    // did the one thing it was demanding. Re-issuing also logs out every other
+    // device, which is correct when the old credential may be known to whoever
+    // generated it.
+    //
+    // The order (revoke, then set password, then issue) is deliberate and not
+    // a transaction: `conn.transaction` needs async closures, which need Rust
+    // 1.85+, and this workspace's MSRV is 1.82 per packaging/rpm/sauron.spec.
+    // If the revoke fails, the caller is still on the temp password —
+    // recoverable, since they log in again with it and remain flagged. The
+    // reverse order would leave the password changed but every old session
+    // (including one held by whoever handed out the temp credential) still
+    // valid, which is the direction that must never happen on a partial
+    // failure.
+    repo::revoke_all_refresh_tokens_for_user_with_reason(
+        &mut conn,
+        auth.user_id,
+        repo::REVOKE_PASSWORD_CHANGED,
+    )
+    .await?;
+    repo::set_user_password(&mut conn, auth.user_id, &hash).await?;
+    let tokens = issue_tokens(&state, &mut conn, auth.user_id, None, false).await?;
+
+    // Re-read so the returned user has must_change_password already false; the
+    // dashboard's stored user object is then correct without a second round trip.
+    let fresh = repo::get_user(&mut conn, auth.user_id)
+        .await?
+        .ok_or_else(|| ApiError::Internal("user vanished mid-request".into()))?;
+    Ok(Json(AuthResponse {
+        tokens,
+        user: fresh,
+    }))
 }
 
 pub async fn me(auth: AuthUser, State(state): State<AppState>) -> Result<Json<User>, ApiError> {

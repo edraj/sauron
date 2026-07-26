@@ -24,8 +24,16 @@
   });
 
   function onConditionsFailed() {
-    // A guarded route rejected an unauthenticated visitor.
-    push('/login');
+    // A guarded route rejected the visitor. Tell apart "not logged in" (send
+    // to /login) from "logged in but owes a password change" (send to
+    // /change-password) — routes.ts's passwordCurrent() reports the latter
+    // without navigating itself, so this is the one place that decides,
+    // rather than two navigations racing each other.
+    if (authStore.isAuthenticated && authStore.mustChangePassword) {
+      push('/change-password');
+    } else {
+      push('/login');
+    }
   }
 </script>
 

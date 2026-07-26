@@ -6,38 +6,17 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
+  import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
+  import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
+  import CreateMemberDialog from '../lib/components/members/CreateMemberDialog.svelte';
+  import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
+  import MembersTable from '../lib/components/members/MembersTable.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import {
-    listMembers,
-    listRoles,
-    createGrant,
-    deleteGrant,
-    createRole,
-  } from '../lib/api/orgs';
+  import { listMembers, listRoles, createGrant, deleteGrant, setMemberActive } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
-  import { initials } from '../lib/utils/format';
-  import type { App, MemberGrant, Permission, Role, ScopeType } from '../lib/models';
-
-  const ALL_PERMISSIONS: Permission[] = [
-    'issue:read',
-    'issue:write',
-    'event:read',
-    'app:read',
-    'app:create',
-    'app:update',
-    'app:delete',
-    'app:rotate_key',
-    'project:read',
-    'project:create',
-    'project:update',
-    'project:delete',
-    'member:read',
-    'member:manage',
-    'role:manage',
-    'org:manage',
-  ];
+  import { groupMembers, type App, type Member, type MemberGrant, type Role, type ScopeOption } from '../lib/models';
 
   let members = $state<MemberGrant[]>([]);
   let roles = $state<Role[]>([]);
@@ -45,30 +24,60 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
 
-  // Invite / grant form
-  let inviteEmail = $state('');
-  let inviteRoleId = $state('');
-  let inviteScopeKey = $state(''); // `${scope_type}:${scope_id}`
-  let inviting = $state(false);
+  // Grant access form — grants a scoped role to someone who already has an
+  // account (possibly in another org). This is distinct from "Create member"
+  // below, which provisions a brand-new account. There is no invitation flow.
+  let grantEmail = $state('');
+  let grantRoleId = $state('');
+  let grantScopeKey = $state(''); // `${scope_type}:${scope_id}`
+  let granting = $state(false);
   let removingId = $state<string | null>(null);
 
-  // Create role form
-  let showRoleForm = $state(false);
-  let roleName = $state('');
-  let roleDescription = $state('');
-  let rolePerms = $state<Record<string, boolean>>({});
-  let creatingRole = $state(false);
+  // Role editor dialog (create + edit + read-only view of system presets)
+  let roleDialogOpen = $state(false);
+  let editingRole = $state<Role | null>(null);
+
+  // Create / edit member dialogs.
+  let createOpen = $state(false);
+  let editingMemberId = $state<string | null>(null);
+  let togglingUserId = $state<string | null>(null);
+  let deactivateTarget = $state<Member | null>(null);
+
+  // One row per person: this recomputes fresh Member/grant objects every time
+  // `members` is reloaded, so anything derived from it (below) is never a
+  // stale reference held across a save.
+  const grouped = $derived(groupMembers(members));
+
+  // Re-derived (not captured at click time) so that after a save triggers
+  // load() -> members update -> grouped recomputes, EditMemberDialog receives
+  // a brand-new Member object and its internal dirty-tracking clears.
+  const editingMember = $derived(
+    editingMemberId ? (grouped.find((m) => m.user_id === editingMemberId) ?? null) : null,
+  );
+
+  // Distinct users per role, not grant count — a person holding the same role
+  // at three scopes must still only count once, since that's what the
+  // "N members hold this role" impact warning in RoleEditorDialog means.
+  const roleMemberCounts = $derived.by(() => {
+    const usersByRole = new Map<string, Set<string>>();
+    for (const m of grouped) {
+      for (const g of m.grants) {
+        let users = usersByRole.get(g.role_id);
+        if (!users) {
+          users = new Set();
+          usersByRole.set(g.role_id, users);
+        }
+        users.add(m.user_id);
+      }
+    }
+    const counts: Record<string, number> = {};
+    for (const [roleId, users] of usersByRole) counts[roleId] = users.size;
+    return counts;
+  });
 
   const canManage = $derived(sessionStore.can('member:manage'));
   const canReadMembers = $derived(sessionStore.can('member:read'));
   const canManageRoles = $derived(sessionStore.can('role:manage'));
-
-  interface ScopeOption {
-    key: string;
-    label: string;
-    scope_type: ScopeType;
-    scope_id: string;
-  }
 
   const scopeOptions = $derived.by<ScopeOption[]>(() => {
     const opts: ScopeOption[] = [];
@@ -90,22 +99,6 @@
     return opts;
   });
 
-  function scopeLabel(member: MemberGrant): string {
-    if (member.scope_type === 'org') return 'Org';
-    if (member.scope_type === 'project') {
-      const p = sessionStore.projects.find((x) => x.id === member.scope_id);
-      return `Project: ${p?.name ?? member.scope_id.slice(0, 8)}`;
-    }
-    const a = appsById[member.scope_id];
-    return `App: ${a?.name ?? member.scope_id.slice(0, 8)}`;
-  }
-
-  function scopeTone(type: ScopeType): 'primary' | 'info' | 'neutral' {
-    if (type === 'org') return 'primary';
-    if (type === 'project') return 'info';
-    return 'neutral';
-  }
-
   async function load(orgId: string) {
     loading = true;
     error = null;
@@ -113,7 +106,7 @@
       const [mem, rls] = await Promise.all([listMembers(orgId), listRoles(orgId)]);
       members = mem;
       roles = rls;
-      if (rls.length && !inviteRoleId) inviteRoleId = rls[0].id;
+      if (rls.length && !grantRoleId) grantRoleId = rls[0].id;
       // Resolve app names across every project so app-scoped grants read nicely.
       const appLists = await Promise.all(
         sessionStore.projects.map((p) => listApps(p.id).catch(() => [] as App[])),
@@ -134,28 +127,28 @@
     else if (org) loading = false;
   });
 
-  async function submitInvite(event: SubmitEvent) {
+  async function submitGrant(event: SubmitEvent) {
     event.preventDefault();
     const org = sessionStore.currentOrgId;
-    if (!org || inviting || !inviteEmail.trim() || !inviteRoleId || !inviteScopeKey) return;
-    const opt = scopeOptions.find((o) => o.key === inviteScopeKey);
+    if (!org || granting || !grantEmail.trim() || !grantRoleId || !grantScopeKey) return;
+    const opt = scopeOptions.find((o) => o.key === grantScopeKey);
     if (!opt) return;
-    inviting = true;
+    granting = true;
     try {
       await createGrant(org, {
-        email: inviteEmail.trim(),
-        role_id: inviteRoleId,
+        email: grantEmail.trim(),
+        role_id: grantRoleId,
         scope_type: opt.scope_type,
         scope_id: opt.scope_id,
       });
-      inviteEmail = '';
-      inviteScopeKey = '';
+      grantEmail = '';
+      grantScopeKey = '';
       await load(org);
       toastStore.success('Access granted.');
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
-      inviting = false;
+      granting = false;
     }
   }
 
@@ -173,29 +166,58 @@
     }
   }
 
-  async function submitRole(event: SubmitEvent) {
-    event.preventDefault();
-    const org = sessionStore.currentOrgId;
-    if (!org || creatingRole || !roleName.trim()) return;
-    const permissions = ALL_PERMISSIONS.filter((p) => rolePerms[p]);
-    creatingRole = true;
+  function openNewRole() {
+    editingRole = null;
+    roleDialogOpen = true;
+  }
+
+  function openEditRole(role: Role) {
+    editingRole = role;
+    roleDialogOpen = true;
+  }
+
+  function onRoleSaved(saved: Role) {
+    const i = roles.findIndex((r) => r.id === saved.id);
+    if (i >= 0) roles[i] = saved;
+    else roles = [...roles, saved];
+    toastStore.success(`Role "${saved.name}" saved.`);
+  }
+
+  async function toggleActive(member: Member) {
+    const org = sessionStore.currentOrg;
+    if (!org) return;
+    togglingUserId = member.user_id;
     try {
-      const role = await createRole(org, {
-        name: roleName.trim(),
-        description: roleDescription.trim() || undefined,
-        permissions,
-      });
-      roles = [...roles, role];
-      roleName = '';
-      roleDescription = '';
-      rolePerms = {};
-      showRoleForm = false;
-      toastStore.success('Role created.');
+      await setMemberActive(org.id, member.user_id, !member.is_active);
+      toastStore.success(
+        member.is_active
+          ? `${member.email} can no longer sign in.`
+          : `${member.email} can sign in again.`,
+      );
+      await load(org.id);
     } catch (err) {
+      // The backend's 409s carry the actionable text (last owner, cross-org,
+      // self) — surface it verbatim rather than a generic failure.
       toastStore.error(errorMessage(err));
     } finally {
-      creatingRole = false;
+      togglingUserId = null;
     }
+  }
+
+  function requestToggle(member: Member) {
+    // Deactivation signs the person out of every device, so it is confirmed.
+    // Reactivation is reversible and low-stakes, so it fires immediately.
+    if (member.is_active) {
+      deactivateTarget = member;
+    } else {
+      void toggleActive(member);
+    }
+  }
+
+  async function confirmDeactivate() {
+    const member = deactivateTarget;
+    deactivateTarget = null;
+    if (member) await toggleActive(member);
   }
 </script>
 
@@ -220,15 +242,23 @@
   {:else if error}
     <Card><p class="err-msg">{error}</p></Card>
   {:else}
-    {#if canManage}
-      <Card title="Grant access" class="grant-card">
-        <form class="grant-form" onsubmit={submitInvite}>
+    <div class="stack">
+      {#if canManage}
+      <Card>
+        {#snippet header()}
+          <h3 class="card-title-inline">Grant access</h3>
+          <p class="muted grant-sub">For someone who already has an account, here or in another org.</p>
+        {/snippet}
+        {#snippet actions()}
+          <Button variant="primary" onclick={() => (createOpen = true)}>Create member</Button>
+        {/snippet}
+        <form class="grant-form" onsubmit={submitGrant}>
           <div class="gf-field">
-            <Input label="Email" type="email" bind:value={inviteEmail} placeholder="teammate@company.com" required />
+            <Input label="Email" type="email" bind:value={grantEmail} placeholder="teammate@company.com" required />
           </div>
           <div class="gf-field">
             <span class="lbl">Role</span>
-            <select class="sel" bind:value={inviteRoleId} aria-label="Role">
+            <select class="sel" bind:value={grantRoleId} aria-label="Role">
               {#each roles as role (role.id)}
                 <option value={role.id}>{role.name}</option>
               {/each}
@@ -236,94 +266,38 @@
           </div>
           <div class="gf-field">
             <span class="lbl">Scope</span>
-            <select class="sel" bind:value={inviteScopeKey} aria-label="Scope">
+            <select class="sel" bind:value={grantScopeKey} aria-label="Scope">
               <option value="" disabled>Select scope…</option>
               {#each scopeOptions as opt (opt.key)}
                 <option value={opt.key}>{opt.label}</option>
               {/each}
             </select>
           </div>
-          <Button type="submit" variant="primary" loading={inviting}>Grant</Button>
+          <Button type="submit" variant="primary" loading={granting}>Grant</Button>
         </form>
       </Card>
     {/if}
 
-    <Card padding="none">
-      <div class="table-scroll">
-        <table class="members">
-          <thead>
-            <tr>
-              <th>Member</th>
-              <th>Role</th>
-              <th>Scope</th>
-              {#if canManage}<th class="col-act"></th>{/if}
-            </tr>
-          </thead>
-          <tbody>
-            {#each members as m (m.id)}
-              <tr>
-                <td>
-                  <div class="member-cell">
-                    <span class="m-avatar">{initials(m.name || m.email)}</span>
-                    <div class="m-meta">
-                      <span class="m-name">{m.name || m.email}</span>
-                      {#if m.name}<span class="m-email">{m.email}</span>{/if}
-                    </div>
-                  </div>
-                </td>
-                <td><span class="role-tag">{m.role_name}</span></td>
-                <td>
-                  <Badge tone={scopeTone(m.scope_type)} size="sm">{scopeLabel(m)}</Badge>
-                </td>
-                {#if canManage}
-                  <td class="col-act">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      loading={removingId === m.id}
-                      onclick={() => removeGrant(m.id)}
-                    >
-                      Remove
-                    </Button>
-                  </td>
-                {/if}
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    </Card>
+    <MembersTable
+      {grouped}
+      {appsById}
+      {canManage}
+      {removingId}
+      {togglingUserId}
+      onedit={(userId) => (editingMemberId = userId)}
+      ontoggle={requestToggle}
+      onremovegrant={removeGrant}
+    />
 
-    <Card class="roles-card">
+    <Card>
       {#snippet header()}
-        <div class="roles-head">
-          <h3 class="card-title-inline">Roles</h3>
-          {#if canManageRoles}
-            <Button variant="secondary" size="sm" onclick={() => (showRoleForm = !showRoleForm)}>
-              {showRoleForm ? 'Cancel' : 'New role'}
-            </Button>
-          {/if}
-        </div>
+        <h3 class="card-title-inline">Roles</h3>
       {/snippet}
-
-      {#if showRoleForm && canManageRoles}
-        <form class="role-form" onsubmit={submitRole}>
-          <div class="role-fields">
-            <Input label="Role name" bind:value={roleName} placeholder="Support" required />
-            <Input label="Description" bind:value={roleDescription} placeholder="Read + resolve issues" />
-          </div>
-          <span class="lbl perms-label">Permissions</span>
-          <div class="perms-grid">
-            {#each ALL_PERMISSIONS as perm (perm)}
-              <label class="perm">
-                <input type="checkbox" bind:checked={rolePerms[perm]} />
-                <span class="mono">{perm}</span>
-              </label>
-            {/each}
-          </div>
-          <Button type="submit" variant="primary" loading={creatingRole}>Create role</Button>
-        </form>
-      {/if}
+      {#snippet actions()}
+        {#if canManageRoles}
+          <Button variant="secondary" size="sm" onclick={openNewRole}>New role</Button>
+        {/if}
+      {/snippet}
 
       <ul class="role-list">
         {#each roles as role (role.id)}
@@ -333,11 +307,62 @@
               {#if role.is_system}<Badge tone="neutral" size="sm">system</Badge>{/if}
               {#if role.description}<span class="r-desc muted">{role.description}</span>{/if}
             </div>
-            <span class="r-count muted">{role.permissions.length} permissions</span>
+            <div class="r-actions">
+              <span class="r-count muted">{role.permissions.length} permissions</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onclick={() => openEditRole(role)}
+                disabled={!canManageRoles && !role.is_system}
+              >
+                {role.is_system ? 'View' : 'Edit'}
+              </Button>
+            </div>
           </li>
         {/each}
       </ul>
     </Card>
+    </div>
+  {/if}
+
+  {#if sessionStore.currentOrg}
+    <RoleEditorDialog
+      open={roleDialogOpen}
+      orgId={sessionStore.currentOrg.id}
+      role={editingRole}
+      memberCount={editingRole ? (roleMemberCounts[editingRole.id] ?? 0) : 0}
+      onclose={() => (roleDialogOpen = false)}
+      onsaved={onRoleSaved}
+    />
+    <CreateMemberDialog
+      open={createOpen}
+      orgId={sessionStore.currentOrg.id}
+      {roles}
+      {scopeOptions}
+      onclose={() => (createOpen = false)}
+      oncreated={() => load(sessionStore.currentOrg!.id)}
+    />
+    <EditMemberDialog
+      open={editingMemberId !== null}
+      orgId={sessionStore.currentOrg.id}
+      member={editingMember}
+      {roles}
+      {scopeOptions}
+      onclose={() => (editingMemberId = null)}
+      onchanged={() => load(sessionStore.currentOrg!.id)}
+    />
+  {/if}
+
+  {#if deactivateTarget}
+    <ConfirmDialog
+      open
+      title="Deactivate member?"
+      message={`${deactivateTarget.email} will be signed out of every device and won't be able to sign in until reactivated. Their access grants are kept.`}
+      confirmLabel="Deactivate"
+      danger
+      onconfirm={confirmDeactivate}
+      oncancel={() => (deactivateTarget = null)}
+    />
   {/if}
 </AppShell>
 
@@ -354,9 +379,17 @@
     place-items: center;
     padding: 80px;
   }
-  :global(.grant-card),
-  :global(.roles-card) {
-    margin-bottom: 16px;
+  /* Owns the vertical rhythm for the page's cards. Previously each card carried
+     its own margin-bottom via :global(), which silently skipped the members
+     table once it moved into its own component and left it stuck to Roles. */
+  .stack {
+    display: grid;
+    gap: 16px;
+  }
+  .grant-sub {
+    font-size: 12.5px;
+    margin-top: 3px;
+    max-width: 46ch;
   }
   .grant-form {
     display: flex;
@@ -390,112 +423,9 @@
     background: var(--surface);
     color: var(--text);
   }
-  .table-scroll {
-    overflow-x: auto;
-  }
-  table.members {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13.5px;
-  }
-  thead th {
-    text-align: left;
-    padding: 12px 16px;
-    font-size: 11px;
-    font-weight: 650;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
-  }
-  td {
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-    vertical-align: middle;
-  }
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-  .col-act {
-    text-align: right;
-    width: 1%;
-    white-space: nowrap;
-  }
-  .member-cell {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .m-avatar {
-    width: 30px;
-    height: 30px;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    background: var(--primary-soft);
-    color: var(--primary);
-    font-size: 11px;
-    font-weight: 650;
-    flex-shrink: 0;
-  }
-  .m-meta {
-    display: flex;
-    flex-direction: column;
-    line-height: 1.3;
-  }
-  .m-name {
-    font-weight: 560;
-  }
-  .m-email {
-    font-size: 11.5px;
-    color: var(--text-faint);
-  }
-  .role-tag {
-    font-weight: 560;
-    color: var(--text);
-  }
   .card-title-inline {
     font-size: 14.5px;
     font-weight: 620;
-  }
-  .roles-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-    gap: 12px;
-  }
-  .role-form {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    padding-bottom: 18px;
-    margin-bottom: 6px;
-    border-bottom: 1px solid var(--border);
-  }
-  .role-fields {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-  }
-  .perms-label {
-    margin-bottom: -4px;
-  }
-  .perms-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 6px 14px;
-  }
-  .perm {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 12.5px;
-    color: var(--text-muted);
-  }
-  .perm input {
-    accent-color: var(--primary);
   }
   .role-list {
     list-style: none;
@@ -533,14 +463,14 @@
     font-size: 12px;
     white-space: nowrap;
   }
+  .r-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
   .err-msg {
     color: var(--error);
     font-size: 13.5px;
-  }
-
-  @media (max-width: 640px) {
-    .role-fields {
-      grid-template-columns: 1fr;
-    }
   }
 </style>

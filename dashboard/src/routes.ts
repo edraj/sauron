@@ -29,19 +29,33 @@ import Projects from './pages/Projects.svelte';
 import Members from './pages/Members.svelte';
 import SettingsApp from './pages/SettingsApp.svelte';
 import Docs from './pages/Docs.svelte';
+import ChangePassword from './pages/ChangePassword.svelte';
 import Redirect from './lib/components/Redirect.svelte';
 
 const authed = () => authStore.isAuthenticated;
 
+// A pending password change blocks every authenticated page except the one
+// that can resolve it (the server enforces this for real via Task 7's
+// extractor gate — this is convenience only). Deliberately does NOT navigate
+// itself: App.svelte's `conditionsFailed` handler does that, so there is a
+// single place deciding between /login and /change-password instead of two
+// navigations racing each other.
+function passwordCurrent(): boolean {
+  return !authStore.mustChangePassword;
+}
+
 // Svelte 5 components are functions; svelte-spa-router's `wrap` types against the
 // legacy ComponentType, so we cast at the boundary.
 function guarded(component: Component<never>) {
-  return wrap({ component: component as never, conditions: [authed] });
+  return wrap({ component: component as never, conditions: [authed, passwordCurrent] });
 }
 
 export const routes = {
   '/login': Login,
   '/register': Register,
+  // Ungated on passwordCurrent — otherwise a temp-password holder redirected
+  // here would immediately redirect right back to itself.
+  '/change-password': wrap({ component: ChangePassword as never, conditions: [authed] }),
   '/onboarding': guarded(Onboarding as Component<never>),
 
   // Monitor

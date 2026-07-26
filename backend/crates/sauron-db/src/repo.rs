@@ -38,6 +38,57 @@ pub async fn create_user(
         .await
 }
 
+#[derive(Debug, QueryableByName)]
+pub struct NewMemberRow {
+    #[diesel(sql_type = SqlUuid)]
+    pub user_id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    pub grant_id: Uuid,
+}
+
+/// Create a user and their first grant in one statement.
+///
+/// A single data-modifying CTE rather than a transaction: Postgres runs both
+/// INSERTs atomically within the statement, so a grant failure rolls the user
+/// back for free. This avoids `conn.transaction`, whose diesel-async 0.9
+/// signature needs async closures (Rust 1.85) and would push the workspace
+/// MSRV past the 1.82 the RPM spec builds against.
+///
+/// A duplicate email surfaces as `DatabaseError(UniqueViolation)` from
+/// `users_email_lower_key`; the caller maps that to 409.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_member_with_grant(
+    conn: &mut AsyncPgConnection,
+    email: &str,
+    password_hash: &str,
+    name: &str,
+    org_id: Uuid,
+    role_id: Uuid,
+    scope_type: &str,
+    scope_id: Uuid,
+) -> QueryResult<NewMemberRow> {
+    let email = email.to_lowercase();
+    diesel::sql_query(
+        "WITH new_user AS ( \
+             INSERT INTO users (email, password_hash, name, must_change_password) \
+             VALUES ($1, $2, $3, true) \
+             RETURNING id \
+         ) \
+         INSERT INTO role_grants (org_id, user_id, role_id, scope_type, scope_id) \
+         SELECT $4, new_user.id, $5, $6, $7 FROM new_user \
+         RETURNING user_id, id AS grant_id",
+    )
+    .bind::<Text, _>(email)
+    .bind::<Text, _>(password_hash)
+    .bind::<Text, _>(name)
+    .bind::<SqlUuid, _>(org_id)
+    .bind::<SqlUuid, _>(role_id)
+    .bind::<Text, _>(scope_type)
+    .bind::<SqlUuid, _>(scope_id)
+    .get_result(conn)
+    .await
+}
+
 pub async fn find_user_by_email(
     conn: &mut AsyncPgConnection,
     email: &str,
@@ -63,6 +114,47 @@ pub async fn find_user_by_id(conn: &mut AsyncPgConnection, id: Uuid) -> QueryRes
 pub async fn touch_last_login(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
     diesel::update(users::table.find(id))
         .set(users::last_login_at.eq(Utc::now()))
+        .execute(conn)
+        .await
+}
+
+pub async fn get_user(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<Option<User>> {
+    users::table
+        .find(id)
+        .select(User::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+pub async fn set_user_active(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    active: bool,
+) -> QueryResult<usize> {
+    diesel::update(users::table.find(user_id))
+        .set((
+            users::is_active.eq(active),
+            users::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
+}
+
+/// Set a new password and clear the forced-change flag. Always clears it: the
+/// only way to reach this is the self-service change endpoint, where the user
+/// chose the password themselves.
+pub async fn set_user_password(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    password_hash: &str,
+) -> QueryResult<usize> {
+    diesel::update(users::table.find(user_id))
+        .set((
+            users::password_hash.eq(password_hash),
+            users::must_change_password.eq(false),
+            users::updated_at.eq(Utc::now()),
+        ))
         .execute(conn)
         .await
 }
@@ -106,6 +198,12 @@ pub const REVOKE_ROTATED: &str = "rotated";
 pub const REVOKE_LOGOUT: &str = "logout";
 /// Revoked as part of a token-family kill after replay was detected.
 pub const REVOKE_REUSE: &str = "reuse";
+/// Refresh tokens killed because an admin deactivated the account. Distinct
+/// from `REVOKE_REUSE` so the rotation grace window (which exists to survive
+/// two dashboard tabs racing) can never resurrect a deactivated session.
+pub const REVOKE_DEACTIVATED: &str = "deactivated";
+/// Refresh tokens rotated out because the user changed their own password.
+pub const REVOKE_PASSWORD_CHANGED: &str = "password_changed";
 
 pub async fn revoke_refresh_token(
     conn: &mut AsyncPgConnection,
@@ -190,6 +288,24 @@ pub async fn revoke_all_refresh_tokens_for_user(
     .set((
         refresh_tokens::revoked_at.eq(Utc::now()),
         refresh_tokens::revoked_reason.eq(REVOKE_REUSE),
+    ))
+    .execute(conn)
+    .await
+}
+
+pub async fn revoke_all_refresh_tokens_for_user_with_reason(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    reason: &str,
+) -> QueryResult<usize> {
+    diesel::update(
+        refresh_tokens::table
+            .filter(refresh_tokens::user_id.eq(user_id))
+            .filter(refresh_tokens::revoked_at.is_null()),
+    )
+    .set((
+        refresh_tokens::revoked_at.eq(Utc::now()),
+        refresh_tokens::revoked_reason.eq(reason),
     ))
     .execute(conn)
     .await
@@ -295,6 +411,33 @@ pub async fn create_role(
         .await
 }
 
+/// Update a custom role. Scoped by `org_id` as well as `role_id` so a mistaken
+/// call cannot reach across orgs, and filtered on `is_system` so a preset can
+/// never be written even if a caller-side check is missed.
+pub async fn update_role(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    role_id: Uuid,
+    name: &str,
+    description: &str,
+    permissions: Value,
+) -> QueryResult<Role> {
+    diesel::update(
+        roles::table
+            .filter(roles::id.eq(role_id))
+            .filter(roles::org_id.eq(org_id))
+            .filter(roles::is_system.eq(false)),
+    )
+    .set((
+        roles::name.eq(name),
+        roles::description.eq(description),
+        roles::permissions.eq(permissions),
+    ))
+    .returning(Role::as_returning())
+    .get_result(conn)
+    .await
+}
+
 /// Idempotently upsert a system preset role (keeps DB in sync with code).
 pub async fn upsert_preset_role(
     conn: &mut AsyncPgConnection,
@@ -346,6 +489,24 @@ pub async fn delete_grant(
     )
     .execute(conn)
     .await
+}
+
+pub async fn update_grant(
+    conn: &mut AsyncPgConnection,
+    grant_id: Uuid,
+    role_id: Uuid,
+    scope_type: &str,
+    scope_id: Uuid,
+) -> QueryResult<RoleGrant> {
+    diesel::update(role_grants::table.find(grant_id))
+        .set((
+            role_grants::role_id.eq(role_id),
+            role_grants::scope_type.eq(scope_type),
+            role_grants::scope_id.eq(scope_id),
+        ))
+        .returning(RoleGrant::as_returning())
+        .get_result(conn)
+        .await
 }
 
 /// The org a grant belongs to (for authorizing its deletion).
@@ -401,12 +562,89 @@ pub struct GrantCountRow {
     pub n: i64,
 }
 
-/// All grants in an org with the user email/name and role name, for the
-/// members page.
+/// How many grants would still confer `org:manage` in this org if `role_id`
+/// stopped conferring it.
+///
+/// Editing a role affects every grant that holds it at once, unlike deleting
+/// one grant or deactivating one user, so the exclusion here is by role
+/// rather than by grant id or user id.
+pub async fn count_org_manage_grants_excluding_role(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    role_id: Uuid,
+) -> QueryResult<i64> {
+    let row: GrantCountRow = diesel::sql_query(
+        "SELECT count(*)::bigint AS n \
+         FROM role_grants g JOIN roles r ON g.role_id = r.id \
+         WHERE g.org_id = $1 AND g.role_id <> $2 AND g.scope_type = 'org' \
+           AND r.permissions @> to_jsonb('org:manage'::text)",
+    )
+    .bind::<SqlUuid, _>(org_id)
+    .bind::<SqlUuid, _>(role_id)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
+/// How many grants this user holds in orgs *other* than `org_id`.
+///
+/// Deactivation is account-global, but `member:manage` is org-scoped. If the
+/// target belongs to another org too, this org's admin has no authority to
+/// disable their login there, so a non-zero count blocks the operation.
+pub async fn count_user_grants_outside_org(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+) -> QueryResult<i64> {
+    let row: GrantCountRow = diesel::sql_query(
+        "SELECT count(*)::bigint AS n FROM role_grants \
+         WHERE user_id = $1 AND org_id <> $2",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<SqlUuid, _>(org_id)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
+/// How many grants conferring `org:manage` this org would still have if every
+/// grant belonging to `user_id` were ignored.
+///
+/// `count_org_manage_grants_excluding` excludes a single grant, which is right
+/// for deleting one. Deactivation disables a whole person, who may hold several
+/// org:manage grants at once, so the exclusion has to be by user.
+///
+/// Unlike its two siblings this one joins `users.is_active`: it guards a
+/// *deactivation*, and a holder who is already deactivated cannot administer
+/// anything, so counting them would let an admin walk the org's owners down one
+/// at a time — each deactivation kept legal by the ones already performed. The
+/// other three clauses stay identical to the siblings on purpose; they must all
+/// agree on what "a grant conferring org:manage" is.
+pub async fn count_org_manage_grants_for_user_excluding_user(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    user_id: Uuid,
+) -> QueryResult<i64> {
+    let row: GrantCountRow = diesel::sql_query(
+        "SELECT count(*)::bigint AS n \
+         FROM role_grants g JOIN roles r ON g.role_id = r.id \
+         JOIN users u ON u.id = g.user_id AND u.is_active \
+         WHERE g.org_id = $1 AND g.user_id <> $2 AND g.scope_type = 'org' \
+           AND r.permissions @> to_jsonb('org:manage'::text)",
+    )
+    .bind::<SqlUuid, _>(org_id)
+    .bind::<SqlUuid, _>(user_id)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
+/// All grants in an org with the user email/name/active-status and role name,
+/// for the members page.
 pub async fn list_org_grants(
     conn: &mut AsyncPgConnection,
     org_id: Uuid,
-) -> QueryResult<Vec<(RoleGrant, String, String, String)>> {
+) -> QueryResult<Vec<(RoleGrant, String, String, String, bool)>> {
     role_grants::table
         .inner_join(users::table.on(users::id.eq(role_grants::user_id)))
         .inner_join(roles::table.on(roles::id.eq(role_grants::role_id)))
@@ -416,6 +654,7 @@ pub async fn list_org_grants(
             users::email,
             users::name,
             roles::name,
+            users::is_active,
         ))
         .order(role_grants::created_at.asc())
         .load(conn)

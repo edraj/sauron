@@ -103,10 +103,11 @@ pub(crate) async fn issue_tokens(
     conn: &mut AsyncPgConnection,
     user_id: Uuid,
     user_agent: Option<String>,
+    must_change_password: bool,
 ) -> Result<TokenPair, ApiError> {
     let (access, exp) = state
         .keys
-        .issue_access(user_id)
+        .issue_access(user_id, must_change_password)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let raw = sauron_core::ids::opaque_token();
     let hash = sauron_auth::hash_token(&raw);

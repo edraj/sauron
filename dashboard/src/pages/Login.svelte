@@ -19,6 +19,10 @@
     submitting = true;
     try {
       await authStore.login({ email: email.trim(), password });
+      if (authStore.mustChangePassword) {
+        push('/change-password');
+        return;
+      }
       await sessionStore.load(true);
       // First-time / project-less accounts land on onboarding.
       push(sessionStore.projects.length === 0 ? '/onboarding' : '/overview');
