@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use sauron_auth::guard::{check_no_escalation, role_permissions, scope_parts};
 use sauron_auth::rbac::grants_from_rows;
 use sauron_auth::{authorize_org, perm, AuthError, AuthUser};
 use sauron_db::models::{NewRoleGrant, Organization, Role};
@@ -163,6 +164,41 @@ pub struct CreateGrantReq {
     pub scope_id: Uuid,
 }
 
+/// Validate that a scope target belongs to `org_id`, returning the app's
+/// parent project when the scope is an app (which `scope_parts` needs).
+///
+/// This is the cross-tenant boundary for grants: without it a caller could
+/// name a project or app in someone else's org and have a grant created
+/// against it. One implementation, called by every handler that accepts a
+/// caller-supplied scope.
+async fn validate_scope_in_org(
+    conn: &mut sauron_db::AsyncPgConnection,
+    org_id: Uuid,
+    scope_type: &str,
+    scope_id: Uuid,
+) -> Result<Option<Uuid>, ApiError> {
+    let not_in_org = || ApiError::BadRequest("scope target is not in this org".into());
+    match scope_type {
+        "org" => {
+            if scope_id != org_id {
+                return Err(not_in_org());
+            }
+            Ok(None)
+        }
+        "project" => {
+            if repo::project_org(conn, scope_id).await? != Some(org_id) {
+                return Err(not_in_org());
+            }
+            Ok(None)
+        }
+        "app" => match repo::app_ancestry(conn, scope_id).await? {
+            Some((project_id, o)) if o == org_id => Ok(Some(project_id)),
+            _ => Err(not_in_org()),
+        },
+        _ => Err(ApiError::BadRequest("invalid scope_type".into())),
+    }
+}
+
 pub async fn create_grant(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -197,52 +233,18 @@ pub async fn create_grant(
 
     // Scope target must belong to this org (prevents cross-org grants). Also
     // capture the scope's (project, app) for the escalation check below.
-    let (scope_project, scope_app): (Option<Uuid>, Option<Uuid>) = match req.scope_type.as_str() {
-        "org" => {
-            if req.scope_id != org_id {
-                return Err(ApiError::BadRequest(
-                    "scope target is not in this org".into(),
-                ));
-            }
-            (None, None)
-        }
-        "project" => {
-            if repo::project_org(&mut conn, req.scope_id).await? != Some(org_id) {
-                return Err(ApiError::BadRequest(
-                    "scope target is not in this org".into(),
-                ));
-            }
-            (Some(req.scope_id), None)
-        }
-        "app" => match repo::app_ancestry(&mut conn, req.scope_id).await? {
-            Some((project_id, o)) if o == org_id => (Some(project_id), Some(req.scope_id)),
-            _ => {
-                return Err(ApiError::BadRequest(
-                    "scope target is not in this org".into(),
-                ))
-            }
-        },
-        _ => unreachable!("scope_type validated above"),
-    };
+    let project_of_app =
+        validate_scope_in_org(&mut conn, org_id, &req.scope_type, req.scope_id).await?;
+    let (scope_project, scope_app) = scope_parts(&req.scope_type, req.scope_id, project_of_app);
 
     // No privilege escalation: the granter must themselves hold every permission
     // the granted role confers, at the grant's scope. (Stops an Admin from
     // granting Owner to gain org:manage.)
-    let role_perms: Vec<String> = match &role.permissions {
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let role_perms = role_permissions(&role.permissions);
     let granter =
         sauron_auth::effective_at(&mut conn, auth.user_id, org_id, scope_project, scope_app)
             .await?;
-    for p in &role_perms {
-        if !granter.contains(p) {
-            return Err(ApiError::Auth(AuthError::Forbidden));
-        }
-    }
+    check_no_escalation(&granter, &role_perms).map_err(ApiError::Auth)?;
 
     let grant = repo::create_grant(
         &mut conn,
@@ -273,35 +275,24 @@ pub async fn delete_grant(
     let role = repo::get_role(&mut conn, grant.role_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let role_perms: Vec<String> = match &role.permissions {
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let role_perms = role_permissions(&role.permissions);
 
     // Symmetry with create_grant: you may not remove a grant conferring
     // permissions you do not hold yourself at that scope. Without this, an Admin
     // (member:manage but not org:manage) could delete the Owner's grant and
     // evict them from their own org.
-    let (scope_project, scope_app): (Option<Uuid>, Option<Uuid>) = match grant.scope_type.as_str() {
-        "org" => (None, None),
-        "project" => (Some(grant.scope_id), None),
-        "app" => match repo::app_ancestry(&mut conn, grant.scope_id).await? {
-            Some((project_id, _)) => (Some(project_id), Some(grant.scope_id)),
-            None => (None, Some(grant.scope_id)),
-        },
-        _ => (None, None),
+    let project_of_app = if grant.scope_type == "app" {
+        repo::app_ancestry(&mut conn, grant.scope_id)
+            .await?
+            .map(|(project_id, _)| project_id)
+    } else {
+        None
     };
+    let (scope_project, scope_app) = scope_parts(&grant.scope_type, grant.scope_id, project_of_app);
     let remover =
         sauron_auth::effective_at(&mut conn, auth.user_id, org_id, scope_project, scope_app)
             .await?;
-    for p in &role_perms {
-        if !remover.contains(p) {
-            return Err(ApiError::Auth(AuthError::Forbidden));
-        }
-    }
+    check_no_escalation(&remover, &role_perms).map_err(ApiError::Auth)?;
 
     // Never let the org lose its last administrator: once no grant confers
     // org:manage, create_grant's own escalation check makes it impossible for
