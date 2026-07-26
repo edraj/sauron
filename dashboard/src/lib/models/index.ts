@@ -204,6 +204,14 @@ export interface CreateMemberResult {
   temp_password: string;
 }
 
+/** One entry in the scope picker: the org, a project, or an app. */
+export interface ScopeOption {
+  key: string; // `${scope_type}:${scope_id}`
+  label: string;
+  scope_type: ScopeType;
+  scope_id: string;
+}
+
 export interface UpdateGrantPayload {
   role_id?: string;
   scope_type?: ScopeType;

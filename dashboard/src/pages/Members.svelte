@@ -13,7 +13,7 @@
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { initials } from '../lib/utils/format';
-  import type { App, MemberGrant, Role, ScopeType } from '../lib/models';
+  import type { App, MemberGrant, Role, ScopeOption, ScopeType } from '../lib/models';
 
   let members = $state<MemberGrant[]>([]);
   let roles = $state<Role[]>([]);
@@ -41,13 +41,6 @@
   const canManage = $derived(sessionStore.can('member:manage'));
   const canReadMembers = $derived(sessionStore.can('member:read'));
   const canManageRoles = $derived(sessionStore.can('role:manage'));
-
-  interface ScopeOption {
-    key: string;
-    label: string;
-    scope_type: ScopeType;
-    scope_id: string;
-  }
 
   const scopeOptions = $derived.by<ScopeOption[]>(() => {
     const opts: ScopeOption[] = [];
