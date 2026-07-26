@@ -11,7 +11,7 @@
 # shipped in the sauron-server package) instead of compiling the C++ amalgamation.
 #
 # --prebuilt DIR decouples the (slow) compile from the (fast) packaging step. DIR:
-#   DIR/bin/{sauron-api,sauron-ingest,sauron-monitor,sauron-tier,sauron-migrate,sauron-symcli,crebain}
+#   DIR/bin/<name>     one per line of packaging/rpm/binaries.txt
 #   DIR/dist/          dashboard build output (contents of dashboard/dist)
 #   DIR/libduckdb.so   the prebuilt DuckDB library the binaries were linked against
 # In this mode no toolchain is required, so --nodeps is added automatically.
@@ -62,7 +62,12 @@ fi
 # --- prebuilt mode: overlay tarball of binaries + dashboard/dist (Source51) ---
 prebuilt_with=()
 if [ -n "$prebuilt_dir" ]; then
-    bins=(sauron-api sauron-ingest sauron-monitor sauron-tier sauron-migrate sauron-symcli crebain)
+    # Single source of truth, shared with release.yml's assemble step and the
+    # spec's %install loop — so a new binary can't reach one list but not another.
+    manifest=packaging/rpm/binaries.txt
+    [ -f "$manifest" ] || { echo "missing binary manifest: $manifest" >&2; exit 1; }
+    mapfile -t bins < <(grep -vE '^[[:space:]]*(#|$)' "$manifest")
+    [ "${#bins[@]}" -gt 0 ] || { echo "no binaries listed in $manifest" >&2; exit 1; }
     for b in "${bins[@]}"; do
         [ -f "$prebuilt_dir/bin/$b" ] || { echo "missing prebuilt binary: $prebuilt_dir/bin/$b" >&2; exit 1; }
     done

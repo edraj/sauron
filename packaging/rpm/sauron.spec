@@ -131,7 +131,12 @@ wait "$dashboard_build"
 
 %install
 # --- binaries ---
-for b in sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier sauron-migrate sauron-symcli crebain; do
+# packaging/rpm/binaries.txt is the single source of truth for what ships; CI's
+# prebuilt assemble step and build-rpm.sh read the same file, so the lists can't
+# drift apart (a binary in the spec but absent from the prebuilt overlay used to
+# fail here with "install: cannot stat"). Which subpackage owns each one is still
+# declared in %%files below, and rpm errors on installed-but-unpackaged files.
+for b in $(grep -vE '^[[:space:]]*(#|$)' packaging/rpm/binaries.txt); do
     install -Dm0755 backend/target/release/$b %{buildroot}%{_bindir}/$b
 done
 
