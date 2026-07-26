@@ -416,6 +416,78 @@ pub async fn delete_grant(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+pub struct SetMemberActiveReq {
+    pub is_active: bool,
+}
+
+/// Enable or disable a member's ability to log in.
+///
+/// Deliberately leaves `role_grants` untouched. This is not a delete: the
+/// member stays in the list, badged and reversible. Removing access to one
+/// scope is what `DELETE /v1/grants/{id}` is for.
+pub async fn set_member_active(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((org_id, user_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<SetMemberActiveReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_MANAGE).await?;
+
+    let _user = repo::get_user(&mut conn, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    // The target must actually be a member of this org, or any admin could
+    // toggle any account in the deployment by guessing a uuid.
+    if repo::user_grants_in_org(&mut conn, user_id, org_id)
+        .await?
+        .is_empty()
+    {
+        return Err(ApiError::NotFound);
+    }
+
+    if !req.is_active {
+        if user_id == auth.user_id {
+            return Err(ApiError::Conflict(
+                "you cannot deactivate your own account".into(),
+            ));
+        }
+        // member:manage is org-scoped; deactivation is account-global. Allowing
+        // it for someone who also belongs to another org would let this org's
+        // admin lock them out of an org they have no authority over.
+        if repo::count_user_grants_outside_org(&mut conn, user_id, org_id).await? > 0 {
+            return Err(ApiError::Conflict(
+                "this member belongs to another organization and cannot be deactivated from here"
+                    .into(),
+            ));
+        }
+        // Same reasoning as delete_grant's last-owner guard: an org with no
+        // org:manage holder can never regain one, because create_grant's
+        // escalation check makes it ungrantable.
+        if repo::count_org_manage_grants_for_user_excluding_user(&mut conn, org_id, user_id).await?
+            == 0
+        {
+            return Err(ApiError::Conflict(
+                "cannot deactivate the last member with org:manage — assign it to someone else first"
+                    .into(),
+            ));
+        }
+    }
+
+    repo::set_user_active(&mut conn, user_id, req.is_active).await?;
+    if !req.is_active {
+        repo::revoke_all_refresh_tokens_for_user_with_reason(
+            &mut conn,
+            user_id,
+            repo::REVOKE_DEACTIVATED,
+        )
+        .await?;
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 // --- roles ------------------------------------------------------------------
 
 pub async fn list_roles(

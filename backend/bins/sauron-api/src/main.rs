@@ -161,6 +161,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/orgs/{org_id}/members",
             get(routes::orgs::list_members).post(routes::orgs::create_member),
         )
+        .route(
+            "/v1/orgs/{org_id}/members/{user_id}",
+            patch(routes::orgs::set_member_active),
+        )
         .route("/v1/orgs/{org_id}/grants", post(routes::orgs::create_grant))
         .route("/v1/grants/{grant_id}", delete(routes::orgs::delete_grant))
         .route(
