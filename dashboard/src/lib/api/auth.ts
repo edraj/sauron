@@ -36,3 +36,19 @@ export async function getMe(): Promise<User> {
   const { data } = await api.get<User>('/v1/me');
   return data;
 }
+
+/**
+ * Goes through the main client, not bareClient: it needs the bearer token, and
+ * it is one of only two endpoints the API allows while a password change is
+ * outstanding.
+ */
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<AuthSession> {
+  const { data } = await api.post<AuthSession>('/v1/auth/password', {
+    current_password: currentPassword,
+    new_password: newPassword,
+  });
+  return data;
+}

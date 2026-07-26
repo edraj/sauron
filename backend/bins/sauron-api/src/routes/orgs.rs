@@ -134,6 +134,7 @@ pub struct MemberGrant {
     pub role_name: String,
     pub scope_type: String,
     pub scope_id: Uuid,
+    pub is_active: bool,
 }
 
 pub async fn list_members(
@@ -146,7 +147,7 @@ pub async fn list_members(
     let rows = repo::list_org_grants(&mut conn, org_id).await?;
     let members = rows
         .into_iter()
-        .map(|(g, email, name, role_name)| MemberGrant {
+        .map(|(g, email, name, role_name, is_active)| MemberGrant {
             id: g.id,
             user_id: g.user_id,
             email,
@@ -155,6 +156,7 @@ pub async fn list_members(
             role_name,
             scope_type: g.scope_type,
             scope_id: g.scope_id,
+            is_active,
         })
         .collect();
     Ok(Json(members))

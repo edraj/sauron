@@ -631,12 +631,12 @@ pub async fn count_org_manage_grants_for_user_excluding_user(
     Ok(row.n)
 }
 
-/// All grants in an org with the user email/name and role name, for the
-/// members page.
+/// All grants in an org with the user email/name/active-status and role name,
+/// for the members page.
 pub async fn list_org_grants(
     conn: &mut AsyncPgConnection,
     org_id: Uuid,
-) -> QueryResult<Vec<(RoleGrant, String, String, String)>> {
+) -> QueryResult<Vec<(RoleGrant, String, String, String, bool)>> {
     role_grants::table
         .inner_join(users::table.on(users::id.eq(role_grants::user_id)))
         .inner_join(roles::table.on(roles::id.eq(role_grants::role_id)))
@@ -646,6 +646,7 @@ pub async fn list_org_grants(
             users::email,
             users::name,
             roles::name,
+            users::is_active,
         ))
         .order(role_grants::created_at.asc())
         .load(conn)

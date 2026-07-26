@@ -13,6 +13,7 @@ export interface User {
   last_login_at: string | null;
   created_at: string;
   updated_at: string;
+  must_change_password: boolean;
 }
 
 export interface AuthTokens {
@@ -171,6 +172,48 @@ export interface MemberGrant {
   role_name: string;
   scope_type: ScopeType;
   scope_id: string;
+  is_active: boolean;
+}
+
+/**
+ * One person, with every grant they hold in the org.
+ *
+ * The API returns one row per grant. The table renders one row per person:
+ * deactivation and editing are per-account, so a member with three grants
+ * would otherwise show three identical Deactivate buttons.
+ */
+export interface Member {
+  user_id: string;
+  email: string;
+  name: string | null;
+  is_active: boolean;
+  grants: MemberGrant[];
+}
+
+export interface CreateMemberPayload {
+  email: string;
+  name: string;
+  role_id: string;
+  scope_type: ScopeType;
+  scope_id: string;
+}
+
+export interface CreateMemberResult {
+  user_id: string;
+  grant_id: string;
+  temp_password: string;
+}
+
+export interface UpdateGrantPayload {
+  role_id?: string;
+  scope_type?: ScopeType;
+  scope_id?: string;
+}
+
+export interface UpdateRolePayload {
+  name?: string;
+  description?: string;
+  permissions?: Permission[];
 }
 
 export interface CreateGrantPayload {
@@ -184,6 +227,26 @@ export interface CreateRolePayload {
   name: string;
   description?: string;
   permissions: Permission[];
+}
+
+/** Collapse the flat grant list into one entry per person, preserving order. */
+export function groupMembers(grants: MemberGrant[]): Member[] {
+  const byUser = new Map<string, Member>();
+  for (const g of grants) {
+    const existing = byUser.get(g.user_id);
+    if (existing) {
+      existing.grants.push(g);
+    } else {
+      byUser.set(g.user_id, {
+        user_id: g.user_id,
+        email: g.email,
+        name: g.name,
+        is_active: g.is_active,
+        grants: [g],
+      });
+    }
+  }
+  return [...byUser.values()];
 }
 
 // ---------------------------------------------------------------------------

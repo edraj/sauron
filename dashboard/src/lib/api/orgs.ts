@@ -2,10 +2,14 @@ import { api } from './client';
 import type {
   AccessResponse,
   CreateGrantPayload,
+  CreateMemberPayload,
+  CreateMemberResult,
   CreateRolePayload,
   MemberGrant,
   Organization,
   Role,
+  UpdateGrantPayload,
+  UpdateRolePayload,
 } from '../models';
 
 export async function listOrgs(): Promise<Organization[]> {
@@ -54,5 +58,38 @@ export async function createRole(
   body: CreateRolePayload,
 ): Promise<Role> {
   const { data } = await api.post<Role>(`/v1/orgs/${orgId}/roles`, body);
+  return data;
+}
+
+export async function createMember(
+  orgId: string,
+  body: CreateMemberPayload,
+): Promise<CreateMemberResult> {
+  const { data } = await api.post<CreateMemberResult>(`/v1/orgs/${orgId}/members`, body);
+  return data;
+}
+
+export async function setMemberActive(
+  orgId: string,
+  userId: string,
+  isActive: boolean,
+): Promise<void> {
+  await api.patch(`/v1/orgs/${orgId}/members/${userId}`, { is_active: isActive });
+}
+
+export async function updateGrant(
+  grantId: string,
+  body: UpdateGrantPayload,
+): Promise<{ id: string }> {
+  const { data } = await api.patch<{ id: string }>(`/v1/grants/${grantId}`, body);
+  return data;
+}
+
+export async function updateRole(
+  orgId: string,
+  roleId: string,
+  body: UpdateRolePayload,
+): Promise<Role> {
+  const { data } = await api.patch<Role>(`/v1/orgs/${orgId}/roles/${roleId}`, body);
   return data;
 }
