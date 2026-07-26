@@ -233,6 +233,8 @@ diesel::table! {
         last_login_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        is_active -> Bool,
+        must_change_password -> Bool,
     }
 }
 

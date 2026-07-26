@@ -80,6 +80,8 @@ pub struct User {
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub is_active: bool,
+    pub must_change_password: bool,
 }
 
 #[derive(Debug, Insertable)]
