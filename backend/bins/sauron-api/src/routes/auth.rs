@@ -395,7 +395,19 @@ pub async fn refresh(
             // unreliable exactly when it matters. Report the mundane cause
             // and skip the alarm.
             if reason.as_deref() == Some(repo::REVOKE_DEACTIVATED) {
-                return Err(ApiError::Auth(AuthError::AccountDeactivated));
+                // The reason reflects the revocation at the time it happened,
+                // not whether the account is still deactivated: an admin may
+                // have reactivated it since without touching this already-
+                // revoked row. Re-check the user's current state so a
+                // reactivated user falls through to the ordinary
+                // reuse-detection path below instead of being told their
+                // (now-active) account is deactivated.
+                let user = repo::get_user(&mut conn, user_id)
+                    .await?
+                    .ok_or(ApiError::Auth(AuthError::InvalidToken))?;
+                if !user.is_active {
+                    return Err(ApiError::Auth(AuthError::AccountDeactivated));
+                }
             }
 
             let revoked = repo::revoke_all_refresh_tokens_for_user(&mut conn, user_id).await?;
