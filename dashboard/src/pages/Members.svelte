@@ -242,19 +242,15 @@
   {:else if error}
     <Card><p class="err-msg">{error}</p></Card>
   {:else}
-    {#if canManage}
-      <Card class="grant-card">
+    <div class="stack">
+      {#if canManage}
+      <Card>
         {#snippet header()}
-          <div class="grant-head">
-            <div>
-              <h3 class="card-title-inline">Grant access</h3>
-              <p class="muted grant-sub">
-                For someone who already has an account — in this org or another. To provision a
-                brand-new account instead, use Create member.
-              </p>
-            </div>
-            <Button variant="primary" onclick={() => (createOpen = true)}>Create member</Button>
-          </div>
+          <h3 class="card-title-inline">Grant access</h3>
+          <p class="muted grant-sub">For someone who already has an account, here or in another org.</p>
+        {/snippet}
+        {#snippet actions()}
+          <Button variant="primary" onclick={() => (createOpen = true)}>Create member</Button>
         {/snippet}
         <form class="grant-form" onsubmit={submitGrant}>
           <div class="gf-field">
@@ -293,14 +289,14 @@
       onremovegrant={removeGrant}
     />
 
-    <Card class="roles-card">
+    <Card>
       {#snippet header()}
-        <div class="roles-head">
-          <h3 class="card-title-inline">Roles</h3>
-          {#if canManageRoles}
-            <Button variant="secondary" size="sm" onclick={openNewRole}>New role</Button>
-          {/if}
-        </div>
+        <h3 class="card-title-inline">Roles</h3>
+      {/snippet}
+      {#snippet actions()}
+        {#if canManageRoles}
+          <Button variant="secondary" size="sm" onclick={openNewRole}>New role</Button>
+        {/if}
       {/snippet}
 
       <ul class="role-list">
@@ -326,6 +322,7 @@
         {/each}
       </ul>
     </Card>
+    </div>
   {/if}
 
   {#if sessionStore.currentOrg}
@@ -382,15 +379,11 @@
     place-items: center;
     padding: 80px;
   }
-  :global(.grant-card),
-  :global(.roles-card) {
-    margin-bottom: 16px;
-  }
-  .grant-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    width: 100%;
+  /* Owns the vertical rhythm for the page's cards. Previously each card carried
+     its own margin-bottom via :global(), which silently skipped the members
+     table once it moved into its own component and left it stuck to Roles. */
+  .stack {
+    display: grid;
     gap: 16px;
   }
   .grant-sub {
@@ -433,13 +426,6 @@
   .card-title-inline {
     font-size: 14.5px;
     font-weight: 620;
-  }
-  .roles-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-    gap: 12px;
   }
   .role-list {
     list-style: none;
