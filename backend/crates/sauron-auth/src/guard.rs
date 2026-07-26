@@ -11,6 +11,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::extractors::AuthError;
+use crate::rbac::perm;
 
 /// Length of a generated temp password.
 pub const TEMP_PASSWORD_LEN: usize = 16;
@@ -65,6 +66,16 @@ pub fn check_role_edit(
         }
     }
     Ok(())
+}
+
+/// True when an edit strips `org:manage` from a permission set.
+///
+/// Order-independent: only membership matters, not position. Used to guard
+/// both a grant edit (does the grant stop conferring `org:manage`?) and a role
+/// edit (does the role stop granting it to every holder?) against orphaning an
+/// org that has no other source of `org:manage` left.
+pub fn drops_org_manage(old: &[String], new: &[String]) -> bool {
+    old.iter().any(|p| p == perm::ORG_MANAGE) && !new.iter().any(|p| p == perm::ORG_MANAGE)
 }
 
 /// Split a grant's scope into the `(project, app)` pair `effective_at` expects.
@@ -238,6 +249,47 @@ mod tests {
             &strings(&["app:read", "issue:read"]),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn drops_org_manage_true_when_old_has_it_and_new_does_not() {
+        let old = strings(&["issue:read", "org:manage"]);
+        let new = strings(&["issue:read"]);
+        assert!(drops_org_manage(&old, &new));
+    }
+
+    #[test]
+    fn drops_org_manage_false_when_both_have_it() {
+        let old = strings(&["org:manage", "issue:read"]);
+        let new = strings(&["issue:read", "org:manage"]);
+        assert!(!drops_org_manage(&old, &new));
+    }
+
+    #[test]
+    fn drops_org_manage_false_when_neither_has_it() {
+        let old = strings(&["issue:read"]);
+        let new = strings(&["issue:read", "app:read"]);
+        assert!(!drops_org_manage(&old, &new));
+    }
+
+    #[test]
+    fn drops_org_manage_false_when_new_gains_it() {
+        let old = strings(&["issue:read"]);
+        let new = strings(&["issue:read", "org:manage"]);
+        assert!(!drops_org_manage(&old, &new));
+    }
+
+    #[test]
+    fn drops_org_manage_ignores_position() {
+        // org:manage sitting at a different index in each list must not change
+        // the answer — only set membership matters.
+        let old = strings(&["org:manage", "issue:read", "app:read"]);
+        let new = strings(&["issue:read", "app:read"]);
+        assert!(drops_org_manage(&old, &new));
+
+        let old2 = strings(&["issue:read", "app:read", "org:manage"]);
+        let new2 = strings(&["app:read", "org:manage", "issue:read"]);
+        assert!(!drops_org_manage(&old2, &new2));
     }
 
     #[test]

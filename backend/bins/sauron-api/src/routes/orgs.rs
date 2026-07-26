@@ -8,7 +8,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use sauron_auth::guard::{
-    check_no_escalation, check_role_edit, generate_temp_password, role_permissions, scope_parts,
+    check_no_escalation, check_role_edit, drops_org_manage, generate_temp_password,
+    role_permissions, scope_parts,
 };
 use sauron_auth::hash_password_async;
 use sauron_auth::rbac::grants_from_rows;
@@ -569,8 +570,7 @@ pub async fn update_grant_handler(
 
     // If this grant currently carries org:manage and the edit drops it, the org
     // must retain another holder.
-    let loses_org_manage = old_perms.iter().any(|p| p == perm::ORG_MANAGE)
-        && !new_perms.iter().any(|p| p == perm::ORG_MANAGE);
+    let loses_org_manage = drops_org_manage(&old_perms, &new_perms);
     let leaves_org_scope = grant.scope_type == "org" && new_scope_type != "org";
     if loses_org_manage || (leaves_org_scope && old_perms.iter().any(|p| p == perm::ORG_MANAGE)) {
         let remaining =
@@ -653,7 +653,15 @@ pub async fn create_role(
             .map(|p| Value::String(p.clone()))
             .collect(),
     );
-    let role = repo::create_role(&mut conn, org_id, &req.name, &req.description, perms).await?;
+    let role = repo::create_role(&mut conn, org_id, &req.name, &req.description, perms)
+        .await
+        .map_err(|e| match e {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _,
+            ) => ApiError::Conflict("a role with that name already exists in this org".into()),
+            other => ApiError::from(other),
+        })?;
     Ok(Json(role))
 }
 
@@ -684,11 +692,11 @@ pub async fn update_role_handler(
     if role.org_id != Some(org_id) {
         // Covers both a preset (org_id NULL) and another org's role. Returning
         // NotFound rather than Forbidden avoids confirming the role exists.
-        if role.is_system {
-            return Err(ApiError::BadRequest("system roles cannot be edited".into()));
-        }
         return Err(ApiError::NotFound);
     }
+    // Reached only when role.org_id == Some(org_id), i.e. the role belongs to
+    // this org. A preset always has org_id NULL, so it is already turned away
+    // as NotFound above and never reaches this check.
     if role.is_system {
         return Err(ApiError::BadRequest("system roles cannot be edited".into()));
     }
@@ -720,9 +728,7 @@ pub async fn update_role_handler(
     // A role edit changes every holder's access at once. If this role is the
     // only source of org:manage in the org, dropping it orphans the org exactly
     // as deleting the last owner grant would.
-    if old_perms.iter().any(|p| p == perm::ORG_MANAGE)
-        && !new_perms.iter().any(|p| p == perm::ORG_MANAGE)
-    {
+    if drops_org_manage(&old_perms, &new_perms) {
         let remaining =
             repo::count_org_manage_grants_excluding_role(&mut conn, org_id, role_id).await?;
         if remaining == 0 {
@@ -733,6 +739,14 @@ pub async fn update_role_handler(
     }
 
     let perms = Value::Array(new_perms.iter().map(|p| Value::String(p.clone())).collect());
-    let updated = repo::update_role(&mut conn, org_id, role_id, &name, &description, perms).await?;
+    let updated = repo::update_role(&mut conn, org_id, role_id, &name, &description, perms)
+        .await
+        .map_err(|e| match e {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _,
+            ) => ApiError::Conflict("a role with that name already exists in this org".into()),
+            other => ApiError::from(other),
+        })?;
     Ok(Json(updated))
 }
