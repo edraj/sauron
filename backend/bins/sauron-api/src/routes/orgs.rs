@@ -689,16 +689,17 @@ pub async fn update_role_handler(
     let role = repo::get_role(&mut conn, role_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if role.org_id != Some(org_id) {
-        // Covers both a preset (org_id NULL) and another org's role. Returning
-        // NotFound rather than Forbidden avoids confirming the role exists.
-        return Err(ApiError::NotFound);
-    }
-    // Reached only when role.org_id == Some(org_id), i.e. the role belongs to
-    // this org. A preset always has org_id NULL, so it is already turned away
-    // as NotFound above and never reaches this check.
+    // Check presets first. Presets (org_id NULL) are listed to every org
+    // member via repo::list_roles, so their existence is already public; a
+    // clear "cannot be edited" refusal is correct here, not a 404.
     if role.is_system {
         return Err(ApiError::BadRequest("system roles cannot be edited".into()));
+    }
+    // Reached only for custom (non-system) roles. A role owned by another
+    // org is not public, so returning NotFound rather than Forbidden avoids
+    // confirming it exists.
+    if role.org_id != Some(org_id) {
+        return Err(ApiError::NotFound);
     }
 
     let name = req.name.clone().unwrap_or_else(|| role.name.clone());
