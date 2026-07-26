@@ -1,4 +1,4 @@
-import { configureAuthBridge } from '../api/client';
+import { configureAuthBridge, isNormalizedError } from '../api/client';
 import * as authApi from '../api/auth';
 import type { LoginPayload, RegisterPayload, User } from '../models';
 
@@ -9,6 +9,11 @@ export type AuthStatus =
   | 'unauthenticated';
 
 const REFRESH_KEY = 'sauron.refresh_token';
+
+/** True for the API's 403 password_change_required. */
+function isPasswordChangeRequired(err: unknown): boolean {
+  return isNormalizedError(err) && err.status === 403 && err.code === 'password_change_required';
+}
 
 function readRefreshToken(): string | null {
   if (typeof window === 'undefined') return null;
@@ -26,6 +31,12 @@ class AuthStore {
   accessToken = $state<string | null>(null);
   user = $state<User | null>(null);
   status = $state<AuthStatus>('idle');
+  /**
+   * The session is valid but owes a password change. Derived from the user
+   * object when we have one; when /v1/me was blocked we have no user, and the
+   * block itself is the signal.
+   */
+  mustChangePassword = $state(false);
 
   get isAuthenticated(): boolean {
     return this.status === 'authenticated' && this.accessToken !== null;
@@ -49,6 +60,7 @@ class AuthStore {
   private clearLocal(): void {
     this.accessToken = null;
     this.user = null;
+    this.mustChangePassword = false;
     writeRefreshToken(null);
   }
 
@@ -56,6 +68,7 @@ class AuthStore {
     const session = await authApi.login(payload);
     this.accessToken = session.access_token;
     this.user = session.user;
+    this.mustChangePassword = session.user.must_change_password;
     writeRefreshToken(session.refresh_token);
     this.status = 'authenticated';
   }
@@ -64,7 +77,22 @@ class AuthStore {
     const session = await authApi.register(payload);
     this.accessToken = session.access_token;
     this.user = session.user;
+    this.mustChangePassword = session.user.must_change_password;
     writeRefreshToken(session.refresh_token);
+    this.status = 'authenticated';
+  }
+
+  /**
+   * Change the password and adopt the fresh session the server returns. The
+   * old refresh token is revoked server-side, so the new pair must replace it
+   * here or the next refresh fails.
+   */
+  async applyPasswordChange(currentPassword: string, newPassword: string): Promise<void> {
+    const session = await authApi.changePassword(currentPassword, newPassword);
+    this.accessToken = session.access_token;
+    this.user = session.user;
+    writeRefreshToken(session.refresh_token);
+    this.mustChangePassword = false;
     this.status = 'authenticated';
   }
 
@@ -101,9 +129,25 @@ class AuthStore {
     }
     try {
       await this.refresh();
+    } catch {
+      this.clearLocal();
+      this.status = 'unauthenticated';
+      return;
+    }
+    try {
       this.user = await authApi.getMe();
       this.status = 'authenticated';
-    } catch {
+    } catch (err) {
+      // A pending password change blocks /v1/me along with everything else.
+      // That is a valid session that owes one action, not a failed one —
+      // clearing it here would lock the user out of the only screen that can
+      // fix it.
+      if (isPasswordChangeRequired(err)) {
+        this.user = null;
+        this.mustChangePassword = true;
+        this.status = 'authenticated';
+        return;
+      }
       this.clearLocal();
       this.status = 'unauthenticated';
     }
