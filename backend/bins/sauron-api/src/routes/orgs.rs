@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use sauron_auth::guard::{
     check_no_escalation, check_role_edit, drops_org_manage, generate_temp_password,
-    role_permissions, scope_parts,
+    role_permissions, scope_parts, union_permissions,
 };
 use sauron_auth::hash_password_async;
 use sauron_auth::rbac::grants_from_rows;
@@ -225,6 +225,20 @@ pub async fn create_grant(
             ApiError::BadRequest("no user with that email (ask them to sign up)".into())
         })?;
 
+    // A deactivated account cannot log in, so the grant would do nothing — and
+    // worse, it would strand the account. `set_member_active` refuses to touch
+    // anyone holding grants outside the org, in both directions, so adding a
+    // second org to a deactivated user makes them un-reactivatable from either
+    // one; recovery would need direct database access. Keeping "a deactivated
+    // user's set of orgs never grows" true here is what keeps that guard
+    // reversible.
+    if !user.is_active {
+        return Err(ApiError::Conflict(
+            "that account is deactivated — reactivate it where it is already a member, then grant access here"
+                .into(),
+        ));
+    }
+
     // Role must be a preset or belong to this org.
     let role = repo::get_role(&mut conn, req.role_id)
         .await?
@@ -252,6 +266,8 @@ pub async fn create_grant(
             .await?;
     check_no_escalation(&granter, &role_perms).map_err(ApiError::Auth)?;
 
+    // Same convention as update_grant_handler: re-granting a role a member
+    // already holds at that scope is a conflict the user can act on, not a 500.
     let grant = repo::create_grant(
         &mut conn,
         NewRoleGrant {
@@ -262,7 +278,14 @@ pub async fn create_grant(
             scope_id: req.scope_id,
         },
     )
-    .await?;
+    .await
+    .map_err(|e| match e {
+        diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        ) => ApiError::Conflict("this member already has that role at that scope".into()),
+        other => ApiError::from(other),
+    })?;
     Ok(Json(serde_json::json!({ "id": grant.id })))
 }
 
@@ -443,29 +466,53 @@ pub async fn set_member_active(
         .ok_or(ApiError::NotFound)?;
 
     // The target must actually be a member of this org, or any admin could
-    // toggle any account in the deployment by guessing a uuid.
-    if repo::user_grants_in_org(&mut conn, user_id, org_id)
-        .await?
-        .is_empty()
-    {
+    // toggle any account in the deployment by guessing a uuid. The rows are
+    // also what the escalation check below reads, so this is one query, not two.
+    let target_grants = repo::user_grants_in_org(&mut conn, user_id, org_id).await?;
+    if target_grants.is_empty() {
         return Err(ApiError::NotFound);
     }
 
-    if !req.is_active {
-        if user_id == auth.user_id {
-            return Err(ApiError::Conflict(
-                "you cannot deactivate your own account".into(),
-            ));
-        }
-        // member:manage is org-scoped; deactivation is account-global. Allowing
-        // it for someone who also belongs to another org would let this org's
-        // admin lock them out of an org they have no authority over.
-        if repo::count_user_grants_outside_org(&mut conn, user_id, org_id).await? > 0 {
-            return Err(ApiError::Conflict(
+    // Refuse a self-deactivation before anything else, so it always gets the
+    // explanatory 409 rather than tripping one of the general guards below.
+    if !req.is_active && user_id == auth.user_id {
+        return Err(ApiError::Conflict(
+            "you cannot deactivate your own account".into(),
+        ));
+    }
+
+    // You may not flip is_active on someone who outranks you — the same rule
+    // delete_grant and update_grant_handler already apply to a single grant,
+    // and this is strictly more severe than either: it reaches the whole
+    // account rather than one scope. Without it an Admin (member:manage, no
+    // org:manage) could deactivate every Owner in turn and orphan the org
+    // permanently. Reactivation needs it too: switching someone's login back on
+    // hands their authority back, which is a grant of authority.
+    //
+    // The target's side is the union over every grant they hold here, not their
+    // org-scoped subset, because is_active is not scoped either. The caller's
+    // side is deliberately their *org*-scope permissions: an account-global act
+    // takes org-level standing, which a project grant does not confer.
+    let target_perms = union_permissions(&grants_from_rows(target_grants));
+    let caller = sauron_auth::effective_at_org(&mut conn, auth.user_id, org_id).await?;
+    check_no_escalation(&caller, &target_perms).map_err(ApiError::Auth)?;
+
+    // member:manage is org-scoped; is_active is account-global. Both directions
+    // are out of bounds for a member of another org: deactivating locks them
+    // out of an org this caller has no authority over, and reactivating
+    // overrides that org's decision to lock them out.
+    if repo::count_user_grants_outside_org(&mut conn, user_id, org_id).await? > 0 {
+        return Err(ApiError::Conflict(
+            if req.is_active {
+                "this member belongs to another organization and cannot be reactivated from here"
+            } else {
                 "this member belongs to another organization and cannot be deactivated from here"
-                    .into(),
-            ));
-        }
+            }
+            .into(),
+        ));
+    }
+
+    if !req.is_active {
         // Same reasoning as delete_grant's last-owner guard: an org with no
         // org:manage holder can never regain one, because create_grant's
         // escalation check makes it ungrantable.

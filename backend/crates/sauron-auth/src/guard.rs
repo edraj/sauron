@@ -11,7 +11,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::extractors::AuthError;
-use crate::rbac::perm;
+use crate::rbac::{perm, Grant};
 
 /// Length of a generated temp password.
 pub const TEMP_PASSWORD_LEN: usize = 16;
@@ -45,6 +45,28 @@ pub fn check_no_escalation(caller: &HashSet<String>, required: &[String]) -> Res
         }
     }
     Ok(())
+}
+
+/// Every permission a set of grants confers, at **any** scope.
+///
+/// [`crate::rbac::effective_permissions`] answers "what may this user do to
+/// *this* resource", which is the right question for a scoped action such as
+/// editing one grant. Flipping an account's `is_active` is not scoped: it
+/// reaches every grant the target holds at once. So the authority a caller must
+/// outrank before doing it is the union over all of the target's grants in the
+/// org — otherwise an Admin could disable someone whose only `org:manage`-
+/// bearing grant happened to sit on a project.
+///
+/// Sorted and deduplicated, so the result is a stable slice for
+/// [`check_no_escalation`].
+pub fn union_permissions(grants: &[Grant]) -> Vec<String> {
+    let mut out: Vec<String> = grants
+        .iter()
+        .flat_map(|g| g.permissions.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Guard a role edit in both directions.
@@ -196,6 +218,59 @@ mod tests {
         let caller = set(&["issue:read"]);
         let err = check_no_escalation(&caller, &strings(&["issue:read", "org:manage"]));
         assert!(matches!(err, Err(AuthError::Forbidden)));
+    }
+
+    #[test]
+    fn union_permissions_merges_every_scope() {
+        // The Admin-deactivates-Owner hole: an org-scoped Viewer grant looks
+        // harmless, but the same person holding org:manage on a project must
+        // still outrank a caller who lacks it.
+        let grants = vec![
+            Grant {
+                scope: crate::rbac::Scope::Org(Uuid::new_v4()),
+                permissions: strings(&["issue:read", "member:read"]),
+            },
+            Grant {
+                scope: crate::rbac::Scope::Project(Uuid::new_v4()),
+                permissions: strings(&["org:manage", "issue:read"]),
+            },
+        ];
+        assert_eq!(
+            union_permissions(&grants),
+            strings(&["issue:read", "member:read", "org:manage"])
+        );
+    }
+
+    #[test]
+    fn union_permissions_of_nothing_is_empty() {
+        assert!(union_permissions(&[]).is_empty());
+        assert!(union_permissions(&[Grant {
+            scope: crate::rbac::Scope::Org(Uuid::new_v4()),
+            permissions: Vec::new(),
+        }])
+        .is_empty());
+    }
+
+    #[test]
+    fn a_caller_who_outranks_the_union_may_proceed() {
+        // Owner (holds everything) vs an Admin target: allowed. The reverse —
+        // Admin vs an Owner target — is the escalation the guard exists for.
+        let owner = set(&["issue:read", "member:manage", "org:manage"]);
+        let admin_target = vec![Grant {
+            scope: crate::rbac::Scope::Org(Uuid::new_v4()),
+            permissions: strings(&["issue:read", "member:manage"]),
+        }];
+        assert!(check_no_escalation(&owner, &union_permissions(&admin_target)).is_ok());
+
+        let admin = set(&["issue:read", "member:manage"]);
+        let owner_target = vec![Grant {
+            scope: crate::rbac::Scope::Org(Uuid::new_v4()),
+            permissions: strings(&["issue:read", "member:manage", "org:manage"]),
+        }];
+        assert!(matches!(
+            check_no_escalation(&admin, &union_permissions(&owner_target)),
+            Err(AuthError::Forbidden)
+        ));
     }
 
     #[test]

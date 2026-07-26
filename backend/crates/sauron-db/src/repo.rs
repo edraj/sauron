@@ -613,6 +613,13 @@ pub async fn count_user_grants_outside_org(
 /// `count_org_manage_grants_excluding` excludes a single grant, which is right
 /// for deleting one. Deactivation disables a whole person, who may hold several
 /// org:manage grants at once, so the exclusion has to be by user.
+///
+/// Unlike its two siblings this one joins `users.is_active`: it guards a
+/// *deactivation*, and a holder who is already deactivated cannot administer
+/// anything, so counting them would let an admin walk the org's owners down one
+/// at a time — each deactivation kept legal by the ones already performed. The
+/// other three clauses stay identical to the siblings on purpose; they must all
+/// agree on what "a grant conferring org:manage" is.
 pub async fn count_org_manage_grants_for_user_excluding_user(
     conn: &mut AsyncPgConnection,
     org_id: Uuid,
@@ -621,6 +628,7 @@ pub async fn count_org_manage_grants_for_user_excluding_user(
     let row: GrantCountRow = diesel::sql_query(
         "SELECT count(*)::bigint AS n \
          FROM role_grants g JOIN roles r ON g.role_id = r.id \
+         JOIN users u ON u.id = g.user_id AND u.is_active \
          WHERE g.org_id = $1 AND g.user_id <> $2 AND g.scope_type = 'org' \
            AND r.permissions @> to_jsonb('org:manage'::text)",
     )

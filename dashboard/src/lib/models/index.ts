@@ -14,6 +14,7 @@ export interface User {
   created_at: string;
   updated_at: string;
   must_change_password: boolean;
+  is_active: boolean;
 }
 
 export interface AuthTokens {
