@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use sauron_auth::guard::{check_no_escalation, role_permissions, scope_parts};
+use sauron_auth::guard::{
+    check_no_escalation, generate_temp_password, role_permissions, scope_parts,
+};
+use sauron_auth::hash_password_async;
 use sauron_auth::rbac::grants_from_rows;
 use sauron_auth::{authorize_org, perm, AuthError, AuthUser};
 use sauron_db::models::{NewRoleGrant, Organization, Role};
@@ -258,6 +261,107 @@ pub async fn create_grant(
     )
     .await?;
     Ok(Json(serde_json::json!({ "id": grant.id })))
+}
+
+#[derive(Deserialize)]
+pub struct CreateMemberReq {
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
+    pub role_id: Uuid,
+    pub scope_type: String,
+    pub scope_id: Uuid,
+}
+
+/// Create a user account and its first grant in one step.
+///
+/// The password is generated, never supplied by the caller: an admin who could
+/// choose it would hold a working durable credential for somebody else's
+/// account. It is returned exactly once, here, and `must_change_password`
+/// makes it useless for anything but being replaced.
+pub async fn create_member(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(org_id): Path<Uuid>,
+    Json(req): Json<CreateMemberReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_MANAGE).await?;
+
+    if !req.email.contains('@') {
+        return Err(ApiError::BadRequest("a valid email is required".into()));
+    }
+    if !matches!(req.scope_type.as_str(), "org" | "project" | "app") {
+        return Err(ApiError::BadRequest("invalid scope_type".into()));
+    }
+    if repo::find_user_by_email(&mut conn, &req.email)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::Conflict(
+            "a user with that email already exists — use Grant access instead".into(),
+        ));
+    }
+
+    // Role must be a preset or belong to this org.
+    let role = repo::get_role(&mut conn, req.role_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if let Some(role_org) = role.org_id {
+        if role_org != org_id {
+            return Err(ApiError::BadRequest(
+                "role does not belong to this org".into(),
+            ));
+        }
+    }
+
+    // Scope target must belong to this org, and gives us the (project, app)
+    // pair the escalation check needs. Shared helper from Task 4 Step 3a — the
+    // org-containment check has one implementation, not one per handler.
+    let project_of_app =
+        validate_scope_in_org(&mut conn, org_id, &req.scope_type, req.scope_id).await?;
+    let (scope_project, scope_app) = scope_parts(&req.scope_type, req.scope_id, project_of_app);
+
+    // Creating a user must not be a way around the grant escalation check.
+    let role_perms = role_permissions(&role.permissions);
+    let creator =
+        sauron_auth::effective_at(&mut conn, auth.user_id, org_id, scope_project, scope_app)
+            .await?;
+    check_no_escalation(&creator, &role_perms).map_err(ApiError::Auth)?;
+
+    let temp_password = generate_temp_password();
+    let hash = hash_password_async(temp_password.clone())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // One statement, atomic: a grant failure must not leave an account that
+    // holds the email but has no access and appears in no list.
+    let created = repo::create_member_with_grant(
+        &mut conn,
+        &req.email,
+        &hash,
+        &req.name,
+        org_id,
+        req.role_id,
+        &req.scope_type,
+        req.scope_id,
+    )
+    .await
+    .map_err(|e| match e {
+        diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        ) => ApiError::Conflict(
+            "a user with that email already exists — use Grant access instead".into(),
+        ),
+        other => ApiError::from(other),
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "user_id": created.user_id,
+        "grant_id": created.grant_id,
+        "temp_password": temp_password,
+    })))
 }
 
 pub async fn delete_grant(
