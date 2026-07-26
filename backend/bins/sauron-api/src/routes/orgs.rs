@@ -8,7 +8,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use sauron_auth::guard::{
-    check_no_escalation, generate_temp_password, role_permissions, scope_parts,
+    check_no_escalation, check_role_edit, generate_temp_password, role_permissions, scope_parts,
 };
 use sauron_auth::hash_password_async;
 use sauron_auth::rbac::grants_from_rows;
@@ -655,4 +655,84 @@ pub async fn create_role(
     );
     let role = repo::create_role(&mut conn, org_id, &req.name, &req.description, perms).await?;
     Ok(Json(role))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateRoleReq {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub permissions: Option<Vec<String>>,
+}
+
+/// Edit a role this org owns.
+///
+/// Presets are refused: `ensure_preset_roles` re-syncs them from rbac.rs at
+/// every API boot, so an edit would silently revert on the next restart —
+/// worse than not offering it.
+pub async fn update_role_handler(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((org_id, role_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<UpdateRoleReq>,
+) -> Result<Json<Role>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::ROLE_MANAGE).await?;
+
+    let role = repo::get_role(&mut conn, role_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if role.org_id != Some(org_id) {
+        // Covers both a preset (org_id NULL) and another org's role. Returning
+        // NotFound rather than Forbidden avoids confirming the role exists.
+        if role.is_system {
+            return Err(ApiError::BadRequest("system roles cannot be edited".into()));
+        }
+        return Err(ApiError::NotFound);
+    }
+    if role.is_system {
+        return Err(ApiError::BadRequest("system roles cannot be edited".into()));
+    }
+
+    let name = req.name.clone().unwrap_or_else(|| role.name.clone());
+    if name.trim().is_empty() {
+        return Err(ApiError::BadRequest("role name is required".into()));
+    }
+    let description = req
+        .description
+        .clone()
+        .unwrap_or_else(|| role.description.clone());
+
+    let old_perms = role_permissions(&role.permissions);
+    let new_perms = req.permissions.clone().unwrap_or_else(|| old_perms.clone());
+
+    for p in &new_perms {
+        if !perm::ALL.contains(&p.as_str()) {
+            return Err(ApiError::BadRequest(format!("unknown permission: {p}")));
+        }
+    }
+
+    // Both directions. Adding a permission you lack is escalation; removing one
+    // you lack is sabotage — a Developer holding role:manage could otherwise
+    // strip org:manage from the Admin role and disable everyone above them.
+    let own = sauron_auth::effective_at_org(&mut conn, auth.user_id, org_id).await?;
+    check_role_edit(&own, &old_perms, &new_perms).map_err(ApiError::Auth)?;
+
+    // A role edit changes every holder's access at once. If this role is the
+    // only source of org:manage in the org, dropping it orphans the org exactly
+    // as deleting the last owner grant would.
+    if old_perms.iter().any(|p| p == perm::ORG_MANAGE)
+        && !new_perms.iter().any(|p| p == perm::ORG_MANAGE)
+    {
+        let remaining =
+            repo::count_org_manage_grants_excluding_role(&mut conn, org_id, role_id).await?;
+        if remaining == 0 {
+            return Err(ApiError::Conflict(
+                "this is the org's last role granting org:manage — grant it elsewhere first".into(),
+            ));
+        }
+    }
+
+    let perms = Value::Array(new_perms.iter().map(|p| Value::String(p.clone())).collect());
+    let updated = repo::update_role(&mut conn, org_id, role_id, &name, &description, perms).await?;
+    Ok(Json(updated))
 }

@@ -562,6 +562,30 @@ pub struct GrantCountRow {
     pub n: i64,
 }
 
+/// How many grants would still confer `org:manage` in this org if `role_id`
+/// stopped conferring it.
+///
+/// Editing a role affects every grant that holds it at once, unlike deleting
+/// one grant or deactivating one user, so the exclusion here is by role
+/// rather than by grant id or user id.
+pub async fn count_org_manage_grants_excluding_role(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    role_id: Uuid,
+) -> QueryResult<i64> {
+    let row: GrantCountRow = diesel::sql_query(
+        "SELECT count(*)::bigint AS n \
+         FROM role_grants g JOIN roles r ON g.role_id = r.id \
+         WHERE g.org_id = $1 AND g.role_id <> $2 AND g.scope_type = 'org' \
+           AND r.permissions @> to_jsonb('org:manage'::text)",
+    )
+    .bind::<SqlUuid, _>(org_id)
+    .bind::<SqlUuid, _>(role_id)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
 /// How many grants this user holds in orgs *other* than `org_id`.
 ///
 /// Deactivation is account-global, but `member:manage` is org-scoped. If the

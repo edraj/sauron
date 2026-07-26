@@ -176,6 +176,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/orgs/{org_id}/roles",
             get(routes::orgs::list_roles).post(routes::orgs::create_role),
         )
+        .route(
+            "/v1/orgs/{org_id}/roles/{role_id}",
+            patch(routes::orgs::update_role_handler),
+        )
         // --- projects (grouping) ---
         .route(
             "/v1/orgs/{org_id}/projects",
