@@ -161,10 +161,14 @@ jobs:
 
       - name: Assemble prebuilt artifacts
         run: |
+          set -euo pipefail
           mkdir -p prebuilt/bin prebuilt/dist
-          for b in sauron-api sauron-ingest sauron-monitor sauron-tier sauron-migrate sauron-symcli crebain; do
+          # packaging/rpm/binaries.txt is the single source of truth for what ships —
+          # build-rpm.sh and the spec's %install read the same file, so a binary added
+          # to one can't go missing from another.
+          while read -r b; do
             install -m0755 "backend/target/release/$b" "prebuilt/bin/$b"
-          done
+          done < <(grep -vE '^[[:space:]]*(#|$)' packaging/rpm/binaries.txt)
           cp -a dashboard/dist/. prebuilt/dist/
           install -m0755 "$DUCKDB_LIB_DIR/libduckdb.so" prebuilt/libduckdb.so
 

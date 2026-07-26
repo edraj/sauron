@@ -1,0 +1,25 @@
+# Workspace binaries shipped in the RPMs — the single source of truth.
+#
+# Read by all three stages of the release pipeline, so the list cannot drift:
+#   .github/workflows/release.yml  "Assemble prebuilt artifacts" (copies them out
+#                                  of backend/target/release into prebuilt/bin)
+#   packaging/rpm/build-rpm.sh     --prebuilt preflight check + overlay tarball
+#   packaging/rpm/sauron.spec      %install loop
+#
+# Which subpackage each binary lands in is still declared explicitly in the spec's
+# %files sections; rpmbuild fails the build on an installed-but-unpackaged file, so
+# adding a line here without the matching %files entry is caught at package time.
+#
+# Format: one binary name per line. Blank lines and # comments ignored.
+
+# --- sauron-server ---
+sauron-api
+sauron-ingest
+sauron-monitor
+sauron-alerts
+sauron-tier
+sauron-migrate
+
+# --- sauron-cli ---
+sauron-symcli
+crebain
