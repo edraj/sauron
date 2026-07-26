@@ -6,38 +6,14 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
+  import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import {
-    listMembers,
-    listRoles,
-    createGrant,
-    deleteGrant,
-    createRole,
-  } from '../lib/api/orgs';
+  import { listMembers, listRoles, createGrant, deleteGrant } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { initials } from '../lib/utils/format';
-  import type { App, MemberGrant, Permission, Role, ScopeType } from '../lib/models';
-
-  const ALL_PERMISSIONS: Permission[] = [
-    'issue:read',
-    'issue:write',
-    'event:read',
-    'app:read',
-    'app:create',
-    'app:update',
-    'app:delete',
-    'app:rotate_key',
-    'project:read',
-    'project:create',
-    'project:update',
-    'project:delete',
-    'member:read',
-    'member:manage',
-    'role:manage',
-    'org:manage',
-  ];
+  import type { App, MemberGrant, Role, ScopeType } from '../lib/models';
 
   let members = $state<MemberGrant[]>([]);
   let roles = $state<Role[]>([]);
@@ -52,12 +28,15 @@
   let inviting = $state(false);
   let removingId = $state<string | null>(null);
 
-  // Create role form
-  let showRoleForm = $state(false);
-  let roleName = $state('');
-  let roleDescription = $state('');
-  let rolePerms = $state<Record<string, boolean>>({});
-  let creatingRole = $state(false);
+  // Role editor dialog (create + edit + read-only view of system presets)
+  let roleDialogOpen = $state(false);
+  let editingRole = $state<Role | null>(null);
+
+  const roleMemberCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const m of members) counts[m.role_id] = (counts[m.role_id] ?? 0) + 1;
+    return counts;
+  });
 
   const canManage = $derived(sessionStore.can('member:manage'));
   const canReadMembers = $derived(sessionStore.can('member:read'));
@@ -173,29 +152,21 @@
     }
   }
 
-  async function submitRole(event: SubmitEvent) {
-    event.preventDefault();
-    const org = sessionStore.currentOrgId;
-    if (!org || creatingRole || !roleName.trim()) return;
-    const permissions = ALL_PERMISSIONS.filter((p) => rolePerms[p]);
-    creatingRole = true;
-    try {
-      const role = await createRole(org, {
-        name: roleName.trim(),
-        description: roleDescription.trim() || undefined,
-        permissions,
-      });
-      roles = [...roles, role];
-      roleName = '';
-      roleDescription = '';
-      rolePerms = {};
-      showRoleForm = false;
-      toastStore.success('Role created.');
-    } catch (err) {
-      toastStore.error(errorMessage(err));
-    } finally {
-      creatingRole = false;
-    }
+  function openNewRole() {
+    editingRole = null;
+    roleDialogOpen = true;
+  }
+
+  function openEditRole(role: Role) {
+    editingRole = role;
+    roleDialogOpen = true;
+  }
+
+  function onRoleSaved(saved: Role) {
+    const i = roles.findIndex((r) => r.id === saved.id);
+    if (i >= 0) roles[i] = saved;
+    else roles = [...roles, saved];
+    toastStore.success(`Role "${saved.name}" saved.`);
   }
 </script>
 
@@ -299,31 +270,10 @@
         <div class="roles-head">
           <h3 class="card-title-inline">Roles</h3>
           {#if canManageRoles}
-            <Button variant="secondary" size="sm" onclick={() => (showRoleForm = !showRoleForm)}>
-              {showRoleForm ? 'Cancel' : 'New role'}
-            </Button>
+            <Button variant="secondary" size="sm" onclick={openNewRole}>New role</Button>
           {/if}
         </div>
       {/snippet}
-
-      {#if showRoleForm && canManageRoles}
-        <form class="role-form" onsubmit={submitRole}>
-          <div class="role-fields">
-            <Input label="Role name" bind:value={roleName} placeholder="Support" required />
-            <Input label="Description" bind:value={roleDescription} placeholder="Read + resolve issues" />
-          </div>
-          <span class="lbl perms-label">Permissions</span>
-          <div class="perms-grid">
-            {#each ALL_PERMISSIONS as perm (perm)}
-              <label class="perm">
-                <input type="checkbox" bind:checked={rolePerms[perm]} />
-                <span class="mono">{perm}</span>
-              </label>
-            {/each}
-          </div>
-          <Button type="submit" variant="primary" loading={creatingRole}>Create role</Button>
-        </form>
-      {/if}
 
       <ul class="role-list">
         {#each roles as role (role.id)}
@@ -333,11 +283,32 @@
               {#if role.is_system}<Badge tone="neutral" size="sm">system</Badge>{/if}
               {#if role.description}<span class="r-desc muted">{role.description}</span>{/if}
             </div>
-            <span class="r-count muted">{role.permissions.length} permissions</span>
+            <div class="r-actions">
+              <span class="r-count muted">{role.permissions.length} permissions</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onclick={() => openEditRole(role)}
+                disabled={!canManageRoles && !role.is_system}
+              >
+                {role.is_system ? 'View' : 'Edit'}
+              </Button>
+            </div>
           </li>
         {/each}
       </ul>
     </Card>
+  {/if}
+
+  {#if sessionStore.currentOrg}
+    <RoleEditorDialog
+      open={roleDialogOpen}
+      orgId={sessionStore.currentOrg.id}
+      role={editingRole}
+      memberCount={editingRole ? (roleMemberCounts[editingRole.id] ?? 0) : 0}
+      onclose={() => (roleDialogOpen = false)}
+      onsaved={onRoleSaved}
+    />
   {/if}
 </AppShell>
 
@@ -466,37 +437,6 @@
     width: 100%;
     gap: 12px;
   }
-  .role-form {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    padding-bottom: 18px;
-    margin-bottom: 6px;
-    border-bottom: 1px solid var(--border);
-  }
-  .role-fields {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-  }
-  .perms-label {
-    margin-bottom: -4px;
-  }
-  .perms-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 6px 14px;
-  }
-  .perm {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 12.5px;
-    color: var(--text-muted);
-  }
-  .perm input {
-    accent-color: var(--primary);
-  }
   .role-list {
     list-style: none;
     margin: 0;
@@ -533,14 +473,14 @@
     font-size: 12px;
     white-space: nowrap;
   }
+  .r-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
   .err-msg {
     color: var(--error);
     font-size: 13.5px;
-  }
-
-  @media (max-width: 640px) {
-    .role-fields {
-      grid-template-columns: 1fr;
-    }
   }
 </style>
