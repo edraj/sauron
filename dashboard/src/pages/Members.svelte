@@ -10,13 +10,13 @@
   import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
   import CreateMemberDialog from '../lib/components/members/CreateMemberDialog.svelte';
   import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
+  import MembersTable from '../lib/components/members/MembersTable.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listMembers, listRoles, createGrant, deleteGrant, setMemberActive } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
-  import { initials } from '../lib/utils/format';
-  import { groupMembers, type App, type Member, type MemberGrant, type Role, type ScopeOption, type ScopeType } from '../lib/models';
+  import { groupMembers, type App, type Member, type MemberGrant, type Role, type ScopeOption } from '../lib/models';
 
   let members = $state<MemberGrant[]>([]);
   let roles = $state<Role[]>([]);
@@ -55,9 +55,23 @@
     editingMemberId ? (grouped.find((m) => m.user_id === editingMemberId) ?? null) : null,
   );
 
+  // Distinct users per role, not grant count — a person holding the same role
+  // at three scopes must still only count once, since that's what the
+  // "N members hold this role" impact warning in RoleEditorDialog means.
   const roleMemberCounts = $derived.by(() => {
+    const usersByRole = new Map<string, Set<string>>();
+    for (const m of grouped) {
+      for (const g of m.grants) {
+        let users = usersByRole.get(g.role_id);
+        if (!users) {
+          users = new Set();
+          usersByRole.set(g.role_id, users);
+        }
+        users.add(m.user_id);
+      }
+    }
     const counts: Record<string, number> = {};
-    for (const m of members) counts[m.role_id] = (counts[m.role_id] ?? 0) + 1;
+    for (const [roleId, users] of usersByRole) counts[roleId] = users.size;
     return counts;
   });
 
@@ -84,22 +98,6 @@
     }
     return opts;
   });
-
-  function scopeLabel(member: MemberGrant): string {
-    if (member.scope_type === 'org') return 'Org';
-    if (member.scope_type === 'project') {
-      const p = sessionStore.projects.find((x) => x.id === member.scope_id);
-      return `Project: ${p?.name ?? member.scope_id.slice(0, 8)}`;
-    }
-    const a = appsById[member.scope_id];
-    return `App: ${a?.name ?? member.scope_id.slice(0, 8)}`;
-  }
-
-  function scopeTone(type: ScopeType): 'primary' | 'info' | 'neutral' {
-    if (type === 'org') return 'primary';
-    if (type === 'project') return 'info';
-    return 'neutral';
-  }
 
   async function load(orgId: string) {
     loading = true;
@@ -284,83 +282,16 @@
       </Card>
     {/if}
 
-    <Card padding="none">
-      <div class="table-scroll">
-        <table class="members">
-          <thead>
-            <tr>
-              <th>Member</th>
-              <th>Role</th>
-              <th>Scope</th>
-              {#if canManage}<th class="col-act"></th>{/if}
-            </tr>
-          </thead>
-          <tbody>
-            {#each grouped as member (member.user_id)}
-              <tr class:inactive={!member.is_active}>
-                <td>
-                  <div class="member-cell">
-                    <span class="m-avatar">{initials(member.name || member.email)}</span>
-                    <div class="m-meta">
-                      <span class="m-name-row">
-                        <span class="m-name">{member.name || member.email}</span>
-                        {#if !member.is_active}<Badge tone="warning" size="sm">Deactivated</Badge>{/if}
-                      </span>
-                      {#if member.name}<span class="m-email">{member.email}</span>{/if}
-                    </div>
-                  </div>
-                </td>
-                <td>
-                  <div class="chip-list">
-                    {#each member.grants as grant (grant.id)}
-                      <Badge size="sm">{grant.role_name}</Badge>
-                    {/each}
-                  </div>
-                </td>
-                <td>
-                  <div class="chip-list">
-                    {#each member.grants as grant (grant.id)}
-                      <span class="scope-chip">
-                        <Badge tone={scopeTone(grant.scope_type)} size="sm">{scopeLabel(grant)}</Badge>
-                        {#if canManage}
-                          <button
-                            type="button"
-                            class="chip-remove"
-                            aria-label={`Remove ${scopeLabel(grant)} access`}
-                            title="Remove access"
-                            disabled={removingId === grant.id}
-                            onclick={() => removeGrant(grant.id)}
-                          >
-                            ×
-                          </button>
-                        {/if}
-                      </span>
-                    {/each}
-                  </div>
-                </td>
-                {#if canManage}
-                  <td class="col-act">
-                    <div class="row-actions">
-                      <Button variant="ghost" size="sm" onclick={() => (editingMemberId = member.user_id)}>
-                        Edit
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        loading={togglingUserId === member.user_id}
-                        onclick={() => requestToggle(member)}
-                      >
-                        {member.is_active ? 'Deactivate' : 'Reactivate'}
-                      </Button>
-                    </div>
-                  </td>
-                {/if}
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    </Card>
+    <MembersTable
+      {grouped}
+      {appsById}
+      {canManage}
+      {removingId}
+      {togglingUserId}
+      onedit={(userId) => (editingMemberId = userId)}
+      ontoggle={requestToggle}
+      onremovegrant={removeGrant}
+    />
 
     <Card class="roles-card">
       {#snippet header()}
@@ -498,115 +429,6 @@
   .sel option {
     background: var(--surface);
     color: var(--text);
-  }
-  .table-scroll {
-    overflow-x: auto;
-  }
-  table.members {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13.5px;
-  }
-  thead th {
-    text-align: left;
-    padding: 12px 16px;
-    font-size: 11px;
-    font-weight: 650;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
-  }
-  td {
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-    vertical-align: middle;
-  }
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-  tr.inactive {
-    opacity: 0.58;
-  }
-  .col-act {
-    text-align: right;
-    width: 1%;
-    white-space: nowrap;
-  }
-  .row-actions {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 8px;
-  }
-  .member-cell {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .m-avatar {
-    width: 30px;
-    height: 30px;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    background: var(--primary-soft);
-    color: var(--primary);
-    font-size: 11px;
-    font-weight: 650;
-    flex-shrink: 0;
-  }
-  .m-meta {
-    display: flex;
-    flex-direction: column;
-    line-height: 1.3;
-    gap: 2px;
-  }
-  .m-name-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .m-name {
-    font-weight: 560;
-  }
-  .m-email {
-    font-size: 11.5px;
-    color: var(--text-faint);
-  }
-  .chip-list {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-  }
-  .scope-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-  }
-  .chip-remove {
-    display: inline-grid;
-    place-items: center;
-    width: 16px;
-    height: 16px;
-    padding: 0;
-    border: none;
-    border-radius: 50%;
-    background: transparent;
-    color: var(--text-faint);
-    font-size: 13px;
-    line-height: 1;
-    cursor: pointer;
-  }
-  .chip-remove:hover:not(:disabled) {
-    background: var(--surface-3);
-    color: var(--error);
-  }
-  .chip-remove:disabled {
-    cursor: not-allowed;
-    opacity: 0.5;
   }
   .card-title-inline {
     font-size: 14.5px;
