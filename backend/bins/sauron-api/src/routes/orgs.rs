@@ -488,6 +488,120 @@ pub async fn set_member_active(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+pub struct UpdateGrantReq {
+    pub role_id: Option<Uuid>,
+    pub scope_type: Option<String>,
+    pub scope_id: Option<Uuid>,
+}
+
+/// Change a member's role and/or scope in place.
+///
+/// One statement rather than a client-side delete-then-recreate: a recreate
+/// that failed would silently strand the member with no access, and the
+/// last-owner guard has to judge the final state, not the intermediate one
+/// where the grant is already gone.
+pub async fn update_grant_handler(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(grant_id): Path<Uuid>,
+    Json(req): Json<UpdateGrantReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut conn = db(&state).await?;
+    let grant = repo::get_grant(&mut conn, grant_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let org_id = grant.org_id;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_MANAGE).await?;
+
+    let new_role_id = req.role_id.unwrap_or(grant.role_id);
+    let new_scope_type = req
+        .scope_type
+        .clone()
+        .unwrap_or_else(|| grant.scope_type.clone());
+    let new_scope_id = req.scope_id.unwrap_or(grant.scope_id);
+
+    if !matches!(new_scope_type.as_str(), "org" | "project" | "app") {
+        return Err(ApiError::BadRequest("invalid scope_type".into()));
+    }
+
+    let new_role = repo::get_role(&mut conn, new_role_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if let Some(role_org) = new_role.org_id {
+        if role_org != org_id {
+            return Err(ApiError::BadRequest(
+                "role does not belong to this org".into(),
+            ));
+        }
+    }
+
+    // New scope must be inside this org. Shared helper from Task 4 Step 3a.
+    let new_project_of_app =
+        validate_scope_in_org(&mut conn, org_id, &new_scope_type, new_scope_id).await?;
+
+    // Both directions, mirroring create_grant + delete_grant: the caller must
+    // outrank what they are granting AND what they are taking away. Checking
+    // only the new role would let an Admin rewrite the Owner's grant down to
+    // Viewer — a delete they are already forbidden from performing.
+    let old_role = repo::get_role(&mut conn, grant.role_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let old_perms = role_permissions(&old_role.permissions);
+    let new_perms = role_permissions(&new_role.permissions);
+
+    let old_project_of_app = if grant.scope_type == "app" {
+        repo::app_ancestry(&mut conn, grant.scope_id)
+            .await?
+            .map(|(project_id, _)| project_id)
+    } else {
+        None
+    };
+    let (old_sp, old_sa) = scope_parts(&grant.scope_type, grant.scope_id, old_project_of_app);
+    let caller_at_old =
+        sauron_auth::effective_at(&mut conn, auth.user_id, org_id, old_sp, old_sa).await?;
+    check_no_escalation(&caller_at_old, &old_perms).map_err(ApiError::Auth)?;
+
+    let (new_sp, new_sa) = scope_parts(&new_scope_type, new_scope_id, new_project_of_app);
+    let caller_at_new =
+        sauron_auth::effective_at(&mut conn, auth.user_id, org_id, new_sp, new_sa).await?;
+    check_no_escalation(&caller_at_new, &new_perms).map_err(ApiError::Auth)?;
+
+    // If this grant currently carries org:manage and the edit drops it, the org
+    // must retain another holder.
+    let loses_org_manage = old_perms.iter().any(|p| p == perm::ORG_MANAGE)
+        && !new_perms.iter().any(|p| p == perm::ORG_MANAGE);
+    let leaves_org_scope = grant.scope_type == "org" && new_scope_type != "org";
+    if loses_org_manage || (leaves_org_scope && old_perms.iter().any(|p| p == perm::ORG_MANAGE)) {
+        let remaining =
+            repo::count_org_manage_grants_excluding(&mut conn, org_id, grant_id).await?;
+        if remaining == 0 {
+            return Err(ApiError::Conflict(
+                "cannot remove the last grant with org:manage — assign it to another member first"
+                    .into(),
+            ));
+        }
+    }
+
+    let updated = repo::update_grant(
+        &mut conn,
+        grant_id,
+        new_role_id,
+        &new_scope_type,
+        new_scope_id,
+    )
+    .await
+    .map_err(|e| match e {
+        diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        ) => ApiError::Conflict("this member already has that role at that scope".into()),
+        other => ApiError::from(other),
+    })?;
+
+    Ok(Json(serde_json::json!({ "id": updated.id })))
+}
+
 // --- roles ------------------------------------------------------------------
 
 pub async fn list_roles(
