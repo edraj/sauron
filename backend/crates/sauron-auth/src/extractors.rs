@@ -12,6 +12,33 @@ use uuid::Uuid;
 
 use crate::jwt::{Claims, JwtKeys};
 
+/// The only paths a temp-password holder may reach.
+///
+/// The allowlist is matched on the exact path. If the API is ever mounted
+/// under a prefix, this has to become a suffix match; noted rather than
+/// generalised now.
+///
+/// `/v1/auth/logout` is listed defensively only: it currently takes the
+/// refresh token in the body and no `AuthUser`, so it never reaches this
+/// gate. Listing it means it stays reachable if it later gains the
+/// extractor. `/v1/auth/refresh` is deliberately absent for the same reason
+/// inverted — it is likewise unauthenticated, and listing it would wrongly
+/// suggest a temp-password holder can rotate into a clean token.
+fn password_change_allowed_path(path: &str) -> bool {
+    matches!(path, "/v1/auth/password" | "/v1/auth/logout")
+}
+
+/// Pure decision behind the `must_change_password` gate: does this caller,
+/// on this path, get through? Extracted so the reject branch is unit
+/// testable without an axum `Parts` fixture — deleting the gate's logic
+/// should turn the test suite red.
+fn password_change_gate(must_change_password: bool, path: &str) -> Result<(), AuthError> {
+    if must_change_password && !password_change_allowed_path(path) {
+        return Err(AuthError::PasswordChangeRequired);
+    }
+    Ok(())
+}
+
 /// Authentication / authorization failure, rendered as a JSON error response.
 #[derive(Debug, Clone, Copy)]
 pub enum AuthError {
@@ -119,24 +146,7 @@ where
         // point — a UI redirect is bypassable with curl, which would leave the
         // admin who generated the password holding a working credential for
         // somebody else's account.
-        //
-        // The allowlist is matched on the exact path. If the API is ever mounted
-        // under a prefix, this has to become a suffix match; noted rather than
-        // generalised now.
-        //
-        // `/v1/auth/logout` is listed defensively only: it currently takes the
-        // refresh token in the body and no `AuthUser`, so it never reaches this
-        // gate. Listing it means it stays reachable if it later gains the
-        // extractor. `/v1/auth/refresh` is deliberately absent for the same
-        // reason inverted — it is likewise unauthenticated, and listing it would
-        // wrongly suggest a temp-password holder can rotate into a clean token.
-        if claims.must_change_password {
-            let path = parts.uri.path();
-            let allowed = matches!(path, "/v1/auth/password" | "/v1/auth/logout");
-            if !allowed {
-                return Err(AuthError::PasswordChangeRequired);
-            }
-        }
+        password_change_gate(claims.must_change_password, parts.uri.path())?;
 
         Ok(AuthUser { user_id, claims })
     }
@@ -165,9 +175,8 @@ mod tests {
 
     #[test]
     fn password_change_allowlist_is_exactly_two_paths() {
-        let allowed = |p: &str| matches!(p, "/v1/auth/password" | "/v1/auth/logout");
-        assert!(allowed("/v1/auth/password"));
-        assert!(allowed("/v1/auth/logout"));
+        assert!(password_change_allowed_path("/v1/auth/password"));
+        assert!(password_change_allowed_path("/v1/auth/logout"));
         // Everything a temp-password holder might otherwise reach.
         for p in [
             "/v1/orgs",
@@ -176,8 +185,33 @@ mod tests {
             "/v1/admin/storage",
             "/v1/auth/passwordx",
         ] {
-            assert!(!allowed(p), "{p} must not be reachable");
+            assert!(
+                !password_change_allowed_path(p),
+                "{p} must not be reachable"
+            );
         }
+    }
+
+    #[test]
+    fn password_change_gate_blocks_temp_password_outside_allowlist() {
+        // The case that matters: a temp-password holder hitting an arbitrary
+        // endpoint must be rejected. This exercises the gate function the
+        // extractor actually calls, not a re-declared copy of its predicate —
+        // deleting the gate's `if` in `from_request_parts` turns this red.
+        assert!(matches!(
+            password_change_gate(true, "/v1/orgs"),
+            Err(AuthError::PasswordChangeRequired)
+        ));
+    }
+
+    #[test]
+    fn password_change_gate_allows_temp_password_on_change_endpoint() {
+        assert!(password_change_gate(true, "/v1/auth/password").is_ok());
+    }
+
+    #[test]
+    fn password_change_gate_allows_normal_user_everywhere() {
+        assert!(password_change_gate(false, "/v1/orgs").is_ok());
     }
 
     #[test]

@@ -385,6 +385,19 @@ pub async fn refresh(
                 return Ok(Json(tokens));
             }
 
+            // A deactivated account's tokens are mass-revoked with
+            // REVOKE_DEACTIVATED (see set_active in orgs.rs), so a routine
+            // deactivation lands here too: the reason is not REVOKE_ROTATED,
+            // so `raced` is false above, and without this check a disabled
+            // user presenting their old refresh token would trip the "reuse
+            // detected" WARN below. That signal exists to flag actual token
+            // theft; poisoning it with routine deactivations makes it
+            // unreliable exactly when it matters. Report the mundane cause
+            // and skip the alarm.
+            if reason.as_deref() == Some(repo::REVOKE_DEACTIVATED) {
+                return Err(ApiError::Auth(AuthError::AccountDeactivated));
+            }
+
             let revoked = repo::revoke_all_refresh_tokens_for_user(&mut conn, user_id).await?;
             tracing::warn!(
                 %user_id,
@@ -445,6 +458,20 @@ pub async fn change_password(
     State(state): State<AppState>,
     Json(req): Json<ChangePasswordReq>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    // Throttle before any hashing: this handler runs a verify plus a fresh
+    // hash (two ~19 MiB Argon2 ops) per call, and it is the one endpoint
+    // deliberately left reachable by a temp-password holder — the least-
+    // trusted principal in this feature. Keyed per user id rather than per
+    // IP since the caller is already authenticated; same budget as login,
+    // since both gate an Argon2 verify against a caller-supplied guess.
+    rate_limit(
+        &state,
+        &format!("sauron:auth:password:{}", auth.user_id),
+        LOGIN_ATTEMPTS_PER_MIN,
+        60,
+    )
+    .await?;
+
     if req.current_password.len() > MAX_PASSWORD_LEN {
         return Err(ApiError::Auth(AuthError::InvalidCredentials));
     }
@@ -478,20 +505,31 @@ pub async fn change_password(
     let hash = hash_password_async(req.new_password.clone())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    repo::set_user_password(&mut conn, auth.user_id, &hash).await?;
 
-    // Revoke everything, including the caller's own session, then re-issue.
-    // Keeping the current session would not work: its access token still
-    // carries must_change_password, so the extractor gate would keep rejecting
-    // the user until it expired — immediately after they did the one thing it
-    // was demanding. Re-issuing also logs out every other device, which is
-    // correct when the old credential may be known to whoever generated it.
+    // Revoke everything, including the caller's own session, before setting the
+    // new password. Keeping the current session would not work anyway: its
+    // access token still carries must_change_password, so the extractor gate
+    // would keep rejecting the user until it expired — immediately after they
+    // did the one thing it was demanding. Re-issuing also logs out every other
+    // device, which is correct when the old credential may be known to whoever
+    // generated it.
+    //
+    // The order (revoke, then set password, then issue) is deliberate and not
+    // a transaction: `conn.transaction` needs async closures, which need Rust
+    // 1.85+, and this workspace's MSRV is 1.82 per packaging/rpm/sauron.spec.
+    // If the revoke fails, the caller is still on the temp password —
+    // recoverable, since they log in again with it and remain flagged. The
+    // reverse order would leave the password changed but every old session
+    // (including one held by whoever handed out the temp credential) still
+    // valid, which is the direction that must never happen on a partial
+    // failure.
     repo::revoke_all_refresh_tokens_for_user_with_reason(
         &mut conn,
         auth.user_id,
         repo::REVOKE_PASSWORD_CHANGED,
     )
     .await?;
+    repo::set_user_password(&mut conn, auth.user_id, &hash).await?;
     let tokens = issue_tokens(&state, &mut conn, auth.user_id, None, false).await?;
 
     // Re-read so the returned user has must_change_password already false; the
