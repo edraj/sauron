@@ -455,7 +455,7 @@ GROUP BY name, op`;
   ];
 
   const presetRows = [
-    { q: 'Owner', a: 'All 21 permissions.' },
+    { q: 'Owner', a: 'All 23 permissions.' },
     { q: 'Admin', a: 'Everything except org:manage.' },
     { q: 'Developer', a: 'Read/write issues, events, funnels, artifacts, source maps and monitors; create and update apps.' },
     { q: 'Viewer', a: 'Read-only across the board.' },
@@ -1122,7 +1122,7 @@ GROUP BY name, op`;
               <div class="card-h"><Icon name="lock" size={16} /><h3>Access control</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              Fine-grained RBAC: <b>21 atomic permissions</b> (<code class="ic">issue:read</code>,
+              Fine-grained RBAC: <b>23 atomic permissions</b> (<code class="ic">issue:read</code>,
               <code class="ic">funnel:write</code>, <code class="ic">source:read</code>, …) bundle
               into <b>roles</b>, which are <b>granted</b> at a scope — org, project, or app. Your
               effective permissions are the <b>union</b> of every grant that applies, cascading down
@@ -1130,9 +1130,41 @@ GROUP BY name, op`;
               its apps but not its siblings.
             </p>
             {@render defRows(presetRows)}
+            <p class="muted concept-lead">
+              <b>Create member</b> (Members → Create member) is for someone who doesn't have an
+              account yet. An admin with <code class="ic">member:manage</code> supplies their
+              email, name, role and scope, and the server creates the account and its first grant
+              together. The response reveals a <b>16-character temporary password exactly once</b>,
+              with a copy button — no endpoint can retrieve it again, so a lost password means
+              deactivating the account and creating it again. The admin can't choose or see a
+              durable password for them.
+            </p>
             <p class="faint fine">
-              You can't grant a role — or mint a custom one — with permissions you don't already hold
-              at that scope, so access can never escalate itself.
+              That temp password grants nothing except replacing itself: every authenticated
+              endpoint but changing the password and logging out is refused until it's replaced, and
+              first sign-in routes straight to a change-password screen. After that they get a fresh
+              session and normal access. <b>Grant access</b> — the other form on the Members page —
+              is still the right tool for someone who already has an account, including a member of
+              another organization; Create member is only for someone who doesn't.
+            </p>
+            <p class="muted concept-lead">
+              A member's row has <b>Edit</b> and <b>Deactivate</b>. Edit changes their role and
+              scope in place, or adds another grant alongside the ones they already hold — each
+              grant saves independently. Deactivate is a <b>login kill switch, not a removal</b>:
+              every grant stays intact, the row stays listed with a "Deactivated" badge, and
+              Reactivate restores normal sign-in. Their refresh tokens are revoked immediately, though
+              an access token already issued keeps working until it expires (up to 15 minutes by
+              default). Deactivating yourself, a member who also belongs to another organization, or
+              the last holder of <code class="ic">org:manage</code> is refused with an explanation
+              instead.
+            </p>
+            <p class="faint fine">
+              Custom roles can now be <b>edited</b> in place — the dialog shows how many members hold
+              the role, since saving changes their access immediately. The built-in Owner, Admin,
+              Developer and Viewer roles open in a <b>view-only</b> dialog instead: they're re-synced
+              from the server's own definitions on every restart, so an edit would silently revert.
+              You can't grant a role, edit one, or mint a custom one with permissions you don't
+              already hold at that scope, so access can never escalate itself.
             </p>
           </Card>
         </section>
