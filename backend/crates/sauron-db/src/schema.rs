@@ -76,6 +76,7 @@ diesel::table! {
         debug_meta -> Nullable<Jsonb>,
         contexts -> Jsonb,
         extra -> Jsonb,
+        handled -> Nullable<Bool>,
     }
 }
 

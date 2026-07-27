@@ -273,6 +273,7 @@ async fn ingest(
             ip: ip.clone(),
             user_agent: user_agent.clone(),
             context: envelope.context.clone(),
+            sdk: Some(envelope.header.sdk.clone()),
             item,
         };
         match serde_json::to_string(&job) {

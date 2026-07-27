@@ -961,23 +961,19 @@ pub async fn insert_error_event(
         .await
 }
 
-/// Longest window a free-text payload search may scan. The jsonb→text cast is
-/// unindexable, so the window is the only bound on its cost.
-pub const MAX_PAYLOAD_SEARCH_DAYS: i64 = 90;
-
 pub async fn list_issues(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
     filters: &[ParsedFilter],
     q: Option<&str>,
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    since: chrono::DateTime<chrono::Utc>,
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<Issue>> {
-    let mut query = issues::table.filter(issues::app_id.eq(app_id)).into_boxed();
-    if let Some(s) = since {
-        query = query.filter(issues::last_seen.ge(s));
-    }
+    let mut query = issues::table
+        .filter(issues::app_id.eq(app_id))
+        .filter(issues::last_seen.ge(since))
+        .into_boxed();
     for f in filters {
         query = match (f.field, f.op) {
             ("level", Op::Eq) => query.filter(issues::level.eq(f.value.clone())),
@@ -1026,11 +1022,6 @@ pub async fn list_issues(
         };
     }
     if let Some(term) = q {
-        // Cap how far back the (unindexable) payload scan may reach, even when
-        // the caller asked for an unbounded issue list.
-        let payload_since = since.unwrap_or_else(|| {
-            chrono::Utc::now() - chrono::Duration::days(MAX_PAYLOAD_SEARCH_DAYS)
-        });
         let p = like_contains(term);
         query = query.filter(
             issues::title
@@ -1041,13 +1032,18 @@ pub async fn list_issues(
                 // Bounding the correlated scan by time is what keeps it viable:
                 // without it, an issue with no match forces a full scan of that
                 // issue's entire event history — for EVERY issue in the app.
-                // `payload_since` is the caller's window (defaulted, never open).
+                // `since` is always supplied by the caller (see `list()` in
+                // `routes/issues.rs`) — there used to be a `MAX_PAYLOAD_SEARCH_
+                // DAYS` fallback for when it wasn't, but every route already
+                // passed `Some(since)`, so that fallback never fired. Deleted
+                // rather than kept as a guard that reads as protection but
+                // isn't one.
                 .or(sql::<Bool>(
                     "EXISTS (SELECT 1 FROM error_events e \
                      WHERE e.issue_id = issues.id AND e.app_id = issues.app_id \
                      AND e.occurred_at >= ",
                 )
-                .bind::<Timestamptz, _>(payload_since)
+                .bind::<Timestamptz, _>(since)
                 .sql(" AND (e.contexts::text ILIKE ")
                 .bind::<Text, _>(p.clone())
                 .sql(" OR e.extra::text ILIKE ")

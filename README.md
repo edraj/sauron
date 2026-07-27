@@ -218,6 +218,12 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | `TIER_TICK_SECS` | Tiering loop cadence. | `3600` | tier |
 | `TIER_PARTITION_AHEAD` | How many future partitions to pre-create. | `7` | tier |
 
+### Search & query planner
+
+| Variable | What it does | Default | Used by |
+| --- | --- | --- | --- |
+| `SEARCH_SCAN_CLAMP_DAYS` | Window an unindexed search query (wildcard, substring, or free-text match) is clamped to. Defaults to `TIER_HOT_DAYS`: clamping a scan further back than the tier worker's hot window buys nothing, since older rows are already gone from Postgres — so the default is simultaneously the honest cost bound and the honest coverage bound. | `TIER_HOT_DAYS` (`30`) | api |
+
 ### Source maps & symbolication
 
 | Variable | What it does | Default | Used by |
