@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::sql_types::{
-    BigInt, Bool, Double, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+    Array, BigInt, Bool, Double, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
 };
 use diesel::upsert::excluded;
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -46,27 +46,34 @@ pub struct NewMemberRow {
     pub grant_id: Uuid,
 }
 
-/// Create a user and their first grant in one statement.
+/// Create a user and all of their initial grants in one statement.
 ///
 /// A single data-modifying CTE rather than a transaction: Postgres runs both
 /// INSERTs atomically within the statement, so a grant failure rolls the user
 /// back for free. This avoids `conn.transaction`, whose diesel-async 0.9
 /// signature needs async closures (Rust 1.85) and would push the workspace
-/// MSRV past the 1.82 the RPM spec builds against.
+/// MSRV past the 1.82 the RPM spec builds against. The scopes travel as two
+/// parallel arrays unnested into rows, so N grants stay one round trip; they
+/// must be the same length, as multi-argument `unnest` pads the shorter one
+/// with NULLs that then fail `role_grants`' NOT NULL.
+///
+/// The caller must de-duplicate `(scope_type, scope_id)` pairs first: a repeat
+/// trips `role_grants`' UNIQUE key, and that `UniqueViolation` is
+/// indistinguishable here from the duplicate-email one below.
 ///
 /// A duplicate email surfaces as `DatabaseError(UniqueViolation)` from
 /// `users_email_lower_key`; the caller maps that to 409.
 #[allow(clippy::too_many_arguments)]
-pub async fn create_member_with_grant(
+pub async fn create_member_with_grants(
     conn: &mut AsyncPgConnection,
     email: &str,
     password_hash: &str,
     name: &str,
     org_id: Uuid,
     role_id: Uuid,
-    scope_type: &str,
-    scope_id: Uuid,
-) -> QueryResult<NewMemberRow> {
+    scope_types: &[String],
+    scope_ids: &[Uuid],
+) -> QueryResult<Vec<NewMemberRow>> {
     let email = email.to_lowercase();
     diesel::sql_query(
         "WITH new_user AS ( \
@@ -75,7 +82,8 @@ pub async fn create_member_with_grant(
              RETURNING id \
          ) \
          INSERT INTO role_grants (org_id, user_id, role_id, scope_type, scope_id) \
-         SELECT $4, new_user.id, $5, $6, $7 FROM new_user \
+         SELECT $4, new_user.id, $5, s.scope_type, s.scope_id \
+         FROM new_user, unnest($6::text[], $7::uuid[]) AS s(scope_type, scope_id) \
          RETURNING user_id, id AS grant_id",
     )
     .bind::<Text, _>(email)
@@ -83,9 +91,9 @@ pub async fn create_member_with_grant(
     .bind::<Text, _>(name)
     .bind::<SqlUuid, _>(org_id)
     .bind::<SqlUuid, _>(role_id)
-    .bind::<Text, _>(scope_type)
-    .bind::<SqlUuid, _>(scope_id)
-    .get_result(conn)
+    .bind::<Array<Text>, _>(scope_types.to_vec())
+    .bind::<Array<SqlUuid>, _>(scope_ids.to_vec())
+    .get_results(conn)
     .await
 }
 
@@ -477,6 +485,33 @@ pub async fn create_grant(
         .await
 }
 
+/// Upsert a batch of grants in one statement, same idempotent semantics as
+/// `create_grant`: re-granting an existing `(user, role, scope)` just re-points
+/// its `org_id`. Because that is a DO UPDATE rather than DO NOTHING, every row
+/// comes back, so the caller can rely on `ids.len() == rows.len()`.
+pub async fn create_grants(
+    conn: &mut AsyncPgConnection,
+    rows: Vec<NewRoleGrant>,
+) -> QueryResult<Vec<Uuid>> {
+    // An empty VALUES list is not valid SQL; nothing to insert either way.
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    diesel::insert_into(role_grants::table)
+        .values(&rows)
+        .on_conflict((
+            role_grants::user_id,
+            role_grants::role_id,
+            role_grants::scope_type,
+            role_grants::scope_id,
+        ))
+        .do_update()
+        .set(role_grants::org_id.eq(excluded(role_grants::org_id)))
+        .returning(role_grants::id)
+        .get_results(conn)
+        .await
+}
+
 pub async fn delete_grant(
     conn: &mut AsyncPgConnection,
     org_id: Uuid,
@@ -749,6 +784,21 @@ pub async fn project_org(
         .optional()
 }
 
+/// Which of `ids` are projects in `org_id`. Used to validate a batch of
+/// scopes without one round trip per scope.
+pub async fn projects_in_org(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    ids: &[Uuid],
+) -> QueryResult<Vec<Uuid>> {
+    projects::table
+        .filter(projects::org_id.eq(org_id))
+        .filter(projects::id.eq_any(ids.to_vec()))
+        .select(projects::id)
+        .load(conn)
+        .await
+}
+
 // ===========================================================================
 // Apps (ingest unit)
 // ===========================================================================
@@ -858,6 +908,21 @@ pub async fn app_ancestry(
         .optional()
 }
 
+/// `(app_id, project_id, org_id)` for each of `ids` that resolves — the
+/// batched `app_ancestry`, so validating a batch of scopes costs one query.
+/// Ids that are not apps are simply absent from the result.
+pub async fn app_ancestries(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid, Uuid)>> {
+    apps::table
+        .inner_join(projects::table.on(projects::id.eq(apps::project_id)))
+        .filter(apps::id.eq_any(ids.to_vec()))
+        .select((apps::id, apps::project_id, projects::org_id))
+        .load(conn)
+        .await
+}
+
 // --- environments -----------------------------------------------------------
 
 /// Resolve an environment by name, creating it if the app is under its cap.
@@ -961,23 +1026,19 @@ pub async fn insert_error_event(
         .await
 }
 
-/// Longest window a free-text payload search may scan. The jsonb→text cast is
-/// unindexable, so the window is the only bound on its cost.
-pub const MAX_PAYLOAD_SEARCH_DAYS: i64 = 90;
-
 pub async fn list_issues(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
     filters: &[ParsedFilter],
     q: Option<&str>,
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    since: chrono::DateTime<chrono::Utc>,
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<Issue>> {
-    let mut query = issues::table.filter(issues::app_id.eq(app_id)).into_boxed();
-    if let Some(s) = since {
-        query = query.filter(issues::last_seen.ge(s));
-    }
+    let mut query = issues::table
+        .filter(issues::app_id.eq(app_id))
+        .filter(issues::last_seen.ge(since))
+        .into_boxed();
     for f in filters {
         query = match (f.field, f.op) {
             ("level", Op::Eq) => query.filter(issues::level.eq(f.value.clone())),
@@ -1026,11 +1087,6 @@ pub async fn list_issues(
         };
     }
     if let Some(term) = q {
-        // Cap how far back the (unindexable) payload scan may reach, even when
-        // the caller asked for an unbounded issue list.
-        let payload_since = since.unwrap_or_else(|| {
-            chrono::Utc::now() - chrono::Duration::days(MAX_PAYLOAD_SEARCH_DAYS)
-        });
         let p = like_contains(term);
         query = query.filter(
             issues::title
@@ -1041,13 +1097,18 @@ pub async fn list_issues(
                 // Bounding the correlated scan by time is what keeps it viable:
                 // without it, an issue with no match forces a full scan of that
                 // issue's entire event history — for EVERY issue in the app.
-                // `payload_since` is the caller's window (defaulted, never open).
+                // `since` is always supplied by the caller (see `list()` in
+                // `routes/issues.rs`) — there used to be a `MAX_PAYLOAD_SEARCH_
+                // DAYS` fallback for when it wasn't, but every route already
+                // passed `Some(since)`, so that fallback never fired. Deleted
+                // rather than kept as a guard that reads as protection but
+                // isn't one.
                 .or(sql::<Bool>(
                     "EXISTS (SELECT 1 FROM error_events e \
                      WHERE e.issue_id = issues.id AND e.app_id = issues.app_id \
                      AND e.occurred_at >= ",
                 )
-                .bind::<Timestamptz, _>(payload_since)
+                .bind::<Timestamptz, _>(since)
                 .sql(" AND (e.contexts::text ILIKE ")
                 .bind::<Text, _>(p.clone())
                 .sql(" OR e.extra::text ILIKE ")

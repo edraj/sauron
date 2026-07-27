@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -11,25 +12,48 @@
   import CreateMemberDialog from '../lib/components/members/CreateMemberDialog.svelte';
   import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
   import MembersTable from '../lib/components/members/MembersTable.svelte';
+  import ScopeTree from '../lib/components/members/ScopeTree.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listMembers, listRoles, createGrant, deleteGrant, setMemberActive } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { groupMembers, type App, type Member, type MemberGrant, type Role, type ScopeOption } from '../lib/models';
+  import {
+    EMPTY_SELECTION,
+    isEmptySelection,
+    selectionToScopes,
+    type ScopeSelection,
+  } from '../lib/models/scope-tree';
 
   let members = $state<MemberGrant[]>([]);
   let roles = $state<Role[]>([]);
-  let appsById = $state<Record<string, App>>({});
+  // Keyed by project because the scope tree renders by project; `appsById` is
+  // the flattened view the table and the scope labels want.
+  let appsByProject = $state<Record<string, App[]>>({});
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  const appsById = $derived.by(() => {
+    const map: Record<string, App> = {};
+    for (const list of Object.values(appsByProject)) for (const a of list) map[a.id] = a;
+    return map;
+  });
+
+  const projectsById = $derived.by(() => {
+    const map: Record<string, { name: string }> = {};
+    for (const p of sessionStore.projects) map[p.id] = { name: p.name };
+    return map;
+  });
 
   // Grant access form — grants a scoped role to someone who already has an
   // account (possibly in another org). This is distinct from "Create member"
   // below, which provisions a brand-new account. There is no invitation flow.
   let grantEmail = $state('');
   let grantRoleId = $state('');
-  let grantScopeKey = $state(''); // `${scope_type}:${scope_id}`
+  // Fresh arrays — EMPTY_SELECTION's are frozen, and $state proxies what it is
+  // handed.
+  let grantSelection = $state<ScopeSelection>({ ...EMPTY_SELECTION, projects: [], apps: [] });
   let granting = $state(false);
   let removingId = $state<string | null>(null);
 
@@ -99,6 +123,21 @@
     return opts;
   });
 
+  const projectOfApp = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const [projectId, list] of Object.entries(appsByProject)) {
+      for (const a of list) map[a.id] = projectId;
+    }
+    return map;
+  });
+
+  const canGrant = $derived(
+    !granting &&
+      grantEmail.trim().includes('@') &&
+      grantRoleId !== '' &&
+      !isEmptySelection(grantSelection),
+  );
+
   async function load(orgId: string) {
     loading = true;
     error = null;
@@ -107,13 +146,6 @@
       members = mem;
       roles = rls;
       if (rls.length && !grantRoleId) grantRoleId = rls[0].id;
-      // Resolve app names across every project so app-scoped grants read nicely.
-      const appLists = await Promise.all(
-        sessionStore.projects.map((p) => listApps(p.id).catch(() => [] as App[])),
-      );
-      const map: Record<string, App> = {};
-      for (const list of appLists) for (const a of list) map[a.id] = a;
-      appsById = map;
     } catch (err) {
       error = errorMessage(err);
     } finally {
@@ -121,28 +153,71 @@
     }
   }
 
+  // Resolve app names across every project so app-scoped grants read nicely and
+  // the scope tree can list apps under their project.
+  //
+  // This tracks `sessionStore.projects` instead of sampling it once inside
+  // load(): switching orgs empties the store's project list and refills it from
+  // its own request, which raced load()'s awaits. Losing that race left
+  // `appsByProject` empty for good — no twisties in the scope tree, no app
+  // names in the table — with nothing to recompute it short of a page reload.
+  $effect(() => {
+    const projects = sessionStore.projects;
+    let stale = false;
+    void (async () => {
+      const appLists = await Promise.all(
+        projects.map((p) => listApps(p.id).catch(() => [] as App[])),
+      );
+      if (stale) return;
+      const byProject: Record<string, App[]> = {};
+      projects.forEach((p, i) => (byProject[p.id] = appLists[i]));
+      appsByProject = byProject;
+    })();
+    return () => {
+      stale = true;
+    };
+  });
+
   $effect(() => {
     const org = sessionStore.currentOrgId;
     if (org && canReadMembers) void load(org);
     else if (org) loading = false;
   });
 
+  // The grant form holds bare project/app ids belonging to the org that was
+  // current when they were ticked, and selectionToScopes() substitutes whatever
+  // org is current at submit time. Switching orgs must therefore clear it —
+  // otherwise the tree redraws with the new org's projects and nothing ticked
+  // while the summary and the enabled Grant button still act on the old org's
+  // picks (and an org-level tick would silently retarget the new org).
+  $effect(() => {
+    // Read into a variable the guard uses: a bare property access would be a
+    // side-effect-free expression statement that a minifier is free to drop,
+    // taking the dependency — and the reset — with it.
+    const org = sessionStore.currentOrgId;
+    if (!org) return;
+    untrack(() => {
+      grantEmail = '';
+      // Cleared so load() re-seeds it from the new org's roles; the old id is
+      // not in this org's list and the API would reject it.
+      grantRoleId = '';
+      grantSelection = { ...EMPTY_SELECTION, projects: [], apps: [] };
+    });
+  });
+
   async function submitGrant(event: SubmitEvent) {
     event.preventDefault();
     const org = sessionStore.currentOrgId;
-    if (!org || granting || !grantEmail.trim() || !grantRoleId || !grantScopeKey) return;
-    const opt = scopeOptions.find((o) => o.key === grantScopeKey);
-    if (!opt) return;
+    if (!org || !canGrant) return;
     granting = true;
     try {
       await createGrant(org, {
         email: grantEmail.trim(),
         role_id: grantRoleId,
-        scope_type: opt.scope_type,
-        scope_id: opt.scope_id,
+        scopes: selectionToScopes(grantSelection, org, projectOfApp),
       });
       grantEmail = '';
-      grantScopeKey = '';
+      grantSelection = { ...EMPTY_SELECTION, projects: [], apps: [] };
       await load(org);
       toastStore.success('Access granted.');
     } catch (err) {
@@ -253,27 +328,34 @@
           <Button variant="primary" onclick={() => (createOpen = true)}>Create member</Button>
         {/snippet}
         <form class="grant-form" onsubmit={submitGrant}>
-          <div class="gf-field">
-            <Input label="Email" type="email" bind:value={grantEmail} placeholder="teammate@company.com" required />
-          </div>
-          <div class="gf-field">
-            <span class="lbl">Role</span>
-            <select class="sel" bind:value={grantRoleId} aria-label="Role">
-              {#each roles as role (role.id)}
-                <option value={role.id}>{role.name}</option>
-              {/each}
-            </select>
+          <div class="gf-row">
+            <div class="gf-field">
+              <Input label="Email" type="email" bind:value={grantEmail} placeholder="teammate@company.com" required />
+            </div>
+            <div class="gf-field">
+              <span class="lbl">Role</span>
+              <select class="sel" bind:value={grantRoleId} aria-label="Role">
+                {#each roles as role (role.id)}
+                  <option value={role.id}>{role.name}</option>
+                {/each}
+              </select>
+            </div>
           </div>
           <div class="gf-field">
             <span class="lbl">Scope</span>
-            <select class="sel" bind:value={grantScopeKey} aria-label="Scope">
-              <option value="" disabled>Select scope…</option>
-              {#each scopeOptions as opt (opt.key)}
-                <option value={opt.key}>{opt.label}</option>
-              {/each}
-            </select>
+            <ScopeTree
+              orgId={sessionStore.currentOrg?.id ?? ''}
+              orgName={sessionStore.currentOrg?.name ?? 'this org'}
+              projects={sessionStore.projects}
+              {appsByProject}
+              value={grantSelection}
+              disabled={granting}
+              onchange={(next) => (grantSelection = next)}
+            />
           </div>
-          <Button type="submit" variant="primary" loading={granting}>Grant</Button>
+          <div class="gf-actions">
+            <Button type="submit" variant="primary" loading={granting} disabled={!canGrant}>Grant</Button>
+          </div>
         </form>
       </Card>
     {/if}
@@ -281,6 +363,7 @@
     <MembersTable
       {grouped}
       {appsById}
+      {projectsById}
       {canManage}
       {removingId}
       {togglingUserId}
@@ -337,8 +420,10 @@
     <CreateMemberDialog
       open={createOpen}
       orgId={sessionStore.currentOrg.id}
+      orgName={sessionStore.currentOrg.name}
       {roles}
-      {scopeOptions}
+      projects={sessionStore.projects}
+      {appsByProject}
       onclose={() => (createOpen = false)}
       oncreated={() => load(sessionStore.currentOrg!.id)}
     />
@@ -393,9 +478,18 @@
   }
   .grant-form {
     display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .gf-row {
+    display: flex;
     align-items: flex-end;
     gap: 12px;
     flex-wrap: wrap;
+  }
+  .gf-actions {
+    display: flex;
+    justify-content: flex-end;
   }
   .gf-field {
     display: flex;

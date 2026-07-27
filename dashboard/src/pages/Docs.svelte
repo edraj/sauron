@@ -359,6 +359,95 @@ SauronSdk.Track("signup_completed", "u_123");`;
     { sig: 'Close(timeout?)', desc: 'Flush, then stop the flush timer.' },
   ];
 
+  // --- Search & filtering ---------------------------------------------------
+
+  const searchCoverageRows: { q: string; a: string }[] = [
+    {
+      q: 'Exceptions (Issues)',
+      a: 'Filter chips + free-text box — both run server-side over the full dataset in the selected date range.',
+    },
+    {
+      q: 'Events',
+      a: 'Filter chips + free-text box — both run server-side over the full dataset in the selected date range.',
+    },
+    {
+      q: "An issue's Occurrences (Issue detail page)",
+      a: "The same Tag chip and free-text box, server-side, scoped to just that issue's events — but this view doesn't write its state to the URL.",
+    },
+    {
+      q: 'Users, Devices, Screens',
+      a: 'Free-text box only — no filter chips. Server-side; Users has no date window (searches all time), Devices and Screens are scoped to the selected range.',
+    },
+    {
+      q: 'Sessions, Funnels',
+      a: "A search box exists, but it only filters rows already loaded on the current page in the browser. It never queries the server — a match sitting on the next page won't show up.",
+    },
+    {
+      q: 'Performance, Journeys, Overview, Members, Monitors, Storage',
+      a: 'No search.',
+    },
+  ];
+
+  const freeTextRows: { q: string; a: string }[] = [
+    {
+      q: 'Exceptions',
+      a: "title, type, culprit — plus the underlying event's tags/contexts/extra payload (matched as text).",
+    },
+    {
+      q: 'Events',
+      a: 'name, distinct_id — plus the tags/contexts/extra/properties payload (as text).',
+    },
+    {
+      q: 'Occurrences',
+      a: 'message, exception_value, exception_type — plus the tags/contexts/extra payload.',
+    },
+    {
+      q: 'Users',
+      a: 'distinct_id — plus the entire traits object as text, so an email, plan, or company typed here finds the person.',
+    },
+    {
+      q: 'Devices',
+      a: 'family, model, os_name and device_key, glued together — "iphone 15" or "macos" both work.',
+    },
+    { q: 'Screens', a: 'the screen name only.' },
+  ];
+
+  const filterOpRows: { sig: string; desc: string }[] = [
+    { sig: 'text', desc: '=  ≠  contains — exact / not-exact / case-insensitive substring' },
+    { sig: 'enum', desc: '=  ≠ — exact / not-exact against a fixed option list' },
+    { sig: 'number', desc: '=  >  < — numeric compare' },
+    { sig: 'tag', desc: 'contains (default)  = — see "The Tag filter" below' },
+  ];
+
+  const issueFilterRows: { sig: string; desc: string }[] = [
+    { sig: 'level', desc: 'enum: debug, info, warning, error, fatal' },
+    { sig: 'status', desc: 'enum: unresolved, resolved, ignored' },
+    { sig: 'type', desc: 'text — the exception class' },
+    { sig: 'culprit', desc: 'text — the failing frame' },
+    { sig: 'times_seen', desc: 'number — shown as "Events" in the UI' },
+    { sig: 'users_seen', desc: 'number — shown as "Users" in the UI' },
+    { sig: 'tag', desc: "key + value against the event's tags — see below" },
+  ];
+
+  const eventFilterRows: { sig: string; desc: string }[] = [
+    { sig: 'name', desc: 'text — the event name' },
+    { sig: 'distinct_id', desc: 'text — shown as "User" in the UI' },
+    { sig: 'session_id', desc: 'text' },
+    { sig: 'environment', desc: "enum — populated from this app's real environments" },
+    { sig: 'release', desc: 'text' },
+    { sig: 'tag', desc: "key + value against the event's tags — see below" },
+  ];
+
+  const searchUrlExample =
+    '#/issues?filter=status:eq:unresolved&filter=culprit:contains:checkout&q=timeout&since_days=30';
+
+  const tagFilterExample = `Chip: Tag   contains   key=region   value=eu
+→ matches tags.region containing "eu": "eu-central-1", "EU-WEST-2", …
+
+Chip: Tag   =   key=region   value=eu
+→ matches ONLY an exact, case-sensitive tags.region of "eu" — zero rows
+  if every event actually has "eu-central-1" or "EU-CENTRAL-1"`;
+
   const troubleshooting: { q: string; a: string }[] = [
     {
       q: 'Nothing shows up in the dashboard',
@@ -393,6 +482,7 @@ SauronSdk.Track("signup_completed", "u_123");`;
   const guideNav: { id: string; label: string; icon: IconName }[] = [
     { id: 'funnels', label: 'Funnels', icon: 'funnel' },
     { id: 'verify', label: 'Verify setup', icon: 'circle-check' },
+    { id: 'search', label: 'Search & filtering', icon: 'search' },
     { id: 'troubleshooting', label: 'Troubleshooting', icon: 'life-buoy' },
   ];
   // "How it works under the hood" — every feature + its internals.
@@ -408,7 +498,7 @@ SauronSdk.Track("signup_completed", "u_123");`;
   ];
   // Section anchors in document order — drives scroll-spy highlighting.
   const sectionIds = [
-    'dsn', 'concepts', 'quickstart', 'funnels', 'verify', 'troubleshooting',
+    'dsn', 'concepts', 'quickstart', 'funnels', 'verify', 'search', 'troubleshooting',
     'architecture', 'grouping', 'analytics-internals', 'queries', 'tiering', 'uptime', 'rbac',
     'sdk-internals',
   ];
@@ -915,6 +1005,96 @@ GROUP BY name, op`;
 
         </section>
 
+        <!-- Search & filtering -->
+        <section id="search" class="doc-sec">
+    <Card>
+      {#snippet header()}
+        <div class="card-h"><Icon name="search" size={16} /><h3>Search &amp; filtering</h3></div>
+      {/snippet}
+      <p class="muted concept-lead">
+        Two independent mechanisms narrow a list: a <b>free-text box</b> (a case-insensitive
+        substring match over a fixed set of columns) and, on two pages, <b>structured filter
+        chips</b> (<code class="ic">field · operator · value</code>). Coverage is uneven by
+        design — know which a page has before you decide a term "isn't there."
+      </p>
+
+      <h4 class="q-h">Where each page searches</h4>
+      {@render defRows(searchCoverageRows)}
+
+      <h4 class="q-h">Free-text: what each box actually matches</h4>
+      <p class="muted q-note">
+        Always a case-insensitive substring match (Postgres <code class="ic">ILIKE</code>) — no
+        ranking, no fuzzy matching, no tokenizer. An empty box returns everything in range.
+      </p>
+      {@render defRows(freeTextRows)}
+
+      <h4 class="q-h">Structured filters — Exceptions &amp; Events</h4>
+      <p class="muted q-note">
+        Click <b>+ Add filter</b> to build a chip. Chips combine with <b>AND</b>; the free-text
+        box and date range still apply on top. An issue's <b>Occurrences</b> list (Issue detail
+        page) offers the same mechanism, but only the <code class="ic">Tag</code> field.
+      </p>
+      {@render apiTable(filterOpRows)}
+      <p class="muted q-note"><b>Exceptions</b> fields:</p>
+      {@render apiTable(issueFilterRows)}
+      <p class="muted q-note"><b>Events</b> fields:</p>
+      {@render apiTable(eventFilterRows)}
+
+      <h4 class="q-h">Example: find your error</h4>
+      <p class="muted q-note">
+        Two chips — <code class="ic">Status = unresolved</code> and
+        <code class="ic">Culprit contains checkout</code> — narrowed to unresolved issues on the
+        checkout path, plus a free-text term for good measure. This is the URL that view produces:
+      </p>
+      <CodeBlock code={searchUrlExample} language="url" />
+
+      <h4 class="q-h">The Tag filter — read this before you file a bug</h4>
+      <p class="muted concept-lead">
+        <code class="ic">Tag</code> is a two-input chip — a <b>key</b> and a <b>value</b> — composed
+        into one <code class="ic">key=value</code> filter value under the hood (the backend splits
+        on the <b>first</b> <code class="ic">=</code>, so a value that itself contains
+        <code class="ic">=</code> still round-trips). Both a key and a value are required, or the
+        chip silently doesn't get added. Two operators are offered, and the UI picks the
+        <b>first</b> one — <code class="ic">contains</code> — by default:
+      </p>
+      <ul class="mini-steps">
+        <li>
+          <b>contains</b> <i>(default)</i> — case-insensitive substring match on that key's value.
+          Use this when you know the key but only part of the value, or aren't sure of the casing —
+          key <code class="ic">region</code>, value <code class="ic">eu</code> matches
+          <code class="ic">eu-central-1</code>, <code class="ic">EU-WEST-2</code>, etc.
+        </li>
+        <li>
+          <b>=</b> — exact, <b>case-sensitive</b> whole-value match (a JSONB containment check,
+          backed by a GIN index so it stays fast on a large app). Only reach for it when you know
+          the value's exact spelling and casing.
+        </li>
+      </ul>
+      <p class="faint fine">
+        This is the one that generates real support tickets: switch to <code class="ic">=</code>
+        and type a partial or wrong-case value, and the filter returns <b>zero rows with no
+        error</b> — indistinguishable from "search doesn't work." If a Tag chip comes back empty,
+        switch it to <code class="ic">contains</code> before concluding the tag isn't there.
+        <code class="ic">Tag</code> only looks at the developer-set <code class="ic">tags</code>
+        map — never <code class="ic">contexts</code>, <code class="ic">extra</code>, or the
+        machine-owned <code class="ic">context</code> (singular) blob; use the free-text box for
+        those.
+      </p>
+      <CodeBlock code={tagFilterExample} language="text" />
+
+      <h4 class="q-h">Filters live in the URL</h4>
+      <p class="muted q-note">
+        On <b>Exceptions</b> and <b>Events</b>, every chip and the search term are written into the
+        address bar (<code class="ic">filter=field:op:value</code>, repeated, plus
+        <code class="ic">q=</code> and <code class="ic">since_days=</code>) — copy the URL to hand
+        someone the exact same filtered view. The Occurrences list, and every free-text-only or
+        client-side page above, doesn't do this — reloading or sharing the link loses whatever you
+        typed.
+      </p>
+    </Card>
+
+        </section>
+
         <!-- Troubleshooting -->
         <section id="troubleshooting" class="doc-sec">
     <Card>
@@ -1132,9 +1312,11 @@ GROUP BY name, op`;
             {@render defRows(presetRows)}
             <p class="muted concept-lead">
               <b>Create member</b> (Members → Create member) is for someone who doesn't have an
-              account yet. An admin with <code class="ic">member:manage</code> supplies their
-              email, name, role and scope, and the server creates the account and its first grant
-              together. The response reveals a <b>16-character temporary password exactly once</b>,
+              account yet. An admin with <code class="ic">member:manage</code> supplies their email
+              and name, picks <b>one role</b>, then ticks any mix of scopes to hand it at — the
+              whole org, whole projects, individual apps — and the server creates the account and
+              every grant together, all or nothing. Ticking a whole project also covers apps added
+              to it later. The response reveals a <b>16-character temporary password exactly once</b>,
               with a copy button — no endpoint can retrieve it again, so a lost password means
               deactivating the account and creating it again. The admin can't choose or see a
               durable password for them.

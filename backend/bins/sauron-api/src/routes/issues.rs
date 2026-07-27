@@ -55,7 +55,7 @@ pub async fn list(
             app_id,
             &filters,
             search,
-            Some(since),
+            since,
             limit,
             super::clamp_offset(q.offset),
         )

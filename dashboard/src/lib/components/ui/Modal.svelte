@@ -5,7 +5,7 @@
   interface Props {
     open: boolean;
     title?: string;
-    size?: 'sm' | 'md';
+    size?: 'sm' | 'md' | 'lg';
     /** When false, the header X, Escape, and backdrop click are all
         disabled — the caller must close via its own footer action. */
     dismissible?: boolean;
@@ -109,6 +109,9 @@
   }
   .modal.sm {
     width: min(400px, calc(100vw - 32px));
+  }
+  .modal.lg {
+    width: min(680px, calc(100vw - 32px));
   }
   .modal::backdrop {
     background: rgba(8, 10, 14, 0.55);

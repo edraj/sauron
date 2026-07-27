@@ -4,55 +4,80 @@
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
   import CopyButton from '../ui/CopyButton.svelte';
+  import ScopeTree from './ScopeTree.svelte';
   import { createMember } from '../../api/orgs';
   import { errorMessage } from '../../api/client';
-  import type { Role, ScopeOption } from '../../models';
+  import {
+    EMPTY_SELECTION,
+    isEmptySelection,
+    selectionToScopes,
+    type ScopeSelection,
+  } from '../../models/scope-tree';
+  import type { App, Project, Role } from '../../models';
 
   interface Props {
     open: boolean;
     orgId: string;
+    orgName: string;
     roles: Role[];
-    scopeOptions: ScopeOption[];
+    projects: Project[];
+    appsByProject: Record<string, App[]>;
     onclose: () => void;
     oncreated: () => void;
   }
 
-  let { open, orgId, roles, scopeOptions, onclose, oncreated }: Props = $props();
+  let {
+    open,
+    orgId,
+    orgName,
+    roles,
+    projects,
+    appsByProject,
+    onclose,
+    oncreated,
+  }: Props = $props();
 
   let email = $state('');
   let name = $state('');
   let roleId = $state('');
-  let scopeKey = $state('');
+  // Fresh arrays — EMPTY_SELECTION's are frozen, and $state proxies what it is
+  // handed. Nothing is preselected: the org tick is the broadest grant there is.
+  let selection = $state<ScopeSelection>({ ...EMPTY_SELECTION, projects: [], apps: [] });
   let saving = $state(false);
   let error = $state<string | null>(null);
   /** Set once the account exists. The dialog switches to the reveal panel. */
   let tempPassword = $state<string | null>(null);
 
-  // Repopulate on the false -> true transition only. `roles`/`scopeOptions`
-  // are read inside `untrack` so a parent-triggered reload (which replaces
-  // those arrays with new references while the dialog is still open, e.g.
-  // right after a successful create) does not re-run this effect and wipe
-  // the one-time temp-password reveal panel underneath the admin.
+  const projectOfApp = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const p of projects) for (const a of appsByProject[p.id] ?? []) map[a.id] = p.id;
+    return map;
+  });
+
+  // Repopulate on the false -> true transition only. Every prop this reads is
+  // read inside `untrack` — a parent-triggered reload replaces `roles`,
+  // `projects` and `appsByProject` with new references while the dialog is
+  // still open (e.g. right after a successful create), and tracking any of them
+  // would re-run this effect and wipe the one-time temp-password reveal panel
+  // underneath the admin.
   $effect(() => {
     if (!open) return;
     untrack(() => {
       email = '';
       name = '';
       roleId = roles[0]?.id ?? '';
-      scopeKey = scopeOptions[0]?.key ?? '';
+      selection = { ...EMPTY_SELECTION, projects: [], apps: [] };
       tempPassword = null;
       error = null;
     });
   });
 
   const canSubmit = $derived(
-    !saving && email.trim().includes('@') && roleId !== '' && scopeKey !== '',
+    !saving && email.trim().includes('@') && roleId !== '' && !isEmptySelection(selection),
   );
 
   async function submit() {
     if (!canSubmit) return;
-    const scope = scopeOptions.find((s) => s.key === scopeKey);
-    if (!scope) return;
     saving = true;
     error = null;
     try {
@@ -60,8 +85,7 @@
         email: email.trim(),
         name: name.trim(),
         role_id: roleId,
-        scope_type: scope.scope_type,
-        scope_id: scope.scope_id,
+        scopes: selectionToScopes(selection, orgId, projectOfApp),
       });
       // Reveal, do not close. This is the only time this value exists.
       tempPassword = result.temp_password;
@@ -76,6 +100,7 @@
 
 <Modal
   {open}
+  size="lg"
   title={tempPassword ? 'Member created' : 'Create member'}
   dismissible={tempPassword === null}
   onclose={onclose}
@@ -113,12 +138,15 @@
       </div>
       <div class="gf-field">
         <span class="lbl">Scope</span>
-        <select class="sel" bind:value={scopeKey} aria-label="Scope">
-          <option value="" disabled>Select scope…</option>
-          {#each scopeOptions as opt (opt.key)}
-            <option value={opt.key}>{opt.label}</option>
-          {/each}
-        </select>
+        <ScopeTree
+          {orgId}
+          {orgName}
+          {projects}
+          {appsByProject}
+          value={selection}
+          disabled={saving}
+          onchange={(next) => (selection = next)}
+        />
       </div>
     </div>
     {#if error}<p class="err-msg">{error}</p>{/if}

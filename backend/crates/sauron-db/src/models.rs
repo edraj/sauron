@@ -296,6 +296,9 @@ pub struct ErrorEvent {
     pub contexts: Value,
     /// Dev-supplied freeform JSON.
     pub extra: Value,
+    /// Whether the SDK saw this error caught (`Some(true)`) or uncaught (`Some(false)`).
+    /// `None` for rows ingested before this column existed — never backfilled.
+    pub handled: Option<bool>,
 }
 
 #[derive(Debug, Insertable)]
@@ -331,6 +334,8 @@ pub struct NewErrorEvent {
     pub debug_meta: Option<Value>,
     pub contexts: Value,
     pub extra: Value,
+    /// Whether the SDK saw this error caught (`Some(true)`) or uncaught (`Some(false)`).
+    pub handled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,15 @@
+-- `handled` records whether the SDK saw the error caught or uncaught — the single
+-- most-used filter in any crash reporter ("did this take the app down?"). Every
+-- SDK has always sent it as `mechanism.handled` and the pipeline has always
+-- dropped it on the floor, so `is:unhandled` was inexpressible.
+--
+-- Deliberately NULLable, with NO DEFAULT and no backfill. Rows written before
+-- this migration genuinely do not know, and `handled = false` AND `handled = true`
+-- must BOTH exclude them: folding unknown into either bucket would report every
+-- pre-upgrade error as handled, which is the exact opposite of what an on-call
+-- engineer filtering for crashes needs. `has:handled` selects the known rows.
+-- SQL three-valued logic gives this for free; the only requirement is that
+-- nothing ever writes a fallback value.
+--
+-- ADD COLUMN on the partitioned parent propagates to every existing partition.
+ALTER TABLE error_events ADD COLUMN handled BOOLEAN;

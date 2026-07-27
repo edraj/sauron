@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 sauron-core.workspace = true
+sauron-query.workspace = true
 diesel.workspace = true
 diesel-async.workspace = true
 deadpool.workspace = true

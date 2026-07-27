@@ -322,6 +322,12 @@ pub struct IngestJob {
     pub user_agent: Option<String>,
     #[serde(default)]
     pub context: EnvelopeContext,
+    /// Envelope-scoped SDK identity. `#[serde(default)]` is load-bearing: the
+    /// queue is a Redis stream, so during a rolling upgrade jobs serialized by
+    /// the previous ingest binary are still in flight and must keep
+    /// deserializing against the new struct.
+    #[serde(default)]
+    pub sdk: Option<SdkInfo>,
     pub item: EnvelopeItem,
 }
 
@@ -393,6 +399,37 @@ mod tests {
             EnvelopeItem::Identify(id) => assert_eq!(id.distinct_id, "u_123"),
             other => panic!("expected identify item, got {other:?}"),
         }
+    }
+
+    /// A job serialized by the pre-upgrade ingest binary carries no `sdk` key.
+    /// Those are still sitting in the Redis stream during a rolling upgrade, so
+    /// the new worker has to keep reading them — that is what the
+    /// `#[serde(default)]` on `IngestJob::sdk` buys.
+    #[test]
+    fn ingest_job_from_a_previous_binary_still_deserializes() {
+        let legacy = r#"{
+            "app_id": "00000000-0000-0000-0000-000000000001",
+            "project_id": "00000000-0000-0000-0000-000000000002",
+            "org_id": "00000000-0000-0000-0000-000000000003",
+            "received_at": "2026-07-12T10:30:00Z",
+            "item": { "type": "identify", "distinct_id": "u_123" }
+        }"#;
+        let job: IngestJob = serde_json::from_str(legacy).expect("legacy job must parse");
+        assert!(job.sdk.is_none());
+    }
+
+    /// `sdk` is stored as a JSON object because the query catalog declares it a
+    /// JSON root — `sdk.name:…` lowers to containment against `{"name":…}`.
+    #[test]
+    fn ingest_job_sdk_serializes_as_an_object() {
+        let sdk = SdkInfo {
+            name: "sauron.javascript".to_string(),
+            version: "0.3.0".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&sdk).unwrap(),
+            serde_json::json!({ "name": "sauron.javascript", "version": "0.3.0" })
+        );
     }
 
     #[test]

@@ -52,6 +52,15 @@ pub struct Config {
     pub tier_drop_lag_hours: i64,
     pub tier_tick_secs: u64,
     pub tier_partition_ahead: i64,
+    /// Window a `Cost::Scan` search query (an unindexed wildcard/substring/
+    /// free-text match) is clamped to — `sauron_db::query_plan::prepare`.
+    /// Defaults to `tier_hot_days`: clamping a scan to more than the tier
+    /// worker's hot window buys nothing, since older rows are already gone
+    /// from Postgres, so that default is simultaneously the honest cost bound
+    /// and the honest coverage bound. Replaces `sauron_db::repo::
+    /// MAX_PAYLOAD_SEARCH_DAYS`, a constant that was unreachable dead code
+    /// (every route already passed an explicit `since`).
+    pub search_scan_clamp_days: i64,
     // --- symbolication / source maps ---
     /// In-process parsed-index LRU byte budget (megabytes).
     pub symbols_cache_mb: usize,
@@ -156,6 +165,9 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        // Read once so `search_scan_clamp_days`'s default can track it below.
+        let tier_hot_days = parse("TIER_HOT_DAYS", 30);
+
         Ok(Self {
             database_url,
             redis_url: var("REDIS_URL").unwrap_or_else(|| "redis://127.0.0.1:6379".to_string()),
@@ -183,13 +195,14 @@ impl Config {
             monitor_ssrf_allow_private: var("MONITOR_SSRF_ALLOW_PRIVATE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            tier_hot_days: parse("TIER_HOT_DAYS", 30),
+            tier_hot_days,
             tier_granularity: var("TIER_GRANULARITY").unwrap_or_else(|| "day".to_string()),
             tier_cold_path: var("TIER_COLD_PATH")
                 .unwrap_or_else(|| "/var/lib/sauron/cold".to_string()),
             tier_drop_lag_hours: parse("TIER_DROP_LAG_HOURS", 24),
             tier_tick_secs: parse("TIER_TICK_SECS", 3600),
             tier_partition_ahead: parse("TIER_PARTITION_AHEAD", 7),
+            search_scan_clamp_days: parse("SEARCH_SCAN_CLAMP_DAYS", tier_hot_days),
             symbols_cache_mb: parse("SYMBOLS_CACHE_MB", 256),
             symbols_redis_url: var("SYMBOLS_REDIS_URL"),
             symbols_redis_max_blob_mb: parse("SYMBOLS_REDIS_MAX_BLOB_MB", 8),

@@ -20,6 +20,7 @@ sauron-monitor-core = { path = "crates/sauron-monitor-core" }
 sauron-tier = { path = "crates/sauron-tier" }
 sauron-symbols = { path = "crates/sauron-symbols" }
 sauron-alerts = { path = "crates/sauron-alerts" }
+sauron-query = { path = "crates/sauron-query" }
 
 # --- async runtime / http ---
 # Scoped tokio features (was "full") — only what the workspace actually uses:

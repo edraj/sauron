@@ -167,6 +167,20 @@ pub enum Scope {
     App(Uuid),
 }
 
+impl Scope {
+    /// The `(scope_type, scope_id)` pair as stored in `role_grants`.
+    ///
+    /// Round-trips [`grants_from_rows`], and lets a caller name the offending
+    /// scope in an error message without rebuilding the string form itself.
+    pub fn parts(self) -> (&'static str, Uuid) {
+        match self {
+            Scope::Org(id) => ("org", id),
+            Scope::Project(id) => ("project", id),
+            Scope::App(id) => ("app", id),
+        }
+    }
+}
+
 /// A user's grant: a scope plus the permissions its role confers.
 #[derive(Clone, Debug)]
 pub struct Grant {
@@ -726,6 +740,28 @@ mod tests {
         assert!(!VIEWER.permissions.contains(&perm::MONITOR_WRITE));
         // Developer can write.
         assert!(DEVELOPER.permissions.contains(&perm::MONITOR_WRITE));
+    }
+
+    #[test]
+    fn scope_parts_round_trips_the_stored_column_values() {
+        assert_eq!(Scope::Org(org()).parts(), ("org", org()));
+        assert_eq!(Scope::Project(proj_a()).parts(), ("project", proj_a()));
+        assert_eq!(Scope::App(app_a1()).parts(), ("app", app_a1()));
+        // The strings must match what grants_from_rows accepts, or a scope
+        // named in an error could not be looked up again.
+        for scope in [
+            Scope::Org(org()),
+            Scope::Project(proj_a()),
+            Scope::App(app_a1()),
+        ] {
+            let (scope_type, scope_id) = scope.parts();
+            let rows = vec![(
+                scope_type.to_string(),
+                scope_id,
+                serde_json::json!(["issue:read"]),
+            )];
+            assert_eq!(grants_from_rows(rows)[0].scope, scope);
+        }
     }
 
     #[test]

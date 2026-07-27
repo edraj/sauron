@@ -1,8 +1,27 @@
 # For documentation on how to configure this file,
 # see https://diesel.rs/guides/configuring-diesel-cli
 
+# DELIBERATELY NO `file = …` KEY.
+#
+# `crates/sauron-db/src/schema.rs` is hand-maintained despite its `@generated`
+# header. Setting `file` here makes `diesel migration run` REWRITE it as a side
+# effect — not just on an explicit `print-schema` — and that rewrite is
+# destructive in three ways:
+#
+#   1. It emits a `table!` block for every PARTITION CHILD (`error_events_2026_07_15`,
+#      `analytics_events_default`, …). The tier worker creates and drops those on a
+#      schedule, so the file goes stale the moment a partition rolls over. This
+#      turned the 27-table file into an 87-table one twice during the search work.
+#   2. It redeclares `error_events (id)` as `error_events (id, occurred_at)`,
+#      changing the primary key the query builder assumes.
+#   3. It reorders every block and rewrites the `joinable!` and
+#      `allow_tables_to_appear_in_same_query!` lists.
+#
+# All three compile cleanly, so the gates do not catch any of it.
+#
+# To regenerate deliberately, print to stdout and merge by hand:
+#   diesel print-schema --except-tables '_\d{4}_\d{2}_\d{2}$' '_default$'
 [print_schema]
-file = "crates/sauron-db/src/schema.rs"
 custom_type_derives = ["diesel::query_builder::QueryId", "Clone"]
 
 [migrations_directory]

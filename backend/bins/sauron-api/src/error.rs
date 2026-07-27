@@ -11,6 +11,11 @@ use sauron_auth::AuthError;
 pub enum ApiError {
     Auth(AuthError),
     BadRequest(String),
+    /// A 403 that can say *why*. `AuthError::Forbidden` carries no message, so
+    /// a batch operation refused at one of many scopes could only answer
+    /// "forbidden" — leaving the admin to guess which of the scopes they ticked
+    /// was the problem.
+    Forbidden(String),
     NotFound,
     Conflict(String),
     RateLimited,
@@ -22,6 +27,7 @@ impl IntoResponse for ApiError {
         match self {
             ApiError::Auth(e) => e.into_response(),
             ApiError::BadRequest(m) => body(StatusCode::BAD_REQUEST, "bad_request", &m),
+            ApiError::Forbidden(m) => body(StatusCode::FORBIDDEN, "forbidden", &m),
             ApiError::NotFound => body(StatusCode::NOT_FOUND, "not_found", "resource not found"),
             ApiError::Conflict(m) => body(StatusCode::CONFLICT, "conflict", &m),
             ApiError::RateLimited => body(

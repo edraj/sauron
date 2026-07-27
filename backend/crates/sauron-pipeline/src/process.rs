@@ -227,7 +227,7 @@ async fn process_error(
             release: job.release.clone(),
             distinct_id: distinct.clone(),
             event_user,
-            sdk: None,
+            sdk: job.sdk.as_ref().and_then(|s| serde_json::to_value(s).ok()),
             ip_address: job.ip.clone(),
             occurred_at: now,
             session_id: e.session_id.clone(),
@@ -236,6 +236,7 @@ async fn process_error(
             stacktrace_symbolicated,
             symbolication_status,
             debug_meta,
+            handled: handled_of(exc),
         },
     )
     .await?;
@@ -419,6 +420,18 @@ fn object_or_empty(v: Value) -> Value {
     }
 }
 
+/// Whether the SDK reported this exception as caught by application code.
+///
+/// `None` means the SDK did not tell us, and it must stay `None` all the way
+/// to the column: NULL is the design's "unknown". Never substitute a fallback
+/// here — `unwrap_or(true)` would file every pre-upgrade crash as handled, and
+/// `unwrap_or(false)` would report every unknown as a crash. Both `handled =
+/// true` and `handled = false` filters must exclude unknown rows.
+fn handled_of(exc: Option<&ExceptionInfo>) -> Option<bool> {
+    exc.and_then(|x| x.mechanism.as_ref())
+        .and_then(|m| m.handled)
+}
+
 fn build_title(exc: Option<&ExceptionInfo>, message: Option<&str>) -> String {
     match exc {
         Some(x) => {
@@ -469,8 +482,47 @@ fn truncate(s: &str, max: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::object_or_empty;
+    use super::{handled_of, object_or_empty};
+    use sauron_core::envelope::{ExceptionInfo, Mechanism};
     use serde_json::json;
+
+    fn exception(mechanism: Option<Mechanism>) -> ExceptionInfo {
+        ExceptionInfo {
+            ty: "TypeError".to_string(),
+            value: Some("x is not a function".to_string()),
+            mechanism,
+            stacktrace: Vec::new(),
+        }
+    }
+
+    fn mechanism(handled: Option<bool>) -> Mechanism {
+        Mechanism {
+            ty: "onerror".to_string(),
+            handled,
+        }
+    }
+
+    #[test]
+    fn handled_is_none_when_the_sdk_did_not_say() {
+        // Three ways to arrive at unknown: no exception, an exception with no
+        // mechanism, and a mechanism that omitted the flag. None may become
+        // `Some(true)` — that would classify a real crash as handled.
+        assert_eq!(handled_of(None), None);
+        assert_eq!(handled_of(Some(&exception(None))), None);
+        assert_eq!(handled_of(Some(&exception(Some(mechanism(None))))), None);
+    }
+
+    #[test]
+    fn handled_round_trips_both_known_values() {
+        assert_eq!(
+            handled_of(Some(&exception(Some(mechanism(Some(true)))))),
+            Some(true)
+        );
+        assert_eq!(
+            handled_of(Some(&exception(Some(mechanism(Some(false)))))),
+            Some(false)
+        );
+    }
 
     #[test]
     fn object_or_empty_maps_null_to_empty_object() {

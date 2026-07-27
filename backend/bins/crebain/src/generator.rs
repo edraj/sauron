@@ -2,6 +2,14 @@
 //! `sauron_core` envelopes. No randomness crate: variation is derived
 //! deterministically from `(user.index + seq)` so runs are reproducible and the
 //! backend still sees a realistic spread of error types, events, and routes.
+//!
+//! The `tags`/`contexts`/`extra`/`properties` JSONB payloads are deliberately
+//! built with 8-15 keys and a realistic cardinality mix (mostly repeating
+//! low-cardinality values, a couple of medium-cardinality buckets, at most a
+//! couple of unique-per-event ids) rather than the 1-3 trivial keys it'd take
+//! to just satisfy the schema — GIN index write-amplification measurements
+//! are taken from this generator's output, and they only transfer to
+//! production if the shape here resembles what real SDKs actually send.
 
 use chrono::Utc;
 use serde_json::json;
@@ -40,6 +48,37 @@ const TXN_OPS: &[(&str, &str)] = &[
     ("resource", "app.bundle.js"),
     ("screen_load", "HomeScreen"),
 ];
+
+// Pools for the dev-supplied-metadata payloads below (`tags`/`contexts`/`extra`/
+// `properties`). These back a GIN-index write-amplification measurement, so
+// their shapes deliberately mimic real SDK metadata: mostly low-cardinality
+// repeating values (plan/region/locale/payment/version/variant), a couple of
+// medium-cardinality buckets (cart value, item count, latency), and at most
+// one or two genuinely unique-per-event ids. See the payload builders in
+// `event_envelope`/`issue_envelope` for how they're mixed — do not collapse
+// this back down to 1-3 keys, the whole point is that it's representative.
+const PLAN_TIERS: &[&str] = &["free", "pro", "team", "enterprise"];
+const REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-west-2",
+    "eu-west-1",
+    "eu-central-1",
+    "ap-southeast-1",
+    "ap-northeast-1",
+    "sa-east-1",
+    "ca-central-1",
+];
+const LOCALES: &[&str] = &["en-US", "en-GB", "de-DE", "fr-FR", "ja-JP", "pt-BR"];
+const PAYMENT_METHODS: &[&str] = &[
+    "credit_card",
+    "paypal",
+    "apple_pay",
+    "google_pay",
+    "bank_transfer",
+];
+const APP_VERSIONS: &[&str] = &["3.4.0", "3.4.1", "3.5.0", "3.5.1", "3.6.0"];
+const AB_VARIANTS: &[&str] = &["control", "variant_a", "variant_b"];
+const DEVICE_TYPES: &[&str] = &["desktop", "mobile", "tablet"];
 
 /// Tally of signal items in an envelope, so metrics can attribute per-type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -133,13 +172,68 @@ pub fn event_envelope(user: &VirtualUser, seq: u64) -> Envelope {
     let event = EnvelopeItem::Event(AnalyticsItem {
         name: name.to_string(),
         distinct_id: user.distinct_id.clone(),
-        properties: json!({ "screen": user.screen, "seq": seq, "value": pick % 100 }),
+        // Deliberately mimics real SDK `properties` payloads (funnel/commerce
+        // metadata a dev would actually attach) — GIN index cost measurements
+        // are taken from this shape, so keep it rich; do not simplify.
+        properties: json!({
+            "screen": user.screen,
+            "seq": seq,
+            "value": pick % 100,
+            "plan": PLAN_TIERS[pick % PLAN_TIERS.len()],
+            "region": REGIONS[(pick / 2) % REGIONS.len()],
+            "locale": LOCALES[(pick + 1) % LOCALES.len()],
+            "payment_method": PAYMENT_METHODS[(pick + 3) % PAYMENT_METHODS.len()],
+            "app_version": APP_VERSIONS[(pick + 7) % APP_VERSIONS.len()],
+            "ab_variant": AB_VARIANTS[pick % AB_VARIANTS.len()],
+            "feature_flag_checkout_v2": pick % 2 == 0,
+            "cart_value_cents": (pick % 100) * 149,
+            "item_count": (pick % 20) + 1,
+            "order_id": format!("order-{}-{}", user.index, seq),
+        }),
         timestamp: Utc::now(),
         session_id: Some(user.session_id.clone()),
         screen: Some(user.screen.to_string()),
         tags: json!({ "screen": user.screen }),
-        contexts: json!({ "session": { "seq": seq } }),
-        extra: json!({ "value": pick % 100 }),
+        // Deliberately mimics real SDK `contexts` payloads (nested
+        // session/device metadata + a feature-flag list — real `contexts` are
+        // nested) — GIN index cost measurements are taken from this shape,
+        // so keep it rich; do not simplify.
+        contexts: json!({
+            "session": {
+                "seq": seq,
+                "device": {
+                    "type": DEVICE_TYPES[pick % DEVICE_TYPES.len()],
+                    "region": REGIONS[(pick + 2) % REGIONS.len()],
+                },
+            },
+            "locale": LOCALES[(pick + 4) % LOCALES.len()],
+            "plan": PLAN_TIERS[(pick + 1) % PLAN_TIERS.len()],
+            "ab_variant": AB_VARIANTS[(pick + 2) % AB_VARIANTS.len()],
+            "payment_method": PAYMENT_METHODS[(pick + 1) % PAYMENT_METHODS.len()],
+            "app_version": APP_VERSIONS[(pick + 2) % APP_VERSIONS.len()],
+            "feature_flag_dark_mode": pick % 3 == 0,
+            "active_flags": [
+                AB_VARIANTS[pick % AB_VARIANTS.len()],
+                DEVICE_TYPES[pick % DEVICE_TYPES.len()],
+            ],
+            "latency_bucket_ms": (pick % 50) * 20,
+        }),
+        // Deliberately mimics real SDK `extra` payloads (dev-supplied debug
+        // scalars) — GIN index cost measurements are taken from this shape,
+        // so keep it rich; do not simplify.
+        extra: json!({
+            "value": pick % 100,
+            "plan": PLAN_TIERS[(pick + 2) % PLAN_TIERS.len()],
+            "region": REGIONS[(pick + 3) % REGIONS.len()],
+            "locale": LOCALES[(pick + 2) % LOCALES.len()],
+            "payment_method": PAYMENT_METHODS[(pick + 2) % PAYMENT_METHODS.len()],
+            "app_version": APP_VERSIONS[(pick + 3) % APP_VERSIONS.len()],
+            "ab_variant": AB_VARIANTS[(pick + 1) % AB_VARIANTS.len()],
+            "feature_flag_checkout_v2": pick % 2 == 0,
+            "cart_value_cents": (pick % 100) * 173,
+            "item_count": (pick % 20) + 1,
+            "retry_count": pick % 4,
+        }),
     });
     let txn = EnvelopeItem::Transaction(TransactionItem {
         name: txn_name.to_string(),
@@ -211,8 +305,47 @@ pub fn issue_envelope(user: &VirtualUser, seq: u64) -> Envelope {
         message: None,
         breadcrumbs: breadcrumbs(user, 2),
         tags: json!({ "screen": user.screen }),
-        contexts: json!({ "issue": { "seq": seq } }),
-        extra: json!({ "lineno": lineno }),
+        // Deliberately mimics real SDK `contexts` payloads (dev-supplied
+        // feature flags, plan/region metadata, and a nested request context —
+        // real `contexts` are nested) — GIN index cost measurements are
+        // taken from this shape, so keep it rich; do not simplify.
+        contexts: json!({
+            "issue": {
+                "seq": seq,
+                "request": {
+                    "id": format!("req-{}-{}", user.index, seq),
+                    "region": REGIONS[pick % REGIONS.len()],
+                },
+            },
+            "plan": PLAN_TIERS[(pick + 2) % PLAN_TIERS.len()],
+            "locale": LOCALES[(pick + 3) % LOCALES.len()],
+            "payment_method": PAYMENT_METHODS[(pick + 2) % PAYMENT_METHODS.len()],
+            "app_version": APP_VERSIONS[(pick + 4) % APP_VERSIONS.len()],
+            "ab_variant": AB_VARIANTS[(pick + 1) % AB_VARIANTS.len()],
+            "feature_flag_dark_mode": pick % 2 == 0,
+            "device_type": DEVICE_TYPES[(pick + 1) % DEVICE_TYPES.len()],
+            "tags": [
+                PLAN_TIERS[pick % PLAN_TIERS.len()],
+                REGIONS[(pick + 1) % REGIONS.len()],
+            ],
+        }),
+        // Deliberately mimics real SDK `extra` payloads (dev-supplied debug
+        // scalars: order/cart metrics, retry/latency counters) — GIN index
+        // cost measurements are taken from this shape, so keep it rich; do
+        // not simplify.
+        extra: json!({
+            "lineno": lineno,
+            "order_id": format!("order-{}-{}", user.index, seq),
+            "cart_value_cents": (pick % 100) * 211,
+            "item_count": (pick % 20) + 1,
+            "latency_bucket_ms": (pick % 60) * 25,
+            "retry_count": pick % 4,
+            "plan": PLAN_TIERS[(pick + 3) % PLAN_TIERS.len()],
+            "region": REGIONS[(pick + 5) % REGIONS.len()],
+            "payment_method": PAYMENT_METHODS[(pick + 4) % PAYMENT_METHODS.len()],
+            "app_version": APP_VERSIONS[(pick + 1) % APP_VERSIONS.len()],
+            "feature_flag_checkout_v2": pick % 3 == 0,
+        }),
         fingerprint: None,
         user: None,
         session_id: Some(user.session_id.clone()),
