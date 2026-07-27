@@ -1,6 +1,8 @@
 //! Organizations, membership (grants), roles, and the `/access` endpoint the
 //! dashboard uses to gate its UI.
 
+use std::collections::{HashMap, HashSet};
+
 use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -8,11 +10,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use sauron_auth::guard::{
-    check_no_escalation, check_role_edit, drops_org_manage, generate_temp_password,
-    role_permissions, scope_parts, union_permissions,
+    check_no_escalation, check_no_escalation_at_scopes, check_role_edit, drops_org_manage,
+    generate_temp_password, role_permissions, scope_parts, union_permissions, ResolvedScope,
 };
 use sauron_auth::hash_password_async;
-use sauron_auth::rbac::grants_from_rows;
+use sauron_auth::rbac::{grants_from_rows, Scope};
 use sauron_auth::{authorize_org, perm, AuthError, AuthUser};
 use sauron_db::models::{NewRoleGrant, Organization, Role};
 use sauron_db::repo;
@@ -162,12 +164,192 @@ pub async fn list_members(
     Ok(Json(members))
 }
 
+/// One scope target in a grant request.
+#[derive(Deserialize, Clone)]
+pub struct ScopeRef {
+    pub scope_type: String,
+    pub scope_id: Uuid,
+}
+
+/// Largest batch one grant request may carry.
+const MAX_SCOPES: usize = 200;
+
 #[derive(Deserialize)]
 pub struct CreateGrantReq {
     pub email: String,
     pub role_id: Uuid,
-    pub scope_type: String,
-    pub scope_id: Uuid,
+    #[serde(default)]
+    pub scopes: Vec<ScopeRef>,
+    #[serde(default)]
+    pub scope_type: Option<String>,
+    #[serde(default)]
+    pub scope_id: Option<Uuid>,
+}
+
+/// Collapse the batch and legacy singular request shapes into one scope list.
+///
+/// The singular `scope_type`/`scope_id` pair is still accepted because the RPM
+/// ships the api and the dashboard as separate subpackages: after a partial
+/// upgrade an older dashboard still posts the old shape, and refusing it would
+/// 422 every member creation until both halves are updated.
+///
+/// Exact duplicate pairs are dropped, first-seen order preserved. That is
+/// load-bearing rather than tidiness: a repeat trips `role_grants`' UNIQUE key,
+/// which `create_member`'s UniqueViolation arm would then report as "a user
+/// with that email already exists".
+fn normalize_scopes(
+    scopes: &[ScopeRef],
+    scope_type: Option<&String>,
+    scope_id: Option<Uuid>,
+) -> Result<Vec<ScopeRef>, ApiError> {
+    let requested: Vec<ScopeRef> = if scopes.is_empty() {
+        match (scope_type, scope_id) {
+            (Some(t), Some(id)) => vec![ScopeRef {
+                scope_type: t.clone(),
+                scope_id: id,
+            }],
+            _ => Vec::new(),
+        }
+    } else {
+        scopes.to_vec()
+    };
+
+    if requested.is_empty() {
+        return Err(ApiError::BadRequest(
+            "at least one scope is required".into(),
+        ));
+    }
+    if requested.len() > MAX_SCOPES {
+        return Err(ApiError::BadRequest(format!(
+            "too many scopes (max {MAX_SCOPES})"
+        )));
+    }
+
+    let mut seen: HashSet<(String, Uuid)> = HashSet::with_capacity(requested.len());
+    let mut out = Vec::with_capacity(requested.len());
+    for s in requested {
+        if !matches!(s.scope_type.as_str(), "org" | "project" | "app") {
+            return Err(ApiError::BadRequest("invalid scope_type".into()));
+        }
+        if seen.insert((s.scope_type.clone(), s.scope_id)) {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+/// Validate a batch of scope targets against `org_id`, resolving each app's
+/// parent project. At most two queries regardless of batch size.
+///
+/// This is the cross-tenant boundary for grants: `scope_id` carries no foreign
+/// key, so nothing in the database stops a grant pointing at another tenant's
+/// project or app. One implementation, shared by every handler that accepts
+/// caller-supplied scopes.
+async fn validate_scopes_in_org(
+    conn: &mut sauron_db::AsyncPgConnection,
+    org_id: Uuid,
+    scopes: &[ScopeRef],
+) -> Result<Vec<ResolvedScope>, ApiError> {
+    let not_in_org = || ApiError::BadRequest("scope target is not in this org".into());
+
+    let project_ids: Vec<Uuid> = scopes
+        .iter()
+        .filter(|s| s.scope_type == "project")
+        .map(|s| s.scope_id)
+        .collect();
+    let app_ids: Vec<Uuid> = scopes
+        .iter()
+        .filter(|s| s.scope_type == "app")
+        .map(|s| s.scope_id)
+        .collect();
+
+    let projects_here: HashSet<Uuid> = if project_ids.is_empty() {
+        HashSet::new()
+    } else {
+        repo::projects_in_org(conn, org_id, &project_ids)
+            .await?
+            .into_iter()
+            .collect()
+    };
+    // Apps are matched through their project's org, so an app whose ancestry
+    // lands in another tenant simply never enters the map and is refused below.
+    let app_parents: HashMap<Uuid, Uuid> = if app_ids.is_empty() {
+        HashMap::new()
+    } else {
+        repo::app_ancestries(conn, &app_ids)
+            .await?
+            .into_iter()
+            .filter(|(_, _, owner_org)| *owner_org == org_id)
+            .map(|(app_id, project_id, _)| (app_id, project_id))
+            .collect()
+    };
+
+    scopes
+        .iter()
+        .map(|s| match s.scope_type.as_str() {
+            "org" => {
+                if s.scope_id != org_id {
+                    return Err(not_in_org());
+                }
+                Ok(ResolvedScope {
+                    scope: Scope::Org(s.scope_id),
+                    project_of_app: None,
+                })
+            }
+            "project" => {
+                if !projects_here.contains(&s.scope_id) {
+                    return Err(not_in_org());
+                }
+                Ok(ResolvedScope {
+                    scope: Scope::Project(s.scope_id),
+                    project_of_app: None,
+                })
+            }
+            "app" => match app_parents.get(&s.scope_id) {
+                Some(project_id) => Ok(ResolvedScope {
+                    scope: Scope::App(s.scope_id),
+                    project_of_app: Some(*project_id),
+                }),
+                None => Err(not_in_org()),
+            },
+            _ => Err(ApiError::BadRequest("invalid scope_type".into())),
+        })
+        .collect()
+}
+
+/// Refuse the batch unless the caller outranks `role_perms` at **every** scope.
+///
+/// The caller's grants are read once and evaluated per scope in memory:
+/// `effective_at` reloads them on every call, which would turn a 200-scope
+/// request into 200 round-trips. Collapsing this to one org-level check would
+/// be a silent widening — granting at project A and at project B are
+/// independent authorization decisions.
+async fn check_batch_escalation(
+    conn: &mut sauron_db::AsyncPgConnection,
+    caller_id: Uuid,
+    org_id: Uuid,
+    scopes: &[ResolvedScope],
+    role_perms: &[String],
+) -> Result<(), ApiError> {
+    let caller = grants_from_rows(repo::user_grants_in_org(conn, caller_id, org_id).await?);
+    check_no_escalation_at_scopes(&caller, org_id, scopes, role_perms).map_err(|scope| {
+        // Name the refused scope. A batch can carry many, and a bare "forbidden"
+        // leaves the admin re-ticking boxes to find the one that failed. It
+        // discloses nothing: the caller already cleared `authorize_org` and
+        // picked this scope out of a tree we rendered for them.
+        let (scope_type, scope_id) = scope.parts();
+        tracing::warn!(
+            user_id = %caller_id,
+            %org_id,
+            scope_type,
+            %scope_id,
+            "refusing grant: caller lacks the role's permissions at this scope"
+        );
+        ApiError::Forbidden(format!(
+            "you do not hold every permission in that role on one of the selected scopes \
+             ({scope_type} {scope_id}) — choose a narrower role, or deselect that scope"
+        ))
+    })
 }
 
 /// Validate that a scope target belongs to `org_id`, returning the app's
@@ -175,8 +357,8 @@ pub struct CreateGrantReq {
 ///
 /// This is the cross-tenant boundary for grants: without it a caller could
 /// name a project or app in someone else's org and have a grant created
-/// against it. One implementation, called by every handler that accepts a
-/// caller-supplied scope.
+/// against it. The single-scope counterpart of `validate_scopes_in_org`, for
+/// the handlers that edit one grant at a time.
 async fn validate_scope_in_org(
     conn: &mut sauron_db::AsyncPgConnection,
     org_id: Uuid,
@@ -214,9 +396,7 @@ pub async fn create_grant(
     let mut conn = db(&state).await?;
     authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_MANAGE).await?;
 
-    if !matches!(req.scope_type.as_str(), "org" | "project" | "app") {
-        return Err(ApiError::BadRequest("invalid scope_type".into()));
-    }
+    let scopes = normalize_scopes(&req.scopes, req.scope_type.as_ref(), req.scope_id)?;
 
     // Target user must already exist.
     let user = repo::find_user_by_email(&mut conn, &req.email)
@@ -239,7 +419,8 @@ pub async fn create_grant(
         ));
     }
 
-    // Role must be a preset or belong to this org.
+    // One role for the whole batch, so it is loaded and checked once: it must
+    // be a preset or belong to this org.
     let role = repo::get_role(&mut conn, req.role_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -251,42 +432,42 @@ pub async fn create_grant(
         }
     }
 
-    // Scope target must belong to this org (prevents cross-org grants). Also
-    // capture the scope's (project, app) for the escalation check below.
-    let project_of_app =
-        validate_scope_in_org(&mut conn, org_id, &req.scope_type, req.scope_id).await?;
-    let (scope_project, scope_app) = scope_parts(&req.scope_type, req.scope_id, project_of_app);
+    // Every scope target must belong to this org (prevents cross-org grants).
+    // Also resolves each app's parent project for the escalation check below.
+    let resolved = validate_scopes_in_org(&mut conn, org_id, &scopes).await?;
 
     // No privilege escalation: the granter must themselves hold every permission
-    // the granted role confers, at the grant's scope. (Stops an Admin from
+    // the granted role confers, at every scope in the batch. (Stops an Admin from
     // granting Owner to gain org:manage.)
     let role_perms = role_permissions(&role.permissions);
-    let granter =
-        sauron_auth::effective_at(&mut conn, auth.user_id, org_id, scope_project, scope_app)
-            .await?;
-    check_no_escalation(&granter, &role_perms).map_err(ApiError::Auth)?;
+    check_batch_escalation(&mut conn, auth.user_id, org_id, &resolved, &role_perms).await?;
 
-    // Same convention as update_grant_handler: re-granting a role a member
-    // already holds at that scope is a conflict the user can act on, not a 500.
-    let grant = repo::create_grant(
-        &mut conn,
-        NewRoleGrant {
+    let rows: Vec<NewRoleGrant> = scopes
+        .into_iter()
+        .map(|s| NewRoleGrant {
             org_id,
             user_id: user.id,
             role_id: req.role_id,
-            scope_type: req.scope_type,
-            scope_id: req.scope_id,
-        },
-    )
-    .await
-    .map_err(|e| match e {
-        diesel::result::Error::DatabaseError(
-            diesel::result::DatabaseErrorKind::UniqueViolation,
-            _,
-        ) => ApiError::Conflict("this member already has that role at that scope".into()),
-        other => ApiError::from(other),
-    })?;
-    Ok(Json(serde_json::json!({ "id": grant.id })))
+            scope_type: s.scope_type,
+            scope_id: s.scope_id,
+        })
+        .collect();
+
+    // Same convention as update_grant_handler: re-granting a role a member
+    // already holds at that scope is a conflict the user can act on, not a 500.
+    let ids = repo::create_grants(&mut conn, rows)
+        .await
+        .map_err(|e| match e {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _,
+            ) => ApiError::Conflict("this member already has that role at that scope".into()),
+            other => ApiError::from(other),
+        })?;
+
+    // `id` repeats the first id purely so a dashboard build older than this api
+    // keeps working after a partial RPM upgrade — they are separate subpackages.
+    Ok(Json(serde_json::json!({ "ids": ids, "id": ids.first() })))
 }
 
 #[derive(Deserialize)]
@@ -295,11 +476,15 @@ pub struct CreateMemberReq {
     #[serde(default)]
     pub name: String,
     pub role_id: Uuid,
-    pub scope_type: String,
-    pub scope_id: Uuid,
+    #[serde(default)]
+    pub scopes: Vec<ScopeRef>,
+    #[serde(default)]
+    pub scope_type: Option<String>,
+    #[serde(default)]
+    pub scope_id: Option<Uuid>,
 }
 
-/// Create a user account and its first grant in one step.
+/// Create a user account and its initial grants in one step.
 ///
 /// The password is generated, never supplied by the caller: an admin who could
 /// choose it would hold a working durable credential for somebody else's
@@ -314,11 +499,10 @@ pub async fn create_member(
     let mut conn = db(&state).await?;
     authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_MANAGE).await?;
 
+    let scopes = normalize_scopes(&req.scopes, req.scope_type.as_ref(), req.scope_id)?;
+
     if !req.email.contains('@') {
         return Err(ApiError::BadRequest("a valid email is required".into()));
-    }
-    if !matches!(req.scope_type.as_str(), "org" | "project" | "app") {
-        return Err(ApiError::BadRequest("invalid scope_type".into()));
     }
     if repo::find_user_by_email(&mut conn, &req.email)
         .await?
@@ -329,7 +513,8 @@ pub async fn create_member(
         ));
     }
 
-    // Role must be a preset or belong to this org.
+    // One role for the whole batch, so it is loaded and checked once: it must
+    // be a preset or belong to this org.
     let role = repo::get_role(&mut conn, req.role_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -341,39 +526,42 @@ pub async fn create_member(
         }
     }
 
-    // Scope target must belong to this org, and gives us the (project, app)
-    // pair the escalation check needs. Shared helper from Task 4 Step 3a — the
-    // org-containment check has one implementation, not one per handler.
-    let project_of_app =
-        validate_scope_in_org(&mut conn, org_id, &req.scope_type, req.scope_id).await?;
-    let (scope_project, scope_app) = scope_parts(&req.scope_type, req.scope_id, project_of_app);
+    // Every scope target must belong to this org, and each app's parent project
+    // is what the escalation check needs. Shared helper — the org-containment
+    // check has one implementation, not one per handler.
+    let resolved = validate_scopes_in_org(&mut conn, org_id, &scopes).await?;
 
-    // Creating a user must not be a way around the grant escalation check.
+    // Creating a user must not be a way around the grant escalation check, at
+    // any of the scopes the new account is being handed.
     let role_perms = role_permissions(&role.permissions);
-    let creator =
-        sauron_auth::effective_at(&mut conn, auth.user_id, org_id, scope_project, scope_app)
-            .await?;
-    check_no_escalation(&creator, &role_perms).map_err(ApiError::Auth)?;
+    check_batch_escalation(&mut conn, auth.user_id, org_id, &resolved, &role_perms).await?;
 
     let temp_password = generate_temp_password();
     let hash = hash_password_async(temp_password.clone())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    // Parallel arrays, same length: the repo unnests them together, and a
+    // shorter one would pad the other with NULLs and fail role_grants' NOT NULL.
+    let scope_types: Vec<String> = scopes.iter().map(|s| s.scope_type.clone()).collect();
+    let scope_ids: Vec<Uuid> = scopes.iter().map(|s| s.scope_id).collect();
+
     // One statement, atomic: a grant failure must not leave an account that
     // holds the email but has no access and appears in no list.
-    let created = repo::create_member_with_grant(
+    let created = repo::create_member_with_grants(
         &mut conn,
         &req.email,
         &hash,
         &req.name,
         org_id,
         req.role_id,
-        &req.scope_type,
-        req.scope_id,
+        &scope_types,
+        &scope_ids,
     )
     .await
     .map_err(|e| match e {
+        // Unambiguous because normalize_scopes de-duplicated the pairs: the only
+        // unique key a well-formed batch can trip is the one on the email.
         diesel::result::Error::DatabaseError(
             diesel::result::DatabaseErrorKind::UniqueViolation,
             _,
@@ -383,9 +571,18 @@ pub async fn create_member(
         other => ApiError::from(other),
     })?;
 
+    let user_id = created
+        .first()
+        .map(|row| row.user_id)
+        .ok_or_else(|| ApiError::Internal("member insert returned no grants".into()))?;
+    let grant_ids: Vec<Uuid> = created.iter().map(|row| row.grant_id).collect();
+
+    // `grant_id` repeats the first id purely so a dashboard build older than
+    // this api keeps working after a partial RPM upgrade.
     Ok(Json(serde_json::json!({
-        "user_id": created.user_id,
-        "grant_id": created.grant_id,
+        "user_id": user_id,
+        "grant_ids": grant_ids,
+        "grant_id": grant_ids.first(),
         "temp_password": temp_password,
     })))
 }

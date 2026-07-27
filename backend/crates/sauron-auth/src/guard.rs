@@ -11,7 +11,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::extractors::AuthError;
-use crate::rbac::{perm, Grant};
+use crate::rbac::{effective_permissions, perm, Grant, Scope};
 
 /// Length of a generated temp password.
 pub const TEMP_PASSWORD_LEN: usize = 16;
@@ -117,6 +117,47 @@ pub fn scope_parts(
     }
 }
 
+/// A scope a batch grant will be written at, with the app's parent
+/// project already resolved by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedScope {
+    pub scope: Scope,
+    pub project_of_app: Option<Uuid>,
+}
+
+impl ResolvedScope {
+    /// The (project, app) pair `effective_permissions` expects.
+    pub fn target(self) -> (Option<Uuid>, Option<Uuid>) {
+        match self.scope {
+            Scope::Org(_) => (None, None),
+            Scope::Project(p) => (Some(p), None),
+            Scope::App(a) => (self.project_of_app, Some(a)),
+        }
+    }
+}
+
+/// Refuse a batch grant unless the caller outranks `required` at EVERY scope.
+///
+/// One org-level check is not equivalent and would be a silent widening:
+/// granting a role at project A and at project B are two independent
+/// authorization decisions. Returns the first scope the caller may not
+/// grant at, so the error can name it.
+pub fn check_no_escalation_at_scopes(
+    caller_grants: &[Grant],
+    org: Uuid,
+    scopes: &[ResolvedScope],
+    required: &[String],
+) -> Result<(), Scope> {
+    for resolved in scopes {
+        let (project, app) = resolved.target();
+        let caller = effective_permissions(caller_grants, org, project, app);
+        if check_no_escalation(&caller, required).is_err() {
+            return Err(resolved.scope);
+        }
+    }
+    Ok(())
+}
+
 /// Map random bytes onto the alphabet, up to [`TEMP_PASSWORD_LEN`] characters.
 ///
 /// Pure and deterministic, which is the whole point: the caller supplies the
@@ -179,6 +220,43 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn org_id() -> Uuid {
+        Uuid::from_u128(1)
+    }
+    fn proj_a() -> Uuid {
+        Uuid::from_u128(10)
+    }
+    fn proj_b() -> Uuid {
+        Uuid::from_u128(11)
+    }
+    fn app_a1() -> Uuid {
+        Uuid::from_u128(100)
+    }
+    fn app_b1() -> Uuid {
+        Uuid::from_u128(110)
+    }
+
+    fn grant(scope: Scope, perms: &[&str]) -> Grant {
+        Grant {
+            scope,
+            permissions: strings(perms),
+        }
+    }
+
+    fn at(scope: Scope) -> ResolvedScope {
+        ResolvedScope {
+            scope,
+            project_of_app: None,
+        }
+    }
+
+    fn app_under(app: Uuid, project: Uuid) -> ResolvedScope {
+        ResolvedScope {
+            scope: Scope::App(app),
+            project_of_app: Some(project),
+        }
     }
 
     #[test]
@@ -382,6 +460,113 @@ mod tests {
         // Unknown scope types degrade to org scope, the narrowest grant of
         // authority, so a bad value cannot widen anyone's effective permissions.
         assert_eq!(scope_parts("nonsense", id, None), (None, None));
+    }
+
+    #[test]
+    fn resolved_scope_target_mirrors_scope_parts() {
+        let id = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        assert_eq!(at(Scope::Org(id)).target(), scope_parts("org", id, None));
+        assert_eq!(
+            at(Scope::Project(id)).target(),
+            scope_parts("project", id, None)
+        );
+        assert_eq!(
+            app_under(id, project).target(),
+            scope_parts("app", id, Some(project))
+        );
+        // An app whose ancestry lookup failed still scopes to the app itself.
+        assert_eq!(at(Scope::App(id)).target(), scope_parts("app", id, None));
+    }
+
+    #[test]
+    fn no_escalation_at_scopes_allows_an_empty_scope_list() {
+        assert!(
+            check_no_escalation_at_scopes(&[], org_id(), &[], &strings(&["member:manage"])).is_ok()
+        );
+    }
+
+    #[test]
+    fn no_escalation_at_scopes_allows_an_empty_requirement() {
+        let scopes = [
+            at(Scope::Org(org_id())),
+            at(Scope::Project(proj_a())),
+            app_under(app_a1(), proj_a()),
+        ];
+        assert!(check_no_escalation_at_scopes(&[], org_id(), &scopes, &[]).is_ok());
+    }
+
+    #[test]
+    fn an_org_grant_outranks_every_scope_beneath_it() {
+        let caller = vec![grant(
+            Scope::Org(org_id()),
+            &["member:manage", "issue:read", "app:read"],
+        )];
+        let scopes = [
+            at(Scope::Org(org_id())),
+            at(Scope::Project(proj_a())),
+            at(Scope::Project(proj_b())),
+            app_under(app_a1(), proj_a()),
+        ];
+        assert!(check_no_escalation_at_scopes(
+            &caller,
+            org_id(),
+            &scopes,
+            &strings(&["issue:read", "app:read"]),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_project_scoped_caller_cannot_grant_at_a_sibling_project() {
+        // The regression this guard exists for: one org-level check would pass
+        // here for a caller who holds nothing at all on project B.
+        let caller = vec![grant(Scope::Project(proj_a()), &["member:manage"])];
+        let scopes = [at(Scope::Project(proj_a())), at(Scope::Project(proj_b()))];
+        assert_eq!(
+            check_no_escalation_at_scopes(&caller, org_id(), &scopes, &strings(&["member:manage"])),
+            Err(Scope::Project(proj_b()))
+        );
+    }
+
+    #[test]
+    fn an_app_scope_is_judged_at_its_parent_project() {
+        let caller = vec![grant(Scope::Project(proj_a()), &["member:manage"])];
+        let required = strings(&["member:manage"]);
+        assert!(check_no_escalation_at_scopes(
+            &caller,
+            org_id(),
+            &[app_under(app_a1(), proj_a())],
+            &required,
+        )
+        .is_ok());
+        // Same shape, but the app hangs off a project the caller holds nothing on.
+        assert_eq!(
+            check_no_escalation_at_scopes(
+                &caller,
+                org_id(),
+                &[app_under(app_b1(), proj_b())],
+                &required,
+            ),
+            Err(Scope::App(app_b1()))
+        );
+    }
+
+    #[test]
+    fn the_first_offending_scope_is_the_one_reported() {
+        // Two scopes fail; the error must name the earlier one so the 403 is
+        // the same on every run.
+        let caller = vec![grant(Scope::Project(proj_a()), &["member:manage"])];
+        let scopes = [
+            at(Scope::Project(proj_a())),
+            at(Scope::Project(proj_b())),
+            at(Scope::Org(org_id())),
+            app_under(app_b1(), proj_b()),
+        ];
+        assert_eq!(
+            check_no_escalation_at_scopes(&caller, org_id(), &scopes, &strings(&["member:manage"])),
+            Err(Scope::Project(proj_b()))
+        );
     }
 
     #[test]

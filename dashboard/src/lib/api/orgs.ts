@@ -39,8 +39,11 @@ export async function listMembers(orgId: string): Promise<MemberGrant[]> {
 export async function createGrant(
   orgId: string,
   body: CreateGrantPayload,
-): Promise<{ id: string }> {
-  const { data } = await api.post<{ id: string }>(`/v1/orgs/${orgId}/grants`, body);
+): Promise<{ ids: string[]; id?: string }> {
+  const { data } = await api.post<{ ids: string[]; id?: string }>(
+    `/v1/orgs/${orgId}/grants`,
+    body,
+  );
   return data;
 }
 

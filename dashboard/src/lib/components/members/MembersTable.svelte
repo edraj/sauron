@@ -9,6 +9,9 @@
   interface Props {
     grouped: Member[];
     appsById: Record<string, App>;
+    /** Names for the projects an app grant can hang off. Optional — without it
+        an app chip just drops its project prefix instead of breaking. */
+    projectsById?: Record<string, { name: string }>;
     canManage: boolean;
     /** Grant id mid-removal, if any — only that chip shows busy styling, but
         every chip is disabled while it's in flight since deleteGrant() only
@@ -21,17 +24,33 @@
     onremovegrant: (grantId: string) => void;
   }
 
-  let { grouped, appsById, canManage, removingId, togglingUserId, onedit, ontoggle, onremovegrant }: Props =
-    $props();
+  let {
+    grouped,
+    appsById,
+    projectsById = {},
+    canManage,
+    removingId,
+    togglingUserId,
+    onedit,
+    ontoggle,
+    onremovegrant,
+  }: Props = $props();
+
+  function projectName(id: string): string | undefined {
+    return projectsById[id]?.name ?? sessionStore.projects.find((x) => x.id === id)?.name;
+  }
 
   function scopeLabel(member: MemberGrant): string {
     if (member.scope_type === 'org') return 'Org';
     if (member.scope_type === 'project') {
-      const p = sessionStore.projects.find((x) => x.id === member.scope_id);
-      return `Project: ${p?.name ?? member.scope_id.slice(0, 8)}`;
+      return `Project: ${projectName(member.scope_id) ?? member.scope_id.slice(0, 8)}`;
     }
+    // Grants can point at a deleted project/app — delete_project/delete_app
+    // don't cascade to role_grants — so every lookup falls back a step.
     const a = appsById[member.scope_id];
-    return `App: ${a?.name ?? member.scope_id.slice(0, 8)}`;
+    if (!a) return `App: ${member.scope_id.slice(0, 8)}`;
+    const p = projectName(a.project_id);
+    return p ? `App: ${p} / ${a.name}` : `App: ${a.name}`;
   }
 
   function scopeTone(type: ScopeType): 'primary' | 'info' | 'neutral' {

@@ -1312,9 +1312,11 @@ GROUP BY name, op`;
             {@render defRows(presetRows)}
             <p class="muted concept-lead">
               <b>Create member</b> (Members → Create member) is for someone who doesn't have an
-              account yet. An admin with <code class="ic">member:manage</code> supplies their
-              email, name, role and scope, and the server creates the account and its first grant
-              together. The response reveals a <b>16-character temporary password exactly once</b>,
+              account yet. An admin with <code class="ic">member:manage</code> supplies their email
+              and name, picks <b>one role</b>, then ticks any mix of scopes to hand it at — the
+              whole org, whole projects, individual apps — and the server creates the account and
+              every grant together, all or nothing. Ticking a whole project also covers apps added
+              to it later. The response reveals a <b>16-character temporary password exactly once</b>,
               with a copy button — no endpoint can retrieve it again, so a lost password means
               deactivating the account and creating it again. The admin can't choose or see a
               durable password for them.

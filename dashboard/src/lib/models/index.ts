@@ -2,6 +2,8 @@
 // Shapes were verified against the live backend at http://localhost:8090.
 // Hierarchy: Org → Project (grouping) → App (holds the DSN). Signals live under apps.
 
+import type { ScopeRef } from './scope-tree';
+
 // ---------------------------------------------------------------------------
 // Auth & user
 // ---------------------------------------------------------------------------
@@ -195,13 +197,15 @@ export interface CreateMemberPayload {
   email: string;
   name: string;
   role_id: string;
-  scope_type: ScopeType;
-  scope_id: string;
+  scopes: ScopeRef[];
 }
 
 export interface CreateMemberResult {
   user_id: string;
-  grant_id: string;
+  grant_ids: string[];
+  /** First of `grant_ids`. The API still emits it so an older dashboard build
+      keeps working after a partial upgrade; nothing here reads it. */
+  grant_id?: string;
   temp_password: string;
 }
 
@@ -225,12 +229,15 @@ export interface UpdateRolePayload {
   permissions?: Permission[];
 }
 
-export interface CreateGrantPayload {
-  email: string;
-  role_id: string;
-  scope_type: ScopeType;
-  scope_id: string;
-}
+/**
+ * The batch form (`scopes`) is what the picker sends. The singular pair is the
+ * legacy shape the API still accepts, and is kept in the union because
+ * EditMemberDialog adds exactly one grant at a time.
+ */
+export type CreateGrantPayload = { email: string; role_id: string } & (
+  | { scopes: ScopeRef[] }
+  | { scope_type: ScopeType; scope_id: string }
+);
 
 export interface CreateRolePayload {
   name: string;
