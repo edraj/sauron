@@ -1,5 +1,5 @@
 /**
- * @sauron/node — server-side Node/TypeScript SDK.
+ * @edraj/sauron-node — server-side Node/TypeScript SDK.
  *
  * Dispatches product-analytics events and captured exceptions to the Sauron
  * ingest gateway. No browser/DOM/auto-instrumentation — a buffered background

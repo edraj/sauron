@@ -1,7 +1,16 @@
 {
-  "name": "@sauron/browser",
-  "version": "0.3.0",
+  "name": "@edraj/sauron-browser",
+  "version": "1.0.0",
   "description": "Sauron browser SDK: automatic error reporting + product analytics for the web.",
+  "homepage": "https://github.com/edraj/sauron/tree/main/sdks/js#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edraj/sauron.git",
+    "directory": "sdks/js"
+  },
+  "bugs": {
+    "url": "https://github.com/edraj/sauron/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.cjs",
@@ -17,14 +26,17 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "fflate": "^0.8.2"

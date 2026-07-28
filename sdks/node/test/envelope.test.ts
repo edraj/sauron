@@ -102,7 +102,7 @@ const GOLDEN_TRANSACTION: TransactionItem = {
 const GOLDEN: Envelope = {
   header: {
     dsn: 'https://pk_test@localhost:8081/1',
-    sdk: { name: 'sauron-node', version: '0.3.0' },
+    sdk: { name: 'sauron-node', version: '1.0.0' },
     sent_at: '2026-07-15T10:30:00.123Z',
     environment: 'production',
     release: 'api@1.4.2',
@@ -216,12 +216,12 @@ describe('client emits the reconciled golden shape', () => {
     expect(items.map(normalize)).toEqual(GOLDEN.items.map((i) => normalize(i as any)));
   });
 
-  it('carries the bumped 0.3.0 sauron-node SDK identity in the header', async () => {
+  it('carries the sauron-node SDK identity in the header', async () => {
     const client = newClient(fake.fetchImpl);
     client.captureMessage('hello');
     await client.flush();
 
-    expect(fake.envelopes[0].header.sdk).toEqual({ name: 'sauron-node', version: '0.3.0' });
+    expect(fake.envelopes[0].header.sdk).toEqual({ name: 'sauron-node', version: '1.0.0' });
   });
 
   it('stamps a real event_id and ISO timestamp on the captured error', async () => {

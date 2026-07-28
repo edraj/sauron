@@ -11,7 +11,7 @@ import type {
 } from './types.js';
 
 const SDK_NAME = 'sauron-node';
-const SDK_VERSION = '0.3.0';
+const SDK_VERSION = '1.0.0';
 
 /** Default exponential-backoff base (ms) for the first retry. */
 const DEFAULT_RETRY_BASE_MS = 200;

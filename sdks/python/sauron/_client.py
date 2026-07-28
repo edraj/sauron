@@ -22,7 +22,7 @@ from ._stacktrace import exception_type_name, extract_stacktrace
 from ._transport import Sender, Transport
 
 SDK_NAME = "sauron-python"
-SDK_VERSION = "0.3.0"
+SDK_VERSION = "1.0.0"
 
 _VALID_LEVELS = frozenset({"debug", "info", "warning", "error", "fatal"})
 

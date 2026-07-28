@@ -1,9 +1,15 @@
 # Changelog
 
-All notable changes to `@sauron/node` are documented here.
+All notable changes to `@edraj/sauron-node` are documented here.
 
-## Unreleased
+## 1.0.0 - 2026-07-27
 
+First public release. Prior `0.x` versions were internal-only and were never
+published to npm.
+
+- **Renamed to `@edraj/sauron-node`.** The wire identity is unchanged — the SDK
+  still reports itself as `sauron-node` in the envelope header — so the rename
+  is invisible to the ingest gateway and the dashboard.
 - **Fixed: a full send queue could wedge the transport permanently.** The whole queue went
   out as one envelope and `413` was treated as retryable, so once the buffer filled during
   an outage every flush resent the same oversized body and failed identically — no event was

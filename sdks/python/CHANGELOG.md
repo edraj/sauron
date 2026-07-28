@@ -2,7 +2,10 @@
 
 All notable changes to the Sauron Python SDK are documented here.
 
-## Unreleased
+## 1.0.0 - 2026-07-27
+
+First public release. Prior `0.x` versions were internal-only and were never
+published to PyPI.
 
 - **Fixed: a rejected envelope was replayed from disk forever.** Persisted files were only
   deleted on success, so a payload the server permanently refuses (e.g. a `400`) was reloaded
