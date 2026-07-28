@@ -7,7 +7,7 @@ Covers the three public registries: **npm**, **PyPI**, **pub.dev**.
 | Browser | `sdks/js` | npm | `@edraj/sauron-browser` | 1.0.0 |
 | Node | `sdks/node` | npm | `@edraj/sauron-node` | 1.0.0 |
 | Python | `sdks/python` | PyPI | `sauron-sdk` | 1.0.0 |
-| Flutter | `sdks/flutter` | pub.dev | `sauron_flutter` | 1.0.0 |
+| Flutter | `sdks/flutter` | pub.dev | `sauron_flutter` | 1.2.0 |
 
 `sdks/csharp` targets NuGet and is **not** covered here.
 
