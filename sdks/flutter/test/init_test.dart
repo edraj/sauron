@@ -60,7 +60,6 @@ void main() {
       () async {
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
-      environment: 'staging',
       release: 'app@1.4.2+1402',
       tags: <String, String>{'tier': 'free'},
       httpClient: httpClient,
@@ -68,7 +67,6 @@ void main() {
     ));
 
     expect(Sauron.isEnabled, isTrue);
-    expect(Sauron.client!.options.environment, 'staging');
 
     Sauron.track('checkout_completed');
     await Sauron.flush();
@@ -76,7 +74,8 @@ void main() {
     final Map<String, dynamic> envelope = envelopes.single;
     final Map<String, dynamic> header =
         envelope['header'] as Map<String, dynamic>;
-    expect(header['environment'], 'staging');
+    // Removed: environment is now proven by the ingest key, not client-supplied.
+    expect(header.containsKey('environment'), isFalse);
     expect(header['release'], 'app@1.4.2+1402');
     final Map<String, dynamic> item =
         (envelope['items'] as List<dynamic>).single as Map<String, dynamic>;
@@ -91,7 +90,6 @@ void main() {
     ));
 
     final SauronOptions options = Sauron.client!.options;
-    expect(options.environment, 'production');
     expect(options.sampleRate, 1.0);
     expect(options.maxBreadcrumbs, 100);
     expect(options.flushInterval, const Duration(seconds: 5));

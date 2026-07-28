@@ -14,7 +14,6 @@ import 'types.dart';
 /// await Sauron.init(
 ///   SauronOptions(
 ///     dsn: 'https://pk_test@localhost:8081/1',
-///     environment: 'production',
 ///     release: 'app@1.4.2+1402',
 ///   ),
 ///   appRunner: () => runApp(const MyApp()),

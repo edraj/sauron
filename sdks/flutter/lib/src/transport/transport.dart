@@ -8,7 +8,6 @@ import 'package:http/http.dart' as http;
 import '../dsn.dart';
 import '../envelope.dart';
 import '../sauron_options.dart';
-import 'connectivity.dart';
 import 'gzip.dart';
 import 'queue.dart';
 
@@ -44,7 +43,6 @@ class SauronTransport {
     required ContextBuilder contextBuilder,
     required EnvelopeQueue queue,
     http.Client? httpClient,
-    ConnectivityMonitor? connectivity,
     Random? random,
   })  : _options = options,
         _dsn = dsn,
@@ -52,7 +50,6 @@ class SauronTransport {
         _contextBuilder = contextBuilder,
         _queue = queue,
         _client = httpClient ?? options.httpClient ?? http.Client(),
-        _connectivity = connectivity,
         _random = random ?? Random();
 
   final SauronOptions _options;
@@ -61,7 +58,6 @@ class SauronTransport {
   final ContextBuilder _contextBuilder;
   final EnvelopeQueue _queue;
   final http.Client _client;
-  final ConnectivityMonitor? _connectivity;
   final Random _random;
 
   final List<EnvelopeItem> _buffer = <EnvelopeItem>[];
@@ -77,8 +73,14 @@ class SauronTransport {
   /// Whether the transport is still accepting/sending data.
   bool get isEnabled => _enabled && !_closed;
 
-  /// Starts the flush timer, connectivity listener, and an initial drain of any
-  /// envelopes persisted by a previous app session.
+  /// Starts the flush timer and an initial drain of any envelopes persisted by
+  /// a previous app session.
+  ///
+  /// The queue is additionally drained when a batch fills, and on app resume
+  /// (see `SauronWidgetsBindingObserver`). There is deliberately no connectivity
+  /// listener: the authoritative signal of reachability is the HTTP response,
+  /// and a connectivity plugin would inject `ACCESS_NETWORK_STATE` into every
+  /// consuming app's merged manifest.
   void start() {
     if (_started) {
       return;
@@ -86,9 +88,6 @@ class SauronTransport {
     _started = true;
     _flushTimer = Timer.periodic(_options.flushInterval, (_) {
       unawaited(flush());
-    });
-    _connectivity?.start(() {
-      unawaited(_drainQueue());
     });
     unawaited(_drainQueue());
   }
@@ -124,7 +123,6 @@ class SauronTransport {
       await _drainQueue();
     } finally {
       _closed = true;
-      await _connectivity?.dispose();
       _client.close();
     }
   }
@@ -214,8 +212,8 @@ class SauronTransport {
       );
       return _classify(response.statusCode, response.headers);
     } on Object catch (error) {
-      // Connectivity is a hint; the real signal is the HTTP response (or lack
-      // of one). A network error means: keep the envelope and back off.
+      // The HTTP response (or lack of one) is the only signal of reachability
+      // the SDK trusts. A network error means: keep the envelope and back off.
       _log('network error: $error');
       return const _Outcome(_OutcomeKind.retry);
     }

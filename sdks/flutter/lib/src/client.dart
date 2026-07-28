@@ -15,7 +15,6 @@ import 'integrations/widgets_binding_observer.dart';
 import 'sauron_options.dart';
 import 'scope.dart';
 import 'stacktrace/dart_stacktrace_parser.dart';
-import 'transport/connectivity.dart';
 import 'transport/queue.dart';
 import 'transport/transport.dart';
 import 'types.dart';
@@ -104,7 +103,6 @@ class SauronClient {
       contextBuilder: _buildContext,
       queue: queue,
       httpClient: options.httpClient,
-      connectivity: ConnectivityMonitor(),
     );
     _transport = transport;
     await _deviceContext.load(storageDirectory: dir, app: _appDescriptor());
@@ -376,7 +374,6 @@ class SauronClient {
   EnvelopeHeader _buildHeader(DateTime sentAt) => EnvelopeHeader(
         dsn: _dsn!.toString(),
         sentAt: sentAt,
-        environment: options.environment,
         release: options.release,
       );
 

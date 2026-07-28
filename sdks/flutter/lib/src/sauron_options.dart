@@ -19,7 +19,6 @@ typedef BeforeSendCallback = Object? Function(Object item);
 /// await Sauron.init(
 ///   SauronOptions(
 ///     dsn: 'https://pk_test@localhost:8081/1',
-///     environment: 'production',
 ///     release: 'app@1.4.2+1402',
 ///   ),
 ///   appRunner: () => runApp(const MyApp()),
@@ -36,7 +35,6 @@ class SauronOptions {
   /// maps you pass in afterwards does not affect the SDK.
   SauronOptions({
     this.dsn,
-    this.environment = 'production',
     this.release,
     this.appVersion,
     this.appBuild,
@@ -62,10 +60,6 @@ class SauronOptions {
 
   /// The project DSN. When null/empty the SDK stays disabled (all calls no-op).
   String? dsn;
-
-  /// Deployment environment, e.g. `production`, `staging`. Defaults to
-  /// `production`.
-  String environment;
 
   /// Release identifier, e.g. `app@1.4.2+1402`.
   String? release;

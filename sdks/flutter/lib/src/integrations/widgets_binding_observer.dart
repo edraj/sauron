@@ -6,6 +6,11 @@ import '../types.dart';
 /// Observes app lifecycle transitions: records a breadcrumb on each change and
 /// flushes the transport when the app is backgrounded (`paused`) or torn down
 /// (`detached`) so buffered data is not lost.
+///
+/// It also flushes on `resumed`. Returning to the foreground is the SDK's cue to
+/// drain envelopes queued while the app was away or offline — the SDK carries no
+/// connectivity plugin, so this (plus the periodic flush timer) is what gets a
+/// backlog moving again once the network returns.
 class SauronWidgetsBindingObserver with WidgetsBindingObserver {
   SauronWidgetsBindingObserver(this._client);
 
@@ -43,7 +48,8 @@ class SauronWidgetsBindingObserver with WidgetsBindingObserver {
       ),
     );
     if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached) {
+        state == AppLifecycleState.detached ||
+        state == AppLifecycleState.resumed) {
       _client.flush();
     }
   }

@@ -1,11 +1,42 @@
 # Changelog
 
+## 1.3.0 - 2026-07-28
+
+- **`connectivity_plus` dropped — the SDK no longer adds a permission to your
+  manifest.** `connectivity_plus` merges
+  `<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>`
+  into every consuming app, so apps inherited a permission they had to justify
+  in store listings and privacy reviews in exchange for a queue-drain latency
+  optimization. Dependencies drop from four to three (`http`,
+  `device_info_plus`, `path_provider`).
+
+  **No action required**, and no API change. The offline queue, retry/backoff
+  and response policy are untouched — connectivity was only ever a hint, and the
+  HTTP response has always been the authoritative signal. The `isOnline`
+  pre-flight check was never wired into the send path, so this adds no wasted
+  requests while offline.
+
+  **Behaviour change:** a backlog queued while offline now drains on the flush
+  timer (`flushInterval`, default 5 s) or on app resume, instead of the instant a
+  network interface comes back. If you need tighter delivery, lower
+  `flushInterval`.
+
+- **Added: the queue now drains when the app returns to the foreground.**
+  `SauronWidgetsBindingObserver` already flushed on `paused`/`detached`; it now
+  also flushes on `resumed`. This closes a real gap — previously, foregrounding
+  an app triggered no drain at all and a backlog waited for the next timer tick.
+
 ## 1.2.0 - 2026-07-28
 
-> Contains breaking API changes despite the minor bump — see the two
+> Contains breaking API changes despite the minor bump — see the three
 > **Breaking** entries below. `Sauron.init` now takes a `SauronOptions` object,
 > so an upgrade from 1.x needs a one-line edit at your `init` call site.
 
+- **Breaking: the `environment` option has been removed.** An environment is now
+  identified by the ingest key it belongs to, not by a string the client sends.
+  Create environments in the dashboard under app settings; each one has its own
+  DSN. Delete `environment` from your `SauronOptions`/`init` call and swap in the
+  DSN of the environment you want to report to.
 - **Fixed: `Sauron.init` no longer triggers Flutter's `Zone mismatch.` assertion.**
   When an app called `WidgetsFlutterBinding.ensureInitialized()` before `init` —
   as it must to read config, initialize Firebase or lock orientation — the
@@ -40,12 +71,12 @@
   // before
   await Sauron.init((o) {
     o.dsn = dsn;
-    o.environment = 'production';
+    o.release = 'app@1.0.0';
   }, appRunner: appRunner);
 
   // after
   await Sauron.init(
-    SauronOptions(dsn: dsn, environment: 'production'),
+    SauronOptions(dsn: dsn, release: 'app@1.0.0'),
     appRunner: appRunner,
   );
   ```

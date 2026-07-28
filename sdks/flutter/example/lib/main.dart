@@ -9,7 +9,6 @@ Future<void> main() async {
     SauronOptions(
       // A local dev DSN — point this at your Sauron ingest gateway.
       dsn: 'https://pk_test@localhost:8081/1',
-      environment: 'production',
       release: 'sauron_example@1.0.0+1',
       sampleRate: 1.0,
       maxBreadcrumbs: 100,

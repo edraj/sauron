@@ -16,10 +16,10 @@ for a browser page, use `@edraj/sauron-browser`.
 - Auto-collects device / OS / runtime context plus a stable, per-install
   `device_id`. App version/build are supplied by you at init — no plugin needed.
 - **Batches → gzips → persists** envelopes to an offline JSONL queue that
-  survives app restarts, drains on reconnect, and honors the full ingest
-  response policy.
-- Four package dependencies (`http`, `device_info_plus`, `connectivity_plus`,
-  `path_provider`); no native code of its own.
+  survives app restarts, drains on the flush timer and on app resume, and honors
+  the full ingest response policy.
+- Three package dependencies (`http`, `device_info_plus`, `path_provider`); no
+  native code of its own, and **no permissions added to your manifest**.
 
 ## Install
 
@@ -50,7 +50,6 @@ Future<void> main() async {
   await Sauron.init(
     SauronOptions(
       dsn: 'https://pk_test@localhost:8081/1',
-      environment: 'production',
       release: 'app@1.4.2+1402',
     ),
     appRunner: () => runApp(const MyApp()),
@@ -90,8 +89,7 @@ works. Every field, in constructor order:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `dsn` | `String?` | `null` | **Required to send anything.** `https://<public_key>@<host>/<project_id>`. Null, empty or malformed leaves the SDK disabled and every call a no-op. |
-| `environment` | `String` | `'production'` | Deployment environment, stamped on the envelope header. |
+| `dsn` | `String?` | `null` | **Required to send anything.** `https://<public_key>@<host>/<environment_id>`. Null, empty or malformed leaves the SDK disabled and every call a no-op. |
 | `release` | `String?` | `null` | Release identifier, e.g. `app@1.4.2+1402`. Stamped on the envelope header. |
 | `appVersion` | `String?` | `null` | App version for `context.app`, e.g. `1.4.2`. Developer-supplied — the SDK does not read it from the platform. |
 | `appBuild` | `String?` | `null` | App build number for `context.app`, e.g. `1402`. When this and `appVersion` are both null the `app` block is omitted. |
@@ -140,7 +138,6 @@ Everything set at once:
 await Sauron.init(
   SauronOptions(
     dsn: 'https://pk_test@ingest.example.com/42',
-    environment: 'staging',
     release: 'app@1.4.2+1402',
     appVersion: '1.4.2',
     appBuild: '1402',
@@ -534,9 +531,9 @@ await Sauron.flush();
 static Future<void> close()
 ```
 
-Zero-argument. Flushes, cancels the timers, disposes the connectivity listener,
-closes the HTTP client, uninstalls the four capture layers (restoring the
-handlers they replaced), and clears `Sauron.client`.
+Zero-argument. Flushes, cancels the timers, closes the HTTP client, uninstalls
+the four capture layers (restoring the handlers they replaced), and clears
+`Sauron.client`.
 
 Terminal and idempotent: `isEnabled` flips to `false`, and anything captured
 afterwards is dropped rather than buffered — a long-lived process that closes
@@ -630,7 +627,7 @@ Everything below is exported from `package:sauron_flutter/sauron_flutter.dart`.
 | `AppDescriptor` | `const AppDescriptor({String? version, String? build})` | |
 | `RuntimeDescriptor` | `const RuntimeDescriptor({String? name, String? version})` | |
 | `SauronContext` | `const SauronContext({DeviceDescriptor? device, OsDescriptor? os, AppDescriptor? app, RuntimeDescriptor? runtime, SauronUser? user})` | Has `copyWith`. Built by the SDK each send. |
-| `EnvelopeHeader` | `const EnvelopeHeader({required String dsn, required DateTime sentAt, required String environment, String? release, String sdkName = kSauronSdkName, String sdkVersion = kSauronSdkVersion})` | |
+| `EnvelopeHeader` | `const EnvelopeHeader({required String dsn, required DateTime sentAt, String? release, String sdkName = kSauronSdkName, String sdkVersion = kSauronSdkVersion})` | |
 | `Envelope` | `const Envelope({required EnvelopeHeader header, required SauronContext context, required List<EnvelopeItem> items})` | `encode()` returns the compact wire JSON. |
 | `EnvelopeItem` | abstract; `String get type`, `Map<String, Object?> toJson()`, `int get approximateBytes` | Base of all items below. |
 | `ErrorItem` | `ErrorItem({required SauronException exception, required DateTime timestamp, SauronLevel level = SauronLevel.error, List<Breadcrumb> breadcrumbs = const [], List<String>? fingerprint, String? sessionId, String? screen, String? rawStacktrace, DebugMeta? debugMeta, Map<String, String> tags = const {}, Map<String, Map<String, Object?>> contexts = const {}, Map<String, Object?> extra = const {}})` | `fingerprint` is never set by the SDK — `null` lets the server group. |
@@ -638,12 +635,12 @@ Everything below is exported from `package:sauron_flutter/sauron_flutter.dart`.
 | `IdentifyItem` | `IdentifyItem({required String distinctId, String? anonymousId, Map<String, Object?>? traits})` | |
 | `TransactionItem` | `TransactionItem({required String name, required double durationMs, String op = 'custom', String? status, String? httpMethod, int? httpStatus, String? url, String? distinctId, String? sessionId, DateTime? timestamp})` | |
 | `BreadcrumbBatchItem` | `BreadcrumbBatchItem({required List<Breadcrumb> breadcrumbs, DateTime? timestamp})` | Part of the wire contract; the Flutter SDK never emits one on its own. Construct and pass it through a `SauronClient` only if you need standalone breadcrumbs. |
-| `Dsn` | `Dsn({required String scheme, required String publicKey, required String host, required int port, required String projectId, List<String> pathPrefix = const []})`, `Dsn.parse(String input)` | `parse` throws `FormatException`. `envelopeEndpoint` → `Uri` of `.../api/{project_id}/envelope`; `toString()` round-trips the canonical DSN. |
+| `Dsn` | `Dsn({required String scheme, required String publicKey, required String host, required int port, required String projectId, List<String> pathPrefix = const []})` | `projectId` is the DSN's path segment — despite the name, this is the **environment** id since the ingest key now lives on the environment, not the app. `Dsn.parse(String input)` throws `FormatException`. `envelopeEndpoint` → `Uri` of `.../api/{environment_id}/envelope`; `toString()` round-trips the canonical DSN. |
 | `DartStackTraceParser` | `const DartStackTraceParser()`, `List<StackFrame> parse(Object? stackTrace)`, `static bool isNoise(String line)` | Parses JIT and AOT traces; unrecognized lines are dropped. |
 | `isObfuscatedDartTrace` | `bool isObfuscatedDartTrace(String raw)` | `true` when the trace contains `isolate_dso_base` or `build_id:`. |
 | `sauronIso` | `String sauronIso(DateTime dateTime)` | ISO-8601 UTC with a trailing `Z`. |
 | `kSauronSdkName` | `const String = 'sauron.flutter'` | Sent in `header.sdk.name`. |
-| `kSauronSdkVersion` | `const String = '1.0.0'` | Sent in `header.sdk.version`. |
+| `kSauronSdkVersion` | `const String = '1.2.0'` | Sent in `header.sdk.version`. |
 | `SauronNavigatorObserver` | see [Flutter integration](#flutter-integration) | |
 | `SauronWidgetsBindingObserver` | see [Flutter integration](#flutter-integration) | |
 
@@ -905,9 +902,11 @@ trace.
   if it alone exceeds the cap. A corrupt or unreadable queue file is discarded
   rather than crashing the app.
 - **Draining.** The queue is drained on `bootstrap()` (picking up a previous
-  session's envelopes), on the flush timer, and whenever `connectivity_plus`
-  reports a non-`none` interface. Connectivity is only a hint; the HTTP response
-  is the authoritative signal.
+  session's envelopes), on the flush timer, when a batch fills, and when the app
+  returns to the foreground (`AppLifecycleState.resumed`). The SDK ships no
+  connectivity plugin — the HTTP response is the only reachability signal it
+  trusts, so a backlog accumulated while offline moves on the next flush tick or
+  the next resume, whichever comes first.
 - **Retry.** Exponential backoff with full jitter — `min(30, 2^attempt)`
   seconds plus 0-999 ms, capped at 30 s. The attempt counter resets on the first
   success.
@@ -915,7 +914,7 @@ trace.
 Request shape:
 
 ```
-POST /api/{project_id}/envelope
+POST /api/{environment_id}/envelope
 Content-Type: application/json
 Content-Encoding: gzip            # when compressed
 X-Sauron-Key: <public_key>
@@ -949,8 +948,8 @@ Response policy:
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Nothing arrives, no logs | `dsn` unset/empty, so the SDK is disabled | Pass `dsn:` to `SauronOptions`; check `Sauron.isEnabled`. |
-| Nothing arrives, `[Sauron] invalid DSN, SDK disabled` | DSN failed to parse | Use `https://<public_key>@<host>[:port]/<project_id>`; the project id is the last path segment. |
-| Requests leave but nothing lands | Your proxy does not expose ingest at `/api/{project_id}/envelope` on the DSN's host (plus any DSN path prefix) | Route that exact path to the gateway — events otherwise drop silently and look delivered. |
+| Nothing arrives, `[Sauron] invalid DSN, SDK disabled` | DSN failed to parse | Use `https://<public_key>@<host>[:port]/<environment_id>`; the environment id is the last path segment. |
+| Requests leave but nothing lands | Your proxy does not expose ingest at `/api/{environment_id}/envelope` on the DSN's host (plus any DSN path prefix) | Route that exact path to the gateway — events otherwise drop silently and look delivered. |
 | Delivery stops permanently mid-session | A `401`/`403` disabled the transport | Verify the public key belongs to the project; restart the app after fixing. |
 | Events arrive, errors do not | `sampleRate < 1.0`, or `beforeSend` returned `null` | Pass `sampleRate: 1.0`; log inside `beforeSend`. |
 | No breadcrumbs on errors | `maxBreadcrumbs <= 0` | Set a positive `maxBreadcrumbs`. |

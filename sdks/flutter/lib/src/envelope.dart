@@ -13,7 +13,6 @@ class EnvelopeHeader {
   const EnvelopeHeader({
     required this.dsn,
     required this.sentAt,
-    required this.environment,
     this.release,
     this.sdkName = kSauronSdkName,
     this.sdkVersion = kSauronSdkVersion,
@@ -24,9 +23,6 @@ class EnvelopeHeader {
 
   /// When the envelope left the device (UTC).
   final DateTime sentAt;
-
-  /// Deployment environment, e.g. `production`.
-  final String environment;
 
   /// Release identifier, e.g. `app@1.4.2+1402`.
   final String? release;
@@ -41,7 +37,6 @@ class EnvelopeHeader {
           'version': sdkVersion,
         },
         'sent_at': sauronIso(sentAt),
-        'environment': environment,
         'release': release,
       };
 }

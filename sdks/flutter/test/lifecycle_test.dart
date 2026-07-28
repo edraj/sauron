@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:mocktail/mocktail.dart';
@@ -122,6 +123,29 @@ void main() {
     await client.close();
     await client.close();
     expect(client.isEnabled, isFalse);
+  });
+
+  // The SDK ships no connectivity plugin, so returning to the foreground is one
+  // of only two things (with the flush timer) that gets a backlog moving again
+  // after the network comes back. Regressing this silently strands events.
+  test('resuming the app drains the queue', () async {
+    final SauronClient client = await buildClient();
+
+    client.track('queued_while_away');
+    // Below maxBatchItems (30) and well inside flushInterval (5s), so nothing
+    // should have gone out on its own yet.
+    expect(events(), isEmpty);
+
+    SauronWidgetsBindingObserver(client)
+        .didChangeAppLifecycleState(AppLifecycleState.resumed);
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+
+    expect(
+      events().map((Map<String, Object?> e) => e['name']),
+      contains('queued_while_away'),
+    );
+
+    await client.close();
   });
 
   test('items captured before bootstrap still replay', () async {
