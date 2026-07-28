@@ -1,6 +1,59 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 - 2026-07-28
+
+> Contains breaking API changes despite the minor bump — see the two
+> **Breaking** entries below. `Sauron.init` now takes a `SauronOptions` object,
+> so an upgrade from 1.x needs a one-line edit at your `init` call site.
+
+- **Fixed: `Sauron.init` no longer triggers Flutter's `Zone mismatch.` assertion.**
+  When an app called `WidgetsFlutterBinding.ensureInitialized()` before `init` —
+  as it must to read config, initialize Firebase or lock orientation — the
+  binding was pinned to that zone while `appRunner` launched inside a new
+  `runZonedGuarded` zone, so `runApp` reported:
+
+  > Zone mismatch. The Flutter bindings were initialized in a different zone
+  > than is now being used.
+
+  The SDK now detects an already-initialized binding and runs the app in the
+  current zone instead. Uncaught errors are still captured: outside a guarded
+  zone `PlatformDispatcher.onError` is Flutter's catch-all and covers what
+  `runZonedGuarded` would have caught. Apps that let Sauron initialize the
+  binding are unaffected and keep the zone layer. With `debug: true` the SDK
+  logs which path it took. See "Startup ordering" in the README.
+
+- **`debug: true` now logs every item delivered to the server** — errors,
+  events, identifies, transactions and breadcrumb batches — one line each, at
+  the point the server accepted them:
+
+  ```
+  [Sauron] delivered 2 item(s) to http://localhost:8081/api/<project>/envelope:
+  [Sauron]   event $screen (distinct_id=u_123, screen=Home, properties={"screen":"Home"})
+  [Sauron]   error StateError: Bad state: card declined (level=error, screen=Checkout)
+  ```
+
+- **Breaking: `Sauron.init` takes a `SauronOptions` object instead of a configure
+  callback,** and `SauronOptions` gained a named constructor covering every field.
+  Dart has no overloads, so the callback form is gone rather than deprecated.
+
+  ```dart
+  // before
+  await Sauron.init((o) {
+    o.dsn = dsn;
+    o.environment = 'production';
+  }, appRunner: appRunner);
+
+  // after
+  await Sauron.init(
+    SauronOptions(dsn: dsn, environment: 'production'),
+    appRunner: appRunner,
+  );
+  ```
+
+  **Action required:** rewrite the `init` call. Fields stay mutable, so
+  `SauronOptions(dsn: dsn)..debug = true` still works when you set values
+  conditionally. `tags`, `contexts` and `extra` passed to the constructor are
+  now copied, so mutating your own map afterwards no longer leaks into the SDK.
 
 - **Breaking: `package_info_plus` dropped; app version is now developer-supplied.**
   The SDK no longer reads `context.app` off the platform. Set the new

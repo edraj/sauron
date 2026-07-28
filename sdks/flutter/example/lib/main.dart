@@ -6,19 +6,19 @@ import 'package:sauron_flutter/sauron_flutter.dart';
 
 Future<void> main() async {
   await Sauron.init(
-    (SauronOptions o) {
+    SauronOptions(
       // A local dev DSN — point this at your Sauron ingest gateway.
-      o.dsn = 'https://pk_test@localhost:8081/1';
-      o.environment = 'production';
-      o.release = 'sauron_example@1.0.0+1';
-      o.sampleRate = 1.0;
-      o.maxBreadcrumbs = 100;
-      o.debug = true;
-      o.flushInterval = const Duration(seconds: 5);
+      dsn: 'https://pk_test@localhost:8081/1',
+      environment: 'production',
+      release: 'sauron_example@1.0.0+1',
+      sampleRate: 1.0,
+      maxBreadcrumbs: 100,
+      debug: true,
+      flushInterval: const Duration(seconds: 5),
       // Runs on every outgoing item (error / event / identify / transaction).
       // Return the item to send it, or null to drop it.
-      o.beforeSend = (Object item) => item;
-    },
+      beforeSend: (Object item) => item,
+    ),
     appRunner: () => runApp(const SauronExampleApp()),
   );
 }

@@ -31,7 +31,7 @@ or, in `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  sauron_flutter: ^1.0.0
+  sauron_flutter: ^1.2.0
 ```
 
 Requires Dart SDK `>=3.4.0 <4.0.0` and Flutter `>=3.19.0`.
@@ -48,11 +48,11 @@ import 'package:sauron_flutter/sauron_flutter.dart';
 
 Future<void> main() async {
   await Sauron.init(
-    (SauronOptions o) {
-      o.dsn = 'https://pk_test@localhost:8081/1';
-      o.environment = 'production';
-      o.release = 'app@1.4.2+1402';
-    },
+    SauronOptions(
+      dsn: 'https://pk_test@localhost:8081/1',
+      environment: 'production',
+      release: 'app@1.4.2+1402',
+    ),
     appRunner: () => runApp(const MyApp()),
   );
 }
@@ -62,6 +62,10 @@ Future<void> main() async {
 capture layers, awaits `bootstrap()` and then launches your app — all inside a
 single `runZonedGuarded` zone. Do not call `runApp` yourself when you pass
 `appRunner`.
+
+Keep `ensureInitialized()` out of `main()`. Flutter pins `runApp` to the zone
+the binding was built in, so initializing it before `Sauron.init` makes the zone
+layer unavailable — see [Startup ordering](#startup-ordering).
 
 That is enough for uncaught errors. Add analytics and manual capture anywhere:
 
@@ -80,7 +84,9 @@ try {
 
 ## Configuration
 
-`Sauron.init` hands you a mutable `SauronOptions`. Every field, in source order:
+`Sauron.init` takes a `SauronOptions`. Every parameter is named and optional;
+fields stay mutable afterwards, so `SauronOptions(dsn: dsn)..debug = true` also
+works. Every field, in constructor order:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -101,44 +107,64 @@ try {
 | `maxItemsPerEnvelope` | `int` | `1000` | Hard ceiling on items per envelope, matching the server limit. The buffer is packed into chunks of this size. `<= 0` means "one envelope, whatever the size". |
 | `maxQueueBytes` | `int` | `5 * 1024 * 1024` | On-disk offline-queue cap. Oldest envelopes evicted FIFO; the newest is always kept. |
 | `gzipThresholdBytes` | `int` | `1024` | Bodies **at or above** this size are gzipped, where gzip is available. |
-| `debug` | `bool` | `false` | Emit `[Sauron] …` diagnostics via `debugPrint`. |
+| `debug` | `bool` | `false` | Emit `[Sauron] …` diagnostics via `debugPrint`, including every item delivered to the server — see [Seeing what is sent](#seeing-what-is-sent). |
 | `attachStacktrace` | `bool` | `true` | Attach `StackTrace.current` to captured errors that arrive without one. |
 | `httpClient` | `http.Client?` | `null` | Injected HTTP client (tests). Defaults to a fresh `http.Client()`. |
 
 Two derived getters are also public: `normalizedSampleRate` (`sampleRate`
 clamped to `[0.0, 1.0]`) and `isConfigured` (`dsn` is non-null and non-empty).
 
+### Seeing what is sent
+
+`debug: true` prints every item the server accepted, so you can confirm what
+actually left the device instead of inferring it from the absence of errors.
+The line is emitted on delivery, not on capture — items are queued, may be
+split or retried, and can survive a restart before they land:
+
+```
+[Sauron] delivered 3 item(s) to https://ingest.example.com/api/42/envelope:
+[Sauron]   identify u_123 (traits={"plan":"pro"})
+[Sauron]   event checkout_completed (distinct_id=u_123, screen=Checkout, properties={"cart_value":42.5})
+[Sauron]   error StateError: Bad state: card declined (level=error, screen=Checkout)
+```
+
+Transactions and breadcrumb batches are logged the same way
+(`transaction GET /orders op=http 120.0ms status=null`,
+`breadcrumb_batch 12 crumb(s)`). Long values are truncated to keep one item on
+one line. Keep `debug` off in release builds — the payload summaries include
+user-supplied properties and traits.
+
 Everything set at once:
 
 ```dart
 await Sauron.init(
-  (SauronOptions o) {
-    o.dsn = 'https://pk_test@ingest.example.com/42';
-    o.environment = 'staging';
-    o.release = 'app@1.4.2+1402';
-    o.appVersion = '1.4.2';
-    o.appBuild = '1402';
-    o.screen = 'Splash';
-    o.sampleRate = 0.25;
-    o.maxBreadcrumbs = 50;
-    o.tags = <String, String>{'tier': 'free'};
-    o.contexts = <String, Map<String, Object?>>{
+  SauronOptions(
+    dsn: 'https://pk_test@ingest.example.com/42',
+    environment: 'staging',
+    release: 'app@1.4.2+1402',
+    appVersion: '1.4.2',
+    appBuild: '1402',
+    screen: 'Splash',
+    sampleRate: 0.25,
+    maxBreadcrumbs: 50,
+    tags: <String, String>{'tier': 'free'},
+    contexts: <String, Map<String, Object?>>{
       'build': <String, Object?>{'flavor': 'beta'},
-    };
-    o.extra = <String, Object?>{'boot_ms': 412};
-    o.beforeSend = (Object item) {
+    },
+    extra: <String, Object?>{'boot_ms': 412},
+    beforeSend: (Object item) {
       if (item is EventItem && item.name == 'secret') return null;
       return item;
-    };
-    o.flushInterval = const Duration(seconds: 10);
-    o.maxBatchItems = 50;
-    o.maxItemsPerEnvelope = 500;
-    o.maxQueueBytes = 2 * 1024 * 1024;
-    o.gzipThresholdBytes = 2048;
-    o.debug = true;
-    o.attachStacktrace = true;
-    o.httpClient = null; // leave null outside tests
-  },
+    },
+    flushInterval: const Duration(seconds: 10),
+    maxBatchItems: 50,
+    maxItemsPerEnvelope: 500,
+    maxQueueBytes: 2 * 1024 * 1024,
+    gzipThresholdBytes: 2048,
+    debug: true,
+    attachStacktrace: true,
+    httpClient: null, // leave null outside tests
+  ),
   appRunner: () => runApp(const MyApp()),
 );
 ```
@@ -159,8 +185,11 @@ flutter build apk \
 ```
 
 ```dart
-o.appVersion = const String.fromEnvironment('APP_VERSION');
-o.appBuild = const String.fromEnvironment('APP_BUILD');
+SauronOptions(
+  dsn: dsn,
+  appVersion: const String.fromEnvironment('APP_VERSION'),
+  appBuild: const String.fromEnvironment('APP_BUILD'),
+);
 ```
 
 If you already depend on `package_info_plus` for other reasons, read it from
@@ -168,8 +197,7 @@ there instead — the SDK is happy either way:
 
 ```dart
 final PackageInfo info = await PackageInfo.fromPlatform();
-o.appVersion = info.version;
-o.appBuild = info.buildNumber;
+SauronOptions(dsn: dsn, appVersion: info.version, appBuild: info.buildNumber);
 ```
 
 Leave both unset and the `app` context block is omitted; nothing else is
@@ -188,11 +216,14 @@ mutated), return a replacement item, or return `null` to drop it. It runs on
 every item type, so guard on the runtime type if you only care about a subset:
 
 ```dart
-o.beforeSend = (Object item) {
-  if (item is! ErrorItem) return item;
-  if (item.exception.value.contains('@')) return null; // drop PII
-  return item;
-};
+SauronOptions(
+  dsn: dsn,
+  beforeSend: (Object item) {
+    if (item is! ErrorItem) return item;
+    if (item.exception.value.contains('@')) return null; // drop PII
+    return item;
+  },
+);
 ```
 
 ## API reference
@@ -208,15 +239,15 @@ All `Sauron.*` members are static and delegate to `Sauron.client`. Before
 
 ```dart
 static Future<void> init(
-  void Function(SauronOptions options) configure, {
+  SauronOptions options, {
   FutureOr<void> Function()? appRunner,
 })
 ```
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `configure` | `void Function(SauronOptions)` | required | Builder that mutates the fresh `SauronOptions`. |
-| `appRunner:` | `FutureOr<void> Function()?` | `null` | When supplied, binding init + integrations + `bootstrap()` + your app all run inside one `runZonedGuarded`. |
+| `options` | `SauronOptions` | required | The configuration object — see [Configuration](#configuration). |
+| `appRunner:` | `FutureOr<void> Function()?` | `null` | When supplied, binding init + integrations + `bootstrap()` + your app all run inside one `runZonedGuarded`. If the binding is already initialized the zone is skipped — see [Startup ordering](#startup-ordering). |
 
 Returns `Future<void>`. Without `appRunner`, `init` calls
 `WidgetsFlutterBinding.ensureInitialized()`, installs the integrations and
@@ -225,10 +256,11 @@ awaits `bootstrap()` itself — you then call `runApp` yourself and forgo the
 
 ```dart
 // With the zone (recommended):
-await Sauron.init((o) => o.dsn = dsn, appRunner: () => runApp(const MyApp()));
+await Sauron.init(SauronOptions(dsn: dsn),
+    appRunner: () => runApp(const MyApp()));
 
 // Without it:
-await Sauron.init((o) => o.dsn = dsn);
+await Sauron.init(SauronOptions(dsn: dsn));
 runApp(const MyApp());
 ```
 
@@ -677,7 +709,7 @@ single item.
 ```dart
 Future<void> main() async {
   await Sauron.init(
-    (SauronOptions o) => o.dsn = 'https://pk_test@localhost:8081/1',
+    SauronOptions(dsn: 'https://pk_test@localhost:8081/1'),
     appRunner: () => runApp(const MyApp()),
   );
 }
@@ -688,6 +720,47 @@ Future<void> main() async {
 `bootstrap()` **inside** `runZonedGuarded`, so binding-owned callbacks and any
 failure during startup are captured too. If you must control `runApp` yourself,
 omit `appRunner` — you keep layers 1-3 and lose the zone catch-all.
+
+#### Startup ordering
+
+Flutter records the zone the binding was created in and asserts `runApp` still
+runs in it. So the zone layer is only available when Sauron initializes the
+binding — that is, when nothing touched it first:
+
+```dart
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();   // ← binding pinned to this zone
+  final config = await loadConfig();
+  await Sauron.init(
+    SauronOptions(dsn: config.dsn),
+    appRunner: () => runApp(MyApp(config: config)),   // would be a second zone
+  );
+}
+```
+
+Sauron detects this and runs your app in the current zone instead, so you never
+see Flutter's `Zone mismatch.` assertion — but layer 4 is skipped (with `debug:
+true` the SDK logs that it did). Layers 1-3 still catch everything:
+`PlatformDispatcher.onError` is Flutter's supported catch-all for async errors
+outside a guarded zone.
+
+To keep all four layers, move the pre-`runApp` work into `appRunner`, which
+already runs after `ensureInitialized()` inside the zone:
+
+```dart
+Future<void> main() async {
+  await Sauron.init(
+    SauronOptions(dsn: const String.fromEnvironment('SAURON_DSN')),
+    appRunner: () async {
+      final config = await loadConfig();   // binding is up, same zone as runApp
+      runApp(MyApp(config: config));
+    },
+  );
+}
+```
+
+If your DSN itself comes from that async work, keep the pre-init version — the
+zone layer is the only thing you give up.
 
 ### Error capture layers
 
@@ -875,17 +948,17 @@ Response policy:
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Nothing arrives, no logs | `dsn` unset/empty, so the SDK is disabled | Set `o.dsn`; check `Sauron.isEnabled`. |
+| Nothing arrives, no logs | `dsn` unset/empty, so the SDK is disabled | Pass `dsn:` to `SauronOptions`; check `Sauron.isEnabled`. |
 | Nothing arrives, `[Sauron] invalid DSN, SDK disabled` | DSN failed to parse | Use `https://<public_key>@<host>[:port]/<project_id>`; the project id is the last path segment. |
 | Requests leave but nothing lands | Your proxy does not expose ingest at `/api/{project_id}/envelope` on the DSN's host (plus any DSN path prefix) | Route that exact path to the gateway — events otherwise drop silently and look delivered. |
 | Delivery stops permanently mid-session | A `401`/`403` disabled the transport | Verify the public key belongs to the project; restart the app after fixing. |
-| Events arrive, errors do not | `sampleRate < 1.0`, or `beforeSend` returned `null` | Set `o.sampleRate = 1.0`; log inside `beforeSend`. |
+| Events arrive, errors do not | `sampleRate < 1.0`, or `beforeSend` returned `null` | Pass `sampleRate: 1.0`; log inside `beforeSend`. |
 | No breadcrumbs on errors | `maxBreadcrumbs <= 0` | Set a positive `maxBreadcrumbs`. |
 | Stack traces are hex addresses | Obfuscated AOT build with no symbols uploaded | Upload the `--split-debug-info` output (see above). |
 | Errors from a spawned isolate are missing | Only `Isolate.current` is auto-listened | Call `Sauron.addIsolateErrorListener(isolate)`. |
 | Nothing captured after `close()` | `close()` is terminal: it disables the client and uninstalls the capture layers | Treat `close()` as end-of-process; do not re-`init`. |
 | Web build fails on `dart:io` | Web is not a supported target | Use `@edraj/sauron-browser`. |
-| Need to see what the SDK is doing | — | `o.debug = true` prints `[Sauron] …` lines (sampling drops, `beforeSend` drops, invalid DSN, network errors, retry schedule, non-retryable drops). |
+| Need to see what the SDK is doing | — | `debug: true` prints `[Sauron] …` lines (sampling drops, `beforeSend` drops, invalid DSN, network errors, retry schedule, non-retryable drops). |
 
 ## Development
 

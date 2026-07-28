@@ -6,7 +6,7 @@ import 'types.dart';
 const String kSauronSdkName = 'sauron.flutter';
 
 /// SDK version — keep in sync with `pubspec.yaml`.
-const String kSauronSdkVersion = '1.0.0';
+const String kSauronSdkVersion = '1.2.0';
 
 /// The envelope header: routing + provenance metadata.
 class EnvelopeHeader {
