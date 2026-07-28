@@ -3,8 +3,16 @@ description: >-
   Sauron SDK for Flutter — captures uncaught Flutter/Dart errors across all four
   layers, records breadcrumbs, exposes track()/identify(), and batches, gzips,
   persists and delivers envelopes to the Sauron ingest gateway.
-version: 0.3.0
-publish_to: none
+version: 1.1.0
+homepage: https://github.com/edraj/sauron
+repository: https://github.com/edraj/sauron
+issue_tracker: https://github.com/edraj/sauron/issues
+documentation: https://github.com/edraj/sauron/wiki
+topics:
+  - error-tracking
+  - analytics
+  - observability
+  - monitoring
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
@@ -15,7 +23,6 @@ dependencies:
     sdk: flutter
   http: ^1.2.0
   device_info_plus: ^12.0.0
-  package_info_plus: ^8.0.0
   connectivity_plus: ^6.1.0
   path_provider: ^2.1.0
 

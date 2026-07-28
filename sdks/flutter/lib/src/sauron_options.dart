@@ -25,6 +25,19 @@ class SauronOptions {
   /// Release identifier, e.g. `app@1.4.2+1402`.
   String? release;
 
+  /// App version reported in the envelope's `context.app`, e.g. `1.4.2`.
+  ///
+  /// Developer-supplied: the SDK does not read this off the platform, so it
+  /// carries no plugin dependency. Wire it from your own build config — e.g.
+  /// a `--dart-define`, a generated constants file, or `package_info_plus` if
+  /// you already depend on it. When both this and [appBuild] are null the
+  /// `app` block is omitted.
+  String? appVersion;
+
+  /// App build number reported in the envelope's `context.app`, e.g. `1402`.
+  /// See [appVersion].
+  String? appBuild;
+
   /// Seed the initial screen/route name. Stamped on events/errors until
   /// [SauronClient.setScreen] (or the [SauronNavigatorObserver]) changes it.
   String? screen;

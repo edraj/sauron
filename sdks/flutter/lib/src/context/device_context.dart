@@ -2,7 +2,6 @@ import 'dart:io' show Directory, Platform;
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
-import 'package:package_info_plus/package_info_plus.dart';
 
 import '../envelope.dart';
 import '../types.dart';
@@ -32,7 +31,13 @@ class DeviceContextProvider {
   /// When [storageDirectory] is supplied, a stable per-install `device_id` is
   /// resolved (and persisted on first run) and attached to the device
   /// descriptor.
-  Future<SauronContext> load({Directory? storageDirectory}) async {
+  ///
+  /// [app] is developer-supplied (from `SauronOptions.appVersion` /
+  /// `appBuild`) rather than read off the platform — see [SauronOptions].
+  Future<SauronContext> load({
+    Directory? storageDirectory,
+    AppDescriptor? app,
+  }) async {
     final SauronContext? cached = _cached;
     if (cached != null) {
       return cached;
@@ -43,7 +48,6 @@ class DeviceContextProvider {
       device = (device ?? const DeviceDescriptor()).copyWith(deviceId: deviceId);
     }
     final OsDescriptor? os = await _readOs();
-    final AppDescriptor? app = await _readApp();
     final RuntimeDescriptor runtime = _readRuntime();
     final SauronContext context = SauronContext(
       device: device,
@@ -157,15 +161,6 @@ class DeviceContextProvider {
         case TargetPlatform.fuchsia:
           return const OsDescriptor(name: 'Fuchsia');
       }
-    } on Object {
-      return null;
-    }
-  }
-
-  Future<AppDescriptor?> _readApp() async {
-    try {
-      final PackageInfo info = await PackageInfo.fromPlatform();
-      return AppDescriptor(version: info.version, build: info.buildNumber);
     } on Object {
       return null;
     }

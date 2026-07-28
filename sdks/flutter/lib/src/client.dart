@@ -62,9 +62,11 @@ class SauronClient {
 
   Dsn? _dsn;
   SauronTransport? _transport;
+  bool _closed = false;
 
-  /// Whether the SDK is configured and active.
-  bool get isEnabled => _dsn != null;
+  /// Whether the SDK is configured and active. Becomes false once [close] has
+  /// run — a closed client is terminal and cannot be restarted.
+  bool get isEnabled => _dsn != null && !_closed;
 
   // ---- lifecycle -------------------------------------------------------------
 
@@ -105,13 +107,25 @@ class SauronClient {
       connectivity: ConnectivityMonitor(),
     );
     _transport = transport;
-    await _deviceContext.load(storageDirectory: dir);
+    await _deviceContext.load(storageDirectory: dir, app: _appDescriptor());
     transport.start();
     // Replay anything captured before the transport was ready.
     for (final EnvelopeItem item in _pending) {
       transport.capture(item);
     }
     _pending.clear();
+  }
+
+  /// The developer-supplied app descriptor, or null when neither
+  /// `appVersion` nor `appBuild` was set (the `app` block is then omitted).
+  AppDescriptor? _appDescriptor() {
+    if (options.appVersion == null && options.appBuild == null) {
+      return null;
+    }
+    return AppDescriptor(
+      version: options.appVersion,
+      build: options.appBuild,
+    );
   }
 
   Future<Directory> _resolveQueueDirectory() async {
@@ -283,10 +297,32 @@ class SauronClient {
   /// Flushes buffered + persisted envelopes.
   Future<void> flush() async => _transport?.flush();
 
-  /// Flushes and tears down the client.
+  /// Flushes and tears down the client: drains the transport, uninstalls the
+  /// capture layers (handing the global hooks back to whoever owned them), and
+  /// disables the client.
+  ///
+  /// Terminal and idempotent. A closed client cannot be restarted — anything
+  /// captured afterwards is dropped rather than buffered, so a long-lived
+  /// process that closes the SDK does not accumulate events forever.
   Future<void> close() async {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    _uninstallIntegrations();
     await _transport?.close();
     _transport = null;
+    // Anything still waiting on a transport will never be sent.
+    _pending.clear();
+  }
+
+  void _uninstallIntegrations() {
+    FlutterErrorIntegration.uninstall();
+    PlatformDispatcherIntegration.uninstall();
+    if (!kIsWeb) {
+      IsolateErrorIntegration.uninstall();
+    }
+    SauronWidgetsBindingObserver.uninstall();
   }
 
   /// Registers an error listener on a user-spawned [isolate].
