@@ -107,6 +107,32 @@ export function isEmptySelection(sel: ScopeSelection): boolean {
 }
 
 /**
+ * The one-line English summary of a selection ("Full access to Acme",
+ * "2 projects, 1 app").
+ *
+ * Lives here rather than inline in ScopeTree so it is testable at all — the
+ * dashboard has no DOM test environment, so a component-local `$derived` could
+ * never be exercised. Any future surface that has to phrase a selection the
+ * same way the picker does should call this rather than restate the rules.
+ */
+export function describeSelection(
+  sel: ScopeSelection,
+  orgId: string,
+  orgName: string,
+  projectOfApp?: Record<string, string>,
+): string {
+  if (isEmptySelection(sel)) return 'Nothing selected yet.';
+  if (sel.org) return `Full access to ${orgName}`;
+  const scopes = selectionToScopes(sel, orgId, projectOfApp);
+  const projectCount = scopes.filter((s) => s.scope_type === 'project').length;
+  const appCount = scopes.length - projectCount;
+  const parts: string[] = [];
+  if (projectCount) parts.push(`${projectCount} project${projectCount === 1 ? '' : 's'}`);
+  if (appCount) parts.push(`${appCount} app${appCount === 1 ? '' : 's'}`);
+  return parts.join(', ');
+}
+
+/**
  * True when this row is already covered by an ancestor tick and must render
  * dimmed and disabled — ticking it would add a grant that changes nothing.
  *

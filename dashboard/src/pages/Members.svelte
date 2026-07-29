@@ -18,7 +18,7 @@
   import { listApps } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
-  import { groupMembers, type App, type Member, type MemberGrant, type Role, type ScopeOption } from '../lib/models';
+  import { groupMembers, type App, type Member, type MemberGrant, type Role } from '../lib/models';
   import {
     EMPTY_SELECTION,
     isEmptySelection,
@@ -31,6 +31,10 @@
   // Keyed by project because the scope tree renders by project; `appsById` is
   // the flattened view the table and the scope labels want.
   let appsByProject = $state<Record<string, App[]>>({});
+  // The app load below is async and races the dialogs opening. Until it
+  // settles, EditMemberDialog cannot tell an app-scoped grant from one whose
+  // target it can't see, so it waits rather than seeding a wrong tree.
+  let appsLoaded = $state(false);
   let loading = $state(true);
   let error = $state<string | null>(null);
 
@@ -103,26 +107,6 @@
   const canReadMembers = $derived(sessionStore.can('member:read'));
   const canManageRoles = $derived(sessionStore.can('role:manage'));
 
-  const scopeOptions = $derived.by<ScopeOption[]>(() => {
-    const opts: ScopeOption[] = [];
-    const org = sessionStore.currentOrg;
-    if (org) {
-      opts.push({ key: `org:${org.id}`, label: `Org: ${org.name}`, scope_type: 'org', scope_id: org.id });
-    }
-    for (const p of sessionStore.projects) {
-      opts.push({
-        key: `project:${p.id}`,
-        label: `Project: ${p.name}`,
-        scope_type: 'project',
-        scope_id: p.id,
-      });
-    }
-    for (const a of Object.values(appsById)) {
-      opts.push({ key: `app:${a.id}`, label: `App: ${a.name}`, scope_type: 'app', scope_id: a.id });
-    }
-    return opts;
-  });
-
   const projectOfApp = $derived.by(() => {
     const map: Record<string, string> = {};
     for (const [projectId, list] of Object.entries(appsByProject)) {
@@ -164,6 +148,10 @@
   $effect(() => {
     const projects = sessionStore.projects;
     let stale = false;
+    // Switching orgs restarts the load, so the previous org's apps must stop
+    // counting as loaded — otherwise the edit dialog would seed its tree from
+    // the old org's app list.
+    appsLoaded = false;
     void (async () => {
       const appLists = await Promise.all(
         projects.map((p) => listApps(p.id).catch(() => [] as App[])),
@@ -172,6 +160,7 @@
       const byProject: Record<string, App[]> = {};
       projects.forEach((p, i) => (byProject[p.id] = appLists[i]));
       appsByProject = byProject;
+      appsLoaded = true;
     })();
     return () => {
       stale = true;
@@ -430,11 +419,16 @@
     <EditMemberDialog
       open={editingMemberId !== null}
       orgId={sessionStore.currentOrg.id}
+      orgName={sessionStore.currentOrg.name}
       member={editingMember}
       {roles}
-      {scopeOptions}
+      projects={sessionStore.projects}
+      {appsByProject}
+      orgGrants={members}
+      ready={appsLoaded}
       onclose={() => (editingMemberId = null)}
       onchanged={() => load(sessionStore.currentOrg!.id)}
+      onsaved={() => toastStore.success('Access updated.')}
     />
   {/if}
 

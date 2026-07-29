@@ -72,12 +72,16 @@ export const ISSUE_FIELDS: FieldDef[] = [
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
 ];
 
-// `environment` options are injected at runtime (loaded from the environments API).
+// `environment` used to live here as a chip whose options were injected at
+// runtime (loaded from the environments API). It's now scoped globally via
+// the topbar environment switcher instead — see `sessionStore.currentEnvId`
+// — so it's no longer a per-page filter field. The backend's legacy
+// `filter=environment:eq:<name>` handling (`EVENT_FILTERS`) stays for API
+// back-compatibility; this registry only drives the dashboard's FilterBar.
 export const EVENT_FIELDS: FieldDef[] = [
   { key: 'name', label: 'Event', type: 'string', ops: OPS_STR },
   { key: 'distinct_id', label: 'User', type: 'string', ops: OPS_STR },
   { key: 'session_id', label: 'Session', type: 'string', ops: OPS_STR },
-  { key: 'environment', label: 'Environment', type: 'enum', ops: OPS_ENUM, options: [] },
   { key: 'release', label: 'Release', type: 'string', ops: OPS_STR },
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
 ];

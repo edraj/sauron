@@ -203,12 +203,18 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::apps::delete_app),
         )
         .route(
-            "/v1/apps/{app_id}/rotate-key",
-            post(routes::apps::rotate_key),
+            "/v1/apps/{app_id}/environments",
+            get(routes::environments::list_environments)
+                .post(routes::environments::create_environment),
         )
         .route(
-            "/v1/apps/{app_id}/environments",
-            get(routes::apps::list_environments),
+            "/v1/environments/{env_id}",
+            patch(routes::environments::update_environment)
+                .delete(routes::environments::retire_environment),
+        )
+        .route(
+            "/v1/environments/{env_id}/rotate-key",
+            post(routes::environments::rotate_environment_key),
         )
         .route(
             "/v1/apps/{app_id}/first-event",

@@ -19,8 +19,8 @@ which launches the app inside `runZonedGuarded` and binds all four uncaught
 capture layers (`FlutterError.onError`, `PlatformDispatcher.onError`,
 `Isolate.addErrorListener`, and the guarding zone).
 
-The home screen has an editable **DSN / environment / release** section, a
-`distinct_id` field, and buttons wired to the SDK:
+The home screen has an editable **DSN / release** section, a `distinct_id`
+field, and buttons wired to the SDK:
 
 | Button | What it exercises |
 | --- | --- |
@@ -112,9 +112,9 @@ POST http://localhost:8091/api/b13ff85c-ccd1-450e-95a5-fcc52f7650a3/envelope
 X-Sauron-Key: pk_2f587381b889049a0a21fd619a7ba41d
 ```
 
-Editing DSN / environment / release binds at **startup**, so the app shows a
-"restart to apply" banner after you save those — restart to re-point every
-capture layer. (The `distinct_id` field is read live by **identify**.)
+Editing DSN / release binds at **startup**, so the app shows a "restart to
+apply" banner after you save those — restart to re-point every capture layer.
+(The `distinct_id` field is read live by **identify**.)
 
 ### Ports
 
@@ -145,8 +145,7 @@ curl -i -X POST \
   -H "Content-Type: application/json" \
   -H "X-Sauron-Key: pk_2f587381b889049a0a21fd619a7ba41d" \
   -d '{
-    "header": { "sdk": { "name": "sauron.flutter", "version": "0.1.0" },
-      "environment": "development" },
+    "header": { "sdk": { "name": "sauron.flutter", "version": "0.1.0" } },
     "items": [ { "type": "error", "exception": { "type": "ConnectivityProbe",
       "value": "hello from curl" } } ]
   }'

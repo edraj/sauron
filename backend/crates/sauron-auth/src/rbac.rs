@@ -37,7 +37,15 @@ pub mod perm {
     pub const APP_CREATE: &str = "app:create";
     pub const APP_UPDATE: &str = "app:update";
     pub const APP_DELETE: &str = "app:delete";
-    pub const APP_ROTATE_KEY: &str = "app:rotate_key";
+    /// Environments own the ingest credential, so they carry their own family
+    /// rather than borrowing the app's. These name *what* is managed, not a new
+    /// scope level — checks still resolve against the parent app until Slice 3
+    /// introduces `Scope::Env`.
+    pub const ENV_READ: &str = "env:read";
+    pub const ENV_CREATE: &str = "env:create";
+    pub const ENV_UPDATE: &str = "env:update";
+    pub const ENV_DELETE: &str = "env:delete";
+    pub const ENV_ROTATE_KEY: &str = "env:rotate_key";
     pub const PROJECT_READ: &str = "project:read";
     pub const PROJECT_CREATE: &str = "project:create";
     pub const PROJECT_UPDATE: &str = "project:update";
@@ -53,7 +61,7 @@ pub mod perm {
     pub const ALERT_WRITE: &str = "alert:write";
 
     /// Every permission, in canonical order.
-    pub const ALL: [&str; 23] = [
+    pub const ALL: [&str; 27] = [
         ISSUE_READ,
         ISSUE_WRITE,
         EVENT_READ,
@@ -66,7 +74,11 @@ pub mod perm {
         APP_CREATE,
         APP_UPDATE,
         APP_DELETE,
-        APP_ROTATE_KEY,
+        ENV_READ,
+        ENV_CREATE,
+        ENV_UPDATE,
+        ENV_DELETE,
+        ENV_ROTATE_KEY,
         PROJECT_READ,
         PROJECT_CREATE,
         PROJECT_UPDATE,
@@ -109,7 +121,11 @@ pub const ADMIN: PresetRole = PresetRole {
         perm::APP_CREATE,
         perm::APP_UPDATE,
         perm::APP_DELETE,
-        perm::APP_ROTATE_KEY,
+        perm::ENV_READ,
+        perm::ENV_CREATE,
+        perm::ENV_UPDATE,
+        perm::ENV_DELETE,
+        perm::ENV_ROTATE_KEY,
         perm::PROJECT_READ,
         perm::PROJECT_CREATE,
         perm::PROJECT_UPDATE,
@@ -137,7 +153,10 @@ pub const DEVELOPER: PresetRole = PresetRole {
         perm::APP_READ,
         perm::APP_CREATE,
         perm::APP_UPDATE,
-        perm::APP_ROTATE_KEY,
+        perm::ENV_READ,
+        perm::ENV_CREATE,
+        perm::ENV_UPDATE,
+        perm::ENV_ROTATE_KEY,
         perm::PROJECT_READ,
         perm::MEMBER_READ,
         perm::ALERT_READ,
@@ -152,6 +171,7 @@ pub const VIEWER: PresetRole = PresetRole {
         perm::EVENT_READ,
         perm::MONITOR_READ,
         perm::APP_READ,
+        perm::ENV_READ,
         perm::PROJECT_READ,
         perm::MEMBER_READ,
     ],
@@ -225,6 +245,39 @@ pub fn has_permission(
     grants.iter().any(|g| {
         grant_applies(g.scope, org, project, app) && g.permissions.iter().any(|p| p == permission)
     })
+}
+
+/// Where a set of grants confers `permission`, decomposed for discovery queries.
+///
+/// `authorize_*` answers "may this caller act on THIS resource". Listing needs the
+/// inverse — "which resources may this caller see" — and that cannot be expressed as a
+/// single check at a fixed scope: a grant narrower than the check can never satisfy it,
+/// which is why an app-scoped member used to get 403 from every listing endpoint.
+#[derive(Debug, Default, PartialEq)]
+pub struct Reach {
+    /// Held at org scope — everything in the org is visible.
+    pub org: bool,
+    pub projects: Vec<Uuid>,
+    pub apps: Vec<Uuid>,
+}
+
+/// Callers MUST pass grants already filtered to a single organization (as
+/// `repo::user_grants_in_org` does). The `Scope::Org` arm does not compare the
+/// grant's org id, so an unfiltered grant list would leak another org's
+/// visibility.
+pub fn reach_for(grants: &[Grant], permission: &str) -> Reach {
+    let mut reach = Reach::default();
+    for g in grants {
+        if !g.permissions.iter().any(|p| p == permission) {
+            continue;
+        }
+        match g.scope {
+            Scope::Org(_) => reach.org = true,
+            Scope::Project(p) => reach.projects.push(p),
+            Scope::App(a) => reach.apps.push(a),
+        }
+    }
+    reach
 }
 
 /// Convert `(scope_type, scope_id, permissions_json)` rows into [`Grant`]s.
@@ -418,13 +471,13 @@ mod tests {
         for p in perm::ALL {
             assert!(OWNER.permissions.contains(&p), "Owner missing {p}");
         }
-        assert_eq!(OWNER.permissions.len(), 23);
+        assert_eq!(OWNER.permissions.len(), 27);
     }
 
     #[test]
     fn admin_is_all_except_org_manage() {
         assert!(!ADMIN.permissions.contains(&perm::ORG_MANAGE));
-        assert_eq!(ADMIN.permissions.len(), 22);
+        assert_eq!(ADMIN.permissions.len(), 26);
         for p in perm::ALL {
             if p != perm::ORG_MANAGE {
                 assert!(ADMIN.permissions.contains(&p), "Admin missing {p}");
@@ -435,14 +488,24 @@ mod tests {
     #[test]
     fn developer_can_write_issues_not_manage_members() {
         assert!(DEVELOPER.permissions.contains(&perm::ISSUE_WRITE));
-        assert!(DEVELOPER.permissions.contains(&perm::APP_ROTATE_KEY));
+        assert!(DEVELOPER.permissions.contains(&perm::ENV_ROTATE_KEY));
         assert!(!DEVELOPER.permissions.contains(&perm::MEMBER_MANAGE));
         assert!(!DEVELOPER.permissions.contains(&perm::PROJECT_DELETE));
         assert!(!DEVELOPER.permissions.contains(&perm::ROLE_MANAGE));
         assert!(DEVELOPER.permissions.contains(&perm::FUNNEL_WRITE));
         assert!(DEVELOPER.permissions.contains(&perm::ARTIFACT_WRITE));
         assert!(DEVELOPER.permissions.contains(&perm::SOURCE_READ));
-        assert_eq!(DEVELOPER.permissions.len(), 15);
+        assert_eq!(DEVELOPER.permissions.len(), 18);
+    }
+
+    /// Developer manages environments day to day but cannot retire one, mirroring
+    /// how it holds `app:update` without `app:delete`.
+    #[test]
+    fn developer_manages_envs_but_cannot_retire() {
+        assert!(DEVELOPER.permissions.contains(&perm::ENV_READ));
+        assert!(DEVELOPER.permissions.contains(&perm::ENV_CREATE));
+        assert!(DEVELOPER.permissions.contains(&perm::ENV_UPDATE));
+        assert!(!DEVELOPER.permissions.contains(&perm::ENV_DELETE));
     }
 
     #[test]
@@ -458,7 +521,7 @@ mod tests {
         }
         assert!(VIEWER.permissions.contains(&perm::ISSUE_READ));
         assert!(!VIEWER.permissions.contains(&perm::ISSUE_WRITE));
-        assert_eq!(VIEWER.permissions.len(), 6);
+        assert_eq!(VIEWER.permissions.len(), 7);
     }
 
     #[test]
@@ -471,7 +534,7 @@ mod tests {
     fn all_permissions_are_unique() {
         let set: HashSet<_> = perm::ALL.iter().collect();
         assert_eq!(set.len(), perm::ALL.len(), "duplicate in perm::ALL");
-        assert_eq!(perm::ALL.len(), 23);
+        assert_eq!(perm::ALL.len(), 27);
     }
 
     #[test]
@@ -762,6 +825,80 @@ mod tests {
             )];
             assert_eq!(grants_from_rows(rows)[0].scope, scope);
         }
+    }
+
+    // --- reach_for: decompose grants for discovery -----------------------
+
+    #[test]
+    fn reach_for_org_grant_sets_org_flag_and_leaves_vectors_empty() {
+        let g = vec![grant(Scope::Org(org()), &[perm::PROJECT_READ])];
+        let reach = reach_for(&g, perm::PROJECT_READ);
+        assert!(reach.org);
+        assert!(reach.projects.is_empty());
+        assert!(reach.apps.is_empty());
+    }
+
+    #[test]
+    fn reach_for_project_grant_collects_only_that_project() {
+        let g = vec![grant(Scope::Project(proj_a()), &[perm::PROJECT_READ])];
+        let reach = reach_for(&g, perm::PROJECT_READ);
+        assert!(!reach.org);
+        assert_eq!(reach.projects, vec![proj_a()]);
+        assert!(reach.apps.is_empty());
+    }
+
+    #[test]
+    fn reach_for_app_grant_collects_only_that_app() {
+        let g = vec![grant(Scope::App(app_a1()), &[perm::APP_READ])];
+        let reach = reach_for(&g, perm::APP_READ);
+        assert!(!reach.org);
+        assert!(reach.projects.is_empty());
+        assert_eq!(reach.apps, vec![app_a1()]);
+    }
+
+    #[test]
+    fn reach_for_grant_lacking_permission_contributes_nothing() {
+        let g = vec![
+            grant(Scope::Org(org()), &[perm::ISSUE_READ]),
+            grant(Scope::Project(proj_a()), &[perm::ISSUE_READ]),
+            grant(Scope::App(app_a1()), &[perm::ISSUE_READ]),
+        ];
+        let reach = reach_for(&g, perm::PROJECT_READ);
+        assert_eq!(reach, Reach::default());
+    }
+
+    #[test]
+    fn reach_for_mixed_grants_accumulate_across_all_three_scopes() {
+        let g = vec![
+            grant(Scope::Org(org()), &[perm::PROJECT_READ]),
+            grant(Scope::Project(proj_a()), &[perm::PROJECT_READ]),
+            grant(Scope::Project(proj_b()), &[perm::PROJECT_READ]),
+            grant(Scope::App(app_a1()), &[perm::PROJECT_READ]),
+            grant(Scope::App(app_a2()), &[perm::PROJECT_READ]),
+            // a grant that doesn't carry the permission contributes nothing
+            grant(Scope::App(app_b1()), &[perm::ISSUE_READ]),
+        ];
+        let reach = reach_for(&g, perm::PROJECT_READ);
+        assert!(reach.org);
+        assert_eq!(reach.projects, vec![proj_a(), proj_b()]);
+        assert_eq!(reach.apps, vec![app_a1(), app_a2()]);
+    }
+
+    #[test]
+    fn reach_for_empty_grants_yields_default() {
+        let g: Vec<Grant> = vec![];
+        assert_eq!(reach_for(&g, perm::PROJECT_READ), Reach::default());
+    }
+
+    /// `reach_for` trusts its caller to have filtered grants to one org: an org-scoped
+    /// grant sets `org` regardless of WHICH org it names. This is the documented
+    /// contract, not an oversight — pinning it here so a future change that starts
+    /// comparing ids has to update this test deliberately.
+    #[test]
+    fn reach_for_org_arm_does_not_compare_the_org_id() {
+        let other_org = Uuid::from_u128(999);
+        let grants = vec![grant(Scope::Org(other_org), &[perm::PROJECT_READ])];
+        assert!(reach_for(&grants, perm::PROJECT_READ).org);
     }
 
     #[test]

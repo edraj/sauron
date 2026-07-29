@@ -25,7 +25,6 @@ use crate::user::VirtualUser;
 
 const SDK_NAME: &str = "sauron.crebain";
 const SDK_VERSION: &str = "0.1.0";
-const ENVIRONMENT: &str = "benchmark";
 const RELEASE: &str = "crebain@0.1.0";
 
 const ERROR_TYPES: &[(&str, &str)] = &[
@@ -114,7 +113,6 @@ fn header() -> EnvelopeHeader {
             version: SDK_VERSION.to_string(),
         },
         sent_at: Utc::now(),
-        environment: Some(ENVIRONMENT.to_string()),
         release: Some(RELEASE.to_string()),
     }
 }

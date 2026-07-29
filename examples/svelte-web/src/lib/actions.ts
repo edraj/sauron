@@ -1,13 +1,13 @@
 /**
  * The demo's action catalog. Each entry maps a button in the UI to a real call
- * into `@sauron/browser`, plus a short client-side echo into the activity log.
+ * into `@edraj/sauron-browser`, plus a short client-side echo into the activity log.
  *
  * Note: the "throw" / "reject" actions deliberately produce *genuine* uncaught
  * failures — the SDK's global `window.onerror` / `onunhandledrejection`
  * handlers (installed by `Sauron.init`) are what capture them, exactly as they
  * would in a real app. Nothing here calls captureException for those two.
  */
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 import { activity, config } from './store.svelte';
 
 export type ActionCategory = 'error' | 'warning' | 'event' | 'identify' | 'breadcrumb';

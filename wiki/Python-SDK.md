@@ -26,7 +26,7 @@ Then `import sauron`.
 ```python
 import sauron
 
-sauron.init(dsn="https://<public_key>@<host>/<project_id>")
+sauron.init(dsn="https://<public_key>@<host>/<environment_id>")
 ```
 
 A **missing/empty** `dsn` puts the SDK into disabled no-op mode (it logs, does not
@@ -37,8 +37,7 @@ raise) so code can ship without a DSN. A **non-empty but malformed** DSN raises
 
 | Option | Default | Notes |
 | --- | --- | --- |
-| `dsn` | `None` | `https://<public_key>@<host>/<project_id>`; empty ⇒ disabled |
-| `environment` | `"production"` | |
+| `dsn` | `None` | `https://<public_key>@<host>/<environment_id>`; empty ⇒ disabled |
 | `release` | `None` | |
 | `sample_rate` | `1.0` | error sample rate |
 | `flush_interval` | `5.0` | background flush interval, seconds |
@@ -235,7 +234,7 @@ See [`examples/python-server`](../examples/python-server). Run it with:
 ```bash
 cd examples/python-server
 pip install -e ../../sdks/python
-SAURON_DSN="https://<public_key>@<host>/<project_id>" python main.py
+SAURON_DSN="https://<public_key>@<host>/<environment_id>" python main.py
 ```
 
 Run the SDK tests with `cd sdks/python && python -m pytest -q` (or `python -m

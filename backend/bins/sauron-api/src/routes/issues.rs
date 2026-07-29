@@ -1,7 +1,7 @@
 //! The issues API, scoped to an app: list, detail (with occurrences chart +
 //! latest event), status updates, and per-issue occurrences.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 use axum_extra::extract::Query;
 use chrono::{Duration, Utc};
@@ -28,6 +28,13 @@ pub struct ListQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    // `environment_id` is deliberately NOT a field here — it is read from the
+    // raw query string via `RawQuery` + `scope::read_scope_raw` instead of
+    // this `Query<T>` extractor. See `routes::scope`'s module docs for why:
+    // an `Option<String>` field on this struct would go through
+    // `axum_extra::extract::Query` (needed for this struct's own `Vec<String>`
+    // `filter` field), whose codec silently collapses `?environment_id=` to
+    // `None`.
 }
 
 fn default_limit() -> i64 {
@@ -42,6 +49,7 @@ pub async fn list(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<ListQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<Issue>>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
@@ -49,10 +57,11 @@ pub async fn list(
     let search = q.q.as_deref().filter(|s| !s.is_empty());
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 3650));
     let limit = q.limit.clamp(1, 200);
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
         repo::list_issues(
             &mut conn,
-            app_id,
+            scope,
             &filters,
             search,
             since,
@@ -71,10 +80,14 @@ pub struct IssueDetail {
     pub series: Vec<SeriesPoint>,
 }
 
+// No bespoke query struct: `detail` takes only `environment_id`, which comes
+// from `RawQuery` (see `list`'s comment above), not a `Query<T>` extractor.
+
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
     Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<IssueDetail>, ApiError> {
     let mut conn = db(&state).await?;
     // One ancestry+grant resolution covers both permission checks.
@@ -83,12 +96,13 @@ pub async fn detail(
     // Viewing de-obfuscated source code needs source:read; symbol/file/line don't.
     let include_source = perms.contains(perm::SOURCE_READ);
 
-    let issue = repo::get_issue(&mut conn, app_id, issue_id)
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
+    let issue = repo::get_issue(&mut conn, scope, issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let mut latest_event = repo::latest_error_event(&mut conn, issue_id).await?;
+    let mut latest_event = repo::latest_error_event(&mut conn, scope, issue_id).await?;
     let since = Utc::now() - Duration::days(30);
-    let series = repo::issue_occurrence_series(&mut conn, issue_id, since).await?;
+    let series = repo::issue_occurrence_series(&mut conn, scope, issue_id, since).await?;
     drop(conn); // release the pooled conn; symbolication checks out its own
 
     if let Some(ev) = latest_event.as_mut() {
@@ -138,6 +152,8 @@ pub struct EventsQuery {
     pub since_days: i64,
     #[serde(default = "default_events_limit")]
     pub limit: i64,
+    // `environment_id` comes from `RawQuery`, not this struct — see `list`'s
+    // comment above.
 }
 
 fn default_events_limit() -> i64 {
@@ -152,15 +168,17 @@ pub async fn events(
     State(state): State<AppState>,
     Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
     Query(q): Query<EventsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<ErrorEvent>>, ApiError> {
     let mut conn = db(&state).await?;
     // One ancestry+grant resolution covers both permission checks.
     let perms =
         super::authorize_app_perms(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
     let include_source = perms.contains(perm::SOURCE_READ);
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     // Confirm the issue belongs to this app before returning its events (prevents
     // reading another app's events by passing a foreign issue_id).
-    repo::get_issue(&mut conn, app_id, issue_id)
+    repo::get_issue(&mut conn, scope, issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     let filters =
@@ -170,6 +188,7 @@ pub async fn events(
     let limit = q.limit.clamp(1, 100);
     let mut events = repo::list_error_events_for_issue(
         &mut conn,
+        scope,
         issue_id,
         &filters,
         search,
@@ -197,6 +216,8 @@ pub async fn events(
 pub struct StatsQuery {
     #[serde(default = "default_stats_days")]
     pub since_days: i64,
+    // `environment_id` comes from `RawQuery`, not this struct — see `list`'s
+    // comment above.
 }
 
 fn default_stats_days() -> i64 {
@@ -215,11 +236,13 @@ pub async fn stats(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<StatsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<IssueStats>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
-    let counts = repo::issue_stats(&mut conn, app_id).await?;
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
+    let counts = repo::issue_stats(&mut conn, scope).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
-    let series = repo::error_series(&mut conn, app_id, since).await?;
+    let series = repo::error_series(&mut conn, scope, since).await?;
     Ok(Json(IssueStats { counts, series }))
 }

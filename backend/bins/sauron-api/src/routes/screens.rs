@@ -22,6 +22,7 @@ pub struct ScreenListQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    pub environment_id: Option<String>,
 }
 fn days30() -> i64 {
     30
@@ -43,9 +44,10 @@ pub async fn list(
         Some(term) => repo::like_contains(term),
         None => "%".to_string(),
     };
+    let scope = super::scope::read_scope(app_id, q.environment_id.as_deref())?;
     let rows = repo::screen_list(
         &mut conn,
-        app_id,
+        scope,
         since,
         &pattern,
         q.limit.clamp(1, 200),
@@ -60,6 +62,7 @@ pub struct ScreenDetailQuery {
     pub name: String,
     #[serde(default = "days30")]
     pub since_days: i64,
+    pub environment_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -81,11 +84,12 @@ pub async fn detail(
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
-    let stats = repo::screen_stats(&mut conn, app_id, since, &q.name).await?;
+    let scope = super::scope::read_scope(app_id, q.environment_id.as_deref())?;
+    let stats = repo::screen_stats(&mut conn, scope, since, &q.name).await?;
     let recent_events =
-        repo::recent_events_for_screen(&mut conn, app_id, &q.name, since, 20).await?;
+        repo::recent_events_for_screen(&mut conn, scope, &q.name, since, 20).await?;
     let recent_exceptions =
-        repo::recent_exceptions_for_screen(&mut conn, app_id, &q.name, since, 20).await?;
+        repo::recent_exceptions_for_screen(&mut conn, scope, &q.name, since, 20).await?;
     Ok(Json(ScreenDetail {
         stats,
         recent_events,

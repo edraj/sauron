@@ -1,10 +1,10 @@
 /**
- * Thin wrapper around `@sauron/browser` that ties the SDK to the reactive
+ * Thin wrapper around `@edraj/sauron-browser` that ties the SDK to the reactive
  * config/status stores. `connect()` (re)initializes the SDK from the current
  * config — used both on first mount and whenever the user edits the DSN and
  * clicks "Init / Reconnect".
  */
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 import { activity, config, initStatus } from './store.svelte';
 import type { ShowcaseSink } from './showcase';
 import type { SeedingSink } from './seeding';
@@ -35,7 +35,7 @@ export function captureExampleError(): void {
 }
 
 /**
- * A {@link ShowcaseSink} backed by the live `@sauron/browser` client. The
+ * A {@link ShowcaseSink} backed by the live `@edraj/sauron-browser` client. The
  * cohort simulator switches identities through `setUser` (not `identify`) so
  * each synthetic user's events keep their own `distinct_id` — real funnel
  * drop-off, no person-aliasing.
@@ -62,7 +62,7 @@ export function sauronSink(): ShowcaseSink {
 }
 
 /**
- * A {@link SeedingSink} backed by the live `@sauron/browser` client. Errors and
+ * A {@link SeedingSink} backed by the live `@edraj/sauron-browser` client. Errors and
  * events are the focus, so this sink additionally drives per-signal **tags**
  * (lifted onto errors) and the **breadcrumb** trail via the client's `Scope` —
  * exactly where the SDK reads them from at capture time.
@@ -132,7 +132,6 @@ export async function connect(): Promise<void> {
 
     Sauron.init({
       dsn,
-      environment: config.environment.trim() || 'demo',
       release: config.release.trim() || undefined,
       // Flush a little more eagerly than the 5s default so freshly-clicked
       // actions show up in the dashboard within a couple of seconds.
@@ -151,8 +150,7 @@ export async function connect(): Promise<void> {
     activity.push(
       'system',
       'Sauron.init()',
-      `env=${config.environment.trim() || 'demo'}` +
-        (config.release.trim() ? ` · release=${config.release.trim()}` : ''),
+      config.release.trim() ? `release=${config.release.trim()}` : 'no release set',
     );
 
     // v0.2.0 screen API — declare the initial screen right after init. This

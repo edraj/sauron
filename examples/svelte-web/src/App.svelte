@@ -39,7 +39,7 @@
   <section class="actions-section">
     <div class="section-head">
       <h2>Trigger the SDK</h2>
-      <p>Each button makes a real call into <code>@sauron/browser</code>. Initialize first, then fire away.</p>
+      <p>Each button makes a real call into <code>@edraj/sauron-browser</code>. Initialize first, then fire away.</p>
     </div>
     <div class="grid" class:locked={!ready}>
       {#each actions as action (action.id)}

@@ -123,6 +123,9 @@
   // doesn't fire per keystroke.
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
     const days = sinceDays;
@@ -137,6 +140,9 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const days = sinceDays;
     if (aid) {
       void loadStats(aid, days);

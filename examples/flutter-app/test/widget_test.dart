@@ -12,7 +12,6 @@ import 'package:sauron_flutter_demo/main.dart';
 void main() {
   const DemoConfig config = DemoConfig(
     dsn: kDefaultDsn,
-    environment: kDefaultEnvironment,
     release: kDefaultRelease,
     distinctId: kDefaultDistinctId,
   );

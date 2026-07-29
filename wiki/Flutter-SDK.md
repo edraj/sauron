@@ -37,17 +37,19 @@ import 'package:sauron_flutter/sauron_flutter.dart';
 
 ## Init
 
-`Sauron.init` takes a configure callback and an optional `appRunner`. When `appRunner`
+`Sauron.init` takes a `SauronOptions` and an optional `appRunner`. When `appRunner`
 is supplied, the app launches inside `runZonedGuarded` with all four capture layers
 bound inside the zone:
 
 ```dart
 Future<void> main() async {
-  await Sauron.init((o) {
-    o.dsn = 'https://<public_key>@<host>/<project_id>';
-    o.environment = 'production';
-    o.release = 'app@1.4.2+1402';
-  }, appRunner: () => runApp(const MyApp()));
+  await Sauron.init(
+    SauronOptions(
+      dsn: 'https://<public_key>@<host>/<environment_id>',
+      release: 'app@1.4.2+1402',
+    ),
+    appRunner: () => runApp(const MyApp()),
+  );
 }
 ```
 
@@ -59,7 +61,6 @@ Uncaught errors are captured automatically via the four layers bound at init.
 | Field | Type | Default |
 | --- | --- | --- |
 | `dsn` | `String?` | — (null/empty ⇒ SDK disabled, all calls no-op) |
-| `environment` | `String` | `'production'` |
 | `release` | `String?` | — |
 | `screen` | `String?` | — (seed the initial screen) |
 | `tags` | `Map<String, String>` | `{}` — default scope tags |
@@ -167,13 +168,13 @@ afterwards. `Breadcrumb.navigation`/`ui`/`log` are shorthand factories.
 change — see above). Return the item to send it, or `null` to drop it:
 
 ```dart
-await Sauron.init((o) {
-  o.dsn = dsn;
-  o.beforeSend = (item) {
+await Sauron.init(SauronOptions(
+  dsn: dsn,
+  beforeSend: (item) {
     if (item is EventItem) return null; // drop analytics events
     return item;                        // send everything else (incl. errors)
-  };
-});
+  },
+));
 ```
 
 ### Screen tracking

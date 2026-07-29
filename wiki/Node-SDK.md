@@ -1,9 +1,9 @@
-# Node SDK — `@sauron/node`
+# Node SDK — `@edraj/sauron-node`
 
 Server-side Node/TypeScript SDK (**v0.3.0**). Dispatches product-analytics events and
 captured exceptions from your Node backends over a buffered background HTTP transport
 (Node's global `fetch`). **No browser/DOM/auto-instrumentation** — for the browser use
-the **[Browser SDK](Browser-SDK.md)** (`@sauron/browser`). Source:
+the **[Browser SDK](Browser-SDK.md)** (`@edraj/sauron-browser`). Source:
 [`sdks/node`](../sdks/node). SDK header name: `sauron-node`.
 
 See also: **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
@@ -13,7 +13,7 @@ See also: **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
 ## Install
 
 ```bash
-npm install @sauron/node
+npm install @edraj/sauron-node
 ```
 
 Requires **Node >= 18** (uses the global `fetch` and `zlib`).
@@ -21,11 +21,10 @@ Requires **Node >= 18** (uses the global `fetch` and `zlib`).
 ## Init
 
 ```ts
-import { init, track, captureException, identify, flush, close } from '@sauron/node';
+import { init, track, captureException, identify, flush, close } from '@edraj/sauron-node';
 
 init({
-  dsn: 'https://<public_key>@<host>/<project_id>',
-  environment: 'production',
+  dsn: 'https://<public_key>@<host>/<environment_id>',
   release: '1.4.2',
 });
 ```
@@ -40,8 +39,7 @@ clearly-invalid DSN. `getClient()` returns the client created by the most recent
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `dsn` | `string` | *(required)* | `https://<public_key>@<host>/<project_id>` |
-| `environment` | `string` | `"production"` | |
+| `dsn` | `string` | *(required)* | `https://<public_key>@<host>/<environment_id>` |
 | `release` | `string \| null` | `null` | |
 | `sampleRate` | `number` | `1` | error sample rate in `[0,1]` |
 | `flushInterval` | `number` | `5000` | background flush interval, ms |
@@ -119,7 +117,7 @@ A single **global scope** holds process-wide user/tags/context/breadcrumbs. The
 top-level setters mutate the *active* scope (the global one outside a scoped block):
 
 ```ts
-import { setUser, setTag, setTags, setContext, setExtra } from '@sauron/node';
+import { setUser, setTag, setTags, setContext, setExtra } from '@edraj/sauron-node';
 
 setUser({ id: 'user-123', email: 'ada@example.com' }); // pass null to clear
 setTag('region', 'eu-west-1');
@@ -138,7 +136,7 @@ a callback, backed by `AsyncLocalStorage` so concurrent requests never leak stat
 each other. It returns whatever the callback returns (await it if the callback is async):
 
 ```ts
-import { withScope } from '@sauron/node';
+import { withScope } from '@edraj/sauron-node';
 
 await withScope(async (scope) => {
   scope.setUser({ id: req.userId });
@@ -155,7 +153,7 @@ mutates the active scope in place.
 ## Breadcrumbs
 
 ```ts
-import { addBreadcrumb } from '@sauron/node';
+import { addBreadcrumb } from '@edraj/sauron-node';
 
 addBreadcrumb({ category: 'db', message: 'SELECT users', level: 'info', data: { ms: 4 } });
 ```
@@ -193,7 +191,7 @@ init({
 ## Performance transactions
 
 ```ts
-import { trackTransaction } from '@sauron/node';
+import { trackTransaction } from '@edraj/sauron-node';
 
 const start = performance.now();
 // ... handle request ...
@@ -260,7 +258,7 @@ See [`examples/node-server`](../examples/node-server). Run it with:
 ```bash
 cd examples/node-server
 npm install
-SAURON_DSN="https://<public_key>@<host>/<project_id>" npm start
+SAURON_DSN="https://<public_key>@<host>/<environment_id>" npm start
 ```
 
 Typecheck against the shipped types with `npm run typecheck`. More in

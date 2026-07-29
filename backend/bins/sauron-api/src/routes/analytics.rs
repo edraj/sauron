@@ -1,7 +1,7 @@
 //! Product-analytics queries, scoped to an app: top events, time series, and
 //! the unified person profile (a person's events + errors).
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 use axum_extra::extract::Query;
 use chrono::{Duration, Utc};
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use sauron_auth::{authorize_app, perm, AuthUser};
-use sauron_db::models::{AnalyticsEvent, ErrorEvent, EventUser, Issue};
+use sauron_db::models::{AnalyticsEvent, ErrorEvent, Issue};
 use sauron_db::repo;
 use sauron_db::repo::{EventCount, PersonRow, SeriesPoint};
 
@@ -24,6 +24,12 @@ pub struct RangeQuery {
     #[serde(default = "default_top")]
     pub limit: i64,
     pub name: Option<String>,
+    // `environment_id` is deliberately NOT a field here — it is read from the
+    // raw query string via `RawQuery` + `scope::read_scope_raw` instead of
+    // this `Query<T>` extractor. See `routes::scope`'s module docs for why:
+    // an `Option<String>` field on this struct would go through
+    // `axum_extra::extract::Query` (needed for other handlers' `Vec<String>`
+    // fields), whose codec silently collapses `?environment_id=` to `None`.
 }
 
 fn default_days() -> i64 {
@@ -38,13 +44,15 @@ pub async fn top_events(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<EventCount>>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
     let limit = q.limit.clamp(1, 100);
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
-        repo::top_events(&mut conn, app_id, since, limit).await?,
+        repo::top_events(&mut conn, scope, since, limit).await?,
     ))
 }
 
@@ -53,12 +61,14 @@ pub async fn event_series(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<SeriesPoint>>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
-        repo::event_series(&mut conn, app_id, q.name.as_deref(), since).await?,
+        repo::event_series(&mut conn, scope, q.name.as_deref(), since).await?,
     ))
 }
 
@@ -66,6 +76,8 @@ pub async fn event_series(
 pub struct PersonQuery {
     #[serde(default = "default_person_limit")]
     pub limit: i64,
+    // See `RangeQuery`'s comment: `environment_id` comes from `RawQuery`, not
+    // this struct.
 }
 
 fn default_person_limit() -> i64 {
@@ -75,7 +87,10 @@ fn default_person_limit() -> i64 {
 #[derive(Serialize)]
 pub struct PersonProfile {
     pub distinct_id: String,
-    pub user: Option<EventUser>,
+    // `PersonRow`, not the raw `EventUser` model — see `repo::get_event_user`'s
+    // doc comment: `first_seen`/`last_seen` here are environment-scoped, the
+    // same fix F4 made for `list_persons`.
+    pub user: Option<PersonRow>,
     pub events: Vec<AnalyticsEvent>,
     pub errors: Vec<ErrorEvent>,
 }
@@ -85,14 +100,16 @@ pub async fn person(
     State(state): State<AppState>,
     Path((app_id, distinct_id)): Path<(Uuid, String)>,
     Query(q): Query<PersonQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<PersonProfile>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let limit = q.limit.clamp(1, 200);
 
-    let user = repo::get_event_user(&mut conn, app_id, &distinct_id).await?;
-    let events = repo::events_for_person(&mut conn, app_id, &distinct_id, limit).await?;
-    let errors = repo::error_events_for_person(&mut conn, app_id, &distinct_id, limit).await?;
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
+    let user = repo::get_event_user(&mut conn, scope, &distinct_id).await?;
+    let events = repo::events_for_person(&mut conn, scope, &distinct_id, limit).await?;
+    let errors = repo::error_events_for_person(&mut conn, scope, &distinct_id, limit).await?;
 
     Ok(Json(PersonProfile {
         distinct_id,
@@ -113,6 +130,8 @@ pub struct PersonsQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    // See `RangeQuery`'s comment: `environment_id` comes from `RawQuery`, not
+    // this struct.
 }
 
 fn default_persons_list_limit() -> i64 {
@@ -124,14 +143,16 @@ pub async fn persons_list(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<PersonsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<PersonRow>>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let search = q.search.as_deref().filter(|s| !s.is_empty());
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
         repo::list_persons(
             &mut conn,
-            app_id,
+            scope,
             search,
             q.limit.clamp(1, 200),
             super::clamp_offset(q.offset),
@@ -155,6 +176,8 @@ pub struct EventsListQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    // See `RangeQuery`'s comment: `environment_id` comes from `RawQuery`, not
+    // this struct.
 }
 
 fn default_events_list_limit() -> i64 {
@@ -169,6 +192,7 @@ pub async fn events_list(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<EventsListQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<AnalyticsEvent>>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
@@ -177,10 +201,11 @@ pub async fn events_list(
     // Free-text search scans jsonb::text, which no index can serve; keep the
     // window bounded rather than defaulting to effectively all history.
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
         repo::list_analytics_events(
             &mut conn,
-            app_id,
+            scope,
             &filters,
             search,
             Some(since),
@@ -211,16 +236,18 @@ pub async fn overview(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Overview>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
-    let totals = repo::overview_totals(&mut conn, app_id, since).await?;
-    let events_series = repo::event_series(&mut conn, app_id, None, since).await?;
-    let errors_series = repo::error_series(&mut conn, app_id, since).await?;
-    let top_issues = repo::top_issues(&mut conn, app_id, since, 5).await?;
-    let top_events = repo::top_events(&mut conn, app_id, since, 5).await?;
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
+    let totals = repo::overview_totals(&mut conn, scope, since).await?;
+    let events_series = repo::event_series(&mut conn, scope, None, since).await?;
+    let errors_series = repo::error_series(&mut conn, scope, since).await?;
+    let top_issues = repo::top_issues(&mut conn, scope, since, 5).await?;
+    let top_events = repo::top_events(&mut conn, scope, since, 5).await?;
 
     let error_rate = {
         let denom = totals.events + totals.errors;
@@ -272,13 +299,15 @@ pub async fn users_summary(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<UsersAnalytics>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
-    let stats = repo::user_stats(&mut conn, app_id, since).await?;
-    let series = repo::active_user_series(&mut conn, app_id, since).await?;
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
+    let stats = repo::user_stats(&mut conn, scope, since).await?;
+    let series = repo::active_user_series(&mut conn, scope, since).await?;
     let stickiness = stickiness(stats.dau, stats.mau);
 
     Ok(Json(UsersAnalytics {
@@ -304,14 +333,16 @@ pub async fn sessions_summary(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<SessionsAnalytics>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
-    let stats = repo::session_stats(&mut conn, app_id, since).await?;
-    let duration_series = repo::session_duration_series(&mut conn, app_id, since).await?;
-    let duration_histogram = repo::session_duration_histogram(&mut conn, app_id, since).await?;
+    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
+    let stats = repo::session_stats(&mut conn, scope, since).await?;
+    let duration_series = repo::session_duration_series(&mut conn, scope, since).await?;
+    let duration_histogram = repo::session_duration_histogram(&mut conn, scope, since).await?;
 
     Ok(Json(SessionsAnalytics {
         stats,
@@ -328,6 +359,20 @@ pub async fn sessions_summary(
 pub struct TimeseriesQuery {
     pub from: chrono::DateTime<chrono::Utc>,
     pub to: chrono::DateTime<chrono::Utc>,
+    // `environment_id` is NOT a field here, same reasoning as `RangeQuery`
+    // above — but doubly so for this struct: these three handlers must
+    // reject *any* `environment_id`, including `?environment_id=`, and
+    // `axum_extra::extract::Query` silently turning that into a missing
+    // field is exactly the bug that let it slip through as a bare
+    // `q.environment_id.is_some()` check (that check was `false` for
+    // `?environment_id=`, so the "not supported yet" 400 below never fired).
+    // Each handler instead reads `environment_id` via `RawQuery` +
+    // `scope::raw_environment_id`, then rejects it through
+    // `scope::reject_environment_id_with_message` — the same
+    // `reject_environment_id*` call every other rejecting endpoint in this
+    // crate makes, so `dashboard/src/lib/api/scope.ts`'s reconciliation grep
+    // (`grep reject_environment_id`) finds these three too, instead of an
+    // inline `.is_some()` check it cannot see.
 }
 
 /// Longest span a cross-tier timeseries may cover.
@@ -335,6 +380,12 @@ pub struct TimeseriesQuery {
 /// These endpoints route across hot Postgres and cold Parquet; an unbounded
 /// `from`/`to` lets one request scan an app's entire cold dataset.
 const MAX_TIMESERIES_DAYS: i64 = 400;
+
+/// The reason all three cross-tier timeseries handlers below reject any
+/// `environment_id` at all, named once so the three call sites can't drift
+/// apart in wording.
+const TIMESERIES_ENV_SCOPING_NOT_SUPPORTED: &str = "environment scoping is not available on \
+     cross-tier timeseries yet — cold storage is not partitioned by environment";
 
 impl TimeseriesQuery {
     /// Validate and clamp the requested window.
@@ -365,7 +416,12 @@ pub async fn error_timeseries(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<TimeseriesQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<DayCountOut>>, ApiError> {
+    super::scope::reject_environment_id_with_message(
+        super::scope::raw_environment_id(raw_query.as_deref()).as_deref(),
+        TIMESERIES_ENV_SCOPING_NOT_SUPPORTED,
+    )?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
     drop(conn); // release the pooled conn before the router checks out its own
@@ -391,7 +447,12 @@ pub async fn event_timeseries(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<TimeseriesQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<DayCountOut>>, ApiError> {
+    super::scope::reject_environment_id_with_message(
+        super::scope::raw_environment_id(raw_query.as_deref()).as_deref(),
+        TIMESERIES_ENV_SCOPING_NOT_SUPPORTED,
+    )?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     drop(conn); // release the pooled conn before the router checks out its own
@@ -419,7 +480,12 @@ pub async fn transaction_timeseries(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<TimeseriesQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<DayCountOut>>, ApiError> {
+    super::scope::reject_environment_id_with_message(
+        super::scope::raw_environment_id(raw_query.as_deref()).as_deref(),
+        TIMESERIES_ENV_SCOPING_NOT_SUPPORTED,
+    )?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     drop(conn); // release the pooled conn before the router checks out its own

@@ -30,7 +30,7 @@
       <h1>Sauron — Web SDK Demo</h1>
       <p class="sub">
         Push errors &amp; product events to a live Sauron ingest gateway with
-        <code>@sauron/browser</code>.
+        <code>@edraj/sauron-browser</code>.
       </p>
     </div>
     <span class="status {initStatus.state}" title={initStatus.message}>
@@ -49,10 +49,6 @@
         bind:value={config.dsn}
         placeholder="http://pk_...@host/project-id"
       />
-    </label>
-    <label class="field">
-      <span>Environment</span>
-      <input type="text" spellcheck="false" bind:value={config.environment} placeholder="demo" />
     </label>
     <label class="field">
       <span>Release</span>
@@ -187,7 +183,7 @@
 
   .config {
     display: grid;
-    grid-template-columns: minmax(0, 2.4fr) repeat(3, minmax(0, 1fr)) auto;
+    grid-template-columns: minmax(0, 2.4fr) repeat(2, minmax(0, 1fr)) auto;
     gap: 12px;
     align-items: end;
   }

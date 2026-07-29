@@ -201,9 +201,17 @@ async fn resolve_environments(
         return Ok(resolved);
     }
 
+    // `retired_at IS NULL` is load-bearing: (app_id, name) is only unique among
+    // LIVE environments, so retiring `staging` and creating a fresh `staging`
+    // leaves two rows with that name. Without this filter, `load()` returns both
+    // rows and whichever is last in the (unordered) result set wins in the map
+    // below, so a filter on the current `staging` could silently resolve to the
+    // retired row. The partial unique index guarantees at most one live match per
+    // name, so this is deterministic.
     let rows: Vec<(String, Uuid)> = environments::table
         .filter(environments::app_id.eq(app_id))
         .filter(environments::name.eq_any(&names))
+        .filter(environments::retired_at.is_null())
         .select((environments::name, environments::id))
         .load(conn)
         .await

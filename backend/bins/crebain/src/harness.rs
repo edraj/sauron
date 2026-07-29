@@ -153,10 +153,11 @@ async fn seed(bench_pg_url: &str, public_key: &str) -> anyhow::Result<uuid::Uuid
         let org = sauron_db::repo::create_org(&mut conn, "crebain", "crebain").await?;
         let project =
             sauron_db::repo::create_project(&mut conn, org.id, "crebain", "crebain").await?;
-        let app = sauron_db::repo::create_app(
-            &mut conn, project.id, "crebain", "crebain", "web", public_key,
-        )
-        .await?;
+        let app =
+            sauron_db::repo::create_app(&mut conn, project.id, "crebain", "crebain", "web").await?;
+        // The generator addresses the app by key, and the key now belongs to an
+        // environment rather than the app.
+        sauron_db::repo::create_environment(&mut conn, app.id, "bench", public_key, true).await?;
         app.id
     };
     // Drop the pool so no seed connection lingers to block DROP DATABASE.

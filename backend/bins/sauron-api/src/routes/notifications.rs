@@ -59,7 +59,9 @@ pub async fn list_channels(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(org_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
     authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_READ).await?;
     let rows = repo::list_channels_for_org(&mut conn, org_id).await?;
@@ -84,8 +86,13 @@ pub async fn create_channel(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(org_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<CreateChannelReq>,
 ) -> Result<Json<Value>, ApiError> {
+    // Notification channels are org-scoped, no environment dimension; rejected
+    // here too, matching `list_channels`/`get_channel` in this same file
+    // rather than silently discarding it on writes alone.
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("channel name is required".into()));
     }
@@ -149,7 +156,9 @@ pub async fn get_channel(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(channel_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (_conn, ch) =
         load_channel_authorized(&state, auth.user_id, channel_id, perm::ALERT_READ).await?;
     Ok(Json(channel_view(&ch)))
@@ -170,8 +179,10 @@ pub async fn update_channel(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(channel_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<UpdateChannelReq>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, ch) =
         load_channel_authorized(&state, auth.user_id, channel_id, perm::ALERT_WRITE).await?;
     let kind = ChannelKind::parse(&ch.kind)
@@ -242,7 +253,9 @@ pub async fn delete_channel(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(channel_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, _ch) =
         load_channel_authorized(&state, auth.user_id, channel_id, perm::ALERT_WRITE).await?;
     repo::delete_channel(&mut conn, channel_id).await?;
@@ -293,7 +306,9 @@ pub async fn list_rules(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(org_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
     authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_READ).await?;
     let rules = repo::list_alert_rules_for_org(&mut conn, org_id).await?;
@@ -391,8 +406,13 @@ pub async fn create_rule(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(org_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<CreateRuleReq>,
 ) -> Result<Json<Value>, ApiError> {
+    // Alert rules narrow by project/app, not by environment; rejected here
+    // too, matching `list_rules`/`get_rule` in this same file rather than
+    // silently discarding it on writes alone.
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("rule name is required".into()));
     }
@@ -468,7 +488,9 @@ pub async fn get_rule(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(rule_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, rule) =
         load_rule_authorized(&state, auth.user_id, rule_id, perm::ALERT_READ).await?;
     Ok(Json(rule_view(&mut conn, &rule).await?))
@@ -492,8 +514,10 @@ pub async fn update_rule(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(rule_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<UpdateRuleReq>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, rule) =
         load_rule_authorized(&state, auth.user_id, rule_id, perm::ALERT_WRITE).await?;
     let trigger = TriggerType::parse(&rule.trigger_type)
@@ -549,7 +573,9 @@ pub async fn delete_rule(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(rule_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, _rule) =
         load_rule_authorized(&state, auth.user_id, rule_id, perm::ALERT_WRITE).await?;
     repo::delete_alert_rule(&mut conn, rule_id).await?;
@@ -562,6 +588,9 @@ pub async fn delete_rule(
 pub struct HistoryQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// Alert history is org-scoped, not environment-scoped; rejected rather
+    /// than silently accepted-and-ignored.
+    pub environment_id: Option<String>,
 }
 
 pub async fn list_history(
@@ -570,6 +599,7 @@ pub async fn list_history(
     Path(org_id): Path<Uuid>,
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(q.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
     authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_READ).await?;
     let rows = repo::list_alert_events(
@@ -584,8 +614,19 @@ pub async fn list_history(
 
 /// Static metadata the rule-builder UI needs: trigger types, channel kinds,
 /// comparators, and the template variables each trigger exposes.
-pub async fn meta(_auth: AuthUser) -> Json<Value> {
-    Json(json!({
+///
+/// Takes (and rejects) `environment_id` purely for consistency with every
+/// other read in this group (`list_channels`, `list_rules`, `list_history`):
+/// this response is static enums, with no environment dimension to even
+/// silently ignore, but a caller passing the parameter here and having it
+/// vanish without complaint — while every sibling endpoint 400s — is the same
+/// "did my filter apply?" trap as the scoping bug itself.
+pub async fn meta(
+    _auth: AuthUser,
+    Query(env): Query<super::scope::RejectEnvQuery>,
+) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
+    Ok(Json(json!({
         "channel_kinds": ChannelKind::ALL.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
         "trigger_types": TriggerType::ALL.iter().map(|t| json!({
             "key": t.as_str(),
@@ -604,5 +645,5 @@ pub async fn meta(_auth: AuthUser) -> Json<Value> {
             "event_threshold": ["count", "threshold", "window_minutes", "event_name"],
             "perf_degradation": ["value_ms", "threshold_ms", "metric", "window_minutes"],
         },
-    }))
+    })))
 }

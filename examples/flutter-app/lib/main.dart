@@ -17,7 +17,6 @@ import 'showcase.dart';
 const String kDefaultDsn =
     'http://pk_8c94e744ebc5376ffd9a16049ac4147b@localhost:8081/'
     '32a7799a-2027-45bd-9d67-2c0df85656ac';
-const String kDefaultEnvironment = 'development';
 const String kDefaultRelease = 'sauron_flutter_demo@1.0.0+1';
 const String kDefaultDistinctId = 'demo_user_1';
 
@@ -30,13 +29,12 @@ Future<void> main() async {
   // uncaught-error capture layers inside the zone. Any uncaught Flutter/Dart
   // error is auto-captured from here on.
   await Sauron.init(
-    (SauronOptions o) {
-      o.dsn = config.dsn;
-      o.environment = config.environment;
-      o.release = config.release;
-      o.debug = true;
-      o.flushInterval = const Duration(seconds: 5);
-    },
+    SauronOptions(
+      dsn: config.dsn,
+      release: config.release,
+      debug: true,
+      flushInterval: const Duration(seconds: 5),
+    ),
     appRunner: () => runApp(SauronDemoApp(config: config)),
   );
 }
@@ -45,18 +43,15 @@ Future<void> main() async {
 class DemoConfig {
   const DemoConfig({
     required this.dsn,
-    required this.environment,
     required this.release,
     required this.distinctId,
   });
 
   final String dsn;
-  final String environment;
   final String release;
   final String distinctId;
 
   static const String _kDsn = 'demo.dsn';
-  static const String _kEnvironment = 'demo.environment';
   static const String _kRelease = 'demo.release';
   static const String _kDistinctId = 'demo.distinctId';
 
@@ -64,7 +59,6 @@ class DemoConfig {
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     return DemoConfig(
       dsn: prefs.getString(_kDsn) ?? kDefaultDsn,
-      environment: prefs.getString(_kEnvironment) ?? kDefaultEnvironment,
       release: prefs.getString(_kRelease) ?? kDefaultRelease,
       distinctId: prefs.getString(_kDistinctId) ?? kDefaultDistinctId,
     );
@@ -73,17 +67,14 @@ class DemoConfig {
   Future<void> save() async {
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kDsn, dsn);
-    await prefs.setString(_kEnvironment, environment);
     await prefs.setString(_kRelease, release);
     await prefs.setString(_kDistinctId, distinctId);
   }
 
-  /// True when a field that only binds at startup (DSN / environment / release)
-  /// differs, meaning a restart is required to fully re-point the SDK.
+  /// True when a field that only binds at startup (DSN / release) differs,
+  /// meaning a restart is required to fully re-point the SDK.
   bool requiresRestartVersus(DemoConfig other) =>
-      dsn != other.dsn ||
-      environment != other.environment ||
-      release != other.release;
+      dsn != other.dsn || release != other.release;
 }
 
 class SauronDemoApp extends StatelessWidget {
@@ -143,8 +134,6 @@ class _DemoHomePageState extends State<DemoHomePage> {
   late final DemoConfig _launchConfig = widget.config;
   late final TextEditingController _dsnController =
       TextEditingController(text: widget.config.dsn);
-  late final TextEditingController _environmentController =
-      TextEditingController(text: widget.config.environment);
   late final TextEditingController _releaseController =
       TextEditingController(text: widget.config.release);
   late final TextEditingController _distinctIdController =
@@ -184,7 +173,6 @@ class _DemoHomePageState extends State<DemoHomePage> {
   @override
   void dispose() {
     _dsnController.dispose();
-    _environmentController.dispose();
     _releaseController.dispose();
     _distinctIdController.dispose();
     _showcaseCountController.dispose();
@@ -202,7 +190,6 @@ class _DemoHomePageState extends State<DemoHomePage> {
   Future<void> _saveConfig() async {
     final DemoConfig next = DemoConfig(
       dsn: _dsnController.text.trim(),
-      environment: _environmentController.text.trim(),
       release: _releaseController.text.trim(),
       distinctId: _distinctIdController.text.trim(),
     );
@@ -222,8 +209,8 @@ class _DemoHomePageState extends State<DemoHomePage> {
       SnackBar(
         content: Text(
           needsRestart
-              ? 'Saved. Restart the app to apply the new DSN / environment / '
-                  'release to all capture layers.'
+              ? 'Saved. Restart the app to apply the new DSN / release to '
+                  'all capture layers.'
               : 'Saved.',
         ),
       ),
@@ -428,7 +415,6 @@ class _DemoHomePageState extends State<DemoHomePage> {
           if (_pendingRestart) const _RestartBanner(),
           _ConnectionCard(
             dsnController: _dsnController,
-            environmentController: _environmentController,
             releaseController: _releaseController,
             distinctIdController: _distinctIdController,
             resolvedEndpoint: _resolvedEndpoint,
@@ -573,7 +559,7 @@ class _RestartBanner extends StatelessWidget {
           Expanded(
             child: Text(
               'Config saved. Restart the app to apply the new DSN / '
-              'environment / release to all capture layers.',
+              'release to all capture layers.',
               style: theme.textTheme.bodyMedium?.copyWith(
                 color: theme.colorScheme.onTertiaryContainer,
               ),
@@ -588,7 +574,6 @@ class _RestartBanner extends StatelessWidget {
 class _ConnectionCard extends StatelessWidget {
   const _ConnectionCard({
     required this.dsnController,
-    required this.environmentController,
     required this.releaseController,
     required this.distinctIdController,
     required this.resolvedEndpoint,
@@ -598,7 +583,6 @@ class _ConnectionCard extends StatelessWidget {
   });
 
   final TextEditingController dsnController;
-  final TextEditingController environmentController;
   final TextEditingController releaseController;
   final TextEditingController distinctIdController;
   final String resolvedEndpoint;
@@ -634,7 +618,7 @@ class _ConnectionCard extends StatelessWidget {
               decoration: const InputDecoration(
                 labelText: 'DSN',
                 border: OutlineInputBorder(),
-                helperText: 'pk_…@host:port/project_id',
+                helperText: 'pk_…@host:port/environment_id',
               ),
             ),
             const SizedBox(height: 8),
@@ -646,28 +630,12 @@ class _ConnectionCard extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 16),
-            Row(
-              children: <Widget>[
-                Expanded(
-                  child: TextField(
-                    controller: environmentController,
-                    decoration: const InputDecoration(
-                      labelText: 'Environment',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: TextField(
-                    controller: releaseController,
-                    decoration: const InputDecoration(
-                      labelText: 'Release',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                ),
-              ],
+            TextField(
+              controller: releaseController,
+              decoration: const InputDecoration(
+                labelText: 'Release',
+                border: OutlineInputBorder(),
+              ),
             ),
             const SizedBox(height: 16),
             TextField(

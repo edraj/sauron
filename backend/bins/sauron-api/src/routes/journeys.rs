@@ -21,6 +21,7 @@ pub struct JourneyQuery {
     pub since_days: i64,
     #[serde(default = "default_depth")]
     pub depth: i64,
+    pub environment_id: Option<String>,
 }
 
 fn default_days() -> i64 {
@@ -50,7 +51,8 @@ pub async fn explore(
 
     // One query for both halves of the graph: the step-indexed window CTE is
     // the expensive part and was previously evaluated once per result set.
-    let (nodes, links) = repo::journey_graph(&mut conn, app_id, since, depth).await?;
+    let scope = super::scope::read_scope(app_id, q.environment_id.as_deref())?;
+    let (nodes, links) = repo::journey_graph(&mut conn, scope, since, depth).await?;
 
     Ok(Json(Journey {
         depth,

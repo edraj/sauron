@@ -26,6 +26,7 @@ pub struct ListQuery {
     pub offset: i64,
     pub distinct_id: Option<String>,
     pub device_key: Option<String>,
+    pub environment_id: Option<String>,
 }
 
 fn default_days() -> i64 {
@@ -45,10 +46,11 @@ pub async fn list(
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
     let limit = q.limit.clamp(1, 200);
+    let scope = super::scope::read_scope(app_id, q.environment_id.as_deref())?;
     Ok(Json(
         repo::list_sessions(
             &mut conn,
-            app_id,
+            scope,
             since,
             limit,
             super::clamp_offset(q.offset),
@@ -96,21 +98,29 @@ pub struct SessionDetail {
     pub timeline: Vec<TimelineItem>,
 }
 
+#[derive(Deserialize)]
+pub struct DetailQuery {
+    pub environment_id: Option<String>,
+}
+
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
     Path((app_id, session_id)): Path<(Uuid, String)>,
+    Query(q): Query<DetailQuery>,
 ) -> Result<Json<SessionDetail>, ApiError> {
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
 
-    let session = repo::get_session(&mut conn, app_id, &session_id)
+    let scope = super::scope::read_scope(app_id, q.environment_id.as_deref())?;
+
+    let session = repo::get_session(&mut conn, scope, &session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let events = repo::events_for_session(&mut conn, app_id, &session_id, 500).await?;
-    let errors = repo::errors_for_session(&mut conn, app_id, &session_id, 500).await?;
-    let txns = repo::transactions_for_session(&mut conn, app_id, &session_id, 500).await?;
+    let events = repo::events_for_session(&mut conn, scope, &session_id, 500).await?;
+    let errors = repo::errors_for_session(&mut conn, scope, &session_id, 500).await?;
+    let txns = repo::transactions_for_session(&mut conn, scope, &session_id, 500).await?;
 
     let mut timeline: Vec<TimelineItem> =
         Vec::with_capacity(events.len() + errors.len() + txns.len());

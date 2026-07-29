@@ -19,9 +19,27 @@
   const appItems = $derived(
     sessionStore.apps.map((a) => ({ id: a.id, name: a.name, icon: appTypeIcon(a.app_type) })),
   );
+  // `''` means "all environments" and `'none'` means "unattributed" — both
+  // pseudo-entries bracket the live list. `currentEnvId` is `null` for "all",
+  // so the trigger's `currentId` below maps that back to `''` to match.
+  const envItems = $derived([
+    { id: '', name: 'All environments' },
+    ...sessionStore.environments.map((e) => ({ id: e.id, name: e.name })),
+    { id: 'none', name: 'Unattributed' },
+  ]);
 
   // The current app's icon (falls back to a generic glyph before apps resolve).
   const currentAppIcon = $derived(appTypeIcon(sessionStore.currentApp?.app_type ?? ''));
+
+  // `removeApp` clears `environments` synchronously without reloading the
+  // replacement app's list (see session.svelte.ts), and `setApp`'s same-id
+  // no-op guard means `setApp(currentAppId)` can't force one either — so an
+  // app selected with no environments loaded yet needs an explicit nudge.
+  $effect(() => {
+    if (sessionStore.currentAppId && sessionStore.environments.length === 0) {
+      void sessionStore.ensureEnvironmentsLoaded();
+    }
+  });
 
   // "+ New …" affordances mirror the Projects page, where creation actually happens.
   const canCreateProject = $derived(sessionStore.can('project:create'));
@@ -44,15 +62,17 @@
     <!-- Project switcher -->
     {#if projectItems.length > 0}
       <span class="sep" aria-hidden="true">/</span>
-      <SwitcherMenu
-        label="Project"
-        items={projectItems}
-        currentId={sessionStore.currentProjectId}
-        onSelect={(id) => void sessionStore.setProject(id)}
-        createLabel={canCreateProject ? 'New project' : undefined}
-        onCreate={canCreateProject ? () => push('/projects') : undefined}
-        ariaLabel="Switch project"
-      />
+      <div class="project-switcher">
+        <SwitcherMenu
+          label="Project"
+          items={projectItems}
+          currentId={sessionStore.currentProjectId}
+          onSelect={(id) => void sessionStore.setProject(id)}
+          createLabel={canCreateProject ? 'New project' : undefined}
+          onCreate={canCreateProject ? () => push('/projects') : undefined}
+          ariaLabel="Switch project"
+        />
+      </div>
     {/if}
 
     <!-- App switcher -->
@@ -62,10 +82,24 @@
         triggerIcon={currentAppIcon}
         items={appItems}
         currentId={sessionStore.currentAppId}
-        onSelect={(id) => sessionStore.setApp(id)}
+        onSelect={(id) => void sessionStore.setApp(id)}
         createLabel={canCreateApp ? 'New app' : undefined}
         onCreate={canCreateApp ? () => push('/projects') : undefined}
         ariaLabel="Switch app"
+      />
+    {/if}
+
+    <!-- Environment switcher — app and environment are what change the
+         meaning of the data on screen, so this stays visible (with its name)
+         at widths where the project switcher's name gets dropped instead. -->
+    {#if sessionStore.currentAppId}
+      <span class="sep" aria-hidden="true">/</span>
+      <SwitcherMenu
+        label="Env"
+        items={envItems}
+        currentId={sessionStore.currentEnvId ?? ''}
+        onSelect={(id) => void sessionStore.setEnvironment(id === '' ? null : id)}
+        ariaLabel="Switch environment"
       />
     {/if}
   </div>
@@ -198,6 +232,14 @@
     }
     .topbar {
       padding: 0 14px;
+    }
+    /* App and environment are what change the meaning of the data on
+       screen; project is navigational. When the four triggers no longer
+       fit, drop the project switcher's name first (its "Project" label
+       chip is already gone below 860px via SwitcherMenu's own rule), not
+       the app's or environment's. */
+    .project-switcher :global(.name) {
+      display: none;
     }
   }
 </style>

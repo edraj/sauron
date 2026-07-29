@@ -7,7 +7,7 @@ using Sauron;
 // is unset (or the DSN is invalid) the SDK runs in no-op mode, so this program
 // stays runnable — and exits 0 — even without a live ingest gateway.
 //
-//   export SAURON_DSN="https://<public_key>@<host>/<project_id>"
+//   export SAURON_DSN="https://<public_key>@<host>/<environment_id>"
 //   dotnet run
 
 var dsn = Environment.GetEnvironmentVariable("SAURON_DSN");
@@ -17,14 +17,13 @@ if (string.IsNullOrWhiteSpace(dsn))
     Console.Error.WriteLine(
         "SAURON_DSN is not set — the SDK will run in no-op mode. " +
         "Set it to dispatch to a live ingest gateway, e.g.:\n" +
-        "  export SAURON_DSN=\"https://<public_key>@<host>/<project_id>\"");
+        "  export SAURON_DSN=\"https://<public_key>@<host>/<environment_id>\"");
 }
 
 // 1. Initialize the process-wide client once at startup.
 SauronSdk.Init(new SauronOptions
 {
     Dsn = dsn ?? string.Empty,
-    Environment = "development",
     Release = "csharp-server-example@0.3.0",
     Debug = true,
 });

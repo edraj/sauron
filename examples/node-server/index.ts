@@ -1,5 +1,5 @@
 /**
- * Minimal server-side example for the @sauron/node SDK (v0.3.0).
+ * Minimal server-side example for the @edraj/sauron-node SDK (v0.3.0).
  *
  * Demonstrates the per-request pattern the 0.3.0 surface unlocks:
  *   - withScope()      — an isolated scope per request; a user + tag set inside
@@ -12,7 +12,7 @@
  * The DSN comes from SAURON_DSN. With it unset the client is never initialized,
  * every dispatch call is a no-op, and the process still exits 0 (disabled mode).
  *
- *   SAURON_DSN="https://<public_key>@<host>/<project_id>" npm start
+ *   SAURON_DSN="https://<public_key>@<host>/<environment_id>" npm start
  */
 import {
   init,
@@ -26,7 +26,7 @@ import {
   setTag,
   flush,
   close,
-} from '@sauron/node';
+} from '@edraj/sauron-node';
 
 const dsn = process.env.SAURON_DSN;
 const distinctId = 'user-42';
@@ -64,7 +64,6 @@ async function main(): Promise<void> {
     // Initialize the global client. Throws a typed DsnError on a bad DSN.
     init({
       dsn,
-      environment: process.env.NODE_ENV ?? 'development',
       release: process.env.SAURON_RELEASE ?? '1.0.0',
     });
   } else {

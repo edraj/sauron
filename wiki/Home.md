@@ -12,14 +12,21 @@ the analytics.
 ```
 Organization
   └─ Project        (grouping / product)
-       └─ App       (app_type + its own DSN — the ingest unit)
-            └─ Environments, Issues, Events, Sessions, People, Screens, Transactions
+       └─ App       (app_type)
+            ├─ Environments   (each with its own DSN — the ingest unit; every app
+            │                  starts with one, `dev`, marked default)
+            └─ Issues, Events, Sessions, People, Screens, Transactions
 ```
 
 - An **Organization** owns projects and members.
 - A **Project** groups related apps (one product can hold many heterogeneous apps).
-- An **App** is the ingest unit. Each app has an `app_type` and its own **DSN**. Signals
-  are keyed by `app_id`.
+- An **App** has an `app_type` and one or more **Environments** (e.g. `dev`,
+  `staging`, `production`); every app starts with one, `dev`, marked default. Signals
+  are keyed by `app_id`, and each carries the `environment_id` of the key it arrived
+  with.
+- An **Environment** is the ingest unit: it owns the DSN, found under
+  **Settings → Environments**. The environment an event belongs to is proven by the
+  ingest key it arrived with, so it cannot be spoofed by a client.
 - **Signals** are the things SDKs emit: **errors** (grouped into issues), **events**
   (product analytics), **identify** calls (people/traits), **transactions**
   (performance), and **breadcrumb batches**.
@@ -32,10 +39,10 @@ scope and resolved as a union down the tree.
 
 ## Pages
 
-- **[Getting Started](Getting-Started.md)** — create an app, get its DSN, pick an app
-  type, send your first event.
+- **[Getting Started](Getting-Started.md)** — create an app, get its default
+  environment's DSN, pick an app type, send your first event.
 - **[Ingest Wire Contract](Ingest-Wire-Contract.md)** — the DSN format, the
-  `POST /api/{project_id}/envelope` endpoint, the `X-Sauron-Key` header, and every
+  `POST /api/{environment_id}/envelope` endpoint, the `X-Sauron-Key` header, and every
   envelope / item JSON shape. This is what all SDKs emit.
 - **[Architecture](Architecture.md)** — how it works under the hood: the
   ingest pipeline, error grouping & symbolication, the SQL behind the analytics, data
@@ -46,12 +53,12 @@ scope and resolved as a union down the tree.
 
 ### SDKs
 
-- **[Browser SDK](Browser-SDK.md)** — `@sauron/browser` (client, errors + analytics +
+- **[Browser SDK](Browser-SDK.md)** — `@edraj/sauron-browser` (client, errors + analytics +
   performance + screens + breadcrumbs).
 - **[Flutter SDK](Flutter-SDK.md)** — `sauron_flutter` (client, four uncaught-error
   layers + analytics + screens).
 - **[Python SDK](Python-SDK.md)** — `sauron-sdk` (server-side dispatch).
-- **[Node SDK](Node-SDK.md)** — `@sauron/node` (server-side dispatch).
+- **[Node SDK](Node-SDK.md)** — `@edraj/sauron-node` (server-side dispatch).
 - **[C# SDK](CSharp-SDK.md)** — `Sauron` / `sauron-dotnet` (server-side dispatch).
 
 ### Guides

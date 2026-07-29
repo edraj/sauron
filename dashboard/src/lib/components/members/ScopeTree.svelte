@@ -1,10 +1,9 @@
 <script lang="ts">
   import Icon from '../ui/Icon.svelte';
   import {
-    isEmptySelection,
+    describeSelection,
     isImpliedByAncestor,
     projectCheckState,
-    selectionToScopes,
     type ScopeSelection,
   } from '../../models/scope-tree';
 
@@ -37,17 +36,7 @@
     return map;
   });
 
-  const summary = $derived.by(() => {
-    if (isEmptySelection(value)) return 'Nothing selected yet.';
-    if (value.org) return `Full access to ${orgName}`;
-    const scopes = selectionToScopes(value, orgId, projectOfApp);
-    const projectCount = scopes.filter((s) => s.scope_type === 'project').length;
-    const appCount = scopes.length - projectCount;
-    const parts: string[] = [];
-    if (projectCount) parts.push(`${projectCount} project${projectCount === 1 ? '' : 's'}`);
-    if (appCount) parts.push(`${appCount} app${appCount === 1 ? '' : 's'}`);
-    return parts.join(', ');
-  });
+  const summary = $derived(describeSelection(value, orgId, orgName, projectOfApp));
 
   function appsOf(projectId: string) {
     return appsByProject[projectId] ?? [];

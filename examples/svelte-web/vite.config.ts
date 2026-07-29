@@ -18,6 +18,6 @@ export default defineConfig({
   // methods). Excluding it makes Vite serve the freshly-built ESM directly so
   // the example always reflects the current SDK build.
   optimizeDeps: {
-    exclude: ['@sauron/browser'],
+    exclude: ['@edraj/sauron-browser'],
   },
 });

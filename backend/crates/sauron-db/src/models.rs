@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -124,7 +124,6 @@ pub struct App {
     pub name: String,
     pub slug: String,
     pub platform: Option<String>,
-    pub public_key: String,
     pub ingest_enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -139,7 +138,6 @@ pub struct NewApp<'a> {
     pub name: &'a str,
     pub slug: &'a str,
     pub app_type: &'a str,
-    pub public_key: &'a str,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]
@@ -150,6 +148,11 @@ pub struct Environment {
     pub app_id: Uuid,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    pub public_key: String,
+    pub ingest_enabled: bool,
+    pub is_default: bool,
+    pub retired_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Insertable)]
@@ -157,6 +160,20 @@ pub struct Environment {
 pub struct NewEnvironment<'a> {
     pub app_id: Uuid,
     pub name: &'a str,
+    pub public_key: &'a str,
+    pub is_default: bool,
+}
+
+/// Everything the ingest edge needs after presenting a key: the environment it
+/// belongs to, its ancestry, and both ingest switches. Cached in Redis as JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvRef {
+    pub env_id: Uuid,
+    pub app_id: Uuid,
+    pub project_id: Uuid,
+    pub org_id: Uuid,
+    pub env_ingest_enabled: bool,
+    pub app_ingest_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------

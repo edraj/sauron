@@ -1,6 +1,6 @@
 <script lang="ts">
   import { runSeeding, PRESETS, type PresetKey, type SeedProgress, type SeedSummary } from '../seeding';
-  import type { Level } from '@sauron/browser';
+  import type { Level } from '@edraj/sauron-browser';
   import { seedingSink, captureExampleError } from '../sauron';
   import { activity } from '../store.svelte';
 

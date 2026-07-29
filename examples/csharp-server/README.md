@@ -14,7 +14,7 @@ so no NuGet package install is required.
 The app reads its ingest DSN from the `SAURON_DSN` environment variable:
 
 ```bash
-export SAURON_DSN="https://<public_key>@<host>/<project_id>"
+export SAURON_DSN="https://<public_key>@<host>/<environment_id>"
 cd examples/csharp-server
 dotnet run
 ```
@@ -34,7 +34,7 @@ dotnet build
 
 The static `SauronSdk` facade (namespace `Sauron`) wraps a single process-wide client:
 
-- `SauronSdk.Init(new SauronOptions { Dsn = ..., Environment = ..., Release = ... })` — initialize once at startup.
+- `SauronSdk.Init(new SauronOptions { Dsn = ..., Release = ... })` — initialize once at startup.
 - `SauronSdk.SetTag(key, value)` / `SauronSdk.SetUser(user)` — set defaults on the active scope (the global scope when none is pushed).
 - `SauronSdk.Identify(distinctId, traits)` — attach traits to a user.
 - `using (SauronSdk.PushScope()) { ... }` — open an isolated per-request scope. User and tags set inside ride along on anything captured in the block, and are torn down on dispose so they never leak into other requests.

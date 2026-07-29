@@ -1,0 +1,4524 @@
+mod common;
+
+use chrono::{Duration, Utc};
+use common::{count_in_env, count_rows, distinct_envs_for_identity, far_past, TestDb};
+use diesel::prelude::*;
+use diesel::sql_types::{BigInt, Uuid as SqlUuid};
+use diesel_async::RunQueryDsl;
+use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewTransaction};
+use sauron_db::scope::{EnvFilter, ReadScope};
+use serde_json::json;
+use uuid::Uuid;
+
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+/// The harness itself works: it can reach a database, seed two environments,
+/// and read back exactly what it wrote. Everything else in this file depends on
+/// this being true, so it is asserted first and separately.
+#[tokio::test]
+async fn harness_seeds_two_isolated_environments() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    assert_ne!(ids.env_a, ids.env_b);
+
+    let mut conn = db.conn().await;
+
+    // The asymmetric, per-table-distinct seed counts are the whole point of
+    // this harness: identical tuples across tables would let a swapped
+    // sub-select or an off-by-one environment filter pass every later task's
+    // tests silently. See the doc comment on `SeedIds` for why each table's
+    // tuple is different from the others.
+    for (table, a, b, none) in [
+        ("analytics_events", 5, 5, 1),
+        ("error_events", 4, 2, 1),
+        ("sessions", 3, 3, 1),
+        ("transactions", 5, 2, 1),
+    ] {
+        assert_eq!(
+            count_in_env(&mut conn, table, ids.app_id, Some(ids.env_a)).await,
+            a,
+            "{table}: expected {a} rows in env_a"
+        );
+        assert_eq!(
+            count_in_env(&mut conn, table, ids.app_id, Some(ids.env_b)).await,
+            b,
+            "{table}: expected {b} rows in env_b"
+        );
+        assert_eq!(
+            count_in_env(&mut conn, table, ids.app_id, None).await,
+            none,
+            "{table}: expected {none} row(s) with environment_id NULL"
+        );
+    }
+
+    // `issue_id` spans all three buckets: 4 of env_a's error_events, 1 of
+    // env_b's 2, and the 1 unattributed row — 6 total, matching its stored
+    // `times_seen`. `issue_env_b_only` is the other row in env_b — 1 total,
+    // confined to env_b alone. Task 9's membership bug (a `LEFT JOIN LATERAL`
+    // instead of an inner join/`EXISTS`) is invisible unless a second issue
+    // that must NOT appear under `One(env_a)` actually exists.
+    let issue_id_count: CountRow =
+        diesel::sql_query("SELECT count(*)::bigint AS n FROM error_events WHERE issue_id = $1")
+            .bind::<SqlUuid, _>(ids.issue_id)
+            .get_result(&mut conn)
+            .await
+            .expect("count error events for issue_id");
+    assert_eq!(
+        issue_id_count.n, 6,
+        "issue_id should have 6 error_events (matches its times_seen)"
+    );
+
+    let issue_env_b_only_count: CountRow =
+        diesel::sql_query("SELECT count(*)::bigint AS n FROM error_events WHERE issue_id = $1")
+            .bind::<SqlUuid, _>(ids.issue_env_b_only)
+            .get_result(&mut conn)
+            .await
+            .expect("count error events for issue_env_b_only");
+    assert_eq!(
+        issue_env_b_only_count.n, 1,
+        "issue_env_b_only should have exactly 1 error event"
+    );
+
+    let issue_env_b_only_outside_b: CountRow = diesel::sql_query(
+        "SELECT count(*)::bigint AS n FROM error_events \
+         WHERE issue_id = $1 AND (environment_id IS DISTINCT FROM $2)",
+    )
+    .bind::<SqlUuid, _>(ids.issue_env_b_only)
+    .bind::<SqlUuid, _>(ids.env_b)
+    .get_result(&mut conn)
+    .await
+    .expect("count issue_env_b_only rows outside env_b");
+    assert_eq!(
+        issue_env_b_only_outside_b.n, 0,
+        "issue_env_b_only must never appear in env_a or unattributed"
+    );
+
+    // These three guard the fixture six later tasks depend on. Without them a refactor
+    // of `note_identity` could silently empty event_users/devices, and every Task 8
+    // assertion would revert to `0 == 0` — passing identically for correct code and for
+    // a read with no environment filter at all.
+    //
+    // 8, not 7: a Task 8 review round added `session_only_distinct_id`/
+    // `session_only_device_key` — see `SeedIds`'s doc comment — to close a gap
+    // where no identity qualified for an environment solely via `sessions`.
+    assert_eq!(count_rows(&mut conn, "event_users", ids.app_id).await, 8);
+    assert_eq!(count_rows(&mut conn, "devices", ids.app_id).await, 8);
+    // The load-bearing one: the shared identity must really appear in BOTH environments.
+    assert_eq!(
+        distinct_envs_for_identity(&mut conn, ids.app_id, &ids.shared_distinct_id).await,
+        2,
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `list_sessions` (a boxed-diesel read) must honor `ReadScope` for every one
+/// of the four cases: a single environment, the other single environment,
+/// the unattributed bucket, and `All`. `sessions` is seeded 3/3/1 (see the
+/// `SeedIds` doc comment) — `env_a` and `env_b` hold the SAME count, so a
+/// length-only assertion could not tell a correct filter from a swapped one;
+/// every branch below also asserts `environment_id` on each returned row.
+#[tokio::test]
+async fn list_sessions_returns_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::list_sessions(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        100,
+        0,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.len(), 3, "env_a was seeded with 3 sessions");
+    assert!(a.iter().all(|s| s.environment_id == Some(ids.env_a)));
+
+    let b = sauron_db::repo::list_sessions(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+        100,
+        0,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.len(), 3, "env_b was seeded with 3 sessions");
+    assert!(b.iter().all(|s| s.environment_id == Some(ids.env_b)));
+
+    let none = sauron_db::repo::list_sessions(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        100,
+        0,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.len(), 1);
+    assert!(none.iter().all(|s| s.environment_id.is_none()));
+
+    let all = sauron_db::repo::list_sessions(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+        100,
+        0,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        all.len(),
+        7,
+        "All must equal the sum of the parts, including unattributed"
+    );
+
+    // NOTE: sessions are seeded 3/3/1, so env_a and env_b have the SAME count. A test that
+    // asserts only lengths cannot tell a swapped filter from a correct one here — assert on
+    // `environment_id` per row (as above) or on `avg_session_ms`, which differs by design.
+    // The per-table counts are deliberately NOT uniform; see the `SeedIds` doc comment for
+    // the authoritative table.
+
+    // `conn` holds the pool's only connection (`TestDb`'s pool is size 1) — it must be
+    // dropped before `cleanup()`, which needs its own connection to run the DELETE, or the
+    // checkout deadlocks until the 5s pool-wait timeout (see `harness_seeds_two_isolated_environments`).
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Seeds one child row of each kind (`analytics_events`/`error_events`/`transactions`)
+/// sharing `session_id`, tagged `env`. Helper for
+/// `session_detail_reads_are_scoped_independently_of_the_sessions_own_label` only.
+#[allow(clippy::too_many_arguments)]
+async fn seed_cross_env_session_child_rows(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    env: Uuid,
+    issue_id: Uuid,
+    session_id: &str,
+    distinct_id: &str,
+    device_key: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    sauron_db::repo::insert_analytics_event(
+        conn,
+        NewAnalyticsEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: Some(env),
+            name: "cross.flip".to_string(),
+            distinct_id: distinct_id.to_string(),
+            properties: json!({}),
+            context: json!({}),
+            session_id: Some(session_id.to_string()),
+            release: None,
+            ip_address: None,
+            occurred_at: at,
+            device_key: Some(device_key.to_string()),
+            screen: None,
+            tags: json!({}),
+            contexts: json!({}),
+            extra: json!({}),
+        },
+    )
+    .await
+    .expect("insert cross-env analytics event");
+
+    sauron_db::repo::insert_error_event(
+        conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: Some(env),
+            issue_id,
+            fingerprint: "harness-fingerprint".to_string(),
+            level: "error".into(),
+            message: format!("cross flip error {}", Uuid::new_v4().simple()),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some(distinct_id.to_string()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: at,
+            session_id: Some(session_id.to_string()),
+            device_key: Some(device_key.to_string()),
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert cross-env error event");
+
+    sauron_db::repo::insert_transaction(
+        conn,
+        NewTransaction {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: Some(env),
+            name: "cross.flip".into(),
+            op: "test".into(),
+            duration_ms: 1.0,
+            status: None,
+            http_method: None,
+            http_status: None,
+            url: None,
+            distinct_id: None,
+            session_id: Some(session_id.to_string()),
+            device_key: None,
+            release: None,
+            ip_address: None,
+            occurred_at: at,
+        },
+    )
+    .await
+    .expect("insert cross-env transaction");
+}
+
+/// The review that added `ReadScope` to `get_session`/`events_for_session`/
+/// `errors_for_session`/`transactions_for_session` found the schema does not support Task 6's
+/// "a session belongs to one environment so its children are already disambiguated" reasoning:
+/// only `sessions` has `UNIQUE (app_id, session_id)`; the three child tables' `session_id` is
+/// nullable free text with no uniqueness and no environment linkage, and `bump_session`'s
+/// `environment_id = COALESCE(EXCLUDED.environment_id, sessions.environment_id)` lets the most
+/// recent non-null write flip a session's own label while its already-written children stay put
+/// — the shape a device repointed from staging to prod without a fresh session id produces.
+///
+/// This seeds exactly that: one session bumped first with `env_a`, then again with `env_b` (so
+/// its *current* label is `env_b`, even though it started in `env_a`), plus one child row of
+/// each kind tagged `env_a` and one tagged `env_b`, all sharing the same `session_id`.
+#[tokio::test]
+async fn session_detail_reads_are_scoped_independently_of_the_sessions_own_label() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let session_id = format!("cross-env-flip-{}", Uuid::new_v4().simple());
+    let t0 = far_past() + Duration::days(1);
+    let t1 = t0 + Duration::seconds(60);
+
+    // First bump labels the session env_a; the second, later bump relabels it env_b via
+    // `bump_session`'s COALESCE — the session's row is env_b now, though it started in env_a.
+    sauron_db::repo::bump_session(
+        &mut conn,
+        ids.app_id,
+        &session_id,
+        Some("cross-flip-user"),
+        Some("cross-flip-device"),
+        t0,
+        &json!({}),
+        None,
+        Some(ids.env_a),
+        None,
+        1,
+        0,
+    )
+    .await
+    .expect("bump session into env_a");
+    sauron_db::repo::bump_session(
+        &mut conn,
+        ids.app_id,
+        &session_id,
+        None,
+        None,
+        t1,
+        &json!({}),
+        None,
+        Some(ids.env_b),
+        None,
+        1,
+        0,
+    )
+    .await
+    .expect("bump session into env_b");
+
+    seed_cross_env_session_child_rows(
+        &mut conn,
+        ids.app_id,
+        ids.env_a,
+        ids.issue_id,
+        &session_id,
+        "cross-flip-user",
+        "cross-flip-device",
+        t0,
+    )
+    .await;
+    seed_cross_env_session_child_rows(
+        &mut conn,
+        ids.app_id,
+        ids.env_b,
+        ids.issue_id,
+        &session_id,
+        "cross-flip-user",
+        "cross-flip-device",
+        t1,
+    )
+    .await;
+
+    // -- get_session: fails narrow, does not fall back to any child's environment ----------
+    let by_b = sauron_db::repo::get_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &session_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        by_b.map(|s| s.environment_id),
+        Some(Some(ids.env_b)),
+        "the session's CURRENT label is env_b — the later bump wins"
+    );
+
+    let by_a = sauron_db::repo::get_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &session_id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_a.is_none(),
+        "the session's label is env_b now, even though it started in env_a and has an \
+         env_a-tagged child — env_a scope must not see it (fail narrow -> 404, not fall back)"
+    );
+
+    let by_none = sauron_db::repo::get_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        &session_id,
+    )
+    .await
+    .unwrap();
+    assert!(by_none.is_none());
+
+    let by_all = sauron_db::repo::get_session(&mut conn, ReadScope::all(ids.app_id), &session_id)
+        .await
+        .unwrap();
+    assert!(by_all.is_some());
+
+    // -- children: scoped on their OWN environment_id, independent of the session's label ---
+    let events_a = sauron_db::repo::events_for_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &session_id,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        events_a.len(),
+        1,
+        "env_a scope returns the env_a-tagged child even though the session's own current \
+         label is env_b — proves the filter is not inherited from the session row"
+    );
+    assert_eq!(events_a[0].environment_id, Some(ids.env_a));
+
+    let events_b = sauron_db::repo::events_for_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &session_id,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(events_b.len(), 1);
+    assert_eq!(events_b[0].environment_id, Some(ids.env_b));
+
+    let events_all =
+        sauron_db::repo::events_for_session(&mut conn, ReadScope::all(ids.app_id), &session_id, 10)
+            .await
+            .unwrap();
+    assert_eq!(events_all.len(), 2, "All must equal the sum of the parts");
+
+    let errors_a = sauron_db::repo::errors_for_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &session_id,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(errors_a.len(), 1);
+    assert_eq!(errors_a[0].environment_id, Some(ids.env_a));
+
+    let errors_b = sauron_db::repo::errors_for_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &session_id,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(errors_b.len(), 1);
+    assert_eq!(errors_b[0].environment_id, Some(ids.env_b));
+
+    let errors_all =
+        sauron_db::repo::errors_for_session(&mut conn, ReadScope::all(ids.app_id), &session_id, 10)
+            .await
+            .unwrap();
+    assert_eq!(errors_all.len(), 2);
+
+    let txns_a = sauron_db::repo::transactions_for_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &session_id,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(txns_a.len(), 1);
+    assert_eq!(txns_a[0].environment_id, Some(ids.env_a));
+
+    let txns_b = sauron_db::repo::transactions_for_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &session_id,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(txns_b.len(), 1);
+    assert_eq!(txns_b[0].environment_id, Some(ids.env_b));
+
+    let txns_all = sauron_db::repo::transactions_for_session(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &session_id,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(txns_all.len(), 2);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `list_analytics_events` (the other boxed-diesel read this task threads
+/// `ReadScope` through) must honor all four cases too.
+///
+/// The raw `analytics_events` table is seeded 5/5/1 (see the `SeedIds` doc
+/// comment) — but `list_analytics_events` itself excludes synthetic
+/// `name = '$screen'` rows (those belong to the Screens section, not the
+/// event stream), and the seed's `'$screen'` rows are NOT split evenly: one
+/// in `env_a` (of its 5) and two in `env_b` (of its 5). So what this
+/// function returns is 4 / 3 / 1 / 8, not 5 / 5 / 1 / 11 — the `$screen`
+/// exclusion already makes `env_a` and `env_b`'s lengths differ, but every
+/// row is still checked for `environment_id` too, both for defense in depth
+/// and because the underlying table counts (5/5) are the ones that are
+/// actually equal.
+#[tokio::test]
+async fn list_analytics_events_returns_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::list_analytics_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &[],
+        None,
+        Some(far_past()),
+        100,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        a.len(),
+        4,
+        "env_a was seeded with 5 analytics events, 1 of them '$screen' (excluded)"
+    );
+    assert!(a.iter().all(|e| e.environment_id == Some(ids.env_a)));
+
+    let b = sauron_db::repo::list_analytics_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &[],
+        None,
+        Some(far_past()),
+        100,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        b.len(),
+        3,
+        "env_b was seeded with 5 analytics events, 2 of them '$screen' (excluded)"
+    );
+    assert!(b.iter().all(|e| e.environment_id == Some(ids.env_b)));
+
+    let none = sauron_db::repo::list_analytics_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        &[],
+        None,
+        Some(far_past()),
+        100,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.len(), 1);
+    assert!(none.iter().all(|e| e.environment_id.is_none()));
+
+    let all = sauron_db::repo::list_analytics_events(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &[],
+        None,
+        Some(far_past()),
+        100,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        all.len(),
+        8,
+        "All must equal the sum of the parts, including unattributed (11 raw rows minus 3 '$screen')"
+    );
+
+    // See the comment in `list_sessions_returns_only_the_selected_environment`: `conn`
+    // must be dropped before `cleanup()` or the single-connection pool deadlocks.
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `top_events` (a hand-written raw-SQL read) must honor `ReadScope`. `analytics_events`
+/// is seeded 5/5/1 — env_a and env_b hold the SAME total, so the total alone cannot tell a
+/// correct filter from a swapped one; the seed also gives the two environments different
+/// event-name mixes (see `SeedIds`/`seed_two_envs`), so the per-name breakdown must differ.
+#[tokio::test]
+async fn top_events_counts_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::top_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        50,
+    )
+    .await
+    .unwrap();
+    let a_total: i64 = a.iter().map(|r| r.count).sum();
+    assert_eq!(a_total, 5, "analytics_events is seeded 5/5/1");
+
+    let all = sauron_db::repo::top_events(&mut conn, ReadScope::all(ids.app_id), far_past(), 50)
+        .await
+        .unwrap();
+    let all_total: i64 = all.iter().map(|r| r.count).sum();
+    assert_eq!(all_total, 11, "All includes the unattributed row");
+
+    // env_a and env_b both hold 5 analytics rows, so this total alone cannot tell a
+    // correct filter from a swapped one. Assert the per-name breakdown differs too:
+    // the seed gives the two environments different event-name mixes.
+    let b = sauron_db::repo::top_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+        50,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        a, b,
+        "env_a and env_b must differ by name mix, not just by total"
+    );
+
+    let none = sauron_db::repo::top_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        50,
+    )
+    .await
+    .unwrap();
+    let none_total: i64 = none.iter().map(|r| r.count).sum();
+    assert_eq!(none_total, 1);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `event_series` has NO `$screen` exclusion (unlike `list_analytics_events`), so it must
+/// see the full 5/5/1/11 counts. Exercises both match arms (`name: Some(_)` and `None`) since
+/// each builds a differently-shaped SQL string with its own bind sequence — the env fragment
+/// must land at the right index in both.
+#[tokio::test]
+async fn event_series_counts_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // `name: None` arm.
+    let a = sauron_db::repo::event_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        None,
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let a_total: i64 = a.iter().map(|p| p.count).sum();
+    assert_eq!(
+        a_total, 5,
+        "analytics_events is seeded 5/5/1, no $screen filter here"
+    );
+
+    let b = sauron_db::repo::event_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        None,
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let b_total: i64 = b.iter().map(|p| p.count).sum();
+    assert_eq!(b_total, 5);
+
+    let none = sauron_db::repo::event_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        None,
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let none_total: i64 = none.iter().map(|p| p.count).sum();
+    assert_eq!(none_total, 1);
+
+    let all =
+        sauron_db::repo::event_series(&mut conn, ReadScope::all(ids.app_id), None, far_past())
+            .await
+            .unwrap();
+    let all_total: i64 = all.iter().map(|p| p.count).sum();
+    assert_eq!(
+        all_total, 11,
+        "All must equal the sum of the parts, including unattributed"
+    );
+
+    // `name: Some(_)` arm — a different SQL string with its own bind sequence. "harness.event"
+    // is only ever seeded in env_a (the baseline row); env_b has none, which is a much
+    // stronger signal than a total (a broken filter would surface as a nonzero count instead
+    // of a swapped value).
+    let named_a = sauron_db::repo::event_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        Some("harness.event"),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let named_a_total: i64 = named_a.iter().map(|p| p.count).sum();
+    assert_eq!(named_a_total, 1, "'harness.event' is only seeded in env_a");
+
+    let named_b = sauron_db::repo::event_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        Some("harness.event"),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let named_b_total: i64 = named_b.iter().map(|p| p.count).sum();
+    assert_eq!(
+        named_b_total, 0,
+        "'harness.event' was never seeded in env_b"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `error_events` is seeded 4/2/1 — unlike `analytics_events`/`sessions`, env_a and env_b
+/// hold DIFFERENT counts, so a total-only assertion already discriminates a swapped filter.
+#[tokio::test]
+async fn error_series_counts_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::error_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let a_total: i64 = a.iter().map(|p| p.count).sum();
+    assert_eq!(a_total, 4, "error_events is seeded 4/2/1");
+
+    let b = sauron_db::repo::error_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let b_total: i64 = b.iter().map(|p| p.count).sum();
+    assert_eq!(b_total, 2);
+
+    let none = sauron_db::repo::error_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let none_total: i64 = none.iter().map(|p| p.count).sum();
+    assert_eq!(none_total, 1);
+
+    let all = sauron_db::repo::error_series(&mut conn, ReadScope::all(ids.app_id), far_past())
+        .await
+        .unwrap();
+    let all_total: i64 = all.iter().map(|p| p.count).sum();
+    assert_eq!(
+        all_total, 7,
+        "All must equal the sum of the parts, including unattributed"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `journey_graph` step-numbers each `distinct_id`'s events by `occurred_at` order, so the
+/// SUM of node counts always equals the row count passing the WHERE/depth filter regardless
+/// of how those rows get bucketed into (step, name) groups — that sum is what a missing/
+/// swapped env fragment would get wrong (env_a-scoped would leak to the full 11-row app-wide
+/// graph instead of just its own 5). `analytics_events` is 5/5/1 (equal env_a/env_b totals),
+/// so beyond the sum this also asserts the actual node SET differs: env_a's step1 lands on
+/// "harness.event" (`shared_distinct_id`'s baseline event), which env_b's timeline never has.
+#[tokio::test]
+async fn journey_graph_counts_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let (nodes_a, _) = sauron_db::repo::journey_graph(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        10,
+    )
+    .await
+    .unwrap();
+    let a_total: i64 = nodes_a.iter().map(|n| n.count).sum();
+    assert_eq!(
+        a_total, 5,
+        "analytics_events is seeded 5/5/1, no filter excludes rows here"
+    );
+
+    let (nodes_b, _) = sauron_db::repo::journey_graph(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+        10,
+    )
+    .await
+    .unwrap();
+    let b_total: i64 = nodes_b.iter().map(|n| n.count).sum();
+    assert_eq!(b_total, 5);
+
+    // env_a and env_b both sum to 5 — assert the node SET differs too, not just the total.
+    let mut a_pairs: Vec<(i64, String)> =
+        nodes_a.iter().map(|n| (n.step, n.event.clone())).collect();
+    let mut b_pairs: Vec<(i64, String)> =
+        nodes_b.iter().map(|n| (n.step, n.event.clone())).collect();
+    a_pairs.sort();
+    b_pairs.sort();
+    assert_ne!(
+        a_pairs, b_pairs,
+        "env_a and env_b must differ by node set, not just by total"
+    );
+    assert!(
+        a_pairs.iter().any(|(_, e)| e == "harness.event"),
+        "env_a's timeline includes the 'harness.event' baseline row: {a_pairs:?}"
+    );
+    assert!(
+        !b_pairs.iter().any(|(_, e)| e == "harness.event"),
+        "env_b never saw 'harness.event': {b_pairs:?}"
+    );
+
+    let (nodes_none, _) = sauron_db::repo::journey_graph(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        10,
+    )
+    .await
+    .unwrap();
+    let none_total: i64 = nodes_none.iter().map(|n| n.count).sum();
+    assert_eq!(none_total, 1);
+
+    let (nodes_all, _) =
+        sauron_db::repo::journey_graph(&mut conn, ReadScope::all(ids.app_id), far_past(), 10)
+            .await
+            .unwrap();
+    let all_total: i64 = nodes_all.iter().map(|n| n.count).sum();
+    assert_eq!(
+        all_total, 11,
+        "All must equal the sum of the parts, including unattributed"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `performance_summary` — `transactions` is seeded 5/2/1, both `count` and `error_rate`
+/// (0.2 vs 0.5) discriminate env_a from env_b. `op`/`device_key` stay `None` here so this
+/// exercises the env fragment appended after the pre-existing `($3::text IS NULL OR op=$3)`
+/// idiom without colliding with it.
+#[tokio::test]
+async fn performance_summary_counts_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::performance_summary(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        a.len(),
+        1,
+        "one (name, op) group: 'harness.transaction'/'test'"
+    );
+    assert_eq!(a[0].count, 5, "transactions is seeded 5/2/1");
+    assert!(
+        (a[0].error_rate - 0.2).abs() < 1e-9,
+        "1 error out of 5: {}",
+        a[0].error_rate
+    );
+    assert!(
+        (a[0].avg - 30.0).abs() < 1e-9,
+        "avg of 10/20/30/40/50: {}",
+        a[0].avg
+    );
+
+    let b = sauron_db::repo::performance_summary(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].count, 2);
+    assert!(
+        (b[0].error_rate - 0.5).abs() < 1e-9,
+        "1 error out of 2: {}",
+        b[0].error_rate
+    );
+    assert!(
+        (b[0].avg - 150.0).abs() < 1e-9,
+        "avg of 100/200: {}",
+        b[0].avg
+    );
+
+    let none = sauron_db::repo::performance_summary(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.len(), 1);
+    assert_eq!(none[0].count, 1);
+
+    let all = sauron_db::repo::performance_summary(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0].count, 8,
+        "All must equal the sum of the parts, including unattributed"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `performance_series` — same 5/2/1 transactions seed as `performance_summary`, bucketed by
+/// hour. `name`/`op` stay `None` so this exercises the env fragment appended after that
+/// function's own pre-existing optional-filter idiom too.
+#[tokio::test]
+async fn performance_series_counts_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::performance_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let a_total: i64 = a.iter().map(|p| p.throughput).sum();
+    assert_eq!(a_total, 5, "transactions is seeded 5/2/1");
+
+    let b = sauron_db::repo::performance_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let b_total: i64 = b.iter().map(|p| p.throughput).sum();
+    assert_eq!(b_total, 2);
+
+    let none = sauron_db::repo::performance_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let none_total: i64 = none.iter().map(|p| p.throughput).sum();
+    assert_eq!(none_total, 1);
+
+    let all = sauron_db::repo::performance_series(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let all_total: i64 = all.iter().map(|p| p.throughput).sum();
+    assert_eq!(
+        all_total, 8,
+        "All must equal the sum of the parts, including unattributed"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `overview_totals` aggregates across four tables in one statement. `events` (analytics,
+/// 5/5/1), `sessions` (3/3/1) and `crashed_sessions` (1/1/0) all tie between env_a/env_b, so
+/// `errors` (error_events, 4/2/1 — the one field that actually differs) is the load-bearing
+/// discriminator for a swapped filter.
+///
+/// `users`/`new_users` come from `event_users`, which carries no `environment_id` column at
+/// all, so they are scoped by membership (activity in analytics_events/error_events/sessions
+/// for this environment) — the gap Task 8 deferred, closed by this fix. Membership per
+/// identity, hand-derived from `seed_two_envs` (see `SeedIds`'s doc comment):
+///   - `shared_distinct_id`: env_a (analytics+error+session) AND env_b (error+session)
+///   - `distinct_id_cross_env`: env_a (analytics+error) AND env_b (analytics)
+///   - `distinct_id_env_b_only`: env_b only
+///   - the two env_a-only error identities (`a-er-1`, `a-er-3`): env_a only
+///   - `session_only_distinct_id`: env_a only (sessions leg alone)
+///   - the two unattributed-only identities (`none-an-0`, `none-er-0`): Unattributed only
+/// So `One(env_a)` = {shared, cross_env, a-er-1, a-er-3, session_only} = 5;
+/// `One(env_b)` = {shared, cross_env, env_b_only} = 3; `Unattributed` = {none-an-0,
+/// none-er-0} = 2; `All` = all 8 (union, not a sum — shared/cross_env are each counted once
+/// despite belonging to two environments, unlike a naive `5+3+2=10`).
+///
+/// `since` is `far_past()`, so every identity's `last_seen`/`first_seen` (both wall-clock
+/// timestamps stamped by `note_identity` at seed time, not derived from the seed's own
+/// `occurred_at` offsets) clears the bound — `users`/`new_users` therefore land on the same
+/// per-scope numbers as the membership counts above.
+#[tokio::test]
+async fn overview_totals_counts_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::overview_totals(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.events, 5, "analytics_events is seeded 5/5/1");
+    assert_eq!(
+        a.errors, 4,
+        "error_events is seeded 4/2/1 — the discriminating field"
+    );
+    assert_eq!(a.sessions, 3, "sessions is seeded 3/3/1");
+    assert_eq!(a.crashed_sessions, 1);
+    assert_eq!(
+        a.users, 5,
+        "env_a members: shared, cross_env, a-er-1, a-er-3, session_only"
+    );
+    assert_eq!(a.new_users, 5, "same 5 — all clear far_past()'s bound");
+
+    let b = sauron_db::repo::overview_totals(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.events, 5);
+    assert_eq!(
+        b.errors, 2,
+        "the field that actually differs from env_a's 4"
+    );
+    assert_eq!(b.sessions, 3);
+    assert_eq!(b.crashed_sessions, 1);
+    assert_eq!(
+        b.users, 3,
+        "env_b members: shared, cross_env, distinct_id_env_b_only"
+    );
+    assert_eq!(b.new_users, 3);
+
+    let none = sauron_db::repo::overview_totals(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.events, 1);
+    assert_eq!(none.errors, 1);
+    assert_eq!(none.sessions, 1);
+    assert_eq!(none.crashed_sessions, 0);
+    assert_eq!(
+        none.users, 2,
+        "unattributed-only members: none-an-0, none-er-0"
+    );
+    assert_eq!(none.new_users, 2);
+
+    let all = sauron_db::repo::overview_totals(&mut conn, ReadScope::all(ids.app_id), far_past())
+        .await
+        .unwrap();
+    assert_eq!(
+        all.events, 11,
+        "All must equal the sum of the parts, including unattributed"
+    );
+    assert_eq!(all.errors, 7);
+    assert_eq!(all.sessions, 7);
+    assert_eq!(all.crashed_sessions, 2);
+    assert_eq!(
+        all.users, 8,
+        "matches the harness's own event_users row count; NOT 5+3+2=10 — shared/cross_env \
+         double-count across environments"
+    );
+    assert_eq!(all.new_users, 8);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `user_stats` mixes tables that carry `environment_id` (analytics_events/error_events for
+/// dau/wau/mau, sessions for avg/median_session_ms) with `event_users` (total_users/
+/// active_in_range/new_in_range), which does not. The latter three are scoped by membership
+/// (see `event_user_membership_exists`'s doc comment in `repo.rs`) — the same gap
+/// `overview_totals` closes, hand-derived counts identical to that test's doc comment:
+/// `One(env_a)`=5, `One(env_b)`=3, `Unattributed`=2, `All`=8.
+///
+/// `dau` (distinct_id union of analytics_events ∪ error_events, both env-scoped) is NOT a
+/// simple env_a + env_b + unattributed partition: `shared_distinct_id` and
+/// `distinct_id_cross_env` are seeded to appear in BOTH environments (see `SeedIds`'s doc
+/// comment), so summing the per-environment counts double-counts them. env_a=4, env_b=3,
+/// unattributed=2, All=7 (not 9) is the correct, directly-derived shape — asserted as such
+/// rather than via a sum-of-parts invariant that would be actively wrong here. This is a
+/// *different* 7-vs-9 double-count than `total_users`' 8-vs-10 above: `dau` and
+/// `total_users` are governed by different tables (a distinct_id union vs. `event_users` row
+/// membership) that merely share the same double-counting shape, not the same numbers.
+#[tokio::test]
+async fn user_stats_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::user_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        a.dau, 4,
+        "distinct analytics/error identities scoped to env_a"
+    );
+    assert!(
+        (a.avg_session_ms - 120000.0).abs() < 1e-9,
+        "env_a sessions average 120s: {}",
+        a.avg_session_ms
+    );
+    assert_eq!(
+        a.total_users, 5,
+        "env_a members: shared, cross_env, a-er-1, a-er-3, session_only"
+    );
+    assert_eq!(
+        a.active_in_range, 5,
+        "same 5 — all clear far_past()'s bound"
+    );
+    assert_eq!(a.new_in_range, 5);
+
+    let b = sauron_db::repo::user_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.dau, 3);
+    assert!(
+        (b.avg_session_ms - 400000.0).abs() < 1e-9,
+        "env_b sessions average 400s: {}",
+        b.avg_session_ms
+    );
+    assert_eq!(
+        b.total_users, 3,
+        "env_b members: shared, cross_env, distinct_id_env_b_only"
+    );
+    assert_eq!(b.active_in_range, 3);
+    assert_eq!(b.new_in_range, 3);
+
+    let none = sauron_db::repo::user_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.dau, 2);
+    assert_eq!(
+        none.total_users, 2,
+        "unattributed-only members: none-an-0, none-er-0"
+    );
+    assert_eq!(none.active_in_range, 2);
+    assert_eq!(none.new_in_range, 2);
+
+    let all = sauron_db::repo::user_stats(&mut conn, ReadScope::all(ids.app_id), far_past())
+        .await
+        .unwrap();
+    assert_eq!(
+        all.dau, 7,
+        "NOT env_a+env_b+unattributed (9) — shared_distinct_id/distinct_id_cross_env double-count across environments"
+    );
+    assert_eq!(
+        all.total_users, 8,
+        "matches the harness's own event_users row count; NOT 5+3+2=10"
+    );
+    assert_eq!(all.active_in_range, 8);
+    assert_eq!(all.new_in_range, 8);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `active_user_series`'s `active` component sources the same analytics_events ∪ error_events
+/// distinct-id union as `user_stats.dau` (env_a=4, env_b=3, unattributed=2, all seeded rows
+/// fall in one day-bucket) — see that test's doc comment for why `All` is 7, not 9. Its
+/// `new_users` component reads `event_users` (no `environment_id`), scoped by membership like
+/// `overview_totals.new_users`/`user_stats.new_in_range` — same per-scope counts as those two
+/// (5/3/2/8), since all three read the identical `event_users` membership + `first_seen`
+/// bound.
+#[tokio::test]
+async fn active_user_series_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::active_user_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let a_active: i64 = a.iter().map(|p| p.active).sum();
+    let a_new: i64 = a.iter().map(|p| p.new_users).sum();
+    assert_eq!(
+        a_active, 4,
+        "distinct analytics/error identities scoped to env_a"
+    );
+    assert_eq!(
+        a_new, 5,
+        "env_a members: shared, cross_env, a-er-1, a-er-3, session_only"
+    );
+
+    let b = sauron_db::repo::active_user_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let b_active: i64 = b.iter().map(|p| p.active).sum();
+    let b_new: i64 = b.iter().map(|p| p.new_users).sum();
+    assert_eq!(b_active, 3);
+    assert_eq!(
+        b_new, 3,
+        "env_b members: shared, cross_env, distinct_id_env_b_only"
+    );
+
+    let none = sauron_db::repo::active_user_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let none_active: i64 = none.iter().map(|p| p.active).sum();
+    let none_new: i64 = none.iter().map(|p| p.new_users).sum();
+    assert_eq!(none_active, 2);
+    assert_eq!(
+        none_new, 2,
+        "unattributed-only members: none-an-0, none-er-0"
+    );
+
+    let all =
+        sauron_db::repo::active_user_series(&mut conn, ReadScope::all(ids.app_id), far_past())
+            .await
+            .unwrap();
+    let all_active: i64 = all.iter().map(|p| p.active).sum();
+    let all_new: i64 = all.iter().map(|p| p.new_users).sum();
+    assert_eq!(
+        all_active, 7,
+        "NOT env_a+env_b+unattributed (9) — shared identities double-count across environments"
+    );
+    assert_eq!(
+        all_new, 8,
+        "matches the harness's own event_users row count; NOT 5+3+2=10 — shared/cross_env \
+         double-count across environments, same union shape as overview_totals/user_stats"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `session_stats` — `sessions` is seeded 3/3/1, so env_a and env_b tie on BOTH `sessions`
+/// and `crashed` (1/1). `avg_session_ms` (120000 vs 400000) is the only field that actually
+/// discriminates a swapped filter here, per the brief.
+#[tokio::test]
+async fn session_stats_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::session_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.sessions, 3, "sessions is seeded 3/3/1 — ties with env_b");
+    assert_eq!(
+        a.crashed, 1,
+        "ties with env_b too — not discriminating alone"
+    );
+    assert!(
+        (a.avg_session_ms - 120000.0).abs() < 1e-9,
+        "the field that actually discriminates: {}",
+        a.avg_session_ms
+    );
+
+    let b = sauron_db::repo::session_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.sessions, 3);
+    assert_eq!(b.crashed, 1);
+    assert!(
+        (b.avg_session_ms - 400000.0).abs() < 1e-9,
+        "{}",
+        b.avg_session_ms
+    );
+
+    let none = sauron_db::repo::session_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.sessions, 1);
+    assert_eq!(none.crashed, 0);
+
+    let all = sauron_db::repo::session_stats(&mut conn, ReadScope::all(ids.app_id), far_past())
+        .await
+        .unwrap();
+    assert_eq!(
+        all.sessions, 7,
+        "All must equal the sum of the parts, including unattributed"
+    );
+    assert_eq!(all.crashed, 2);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `session_duration_series` — env_a's 60/120/180s sessions average 120000ms, env_b's
+/// 300/400/500s average 400000ms; all fall in the same day-bucket, so the single bucket's
+/// `avg_ms` is the discriminator (sessions is 3/3/1, tied on count).
+#[tokio::test]
+async fn session_duration_series_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::session_duration_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.len(), 1, "all seeded sessions fall in one day-bucket");
+    assert!((a[0].avg_ms - 120000.0).abs() < 1e-9, "{}", a[0].avg_ms);
+
+    let b = sauron_db::repo::session_duration_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.len(), 1);
+    assert!((b[0].avg_ms - 400000.0).abs() < 1e-9, "{}", b[0].avg_ms);
+
+    let none = sauron_db::repo::session_duration_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.len(), 1);
+    assert!(
+        (none[0].avg_ms - 200000.0).abs() < 1e-9,
+        "the unattributed session is 200s: {}",
+        none[0].avg_ms
+    );
+
+    let all =
+        sauron_db::repo::session_duration_series(&mut conn, ReadScope::all(ids.app_id), far_past())
+            .await
+            .unwrap();
+    assert_eq!(all.len(), 1, "still one bucket under All");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `session_duration_histogram` — env_a's sessions (60/120/180s) all land in the `1-5m` bin,
+/// env_b's (300/400/500s) in `5-30m`. A swapped filter would move rows to the wrong bin
+/// LABEL, not just change a number in the same bin — the strongest possible signal here.
+#[tokio::test]
+async fn session_duration_histogram_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    fn bucket_count(rows: &[sauron_db::repo::HistoBucket], label: &str) -> i64 {
+        rows.iter()
+            .find(|r| r.bucket == label)
+            .map(|r| r.count)
+            .unwrap_or(0)
+    }
+
+    let a = sauron_db::repo::session_duration_histogram(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bucket_count(&a, "1-5m"),
+        3,
+        "env_a's 60/120/180s sessions all land here"
+    );
+    assert_eq!(bucket_count(&a, "5-30m"), 0, "must NOT see env_b's bin");
+
+    let b = sauron_db::repo::session_duration_histogram(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bucket_count(&b, "5-30m"),
+        3,
+        "env_b's 300/400/500s sessions all land here"
+    );
+    assert_eq!(bucket_count(&b, "1-5m"), 0, "must NOT see env_a's bin");
+
+    let none = sauron_db::repo::session_duration_histogram(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bucket_count(&none, "1-5m"),
+        1,
+        "the unattributed session is 200s"
+    );
+
+    let all = sauron_db::repo::session_duration_histogram(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bucket_count(&all, "1-5m"),
+        4,
+        "All must equal the sum of the parts, including unattributed: env_a's 3 + unattributed's 1"
+    );
+    assert_eq!(bucket_count(&all, "5-30m"), 3, "env_b's 3");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `funnel` is the sharpest test of the "env filter on every CTE, not just s0" risk the task
+/// brief calls out. `distinct_id_cross_env` does step1 (`harness.funnel.step1`) in env_a and
+/// step2 (`harness.funnel.step2`) in env_b, never both in the same environment (see
+/// `SeedIds`'s doc comment) — specifically so that a funnel which scopes `s0` correctly but
+/// forgets the env filter on `s1` disagrees with a correctly-scoped one: under `One(env_a)`,
+/// `distinct_id_cross_env` IS a step-0 candidate (its step1 is in env_a) but must NOT clear
+/// step1 (its step2 is in env_b only). A broken `s1` filter would let it through anyway,
+/// making `step1`'s count 2 instead of the correct 1.
+#[tokio::test]
+async fn funnel_counts_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let steps = vec![
+        "harness.funnel.step1".to_string(),
+        "harness.funnel.step2".to_string(),
+    ];
+
+    let a = sauron_db::repo::funnel(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &steps,
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        a[0].count, 2,
+        "shared_distinct_id + distinct_id_cross_env both did step1 in env_a"
+    );
+    assert_eq!(
+        a[1].count, 1,
+        "only shared_distinct_id completes step2 in env_a — distinct_id_cross_env's step2 is env_b-only; \
+         a filter missing on s1 would leak it through and give 2"
+    );
+
+    let b = sauron_db::repo::funnel(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &steps,
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        b[0].count, 1,
+        "only distinct_id_env_b_only did step1 in env_b"
+    );
+    assert_eq!(b[1].count, 1);
+
+    let none = sauron_db::repo::funnel(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        &steps,
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        none[0].count, 0,
+        "no unattributed row uses the funnel step names"
+    );
+    assert_eq!(none[1].count, 0);
+
+    let all = sauron_db::repo::funnel(&mut conn, ReadScope::all(ids.app_id), &steps, far_past())
+        .await
+        .unwrap();
+    assert_eq!(
+        all[0].count, 3,
+        "all three identities did step1 somewhere: shared, cross_env, b_only"
+    );
+    assert_eq!(
+        all[1].count, 3,
+        "under All, distinct_id_cross_env's step2 (env_b) counts against its own step1 (env_a) too"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The legacy `filter=environment:eq:<name>` chip (kept for API back-compat,
+/// see `EVENT_FILTERS`) must compose with `ReadScope` rather than replace it:
+/// the topbar scope is the outer boundary, the chip narrows within it.
+#[tokio::test]
+async fn list_analytics_events_legacy_chip_composes_with_scope() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // The seed names its environments literally "env_a"/"env_b" (see
+    // `TestDb::seed_two_envs`'s `repo::create_environment` calls), so the chip
+    // can name one directly without a lookup helper.
+    let chip_env_b = vec![sauron_db::filter::ParsedFilter {
+        field: "environment",
+        op: sauron_db::filter::Op::Eq,
+        value: "env_b".to_string(),
+    }];
+
+    // All-scope + chip=env_b must narrow down to exactly env_b's rows — the
+    // chip does real work on top of a scope that otherwise covers everything.
+    let narrowed = sauron_db::repo::list_analytics_events(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &chip_env_b,
+        None,
+        Some(far_past()),
+        100,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        narrowed.len(),
+        3,
+        "All + chip=env_b narrows to env_b's 3 non-'$screen' rows"
+    );
+    assert!(narrowed.iter().all(|e| e.environment_id == Some(ids.env_b)));
+
+    // scope=One(env_a) + chip=env_b must compose as AND (0 rows), not have the
+    // chip silently override or bypass the outer scope.
+    let conflicting = sauron_db::repo::list_analytics_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &chip_env_b,
+        None,
+        Some(far_past()),
+        100,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        conflicting.len(),
+        0,
+        "scope=env_a AND chip=env_b must yield nothing — the chip cannot escape the outer scope"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The onboarding UI builds its DSN from one specific environment, then polls this app-wide
+/// existence check — so an unscoped "has ANY environment sent anything" answer can report
+/// success purely from a *different* environment's traffic. Concretely: an app with existing
+/// `env_a` traffic gets a fresh `env_c` added; onboarding shows `env_c`'s DSN and must NOT
+/// report "received" until `env_c` itself has events, even though the app overall (and `env_a`)
+/// already does — the false-positive this review found in `dashboard/src/pages/Onboarding.svelte`.
+#[tokio::test]
+async fn app_has_events_reports_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let env_c = sauron_db::repo::create_environment(
+        &mut conn,
+        ids.app_id,
+        "env_c",
+        &format!("pk_test_c_{}", Uuid::new_v4().simple()),
+        false,
+    )
+    .await
+    .expect("create env_c")
+    .id;
+
+    let brand_new = sauron_db::repo::app_has_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(env_c)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        brand_new,
+        (false, false),
+        "env_c is brand new and has received nothing — must not report true just because \
+         env_a/env_b have traffic"
+    );
+
+    let a = sauron_db::repo::app_has_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        a,
+        (true, true),
+        "env_a was seeded with both error and analytics events"
+    );
+
+    let none = sauron_db::repo::app_has_events(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+    )
+    .await
+    .unwrap();
+    assert_eq!(none, (true, true), "the unattributed bucket has 1 of each");
+
+    let all = sauron_db::repo::app_has_events(&mut conn, ReadScope::all(ids.app_id))
+        .await
+        .unwrap();
+    assert_eq!(all, (true, true), "All must still see the app-wide traffic");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `event_series`'s `Some(name)` arm builds a distinct SQL string with the env fragment at a
+/// different bind index ($4, not $3 — see the function's own comments). The pre-existing test
+/// above only exercises it under `One`; both other variants went through the `None` arm. This
+/// closes that gap so the named arm's `All`/`Unattributed` bind layout is covered too.
+#[tokio::test]
+async fn event_series_named_arm_covers_all_and_unattributed() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // "harness.event" is seeded once in env_a and once unattributed (see `seed_two_envs`) —
+    // never in env_b — so `All` must be 2 (the sum of the parts) and `Unattributed` must be 1.
+    let all = sauron_db::repo::event_series(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Some("harness.event"),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let all_total: i64 = all.iter().map(|p| p.count).sum();
+    assert_eq!(
+        all_total, 2,
+        "'harness.event' is seeded once in env_a and once unattributed"
+    );
+
+    let unattributed = sauron_db::repo::event_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        Some("harness.event"),
+        far_past(),
+    )
+    .await
+    .unwrap();
+    let unattributed_total: i64 = unattributed.iter().map(|p| p.count).sum();
+    assert_eq!(
+        unattributed_total, 1,
+        "the unattributed 'harness.event' row must still be found through the $4 bind layout"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Task 7: there is no `screens` table — `screen_ctes` derives every column from
+/// `analytics_events`/`error_events`, both of which carry `environment_id`, across **four**
+/// CTEs (`ev`, `ex`, `us`'s two `UNION ALL` arms, and `dw`'s window subquery). The env
+/// fragment must reach all four, or one column (or one arm of `us`) silently mixes
+/// environments while the rest of the row still looks plausible — which is why every field
+/// below is asserted independently, never just presence or a total.
+///
+/// `home` is the discriminating screen: seeded with a `'$screen'`/dwell pair in **both**
+/// environments with different views/dwell counts (env_a: 1 view, 60s dwell; env_b: 2 views,
+/// 90s dwell — see `SeedIds`'s doc comment on `seed_two_envs`), specifically so a `dw` CTE
+/// that omits its environment fragment pools dwell across environments (wrong nonzero number)
+/// instead of merely going to zero (which would be an obvious, not silent, failure).
+#[tokio::test]
+async fn screen_stats_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::screen_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        "home",
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.views, 1, "env_a's own '$screen' row on home");
+    assert_eq!(
+        a.events, 3,
+        "harness.event + env_a's own funnel step1 + the cross-env identity's step1"
+    );
+    assert_eq!(
+        a.exceptions, 2,
+        "shared_distinct_id's + distinct_id_cross_env's error, both on home in env_a"
+    );
+    assert_eq!(
+        a.users, 2,
+        "shared_distinct_id + distinct_id_cross_env, from analytics ∪ error"
+    );
+    assert!(
+        (a.total_dwell_ms - 60000.0).abs() < 1e-9,
+        "env_a's paired '$screen' row: 60s gap; {}",
+        a.total_dwell_ms
+    );
+    assert!(
+        (a.avg_dwell_ms - 60000.0).abs() < 1e-9,
+        "60000 / 1 view; {}",
+        a.avg_dwell_ms
+    );
+
+    let b = sauron_db::repo::screen_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+        "home",
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.views, 2, "env_b's two '$screen' rows on home");
+    assert_eq!(
+        b.events, 1,
+        "funnel step1 only — env_b's '$screen' rows don't count as events"
+    );
+    assert_eq!(
+        b.exceptions, 1,
+        "shared_distinct_id's env_b error, on home; must NOT see env_a's 2"
+    );
+    assert_eq!(
+        b.users, 2,
+        "distinct_id_env_b_only (analytics) + shared_distinct_id (its env_b error is on home too)"
+    );
+    assert!(
+        (b.total_dwell_ms - 90000.0).abs() < 1e-9,
+        "env_b's paired '$screen' row: 90s gap; must NOT see env_a's 60s or pool with it; {}",
+        b.total_dwell_ms
+    );
+    assert!(
+        (b.avg_dwell_ms - 45000.0).abs() < 1e-9,
+        "90000 / 2 views; {}",
+        b.avg_dwell_ms
+    );
+
+    let none = sauron_db::repo::screen_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        "home",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        none.views, 0,
+        "the unattributed home row is 'harness.event', not '$screen'"
+    );
+    assert_eq!(none.events, 1);
+    assert_eq!(none.exceptions, 1);
+    assert_eq!(
+        none.users, 2,
+        "the unattributed analytics identity + the unattributed error identity"
+    );
+    assert_eq!(
+        none.total_dwell_ms, 0.0,
+        "the unattributed analytics row has no session_id, so no dwell partner"
+    );
+
+    let all =
+        sauron_db::repo::screen_stats(&mut conn, ReadScope::all(ids.app_id), far_past(), "home")
+            .await
+            .unwrap();
+    assert_eq!(all.views, 3, "All is the sum of the parts: 1 + 2 + 0");
+    assert_eq!(all.events, 5, "3 + 1 + 1");
+    assert_eq!(all.exceptions, 4, "2 + 1 + 1");
+    // NOT 6 (2+2+2): shared_distinct_id has a home error row in BOTH env_a and
+    // env_b, so it is counted once in each per-scope "2" — the per-scope sum
+    // double-counts it. `All`'s own query has no environment predicate at
+    // all, so it computes the true distinct count directly; there is nothing
+    // to double-count. Same "shared cross-environment identity" math Task 6
+    // found for `user_stats.dau`/`active_user_series.active` — asserted
+    // directly here rather than as a (here-incorrect) sum-of-parts.
+    assert_eq!(
+        all.users, 5,
+        "the true distinct count across environments, not the per-scope sum (6)"
+    );
+    assert!(
+        (all.total_dwell_ms - 150000.0).abs() < 1e-9,
+        "All must equal the sum of the parts: env_a's 60000 + env_b's 90000; {}",
+        all.total_dwell_ms
+    );
+    assert!(
+        (all.avg_dwell_ms - 50000.0).abs() < 1e-9,
+        "150000 / 3 views; {}",
+        all.avg_dwell_ms
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `screen_list` shares `screen_ctes` with `screen_stats` but has its own bind sequence
+/// ($3 is a LIKE pattern, not an exact name, and $4/$5 are limit/offset that shift to $5/$6
+/// when the env fragment consumes $4). This test exercises that shift directly: `home` sorts
+/// first under every scope (higher `views`), so `limit=1/offset=0` and `limit=1/offset=1`
+/// must return `home` then `checkout` — if limit and offset were ever swapped (both are
+/// `BigInt`, so a swap would NOT be a type error, unlike a Uuid/BigInt mix-up), this would
+/// come back in the wrong order silently rather than fail loudly.
+#[tokio::test]
+async fn screen_list_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    fn find<'a>(
+        rows: &'a [sauron_db::repo::ScreenRow],
+        screen: &str,
+    ) -> &'a sauron_db::repo::ScreenRow {
+        rows.iter()
+            .find(|r| r.screen == screen)
+            .unwrap_or_else(|| panic!("no '{screen}' row in {rows:?}"))
+    }
+
+    let a = sauron_db::repo::screen_list(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        "%",
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.len(), 2, "home + checkout, both present in env_a");
+    let a_home = find(&a, "home");
+    assert_eq!(a_home.views, 1);
+    assert_eq!(a_home.events, 3);
+    assert_eq!(a_home.exceptions, 2);
+    assert_eq!(a_home.users, 2);
+    assert!(
+        (a_home.avg_dwell_ms - 60000.0).abs() < 1e-9,
+        "{}",
+        a_home.avg_dwell_ms
+    );
+    let a_checkout = find(&a, "checkout");
+    assert_eq!(
+        a_checkout.views, 0,
+        "no '$screen' row is ever named checkout"
+    );
+    assert_eq!(
+        a_checkout.events, 1,
+        "env_a's own funnel step2 only — the cross-env identity's step2 is in env_b, not env_a \
+         (see SeedIds' doc comment: it does step1 in env_a, step2 in env_b, never both in one)"
+    );
+    assert_eq!(a_checkout.exceptions, 2);
+    assert_eq!(
+        a_checkout.users, 3,
+        "shared_distinct_id (step2) + the two error-only identities (a-er-1, a-er-3)"
+    );
+    assert_eq!(a_checkout.avg_dwell_ms, 0.0, "views=0 guards the division");
+
+    let b = sauron_db::repo::screen_list(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+        "%",
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.len(), 2, "home + checkout, both present in env_b");
+    let b_home = find(&b, "home");
+    assert_eq!(b_home.views, 2);
+    assert_eq!(b_home.events, 1);
+    assert_eq!(b_home.exceptions, 1);
+    assert_eq!(b_home.users, 2);
+    assert!(
+        (b_home.avg_dwell_ms - 45000.0).abs() < 1e-9,
+        "{}",
+        b_home.avg_dwell_ms
+    );
+    let b_checkout = find(&b, "checkout");
+    assert_eq!(b_checkout.views, 0);
+    assert_eq!(
+        b_checkout.events, 2,
+        "env_b's own funnel step2 + the cross-env identity's step2 (its step1 was env_a's, on home)"
+    );
+    assert_eq!(b_checkout.exceptions, 1);
+    assert_eq!(
+        b_checkout.users, 2,
+        "distinct_id_env_b_only + distinct_id_cross_env"
+    );
+
+    let none = sauron_db::repo::screen_list(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        "%",
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        none.len(),
+        1,
+        "checkout has no unattributed rows at all, so it must not appear as a key"
+    );
+    let none_home = find(&none, "home");
+    assert_eq!(none_home.views, 0);
+    assert_eq!(none_home.events, 1);
+    assert_eq!(none_home.exceptions, 1);
+    assert_eq!(none_home.users, 2);
+
+    let all = sauron_db::repo::screen_list(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+        "%",
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(all.len(), 2);
+    let all_home = find(&all, "home");
+    assert_eq!(all_home.views, 3);
+    assert_eq!(all_home.events, 5);
+    assert_eq!(all_home.exceptions, 4);
+    assert_eq!(
+        all_home.users, 5,
+        "true distinct count, not the per-scope sum — see screen_stats' test"
+    );
+    assert!(
+        (all_home.avg_dwell_ms - 50000.0).abs() < 1e-9,
+        "{}",
+        all_home.avg_dwell_ms
+    );
+    let all_checkout = find(&all, "checkout");
+    assert_eq!(all_checkout.views, 0);
+    assert_eq!(all_checkout.events, 3);
+    assert_eq!(all_checkout.exceptions, 3);
+    assert_eq!(all_checkout.users, 5);
+
+    // Bind-index-shift proof: under `One(env_a)` the env fragment consumes $4, pushing
+    // limit/offset to $5/$6. `home` (views=1) must sort before `checkout` (views=0).
+    let page1 = sauron_db::repo::screen_list(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        "%",
+        1,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page1.len(), 1);
+    assert_eq!(
+        page1[0].screen, "home",
+        "limit=1 offset=0 must return the higher-views row"
+    );
+
+    let page2 = sauron_db::repo::screen_list(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        "%",
+        1,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(
+        page2[0].screen, "checkout",
+        "limit=1 offset=1 must skip 'home', not return it again — proves limit/offset \
+         landed on $5/$6, not swapped or double-bound"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `recent_events_for_screen`/`recent_exceptions_for_screen` are boxed-diesel reads (not raw
+/// SQL, unlike `screen_ctes`' four callers above), scoped via the ordinary `scope_env!` macro.
+/// Counts must match `screen_stats`' `events`/`exceptions` columns for the same screen+scope.
+#[tokio::test]
+async fn recent_events_and_exceptions_for_screen_are_scoped() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a_events = sauron_db::repo::recent_events_for_screen(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        "home",
+        far_past(),
+        20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        a_events.len(),
+        3,
+        "matches screen_stats' env_a events=3 for home"
+    );
+
+    let b_events = sauron_db::repo::recent_events_for_screen(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        "home",
+        far_past(),
+        20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        b_events.len(),
+        1,
+        "matches screen_stats' env_b events=1 for home"
+    );
+
+    let a_exceptions = sauron_db::repo::recent_exceptions_for_screen(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        "home",
+        far_past(),
+        20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        a_exceptions.len(),
+        2,
+        "matches screen_stats' env_a exceptions=2 for home"
+    );
+
+    let b_exceptions = sauron_db::repo::recent_exceptions_for_screen(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        "home",
+        far_past(),
+        20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        b_exceptions.len(),
+        1,
+        "matches screen_stats' env_b exceptions=1 for home"
+    );
+
+    let all_events = sauron_db::repo::recent_events_for_screen(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        "home",
+        far_past(),
+        20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(all_events.len(), 5, "3 + 1 + 1 (unattributed)");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Task 8: Persons and devices — the LATERAL reads
+// ===========================================================================
+
+/// `list_persons`' counts come from three LATERAL subqueries over
+/// `analytics_events`/`error_events`/`sessions` (all of which carry
+/// `environment_id`); its outer page comes from `event_users`, which does
+/// not, so membership in a specific environment is derived via an `EXISTS`
+/// over the same three tables.
+///
+/// `shared_distinct_id` has activity in both environments, asymmetrically:
+/// env_a has all 4 of its analytics_events rows, env_b has none — only 1
+/// error and 1 session. That zero-analytics-events case is exactly what a
+/// membership filter naively written as "has an analytics event in this
+/// environment" would get wrong (it would drop this row under `One(env_b)`
+/// even though the person is genuinely active there).
+///
+/// `distinct_id_env_b_only` has activity in env_b alone and must not appear
+/// at all under `One(env_a)` — not "appear with all-zero counts", which is
+/// what a `LEFT JOIN LATERAL` alone (with no membership filter) would do.
+///
+/// `session_only_distinct_id` (see `SeedIds`' doc comment) has **zero**
+/// `analytics_events`/`error_events` rows anywhere — its only row in any
+/// signal table is one `sessions` row in env_a. It is what proves the third,
+/// `sessions`-only leg of the membership `EXISTS` actually matters: delete
+/// that leg and this identity has nothing left to qualify on in env_a, so it
+/// silently disappears from `One(env_a)` instead of appearing with
+/// `events_count: 0, errors_count: 0, sessions_count: 1`. Verified live
+/// during review — see `.superpowers/sdd/s2-task-8-report.md`'s "Review
+/// findings applied" section for the delete/fail/restore/pass proof.
+#[tokio::test]
+async fn list_persons_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let rows_a = sauron_db::repo::list_persons(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        None,
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows_a.len(),
+        5,
+        "env_a: shared_distinct_id, the cross-env funnel identity, two error-only identities, \
+         and session_only_distinct_id (sessions-leg-only membership)"
+    );
+    assert!(
+        rows_a
+            .iter()
+            .all(|r| r.distinct_id != ids.distinct_id_env_b_only),
+        "distinct_id_env_b_only has zero activity in env_a and must not appear at all"
+    );
+    let shared_a = rows_a
+        .iter()
+        .find(|r| r.distinct_id == ids.shared_distinct_id)
+        .expect("shared_distinct_id must appear under One(env_a)");
+    assert_eq!(shared_a.events_count, 4);
+    assert_eq!(shared_a.errors_count, 1);
+    assert_eq!(shared_a.sessions_count, 1);
+    let session_only_a = rows_a
+        .iter()
+        .find(|r| r.distinct_id == ids.session_only_distinct_id)
+        .expect(
+            "session_only_distinct_id must appear under One(env_a) via the sessions leg of the \
+             membership EXISTS alone — it has no analytics/error activity anywhere",
+        );
+    assert_eq!(session_only_a.events_count, 0);
+    assert_eq!(session_only_a.errors_count, 0);
+    assert_eq!(session_only_a.sessions_count, 1);
+    assert_eq!(
+        rows_a.iter().map(|r| r.events_count).sum::<i64>(),
+        5,
+        "matches analytics_events' env_a total"
+    );
+    assert_eq!(
+        rows_a.iter().map(|r| r.errors_count).sum::<i64>(),
+        4,
+        "matches error_events' env_a total"
+    );
+
+    let rows_b = sauron_db::repo::list_persons(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        None,
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows_b.len(),
+        3,
+        "env_b: shared_distinct_id, distinct_id_env_b_only, and the cross-env funnel identity"
+    );
+    assert!(
+        rows_b
+            .iter()
+            .all(|r| r.distinct_id != ids.session_only_distinct_id),
+        "session_only_distinct_id's one session is in env_a, not env_b — must not appear here"
+    );
+    let shared_b = rows_b
+        .iter()
+        .find(|r| r.distinct_id == ids.shared_distinct_id)
+        .expect(
+            "shared_distinct_id must appear under One(env_b) via its error/session activity \
+             alone — the zero-analytics-events case",
+        );
+    assert_eq!(shared_b.events_count, 0);
+    assert_eq!(shared_b.errors_count, 1);
+    assert_eq!(shared_b.sessions_count, 1);
+    let b_only = rows_b
+        .iter()
+        .find(|r| r.distinct_id == ids.distinct_id_env_b_only)
+        .expect("distinct_id_env_b_only must appear under One(env_b)");
+    assert_eq!(b_only.events_count, 4);
+    assert_eq!(b_only.errors_count, 1);
+    assert_eq!(b_only.sessions_count, 1);
+    assert_eq!(rows_b.iter().map(|r| r.events_count).sum::<i64>(), 5);
+    assert_eq!(rows_b.iter().map(|r| r.errors_count).sum::<i64>(), 2);
+
+    let rows_none = sauron_db::repo::list_persons(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        None,
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows_none.len(),
+        2,
+        "only the two identities with an unattributed analytics/error row"
+    );
+    assert!(rows_none
+        .iter()
+        .all(|r| r.distinct_id != ids.shared_distinct_id
+            && r.distinct_id != ids.distinct_id_env_b_only
+            && r.distinct_id != ids.session_only_distinct_id));
+
+    let rows_all =
+        sauron_db::repo::list_persons(&mut conn, ReadScope::all(ids.app_id), None, 50, 0)
+            .await
+            .unwrap();
+    assert_eq!(rows_all.len(), 8, "all 8 event_users identities");
+    let shared_all = rows_all
+        .iter()
+        .find(|r| r.distinct_id == ids.shared_distinct_id)
+        .unwrap();
+    assert_eq!(shared_all.events_count, 4);
+    assert_eq!(shared_all.errors_count, 2);
+    assert_eq!(shared_all.sessions_count, 2);
+    assert_eq!(
+        rows_all.iter().map(|r| r.events_count).sum::<i64>(),
+        11,
+        "matches analytics_events' total across all three buckets"
+    );
+    assert_eq!(
+        rows_all.iter().map(|r| r.errors_count).sum::<i64>(),
+        7,
+        "matches error_events' total across all three buckets"
+    );
+    // NOT 7 (sessions' own table total): 3 of the 7 seeded sessions still belong to
+    // distinct_ids never registered in `event_users` via `note_identity` (session_only_a-2
+    // and b-se-2's sibling `-a-se-2`/`-b-se-2`, plus the unattributed `-none-se-0`) — so
+    // they have no person row to attach to at all, scoped or not.
+    // session_only_distinct_id's 1 IS counted here (unlike before this task's seed change):
+    // it is now registered, so its session ties to a real event_users row.
+    assert_eq!(
+        rows_all.iter().map(|r| r.sessions_count).sum::<i64>(),
+        4,
+        "the 4 sessions tied to a registered event_users identity"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `list_devices` mirrors `list_persons` exactly: every seeded row that
+/// carries a `distinct_id` also carries a paired `device_key` (see
+/// `seed_two_envs`), so the membership/count math is identical, keyed by
+/// `device_key` instead.
+///
+/// `events_count`/`errors_count` come from a different source depending on
+/// `scope.env` — see `list_devices`' (the function, not this test's) doc
+/// comment for the full reasoning. Under `One`/`Unattributed` they come from
+/// environment-scoped LATERALs (asserted below via `shared_a`/`shared_b`/
+/// `b_only`, and via `session_only_a`, which proves the sessions leg of the
+/// membership `EXISTS` — see that assertion's own comment). Under `All` they
+/// come from the denormalized `devices` columns directly (asserted below via
+/// `rows_all`'s sums, which must therefore match `devices`' own real,
+/// cross-environment totals — not just `analytics_events`/`error_events`'
+/// totals by coincidence of them being equal, which they are here).
+#[tokio::test]
+async fn list_devices_covers_only_the_selected_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let rows_a = sauron_db::repo::list_devices(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        50,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows_a.len(), 5);
+    assert!(rows_a
+        .iter()
+        .all(|r| r.device_key != ids.device_key_env_b_only));
+    let shared_a = rows_a
+        .iter()
+        .find(|r| r.device_key == ids.shared_device_key)
+        .expect("shared_device_key must appear under One(env_a)");
+    assert_eq!(shared_a.events_count, 4);
+    assert_eq!(shared_a.errors_count, 1);
+    assert_eq!(shared_a.sessions_count, 1);
+    let session_only_a = rows_a
+        .iter()
+        .find(|r| r.device_key == ids.session_only_device_key)
+        .expect(
+            "session_only_device_key must appear under One(env_a) via the sessions leg of the \
+             membership EXISTS alone — it has no analytics/error activity anywhere",
+        );
+    assert_eq!(session_only_a.events_count, 0);
+    assert_eq!(session_only_a.errors_count, 0);
+    assert_eq!(session_only_a.sessions_count, 1);
+
+    let rows_b = sauron_db::repo::list_devices(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        far_past(),
+        50,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows_b.len(), 3);
+    assert!(
+        rows_b
+            .iter()
+            .all(|r| r.device_key != ids.session_only_device_key),
+        "session_only_device_key's one session is in env_a, not env_b — must not appear here"
+    );
+    let shared_b = rows_b
+        .iter()
+        .find(|r| r.device_key == ids.shared_device_key)
+        .expect("shared_device_key must appear under One(env_b) via error/session activity alone");
+    assert_eq!(shared_b.events_count, 0);
+    // 2, not 1: F4's seed extension repoints `issue_env_b_only`'s one error
+    // event (`distinct_id_env_b_only`) onto `shared_device_key` (see
+    // `SeedIds`'s doc comment) — this is device-level, keyed by `device_key`,
+    // so it credits `shared_device_key`'s count even though the identity
+    // behind it is not `shared_distinct_id`'s own.
+    assert_eq!(shared_b.errors_count, 2);
+    assert_eq!(shared_b.sessions_count, 1);
+    let b_only = rows_b
+        .iter()
+        .find(|r| r.device_key == ids.device_key_env_b_only)
+        .expect("device_key_env_b_only must appear under One(env_b)");
+    assert_eq!(b_only.events_count, 4);
+    // 0, not 1: its one error row was repointed to `shared_device_key` above —
+    // `device_key_env_b_only` keeps its 2 analytics events (unaffected, still
+    // its own device_key) and so still has membership, just zero errors now.
+    assert_eq!(b_only.errors_count, 0);
+    assert_eq!(b_only.sessions_count, 1);
+
+    let rows_none = sauron_db::repo::list_devices(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        50,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows_none.len(), 2);
+
+    let rows_all = sauron_db::repo::list_devices(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+        50,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows_all.len(), 8);
+    // These now come straight off `devices.events_count`/`errors_count` (fix 1's
+    // per-variant source rule), not a LATERAL — still 11/7 because every
+    // analytics/error event that drives an env-scoped LATERAL also drove exactly
+    // one `bump_device` call with a matching events_delta/errors_delta (see
+    // `note_identity` in `tests/common/mod.rs`), so the two sources agree here.
+    assert_eq!(rows_all.iter().map(|r| r.events_count).sum::<i64>(), 11);
+    assert_eq!(rows_all.iter().map(|r| r.errors_count).sum::<i64>(), 7);
+    // sessions_count stays a LATERAL under every variant (no durable column to
+    // fall back to — see `list_devices`' doc comment), so this is unaffected by
+    // fix 1. 4, not 3: session_only_device_key's one session is now tied to a
+    // registered `devices` row (it wasn't before this task's seed change), and
+    // 3 of the 7 seeded sessions still belong to distinct_ids never registered
+    // via `note_identity` (a-se-2, b-se-2, and the unattributed none-se-0).
+    assert_eq!(rows_all.iter().map(|r| r.sessions_count).sum::<i64>(), 4);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `get_event_user`/`get_device` are single-identity lookups over tables with
+/// no `environment_id` of their own — same membership derivation as
+/// `list_persons`/`list_devices`, but returning `Option::None` (rather than
+/// omitting a row from a page) when the identity has no activity in scope.
+///
+/// `get_device` also returns [`sauron_db::repo::DeviceRow`], not the raw
+/// `Device` model — this is fix 2's core claim, so it is checked directly
+/// below (`shared_device_key` under `All` vs. `One(env_a)`), not just
+/// inferred from `Option::is_some()`.
+#[tokio::test]
+async fn get_event_user_and_get_device_are_scoped_by_membership() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // shared_distinct_id/shared_device_key: present under One(env_a) and
+    // One(env_b) (env_b via error/session activity alone — the
+    // zero-analytics-events case), absent under Unattributed.
+    for (env, expect_present) in [
+        (EnvFilter::One(ids.env_a), true),
+        (EnvFilter::One(ids.env_b), true),
+        (EnvFilter::Unattributed, false),
+    ] {
+        let scope = ReadScope::new(ids.app_id, env);
+        let user = sauron_db::repo::get_event_user(&mut conn, scope, &ids.shared_distinct_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            user.is_some(),
+            expect_present,
+            "get_event_user under {env:?}"
+        );
+        let device = sauron_db::repo::get_device(&mut conn, scope, &ids.shared_device_key)
+            .await
+            .unwrap();
+        assert_eq!(device.is_some(), expect_present, "get_device under {env:?}");
+    }
+    // fix 2's per-variant source rule, checked directly: under One(env_a) the
+    // LATERAL sees only env_a's activity (4 events, 1 error); under All the
+    // durable `devices` columns see shared_device_key's whole lifetime (4
+    // events, 2 errors — env_a's 4 analytics + 0 from env_b, 1 error each).
+    let device_a = sauron_db::repo::get_device(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.shared_device_key,
+    )
+    .await
+    .unwrap()
+    .expect("shared_device_key must resolve under One(env_a)");
+    assert_eq!(device_a.events_count, 4);
+    assert_eq!(device_a.errors_count, 1);
+    let device_all = sauron_db::repo::get_device(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &ids.shared_device_key,
+    )
+    .await
+    .unwrap()
+    .expect("shared_device_key must resolve under All");
+    assert_eq!(
+        device_all.events_count, 4,
+        "durable devices.events_count: all of shared_device_key's analytics activity is in env_a"
+    );
+    assert_eq!(
+        device_all.errors_count, 3,
+        "durable devices.errors_count: env_a's own error, env_b's own error, plus \
+         issue_env_b_only's error — F4's seed extension repoints that row's \
+         device_key onto shared_device_key (see SeedIds's doc comment), and \
+         bump_device credits whatever device_key note_identity is actually \
+         called with, so the durable counter picks it up too"
+    );
+    assert!(sauron_db::repo::get_event_user(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &ids.shared_distinct_id
+    )
+    .await
+    .unwrap()
+    .is_some());
+
+    // distinct_id_env_b_only/device_key_env_b_only: confined to env_b alone —
+    // must resolve to None under One(env_a), not a row with zeroed activity.
+    let none_a = sauron_db::repo::get_event_user(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.distinct_id_env_b_only,
+    )
+    .await
+    .unwrap();
+    assert!(
+        none_a.is_none(),
+        "distinct_id_env_b_only must not resolve under One(env_a)"
+    );
+    let some_b = sauron_db::repo::get_event_user(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &ids.distinct_id_env_b_only,
+    )
+    .await
+    .unwrap();
+    assert!(some_b.is_some());
+    let device_none_a = sauron_db::repo::get_device(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.device_key_env_b_only,
+    )
+    .await
+    .unwrap();
+    assert!(
+        device_none_a.is_none(),
+        "device_key_env_b_only must not resolve under One(env_a)"
+    );
+
+    // session_only_device_key: resolves under One(env_a) via the sessions leg
+    // of the membership EXISTS alone (zero analytics/error activity anywhere)
+    // — must NOT resolve under One(env_b) or Unattributed, where it has no
+    // row at all.
+    let session_only_a = sauron_db::repo::get_device(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.session_only_device_key,
+    )
+    .await
+    .unwrap()
+    .expect("session_only_device_key must resolve under One(env_a) via the sessions leg alone");
+    assert_eq!(session_only_a.events_count, 0);
+    assert_eq!(session_only_a.errors_count, 0);
+    assert_eq!(session_only_a.sessions_count, 1);
+    let session_only_b = sauron_db::repo::get_device(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &ids.session_only_device_key,
+    )
+    .await
+    .unwrap();
+    assert!(session_only_b.is_none());
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `events_for_person`/`error_events_for_person`/`errors_for_device` read
+/// tables that carry `environment_id` directly (`analytics_events`,
+/// `error_events`) — no LATERAL/EXISTS involved, just an ordinary
+/// `scope_env!` filter, unlike their `event_users`/`devices`-backed
+/// siblings above.
+#[tokio::test]
+async fn events_and_errors_for_person_and_device_are_scoped_directly() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let events_a = sauron_db::repo::events_for_person(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.shared_distinct_id,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        events_a.len(),
+        4,
+        "shared_distinct_id's whole analytics history is in env_a"
+    );
+    let events_b = sauron_db::repo::events_for_person(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &ids.shared_distinct_id,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        events_b.len(),
+        0,
+        "shared_distinct_id has zero analytics events in env_b"
+    );
+
+    let errors_a = sauron_db::repo::error_events_for_person(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.shared_distinct_id,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(errors_a.len(), 1);
+    let errors_b = sauron_db::repo::error_events_for_person(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &ids.shared_distinct_id,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(errors_b.len(), 1);
+    let errors_all = sauron_db::repo::error_events_for_person(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &ids.shared_distinct_id,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(errors_all.len(), 2);
+
+    let device_errors_a = sauron_db::repo::errors_for_device(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.shared_device_key,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(device_errors_a.len(), 1);
+    let device_errors_b = sauron_db::repo::errors_for_device(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &ids.shared_device_key,
+        50,
+    )
+    .await
+    .unwrap();
+    // 2, not 1: F4's seed extension repoints `issue_env_b_only`'s error event
+    // onto `shared_device_key` (see `SeedIds`'s doc comment) — `errors_for_device`
+    // reads `error_events` directly by `device_key`, so it picks up both rows.
+    assert_eq!(device_errors_b.len(), 2);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// F4 (final whole-branch review, pre-Slice-3 fix round): PersonRow/DeviceRow
+// no longer mix per-environment counts with app-wide identity fields
+// ===========================================================================
+
+/// `PersonRow`/`DeviceRow` used to return the env-scoped `events_count`/
+/// `errors_count`/`sessions_count` (Task 8) alongside `first_seen`/
+/// `last_seen` read straight off the app-wide `event_users`/`devices` row —
+/// and, on devices, `last_distinct_id` too — the same mixed-scope shape the
+/// slice's own `overview_totals`/`user_stats` already document and guard
+/// against elsewhere, on fields Task 8's own sweep didn't look at because it
+/// only checked counts. `list_persons`/`list_devices`/`get_device` now derive
+/// `first_seen`/`last_seen` as `LEAST`/`GREATEST` over the same
+/// per-environment LATERALs that already produce the three counts, and
+/// devices additionally derive `last_distinct_id` — the concrete disclosure
+/// vector the review named: a device whose most recent identity is
+/// production-only must not surface that identity under a staging scope.
+/// `PersonRow::properties` is the one field deliberately left un-derived —
+/// see its own doc comment for why that is a decision, not a gap.
+///
+/// Needs the F4 seed extension documented on `SeedIds` (`pinned_now`, the
+/// `env_b` timestamp shifts on `shared_distinct_id`'s error/session, and the
+/// `shared_device_key` repoint of `issue_env_b_only`'s error event) —
+/// without it, `env_a` and `env_b` tied at exactly `now` for `last_seen`, and
+/// no device in the seed was ever touched by two different identities, so
+/// neither half of this could be asserted against a genuinely discriminating
+/// case. See that doc comment for the full reasoning and exact offsets.
+#[tokio::test]
+async fn person_and_device_seen_and_identity_are_derived_per_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let now = ids.pinned_now;
+
+    // ----- PersonRow (list_persons): first_seen/last_seen, One(env_a) vs One(env_b) -----
+    let persons_a = sauron_db::repo::list_persons(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        None,
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    let shared_a = persons_a
+        .iter()
+        .find(|r| r.distinct_id == ids.shared_distinct_id)
+        .expect("shared_distinct_id must appear under One(env_a)");
+
+    let persons_b = sauron_db::repo::list_persons(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        None,
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    let shared_b = persons_b
+        .iter()
+        .find(|r| r.distinct_id == ids.shared_distinct_id)
+        .expect("shared_distinct_id must appear under One(env_b)");
+
+    assert_eq!(
+        shared_a.first_seen,
+        now - Duration::seconds(240),
+        "env_a's earliest signal for shared_distinct_id is its own '$screen' analytics row"
+    );
+    assert_eq!(
+        shared_a.last_seen, now,
+        "env_a's most recent signal is its error/session tie, both at `now`"
+    );
+    assert_eq!(
+        shared_b.first_seen,
+        now - Duration::seconds(345),
+        "env_b's earliest signal is session_b0's started_at (now - 300s duration, ends at now - 45s)"
+    );
+    assert_eq!(
+        shared_b.last_seen,
+        now - Duration::seconds(45),
+        "env_b's most recent signal is its own error/session tie at now - 45s"
+    );
+    // The whole point: under the old app-wide `eu.first_seen`/`eu.last_seen`
+    // read, all four of the values above would have been identical regardless
+    // of scope. They must differ by environment now.
+    assert_ne!(shared_a.first_seen, shared_b.first_seen);
+    assert_ne!(shared_a.last_seen, shared_b.last_seen);
+
+    // `properties` stays app-wide and un-derived by design (see `PersonRow`'s
+    // doc comment) — confirming the documented no-change path is still true,
+    // not asserting new behaviour.
+    assert_eq!(shared_a.properties, shared_b.properties);
+
+    // ----- DeviceRow (list_devices/get_device): first_seen/last_seen + last_distinct_id -----
+    let devices_a = sauron_db::repo::list_devices(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        50,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    let device_shared_a = devices_a
+        .iter()
+        .find(|r| r.device_key == ids.shared_device_key)
+        .expect("shared_device_key must appear under One(env_a)");
+    assert_eq!(device_shared_a.first_seen, now - Duration::seconds(240));
+    assert_eq!(device_shared_a.last_seen, now);
+    assert_eq!(
+        device_shared_a.last_distinct_id,
+        Some(ids.shared_distinct_id.clone()),
+        "env_a's only identity ever seen on this device is shared_distinct_id itself"
+    );
+
+    // get_device must agree with list_devices — same derivation, different
+    // function (and, under One(env_a), no `since`-vs-unbounded discrepancy to
+    // worry about either: see get_device's doc comment).
+    let device_a = sauron_db::repo::get_device(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.shared_device_key,
+    )
+    .await
+    .unwrap()
+    .expect("shared_device_key must resolve under One(env_a)");
+    assert_eq!(device_a.first_seen, device_shared_a.first_seen);
+    assert_eq!(device_a.last_seen, device_shared_a.last_seen);
+    assert_eq!(device_a.last_distinct_id, device_shared_a.last_distinct_id);
+
+    // The disclosure case: under One(env_b), shared_device_key's most recent
+    // signal is the F4 seed extension's repointed error — a DIFFERENT
+    // identity (distinct_id_env_b_only) that has never touched env_a at all.
+    let device_b = sauron_db::repo::get_device(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &ids.shared_device_key,
+    )
+    .await
+    .unwrap()
+    .expect("shared_device_key must resolve under One(env_b)");
+    assert_eq!(device_b.first_seen, now - Duration::seconds(345));
+    assert_eq!(device_b.last_seen, now - Duration::seconds(10));
+    assert_eq!(
+        device_b.last_distinct_id,
+        Some(ids.distinct_id_env_b_only.clone()),
+        "env_b's most recent signal on this device is the repointed error, whose identity \
+         is distinct_id_env_b_only, not shared_distinct_id"
+    );
+
+    // The assertion that matters most: under One(env_a), this device's
+    // derived identity must NOT be the one that appears only in env_b. Under
+    // the old code (`devices.last_distinct_id`, read regardless of scope)
+    // this would have been `distinct_id_env_b_only` under BOTH env_a and
+    // env_b — that repointed write is the last one `bump_device` sees for
+    // this device_key during seeding, and `bump_device`'s `last_distinct_id`
+    // column carries no notion of "as of which environment" at all.
+    assert_ne!(
+        device_shared_a.last_distinct_id,
+        Some(ids.distinct_id_env_b_only.clone()),
+        "a device scoped to env_a must never surface an identity that appears only in env_b"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// S2 follow-up (`.superpowers/sdd/s2-get-event-user-fix.md`): `get_event_user`
+/// was the one instance of this same bug class the F4 review above named
+/// `PersonRow`/`DeviceRow` for but not for — its raw `EventUser` return still
+/// carried `first_seen`/`last_seen` straight off the app-wide `event_users`
+/// row, rendered by the Person Profile page directly beside an
+/// environment-scoped events/errors list. `get_event_user` now returns
+/// [`sauron_db::repo::PersonRow`] (not the raw `EventUser` model), deriving
+/// `first_seen`/`last_seen` exactly as `list_persons` does — see
+/// `repo::get_event_user`'s doc comment.
+///
+/// Reuses the exact per-environment values the test above already established
+/// for `shared_distinct_id` via `list_persons` (`pinned_now`-relative, from
+/// the F4 seed extension documented on `SeedIds`): `get_event_user` must
+/// *agree* with `list_persons` for the same identity/scope, not just
+/// independently look plausible.
+#[tokio::test]
+async fn get_event_user_seen_is_derived_per_environment_not_app_wide() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let now = ids.pinned_now;
+
+    let user_a = sauron_db::repo::get_event_user(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.shared_distinct_id,
+    )
+    .await
+    .unwrap()
+    .expect("shared_distinct_id must resolve under One(env_a)");
+    assert_eq!(
+        user_a.first_seen,
+        now - Duration::seconds(240),
+        "env_a's earliest signal for shared_distinct_id is its own '$screen' analytics \
+         row — the same value list_persons derives for the identical identity/scope"
+    );
+    assert_eq!(
+        user_a.last_seen, now,
+        "env_a's most recent signal is its error/session tie, both at `now`"
+    );
+
+    let user_b = sauron_db::repo::get_event_user(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &ids.shared_distinct_id,
+    )
+    .await
+    .unwrap()
+    .expect("shared_distinct_id must resolve under One(env_b)");
+    assert_eq!(user_b.first_seen, now - Duration::seconds(345));
+    assert_eq!(user_b.last_seen, now - Duration::seconds(45));
+
+    // The whole point: under the old app-wide `eu.first_seen`/`eu.last_seen`
+    // read, `user_a` and `user_b` would have been identical regardless of
+    // scope. They must differ by environment now.
+    assert_ne!(user_a.first_seen, user_b.first_seen);
+    assert_ne!(user_a.last_seen, user_b.last_seen);
+
+    // The disclosure case the task names directly: a person first seen in
+    // production a year ago must not carry that timestamp into a
+    // staging-only view. `All`'s exact value depends on the wall-clock time
+    // `note_identity` ran at (the `event_users` row's real `first_seen`
+    // DEFAULT / `last_seen` bump), not a `pinned_now` offset, so this asserts
+    // inequality against the scoped values rather than a third exact value —
+    // see `SeedIds`'s doc comment on `pinned_now` for why the two clocks are
+    // independent.
+    let user_all = sauron_db::repo::get_event_user(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &ids.shared_distinct_id,
+    )
+    .await
+    .unwrap()
+    .expect("shared_distinct_id must resolve under All");
+    assert_ne!(
+        user_all.first_seen, user_a.first_seen,
+        "All's app-wide first_seen must not leak into a One(env_a)-scoped read"
+    );
+    assert_ne!(
+        user_all.last_seen, user_a.last_seen,
+        "All's app-wide last_seen must not leak into a One(env_a)-scoped read"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Task 9: issue reads compute per-environment counts
+// ===========================================================================
+
+/// The assertion that matters is the *counts*, not mere presence — a
+/// membership-only filter would return `issue_id` in all three buckets with
+/// `times_seen == 6` and this would still pass a presence-only check.
+#[tokio::test]
+async fn list_issues_reports_per_environment_counts_not_app_wide() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &[],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    let issue = a
+        .iter()
+        .find(|i| i.id == ids.issue_id)
+        .expect("issue appears under env_a");
+    assert_eq!(
+        issue.times_seen, 4,
+        "must be env_a's count, not the app-wide 6"
+    );
+
+    let b = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &[],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        b.iter().find(|i| i.id == ids.issue_id).unwrap().times_seen,
+        1
+    );
+
+    let none = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        &[],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        none.iter()
+            .find(|i| i.id == ids.issue_id)
+            .unwrap()
+            .times_seen,
+        1
+    );
+
+    let all = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &[],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        all.iter()
+            .find(|i| i.id == ids.issue_id)
+            .unwrap()
+            .times_seen,
+        6
+    );
+
+    drop(conn); // required before cleanup(): the pool is sized 1 and would deadlock
+    db.cleanup().await;
+}
+
+/// Proves the LATERAL is an *inner* join, not a `LEFT JOIN`. `issue_env_b_only`
+/// has its one error event confined to `env_b` alone (see `SeedIds`'s doc
+/// comment) — it must not appear at all under `One(env_a)` or `Unattributed`.
+/// A `LEFT JOIN LATERAL` would still return the row (with `agg.last_seen` NULL,
+/// which combined with `far_past()` as `since` would make `agg.last_seen >=
+/// since` false and coincidentally also drop it — so this test additionally
+/// pins `issue_env_b_only`'s presence under `One(env_b)` with the *correct*
+/// count, which a `LEFT JOIN` cannot forge since the aggregate is only ever
+/// wrong, never fabricated with the right value by accident).
+#[tokio::test]
+async fn list_issues_membership_is_an_inner_join_not_a_left_join() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &[],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        a.iter().all(|i| i.id != ids.issue_env_b_only),
+        "issue_env_b_only has zero occurrences in env_a and must not appear at all"
+    );
+
+    let none = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        &[],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        none.iter().all(|i| i.id != ids.issue_env_b_only),
+        "issue_env_b_only has no unattributed occurrence and must not appear at all"
+    );
+
+    let b = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &[],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    let b_only = b
+        .iter()
+        .find(|i| i.id == ids.issue_env_b_only)
+        .expect("issue_env_b_only must appear under its own environment");
+    assert_eq!(b_only.times_seen, 1);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The brief's required test and the two above all call `list_issues` with
+/// `filters: &[]`/`q: None`, which never exercises the scoped path's dynamic
+/// two-pass bind bookkeeping (build the `$N` placeholder text, then a second
+/// pass applies `.bind()` calls in the same order) — a mismatch there is a
+/// runtime bind-count error, not a compile error, so it is invisible unless a
+/// real query with filters actually runs. Exercises `level`/`times_seen`
+/// (plain column filters), `tag:eq`/`tag:contains` (their own `EXISTS`
+/// sub-binds), and free-text `q` (reuses the `$2` `since` bind plus its own
+/// pattern bind) together in one call, under `One`.
+#[tokio::test]
+async fn list_issues_filters_tag_and_free_text_compose_with_scope() {
+    use sauron_db::filter::{Op, ParsedFilter};
+
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let now = Utc::now();
+    let issue_id = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "filter-compose-test-fingerprint",
+            type_: "Error",
+            title: "filter-compose distinctive-marker issue",
+            culprit: "harness::filter_compose",
+            level: "warning",
+            first_seen: now,
+            last_seen: now,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create filter-compose issue");
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_a),
+            issue_id,
+            fingerprint: "filter-compose-test-fingerprint".into(),
+            level: "warning".into(),
+            message: "filter-compose distinctive-marker message".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({"release": "1.2.3"}),
+            release: None,
+            distinct_id: Some("filter-compose-user".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: now,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert filter-compose error event");
+
+    let scope_a = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
+
+    // Plain column filters (level eq, times_seen gt) — bind types Text/BigInt.
+    let by_level = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a,
+        &[ParsedFilter {
+            field: "level",
+            op: Op::Eq,
+            value: "warning".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_level.iter().any(|i| i.id == issue_id),
+        "level:eq:warning must match the filter-compose issue"
+    );
+    assert!(
+        by_level.iter().all(|i| i.id != ids.issue_id),
+        "level:eq:warning must not match the seed's level=error issue"
+    );
+
+    // tag:eq — own EXISTS sub-bind (Jsonb).
+    let by_tag_eq = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a,
+        &[ParsedFilter {
+            field: "tag",
+            op: Op::Eq,
+            value: "release=1.2.3".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(by_tag_eq.iter().any(|i| i.id == issue_id));
+
+    // tag:contains — two EXISTS sub-binds (Text key, Text ILIKE pattern).
+    let by_tag_contains = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a,
+        &[ParsedFilter {
+            field: "tag",
+            op: Op::Contains,
+            value: "release=1.2".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(by_tag_contains.iter().any(|i| i.id == issue_id));
+
+    // Free-text q — reuses the $2 since bind inside its own EXISTS, plus its
+    // own pattern bind, combined with a plain filter in the same call so the
+    // two-pass bind bookkeeping is exercised together, not in isolation.
+    let by_q_and_filter = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a,
+        &[ParsedFilter {
+            field: "times_seen",
+            op: Op::Gt,
+            value: "0".to_string(),
+        }],
+        Some("distinctive-marker"),
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_q_and_filter.iter().any(|i| i.id == issue_id),
+        "q free-text match (title) combined with a times_seen filter must still find the issue"
+    );
+    assert!(
+        by_q_and_filter.iter().all(|i| i.id != ids.issue_env_b_only),
+        "issue_env_b_only has no occurrence in env_a regardless of filters/q"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `since` must be checked against the environment-*derived* `last_seen`, not
+/// `issues.last_seen` (app-wide). Builds a dedicated issue (outside
+/// `seed_two_envs`'s shared fixture, whose own `issue_id` has all six error
+/// events pinned to the identical seed timestamp and so cannot exercise this)
+/// with one occurrence 40 days ago in `env_a` and one occurrence 1 day ago in
+/// `env_b`. Under a 7-day `since`, `env_a`'s view must NOT surface it (its
+/// only env_a activity is 40 days stale) even though the issue's app-wide
+/// `last_seen` (driven by the env_b row) is recent; `env_b`'s view must.
+#[tokio::test]
+async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let old = Utc::now() - Duration::days(40);
+    let recent = Utc::now() - Duration::days(1);
+    let since_7d = Utc::now() - Duration::days(7);
+
+    let issue_id = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "since-derived-test-fingerprint",
+            type_: "HarnessError",
+            title: "since-derived test issue",
+            culprit: "harness",
+            level: "error",
+            first_seen: old,
+            last_seen: old,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create dedicated issue");
+
+    // env_a: one occurrence, 40 days ago.
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_a),
+            issue_id,
+            fingerprint: "since-derived-test-fingerprint".into(),
+            level: "error".into(),
+            message: "old env_a occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("since-derived-user-a".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: old,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert old env_a error event");
+
+    // env_b: one occurrence, 1 day ago — this is what makes the issue's
+    // app-wide `issues.last_seen` recent, via the ON CONFLICT upsert's
+    // `last_seen = excluded(last_seen)` — even though `env_a` has never seen
+    // anything but the 40-day-old row.
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_b),
+            issue_id,
+            fingerprint: "since-derived-test-fingerprint".into(),
+            level: "error".into(),
+            message: "recent env_b occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("since-derived-user-b".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: recent,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert recent env_b error event");
+    // Mirror `upsert_issue`'s own ON CONFLICT semantics so `issues.last_seen`
+    // really is the recent env_b timestamp, exactly like ingest would leave
+    // it (`process_error` calls `upsert_issue` per event; a second call here
+    // mimics the env_b event's own ingest-time upsert).
+    sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "since-derived-test-fingerprint",
+            type_: "HarnessError",
+            title: "since-derived test issue",
+            culprit: "harness",
+            level: "error",
+            first_seen: old,
+            last_seen: recent,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("bump issue to the recent env_b timestamp");
+
+    let a = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &[],
+        None,
+        since_7d,
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        a.iter().all(|i| i.id != issue_id),
+        "env_a's only occurrence is 40 days stale — must not surface in a 7-day view \
+         merely because the issue's app-wide last_seen (driven by env_b) is recent"
+    );
+
+    let b = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        &[],
+        None,
+        since_7d,
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        b.iter().any(|i| i.id == issue_id),
+        "env_b's occurrence is 1 day old — must surface in a 7-day view"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `list_issues` must page the returned rows by the *derived*, per-environment
+/// `last_seen` (`agg.last_seen`) — the value actually displayed — not by
+/// `issues.last_seen` (app-wide). Same shape as
+/// `list_issues_and_top_issues_page_by_environment_membership_not_app_wide_ranking`'s
+/// coverage of `top_issues`' identical bug for `times_seen`; this is the
+/// `list_issues` counterpart for `last_seen`.
+///
+/// Reuses the discriminator from
+/// `list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own`
+/// (an occurrence 40 days stale in `env_a`, 1 day fresh in `env_b`, so the
+/// issue's app-wide `last_seen` is recent while its `env_a`-derived one is
+/// not) — confirmed against that test rather than assumed to be part of
+/// `seed_two_envs`'s shared fixture, which pins every occurrence to the
+/// identical seed timestamp and so cannot tell these two orderings apart.
+/// Pairs it with a second issue whose *only* activity, anywhere, is a single
+/// `env_a` occurrence 5 days ago: its app-wide `last_seen` (5 days ago) is
+/// therefore *older* than the first issue's app-wide `last_seen` (1 day ago,
+/// driven by `env_b`), but its `env_a`-derived `last_seen` (5 days ago) is
+/// *more recent* than the first issue's `env_a`-derived one (40 days ago).
+/// The two orderings disagree, which is what makes this discriminating:
+/// pre-fix (`ORDER BY i.last_seen DESC`) ranks the 40-day-stale issue first;
+/// post-fix (`ORDER BY agg.last_seen DESC`) ranks the 5-day-old one first.
+#[tokio::test]
+async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let old_40d = Utc::now() - Duration::days(40);
+    let recent_1d = Utc::now() - Duration::days(1);
+    let mid_5d = Utc::now() - Duration::days(5);
+
+    // Issue A: only env_a activity is 40 days stale; app-wide `last_seen` is
+    // dragged recent (1 day ago) by an env_b occurrence.
+    let stale_in_env_a = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "order-test-stale-in-env-a",
+            type_: "HarnessError",
+            title: "order test: stale in env_a, recent app-wide",
+            culprit: "harness",
+            level: "error",
+            first_seen: old_40d,
+            last_seen: old_40d,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create stale_in_env_a issue");
+
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_a),
+            issue_id: stale_in_env_a,
+            fingerprint: "order-test-stale-in-env-a".into(),
+            level: "error".into(),
+            message: "old env_a occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("order-test-user-a".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: old_40d,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert old env_a error event");
+
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_b),
+            issue_id: stale_in_env_a,
+            fingerprint: "order-test-stale-in-env-a".into(),
+            level: "error".into(),
+            message: "recent env_b occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("order-test-user-b".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: recent_1d,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert recent env_b error event");
+    // Mirror the ON CONFLICT upsert `process_error` does at real ingest, so
+    // `issues.last_seen` really is the recent env_b timestamp.
+    sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "order-test-stale-in-env-a",
+            type_: "HarnessError",
+            title: "order test: stale in env_a, recent app-wide",
+            culprit: "harness",
+            level: "error",
+            first_seen: old_40d,
+            last_seen: recent_1d,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("bump stale_in_env_a to the recent env_b timestamp");
+
+    // Issue B: only activity anywhere is one env_a occurrence, 5 days ago.
+    // App-wide and env_a-derived `last_seen` coincide (both 5 days ago).
+    let recent_in_env_a = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "order-test-recent-in-env-a",
+            type_: "HarnessError",
+            title: "order test: recent in env_a only",
+            culprit: "harness",
+            level: "error",
+            first_seen: mid_5d,
+            last_seen: mid_5d,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create recent_in_env_a issue");
+
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_a),
+            issue_id: recent_in_env_a,
+            fingerprint: "order-test-recent-in-env-a".into(),
+            level: "error".into(),
+            message: "env_a occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("order-test-user-c".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: mid_5d,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert env_a occurrence for recent_in_env_a");
+
+    let page = sauron_db::repo::list_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &[],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+
+    let position_of = |id: Uuid| {
+        page.iter()
+            .position(|i| i.id == id)
+            .unwrap_or_else(|| panic!("issue {id} missing from the One(env_a) page"))
+    };
+    let stale_pos = position_of(stale_in_env_a);
+    let recent_pos = position_of(recent_in_env_a);
+    assert!(
+        recent_pos < stale_pos,
+        "recent_in_env_a (env_a-derived last_seen: 5 days ago) must sort ahead of \
+         stale_in_env_a (env_a-derived last_seen: 40 days ago) under One(env_a), even \
+         though stale_in_env_a's app-wide last_seen (dragged recent by an env_b \
+         occurrence) is the more recent of the two app-wide. The page must be ordered \
+         by the *displayed*, per-environment agg.last_seen, not issues.last_seen — \
+         pre-fix (ORDER BY i.last_seen DESC) this ranks stale_in_env_a first instead."
+    );
+
+    // The displayed value itself must be the env_a occurrence (40 days ago),
+    // not the app-wide one (1 day ago) — a future change to the ordering
+    // alone, without also fixing what's selected, would still fail here.
+    let stale_row = page.iter().find(|i| i.id == stale_in_env_a).unwrap();
+    assert!(
+        (stale_row.last_seen - old_40d).num_seconds().abs() < 5,
+        "stale_in_env_a's displayed last_seen must be its env_a occurrence (40 days \
+         ago), not its app-wide one (1 day ago): got {}",
+        stale_row.last_seen
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `get_issue`, `top_issues`, `issue_stats`, `issue_occurrence_series`,
+/// `list_error_events_for_issue` and `latest_error_event` all share the same
+/// membership/derivation rules `list_issues` established — asserted here
+/// together against the same seeded `issue_id`/`issue_env_b_only` pair.
+#[tokio::test]
+async fn issue_detail_reads_are_scoped_by_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // get_issue: counts derived per environment; out-of-scope is None.
+    let issue_a = sauron_db::repo::get_issue(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        ids.issue_id,
+    )
+    .await
+    .unwrap()
+    .expect("issue_id appears under env_a");
+    assert_eq!(issue_a.times_seen, 4);
+    let issue_b = sauron_db::repo::get_issue(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        ids.issue_id,
+    )
+    .await
+    .unwrap()
+    .expect("issue_id appears under env_b");
+    assert_eq!(issue_b.times_seen, 1);
+    let issue_all = sauron_db::repo::get_issue(&mut conn, ReadScope::all(ids.app_id), ids.issue_id)
+        .await
+        .unwrap()
+        .expect("issue_id appears under All");
+    assert_eq!(issue_all.times_seen, 6);
+    let b_only_under_a = sauron_db::repo::get_issue(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        ids.issue_env_b_only,
+    )
+    .await
+    .unwrap();
+    assert!(
+        b_only_under_a.is_none(),
+        "issue_env_b_only has no occurrence in env_a — get_issue must return None, not a \
+         zero-count row"
+    );
+
+    // top_issues: membership + derived times_seen, same rules.
+    let top_a = sauron_db::repo::top_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        far_past(),
+        50,
+    )
+    .await
+    .unwrap();
+    let top_issue_a = top_a
+        .iter()
+        .find(|i| i.id == ids.issue_id)
+        .expect("issue_id appears in top_issues under env_a");
+    assert_eq!(top_issue_a.times_seen, 4);
+    assert!(
+        top_a.iter().all(|i| i.id != ids.issue_env_b_only),
+        "issue_env_b_only must not appear in top_issues under env_a"
+    );
+
+    // issue_stats: membership-only (status/level are issue-level, not
+    // per-environment) — both issues count toward env_b's total (issue_id has
+    // an env_b occurrence too), only issue_id counts toward env_a's.
+    let stats_a = sauron_db::repo::issue_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats_a.total, 1, "only issue_id has occurrences in env_a");
+    let stats_b = sauron_db::repo::issue_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stats_b.total, 2,
+        "both issue_id and issue_env_b_only have occurrences in env_b"
+    );
+    let stats_all = sauron_db::repo::issue_stats(&mut conn, ReadScope::all(ids.app_id))
+        .await
+        .unwrap();
+    assert_eq!(stats_all.total, 2, "both issues exist app-wide");
+
+    // issue_occurrence_series: error_events carries environment_id directly.
+    let series_a = sauron_db::repo::issue_occurrence_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        ids.issue_id,
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(series_a.iter().map(|p| p.count).sum::<i64>(), 4);
+    let series_b = sauron_db::repo::issue_occurrence_series(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        ids.issue_id,
+        far_past(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(series_b.iter().map(|p| p.count).sum::<i64>(), 1);
+
+    // list_error_events_for_issue: same direct scoping.
+    let events_a = sauron_db::repo::list_error_events_for_issue(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        ids.issue_id,
+        &[],
+        None,
+        None,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(events_a.len(), 4);
+    let events_b = sauron_db::repo::list_error_events_for_issue(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        ids.issue_id,
+        &[],
+        None,
+        None,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(events_b.len(), 1);
+
+    // latest_error_event: the function `grep "app_id: Uuid"` cannot find —
+    // must still respect scope. Its one env_b occurrence must be returned
+    // under One(env_b) and nothing must be returned for issue_env_b_only
+    // under One(env_a).
+    let latest_b = sauron_db::repo::latest_error_event(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        ids.issue_id,
+    )
+    .await
+    .unwrap()
+    .expect("issue_id has one env_b error event");
+    assert_eq!(latest_b.environment_id, Some(ids.env_b));
+    let latest_b_only_under_a = sauron_db::repo::latest_error_event(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        ids.issue_env_b_only,
+    )
+    .await
+    .unwrap();
+    assert!(
+        latest_b_only_under_a.is_none(),
+        "issue_env_b_only has no error event in env_a"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Regression test for Task 10's "Critical 1": the `tag`/free-text `q`
+/// `EXISTS` fragments in `list_issues`' scoped path carried no environment
+/// predicate, so a tag or payload match in *any* environment could surface —
+/// or, for `q`, extract characters from — an issue under a scope that
+/// excludes that environment, as long as the issue happened to be a genuine
+/// member of the selected environment via some *other*, unrelated
+/// occurrence. `issue_env_b_only` (the existing seed fixture used by
+/// `list_issues_filters_tag_and_free_text_compose_with_scope`) cannot catch
+/// this: it isn't an `env_a` member at all, so Critical 2's membership
+/// `EXISTS` alone already excludes it under `One(env_a)`, regardless of
+/// whether the tag/q predicate itself is scoped — which is exactly why this
+/// bug shipped past a test written to cover this code (see
+/// `.superpowers/sdd/s2-task-9-report.md`). This fixture is a genuine
+/// `env_a` member (a plain, untagged occurrence) that *also* has a second,
+/// `env_b`-only occurrence carrying a distinguishing tag and payload
+/// string — mirroring a reviewer's live reproduction on the dev app, where a
+/// staging-scoped issue's production-only `extra.prod_secret` was
+/// extractable character-by-character through `q`.
+#[tokio::test]
+async fn list_issues_tag_and_q_do_not_leak_across_environments() {
+    use sauron_db::filter::{Op, ParsedFilter};
+
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let now = Utc::now();
+    let issue_id = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "cross-env-leak-fingerprint",
+            type_: "Error",
+            title: "cross-env leak test issue",
+            culprit: "harness::cross_env_leak",
+            level: "error",
+            first_seen: now,
+            last_seen: now,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create cross-env-leak issue");
+
+    // Genuine env_a occurrence — plain, no distinguishing tag/payload. This
+    // alone is what makes the issue a real env_a member, independent of the
+    // env_b occurrence below.
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_a),
+            issue_id,
+            fingerprint: "cross-env-leak-fingerprint".into(),
+            level: "error".into(),
+            message: "plain env_a occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("cross-env-leak-user-a".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: now,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert plain env_a occurrence");
+
+    // env_b-only occurrence carrying the distinguishing tag and payload
+    // string — the "secret" a cross-environment match must not surface.
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_b),
+            issue_id,
+            fingerprint: "cross-env-leak-fingerprint".into(),
+            level: "error".into(),
+            message: "env_b occurrence carrying the secret".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({"release": "canary"}),
+            release: None,
+            distinct_id: Some("cross-env-leak-user-b".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: now,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({"prod_secret": "ACME-INTERNAL-42"}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert env_b-only occurrence carrying the secret tag/payload");
+
+    let scope_a = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
+    let scope_b = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b));
+
+    // Sanity: the issue really is a genuine env_a member (no filter/q).
+    let plain_a = sauron_db::repo::list_issues(&mut conn, scope_a, &[], None, far_past(), 50, 0)
+        .await
+        .unwrap();
+    assert!(
+        plain_a.iter().any(|i| i.id == issue_id),
+        "issue must be a genuine env_a member via its plain occurrence"
+    );
+
+    // tag:eq — the tag lives only in env_b; must not match under env_a even
+    // though the issue is a genuine env_a member.
+    let by_tag_a = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a,
+        &[ParsedFilter {
+            field: "tag",
+            op: Op::Eq,
+            value: "release=canary".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_tag_a.iter().all(|i| i.id != issue_id),
+        "tag:release=canary lives only in env_b — must not match under One(env_a)"
+    );
+
+    // Same tag under env_b, where it actually lives, must still match, with
+    // the correct env_b-derived count.
+    let by_tag_b = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_b,
+        &[ParsedFilter {
+            field: "tag",
+            op: Op::Eq,
+            value: "release=canary".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    let tag_b_hit = by_tag_b
+        .iter()
+        .find(|i| i.id == issue_id)
+        .expect("tag:release=canary must match under its real environment, One(env_b)");
+    assert_eq!(tag_b_hit.times_seen, 1, "must be env_b's own derived count");
+
+    // tag:contains — the same predicate's other bind shape.
+    let by_tag_contains_a = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a,
+        &[ParsedFilter {
+            field: "tag",
+            op: Op::Contains,
+            value: "release=can".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_tag_contains_a.iter().all(|i| i.id != issue_id),
+        "tag:contains release=can must not match under One(env_a) either"
+    );
+
+    // Free-text q, the character-extendable oracle: a substring of the
+    // env_b-only `extra.prod_secret` must not match under env_a...
+    let by_q_a = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a,
+        &[],
+        Some("ACME-INTERNAL-4"),
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_q_a.iter().all(|i| i.id != issue_id),
+        "q=ACME-INTERNAL-4 matches a payload string that exists only in env_b — \
+         must not match, and must not leak, under One(env_a)"
+    );
+
+    // ...but must match under env_b, where it really lives.
+    let by_q_b = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_b,
+        &[],
+        Some("ACME-INTERNAL-4"),
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_q_b.iter().any(|i| i.id == issue_id),
+        "q=ACME-INTERNAL-4 must match under One(env_b), where the payload actually lives"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Regression test for Task 10's "Critical 2": neither `list_issues`' nor
+/// `top_issues`' paging subquery carried an environment membership
+/// predicate, so `LIMIT`/`OFFSET` (and, for `top_issues`, the ranking
+/// itself) operated over the issue's *app-wide* `last_seen`/`times_seen`
+/// before membership was known — an issue confined to a *different*
+/// environment could still consume a page slot (or a top-N rank) ahead of a
+/// genuine member, producing non-monotonic pages and even an empty first
+/// page. Reproduced live on the dev app: `list_issues(One(demo), limit 5,
+/// offset 0)` returned 0 rows while `offset 5`/`offset 10` returned real
+/// ones, and `top_issues(One(demo), since=30d)` returned 0 rows where `All`
+/// returned 5.
+///
+/// This fixture mints three `env_b`-only "noise" issues with a `last_seen`
+/// strictly more recent than every other issue in the app (including the
+/// seed's own `issue_id`/`issue_env_b_only`, created moments earlier) — so
+/// under the pre-fix behaviour, a `LIMIT` of 3 issues under `One(env_a)`
+/// would page in exactly these three (ranked purely by app-wide
+/// `last_seen`), none of which are `env_a` members, yielding an empty page.
+/// It also mints two genuine `env_a` members, `r1`/`r2`, with a
+/// *reversed* relationship between their app-wide and env_a-derived
+/// `times_seen` (`r1`: app-wide 10, env_a-derived 1; `r2`: app-wide 1,
+/// env_a-derived 5) — chosen specifically so that ranking by the app-wide
+/// count (the pre-fix `top_issues` behaviour) and ranking by the derived
+/// count (Task 10's "Important 3" fix) disagree on the order, not just on
+/// the displayed numbers.
+#[tokio::test]
+async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_ranking() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // Three env_b-only "noise" issues, no env_a occurrence at all — not
+    // members of env_a under any definition. `last_seen` is a fresh
+    // `Utc::now()` read strictly after `seed_two_envs()` returned, so it is
+    // guaranteed more recent than every issue that fixture created.
+    let noise_now = Utc::now();
+    let mut noise_ids = Vec::new();
+    for n in 0..3 {
+        let id = sauron_db::repo::upsert_issue(
+            &mut conn,
+            sauron_db::models::NewIssue {
+                app_id: ids.app_id,
+                fingerprint: &format!("c2-noise-{n}"),
+                type_: "Error",
+                title: "c2 noise issue (env_b only, never env_a)",
+                culprit: "harness::c2_noise",
+                level: "error",
+                first_seen: noise_now,
+                last_seen: noise_now,
+                times_seen: 1,
+            },
+        )
+        .await
+        .expect("create noise issue");
+        noise_ids.push(id);
+    }
+
+    // r1: genuine env_a member (1 occurrence, env_a-derived times_seen=1),
+    // but app-wide times_seen artificially inflated to 10 via repeated
+    // upserts, and last_seen held older than the noise issues throughout.
+    let r1_last_seen = noise_now - Duration::hours(2);
+    let r1 = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "c2-real-r1",
+            type_: "Error",
+            title: "c2 real issue r1 (low env_a count, inflated app-wide count)",
+            culprit: "harness::c2_real",
+            level: "error",
+            first_seen: r1_last_seen,
+            last_seen: r1_last_seen,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create r1");
+    for _ in 0..9 {
+        sauron_db::repo::upsert_issue(
+            &mut conn,
+            sauron_db::models::NewIssue {
+                app_id: ids.app_id,
+                fingerprint: "c2-real-r1",
+                type_: "Error",
+                title: "c2 real issue r1 (low env_a count, inflated app-wide count)",
+                culprit: "harness::c2_real",
+                level: "error",
+                first_seen: r1_last_seen,
+                last_seen: r1_last_seen,
+                times_seen: 1,
+            },
+        )
+        .await
+        .expect("inflate r1's app-wide times_seen");
+    }
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_a),
+            issue_id: r1,
+            fingerprint: "c2-real-r1".into(),
+            level: "error".into(),
+            message: "r1's one env_a occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("c2-r1-user".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: r1_last_seen,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+        },
+    )
+    .await
+    .expect("insert r1's env_a occurrence");
+
+    // r2: genuine env_a member with 5 occurrences (env_a-derived
+    // times_seen=5), app-wide times_seen left at 1 (no extra upserts),
+    // last_seen held older than r1 so the paging order among real members is
+    // deterministic: issue_id (seed, recent) > r1 > r2.
+    let r2_last_seen = noise_now - Duration::hours(3);
+    let r2 = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "c2-real-r2",
+            type_: "Error",
+            title: "c2 real issue r2 (high env_a count, low app-wide count)",
+            culprit: "harness::c2_real",
+            level: "error",
+            first_seen: r2_last_seen,
+            last_seen: r2_last_seen,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create r2");
+    for n in 0..5 {
+        sauron_db::repo::insert_error_event(
+            &mut conn,
+            NewErrorEvent {
+                id: Uuid::new_v4(),
+                app_id: ids.app_id,
+                environment_id: Some(ids.env_a),
+                issue_id: r2,
+                fingerprint: "c2-real-r2".into(),
+                level: "error".into(),
+                message: format!("r2 env_a occurrence {n}"),
+                exception_type: "HarnessError".into(),
+                exception_value: "seeded".into(),
+                stacktrace: json!([]),
+                breadcrumbs: json!([]),
+                context: json!({}),
+                tags: json!({}),
+                release: None,
+                distinct_id: Some(format!("c2-r2-user-{n}")),
+                event_user: None,
+                sdk: None,
+                ip_address: None,
+                occurred_at: r2_last_seen,
+                session_id: None,
+                device_key: None,
+                screen: None,
+                stacktrace_symbolicated: None,
+                symbolication_status: "not_applicable".into(),
+                debug_meta: None,
+                contexts: json!({}),
+                extra: json!({}),
+                handled: Some(true),
+            },
+        )
+        .await
+        .expect("insert r2 env_a occurrence");
+    }
+
+    let scope_a = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
+
+    // The only genuine env_a members in this app are the seed's own
+    // `issue_id`, plus `r1` and `r2` — never the three noise issues, never
+    // `issue_env_b_only`.
+    let real_members: std::collections::HashSet<Uuid> =
+        [ids.issue_id, r1, r2].into_iter().collect();
+
+    // A page of exactly 3, at offset 0, must be exactly the 3 real members —
+    // not the 3 (more recent) noise issues, and not empty. Pre-fix, this
+    // would return 0 rows: the paging subquery would pick the 3 noise
+    // issues by app-wide `last_seen` alone, and the LATERAL's `HAVING`
+    // would then drop all three for having no env_a occurrence.
+    let page = sauron_db::repo::list_issues(&mut conn, scope_a, &[], None, far_past(), 3, 0)
+        .await
+        .unwrap();
+    let page_ids: std::collections::HashSet<Uuid> = page.iter().map(|i| i.id).collect();
+    assert_eq!(
+        page_ids, real_members,
+        "limit=3 offset=0 under One(env_a) must be exactly the 3 real env_a members, \
+         not the more-recent noise issues and not empty"
+    );
+
+    // Monotonic single-row paging across the 3 real members: three distinct
+    // pages, no repeats, page 4 exhausted (empty, not spilling into noise).
+    let mut seen_via_paging: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for offset in 0..3i64 {
+        let one =
+            sauron_db::repo::list_issues(&mut conn, scope_a, &[], None, far_past(), 1, offset)
+                .await
+                .unwrap();
+        assert_eq!(
+            one.len(),
+            1,
+            "offset {offset} of 3 real members must return exactly one row"
+        );
+        assert!(
+            real_members.contains(&one[0].id),
+            "offset {offset} must be one of the real members, not noise"
+        );
+        assert!(
+            seen_via_paging.insert(one[0].id),
+            "offset {offset} returned a duplicate of an earlier page — paging is not monotonic"
+        );
+    }
+    assert_eq!(seen_via_paging, real_members);
+    let exhausted = sauron_db::repo::list_issues(&mut conn, scope_a, &[], None, far_past(), 1, 3)
+        .await
+        .unwrap();
+    assert!(
+        exhausted.is_empty(),
+        "offset 3 is past all 3 real members and must come back empty, not noise"
+    );
+
+    // top_issues: must be non-empty (pre-fix: 0 rows, all slots taken by
+    // app-wide-ranked non-members before the LATERAL even runs) and must
+    // rank by the *derived* count, not the app-wide one — r2 (derived 5)
+    // ahead of issue_id (derived 4) ahead of r1 (derived 1), the exact
+    // reverse of ranking by app-wide times_seen (r1=10, issue_id=6, r2=1).
+    let top = sauron_db::repo::top_issues(&mut conn, scope_a, far_past(), 10)
+        .await
+        .unwrap();
+    assert!(
+        !top.is_empty(),
+        "top_issues under One(env_a) must not be empty"
+    );
+    let top_ids: std::collections::HashSet<Uuid> = top.iter().map(|i| i.id).collect();
+    assert_eq!(
+        top_ids, real_members,
+        "top_issues under One(env_a) must be exactly the 3 real env_a members"
+    );
+    let ranked_ids: Vec<Uuid> = top.iter().map(|i| i.id).collect();
+    assert_eq!(
+        ranked_ids,
+        vec![r2, ids.issue_id, r1],
+        "top_issues must be ordered by the *derived* times_seen (5, 4, 1), \
+         the reverse of ranking by the app-wide count (r1=10, issue_id=6, r2=1)"
+    );
+    let r2_row = top.iter().find(|i| i.id == r2).unwrap();
+    assert_eq!(
+        r2_row.times_seen, 5,
+        "r2's displayed count must be its env_a-derived one"
+    );
+    let issue_id_row = top.iter().find(|i| i.id == ids.issue_id).unwrap();
+    assert_eq!(issue_id_row.times_seen, 4);
+    let r1_row = top.iter().find(|i| i.id == r1).unwrap();
+    assert_eq!(
+        r1_row.times_seen, 1,
+        "r1's displayed count must be its env_a-derived one, not its inflated app-wide 10"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}

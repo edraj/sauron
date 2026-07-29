@@ -1,17 +1,17 @@
 # Sauron — Web SDK Demo (Svelte + Vite)
 
 A small single-page **Vite + Svelte 5 (TypeScript)** app that showcases the
-[`@sauron/browser`](../../sdks/js) SDK end-to-end. Click the buttons to push
+[`@edraj/sauron-browser`](../../sdks/js) SDK end-to-end. Click the buttons to push
 errors and product-analytics events to a running Sauron **ingest gateway**, then
 open the dashboard to see the grouped issue + events appear.
 
-It depends on the SDK via a local path (`"@sauron/browser": "file:../../sdks/js"`),
+It depends on the SDK via a local path (`"@edraj/sauron-browser": "file:../../sdks/js"`),
 so no publish/registry step is needed.
 
 ## What it demonstrates
 
-- `Sauron.init({ dsn, environment, release })` — with a DSN you can edit in the
-  UI (persisted to `localStorage`) and re-init on demand.
+- `Sauron.init({ dsn, release })` — with a DSN you can edit in the UI
+  (persisted to `localStorage`) and re-init on demand.
 - Automatic capture of **uncaught errors** and **unhandled promise rejections**
   (installed by `init`).
 - `captureException`, `captureMessage`, `track`, `identify`, and `addBreadcrumb`.
@@ -121,7 +121,7 @@ npm run preview   # serve the built bundle
 
 ## DSN configuration
 
-The DSN is `http://<public_key>@<host>/<project_id>`. The public key is a
+The DSN is `http://<public_key>@<host>/<environment_id>`. The public key is a
 non-secret, write-only credential — safe to ship in client code.
 
 **Default (local dev ingest, port 8091):**
@@ -140,8 +140,9 @@ the compose stack, change the host in the DSN input to `localhost:8081`:
 http://pk_4cf799b01ea53473661c82827a75cb87@localhost:8081/3ccbaa22-3750-477c-a330-faca235d7337
 ```
 
-(The public key / project id above belong to the dev ingest's seeded app; a
-fresh compose stack will have its own app — paste that app's DSN instead.)
+(The public key / environment id above belong to the dev ingest's seeded app; a
+fresh compose stack will have its own app — paste that app's environment DSN
+instead.)
 
 You can paste any DSN into the header input and click **Init / Reconnect**; the
 value is saved to `localStorage`. **Reset** restores the dev default.
@@ -150,5 +151,5 @@ value is saved to `localStorage`. **Reset** restores the dev default.
 
 - The ingest accepts cross-origin requests (`Access-Control-Allow-Origin: *`),
   so the browser can POST envelopes from the Vite dev server directly.
-- The wire endpoint is `POST /api/{project_id}/envelope` with an
+- The wire endpoint is `POST /api/{environment_id}/envelope` with an
   `X-Sauron-Key: <public_key>` header — handled entirely by the SDK.

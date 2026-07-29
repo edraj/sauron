@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 pub struct Args {
     // --- target selection (exactly one) ---
     /// Direct mode: SDK-format DSN of a running ingest edge
-    /// (scheme://<public_key>@host:port/<app_id>). Env: CREBAIN_DSN.
+    /// (scheme://<public_key>@host:port/<environment_id>). Env: CREBAIN_DSN.
     #[arg(long)]
     pub dsn: Option<String>,
 

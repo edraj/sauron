@@ -9,18 +9,18 @@ See also: **[Getting Started](Getting-Started.md)** ·
 
 | Example | SDK | Directory |
 | --- | --- | --- |
-| Svelte web | `@sauron/browser` | [`examples/svelte-web`](../examples/svelte-web) |
+| Svelte web | `@edraj/sauron-browser` | [`examples/svelte-web`](../examples/svelte-web) |
 | Flutter app | `sauron_flutter` | [`examples/flutter-app`](../examples/flutter-app) |
-| Node server | `@sauron/node` | [`examples/node-server`](../examples/node-server) |
+| Node server | `@edraj/sauron-node` | [`examples/node-server`](../examples/node-server) |
 | Python server | `sauron-sdk` | [`examples/python-server`](../examples/python-server) |
 | C# server | `Sauron` | [`examples/csharp-server`](../examples/csharp-server) |
 
-## Svelte web — `@sauron/browser`
+## Svelte web — `@edraj/sauron-browser`
 
 A Vite + Svelte 5 single-page app that showcases the browser SDK: crashes, product
 events, identify, screens, performance. See
 [`examples/svelte-web/README.md`](../examples/svelte-web/README.md). Depends on the
-local SDK via `"@sauron/browser": "file:../../sdks/js"`.
+local SDK via `"@edraj/sauron-browser": "file:../../sdks/js"`.
 
 ```bash
 cd examples/svelte-web
@@ -41,16 +41,16 @@ flutter pub get
 flutter run
 ```
 
-## Node server — `@sauron/node`
+## Node server — `@edraj/sauron-node`
 
 A tiny backend exercising `init → identify → track → captureException →
 flush/close`. See [`examples/node-server/README.md`](../examples/node-server/README.md).
-Depends on the local SDK via `"@sauron/node": "file:../../sdks/node"`.
+Depends on the local SDK via `"@edraj/sauron-node": "file:../../sdks/node"`.
 
 ```bash
 cd examples/node-server
 npm install
-SAURON_DSN="https://<public_key>@<host>/<project_id>" npm start
+SAURON_DSN="https://<public_key>@<host>/<environment_id>" npm start
 # typecheck only:
 npm run typecheck
 ```
@@ -63,7 +63,7 @@ Identifies a user, tracks an event, and captures a deliberate exception. See
 ```bash
 cd examples/python-server
 pip install -e ../../sdks/python
-SAURON_DSN="https://<public_key>@<host>/<project_id>" python main.py
+SAURON_DSN="https://<public_key>@<host>/<environment_id>" python main.py
 ```
 
 ## C# server — `Sauron`
@@ -73,7 +73,7 @@ See [`examples/csharp-server/README.md`](../examples/csharp-server/README.md).
 References the shipped SDK via a project reference.
 
 ```bash
-export SAURON_DSN="https://<public_key>@<host>/<project_id>"
+export SAURON_DSN="https://<public_key>@<host>/<environment_id>"
 cd examples/csharp-server
 dotnet run
 ```

@@ -82,7 +82,7 @@ def handle_request() -> None:
 
 def main() -> int:
     dsn = os.environ.get("SAURON_DSN")
-    sauron.init(dsn, environment="development", debug=True)
+    sauron.init(dsn, debug=True)
 
     # Attach traits to the person behind this distinct_id (process-wide).
     sauron.identify(

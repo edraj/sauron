@@ -6,6 +6,7 @@ pub mod apps;
 pub mod artifacts;
 pub mod auth;
 pub mod devices;
+pub mod environments;
 pub mod funnels;
 pub mod issues;
 pub mod journeys;
@@ -14,6 +15,7 @@ pub mod notifications;
 pub mod orgs;
 pub mod performance;
 pub mod projects;
+pub mod scope;
 pub mod screens;
 pub mod sessions;
 

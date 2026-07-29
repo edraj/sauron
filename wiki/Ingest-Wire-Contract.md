@@ -11,18 +11,20 @@ See also: **[Home](Home.md)** · **[Getting Started](Getting-Started.md)** ·
 ## DSN
 
 ```
-https://<public_key>@<host>/<project_id>
+https://<public_key>@<host>/<environment_id>
 ```
 
 - `<public_key>` — a **non-secret, write-only** credential (the URL "user" part). Safe
   to embed in client code. A DSN **must not** contain a password/secret component.
+  The key identifies exactly one environment, and therefore one app, project and org.
 - `<host>` — `host:port` of the ingest gateway (`https` or `http`).
-- `<project_id>` — the path segment (id/UUID).
+- `<environment_id>` — the environment's UUID. Informational: the gateway
+  authenticates on the key alone and does not read this segment.
 
 ## Endpoint
 
 ```
-POST {protocol}://{host}/api/{project_id}/envelope
+POST {protocol}://{host}/api/{environment_id}/envelope
 ```
 
 Headers:
@@ -63,7 +65,6 @@ default to now.
     "dsn": "https://pk_test@localhost:8081/1",
     "sdk": { "name": "sauron.javascript", "version": "0.1.0" },
     "sent_at": "2026-07-12T10:30:00.123Z",
-    "environment": "production",
     "release": "web@1.4.2"
   },
   "context": {

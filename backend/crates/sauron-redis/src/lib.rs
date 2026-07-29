@@ -32,16 +32,15 @@ pub mod keys {
         hex::encode(&h.finalize()[..16])
     }
 
-    /// Cache slot for a resolved DSN. Takes the **raw** public key and
+    /// Cache slot for a resolved ingest key. Takes the **raw** public key and
     /// fingerprints it internally.
     ///
-    /// Hashing lives here rather than at the call site on purpose: when the
-    /// ingest edge hashed but the API's invalidation path did not, every
-    /// `DEL` silently missed and a rotated (revoked) key kept resolving for
-    /// the full positive-cache TTL. One caller cannot now disagree with
-    /// another about how the key is derived.
+    /// The `v2` segment is load-bearing. The cached value changed shape when the
+    /// key moved from apps to environments; without a new prefix, entries written
+    /// by the previous binary would deserialize into the wrong struct (or fail
+    /// and silently fall through to Postgres) for the full 300s TTL after deploy.
     pub fn dsn_cache(public_key: &str) -> String {
-        format!("sauron:dsn:{}", key_fingerprint(public_key))
+        format!("sauron:dsn:v2:{}", key_fingerprint(public_key))
     }
     /// Per-DSN-key ingest rate-limit counter. Takes the **raw** public key.
     pub fn key_rate_limit(public_key: &str) -> String {

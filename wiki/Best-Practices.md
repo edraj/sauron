@@ -105,13 +105,13 @@ before). Item fields are **immutable (`final`)**, so use it to **drop or replace
 items**, and scrub sensitive values at the call site rather than mutating in place:
 
 ```dart
-await Sauron.init((o) {
-  o.dsn = dsn;
-  o.beforeSend = (item) {
+await Sauron.init(SauronOptions(
+  dsn: dsn,
+  beforeSend: (item) {
     if (item is EventItem && item.name == r'$secret') return null; // drop
     return item; // guard the type if you only care about a subset
-  };
-});
+  },
+));
 ```
 
 **Also scrub breadcrumbs.** Breadcrumb `data` can leak the same way. Node/Python/C#/

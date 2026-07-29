@@ -7,17 +7,48 @@
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon, { type IconName } from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { listEnvironments } from '../lib/api/environments';
   import { buildDsn, appTypeIcon, appTypeLabel } from '../lib/utils/format';
+  import type { Environment } from '../lib/models';
 
   type Platform = 'web' | 'flutter' | 'python' | 'node' | 'csharp';
 
   const app = $derived(sessionStore.currentApp);
   const hasApp = $derived(!!app);
 
-  // Every snippet is filled in with the selected app's DSN so it's copy-paste
-  // ready. Falls back to an obvious placeholder when no app is selected yet.
+  // The DSN now lives on the app's default environment, not the app itself —
+  // re-fetch whenever the current app changes.
+  let defaultEnv = $state<Environment | null>(null);
+
+  $effect(() => {
+    const aid = sessionStore.currentAppId;
+    // Clear synchronously, before awaiting. The app name and type badge are derived
+    // straight off the store and update in the same tick as the switch, so holding the
+    // previous app's environment here would render the NEW app's name beside the OLD
+    // app's DSN — a well-formed, copyable credential pointing at the wrong app.
+    defaultEnv = null;
+    if (!aid) return;
+    void (async () => {
+      try {
+        const envs = await listEnvironments(aid);
+        // Discard a response that lost the race: on rapid A -> B -> A switching the
+        // requests can settle out of order, which would otherwise leave the wrong
+        // environment in place permanently rather than only transiently.
+        if (sessionStore.currentAppId !== aid) return;
+        defaultEnv = envs.find((e) => e.is_default) ?? envs[0] ?? null;
+      } catch {
+        if (sessionStore.currentAppId === aid) defaultEnv = null;
+      }
+    })();
+  });
+
+  // Every snippet is filled in with the selected environment's DSN so it's
+  // copy-paste ready. Falls back to an obvious placeholder when no app is
+  // selected yet, or while the environment fetch is still in flight.
   const dsn = $derived(
-    app ? buildDsn(app.public_key, app.id) : buildDsn('pk_your_public_key', '<APP_ID>'),
+    defaultEnv
+      ? buildDsn(defaultEnv.public_key, defaultEnv.id)
+      : buildDsn('pk_your_public_key', '<ENVIRONMENT_ID>'),
   );
 
   // Default the platform tab to the current app's SDK; a manual pick wins after.
@@ -45,14 +76,13 @@
 
   // --- snippets (derived so the DSN stays live) ----------------------------
 
-  const webInstall = 'npm install @sauron/browser';
+  const webInstall = 'npm install @edraj/sauron-browser';
 
-  const webInit = $derived(`import { Sauron } from '@sauron/browser';
+  const webInit = $derived(`import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({
   dsn: '${dsn}',
-  environment: 'production', // e.g. import.meta.env.MODE
-  release: 'web@1.0.0',      // ties errors to a version
+  release: 'web@1.0.0', // ties errors to a version
 });`);
 
   const webCapture = `// Uncaught errors + unhandled promise rejections are captured automatically.
@@ -73,11 +103,10 @@ Sauron.identify('u_123', { plan: 'pro', email: 'ada@example.com' });
 // …then record product events:
 Sauron.track('checkout_completed', { cart_value: 42.5, currency: 'USD' });`;
 
-  const webFull = $derived(`import { Sauron } from '@sauron/browser';
+  const webFull = $derived(`import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({
   dsn: '${dsn}',
-  environment: import.meta.env.MODE,
   release: 'web@1.0.0',
   sampleRate: 1,
   beforeSend(item) {
@@ -104,11 +133,13 @@ flutter pub get`;
 import 'package:sauron_flutter/sauron_flutter.dart';
 
 Future<void> main() async {
-  await Sauron.init((o) {
-    o.dsn = '${dsn}';
-    o.environment = 'production';
-    o.release = 'app@1.0.0+1';
-  }, appRunner: () => runApp(const MyApp()));
+  await Sauron.init(
+    SauronOptions(
+      dsn: '${dsn}',
+      release: 'app@1.0.0+1',
+    ),
+    appRunner: () => runApp(const MyApp()),
+  );
 }`);
 
   const flutterCapture = `// All four Flutter/Dart layers are captured automatically (FlutterError,
@@ -133,12 +164,14 @@ Sauron.track('checkout_completed', properties: {'cart_value': 42.5});`;
 import 'package:sauron_flutter/sauron_flutter.dart';
 
 Future<void> main() async {
-  await Sauron.init((o) {
-    o.dsn = '${dsn}';
-    o.environment = 'production';
-    o.release = 'app@1.0.0+1';
-    o.sampleRate = 1.0;
-  }, appRunner: () => runApp(const MyApp()));
+  await Sauron.init(
+    SauronOptions(
+      dsn: '${dsn}',
+      release: 'app@1.0.0+1',
+      sampleRate: 1.0,
+    ),
+    appRunner: () => runApp(const MyApp()),
+  );
 }
 
 class MyApp extends StatelessWidget {
@@ -161,8 +194,7 @@ class MyApp extends StatelessWidget {
 
 sauron.init(
     dsn="${dsn}",
-    environment="production",  # e.g. os.environ["ENV"]
-    release="api@1.0.0",       # ties errors to a version
+    release="api@1.0.0",  # ties errors to a version
 )`);
 
   const pyCapture = `# Report a handled exception (reads the active traceback):
@@ -186,15 +218,14 @@ sauron.track(
     properties={"cart_value": 42.5, "currency": "USD"},
 )`;
 
-  // --- Node (server) — @sauron/node ----------------------------------------
+  // --- Node (server) — @edraj/sauron-node ----------------------------------------
 
-  const nodeInstall = 'npm install @sauron/node';
+  const nodeInstall = 'npm install @edraj/sauron-node';
 
-  const nodeInit = $derived(`import { Sauron } from '@sauron/node';
+  const nodeInit = $derived(`import { Sauron } from '@edraj/sauron-node';
 
 Sauron.init({
   dsn: '${dsn}',
-  environment: process.env.NODE_ENV, // e.g. 'production'
   release: 'api@1.0.0',
 });`);
 
@@ -225,7 +256,6 @@ Sauron.track('checkout_completed', 'u_123', { cart_value: 42.5, currency: 'USD' 
 SauronSdk.Init(new SauronOptions
 {
     Dsn = "${dsn}",
-    Environment = "production",
     Release = "api@1.0.0",
 });`);
 
@@ -319,7 +349,7 @@ SauronSdk.Track("signup_completed", "u_123");`;
   ];
 
   const flutterApi: { sig: string; desc: string }[] = [
-    { sig: 'Sauron.init(configure, appRunner:)', desc: 'Initialize inside runZonedGuarded.' },
+    { sig: 'Sauron.init(options, appRunner:)', desc: 'Initialize inside runZonedGuarded.' },
     { sig: 'captureException(error, stackTrace:)', desc: 'Report an error with its stack.' },
     { sig: 'track(name, properties:)', desc: 'Record a product-analytics event.' },
     { sig: 'identify(id, traits:)', desc: 'Associate the session with a user.' },
@@ -330,7 +360,7 @@ SauronSdk.Track("signup_completed", "u_123");`;
   ];
 
   const pythonApi: { sig: string; desc: string }[] = [
-    { sig: 'init(dsn, environment?, release?, …)', desc: 'Initialize the SDK (no-op when the DSN is missing).' },
+    { sig: 'init(dsn, release?, …)', desc: 'Initialize the SDK (no-op when the DSN is missing).' },
     { sig: 'capture_exception(exc, *, level?)', desc: 'Report an exception with its traceback.' },
     { sig: 'capture_message(msg, level?)', desc: 'Report a plain message.' },
     { sig: 'track(event, distinct_id, properties?)', desc: 'Record a product-analytics event.' },
@@ -433,7 +463,6 @@ SauronSdk.Track("signup_completed", "u_123");`;
     { sig: 'name', desc: 'text — the event name' },
     { sig: 'distinct_id', desc: 'text — shown as "User" in the UI' },
     { sig: 'session_id', desc: 'text' },
-    { sig: 'environment', desc: "enum — populated from this app's real environments" },
     { sig: 'release', desc: 'text' },
     { sig: 'tag', desc: "key + value against the event's tags — see below" },
   ];
@@ -451,11 +480,11 @@ Chip: Tag   =   key=region   value=eu
   const troubleshooting: { q: string; a: string }[] = [
     {
       q: 'Nothing shows up in the dashboard',
-      a: "Confirm the DSN matches this app (top-bar app switcher or App settings) and that the ingest gateway is reachable from your client. Watch for POST /api/<app_id>/envelope in the Network tab.",
+      a: "Confirm the DSN matches the right app and environment (top-bar app switcher, then Settings → Environments) and that the ingest gateway is reachable from your client. Watch for POST /api/<environment_id>/envelope in the Network tab.",
     },
     {
       q: '401 or 403 responses',
-      a: 'The public key is wrong or was rotated. Copy the current DSN from App settings. (The Flutter SDK disables itself after a 401/403.)',
+      a: 'The public key is wrong or was rotated. Copy the current DSN from Settings → Environments. (The Flutter SDK disables itself after a 401/403.)',
     },
     {
       q: 'Events arrive but there is no person',
@@ -717,12 +746,16 @@ GROUP BY name, op`;
             {app.name}
           </span>
           <Badge tone="neutral" size="sm">{appTypeLabel(app.app_type)}</Badge>
-          <span class="dsn-note muted">Snippets below use this app's DSN.</span>
+          <span class="dsn-note muted">Snippets below use the DSN shown here.</span>
         </div>
         <div class="dsn-row">
           <code class="dsn mono">{dsn}</code>
           <CopyButton value={dsn} />
         </div>
+        <p class="muted dsn-env-hint">
+          Showing the DSN for the <strong>{defaultEnv?.name ?? 'default'}</strong> environment.
+          Each environment has its own — see <a href="#/settings">Settings → Environments</a>.
+        </p>
       {:else}
         <div class="dsn-empty">
           <span class="ic"><Icon name="key-round" size={18} /></span>
@@ -749,11 +782,15 @@ GROUP BY name, op`;
         <Icon name="chevron-right" size={14} />
         <span class="node">App</span>
         <Icon name="chevron-right" size={14} />
+        <span class="node">Environment</span>
+        <Icon name="chevron-right" size={14} />
         <span class="node key">DSN</span>
       </div>
       <p class="muted concept-lead">
-        An <b>app</b> holds a DSN — a public key plus the app id. Your SDK batches, gzips, and posts
-        envelopes to the ingest gateway, where the dashboard sorts them into two signal types:
+        An <b>environment</b> holds the DSN — a public key plus the environment id. Each
+        environment under an app gets its own, so switching environments means switching DSNs.
+        Your SDK batches, gzips, and posts envelopes to the ingest gateway, where the dashboard
+        sorts them into two signal types:
       </p>
       <div class="signals">
         <div class="signal">
@@ -1359,7 +1396,7 @@ GROUP BY name, op`;
             {/snippet}
             <p class="muted concept-lead">
               What every SDK does between your call and the wire. Calls accumulate into one
-              <b>envelope</b> — a header (SDK, release, environment), a context block (device, os,
+              <b>envelope</b> — a header (SDK, release), a context block (device, os,
               app, runtime, user) and a list of typed items (error, event, identify, transaction,
               breadcrumb batch).
             </p>
@@ -1507,6 +1544,10 @@ GROUP BY name, op`;
   .dsn-note {
     font-size: 12.5px;
     margin-left: auto;
+  }
+  .dsn-env-hint {
+    font-size: 12.5px;
+    margin-top: 10px;
   }
   .dsn-row {
     display: flex;

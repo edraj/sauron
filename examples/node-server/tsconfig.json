@@ -12,7 +12,7 @@
     "forceConsistentCasingInFileNames": true,
     "baseUrl": ".",
     "paths": {
-      "@sauron/node": ["../../sdks/node/src/index.ts"]
+      "@edraj/sauron-node": ["../../sdks/node/src/index.ts"]
     }
   },
   "include": ["index.ts"]

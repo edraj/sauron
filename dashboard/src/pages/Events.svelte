@@ -18,11 +18,9 @@
     encodeFilters,
     parseFilters,
     type Filter,
-    type FieldDef,
   } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { topEvents, eventSeries, listEvents } from '../lib/api/events';
-  import { listEnvironments } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
   import { relativeTime, formatDateTime } from '../lib/utils/format';
   import type { AnalyticsEvent, SeriesPoint, TopEvent } from '../lib/models';
@@ -42,11 +40,6 @@
   let appliedSearch = $state(initial.get('q') ?? '');
   let sinceDays = $state(Number(initial.get('since_days')) || 30);
 
-  // `environment` field options are loaded per-app; start from the static
-  // defs and inject a fresh copy once environments resolve (never mutate the
-  // exported EVENT_FIELDS array in place).
-  let eventFields = $state<FieldDef[]>(EVENT_FIELDS);
-
   const selectedTopEvent = $derived(
     filters.find((f) => f.field === 'name' && f.op === 'eq')?.value ?? null,
   );
@@ -64,19 +57,6 @@
   let loadingStream = $state(true);
   let streamError = $state<string | null>(null);
   let expandedId = $state<string | null>(null);
-
-  async function loadEnvironmentOptions(appId: string) {
-    let names: string[] = [];
-    try {
-      const envs = await listEnvironments(appId);
-      names = envs.map((e) => e.name);
-    } catch {
-      names = [];
-    }
-    eventFields = EVENT_FIELDS.map((f) =>
-      f.key === 'environment' ? { ...f, options: names } : f,
-    );
-  }
 
   async function loadTop(appId: string, days: number) {
     loadingTop = true;
@@ -150,17 +130,18 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    if (aid) void loadEnvironmentOptions(aid);
-  });
-
-  $effect(() => {
-    const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const days = sinceDays;
     if (aid) void loadTop(aid, days);
   });
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const days = sinceDays;
     const name = selectedTopEvent;
     if (aid) void loadSeries(aid, days, name);
@@ -184,6 +165,9 @@
   // keystroke.
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
     const days = sinceDays;
@@ -199,6 +183,9 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
     const days = sinceDays;
@@ -243,7 +230,7 @@
   </div>
 
   <p class="hint muted">Filter by <code>Tag</code> (key = value); the search box also matches tag &amp; payload content.</p>
-  <FilterBar fields={eventFields} bind:filters bind:search bind:sinceDays />
+  <FilterBar fields={EVENT_FIELDS} bind:filters bind:search bind:sinceDays />
 
   {#if error && top.length === 0 && series.length === 0}
     <Card>

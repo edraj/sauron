@@ -50,6 +50,9 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const id = issueId;
     if (aid && id) void load(aid, id);
   });
@@ -79,6 +82,9 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const id = issueId;
     const enc = encodeFilters(occFilters);
     const term = occSearch;

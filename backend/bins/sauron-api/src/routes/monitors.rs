@@ -29,6 +29,10 @@ fn invalid_interval_msg() -> String {
 #[derive(Deserialize)]
 pub struct RangeQuery {
     pub hours: Option<i64>,
+    /// Monitors are project-scoped with no app/environment link at all;
+    /// rejected rather than silently accepted-and-ignored — see
+    /// `routes::scope::reject_environment_id`.
+    pub environment_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -56,7 +60,9 @@ pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
     authorize_project(&mut conn, auth.user_id, project_id, perm::MONITOR_READ).await?;
     let rows = repo::list_monitors_for_project(&mut conn, project_id).await?;
@@ -67,8 +73,14 @@ pub async fn create(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<CreateMonitorReq>,
 ) -> Result<Json<Monitor>, ApiError> {
+    // Monitors have no environment dimension at all (see `RangeQuery`'s doc
+    // comment above); rejected here too, matching `list`/`detail`/`checks`/
+    // `incidents` in this same file rather than silently discarding it on
+    // writes alone.
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("monitor name is required".into()));
     }
@@ -136,7 +148,9 @@ pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(monitor_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, m) =
         load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
     let uptime_24h = repo::uptime_pct(&mut conn, monitor_id, 24).await?;
@@ -162,8 +176,10 @@ pub async fn update(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(monitor_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<UpdateMonitorReq>,
 ) -> Result<Json<Monitor>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if let Some(i) = req.interval_seconds {
         if !sauron_core::is_valid_monitor_interval(i) {
             return Err(ApiError::BadRequest(invalid_interval_msg()));
@@ -200,7 +216,9 @@ pub async fn delete(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(monitor_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, _m) =
         load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
     repo::delete_monitor(&mut conn, monitor_id).await?;
@@ -213,6 +231,7 @@ pub async fn checks(
     Path(monitor_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(q.environment_id.as_deref())?;
     let (mut conn, _m) =
         load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
     let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
@@ -224,7 +243,9 @@ pub async fn incidents(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(monitor_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, _m) =
         load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
     let rows = repo::list_incidents(&mut conn, monitor_id, 50).await?;

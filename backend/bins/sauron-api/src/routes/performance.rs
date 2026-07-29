@@ -20,6 +20,7 @@ pub struct SummaryQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
     pub op: Option<String>,
+    pub environment_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +29,7 @@ pub struct SeriesQuery {
     pub since_days: i64,
     pub name: Option<String>,
     pub op: Option<String>,
+    pub environment_id: Option<String>,
 }
 
 fn default_days() -> i64 {
@@ -51,8 +53,9 @@ pub async fn summary(
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, MAX_PERF_WINDOW_DAYS));
     let op = q.op.as_deref().filter(|s| !s.is_empty());
+    let scope = super::scope::read_scope(app_id, q.environment_id.as_deref())?;
     Ok(Json(
-        repo::performance_summary(&mut conn, app_id, since, op, None).await?,
+        repo::performance_summary(&mut conn, scope, since, op, None).await?,
     ))
 }
 
@@ -67,7 +70,8 @@ pub async fn series(
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, MAX_PERF_WINDOW_DAYS));
     let name = q.name.as_deref().filter(|s| !s.is_empty());
     let op = q.op.as_deref().filter(|s| !s.is_empty());
+    let scope = super::scope::read_scope(app_id, q.environment_id.as_deref())?;
     Ok(Json(
-        repo::performance_series(&mut conn, app_id, since, name, op).await?,
+        repo::performance_series(&mut conn, scope, since, name, op).await?,
     ))
 }
