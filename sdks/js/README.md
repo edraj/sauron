@@ -32,7 +32,6 @@ import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({
   dsn: 'https://pk_test@ingest.example.com/42',
-  environment: 'production',
   release: 'web@1.4.2',
 });
 
@@ -59,8 +58,7 @@ missing falls back to the default below (resolved in `resolveOptions()`).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `dsn` | `string` | — **(required)** | `https://<public_key>@<host>/<project_id>`. A non-string or empty value throws `Error`; a malformed URL throws `DsnError`. |
-| `environment` | `string` | `'production'` | Stamped on `header.environment`. |
+| `dsn` | `string` | — **(required)** | `https://<public_key>@<host>/<environment_id>`. A non-string or empty value throws `Error`; a malformed URL throws `DsnError`. |
 | `release` | `string` | `null` | Stamped on `header.release`; the part after the last `@` also becomes `context.app.version` (`web@1.4.2` → `1.4.2`). |
 | `sampleRate` | `number` | `1` | Fraction of **error items** sent, clamped into `[0, 1]`. Applies to `captureException`, `captureMessage` and the global handlers only — events, identifies and transactions are never sampled. |
 | `maxBreadcrumbs` | `number` | `50` | Ring-buffer size; oldest entries are evicted first. Negative values are treated as `0`, which disables breadcrumbs entirely. |
@@ -90,7 +88,6 @@ import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({
   dsn: 'https://pk_test@ingest.example.com/42',
-  environment: 'staging',
   release: 'web@1.4.2',
   sampleRate: 0.5,
   maxBreadcrumbs: 100,
@@ -160,7 +157,7 @@ the DSN itself is malformed.
 
 ```ts
 const client = Sauron.init({ dsn: 'https://pk_test@localhost:8081/1' });
-client.options.environment; // 'production'
+client.options.release;     // null
 client.dsn.projectId;       // '1'
 ```
 
@@ -566,17 +563,19 @@ class DsnError extends Error
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `dsn` | `string` | — (required) | `https://<public_key>@<host>/<project_id>`. |
+| `dsn` | `string` | — (required) | `https://<public_key>@<host>/<environment_id>`. |
 
 Returns a `Dsn` with `raw`, `publicKey`, `host` (`host:port`), `hostname`,
-`protocol` (`http` or `https`, no colon), `projectId`, `envelopeUrl`
-(`<protocol>://<host>/api/<project_id>/envelope`) and `beaconUrl` (the same URL
-with `?k=<public_key>`).
+`protocol` (`http` or `https`, no colon), `projectId` (the DSN's path
+segment — despite the name, this is the **environment** id since the ingest
+key now lives on the environment, not the app), `envelopeUrl`
+(`<protocol>://<host>/api/<environment_id>/envelope`) and `beaconUrl` (the same
+URL with `?k=<public_key>`).
 
 Throws `DsnError` (message prefixed `[sauron] invalid DSN:`) for an empty or
 non-string value, an unparseable URL, a protocol other than `http`/`https`, a
 missing public key, a DSN that carries a password component, a missing host, or
-a missing project-id path segment.
+a missing environment-id path segment.
 
 ```ts
 import { parseDsn, DsnError } from '@edraj/sauron-browser';
@@ -601,7 +600,7 @@ function buildEnvelope(
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `header` | `EnvelopeHeader` | — (required) | `dsn`, `sdk`, `sent_at`, `environment`, `release`. |
+| `header` | `EnvelopeHeader` | — (required) | `dsn`, `sdk`, `sent_at`, `release`. |
 | `context` | `Context` | — (required) | `device`, `os`, `app`, `runtime`, `user`. |
 | `items` | `EnvelopeItem[]` | — (required) | The payload items. |
 
@@ -616,7 +615,6 @@ const envelope = buildEnvelope(
     dsn: 'https://pk_test@localhost:8081/1',
     sdk: { name: SDK_NAME, version: SDK_VERSION },
     sent_at: new Date().toISOString(),
-    environment: 'test',
     release: null,
   },
   context,
@@ -658,7 +656,7 @@ const appFrames = frames.filter((f) => isInAppFrame(f.filename));
 
 ```ts
 const SDK_NAME: string  // 'sauron.javascript'
-const SDK_VERSION: string // '1.0.0'
+const SDK_VERSION: string // '1.2.0'
 ```
 
 The SDK identity embedded in `header.sdk` of every envelope.
@@ -781,7 +779,7 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.0.0';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.2.0';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42' });
 </script>
 ```
@@ -800,7 +798,7 @@ clamped to `[1, 1000]`), and on demand via `flush()`/`close()`. Each `flush()`
 drains the offline queue first, then posts the buffered items in
 `maxBatch`-sized envelopes.
 
-**Request.** `POST <protocol>://<host>/api/<project_id>/envelope` with:
+**Request.** `POST <protocol>://<host>/api/<environment_id>/envelope` with:
 
 ```
 Content-Type: application/json
@@ -849,7 +847,7 @@ are dropped.
 **Page unload.** On `visibilitychange` → `hidden` and on `pagehide`, the pending
 batch is chunked to 1000 items and handed to `navigator.sendBeacon` as an
 uncompressed `application/json` Blob posted to
-`POST /api/<project_id>/envelope?k=<public_key>` (the key moves to the query
+`POST /api/<environment_id>/envelope?k=<public_key>` (the key moves to the query
 string because beacons cannot set headers). Chunks larger than 64 KiB, or a
 `sendBeacon` that is unavailable or refuses, are parked in the offline queue for
 the next page load.
@@ -858,10 +856,10 @@ the next page load.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Nothing arrives, no client-side errors | The gateway is not exposed at `/api/{project_id}/envelope` on the host root. A DSN cannot express a path prefix, so the SDK posts to the root path and a proxy that serves ingest under a sub-path silently 404s. | Expose ingest at `/api/{project_id}/envelope` on the DSN host root. |
+| Nothing arrives, no client-side errors | The gateway is not exposed at `/api/{environment_id}/envelope` on the host root. A DSN cannot express a path prefix, so the SDK posts to the root path and a proxy that serves ingest under a sub-path silently 404s. | Expose ingest at `/api/{environment_id}/envelope` on the DSN host root. |
 | Nothing arrives | `init()` was never called, or was called after the failing code ran. | Call `init()` first, as early in the page as possible. |
 | `[sauron] client disabled` in the console | The gateway returned 401/403 — wrong, revoked or foreign-project public key. | Fix the DSN key/project; re-`init()` after correcting. |
-| `DsnError` thrown at `init()` | Malformed DSN: bad protocol, missing public key, a password component, or a missing project-id path segment. | Use `https://<public_key>@<host>/<project_id>`. |
+| `DsnError` thrown at `init()` | Malformed DSN: bad protocol, missing public key, a password component, or a missing environment-id path segment. | Use `https://<public_key>@<host>/<environment_id>`. |
 | Only some errors show up | `sampleRate` below 1 (errors and messages are sampled; events, identifies and transactions are not). | Set `sampleRate: 1`. |
 | Errors arrive with no breadcrumbs | `maxBreadcrumbs: 0`, or `beforeBreadcrumb` returned `null`. | Raise `maxBreadcrumbs`; check the hook. |
 | Items disappear silently | `beforeSend` returned `null`, or it threw (the original is then sent and a warning logged). | Enable `debug: true` and read the `[sauron]` logs. |

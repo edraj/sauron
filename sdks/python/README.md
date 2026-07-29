@@ -58,9 +58,9 @@ sauron.capture_message("worker started", level="info")
 sauron.close()
 ```
 
-A DSN looks like `https://<public_key>@<host>/<project_id>`. The SDK derives the
+A DSN looks like `https://<public_key>@<host>/<environment_id>`. The SDK derives the
 ingest endpoint from it and POSTs to
-`{protocol}://{host}/api/{project_id}/envelope` with the header
+`{protocol}://{host}/api/{environment_id}/envelope` with the header
 `X-Sauron-Key: <public_key>`.
 
 ## Configuration
@@ -70,8 +70,7 @@ is keyword-only**.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `dsn` | `Optional[str]` | `None` | `https://<public_key>@<host>/<project_id>`. Empty/`None` puts the SDK in disabled no-op mode (never raises); a non-empty malformed value raises `DsnError`. |
-| `environment` | `str` | `"production"` | Stamped onto the envelope header. |
+| `dsn` | `Optional[str]` | `None` | `https://<public_key>@<host>/<environment_id>`. Empty/`None` puts the SDK in disabled no-op mode (never raises); a non-empty malformed value raises `DsnError`. |
 | `release` | `Optional[str]` | `None` | Release/version string, stamped onto the envelope header. |
 | `sample_rate` | `float` | `1.0` | Fraction of **errors** kept (`capture_exception` only). Events, identifies, messages and transactions are never sampled. |
 | `flush_interval` | `float` | `5.0` | Seconds the background worker waits between drains. |
@@ -105,7 +104,6 @@ def quiet(crumb):
 
 sauron.init(
     "https://pk_live_xxx@ingest.sauron.example/1",
-    environment="staging",
     release="api@2.4.1",
     sample_rate=0.25,
     flush_interval=2.0,
@@ -151,7 +149,7 @@ Arguments are documented in [Configuration](#configuration).
 import os
 import sauron
 
-client = sauron.init(os.environ.get("SAURON_DSN"), environment="production")
+client = sauron.init(os.environ.get("SAURON_DSN"))
 if client is None:
     print("sauron disabled: no DSN")
 ```
@@ -634,7 +632,7 @@ atexit.register(lambda: sauron.close(timeout=2))
 ### `Client`
 
 ```python
-sauron.Client(dsn: str, *, environment: str = "production", ...) -> Client
+sauron.Client(dsn: str, *, release: Optional[str] = None, ...) -> Client
 ```
 
 The class behind `init`. Constructing one directly gives you an isolated client
@@ -643,7 +641,7 @@ for multi-tenant dispatch. It takes the same keyword options as `init` (minus
 `dsn`, which is a required positional here), starts its own transport thread,
 and is not registered with `atexit`, so you must `close()` it yourself.
 
-Attributes: `dsn` (a parsed `Dsn`), `environment`, `release`, `sample_rate`,
+Attributes: `dsn` (a parsed `Dsn`), `release`, `sample_rate`,
 `enabled` (flipped to `False` after `close()` or a hard `401`/`403`).
 
 Methods mirror the module-level functions — `track`, `capture_exception`,
@@ -656,7 +654,7 @@ uncaught crashes `handled=False`.
 ```python
 from sauron import Client
 
-client = Client("https://pk@ingest.example/1", environment="test",
+client = Client("https://pk@ingest.example/1",
                 flush_interval=3600, max_batch=1000)
 try:
     client.capture_message("hello from an isolated client")
@@ -706,13 +704,14 @@ sauron.parse_dsn(dsn: str) -> Dsn
 
 **Returns** a `Dsn` with attributes `raw`, `public_key`, `host` (`host:port` when
 a port is present), `hostname`, `protocol` (`http` or `https`, no colon),
-`project_id`, and `envelope_url`
-(`{protocol}://{host}/api/{project_id}/envelope`).
+`project_id` (the DSN's path segment — despite the name, this is the
+**environment** id since the ingest key now lives on the environment, not the
+app), and `envelope_url` (`{protocol}://{host}/api/{environment_id}/envelope`).
 
 **Raises** `DsnError` (a subclass of `ValueError`, message prefixed
 `[sauron] invalid DSN: `) when the DSN is empty or not a string, uses a protocol
 other than `http`/`https`, is missing the public key, carries a password/secret
-component, or is missing the host or the project-id path segment.
+component, or is missing the host or the environment-id path segment.
 
 ```python
 from sauron import DsnError, parse_dsn
@@ -730,11 +729,11 @@ print(dsn.envelope_url)  # https://ingest.sauron.example:8443/api/7/envelope
 ### `SDK_NAME`, `SDK_VERSION`
 
 Module constants (`str`) reported in the envelope header's `sdk` block:
-`"sauron-python"` and `"1.0.0"`.
+`"sauron-python"` and `"1.2.0"`.
 
 ```python
 import sauron
-print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.0.0
+print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.2.0
 ```
 
 ## Scope & metadata
@@ -887,7 +886,6 @@ def post_fork(server, worker):
     # After the fork, so the transport thread exists in this process.
     sauron.init(
         os.environ["SAURON_DSN"],
-        environment=os.environ.get("APP_ENV", "production"),
         release=os.environ.get("APP_RELEASE"),
         auto_capture_unhandled=True,
     )
@@ -914,7 +912,6 @@ class MyAppConfig(AppConfig):
     def ready(self):
         sauron.init(
             os.environ.get("SAURON_DSN"),
-            environment=os.environ.get("DJANGO_ENV", "production"),
             release=os.environ.get("APP_RELEASE"),
             tags={"service": "django"},
         )
@@ -995,7 +992,6 @@ from fastapi import FastAPI, Request
 async def lifespan(app: FastAPI):
     sauron.init(
         os.environ.get("SAURON_DSN"),
-        environment=os.environ.get("APP_ENV", "production"),
         release=os.environ.get("APP_RELEASE"),
         auto_capture_unhandled=True,
     )
@@ -1072,10 +1068,10 @@ lifespan runs per worker).
   immediately once `max_batch` (default `30`) items are pending.
 - **Envelope**: each flush builds exactly one envelope
   (`header` + `context` + `items[]`) and POSTs it to
-  `{protocol}://{host}/api/{project_id}/envelope` with
+  `{protocol}://{host}/api/{environment_id}/envelope` with
   `X-Sauron-Key: <public_key>` and `Content-Type: application/json`. The header
-  carries the raw DSN, `sdk: {name, version}`, `sent_at`, `environment` and
-  `release`; the context carries a per-process `device.device_id` (a uuid4), the
+  carries the raw DSN, `sdk: {name, version}`, `sent_at` and `release`; the
+  context carries a per-process `device.device_id` (a uuid4), the
   OS name from `platform.system()`, and `runtime: {name: "python", version}`.
 - **Envelope size cap**: at most **1000 items** per envelope
   (`MAX_ITEMS_PER_ENVELOPE`), matching the server limit. A larger backlog drains
@@ -1113,8 +1109,8 @@ lifespan runs per worker).
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Nothing arrives, no error, `init` returned `None` | No DSN was supplied — the SDK is in disabled no-op mode | Pass a DSN. Run with `debug=True` to see `[sauron] no DSN configured; SDK disabled`. |
-| Nothing arrives, requests reach a proxy but never the ingest | The DSN cannot express a path prefix — ingest **must** be exposed at `/api/{project_id}/envelope` on the host root | Fix the proxy/route so `POST /api/{project_id}/envelope` on the DSN host reaches the ingest. Events dropped this way look delivered client-side. |
-| `DsnError` at startup | Malformed DSN (bad protocol, missing key/host/project id, or a password component) | Use `https://<public_key>@<host>/<project_id>`, key only, no secret. |
+| Nothing arrives, requests reach a proxy but never the ingest | The DSN cannot express a path prefix — ingest **must** be exposed at `/api/{environment_id}/envelope` on the host root | Fix the proxy/route so `POST /api/{environment_id}/envelope` on the DSN host reaches the ingest. Events dropped this way look delivered client-side. |
+| `DsnError` at startup | Malformed DSN (bad protocol, missing key/host/environment id, or a password component) | Use `https://<public_key>@<host>/<environment_id>`, key only, no secret. |
 | Events stop arriving after a while | A `401`/`403` disabled the client permanently and cleared the queue | Fix the public key, then re-`init`. `debug=True` logs `auth rejected (status=...), disabling`. |
 | A short-lived script sends nothing | The process exited before the 5s flush tick | Call `sauron.flush()` or `sauron.close()` before exit (the `atexit` hook also closes, but only on a clean interpreter shutdown). |
 | Nothing sends under gunicorn/uWSGI | `init` ran in the pre-fork parent, so the worker has no transport thread | `init` in `post_fork` / `@postfork` / the ASGI `lifespan`. |

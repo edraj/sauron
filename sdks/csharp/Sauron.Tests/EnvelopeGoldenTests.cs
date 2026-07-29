@@ -25,9 +25,8 @@ public class EnvelopeGoldenTests
     {
       "header": {
         "dsn": "https://pk_test@localhost:8081/1",
-        "sdk": { "name": "sauron-dotnet", "version": "0.3.0" },
+        "sdk": { "name": "sauron-dotnet", "version": "1.2.0" },
         "sent_at": "2026-07-12T10:30:00.123Z",
-        "environment": "production",
         "release": "svc@1.4.2"
       },
       "context": {
@@ -103,7 +102,6 @@ public class EnvelopeGoldenTests
             Dsn = "https://pk_test@localhost:8081/1",
             Sdk = new SdkInfo(),
             SentAt = "2026-07-12T10:30:00.123Z",
-            Environment = "production",
             Release = "svc@1.4.2",
         },
         Context = new EnvelopeContext
@@ -232,13 +230,22 @@ public class EnvelopeGoldenTests
     }
 
     [Fact]
-    public void SdkHeader_ReportsVersion_0_3_0()
+    public void SdkHeader_ReportsVersion_1_2_0()
     {
         string actual = JsonSerializer.Serialize(BuildGoldenEnvelope(), SauronJson.Options);
         using var doc = JsonDocument.Parse(actual);
         var sdk = doc.RootElement.GetProperty("header").GetProperty("sdk");
         Assert.Equal("sauron-dotnet", sdk.GetProperty("name").GetString());
-        Assert.Equal("0.3.0", sdk.GetProperty("version").GetString());
+        Assert.Equal("1.2.0", sdk.GetProperty("version").GetString());
+    }
+
+    [Fact]
+    public void Header_NeverCarriesEnvironment()
+    {
+        // Removed: environment is now proven by the ingest key, not client-supplied.
+        string actual = JsonSerializer.Serialize(BuildGoldenEnvelope(), SauronJson.Options);
+        using var doc = JsonDocument.Parse(actual);
+        Assert.False(doc.RootElement.GetProperty("header").TryGetProperty("environment", out _));
     }
 
     // ---- End-to-end reconciliation through the real capture path ----------

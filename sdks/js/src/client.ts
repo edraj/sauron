@@ -139,7 +139,6 @@ export class SauronClient {
       dsn: this.dsn.raw,
       sdk: { name: SDK_NAME, version: SDK_VERSION },
       sent_at: nowIso(),
-      environment: this.options.environment,
       release: this.options.release,
     };
     const context = buildContext(this.options.release, this.scope.getUser());
@@ -272,7 +271,6 @@ function resolveOptions(options: InitOptions): ResolvedOptions {
   const t = options.transport ?? {};
   return {
     dsn: options.dsn,
-    environment: options.environment ?? 'production',
     release: options.release ?? null,
     sampleRate: clamp(options.sampleRate ?? 1, 0, 1),
     maxBreadcrumbs: options.maxBreadcrumbs ?? 50,

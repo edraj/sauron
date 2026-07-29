@@ -31,7 +31,7 @@ or, in `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  sauron_flutter: ^1.2.0
+  sauron_flutter: ^1.3.0
 ```
 
 Requires Dart SDK `>=3.4.0 <4.0.0` and Flutter `>=3.19.0`.
@@ -640,7 +640,7 @@ Everything below is exported from `package:sauron_flutter/sauron_flutter.dart`.
 | `isObfuscatedDartTrace` | `bool isObfuscatedDartTrace(String raw)` | `true` when the trace contains `isolate_dso_base` or `build_id:`. |
 | `sauronIso` | `String sauronIso(DateTime dateTime)` | ISO-8601 UTC with a trailing `Z`. |
 | `kSauronSdkName` | `const String = 'sauron.flutter'` | Sent in `header.sdk.name`. |
-| `kSauronSdkVersion` | `const String = '1.2.0'` | Sent in `header.sdk.version`. |
+| `kSauronSdkVersion` | `const String = '1.3.0'` | Sent in `header.sdk.version`. |
 | `SauronNavigatorObserver` | see [Flutter integration](#flutter-integration) | |
 | `SauronWidgetsBindingObserver` | see [Flutter integration](#flutter-integration) | |
 

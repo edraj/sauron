@@ -69,7 +69,6 @@ function scriptedFetch(script: Array<number | { status: number; retryAfter?: str
 function makeTransport(fetchImpl: FetchLike, sleeps: number[], overrides = {}) {
   return new Transport({
     dsn: parseDsn(DSN),
-    environment: 'test',
     release: null,
     context: ctx(),
     flushInterval: 0,

@@ -34,8 +34,7 @@ ESM-only (`"type": "module"`) and ships its own `.d.ts`.
 import { init, track, captureException, close } from '@edraj/sauron-node';
 
 init({
-  dsn: 'https://<public_key>@<host>/<project_id>',
-  environment: 'production',
+  dsn: 'https://<public_key>@<host>/<environment_id>',
   release: 'api@1.4.2',
 });
 
@@ -52,7 +51,7 @@ await close();
 ```
 
 The SDK POSTs a canonical JSON envelope (`header` + `context` + `items[]`) to
-`POST /api/{project_id}/envelope` with an `X-Sauron-Key: <public_key>` header,
+`POST /api/{environment_id}/envelope` with an `X-Sauron-Key: <public_key>` header,
 adding `Content-Encoding: gzip` once the body crosses the gzip threshold.
 
 ## Configuration
@@ -62,8 +61,7 @@ optional.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `dsn` | `string` | — (**required**) | `https://<public_key>@<host>/<project_id>`. A non-string throws `Error`; a malformed value throws `DsnError`. |
-| `environment` | `string` | `'production'` | Written to `header.environment`. |
+| `dsn` | `string` | — (**required**) | `https://<public_key>@<host>/<environment_id>`. A non-string throws `Error`; a malformed value throws `DsnError`. |
 | `release` | `string \| null` | `null` | Written to `header.release`. |
 | `tags` | `Record<string, string>` | `{}` | Default tags seeded into the global scope at init. |
 | `contexts` | `Record<string, unknown>` | `{}` | Default named dev context blocks seeded into the global scope. Distinct from the machine `context` (device/os/app/runtime). |
@@ -99,7 +97,6 @@ import { init, type EnvelopeItem, type Breadcrumb } from '@edraj/sauron-node';
 
 const client = init({
   dsn: 'https://pk_live_abc@ingest.example.com/42',
-  environment: 'staging',
   release: 'api@1.4.2',
   tags: { service: 'checkout-api', region: 'eu-west-1' },
   contexts: { deployment: { cluster: 'eu-1', pod: process.env.HOSTNAME } },
@@ -663,15 +660,17 @@ class DsnError extends Error
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `dsn` | `string` | — (required) | `https://<public_key>@<host>/<project_id>`. |
+| `dsn` | `string` | — (required) | `https://<public_key>@<host>/<environment_id>`. |
 
 Returns a `Dsn`: `{ raw, publicKey, host, hostname, protocol, projectId,
-envelopeUrl }`, where `envelopeUrl` is
-`{protocol}://{host}/api/{project_id}/envelope`. Throws `DsnError` (`name` is
-`'DsnError'`, message prefixed `[sauron] invalid DSN:`) for an empty/unparseable
-string, a protocol other than `http`/`https`, a missing public key, a **present
-password** (a DSN must never carry a secret), a missing host, or a missing
-project-id path segment.
+envelopeUrl }` — `projectId` is the DSN's path segment (despite the name, this
+is the **environment** id since the ingest key now lives on the environment,
+not the app) — where `envelopeUrl` is
+`{protocol}://{host}/api/{environment_id}/envelope`. Throws `DsnError` (`name`
+is `'DsnError'`, message prefixed `[sauron] invalid DSN:`) for an
+empty/unparseable string, a protocol other than `http`/`https`, a missing
+public key, a **present password** (a DSN must never carry a secret), a
+missing host, or a missing environment-id path segment.
 
 ```ts
 import { parseDsn, DsnError } from '@edraj/sauron-node';
@@ -747,7 +746,6 @@ import { Transport, parseDsn } from '@edraj/sauron-node';
 
 const transport = new Transport({
   dsn: parseDsn(process.env.SAURON_DSN!),
-  environment: 'production',
   release: null,
   context: {
     device: { device_id: 'worker-1' },
@@ -855,7 +853,6 @@ import {
 
 init({
   dsn: process.env.SAURON_DSN!,
-  environment: process.env.NODE_ENV ?? 'production',
   release: process.env.GIT_SHA,
   autoCaptureUnhandled: true,
 });
@@ -1054,7 +1051,7 @@ rejects.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Nothing arrives, no errors logged | The ingest is not exposed at `/api/{project_id}/envelope` on the host root. A DSN cannot express a path prefix, so a proxy that serves Sauron under e.g. `/sauron/` silently 404s and the SDK drops the batch. | Expose ingest at `/api/{project_id}/envelope` on the DSN host root. |
+| Nothing arrives, no errors logged | The ingest is not exposed at `/api/{environment_id}/envelope` on the host root. A DSN cannot express a path prefix, so a proxy that serves Sauron under e.g. `/sauron/` silently 404s and the SDK drops the batch. | Expose ingest at `/api/{environment_id}/envelope` on the DSN host root. |
 | Nothing arrives, nothing happens at all | Capture calls ran before `init` or after `close()` — they are silent no-ops. | Check `getClient() !== null`. |
 | Events stop after a while, one warning logged | The ingest returned 401/403; the SDK disabled itself for the process. | Fix the public key in the DSN and restart. Set `debug: true` to see `auth failed (401); disabling SDK`. |
 | Events lost when the process exits | Buffered items had not flushed; the flush timer is `unref`'d and does not hold the loop open. | `await close()` before exiting, or `init({ autoShutdown: true })`. |
@@ -1063,7 +1060,7 @@ rejects.
 | No breadcrumbs on captured errors | `maxBreadcrumbs: 0`, `beforeBreadcrumb` returned `null`, or the crumbs were added in a different `withScope` than the capture. | Add crumbs and capture inside the same scope. |
 | Scope data leaking between requests | Metadata was set on the global scope instead of a per-request child. | Wrap each request in `withScope` / `runWithAsyncScope`. |
 | `Error: [sauron] global fetch is unavailable` | Node < 18. | Upgrade to Node >= 18 or pass `fetchImpl`. |
-| `DsnError: [sauron] invalid DSN: …` | Malformed DSN, wrong protocol, or a password component. | Use `https://<public_key>@<host>/<project_id>` with no secret. |
+| `DsnError: [sauron] invalid DSN: …` | Malformed DSN, wrong protocol, or a password component. | Use `https://<public_key>@<host>/<environment_id>` with no secret. |
 | Want to see what the transport is doing | — | `init({ debug: true })` — decisions are logged to `console.warn` with a `[sauron]` prefix. |
 
 ## Development

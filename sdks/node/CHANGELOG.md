@@ -2,6 +2,14 @@
 
 All notable changes to `@edraj/sauron-node` are documented here.
 
+## 1.2.0
+
+- **Breaking: the `environment` option has been removed.** An environment is now
+  identified by the ingest key it belongs to, not by a string the client sends.
+  Create environments in the dashboard under app settings; each one has its own
+  DSN. Delete `environment` from your `init` call and swap in the DSN of the
+  environment you want to report to.
+
 ## 1.0.0 - 2026-07-27
 
 First public release. Prior `0.x` versions were internal-only and were never

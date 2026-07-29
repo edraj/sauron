@@ -22,7 +22,7 @@ from ._stacktrace import exception_type_name, extract_stacktrace
 from ._transport import Sender, Transport
 
 SDK_NAME = "sauron-python"
-SDK_VERSION = "1.0.0"
+SDK_VERSION = "1.2.0"
 
 _VALID_LEVELS = frozenset({"debug", "info", "warning", "error", "fatal"})
 
@@ -47,7 +47,6 @@ class Client:
         self,
         dsn: str,
         *,
-        environment: str = "production",
         release: Optional[str] = None,
         sample_rate: float = 1.0,
         flush_interval: float = 5.0,
@@ -69,7 +68,6 @@ class Client:
     ) -> None:
         self._log = _make_logger(debug)
         self.dsn: Dsn = parse_dsn(dsn)
-        self.environment = environment
         self.release = release
         self.sample_rate = sample_rate
         self._before_send = before_send
@@ -127,7 +125,6 @@ class Client:
             "dsn": self.dsn.raw,
             "sdk": {"name": SDK_NAME, "version": SDK_VERSION},
             "sent_at": _now_iso(),
-            "environment": self.environment,
             "release": self.release,
         }
         context = {

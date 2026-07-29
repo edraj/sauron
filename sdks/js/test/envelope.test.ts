@@ -5,6 +5,7 @@ import { parseDsn } from '../src/dsn';
 import { getClient, init } from '../src/client';
 import { captureException } from '../src/api/capture';
 import type { Envelope, EnvelopeItem, ErrorItem, EventItem, TransactionItem } from '../src/types';
+import { SDK_NAME, SDK_VERSION } from '../src/utils';
 
 /**
  * Golden envelope from the LOCKED wire contract. The Rust ingest gateway and the
@@ -16,9 +17,8 @@ import type { Envelope, EnvelopeItem, ErrorItem, EventItem, TransactionItem } fr
 const GOLDEN: Envelope = {
   header: {
     dsn: 'https://pk_test@localhost:8081/1',
-    sdk: { name: 'sauron.javascript', version: '0.1.0' },
+    sdk: { name: 'sauron.javascript', version: '1.2.0' },
     sent_at: '2026-07-12T10:30:00.123Z',
-    environment: 'production',
     release: 'web@1.4.2',
   },
   context: {
@@ -100,7 +100,27 @@ describe('buildEnvelope', () => {
 
   it('carries the locked SDK identity in the header', () => {
     const built = buildEnvelope(GOLDEN.header, GOLDEN.context, GOLDEN.items);
-    expect(built.header.sdk).toEqual({ name: 'sauron.javascript', version: '0.1.0' });
+    expect(built.header.sdk).toEqual({ name: 'sauron.javascript', version: '1.2.0' });
+  });
+
+  it('stamps the real client header with SDK_NAME/SDK_VERSION, not a hardcoded string', () => {
+    // Unlike the golden tests above (which pass a self-authored header straight
+    // through `buildEnvelope`), this drives the real header construction in
+    // `SauronClient.makeEnvelope`, so a bump to `SDK_VERSION` without a matching
+    // bump to `package.json` — or vice versa — cannot go unnoticed the way a
+    // stale hardcoded golden literal can. Mirrors the equivalent assertion in
+    // the Python SDK (`test_envelope_header_and_context`).
+    init({ dsn: 'https://pk_test@localhost:9/1' });
+    const built = getClient()!.makeEnvelope([]);
+    expect(built.header.sdk).toEqual({ name: SDK_NAME, version: SDK_VERSION });
+    expect(SDK_VERSION).toBe('1.2.0');
+  });
+
+  it('never carries an environment key on the header (removed: environment is now proven by the ingest key)', () => {
+    const built = buildEnvelope(GOLDEN.header, GOLDEN.context, GOLDEN.items);
+    expect('environment' in built.header).toBe(false);
+    const roundTripped = JSON.parse(JSON.stringify(built));
+    expect('environment' in roundTripped.header).toBe(false);
   });
 
   it('uses the discriminated item types error/event/identify', () => {

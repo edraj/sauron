@@ -59,19 +59,26 @@ describe('transport POST', () => {
   });
 
   it('builds a header with the sauron-node SDK name/version', async () => {
-    const client = newClient(fake.fetchImpl, { environment: 'staging', release: '1.2.3' });
+    const client = newClient(fake.fetchImpl, { release: '1.2.3' });
     client.track('e', 'u');
     await client.flush();
 
     const { header, context } = fake.calls[0].envelope;
-    expect(header.sdk).toEqual({ name: 'sauron-node', version: '1.0.0' });
+    expect(header.sdk).toEqual({ name: 'sauron-node', version: '1.2.0' });
     expect(header.dsn).toBe(DSN);
-    expect(header.environment).toBe('staging');
     expect(header.release).toBe('1.2.3');
     expect(typeof header.sent_at).toBe('string');
     expect(context.runtime.name).toBe('node');
     expect(typeof context.device.device_id).toBe('string');
     expect(context.user).toBeNull();
+  });
+
+  it('never carries an environment key on the header (removed: environment is now proven by the ingest key)', async () => {
+    const client = newClient(fake.fetchImpl);
+    client.track('e', 'u');
+    await client.flush();
+
+    expect('environment' in fake.calls[0].envelope.header).toBe(false);
   });
 
   it('emits a well-shaped event item', async () => {

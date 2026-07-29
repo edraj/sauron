@@ -163,7 +163,6 @@ internal sealed class Transport : IDisposable
             Dsn = _dsn.Raw,
             Sdk = new SdkInfo { Name = SauronSdkMeta.Name, Version = SauronSdkMeta.Version },
             SentAt = Iso8601Now(),
-            Environment = _options.Environment,
             Release = _options.Release,
         },
         Context = _context,

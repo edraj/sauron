@@ -13,7 +13,6 @@ class TestEnvelopeWireContract(unittest.TestCase):
         # Large flush_interval so only explicit flush() sends (deterministic).
         self.client = Client(
             DSN,
-            environment="production",
             release="svc@1.2.3",
             flush_interval=3600,
             max_batch=1000,
@@ -45,11 +44,12 @@ class TestEnvelopeWireContract(unittest.TestCase):
             "version": SDK_VERSION,
         })
         self.assertEqual(SDK_NAME, "sauron-python")
-        self.assertEqual(SDK_VERSION, "1.0.0")
+        self.assertEqual(SDK_VERSION, "1.2.0")
         self.assertEqual(env["header"]["dsn"], DSN)
-        self.assertEqual(env["header"]["environment"], "production")
         self.assertEqual(env["header"]["release"], "svc@1.2.3")
         self.assertIn("sent_at", env["header"])
+        # Removed: environment is now proven by the ingest key, not client-supplied.
+        self.assertNotIn("environment", env["header"])
 
         ctx = env["context"]
         self.assertIn("device_id", ctx["device"])

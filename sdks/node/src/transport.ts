@@ -11,7 +11,7 @@ import type {
 } from './types.js';
 
 const SDK_NAME = 'sauron-node';
-const SDK_VERSION = '1.0.0';
+const SDK_VERSION = '1.2.0';
 
 /** Default exponential-backoff base (ms) for the first retry. */
 const DEFAULT_RETRY_BASE_MS = 200;
@@ -20,7 +20,6 @@ const RETRY_CAP_MS = 30_000;
 
 export interface TransportConfig {
   dsn: Dsn;
-  environment: string;
   release: string | null;
   context: Context;
   flushInterval: number;
@@ -157,7 +156,6 @@ export class Transport {
       dsn: this.config.dsn.raw,
       sdk: { name: SDK_NAME, version: SDK_VERSION },
       sent_at: new Date().toISOString(),
-      environment: this.config.environment,
       release: this.config.release,
     };
     return { header, context: this.config.context, items };

@@ -193,7 +193,6 @@ export interface EnvelopeHeader {
   dsn: string;
   sdk: SdkInfo;
   sent_at: string;
-  environment: string;
   release: string | null;
 }
 
@@ -253,7 +252,6 @@ export interface TransportOptions {
 export interface InitOptions {
   /** `https://<public_key>@<host>/<project_id>` */
   dsn: string;
-  environment?: string;
   release?: string;
   /** Error sample rate in [0, 1]. Default 1 (send everything). */
   sampleRate?: number;
@@ -287,7 +285,6 @@ export interface InitOptions {
 /** Fully-resolved options with all defaults applied. */
 export interface ResolvedOptions {
   dsn: string;
-  environment: string;
   release: string | null;
   sampleRate: number;
   maxBreadcrumbs: number;

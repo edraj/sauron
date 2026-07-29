@@ -44,7 +44,7 @@ Or build a local package and consume it from a local feed:
 cd sdks/csharp
 dotnet pack Sauron/Sauron.csproj -c Release -o ./nupkg
 dotnet nuget add source "$(pwd)/nupkg" --name sauron-local
-dotnet add <your-project>.csproj package Sauron --version 0.3.0
+dotnet add <your-project>.csproj package Sauron --version 1.2.0
 ```
 
 Once published, the install command will be:
@@ -65,7 +65,6 @@ using Sauron;
 SauronSdk.Init(new SauronOptions
 {
     Dsn = Environment.GetEnvironmentVariable("SAURON_DSN")!,
-    Environment = "production",
     Release = "1.4.2",
 });
 
@@ -90,9 +89,9 @@ catch (Exception ex)
 SauronSdk.Close();
 ```
 
-DSN format: `https://<public_key>@<host>/<project_id>`. The SDK POSTs a canonical
+DSN format: `https://<public_key>@<host>/<environment_id>`. The SDK POSTs a canonical
 JSON envelope (`header` + `context` + `items[]`, identical across all Sauron
-SDKs) to `POST /api/{project_id}/envelope`, authenticated with the
+SDKs) to `POST /api/{environment_id}/envelope`, authenticated with the
 `X-Sauron-Key: <public_key>` header. Bodies over the gzip threshold are sent with
 `Content-Encoding: gzip`.
 
@@ -106,8 +105,7 @@ does not throw, `Enabled` is `false`, and every dispatch call silently returns.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `Dsn` | `string` | `""` (**required**) | Ingest DSN, `https://<public_key>@<host>/<project_id>`. Empty or invalid puts the client in no-op mode. |
-| `Environment` | `string` | `"production"` | Deployment environment, sent in `header.environment`. |
+| `Dsn` | `string` | `""` (**required**) | Ingest DSN, `https://<public_key>@<host>/<environment_id>`. Empty or invalid puts the client in no-op mode. |
 | `Release` | `string?` | `null` | Release identifier, sent in `header.release`. |
 | `Tags` | `IReadOnlyDictionary<string, string>?` | `null` | Default tags seeded into the process-wide global scope at construction. |
 | `Contexts` | `IReadOnlyDictionary<string, object?>?` | `null` | Default context blocks (name → block) seeded into the global scope. Distinct from the machine `context` in the envelope. |
@@ -137,7 +135,6 @@ Fully-populated example:
 var options = new SauronOptions
 {
     Dsn = "https://pub_abc123@sauron.example.com/proj_42",
-    Environment = "staging",
     Release = "api@1.4.2",
     Tags = new Dictionary<string, string> { ["service"] = "checkout" },
     Contexts = new Dictionary<string, object?>
@@ -218,7 +215,6 @@ SauronSdk.Init("https://pub_abc123@sauron.example.com/proj_42");
 SauronSdk.Init(new SauronOptions
 {
     Dsn = builder.Configuration["Sauron:Dsn"]!,
-    Environment = builder.Environment.EnvironmentName,
     Release = ThisAssembly.InformationalVersion,
 });
 ```
@@ -697,14 +693,16 @@ public sealed class Dsn
     public string Protocol { get; }    // "http" | "https"
     public string PublicKey { get; }   // DSN user component
     public string Host { get; }        // includes a non-default port
-    public string ProjectId { get; }   // DSN path segment
+    public string ProjectId { get; }   // DSN path segment — despite the name, this
+                                        // is the environment id (the ingest key now
+                                        // lives on the environment, not the app)
     public string Raw { get; }         // the original string
-    public string EnvelopeUrl { get; } // {protocol}://{host}/api/{project_id}/envelope
+    public string EnvelopeUrl { get; } // {protocol}://{host}/api/{environment_id}/envelope
 }
 ```
 
 `Parse` throws `ArgumentException` for an empty string, a non-`http(s)` scheme, a
-missing/empty public key, a missing host, or a missing project id. A password
+missing/empty public key, a missing host, or a missing environment id. A password
 component, if present, is ignored. Handy for validating configuration at startup
 instead of silently landing in no-op mode:
 
@@ -794,7 +792,6 @@ var builder = WebApplication.CreateBuilder(args);
 SauronSdk.Init(new SauronOptions
 {
     Dsn = builder.Configuration["Sauron:Dsn"]!,
-    Environment = builder.Environment.EnvironmentName,
     Release = typeof(Program).Assembly.GetName().Version?.ToString(),
     AutoCaptureUnhandled = true,
 });
@@ -807,7 +804,6 @@ factory so the container owns disposal:
 builder.Services.AddSingleton(sp => new SauronClient(new SauronOptions
 {
     Dsn = sp.GetRequiredService<IConfiguration>()["Sauron:Dsn"]!,
-    Environment = sp.GetRequiredService<IHostEnvironment>().EnvironmentName,
 }));
 ```
 
@@ -1001,9 +997,9 @@ disposes that client on `Dispose` — your handler stays yours.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Nothing arrives, no errors | Ingest is not exposed at `/api/{project_id}/envelope` on the host root. A DSN cannot express a path prefix, so a proxy that serves Sauron under e.g. `/sauron/` silently swallows envelopes. | Expose the ingest at `/api/{project_id}/envelope` on the DSN host root. |
+| Nothing arrives, no errors | Ingest is not exposed at `/api/{environment_id}/envelope` on the host root. A DSN cannot express a path prefix, so a proxy that serves Sauron under e.g. `/sauron/` silently swallows envelopes. | Expose the ingest at `/api/{environment_id}/envelope` on the DSN host root. |
 | Nothing arrives, `Enabled == false` at startup | DSN missing or unparseable — the client is in no-op mode. | Set `Debug = true` to see `[sauron] disabled: ...`, or validate with `Dsn.Parse(dsn)` at startup. |
-| Worked, then stopped; `Enabled == false` | Ingest answered `401`/`403`; the client disabled itself. | Check the public key and the project id in the DSN. |
+| Worked, then stopped; `Enabled == false` | Ingest answered `401`/`403`; the client disabled itself. | Check the public key and the environment id in the DSN. |
 | Events lost at process exit | The buffer is in memory and the flush timer never fired. | Call `SauronSdk.Close()` / `await client.FlushAsync()` on shutdown (see the ASP.NET Core recipe). |
 | `ArgumentException: distinctId is required` | `Track` / `Identify` were called without a distinct id — the wire contract has no anonymous fallback. | Pass a stable user id. |
 | Breadcrumbs missing from an error | They are attached from the **active** scope; a scope pushed after the crumbs, or crumbs added after the capture, will not appear. Also check `MaxBreadcrumbs` and `BeforeBreadcrumb`. | Add crumbs inside the same `PushScope` block that captures. |

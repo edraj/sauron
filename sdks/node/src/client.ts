@@ -28,7 +28,6 @@ import type {
 } from './types.js';
 
 const DEFAULTS = {
-  environment: 'production',
   release: null as string | null,
   sampleRate: 1,
   flushInterval: 5000,
@@ -48,7 +47,6 @@ function resolveOptions(options: InitOptions): ResolvedOptions {
     typeof options.sampleRate === 'number' ? options.sampleRate : DEFAULTS.sampleRate;
   return {
     dsn: options.dsn,
-    environment: options.environment ?? DEFAULTS.environment,
     release: options.release ?? DEFAULTS.release,
     tags: options.tags ?? {},
     contexts: options.contexts ?? {},
@@ -131,7 +129,6 @@ export class SauronClient {
     }
     this.transport = new Transport({
       dsn,
-      environment: this.options.environment,
       release: this.options.release,
       context: buildContext(),
       flushInterval: this.options.flushInterval,
