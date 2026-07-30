@@ -1,4 +1,4 @@
-# Browser SDK — `@sauron/browser`
+# Browser SDK — `@edraj/sauron-browser`
 
 Error reporting **+** product analytics **+** performance for the browser, from one
 SDK (**v0.3.0**). Source: [`sdks/js`](../sdks/js). SDK header name: `sauron.javascript`.
@@ -10,7 +10,7 @@ See also: **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
 ## Install
 
 ```bash
-npm install @sauron/browser
+npm install @edraj/sauron-browser
 ```
 
 ## What's new in 0.3.0
@@ -24,25 +24,23 @@ npm install @sauron/browser
 ## Init
 
 ```ts
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({
-  dsn: 'https://<public_key>@<host>/<project_id>',
-  environment: 'production',
+  dsn: 'https://<public_key>@<host>/<environment_id>',
   release: 'web@1.4.2',
 });
 ```
 
 You can also import the named functions directly (`import { init, track } from
-'@sauron/browser'`) — the `Sauron` facade and the default export bundle the same
+'@edraj/sauron-browser'`) — the `Sauron` facade and the default export bundle the same
 functions.
 
 ### `init(options)` options
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `dsn` | `string` | *(required)* | `https://<public_key>@<host>/<project_id>` |
-| `environment` | `string` | — | e.g. `production` |
+| `dsn` | `string` | *(required)* | `https://<public_key>@<host>/<environment_id>` |
 | `release` | `string` | — | e.g. `web@1.4.2` |
 | `tags` | `Record<string, string>` | — | default scope tags (see [Tags, contexts & extra](#tags-contexts--extra)) |
 | `contexts` | `Record<string, Record<string, unknown>>` | — | default scope context blocks |

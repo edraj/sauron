@@ -60,6 +60,11 @@ pub struct TableSize {
 pub struct AppStorage {
     pub app_id: Uuid,
     pub app_name: String,
+    /// The project the app hangs off. Defaulted on read so a report cached by
+    /// an older build — one that had no such field — still deserializes rather
+    /// than missing the cache on every request until the entry expires.
+    #[serde(default)]
+    pub project_name: String,
     pub org_name: String,
     pub tables: Vec<AppTableStorage>,
     pub hot_rows_total: i64,
@@ -243,6 +248,7 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
             AppStorage {
                 app_id: a.app_id,
                 app_name: a.app_name,
+                project_name: a.project_name,
                 org_name: a.org_name,
                 tables: per_table,
                 hot_rows_total: hr,

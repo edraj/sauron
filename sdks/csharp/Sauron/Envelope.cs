@@ -31,7 +31,6 @@ internal sealed class EnvelopeHeader
     public string? Dsn { get; set; }
     public SdkInfo Sdk { get; set; } = new();
     public string SentAt { get; set; } = string.Empty;
-    public string Environment { get; set; } = "production";
     public string? Release { get; set; }
 }
 
@@ -39,7 +38,7 @@ internal sealed class EnvelopeHeader
 internal static class SauronSdkMeta
 {
     public const string Name = "sauron-dotnet";
-    public const string Version = "0.3.0";
+    public const string Version = "1.2.0";
 }
 
 internal sealed class SdkInfo

@@ -135,7 +135,6 @@ class TestGoldenShapeLock(unittest.TestCase):
         self.sender = FakeSender(status=200)
         self.client = Client(
             DSN,
-            environment="production",
             release="svc@1.2.3",
             flush_interval=3600,
             max_batch=1000,
@@ -159,10 +158,15 @@ class TestGoldenShapeLock(unittest.TestCase):
         built = self.client._make_envelope(GOLDEN_ITEMS)
         self.assertEqual(
             built["header"]["sdk"],
-            {"name": "sauron-python", "version": "0.3.0"},
+            {"name": "sauron-python", "version": "1.2.0"},
         )
         self.assertEqual(SDK_NAME, "sauron-python")
-        self.assertEqual(SDK_VERSION, "0.3.0")
+        self.assertEqual(SDK_VERSION, "1.2.0")
+
+    def test_header_never_carries_environment(self):
+        # Removed: environment is now proven by the ingest key, not client-supplied.
+        built = self.client._make_envelope(GOLDEN_ITEMS)
+        self.assertNotIn("environment", built["header"])
 
     def test_item_type_discriminators(self):
         types = [i["type"] for i in GOLDEN_ITEMS]
@@ -189,7 +193,6 @@ class TestGoldenClientEmitsShape(unittest.TestCase):
         self.sender = FakeSender(status=200)
         self.client = Client(
             DSN,
-            environment="production",
             release="svc@1.2.3",
             flush_interval=3600,
             max_batch=1000,

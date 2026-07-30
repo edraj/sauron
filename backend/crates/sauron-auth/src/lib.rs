@@ -16,6 +16,7 @@ pub use password::{
     hash_password, hash_password_async, spend_dummy_verify, verify_password, verify_password_async,
 };
 pub use rbac::{
-    authorize_app, authorize_org, authorize_project, effective_at, effective_at_org,
-    ensure_preset_roles, perm, require_permission,
+    authorize_app, authorize_app_reachable, authorize_env_read, authorize_env_read_with_perms,
+    authorize_org, authorize_project, effective_at, effective_at_org, ensure_preset_roles, perm,
+    require_permission,
 };

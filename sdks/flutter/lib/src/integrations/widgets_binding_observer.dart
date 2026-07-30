@@ -6,6 +6,11 @@ import '../types.dart';
 /// Observes app lifecycle transitions: records a breadcrumb on each change and
 /// flushes the transport when the app is backgrounded (`paused`) or torn down
 /// (`detached`) so buffered data is not lost.
+///
+/// It also flushes on `resumed`. Returning to the foreground is the SDK's cue to
+/// drain envelopes queued while the app was away or offline — the SDK carries no
+/// connectivity plugin, so this (plus the periodic flush timer) is what gets a
+/// backlog moving again once the network returns.
 class SauronWidgetsBindingObserver with WidgetsBindingObserver {
   SauronWidgetsBindingObserver(this._client);
 
@@ -43,7 +48,8 @@ class SauronWidgetsBindingObserver with WidgetsBindingObserver {
       ),
     );
     if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached) {
+        state == AppLifecycleState.detached ||
+        state == AppLifecycleState.resumed) {
       _client.flush();
     }
   }
@@ -90,18 +96,21 @@ class SauronNavigatorObserver extends NavigatorObserver {
   }
 
   /// Emits a transaction for the route we're leaving, then starts timing the
-  /// newly-active [route]. Never throws — instrumentation must not break
-  /// navigation.
+  /// newly-active [route], and attributes subsequent signals to it. Never
+  /// throws — instrumentation must not break navigation.
+  ///
+  /// [recordTransactions] and [trackScreens] are independent: either may be
+  /// enabled without the other.
   void _enterRoute(Route<dynamic>? route) {
-    if (!recordTransactions) {
-      return;
-    }
     try {
-      _emitScreenTransaction();
-      _currentRouteEnteredAt = DateTime.now().toUtc();
-      _currentRouteName = route?.settings.name;
-      if (trackScreens && route?.settings.name != null) {
-        _client.setScreen(route!.settings.name!);
+      final String? name = route?.settings.name;
+      if (recordTransactions) {
+        _emitScreenTransaction();
+        _currentRouteEnteredAt = DateTime.now().toUtc();
+        _currentRouteName = name;
+      }
+      if (trackScreens && name != null) {
+        _client.setScreen(name);
       }
     } on Object {
       // Never let instrumentation crash navigation.

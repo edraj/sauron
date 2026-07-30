@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "bins/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 rust-version = "1.82"
@@ -39,6 +39,13 @@ tokio = { version = "1", features = [
 ] }
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["typed-header", "query"] }
+# Already resolved transitively (axum, axum-extra, reqwest all pull it in for
+# their own query/form codecs) — taken as a direct dependency so
+# `routes::scope` can parse the raw query string itself, rather than through
+# whichever `Query` extractor a handler happens to import. See
+# `bins/sauron-api/src/routes/scope.rs` module docs for why that distinction
+# matters.
+form_urlencoded = "1"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.7", features = [
     "trace",

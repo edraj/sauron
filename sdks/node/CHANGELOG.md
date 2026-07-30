@@ -1,9 +1,23 @@
 # Changelog
 
-All notable changes to `@sauron/node` are documented here.
+All notable changes to `@edraj/sauron-node` are documented here.
 
-## Unreleased
+## 1.2.0
 
+- **Breaking: the `environment` option has been removed.** An environment is now
+  identified by the ingest key it belongs to, not by a string the client sends.
+  Create environments in the dashboard under app settings; each one has its own
+  DSN. Delete `environment` from your `init` call and swap in the DSN of the
+  environment you want to report to.
+
+## 1.0.0 - 2026-07-27
+
+First public release. Prior `0.x` versions were internal-only and were never
+published to npm.
+
+- **Renamed to `@edraj/sauron-node`.** The wire identity is unchanged — the SDK
+  still reports itself as `sauron-node` in the envelope header — so the rename
+  is invisible to the ingest gateway and the dashboard.
 - **Fixed: a full send queue could wedge the transport permanently.** The whole queue went
   out as one envelope and `413` was treated as retryable, so once the buffer filled during
   an outage every flush resent the same oversized body and failed identically — no event was

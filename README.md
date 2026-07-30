@@ -16,9 +16,9 @@ This repository is a working MVP: a client SDK emits an error or event → the b
 ## Architecture
 
 ```
- @sauron/browser  ┐                        ┌─────────────────────────────┐
+ @edraj/sauron-browser  ┐                        ┌─────────────────────────────┐
  sauron_flutter   ├── gzip envelope ──────▶│ sauron-ingest (axum edge)   │
-                  ┘  POST /api/{pid}/       │  DSN auth → rate-limit →     │
+                  ┘  POST /api/{env_id}/    │  DSN auth → rate-limit →     │
                      envelope               │  validate → Redis stream     │
                                             │  → [co-located workers]:     │
                                             │    enrich → fingerprint →    │
@@ -42,13 +42,15 @@ This repository is a working MVP: a client SDK emits an error or event → the b
 ```
 Organization
   └─ Project        (grouping / product)
-       └─ App       (app_type + its own DSN — the ingest unit)
-            └─ Environments, Issues, Events, People   (keyed by app_id)
+       └─ App       (app_type)
+            ├─ Environments   (each with its own DSN — the ingest unit; every app
+            │                  starts with one, `dev`, marked default)
+            └─ Issues, Events, People   (keyed by app_id)
 ```
 
-One product ("Project X") can hold many heterogeneous **apps** (e.g. 3 Flutter apps + 2 webapps), each with its own DSN. `app_type ∈ web · flutter · ios · android · react_native · node`.
+One product ("Project X") can hold many heterogeneous **apps** (e.g. 3 Flutter apps + 2 webapps). Every app is created with one **environment** named `dev` (marked default), and can hold more (e.g. `dev`, `staging`, `production`) — each with its own DSN, managed under **Settings → Environments**. `app_type ∈ web · flutter · ios · android · react_native · node`.
 
-**Fine-grained RBAC.** Atomic permissions (`issue:read`, `issue:write`, `event:read`, `app:*`, `project:*`, `member:*`, `role:manage`, `org:manage`) are bundled into **roles**. Four presets ship — **Owner ⊇ Admin ⊇ Developer ⊇ Viewer** — plus custom roles. A user is granted a role at **org, project, or app** scope; permissions resolve as a **union down the tree** (an org grant covers everything; a project grant covers its apps but not siblings; an app grant is narrowest). So "Admin of Project X, Viewer of Project Y" is expressible. Grants and custom roles are guarded against privilege escalation (you can't grant permissions you don't hold). The dashboard reads `GET /v1/orgs/{org}/access` and hides actions the caller can't perform. See [`docs/audit-2026-07-12-rbac.md`](docs/audit-2026-07-12-rbac.md).
+**Fine-grained RBAC.** Atomic permissions (`issue:read`, `issue:write`, `event:read`, `app:*`, `env:*`, `project:*`, `member:*`, `role:manage`, `org:manage`) are bundled into **roles**. Four presets ship — **Owner ⊇ Admin ⊇ Developer ⊇ Viewer** — plus custom roles. A user is granted a role at **org, project, or app** scope; permissions resolve as a **union down the tree** (an org grant covers everything; a project grant covers its apps but not siblings; an app grant is narrowest). So "Admin of Project X, Viewer of Project Y" is expressible. Grants and custom roles are guarded against privilege escalation (you can't grant permissions you don't hold). The dashboard reads `GET /v1/orgs/{org}/access` and hides actions the caller can't perform. See [`docs/audit-2026-07-12-rbac.md`](docs/audit-2026-07-12-rbac.md).
 
 ## Repository layout
 
@@ -68,10 +70,10 @@ backend/          Rust Cargo workspace
     crebain           load/benchmark generator (isolated ephemeral stack)
 dashboard/        Vite + Svelte 5 (runes) + TypeScript + axios SPA
 sdks/
-  js/             @sauron/browser (TypeScript, tsup)
+  js/             @edraj/sauron-browser (TypeScript, tsup)
   flutter/        sauron_flutter (Dart)
 examples/
-  svelte-web/     runnable demo webapp wired to @sauron/browser
+  svelte-web/     runnable demo webapp wired to @edraj/sauron-browser
   flutter-app/    runnable demo app wired to sauron_flutter
 docs/             design specs + the RBAC security/performance audit
 ```
@@ -93,7 +95,7 @@ docker compose up --build
 > `API_BASE_URL` / `INGEST_BASE_URL` / `CORS_ALLOWED_ORIGINS`; if you change the
 > `ports:` mappings, change those too.
 
-Register in the dashboard, create a project → an app, copy that app's DSN into an SDK, and watch the first event land.
+Register in the dashboard, create a project → an app (it starts with one environment, `dev`), copy that environment's DSN from **Settings → Environments** into an SDK, and watch the first event land. The environment an event belongs to is proven by the ingest key it arrived with, so it cannot be spoofed by a client.
 
 > First build compiles the Rust workspace three times (one per service image); subsequent builds are cached.
 
@@ -244,7 +246,7 @@ ports, not Compose-network service names.
 | Variable | What it does | Default | Used by |
 | --- | --- | --- | --- |
 | `API_BASE_URL` | API base URL the dashboard calls. | `http://localhost:8080` | dashboard |
-| `INGEST_BASE_URL` | Ingest base URL, used to render app DSNs. | `http://localhost:8081` | dashboard |
+| `INGEST_BASE_URL` | Ingest base URL, used to render environment DSNs. | `http://localhost:8081` | dashboard |
 | `VITE_API_BASE_URL` | Build-time override for `npm run dev`; loses to the runtime value above. | unset ⇒ `http://localhost:8090` | dashboard (dev) |
 | `VITE_INGEST_BASE_URL` | Build-time override for `npm run dev`. | unset ⇒ `http://localhost:8091` | dashboard (dev) |
 
@@ -287,10 +289,10 @@ so the SDKs themselves stay config-free. Not used by the backend.
 
 ## Sending your first event
 
-**Web (`@sauron/browser`):**
+**Web (`@edraj/sauron-browser`):**
 ```js
-import { Sauron } from '@sauron/browser';
-Sauron.init({ dsn: 'http://<app_public_key>@localhost:8081/<app_id>' });
+import { Sauron } from '@edraj/sauron-browser';
+Sauron.init({ dsn: 'http://<public_key>@localhost:8081/<environment_id>' });
 throw new Error('hello from the browser');   // auto-captured & grouped
 Sauron.track('checkout_completed', { cart_value: 42.5 });
 Sauron.identify('u_42', { plan: 'pro' });
@@ -299,7 +301,7 @@ Sauron.identify('u_42', { plan: 'pro' });
 **Flutter (`sauron_flutter`):**
 ```dart
 await Sauron.init(
-  (o) => o.dsn = 'http://<app_public_key>@localhost:8081/<app_id>',
+  SauronOptions(dsn: 'http://<public_key>@localhost:8081/<environment_id>'),
   appRunner: () => runApp(const MyApp()),
 );
 Sauron.track('checkout_completed', properties: {'cart_value': 42.5});
@@ -310,10 +312,16 @@ Sauron.track('checkout_completed', properties: {'cart_value': 42.5});
 One JSON envelope, shared by both SDKs and the backend (defined in `backend/crates/sauron-core/src/envelope.rs`; a golden fixture guards parity across all three test suites):
 
 ```
-POST /api/{app_id}/envelope
+POST /api/{environment_id}/envelope
 X-Sauron-Key: <public_key>          # or ?k=<public_key> for sendBeacon
 Content-Encoding: gzip              # optional
 ```
+
+The DSN's key identifies exactly one environment (and therefore one app, project and
+org); the `{environment_id}` path segment is informational only — the gateway
+authenticates on the key alone, so an event's environment is proven by the key it
+arrived with and cannot be spoofed by a client. See the
+**[Ingest Wire Contract](wiki/Ingest-Wire-Contract.md)** for the full DSN shape.
 
 Error grouping is line-number–independent: two occurrences of the same bug on different lines/releases collapse into one issue.
 

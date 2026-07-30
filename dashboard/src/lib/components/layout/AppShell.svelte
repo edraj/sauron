@@ -26,16 +26,36 @@
   onMount(async () => {
     try {
       await sessionStore.load();
-      if (!sessionStore.loaded) return;
-      if (sessionStore.projects.length === 0) {
-        if (requireProject || requireApp) push('/onboarding');
-        return;
-      }
-      if (requireApp && !sessionStore.currentAppId) {
-        push('/projects');
-      }
     } catch (err) {
       loadError = errorMessage(err);
+    }
+  });
+
+  // Derived, not latched: switching orgs from the Topbar mutates sessionStore without
+  // remounting this component (Topbar calls setOrg with no route push), so a flag set
+  // once in onMount would strand the member on the empty state in an org where they
+  // actually have access.
+  const needsScope = $derived(
+    sessionStore.loaded && sessionStore.projects.length === 0 && (requireProject || requireApp),
+  );
+  // Onboarding asks the member to create a project, so only offer it to someone who
+  // can actually create one — otherwise it is a dead end they cannot exit.
+  const canOnboard = $derived(sessionStore.can('project:create'));
+  // Set when the member has zero reachable projects AND can't create one —
+  // onboarding would just ask them to create a project they have no
+  // permission for, so show a dead-end state instead of redirecting there.
+  const noAccess = $derived(needsScope && !canOnboard);
+
+  $effect(() => {
+    if (needsScope && canOnboard) push('/onboarding');
+  });
+
+  // Mirrors the onboarding effect above: only steer a requireApp page to /projects
+  // once we're past the "no reachable projects" case entirely (onboarding/noAccess
+  // above already own that case), so this never fires while noAccess holds.
+  $effect(() => {
+    if (sessionStore.loaded && !needsScope && requireApp && !sessionStore.currentAppId) {
+      push('/projects');
     }
   });
 </script>
@@ -53,6 +73,12 @@
         </EmptyState>
       {:else if !sessionStore.loaded}
         <div class="shell-loading"><Spinner size={26} /></div>
+      {:else if noAccess}
+        <EmptyState
+          title="No apps available"
+          description="You don't have access to any app in this organization yet. Ask an administrator to grant you access."
+          icon="lock"
+        />
       {:else}
         {@render children()}
       {/if}

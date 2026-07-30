@@ -22,15 +22,15 @@ SDK batch ──▶ Ingest edge ──▶ Redis stream ──▶ Workers ──�
 ```
 
 An SDK batches items into an **envelope** and `POST`s it to
-`/api/{project_id}/envelope` with the public key in the `X-Sauron-Key` header (or the
-`?k=` query param, for `navigator.sendBeacon`, which can't set headers).
+`/api/{environment_id}/envelope` with the public key in the `X-Sauron-Key` header (or
+the `?k=` query param, for `navigator.sendBeacon`, which can't set headers).
 
 **At the edge** (a small, stateless service):
 
-- **Auth & tenancy.** The public key is resolved to an app — cached in Redis, falling
-  back to Postgres — yielding its project and org. The `{project_id}` in the URL is
-  **ignored**; tenancy comes from the key. An unknown key is `401`; an app with ingest
-  disabled is `403`.
+- **Auth & tenancy.** The public key is resolved to an environment — cached in Redis,
+  falling back to Postgres — yielding its app, project and org. The `{environment_id}`
+  in the URL is **ignored**; tenancy comes from the key. An unknown key is `401`; an
+  app or environment with ingest disabled is `403`.
 - **Rate limiting.** A per-app fixed-window limit (Redis `INCR` + `EXPIRE`) returns
   `429` with `Retry-After` when exceeded.
 - **Decompression.** `Content-Encoding: gzip` is decompressed transparently; the body
@@ -222,13 +222,14 @@ Active HTTP/TCP probes on a fixed schedule — one of 14 interval presets (1 sec
 
 Fine-grained, and enforced per request:
 
-- **21 atomic permissions** (`issue:read`, `funnel:write`, `source:read`, `monitor:write`,
-  `member:manage`, `org:manage`, …) bundle into **roles** (a named permission set),
-  which are **granted** at a scope — org, project, or app.
+- **27 atomic permissions** (`issue:read`, `funnel:write`, `source:read`, `monitor:write`,
+  `member:manage`, `org:manage`, the `env:*` family (`env:read`, `env:create`,
+  `env:update`, `env:delete`, `env:rotate_key`), …) bundle into **roles** (a named
+  permission set), which are **granted** at a scope — org, project, or app.
 - **Resolution** is the **union** of every grant that applies, cascading **down** Org →
   Project → App: an org grant covers everything beneath it; a project grant covers its
   apps but **not** its sibling projects; an app grant covers only that app.
-- **Presets** form a strict ladder — **Owner** (all 21) ⊇ **Admin** (all but
+- **Presets** form a strict ladder — **Owner** (all 27) ⊇ **Admin** (all but
   `org:manage`) ⊇ **Developer** (read/write issues, events, funnels, artifacts, source
   maps, monitors; create/update apps) ⊇ **Viewer** (read-only). Presets are re-synced
   from code at startup, so they stay current as permissions are added.
@@ -238,7 +239,7 @@ Fine-grained, and enforced per request:
 ## 8. SDK internals
 
 What every SDK does between your call and the wire. Calls accumulate into one
-**envelope**: a header (SDK, release, environment), a context block (device, os, app,
+**envelope**: a header (SDK, release), a context block (device, os, app,
 runtime, user), and a list of typed items.
 
 - **Batching** — signals buffer and flush every 5 seconds, or as soon as 30

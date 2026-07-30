@@ -35,6 +35,15 @@ describe('filters codec', () => {
     const ef: Filter[] = [{ field: 'name', op: 'contains', value: 'checkout' }];
     expect(parseFilters(encodeFilters(ef), EVENT_FIELDS)).toEqual(ef);
   });
+
+  it('drops an environment filter from an old shared URL rather than erroring', () => {
+    // The chip moved to the topbar. parseFilters already discards unknown fields,
+    // so a link shared before this change still loads — it just no longer
+    // constrains environment. Asserted so the graceful degradation is deliberate
+    // rather than incidental.
+    expect(parseFilters(['environment:eq:prod', 'name:eq:click'], EVENT_FIELDS))
+      .toEqual([{ field: 'name', op: 'eq', value: 'click' }]);
+  });
 });
 
 describe('tag filter', () => {

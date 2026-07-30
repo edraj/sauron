@@ -1,0 +1,43 @@
+-- Migration 28 created error_events_issue_env_covering_idx: (issue_id,
+-- environment_id) INCLUDE (distinct_id, occurred_at) -- a covering index for
+-- the `agg` LATERAL's count(*)/count(DISTINCT distinct_id)/min(occurred_at)/
+-- max(occurred_at) aggregate in `list_issues`/`get_issue`/`top_issues`.
+--
+-- Task 9 adds a second LATERAL beside it that derives `title`/`culprit`/
+-- `level` from the single NEWEST error_events row in an issue+environment:
+-- `ORDER BY occurred_at DESC LIMIT 1`. `occurred_at` sitting in `INCLUDE`
+-- cannot serve that ordering -- Postgres cannot walk an INCLUDE payload in
+-- sorted order -- so that plan would fetch every matching row for the
+-- (issue_id, environment_id) key and sort it before taking the top one. For
+-- a hot issue with tens of thousands of events in one environment, that is a
+-- full sort on every list/detail read, exactly the regression migration 28
+-- itself closed for the aggregate half of this same query.
+--
+-- Promoting occurred_at to a KEY column (not INCLUDE) fixes this: with
+-- `(issue_id, environment_id, occurred_at DESC)` as the index's leading
+-- columns, `ORDER BY occurred_at DESC LIMIT 1` for a given (issue_id,
+-- environment_id) is a plain index scan (in the index's own DESC order) that
+-- stops after the first matching row -- no sort node, no full scan of the
+-- issue's history. The same reordered key still serves migration 28's
+-- min()/max() aggregate (the index-ordered scan already gives the
+-- first/last row directly), and count(*)/count(DISTINCT distinct_id) still
+-- only need `distinct_id`, which stays in INCLUDE -- so this migration is a
+-- strict superset of what migration 28 served, not an addition alongside it.
+--
+-- Replaces (does not sit beside) migration 28's index, same reasoning
+-- 2026-07-28-000028 itself gave for retiring the index it replaced: two
+-- B-trees leading with the same key columns on the hottest-write,
+-- partitioned table in the schema buy nothing on the read side once the
+-- wider key subsumes the narrower one, and only cost more on every INSERT.
+--
+-- error_events is a partitioned parent (RANGE on occurred_at); CREATE INDEX/
+-- DROP INDEX on the parent apply synchronously across every child partition
+-- inside this migration's transaction, holding locks on the parent and each
+-- child for the duration. CONCURRENTLY is not available inside a migration
+-- transaction. See .superpowers/sdd/2026-07-29-environment-rbac-scope/
+-- task-9-report.md for the measured before/after EXPLAIN (ANALYZE, BUFFERS)
+-- plans against the real dev app.
+DROP INDEX IF EXISTS error_events_issue_env_covering_idx;
+CREATE INDEX error_events_issue_env_time_idx
+    ON error_events (issue_id, environment_id, occurred_at DESC)
+    INCLUDE (distinct_id);

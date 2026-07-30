@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Single-page Vite + Svelte 5 demo that showcases the @sauron/browser SDK end-to-end.",
+  "description": "Single-page Vite + Svelte 5 demo that showcases the @edraj/sauron-browser SDK end-to-end.",
   "scripts": {
     "dev": "vite",
     "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
@@ -12,7 +12,7 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@sauron/browser": "file:../../sdks/js"
+    "@edraj/sauron-browser": "file:../../sdks/js"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.3",

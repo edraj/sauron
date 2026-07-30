@@ -1,0 +1,65 @@
+-- Slice 2 continued: close the ~500ms `Bitmap Heap Scan` half of the `One(env)` issues-list
+-- regression that 2026-07-28-000027_env_scoped_reads' `error_events_issue_env_idx` didn't
+-- reach. That index locates the rows the LATERAL aggregate in `list_issues`/`top_issues`
+-- needs (`issue_id`, `environment_id`), but carries none of the columns the aggregate actually
+-- reads, so every matching row still needs a heap fetch. Measured on the real dev app
+-- (22 issues, 210k events, one heavy environment): 163,583 heap blocks (~1.28GB) for a single
+-- issue/environment pair at LIMIT 50. See `.superpowers/sdd/s2-covering-index-report.md` for
+-- the full before/after `EXPLAIN` output and timings.
+--
+-- `list_issues` and `top_issues` (`backend/crates/sauron-db/src/repo.rs`) both run:
+--
+--   SELECT count(*)::bigint AS times_seen,
+--          count(DISTINCT distinct_id)::bigint AS users_seen,
+--          min(occurred_at) AS first_seen,
+--          max(occurred_at) AS last_seen
+--   FROM error_events e
+--   WHERE e.issue_id = i.id AND e.occurred_at >= $2 AND e.environment_id = $3
+--   HAVING count(*) > 0
+--
+-- Every column the aggregate touches beyond the WHERE clause's own `issue_id`/`environment_id`
+-- is `distinct_id` and `occurred_at` -- nothing else. `INCLUDE`ing exactly those two turns the
+-- scan index-only: Postgres can satisfy count(*), count(DISTINCT distinct_id), min(occurred_at),
+-- and max(occurred_at) entirely from the index entry, without visiting the heap at all (modulo
+-- the visibility map -- see the report for `Heap Fetches` before/after `VACUUM ANALYZE`).
+CREATE INDEX error_events_issue_env_covering_idx
+    ON error_events (issue_id, environment_id) INCLUDE (distinct_id, occurred_at);
+
+-- Replaces `error_events_issue_env_idx` rather than sitting alongside it. The covering index
+-- leads with the identical two key columns (`issue_id`, `environment_id`), so it serves every
+-- query the narrow index served -- including the plain `EXISTS` membership checks `list_issues`/
+-- `top_issues`/`get_issue` run for scope filtering, which only need the key columns and never
+-- touch the `INCLUDE` payload. Nothing else in the codebase references `error_events_issue_env_idx`
+-- by name or shape (grepped `backend/crates/sauron-db/src/repo.rs` and the rest of the workspace
+-- before writing this). Keeping both would mean maintaining two B-trees over the same leading
+-- columns on the hottest-write table in the schema, for zero additional read benefit -- the
+-- narrow index's only reason to exist was serving this exact aggregate, and the covering index
+-- now does that strictly better.
+DROP INDEX IF EXISTS error_events_issue_env_idx;
+
+-- `INCLUDE` columns widen every index entry (here: `distinct_id` (variable-length text) +
+-- `occurred_at` (8 bytes) on top of the `(issue_id, environment_id)` key), so this is not free on
+-- the write path -- every INSERT into `error_events` now writes a wider entry into this index.
+-- But this is *substitution*, not *addition*: Task 1 of this slice rejected a per-event
+-- `issue_environments` upsert at 77.3% of the comparable `upsert_issue` cost (~5x the 15%
+-- guardrail) specifically because it was an extra conflict-heavy statement in the per-event path.
+-- This index adds no new statement -- it widens a B-tree entry that a plain INSERT into
+-- error_events already had to write one of (the narrow index this replaces). Measured on a flat
+-- replica of `error_events`'s full index set (all 12 real indexes), single-row inserts in a
+-- PL/pgSQL loop, interleaved and checkpoint-controlled across 10 rounds to cancel out this
+-- shared dev box's I/O jitter: narrow-only (current shape) and covering-only (this migration's
+-- end state) landed within ~1-6% of each other in mean/median -- indistinguishable from the
+-- ~40-70% round-to-round noise floor observed for either shape alone. Keeping *both* indexes,
+-- by contrast, measured ~13-30% slower than either single-index shape, consistently across
+-- rounds -- real evidence for dropping the narrow one, not simply administrative tidiness. Full
+-- numbers in the report.
+--
+-- `error_events` is a partitioned parent (RANGE on `occurred_at`, 20 live child partitions at
+-- measurement time) and the hottest-write table in the schema. `CREATE INDEX` and `DROP INDEX`
+-- on a partitioned parent apply SYNCHRONOUSLY across every child inside this migration's
+-- transaction, holding locks on the parent and each child for the duration -- exactly what
+-- 2026-07-27-000025_search_indexes documented for the same reason, and what
+-- 2026-07-28-000027_env_scoped_reads' own `error_events_issue_env_idx` addition already paid
+-- once. `CONCURRENTLY` is not available here: migrations run inside a transaction, and
+-- `CREATE INDEX CONCURRENTLY` cannot run in one. This needs a maintenance window. See the report
+-- for the measured build time on the real dev app's 210k-row table.

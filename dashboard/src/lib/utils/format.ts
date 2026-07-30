@@ -65,15 +65,24 @@ export const APP_TYPES: { value: string; label: string }[] = [
 ];
 
 /**
- * Build the ingest DSN for an app: http(s)://<public_key>@<ingest_host>/<app_id>.
- * Falls back to a path form if the ingest base URL can't be parsed.
+ * Build the ingest DSN for an environment:
+ * `http(s)://<public_key>@<ingest_host>/<environment_id>`.
+ *
+ * The ingest edge authenticates on the key alone and discards this path segment,
+ * so the id is documentation rather than routing — but it should name the thing
+ * the key actually belongs to.
  */
-export function buildDsn(publicKey: string, appId: string): string {
+export function buildDsn(publicKey: string, environmentId: string): string {
   try {
     const u = new URL(ingestBaseUrl);
-    return `${u.protocol}//${publicKey}@${u.host}/${appId}`;
+    return `${u.protocol}//${publicKey}@${u.host}/${environmentId}`;
   } catch {
-    return `${ingestBaseUrl}/${publicKey}/${appId}`;
+    // `ingestBaseUrl` failed to parse as a URL, so there is no working DSN to
+    // build. This string is not a valid DSN — no SDK can parse it (no scheme,
+    // userinfo stuffed into the path) — it exists only so the malformed
+    // `INGEST_BASE_URL` / `VITE_INGEST_BASE_URL` value is visible in the UI as
+    // a diagnostic, instead of the function throwing or returning nothing.
+    return `${ingestBaseUrl}/${publicKey}@${environmentId}`;
   }
 }
 

@@ -2,13 +2,13 @@
 //! per-session timeline that merges analytics events, errors, and performance
 //! transactions into one chronological stream.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use sauron_auth::{authorize_app, perm, AuthUser};
+use sauron_auth::{perm, AuthUser};
 use sauron_db::models::{AnalyticsEvent, ErrorEvent, Session, Transaction};
 use sauron_db::repo;
 
@@ -26,6 +26,10 @@ pub struct ListQuery {
     pub offset: i64,
     pub distinct_id: Option<String>,
     pub device_key: Option<String>,
+    // `environment_id` is deliberately NOT a field here — it is read from the
+    // raw query string via `RawQuery` + `scope::authorized_read_scope`
+    // instead of this `Query<T>` extractor. See `routes::scope`'s module docs
+    // for the extractor trap this avoids.
 }
 
 fn default_days() -> i64 {
@@ -40,15 +44,23 @@ pub async fn list(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<ListQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<Session>>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
     let limit = q.limit.clamp(1, 200);
     Ok(Json(
         repo::list_sessions(
             &mut conn,
-            app_id,
+            scope,
             since,
             limit,
             super::clamp_offset(q.offset),
@@ -96,21 +108,33 @@ pub struct SessionDetail {
     pub timeline: Vec<TimelineItem>,
 }
 
+// No bespoke query struct: `detail` takes no query parameters of its own —
+// `environment_id` comes from `RawQuery` (see `ListQuery`'s comment above),
+// not a `Query<T>` extractor.
+
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
     Path((app_id, session_id)): Path<(Uuid, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<SessionDetail>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
 
-    let session = repo::get_session(&mut conn, app_id, &session_id)
+    let session = repo::get_session(&mut conn, scope.clone(), &session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let events = repo::events_for_session(&mut conn, app_id, &session_id, 500).await?;
-    let errors = repo::errors_for_session(&mut conn, app_id, &session_id, 500).await?;
-    let txns = repo::transactions_for_session(&mut conn, app_id, &session_id, 500).await?;
+    let events = repo::events_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
+    let errors = repo::errors_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
+    let txns = repo::transactions_for_session(&mut conn, scope, &session_id, 500).await?;
 
     let mut timeline: Vec<TimelineItem> =
         Vec::with_capacity(events.len() + errors.len() + txns.len());

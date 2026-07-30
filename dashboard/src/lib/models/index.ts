@@ -84,7 +84,6 @@ export interface App {
   name: string;
   slug: string;
   app_type: AppType;
-  public_key: string;
   ingest_enabled: boolean;
   // Retained by the API for backwards compat; not surfaced in the UI.
   platform?: string | null;
@@ -97,6 +96,13 @@ export interface Environment {
   app_id: string;
   name: string;
   created_at: string;
+  /** Non-secret, write-only ingest credential. Safe to render. */
+  public_key: string;
+  ingest_enabled: boolean;
+  is_default: boolean;
+  /** Non-null once retired: ingest is off and it is hidden from pickers. */
+  retired_at: string | null;
+  updated_at: string;
 }
 
 export interface FirstEventStatus {
@@ -110,7 +116,7 @@ export interface FirstEventStatus {
 // Access control (RBAC)
 // ---------------------------------------------------------------------------
 
-export type ScopeType = 'org' | 'project' | 'app';
+export type ScopeType = 'org' | 'project' | 'app' | 'env';
 
 // Known permission strings. `(string & {})` keeps autocomplete while tolerating
 // any future permission the backend introduces.
@@ -127,7 +133,11 @@ export type Permission =
   | 'app:create'
   | 'app:update'
   | 'app:delete'
-  | 'app:rotate_key'
+  | 'env:read'
+  | 'env:create'
+  | 'env:update'
+  | 'env:delete'
+  | 'env:rotate_key'
   | 'project:read'
   | 'project:create'
   | 'project:update'
@@ -396,18 +406,6 @@ export interface TopEvent {
   count: number;
 }
 
-// The persisted person record returned by the persons endpoint.
-export interface Person {
-  id: string;
-  app_id: string;
-  distinct_id: string;
-  properties: Record<string, unknown> | null;
-  first_seen: string;
-  last_seen: string;
-  created_at?: string;
-  updated_at?: string;
-}
-
 export interface AnalyticsEvent {
   id: string;
   app_id?: string;
@@ -505,27 +503,14 @@ export interface DeviceRow {
   sessions_count: number;
 }
 
-export interface Device {
-  id: string;
-  app_id: string;
-  device_key: string;
-  family: string | null;
-  model: string | null;
-  os_name: string | null;
-  os_version: string | null;
-  arch: string | null;
-  browser: string | null;
-  last_distinct_id: string | null;
-  first_seen: string;
-  last_seen: string;
-  events_count: number;
-  errors_count: number;
-  created_at: string;
-  updated_at: string;
-}
-
 export interface DeviceDetail {
-  device: Device;
+  // Environment-scoped, not the raw `devices` row — see the backend's
+  // `get_device` doc comment (backend/crates/sauron-db/src/repo.rs).
+  // events_count/errors_count come from the durable devices columns under
+  // the "all environments" scope and from an environment-scoped LATERAL
+  // otherwise, matching sessions/errors/perf below rather than showing
+  // cross-environment, all-time totals above a scoped list.
+  device: DeviceRow;
   sessions: Session[];
   errors: ErrorEvent[];
   perf: PerfSummaryRow[];
@@ -661,7 +646,11 @@ export interface PerfSeriesPoint {
 
 export interface PersonProfile {
   distinct_id: string;
-  user: Person | null;
+  // `PersonRow`, not a raw persisted-row type — see the backend's
+  // `repo::get_event_user` doc comment (backend/crates/sauron-db/src/repo.rs).
+  // `first_seen`/`last_seen` are environment-scoped, matching the events/
+  // errors lists on the same page, not the app-wide identity record.
+  user: PersonRow | null;
   events: AnalyticsEvent[];
   errors: ErrorEvent[];
 }

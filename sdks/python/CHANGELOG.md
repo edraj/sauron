@@ -2,7 +2,18 @@
 
 All notable changes to the Sauron Python SDK are documented here.
 
-## Unreleased
+## 1.2.0
+
+- **Breaking: the `environment` option has been removed.** An environment is now
+  identified by the ingest key it belongs to, not by a string the client sends.
+  Create environments in the dashboard under app settings; each one has its own
+  DSN. Delete `environment` from your `init` call and swap in the DSN of the
+  environment you want to report to.
+
+## 1.0.0 - 2026-07-27
+
+First public release. Prior `0.x` versions were internal-only and were never
+published to PyPI.
 
 - **Fixed: a rejected envelope was replayed from disk forever.** Persisted files were only
   deleted on success, so a payload the server permanently refuses (e.g. a `400`) was reloaded

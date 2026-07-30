@@ -12,12 +12,15 @@
   import { authStore } from '../lib/stores/auth.svelte';
   import { createProject } from '../lib/api/projects';
   import { createApp, getFirstEvent } from '../lib/api/apps';
+  import { listEnvironments } from '../lib/api/environments';
   import { errorMessage } from '../lib/api/client';
   import { buildDsn, appTypeIcon, APP_TYPES } from '../lib/utils/format';
-  import type { App, AppType, FirstEventStatus, Project } from '../lib/models';
+  import type { App, AppType, Environment, FirstEventStatus, Project } from '../lib/models';
 
   let project = $state<Project | null>(null);
   let app = $state<App | null>(null);
+  // The DSN now lives on the app's seeded environment, not on the app itself.
+  let defaultEnv = $state<Environment | null>(null);
 
   let projectName = $state('');
   let creatingProject = $state(false);
@@ -31,9 +34,11 @@
   let firstEvent = $state<FirstEventStatus>({ received: false, errors: false, events: false });
   let pollTimer: ReturnType<typeof setInterval> | undefined;
 
-  const dsn = $derived(app ? buildDsn(app.public_key, app.id) : '');
+  // Empty (not a malformed placeholder) until the environment fetch resolves,
+  // so the DSN step below can guard on it and show the loading affordance.
+  const dsn = $derived(defaultEnv ? buildDsn(defaultEnv.public_key, defaultEnv.id) : '');
   const snippet = $derived(
-    `import { Sauron } from '@sauron/browser';\n\nSauron.init({\n  dsn: '${dsn}',\n});`,
+    `import { Sauron } from '@edraj/sauron-browser';\n\nSauron.init({\n  dsn: '${dsn}',\n});`,
   );
 
   const step = $derived(!project ? 1 : !app ? 2 : 3);
@@ -45,6 +50,7 @@
     if (sessionStore.currentApp) {
       app = sessionStore.currentApp;
       startPolling();
+      void loadDefaultEnv(app.id);
     }
   });
 
@@ -73,6 +79,15 @@
     pollTimer = setInterval(pollOnce, 3000);
   }
 
+  async function loadDefaultEnv(appId: string) {
+    try {
+      const envs = await listEnvironments(appId);
+      defaultEnv = envs.find((e) => e.is_default) ?? envs[0] ?? null;
+    } catch {
+      defaultEnv = null;
+    }
+  }
+
   async function handleCreateProject(event: SubmitEvent) {
     event.preventDefault();
     if (creatingProject || !sessionStore.currentOrgId || !projectName.trim()) return;
@@ -99,6 +114,7 @@
       sessionStore.upsertApp(created);
       app = created;
       startPolling();
+      await loadDefaultEnv(created.id);
     } catch (err) {
       appError = errorMessage(err);
     } finally {
@@ -180,16 +196,25 @@
         </p>
       </div>
 
-      <Card title="Your DSN">
-        <div class="dsn-row">
-          <code class="dsn mono">{dsn}</code>
-          <CopyButton value={dsn} />
-        </div>
-      </Card>
+      {#if dsn}
+        <Card title="Your DSN">
+          <div class="dsn-row">
+            <code class="dsn mono">{dsn}</code>
+            <CopyButton value={dsn} />
+          </div>
+        </Card>
 
-      <Card title="Install snippet">
-        <CodeBlock code={snippet} language="javascript" />
-      </Card>
+        <Card title="Install snippet">
+          <CodeBlock code={snippet} language="javascript" />
+        </Card>
+      {:else}
+        <Card title="Your DSN">
+          <div class="dsn-loading">
+            <Spinner size={18} />
+            <span class="muted">Setting up your environment…</span>
+          </div>
+        </Card>
+      {/if}
 
       <div class="waiting" class:done={firstEvent.received}>
         {#if firstEvent.received}
@@ -376,6 +401,12 @@
     display: flex;
     align-items: center;
     gap: 12px;
+  }
+  .dsn-loading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
   }
   .dsn {
     flex: 1;

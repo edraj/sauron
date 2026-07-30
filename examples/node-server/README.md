@@ -1,6 +1,6 @@
-# @sauron/node — server-side example
+# @edraj/sauron-node — server-side example
 
-A tiny, copy-pasteable Node backend that exercises the `@sauron/node` **0.3.0**
+A tiny, copy-pasteable Node backend that exercises the `@edraj/sauron-node` **0.3.0**
 surface: a per-request `withScope`, `addBreadcrumb` before a captured exception,
 and one `trackTransaction` — plus `identify` / `track` and `flush` / `close`.
 
@@ -9,18 +9,17 @@ and one `trackTransaction` — plus `identify` / `track` and `flush` / `close`.
 ```bash
 cd examples/node-server
 npm install
-SAURON_DSN="https://<public_key>@<host>/<project_id>" npm start
+SAURON_DSN="https://<public_key>@<host>/<environment_id>" npm start
 ```
 
 The DSN is read from the `SAURON_DSN` environment variable. If it is **unset**,
 the client is never initialized, every dispatch call is a no-op, and the process
 still exits `0` (disabled mode) — handy for a smoke run without an ingest.
 
-| Env var          | Default       | Purpose                             |
-| ---------------- | ------------- | ----------------------------------- |
-| `SAURON_DSN`     | *(optional)*  | Your project DSN; unset ⇒ disabled. |
-| `NODE_ENV`       | `development` | Passed as `environment`.            |
-| `SAURON_RELEASE` | `1.0.0`       | Passed as `release`.                |
+| Env var          | Default       | Purpose                                        |
+| ---------------- | ------------- | ----------------------------------------------- |
+| `SAURON_DSN`     | *(optional)*  | Your environment's DSN; unset ⇒ disabled.       |
+| `SAURON_RELEASE` | `1.0.0`       | Passed as `release`.                            |
 
 If the Sauron ingest is not running the SDK simply buffers and the POST fails in
 the background — the process still exits cleanly.
@@ -28,10 +27,10 @@ the background — the process still exits cleanly.
 ## Typecheck
 
 ```bash
-npm run typecheck   # tsc --noEmit against the @sauron/node 0.3.0 types
+npm run typecheck   # tsc --noEmit against the @edraj/sauron-node 0.3.0 types
 ```
 
-> `tsconfig.json` maps `@sauron/node` to the SDK source (`../../sdks/node/src`)
+> `tsconfig.json` maps `@edraj/sauron-node` to the SDK source (`../../sdks/node/src`)
 > so the example typechecks against the shipped 0.3.0 API without a prior
 > `npm run build` of the SDK.
 
@@ -42,10 +41,10 @@ import {
   init, identify, track, captureException,
   trackTransaction, addBreadcrumb, withScope, setUser, setTag,
   flush, close,
-} from '@sauron/node';
+} from '@edraj/sauron-node';
 
 if (process.env.SAURON_DSN) {
-  init({ dsn: process.env.SAURON_DSN, environment: 'production', release: '1.0.0' });
+  init({ dsn: process.env.SAURON_DSN, release: '1.0.0' });
 }
 
 identify('user-42', { plan: 'pro' });

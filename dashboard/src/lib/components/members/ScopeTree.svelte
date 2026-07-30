@@ -1,10 +1,10 @@
 <script lang="ts">
   import Icon from '../ui/Icon.svelte';
+  import Spinner from '../ui/Spinner.svelte';
   import {
-    isEmptySelection,
+    describeSelection,
     isImpliedByAncestor,
     projectCheckState,
-    selectionToScopes,
     type ScopeSelection,
   } from '../../models/scope-tree';
 
@@ -13,9 +13,27 @@
     orgName: string;
     projects: { id: string; name: string }[];
     appsByProject: Record<string, { id: string; name: string }[]>;
+    /**
+     * Environments per app, keyed by app id. Presence of a key — even an empty
+     * array — means "loaded"; absence means the parent has not fetched it yet.
+     * An org can have hundreds of apps, so this is never populated eagerly for
+     * every app up front; see `onopenapp`.
+     */
+    envsByApp: Record<string, { id: string; name: string }[]>;
+    /** App ids whose environment list is currently in flight, so that row can
+        show a spinner instead of a stale/empty twisty. */
+    loadingEnvApps?: Set<string>;
     value: ScopeSelection;
     disabled?: boolean;
     onchange: (next: ScopeSelection) => void;
+    /**
+     * Fired when an app row's disclosure opens and `envsByApp` has no entry
+     * for it yet. The caller owns the network call and the cache — an org
+     * with hundreds of apps must not pay for hundreds of requests just
+     * because a dialog opened, so environments are only ever asked for one
+     * app at a time, on demand, the first time its row is expanded.
+     */
+    onopenapp: (appId: string) => void;
   }
 
   let {
@@ -23,13 +41,17 @@
     orgName,
     projects,
     appsByProject,
+    envsByApp,
+    loadingEnvApps = new Set<string>(),
     value,
     disabled = false,
     onchange,
+    onopenapp,
   }: Props = $props();
 
-  /** Disclosure state the admin set by hand; the rest falls back to isOpen(). */
-  let opened = $state<Record<string, boolean>>({});
+  /** Disclosure state the admin set by hand; the rest falls back to isXOpen(). */
+  let openedProjects = $state<Record<string, boolean>>({});
+  let openedApps = $state<Record<string, boolean>>({});
 
   const projectOfApp = $derived.by(() => {
     const map: Record<string, string> = {};
@@ -37,30 +59,66 @@
     return map;
   });
 
-  const summary = $derived.by(() => {
-    if (isEmptySelection(value)) return 'Nothing selected yet.';
-    if (value.org) return `Full access to ${orgName}`;
-    const scopes = selectionToScopes(value, orgId, projectOfApp);
-    const projectCount = scopes.filter((s) => s.scope_type === 'project').length;
-    const appCount = scopes.length - projectCount;
-    const parts: string[] = [];
-    if (projectCount) parts.push(`${projectCount} project${projectCount === 1 ? '' : 's'}`);
-    if (appCount) parts.push(`${appCount} app${appCount === 1 ? '' : 's'}`);
-    return parts.join(', ');
+  const appOfEnv = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const [appId, envs] of Object.entries(envsByApp)) {
+      for (const e of envs) map[e.id] = appId;
+    }
+    return map;
   });
+
+  const summary = $derived(describeSelection(value, orgId, orgName, projectOfApp, appOfEnv));
 
   function appsOf(projectId: string) {
     return appsByProject[projectId] ?? [];
   }
 
-  // Open by default when something inside is already ticked, so an existing
-  // selection is never hidden behind a collapsed row.
-  function isOpen(projectId: string): boolean {
-    return opened[projectId] ?? appsOf(projectId).some((a) => value.apps.includes(a.id));
+  function envsOf(appId: string) {
+    return envsByApp[appId] ?? [];
   }
 
-  function toggleOpen(projectId: string) {
-    opened = { ...opened, [projectId]: !isOpen(projectId) };
+  /** Tri-state for an app row, given the envs that live under it — the same
+      idea as projectCheckState one level down, kept local since it needs
+      envsOf() rather than a project's static app list. */
+  function appCheckState(appId: string): 'checked' | 'indeterminate' | 'unchecked' {
+    if (value.apps.includes(appId)) return 'checked';
+    if (envsOf(appId).some((e) => value.envs.includes(e.id))) return 'indeterminate';
+    return 'unchecked';
+  }
+
+  // Open by default when something inside is already ticked, so an existing
+  // selection is never hidden behind a collapsed row. This has to check two
+  // levels down, not just direct app children — an edit dialog seeded from an
+  // env-scoped grant ticks value.envs with nothing in value.apps at all, and
+  // without the envsOf() half below, the project row (and everything under
+  // it) would stay collapsed and hide the very tick this auto-open exists to
+  // surface. Only reaches envs already in envsByApp — see isAppOpen's comment.
+  function isProjectOpen(projectId: string): boolean {
+    return (
+      openedProjects[projectId] ??
+      appsOf(projectId).some(
+        (a) => value.apps.includes(a.id) || envsOf(a.id).some((e) => value.envs.includes(e.id)),
+      )
+    );
+  }
+
+  function toggleOpenProject(projectId: string) {
+    openedProjects = { ...openedProjects, [projectId]: !isProjectOpen(projectId) };
+  }
+
+  // Same idea one level down: auto-open when an environment inside is already
+  // ticked. That can only be true once envsByApp[appId] is loaded — ticking an
+  // env requires its row to have rendered in the first place — so this never
+  // needs to trigger a fetch by itself; toggleOpenApp below is what asks the
+  // parent to load an app's environments the first time it is opened.
+  function isAppOpen(appId: string): boolean {
+    return openedApps[appId] ?? envsOf(appId).some((e) => value.envs.includes(e.id));
+  }
+
+  function toggleOpenApp(appId: string) {
+    const next = !isAppOpen(appId);
+    openedApps = { ...openedApps, [appId]: next };
+    if (next && !(appId in envsByApp)) onopenapp(appId);
   }
 
   // Narrower picks are kept rather than dropped: selectionToScopes discards
@@ -76,23 +134,45 @@
       onchange({ ...value, projects: value.projects.filter((id) => id !== projectId) });
       return;
     }
-    // A project grant already covers its apps, so ticking it absorbs them —
-    // otherwise unticking the project later would leave orphaned app grants.
-    const under = new Set(appsOf(projectId).map((a) => a.id));
+    // A project grant already covers its apps and, transitively, their
+    // environments, so ticking it absorbs both — otherwise unticking the
+    // project later would leave orphaned app and environment grants behind.
+    const apps = appsOf(projectId);
+    const underApps = new Set(apps.map((a) => a.id));
+    const underEnvs = new Set(apps.flatMap((a) => envsOf(a.id).map((e) => e.id)));
     onchange({
       ...value,
       projects: [...value.projects, projectId],
-      apps: value.apps.filter((id) => !under.has(id)),
+      apps: value.apps.filter((id) => !underApps.has(id)),
+      envs: value.envs.filter((id) => !underEnvs.has(id)),
     });
   }
 
   function toggleApp(appId: string, projectId: string) {
     if (disabled || isImpliedByAncestor(value, 'app', projectId)) return;
+    if (value.apps.includes(appId)) {
+      onchange({ ...value, apps: value.apps.filter((id) => id !== appId) });
+      return;
+    }
+    // An app grant already covers its environments, so ticking it absorbs
+    // them — otherwise unticking the app later would leave orphaned
+    // environment grants behind, exactly as toggleProject absorbs apps (and
+    // now their environments) above.
+    const under = new Set(envsOf(appId).map((e) => e.id));
     onchange({
       ...value,
-      apps: value.apps.includes(appId)
-        ? value.apps.filter((id) => id !== appId)
-        : [...value.apps, appId],
+      apps: [...value.apps, appId],
+      envs: value.envs.filter((id) => !under.has(id)),
+    });
+  }
+
+  function toggleEnv(envId: string, appId: string, projectId: string) {
+    if (disabled || isImpliedByAncestor(value, 'env', appId, projectId)) return;
+    onchange({
+      ...value,
+      envs: value.envs.includes(envId)
+        ? value.envs.filter((id) => id !== envId)
+        : [...value.envs, envId],
     });
   }
 </script>
@@ -116,7 +196,7 @@
         project.id,
         apps.map((a) => a.id),
       )}
-      {@const open = isOpen(project.id)}
+      {@const open = isProjectOpen(project.id)}
       <div class="row lvl-1" class:implied>
         {#if apps.length}
           <button
@@ -124,7 +204,7 @@
             class="twisty"
             aria-expanded={open}
             aria-label={`${open ? 'Collapse' : 'Expand'} ${project.name}`}
-            onclick={() => toggleOpen(project.id)}
+            onclick={() => toggleOpenProject(project.id)}
           >
             <Icon name={open ? 'chevron-down' : 'chevron-right'} size={13} />
           </button>
@@ -149,18 +229,68 @@
       {#if open}
         {#each apps as app (app.id)}
           {@const appImplied = isImpliedByAncestor(value, 'app', project.id)}
+          {@const appState = appCheckState(app.id)}
+          {@const appOpen = isAppOpen(app.id)}
+          {@const envs = envsOf(app.id)}
+          {@const envsLoading = loadingEnvApps.has(app.id)}
           <div class="row lvl-2" class:implied={appImplied}>
-            <span class="twisty-gap"></span>
+            <!-- Always rendered, unlike the project twisty above: an app's env
+                 count is unknown until fetched, so the disclosure can't be
+                 conditionally hidden the way an empty project's can. -->
+            <button
+              type="button"
+              class="twisty"
+              aria-expanded={appOpen}
+              aria-label={`${appOpen ? 'Collapse' : 'Expand'} ${app.name}`}
+              onclick={() => toggleOpenApp(app.id)}
+            >
+              {#if envsLoading}
+                <Spinner size={11} stroke={1.5} />
+              {:else}
+                <Icon name={appOpen ? 'chevron-down' : 'chevron-right'} size={13} />
+              {/if}
+            </button>
             <label class="node">
               <input
                 type="checkbox"
-                checked={appImplied || value.apps.includes(app.id)}
+                checked={appImplied || appState === 'checked'}
+                indeterminate={!appImplied && appState === 'indeterminate'}
                 disabled={disabled || appImplied}
                 onchange={() => toggleApp(app.id, project.id)}
               />
               <span class="n-name">{app.name}</span>
+              {#if envs.length}
+                <span class="n-hint">{envs.length} env{envs.length === 1 ? '' : 's'}</span>
+              {/if}
             </label>
           </div>
+
+          {#if appOpen}
+            {#if envs.length}
+              {#each envs as env (env.id)}
+                {@const envImplied = isImpliedByAncestor(value, 'env', app.id, project.id)}
+                <div class="row lvl-3" class:implied={envImplied}>
+                  <span class="twisty-gap"></span>
+                  <label class="node">
+                    <input
+                      type="checkbox"
+                      checked={envImplied || value.envs.includes(env.id)}
+                      disabled={disabled || envImplied}
+                      onchange={() => toggleEnv(env.id, app.id, project.id)}
+                    />
+                    <span class="n-name">{env.name}</span>
+                  </label>
+                </div>
+              {/each}
+            {:else if envsLoading}
+              <div class="row lvl-3">
+                <span class="twisty-gap"></span>
+                <span class="n-hint loading-row"><Spinner size={11} stroke={1.5} /> Loading environments…</span>
+              </div>
+            {:else}
+              <p class="empty lvl-3-empty">No environments.</p>
+            {/if}
+          {/if}
         {/each}
       {/if}
     {/each}
@@ -202,6 +332,9 @@
   }
   .lvl-2 {
     padding-left: 34px;
+  }
+  .lvl-3 {
+    padding-left: 54px;
   }
   .row.implied {
     opacity: 0.55;
@@ -252,10 +385,18 @@
     color: var(--text-faint);
     white-space: nowrap;
   }
+  .loading-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
   .empty {
     font-size: 12.5px;
     color: var(--text-faint);
     padding: 4px 0 2px 14px;
+  }
+  .empty.lvl-3-empty {
+    padding: 2px 0 2px 54px;
   }
   .summary {
     font-size: 12px;

@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use sauron_core::envelope::{Envelope, IngestJob};
 use sauron_core::Config;
+use sauron_db::models::EnvRef;
 use sauron_db::PgPool;
 use sauron_redis::{keys, RedisStore};
 
@@ -33,15 +34,6 @@ struct AppState {
     pool: PgPool,
     redis: RedisStore,
     cfg: Arc<Config>,
-}
-
-/// Cached app resolution keyed by DSN public key.
-#[derive(Serialize, Deserialize, Clone)]
-struct AppRef {
-    app_id: Uuid,
-    project_id: Uuid,
-    org_id: Uuid,
-    ingest_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -203,10 +195,10 @@ async fn ingest(
         Err(e) => warn!(error = %e, "key rate limit check failed; allowing"),
     }
 
-    // 3. Resolve the app (cache → Postgres). Unknown keys are negatively cached
-    //    inside `resolve_app` so a repeat miss never reaches the database.
-    let app = match resolve_app(&state, &key).await {
-        Ok(Some(a)) if a.ingest_enabled => a,
+    // 3. Resolve the environment (cache → Postgres). Unknown keys are negatively
+    //    cached inside `resolve_env` so a repeat miss never reaches the database.
+    let env = match resolve_env(&state, &key).await {
+        Ok(Some(e)) if e.env_ingest_enabled && e.app_ingest_enabled => e,
         Ok(Some(_)) => return error(StatusCode::FORBIDDEN, "ingest_disabled", "ingest disabled"),
         Ok(None) => {
             return error(
@@ -216,7 +208,7 @@ async fn ingest(
             )
         }
         Err(e) => {
-            warn!(error = %e, "app resolution failed");
+            warn!(error = %e, "environment resolution failed");
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -226,7 +218,7 @@ async fn ingest(
     };
 
     // 4. Rate limit (fixed 60s window, per app).
-    let rl_key = keys::rate_limit(&app.app_id.to_string());
+    let rl_key = keys::rate_limit(&env.app_id.to_string());
     match state
         .redis
         .rate_limit_ok(&rl_key, state.cfg.ingest_rate_limit_per_min, 60)
@@ -264,10 +256,10 @@ async fn ingest(
 
     for item in envelope.items {
         let job = IngestJob {
-            app_id: app.app_id,
-            project_id: app.project_id,
-            org_id: app.org_id,
-            environment: envelope.header.environment.clone(),
+            app_id: env.app_id,
+            project_id: env.project_id,
+            org_id: env.org_id,
+            environment_id: env.env_id,
             release: envelope.header.release.clone(),
             received_at,
             ip: ip.clone(),
@@ -294,43 +286,34 @@ async fn ingest(
 /// Marker stored in the DSN cache for a key that resolved to nothing.
 const NEGATIVE_CACHE_MARKER: &str = "\u{0}none";
 
-/// Resolve an app by public key, caching the result in Redis.
+/// Resolve an ingest key to its environment, caching the result in Redis.
 ///
 /// Unknown keys are cached too (briefly). Without that, every request bearing a
 /// bogus key is a guaranteed cache miss and therefore a database round-trip on
-/// an unauthenticated path — a cheap way to exhaust the ingest pool.
-async fn resolve_app(state: &AppState, key: &str) -> anyhow::Result<Option<AppRef>> {
+/// an unauthenticated path — a cheap way to exhaust the ingest pool. A retired
+/// environment is excluded by the query, so its key is indistinguishable from an
+/// unknown one and lands on the same path.
+async fn resolve_env(state: &AppState, key: &str) -> anyhow::Result<Option<EnvRef>> {
     let cache_key = keys::dsn_cache(key);
     if let Some(cached) = state.redis.get(&cache_key).await? {
         if cached == NEGATIVE_CACHE_MARKER {
             return Ok(None);
         }
-        if let Ok(a) = serde_json::from_str::<AppRef>(&cached) {
-            return Ok(Some(a));
+        if let Ok(e) = serde_json::from_str::<EnvRef>(&cached) {
+            return Ok(Some(e));
         }
     }
 
     let mut conn = sauron_db::conn(&state.pool).await?;
-    let resolved =
-        match sauron_db::repo::find_app_by_public_key(&mut conn, key).await? {
-            Some(app) => sauron_db::repo::app_ancestry(&mut conn, app.id).await?.map(
-                |(project_id, org_id)| AppRef {
-                    app_id: app.id,
-                    project_id,
-                    org_id,
-                    ingest_enabled: app.ingest_enabled,
-                },
-            ),
-            None => None,
-        };
+    let resolved = sauron_db::repo::find_env_by_public_key(&mut conn, key).await?;
     drop(conn);
 
     match resolved {
-        Some(aref) => {
-            if let Ok(json) = serde_json::to_string(&aref) {
+        Some(eref) => {
+            if let Ok(json) = serde_json::to_string(&eref) {
                 let _ = state.redis.set_ex(&cache_key, &json, 300).await;
             }
-            Ok(Some(aref))
+            Ok(Some(eref))
         }
         None => {
             // Short TTL so a key that is created moments later still works.

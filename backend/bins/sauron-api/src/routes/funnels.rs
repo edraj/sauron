@@ -2,7 +2,7 @@
 //! people progressed through each step (each step counted at-or-after the
 //! previous step's time), plus conversion ratios.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,11 @@ pub struct FunnelReq {
     #[serde(default = "default_days")]
     pub since_days: i64,
 }
+
+// No bespoke query struct for `compute`: it takes only `environment_id`,
+// which comes from `RawQuery` + `scope::authorized_read_scope`, not a
+// `Query<T>` extractor. See `routes::scope`'s module docs for the extractor
+// trap this avoids.
 
 fn default_days() -> i64 {
     30
@@ -46,6 +51,7 @@ pub async fn compute(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
+    RawQuery(raw_query): RawQuery,
     Json(req): Json<FunnelReq>,
 ) -> Result<Json<FunnelResult>, ApiError> {
     if req.steps.len() < 2 {
@@ -58,10 +64,17 @@ pub async fn compute(
     }
 
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let since = Utc::now() - Duration::days(req.since_days.clamp(1, 365));
 
-    let rows = repo::funnel(&mut conn, app_id, &req.steps, since).await?;
+    let rows = repo::funnel(&mut conn, scope, &req.steps, since).await?;
     // rows come back ordered by step; index defensively by step id.
     let mut counts = vec![0i64; req.steps.len()];
     for r in rows {
@@ -158,11 +171,17 @@ pub struct SaveFunnelReq {
     pub steps: Vec<String>,
 }
 
+/// Saved funnel *definitions* have no environment dimension at all (a
+/// funnel's steps are app-wide; only `compute`'s live counts are scoped) —
+/// `environment_id` is rejected rather than silently accepted-and-ignored,
+/// same reasoning as monitors/alert config/artifacts/admin storage.
 pub async fn list_saved(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Vec<repo::SavedFunnelRow>>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
     Ok(Json(repo::list_saved_funnels(&mut conn, app_id).await?))
@@ -172,8 +191,10 @@ pub async fn create_saved(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<SaveFunnelReq>,
 ) -> Result<Json<repo::SavedFunnelRow>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
@@ -198,8 +219,10 @@ pub async fn update_saved(
     auth: AuthUser,
     State(state): State<AppState>,
     Path((app_id, funnel_id)): Path<(Uuid, Uuid)>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<SaveFunnelReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
@@ -227,7 +250,9 @@ pub async fn delete_saved(
     auth: AuthUser,
     State(state): State<AppState>,
     Path((app_id, funnel_id)): Path<(Uuid, Uuid)>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::FUNNEL_WRITE).await?;
     let n = repo::delete_saved_funnel(&mut conn, app_id, funnel_id).await?;

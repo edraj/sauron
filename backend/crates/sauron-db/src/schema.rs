@@ -28,7 +28,6 @@ diesel::table! {
         name -> Text,
         slug -> Text,
         platform -> Nullable<Text>,
-        public_key -> Text,
         ingest_enabled -> Bool,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
@@ -43,6 +42,11 @@ diesel::table! {
         app_id -> Uuid,
         name -> Text,
         created_at -> Timestamptz,
+        public_key -> Text,
+        ingest_enabled -> Bool,
+        is_default -> Bool,
+        retired_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -77,6 +81,8 @@ diesel::table! {
         contexts -> Jsonb,
         extra -> Jsonb,
         handled -> Nullable<Bool>,
+        title -> Nullable<Text>,
+        culprit -> Nullable<Text>,
     }
 }
 

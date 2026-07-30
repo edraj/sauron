@@ -69,6 +69,9 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const days = sinceDays;
     if (aid) void loadAnalytics(aid, days);
   });
@@ -100,6 +103,9 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const q = query;
     const off = offset;
     if (aid) void load(aid, q, off);

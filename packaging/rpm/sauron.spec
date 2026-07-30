@@ -8,8 +8,8 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        0.1.0
-Release:        2%{?dist}
+Version:        1.0.0
+Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
 License:        AGPL-3.0-only
@@ -258,6 +258,9 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Wed Jul 29 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.0.0-1
+- Version 1.0.0: first stable release of the Sauron platform.
+
 * Tue Jul 21 2026 Soheyb Merah <merah.soheyb@gmail.com> - 0.1.0-2
 - Link DuckDB against a prebuilt libduckdb (vendored .so in sauron-server) instead
   of compiling the bundled C++ amalgamation — large build-time reduction.

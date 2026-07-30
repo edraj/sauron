@@ -19,9 +19,46 @@
   const appItems = $derived(
     sessionStore.apps.map((a) => ({ id: a.id, name: a.name, icon: appTypeIcon(a.app_type) })),
   );
+  // `sessionStore.environments` is already reach-filtered server-side (Task 7
+  // of the env-RBAC slice; see `loadAppEnvironments`'s doc comment in
+  // session.svelte.ts) — for a partial-reach member it is only the
+  // environments they hold a grant on, not the app's full list. This mapping
+  // must NOT grow a client-side filter on top of that: the backend has
+  // already applied the only filtering rule that matters, and a second,
+  // independent one here would just be a second place for that rule to drift.
+  //
+  // `''` means "all environments" and `'none'` means "unattributed" — both
+  // pseudo-entries bracket the live list. `currentEnvId` is `null` for "all",
+  // so the trigger's `currentId` below maps that back to `''` to match.
+  //
+  // The "All environments" label is intentionally NOT reworded to something
+  // like "All my environments" for a partial-reach member, even though
+  // selecting it resolves server-side to a `Subset` rather than a literal
+  // `All` (`resolve_env_filter`'s row 2). The list directly above this entry
+  // in the same dropdown is already exactly that caller's reach-filtered set
+  // — there is nothing else "all" could plausibly mean in context, the same
+  // way an "All projects" list elsewhere in this app doesn't get relabeled
+  // for a member who can only see some of them. Rewording would only be
+  // warranted if this entry could show environments beyond what is listed
+  // right below it, which by construction it cannot.
+  const envItems = $derived([
+    { id: '', name: 'All environments' },
+    ...sessionStore.environments.map((e) => ({ id: e.id, name: e.name })),
+    { id: 'none', name: 'Unattributed' },
+  ]);
 
   // The current app's icon (falls back to a generic glyph before apps resolve).
   const currentAppIcon = $derived(appTypeIcon(sessionStore.currentApp?.app_type ?? ''));
+
+  // `removeApp` clears `environments` synchronously without reloading the
+  // replacement app's list (see session.svelte.ts), and `setApp`'s same-id
+  // no-op guard means `setApp(currentAppId)` can't force one either — so an
+  // app selected with no environments loaded yet needs an explicit nudge.
+  $effect(() => {
+    if (sessionStore.currentAppId && sessionStore.environments.length === 0) {
+      void sessionStore.ensureEnvironmentsLoaded();
+    }
+  });
 
   // "+ New …" affordances mirror the Projects page, where creation actually happens.
   const canCreateProject = $derived(sessionStore.can('project:create'));
@@ -44,15 +81,17 @@
     <!-- Project switcher -->
     {#if projectItems.length > 0}
       <span class="sep" aria-hidden="true">/</span>
-      <SwitcherMenu
-        label="Project"
-        items={projectItems}
-        currentId={sessionStore.currentProjectId}
-        onSelect={(id) => void sessionStore.setProject(id)}
-        createLabel={canCreateProject ? 'New project' : undefined}
-        onCreate={canCreateProject ? () => push('/projects') : undefined}
-        ariaLabel="Switch project"
-      />
+      <div class="project-switcher">
+        <SwitcherMenu
+          label="Project"
+          items={projectItems}
+          currentId={sessionStore.currentProjectId}
+          onSelect={(id) => void sessionStore.setProject(id)}
+          createLabel={canCreateProject ? 'New project' : undefined}
+          onCreate={canCreateProject ? () => push('/projects') : undefined}
+          ariaLabel="Switch project"
+        />
+      </div>
     {/if}
 
     <!-- App switcher -->
@@ -62,10 +101,24 @@
         triggerIcon={currentAppIcon}
         items={appItems}
         currentId={sessionStore.currentAppId}
-        onSelect={(id) => sessionStore.setApp(id)}
+        onSelect={(id) => void sessionStore.setApp(id)}
         createLabel={canCreateApp ? 'New app' : undefined}
         onCreate={canCreateApp ? () => push('/projects') : undefined}
         ariaLabel="Switch app"
+      />
+    {/if}
+
+    <!-- Environment switcher — app and environment are what change the
+         meaning of the data on screen, so this stays visible (with its name)
+         at widths where the project switcher's name gets dropped instead. -->
+    {#if sessionStore.currentAppId}
+      <span class="sep" aria-hidden="true">/</span>
+      <SwitcherMenu
+        label="Env"
+        items={envItems}
+        currentId={sessionStore.currentEnvId ?? ''}
+        onSelect={(id) => void sessionStore.setEnvironment(id === '' ? null : id)}
+        ariaLabel="Switch environment"
       />
     {/if}
   </div>
@@ -198,6 +251,14 @@
     }
     .topbar {
       padding: 0 14px;
+    }
+    /* App and environment are what change the meaning of the data on
+       screen; project is navigational. When the four triggers no longer
+       fit, drop the project switcher's name first (its "Project" label
+       chip is already gone below 860px via SwitcherMenu's own rule), not
+       the app's or environment's. */
+    .project-switcher :global(.name) {
+      display: none;
     }
   }
 </style>

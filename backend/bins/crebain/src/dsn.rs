@@ -1,10 +1,10 @@
 //! The DSN wire format shared with the SDKs, and the resolved [`Target`] both
 //! run modes converge on.
 //!
-//! DSN: `scheme://<public_key>@host:port/<app_id>` (identical to what a real SDK
-//! is configured with). The ingest edge authenticates by the key in the
-//! `X-Sauron-Key` header and ignores the `app_id` path segment, but we keep it so
-//! the request is byte-for-byte what an SDK would send.
+//! DSN: `scheme://<public_key>@host:port/<environment_id>` (identical to what a
+//! real SDK is configured with). The ingest edge authenticates by the key in the
+//! `X-Sauron-Key` header and ignores this path segment, but we keep it so the
+//! request is byte-for-byte what an SDK would send.
 
 /// Everything the load engine needs to talk to an ingest edge, however it was
 /// obtained (parsed from `--dsn`, or minted by the isolated harness).

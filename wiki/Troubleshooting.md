@@ -15,7 +15,7 @@ failures, and retries. It's the fastest way to see what the transport is doing.
 | SDK | Enable debug |
 | --- | --- |
 | Browser | `Sauron.init({ dsn, debug: true })` |
-| Flutter | `o.debug = true` in the `init` callback |
+| Flutter | `Sauron.init(SauronOptions(dsn: dsn, debug: true))` |
 | Node | `init({ dsn, debug: true })` |
 | Python | `sauron.init(dsn, debug=True)` |
 | C# | `new SauronOptions { Dsn = dsn, Debug = true }` |
@@ -26,15 +26,21 @@ failures, and retries. It's the fastest way to see what the transport is doing.
 
 Work down this list — the cause is almost always one of the first three.
 
-### 1. The DSN is missing, wrong, or points at another app
+### 1. The DSN is missing, wrong, or points at another environment
 
-Signals are keyed by the **app** the DSN belongs to. A typo, a stale key, or a DSN
-copied from a different app sends your data somewhere you aren't looking.
+Every signal is stamped with the **environment** the DSN's key belongs to — the
+same app can have several DSNs (`dev`, `staging`, `production`, …), one per
+environment, and the environment cannot be spoofed by the client. The classic
+mistake is not a wrong *app* but a **wrong environment**: the SDK is initialized
+with, say, the `staging` DSN while you're looking at `production` in the
+dashboard's environment filter (or vice versa). A typo or a stale/retired key has
+the same effect.
 
-- The DSN is `https://<public_key>@<host>/<project_id>` — no password component. See
+- The DSN is `https://<public_key>@<host>/<environment_id>` — no password component. See
   **[Ingest Wire Contract](Ingest-Wire-Contract.md#dsn)**.
-- Confirm you're viewing the **same app** in the **[Dashboard](Dashboard.md)** that the
-  DSN belongs to.
+- Confirm you're looking at the **same environment** in the
+  **[Dashboard](Dashboard.md)** that the DSN belongs to — each environment's DSN is
+  under **Settings → Environments** on the app.
 - A wrong/expired key yields **401/403** from the ingest, which **permanently disables
   the SDK** for the rest of the process (see [Disabled / no-op mode](#disabled--no-op-mode)).
   Enable debug logging — you'll see `[sauron] auth ...`.
@@ -54,7 +60,7 @@ Make `init` the first thing your process does, and verify the client exists:
 
 ```ts
 // Node
-import { getClient } from '@sauron/node';
+import { getClient } from '@edraj/sauron-node';
 if (!getClient()) console.warn('sauron not initialized');
 ```
 
@@ -145,7 +151,7 @@ be absent (e.g. local dev):
 
 ```ts
 // Node — opt out cleanly when no DSN is configured
-import { init } from '@sauron/node';
+import { init } from '@edraj/sauron-node';
 if (process.env.SAURON_DSN) {
   init({ dsn: process.env.SAURON_DSN });
 }
@@ -189,7 +195,7 @@ Force the behavior to test it:
 
 ```ts
 // Node: inspect the outgoing request
-import { init, track, flush } from '@sauron/node';
+import { init, track, flush } from '@edraj/sauron-node';
 init({
   dsn: 'https://pk@localhost/1',
   gzipThresholdBytes: 0,               // compress even tiny bodies
@@ -291,7 +297,7 @@ A's user/tags. **Fix: push a per-request scope and set request data inside it.**
 app.use((req, _res, next) => { setUser({ id: req.userId }); next(); });
 
 // RIGHT: isolate per request (AsyncLocalStorage)
-import { runWithAsyncScope, setUser, setTag } from '@sauron/node';
+import { runWithAsyncScope, setUser, setTag } from '@edraj/sauron-node';
 app.use((req, res, next) => {
   runWithAsyncScope(() => {
     setUser({ id: req.userId });
@@ -355,9 +361,9 @@ an old version arriving, a stale build is still deployed somewhere.
 
 | SDK | Wire `sdk.name` | Read the version in code |
 | --- | --- | --- |
-| Browser | `sauron.javascript` | `import { SDK_VERSION, SDK_NAME } from '@sauron/browser'` |
+| Browser | `sauron.javascript` | `import { SDK_VERSION, SDK_NAME } from '@edraj/sauron-browser'` |
 | Flutter | `sauron.flutter` | `import 'package:sauron_flutter/sauron_flutter.dart';` → `kSauronSdkVersion` |
-| Node | `sauron-node` | `npm ls @sauron/node` (or the `version` in `package.json`) |
+| Node | `sauron-node` | `npm ls @edraj/sauron-node` (or the `version` in `package.json`) |
 | Python | `sauron-python` | `import sauron; sauron.SDK_VERSION` → `'0.3.0'` (and `sauron.SDK_NAME`) |
 | C# | `sauron-dotnet` | assembly `<Version>0.3.0</Version>` in `Sauron.csproj` |
 

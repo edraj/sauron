@@ -11,9 +11,6 @@ public sealed class SauronOptions
     /// <summary>Ingest DSN (required): <c>https://&lt;public_key&gt;@&lt;host&gt;/&lt;project_id&gt;</c>.</summary>
     public string Dsn { get; set; } = string.Empty;
 
-    /// <summary>Deployment environment. Default <c>production</c>.</summary>
-    public string Environment { get; set; } = "production";
-
     /// <summary>Optional release identifier.</summary>
     public string? Release { get; set; }
 

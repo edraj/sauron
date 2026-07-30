@@ -5,6 +5,7 @@ import axios, {
 } from 'axios';
 import { apiBaseUrl } from '../config/env';
 import type { ApiErrorEnvelope, NormalizedError } from '../models';
+import { computeScopeParams, currentEnvironmentId } from './scope';
 
 // ---------------------------------------------------------------------------
 // Auth bridge
@@ -65,6 +66,28 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   const token = bridge.getAccessToken();
   if (token) {
     config.headers.set('Authorization', `Bearer ${token}`);
+  }
+  return config;
+});
+
+// ---------------------------------------------------------------------------
+// Request interceptor — attach `environment_id` from the session store to
+// every environment-scoped read (see `./scope.ts` for the opt-out list and
+// the wire-contract rule that a `null` environment omits the parameter
+// entirely rather than sending it empty).
+//
+// Imports the predicate from `scope.ts` rather than the store directly —
+// same reasoning as the auth bridge above: a module-level `import
+// { sessionStore }` here would create a `store -> api -> client -> store`
+// cycle (the store's own load path imports `./orgs`, `./apps`, etc., which
+// import this module). `scope.ts` takes the same bridge approach as
+// `configureAuthBridge` to sidestep that.
+// ---------------------------------------------------------------------------
+
+api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+  const scopeParams = computeScopeParams(config.url, currentEnvironmentId());
+  if (scopeParams) {
+    config.params = { ...(config.params as Record<string, unknown> | undefined), ...scopeParams };
   }
   return config;
 });

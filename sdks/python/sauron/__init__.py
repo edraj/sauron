@@ -80,7 +80,6 @@ def _atexit_flush() -> None:
 def init(
     dsn: Optional[str] = None,
     *,
-    environment: str = "production",
     release: Optional[str] = None,
     sample_rate: float = 1.0,
     flush_interval: float = 5.0,
@@ -135,7 +134,6 @@ def init(
 
     _client = Client(
         dsn,
-        environment=environment,
         release=release,
         sample_rate=sample_rate,
         flush_interval=flush_interval,

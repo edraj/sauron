@@ -1,7 +1,16 @@
 {
-  "name": "@sauron/node",
-  "version": "0.3.0",
+  "name": "@edraj/sauron-node",
+  "version": "1.2.0",
   "description": "Sauron server-side Node/TypeScript SDK: product-analytics events + exception capture for Node backends.",
+  "homepage": "https://github.com/edraj/sauron/tree/main/sdks/node#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edraj/sauron.git",
+    "directory": "sdks/node"
+  },
+  "bugs": {
+    "url": "https://github.com/edraj/sauron/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,13 +24,15 @@
   "files": [
     "dist",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

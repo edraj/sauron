@@ -18,9 +18,11 @@ sauron-tier.workspace = true
 sauron-symbols.workspace = true
 sauron-alerts.workspace = true
 diesel.workspace = true
+diesel-async.workspace = true
 tokio.workspace = true
 axum.workspace = true
 axum-extra.workspace = true
+form_urlencoded.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
@@ -30,3 +32,10 @@ uuid.workspace = true
 validator.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# Drives the real, compiled `sauron-api` binary over HTTP in
+# `tests/http_env_scoping.rs` — the only way to exercise the actual extractor
+# stack a `parse_env` unit test cannot see. No "json" feature: the test only
+# asserts on status codes.
+reqwest.workspace = true

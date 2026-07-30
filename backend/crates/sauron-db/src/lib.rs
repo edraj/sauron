@@ -10,6 +10,7 @@ pub mod pool;
 pub mod query_plan;
 pub mod repo;
 pub mod schema;
+pub mod scope;
 
 pub use pool::{build_pool, conn, PgConn, PgPool};
 

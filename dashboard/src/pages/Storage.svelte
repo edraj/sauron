@@ -115,8 +115,9 @@
             <DataTable>
               {#snippet head()}
                 <tr>
-                  <th>App</th>
                   <th>Org</th>
+                  <th>Project</th>
+                  <th>App</th>
                   <th class="num">Hot rows</th>
                   <th class="num">Cold rows</th>
                   <th class="num">Cold bytes</th>
@@ -127,14 +128,20 @@
                 {#each rep.apps as a (a.app_id)}
                   <tr class="clickable" onclick={() => toggleApp(a.app_id)}>
                     <td>
+                      <!-- The disclosure chevron leads the row, so it stays in
+                           the first cell even though what expands below is the
+                           app's breakdown. -->
                       <div class="name-cell">
                         <span class="chevron" class:open={openApp[a.app_id]}>
                           <Icon name="chevron-right" size={14} />
                         </span>
-                        <span class="name">{a.app_name}</span>
+                        <span class="cell-muted">{a.org_name}</span>
                       </div>
                     </td>
-                    <td><span class="cell-muted">{a.org_name}</span></td>
+                    <!-- Empty only for a report cached by a build that predates
+                         project_name; the next refresh fills it in. -->
+                    <td><span class="cell-muted">{a.project_name || '—'}</span></td>
+                    <td><span class="name">{a.app_name}</span></td>
                     <td class="num">{a.hot_rows_total.toLocaleString()}</td>
                     <td class="num">{a.cold_rows_total.toLocaleString()}</td>
                     <td class="num">{fmtBytes(a.cold_bytes_total)}</td>
@@ -142,7 +149,7 @@
                   </tr>
                   {#if openApp[a.app_id]}
                     <tr class="expand-row">
-                      <td colspan="6" style="background: var(--surface-2); white-space: normal; cursor: default;">
+                      <td colspan="7" style="background: var(--surface-2); white-space: normal; cursor: default;">
                         <div class="expand-body">
                           <h4 class="expand-title">Per-table breakdown</h4>
                           <!--

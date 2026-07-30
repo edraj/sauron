@@ -208,18 +208,41 @@
     }
   }
 
-  // Load available events whenever the current app changes.
+  // Load available events whenever the current app or environment changes.
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    // (loadSaved calls listSavedFunnels, which is never environment-scoped —
+    // saved funnel definitions are app-wide — but loadEvents's topEvents call
+    // is, so this effect still needs to key on scopeKey as a whole.)
+    sessionStore.scopeKey;
     if (aid) {
       void loadEvents(aid);
       void loadSaved(aid);
     }
   });
 
-  // Recompute automatically when the date range changes (only tracks sinceDays).
+  // Recompute when the date range or environment changes, but NOT merely
+  // because the app changed — the effect above already recomputes on an app
+  // switch (via loadEvents). This is the one page (of 24) that tracks
+  // `currentEnvId` directly instead of `scopeKey`: `scopeKey` folds the app
+  // id in too, so tracking it here would also re-fire this effect on an app
+  // switch — the exact thing `untrack()` below exists to prevent. That used
+  // to be masked rather than avoided: it was a no-op only because Svelte 5
+  // happens to run effects in registration order and the sibling
+  // `loadEvents` effect's first statement is a synchronous `steps = []`
+  // before its first `await`, so by the time this effect's untracked
+  // `steps.length >= 2` check ran on an app switch, it always saw `[]`.
+  // Neither ordering nor that reset is a documented contract, and without
+  // one, `compute()` has no request-ordering guard — a stale-steps request
+  // for the old app could resolve after a fresh one and overwrite a correct
+  // funnel with one computed from the old step list. Tracking `currentEnvId`
+  // directly is the only new trigger this effect actually needs, and it
+  // removes the dependency on that ordering instead of relying on it.
   $effect(() => {
     const days = sinceDays;
+    sessionStore.currentEnvId;
     untrack(() => {
       const aid = sessionStore.currentAppId;
       if (aid && steps.length >= 2) void compute(aid, days);

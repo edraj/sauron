@@ -48,10 +48,10 @@ A/B bucket. With the [Browser](Browser-SDK.md) SDK (the others are identical sha
 see the table below):
 
 ```ts
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({
-  dsn: 'https://<public_key>@<host>/<project_id>',
+  dsn: 'https://<public_key>@<host>/<environment_id>',
   tags: { region: 'eu-central' },            // default tag on every signal
 });
 
@@ -119,7 +119,8 @@ to find events by them, see **[Search & Filtering](Search.md)**.
 - **Members** — org/project/app members and role grants (shown only to users with
   `member:read`). RBAC is enforced per request; the UI hides actions the caller can't
   perform.
-- **App settings** — per-app configuration, including the app's **DSN**.
+- **App settings** — per-app configuration, including **Settings → Environments**:
+  create/rename/retire environments and copy, rotate, or mute each one's **DSN**.
 
 ## Docs
 

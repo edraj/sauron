@@ -4,11 +4,16 @@
   import Button from '../ui/Button.svelte';
   import { sessionStore } from '../../stores/session.svelte';
   import { initials } from '../../utils/format';
-  import type { App, Member, MemberGrant, ScopeType } from '../../models';
+  import type { App, Environment, Member, MemberGrant, ScopeType } from '../../models';
 
   interface Props {
     grouped: Member[];
     appsById: Record<string, App>;
+    /** Environments per app, keyed by app id. Only ever populated for apps
+        whose row has been expanded somewhere in the scope tree this session —
+        see ScopeTree's doc comment — so an env chip falls back to a truncated
+        id until then, same as a genuinely deleted target would. */
+    envsByApp?: Record<string, Environment[]>;
     /** Names for the projects an app grant can hang off. Optional — without it
         an app chip just drops its project prefix instead of breaking. */
     projectsById?: Record<string, { name: string }>;
@@ -27,6 +32,7 @@
   let {
     grouped,
     appsById,
+    envsByApp = {},
     projectsById = {},
     canManage,
     removingId,
@@ -35,6 +41,12 @@
     ontoggle,
     onremovegrant,
   }: Props = $props();
+
+  const envsById = $derived.by(() => {
+    const map: Record<string, Environment> = {};
+    for (const list of Object.values(envsByApp)) for (const e of list) map[e.id] = e;
+    return map;
+  });
 
   function projectName(id: string): string | undefined {
     return projectsById[id]?.name ?? sessionStore.projects.find((x) => x.id === id)?.name;
@@ -45,6 +57,15 @@
     if (member.scope_type === 'project') {
       return `Project: ${projectName(member.scope_id) ?? member.scope_id.slice(0, 8)}`;
     }
+    if (member.scope_type === 'env') {
+      // scope_id carries no FK, and — unlike project/app — an env may simply
+      // never have been fetched yet (see envsByApp's doc comment above), not
+      // only deleted. Either way the fallback is the same truncated id.
+      const env = envsById[member.scope_id];
+      if (!env) return `Env: ${member.scope_id.slice(0, 8)}`;
+      const a = appsById[env.app_id];
+      return a ? `Env: ${a.name} / ${env.name}` : `Env: ${env.name}`;
+    }
     // Grants can point at a deleted project/app — delete_project/delete_app
     // don't cascade to role_grants — so every lookup falls back a step.
     const a = appsById[member.scope_id];
@@ -53,9 +74,10 @@
     return p ? `App: ${p} / ${a.name}` : `App: ${a.name}`;
   }
 
-  function scopeTone(type: ScopeType): 'primary' | 'info' | 'neutral' {
+  function scopeTone(type: ScopeType): 'primary' | 'info' | 'neutral' | 'success' {
     if (type === 'org') return 'primary';
     if (type === 'project') return 'info';
+    if (type === 'env') return 'success';
     return 'neutral';
   }
 </script>

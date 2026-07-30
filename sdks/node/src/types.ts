@@ -196,7 +196,6 @@ export interface EnvelopeHeader {
   dsn: string;
   sdk: SdkInfo;
   sent_at: string;
-  environment: string;
   release: string | null;
 }
 
@@ -263,7 +262,6 @@ export interface TransportOptions {
 export interface InitOptions {
   /** `https://<public_key>@<host>/<project_id>` */
   dsn: string;
-  environment?: string;
   release?: string | null;
   /** Default tags seeded into the global scope at init. */
   tags?: Record<string, string>;
@@ -310,7 +308,6 @@ export interface InitOptions {
 /** Fully-resolved options with all defaults applied. */
 export interface ResolvedOptions {
   dsn: string;
-  environment: string;
   release: string | null;
   tags: Record<string, string>;
   contexts: Record<string, unknown>;

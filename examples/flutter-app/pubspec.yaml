@@ -39,7 +39,7 @@ dependencies:
   sauron_flutter:
     path: ../../sdks/flutter
 
-  # Persists the editable DSN / environment / release across app launches.
+  # Persists the editable DSN / release across app launches.
   shared_preferences: ^2.3.0
 
 dev_dependencies:

@@ -12,7 +12,7 @@
  * plain Node (see `showcase.test.ts`). The real Sauron-backed sink is built in
  * the UI layer.
  */
-import type { TransactionInput } from '@sauron/browser';
+import type { TransactionInput } from '@edraj/sauron-browser';
 
 /** The ordered funnel. Reuses `checkout_completed` (the manual demo button). */
 export const FUNNEL_STEPS: readonly string[] = [

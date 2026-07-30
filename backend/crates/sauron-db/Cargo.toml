@@ -21,3 +21,15 @@ percent-encoding.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `sauron-auth` depends on `sauron-db` normally; this is a dev-dependency
+# cycle, which Cargo permits because dev-dependencies are only pulled in to
+# build this crate's own tests/examples/benches, never as part of the graph
+# any other crate sees when it depends on `sauron-db`. Needed here (rather
+# than a `sauron-auth`-side integration-test harness) because `sauron-auth`
+# has none: it has no `tests/` directory and no dev-dependency on
+# `sauron-db`'s test-only pieces, while `sauron-db/tests/env_scoping.rs`
+# already has the `TestDb`/`seed_two_envs` harness `authorize_env_read`'s
+# DB-backed tests need.
+sauron-auth.workspace = true

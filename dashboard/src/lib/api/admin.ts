@@ -21,6 +21,7 @@ export interface AppTableStorage {
 export interface AppStorage {
   app_id: string;
   app_name: string;
+  project_name: string;
   org_name: string;
   tables: AppTableStorage[];
   hot_rows_total: number;

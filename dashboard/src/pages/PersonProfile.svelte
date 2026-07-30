@@ -59,6 +59,9 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes; the
+    // interceptor supplies the value, but nothing would refetch without this.
+    sessionStore.scopeKey;
     const id = distinctId;
     if (aid && id) void load(aid, id);
   });
@@ -217,12 +220,7 @@
               <span class="muted">Distinct ID</span>
               <span class="sm-val mono small">{distinctId}</span>
             </div>
-            {#if profile.user}
-              <div class="sm-row">
-                <span class="muted">Person ID</span>
-                <span class="sm-val mono small">{profile.user.id}</span>
-              </div>
-            {:else}
+            {#if !profile.user}
               <div class="sm-row">
                 <span class="muted">Profile</span>
                 <span class="sm-val small">Anonymous</span>

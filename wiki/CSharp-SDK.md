@@ -28,13 +28,12 @@ Everything goes through the static `SauronSdk` facade over a single process-wide
 client. Initialize once at startup:
 
 ```csharp
-SauronSdk.Init("https://<public_key>@<host>/<project_id>");
+SauronSdk.Init("https://<public_key>@<host>/<environment_id>");
 
 // or with options:
 SauronSdk.Init(new SauronOptions
 {
-    Dsn = "https://<public_key>@<host>/<project_id>",
-    Environment = "production",
+    Dsn = "https://<public_key>@<host>/<environment_id>",
     Release = "1.4.2",
     Debug = true,
 });
@@ -49,7 +48,6 @@ previously-initialized client. `SauronSdk.Current` returns the current client (o
 | Property | Type | Default |
 | --- | --- | --- |
 | `Dsn` | `string` | `""` (required for dispatch) |
-| `Environment` | `string` | `"production"` |
 | `Release` | `string?` | `null` |
 | `SampleRate` | `double` | `1.0` (errors) |
 | `FlushInterval` | `TimeSpan` | `5 s` |
@@ -250,7 +248,7 @@ SauronSdk.Close();   // flush then stop — call before the process exits
 See [`examples/csharp-server`](../examples/csharp-server). Run it with:
 
 ```bash
-export SAURON_DSN="https://<public_key>@<host>/<project_id>"
+export SAURON_DSN="https://<public_key>@<host>/<environment_id>"
 cd examples/csharp-server
 dotnet run
 ```

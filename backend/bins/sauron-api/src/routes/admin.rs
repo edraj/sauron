@@ -1,6 +1,6 @@
 //! Storage & records report endpoint.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Json;
 
 use sauron_auth::{perm, AuthError, AuthUser};
@@ -20,7 +20,12 @@ use crate::AppState;
 pub async fn storage(
     auth: AuthUser,
     State(state): State<AppState>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<StorageReport>, ApiError> {
+    // The report is a per-org rollup across every app; there is no single
+    // environment to scope it to, so the parameter is rejected rather than
+    // silently accepted-and-ignored.
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = crate::routes::db(&state).await?;
     let org_ids = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ORG_MANAGE).await?;
     drop(conn);

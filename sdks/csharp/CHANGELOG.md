@@ -1,7 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
+- **Breaking: the `Environment` option has been removed.** An environment is now
+  identified by the ingest key it belongs to, not by a string the client sends.
+  Create environments in the dashboard under app settings; each one has its own
+  DSN. Delete `Environment` from your `SauronOptions` and swap in the DSN of the
+  environment you want to report to.
 - **Fixed: a `413` head-of-line blocked the whole delivery queue.** The queue is FIFO and a
   payload-too-large envelope was retried forever, so nothing behind it could ever be sent.
   Such an envelope is now dropped with a log line instead.

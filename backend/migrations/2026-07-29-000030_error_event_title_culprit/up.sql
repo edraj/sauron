@@ -1,0 +1,25 @@
+-- `issues.title`/`culprit` are one row per (app_id, fingerprint) and are
+-- overwritten by whichever environment sent the most recent occurrence, so a
+-- caller scoped to staging reads strings written by production — beside a
+-- correctly staging-scoped `last_seen`. Storing the per-occurrence strings
+-- lets an environment-scoped read pull the newest occurrence *in that
+-- environment*.
+--
+-- These are computed at ingest already (sauron-pipeline `build_title` /
+-- `build_culprit`, called immediately before `upsert_issue`), so persisting
+-- them costs no extra computation. The alternative — recomputing them in SQL —
+-- works for `title` but not for `culprit`, whose value comes from selecting a
+-- stack frame out of the JSONB stacktrace; that would be a second
+-- implementation of `build_culprit` that drifts the first time the Rust
+-- changes.
+--
+-- NULLABLE ON PURPOSE, and NOT backfilled. Rows written before this migration
+-- keep NULL, and the read path COALESCEs to the app-wide `issues` column, so
+-- old data degrades to exactly today's behaviour instead of to empty strings.
+-- A backfill would rewrite every partition of the largest table in the system
+-- to produce values it can already fall back to.
+--
+-- ADD COLUMN with no DEFAULT is catalog-only on a partitioned parent: no
+-- rewrite, no long lock.
+ALTER TABLE error_events ADD COLUMN title TEXT;
+ALTER TABLE error_events ADD COLUMN culprit TEXT;

@@ -26,17 +26,16 @@ Wire fields are `snake_case` (`distinct_id`, `duration_ms`, `http_method`,
 
 ## Node
 
-Recipes use `@sauron/node`. See the **[Node SDK](Node-SDK.md)** page for the full
+Recipes use `@edraj/sauron-node`. See the **[Node SDK](Node-SDK.md)** page for the full
 surface. Per-request isolation is backed by `AsyncLocalStorage`: `withScope(cb)`
 runs `cb` (and everything it calls, across `await`s) under an isolated child
 scope. Initialize once at startup:
 
 ```ts
-import { init, close } from '@sauron/node';
+import { init, close } from '@edraj/sauron-node';
 
 init({
   dsn: process.env.SAURON_DSN!,
-  environment: process.env.NODE_ENV ?? 'production',
   release: process.env.RELEASE,
 });
 
@@ -53,7 +52,7 @@ import {
   addBreadcrumb,
   captureException,
   trackTransaction,
-} from '@sauron/node';
+} from '@edraj/sauron-node';
 
 const app = express();
 
@@ -102,7 +101,7 @@ async-local scope from an `onRequest` hook by calling `done()` **inside**
 
 ```ts
 import Fastify from 'fastify';
-import { withScope, addBreadcrumb, captureException, trackTransaction } from '@sauron/node';
+import { withScope, addBreadcrumb, captureException, trackTransaction } from '@edraj/sauron-node';
 
 const fastify = Fastify();
 
@@ -141,7 +140,7 @@ the scope span the awaited `next()`:
 
 ```ts
 import Koa from 'koa';
-import { withScope, addBreadcrumb, captureException, trackTransaction } from '@sauron/node';
+import { withScope, addBreadcrumb, captureException, trackTransaction } from '@edraj/sauron-node';
 
 const app = new Koa();
 
@@ -181,10 +180,7 @@ across separate hook functions. Initialize once at startup:
 ```python
 import sauron
 
-sauron.init(
-    dsn=os.environ["SAURON_DSN"],
-    environment=os.environ.get("ENV", "production"),
-)
+sauron.init(dsn=os.environ["SAURON_DSN"])
 # `sauron.init` registers an atexit flush; call `sauron.close()` explicitly for a
 # hard shutdown.
 ```
@@ -337,7 +333,6 @@ var builder = WebApplication.CreateBuilder(args);
 SauronSdk.Init(new SauronOptions
 {
     Dsn = builder.Configuration["Sauron:Dsn"]!,
-    Environment = builder.Environment.EnvironmentName,
 });
 
 var app = builder.Build();
@@ -411,7 +406,7 @@ public sealed class SauronMiddleware
 
 ## Browser (React / Vue / Svelte)
 
-Uses `@sauron/browser` (the `Sauron` facade). See the **[Browser SDK](Browser-SDK.md)**
+Uses `@edraj/sauron-browser` (the `Sauron` facade). See the **[Browser SDK](Browser-SDK.md)**
 page. The browser SDK is a single-user client (one visitor per page), so
 "per-request scope" becomes *set the user/tags/breadcrumbs on the one client* —
 usually on login and on route change. Tags live on the client scope
@@ -421,7 +416,7 @@ and unhandled rejections are auto-captured, so the recipes below add the
 framework-specific error hook plus route scope + timing. Initialize once:
 
 ```ts
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({ dsn: '<public_dsn>', release: 'web@1.4.2' });
 // After sign-in:
@@ -432,7 +427,7 @@ Sauron.setUser({ id: 'user-123', email: 'a@example.com' });
 
 ```tsx
 import React from 'react';
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 
 export class SauronErrorBoundary extends React.Component<
   { fallback?: React.ReactNode; children: React.ReactNode },
@@ -464,7 +459,7 @@ Per-route scope + timing (e.g. with React Router's `useLocation`):
 ```tsx
 import { useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 
 export function useSauronRoute() {
   const location = useLocation();
@@ -488,7 +483,7 @@ export function useSauronRoute() {
 ```ts
 import { createApp } from 'vue';
 import { createRouter } from 'vue-router';
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 import App from './App.vue';
 
 const app = createApp(App);
@@ -524,7 +519,7 @@ Put `init` + the error hook in `src/hooks.client.ts`:
 ```ts
 // src/hooks.client.ts
 import type { HandleClientError } from '@sveltejs/kit';
-import { Sauron } from '@sauron/browser';
+import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({ dsn: '<public_dsn>', release: 'web@1.4.2' });
 
@@ -542,7 +537,7 @@ Per-route scope + timing (e.g. in your root `+layout.svelte`):
 ```svelte
 <script lang="ts">
   import { beforeNavigate, afterNavigate } from '$app/navigation';
-  import { Sauron } from '@sauron/browser';
+  import { Sauron } from '@edraj/sauron-browser';
 
   let start = 0;
   beforeNavigate(() => { start = performance.now(); });

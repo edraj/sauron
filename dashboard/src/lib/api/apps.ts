@@ -1,5 +1,5 @@
 import { api } from './client';
-import type { App, AppType, Environment, FirstEventStatus } from '../models';
+import type { App, AppType, FirstEventStatus } from '../models';
 
 export async function listApps(projectId: string): Promise<App[]> {
   const { data } = await api.get<App[]>(`/v1/projects/${projectId}/apps`);
@@ -29,16 +29,6 @@ export async function updateApp(
 
 export async function deleteApp(appId: string): Promise<void> {
   await api.delete(`/v1/apps/${appId}`);
-}
-
-export async function rotateAppKey(appId: string): Promise<App> {
-  const { data } = await api.post<App>(`/v1/apps/${appId}/rotate-key`);
-  return data;
-}
-
-export async function listEnvironments(appId: string): Promise<Environment[]> {
-  const { data } = await api.get<Environment[]>(`/v1/apps/${appId}/environments`);
-  return data;
 }
 
 export async function getFirstEvent(appId: string): Promise<FirstEventStatus> {

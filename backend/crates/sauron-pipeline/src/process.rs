@@ -14,7 +14,7 @@ use sauron_redis::{keys, RedisStore};
 
 use crate::enrich::enrich_context;
 
-/// Process one job end to end: resolve the environment, then dispatch by type.
+/// Process one job end to end: dispatch by item type.
 pub async fn process_job(
     pool: &PgPool,
     redis: &RedisStore,
@@ -23,18 +23,9 @@ pub async fn process_job(
 ) -> anyhow::Result<()> {
     let mut conn = sauron_db::conn(pool).await?;
 
-    // `upsert_environment` returns None once the app hits its environment cap
-    // (the name is attacker-controlled via the envelope). The event is still
-    // stored, just without an environment association.
-    let environment_id = match &job.environment {
-        Some(name) if !name.is_empty() => {
-            let name = truncate(name, MAX_ENVIRONMENT_NAME_LEN);
-            repo::upsert_environment(&mut conn, job.app_id, name)
-                .await?
-                .map(|e| e.id)
-        }
-        _ => None,
-    };
+    // Resolved at the ingest edge from the presented key. The client no longer
+    // has any say in which environment a signal lands in.
+    let environment_id = Some(job.environment_id);
 
     let context = enrich_context(&job);
 
@@ -237,6 +228,14 @@ async fn process_error(
             symbolication_status,
             debug_meta,
             handled: handled_of(exc),
+            // Same strings just handed to `upsert_issue` above (still in
+            // scope — only borrowed there, not moved). Persisting them here
+            // is what lets a later environment-scoped read derive title/
+            // culprit from this occurrence instead of the app-wide `issues`
+            // row, which `upsert_issue` overwrites from whichever
+            // environment's occurrence lands last.
+            title: Some(title),
+            culprit: Some(culprit),
         },
     )
     .await?;
@@ -469,10 +468,8 @@ fn build_culprit(exc: Option<&ExceptionInfo>) -> String {
     }
 }
 
-/// Cap on a stored environment name. The value arrives from the SDK envelope,
-/// so an unbounded string would be stored verbatim on every event.
-const MAX_ENVIRONMENT_NAME_LEN: usize = 64;
-
+/// Truncate `s` to at most `max` chars (char-boundary safe). Shared by
+/// `build_title` to cap stored issue titles/messages at a fixed length.
 fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((idx, _)) => &s[..idx],

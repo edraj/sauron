@@ -16,9 +16,17 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listMembers, listRoles, createGrant, deleteGrant, setMemberActive } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
+  import { listEnvironments } from '../lib/api/environments';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
-  import { groupMembers, type App, type Member, type MemberGrant, type Role, type ScopeOption } from '../lib/models';
+  import {
+    groupMembers,
+    type App,
+    type Environment,
+    type Member,
+    type MemberGrant,
+    type Role,
+  } from '../lib/models';
   import {
     EMPTY_SELECTION,
     isEmptySelection,
@@ -31,8 +39,41 @@
   // Keyed by project because the scope tree renders by project; `appsById` is
   // the flattened view the table and the scope labels want.
   let appsByProject = $state<Record<string, App[]>>({});
+  // The app load below is async and races the dialogs opening. Until it
+  // settles, EditMemberDialog cannot tell an app-scoped grant from one whose
+  // target it can't see, so it waits rather than seeding a wrong tree.
+  let appsLoaded = $state(false);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  // Environments per app, keyed by app id — the fourth scope level. Unlike
+  // projects and apps this is NOT loaded eagerly: an org can have hundreds of
+  // apps, and there is no batched "environments for this org" endpoint (only
+  // GET /v1/apps/{app_id}/environments), so fetching every app's environments
+  // up front would be exactly the N+1 the tree must not cause. Instead this
+  // cache is filled lazily, one app at a time, the first time that app's row
+  // is expanded anywhere the scope tree is rendered (grant form, create
+  // dialog, edit dialog) — see ScopeTree's `onopenapp`. It is shared across
+  // all three so expanding an app once benefits every surface for the rest of
+  // the page session, including the members table's env-scope labels below.
+  let envsByApp = $state<Record<string, Environment[]>>({});
+  let loadingEnvApps = $state<Set<string>>(new Set());
+
+  async function ensureEnvsLoaded(appId: string) {
+    if (appId in envsByApp || loadingEnvApps.has(appId)) return;
+    loadingEnvApps = new Set(loadingEnvApps).add(appId);
+    try {
+      const envs = await listEnvironments(appId);
+      envsByApp = { ...envsByApp, [appId]: envs };
+    } catch {
+      // Left unloaded — the twisty simply retries the fetch next time that
+      // app's row is expanded.
+    } finally {
+      const next = new Set(loadingEnvApps);
+      next.delete(appId);
+      loadingEnvApps = next;
+    }
+  }
 
   const appsById = $derived.by(() => {
     const map: Record<string, App> = {};
@@ -53,7 +94,7 @@
   let grantRoleId = $state('');
   // Fresh arrays — EMPTY_SELECTION's are frozen, and $state proxies what it is
   // handed.
-  let grantSelection = $state<ScopeSelection>({ ...EMPTY_SELECTION, projects: [], apps: [] });
+  let grantSelection = $state<ScopeSelection>({ ...EMPTY_SELECTION, projects: [], apps: [], envs: [] });
   let granting = $state(false);
   let removingId = $state<string | null>(null);
 
@@ -103,30 +144,18 @@
   const canReadMembers = $derived(sessionStore.can('member:read'));
   const canManageRoles = $derived(sessionStore.can('role:manage'));
 
-  const scopeOptions = $derived.by<ScopeOption[]>(() => {
-    const opts: ScopeOption[] = [];
-    const org = sessionStore.currentOrg;
-    if (org) {
-      opts.push({ key: `org:${org.id}`, label: `Org: ${org.name}`, scope_type: 'org', scope_id: org.id });
-    }
-    for (const p of sessionStore.projects) {
-      opts.push({
-        key: `project:${p.id}`,
-        label: `Project: ${p.name}`,
-        scope_type: 'project',
-        scope_id: p.id,
-      });
-    }
-    for (const a of Object.values(appsById)) {
-      opts.push({ key: `app:${a.id}`, label: `App: ${a.name}`, scope_type: 'app', scope_id: a.id });
-    }
-    return opts;
-  });
-
   const projectOfApp = $derived.by(() => {
     const map: Record<string, string> = {};
     for (const [projectId, list] of Object.entries(appsByProject)) {
       for (const a of list) map[a.id] = projectId;
+    }
+    return map;
+  });
+
+  const appOfEnv = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const [appId, envs] of Object.entries(envsByApp)) {
+      for (const e of envs) map[e.id] = appId;
     }
     return map;
   });
@@ -164,6 +193,14 @@
   $effect(() => {
     const projects = sessionStore.projects;
     let stale = false;
+    // Switching orgs restarts the load, so the previous org's apps must stop
+    // counting as loaded — otherwise the edit dialog would seed its tree from
+    // the old org's app list. The environment cache is keyed by app id, and
+    // app ids don't collide across orgs, so this reset isn't required for
+    // correctness — it just avoids holding onto a stale org's data.
+    appsLoaded = false;
+    envsByApp = {};
+    loadingEnvApps = new Set();
     void (async () => {
       const appLists = await Promise.all(
         projects.map((p) => listApps(p.id).catch(() => [] as App[])),
@@ -172,6 +209,7 @@
       const byProject: Record<string, App[]> = {};
       projects.forEach((p, i) => (byProject[p.id] = appLists[i]));
       appsByProject = byProject;
+      appsLoaded = true;
     })();
     return () => {
       stale = true;
@@ -201,7 +239,7 @@
       // Cleared so load() re-seeds it from the new org's roles; the old id is
       // not in this org's list and the API would reject it.
       grantRoleId = '';
-      grantSelection = { ...EMPTY_SELECTION, projects: [], apps: [] };
+      grantSelection = { ...EMPTY_SELECTION, projects: [], apps: [], envs: [] };
     });
   });
 
@@ -214,10 +252,10 @@
       await createGrant(org, {
         email: grantEmail.trim(),
         role_id: grantRoleId,
-        scopes: selectionToScopes(grantSelection, org, projectOfApp),
+        scopes: selectionToScopes(grantSelection, org, projectOfApp, appOfEnv),
       });
       grantEmail = '';
-      grantSelection = { ...EMPTY_SELECTION, projects: [], apps: [] };
+      grantSelection = { ...EMPTY_SELECTION, projects: [], apps: [], envs: [] };
       await load(org);
       toastStore.success('Access granted.');
     } catch (err) {
@@ -348,6 +386,9 @@
               orgName={sessionStore.currentOrg?.name ?? 'this org'}
               projects={sessionStore.projects}
               {appsByProject}
+              {envsByApp}
+              {loadingEnvApps}
+              onopenapp={ensureEnvsLoaded}
               value={grantSelection}
               disabled={granting}
               onchange={(next) => (grantSelection = next)}
@@ -363,6 +404,7 @@
     <MembersTable
       {grouped}
       {appsById}
+      {envsByApp}
       {projectsById}
       {canManage}
       {removingId}
@@ -424,17 +466,28 @@
       {roles}
       projects={sessionStore.projects}
       {appsByProject}
+      {envsByApp}
+      {loadingEnvApps}
+      onopenapp={ensureEnvsLoaded}
       onclose={() => (createOpen = false)}
       oncreated={() => load(sessionStore.currentOrg!.id)}
     />
     <EditMemberDialog
       open={editingMemberId !== null}
       orgId={sessionStore.currentOrg.id}
+      orgName={sessionStore.currentOrg.name}
       member={editingMember}
       {roles}
-      {scopeOptions}
+      projects={sessionStore.projects}
+      {appsByProject}
+      {envsByApp}
+      {loadingEnvApps}
+      onopenapp={ensureEnvsLoaded}
+      orgGrants={members}
+      ready={appsLoaded}
       onclose={() => (editingMemberId = null)}
       onchanged={() => load(sessionStore.currentOrg!.id)}
+      onsaved={() => toastStore.success('Access updated.')}
     />
   {/if}
 

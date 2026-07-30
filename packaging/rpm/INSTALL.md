@@ -48,14 +48,14 @@ Pick what a given host needs. On an all-in-one box:
 
 ```bash
 cd ~/rpmbuild/RPMS/$(uname -m)
-sudo dnf install ./sauron-0.1.0-*.rpm ./sauron-server-0.1.0-*.rpm \
-                 ./sauron-dashboard-0.1.0-*.rpm ./sauron-cli-0.1.0-*.rpm
+sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm \
+                 ./sauron-dashboard-1.0.0-*.rpm ./sauron-cli-1.0.0-*.rpm
 ```
 
 Backend-only host:
 
 ```bash
-sudo dnf install ./sauron-0.1.0-*.rpm ./sauron-server-0.1.0-*.rpm
+sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm
 ```
 
 `dnf` pulls the base `sauron` package automatically and (for the dashboard) `nginx`.

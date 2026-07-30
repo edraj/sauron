@@ -13,7 +13,7 @@ package under `/usr/share/doc/sauron-server/` ([INSTALL.md](https://github.com/s
 ## The artifacts
 
 One `rpmbuild` run (step 1) emits **four binary RPMs** — one per component — plus a **source
-RPM**, all named `<name>-0.1.0-1.fc44.<arch>`. Binary RPMs land in `~/rpmbuild/RPMS/<arch>/`
+RPM**, all named `<name>-1.0.0-1.fc44.<arch>`. Binary RPMs land in `~/rpmbuild/RPMS/<arch>/`
 and the source RPM in `~/rpmbuild/SRPMS/`. Install only the binary RPMs a given host needs;
 `dnf` pulls in the shared `sauron` base package automatically.
 
@@ -56,14 +56,14 @@ All-in-one box:
 
 ```bash
 cd ~/rpmbuild/RPMS/$(uname -m)
-sudo dnf install ./sauron-0.1.0-*.rpm ./sauron-server-0.1.0-*.rpm \
-                 ./sauron-dashboard-0.1.0-*.rpm ./sauron-cli-0.1.0-*.rpm
+sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm \
+                 ./sauron-dashboard-1.0.0-*.rpm ./sauron-cli-1.0.0-*.rpm
 ```
 
 Backend-only host:
 
 ```bash
-sudo dnf install ./sauron-0.1.0-*.rpm ./sauron-server-0.1.0-*.rpm
+sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm
 ```
 
 `dnf` pulls the base `sauron` package automatically and (for the dashboard) `nginx`.
@@ -222,3 +222,67 @@ sudo dnf remove sauron-server sauron-dashboard sauron-cli sauron
 ```
 
 Removal leaves `/var/lib/sauron` and the `sauron` user in place (standard practice); delete them manually if you want a clean slate.
+
+### Upgrading to per-app environments
+
+This release moves the ingest key from the app to the environment — the migration
+drops `apps.public_key`. It is a **breaking schema change**: run `sudo -u sauron
+sauron-migrate` before starting the new binaries, and remember that an RPM upgrade
+does **not** run it for you (see [step 7](#7-run-database-migrations) above and
+the note in the Troubleshooting table).
+
+This is a **stop-the-world cutover, not a rolling upgrade** — once migrated, any
+still-running old binary 500s on every ingest request, because the column its auth
+check reads no longer exists. There is also no separate `sauron-worker` unit here:
+`sauron-ingest` runs the edge **and** the co-located worker pool in one process
+(see [Architecture §1](Architecture.md#1-the-ingest-pipeline)), and the process has
+no graceful-shutdown handling, so `systemctl stop sauron-ingest` kills in-flight
+work rather than draining it. Pull the host from your load balancer or firewall
+first, or every in-flight signal is lost.
+
+This sequence **replaces** the generic [Upgrade / uninstall](#upgrade--uninstall)
+recipe above for this release, and the ordering matters: that recipe runs `dnf
+upgrade` before stopping anything, which is backwards here. Packaging's `%postun`
+scriptlet (`%systemd_postun_with_restart`) restarts any of these units that is
+still active the moment the new binaries land, so upgrading before the drain
+check passes force-restarts `sauron-ingest` onto the new binary — mid-drain,
+against an un-migrated database. Stop first, install second:
+
+```bash
+# 1. Stop routing new traffic to this host (remove it from the load balancer, or
+#    block the ingest port at the firewall). Leave sauron-ingest itself running
+#    so its co-located workers keep draining what is already queued. Both
+#    `pending` (delivered but not yet acked) and `lag` (never delivered) must
+#    read 0 for the `workers` group before you go further. XLEN is NOT a drain
+#    check: XACK marks an entry processed but never removes it from the stream
+#    (the only trim anywhere is the approximate `MAXLEN ~ 1_000_000` cap on
+#    XADD), so XLEN sits near that cap permanently and would never reach zero.
+redis-cli XINFO GROUPS sauron:ingest:stream   # repeat until pending=0 and lag=0
+
+# 2. Only once drained, stop the two units whose wire format/schema changed:
+sudo systemctl stop sauron-ingest sauron-api
+
+# 3. Install the new RPMs. Both units are already stopped, so the package's
+#    postun try-restart is a no-op instead of racing the migration below.
+sudo dnf upgrade ./sauron-*-*.rpm
+
+# 4. Migrate. RPM upgrades do NOT run this automatically.
+sudo -u sauron sauron-migrate
+
+# 5. Start everything together, then re-admit traffic at the LB/firewall.
+sudo systemctl start sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier
+```
+
+Two reasons the drain matters. `IngestJob` gained a required `environment_id`, so a
+job serialized by the old binary cannot deserialize against the new one — the
+worker dead-letters it to `sauron:ingest:dlq`, which **nothing reads and nothing
+trims**. Those signals are gone from the product even though the SDK already
+received `202 Accepted`. And `sauron-api` and `sauron-ingest` must move together:
+the DSN cache key prefix changed to `sauron:dsn:v2:` in this same release, so an
+old `api` invalidating a rotated key under the old prefix writes to a slot the new
+`ingest` no longer reads, leaving a revoked key live for up to the cache's 300s TTL.
+
+Every deployed SDK stops reporting until its DSN is replaced with an environment
+DSN, found under **Settings → app → Environments** in the dashboard. Existing
+environments are preserved and each is issued a key; the app's old key is gone and
+cannot be recovered.

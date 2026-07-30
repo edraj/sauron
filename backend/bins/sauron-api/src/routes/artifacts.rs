@@ -49,8 +49,13 @@ pub async fn upload(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(p): Query<UploadParams>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // Symbol artifacts are app-wide, not per-environment (see `list`'s
+    // comment below); rejected here too, matching `list` in this same file
+    // rather than silently discarding it on writes alone.
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if !KINDS.contains(&p.kind.as_str()) {
         return Err(ApiError::BadRequest(
             "kind must be 'js_sourcemap' or 'dart_symbols'".into(),
@@ -174,7 +179,12 @@ pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    // Symbol artifacts (source maps / debug info) are app-wide, uploaded per
+    // release/debug-id, not per environment; rejected rather than silently
+    // accepted-and-ignored.
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
     let rows = repo::list_artifacts_with_sizes(&mut conn, app_id).await?;
@@ -205,7 +215,9 @@ pub async fn delete(
     auth: AuthUser,
     State(state): State<AppState>,
     Path((app_id, artifact_id)): Path<(Uuid, Uuid)>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<StatusCode, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ARTIFACT_WRITE).await?;
     if repo::delete_symbol_artifact(&mut conn, app_id, artifact_id).await? {

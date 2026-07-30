@@ -20,7 +20,7 @@
  * plain Node (see `seeding.test.ts`). The Sauron-backed sink lives in the UI
  * layer (`sauron.ts`).
  */
-import type { BreadcrumbInput, Level } from '@sauron/browser';
+import type { BreadcrumbInput, Level } from '@edraj/sauron-browser';
 
 /**
  * Deterministic PRNG (mulberry32 seeded via FNV-1a) — same seed, same run.
@@ -67,7 +67,7 @@ export interface SeedUser {
 /**
  * The SDK surface the seeding driver needs — injected so this module stays
  * testable. `setTags(null)` clears scope tags; `captureException` takes a real
- * `Error` plus a `{ level, fingerprint }` hint, mirroring `@sauron/browser`.
+ * `Error` plus a `{ level, fingerprint }` hint, mirroring `@edraj/sauron-browser`.
  */
 export interface SeedingSink {
   setUser(user: SeedUser | null): void;

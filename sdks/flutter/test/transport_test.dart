@@ -41,7 +41,6 @@ void main() {
       headerBuilder: (DateTime sentAt) => EnvelopeHeader(
         dsn: dsn.toString(),
         sentAt: sentAt,
-        environment: 'test',
       ),
       contextBuilder: () => const SauronContext(),
     );

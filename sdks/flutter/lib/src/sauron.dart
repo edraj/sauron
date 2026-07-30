@@ -11,11 +11,13 @@ import 'types.dart';
 /// The public, static entry point to the Sauron SDK.
 ///
 /// ```dart
-/// await Sauron.init((o) {
-///   o.dsn = 'https://pk_test@localhost:8081/1';
-///   o.environment = 'production';
-///   o.release = 'app@1.4.2+1402';
-/// }, appRunner: () => runApp(const MyApp()));
+/// await Sauron.init(
+///   SauronOptions(
+///     dsn: 'https://pk_test@localhost:8081/1',
+///     release: 'app@1.4.2+1402',
+///   ),
+///   appRunner: () => runApp(const MyApp()),
+/// );
 /// ```
 class Sauron {
   Sauron._();
@@ -28,23 +30,27 @@ class Sauron {
   /// Whether the SDK is initialized and enabled.
   static bool get isEnabled => _client?.isEnabled ?? false;
 
-  /// Initializes the SDK.
+  /// Initializes the SDK with the given [options].
   ///
   /// When [appRunner] is supplied, the app is launched inside
   /// `runZonedGuarded` with all four capture layers bound inside the zone.
   /// Without it, integrations are still installed but you are responsible for
   /// calling `runApp` yourself.
+  ///
+  /// Calling `WidgetsFlutterBinding.ensureInitialized()` before [init] is
+  /// supported, but it pins the zone `runApp` must run in, so the
+  /// `runZonedGuarded` layer is skipped to avoid a "Zone mismatch." from
+  /// inside `runApp`. Uncaught errors are still captured by the other three
+  /// layers. To keep all four, do that setup inside [appRunner] instead.
   static Future<void> init(
-    void Function(SauronOptions options) configure, {
+    SauronOptions options, {
     FutureOr<void> Function()? appRunner,
   }) async {
-    final SauronOptions options = SauronOptions();
-    configure(options);
     final SauronClient client = SauronClient(options);
     _client = client;
 
     if (appRunner != null) {
-      RunZonedGuardedIntegration.run(client, appRunner);
+      await RunZonedGuardedIntegration.run(client, appRunner);
     } else {
       WidgetsFlutterBinding.ensureInitialized();
       client.installIntegrations();

@@ -23,6 +23,35 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    # Backs the `sauron-db`/`sauron-api` integration harnesses (see
+    # `crates/sauron-db/tests/common/mod.rs`): without a reachable database,
+    # `TestDb::setup()` returns `None` and every env-scoping test silently
+    # reports "passed" in 0.00s instead of actually running. Versions matched
+    # to what `docker-compose.yml` pins (`postgres:16`, `redis:7`), not just
+    # "latest", so CI exercises the same server version the project targets.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sauron
+          POSTGRES_PASSWORD: sauron
+          POSTGRES_DB: sauron
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sauron"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=12
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=12
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain deps (pkg-config + libzstd for the system-zstd link)
@@ -56,6 +85,16 @@ jobs:
         # recompile DuckDB from source (needs the C++ toolchain we no longer install).
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
+        # TEST_DATABASE_URL/TEST_REDIS_URL opt the harness in — without them
+        # `TestDb::setup()` returns `None` and every env-scoping test reports
+        # "passed" in 0.00s without running (see the module doc on
+        # `crates/sauron-db/tests/common/mod.rs`). A developer without a local
+        # database still gets a green `cargo test --workspace` by simply not
+        # setting these — the skip path is intentionally preserved, only CI's
+        # reliance on it is being fixed here.
+        env:
+          TEST_DATABASE_URL: postgres://sauron:sauron@localhost:5432/sauron
+          TEST_REDIS_URL: redis://localhost:6379
         run: cargo test --workspace
 
   dashboard:

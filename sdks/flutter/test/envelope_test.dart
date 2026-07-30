@@ -16,9 +16,8 @@ const String _golden = '''
 {
   "header": {
     "dsn": "https://pk_test@localhost:8081/1",
-    "sdk": { "name": "sauron.flutter", "version": "0.3.0" },
+    "sdk": { "name": "sauron.flutter", "version": "1.3.0" },
     "sent_at": "2026-07-12T10:30:00.123Z",
-    "environment": "production",
     "release": "app@1.4.2+1402"
   },
   "context": {
@@ -124,7 +123,6 @@ void main() {
         header: EnvelopeHeader(
           dsn: dsn.toString(),
           sentAt: DateTime.utc(2026, 7, 12, 10, 30, 0, 123),
-          environment: 'production',
           release: 'app@1.4.2+1402',
         ),
         context: const SauronContext(
@@ -157,6 +155,14 @@ void main() {
       expect(header['sent_at'], '2026-07-12T10:30:00.123Z');
       expect(sauronIso(DateTime.utc(2026, 7, 12, 10, 29, 50)),
           '2026-07-12T10:29:50.000Z');
+    });
+
+    test('the header never carries an environment key (removed: environment is now proven by the ingest key)', () {
+      final Map<String, dynamic> decoded =
+          jsonDecode(envelope.encode()) as Map<String, dynamic>;
+      final Map<String, dynamic> header =
+          decoded['header'] as Map<String, dynamic>;
+      expect(header.containsKey('environment'), isFalse);
     });
 
     test('item type discriminators match the wire contract', () {

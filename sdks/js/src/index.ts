@@ -1,11 +1,11 @@
 /**
- * `@sauron/browser` — public API surface.
+ * `@edraj/sauron-browser` — public API surface.
  *
  * Error reporting + product analytics for the browser. Import the named
  * functions, or the `Sauron` facade / default export.
  *
  * ```ts
- * import { Sauron } from '@sauron/browser';
+ * import { Sauron } from '@edraj/sauron-browser';
  * Sauron.init({ dsn: 'https://pk_test@localhost:8081/1', release: 'web@1.4.2' });
  * Sauron.track('checkout_completed', { cart_value: 42.5 });
  * ```

@@ -15,7 +15,7 @@ SAURON_DSN="https://pk_live_xxx@ingest.sauron.example/1" python main.py
 ```
 
 The DSN is read from the `SAURON_DSN` environment variable. Use the public key
-and project id from your Sauron project's ingest DSN.
+and environment id from your app's ingest DSN (**Settings → app → Environments**).
 
 With `SAURON_DSN` **unset** the SDK runs in a disabled **no-op** mode: every
 call below is a harmless no-op and the program still exits `0` — handy as a
@@ -28,8 +28,8 @@ python main.py
 
 ## What it does
 
-1. `sauron.init(dsn, environment="development", debug=True)` — start the client
-   (or enter no-op mode when the DSN is missing).
+1. `sauron.init(dsn, debug=True)` — start the client (or enter no-op mode when
+   the DSN is missing).
 2. `sauron.identify(...)` — attach traits to a `distinct_id`.
 3. `with sauron.scope():` — a **per-request scope** whose user/tags are isolated
    to this request (concurrent requests never leak into each other):

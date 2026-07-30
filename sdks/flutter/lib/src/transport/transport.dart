@@ -8,7 +8,6 @@ import 'package:http/http.dart' as http;
 import '../dsn.dart';
 import '../envelope.dart';
 import '../sauron_options.dart';
-import 'connectivity.dart';
 import 'gzip.dart';
 import 'queue.dart';
 
@@ -44,7 +43,6 @@ class SauronTransport {
     required ContextBuilder contextBuilder,
     required EnvelopeQueue queue,
     http.Client? httpClient,
-    ConnectivityMonitor? connectivity,
     Random? random,
   })  : _options = options,
         _dsn = dsn,
@@ -52,7 +50,6 @@ class SauronTransport {
         _contextBuilder = contextBuilder,
         _queue = queue,
         _client = httpClient ?? options.httpClient ?? http.Client(),
-        _connectivity = connectivity,
         _random = random ?? Random();
 
   final SauronOptions _options;
@@ -61,7 +58,6 @@ class SauronTransport {
   final ContextBuilder _contextBuilder;
   final EnvelopeQueue _queue;
   final http.Client _client;
-  final ConnectivityMonitor? _connectivity;
   final Random _random;
 
   final List<EnvelopeItem> _buffer = <EnvelopeItem>[];
@@ -77,8 +73,14 @@ class SauronTransport {
   /// Whether the transport is still accepting/sending data.
   bool get isEnabled => _enabled && !_closed;
 
-  /// Starts the flush timer, connectivity listener, and an initial drain of any
-  /// envelopes persisted by a previous app session.
+  /// Starts the flush timer and an initial drain of any envelopes persisted by
+  /// a previous app session.
+  ///
+  /// The queue is additionally drained when a batch fills, and on app resume
+  /// (see `SauronWidgetsBindingObserver`). There is deliberately no connectivity
+  /// listener: the authoritative signal of reachability is the HTTP response,
+  /// and a connectivity plugin would inject `ACCESS_NETWORK_STATE` into every
+  /// consuming app's merged manifest.
   void start() {
     if (_started) {
       return;
@@ -86,9 +88,6 @@ class SauronTransport {
     _started = true;
     _flushTimer = Timer.periodic(_options.flushInterval, (_) {
       unawaited(flush());
-    });
-    _connectivity?.start(() {
-      unawaited(_drainQueue());
     });
     unawaited(_drainQueue());
   }
@@ -124,7 +123,6 @@ class SauronTransport {
       await _drainQueue();
     } finally {
       _closed = true;
-      await _connectivity?.dispose();
       _client.close();
     }
   }
@@ -172,6 +170,7 @@ class SauronTransport {
         final _Outcome outcome = await _send(json);
         switch (outcome.kind) {
           case _OutcomeKind.success:
+            _logDelivered(json);
             await _queue.acknowledgeFirst();
             _retryAttempt = 0;
           case _OutcomeKind.dropNoRetry:
@@ -213,8 +212,8 @@ class SauronTransport {
       );
       return _classify(response.statusCode, response.headers);
     } on Object catch (error) {
-      // Connectivity is a hint; the real signal is the HTTP response (or lack
-      // of one). A network error means: keep the envelope and back off.
+      // The HTTP response (or lack of one) is the only signal of reachability
+      // the SDK trusts. A network error means: keep the envelope and back off.
       _log('network error: $error');
       return const _Outcome(_OutcomeKind.retry);
     }
@@ -315,6 +314,69 @@ class SauronTransport {
     if (_options.debug) {
       debugPrint('[Sauron] $message');
     }
+  }
+
+  /// With `debug: true`, prints one line per item the server actually accepted.
+  ///
+  /// Decoding the envelope back is wasteful, but this is the only point that
+  /// knows what really went out: items are queued as JSON and may be split,
+  /// retried, or persisted across a restart between capture and delivery.
+  void _logDelivered(String json) {
+    if (!_options.debug) {
+      return;
+    }
+    try {
+      final Map<String, Object?> envelope =
+          jsonDecode(json) as Map<String, Object?>;
+      final List<Object?> items =
+          envelope['items'] as List<Object?>? ?? const <Object?>[];
+      _log('delivered ${items.length} item(s) to ${_dsn.envelopeEndpoint}:');
+      for (final Object? item in items) {
+        if (item is Map<String, Object?>) {
+          _log('  ${_describeItem(item)}');
+        }
+      }
+    } on Object catch (error) {
+      // Never let diagnostics break delivery — the envelope is already sent.
+      _log('delivered an envelope that could not be described: $error');
+    }
+  }
+
+  String _describeItem(Map<String, Object?> item) {
+    switch (item['type']) {
+      case 'error':
+        final Map<String, Object?>? exception =
+            item['exception'] as Map<String, Object?>?;
+        return 'error ${exception?['type']}: '
+            '${_short(exception?['value'])} '
+            '(level=${item['level']}, screen=${item['screen']})';
+      case 'event':
+        return 'event ${item['name']} '
+            '(distinct_id=${item['distinct_id']}, screen=${item['screen']}, '
+            'properties=${_short(item['properties'])})';
+      case 'identify':
+        return 'identify ${item['distinct_id']} '
+            '(traits=${_short(item['traits'])})';
+      case 'transaction':
+        return 'transaction ${item['name']} op=${item['op']} '
+            '${item['duration_ms']}ms status=${item['status']}';
+      case 'breadcrumb_batch':
+        final List<Object?>? crumbs = item['breadcrumbs'] as List<Object?>?;
+        return 'breadcrumb_batch ${crumbs?.length ?? 0} crumb(s)';
+      default:
+        return '${item['type']}';
+    }
+  }
+
+  /// Keeps one item on one readable line — stack traces and large property maps
+  /// otherwise bury the rest of the log.
+  static String _short(Object? value) {
+    if (value == null) {
+      return 'null';
+    }
+    final String text = value is String ? value : jsonEncode(value);
+    final String single = text.replaceAll('\n', ' ');
+    return single.length <= 120 ? single : '${single.substring(0, 117)}...';
   }
 
   // ---- test/inspection hooks -------------------------------------------------

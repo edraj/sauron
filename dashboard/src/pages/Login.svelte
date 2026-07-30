@@ -24,8 +24,13 @@
         return;
       }
       await sessionStore.load(true);
-      // First-time / project-less accounts land on onboarding.
-      push(sessionStore.projects.length === 0 ? '/onboarding' : '/overview');
+      // First-time accounts land on onboarding — but only if they can actually
+      // complete it. A member scoped to a single app or project sees no projects
+      // here for a completely different reason, and onboarding would ask them to
+      // create one they have no permission to create. Send them to the app shell,
+      // which resolves their reachable app or shows the no-access state.
+      const canOnboard = sessionStore.projects.length === 0 && sessionStore.can('project:create');
+      push(canOnboard ? '/onboarding' : '/overview');
     } catch (err) {
       error = errorMessage(err);
     } finally {

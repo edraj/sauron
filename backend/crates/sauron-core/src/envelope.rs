@@ -2,7 +2,7 @@
 //!
 //! One JSON [`Envelope`] carries a header, an envelope-wide context block, and a
 //! list of tagged [`EnvelopeItem`]s (errors, product events, identify calls, or
-//! a breadcrumb batch). Both SDKs (`@sauron/browser`, `sauron_flutter`) emit
+//! a breadcrumb batch). Both SDKs (`@edraj/sauron-browser`, `sauron_flutter`) emit
 //! exactly this shape; the golden fixture in the SDK test suites guards parity.
 //!
 //! Transport: `POST /api/{project_id}/envelope`, `X-Sauron-Key: <public_key>`,
@@ -55,8 +55,6 @@ pub struct EnvelopeHeader {
     /// When the SDK flushed the batch — used for clock-skew correction.
     #[serde(default = "Utc::now")]
     pub sent_at: DateTime<Utc>,
-    #[serde(default)]
-    pub environment: Option<String>,
     #[serde(default)]
     pub release: Option<String>,
 }
@@ -311,8 +309,10 @@ pub struct IngestJob {
     pub app_id: Uuid,
     pub project_id: Uuid,
     pub org_id: Uuid,
-    #[serde(default)]
-    pub environment: Option<String>,
+    /// Resolved at the edge from the presented ingest key, never from client
+    /// input. Not `Option`: a job cannot exist without a key, and a key cannot
+    /// exist without an environment.
+    pub environment_id: Uuid,
     #[serde(default)]
     pub release: Option<String>,
     pub received_at: DateTime<Utc>,
@@ -349,7 +349,6 @@ mod tests {
         "dsn": "https://pk_test@localhost:8081/1",
         "sdk": { "name": "sauron.javascript", "version": "0.1.0" },
         "sent_at": "2026-07-12T10:30:00.123Z",
-        "environment": "production",
         "release": "web@1.4.2"
       },
       "context": {
@@ -375,7 +374,6 @@ mod tests {
     fn deserializes_golden_envelope() {
         let env: Envelope = serde_json::from_str(GOLDEN).expect("golden envelope must parse");
         assert_eq!(env.header.sdk.name, "sauron.javascript");
-        assert_eq!(env.header.environment.as_deref(), Some("production"));
         assert_eq!(env.items.len(), 3);
 
         match &env.items[0] {
@@ -401,6 +399,35 @@ mod tests {
         }
     }
 
+    /// A stale SDK that has not yet dropped `environment` from the header it
+    /// sends must keep ingesting: the field no longer exists on
+    /// `EnvelopeHeader`, and serde ignores unknown fields by default, so the
+    /// value is silently dropped rather than rejected. The environment for
+    /// this envelope comes from the ingest key, not this string.
+    #[test]
+    fn tolerates_stale_sdk_still_sending_environment_in_header() {
+        let json = r#"{
+          "header": {
+            "sdk": { "name": "sauron.javascript", "version": "0.1.0" },
+            "environment": "production",
+            "release": "web@1.4.2"
+          },
+          "items": []
+        }"#;
+        let env: Envelope =
+            serde_json::from_str(json).expect("unknown `environment` field must be ignored");
+        assert_eq!(env.header.sdk.name, "sauron.javascript");
+        assert_eq!(env.header.release.as_deref(), Some("web@1.4.2"));
+        // Re-serializing must not round-trip the field back onto the wire. Without
+        // this the test would pass just as happily if `environment` were added back
+        // to `EnvelopeHeader` tomorrow, which is the regression it exists to catch.
+        let round_tripped = serde_json::to_string(&env.header).unwrap();
+        assert!(
+            !round_tripped.contains("environment"),
+            "environment must not exist on the header: {round_tripped}"
+        );
+    }
+
     /// A job serialized by the pre-upgrade ingest binary carries no `sdk` key.
     /// Those are still sitting in the Redis stream during a rolling upgrade, so
     /// the new worker has to keep reading them — that is what the
@@ -411,6 +438,7 @@ mod tests {
             "app_id": "00000000-0000-0000-0000-000000000001",
             "project_id": "00000000-0000-0000-0000-000000000002",
             "org_id": "00000000-0000-0000-0000-000000000003",
+            "environment_id": "00000000-0000-0000-0000-000000000004",
             "received_at": "2026-07-12T10:30:00Z",
             "item": { "type": "identify", "distinct_id": "u_123" }
         }"#;

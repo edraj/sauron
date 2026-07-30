@@ -1,8 +1,8 @@
 /**
  * Reactive app state (Svelte 5 runes).
  *
- *  - `config`      : DSN + environment + release + distinct id, persisted to
- *                    localStorage so a paste survives reloads.
+ *  - `config`      : DSN + release + distinct id, persisted to localStorage so
+ *                    a paste survives reloads.
  *  - `initStatus`  : the SDK connection state, shown as a pill in the header.
  *  - `activity`    : a client-side echo log of what the demo asked the SDK to
  *                    do. The SDK itself batches + sends in the background, so
@@ -18,14 +18,12 @@ const LS_KEY = 'sauron-web-demo-config';
 
 interface PersistedConfig {
   dsn: string;
-  environment: string;
   release: string;
   distinctId: string;
 }
 
 class ConfigStore {
   dsn = $state(DEFAULT_DSN);
-  environment = $state('demo');
   release = $state('web-demo@0.1.0');
   distinctId = $state('user_demo_1');
 
@@ -35,7 +33,6 @@ class ConfigStore {
       if (raw) {
         const parsed = JSON.parse(raw) as Partial<PersistedConfig>;
         if (typeof parsed.dsn === 'string' && parsed.dsn) this.dsn = parsed.dsn;
-        if (typeof parsed.environment === 'string') this.environment = parsed.environment;
         if (typeof parsed.release === 'string') this.release = parsed.release;
         if (typeof parsed.distinctId === 'string') this.distinctId = parsed.distinctId;
       }
@@ -48,7 +45,6 @@ class ConfigStore {
     try {
       const snapshot: PersistedConfig = {
         dsn: this.dsn,
-        environment: this.environment,
         release: this.release,
         distinctId: this.distinctId,
       };
@@ -60,7 +56,6 @@ class ConfigStore {
 
   reset(): void {
     this.dsn = DEFAULT_DSN;
-    this.environment = 'demo';
     this.release = 'web-demo@0.1.0';
     this.distinctId = 'user_demo_1';
     this.persist();
