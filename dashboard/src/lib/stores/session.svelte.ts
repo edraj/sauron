@@ -6,7 +6,7 @@ import { configureScopeBridge } from '../api/scope';
 import type {
   AccessResponse,
   App,
-  Environment,
+  AppEnvironment,
   Organization,
   Permission,
   Project,
@@ -48,7 +48,7 @@ class SessionStore {
   orgs = $state<Organization[]>([]);
   projects = $state<Project[]>([]);
   apps = $state<App[]>([]);
-  environments = $state<Environment[]>([]);
+  environments = $state<AppEnvironment[]>([]);
   // True iff the most recent `listEnvironments` fetch for `currentAppId`
   // failed. Distinct from "loaded and empty" (a real, legitimate state where
   // this stays `false` and `environments` is `[]`) — see
@@ -93,7 +93,7 @@ class SessionStore {
     return this.apps.find((a) => a.id === this.currentAppId) ?? null;
   }
 
-  get currentEnvironment(): Environment | null {
+  get currentEnvironment(): AppEnvironment | null {
     return this.environments.find((e) => e.id === this.currentEnvId) ?? null;
   }
 
@@ -323,7 +323,7 @@ class SessionStore {
   private async loadAppEnvironments(appId: string): Promise<void> {
     this.environmentsLoadAttemptedFor = appId;
     this.environmentsError = false;
-    let fetched: Environment[];
+    let fetched: AppEnvironment[];
     try {
       fetched = await listEnvironments(appId);
     } catch {

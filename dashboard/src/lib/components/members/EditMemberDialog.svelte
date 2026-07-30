@@ -20,7 +20,15 @@
     type RoleBlock,
   } from '../../models/grant-plan';
   import { EMPTY_SELECTION } from '../../models/scope-tree';
-  import type { App, Environment, Member, MemberGrant, Project, Role, ScopeType } from '../../models';
+  import type {
+    App,
+    AppEnvironment,
+    Member,
+    MemberGrant,
+    Project,
+    Role,
+    ScopeType,
+  } from '../../models';
 
   interface Props {
     open: boolean;
@@ -33,7 +41,7 @@
     /** Environments per app, keyed by app id — see ScopeTree's own doc comment.
         Owned by the parent (Members.svelte) so the same cache can be reused by
         the grant form, the create dialog, and the members table. */
-    envsByApp: Record<string, Environment[]>;
+    envsByApp: Record<string, AppEnvironment[]>;
     loadingEnvApps: Set<string>;
     onopenapp: (appId: string) => void;
     /** Every grant in the org — the sole-owner pre-flight needs the whole set,

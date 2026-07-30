@@ -14,20 +14,38 @@
   import { buildDsn, relativeTime, formatDateTime } from '../../utils/format';
   import {
     listEnvironments,
-    createEnvironment,
-    updateEnvironment,
-    rotateEnvironmentKey,
-    retireEnvironment,
+    createProjectEnvironment,
+    renameProjectEnvironment,
+    retireProjectEnvironment,
+    updateAppEnvironment,
+    rotateAppEnvironmentKey,
   } from '../../api/environments';
-  import type { Environment } from '../../models';
+  import type { AppEnvironment, AppEnvironmentRow } from '../../models';
 
+  // Every row below is an ENROLLMENT (`app_environments`) — this app's
+  // membership in one of its project's environments — joined to the catalogue
+  // name. Two ids therefore matter and must not be confused:
+  //
+  //   `env.id`             the enrollment. Its key, its mute switch, its
+  //                        default flag, its DSN. Scoped to this app alone.
+  //   `env.environment_id` the catalogue entry (`environments`), owned by the
+  //                        project. Its NAME, and whether it exists at all.
+  //                        Shared by every app in the project.
+  //
+  // So mute / promote / rotate go to `/v1/app-environments/{env.id}`, while
+  // create / rename / retire go to the project catalogue and change what every
+  // sibling app sees. The card says so out loud (see the intro line in the
+  // markup and the confirm copy) — an admin renaming `staging` here is
+  // renaming it for the whole project, and that must not be a surprise.
   interface Props {
     appId: string;
+    /** The app's `project_id` — the catalogue create endpoint hangs off it. */
+    projectId: string;
   }
 
-  let { appId }: Props = $props();
+  let { appId, projectId }: Props = $props();
 
-  let envs = $state<Environment[]>([]);
+  let envs = $state<AppEnvironment[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let showRetired = $state(false);
@@ -37,21 +55,29 @@
   let newName = $state('');
   let createBusy = $state(false);
 
-  let renaming = $state<Environment | null>(null);
+  let renaming = $state<AppEnvironment | null>(null);
   let renameValue = $state('');
   let renameBusy = $state(false);
 
-  let confirmRotate = $state<Environment | null>(null);
-  let confirmRetire = $state<Environment | null>(null);
+  let confirmRotate = $state<AppEnvironment | null>(null);
+  let confirmRetire = $state<AppEnvironment | null>(null);
 
   // `sessionStore` is a class instance with plain fields, not a store contract —
   // reading it inside `$derived` (rather than latching once in `onMount`) is what
   // keeps these reactive to org/app switches. See the AppShell fix for the bug
   // this avoids.
-  const canCreate = $derived(sessionStore.can('env:create', { app: appId }));
+  //
+  // Catalogue actions resolve through the backend's `authorize_project`, so they
+  // are asked at project scope; enrollment actions resolve through
+  // `authorize_app` and are asked at app scope. (`can()` ORs across scope types
+  // and always falls back to `currentAppId` for `app`, so a purely app-scoped
+  // grant can still light up a catalogue button here — the backend is the
+  // authority and answers those with a 403.)
+  const canCreate = $derived(sessionStore.can('env:create', { project: projectId }));
+  const canRename = $derived(sessionStore.can('env:update', { project: projectId }));
+  const canRetire = $derived(sessionStore.can('env:delete', { project: projectId }));
   const canUpdate = $derived(sessionStore.can('env:update', { app: appId }));
   const canRotate = $derived(sessionStore.can('env:rotate_key', { app: appId }));
-  const canRetire = $derived(sessionStore.can('env:delete', { app: appId }));
 
   const active = $derived(envs.filter((e) => !e.retired_at));
   const retired = $derived(envs.filter((e) => e.retired_at));
@@ -72,20 +98,49 @@
     if (appId) void load();
   });
 
-  /** Replace one row in place so the list does not jump while a row is busy. */
-  function merge(updated: Environment) {
-    envs = envs.map((e) => (e.id === updated.id ? updated : e));
+  /**
+   * Refetch the rows without touching `loading`/`error`, and report whether it
+   * worked instead of throwing. Used after a create, which is the one action
+   * whose result this card cannot reconstruct locally: the catalogue POST
+   * returns the catalogue row, but the enrollment (and therefore this app's
+   * freshly minted key and DSN) is created server-side as a side effect. A
+   * failed refetch must not clobber the list the way `load()` would — the
+   * create itself already succeeded.
+   */
+  async function refetchRows(): Promise<boolean> {
+    try {
+      envs = await listEnvironments(appId, true);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Replace one row in place so the list does not jump while a row is busy.
+   * The enrollment endpoints return the bare row with no `name` on it (the name
+   * lives on the catalogue entry), so carry the existing one across rather than
+   * blanking it.
+   */
+  function merge(updated: AppEnvironmentRow) {
+    envs = envs.map((e) => (e.id === updated.id ? { ...updated, name: e.name } : e));
   }
 
   async function submitCreate() {
     if (createBusy || !newName.trim()) return;
     createBusy = true;
     try {
-      const created = await createEnvironment(appId, { name: newName.trim() });
-      envs = [...envs, created].sort((a, b) => a.name.localeCompare(b.name));
+      const created = await createProjectEnvironment(projectId, { name: newName.trim() });
       newName = '';
       creating = false;
-      toastStore.success(`Environment "${created.name}" created.`);
+      const refreshed = await refetchRows();
+      if (refreshed) {
+        toastStore.success(`"${created.name}" added to every app in this project.`);
+      } else {
+        toastStore.success(
+          `"${created.name}" added to every app in this project. Reload to see its ingest key.`,
+        );
+      }
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -99,9 +154,17 @@
     busyId = target.id;
     renameBusy = true;
     try {
-      merge(await updateEnvironment(target.id, { name: renameValue.trim() }));
+      // Catalogue rename: `environment_id`, not `id`. Only the name changes, and
+      // it changes for every app in the project — so patch the name onto every
+      // local row sharing that catalogue entry rather than refetching.
+      const renamed = await renameProjectEnvironment(target.environment_id, {
+        name: renameValue.trim(),
+      });
+      envs = envs.map((e) =>
+        e.environment_id === renamed.id ? { ...e, name: renamed.name } : e,
+      );
       renaming = null;
-      toastStore.success('Environment renamed.');
+      toastStore.success(`Renamed to "${renamed.name}" for every app in this project.`);
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -110,10 +173,10 @@
     }
   }
 
-  async function toggleIngest(env: Environment) {
+  async function toggleIngest(env: AppEnvironment) {
     busyId = env.id;
     try {
-      merge(await updateEnvironment(env.id, { ingest_enabled: !env.ingest_enabled }));
+      merge(await updateAppEnvironment(env.id, { ingest_enabled: !env.ingest_enabled }));
       toastStore.success(env.ingest_enabled ? 'Ingest muted.' : 'Ingest resumed.');
     } catch (err) {
       toastStore.error(errorMessage(err));
@@ -122,10 +185,10 @@
     }
   }
 
-  async function promote(env: Environment) {
+  async function promote(env: AppEnvironment) {
     busyId = env.id;
     try {
-      const promoted = await updateEnvironment(env.id, { is_default: true });
+      const promoted = await updateAppEnvironment(env.id, { is_default: true });
       // A promote changes two rows: this one gains the flag, the previous default loses
       // it. Both are knowable here, so apply them locally rather than refetching.
       // Reloading would couple this action's success to a second request — and `load()`
@@ -133,9 +196,13 @@
       // show a success toast beside a card that had replaced its entire list with a
       // bare error string.
       envs = envs.map((e) =>
-        e.id === promoted.id ? promoted : e.is_default ? { ...e, is_default: false } : e,
+        e.id === promoted.id
+          ? { ...promoted, name: e.name }
+          : e.is_default
+            ? { ...e, is_default: false }
+            : e,
       );
-      toastStore.success(`"${env.name}" is now the default environment.`);
+      toastStore.success(`"${env.name}" is now this app's default environment.`);
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -148,7 +215,7 @@
     if (!target) return;
     busyId = target.id;
     try {
-      merge(await rotateEnvironmentKey(target.id));
+      merge(await rotateAppEnvironmentKey(target.id));
       confirmRotate = null;
       toastStore.success('Key rotated. Update this environment’s DSN everywhere.');
     } catch (err) {
@@ -163,13 +230,31 @@
     if (!target) return;
     busyId = target.id;
     try {
-      merge(await retireEnvironment(target.id));
+      // Catalogue retire: `environment_id`, not `id`. The backend cascades to
+      // every enrollment, setting `retired_at` and clearing both flags — apply
+      // exactly that locally to this app's row rather than refetching, for the
+      // same reason `promote` does.
+      const retiredEnv = await retireProjectEnvironment(target.environment_id);
+      envs = envs.map((e) =>
+        e.environment_id === retiredEnv.id
+          ? {
+              ...e,
+              name: retiredEnv.name,
+              retired_at: retiredEnv.retired_at,
+              ingest_enabled: false,
+              is_default: false,
+              updated_at: retiredEnv.updated_at,
+            }
+          : e,
+      );
       confirmRetire = null;
-      toastStore.success(`"${target.name}" retired. Its data stays queryable.`);
+      toastStore.success(`"${target.name}" retired project-wide. Its data stays queryable.`);
     } catch (err) {
       // A race with another admin can still trip the backend's "last live" or
-      // "can't retire default" 409 even though we hide the button for those
-      // cases locally — surface it rather than failing silently.
+      // "still some app's default" 409 even though we hide the button for those
+      // cases locally — and the backend's default check spans every app in the
+      // project, which this card cannot see. Surface it rather than failing
+      // silently.
       toastStore.error(errorMessage(err));
     } finally {
       busyId = null;
@@ -180,11 +265,22 @@
 <Card title="Environments">
   {#snippet actions()}
     {#if canCreate}
-      <Button variant="secondary" size="sm" onclick={() => (creating = true)}>
+      <Button
+        variant="secondary"
+        size="sm"
+        title="Adds the environment to every app in this project"
+        onclick={() => (creating = true)}
+      >
         New environment
       </Button>
     {/if}
   {/snippet}
+
+  <p class="scope-note muted">
+    Environments are defined by the project and shared by every app in it, so
+    <strong>creating, renaming or retiring one changes it for all of them</strong>. The ingest
+    key, the mute switch and the default below belong to this app alone.
+  </p>
 
   {#if loading}
     <Spinner />
@@ -209,11 +305,12 @@
           </div>
 
           <div class="row-actions">
-            {#if canUpdate}
+            {#if canRename}
               <Button
                 variant="ghost"
                 size="sm"
                 disabled={busyId === env.id}
+                title="Renames this environment for every app in the project"
                 onclick={() => {
                   renaming = env;
                   renameValue = env.name;
@@ -221,6 +318,8 @@
               >
                 Rename
               </Button>
+            {/if}
+            {#if canUpdate}
               <Button
                 variant="ghost"
                 size="sm"
@@ -255,6 +354,7 @@
                 variant="ghost"
                 size="sm"
                 disabled={busyId === env.id}
+                title="Retires this environment for every app in the project"
                 onclick={() => (confirmRetire = env)}
               >
                 Retire
@@ -294,12 +394,12 @@
   {/if}
 </Card>
 
-<Modal bind:open={creating} title="New environment" size="sm">
+<Modal bind:open={creating} title="New project environment" size="sm">
   <Input
     label="Name"
     bind:value={newName}
     placeholder="staging"
-    hint="Lowercase and short works best — this appears in every filter."
+    hint="Added to every app in this project, each with its own ingest key. Lowercase and short works best — this appears in every filter."
   />
   {#snippet footer()}
     <Button variant="secondary" disabled={createBusy} onclick={() => (creating = false)}>
@@ -315,7 +415,11 @@
   size="sm"
   onclose={() => (renaming = null)}
 >
-  <Input label="Name" bind:value={renameValue} />
+  <Input
+    label="Name"
+    bind:value={renameValue}
+    hint="This name belongs to the project — renaming it renames it for every app in the project, not just this one."
+  />
   {#snippet footer()}
     <Button variant="secondary" onclick={() => (renaming = null)} disabled={renameBusy}>
       Cancel
@@ -338,8 +442,8 @@
 
 <ConfirmDialog
   open={confirmRetire !== null}
-  title="Retire environment?"
-  message={`"${confirmRetire?.name ?? ''}" stops accepting events and leaves the picker. Its existing data stays queryable and is archived to cold storage on the normal schedule. This cannot be undone.`}
+  title="Retire environment for the whole project?"
+  message={`"${confirmRetire?.name ?? ''}" is a project environment, so retiring it removes it from EVERY app in this project — not just this one. All of their keys for it stop working immediately and it leaves the picker. Existing data stays queryable and is archived to cold storage on the normal schedule. This cannot be undone.`}
   confirmLabel="Retire"
   danger
   loading={busyId !== null && busyId === confirmRetire?.id}
@@ -348,6 +452,11 @@
 />
 
 <style>
+  .scope-note {
+    font-size: 0.8rem;
+    line-height: 1.55;
+    margin: 0 0 0.85rem;
+  }
   .env-list {
     list-style: none;
     margin: 0;

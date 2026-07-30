@@ -140,28 +140,71 @@ pub struct NewApp<'a> {
     pub app_type: &'a str,
 }
 
+/// An environment as an admin defines it: a name, owned by a *project*.
+///
+/// This is the catalogue entry, not the thing an SDK reports to. It holds no
+/// key and no ingest switch — those belong to the per-app enrollment below,
+/// because a key that did not name an app could not prove which app an incoming
+/// event belonged to.
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]
 #[diesel(table_name = environments)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Environment {
     pub id: Uuid,
-    pub app_id: Uuid,
+    pub project_id: Uuid,
     pub name: String,
-    pub created_at: DateTime<Utc>,
-    pub public_key: String,
-    pub ingest_enabled: bool,
-    pub is_default: bool,
     pub retired_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Insertable)]
 #[diesel(table_name = environments)]
 pub struct NewEnvironment<'a> {
-    pub app_id: Uuid,
+    pub project_id: Uuid,
     pub name: &'a str,
+}
+
+/// One app's enrollment in one environment: the ingest credential and the
+/// switches that are legitimately per-app.
+///
+/// `is_default` lives here rather than on [`Environment`] because "which
+/// environment does this app report to by default" is a property of the app,
+/// and a second `is_default` one level up would give two rows the authority to
+/// answer the same question.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = app_environments)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AppEnvironment {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub public_key: String,
+    pub ingest_enabled: bool,
+    pub is_default: bool,
+    pub retired_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub environment_id: Uuid,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = app_environments)]
+pub struct NewAppEnvironment<'a> {
+    pub app_id: Uuid,
+    pub environment_id: Uuid,
     pub public_key: &'a str,
     pub is_default: bool,
+}
+
+/// An enrollment joined to its catalogue name — what the dashboard's per-app
+/// environment list and DSN table actually render. The name is not stored on
+/// the enrollment (that is exactly the drift this feature removed), so any
+/// caller that needs to *display* an enrollment needs this join.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppEnvironmentView {
+    #[serde(flatten)]
+    pub enrollment: AppEnvironment,
+    pub name: String,
 }
 
 /// Everything the ingest edge needs after presenting a key: the environment it
@@ -500,6 +543,40 @@ pub struct Device {
     pub last_seen: DateTime<Utc>,
     pub events_count: i64,
     pub errors_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// Workflows (named, explicitly-bounded spans of activity within a session;
+// entirely optional -- see docs/superpowers/specs/2026-07-29-workflow-
+// grouping-design.md). Field order below must exactly match the column order
+// declared in `schema.rs`'s `workflows` table! block: `Queryable` is
+// positional, so a mismatch between two same-typed columns (e.g. two `Text`
+// fields, or `started_at`/`ended_at`) would compile cleanly and silently
+// return garbage.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = workflows)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct Workflow {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub environment_id: Uuid,
+    pub workflow_id: String,
+    pub name: String,
+    pub session_id: Option<String>,
+    pub distinct_id: Option<String>,
+    pub device_key: Option<String>,
+    pub release: Option<String>,
+    pub status: String,
+    pub cancel_reason: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub last_event_at: DateTime<Utc>,
+    pub events_count: i32,
+    pub errors_count: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

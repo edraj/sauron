@@ -22,7 +22,7 @@
   import {
     groupMembers,
     type App,
-    type Environment,
+    type AppEnvironment,
     type Member,
     type MemberGrant,
     type Role,
@@ -56,7 +56,7 @@
   // dialog, edit dialog) — see ScopeTree's `onopenapp`. It is shared across
   // all three so expanding an app once benefits every surface for the rest of
   // the page session, including the members table's env-scope labels below.
-  let envsByApp = $state<Record<string, Environment[]>>({});
+  let envsByApp = $state<Record<string, AppEnvironment[]>>({});
   let loadingEnvApps = $state<Set<string>>(new Set());
 
   async function ensureEnvsLoaded(appId: string) {

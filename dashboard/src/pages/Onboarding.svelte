@@ -15,12 +15,12 @@
   import { listEnvironments } from '../lib/api/environments';
   import { errorMessage } from '../lib/api/client';
   import { buildDsn, appTypeIcon, APP_TYPES } from '../lib/utils/format';
-  import type { App, AppType, Environment, FirstEventStatus, Project } from '../lib/models';
+  import type { App, AppType, AppEnvironment, FirstEventStatus, Project } from '../lib/models';
 
   let project = $state<Project | null>(null);
   let app = $state<App | null>(null);
   // The DSN now lives on the app's seeded environment, not on the app itself.
-  let defaultEnv = $state<Environment | null>(null);
+  let defaultEnv = $state<AppEnvironment | null>(null);
 
   let projectName = $state('');
   let creatingProject = $state(false);

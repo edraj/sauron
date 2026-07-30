@@ -1,19 +1,26 @@
-//! Environment management: create, rename, mute, promote, rotate, retire.
+//! Environment management, split across the two levels the data model has.
 //!
-//! Every *mutation* here resolves through `authorize_app` against the parent
-//! app — the `env:*` permissions name what is being managed, and there is no
-//! scenario yet where creating, renaming, or retiring an environment is
-//! itself scoped narrower than its app. `list_environments` is the exception:
-//! it is a discovery endpoint (see `routes::projects::list_apps` for the same
-//! pattern one level up), so it resolves the caller's env-scoped `Reach`
-//! instead and can be satisfied by an env-scoped grant that `authorize_app`
-//! never could.
+//! The **catalogue** (`environments`) is owned by a project: an admin defines
+//! "we ship to dev, staging, production" once, and every app in the project
+//! shares those names. Catalogue mutations resolve through `authorize_project`.
+//!
+//! The **enrollment** (`app_environments`) is one app's membership in one of
+//! those environments. It holds the ingest key and the switches that are
+//! genuinely per-app — whether ingest is muted, and which environment this app
+//! reports to by default. Enrollment mutations resolve through `authorize_app`.
+//!
+//! `list_app_environments` is the one endpoint that resolves neither: it is a
+//! discovery endpoint (see `routes::projects::list_apps` for the same pattern
+//! one level up), so it resolves the caller's env-scoped `Reach` instead and can
+//! be satisfied by an env-scoped grant that `authorize_app` never could. Env
+//! grants name an *enrollment* id, which is why `Reach::envs` can be compared
+//! against these rows directly.
 
 /// Cap on a stored environment name. Was 64 when the value arrived from the
 /// envelope; kept at 64 now that it is admin-supplied so existing rows stay valid.
 const MAX_ENV_NAME_LEN: usize = 64;
 
-/// The environment every new app is born with.
+/// The environment every new project is born with.
 pub const DEFAULT_ENV_NAME: &str = "dev";
 
 /// Trim and bounds-check an admin-supplied environment name.
@@ -75,9 +82,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use sauron_auth::rbac::{grants_from_rows, reach_for};
-use sauron_auth::{authorize_app, perm, AuthError, AuthUser};
+use sauron_auth::{authorize_app, authorize_project, perm, AuthError, AuthUser};
 use sauron_core::ids;
-use sauron_db::models::Environment;
+use sauron_db::models::{AppEnvironment, AppEnvironmentView, Environment, NewAppEnvironment};
 use sauron_db::repo;
 use sauron_redis::keys;
 
@@ -91,13 +98,288 @@ pub struct ListEnvQuery {
     pub include_retired: bool,
 }
 
-pub async fn list_environments(
+/// Which environment a newly created app should treat as its default.
+///
+/// Deterministic and deliberately the same preference order migration 000026
+/// used when it had to pick a default for every existing app: `production`
+/// first because an app seeded with it is actively reporting there, then `dev`,
+/// then alphabetically. Returning `None` is possible only for a project whose
+/// every environment is retired, which the create paths prevent.
+fn pick_default_env(envs: &[Environment]) -> Option<Uuid> {
+    envs.iter()
+        .min_by_key(|e| {
+            (
+                e.name != "production",
+                e.name != DEFAULT_ENV_NAME,
+                e.name.clone(),
+            )
+        })
+        .map(|e| e.id)
+}
+
+/// Build the enrollment rows that put `app_id` into every environment in
+/// `envs`, minting one key per row.
+///
+/// Keys are generated here rather than in `sauron-db` so that every key in the
+/// system comes from `ids::public_key()`. The keys are returned alongside so the
+/// caller can keep them alive for the borrow in `NewAppEnvironment`.
+fn enrollment_keys(envs: &[Environment]) -> Vec<String> {
+    envs.iter().map(|_| ids::public_key()).collect()
+}
+
+fn enrollment_rows<'a>(
+    app_id: Uuid,
+    envs: &[Environment],
+    keys: &'a [String],
+    default_env: Option<Uuid>,
+) -> Vec<NewAppEnvironment<'a>> {
+    envs.iter()
+        .zip(keys)
+        .map(|(env, key)| NewAppEnvironment {
+            app_id,
+            environment_id: env.id,
+            public_key: key,
+            is_default: Some(env.id) == default_env,
+        })
+        .collect()
+}
+
+/// Enroll a brand-new app in every live environment of its project.
+///
+/// Called from the app-create path. Runs inside the caller's transaction: an app
+/// with no enrollment holds no ingest key and is unreachable by any SDK, so a
+/// partial result here must not survive.
+pub async fn enroll_new_app(
+    conn: &mut diesel_async::AsyncPgConnection,
+    app_id: Uuid,
+    project_id: Uuid,
+) -> Result<Vec<AppEnvironment>, ApiError> {
+    let envs = repo::list_project_environments(conn, project_id, false).await?;
+    if envs.is_empty() {
+        // Every project is created with `dev`, and the last live environment
+        // cannot be retired, so this is unreachable rather than merely unlikely.
+        // Failing loudly beats minting an app that no SDK can ever reach.
+        return Err(ApiError::Conflict(
+            "project has no live environments to enroll this app in".into(),
+        ));
+    }
+    let default_env = pick_default_env(&envs);
+    let keys = enrollment_keys(&envs);
+    let rows = enrollment_rows(app_id, &envs, &keys, default_env);
+    Ok(repo::create_app_environments(conn, &rows).await?)
+}
+
+// ---------------------------------------------------------------------------
+// Catalogue: environments as a project defines them
+// ---------------------------------------------------------------------------
+
+pub async fn list_project_environments(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(project_id): Path<Uuid>,
+    Query(q): Query<ListEnvQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<Environment>>, ApiError> {
+    // This endpoint IS the environment list; scoping the request that enumerates
+    // environments to one of them is circular, so `environment_id` is rejected
+    // rather than silently ignored — the same defect class `http_env_scoping.rs`
+    // guards against on every other scoped GET.
+    super::scope::reject_environment_id(
+        super::scope::raw_environment_id(raw_query.as_deref()).as_deref(),
+    )?;
+    let mut conn = db(&state).await?;
+    // Unlike the per-app list below, this is the settings/admin view of the
+    // catalogue, so it takes the ordinary project-scoped check. A member with
+    // only an app- or env-scoped grant populates their picker from
+    // `list_app_environments`, which is the list that actually carries their
+    // keys and reflects what that app is enrolled in.
+    authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_READ).await?;
+    let envs = repo::list_project_environments(&mut conn, project_id, q.include_retired).await?;
+    Ok(Json(envs))
+}
+
+#[derive(Deserialize)]
+pub struct CreateEnvReq {
+    pub name: String,
+}
+
+pub async fn create_project_environment(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(project_id): Path<Uuid>,
+    Json(req): Json<CreateEnvReq>,
+) -> Result<Json<Environment>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_CREATE).await?;
+    let name = validate_env_name(&req.name).map_err(ApiError::BadRequest)?;
+
+    if repo::count_active_project_environments(&mut conn, project_id).await?
+        >= repo::MAX_ENVIRONMENTS_PER_PROJECT
+    {
+        return Err(ApiError::Conflict(format!(
+            "project already has {} environments",
+            repo::MAX_ENVIRONMENTS_PER_PROJECT
+        )));
+    }
+
+    // Catalogue row and enrollments commit together. An environment that exists
+    // in the catalogue but that no app is enrolled in is invisible to every SDK
+    // while still occupying its name, so a half-applied create would look like a
+    // working environment that silently drops everything sent to it.
+    let env = conn
+        .transaction::<_, ApiError, _>(async |conn| {
+            // `environments_project_name_active_key` turns a duplicate live name
+            // into a unique violation; map it rather than pre-checking, so a
+            // concurrent create cannot slip between the check and the insert.
+            let env = match repo::create_project_environment(conn, project_id, name).await {
+                Ok(env) => env,
+                Err(diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::UniqueViolation,
+                    _,
+                )) => {
+                    return Err(ApiError::Conflict(format!(
+                        "an environment named \"{name}\" already exists in this project"
+                    )))
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            // Fan out to every app in the project. `is_default` is false for all
+            // of them: each app already has its default, and
+            // `app_environments_default_key` would reject a second.
+            let app_ids = repo::app_ids_in_project(conn, project_id).await?;
+            let keys: Vec<String> = app_ids.iter().map(|_| ids::public_key()).collect();
+            let rows: Vec<NewAppEnvironment> = app_ids
+                .iter()
+                .zip(&keys)
+                .map(|(app_id, key)| NewAppEnvironment {
+                    app_id: *app_id,
+                    environment_id: env.id,
+                    public_key: key,
+                    is_default: false,
+                })
+                .collect();
+            repo::create_app_environments(conn, &rows).await?;
+            Ok(env)
+        })
+        .await?;
+
+    Ok(Json(env))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateProjectEnvReq {
+    pub name: Option<String>,
+}
+
+pub async fn update_project_environment(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(env_id): Path<Uuid>,
+    Json(req): Json<UpdateProjectEnvReq>,
+) -> Result<Json<Environment>, ApiError> {
+    let mut conn = db(&state).await?;
+    let (project_id, _) = repo::project_env_ancestry(&mut conn, env_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_UPDATE).await?;
+
+    let env = repo::get_project_environment(&mut conn, env_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if env.retired_at.is_some() {
+        return Err(ApiError::Conflict(
+            "this environment is retired and can no longer be edited".into(),
+        ));
+    }
+
+    let Some(raw) = req.name.as_deref() else {
+        return Ok(Json(env));
+    };
+    let name = validate_env_name(raw).map_err(ApiError::BadRequest)?;
+    // No cache invalidation: the name is not part of `EnvRef`, and renaming
+    // changes no key and no ingest switch. Every enrollment keeps resolving.
+    match repo::rename_project_environment(&mut conn, env_id, name).await {
+        Ok(env) => Ok(Json(env)),
+        Err(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        )) => Err(ApiError::Conflict(format!(
+            "an environment named \"{name}\" already exists in this project"
+        ))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn retire_project_environment(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(env_id): Path<Uuid>,
+) -> Result<Json<Environment>, ApiError> {
+    let mut conn = db(&state).await?;
+    let (project_id, _) = repo::project_env_ancestry(&mut conn, env_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_DELETE).await?;
+
+    // Both invariants are read and acted on in one transaction that starts with a
+    // project-level lock, so two concurrent retires of DIFFERENT environments in
+    // the same project serialize rather than each reading a pre-commit count.
+    let (retired, keys, did_retire) = conn
+        .transaction::<_, ApiError, _>(async |conn| {
+            repo::lock_project_for_update(conn, project_id).await?;
+            let env = repo::get_project_environment(conn, env_id)
+                .await?
+                .ok_or(ApiError::NotFound)?;
+            if env.retired_at.is_some() {
+                return Ok((env, Vec::new(), false)); // idempotent
+            }
+            // Count guard first: a project with exactly one live environment
+            // would otherwise be told "promote another one first" — impossible
+            // advice, since there is nothing to promote. The more fundamental
+            // reason must win.
+            if repo::count_active_project_environments(conn, project_id).await? <= 1 {
+                return Err(ApiError::Conflict(
+                    "cannot retire the last environment — apps must have somewhere to report"
+                        .into(),
+                ));
+            }
+            let defaulting = repo::apps_defaulting_to_environment(conn, env_id).await?;
+            if defaulting > 0 {
+                return Err(ApiError::Conflict(format!(
+                    "{defaulting} app(s) still default to this environment — promote another one for them first"
+                )));
+            }
+            let (retired, keys) = repo::retire_project_environment(conn, env_id).await?;
+            Ok((retired, keys, true))
+        })
+        .await?;
+
+    // Only invalidate on an actual state transition — the idempotent path already
+    // invalidated the first time it retired. Every enrollment's key must stop
+    // resolving now that its row is retired, and a silently-failed invalidation
+    // leaves a revoked key working for the full positive-cache TTL.
+    if did_retire {
+        for key in &keys {
+            if let Err(e) = state.redis.del(&keys::dsn_cache(key)).await {
+                tracing::warn!(error = %e, env_id = %env_id, "failed to invalidate ingest key cache");
+            }
+        }
+    }
+    Ok(Json(retired))
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment: one app's membership in one environment
+// ---------------------------------------------------------------------------
+
+pub async fn list_app_environments(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<ListEnvQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<Vec<Environment>>, ApiError> {
+) -> Result<Json<Vec<AppEnvironmentView>>, ApiError> {
     // This endpoint IS the environment list; scoping the request that
     // enumerates environments to one of them is circular, so `environment_id`
     // is rejected rather than silently ignored. Task 14's router-enumeration
@@ -124,15 +406,18 @@ pub async fn list_environments(
     }
     let grants = grants_from_rows(rows);
     let reach = reach_for(&grants, perm::ENV_READ);
-    let all = repo::list_environments(&mut conn, app_id, q.include_retired).await?;
+    let all = repo::list_app_environments(&mut conn, app_id, q.include_retired).await?;
     if reach.org || reach.projects.contains(&project_id) || reach.apps.contains(&app_id) {
         return Ok(Json(all));
     }
 
+    // `reach.envs` holds enrollment ids, which is exactly what these rows are
+    // keyed by — an env grant names one app's enrollment, never the catalogue
+    // entry, so this comparison cannot leak a sibling app's environment.
     let allowed: HashSet<Uuid> = reach.envs.into_iter().collect();
-    let mine: Vec<Environment> = all
+    let mine: Vec<AppEnvironmentView> = all
         .into_iter()
-        .filter(|e| allowed.contains(&e.id))
+        .filter(|e| allowed.contains(&e.enrollment.id))
         .collect();
     if mine.is_empty() {
         return Err(ApiError::Auth(AuthError::Forbidden));
@@ -141,63 +426,24 @@ pub async fn list_environments(
 }
 
 #[derive(Deserialize)]
-pub struct CreateEnvReq {
-    pub name: String,
-}
-
-pub async fn create_environment(
-    auth: AuthUser,
-    State(state): State<AppState>,
-    Path(app_id): Path<Uuid>,
-    Json(req): Json<CreateEnvReq>,
-) -> Result<Json<Environment>, ApiError> {
-    let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::ENV_CREATE).await?;
-    let name = validate_env_name(&req.name).map_err(ApiError::BadRequest)?;
-
-    if repo::count_active_environments(&mut conn, app_id).await? >= repo::MAX_ENVIRONMENTS_PER_APP {
-        return Err(ApiError::Conflict(format!(
-            "app already has {} environments",
-            repo::MAX_ENVIRONMENTS_PER_APP
-        )));
-    }
-
-    let key = ids::public_key();
-    // `environments_app_name_active_key` turns a duplicate live name into a
-    // unique violation; map it rather than pre-checking, so a concurrent create
-    // cannot slip between the check and the insert.
-    match repo::create_environment(&mut conn, app_id, name, &key, false).await {
-        Ok(env) => Ok(Json(env)),
-        Err(diesel::result::Error::DatabaseError(
-            diesel::result::DatabaseErrorKind::UniqueViolation,
-            _,
-        )) => Err(ApiError::Conflict(format!(
-            "an environment named \"{name}\" already exists"
-        ))),
-        Err(e) => Err(e.into()),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct UpdateEnvReq {
-    pub name: Option<String>,
+pub struct UpdateAppEnvReq {
     pub ingest_enabled: Option<bool>,
     pub is_default: Option<bool>,
 }
 
-pub async fn update_environment(
+pub async fn update_app_environment(
     auth: AuthUser,
     State(state): State<AppState>,
-    Path(env_id): Path<Uuid>,
-    Json(req): Json<UpdateEnvReq>,
-) -> Result<Json<Environment>, ApiError> {
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateAppEnvReq>,
+) -> Result<Json<AppEnvironment>, ApiError> {
     let mut conn = db(&state).await?;
-    let (app_id, _, _) = repo::env_ancestry(&mut conn, env_id)
+    let (app_id, _, _) = repo::env_ancestry(&mut conn, id)
         .await?
         .ok_or(ApiError::NotFound)?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ENV_UPDATE).await?;
 
-    let env = repo::get_environment(&mut conn, env_id)
+    let env = repo::get_app_environment(&mut conn, id)
         .await?
         .ok_or(ApiError::NotFound)?;
     if env.retired_at.is_some() {
@@ -208,7 +454,7 @@ pub async fn update_environment(
 
     // Validate everything before mutating anything. `is_default: false` is
     // meaningless (a default is moved, never unset) and must not be discovered
-    // after a rename has already committed.
+    // after an ingest toggle has already committed.
     if req.is_default == Some(false) {
         return Err(ApiError::BadRequest(
             "a default environment is moved, not unset — promote another environment instead"
@@ -222,37 +468,21 @@ pub async fn update_environment(
         .transaction::<_, ApiError, _>(async |conn| {
             let mut current = env;
 
-            if let Some(raw) = req.name.as_deref() {
-                let name = validate_env_name(raw).map_err(ApiError::BadRequest)?;
-                current = match repo::rename_environment(conn, env_id, name).await {
-                    Ok(e) => e,
-                    Err(diesel::result::Error::DatabaseError(
-                        diesel::result::DatabaseErrorKind::UniqueViolation,
-                        _,
-                    )) => {
-                        return Err(ApiError::Conflict(format!(
-                            "an environment named \"{name}\" already exists"
-                        )))
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-            }
-
             if let Some(enabled) = req.ingest_enabled {
-                current = repo::set_environment_ingest(conn, env_id, enabled).await?;
+                current = repo::set_app_environment_ingest(conn, id, enabled).await?;
             }
 
             if req.is_default == Some(true) {
                 current =
-                    match repo::promote_environment_default(conn, app_id, env_id).await {
+                    match repo::promote_app_environment_default(conn, app_id, id).await {
                         Ok(e) => e,
                         // Two concurrent promotions within the same app: under READ
                         // COMMITTED, the second transaction's `WHERE is_default = true`
                         // scans a snapshot that doesn't yet see the first transaction's
                         // clear, so it clears nothing and then collides with the first
-                        // transaction's new default on `environments_default_key`. The
-                        // transaction itself is atomic and non-corrupting — the caller
-                        // just needs to retry.
+                        // transaction's new default on `app_environments_default_key`.
+                        // The transaction itself is atomic and non-corrupting — the
+                        // caller just needs to retry.
                         Err(diesel::result::Error::DatabaseError(
                             diesel::result::DatabaseErrorKind::UniqueViolation,
                             _,
@@ -276,25 +506,25 @@ pub async fn update_environment(
         // pre-transaction key names a dead slot while the new key's slot may
         // already have cached `ingest_enabled: true` from before this update.
         if let Err(e) = state.redis.del(&keys::dsn_cache(&current.public_key)).await {
-            tracing::warn!(error = %e, env_id = %env_id, "failed to invalidate ingest key cache");
+            tracing::warn!(error = %e, env_id = %id, "failed to invalidate ingest key cache");
         }
     }
 
     Ok(Json(current))
 }
 
-pub async fn rotate_environment_key(
+pub async fn rotate_app_environment_key(
     auth: AuthUser,
     State(state): State<AppState>,
-    Path(env_id): Path<Uuid>,
-) -> Result<Json<Environment>, ApiError> {
+    Path(id): Path<Uuid>,
+) -> Result<Json<AppEnvironment>, ApiError> {
     let mut conn = db(&state).await?;
-    let (app_id, _, _) = repo::env_ancestry(&mut conn, env_id)
+    let (app_id, _, _) = repo::env_ancestry(&mut conn, id)
         .await?
         .ok_or(ApiError::NotFound)?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ENV_ROTATE_KEY).await?;
 
-    let env = repo::get_environment(&mut conn, env_id)
+    let env = repo::get_app_environment(&mut conn, id)
         .await?
         .ok_or(ApiError::NotFound)?;
     if env.retired_at.is_some() {
@@ -304,68 +534,13 @@ pub async fn rotate_environment_key(
     }
 
     let new_key = ids::public_key();
-    let updated = repo::rotate_environment_key(&mut conn, env_id, &new_key).await?;
+    let updated = repo::rotate_app_environment_key(&mut conn, id, &new_key).await?;
     // Invalidate the OLD key's slot, captured before the update. `rotate-key` is
     // the platform's revocation button; a silently-failed invalidation means a
     // revoked key keeps working for the full positive-cache TTL with no signal.
     if let Err(e) = state.redis.del(&keys::dsn_cache(&env.public_key)).await {
-        tracing::warn!(error = %e, env_id = %env_id, "failed to invalidate ingest key cache");
+        tracing::warn!(error = %e, env_id = %id, "failed to invalidate ingest key cache");
     }
     Ok(Json(updated))
 }
 
-pub async fn retire_environment(
-    auth: AuthUser,
-    State(state): State<AppState>,
-    Path(env_id): Path<Uuid>,
-) -> Result<Json<Environment>, ApiError> {
-    let mut conn = db(&state).await?;
-    let (app_id, _, _) = repo::env_ancestry(&mut conn, env_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::ENV_DELETE).await?;
-
-    // Both invariants below are read and then acted on in the same transaction,
-    // starting with an app-level lock, so two concurrent env-set mutations on the
-    // SAME app but DIFFERENT rows (e.g. this retire racing a promote) serialize
-    // against each other rather than each locking only its own row and reading a
-    // pre-commit count/default. `lock_environment_for_update` still gives this
-    // handler the specific row it reads and updates below.
-    let (retired, did_retire) = conn
-        .transaction::<_, ApiError, _>(async |conn| {
-            repo::lock_app_for_update(conn, app_id).await?;
-            let env = repo::lock_environment_for_update(conn, env_id)
-                .await?
-                .ok_or(ApiError::NotFound)?;
-            if env.retired_at.is_some() {
-                return Ok((env, false)); // idempotent
-            }
-            // Check the count guard first: an app with exactly one live environment
-            // (which is therefore necessarily the default) would otherwise report
-            // "promote another one first" — impossible advice, since there is
-            // nothing to promote. The more fundamental reason must win.
-            if repo::count_active_environments(conn, app_id).await? <= 1 {
-                return Err(ApiError::Conflict(
-                    "cannot retire the last environment — an app must have somewhere to report"
-                        .into(),
-                ));
-            }
-            if env.is_default {
-                return Err(ApiError::Conflict(
-                    "cannot retire the default environment — promote another one first".into(),
-                ));
-            }
-            let retired = repo::retire_environment(conn, env_id).await?;
-            Ok((retired, true))
-        })
-        .await?;
-
-    // Only invalidate on an actual state transition — the idempotent (already
-    // retired) path already invalidated the cache the first time it retired.
-    if did_retire {
-        if let Err(e) = state.redis.del(&keys::dsn_cache(&retired.public_key)).await {
-            tracing::warn!(error = %e, env_id = %env_id, "failed to invalidate ingest key cache");
-        }
-    }
-    Ok(Json(retired))
-}

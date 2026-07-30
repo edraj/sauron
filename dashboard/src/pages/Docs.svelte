@@ -9,7 +9,7 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listEnvironments } from '../lib/api/environments';
   import { buildDsn, appTypeIcon, appTypeLabel } from '../lib/utils/format';
-  import type { Environment } from '../lib/models';
+  import type { AppEnvironment } from '../lib/models';
 
   type Platform = 'web' | 'flutter' | 'python' | 'node' | 'csharp';
 
@@ -18,7 +18,7 @@
 
   // The DSN now lives on the app's default environment, not the app itself —
   // re-fetch whenever the current app changes.
-  let defaultEnv = $state<Environment | null>(null);
+  let defaultEnv = $state<AppEnvironment | null>(null);
 
   $effect(() => {
     const aid = sessionStore.currentAppId;

@@ -25,8 +25,43 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::json;
 use uuid::Uuid;
 
-use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewIssue, NewTransaction};
+use sauron_db::models::{
+    NewAnalyticsEvent, NewAppEnvironment, NewErrorEvent, NewIssue, NewTransaction,
+};
 use sauron_db::repo;
+
+/// Define an environment on `project_id` and enroll `app_id` in it.
+///
+/// Returns the **enrollment** id, which is what event rows store in
+/// `environment_id` and what `role_grants.scope_id` holds for `scope_type =
+/// 'env'`. The catalogue id is deliberately not returned: no test asserts
+/// against it, and returning the wrong one of the two would produce assertions
+/// that pass for the wrong reason.
+pub async fn seed_env(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+    app_id: Uuid,
+    name: &str,
+    public_key: &str,
+    is_default: bool,
+) -> Uuid {
+    let env = repo::create_project_environment(conn, project_id, name)
+        .await
+        .unwrap_or_else(|e| panic!("create catalogue env {name}: {e}"));
+    repo::create_app_environments(
+        conn,
+        &[NewAppEnvironment {
+            app_id,
+            environment_id: env.id,
+            public_key,
+            is_default,
+        }],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("enroll app in {name}: {e}"))
+    .remove(0)
+    .id
+}
 
 /// One throwaway database per [`TestDb`], created in [`TestDb::setup`] and
 /// dropped in [`TestDb::cleanup`].
@@ -213,6 +248,9 @@ const FUNNEL_STEP_2: &str = "harness.funnel.step2";
 // those too.
 pub struct SeedIds {
     pub app_id: Uuid,
+    /// The project the app belongs to. Environments are defined here, so any
+    /// test that adds one to the seeded fixture needs it.
+    pub project_id: Uuid,
     /// The org `seed_two_envs` creates (previously tracked only internally, on
     /// `TestDb.org_id`, for `cleanup()`'s own use) — surfaced for Slice 3's
     /// `role_grants` tests, which need a real `org_id` to insert a grant under.
@@ -514,26 +552,24 @@ impl TestDb {
         .await
         .expect("create app");
 
-        let env_a = repo::create_environment(
+        let env_a = seed_env(
             &mut conn,
+            project.id,
             app.id,
             "env_a",
             &format!("pk_test_a_{suffix}"),
             true,
         )
-        .await
-        .expect("create env_a")
-        .id;
-        let env_b = repo::create_environment(
+        .await;
+        let env_b = seed_env(
             &mut conn,
+            project.id,
             app.id,
             "env_b",
             &format!("pk_test_b_{suffix}"),
             false,
         )
-        .await
-        .expect("create env_b")
-        .id;
+        .await;
 
         // -- Identities -------------------------------------------------------
         // See the doc comment on `SeedIds` for what each one is for.
@@ -1149,6 +1185,7 @@ impl TestDb {
 
         SeedIds {
             app_id: app.id,
+            project_id: project.id,
             org_id: org.id,
             owner_email,
             env_a,
@@ -1225,26 +1262,24 @@ impl TestDb {
         .await
         .expect("create app");
 
-        let env_a = repo::create_environment(
+        let env_a = seed_env(
             &mut conn,
+            project.id,
             app.id,
             "env_a",
             &format!("pk_test_cross_a_{suffix}"),
             true,
         )
-        .await
-        .expect("create env_a")
-        .id;
-        let env_b = repo::create_environment(
+        .await;
+        let env_b = seed_env(
             &mut conn,
+            project.id,
             app.id,
             "env_b",
             &format!("pk_test_cross_b_{suffix}"),
             false,
         )
-        .await
-        .expect("create env_b")
-        .id;
+        .await;
 
         // Pinned to today's date at a fixed mid-day time-of-day — see
         // `seed_two_envs`'s own `now` local for why (day-bucket straddling).

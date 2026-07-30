@@ -87,10 +87,10 @@ pub async fn update_app(
         // (`find_env_by_public_key` filters `retired_at IS NULL`), so only live
         // ones need revoking — and excluding retired ones keeps them from
         // consuming this call's 500-row cap ahead of the live keys that matter.
-        let envs = repo::list_environments(&mut conn, app_id, false).await?;
-        for env in &envs {
-            if let Err(e) = state.redis.del(&keys::dsn_cache(&env.public_key)).await {
-                tracing::warn!(error = %e, env_id = %env.id, "failed to invalidate ingest key cache");
+        let envs = repo::live_app_environment_keys(&mut conn, app_id).await?;
+        for (env_id, public_key) in &envs {
+            if let Err(e) = state.redis.del(&keys::dsn_cache(public_key)).await {
+                tracing::warn!(error = %e, env_id = %env_id, "failed to invalidate ingest key cache");
             }
         }
     }
@@ -111,11 +111,11 @@ pub async fn delete_app(
     // unresolvable (`find_env_by_public_key` filters `retired_at IS NULL`), so
     // only live ones need revoking — and excluding retired ones keeps them from
     // consuming this call's 500-row cap ahead of the live keys that matter.
-    let envs = repo::list_environments(&mut conn, app_id, false).await?;
+    let envs = repo::live_app_environment_keys(&mut conn, app_id).await?;
     repo::delete_app(&mut conn, app_id).await?;
-    for env in &envs {
-        if let Err(e) = state.redis.del(&keys::dsn_cache(&env.public_key)).await {
-            tracing::warn!(error = %e, env_id = %env.id, "failed to invalidate ingest key cache");
+    for (env_id, public_key) in &envs {
+        if let Err(e) = state.redis.del(&keys::dsn_cache(public_key)).await {
+            tracing::warn!(error = %e, env_id = %env_id, "failed to invalidate ingest key cache");
         }
     }
     Ok(Json(serde_json::json!({ "ok": true })))

@@ -44,6 +44,7 @@
 //! touch).
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -52,8 +53,42 @@ use serde_json::json;
 use uuid::Uuid;
 
 use sauron_auth::{perm, JwtKeys};
-use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewIssue, NewRoleGrant};
+use sauron_db::models::{
+    NewAnalyticsEvent, NewAppEnvironment, NewErrorEvent, NewIssue, NewRoleGrant,
+};
 use sauron_db::repo;
+
+/// Define an environment on `project_id` and enroll `app_id` in it.
+///
+/// Returns the **enrollment** id — what event rows store in `environment_id`
+/// and what an `env` role grant's `scope_id` names. An env grant addresses one
+/// app's enrollment, never the catalogue entry, which is precisely what keeps
+/// granting "prod" from spanning sibling apps.
+async fn seed_env(
+    conn: &mut diesel_async::AsyncPgConnection,
+    project_id: Uuid,
+    app_id: Uuid,
+    name: &str,
+    public_key: &str,
+    is_default: bool,
+) -> Uuid {
+    let env = repo::create_project_environment(conn, project_id, name)
+        .await
+        .unwrap_or_else(|e| panic!("create catalogue env {name}: {e}"));
+    repo::create_app_environments(
+        conn,
+        &[NewAppEnvironment {
+            app_id,
+            environment_id: env.id,
+            public_key,
+            is_default,
+        }],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("enroll app in {name}: {e}"))
+    .remove(0)
+    .id
+}
 
 /// Not a real secret — this process and the one it spawns are the only two
 /// parties that ever see it, and both live only for this test's duration.
@@ -412,26 +447,24 @@ impl TestServer {
         )
         .await
         .expect("create app");
-        let granted_env = repo::create_environment(
+        let granted_env = seed_env(
             &mut conn,
+            project.id,
             app.id,
             "prod",
             &format!("pk_env_scoping_granted_{suffix}"),
             true,
         )
-        .await
-        .expect("create granted_env")
-        .id;
-        let other_env = repo::create_environment(
+        .await;
+        let other_env = seed_env(
             &mut conn,
+            project.id,
             app.id,
             "staging",
             &format!("pk_env_scoping_other_{suffix}"),
             false,
         )
-        .await
-        .expect("create other_env")
-        .id;
+        .await;
 
         // -- owner: app-wide reach --------------------------------------------
         let owner = repo::create_user(
@@ -713,19 +746,19 @@ impl TestServer {
         )
         .await
         .expect("create second app");
-        let env = repo::create_environment(
+        let env_id = seed_env(
             &mut conn,
+            project.id,
             app.id,
             "prod",
             &format!("pk_env_scoping_second_org_{suffix}"),
             true,
         )
-        .await
-        .expect("create second env");
+        .await;
 
         OtherOrgFixture {
             org_id: org.id,
-            env_id: env.id,
+            env_id,
         }
     }
 }
@@ -916,15 +949,15 @@ async fn empty_environment_id_returns_400_over_http_not_all_environments() {
         )
         .await
         .expect("create app");
-        let env = repo::create_environment(
+        let env_id = seed_env(
             &mut conn,
+            project.id,
             app.id,
             "prod",
             &format!("pk_http_scoping_{suffix}"),
             true,
         )
-        .await
-        .expect("create environment");
+        .await;
         let user = repo::create_user(
             &mut conn,
             &format!("http-scoping-{suffix}@example.test"),
@@ -954,7 +987,7 @@ async fn empty_environment_id_returns_400_over_http_not_all_environments() {
         )
         .await
         .expect("grant role at org scope");
-        (app.id, env.id, user.id)
+        (app.id, env_id, user.id)
     };
 
     // --- mint an access token the spawned server will accept ---------------
@@ -1995,6 +2028,483 @@ async fn the_backend_rejection_set_matches_the_dashboard_exclusion_list() {
         rejecting, expected,
         "the backend's rejecting-route set (400 even on a VALID environment_id) and \
          dashboard/src/lib/api/scope.ts's BACKEND_REJECTS_ENVIRONMENT_ID have diverged"
+    );
+
+    h.shutdown().await;
+}
+
+// ===========================================================================
+// Environments are defined per PROJECT (migration 2026-07-30-000033)
+// ===========================================================================
+//
+// The catalogue (`environments`, owned by a project) names an environment once;
+// the enrollment (`app_environments`) is one app's membership in it and carries
+// the ingest key. Everything below is driven over HTTP rather than through
+// `repo::*` on purpose: the fan-out that keeps the two levels consistent —
+// enroll every app when an environment is added, enroll every environment when
+// an app is added — lives in the route layer, so a repo-level test would assert
+// against the very thing it is supposed to be checking.
+
+/// An org + a user holding every permission, granted at org scope. Everything
+/// else each test needs is created through the API so that provisioning runs.
+struct EnvLifecycleFixture {
+    org_id: Uuid,
+    bearer: String,
+}
+
+impl TestServer {
+    async fn seed_env_lifecycle_fixture(&self) -> EnvLifecycleFixture {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let mut conn = self.conn().await;
+        let org = repo::create_org(&mut conn, "env lifecycle org", &format!("env-life-{suffix}"))
+            .await
+            .expect("create org");
+        let user = repo::create_user(
+            &mut conn,
+            &format!("env-life-{suffix}@example.test"),
+            "unused-password-hash",
+            "Env Lifecycle Test User",
+        )
+        .await
+        .expect("create user");
+        let role = repo::create_role(
+            &mut conn,
+            org.id,
+            "env lifecycle role",
+            "everything, so the test asserts behavior rather than permissions",
+            json!(perm::ALL),
+        )
+        .await
+        .expect("create role");
+        repo::create_grant(
+            &mut conn,
+            NewRoleGrant {
+                org_id: org.id,
+                user_id: user.id,
+                role_id: role.id,
+                scope_type: "org".to_string(),
+                scope_id: org.id,
+            },
+        )
+        .await
+        .expect("grant role at org scope");
+        drop(conn);
+
+        let keys = JwtKeys::new(JWT_SECRET, 900);
+        let (token, _exp) = keys
+            .issue_access(user.id, false)
+            .expect("issue access token");
+        EnvLifecycleFixture {
+            org_id: org.id,
+            bearer: token,
+        }
+    }
+}
+
+/// `POST /v1/orgs/{org}/projects`, returning the new project id.
+async fn create_project_http(h: &TestServer, bearer: &str, org_id: Uuid, name: &str) -> Uuid {
+    let resp = h
+        .post(
+            &format!("/v1/orgs/{org_id}/projects"),
+            bearer,
+            json!({ "name": name }),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "create project {name}");
+    let body: serde_json::Value = serde_json::from_str(&resp.text().await.expect("project body")).expect("project json");
+    body["id"].as_str().expect("project id").parse().unwrap()
+}
+
+/// `POST /v1/projects/{project}/apps`, returning the new app id.
+async fn create_app_http(h: &TestServer, bearer: &str, project_id: Uuid, name: &str) -> Uuid {
+    let resp = h
+        .post(
+            &format!("/v1/projects/{project_id}/apps"),
+            bearer,
+            json!({ "name": name, "app_type": "web" }),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "create app {name}");
+    let body: serde_json::Value = serde_json::from_str(&resp.text().await.expect("app body")).expect("app json");
+    body["id"].as_str().expect("app id").parse().unwrap()
+}
+
+/// The app's enrollments as `(environment name, enrollment row)`.
+async fn enrollments(h: &TestServer, bearer: &str, app_id: Uuid) -> Vec<(String, serde_json::Value)> {
+    let body = h
+        .get_json(&format!("/v1/apps/{app_id}/environments"), bearer)
+        .await;
+    body.as_array()
+        .expect("enrollment array")
+        .iter()
+        .map(|e| (e["name"].as_str().expect("name").to_string(), e.clone()))
+        .collect()
+}
+
+/// Names in the project catalogue.
+async fn catalogue(h: &TestServer, bearer: &str, project_id: Uuid) -> Vec<String> {
+    let body = h
+        .get_json(&format!("/v1/projects/{project_id}/environments"), bearer)
+        .await;
+    body.as_array()
+        .expect("catalogue array")
+        .iter()
+        .map(|e| e["name"].as_str().expect("name").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_new_project_is_born_with_the_default_environment() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_env_scoping");
+        return;
+    };
+    let f = h.seed_env_lifecycle_fixture().await;
+    let project_id = create_project_http(&h, &f.bearer, f.org_id, "born with dev").await;
+
+    assert_eq!(
+        catalogue(&h, &f.bearer, project_id).await,
+        vec!["dev".to_string()],
+        "a project must be created with exactly one environment — an empty \
+         catalogue makes every app created in it unreachable by any SDK"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_new_app_is_enrolled_in_every_environment_of_its_project() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_env_scoping");
+        return;
+    };
+    let f = h.seed_env_lifecycle_fixture().await;
+    let project_id = create_project_http(&h, &f.bearer, f.org_id, "enrol new app").await;
+
+    // Add a second environment BEFORE the app exists, so the app-create path is
+    // what has to notice it. An app that only joined `dev` would be missing from
+    // the `staging` picker its siblings already appear in.
+    assert_eq!(
+        h.post_status(
+            &format!("/v1/projects/{project_id}/environments"),
+            &f.bearer,
+            json!({ "name": "staging" }),
+        )
+        .await,
+        200,
+        "create staging"
+    );
+
+    let app_id = create_app_http(&h, &f.bearer, project_id, "late app").await;
+    let rows = enrollments(&h, &f.bearer, app_id).await;
+
+    let mut names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["dev", "staging"],
+        "a new app must be enrolled in every live environment of its project"
+    );
+
+    // Exactly one default, and it is `dev` — the deterministic preference order
+    // (`production`, then `dev`, then alphabetical) that `pick_default_env`
+    // documents, and that migration 000026 used for the same question.
+    let defaults: Vec<&str> = rows
+        .iter()
+        .filter(|(_, e)| e["is_default"] == json!(true))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert_eq!(defaults, vec!["dev"], "exactly one default, chosen by rule");
+
+    // Distinct keys per environment: one leaked key must not expose the others.
+    let keys: HashSet<&str> = rows
+        .iter()
+        .map(|(_, e)| e["public_key"].as_str().expect("public_key"))
+        .collect();
+    assert_eq!(keys.len(), 2, "each enrollment holds its own ingest key");
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn adding_an_environment_enrolls_every_existing_app_with_its_own_key() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_env_scoping");
+        return;
+    };
+    let f = h.seed_env_lifecycle_fixture().await;
+    let project_id = create_project_http(&h, &f.bearer, f.org_id, "fan out").await;
+    let app_a = create_app_http(&h, &f.bearer, project_id, "app a").await;
+    let app_b = create_app_http(&h, &f.bearer, project_id, "app b").await;
+
+    assert_eq!(
+        h.post_status(
+            &format!("/v1/projects/{project_id}/environments"),
+            &f.bearer,
+            json!({ "name": "production" }),
+        )
+        .await,
+        200,
+        "create production"
+    );
+
+    let rows_a = enrollments(&h, &f.bearer, app_a).await;
+    let rows_b = enrollments(&h, &f.bearer, app_b).await;
+    for (label, rows) in [("app a", &rows_a), ("app b", &rows_b)] {
+        assert!(
+            rows.iter().any(|(n, _)| n == "production"),
+            "{label} must be auto-enrolled when the project gains an environment"
+        );
+    }
+
+    // The two apps' `production` enrollments are distinct rows with distinct
+    // keys, which is the whole reason the credential lives on the enrollment:
+    // a key must prove WHICH app an event belongs to, not just which
+    // environment.
+    let key_a = rows_a
+        .iter()
+        .find(|(n, _)| n == "production")
+        .map(|(_, e)| e["public_key"].as_str().unwrap().to_string())
+        .unwrap();
+    let key_b = rows_b
+        .iter()
+        .find(|(n, _)| n == "production")
+        .map(|(_, e)| e["public_key"].as_str().unwrap().to_string())
+        .unwrap();
+    assert_ne!(
+        key_a, key_b,
+        "two apps in the same environment must not share an ingest key"
+    );
+
+    // ...and they name the SAME catalogue entry, or the rename below would not
+    // be project-wide.
+    let env_a = rows_a
+        .iter()
+        .find(|(n, _)| n == "production")
+        .map(|(_, e)| e["environment_id"].clone())
+        .unwrap();
+    let env_b = rows_b
+        .iter()
+        .find(|(n, _)| n == "production")
+        .map(|(_, e)| e["environment_id"].clone())
+        .unwrap();
+    assert_eq!(
+        env_a, env_b,
+        "both enrollments must point at the one catalogue row"
+    );
+
+    // Renaming the catalogue entry is visible from both apps at once — the
+    // single-home-for-the-name property this migration exists to establish.
+    let env_id = env_a.as_str().unwrap();
+    assert_eq!(
+        h.patch_status(
+            &format!("/v1/environments/{env_id}"),
+            &f.bearer,
+            json!({ "name": "prod" }),
+        )
+        .await,
+        200,
+        "rename production -> prod"
+    );
+    for (label, app_id) in [("app a", app_a), ("app b", app_b)] {
+        let names: Vec<String> = enrollments(&h, &f.bearer, app_id)
+            .await
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            names.contains(&"prod".to_string()) && !names.contains(&"production".to_string()),
+            "{label} must see the rename — the name has exactly one home"
+        );
+    }
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn retiring_an_environment_is_guarded_then_cascades_to_every_app() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_env_scoping");
+        return;
+    };
+    let f = h.seed_env_lifecycle_fixture().await;
+    let project_id = create_project_http(&h, &f.bearer, f.org_id, "retire cascade").await;
+    let app_a = create_app_http(&h, &f.bearer, project_id, "app a").await;
+    let app_b = create_app_http(&h, &f.bearer, project_id, "app b").await;
+
+    let staging_id = {
+        let resp = h
+            .post(
+                &format!("/v1/projects/{project_id}/environments"),
+                &f.bearer,
+                json!({ "name": "staging" }),
+            )
+            .await;
+        assert_eq!(resp.status().as_u16(), 200, "create staging");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.expect("env body")).expect("env json");
+        body["id"].as_str().unwrap().to_string()
+    };
+
+    // `dev` is every app's default, so retiring it must be refused with the
+    // "still the default" reason rather than silently leaving those apps with
+    // nowhere to report.
+    let dev_id = {
+        let rows = enrollments(&h, &f.bearer, app_a).await;
+        rows.iter()
+            .find(|(n, _)| n == "dev")
+            .map(|(_, e)| e["environment_id"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    assert_eq!(
+        h.delete_status(&format!("/v1/environments/{dev_id}"), &f.bearer)
+            .await,
+        409,
+        "retiring an environment that apps still default to must be refused"
+    );
+
+    // `staging` is nobody's default and is not the last one, so it retires —
+    // and takes every app's enrollment with it.
+    assert_eq!(
+        h.delete_status(&format!("/v1/environments/{staging_id}"), &f.bearer)
+            .await,
+        200,
+        "retire staging"
+    );
+    for (label, app_id) in [("app a", app_a), ("app b", app_b)] {
+        let names: Vec<String> = enrollments(&h, &f.bearer, app_id)
+            .await
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            !names.contains(&"staging".to_string()),
+            "{label} must lose its enrollment when the environment is retired project-wide"
+        );
+    }
+    assert_eq!(
+        catalogue(&h, &f.bearer, project_id).await,
+        vec!["dev".to_string()],
+        "the retired entry leaves the live catalogue"
+    );
+
+    // Retiring is idempotent, not an error — the second call finds it already
+    // retired and says so without changing anything.
+    assert_eq!(
+        h.delete_status(&format!("/v1/environments/{staging_id}"), &f.bearer)
+            .await,
+        200,
+        "retiring an already-retired environment is idempotent"
+    );
+
+    // And now `dev` is the last one, so the count guard wins over the default
+    // guard: "there is nothing to promote" is the more fundamental reason.
+    assert_eq!(
+        h.delete_status(&format!("/v1/environments/{dev_id}"), &f.bearer)
+            .await,
+        409,
+        "the last environment can never be retired"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_duplicate_environment_name_is_refused_per_project_not_globally() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_env_scoping");
+        return;
+    };
+    let f = h.seed_env_lifecycle_fixture().await;
+    let p1 = create_project_http(&h, &f.bearer, f.org_id, "project one").await;
+    let p2 = create_project_http(&h, &f.bearer, f.org_id, "project two").await;
+
+    assert_eq!(
+        h.post_status(
+            &format!("/v1/projects/{p1}/environments"),
+            &f.bearer,
+            json!({ "name": "staging" }),
+        )
+        .await,
+        200,
+        "first staging"
+    );
+    assert_eq!(
+        h.post_status(
+            &format!("/v1/projects/{p1}/environments"),
+            &f.bearer,
+            json!({ "name": "staging" }),
+        )
+        .await,
+        409,
+        "a duplicate name within one project is refused"
+    );
+    // Uniqueness is scoped to the project, so a sibling project may use the
+    // same name — that is the point of moving the catalogue down from global.
+    assert_eq!(
+        h.post_status(
+            &format!("/v1/projects/{p2}/environments"),
+            &f.bearer,
+            json!({ "name": "staging" }),
+        )
+        .await,
+        200,
+        "the same name in another project is fine"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn rotating_one_apps_key_leaves_its_siblings_alone() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_env_scoping");
+        return;
+    };
+    let f = h.seed_env_lifecycle_fixture().await;
+    let project_id = create_project_http(&h, &f.bearer, f.org_id, "rotate").await;
+    let app_a = create_app_http(&h, &f.bearer, project_id, "app a").await;
+    let app_b = create_app_http(&h, &f.bearer, project_id, "app b").await;
+
+    let (enrollment_a, before_a) = {
+        let rows = enrollments(&h, &f.bearer, app_a).await;
+        let (_, row) = rows.into_iter().find(|(n, _)| n == "dev").unwrap();
+        (
+            row["id"].as_str().unwrap().to_string(),
+            row["public_key"].as_str().unwrap().to_string(),
+        )
+    };
+    let before_b = {
+        let rows = enrollments(&h, &f.bearer, app_b).await;
+        let (_, row) = rows.into_iter().find(|(n, _)| n == "dev").unwrap();
+        row["public_key"].as_str().unwrap().to_string()
+    };
+
+    assert_eq!(
+        h.post_status(
+            &format!("/v1/app-environments/{enrollment_a}/rotate-key"),
+            &f.bearer,
+            json!({}),
+        )
+        .await,
+        200,
+        "rotate app a's dev key"
+    );
+
+    let after_a = {
+        let rows = enrollments(&h, &f.bearer, app_a).await;
+        let (_, row) = rows.into_iter().find(|(n, _)| n == "dev").unwrap();
+        row["public_key"].as_str().unwrap().to_string()
+    };
+    let after_b = {
+        let rows = enrollments(&h, &f.bearer, app_b).await;
+        let (_, row) = rows.into_iter().find(|(n, _)| n == "dev").unwrap();
+        row["public_key"].as_str().unwrap().to_string()
+    };
+
+    assert_ne!(before_a, after_a, "rotation must mint a new key");
+    assert_eq!(
+        before_b, after_b,
+        "rotating one app's key must not disturb a sibling sharing the environment"
     );
 
     h.shutdown().await;

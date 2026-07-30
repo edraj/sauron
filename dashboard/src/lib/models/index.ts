@@ -91,18 +91,77 @@ export interface App {
   updated_at: string;
 }
 
-export interface Environment {
+// ---------------------------------------------------------------------------
+// Environments live at two levels, and the split is load-bearing.
+//
+//  1. The CATALOGUE (`ProjectEnvironment`, table `environments`) is owned by a
+//     project. It is where a name is *defined* — "we ship to dev, staging,
+//     production" — and every app in the project shares those names. It holds
+//     no key and no ingest switch.
+//
+//  2. The ENROLLMENT (`AppEnvironment`, table `app_environments`) is one app's
+//     membership in one catalogue environment. It holds the ingest key and the
+//     switches that are genuinely per-app (muted / default).
+//
+// Enrollments are auto-created on both sides: adding an environment to a
+// project enrolls every app in it, and creating an app enrolls it in every
+// live environment of its project. Neither level is ever created by hand from
+// the other's endpoint.
+// ---------------------------------------------------------------------------
+
+/**
+ * A catalogue entry: an environment *name* as the project defines it, shared
+ * by every app in that project. Returned by
+ * `GET|POST /v1/projects/{project_id}/environments` and by
+ * `PATCH|DELETE /v1/environments/{env_id}`.
+ *
+ * Renaming or retiring one of these is a PROJECT-WIDE action — it changes what
+ * every app in the project sees.
+ */
+export interface ProjectEnvironment {
+  id: string;
+  project_id: string;
+  name: string;
+  /** Non-null once retired: cascades to every app's enrollment in it. */
+  retired_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * One app's enrollment in one catalogue environment, as the mutation
+ * endpoints return it — `PATCH|DELETE /v1/app-environments/{id}` and
+ * `POST /v1/app-environments/{id}/rotate-key`.
+ *
+ * `id` is the ENROLLMENT id, not the catalogue id: it is the id that appears
+ * in a DSN, that env-scoped RBAC grants name, and that `?environment_id=`
+ * filters on. `environment_id` points at the `ProjectEnvironment` this row
+ * enrolls into. These endpoints return the bare row with no name joined on —
+ * the name lives on the catalogue row, which is exactly the drift this model
+ * removed.
+ */
+export interface AppEnvironmentRow {
   id: string;
   app_id: string;
-  name: string;
-  created_at: string;
+  /** The `ProjectEnvironment.id` this enrollment belongs to. */
+  environment_id: string;
   /** Non-secret, write-only ingest credential. Safe to render. */
   public_key: string;
   ingest_enabled: boolean;
   is_default: boolean;
   /** Non-null once retired: ingest is off and it is hidden from pickers. */
   retired_at: string | null;
+  created_at: string;
   updated_at: string;
+}
+
+/**
+ * An enrollment joined to its catalogue name — what
+ * `GET /v1/apps/{app_id}/environments` returns and what every picker, DSN
+ * table and env-scope label in the dashboard renders.
+ */
+export interface AppEnvironment extends AppEnvironmentRow {
+  name: string;
 }
 
 export interface FirstEventStatus {

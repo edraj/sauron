@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 use sauron_auth::rbac::{grants_from_rows, reach_for};
 use sauron_auth::{authorize_org, authorize_project, perm, AuthError, AuthUser};
-use sauron_core::ids;
 use sauron_db::models::{App, Project};
 use sauron_db::repo;
 
@@ -101,7 +100,23 @@ pub async fn create_project(
     }
     let mut conn = db(&state).await?;
     authorize_org(&mut conn, auth.user_id, org_id, perm::PROJECT_CREATE).await?;
-    let project = repo::create_project(&mut conn, org_id, &req.name, &slugify(&req.name)).await?;
+    // Both inserts run in one transaction. A project with an empty environment
+    // catalogue cannot have a usable app created in it — `enroll_new_app` has
+    // nothing to enroll into — so a project that lost its default environment to
+    // a partial failure would be permanently broken rather than merely empty.
+    let project = conn
+        .transaction::<_, ApiError, _>(async |conn| {
+            let project =
+                repo::create_project(conn, org_id, &req.name, &slugify(&req.name)).await?;
+            repo::create_project_environment(
+                conn,
+                project.id,
+                crate::routes::environments::DEFAULT_ENV_NAME,
+            )
+            .await?;
+            Ok(project)
+        })
+        .await?;
     Ok(Json(project))
 }
 
@@ -224,8 +239,13 @@ pub async fn create_app(
     authorize_project(&mut conn, auth.user_id, project_id, perm::APP_CREATE).await?;
 
     // Both inserts run in one transaction: an app is unreachable by any SDK
-    // without at least one environment holding an ingest key, so if the
-    // environment insert fails, the app row must not survive either.
+    // without at least one enrollment holding an ingest key, so if the
+    // enrollment insert fails, the app row must not survive either.
+    //
+    // The new app is enrolled in EVERY live environment of its project, not just
+    // a default one — environments are a project-wide catalogue now, so an app
+    // that only joined `dev` would be missing from the `staging` and `production`
+    // pickers its siblings already appear in.
     let app = conn
         .transaction::<_, ApiError, _>(async |conn| {
             let app = repo::create_app(
@@ -236,14 +256,7 @@ pub async fn create_app(
                 &req.app_type,
             )
             .await?;
-            repo::create_environment(
-                conn,
-                app.id,
-                crate::routes::environments::DEFAULT_ENV_NAME,
-                &ids::public_key(),
-                true,
-            )
-            .await?;
+            crate::routes::environments::enroll_new_app(conn, app.id, project_id).await?;
             Ok(app)
         })
         .await?;

@@ -925,13 +925,13 @@ pub async fn env_ancestries(
     conn: &mut AsyncPgConnection,
     ids: &[Uuid],
 ) -> QueryResult<Vec<(Uuid, Uuid, Uuid, Uuid)>> {
-    environments::table
-        .inner_join(apps::table.on(apps::id.eq(environments::app_id)))
+    app_environments::table
+        .inner_join(apps::table.on(apps::id.eq(app_environments::app_id)))
         .inner_join(projects::table.on(projects::id.eq(apps::project_id)))
-        .filter(environments::id.eq_any(ids.to_vec()))
+        .filter(app_environments::id.eq_any(ids.to_vec()))
         .select((
-            environments::id,
-            environments::app_id,
+            app_environments::id,
+            app_environments::app_id,
             apps::project_id,
             projects::org_id,
         ))
@@ -939,51 +939,49 @@ pub async fn env_ancestries(
         .await
 }
 
-// --- environments -----------------------------------------------------------
+// --- environments: the project-level catalogue -------------------------------
 
-/// Cap on how many live environments an app may hold. Creation is now an
+/// Cap on how many live environments a project may hold. Creation is an
 /// authenticated admin action rather than a side effect of ingest, so this is a
 /// sanity bound rather than an abuse control.
-pub const MAX_ENVIRONMENTS_PER_APP: i64 = 500;
+///
+/// The cap moved from per-app to per-project along with the environments
+/// themselves. It also now bounds a *fan-out*: creating one environment enrolls
+/// every app in the project, so the real ceiling on rows created is this times
+/// the app count.
+pub const MAX_ENVIRONMENTS_PER_PROJECT: i64 = 500;
 
-pub async fn create_environment(
+pub async fn create_project_environment(
     conn: &mut AsyncPgConnection,
-    app_id: Uuid,
+    project_id: Uuid,
     name: &str,
-    public_key: &str,
-    is_default: bool,
 ) -> QueryResult<Environment> {
     diesel::insert_into(environments::table)
-        .values(NewEnvironment {
-            app_id,
-            name,
-            public_key,
-            is_default,
-        })
+        .values(NewEnvironment { project_id, name })
         .returning(Environment::as_returning())
         .get_result(conn)
         .await
 }
 
-pub async fn list_environments(
+pub async fn list_project_environments(
     conn: &mut AsyncPgConnection,
-    app_id: Uuid,
+    project_id: Uuid,
     include_retired: bool,
 ) -> QueryResult<Vec<Environment>> {
     let mut q = environments::table
-        .filter(environments::app_id.eq(app_id))
+        .filter(environments::project_id.eq(project_id))
         .into_boxed();
     if !include_retired {
         q = q.filter(environments::retired_at.is_null());
     }
     q.select(Environment::as_select())
         .order(environments::name.asc())
-        .limit(MAX_ENVIRONMENTS_PER_APP)
+        .limit(MAX_ENVIRONMENTS_PER_PROJECT)
         .load(conn)
         .await
 }
 
-pub async fn get_environment(
+pub async fn get_project_environment(
     conn: &mut AsyncPgConnection,
     id: Uuid,
 ) -> QueryResult<Option<Environment>> {
@@ -995,37 +993,52 @@ pub async fn get_environment(
         .optional()
 }
 
-/// `get_environment` with `SELECT … FOR UPDATE`. The retire path reads two
-/// invariants (not the default, not the last one) and then writes; without the
-/// lock, two concurrent retires can both pass and leave an app with zero live
-/// environments, or zero defaults.
-pub async fn lock_environment_for_update(
+/// `(project_id, org_id)` ancestry of a catalogue environment, for authorizing
+/// the project-level CRUD routes.
+pub async fn project_env_ancestry(
     conn: &mut AsyncPgConnection,
-    id: Uuid,
-) -> QueryResult<Option<Environment>> {
+    env_id: Uuid,
+) -> QueryResult<Option<(Uuid, Uuid)>> {
     environments::table
-        .find(id)
-        .select(Environment::as_select())
-        .for_update()
+        .inner_join(projects::table.on(projects::id.eq(environments::project_id)))
+        .filter(environments::id.eq(env_id))
+        .select((environments::project_id, projects::org_id))
         .first(conn)
         .await
         .optional()
 }
 
-/// Live environments only — the cap must not be consumed by retired rows.
-pub async fn count_active_environments(
+/// Live catalogue entries only — the cap must not be consumed by retired rows.
+pub async fn count_active_project_environments(
     conn: &mut AsyncPgConnection,
-    app_id: Uuid,
+    project_id: Uuid,
 ) -> QueryResult<i64> {
     environments::table
-        .filter(environments::app_id.eq(app_id))
+        .filter(environments::project_id.eq(project_id))
         .filter(environments::retired_at.is_null())
         .count()
         .get_result(conn)
         .await
 }
 
-pub async fn rename_environment(
+/// Take a project-level lock. Every mutation that reads the project's
+/// environment-set invariants (how many are live, is anything still defaulting
+/// to this one) and then writes must hold this, for the same reason
+/// [`lock_app_for_update`] exists one level down.
+pub async fn lock_project_for_update(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+) -> QueryResult<()> {
+    projects::table
+        .find(project_id)
+        .select(projects::id)
+        .for_update()
+        .first::<Uuid>(conn)
+        .await
+        .map(|_| ())
+}
+
+pub async fn rename_project_environment(
     conn: &mut AsyncPgConnection,
     id: Uuid,
     name: &str,
@@ -1040,17 +1053,172 @@ pub async fn rename_environment(
         .await
 }
 
-pub async fn set_environment_ingest(
+/// Retire a catalogue entry and every enrollment in it, in one transaction.
+///
+/// Retire, never delete. The rows are kept so historical events — including any
+/// already exported to cold Parquet, which no FK can reach — stay attributable.
+/// Returns the public keys of the enrollments that were retired, so the caller
+/// can invalidate their Redis DSN cache slots; a key whose row is retired must
+/// stop resolving, and `find_env_by_public_key` filters `retired_at IS NULL`.
+pub async fn retire_project_environment(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<(Environment, Vec<String>)> {
+    conn.transaction::<_, diesel::result::Error, _>(async |conn| {
+        let now = Utc::now();
+        let keys: Vec<String> = diesel::update(
+            app_environments::table
+                .filter(app_environments::environment_id.eq(id))
+                .filter(app_environments::retired_at.is_null()),
+        )
+        .set((
+            app_environments::retired_at.eq(Some(now)),
+            app_environments::ingest_enabled.eq(false),
+            // Clear the flag too. The caller refuses to retire an environment
+            // that is still some app's default, so this is normally a no-op —
+            // but leaving it set would put a retired row in an app's default
+            // slot, which `promote_app_environment_default` can never move.
+            app_environments::is_default.eq(false),
+            app_environments::updated_at.eq(now),
+        ))
+        .returning(app_environments::public_key)
+        .get_results(conn)
+        .await?;
+
+        let env = diesel::update(environments::table.find(id))
+            .set((
+                environments::retired_at.eq(Some(now)),
+                environments::updated_at.eq(now),
+            ))
+            .returning(Environment::as_returning())
+            .get_result(conn)
+            .await?;
+
+        Ok((env, keys))
+    })
+    .await
+}
+
+/// Ids of every app in a project — the fan-out target when an environment is
+/// added to the catalogue. A freshly created environment has no enrollments at
+/// all, so this needs no "missing" predicate.
+pub async fn app_ids_in_project(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+) -> QueryResult<Vec<Uuid>> {
+    apps::table
+        .filter(apps::project_id.eq(project_id))
+        .select(apps::id)
+        .load(conn)
+        .await
+}
+
+/// `(id, public_key)` of an app's live enrollments — for invalidating Redis DSN
+/// cache slots when something app-wide changes.
+///
+/// Retired enrollments are excluded: they are already unresolvable
+/// (`find_env_by_public_key` filters `retired_at IS NULL`), and excluding them
+/// keeps them from consuming the row cap ahead of the live keys that matter.
+pub async fn live_app_environment_keys(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Vec<(Uuid, String)>> {
+    app_environments::table
+        .filter(app_environments::app_id.eq(app_id))
+        .filter(app_environments::retired_at.is_null())
+        .select((app_environments::id, app_environments::public_key))
+        .limit(MAX_ENVIRONMENTS_PER_PROJECT)
+        .load(conn)
+        .await
+}
+
+// --- app_environments: one app's enrollment in one environment ---------------
+
+/// Batch-insert enrollments. Keys are minted by the caller rather than here so
+/// that every key in the system comes from `ids::public_key()`; `sauron-db` has
+/// no dependency on `sauron-core`.
+pub async fn create_app_environments(
+    conn: &mut AsyncPgConnection,
+    rows: &[NewAppEnvironment<'_>],
+) -> QueryResult<Vec<AppEnvironment>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    diesel::insert_into(app_environments::table)
+        .values(rows)
+        .returning(AppEnvironment::as_returning())
+        .get_results(conn)
+        .await
+}
+
+/// An app's enrollments joined to their catalogue names.
+///
+/// A retired *catalogue* entry implies retired enrollments (they are retired in
+/// the same transaction), so filtering on the enrollment's own `retired_at` is
+/// sufficient and avoids a second predicate that could disagree with it.
+pub async fn list_app_environments(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    include_retired: bool,
+) -> QueryResult<Vec<AppEnvironmentView>> {
+    let mut q = app_environments::table
+        .inner_join(environments::table.on(environments::id.eq(app_environments::environment_id)))
+        .filter(app_environments::app_id.eq(app_id))
+        .into_boxed();
+    if !include_retired {
+        q = q.filter(app_environments::retired_at.is_null());
+    }
+    let rows: Vec<(AppEnvironment, String)> = q
+        .select((AppEnvironment::as_select(), environments::name))
+        .order(environments::name.asc())
+        .limit(MAX_ENVIRONMENTS_PER_PROJECT)
+        .load(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(enrollment, name)| AppEnvironmentView { enrollment, name })
+        .collect())
+}
+
+pub async fn get_app_environment(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<AppEnvironment>> {
+    app_environments::table
+        .find(id)
+        .select(AppEnvironment::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Apps that still treat `environment_id` as their default. A catalogue entry
+/// with any of these cannot be retired — doing so would leave those apps with
+/// nowhere to report by default.
+pub async fn apps_defaulting_to_environment(
+    conn: &mut AsyncPgConnection,
+    environment_id: Uuid,
+) -> QueryResult<i64> {
+    app_environments::table
+        .filter(app_environments::environment_id.eq(environment_id))
+        .filter(app_environments::is_default.eq(true))
+        .filter(app_environments::retired_at.is_null())
+        .count()
+        .get_result(conn)
+        .await
+}
+
+pub async fn set_app_environment_ingest(
     conn: &mut AsyncPgConnection,
     id: Uuid,
     enabled: bool,
-) -> QueryResult<Environment> {
-    diesel::update(environments::table.find(id))
+) -> QueryResult<AppEnvironment> {
+    diesel::update(app_environments::table.find(id))
         .set((
-            environments::ingest_enabled.eq(enabled),
-            environments::updated_at.eq(Utc::now()),
+            app_environments::ingest_enabled.eq(enabled),
+            app_environments::updated_at.eq(Utc::now()),
         ))
-        .returning(Environment::as_returning())
+        .returning(AppEnvironment::as_returning())
         .get_result(conn)
         .await
 }
@@ -1070,84 +1238,93 @@ pub async fn lock_app_for_update(conn: &mut AsyncPgConnection, app_id: Uuid) -> 
 }
 
 /// Move the default flag within an app. Both statements run in one transaction
-/// because `environments_default_key` is a partial unique index on
+/// because `app_environments_default_key` is a partial unique index on
 /// `(app_id) WHERE is_default` — setting the new default before clearing the old
 /// one violates it mid-statement.
-pub async fn promote_environment_default(
+pub async fn promote_app_environment_default(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
     id: Uuid,
-) -> QueryResult<Environment> {
+) -> QueryResult<AppEnvironment> {
     conn.transaction::<_, diesel::result::Error, _>(async |conn| {
         lock_app_for_update(conn, app_id).await?;
-        diesel::update(environments::table)
-            .filter(environments::app_id.eq(app_id))
-            .filter(environments::is_default.eq(true))
+        diesel::update(app_environments::table)
+            .filter(app_environments::app_id.eq(app_id))
+            .filter(app_environments::is_default.eq(true))
             .set((
-                environments::is_default.eq(false),
-                environments::updated_at.eq(Utc::now()),
+                app_environments::is_default.eq(false),
+                app_environments::updated_at.eq(Utc::now()),
             ))
             .execute(conn)
             .await?;
         // `app_id` is re-asserted here rather than trusting `find(id)` alone: a caller
-        // that authorized on app A but passed app B's env id would otherwise leave A
-        // with zero defaults and silently give B one.
+        // that authorized on app A but passed app B's enrollment id would otherwise
+        // leave A with zero defaults and silently give B one.
         diesel::update(
-            environments::table
+            app_environments::table
                 .find(id)
-                .filter(environments::app_id.eq(app_id))
-                // A retired environment can never become the default. Without this the
+                .filter(app_environments::app_id.eq(app_id))
+                // A retired enrollment can never become the default. Without this the
                 // row lock alone is insufficient: a concurrent retire commits first, and
                 // this UPDATE's WHERE still matches (retire changes neither id nor
                 // app_id), flagging a retired row and leaving the app with zero live
                 // defaults. The partial index cannot catch it — retired rows are not in it.
-                .filter(environments::retired_at.is_null()),
+                .filter(app_environments::retired_at.is_null()),
         )
         .set((
-            environments::is_default.eq(true),
-            environments::updated_at.eq(Utc::now()),
+            app_environments::is_default.eq(true),
+            app_environments::updated_at.eq(Utc::now()),
         ))
-        .returning(Environment::as_returning())
+        .returning(AppEnvironment::as_returning())
         .get_result(conn)
         .await
     })
     .await
 }
 
-/// Retire, never delete. The row is kept so historical rows — including any
-/// already exported to cold Parquet, which no FK can reach — stay attributable.
-pub async fn retire_environment(
+/// Retire ONE app's enrollment. Retire, never delete: the row is kept so
+/// historical events — including any already exported to cold Parquet, which no
+/// FK can reach — stay attributable.
+///
+/// Deliberately NOT exposed over HTTP. Withdrawing a single app from an
+/// environment would be a one-way door, because enrollment happens only when an
+/// environment or an app is created; muting via `ingest_enabled` says the same
+/// thing reversibly. The only production path that retires an enrollment is
+/// [`retire_project_environment`]'s cascade, which retires all of them at once —
+/// this single-row form is what lets that end state be constructed directly in
+/// tests.
+pub async fn retire_app_environment(
     conn: &mut AsyncPgConnection,
     id: Uuid,
-) -> QueryResult<Environment> {
+) -> QueryResult<AppEnvironment> {
     let now = Utc::now();
-    diesel::update(environments::table.find(id))
+    diesel::update(app_environments::table.find(id))
         .set((
-            environments::retired_at.eq(Some(now)),
-            environments::ingest_enabled.eq(false),
+            app_environments::retired_at.eq(Some(now)),
+            app_environments::ingest_enabled.eq(false),
             // Clear the flag too. The retire handler refuses to retire a live default,
             // so this is normally a no-op — but leaving it set would make
-            // `list_environments(include_retired = true)` return two rows flagged
+            // `list_app_environments(include_retired = true)` return two rows flagged
             // default, and the settings UI would render two "Default" badges.
-            environments::is_default.eq(false),
-            environments::updated_at.eq(now),
+            app_environments::is_default.eq(false),
+            app_environments::updated_at.eq(now),
         ))
-        .returning(Environment::as_returning())
+        .returning(AppEnvironment::as_returning())
         .get_result(conn)
         .await
 }
 
-pub async fn rotate_environment_key(
+pub async fn rotate_app_environment_key(
     conn: &mut AsyncPgConnection,
     id: Uuid,
     new_key: &str,
-) -> QueryResult<Environment> {
-    diesel::update(environments::table.find(id))
+) -> QueryResult<AppEnvironment> {
+    diesel::update(app_environments::table.find(id))
         .set((
-            environments::public_key.eq(new_key),
-            environments::updated_at.eq(Utc::now()),
+            app_environments::public_key.eq(new_key),
+            app_environments::updated_at.eq(Utc::now()),
         ))
-        .returning(Environment::as_returning())
+        .returning(AppEnvironment::as_returning())
         .get_result(conn)
         .await
 }
@@ -1159,17 +1336,17 @@ pub async fn find_env_by_public_key(
     conn: &mut AsyncPgConnection,
     public_key: &str,
 ) -> QueryResult<Option<EnvRef>> {
-    environments::table
-        .inner_join(apps::table.on(apps::id.eq(environments::app_id)))
+    app_environments::table
+        .inner_join(apps::table.on(apps::id.eq(app_environments::app_id)))
         .inner_join(projects::table.on(projects::id.eq(apps::project_id)))
-        .filter(environments::public_key.eq(public_key))
-        .filter(environments::retired_at.is_null())
+        .filter(app_environments::public_key.eq(public_key))
+        .filter(app_environments::retired_at.is_null())
         .select((
-            environments::id,
+            app_environments::id,
             apps::id,
             apps::project_id,
             projects::org_id,
-            environments::ingest_enabled,
+            app_environments::ingest_enabled,
             apps::ingest_enabled,
         ))
         .first::<(Uuid, Uuid, Uuid, Uuid, bool, bool)>(conn)
@@ -1197,27 +1374,31 @@ pub async fn env_ancestry(
     conn: &mut AsyncPgConnection,
     env_id: Uuid,
 ) -> QueryResult<Option<(Uuid, Uuid, Uuid)>> {
-    environments::table
-        .inner_join(apps::table.on(apps::id.eq(environments::app_id)))
+    app_environments::table
+        .inner_join(apps::table.on(apps::id.eq(app_environments::app_id)))
         .inner_join(projects::table.on(projects::id.eq(apps::project_id)))
-        .filter(environments::id.eq(env_id))
-        .select((environments::app_id, apps::project_id, projects::org_id))
+        .filter(app_environments::id.eq(env_id))
+        .select((app_environments::app_id, apps::project_id, projects::org_id))
         .first(conn)
         .await
         .optional()
 }
 
-/// Every environment id of an app, **including retired ones**.
+/// Every enrollment id of an app, **including retired ones**.
 ///
-/// Retired environments are included deliberately: their history stays
+/// Retired enrollments are included deliberately: their history stays
 /// readable (an app's data does not disappear because an environment was
 /// retired), so a caller's readable subset must be able to contain one.
-/// `list_environments` excludes them because they must not be *selectable*;
+/// `list_app_environments` excludes them because they must not be *selectable*;
 /// that is a different question from whether they are *readable*.
+///
+/// These are `app_environments` ids, which is what `role_grants.scope_id` holds
+/// for `scope_type = 'env'` — an env grant names one app's enrollment, never the
+/// catalogue entry, so that granting "staging" cannot silently span sibling apps.
 pub async fn env_ids_for_app(conn: &mut AsyncPgConnection, app_id: Uuid) -> QueryResult<Vec<Uuid>> {
-    environments::table
-        .filter(environments::app_id.eq(app_id))
-        .select(environments::id)
+    app_environments::table
+        .filter(app_environments::app_id.eq(app_id))
+        .select(app_environments::id)
         .load(conn)
         .await
 }
@@ -3613,17 +3794,26 @@ pub async fn list_analytics_events(
     let mut env_neq: Option<Option<Uuid>> = None;
     for f in filters {
         if f.field == "environment" {
-            // `retired_at IS NULL` is load-bearing: (app_id, name) is only unique among
-            // LIVE environments, so retiring `staging` and creating a fresh `staging`
-            // leaves two rows with that name. Without this filter `.first()` returns an
-            // arbitrary one, and a filter on the current `staging` could silently show
-            // only pre-retirement events. The partial unique index guarantees at most one
-            // live match, so this is deterministic.
-            let id: Option<Uuid> = environments::table
-                .filter(environments::app_id.eq(scope.app_id))
+            // The id wanted here is the ENROLLMENT's, because that is what the
+            // event tables store in `environment_id` — the catalogue entry is
+            // only how a human names it.
+            //
+            // `retired_at IS NULL` on the enrollment is load-bearing: a name is
+            // only unique among LIVE rows, so retiring `staging` and creating a
+            // fresh `staging` leaves two enrollments reachable by that name.
+            // Without this filter `.first()` returns an arbitrary one, and a
+            // filter on the current `staging` could silently show only
+            // pre-retirement events. Retiring a catalogue entry retires its
+            // enrollments in the same transaction, so this single predicate
+            // covers both levels and cannot disagree with itself.
+            let id: Option<Uuid> = app_environments::table
+                .inner_join(
+                    environments::table.on(environments::id.eq(app_environments::environment_id)),
+                )
+                .filter(app_environments::app_id.eq(scope.app_id))
                 .filter(environments::name.eq(&f.value))
-                .filter(environments::retired_at.is_null())
-                .select(environments::id)
+                .filter(app_environments::retired_at.is_null())
+                .select(app_environments::id)
                 .first::<Uuid>(conn)
                 .await
                 .ok();

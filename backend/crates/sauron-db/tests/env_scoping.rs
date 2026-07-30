@@ -6,7 +6,8 @@ use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
 use sauron_auth::{authorize_env_read, perm, AuthError};
-use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewTransaction};
+use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewTransaction, Workflow};
+use sauron_db::schema::workflows;
 use sauron_db::scope::{EnvFilter, ReadScope};
 use serde_json::json;
 use uuid::Uuid;
@@ -1924,16 +1925,15 @@ async fn app_has_events_reports_only_the_selected_environment() {
     let ids = db.seed_two_envs().await;
     let mut conn = db.conn().await;
 
-    let env_c = sauron_db::repo::create_environment(
+    let env_c = common::seed_env(
         &mut conn,
+        ids.project_id,
         ids.app_id,
         "env_c",
         &format!("pk_test_c_{}", Uuid::new_v4().simple()),
         false,
     )
-    .await
-    .expect("create env_c")
-    .id;
+    .await;
 
     let brand_new = sauron_db::repo::app_has_events(
         &mut conn,
@@ -5306,7 +5306,7 @@ async fn env_ids_for_app_includes_a_retired_environment() {
 
     // `env_b` is not the app's default (seed_two_envs makes env_a the
     // default), so it is retireable without first promoting another.
-    sauron_db::repo::retire_environment(&mut conn, ids.env_b)
+    sauron_db::repo::retire_app_environment(&mut conn, ids.env_b)
         .await
         .expect("retire env_b");
 
@@ -5319,16 +5319,16 @@ async fn env_ids_for_app_includes_a_retired_environment() {
         "a retired environment must still be included — its history stays readable"
     );
 
-    // `list_environments(include_retired = false)` is the function this is
+    // `list_app_environments(include_retired = false)` is the function this is
     // deliberately NOT — it must now exclude env_b, or the two functions would
     // be indistinguishable and the retired-inclusion behavior above would be
     // accidental rather than intentional.
-    let selectable = sauron_db::repo::list_environments(&mut conn, ids.app_id, false)
+    let selectable = sauron_db::repo::list_app_environments(&mut conn, ids.app_id, false)
         .await
-        .expect("list_environments live-only");
+        .expect("list_app_environments live-only");
     assert!(
-        selectable.iter().all(|e| e.id != ids.env_b),
-        "list_environments must exclude the retired environment"
+        selectable.iter().all(|e| e.enrollment.id != ids.env_b),
+        "list_app_environments must exclude the retired environment"
     );
 
     drop(conn);
@@ -6195,6 +6195,325 @@ async fn list_issues_filters_agree_with_what_it_displays() {
         "level:eq:warning must NOT match on the stored issues.level='warning' — env_a's \
          only real occurrence has level='error', and the filter must agree with what's \
          displayed, not with the app-wide column"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Workflow grouping, Task 1: `workflows` table + stamped columns.
+//
+// Diesel's plain `#[derive(Queryable)]` deserializes a result row
+// positionally: field N of a struct is bound to column N of whatever
+// `SqlType` tuple the query produced. `cargo check`/`check_for_backend`
+// verify that each field's Rust type is compatible with *some* column of
+// that name in the table -- they do not verify that the struct's declared
+// field order matches the table!'s declared column order. A transposition
+// (e.g. swapping `events_count`/`errors_count`, or `started_at`/`ended_at`,
+// or any two of the five `Option<String>` fields) compiles cleanly on both
+// counts and would silently return garbage at runtime. Since `schema.rs`'s
+// `workflows` block and `models.rs`'s `Workflow` struct were both hand-edited
+// (no `diesel print-schema` in this repo -- see task-1-report.md), this test
+// exists to catch exactly that mismatch rather than trust the two hand-edits
+// agree.
+// ---------------------------------------------------------------------------
+
+/// Selects via `workflows::all_columns` -- the tuple of columns in
+/// `schema.rs`'s *declared* order -- rather than `Workflow::as_select()`
+/// (which selects by field name and would mask a pure ordering bug), then
+/// deserializes into `Workflow` positionally. Every same-typed field is given
+/// a distinct, recognisable value so a swap between any two of them flips a
+/// concrete assertion rather than silently passing.
+#[tokio::test]
+async fn workflow_row_round_trips_in_declared_column_order() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let mut conn = db.conn().await;
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let org =
+        sauron_db::repo::create_org(&mut conn, "workflow test org", &format!("wf-org-{suffix}"))
+            .await
+            .expect("create org");
+    let project = sauron_db::repo::create_project(
+        &mut conn,
+        org.id,
+        "workflow test project",
+        &format!("wf-project-{suffix}"),
+    )
+    .await
+    .expect("create project");
+    let app = sauron_db::repo::create_app(
+        &mut conn,
+        project.id,
+        "workflow test app",
+        &format!("wf-app-{suffix}"),
+        "web",
+    )
+    .await
+    .expect("create app");
+    let env_id = common::seed_env(
+        &mut conn,
+        project.id,
+        app.id,
+        "production",
+        &format!("pk_wf_{suffix}"),
+        true,
+    )
+    .await;
+
+    // Pinned, zero-subsecond base (mirrors `seed_two_envs`'s own `now`) so
+    // Postgres's microsecond `timestamptz` round-trips byte-for-byte against
+    // whole-second `Duration` offsets -- no precision-loss false failure.
+    let now = Utc::now()
+        .date_naive()
+        .and_hms_opt(12, 0, 0)
+        .expect("12:00:00 is a valid time")
+        .and_utc();
+    // Three distinct timestamps: a swap between any two of `started_at`/
+    // `ended_at`/`last_event_at` (all three `Timestamptz`) must fail at
+    // least one assertion below.
+    let started_at = now - Duration::minutes(10);
+    let ended_at = now - Duration::minutes(5);
+    let last_event_at = now - Duration::minutes(4);
+
+    let client_workflow_id = format!("wf-client-{suffix}");
+    let session_id = format!("wf-session-{suffix}");
+    let distinct_id = format!("wf-distinct-{suffix}");
+    let device_key = format!("wf-device-{suffix}");
+
+    // INSERT via named `.eq()` pairs -- immune to ordering by construction
+    // (each column is named explicitly), so this half of the test cannot
+    // itself hide the bug; only the SELECT below can.
+    diesel::insert_into(workflows::table)
+        .values((
+            workflows::app_id.eq(app.id),
+            workflows::environment_id.eq(env_id),
+            workflows::workflow_id.eq(client_workflow_id.clone()),
+            workflows::name.eq("checkout"),
+            workflows::session_id.eq(Some(session_id.clone())),
+            workflows::distinct_id.eq(Some(distinct_id.clone())),
+            workflows::device_key.eq(Some(device_key.clone())),
+            workflows::release.eq(Some("1.2.3")),
+            workflows::status.eq("cancelled"),
+            workflows::cancel_reason.eq(Some("superseded")),
+            workflows::started_at.eq(started_at),
+            workflows::ended_at.eq(Some(ended_at)),
+            workflows::last_event_at.eq(last_event_at),
+            workflows::events_count.eq(7),
+            workflows::errors_count.eq(3),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("insert workflow row");
+
+    // SELECT via `all_columns` (schema.rs's declared order) + plain
+    // `Queryable` positional decode -- the order-sensitive path.
+    let row: Workflow = workflows::table
+        .filter(workflows::app_id.eq(app.id))
+        .select(workflows::all_columns)
+        .first(&mut conn)
+        .await
+        .expect("select workflow row back via all_columns");
+
+    assert_eq!(row.app_id, app.id, "app_id");
+    assert_eq!(row.environment_id, env_id, "environment_id");
+    assert_eq!(row.workflow_id, client_workflow_id, "workflow_id");
+    assert_eq!(row.name, "checkout", "name");
+    assert_eq!(
+        row.session_id.as_deref(),
+        Some(session_id.as_str()),
+        "session_id"
+    );
+    assert_eq!(
+        row.distinct_id.as_deref(),
+        Some(distinct_id.as_str()),
+        "distinct_id"
+    );
+    assert_eq!(
+        row.device_key.as_deref(),
+        Some(device_key.as_str()),
+        "device_key"
+    );
+    assert_eq!(row.release.as_deref(), Some("1.2.3"), "release");
+    assert_eq!(row.status, "cancelled", "status");
+    assert_eq!(
+        row.cancel_reason.as_deref(),
+        Some("superseded"),
+        "cancel_reason"
+    );
+    assert_eq!(row.started_at, started_at, "started_at");
+    assert_eq!(row.ended_at, Some(ended_at), "ended_at");
+    assert_eq!(row.last_event_at, last_event_at, "last_event_at");
+    assert_eq!(row.events_count, 7, "events_count");
+    assert_eq!(row.errors_count, 3, "errors_count");
+
+    // Every one of the five Option<String> fields, and all three
+    // timestamps, and the two counters, carries a value distinct from every
+    // other field of the same type -- so the assertions above are not
+    // vacuously satisfiable by a swap (e.g. events_count/errors_count both
+    // being 5 would let a transposition pass unnoticed).
+    assert_ne!(row.events_count, row.errors_count);
+    assert!(row.started_at < row.ended_at.unwrap());
+    assert!(row.ended_at.unwrap() < row.last_event_at);
+    assert_ne!(row.session_id, row.distinct_id);
+    assert_ne!(row.distinct_id, row.device_key);
+    assert_ne!(row.device_key.as_deref(), row.release.as_deref());
+    assert_ne!(row.release.as_deref(), row.cancel_reason.as_deref());
+
+    // `id`/`created_at`/`updated_at` were left to their column DEFAULTs
+    // (`gen_random_uuid()`/`now()`); assert only that they came back at all,
+    // as evidence the row-boundary itself (the very first/last columns of
+    // the table!) decoded rather than erroring.
+    assert_ne!(row.id, Uuid::nil());
+    assert!(row.created_at <= Utc::now());
+    assert!(row.updated_at <= Utc::now());
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Ingest key resolution after environments moved to the project (000033)
+// ===========================================================================
+
+/// `find_env_by_public_key` is the single query every SDK event passes through:
+/// it turns a presented key into the `(env, app, project, org)` tuple that the
+/// rest of ingest attributes the event by. Moving environments to the project
+/// re-tabled it, and nothing else in the test suite touches it — so the
+/// property that makes the whole migration invisible to already-deployed SDKs
+/// had no coverage at all before this test.
+#[tokio::test]
+async fn an_ingest_key_proves_both_its_app_and_its_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let mut conn = db.conn().await;
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let org = sauron_db::repo::create_org(&mut conn, "key org", &format!("key-org-{suffix}"))
+        .await
+        .expect("create org");
+    let project = sauron_db::repo::create_project(
+        &mut conn,
+        org.id,
+        "key project",
+        &format!("key-project-{suffix}"),
+    )
+    .await
+    .expect("create project");
+
+    // Two apps sharing ONE environment — the shape that only exists because the
+    // catalogue is project-level, and the one that makes the credential's
+    // placement load-bearing.
+    let app_a = sauron_db::repo::create_app(
+        &mut conn,
+        project.id,
+        "key app a",
+        &format!("key-app-a-{suffix}"),
+        "web",
+    )
+    .await
+    .expect("create app a");
+    let app_b = sauron_db::repo::create_app(
+        &mut conn,
+        project.id,
+        "key app b",
+        &format!("key-app-b-{suffix}"),
+        "web",
+    )
+    .await
+    .expect("create app b");
+
+    let shared_env = sauron_db::repo::create_project_environment(&mut conn, project.id, "shared")
+        .await
+        .expect("create shared environment");
+
+    let key_a = format!("pk_shared_a_{suffix}");
+    let key_b = format!("pk_shared_b_{suffix}");
+    let enrollment_a = sauron_db::repo::create_app_environments(
+        &mut conn,
+        &[sauron_db::models::NewAppEnvironment {
+            app_id: app_a.id,
+            environment_id: shared_env.id,
+            public_key: &key_a,
+            is_default: true,
+        }],
+    )
+    .await
+    .expect("enroll app a")
+    .remove(0);
+    let enrollment_b = sauron_db::repo::create_app_environments(
+        &mut conn,
+        &[sauron_db::models::NewAppEnvironment {
+            app_id: app_b.id,
+            environment_id: shared_env.id,
+            public_key: &key_b,
+            is_default: true,
+        }],
+    )
+    .await
+    .expect("enroll app b")
+    .remove(0);
+
+    // Each key resolves to ITS OWN app, even though both name the same
+    // environment. This is the property the credential was put on the
+    // enrollment to preserve: if the key hung off the catalogue entry, both of
+    // these would resolve to the same (or an ambiguous) app, and one app's key
+    // could write events attributed to its sibling.
+    let ref_a = sauron_db::repo::find_env_by_public_key(&mut conn, &key_a)
+        .await
+        .expect("resolve key a")
+        .expect("key a must resolve");
+    assert_eq!(ref_a.app_id, app_a.id, "key a must name app a");
+    assert_eq!(ref_a.env_id, enrollment_a.id, "env_id is the enrollment id");
+    assert_eq!(ref_a.project_id, project.id);
+    assert_eq!(ref_a.org_id, org.id);
+
+    let ref_b = sauron_db::repo::find_env_by_public_key(&mut conn, &key_b)
+        .await
+        .expect("resolve key b")
+        .expect("key b must resolve");
+    assert_eq!(ref_b.app_id, app_b.id, "key b must name app b");
+    assert_eq!(ref_b.env_id, enrollment_b.id);
+    assert_ne!(
+        ref_a.env_id, ref_b.env_id,
+        "two apps in one environment must resolve to two distinct enrollments"
+    );
+
+    // An unknown key resolves to nothing rather than erroring.
+    assert!(
+        sauron_db::repo::find_env_by_public_key(&mut conn, &format!("pk_nope_{suffix}"))
+            .await
+            .expect("resolve unknown key")
+            .is_none(),
+        "an unknown key must not resolve"
+    );
+
+    // A retired enrollment stops resolving, which is what makes retirement a
+    // real revocation rather than a display-only flag — and is why the retire
+    // paths invalidate the Redis DSN cache slot.
+    sauron_db::repo::retire_app_environment(&mut conn, enrollment_b.id)
+        .await
+        .expect("retire app b's enrollment");
+    assert!(
+        sauron_db::repo::find_env_by_public_key(&mut conn, &key_b)
+            .await
+            .expect("resolve retired key")
+            .is_none(),
+        "a retired enrollment's key must stop resolving"
+    );
+    // ...and retiring one app's enrollment must not disturb its sibling's.
+    assert!(
+        sauron_db::repo::find_env_by_public_key(&mut conn, &key_a)
+            .await
+            .expect("resolve key a again")
+            .is_some(),
+        "retiring one app's enrollment must not revoke a sibling's key"
     );
 
     drop(conn);
