@@ -190,6 +190,8 @@ pub fn event_envelope(user: &VirtualUser, seq: u64) -> Envelope {
         }),
         timestamp: Utc::now(),
         session_id: Some(user.session_id.clone()),
+        workflow_id: None,
+        workflow_name: None,
         screen: Some(user.screen.to_string()),
         tags: json!({ "screen": user.screen }),
         // Deliberately mimics real SDK `contexts` payloads (nested
@@ -243,6 +245,8 @@ pub fn event_envelope(user: &VirtualUser, seq: u64) -> Envelope {
         url: (op == "http").then(|| "/api/users".to_string()),
         distinct_id: Some(user.distinct_id.clone()),
         session_id: Some(user.session_id.clone()),
+        workflow_id: None,
+        workflow_name: None,
         timestamp: Utc::now(),
     });
     Envelope {
@@ -347,6 +351,8 @@ pub fn issue_envelope(user: &VirtualUser, seq: u64) -> Envelope {
         fingerprint: None,
         user: None,
         session_id: Some(user.session_id.clone()),
+        workflow_id: None,
+        workflow_name: None,
         screen: Some(user.screen.to_string()),
         raw_stacktrace: None,
         debug_meta: None,

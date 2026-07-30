@@ -43,6 +43,7 @@
         { href: '#/users', label: 'Users', icon: 'users', match: (p) => p.startsWith('/users') || p.startsWith('/persons') },
         { href: '#/devices', label: 'Devices', icon: 'monitor-smartphone', match: (p) => p.startsWith('/devices') },
         { href: '#/screens', label: 'Screens', icon: 'layout-panel-top', match: (p) => p.startsWith('/screens') },
+        { href: '#/workflows', label: 'Workflows', icon: 'workflow', match: (p) => p.startsWith('/workflows') },
       ],
     },
     {

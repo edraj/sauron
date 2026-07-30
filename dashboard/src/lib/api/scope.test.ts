@@ -14,6 +14,14 @@ describe('shouldScopeUrl', () => {
     expect(shouldScopeUrl('/v1/apps/app-1/sessions')).toBe(true);
   });
 
+  it('scopes the workflows rollup (a telemetry read, not an app-config subpath)', () => {
+    // Regression guard: workflows is optional data on an otherwise
+    // ordinary `/v1/apps/{id}/...` telemetry route, so it must fall through
+    // to `true` by construction rather than needing an entry of its own in
+    // either exclusion array.
+    expect(shouldScopeUrl('/v1/apps/abc/workflows')).toBe(true);
+  });
+
   it('scopes POST /v1/apps/{id}/funnel (compute, singular) but not GET .../funnels (saved, plural)', () => {
     // These two differ only by a trailing "s" and both matter: `compute` is
     // a live telemetry read (backend calls `read_scope`); the saved-funnels

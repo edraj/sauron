@@ -96,6 +96,9 @@ export class Transport {
   private pending: EnvelopeItem[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private onlineHandler: (() => void) | null = null;
+  /** Permanent auto-disable latch, flipped by this transport itself the moment
+   * it classifies a response as 401/403 — it is the source of truth for
+   * {@link isEnabled}, not merely a mirror of something the client decided. */
   private disabled = false;
 
   constructor(config: TransportConfig) {
@@ -152,6 +155,11 @@ export class Transport {
     this.stop();
   }
 
+  /** Whether the transport still accepts items (false once auth-disabled by a 401/403). */
+  isEnabled(): boolean {
+    return !this.disabled;
+  }
+
   /** Queue an item for the next batch; flush eagerly once the batch is full. */
   send(item: EnvelopeItem): void {
     if (this.disabled) return;
@@ -200,6 +208,11 @@ export class Transport {
         return;
       case 'disable':
         this.logger.warn('server rejected credentials; disabling client');
+        // Flip our own latch FIRST — `disabled` (and therefore `isEnabled()`)
+        // must already be true by the time the client hears about it, so a
+        // client whose enabled predicate is computed from us (not pushed to)
+        // can never observe a stale "still enabled" in between.
+        this.disable();
         this.onDisable();
         return;
       case 'split': {
@@ -241,6 +254,7 @@ export class Transport {
         outcome = { action: 'retry_backoff' };
       }
       if (outcome.action === 'disable') {
+        this.disable();
         this.onDisable();
         this.offline.enqueue(json);
         return;

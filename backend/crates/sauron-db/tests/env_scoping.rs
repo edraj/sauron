@@ -239,6 +239,8 @@ async fn seed_cross_env_session_child_rows(
             occurred_at: at,
             device_key: Some(device_key.to_string()),
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             tags: json!({}),
             contexts: json!({}),
             extra: json!({}),
@@ -272,6 +274,8 @@ async fn seed_cross_env_session_child_rows(
             session_id: Some(session_id.to_string()),
             device_key: Some(device_key.to_string()),
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -301,6 +305,8 @@ async fn seed_cross_env_session_child_rows(
             distinct_id: None,
             session_id: Some(session_id.to_string()),
             device_key: None,
+            workflow_id: None,
+            workflow_name: None,
             release: None,
             ip_address: None,
             occurred_at: at,
@@ -3513,6 +3519,8 @@ async fn list_issues_filters_tag_and_free_text_compose_with_scope() {
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -3684,6 +3692,8 @@ async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own()
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -3726,6 +3736,8 @@ async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own()
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -3875,6 +3887,8 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -3913,6 +3927,8 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -3988,6 +4004,8 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -4314,6 +4332,8 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -4354,6 +4374,12 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
             session_id: None,
             device_key: None,
             screen: None,
+            // Stamped with an env_b-only workflow, for the `workflow:eq` leg
+            // below — the `workflow` filter's `EXISTS` has the identical
+            // shape to the `tag`/`q` ones this test was built for, so it must
+            // be held to the identical standard on the same fixture.
+            workflow_id: Some("cross-env-leak-workflow-id".into()),
+            workflow_name: Some("prod-only-checkout".into()),
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -4365,7 +4391,7 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
         },
     )
     .await
-    .expect("insert env_b-only occurrence carrying the secret tag/payload");
+    .expect("insert env_b-only occurrence carrying the secret tag/payload/workflow");
 
     let scope_a = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
     let scope_b = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b));
@@ -4444,6 +4470,88 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
     assert!(
         by_tag_contains_a.iter().all(|i| i.id != issue_id),
         "tag:contains release=can must not match under One(env_a) either"
+    );
+
+    // workflow:eq — Task 5's filter, whose `EXISTS` fragment has the same
+    // shape (and therefore the same failure mode) as the `tag` ones above.
+    // The workflow stamp lives only on the env_b occurrence, so it must not
+    // match under env_a even though the issue is a genuine env_a member.
+    //
+    // This leg is what exercises the raw-SQL (`One`/`Subset`) branch of the
+    // `workflow` filter at all: an app-wide caller resolves to `EnvFilter::All`
+    // and only ever runs the diesel branch, leaving the `${next_bind}`
+    // bookkeeping and the `we` env fragment — precisely the parts that can
+    // silently return another environment's data — covered by nothing.
+    let by_workflow_a = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a.clone(),
+        &[ParsedFilter {
+            field: "workflow",
+            op: Op::Eq,
+            value: "prod-only-checkout".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_workflow_a.iter().all(|i| i.id != issue_id),
+        "workflow:eq prod-only-checkout is stamped only on the env_b occurrence — \
+         must not match under One(env_a)"
+    );
+
+    // Same workflow under env_b, where it actually lives, must still match,
+    // with the correct env_b-derived count — the positive leg, without which
+    // an `EXISTS` that never matches anything would pass the assertion above
+    // for the wrong reason.
+    let by_workflow_b = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_b.clone(),
+        &[ParsedFilter {
+            field: "workflow",
+            op: Op::Eq,
+            value: "prod-only-checkout".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    let workflow_b_hit = by_workflow_b
+        .iter()
+        .find(|i| i.id == issue_id)
+        .expect("workflow:eq must match under its real environment, One(env_b)");
+    assert_eq!(
+        workflow_b_hit.times_seen, 1,
+        "must be env_b's own derived count"
+    );
+
+    // workflow:contains — the same predicate's other bind shape (a
+    // `like_contains` pattern rather than an exact value), so a bind-index
+    // shift that only affects the ILIKE arm cannot hide here.
+    let by_workflow_contains_a = sauron_db::repo::list_issues(
+        &mut conn,
+        scope_a.clone(),
+        &[ParsedFilter {
+            field: "workflow",
+            op: Op::Contains,
+            value: "prod-only".to_string(),
+        }],
+        None,
+        far_past(),
+        50,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        by_workflow_contains_a.iter().all(|i| i.id != issue_id),
+        "workflow:contains prod-only must not match under One(env_a) either"
     );
 
     // Free-text q, the character-extendable oracle: a substring of the
@@ -4609,6 +4717,8 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -4669,6 +4779,8 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
                 session_id: None,
                 device_key: None,
                 screen: None,
+                workflow_id: None,
+                workflow_name: None,
                 stacktrace_symbolicated: None,
                 symbolication_status: "not_applicable".into(),
                 debug_meta: None,
@@ -4876,6 +4988,8 @@ async fn top_issues_all_ranks_by_the_stored_times_seen_column() {
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -4931,6 +5045,8 @@ async fn top_issues_all_ranks_by_the_stored_times_seen_column() {
                 session_id: None,
                 device_key: None,
                 screen: None,
+                workflow_id: None,
+                workflow_name: None,
                 stacktrace_symbolicated: None,
                 symbolication_status: "not_applicable".into(),
                 debug_meta: None,
@@ -5052,6 +5168,8 @@ async fn top_issues_unattributed_ranks_by_the_unattributed_derived_count() {
                 session_id: None,
                 device_key: None,
                 screen: None,
+                workflow_id: None,
+                workflow_name: None,
                 stacktrace_symbolicated: None,
                 symbolication_status: "not_applicable".into(),
                 debug_meta: None,
@@ -6136,6 +6254,8 @@ async fn list_issues_filters_agree_with_what_it_displays() {
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,

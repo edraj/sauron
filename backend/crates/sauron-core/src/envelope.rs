@@ -126,6 +126,16 @@ pub struct ErrorItem {
     /// onto the session timeline.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Id of the workflow this error occurred within, if the SDK bounded one
+    /// via `startWorkflow`/`endWorkflow`. Optional everywhere: apps that never
+    /// use workflows must be byte-identical to before this field existed, so
+    /// absent must serialize to nothing, never `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    /// Human-readable name of that workflow, denormalized alongside the id so
+    /// downstream consumers don't need a join to display it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
     /// Current screen/route the SDK was on when the error was captured.
     #[serde(default)]
     pub screen: Option<String>,
@@ -220,6 +230,16 @@ pub struct AnalyticsItem {
     pub timestamp: DateTime<Utc>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Id of the workflow this event occurred within, if the SDK bounded one
+    /// via `startWorkflow`/`endWorkflow`. Optional everywhere: apps that never
+    /// use workflows must be byte-identical to before this field existed, so
+    /// absent must serialize to nothing, never `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    /// Human-readable name of that workflow, denormalized alongside the id so
+    /// downstream consumers don't need a join to display it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
     /// Current screen/route the SDK was on when the event was tracked.
     #[serde(default)]
     pub screen: Option<String>,
@@ -256,6 +276,16 @@ pub struct TransactionItem {
     pub distinct_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Id of the workflow this transaction occurred within, if the SDK bounded
+    /// one via `startWorkflow`/`endWorkflow`. Optional everywhere: apps that
+    /// never use workflows must be byte-identical to before this field
+    /// existed, so absent must serialize to nothing, never `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    /// Human-readable name of that workflow, denormalized alongside the id so
+    /// downstream consumers don't need a join to display it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
     #[serde(default = "Utc::now")]
     pub timestamp: DateTime<Utc>,
 }
@@ -569,6 +599,8 @@ mod tests {
             properties: serde_json::json!({ "plan": "free" }),
             timestamp: Utc::now(),
             session_id: None,
+            workflow_id: None,
+            workflow_name: None,
             screen: None,
             tags: serde_json::json!({ "tier": "gold" }),
             contexts: serde_json::json!({ "order": { "id": 7 } }),
@@ -585,5 +617,44 @@ mod tests {
             }
             other => panic!("expected event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workflow_fields_round_trip_on_event_item() {
+        let json = r#"{
+            "type": "event",
+            "name": "checkout_step",
+            "distinct_id": "u1",
+            "properties": {},
+            "timestamp": "2026-07-29T00:00:00Z",
+            "workflow_id": "wf-123",
+            "workflow_name": "checkout"
+        }"#;
+        let item: EnvelopeItem = serde_json::from_str(json).expect("parses");
+        match item {
+            EnvelopeItem::Event(e) => {
+                assert_eq!(e.workflow_id.as_deref(), Some("wf-123"));
+                assert_eq!(e.workflow_name.as_deref(), Some("checkout"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_fields_are_omitted_when_absent() {
+        let json = r#"{
+            "type": "event",
+            "name": "plain",
+            "distinct_id": "u1",
+            "properties": {},
+            "timestamp": "2026-07-29T00:00:00Z"
+        }"#;
+        let item: EnvelopeItem = serde_json::from_str(json).expect("parses");
+        let back = serde_json::to_value(&item).expect("serializes");
+        assert!(
+            back.get("workflow_id").is_none(),
+            "absent field must not serialize"
+        );
+        assert!(back.get("workflow_name").is_none());
     }
 }

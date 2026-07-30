@@ -2,7 +2,9 @@
 
 A tiny, copy-pasteable Node backend that exercises the `@edraj/sauron-node` **0.3.0**
 surface: a per-request `withScope`, `addBreadcrumb` before a captured exception,
-and one `trackTransaction` — plus `identify` / `track` and `flush` / `close`.
+and one `trackTransaction` — plus `identify` / `track`, `flush` / `close`, and a
+`startWorkflow` / `endWorkflow` / `cancelWorkflow` bounded span around each
+simulated request handler.
 
 ## Run
 
@@ -40,6 +42,7 @@ npm run typecheck   # tsc --noEmit against the @edraj/sauron-node 0.3.0 types
 import {
   init, identify, track, captureException,
   trackTransaction, addBreadcrumb, withScope, setUser, setTag,
+  startWorkflow, endWorkflow, cancelWorkflow,
   flush, close,
 } from '@edraj/sauron-node';
 
@@ -50,17 +53,30 @@ if (process.env.SAURON_DSN) {
 identify('user-42', { plan: 'pro' });
 track('order_completed', 'user-42', { total: 42.5, currency: 'USD' });
 
-// Isolated per-request scope: this user/tag/breadcrumbs never leak to a
-// concurrent request, and attach to any error captured inside the callback.
+// Isolated per-request scope: this user/tag/breadcrumbs/workflow never leak
+// to a concurrent request, and attach to any error captured inside the
+// callback.
 withScope(() => {
   setUser({ id: 'user-42', email: 'ada@example.com' });
   setTag('route', 'POST /checkout');
+
+  // Bound a "checkout" span: every track()/captureException() below, until
+  // endWorkflow(), is stamped with this workflow's id and name.
+  startWorkflow('checkout');
   addBreadcrumb({ category: 'payment', message: 'charging card', level: 'info' });
   try {
     doWork();
   } catch (err) {
     captureException(err, { tags: { area: 'checkout' } });
   }
+  endWorkflow('checkout');
+});
+
+// A request that can't complete cancels its workflow instead of ending it:
+withScope(() => {
+  startWorkflow('checkout');
+  // ...validation fails...
+  cancelWorkflow('checkout', { reason: 'invalid_order_total' });
 });
 
 // One timed operation as a performance transaction.

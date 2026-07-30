@@ -8,7 +8,7 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.0.0
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
@@ -258,6 +258,12 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Thu Jul 30 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.1.0-1
+- Workflow grouping: apps can bound a named span of activity, and the events,
+  errors and transactions captured inside it are grouped as one unit.
+- New `workflows` table plus nullable workflow columns on analytics_events,
+  error_events and transactions; run sauron-migrate after upgrading.
+
 * Wed Jul 29 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.0.0-1
 - Version 1.0.0: first stable release of the Sauron platform.
 

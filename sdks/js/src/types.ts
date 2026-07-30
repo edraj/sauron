@@ -82,6 +82,13 @@ export interface ErrorItem {
    */
   user?: UserContext | null;
   session_id?: string | null;
+  /**
+   * The active workflow this item was stamped with, if any. A pair —
+   * always both present or both absent, never one without the other. See
+   * {@link ActiveWorkflow}.
+   */
+  workflow_id?: string;
+  workflow_name?: string;
   screen?: string | null;
 }
 
@@ -91,6 +98,13 @@ export interface EventItem {
   name: string;
   distinct_id: string | null;
   session_id?: string | null;
+  /**
+   * The active workflow this item was stamped with, if any. A pair —
+   * always both present or both absent, never one without the other. See
+   * {@link ActiveWorkflow}.
+   */
+  workflow_id?: string;
+  workflow_name?: string;
   screen?: string | null;
   timestamp: string;
   properties: Record<string, unknown>;
@@ -118,6 +132,13 @@ export interface TransactionItem {
   url?: string | null;
   distinct_id?: string | null;
   session_id?: string | null;
+  /**
+   * The active workflow this item was stamped with, if any. A pair —
+   * always both present or both absent, never one without the other. See
+   * {@link ActiveWorkflow}.
+   */
+  workflow_id?: string;
+  workflow_name?: string;
   timestamp: string;
 }
 
@@ -225,6 +246,36 @@ export interface CaptureOptions {
 /** Options accepted by `track` — {@link CaptureOptions} plus a screen override. */
 export interface TrackOptions extends CaptureOptions {
   screen?: string;
+}
+
+/* ----------------------------------------------------------------- workflow */
+
+/**
+ * Outcome of `startWorkflow` / `endWorkflow` / `cancelWorkflow`. Telemetry
+ * never throws — every call resolves to one of these instead.
+ */
+export type WorkflowStatus =
+  | 'ok'
+  | 'already_active'
+  | 'not_active'
+  | 'name_mismatch'
+  | 'invalid_name'
+  | 'disabled';
+
+/** Result of a workflow lifecycle call. */
+export interface WorkflowResult {
+  status: WorkflowStatus;
+  /** The workflow id involved, when `status` is `'ok'`. */
+  workflowId?: string;
+}
+
+/** The currently-active workflow, as returned by `getWorkflow()`. */
+export interface ActiveWorkflow {
+  /** Client-generated UUID — the server rollup key is `(app_id, workflow_id)`. */
+  workflowId: string;
+  name: string;
+  /** ISO-8601 UTC timestamp of `startWorkflow()`. */
+  startedAt: string;
 }
 
 /** Value accepted by `setUser` — normalized into a `UserContext`. */

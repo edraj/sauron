@@ -126,6 +126,52 @@ void main() {
     expect(names(), contains('kept'));
   });
 
+  test('a throwing beforeSend does not propagate and dispatches unmodified',
+      () async {
+    // Regression test: `_dispatch` must guard the `beforeSend` call. A
+    // throwing hook is NOT the same as a hook that returns null (a deliberate
+    // drop, exercised above) — the item must still reach the wire unchanged,
+    // and the capture call itself must complete without throwing.
+    final SauronClient client = await buildClient((Object item) {
+      throw StateError('boom from beforeSend');
+    });
+
+    // The capture call itself must not throw.
+    expect(() => client.track('unscathed'), returnsNormally);
+    await client.flush();
+    await client.close();
+
+    expect(names(), contains('unscathed'));
+  });
+
+  test(
+      'a throwing beforeSend and a null-returning beforeSend are not '
+      'conflated', () async {
+    // One hook exercises both paths: throws for 'boom' (must still dispatch,
+    // unmodified), returns null for 'drop' (must still be dropped). Proves
+    // the throw-guard didn't accidentally turn drops into unmodified passes
+    // or vice versa.
+    final SauronClient client = await buildClient((Object item) {
+      if (item is EventItem && item.name == 'boom') {
+        throw StateError('boom from beforeSend');
+      }
+      if (item is EventItem && item.name == 'drop') {
+        return null;
+      }
+      return item;
+    });
+
+    client.track('boom');
+    client.track('drop');
+    client.track('kept');
+    await client.flush();
+    await client.close();
+
+    expect(names(), contains('boom')); // thrown -> dispatched unmodified
+    expect(names(), isNot(contains('drop'))); // null -> still dropped
+    expect(names(), contains('kept'));
+  });
+
   test('beforeSend can replace/mutate a non-error item', () async {
     // Returning a different item replaces the original on the wire.
     final SauronClient client = await buildClient((Object item) {

@@ -7,6 +7,7 @@ import 'client.dart';
 import 'integrations/run_zoned_guarded.dart';
 import 'sauron_options.dart';
 import 'types.dart';
+import 'workflow.dart';
 
 /// The public, static entry point to the Sauron SDK.
 ///
@@ -101,6 +102,31 @@ class Sauron {
 
   /// The current screen name, or null.
   static String? get screen => _client?.screen;
+
+  /// Starts a named workflow — a bounded span of activity stamped onto every
+  /// error/event/transaction captured while it is active. See
+  /// [SauronClient.startWorkflow] for the full status contract.
+  ///
+  /// Before `init` / after `close`, returns `disabled` like every other
+  /// facade member.
+  static WorkflowResult startWorkflow(String name, {bool force = false}) =>
+      _client?.startWorkflow(name, force: force) ??
+      const WorkflowResult(WorkflowStatus.disabled);
+
+  /// Ends the active workflow (or the one named [name]). See
+  /// [SauronClient.endWorkflow].
+  static WorkflowResult endWorkflow([String? name]) =>
+      _client?.endWorkflow(name) ?? const WorkflowResult(WorkflowStatus.disabled);
+
+  /// Cancels the active workflow (or the one named [name]). See
+  /// [SauronClient.cancelWorkflow].
+  static WorkflowResult cancelWorkflow([String? name, String? reason]) =>
+      _client?.cancelWorkflow(name, reason) ??
+      const WorkflowResult(WorkflowStatus.disabled);
+
+  /// The active workflow, or null if none (including before `init` / after
+  /// `close`).
+  static ActiveWorkflow? get workflow => _client?.workflow;
 
   /// Records a performance transaction: one timed operation (navigation, HTTP
   /// call, resource fetch, screen load, or a custom span).

@@ -18,6 +18,13 @@ internal sealed class Scope
     public Dictionary<string, object?> Extra { get; } = new();
     public List<Breadcrumb> Breadcrumbs { get; } = new();
 
+    /// <summary>
+    /// The workflow currently bounding this scope, if any. Lives here (not a static field)
+    /// so it flows with the <c>AsyncLocal</c> scope stack: per-request in a server, never
+    /// shared across concurrent requests.
+    /// </summary>
+    public ActiveWorkflow? Workflow { get; set; }
+
     public void SetUser(SauronUser? user) => User = user;
 
     public void SetTag(string key, string value)
@@ -131,7 +138,7 @@ internal sealed class Scope
     /// <summary>A deep-enough copy: independent tag/context/extra maps and breadcrumb list.</summary>
     public Scope Clone()
     {
-        var copy = new Scope { User = User };
+        var copy = new Scope { User = User, Workflow = Workflow };
         foreach (var kv in Tags) copy.Tags[kv.Key] = kv.Value;
         foreach (var kv in Contexts) copy.Contexts[kv.Key] = kv.Value;
         foreach (var kv in Extra) copy.Extra[kv.Key] = kv.Value;
@@ -142,6 +149,7 @@ internal sealed class Scope
     public void Clear()
     {
         User = null;
+        Workflow = null;
         Tags.Clear();
         Contexts.Clear();
         Extra.Clear();

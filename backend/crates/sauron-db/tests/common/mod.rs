@@ -14,6 +14,18 @@
 //! fresh, empty, exactly-known database is what lets assertions be `== 3`
 //! rather than `>= 3` — which is the only kind of assertion that catches an
 //! over-broad filter.
+//!
+//! `mod common;` is compiled once per integration-test binary that declares
+//! it (`env_scoping.rs`, and — since Task 3 of workflow grouping —
+//! `workflows.rs` too), each as its own separate crate with its own
+//! independent dead-code analysis. A helper with a real caller in one binary
+//! but not the other looks unused from that *other* binary's point of view,
+//! since Rust's per-crate dead-code check cannot see across that boundary.
+//! Allowed at the module level, rather than chasing an ever-growing pile of
+//! per-item allows as more binaries share this harness (a few of which
+//! already existed here before Task 3, for the unrelated single-binary
+//! reason `SeedIds`'s own doc comment explains).
+#![allow(dead_code)]
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -229,23 +241,24 @@ const FUNNEL_STEP_2: &str = "harness.funnel.step2";
 /// wide` — both updated there. Nothing else in item 1/2 above changed:
 /// `session_b0` itself, `device_b`'s `now - 10s`, and every row count are
 /// exactly as this comment already described.
-// The three identity-string fields below (`shared_device_key`,
-// `distinct_id_env_b_only`, `device_key_env_b_only` — not the ids/counts, and
-// not `shared_distinct_id`, all of which already have a real reader in this
-// crate's own committed test, `env_scoping.rs`'s
-// `harness_seeds_two_isolated_environments`) are not read anywhere in this
-// crate yet — they exist for Tasks 7-9's own tests (screens, persons/devices,
-// funnels), which is what `dead_code` cannot see across a not-yet-written
-// file. Verified live against a real database while writing this seed (see
+// Several identity-string fields below (`shared_device_key`,
+// `distinct_id_env_b_only`, `device_key_env_b_only`) exist for tests that
+// address them by name rather than for this file's own use, and were verified
+// live against a real database while writing this seed (see
 // `.superpowers/sdd/s2-task-2-report.md`'s "Seed extension" and "Residual gap
-// closure" sections for the proof and its real output) and then allowed here
-// rather than kept as a permanent throwaway test, so the fields don't bit-rot
-// unnoticed if the seed changes shape again before those tasks land. The
-// attribute lives on the fields themselves, not the struct: `app_id`,
-// `env_a`, `env_b`, `issue_id`, `issue_env_b_only` and `shared_distinct_id`
-// already have a real reader in the committed test, and blanketing the whole
-// struct would have silently suppressed a genuine dead-code warning on any of
-// those too.
+// closure" sections for the proof and its real output) rather than kept as a
+// permanent throwaway test, so they don't bit-rot unnoticed if the seed
+// changes shape again.
+//
+// They used to carry individual `#[allow(dead_code)]` attributes, deliberately
+// per-field rather than on the struct so a genuine dead-code warning on any
+// OTHER field would still surface. That distinction stopped being available
+// once this module gained a second consumer: `mod common;` is compiled
+// separately into each integration-test binary that declares it, and the
+// module-level `#![allow(dead_code)]` at the top of this file (see its own
+// comment) now covers every item here regardless. The per-field attributes
+// were removed as dead weight rather than left to imply a granularity that no
+// longer exists.
 pub struct SeedIds {
     pub app_id: Uuid,
     /// The project the app belongs to. Environments are defined here, so any
@@ -306,15 +319,10 @@ pub struct SeedIds {
     /// to handle too.
     pub issue_shared: Uuid,
     /// Present in `error_events` and `sessions` in both `env_a` and `env_b`.
-    /// Has a real reader already (the committed test's `distinct_envs_for_identity`
-    /// guard), unlike the three below — no `#[allow(dead_code)]` needed here.
     pub shared_distinct_id: String,
-    #[allow(dead_code)]
     pub shared_device_key: String,
     /// Confined to `env_b` alone; also `env_b`'s two-step funnel identity.
-    #[allow(dead_code)]
     pub distinct_id_env_b_only: String,
-    #[allow(dead_code)]
     pub device_key_env_b_only: String,
     /// Registered in `event_users`/`devices` (via `note_identity`) with **no**
     /// `analytics_events` or `error_events` row anywhere, in either
@@ -1355,6 +1363,8 @@ impl TestDb {
                 session_id: Some(session_id.clone()),
                 device_key: Some(device_key.clone()),
                 screen: None,
+                workflow_id: None,
+                workflow_name: None,
                 stacktrace_symbolicated: None,
                 symbolication_status: "not_applicable".into(),
                 debug_meta: None,
@@ -1480,6 +1490,8 @@ async fn seed_analytics_event(
             occurred_at,
             device_key: Some(device_key.to_string()),
             screen: Some(screen.to_string()),
+            workflow_id: None,
+            workflow_name: None,
             tags: json!({}),
             contexts: json!({}),
             extra: json!({}),
@@ -1540,6 +1552,8 @@ async fn seed_error_event(
             session_id: None,
             device_key: Some(device_key.to_string()),
             screen: Some(screen.to_string()),
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: None,
             symbolication_status: "not_applicable".into(),
             debug_meta: None,
@@ -1585,6 +1599,8 @@ async fn seed_transaction(
             distinct_id: None,
             session_id: None,
             device_key: None,
+            workflow_id: None,
+            workflow_name: None,
             release: None,
             ip_address: None,
             occurred_at,

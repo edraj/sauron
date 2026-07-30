@@ -190,6 +190,17 @@ pub const ISSUE_FILTERS: &[FieldSpec] = &[
         ops: OPS_TAG,
         options: NO_OPTS,
     },
+    // Predicates on `workflow_name` — see `sauron_db::repo::bump_workflow`'s
+    // doc comment for what stamps it. Unlike `tag`, no per-issue EXISTS
+    // ambiguity to worry about at the FieldSpec level: `list_issues`
+    // translates this into an `EXISTS` against `error_events.workflow_name`,
+    // same idiom as the `tag` field just above.
+    FieldSpec {
+        key: "workflow",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
 ];
 
 // `environment` is validated as a free string here (valid values are per-app and
@@ -231,17 +242,39 @@ pub const EVENT_FILTERS: &[FieldSpec] = &[
         ops: OPS_TAG,
         options: NO_OPTS,
     },
+    // Predicates on `analytics_events.workflow_name`. This is the registry the
+    // dashboard's `EVENT_FIELDS` (the Events page) resolves against — a
+    // different registry from `ISSUE_FILTERS` above and `ERROR_EVENT_FILTERS`
+    // below, which back `ISSUE_FIELDS` and the per-issue occurrences
+    // drill-down respectively. All three carry `workflow` because the same
+    // chip is offered at all three levels; omitting it from any one of them
+    // makes that page 400 outright (`UnknownField`) the moment a user applies
+    // the chip there.
+    FieldSpec {
+        key: "workflow",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
 ];
 
-// Per-error-event occurrences (issue detail). Only the developer `tag` is
-// filterable per-occurrence; issue-group fields (level/status/...) live on the
-// issue, not the individual event.
-pub const ERROR_EVENT_FILTERS: &[FieldSpec] = &[FieldSpec {
-    key: "tag",
-    ty: FieldType::Tag,
-    ops: OPS_TAG,
-    options: NO_OPTS,
-}];
+// Per-error-event occurrences (issue detail). The developer `tag` and the
+// `workflow_name` stamp are filterable per-occurrence; issue-group fields
+// (level/status/...) live on the issue, not the individual event.
+pub const ERROR_EVENT_FILTERS: &[FieldSpec] = &[
+    FieldSpec {
+        key: "tag",
+        ty: FieldType::Tag,
+        ops: OPS_TAG,
+        options: NO_OPTS,
+    },
+    FieldSpec {
+        key: "workflow",
+        ty: FieldType::Str,
+        ops: OPS_STR,
+        options: NO_OPTS,
+    },
+];
 
 #[cfg(test)]
 mod tests {

@@ -6,7 +6,7 @@ import 'types.dart';
 const String kSauronSdkName = 'sauron.flutter';
 
 /// SDK version — keep in sync with `pubspec.yaml`.
-const String kSauronSdkVersion = '1.3.0';
+const String kSauronSdkVersion = '1.4.0';
 
 /// The envelope header: routing + provenance metadata.
 class EnvelopeHeader {
@@ -104,6 +104,8 @@ class ErrorItem extends EnvelopeItem {
     this.breadcrumbs = const <Breadcrumb>[],
     this.fingerprint,
     this.sessionId,
+    this.workflowId,
+    this.workflowName,
     this.screen,
     this.rawStacktrace,
     this.debugMeta,
@@ -122,6 +124,14 @@ class ErrorItem extends EnvelopeItem {
 
   /// The session this error occurred in, tying it onto the session timeline.
   final String? sessionId;
+
+  /// Id of the workflow this error occurred within, if one was active. Omitted
+  /// from the wire entirely when null — see [toJson].
+  final String? workflowId;
+
+  /// Name of that workflow, denormalized alongside the id. Always set/omitted
+  /// as a pair with [workflowId].
+  final String? workflowName;
 
   /// The screen/route this error occurred on, if known.
   final String? screen;
@@ -156,8 +166,17 @@ class ErrorItem extends EnvelopeItem {
           breadcrumbs.map((Breadcrumb crumb) => crumb.toJson()).toList(),
       'fingerprint': fingerprint,
       'session_id': sessionId,
-      'screen': screen,
     };
+    // Absent means the key is OMITTED, never `null` — apps that never call
+    // startWorkflow must serialize byte-identically to before workflows
+    // existed. workflow_id/workflow_name are always set (or omitted) together.
+    if (workflowId != null) {
+      json['workflow_id'] = workflowId;
+    }
+    if (workflowName != null) {
+      json['workflow_name'] = workflowName;
+    }
+    json['screen'] = screen;
     // Only present for obfuscated Dart errors — keeps the common shape identical
     // across SDKs (the server defaults both fields).
     if (rawStacktrace != null) {
@@ -184,6 +203,8 @@ class EventItem extends EnvelopeItem {
     required this.timestamp,
     this.distinctId,
     this.sessionId,
+    this.workflowId,
+    this.workflowName,
     this.screen,
     Map<String, Object?>? properties,
     Map<String, String>? tags,
@@ -200,6 +221,14 @@ class EventItem extends EnvelopeItem {
 
   /// The session this event was recorded in, if the SDK is tracking one.
   final String? sessionId;
+
+  /// Id of the workflow this event occurred within, if one was active.
+  /// Omitted from the wire entirely when null — see [toJson].
+  final String? workflowId;
+
+  /// Name of that workflow, denormalized alongside the id. Always set/omitted
+  /// as a pair with [workflowId].
+  final String? workflowName;
 
   /// The screen/route this event was recorded on, if known.
   final String? screen;
@@ -226,8 +255,14 @@ class EventItem extends EnvelopeItem {
       'timestamp': sauronIso(timestamp),
       'properties': properties,
       'session_id': sessionId,
-      'screen': screen,
     };
+    if (workflowId != null) {
+      json['workflow_id'] = workflowId;
+    }
+    if (workflowName != null) {
+      json['workflow_name'] = workflowName;
+    }
+    json['screen'] = screen;
     if (tags.isNotEmpty) {
       json['tags'] = tags;
     }
@@ -294,7 +329,7 @@ class BreadcrumbBatchItem extends EnvelopeItem {
 /// Wire shape:
 /// `{ "type": "transaction", "name", "op", "duration_ms", "status"?,
 ///    "http_method"?, "http_status"?, "url"?, "distinct_id"?, "session_id"?,
-///    "timestamp" }`.
+///    "workflow_id"?, "workflow_name"?, "timestamp" }`.
 class TransactionItem extends EnvelopeItem {
   TransactionItem({
     required this.name,
@@ -306,6 +341,8 @@ class TransactionItem extends EnvelopeItem {
     this.url,
     this.distinctId,
     this.sessionId,
+    this.workflowId,
+    this.workflowName,
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now().toUtc();
 
@@ -337,6 +374,14 @@ class TransactionItem extends EnvelopeItem {
   /// The session this transaction belongs to, if the SDK is tracking one.
   final String? sessionId;
 
+  /// Id of the workflow this transaction occurred within, if one was active.
+  /// Omitted from the wire entirely when null — see [toJson].
+  final String? workflowId;
+
+  /// Name of that workflow, denormalized alongside the id. Always set/omitted
+  /// as a pair with [workflowId].
+  final String? workflowName;
+
   /// When the transaction was recorded (UTC).
   final DateTime timestamp;
 
@@ -344,19 +389,28 @@ class TransactionItem extends EnvelopeItem {
   String get type => 'transaction';
 
   @override
-  Map<String, Object?> toJson() => <String, Object?>{
-        'type': type,
-        'name': name,
-        'op': op,
-        'duration_ms': durationMs,
-        'status': status,
-        'http_method': httpMethod,
-        'http_status': httpStatus,
-        'url': url,
-        'distinct_id': distinctId,
-        'session_id': sessionId,
-        'timestamp': sauronIso(timestamp),
-      };
+  Map<String, Object?> toJson() {
+    final Map<String, Object?> json = <String, Object?>{
+      'type': type,
+      'name': name,
+      'op': op,
+      'duration_ms': durationMs,
+      'status': status,
+      'http_method': httpMethod,
+      'http_status': httpStatus,
+      'url': url,
+      'distinct_id': distinctId,
+      'session_id': sessionId,
+    };
+    if (workflowId != null) {
+      json['workflow_id'] = workflowId;
+    }
+    if (workflowName != null) {
+      json['workflow_name'] = workflowName;
+    }
+    json['timestamp'] = sauronIso(timestamp);
+    return json;
+  }
 }
 
 /// A complete envelope: header + context + items.

@@ -19,6 +19,8 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 
+from ._workflow import ActiveWorkflow
+
 # The default breadcrumb ring size (aligned with the Flutter SDK).
 DEFAULT_MAX_BREADCRUMBS = 100
 
@@ -66,6 +68,7 @@ class Scope:
         "extra",
         "breadcrumbs",
         "max_breadcrumbs",
+        "workflow",
         "_parent",
     )
 
@@ -76,6 +79,12 @@ class Scope:
         self.extra: Dict[str, Any] = {}
         self.breadcrumbs: List[Dict[str, Any]] = []
         self.max_breadcrumbs = max_breadcrumbs
+        # The active workflow for this scope (see ``_workflow.py``), or
+        # ``None``. Isolated per-request the same way user/tags/breadcrumbs
+        # are: via the ``contextvars.ContextVar``-backed scope stack below,
+        # never a module global (a global here would leak one concurrent
+        # request's workflow into another's captured errors).
+        self.workflow: Optional[ActiveWorkflow] = None
         # Set on push so pop can restore it; ``None`` at the global scope.
         self._parent: Optional["Scope"] = None
 
@@ -117,6 +126,7 @@ class Scope:
         self.contexts = {}
         self.extra = {}
         self.breadcrumbs = []
+        self.workflow = None
 
     # -- read --------------------------------------------------------------
 
@@ -128,6 +138,11 @@ class Scope:
         c.contexts = dict(self.contexts)
         c.extra = dict(self.extra)
         c.breadcrumbs = [dict(b) for b in self.breadcrumbs]
+        # ``ActiveWorkflow`` is only ever replaced wholesale (never mutated
+        # field-by-field) by the workflow mutators, so sharing the reference
+        # here is safe — the clone and the parent independently reassign
+        # ``.workflow`` and never touch each other's.
+        c.workflow = self.workflow
         return c
 
     def apply_to_error(self, item: Dict[str, Any]) -> None:
@@ -188,6 +203,20 @@ class Scope:
             item["extra"] = merged_extra
         else:
             item.pop("extra", None)
+
+    def apply_workflow(self, item: Dict[str, Any]) -> None:
+        """Stamp ``workflow_id``/``workflow_name`` onto an outgoing item in
+        place, when this scope has an active workflow.
+
+        Called from the client's single outbound chokepoint
+        (``Client._dispatch``) for error/event/transaction items — never for
+        ``identify`` (the server has no workflow columns for it). The keys
+        are set as a pair or not at all, and are **omitted entirely** (never
+        emitted as ``null``) when no workflow is active.
+        """
+        if self.workflow is not None:
+            item["workflow_id"] = self.workflow.workflow_id
+            item["workflow_name"] = self.workflow.name
 
 
 # -- module-level scope hub ------------------------------------------------

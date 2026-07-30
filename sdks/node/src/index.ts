@@ -16,6 +16,7 @@ import type {
   MetadataOptions,
   TransactionInput,
   User,
+  WorkflowResult,
 } from './types.js';
 
 export { SauronClient, describeError } from './client.js';
@@ -33,6 +34,8 @@ export {
 } from './scope.js';
 export { installAutoCapture, installShutdownHooks } from './autocapture.js';
 export type { AutoCaptureOptions } from './autocapture.js';
+/** Bare read of the current scope's workflow — client-agnostic, never throws. */
+export { getWorkflow } from './workflow.js';
 export type * from './types.js';
 
 let activeClient: SauronClient | null = null;
@@ -90,6 +93,31 @@ export function trackTransaction(input: TransactionInput): void {
  */
 export function addBreadcrumb(crumb: BreadcrumbInput): void {
   activeClient?.addBreadcrumb(crumb);
+}
+
+/**
+ * Start a named workflow on the current scope (request-isolated via
+ * `AsyncLocalStorage` — see `withScope`). No-op state-wise and returns
+ * `{ status: 'disabled' }` if the SDK is not initialized.
+ */
+export function startWorkflow(name: string, options?: { force?: boolean }): WorkflowResult {
+  return activeClient?.startWorkflow(name, options) ?? { status: 'disabled' };
+}
+
+/**
+ * End the active workflow (or the one named `name`, if given). Returns
+ * `{ status: 'disabled' }` if the SDK is not initialized.
+ */
+export function endWorkflow(name?: string): WorkflowResult {
+  return activeClient?.endWorkflow(name) ?? { status: 'disabled' };
+}
+
+/**
+ * Cancel the active workflow (or the one named `name`, if given). Returns
+ * `{ status: 'disabled' }` if the SDK is not initialized.
+ */
+export function cancelWorkflow(name?: string, options?: { reason?: string }): WorkflowResult {
+  return activeClient?.cancelWorkflow(name, options) ?? { status: 'disabled' };
 }
 
 /** Set the user on the active scope (the global scope outside a `withScope`). */

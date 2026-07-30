@@ -45,6 +45,7 @@ export class Scope {
     contexts: {},
     extra: {},
     breadcrumbs: [],
+    workflow: null,
   };
   private maxBreadcrumbs: number;
 
@@ -99,6 +100,10 @@ export class Scope {
     copy.data.contexts = { ...this.data.contexts };
     copy.data.extra = { ...this.data.extra };
     copy.data.breadcrumbs = this.data.breadcrumbs.slice();
+    // ActiveWorkflow is never mutated in place (always replaced wholesale by
+    // startWorkflow/endWorkflow/cancelWorkflow), so sharing the reference is
+    // safe — no need to deep-copy it.
+    copy.data.workflow = this.data.workflow;
     return copy;
   }
 

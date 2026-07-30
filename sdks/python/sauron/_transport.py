@@ -172,6 +172,19 @@ class Transport:
 
     # -- lifecycle ---------------------------------------------------------
 
+    @property
+    def disabled(self) -> bool:
+        """Whether :meth:`disable` has run (permanent for this transport's
+        lifetime — there is no way back short of constructing a new one).
+
+        Read without the condition lock, matching the existing unlocked read
+        of ``self._disabled`` in :meth:`_send`: a plain ``bool`` attribute
+        read/write is already atomic under the GIL, and the only writer
+        (:meth:`disable`) only ever flips it one-way, so a caller can never
+        observe a torn or stale-then-reverted value.
+        """
+        return self._disabled
+
     def start(self) -> None:
         if self._started:
             return

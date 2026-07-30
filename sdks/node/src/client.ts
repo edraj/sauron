@@ -10,7 +10,9 @@ import {
   getGlobalScope,
   normalizeBreadcrumb,
 } from './scope.js';
+import { normalizeReason, normalizeWorkflowName } from './workflow.js';
 import type {
+  ActiveWorkflow,
   BreadcrumbInput,
   CaptureExceptionOptions,
   Context,
@@ -25,6 +27,7 @@ import type {
   ResolvedOptions,
   TransactionInput,
   TransactionItem,
+  WorkflowResult,
 } from './types.js';
 
 const DEFAULTS = {
@@ -149,15 +152,43 @@ export class SauronClient {
   }
 
   /**
-   * The single enqueue chokepoint. Runs `beforeSend` on every item; a `null`
-   * return drops it, a returned item replaces it, then it is handed to the
-   * transport.
+   * The single enqueue chokepoint — every error/event/transaction (however
+   * constructed, including `captureMessage`'s inline-built item) passes
+   * through here before reaching the transport. Stamping the active
+   * workflow ONCE, right here, means a future capture path can't forget it
+   * the way a per-construction-site stamp could. `identify` items are
+   * excluded: the server has no workflow columns for them.
+   *
+   * Runs `beforeSend` on every item; a `null` return drops it, a returned
+   * item replaces it, then it is handed to the transport.
+   *
+   * `beforeSend` is user-supplied, so it is guarded: a throwing hook must
+   * never propagate into the caller's `track`/`captureException`/etc — that
+   * would break the SDK's no-throw guarantee. On throw, the item is treated
+   * as UNMODIFIED and still sent (never silently dropped); the failure is
+   * only surfaced via the debug logger.
    */
   private dispatch(item: EnvelopeItem): void {
+    if (item.type !== 'identify') {
+      const workflow = getCurrentScope().data.workflow;
+      if (workflow) {
+        item.workflow_id = workflow.workflowId;
+        item.workflow_name = workflow.name;
+      }
+    }
     const beforeSend = this.options.beforeSend;
     if (beforeSend) {
-      const result = beforeSend(item);
-      if (result == null) return;
+      let result: EnvelopeItem | null = item;
+      try {
+        result = beforeSend(item);
+      } catch (err) {
+        this.debugLog('beforeSend threw', err);
+        result = item;
+      }
+      if (result == null) {
+        this.debugLog('dropped by beforeSend');
+        return;
+      }
       this.transport.enqueue(result);
       return;
     }
@@ -207,7 +238,24 @@ export class SauronClient {
     options: MetadataOptions = {},
   ): void {
     if (typeof event !== 'string' || event.length === 0) return;
+    // An empty/absent distinct id drops a MANUAL track call: the caller should
+    // know who acted. The reserved workflow lifecycle events deliberately
+    // bypass this via emitEvent() — see workflowDistinctId().
     if (typeof distinctId !== 'string' || distinctId.length === 0) return;
+    this.emitEvent(event, distinctId, properties, options);
+  }
+
+  /**
+   * Build and dispatch an event item. Shared by the public {@link track} (which
+   * validates first) and the reserved workflow lifecycle emits (which must be
+   * able to send an intentionally empty `distinct_id`).
+   */
+  private emitEvent(
+    event: string,
+    distinctId: string,
+    properties?: Record<string, unknown>,
+    options: MetadataOptions = {},
+  ): void {
     const item: EventItem = {
       type: 'event',
       name: event,
@@ -292,6 +340,216 @@ export class SauronClient {
     this.dispatch(item);
   }
 
+  /**
+   * Whether this client can still deliver telemetry — false once the
+   * transport has auto-disabled itself on a 401/403. Gated on this (not just
+   * "does a client object exist") so `startWorkflow` can't mutate local scope
+   * state and emit an event the transport would silently drop underneath it.
+   */
+  isEnabled(): boolean {
+    return this.transport.isEnabled();
+  }
+
+  /** Debug-gated warning log, matching the transport's own `[sauron]`-prefixed convention. */
+  private debugLog(message: string, ...args: unknown[]): void {
+    if (this.options.debug) {
+      // eslint-disable-next-line no-console
+      console.warn(`[sauron] ${message}`, ...args);
+    }
+  }
+
+  /**
+   * Emit the closing lifecycle event (`$workflow_end`/`$workflow_cancel`) for
+   * `active` while it is STILL the current scope's workflow (so the item-level
+   * `workflow_id`/`workflow_name` stamped by `dispatch()` are its own, not
+   * `null`/absent), through `track()` so scope tags/contexts/extra apply.
+   * Never mutates scope state itself — callers own clearing it, in a `finally`
+   * relative to this call, so a throw here can't leave state half-mutated.
+   *
+   * The `distinctId` comes from {@link SauronClient.workflowDistinctId} — read
+   * its note on the `'system'` fallback's effect on unique-user counts.
+   */
+  private emitWorkflowClose(
+    active: ActiveWorkflow,
+    eventName: '$workflow_end' | '$workflow_cancel',
+    reason?: string,
+  ): void {
+    const properties: Record<string, unknown> = {
+      workflow_id: active.workflowId,
+      workflow_name: active.name,
+      duration_ms: Math.max(0, Date.now() - Date.parse(active.startedAt)),
+    };
+    if (eventName === '$workflow_cancel') {
+      properties.reason = normalizeReason(reason);
+    }
+    this.emitEvent(eventName, this.workflowDistinctId(), properties);
+  }
+
+  /**
+   * The `distinct_id` to attribute a workflow lifecycle event to: the scope's
+   * user id, else **the empty string**.
+   *
+   * Empty is deliberate and correct — do NOT "fix" this to a sentinel like
+   * `'system'`, an anonymous/device id, or anything derived from the workflow
+   * id. The server was built for exactly this case:
+   *
+   *   - `backend/crates/sauron-pipeline/src/process.rs` — both `bump_workflow`
+   *     call sites pass `Some(distinct_id.as_str()).filter(|s| !s.is_empty())`,
+   *     so an empty id is stored as SQL `NULL` on the `workflows` row.
+   *   - `backend/crates/sauron-db/src/repo.rs` — the per-workflow rollup
+   *     computes `COUNT(DISTINCT w.distinct_id) AS unique_users`, and
+   *     `COUNT(DISTINCT ...)` skips NULLs.
+   *
+   * So an anonymous workflow run contributes *nothing* to `unique_users`,
+   * which is honest. Any non-empty sentinel would instead collapse every
+   * anonymous run of a workflow (`password_reset`, `guest_checkout`, …) into
+   * one fake bucket, silently reporting ~1 unique user no matter how many
+   * distinct invocations occurred.
+   *
+   * `EventItem.distinct_id` is a required string on the wire
+   * (`backend/crates/sauron-core/src/envelope.rs`), so the field is still
+   * always sent — it is just `""`. This is why the lifecycle emits route
+   * through {@link emitEvent} rather than the public {@link track}, whose
+   * empty-`distinctId` guard would otherwise drop them entirely.
+   */
+  private workflowDistinctId(): string {
+    return getCurrentScope().data.user?.id ?? '';
+  }
+
+  /**
+   * Start a named workflow on the current scope (the `AsyncLocalStorage`
+   * child inside `withScope`/`runWithAsyncScope`, else the process-wide
+   * global scope) — request-isolated, so concurrent requests never observe
+   * or clobber each other's workflow. `force: true` supersedes an
+   * already-active workflow (emitting `$workflow_cancel` with
+   * `reason: 'superseded'` for it first); otherwise an active workflow makes
+   * this a no-op returning `already_active`.
+   *
+   * The workflow id is a fresh `randomUUID()`, minted here — never derived
+   * from anything deterministic. The server's rollup key is
+   * `(app_id, workflow_id)` app-wide, so a reused/derived id would merge
+   * counters from unrelated requests/environments into one row.
+   *
+   * Never throws: an unexpected failure before any side effect is reported as
+   * `disabled`, and `disabled` always means literally nothing happened — no
+   * event on the wire, no state change. A failure emitting `$workflow_start`
+   * AFTER the scope's workflow field was set is still reported as `ok` — the
+   * workflow IS live locally, and a lost start event is recoverable
+   * server-side (the row materializes from the next stamped item via the same
+   * upsert); a lost local id would not be.
+   */
+  startWorkflow(name: string, options?: { force?: boolean }): WorkflowResult {
+    try {
+      if (!this.isEnabled()) return { status: 'disabled' };
+      const normalized = normalizeWorkflowName(name);
+      if (!normalized) {
+        this.debugLog('startWorkflow: invalid name', name);
+        return { status: 'invalid_name' };
+      }
+
+      const scope = getCurrentScope();
+      const active = scope.data.workflow;
+      if (active && !options?.force) {
+        this.debugLog(
+          `startWorkflow("${normalized}"): "${active.name}" is already active; pass { force: true } to replace it`,
+        );
+        return { status: 'already_active' };
+      }
+
+      // Mint the replacement BEFORE superseding anything. If `randomUUID()` or
+      // `isoNow()` throws, the outer catch returns `disabled` — which promises
+      // the caller that nothing happened and their old workflow is still
+      // running. Minting after the supersede emit would break that promise:
+      // `$workflow_cancel` for the old workflow would already be on the wire
+      // while `scope.data.workflow` still held it, so the caller's eventual
+      // `endWorkflow()` would emit a SECOND terminal lifecycle event for a
+      // workflow row the server already recorded as cancelled.
+      const workflow: ActiveWorkflow = {
+        workflowId: randomUUID(),
+        name: normalized,
+        startedAt: isoNow(),
+      };
+
+      if (active) {
+        // force: supersede the old workflow. Emitted while it is still
+        // `scope.data.workflow`, so `dispatch()` stamps the cancel with it.
+        try {
+          this.emitWorkflowClose(active, '$workflow_cancel', 'superseded');
+        } catch (emitErr) {
+          this.debugLog('startWorkflow: superseding $workflow_cancel emit threw', emitErr);
+        }
+      }
+
+      // Set state BEFORE emitting so $workflow_start is itself stamped with it.
+      scope.data.workflow = workflow;
+      try {
+        this.emitEvent('$workflow_start', this.workflowDistinctId(), {
+          workflow_id: workflow.workflowId,
+          workflow_name: workflow.name,
+        });
+      } catch (emitErr) {
+        this.debugLog('startWorkflow: $workflow_start emit threw (workflow stays active)', emitErr);
+      }
+      return { status: 'ok', workflowId: workflow.workflowId };
+    } catch (err) {
+      this.debugLog('startWorkflow threw', err);
+      return { status: 'disabled' };
+    }
+  }
+
+  /** Shared precondition + close logic for `endWorkflow`/`cancelWorkflow`. */
+  private closeWorkflow(
+    eventName: '$workflow_end' | '$workflow_cancel',
+    name?: string,
+    reason?: string,
+  ): WorkflowResult {
+    try {
+      if (!this.isEnabled()) return { status: 'disabled' };
+      const scope = getCurrentScope();
+      const active = scope.data.workflow;
+      if (!active) return { status: 'not_active' };
+      if (name !== undefined && normalizeWorkflowName(name) !== active.name) {
+        this.debugLog(`${eventName}: "${name}" does not match active workflow "${active.name}"`);
+        return { status: 'name_mismatch' };
+      }
+      const workflowId = active.workflowId;
+      try {
+        this.emitWorkflowClose(active, eventName, reason);
+      } catch (emitErr) {
+        this.debugLog(`${eventName} emit threw`, emitErr);
+      } finally {
+        // Clear AFTER emitting (so the closing event still carries the
+        // workflow it closes) but UNCONDITIONALLY — even if the emit above
+        // threw, endWorkflow/cancelWorkflow must still return `ok` below
+        // rather than leaving state half-mutated.
+        scope.data.workflow = null;
+      }
+      return { status: 'ok', workflowId };
+    } catch (err) {
+      this.debugLog(`${eventName} threw`, err);
+      return { status: 'disabled' };
+    }
+  }
+
+  /**
+   * End the active workflow (or the one named `name`, if given). Emits
+   * `$workflow_end` with `duration_ms` and clears the scope's workflow field.
+   * A no-op returning `not_active` (nothing active) or `name_mismatch` (`name`
+   * given but does not match, including a `name` that fails normalization).
+   */
+  endWorkflow(name?: string): WorkflowResult {
+    return this.closeWorkflow('$workflow_end', name);
+  }
+
+  /**
+   * Cancel the active workflow (or the one named `name`, if given). Emits
+   * `$workflow_cancel` with `duration_ms` and `reason` (default `'user'`,
+   * trimmed and capped at 120 chars) and clears the scope's workflow field.
+   */
+  cancelWorkflow(name?: string, options?: { reason?: string }): WorkflowResult {
+    return this.closeWorkflow('$workflow_cancel', name, options?.reason);
+  }
+
   /** Send any buffered items immediately. */
   flush(): Promise<void> {
     return this.transport.flush();
@@ -300,6 +558,11 @@ export class SauronClient {
   /** Flush then stop the background timer, and remove any opt-in process hooks. */
   close(): Promise<void> {
     for (const uninstall of this.hookUninstallers.splice(0)) uninstall();
+    // Clear (never auto-cancel — an abandoned workflow is a legitimate,
+    // server-derived 30-minute outcome) any workflow left on the shared
+    // global scope, so a later init() sharing the same process-wide scope
+    // doesn't inherit a stale one.
+    getGlobalScope().data.workflow = null;
     return this.transport.close();
   }
 }

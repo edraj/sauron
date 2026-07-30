@@ -31,7 +31,7 @@ or, in `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  sauron_flutter: ^1.3.0
+  sauron_flutter: ^1.4.0
 ```
 
 Requires Dart SDK `>=3.4.0 <4.0.0` and Flutter `>=3.19.0`.
@@ -230,7 +230,10 @@ Convention below: named parameters are written with a trailing colon
 the Default column.
 
 All `Sauron.*` members are static and delegate to `Sauron.client`. Before
-`init` (or after `close`) the client is `null` and every call is a silent no-op.
+`init` (or after `close`) the client is `null` and every call is a silent
+no-op — except the three workflow methods, which instead return a
+`WorkflowResult(status: WorkflowStatus.disabled)` (see
+[Workflows](#sauronstartworkflow--sauronendworkflow--sauroncancelworkflow--sauronworkflow)).
 
 ### `Sauron.init`
 
@@ -399,6 +402,87 @@ the current value (`null` until set or seeded via `options.screen`).
 Sauron.setScreen('Checkout');
 Sauron.setScreen('Checkout'); // no-op, no second $screen event
 assert(Sauron.screen == 'Checkout');
+```
+
+### `Sauron.startWorkflow` / `Sauron.endWorkflow` / `Sauron.cancelWorkflow` / `Sauron.workflow`
+
+A **workflow** is a named, explicitly-bounded span of activity you declare
+around a multi-step flow (checkout, onboarding, a background sync) so the
+dashboard can group the errors/events/transactions captured inside it. Entirely
+optional: if you never call `startWorkflow`, nothing changes — no field is
+added to any item, and `workflow_id`/`workflow_name` are omitted from the wire
+rather than sent as `null`.
+
+```dart
+static WorkflowResult startWorkflow(String name, {bool force = false})
+static WorkflowResult endWorkflow([String? name])
+static WorkflowResult cancelWorkflow([String? name, String? reason])
+static ActiveWorkflow? get workflow
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` (start) | `String` | required | The workflow's name. Trimmed; must be non-empty and at most 120 chars after trimming, or the call is rejected. |
+| `force:` | `bool` | `false` | When `true` and another workflow is already active, that workflow is closed first (`$workflow_cancel`, `reason: 'superseded'`) and the new one starts. When `false`, an already-active workflow makes the call a no-op. |
+| `name` (end/cancel) | `String?` | `null` | Optional guard: when given, the call only takes effect if it equals the active workflow's name. `null` closes whichever workflow is active. |
+| `reason` (cancel only) | `String?` | `null` | Free-form cancellation reason. Trimmed and capped at 120 chars; defaults to `'user'` when omitted or blank. |
+
+While a workflow is active, its `workflow_id` (a fresh, client-generated
+UUIDv4 — never derived from the session id, device id, or the name itself) and
+`workflow_name` are stamped onto every captured error, `track()` event, and
+`trackTransaction()`, in addition to riding along in the lifecycle event's own
+`properties`. `identify()` is never stamped — the server has no workflow
+columns for it.
+
+Starting, ending, and cancelling a workflow each emit one reserved analytics
+event through `track()` — `$workflow_start`, `$workflow_end`, or
+`$workflow_cancel` — so they show up in Events like anything else. `endWorkflow`
+adds `duration_ms`; `cancelWorkflow` adds both `duration_ms` and `reason`.
+
+All three mutators return a `WorkflowResult { status, workflowId }`. Exactly six
+`WorkflowStatus` values, never a seventh:
+
+| Status | From | Meaning |
+| --- | --- | --- |
+| `ok` | any | The call took effect. `workflowId` is the id of the workflow it affected. |
+| `alreadyActive` | `startWorkflow` | Another workflow is active and `force` was not set. No-op. |
+| `invalidName` | `startWorkflow` | `name` is empty after trimming, or over 120 chars. No-op. |
+| `notActive` | `endWorkflow`/`cancelWorkflow` | No workflow is active. No-op. |
+| `nameMismatch` | `endWorkflow`/`cancelWorkflow` | The given `name` does not equal the active workflow's name — **including when the given `name` itself fails normalization** (blank, or over 120 chars). `invalidName` is only ever returned by `startWorkflow`; a malformed name on end/cancel is `nameMismatch`. |
+| `disabled` | any | The SDK did not perform the call: before `init`, after `close()`, after the transport auto-disabled itself (401/403), **or an unexpected internal error**. Never a claim about workflow state or your input — just "the SDK did not do this." |
+
+`Sauron.workflow` reads the active `ActiveWorkflow { workflowId, name,
+startedAt }`, or `null` when none is active (including before `init` / after
+`close()`).
+
+**Abandonment.** A workflow with no further stamped activity for 30 minutes
+reads as `abandoned` when you view it on the dashboard. This is computed
+**on read** from the last stamped event's timestamp — it is never stored, and
+no client action is needed. If a later event or error is stamped with that
+same `workflow_id` after the 30-minute mark, the workflow simply reads as
+active again; nothing needs to be "resumed."
+
+```dart
+// A genuine bounded span: start, do work (events + a captured error land
+// inside it), then end.
+final WorkflowResult started = Sauron.startWorkflow('checkout');
+if (started.status == WorkflowStatus.ok) {
+  Sauron.track('checkout_started');
+  try {
+    await placeOrder();
+    Sauron.track('checkout_completed', properties: <String, Object?>{'cart_value': 42.5});
+  } on Exception catch (error, stack) {
+    Sauron.captureException(error, stackTrace: stack); // stamped with this workflow
+  }
+  Sauron.endWorkflow(); // emits $workflow_end with duration_ms
+}
+
+// Cancelling instead of ending — e.g. the user backs out of the flow.
+Sauron.startWorkflow('checkout');
+Sauron.cancelWorkflow(); // reason defaults to 'user'
+
+Sauron.startWorkflow('checkout');
+Sauron.cancelWorkflow('checkout', 'payment declined 3x');
 ```
 
 ### `Sauron.identify`
@@ -572,7 +656,12 @@ static bool get isEnabled
 ```
 
 `client` is `null` before `init` and after `close`. `isEnabled` is `true` only
-when a client exists **and** its DSN parsed successfully.
+when a client exists, its DSN parsed successfully, **and** the transport has
+not disabled itself. The transport disables itself permanently for the process
+when the gateway rejects the ingest key with a `401`/`403` (see
+[Transport & delivery](#transport--delivery)) — so `isEnabled` going `false`
+mid-session means the key was revoked or rotated, and nothing more will be
+delivered until the app restarts with a valid key.
 
 ### `SauronClient`
 
@@ -592,7 +681,8 @@ four additions:
 | `options` | `final SauronOptions` | The options this client was built with. |
 | `sessionId` | `final String` | UUIDv4 generated at construction; stamped on errors, events and transactions. |
 | `screen` | `String? get` | Current screen. |
-| `isEnabled` | `bool get` | Whether the DSN parsed. |
+| `workflow` | `ActiveWorkflow? get` | Current workflow, or `null`. Same as `Sauron.workflow`; `startWorkflow`/`endWorkflow`/`cancelWorkflow` also exist here with identical signatures to the facade. |
+| `isEnabled` | `bool get` | Whether the DSN parsed, the client is not closed, and the transport has not auto-disabled on a `401`/`403`. |
 | `installIntegrations()` | `void installIntegrations()` | Installs the error layers + lifecycle observer. Must run after `WidgetsFlutterBinding.ensureInitialized()`. Called for you by `Sauron.init`. |
 | `bootstrap({Directory? queueDirectory})` | `Future<void>` | Resolves the queue directory (defaults to `<app-support>/sauron`), loads device context, starts the transport and replays anything captured before it was ready. Idempotent. |
 | `track(...)` | adds `screen:` | `client.track(name, properties:, screen:, tags:, contexts:, extra:)` — the facade omits `screen:`. |
@@ -630,17 +720,20 @@ Everything below is exported from `package:sauron_flutter/sauron_flutter.dart`.
 | `EnvelopeHeader` | `const EnvelopeHeader({required String dsn, required DateTime sentAt, String? release, String sdkName = kSauronSdkName, String sdkVersion = kSauronSdkVersion})` | |
 | `Envelope` | `const Envelope({required EnvelopeHeader header, required SauronContext context, required List<EnvelopeItem> items})` | `encode()` returns the compact wire JSON. |
 | `EnvelopeItem` | abstract; `String get type`, `Map<String, Object?> toJson()`, `int get approximateBytes` | Base of all items below. |
-| `ErrorItem` | `ErrorItem({required SauronException exception, required DateTime timestamp, SauronLevel level = SauronLevel.error, List<Breadcrumb> breadcrumbs = const [], List<String>? fingerprint, String? sessionId, String? screen, String? rawStacktrace, DebugMeta? debugMeta, Map<String, String> tags = const {}, Map<String, Map<String, Object?>> contexts = const {}, Map<String, Object?> extra = const {}})` | `fingerprint` is never set by the SDK — `null` lets the server group. |
-| `EventItem` | `EventItem({required String name, required DateTime timestamp, String? distinctId, String? sessionId, String? screen, Map<String, Object?>? properties, Map<String, String>? tags, Map<String, Map<String, Object?>>? contexts, Map<String, Object?>? extra})` | |
-| `IdentifyItem` | `IdentifyItem({required String distinctId, String? anonymousId, Map<String, Object?>? traits})` | |
-| `TransactionItem` | `TransactionItem({required String name, required double durationMs, String op = 'custom', String? status, String? httpMethod, int? httpStatus, String? url, String? distinctId, String? sessionId, DateTime? timestamp})` | |
+| `ErrorItem` | `ErrorItem({required SauronException exception, required DateTime timestamp, SauronLevel level = SauronLevel.error, List<Breadcrumb> breadcrumbs = const [], List<String>? fingerprint, String? sessionId, String? workflowId, String? workflowName, String? screen, String? rawStacktrace, DebugMeta? debugMeta, Map<String, String> tags = const {}, Map<String, Map<String, Object?>> contexts = const {}, Map<String, Object?> extra = const {}})` | `fingerprint` is never set by the SDK — `null` lets the server group. `workflowId`/`workflowName` are stamped by `captureException` from the active workflow, if any — omitted from the wire (never `null`) when there isn't one. |
+| `EventItem` | `EventItem({required String name, required DateTime timestamp, String? distinctId, String? sessionId, String? workflowId, String? workflowName, String? screen, Map<String, Object?>? properties, Map<String, String>? tags, Map<String, Map<String, Object?>>? contexts, Map<String, Object?>? extra})` | `workflowId`/`workflowName` — see `ErrorItem`. |
+| `IdentifyItem` | `IdentifyItem({required String distinctId, String? anonymousId, Map<String, Object?>? traits})` | Never carries workflow fields — the server has no workflow columns for `identify`. |
+| `TransactionItem` | `TransactionItem({required String name, required double durationMs, String op = 'custom', String? status, String? httpMethod, int? httpStatus, String? url, String? distinctId, String? sessionId, String? workflowId, String? workflowName, DateTime? timestamp})` | `workflowId`/`workflowName` — see `ErrorItem`. |
 | `BreadcrumbBatchItem` | `BreadcrumbBatchItem({required List<Breadcrumb> breadcrumbs, DateTime? timestamp})` | Part of the wire contract; the Flutter SDK never emits one on its own. Construct and pass it through a `SauronClient` only if you need standalone breadcrumbs. |
 | `Dsn` | `Dsn({required String scheme, required String publicKey, required String host, required int port, required String projectId, List<String> pathPrefix = const []})` | `projectId` is the DSN's path segment — despite the name, this is the **environment** id since the ingest key now lives on the environment, not the app. `Dsn.parse(String input)` throws `FormatException`. `envelopeEndpoint` → `Uri` of `.../api/{environment_id}/envelope`; `toString()` round-trips the canonical DSN. |
 | `DartStackTraceParser` | `const DartStackTraceParser()`, `List<StackFrame> parse(Object? stackTrace)`, `static bool isNoise(String line)` | Parses JIT and AOT traces; unrecognized lines are dropped. |
 | `isObfuscatedDartTrace` | `bool isObfuscatedDartTrace(String raw)` | `true` when the trace contains `isolate_dso_base` or `build_id:`. |
 | `sauronIso` | `String sauronIso(DateTime dateTime)` | ISO-8601 UTC with a trailing `Z`. |
 | `kSauronSdkName` | `const String = 'sauron.flutter'` | Sent in `header.sdk.name`. |
-| `kSauronSdkVersion` | `const String = '1.3.0'` | Sent in `header.sdk.version`. |
+| `kSauronSdkVersion` | `const String = '1.4.0'` | Sent in `header.sdk.version`. |
+| `WorkflowStatus` | enum `ok, alreadyActive, notActive, nameMismatch, invalidName, disabled` | Wire values (in lifecycle-adjacent server logs) are snake_case: `already_active`, `not_active`, `name_mismatch`, `invalid_name`. See [Workflows](#sauronstartworkflow--sauronendworkflow--sauroncancelworkflow--sauronworkflow). |
+| `WorkflowResult` | `WorkflowResult(WorkflowStatus status, [String? workflowId])` | `workflowId` is set when `status == ok`. |
+| `ActiveWorkflow` | `ActiveWorkflow({required String workflowId, required String name, required DateTime startedAt})` | What `Sauron.workflow`/`client.workflow` returns; `null` when none is active. |
 | `SauronNavigatorObserver` | see [Flutter integration](#flutter-integration) | |
 | `SauronWidgetsBindingObserver` | see [Flutter integration](#flutter-integration) | |
 
@@ -950,7 +1043,7 @@ Response policy:
 | Nothing arrives, no logs | `dsn` unset/empty, so the SDK is disabled | Pass `dsn:` to `SauronOptions`; check `Sauron.isEnabled`. |
 | Nothing arrives, `[Sauron] invalid DSN, SDK disabled` | DSN failed to parse | Use `https://<public_key>@<host>[:port]/<environment_id>`; the environment id is the last path segment. |
 | Requests leave but nothing lands | Your proxy does not expose ingest at `/api/{environment_id}/envelope` on the DSN's host (plus any DSN path prefix) | Route that exact path to the gateway — events otherwise drop silently and look delivered. |
-| Delivery stops permanently mid-session | A `401`/`403` disabled the transport | Verify the public key belongs to the project; restart the app after fixing. |
+| Delivery stops permanently mid-session | A `401`/`403` disabled the transport (`Sauron.isEnabled` flips to `false`) | Verify the public key belongs to the project; restart the app after fixing. |
 | Events arrive, errors do not | `sampleRate < 1.0`, or `beforeSend` returned `null` | Pass `sampleRate: 1.0`; log inside `beforeSend`. |
 | No breadcrumbs on errors | `maxBreadcrumbs <= 0` | Set a positive `maxBreadcrumbs`. |
 | Stack traces are hex addresses | Obfuscated AOT build with no symbols uploaded | Upload the `--split-debug-info` output (see above). |

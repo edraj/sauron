@@ -77,6 +77,39 @@ export interface ScopeData {
   contexts: Record<string, unknown>;
   extra: Record<string, unknown>;
   breadcrumbs: Breadcrumb[];
+  /**
+   * The workflow bounded by `startWorkflow`/`endWorkflow`/`cancelWorkflow` on
+   * THIS scope, or `null` if none. Request-isolated: the async-local child
+   * scope created by `withScope`/`runWithAsyncScope` gets its own copy, so
+   * concurrent requests never observe each other's workflow.
+   */
+  workflow: ActiveWorkflow | null;
+}
+
+/** Exactly six reachable outcomes for a workflow lifecycle call. No seventh. */
+export type WorkflowStatus =
+  | 'ok'
+  | 'already_active'
+  | 'not_active'
+  | 'name_mismatch'
+  | 'invalid_name'
+  | 'disabled';
+
+/** Return value of `startWorkflow` / `endWorkflow` / `cancelWorkflow`. */
+export interface WorkflowResult {
+  status: WorkflowStatus;
+  /** Present when `status` is `'ok'`. */
+  workflowId?: string;
+}
+
+/** The workflow currently bounded on a scope. */
+export interface ActiveWorkflow {
+  /** Fresh client-generated UUID v4, minted by `startWorkflow`. */
+  workflowId: string;
+  /** Trimmed, caller-supplied name (see `normalizeWorkflowName`). */
+  name: string;
+  /** ISO-8601 timestamp of when the workflow started. */
+  startedAt: string;
 }
 
 /** An error item (manual `captureException` / `captureMessage`). */
@@ -94,6 +127,14 @@ export interface ErrorItem {
   fingerprint: string[] | null;
   user: ErrorUser | null;
   session_id: string | null;
+  /**
+   * Id/name of the workflow this error occurred within, if the SDK bounded
+   * one via `startWorkflow`. Optional-not-nullable: apps that never use
+   * workflows must be byte-identical to before this field existed, so an
+   * absent workflow means the key is OMITTED from the item, never `null`.
+   */
+  workflow_id?: string;
+  workflow_name?: string;
   screen: string | null;
 }
 
@@ -105,6 +146,9 @@ export interface EventItem {
   properties: Record<string, unknown>;
   timestamp: string;
   session_id: string | null;
+  /** See {@link ErrorItem.workflow_id} — same omit-not-null convention. */
+  workflow_id?: string;
+  workflow_name?: string;
   screen: string | null;
   tags?: Record<string, string>;
   contexts?: Record<string, unknown>;
@@ -135,6 +179,9 @@ export interface TransactionItem {
   http_status?: number;
   url?: string;
   distinct_id?: string;
+  /** See {@link ErrorItem.workflow_id} — same omit-not-null convention. */
+  workflow_id?: string;
+  workflow_name?: string;
   timestamp: string;
 }
 

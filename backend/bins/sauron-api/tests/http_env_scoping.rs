@@ -153,8 +153,25 @@ impl TestServer {
         let admin_url = std::env::var("TEST_DATABASE_URL").ok()?;
         let redis_url = std::env::var("TEST_REDIS_URL").ok()?;
 
+        // The segment ORDER is load-bearing: timestamp FIRST, discriminator
+        // glued to the uuid rather than separated by an underscore.
+        //
+        // `sauron-db`'s `tests/common::reap_stale_test_databases` is the only
+        // process that ever collects abandoned `sauron_test_%` databases, and
+        // it does `strip_prefix("sauron_test_")` -> `split('_').next()` ->
+        // `parse::<i64>()`, silently SKIPPING (`else { continue }`) any name
+        // whose first underscore-delimited segment is not a timestamp. The
+        // previous "sauron_test_http_<ts>_<uuid>" spelling yielded "http",
+        // failed that parse, and leaked every database it ever created —
+        // permanently, and invisibly to the reaper. 26 of them had accumulated
+        // on the shared dev server, the oldest several days old, each a fully
+        // migrated copy of the schema. Do not reorder these segments.
+        //
+        // Length is also capped: `sauron_db::validate_db_ident` rejects
+        // identifiers over 63 bytes. "sauron_test_" (12) + 10-digit timestamp
+        // + "_" + "http" (4) + 32-hex uuid = 59.
         let db_name = format!(
-            "sauron_test_http_{}_{}",
+            "sauron_test_{}_http{}",
             Utc::now().timestamp(),
             Uuid::new_v4().simple()
         );
@@ -850,6 +867,8 @@ async fn seed_issue_with_error(
             session_id: None,
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             stacktrace_symbolicated: Some(json!([{
                 "function": "envScopingFixture",
                 "filename": "src/fixture.rs",
@@ -900,6 +919,8 @@ async fn seed_analytics_event(
             occurred_at: Utc::now(),
             device_key: None,
             screen: None,
+            workflow_id: None,
+            workflow_name: None,
             tags: json!({}),
             contexts: json!({}),
             extra: json!({}),
@@ -1821,6 +1842,11 @@ fn build_request_path(template: &str, app_id: Uuid) -> String {
             "issue_id" => Uuid::new_v4().to_string(),
             "session_id" => "task-14-route-enum-session".to_string(),
             "distinct_id" => "task-14-route-enum-person".to_string(),
+            // `workflows::detail`/`workflows::runs` — a nonexistent name is
+            // fine here (see this function's doc comment: `environment_id`
+            // handling happens before any entity lookup), but it must not be
+            // the literal `{name}` text.
+            "name" => "task-14-route-enum-workflow".to_string(),
             other => panic!(
                 "build_request_path: route template {template:?} has an unhandled path \
                  parameter {{{other}}} — add a substitution for it in build_request_path \

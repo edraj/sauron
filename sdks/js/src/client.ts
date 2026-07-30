@@ -13,6 +13,7 @@ import { installXhr } from './integrations/xhr.js';
 import { setScreen } from './api/product.js';
 import { Scope, mergeMeta } from './scope.js';
 import { resetScreen, setScreenState } from './screen.js';
+import { getWorkflow, resetWorkflow } from './workflow.js';
 import { installBeacon } from './transport/beacon.js';
 import { Transport } from './transport/transport.js';
 import type {
@@ -112,8 +113,19 @@ export class SauronClient {
     return this.scope;
   }
 
+  /**
+   * False once this client was explicitly disabled/closed, OR once the
+   * transport has auto-disabled itself on a 401/403 (revoked/invalid DSN
+   * key) — computed from the transport's own state on every call, not a
+   * separately mirrored flag, so a propagation regression there cannot leave
+   * this predicate stale. `this.transport` always exists once a client
+   * exists (it is constructed synchronously in the constructor); the
+   * "nothing installed yet" case is instead handled one layer up, by every
+   * module-level API (`startWorkflow`, `track`, ...) treating `getClient() ===
+   * null` as the no-op/disabled case before it ever reaches here.
+   */
   isEnabled(): boolean {
-    return this.enabled;
+    return this.enabled && this.transport.isEnabled();
   }
 
   /** The current distinct id: the user id when identified, else an anon id. */
@@ -188,6 +200,53 @@ export class SauronClient {
   }
 
   /**
+   * Stamp the active workflow (if any) onto a signal item.
+   *
+   * Done HERE — the single choke point every capture path funnels through —
+   * rather than at each item-construction site, so a capture path added later
+   * is stamped by construction instead of by remembering to. The keys are
+   * ASSIGNED ONLY when a workflow is active: an item with no workflow keeps
+   * them absent entirely (not present-as-`undefined`), which is what makes
+   * `JSON.stringify` omit them and keeps the no-workflow wire bytes identical
+   * to pre-1.3.0.
+   *
+   * Only error/event/transaction carry `workflow_id`/`workflow_name` columns
+   * server-side — identify and breadcrumb_batch items are deliberately left
+   * alone. An item that already carries an explicit `workflow_id` is left
+   * untouched, matching how `enrichErrorItem` defers to caller-set fields.
+   */
+  private stampWorkflow(item: EnvelopeItem): void {
+    if (item.type !== 'error' && item.type !== 'event' && item.type !== 'transaction') return;
+
+    // `captureItem` is a public escape hatch, so an item can arrive already
+    // attributed. Caller-set wins — same rule `enrichErrorItem` applies to
+    // `event_id`/`message`/`user`.
+    //
+    // But the two fields are a PAIR, not two independent options: the server
+    // guards on `if let (Some(id), Some(name))`, so an item carrying only one
+    // of them is silently dropped from every workflow query. That failure is
+    // invisible, so warn rather than let it through quietly — and still leave
+    // the item alone, because overwriting a caller's deliberate (if partial)
+    // attribution with a different workflow would be worse than not stamping.
+    const hasId = item.workflow_id !== undefined;
+    const hasName = item.workflow_name !== undefined;
+    if (hasId || hasName) {
+      if (hasId !== hasName) {
+        this.logger.warn(
+          'item sets only one of workflow_id/workflow_name; the server treats them as a ' +
+            'pair and will drop this attribution. Set both, or neither.',
+        );
+      }
+      return;
+    }
+
+    const workflow = getWorkflow();
+    if (!workflow) return;
+    item.workflow_id = workflow.workflowId;
+    item.workflow_name = workflow.name;
+  }
+
+  /**
    * Run an item through sampling (errors only) and `beforeSend`, then hand it to
    * the transport. Returns silently when dropped.
    */
@@ -201,6 +260,9 @@ export class SauronClient {
       }
       this.enrichErrorItem(item, hint);
     }
+
+    // Before `beforeSend`, so a consumer's hook sees the workflow fields.
+    this.stampWorkflow(item);
 
     let processed: EnvelopeItem | null = item;
     if (this.options.beforeSend) {
@@ -242,6 +304,7 @@ export class SauronClient {
     }
     onNavigation(null);
     resetScreen();
+    resetWorkflow();
     instrument.unpatchAll();
     instrument.setDsnHost(null);
     this.installed = false;

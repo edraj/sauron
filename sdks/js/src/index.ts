@@ -14,15 +14,27 @@
 import { addBreadcrumb as addBreadcrumbApi, type BreadcrumbInput } from './api/breadcrumbs.js';
 import { captureException as captureExceptionApi, captureMessage as captureMessageApi } from './api/capture.js';
 import {
+  cancelWorkflow as cancelWorkflowApi,
+  endWorkflow as endWorkflowApi,
   identify as identifyApi,
   setScreen as setScreenApi,
+  startWorkflow as startWorkflowApi,
   track as trackApi,
   trackTransaction as trackTransactionApi,
   type TransactionInput,
 } from './api/product.js';
 import { getClient, init as initClient, SauronClient } from './client.js';
 import { getScreen as getScreenApi } from './screen.js';
-import type { Hint, InitOptions, Level, TrackOptions, UserInput } from './types.js';
+import type {
+  ActiveWorkflow,
+  Hint,
+  InitOptions,
+  Level,
+  TrackOptions,
+  UserInput,
+  WorkflowResult,
+} from './types.js';
+import { getWorkflow as getWorkflowApi } from './workflow.js';
 
 /** Initialize the SDK. See {@link InitOptions}. */
 export function init(options: InitOptions): SauronClient {
@@ -66,6 +78,31 @@ export function setScreen(name: string): void {
 /** The current screen name, or null. */
 export function getScreen(): string | null {
   return getScreenApi();
+}
+
+/**
+ * Start a named, explicitly-bounded workflow. `workflow_id` is a fresh
+ * client-generated UUID; the id + name are then stamped on every subsequent
+ * event/error/transaction until the workflow ends or is cancelled. Optional —
+ * an app that never calls this behaves exactly as before.
+ */
+export function startWorkflow(name: string, options?: { force?: boolean }): WorkflowResult {
+  return startWorkflowApi(name, options);
+}
+
+/** End the active workflow (or the one named `name`, if given). */
+export function endWorkflow(name?: string): WorkflowResult {
+  return endWorkflowApi(name);
+}
+
+/** Cancel the active workflow (or the one named `name`, if given). */
+export function cancelWorkflow(name?: string, options?: { reason?: string }): WorkflowResult {
+  return cancelWorkflowApi(name, options);
+}
+
+/** The currently active workflow, or `null` when none is active. */
+export function getWorkflow(): ActiveWorkflow | null {
+  return getWorkflowApi();
 }
 
 /** Record a breadcrumb. */
@@ -129,6 +166,10 @@ export const Sauron = {
   setExtra,
   setScreen,
   getScreen,
+  startWorkflow,
+  endWorkflow,
+  cancelWorkflow,
+  getWorkflow,
   flush,
   close,
   getClient,
@@ -178,4 +219,7 @@ export type {
   CaptureOptions,
   TrackOptions,
   ResolvedOptions,
+  WorkflowStatus,
+  WorkflowResult,
+  ActiveWorkflow,
 } from './types.js';

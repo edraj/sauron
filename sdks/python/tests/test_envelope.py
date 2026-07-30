@@ -44,7 +44,7 @@ class TestEnvelopeWireContract(unittest.TestCase):
             "version": SDK_VERSION,
         })
         self.assertEqual(SDK_NAME, "sauron-python")
-        self.assertEqual(SDK_VERSION, "1.2.0")
+        self.assertEqual(SDK_VERSION, "1.3.0")
         self.assertEqual(env["header"]["dsn"], DSN)
         self.assertEqual(env["header"]["release"], "svc@1.2.3")
         self.assertIn("sent_at", env["header"])

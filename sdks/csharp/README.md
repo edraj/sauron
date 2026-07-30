@@ -180,10 +180,16 @@ Two equivalent entry points:
   (e.g. dispatching to two projects). Register it as a singleton.
 
 The dispatch and lifecycle methods — `Track`, `CaptureException`,
-`CaptureMessage`, `Identify`, `TrackTransaction`, `AddBreadcrumb`, `FlushAsync`,
-`Flush`, `Close` — exist in **both** forms with identical parameters: `static` on
-`SauronSdk`, instance on `SauronClient`. The signatures below are shown in the
-instance form; prefix them with `SauronSdk.` for the static one.
+`CaptureMessage`, `Identify`, `TrackTransaction`, `AddBreadcrumb`, `StartWorkflow`,
+`EndWorkflow`, `CancelWorkflow`, `GetWorkflow`, `FlushAsync`, `Flush`, `Close` — exist
+in **both** forms with identical parameters: `static` on `SauronSdk`, instance on
+`SauronClient`. The signatures below are shown in the instance form; prefix them
+with `SauronSdk.` for the static one.
+
+Unlike the rest of the scope API, `StartWorkflow`/`EndWorkflow`/`CancelWorkflow` are
+**not** ambient-only: they need an initialized, enabled client to emit the lifecycle
+event and return `Disabled` otherwise. `GetWorkflow` is a pure read of the active
+scope, so — like `SetUser`/`SetTag`/etc. — it works even before `Init`.
 
 The scope API (`SetUser`, `SetTag`, `SetTags`, `SetContext`, `SetExtra`,
 `PushScope`) is **static-only and process-ambient**, not per-client: an injected
@@ -433,6 +439,148 @@ SauronSdk.TrackTransaction(
     url: "/api/users",
     distinctId: "user-123");
 ```
+
+### `StartWorkflow`
+
+```csharp
+public WorkflowResult StartWorkflow(string name, bool force = false)
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string` | — | Workflow name. Trimmed; rejected (not truncated) if empty after trimming or over 120 characters. |
+| `force` | `bool` | `false` | When an active workflow already exists: `false` makes this a no-op returning `AlreadyActive`; `true` supersedes it — the active workflow is closed with `$workflow_cancel` (`reason: "superseded"`) before the new one starts. |
+
+Returns a `WorkflowResult { Status, WorkflowId }`. Starts a named, explicitly-bounded span of
+activity: from this call until `EndWorkflow`/`CancelWorkflow`, every `Track`,
+`CaptureException`, `CaptureMessage` and `TrackTransaction` call is stamped with
+`workflow_id`/`workflow_name`, and a `$workflow_start` analytics event is emitted (also
+carrying `workflow_id`/`workflow_name` in its `properties`). `workflow_id` is a fresh
+`Guid.NewGuid()` minted on every call — never derived from anything (session, user, name
+hash) — because the server rolls counters up on `(app_id, workflow_id)` app-wide; a reused
+or deterministic id would merge unrelated environments' counts into one row.
+
+Workflows are entirely optional: an app that never calls `StartWorkflow` sees no
+`workflow_id`/`workflow_name` fields on any item, ever — they are omitted from the wire, not
+sent as `null`.
+
+| `Status` | Meaning |
+| --- | --- |
+| `Ok` | Started (or, with `force: true`, superseded the previous one and started). |
+| `AlreadyActive` | A workflow is already active and `force` was not passed. |
+| `InvalidName` | `name` is empty after trimming, or over 120 characters after trimming. |
+| `Disabled` | No initialized/enabled client (before `Init`, after `Close`/dispose, after a `401`/`403`), **or an unexpected internal error.** |
+
+```csharp
+using (SauronSdk.PushScope())
+{
+    var result = SauronSdk.StartWorkflow("checkout");
+    if (result.Status != WorkflowStatus.Ok)
+        logger.LogWarning("StartWorkflow failed: {Status}", result.Status);
+
+    // ... tracked events / captured errors here are stamped with this workflow ...
+
+    SauronSdk.EndWorkflow();
+}
+```
+
+### `EndWorkflow`
+
+```csharp
+public WorkflowResult EndWorkflow(string? name = null)
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string?` | `null` | When given, must match the active workflow's (trimmed) name or the call is a no-op. Omit to end whichever workflow is active. |
+
+Returns a `WorkflowResult`. Emits `$workflow_end` (with `duration_ms` in its `properties`,
+computed from the workflow's start time) for the workflow **being closed** — i.e. it is
+stamped with that workflow, not the cleared state — then clears it from the scope.
+
+| `Status` | Meaning |
+| --- | --- |
+| `Ok` | Ended; `WorkflowId` is the one that was ended. |
+| `NotActive` | No workflow is active on the current scope. |
+| `NameMismatch` | `name` was given and does not match the active workflow's name — **including** when `name` is itself malformed (blank, or over 120 characters): a bad explicit name always reports `NameMismatch` here, never `InvalidName` (that status is reachable only from `StartWorkflow`). |
+| `Disabled` | No initialized/enabled client, or an unexpected internal error. |
+
+### `CancelWorkflow`
+
+```csharp
+public WorkflowResult CancelWorkflow(string? name = null, string? reason = null)
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string?` | `null` | Same matching rule as `EndWorkflow`. |
+| `reason` | `string?` | `null` | Free-form cancellation reason. Blank/null defaults to `"user"`; otherwise trimmed and capped at 120 characters (not truncated silently past that — the cap is the wire limit, not a validation failure). |
+
+Returns a `WorkflowResult` with the same status table as `EndWorkflow`. Emits
+`$workflow_cancel` with `duration_ms` **and** `reason` in its `properties` (the `force:
+true` supersede path in `StartWorkflow` reuses this internally with the literal reason
+`"superseded"`). `reason` is never sent on `$workflow_end`.
+
+```csharp
+SauronSdk.CancelWorkflow(reason: "user backed out at payment step");
+```
+
+### `GetWorkflow`
+
+```csharp
+public ActiveWorkflow? GetWorkflow()
+```
+
+```csharp
+public sealed record ActiveWorkflow(string WorkflowId, string Name, DateTimeOffset StartedAt);
+```
+
+No parameters. Returns the workflow currently bounding the active scope, or `null` if none.
+Like the rest of the scope API it is a pure ambient read with no `Disabled` status of its
+own, so it works before `Init` and after `Close`. It returns `null`:
+
+- before any `StartWorkflow` (nothing has ever been started);
+- after `EndWorkflow`/`CancelWorkflow` closes the active workflow;
+- after `Close`/`Dispose`, **for a workflow left un-ended on the process-wide global
+  scope** — teardown clears it, so a later `Init` starts clean rather than answering
+  `AlreadyActive` from the previous run's leftovers. Consistent with "an abandoned workflow
+  is the server's call to make," teardown clears the state but never emits a
+  `$workflow_cancel` of its own.
+
+It does **not** return `null` for a workflow started inside a `using (SauronSdk.PushScope())`
+block you are still inside — that is precisely what per-request isolation means, and such a
+workflow needs no teardown anyway, since the scope is discarded when the block exits.
+
+**Abandonment (30 minutes).** A workflow that receives no further stamped event for 30
+minutes reads as **abandoned** on the dashboard — this is derived server-side, purely from
+the last stamped event's timestamp, when the workflow is displayed. There is nothing to
+configure and no client-side timer: the SDK never expires a workflow locally, `GetWorkflow`
+keeps returning it indefinitely until you call `EndWorkflow`/`CancelWorkflow`, and if an app
+resumes activity and stamps another event under the same still-active workflow, it simply
+reads as active again — "abandoned" is a display label, not a stored state transition.
+
+**State flows with `AsyncLocal<T>`, not a static field.** The active workflow lives on the
+same `AsyncLocal` `Scope` that `SetUser`/`SetTag`/`PushScope` already use (see "Scope &
+metadata" below) — deliberately, since this is a **server** SDK: one
+process handles many concurrent requests, and a plain static field would let one request's
+`StartWorkflow` stamp another request's errors, or let one request's `EndWorkflow` be
+swallowed by another's `AlreadyActive`. Concretely, this means:
+
+- Always `StartWorkflow`/`EndWorkflow` inside the same `using (SauronSdk.PushScope())` block
+  (or the same ambient call chain) that will observe it — exactly like the per-request
+  scope middleware recipe below.
+- It flows across `await` and into a `Task.Run` **started from inside** that block, because
+  `Task.Run` captures the ambient `ExecutionContext` by default. A workflow started before
+  `Task.Run` is still visible inside it.
+- It does **not** flow *backward*: a workflow started inside a detached `Task.Run` (or any
+  code that isn't awaited before the enclosing `PushScope` block exits) is invisible to the
+  caller once that block has moved on — `AsyncLocal` only propagates parent-to-child.
+- Fire-and-forget background work, a hosted/background service, a queued job processed on
+  its own thread, or any code that hops execution contexts without capturing them (e.g.
+  `ExecutionContext.SuppressFlow()`, or scheduling onto a bare `ThreadPool` work item) will
+  **not** see a request's workflow at all. Give that code its own `PushScope()` and its own
+  `StartWorkflow` call rather than assuming it inherits one from a caller that has already
+  returned.
 
 ### `AddBreadcrumb`
 

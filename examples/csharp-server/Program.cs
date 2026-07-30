@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using Sauron;
 
-// Minimal server-side Sauron example (SDK v0.3.0).
+// Minimal server-side Sauron example (SDK v1.3.0).
 //
 // Reads its ingest DSN from the SAURON_DSN environment variable. If the variable
 // is unset (or the DSN is invalid) the SDK runs in no-op mode, so this program
@@ -24,7 +24,7 @@ if (string.IsNullOrWhiteSpace(dsn))
 SauronSdk.Init(new SauronOptions
 {
     Dsn = dsn ?? string.Empty,
-    Release = "csharp-server-example@0.3.0",
+    Release = "csharp-server-example@1.3.0",
     Debug = true,
 });
 
@@ -49,6 +49,15 @@ using (SauronSdk.PushScope())
     SauronSdk.SetUser(new SauronUser { Id = distinctId, Email = "ada@example.com", Username = "ada" });
     SauronSdk.SetTag("order_id", "ord_1001");
 
+    // Start a workflow to bound this request end-to-end: everything tracked/captured
+    // between here and EndWorkflow (the tracked event, the breadcrumb-carrying
+    // exception, and the timed transaction) is stamped with the same workflow_id/
+    // workflow_name, so the dashboard can group them as one "checkout" span even
+    // though the request itself fails partway through.
+    var workflow = SauronSdk.StartWorkflow("checkout");
+    if (workflow.Status != WorkflowStatus.Ok)
+        Console.Error.WriteLine($"StartWorkflow(\"checkout\") returned {workflow.Status}");
+
     // Track a product-analytics event.
     SauronSdk.Track("order_placed", distinctId, new Dictionary<string, object?>
     {
@@ -59,7 +68,7 @@ using (SauronSdk.PushScope())
 
     // Leave a breadcrumb, then deliberately capture an exception. The breadcrumb,
     // the scoped user and both tags (global `service` + scoped `order_id`) attach
-    // to the captured error automatically.
+    // to the captured error automatically — and so does the active workflow.
     SauronSdk.AddBreadcrumb(new Breadcrumb
     {
         Category = "checkout",
@@ -79,7 +88,8 @@ using (SauronSdk.PushScope())
     sw.Stop();
 
     // 4. Time the request with one transaction. `distinctId` is omitted on purpose:
-    //    it falls back to the scoped user id set above.
+    //    it falls back to the scoped user id set above. Still inside the workflow, so
+    //    this transaction is stamped too.
     SauronSdk.TrackTransaction(
         name: "POST /orders",
         durationMs: sw.Elapsed.TotalMilliseconds,
@@ -88,15 +98,43 @@ using (SauronSdk.PushScope())
         httpMethod: "POST",
         httpStatus: 500,
         url: "/orders");
+
+    // 5. The request is done (however it turned out) — end the workflow. This emits
+    //    $workflow_end with the elapsed duration and clears it from the scope.
+    SauronSdk.EndWorkflow();
 }
 
-// 5. Flush buffered items and shut the client down cleanly before exit.
+// 6. A second request, in its own isolated scope, that starts a workflow and then
+//    abandons it partway — the cancel path. A cancelled workflow is a distinct,
+//    legitimate outcome from "ended": use it when the app itself knows the span
+//    won't complete (as opposed to a silent 30-minute timeout on the dashboard).
+using (SauronSdk.PushScope())
+{
+    SauronSdk.SetUser(new SauronUser { Id = distinctId });
+
+    var refund = SauronSdk.StartWorkflow("refund");
+    if (refund.Status != WorkflowStatus.Ok)
+        Console.Error.WriteLine($"StartWorkflow(\"refund\") returned {refund.Status}");
+
+    SauronSdk.Track("refund_requested", distinctId, new Dictionary<string, object?>
+    {
+        ["order_id"] = "ord_1001",
+        ["amount"] = 49.99,
+    });
+
+    // The customer backed out before the refund completed — cancel, don't end.
+    // `reason` defaults to "user" when omitted; here it's given explicitly.
+    SauronSdk.CancelWorkflow(reason: "customer_backed_out");
+}
+
+// 7. Flush buffered items and shut the client down cleanly before exit.
 SauronSdk.Flush();
 SauronSdk.Close();
 
 Console.WriteLine(
-    "Done. Sent identify, a tracked event, a scoped exception (with breadcrumb + user + tags) " +
-    "and one transaction (if a DSN was configured).");
+    "Done. Sent identify, a tracked event, a scoped exception (with breadcrumb + user + tags), " +
+    "one transaction, a completed \"checkout\" workflow and a cancelled \"refund\" workflow " +
+    "(if a DSN was configured).");
 
 // A stand-in operation that fails so we have something to capture.
 static void ProcessOrder(string orderId)

@@ -23,6 +23,82 @@
   // Sentry convention: most recent call is shown first.
   const ordered = $derived([...active].reverse());
 
+  // Long traces are mostly framework noise in the middle. Pin the 5 most recent
+  // frames, the 5 deepest, and every in-app frame wherever it sits; whatever is
+  // left forms contiguous runs that can fold away.
+  const EDGE = 5;
+  // A run of 1-2 frames isn't worth folding -- the toggle row would take as much
+  // room as the frames it hides. This threshold is also why short traces never
+  // collapse: 12 frames leave at most 2 unpinned, so 13 is the first foldable
+  // length. There is deliberately no separate length constant to keep in sync.
+  const MIN_RUN = 3;
+
+  interface Chunk {
+    // Run start index, used as the expansion key; -1 for always-visible chunks.
+    key: number;
+    frames: Frame[];
+    collapsible: boolean;
+  }
+
+  // Group `ordered` into alternating visible / collapsible chunks.
+  const chunks = $derived.by((): Chunk[] => {
+    const len = ordered.length;
+    const out: Chunk[] = [];
+    let run: Frame[] = [];
+    let runStart = 0;
+    let visible: Frame[] = [];
+
+    const flushRun = () => {
+      if (run.length === 0) return;
+      if (run.length >= MIN_RUN) {
+        if (visible.length > 0) {
+          out.push({ key: -1, frames: visible, collapsible: false });
+          visible = [];
+        }
+        out.push({ key: runStart, frames: run, collapsible: true });
+      } else {
+        // Too short to fold -- fold it back into the visible neighbours.
+        visible.push(...run);
+      }
+      run = [];
+    };
+
+    for (let i = 0; i < len; i++) {
+      const frame = ordered[i];
+      const pinned = i < EDGE || i >= len - EDGE || frame.in_app === true;
+      if (pinned) {
+        flushRun();
+        visible.push(frame);
+      } else {
+        if (run.length === 0) runStart = i;
+        run.push(frame);
+      }
+    }
+    flushRun();
+    if (visible.length > 0) out.push({ key: -1, frames: visible, collapsible: false });
+    return out;
+  });
+
+  // Expansion is per run, not page-wide: in-app frames interleaved with vendor
+  // frames yield several independent runs, and opening one must not open the rest.
+  // Open runs are stored alongside the frame array they were computed against.
+  // Run boundaries differ between symbolicated and minified frames, so keys from
+  // one would silently mean a different run in the other; tying them to `src`
+  // makes the state self-discarding on a `showRaw` flip or a fresh event, with no
+  // reset effect to keep in sync.
+  // `$state.raw`, not `$state`: plain `$state` deep-proxies what it stores, so
+  // `open.src` would read back a *proxy* of the frame array and never `===` the
+  // raw `active` we compare it against, permanently wedging every run shut.
+  let open = $state.raw<{ src: Frame[] | null; keys: number[] }>({ src: null, keys: [] });
+  const expanded = $derived(open.src === active ? open.keys : []);
+
+  function toggle(key: number) {
+    const keys = expanded.includes(key)
+      ? expanded.filter((k) => k !== key)
+      : [...expanded, key];
+    open = { src: active, keys };
+  }
+
   function loc(frame: Frame): string {
     const file = frame.filename ?? frame.module ?? frame.abs_path ?? '<unknown>';
     if (frame.lineno != null) {
@@ -57,35 +133,52 @@
     </div>
   {/if}
   <div class="trace">
-    {#each ordered as frame, i (i)}
-      {@const c = ctx(frame)}
-      <div class="frame" class:in-app={frame.in_app}>
-        <div class="marker" aria-hidden="true"></div>
-        <div class="body">
-          <div class="fn-line">
-            <span class="fn">{frame.function ?? '<anonymous>'}</span>
-            {#if frame.in_app}<span class="chip">in app</span>{/if}
-          </div>
-          <div class="loc mono">{loc(frame)}</div>
-          {#if c}
-            <div class="context mono">
-              {#each c.pre_context ?? [] as line, j (j)}
-                <div class="ctx-line">
-                  <span class="ln">{(c.context_start_line ?? 1) + j}</span><span class="src">{line}</span>
-                </div>
-              {/each}
-              <div class="ctx-line crash">
-                <span class="ln">{frame.lineno ?? ''}</span><span class="src">{c.context_line}</span>
+    {#each chunks as chunk, ci (ci)}
+      {@const isOpen = expanded.includes(chunk.key)}
+      {#if chunk.collapsible}
+        <button
+          type="button"
+          class="fold"
+          onclick={() => toggle(chunk.key)}
+          aria-expanded={isOpen}
+        >
+          <span class="dots" aria-hidden="true">⋯</span>
+          {isOpen ? 'Hide' : 'Show'}
+          {chunk.frames.length} frame{chunk.frames.length === 1 ? '' : 's'}
+        </button>
+      {/if}
+      {#if !chunk.collapsible || isOpen}
+        {#each chunk.frames as frame, i (i)}
+          {@const c = ctx(frame)}
+          <div class="frame" class:in-app={frame.in_app}>
+            <div class="marker" aria-hidden="true"></div>
+            <div class="body">
+              <div class="fn-line">
+                <span class="fn">{frame.function ?? '<anonymous>'}</span>
+                {#if frame.in_app}<span class="chip">in app</span>{/if}
               </div>
-              {#each c.post_context ?? [] as line, j (j)}
-                <div class="ctx-line">
-                  <span class="ln">{(frame.lineno ?? 0) + j + 1}</span><span class="src">{line}</span>
+              <div class="loc mono">{loc(frame)}</div>
+              {#if c}
+                <div class="context mono">
+                  {#each c.pre_context ?? [] as line, j (j)}
+                    <div class="ctx-line">
+                      <span class="ln">{(c.context_start_line ?? 1) + j}</span><span class="src">{line}</span>
+                    </div>
+                  {/each}
+                  <div class="ctx-line crash">
+                    <span class="ln">{frame.lineno ?? ''}</span><span class="src">{c.context_line}</span>
+                  </div>
+                  {#each c.post_context ?? [] as line, j (j)}
+                    <div class="ctx-line">
+                      <span class="ln">{(frame.lineno ?? 0) + j + 1}</span><span class="src">{line}</span>
+                    </div>
+                  {/each}
                 </div>
-              {/each}
+              {/if}
             </div>
-          {/if}
-        </div>
-      </div>
+          </div>
+        {/each}
+      {/if}
     {/each}
   </div>
 {/if}
@@ -141,6 +234,36 @@
   }
   .frame:last-child {
     border-bottom: none;
+  }
+  /* Sits in the frame stack, so it inherits the same rhythm and dividers. The
+     global reset only sets font/cursor -- an unstyled button renders gray here. */
+  .fold {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+    color: var(--text-muted);
+    background: var(--surface-2);
+    border: none;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .fold:last-child {
+    border-bottom: none;
+  }
+  .fold:hover {
+    color: var(--text);
+    background: color-mix(in srgb, var(--primary-soft) 45%, var(--surface-2));
+  }
+  .fold .dots {
+    font-size: 14px;
+    line-height: 1;
+    color: var(--text-faint);
+    letter-spacing: 0.08em;
   }
   .frame.in-app {
     background: color-mix(in srgb, var(--primary-soft) 55%, var(--surface));

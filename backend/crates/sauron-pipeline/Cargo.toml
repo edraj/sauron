@@ -17,3 +17,11 @@ uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# Used only by the workflow-lifecycle pipeline test in `process.rs` (a raw
+# `sql_query` readback of the `workflows` table plus the ephemeral-database
+# admin calls) — `sauron-db` re-exports its own repo/model layer, but not
+# diesel itself, so the test needs these directly.
+diesel.workspace = true
+diesel-async.workspace = true

@@ -322,6 +322,118 @@ addBreadcrumb({
 });
 ```
 
+### `startWorkflow(name, options?)`, `endWorkflow(name?)`, `cancelWorkflow(name?, options?)`, `getWorkflow()`
+
+```ts
+function startWorkflow(name: string, options?: { force?: boolean }): WorkflowResult
+function endWorkflow(name?: string): WorkflowResult
+function cancelWorkflow(name?: string, options?: { reason?: string }): WorkflowResult
+function getWorkflow(): ActiveWorkflow | null
+```
+
+Workflows are an entirely **optional** way to bound a named span of activity
+(e.g. `"checkout"`, `"password_reset"`) and have every event/error/transaction
+captured while it is active stamped with it, so the dashboard can group them.
+An app that never calls any of these four functions emits byte-identical
+telemetry to one that predates this feature — no field is added to any item.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` (start) | `string` | — (required) | Workflow name. Trimmed; rejected if empty after trimming or over 120 chars — **rejected, never truncated**. |
+| `options.force` (start) | `boolean` | `false` | If `true` and a workflow is already active, it is superseded (see below) instead of blocking the new one. |
+| `name` (end/cancel) | `string` | active workflow's name | If given, must match the active workflow's (trimmed) name or the call is a no-op. |
+| `options.reason` (cancel) | `string` | `'user'` | Trimmed and capped at 120 chars. Never sent on `endWorkflow`. |
+
+`WorkflowResult` is `{ status: WorkflowStatus; workflowId?: string }` —
+`workflowId` is present only when `status` is `'ok'`. `WorkflowStatus` is
+exactly six values, never a seventh:
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | The call took effect. |
+| `already_active` | `startWorkflow` while one is already active and `force` was not set. The existing workflow is untouched. |
+| `not_active` | `endWorkflow`/`cancelWorkflow` with none active. |
+| `name_mismatch` | `endWorkflow`/`cancelWorkflow` with an explicit `name` that does not match the active workflow's — **including** a `name` that is itself malformed (empty after trim, or over 120 chars). A bad name on end/cancel is a mismatch against what's actually active, not an `invalid_name` (that status is only reachable from `startWorkflow`). |
+| `invalid_name` | `startWorkflow` with an empty (after trim) or over-120-char name. |
+| `disabled` | Nothing happened: before `init()`/after `close()`, after the transport has auto-disabled itself (401/403), **or an unexpected internal error**. Telemetry never throws into your code, so an internal failure is reported this way rather than propagating; if it happens after `startWorkflow` had already set the workflow locally, the workflow is still live and this case is instead reported as `ok` (see below). |
+
+`startWorkflow` mints a fresh **client-generated UUID v4** (`workflowId`, via
+`node:crypto`'s `randomUUID`) — never a session id, a hash of the name, or
+anything else deterministic. The server's rollup key is
+`(app_id, workflow_id)` **app-wide**, so a reused or derived id would merge
+unrelated requests'/environments' counts into one row.
+
+`startWorkflow(name, { force: true })` while a workflow is already active
+first emits `$workflow_cancel` for it with `reason: 'superseded'`, then starts
+the new one — both as a single call. Without `force`, an active workflow makes
+the call a no-op returning `already_active`.
+
+`endWorkflow`/`cancelWorkflow` emit `$workflow_end`/`$workflow_cancel`
+(respectively) carrying `duration_ms`, then clear the workflow. A workflow is
+also considered **abandoned** if the server sees no further stamped item for
+it within 30 minutes — this is derived purely on read, server-side, from the
+last item's timestamp; there is nothing to configure and no client-side timer
+or action required. If an event stamped with that workflow arrives later
+anyway (a slow retry, an offline-persisted item flushed after a restart, …),
+it simply reads as active again — "abandoned" is not a terminal state you can
+race.
+
+`getWorkflow()` returns the workflow active on the **current scope** (see
+below), or `null` if none — it takes no client and works the same regardless
+of whether the SDK is initialized, exactly like `getCurrentScope()`.
+
+**Attribution and `unique_users`.** The three lifecycle events are attributed
+to the active scope's user id, and to an **empty** `distinct_id` when no user
+has been identified (a background job, a pre-auth request). This is
+deliberate, and it is why they bypass the empty-`distinctId` guard that drops
+an ordinary `track()` call: the ingest pipeline stores an empty `distinct_id`
+as SQL `NULL` on the workflow row, and the dashboard's per-workflow
+`unique_users` figure is a `COUNT(DISTINCT distinct_id)`, which skips `NULL`s.
+So anonymous runs contribute *nothing* to that count rather than collapsing
+into one fake bucket — an anonymous-heavy workflow like `guest_checkout`
+reports honest zeros instead of a misleading `1`. Call `setUser({ id })` (or
+set a scoped user) before `startWorkflow` if you want those runs counted.
+
+```ts
+app.post('/checkout', async (req, res) => {
+  const started = startWorkflow('checkout');
+  addBreadcrumb({ type: 'http', message: 'checkout started' });
+  track('checkout_started', req.userId ?? 'anon');
+  try {
+    await charge(req.body);
+    track('checkout_completed', req.userId ?? 'anon');
+    endWorkflow('checkout');
+  } catch (err) {
+    captureException(err, { tags: { area: 'checkout' } });
+    cancelWorkflow('checkout', { reason: 'payment_declined' });
+    throw err;
+  }
+  res.sendStatus(200);
+});
+```
+
+**Request-scoped via `AsyncLocalStorage`, not a module global.** Unlike the
+browser SDK, this server SDK never holds the active workflow in a
+module-level variable — that would leak one HTTP request's workflow into
+every other concurrent request's telemetry. Instead it lives on the current
+`Scope` (the same `AsyncLocalStorage`-backed mechanism `user`/`tags`/
+`breadcrumbs` already use — see [Scope & metadata](#scope--metadata)):
+`startWorkflow` inside a `withScope`/`runWithAsyncScope` block sets it on that
+request's isolated child scope, and it is gone the moment the block returns,
+never visible to any other concurrent request.
+
+This means workflow state follows the **same async call chain** rules as the
+rest of the scope: it propagates automatically across `await`s and work
+scheduled from within the scoped callback (timers, promise continuations),
+but code that runs **outside** that chain — a listener registered on a
+long-lived `EventEmitter` before you ever called `withScope`, a job resumed
+from a persisted queue/message broker, or anything invoked from a fresh async
+root — will not see it. `getCurrentScope()` (and therefore `getWorkflow()`) in
+that detached code falls back to the global scope, not the request's. If work
+must cross into a detached async context, capture `getWorkflow()`'s
+`workflowId`/`name` explicitly before you leave the scope and pass them along,
+rather than relying on ambient state to still be there.
+
 ### `setUser(user)`
 
 ```ts
@@ -613,7 +725,12 @@ Returned by `init`, or constructible directly for a second, independent client
 (`new SauronClient(options)` with the same `InitOptions`). Its instance methods
 mirror the module-level functions exactly, minus the "no-op before init"
 behavior: `track`, `captureException`, `captureMessage`, `identify`,
-`trackTransaction`, `addBreadcrumb`, `flush()`, `close()`.
+`trackTransaction`, `addBreadcrumb`, `startWorkflow`, `endWorkflow`,
+`cancelWorkflow`, `flush()`, `close()`, plus `isEnabled()` (`false` once the
+transport has auto-disabled itself on a 401/403 — the same check `disabled`
+statuses are gated on). `getWorkflow()` is **not** an instance method: it
+reads the current scope directly and is client-agnostic, like
+`getCurrentScope()`.
 
 ```ts
 import { SauronClient } from '@edraj/sauron-node';
@@ -784,6 +901,9 @@ you are likely to touch:
 | `CaptureExceptionOptions` | `MetadataOptions` + `{ user?, level?, handled?, fingerprint? }` |
 | `TransactionInput` | Input to `trackTransaction`. |
 | `BreadcrumbInput` / `Breadcrumb` | Caller input / stored (stamped) crumb. |
+| `WorkflowStatus` | `'ok' \| 'already_active' \| 'not_active' \| 'name_mismatch' \| 'invalid_name' \| 'disabled'` |
+| `WorkflowResult` | `{ status: WorkflowStatus; workflowId?: string }` — return value of `startWorkflow`/`endWorkflow`/`cancelWorkflow`. |
+| `ActiveWorkflow` | `{ workflowId, name, startedAt }` — return value of `getWorkflow()`. |
 | `User` | `{ id?, email?, username? }` — input to `setUser`. |
 | `ErrorUser` | `{ id, email, username }` — the wire shape (nulls, not absent). |
 | `BeforeSend` / `BeforeBreadcrumb` | `(item, hint?) => item \| null` hooks. |

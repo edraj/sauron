@@ -18,6 +18,7 @@ pub mod projects;
 pub mod scope;
 pub mod screens;
 pub mod sessions;
+pub mod workflows;
 
 use chrono::{Duration, Utc};
 use serde::Serialize;

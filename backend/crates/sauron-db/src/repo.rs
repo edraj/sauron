@@ -1718,6 +1718,58 @@ pub async fn list_issues(
                         .sql(")"),
                     )
                 }
+                // `issues` itself carries no `workflow_name` column — narrow via
+                // an EXISTS against the environment-stamped child row, same
+                // idiom as `tag` just above.
+                //
+                // `e.workflow_id IS NOT NULL` is here for the partial-index
+                // reason Task 4 measured and documented on `workflow_detail`'s
+                // `top_events`/`top_issues` queries: migration
+                // 2026-07-29-000032's `error_events_app_workflow_idx` is
+                // PARTIAL (`WHERE workflow_id IS NOT NULL`), and Postgres uses
+                // a partial index only when the query's WHERE *implies* the
+                // index predicate — `workflow_name = $N` does not, they are
+                // different columns. Semantically a no-op (the pipeline stamps
+                // id and name together, so a row with a name always has an id).
+                // Milder here than in `workflow_detail`, because this EXISTS is
+                // correlated on `e.issue_id = issues.id` and so has
+                // `error_events_issue_idx` as a bounded fallback — but the term
+                // is free and is the only thing that lets the planner consider
+                // the workflow index at all.
+                ("workflow", Op::Eq) => query.filter(
+                    sql::<Bool>(
+                        "EXISTS (SELECT 1 FROM error_events e \
+                         WHERE e.issue_id = issues.id AND e.app_id = issues.app_id \
+                         AND e.workflow_id IS NOT NULL AND e.workflow_name = ",
+                    )
+                    .bind::<Text, _>(f.value.clone())
+                    .sql(")"),
+                ),
+                // NOT EXISTS, so an issue whose occurrences are all unstamped
+                // (no workflow at all) DOES match `neq` — "not part of workflow
+                // X" is true of a row that is part of no workflow. See
+                // `list_error_events_for_issue`'s `workflow` arms for the
+                // occurrence-level predicate deliberately built to agree with
+                // this, and why that one departs from its own file's
+                // `session_id`/`release` precedent to do so.
+                ("workflow", Op::Neq) => query.filter(
+                    sql::<Bool>(
+                        "NOT EXISTS (SELECT 1 FROM error_events e \
+                         WHERE e.issue_id = issues.id AND e.app_id = issues.app_id \
+                         AND e.workflow_id IS NOT NULL AND e.workflow_name = ",
+                    )
+                    .bind::<Text, _>(f.value.clone())
+                    .sql(")"),
+                ),
+                ("workflow", Op::Contains) => query.filter(
+                    sql::<Bool>(
+                        "EXISTS (SELECT 1 FROM error_events e \
+                         WHERE e.issue_id = issues.id AND e.app_id = issues.app_id \
+                         AND e.workflow_id IS NOT NULL AND e.workflow_name ILIKE ",
+                    )
+                    .bind::<Text, _>(like_contains(&f.value))
+                    .sql(")"),
+                ),
                 _ => query, // unreachable: Task 1 whitelists field+op
             };
         }
@@ -1894,6 +1946,40 @@ pub async fn list_issues(
                 );
                 next_bind += 2;
             }
+            // `issues` itself carries no `workflow_name` column — same EXISTS
+            // idiom as `tag` just above, against a distinct alias (`we`) so it
+            // cannot collide with a `tag`/`q` EXISTS in the same query text.
+            // `we.workflow_id IS NOT NULL` is the partial-index term; see the
+            // `EnvFilter::All` branch's `workflow` arms above for the full
+            // reasoning, and for why `Neq` is `NOT EXISTS` (unstamped rows
+            // match) rather than a `<>` that would drop them.
+            ("workflow", Op::Eq) => {
+                let we_env = scope.env.sql_fragment_for("we", env_bind_idx);
+                filter_sql += &format!(
+                    " AND EXISTS (SELECT 1 FROM error_events we WHERE we.issue_id = issues.id \
+                      AND we.app_id = issues.app_id AND we.workflow_id IS NOT NULL \
+                      AND we.workflow_name = ${next_bind}{we_env})"
+                );
+                next_bind += 1;
+            }
+            ("workflow", Op::Neq) => {
+                let we_env = scope.env.sql_fragment_for("we", env_bind_idx);
+                filter_sql += &format!(
+                    " AND NOT EXISTS (SELECT 1 FROM error_events we WHERE we.issue_id = issues.id \
+                      AND we.app_id = issues.app_id AND we.workflow_id IS NOT NULL \
+                      AND we.workflow_name = ${next_bind}{we_env})"
+                );
+                next_bind += 1;
+            }
+            ("workflow", Op::Contains) => {
+                let we_env = scope.env.sql_fragment_for("we", env_bind_idx);
+                filter_sql += &format!(
+                    " AND EXISTS (SELECT 1 FROM error_events we WHERE we.issue_id = issues.id \
+                      AND we.app_id = issues.app_id AND we.workflow_id IS NOT NULL \
+                      AND we.workflow_name ILIKE ${next_bind}{we_env})"
+                );
+                next_bind += 1;
+            }
             _ => {} // unreachable: Task 1 whitelists field+op
         }
     }
@@ -1982,6 +2068,8 @@ pub async fn list_issues(
                 let (k, v) = tag_kv(&f.value);
                 stmt.bind::<Text, _>(k).bind::<Text, _>(like_contains(&v))
             }
+            ("workflow", Op::Eq) | ("workflow", Op::Neq) => stmt.bind::<Text, _>(f.value.clone()),
+            ("workflow", Op::Contains) => stmt.bind::<Text, _>(like_contains(&f.value)),
             _ => stmt,
         };
     }
@@ -2131,6 +2219,36 @@ pub async fn list_error_events_for_issue(
                         .sql(" ILIKE ")
                         .bind::<Text, _>(like_contains(&v)),
                 )
+            }
+            // Unlike `list_issues`, `error_events` carries `workflow_name`
+            // directly — an ordinary column predicate, no EXISTS needed.
+            ("workflow", Op::Eq) => query.filter(error_events::workflow_name.eq(f.value.clone())),
+            // `OR workflow_name IS NULL` — **deliberately NOT the plain `.ne()`
+            // this file uses for `Neq` on every other nullable column.**
+            //
+            // SQL's three-valued logic makes a bare `workflow_name <> 'x'`
+            // drop every unstamped row, because `NULL <> 'x'` is NULL, not
+            // true. For `session_id`/`release`/`distinct_id` in
+            // `list_analytics_events` that is tolerable: each is a
+            // single-level filter, so whatever it means, it means one thing.
+            //
+            // `workflow` is not single-level — the same chip is offered on
+            // Issues (via `list_issues`' `NOT EXISTS`, where an issue with no
+            // stamped occurrence DOES match `neq`) and here on that issue's
+            // occurrences. A bare `<>` here would make one chip mean two
+            // opposite things at two levels of the same drill-down: filter
+            // Issues by `workflow:neq:checkout`, see your unattributed issues,
+            // open one, and every unattributed occurrence silently vanishes.
+            // A filter key must mean one thing wherever the user types it, so
+            // this level bends to match the issue level rather than to match
+            // its own file's precedent.
+            ("workflow", Op::Neq) => query.filter(
+                error_events::workflow_name
+                    .ne(f.value.clone())
+                    .or(error_events::workflow_name.is_null()),
+            ),
+            ("workflow", Op::Contains) => {
+                query.filter(error_events::workflow_name.ilike(like_contains(&f.value)))
             }
             _ => query,
         };
@@ -2686,6 +2804,742 @@ pub async fn bump_device(
     .bind::<BigInt, _>(errors_delta)
     .execute(conn)
     .await
+}
+
+// ===========================================================================
+// Workflows (optional, explicitly-bounded spans; roll-up upserted by the
+// pipeline, keyed by `(app_id, workflow_id)` rather than `session_id` — see
+// migration 2026-07-29-000032_workflows' own doc comment for why)
+// ===========================================================================
+
+/// A workflow still `active` with no activity for this long is reported as
+/// abandoned (derived on read, never stored — there is no fourth `status`
+/// value and no sweeper job). Matches the breadcrumb-buffer TTL. Declared
+/// once, here, so no second copy of the threshold can drift from it.
+pub const WORKFLOW_STALE_MINUTES: i64 = 30;
+
+/// The three reserved lifecycle transitions a `$workflow_start` /
+/// `$workflow_end` / `$workflow_cancel` event drives via
+/// [`apply_workflow_lifecycle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowAction {
+    Start,
+    End,
+    Cancel,
+}
+
+/// Upsert a `workflows` row, folding one stamped signal into it: bump
+/// last-activity/earliest-start and the event/error counters. Idempotent per
+/// `(app_id, workflow_id)` — mirrors [`bump_session`] with `session_id`
+/// swapped for `workflow_id`; read that function's doc comment first.
+///
+/// Deliberately never touches `status`, `ended_at` or `cancel_reason`: those
+/// three columns are [`apply_workflow_lifecycle`]'s alone to set, which is
+/// what protects a terminal (`completed`/`cancelled`) workflow from being
+/// reopened by a late-arriving stamped event that has nothing to do with the
+/// lifecycle itself (e.g. an ordinary analytics event stamped with a
+/// `workflow_id` whose `$workflow_end` was already processed).
+///
+/// ## `environment_id` is the FIRST writer's, and is NOT authoritative
+///
+/// The unique key is `(app_id, workflow_id)` — **app-wide**. `environment_id`
+/// is in the INSERT column list but in no `DO UPDATE SET` clause, so whichever
+/// signal creates the row labels it forever, while `events_count`/
+/// `errors_count` accumulate from every environment that touches that
+/// `workflow_id`. A workflow can therefore be *labelled* one environment while
+/// its counters were incremented by signals from another — the same hazard
+/// [`bump_session`]'s own doc comment describes for sessions, arrived at by a
+/// different route (it lets the label flip to the latest non-null value; this
+/// pins it to the first).
+///
+/// **Read-side scoping filters on `workflows.environment_id` directly** —
+/// see `workflow_list`/`workflow_detail`/`workflow_runs`/
+/// `workflow_spans_for_session` below, which splice `ReadScope`'s SQL
+/// fragment against this table exactly as they would against any other
+/// environment-stamped one. An earlier version of this comment said the
+/// opposite — "a read-side caller must not treat this as an environment
+/// filter... derive environment from the environment-stamped child rows
+/// instead". That instruction was overstated and is superseded by this
+/// paragraph (see
+/// `.superpowers/sdd/2026-07-29-workflow-grouping/task-4-report.md` for the
+/// ruling).
+///
+/// Why the column is trustworthy enough to filter on directly, despite being
+/// the first writer's rather than the most recent: `workflow_id` is a
+/// **client-generated UUID** (see the design doc), so a workflow row belongs
+/// to exactly one app+environment in practice — cross-environment
+/// mislabelling requires a client to violate that contract by reusing an id.
+/// That is a narrower exposure than `sessions.environment_id`'s identical
+/// trade-off, where every reader already trusts the column even though a
+/// real session can legitimately span environments (this one, keyed by a
+/// UUID, is not expected to).
+///
+/// The alternative — deriving environment from the stamped child rows via an
+/// `EXISTS` semi-join instead of trusting this column — **has not been
+/// measured against this table.** What *was* measured is the analogous
+/// semi-join on `sessions`: Slice 3's Task 10 replaced `sessions.crashed`'s
+/// column predicate with an `EXISTS` against `error_events` and found it
+/// ~11x more expensive (11.3x / 11.0x on the two shapes it timed), even with
+/// a purpose-built index, because it becomes a correlated per-row subquery
+/// re-probed against every partition of `error_events` rather than a
+/// missing-index problem. See
+/// `.superpowers/sdd/2026-07-29-environment-rbac-scope/task-10-report.md` —
+/// note that it predates this table and mentions workflows nowhere. The same
+/// shape and therefore a similar cost is *expected* here (same child tables,
+/// same partitioning, same correlated-subquery structure), but that is an
+/// inference from the `sessions` result, not a workflows measurement. Anyone
+/// designing a stricter scoping fix should re-measure against `workflows`
+/// rather than treat ~11x as an established number for this table.
+///
+/// None of this makes the label infallible, and it is still not "fixed" with
+/// a `COALESCE` refresh on every `bump_workflow` call: that would make the
+/// label flip-flop between environments on every signal, which is strictly
+/// worse than a stable-but-occasionally-wrong one. The residual risk — a
+/// hand-rolled client reusing one `workflow_id` across two environments — is
+/// accepted rather than paid for with a materially more expensive read on
+/// every workflow query.
+///
+/// ## `COALESCE` argument order is inverted vs. [`bump_session`], on purpose
+///
+/// `session_id`/`distinct_id`/`device_key`/`release`/`name` here are
+/// `COALESCE(workflows.<col>, EXCLUDED.<col>)` — **first** non-null wins —
+/// whereas `bump_session` writes `COALESCE(EXCLUDED.<col>, sessions.<col>)`,
+/// i.e. **last** non-null wins. Not a typo in either place. A session is a
+/// long-lived, re-identified thing whose newest attribution is its best one
+/// (a user logging in mid-session should re-label it); an explicitly-bounded
+/// workflow's owning session/device/release is a property of where it *began*,
+/// and letting a later straggler signal repoint it would rewrite history the
+/// UI already showed. `name` follows the same rule via `NULLIF`, treating `''`
+/// as absent — see [`apply_workflow_lifecycle`] for the clobber that guards
+/// against.
+#[allow(clippy::too_many_arguments)]
+pub async fn bump_workflow(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    environment_id: Uuid,
+    workflow_id: &str,
+    workflow_name: &str,
+    session_id: Option<&str>,
+    distinct_id: Option<&str>,
+    device_key: Option<&str>,
+    release: Option<&str>,
+    occurred_at: DateTime<Utc>,
+    events_delta: i32,
+    errors_delta: i32,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "INSERT INTO workflows \
+           (app_id, environment_id, workflow_id, name, session_id, distinct_id, \
+            device_key, release, started_at, last_event_at, events_count, errors_count) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11) \
+         ON CONFLICT (app_id, workflow_id) DO UPDATE SET \
+            last_event_at = GREATEST(workflows.last_event_at, EXCLUDED.last_event_at), \
+            started_at    = LEAST(workflows.started_at, EXCLUDED.started_at), \
+            events_count  = workflows.events_count + EXCLUDED.events_count, \
+            errors_count  = workflows.errors_count + EXCLUDED.errors_count, \
+            name          = COALESCE(NULLIF(workflows.name, ''), EXCLUDED.name), \
+            session_id    = COALESCE(workflows.session_id, EXCLUDED.session_id), \
+            distinct_id   = COALESCE(workflows.distinct_id, EXCLUDED.distinct_id), \
+            device_key    = COALESCE(workflows.device_key, EXCLUDED.device_key), \
+            release       = COALESCE(workflows.release, EXCLUDED.release), \
+            updated_at    = now()",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<SqlUuid, _>(environment_id)
+    .bind::<Text, _>(workflow_id)
+    .bind::<Text, _>(workflow_name)
+    .bind::<Nullable<Text>, _>(session_id)
+    .bind::<Nullable<Text>, _>(distinct_id)
+    .bind::<Nullable<Text>, _>(device_key)
+    .bind::<Nullable<Text>, _>(release)
+    .bind::<Timestamptz, _>(occurred_at)
+    .bind::<Integer, _>(events_delta)
+    .bind::<Integer, _>(errors_delta)
+    .execute(conn)
+    .await
+}
+
+/// Apply a `$workflow_start` / `$workflow_end` / `$workflow_cancel` lifecycle
+/// event to its `workflows` row, upserting it if this is the first signal
+/// seen for the workflow.
+///
+/// `Start` deliberately does **not** set `status = 'active'` on conflict —
+/// only backfilling `name`/`started_at` — so a start event that arrives
+/// *after* the end/cancel event (out-of-order delivery) cannot reopen an
+/// already-terminal workflow. `End`/`Cancel` guard every field they touch
+/// (`status`, `ended_at`, `cancel_reason`) with `CASE WHEN workflows.status =
+/// 'active'`: the first terminal transition wins and a second one — of
+/// either kind — is silently ignored, matching `bump_workflow`'s own
+/// never-reopen guarantee.
+///
+/// `Start`'s `name` clause is `COALESCE(NULLIF(EXCLUDED.name, ''),
+/// workflows.name)`, not a bare `EXCLUDED.name`. `workflows.name` is `TEXT NOT
+/// NULL` with no emptiness CHECK, and the caller resolves an absent name to
+/// `""` — so a bare assignment would let the exact client this function's
+/// property-fallback exists for (a hand-rolled one posting `$workflow_start`
+/// with a `workflow_id` but no name) permanently destroy a good display name
+/// that stamped SDK events had already established. `NULLIF` makes `''` mean
+/// "I have nothing to offer", which is what it actually means here.
+///
+/// The caller is deliberately NOT made to skip the lifecycle call when no name
+/// resolves: dropping the transition would strand the workflow `active`
+/// forever and it would then be misreported as abandoned once
+/// [`WORKFLOW_STALE_MINUTES`] elapsed. A missing name is cosmetic; a missing
+/// terminal transition is not. The row can still be *created* with `name = ''`
+/// when a nameless lifecycle event is the very first signal for a workflow —
+/// there is genuinely nothing better to store at that point — and
+/// [`bump_workflow`]'s own `COALESCE(NULLIF(workflows.name, ''), …)` upgrades
+/// it as soon as any named signal arrives.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_workflow_lifecycle(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    environment_id: Uuid,
+    workflow_id: &str,
+    workflow_name: &str,
+    action: WorkflowAction,
+    cancel_reason: Option<&str>,
+    session_id: Option<&str>,
+    distinct_id: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> QueryResult<usize> {
+    match action {
+        WorkflowAction::Start => {
+            diesel::sql_query(
+                "INSERT INTO workflows \
+                   (app_id, environment_id, workflow_id, name, session_id, distinct_id, \
+                    status, started_at, last_event_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $7) \
+                 ON CONFLICT (app_id, workflow_id) DO UPDATE SET \
+                    name       = COALESCE(NULLIF(EXCLUDED.name, ''), workflows.name), \
+                    started_at = LEAST(workflows.started_at, EXCLUDED.started_at), \
+                    updated_at = now()",
+            )
+            .bind::<SqlUuid, _>(app_id)
+            .bind::<SqlUuid, _>(environment_id)
+            .bind::<Text, _>(workflow_id)
+            .bind::<Text, _>(workflow_name)
+            .bind::<Nullable<Text>, _>(session_id)
+            .bind::<Nullable<Text>, _>(distinct_id)
+            .bind::<Timestamptz, _>(occurred_at)
+            .execute(conn)
+            .await
+        }
+        WorkflowAction::End | WorkflowAction::Cancel => {
+            let status = if action == WorkflowAction::End {
+                "completed"
+            } else {
+                "cancelled"
+            };
+            diesel::sql_query(
+                "INSERT INTO workflows \
+                   (app_id, environment_id, workflow_id, name, session_id, distinct_id, \
+                    status, cancel_reason, started_at, ended_at, last_event_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9) \
+                 ON CONFLICT (app_id, workflow_id) DO UPDATE SET \
+                    status        = CASE WHEN workflows.status = 'active' THEN EXCLUDED.status ELSE workflows.status END, \
+                    ended_at      = CASE WHEN workflows.status = 'active' THEN EXCLUDED.ended_at ELSE workflows.ended_at END, \
+                    cancel_reason = CASE WHEN workflows.status = 'active' THEN EXCLUDED.cancel_reason ELSE workflows.cancel_reason END, \
+                    last_event_at = GREATEST(workflows.last_event_at, EXCLUDED.last_event_at), \
+                    started_at    = LEAST(workflows.started_at, EXCLUDED.started_at), \
+                    updated_at    = now()",
+            )
+            .bind::<SqlUuid, _>(app_id)
+            .bind::<SqlUuid, _>(environment_id)
+            .bind::<Text, _>(workflow_id)
+            .bind::<Text, _>(workflow_name)
+            .bind::<Nullable<Text>, _>(session_id)
+            .bind::<Nullable<Text>, _>(distinct_id)
+            .bind::<Text, _>(status)
+            .bind::<Nullable<Text>, _>(cancel_reason)
+            .bind::<Timestamptz, _>(occurred_at)
+            .execute(conn)
+            .await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workflows (read side, Task 4): on-read aggregation over `workflows` plus
+// the environment-stamped child tables it names in its own doc comment
+// (`analytics_events`/`error_events`), following the `screen_list`/
+// `screen_stats` template — raw `sql_query`, `ReadScope::sql_fragment(_for)`
+// spliced into the WHERE clause, positional binds in matching order,
+// `QueryableByName` result structs. `workflows.environment_id` is filtered on
+// directly (see `bump_workflow`'s doc comment above for why that is now the
+// correct call, not an oversight).
+// ---------------------------------------------------------------------------
+
+/// The `eff` (effective status) projection every workflow read function
+/// shares: a workflow's own `status`, unless it is still `active` and has had
+/// no activity for `WORKFLOW_STALE_MINUTES`, in which case it reads as
+/// `'abandoned'` — derived on read, never stored (see `WORKFLOW_STALE_MINUTES`'s
+/// own doc comment). A function rather than a `const &str`, because the
+/// threshold has to be spliced in via `format!`; safe to do so —
+/// `WORKFLOW_STALE_MINUTES` is a compile-time integer constant, never user
+/// input. Defined once so `workflow_list`/`workflow_detail`/`workflow_runs`/
+/// `workflow_spans_for_session` cannot drift from one another or from the
+/// constant itself. Assumes the `workflows` row is aliased `w`, which every
+/// call site below does.
+fn workflow_effective_status_sql() -> String {
+    format!(
+        "CASE WHEN w.status = 'active' AND w.last_event_at < now() - make_interval(mins => {WORKFLOW_STALE_MINUTES}) \
+         THEN 'abandoned' ELSE w.status END"
+    )
+}
+
+/// Shared inner subquery for the workflow outcome/duration aggregate, reused
+/// by `workflow_list` (grouped by name, an outer `ILIKE` narrows which names
+/// survive) and `workflow_detail` (narrowed to one name *inside* this
+/// subquery, so the outer aggregate collapses to a single row) — the same
+/// "shared CTE, different predicate" idiom `screen_ctes` uses for
+/// `screen_list`/`screen_stats`.
+///
+/// `name_pred` is a compile-time SQL fragment, never user data: `""` for the
+/// list (name filtering happens outside, against the derived table's own
+/// `w.name`) or `" AND w.name = $3"` for the detail view (a *bound* param at
+/// a fixed index, never interpolated). `env_sql` is an
+/// `EnvFilter::sql_fragment_for("w", _)` output, and MUST be applied inside
+/// this subquery rather than the outer query — same reasoning as
+/// `screen_ctes`'s own doc comment: the outer query only sees the columns
+/// this subquery selects, and even if `environment_id` were visible there,
+/// filtering after the aggregate `eff`/`dur` projection would still compute
+/// them from every environment's rows first.
+fn workflow_outcome_subquery(env_sql: &str, name_pred: &str) -> String {
+    let eff = workflow_effective_status_sql();
+    format!(
+        "SELECT w.*, {eff} AS eff, \
+                CASE WHEN w.ended_at IS NOT NULL \
+                     THEN EXTRACT(EPOCH FROM (w.ended_at - w.started_at)) * 1000 END AS dur \
+         FROM workflows w \
+         WHERE w.app_id = $1 AND w.started_at >= now() - make_interval(days => $2){env_sql}{name_pred}"
+    )
+}
+
+/// One row per workflow **name** — the outcome/duration aggregate
+/// `workflow_list` and `workflow_detail` both produce (`workflow_detail`
+/// reuses this exact shape for its own single-name aggregate before folding
+/// in the other three pieces).
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct WorkflowRow {
+    #[diesel(sql_type = Text)]
+    pub name: String,
+    #[diesel(sql_type = BigInt)]
+    pub started: i64,
+    #[diesel(sql_type = BigInt)]
+    pub completed: i64,
+    #[diesel(sql_type = BigInt)]
+    pub cancelled: i64,
+    #[diesel(sql_type = BigInt)]
+    pub abandoned: i64,
+    #[diesel(sql_type = BigInt)]
+    pub active: i64,
+    #[diesel(sql_type = BigInt)]
+    pub unique_users: i64,
+    /// `NULL` when no run in the window has an `ended_at` yet — only
+    /// `completed`/`cancelled` rows have one, so an all-`active`/`abandoned`
+    /// group has no duration to report. That is the intended semantic:
+    /// duration describes finished runs.
+    #[diesel(sql_type = Nullable<Double>)]
+    pub median_duration_ms: Option<f64>,
+    #[diesel(sql_type = Nullable<Double>)]
+    pub p95_duration_ms: Option<f64>,
+    #[diesel(sql_type = Timestamptz)]
+    pub last_seen: DateTime<Utc>,
+}
+
+/// The SELECT list shared by `workflow_list`'s and `workflow_detail`'s
+/// outcome/duration aggregate — factored out so the two cannot drift on a
+/// column, an alias, or a FILTER predicate. Operates over
+/// `workflow_outcome_subquery`'s derived table, aliased `w`.
+const WORKFLOW_OUTCOME_SELECT: &str = "\
+    w.name, \
+    COUNT(*)::bigint AS started, \
+    COUNT(*) FILTER (WHERE w.eff = 'completed')::bigint AS completed, \
+    COUNT(*) FILTER (WHERE w.eff = 'cancelled')::bigint AS cancelled, \
+    COUNT(*) FILTER (WHERE w.eff = 'abandoned')::bigint AS abandoned, \
+    COUNT(*) FILTER (WHERE w.eff = 'active')::bigint AS active, \
+    COUNT(DISTINCT w.distinct_id)::bigint AS unique_users, \
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY w.dur)::double precision AS median_duration_ms, \
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY w.dur)::double precision AS p95_duration_ms, \
+    MAX(w.last_event_at) AS last_seen";
+
+/// One row per workflow name: started/completed/cancelled/abandoned/active
+/// counts, unique users, median/p95 duration (finished runs only) and last
+/// seen — paginated, optionally substring-filtered by name.
+///
+/// Bind layout: `$1` app_id, `$2` since_days — env takes `$3` when it needs a
+/// bind (reserved against the inner subquery's `w` alias). `search` always
+/// binds (`Nullable<Text>`) at the next free index — `$4` if env consumed
+/// `$3`, else `$3` — and `limit`/`offset` trail it. Same "trailing-index
+/// shift" idiom as `screen_list`/`top_events`: every index downstream of the
+/// env fragment is computed *from* `scope.env.consumes_bind()`, not
+/// hard-coded, so the two can never drift apart.
+///
+/// `search` is matched with [`like_contains`], so a term containing `%` or
+/// `_` matches those characters *literally* rather than as wildcards —
+/// matching every other free-text search in this file. The `%…%` wrapping
+/// happens in Rust, not via SQL-side `||` concatenation, which is what lets
+/// the escaping apply at all.
+pub async fn workflow_list(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    since_days: i32,
+    search: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> QueryResult<Vec<WorkflowRow>> {
+    let env_sql = scope.env.sql_fragment_for("w", 3);
+    let search_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let limit_idx = search_idx + 1;
+    let offset_idx = limit_idx + 1;
+    let search_pattern = search.map(like_contains);
+
+    let q = format!(
+        "SELECT {WORKFLOW_OUTCOME_SELECT} \
+         FROM ({}) w \
+         WHERE (${search_idx}::text IS NULL OR w.name ILIKE ${search_idx}) \
+         GROUP BY w.name \
+         ORDER BY started DESC, w.name ASC \
+         LIMIT ${limit_idx} OFFSET ${offset_idx}",
+        workflow_outcome_subquery(&env_sql, "")
+    );
+
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Integer, _>(since_days);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    stmt.bind::<Nullable<Text>, _>(search_pattern)
+        .bind::<BigInt, _>(limit)
+        .bind::<BigInt, _>(offset)
+        .get_results(conn)
+        .await
+}
+
+/// One contained event name and its count within a workflow — `top_events`'
+/// row shape.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct NameCount {
+    #[diesel(sql_type = Text)]
+    pub name: String,
+    #[diesel(sql_type = BigInt)]
+    pub count: i64,
+}
+
+/// One contained issue and its occurrence count within a workflow —
+/// `top_issues`' row shape.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct WorkflowIssue {
+    #[diesel(sql_type = SqlUuid)]
+    pub issue_id: Uuid,
+    #[diesel(sql_type = Text)]
+    pub title: String,
+    #[diesel(sql_type = BigInt)]
+    pub count: i64,
+}
+
+/// A single workflow name's full detail: the same outcome/duration aggregate
+/// as `workflow_list` (one name's worth), a duration histogram, the top
+/// contained (non-lifecycle) event names, and the top contained issues.
+#[derive(Debug, serde::Serialize)]
+pub struct WorkflowDetail {
+    pub name: String,
+    pub started: i64,
+    pub completed: i64,
+    pub cancelled: i64,
+    pub abandoned: i64,
+    pub active: i64,
+    pub unique_users: i64,
+    pub median_duration_ms: Option<f64>,
+    pub p95_duration_ms: Option<f64>,
+    pub duration_buckets: Vec<HistoBucket>,
+    pub top_events: Vec<NameCount>,
+    pub top_issues: Vec<WorkflowIssue>,
+}
+
+/// The three reserved lifecycle event names' shared prefix — `NOT LIKE
+/// '$workflow%'` in `workflow_detail`'s `top_events` query excludes all three
+/// (`$workflow_start`/`_end`/`_cancel`), which would otherwise dominate every
+/// contained-event list. A compile-time literal, not user data, so it is
+/// written directly into the SQL text rather than bound.
+const WORKFLOW_LIFECYCLE_EVENT_PATTERN: &str = "$workflow%";
+
+/// Full detail for one workflow name: outcome/duration aggregate, duration
+/// histogram, top contained events, top contained issues.
+///
+/// Every one of the four queries below binds in the same order — `$1`
+/// app_id, `$2` since_days, `$3` name, `$4` env (only when
+/// `scope.env.consumes_bind()`) — a deliberate uniformity (none of them
+/// *needs* to share a layout, since each is an independent prepared
+/// statement) that exists purely to make this function's own bind-index
+/// bookkeeping easy to verify by inspection.
+///
+/// Returns `Err(NotFound)` if `name` never had a matching `workflows` row in
+/// `scope`'s environment(s) within `since_days` — the outcome aggregate's
+/// `GROUP BY w.name` yields zero rows in that case, same "vanishes rather
+/// than zero-fills" behaviour `screen_stats` has for a screen never seen.
+///
+/// ## The four queries use two *different* time windows, on purpose
+///
+/// The outcome aggregate and the duration histogram bound
+/// `workflows.started_at`; `top_events` and `top_issues` bound the child
+/// tables' `occurred_at`. These do not describe the same set of runs, and
+/// the totals are not expected to reconcile: a run that *started* just
+/// outside the window but emitted events inside it contributes to
+/// `top_events`/`top_issues` while contributing nothing to
+/// `started`/`completed`/the histogram. The reverse also happens — a run
+/// that started inside the window but whose events all predate it.
+///
+/// This is deliberate rather than an oversight. Bounding the child tables by
+/// their owning workflow's `started_at` instead would require joining
+/// `workflows` into both queries, which is exactly the correlated-subquery
+/// shape `bump_workflow`'s doc comment records being measured at ~11x on the
+/// analogous `sessions` case — a large cost to make two independently
+/// meaningful numbers agree at the edges. "Events seen inside this window
+/// that belonged to this workflow" is a defensible reading in its own right.
+/// Dashboard note: do not present `sum(top_events.count)` as "events in the
+/// runs counted above" — it is not that number.
+pub async fn workflow_detail(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    name: &str,
+    since_days: i32,
+) -> QueryResult<WorkflowDetail> {
+    const NAME_PRED: &str = " AND w.name = $3";
+
+    // --- outcome/duration aggregate (one row) ------------------------------
+    let env_sql = scope.env.sql_fragment_for("w", 4);
+    let outcome_q = format!(
+        "SELECT {WORKFLOW_OUTCOME_SELECT} FROM ({}) w GROUP BY w.name",
+        workflow_outcome_subquery(&env_sql, NAME_PRED)
+    );
+    let mut outcome_stmt = diesel::sql_query(outcome_q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Integer, _>(since_days)
+        .bind::<Text, _>(name);
+    outcome_stmt = crate::bind_env!(outcome_stmt, &scope.env);
+    let outcome: WorkflowRow = outcome_stmt.get_result(conn).await?;
+
+    // --- duration histogram (finished runs only) ---------------------------
+    // Reuses the whole existing duration-histogram scheme —
+    // `DURATION_BUCKET_CASE_SQL` (the bucketing SQL itself),
+    // `DURATION_BUCKETS`, `order_histogram` and `HistoBucket` — rather than a
+    // fresh `width_bucket` scheme or a second copy of the CASE.
+    let env_sql = scope.env.sql_fragment_for("w", 4);
+    let buckets_q = format!(
+        "SELECT bucket, count(*)::bigint AS count FROM ( \
+           SELECT {DURATION_BUCKET_CASE_SQL} AS bucket \
+           FROM (SELECT EXTRACT(EPOCH FROM (w.ended_at - w.started_at)) * 1000 AS d \
+                 FROM workflows w \
+                 WHERE w.app_id = $1 AND w.started_at >= now() - make_interval(days => $2) \
+                   AND w.name = $3 AND w.ended_at IS NOT NULL{env_sql}) s \
+         ) b GROUP BY bucket"
+    );
+    let mut buckets_stmt = diesel::sql_query(buckets_q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Integer, _>(since_days)
+        .bind::<Text, _>(name);
+    buckets_stmt = crate::bind_env!(buckets_stmt, &scope.env);
+    let bucket_rows: Vec<HistoBucket> = buckets_stmt.get_results(conn).await?;
+    let duration_buckets = order_histogram(bucket_rows);
+
+    // --- top contained events -----------------------------------------------
+    // `analytics_events` is the only table in this FROM clause, so the env
+    // fragment is unqualified — same as `top_events` above.
+    //
+    // `workflow_id IS NOT NULL` is load-bearing for performance, not
+    // semantics: migration 2026-07-29-000032's index on this table is
+    // PARTIAL (`... WHERE workflow_id IS NOT NULL`), and Postgres only uses a
+    // partial index when the query's WHERE clause *implies* the index
+    // predicate. `workflow_name = $3` does not imply it — they are different
+    // columns — so without this term the index is unusable and the planner
+    // falls back to scanning every partition of the largest table in the
+    // system, filtering `workflow_name` as a post-scan qual. Measured on the
+    // dev app (212k events, 22 partitions): 52,744 buffers / cost 56,190
+    // without it, 14 buffers / cost 2,025 with it. Semantically a no-op — the
+    // pipeline stamps `workflow_id` and `workflow_name` together, so a row
+    // with a name always has an id. See task-4-report.md's "Fix round 1" for
+    // both full plans.
+    let env_sql = scope.env.sql_fragment(4);
+    let events_q = format!(
+        "SELECT name, COUNT(*)::bigint AS count \
+         FROM analytics_events \
+         WHERE app_id = $1 AND occurred_at >= now() - make_interval(days => $2) \
+           AND workflow_name = $3 AND workflow_id IS NOT NULL \
+           AND name NOT LIKE '{WORKFLOW_LIFECYCLE_EVENT_PATTERN}'{env_sql} \
+         GROUP BY name ORDER BY count DESC LIMIT 10"
+    );
+    let mut events_stmt = diesel::sql_query(events_q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Integer, _>(since_days)
+        .bind::<Text, _>(name);
+    events_stmt = crate::bind_env!(events_stmt, &scope.env);
+    let top_events: Vec<NameCount> = events_stmt.get_results(conn).await?;
+
+    // --- top contained issues -----------------------------------------------
+    // `error_events` (aliased `e`) joined to `issues` (aliased `i`) — env
+    // must qualify `e`, the environment-stamped side of the join.
+    //
+    // `e.workflow_id IS NOT NULL` is here for the same partial-index reason
+    // as the `top_events` query above — `error_events` carries the identical
+    // partial index. Measured on the dev app (210k error events): 52,559
+    // buffers / cost 56,267 without it, 14 buffers / cost 2,043 with it.
+    let env_sql = scope.env.sql_fragment_for("e", 4);
+    let issues_q = format!(
+        "SELECT i.id AS issue_id, i.title, COUNT(*)::bigint AS count \
+         FROM error_events e \
+         JOIN issues i ON i.id = e.issue_id \
+         WHERE e.app_id = $1 AND e.occurred_at >= now() - make_interval(days => $2) \
+           AND e.workflow_name = $3 AND e.workflow_id IS NOT NULL{env_sql} \
+         GROUP BY i.id, i.title \
+         ORDER BY count DESC LIMIT 10"
+    );
+    let mut issues_stmt = diesel::sql_query(issues_q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Integer, _>(since_days)
+        .bind::<Text, _>(name);
+    issues_stmt = crate::bind_env!(issues_stmt, &scope.env);
+    let top_issues: Vec<WorkflowIssue> = issues_stmt.get_results(conn).await?;
+
+    Ok(WorkflowDetail {
+        name: outcome.name,
+        started: outcome.started,
+        completed: outcome.completed,
+        cancelled: outcome.cancelled,
+        abandoned: outcome.abandoned,
+        active: outcome.active,
+        unique_users: outcome.unique_users,
+        median_duration_ms: outcome.median_duration_ms,
+        p95_duration_ms: outcome.p95_duration_ms,
+        duration_buckets,
+        top_events,
+        top_issues,
+    })
+}
+
+/// One individual workflow run — `workflow_runs`' row shape, linking to
+/// session detail via `session_id`.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct WorkflowRun {
+    #[diesel(sql_type = Text)]
+    pub workflow_id: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub session_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub distinct_id: Option<String>,
+    /// The effective status (see `workflow_effective_status_sql`), not the
+    /// raw column — an `active` row past `WORKFLOW_STALE_MINUTES` reports as
+    /// `abandoned` here too.
+    #[diesel(sql_type = Text)]
+    pub status: String,
+    #[diesel(sql_type = Timestamptz)]
+    pub started_at: DateTime<Utc>,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub duration_ms: Option<i64>,
+    #[diesel(sql_type = Integer)]
+    pub events_count: i32,
+    #[diesel(sql_type = Integer)]
+    pub errors_count: i32,
+}
+
+/// Individual runs of one workflow name, newest first, optionally filtered by
+/// effective status (`active`/`completed`/`cancelled`/`abandoned` — compared
+/// against the *projection*, not the raw `status` column, which is what makes
+/// `abandoned` a filterable value at all, since it never appears as a stored
+/// value).
+///
+/// Bind layout: `$1` app_id, `$2` since_days, `$3` name — env takes `$4` when
+/// it needs a bind. `status` always binds (`Nullable<Text>`) at the next free
+/// index — `$5` if env consumed `$4`, else `$4` — and `limit`/`offset` trail
+/// it, same trailing-index-shift idiom as `workflow_list`.
+pub async fn workflow_runs(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    name: &str,
+    since_days: i32,
+    status: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> QueryResult<Vec<WorkflowRun>> {
+    let env_sql = scope.env.sql_fragment_for("w", 4);
+    let status_idx = if scope.env.consumes_bind() { 5 } else { 4 };
+    let limit_idx = status_idx + 1;
+    let offset_idx = limit_idx + 1;
+    let eff = workflow_effective_status_sql();
+
+    let q = format!(
+        "SELECT w.workflow_id, w.session_id, w.distinct_id, {eff} AS status, \
+                w.started_at, w.ended_at, \
+                CASE WHEN w.ended_at IS NOT NULL \
+                     THEN (EXTRACT(EPOCH FROM (w.ended_at - w.started_at)) * 1000)::bigint END AS duration_ms, \
+                w.events_count, w.errors_count \
+         FROM workflows w \
+         WHERE w.app_id = $1 AND w.started_at >= now() - make_interval(days => $2) \
+           AND w.name = $3{env_sql} \
+           AND (${status_idx}::text IS NULL OR {eff} = ${status_idx}) \
+         ORDER BY w.started_at DESC \
+         LIMIT ${limit_idx} OFFSET ${offset_idx}"
+    );
+
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Integer, _>(since_days)
+        .bind::<Text, _>(name);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    stmt.bind::<Nullable<Text>, _>(status)
+        .bind::<BigInt, _>(limit)
+        .bind::<BigInt, _>(offset)
+        .get_results(conn)
+        .await
+}
+
+/// One workflow span within a session — for the session timeline lane.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct WorkflowSpan {
+    #[diesel(sql_type = Text)]
+    pub workflow_id: String,
+    #[diesel(sql_type = Text)]
+    pub name: String,
+    #[diesel(sql_type = Text)]
+    pub status: String,
+    #[diesel(sql_type = Timestamptz)]
+    pub started_at: DateTime<Utc>,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// Every workflow span within one session, oldest first — feeds the session
+/// timeline lane.
+///
+/// Bind layout: `$1` app_id, `$2` session_id — env takes `$3` when it needs a
+/// bind.
+pub async fn workflow_spans_for_session(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    session_id: &str,
+) -> QueryResult<Vec<WorkflowSpan>> {
+    let env_sql = scope.env.sql_fragment_for("w", 3);
+    let eff = workflow_effective_status_sql();
+    let q = format!(
+        "SELECT w.workflow_id, w.name, {eff} AS status, w.started_at, w.ended_at \
+         FROM workflows w \
+         WHERE w.app_id = $1 AND w.session_id = $2{env_sql} \
+         ORDER BY w.started_at ASC"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Text, _>(session_id);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    stmt.get_results(conn).await
 }
 
 pub async fn insert_transaction(
@@ -3889,6 +4743,36 @@ pub async fn list_analytics_events(
                         .bind::<Text, _>(like_contains(&v)),
                 )
             }
+            // `workflow_id IS NOT NULL` alongside the name predicate is the
+            // partial-index term: migration 2026-07-29-000032's
+            // `analytics_events_app_workflow_idx` is
+            // `WHERE workflow_id IS NOT NULL`, and Postgres uses a partial
+            // index only when the query's WHERE *implies* that predicate —
+            // `workflow_name = $N` does not. Semantically a no-op (the
+            // pipeline stamps id and name together). This is the case Task 4
+            // measured on the largest table in the system: 14 buffers / cost
+            // 2,025 with the term vs 52,744 / 56,190 without.
+            ("workflow", Op::Eq) => query
+                .filter(analytics_events::workflow_id.is_not_null())
+                .filter(analytics_events::workflow_name.eq(f.value.clone())),
+            // `OR workflow_name IS NULL`, and deliberately NO
+            // `workflow_id IS NOT NULL` term — see
+            // `list_error_events_for_issue`'s `workflow` arms for the full
+            // reasoning. Short version: `workflow` is one chip offered at
+            // three levels (Events, Issues, occurrences), so it must mean the
+            // same thing at each, and at the issue level `NOT EXISTS` already
+            // makes an unstamped row match `neq`. The partial index is
+            // deliberately forgone here: this arm's whole purpose is to RETURN
+            // the unstamped rows, which are exactly the rows that index
+            // excludes.
+            ("workflow", Op::Neq) => query.filter(
+                analytics_events::workflow_name
+                    .ne(f.value.clone())
+                    .or(analytics_events::workflow_name.is_null()),
+            ),
+            ("workflow", Op::Contains) => query
+                .filter(analytics_events::workflow_id.is_not_null())
+                .filter(analytics_events::workflow_name.ilike(like_contains(&f.value))),
             _ => query, // environment handled below; others unreachable
         };
     }
@@ -4401,6 +5285,24 @@ pub struct HistoBucket {
 /// Duration-histogram bucket labels, in display order.
 pub const DURATION_BUCKETS: [&str; 5] = ["<10s", "10-60s", "1-5m", "5-30m", "30m+"];
 
+/// The SQL `CASE` mapping a duration in milliseconds (aliased `d`) onto
+/// [`DURATION_BUCKETS`]' labels.
+///
+/// Shared by every duration histogram — `session_duration_histogram` and
+/// `workflow_detail` — rather than copied into each, because the failure
+/// mode of a divergent copy is *silent*: [`order_histogram`] matches these
+/// labels against `DURATION_BUCKETS` by string equality and 0-fills anything
+/// it doesn't recognise, so a single typo'd label here produces a
+/// permanently all-zero bucket that no error, no type check and no `NULL`
+/// ever reveals. `duration_bucket_case_emits_exactly_the_declared_labels`
+/// below locks the SQL and the Rust array together.
+const DURATION_BUCKET_CASE_SQL: &str = "CASE \
+             WHEN d < 10000  THEN '<10s' \
+             WHEN d < 60000  THEN '10-60s' \
+             WHEN d < 300000 THEN '1-5m' \
+             WHEN d < 1800000 THEN '5-30m' \
+             ELSE '30m+' END";
+
 /// Reorder DB histogram rows into the fixed bucket order, 0-filling gaps. Pure.
 pub fn order_histogram(rows: Vec<HistoBucket>) -> Vec<HistoBucket> {
     DURATION_BUCKETS
@@ -4476,12 +5378,7 @@ pub async fn session_duration_histogram(
     let env_sql = scope.env.sql_fragment(3);
     let q = format!(
         "SELECT bucket, count(*)::bigint AS count FROM ( \
-           SELECT CASE \
-             WHEN d < 10000  THEN '<10s' \
-             WHEN d < 60000  THEN '10-60s' \
-             WHEN d < 300000 THEN '1-5m' \
-             WHEN d < 1800000 THEN '5-30m' \
-             ELSE '30m+' END AS bucket \
+           SELECT {DURATION_BUCKET_CASE_SQL} AS bucket \
            FROM (SELECT EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000 AS d \
                  FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}) s \
          ) b GROUP BY bucket"
@@ -4558,6 +5455,37 @@ mod histogram_tests {
             ]
         );
         assert_eq!(out.len(), DURATION_BUCKETS.len());
+    }
+
+    /// The SQL `CASE` and the Rust label array must agree exactly.
+    ///
+    /// This is the only thing standing between a typo'd SQL label and a
+    /// permanently all-zero histogram bucket: `order_histogram` matches by
+    /// string equality and 0-fills whatever it doesn't recognise, so a
+    /// divergence produces no error, no `NULL`, and no type failure — just a
+    /// bucket that is always empty, in every environment, forever. Asserting
+    /// on the extracted string literals (rather than eyeballing the two) is
+    /// what makes the coupling mechanical.
+    #[test]
+    fn duration_bucket_case_emits_exactly_the_declared_labels() {
+        // Pull every `'...'` literal out of the CASE's THEN/ELSE arms.
+        let emitted: Vec<&str> = super::DURATION_BUCKET_CASE_SQL
+            .match_indices('\'')
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .filter(|pair| pair.len() == 2)
+            .map(|pair| {
+                let start = pair[0].0 + 1;
+                let end = pair[1].0;
+                &super::DURATION_BUCKET_CASE_SQL[start..end]
+            })
+            .collect();
+        assert_eq!(
+            emitted,
+            DURATION_BUCKETS.to_vec(),
+            "the CASE's labels must match DURATION_BUCKETS exactly, in order — \
+             a mismatch silently 0-fills that bucket instead of erroring"
+        );
     }
 }
 

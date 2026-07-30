@@ -11,7 +11,7 @@ import type {
 } from './types.js';
 
 const SDK_NAME = 'sauron-node';
-const SDK_VERSION = '1.2.0';
+const SDK_VERSION = '1.3.0';
 
 /** Default exponential-backoff base (ms) for the first retry. */
 const DEFAULT_RETRY_BASE_MS = 200;
@@ -140,6 +140,11 @@ export class Transport {
     }, this.config.flushInterval);
     // Do not hold the event loop open for the flush timer.
     if (typeof this.timer.unref === 'function') this.timer.unref();
+  }
+
+  /** Whether the transport still accepts items (false once auth-disabled by a 401/403). */
+  isEnabled(): boolean {
+    return !this.disabled;
   }
 
   /** Enqueue an item; triggers an eager flush at `maxBatch`. */

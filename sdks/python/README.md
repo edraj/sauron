@@ -122,9 +122,15 @@ sauron.init(
 )
 ```
 
-Every capture/track function is a **silent no-op before `init`** (and after
-`close()`), so instrumented library code is safe to import in a process that
-never configures a DSN.
+Every capture/track function is a **silent no-op before `init`**, after
+`close()`, **and** after the transport auto-disables itself on a `401`/`403`
+(see [`Client`](#client)'s `enabled` attribute below) — the last one can
+happen mid-process with no `close()` call from you at all. So instrumented
+library code is safe to import in a process that never configures a DSN.
+`start_workflow`/`end_workflow`/`cancel_workflow` follow the same rule but
+aren't silent about it the way the `None`-returning functions are — each
+returns `WorkflowResult(status="disabled")` so callers that branch on the
+status still get a well-formed value.
 
 ## API reference
 
@@ -276,7 +282,7 @@ sauron.track(
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `event` | `str` | — (required) | Event name. |
-| `distinct_id` | `str` | — (required) | Person identifier. An empty value drops the event (logged when `debug=True`). |
+| `distinct_id` | `str` | — (required) | Person identifier. An empty value drops the event (logged when `debug=True`) — except for the three reserved `$workflow_start`/`$workflow_end`/`$workflow_cancel` names, which are [deliberately exempt](#start_workflow). |
 | `properties` | `Optional[Mapping[str, Any]]` | `None` | Event properties; serialized as `{}` when omitted. |
 | `tags` | `Optional[Mapping[str, Any]]` | `None` | Per-call tags, merged over scope tags. |
 | `contexts` | `Optional[Mapping[str, Any]]` | `None` | Per-call context blocks, merged over scope contexts. |
@@ -362,6 +368,151 @@ sauron.track_transaction(
     distinct_id="u_123",
 )
 ```
+
+### `start_workflow`
+
+```python
+sauron.start_workflow(
+    name: str,
+    *,
+    force: bool = False,
+) -> WorkflowResult
+```
+
+A workflow is a named, explicitly-bounded span of activity — start it, let
+events/errors/transactions happen inside it, then end (or cancel) it.
+**Workflows are entirely optional**: an app that never calls `start_workflow`
+never sees `workflow_id`/`workflow_name` on any item — the keys are omitted
+entirely, never sent as `null`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `str` | — (required) | Workflow name. Trimmed; rejected (`invalid_name`) if empty after trimming or over 120 characters — never truncated. |
+| `force` | `bool` | `False` | When `True`, supersede an already-active workflow instead of returning `already_active`: emits `$workflow_cancel` (`reason="superseded"`) for the old one, then starts the new. |
+
+**Returns** a `WorkflowResult(status, workflow_id)`. `workflow_id` is a fresh,
+**client-generated UUID v4** minted by `start_workflow` itself — never a
+session id, a device id, or anything derived from the name. (The server rolls
+counters up on `(app_id, workflow_id)` across the whole app, so a
+deterministic or reused id would merge unrelated environments'/sessions'
+counts into one row.)
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | Started (or, with `force=True`, superseded the previous one). `workflow_id` is set. |
+| `invalid_name` | `name` is empty after trimming, or over 120 characters. Only reachable from `start_workflow` — a malformed name passed to `end_workflow`/`cancel_workflow` is `name_mismatch` instead (see below). |
+| `already_active` | Another workflow is already active on this scope and `force` was not passed. |
+| `disabled` | No client, the client is closed/disabled, or an unexpected internal error. Never raises. |
+
+The scope's workflow is set **before** `$workflow_start` is emitted, so the
+start event itself carries the new `workflow_id`/`workflow_name`. From then on,
+every `track` / `capture_exception` / `capture_message` / `track_transaction`
+call is stamped with `workflow_id` and `workflow_name` — **never** `identify`
+(the server has no workflow columns for it). See
+[Workflows are request-scoped](#workflows-are-request-scoped-not-global) below
+for what "the active scope" means under concurrency.
+
+```python
+result = sauron.start_workflow("checkout")
+if result.status == "ok":
+    ...  # result.workflow_id
+```
+
+**Who the lifecycle events are attributed to.** The three `$workflow_*` events
+carry the active scope user's `id` as their `distinct_id`
+(`sauron.set_user({"id": ...})`), or an **empty string** when nobody has been
+identified. Empty is intentional, not a fallback gap: the server stores an
+empty `distinct_id` as `NULL`, and its `unique_users` metric counts distinct
+non-`NULL` values — so an anonymous workflow run correctly contributes nothing
+to that count instead of collapsing every anonymous run in the process onto one
+synthetic user. These three reserved events are the only ones exempt from
+`track`'s "an empty `distinct_id` drops the event" rule; ordinary `track` calls
+are unaffected.
+
+### `end_workflow`
+
+```python
+sauron.end_workflow(name: Optional[str] = None) -> WorkflowResult
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `Optional[str]` | `None` | When given, must match the active workflow's (trimmed) name or the call is a no-op. `None` ends whichever workflow is active. |
+
+**Returns** a `WorkflowResult`.
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | Ended. The emitted `$workflow_end` carries `duration_ms` — wall-clock time since `start_workflow`. |
+| `not_active` | No workflow is active on this scope. |
+| `name_mismatch` | `name` was given and doesn't match the active workflow — **including** when `name` is itself blank or over 120 characters. (`invalid_name` is reachable only from `start_workflow`; a malformed name here is just another kind of mismatch.) |
+| `disabled` | No client, the client is closed/disabled, or an unexpected internal error. |
+
+Emits `$workflow_end` **while the workflow is still active** (so the event is
+itself stamped with it), then clears it. Never auto-cancels or otherwise
+fabricates a lifecycle event on its own — this is the only way a workflow's
+state changes.
+
+### `cancel_workflow`
+
+```python
+sauron.cancel_workflow(
+    name: Optional[str] = None,
+    *,
+    reason: Optional[str] = None,
+) -> WorkflowResult
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `Optional[str]` | `None` | Same matching rule as `end_workflow`. |
+| `reason` | `Optional[str]` | `None` → `"user"` | Trimmed and capped at 120 characters (never truncated *before* the cap — the trim happens first). `start_workflow(..., force=True)`'s internal supersede call passes the literal reason `"superseded"` through this same normalization. |
+
+**Returns** a `WorkflowResult` with the same status table as `end_workflow`.
+Emits `$workflow_cancel` (carrying `duration_ms` **and** `reason`) instead of
+`$workflow_end` — `$workflow_end` never carries a `reason`.
+
+### `get_workflow`
+
+```python
+sauron.get_workflow() -> Optional[ActiveWorkflow]
+```
+
+**Returns** the active `ActiveWorkflow` (`workflow_id: str`, `name: str`,
+`started_at: datetime`) on the current scope, or `None`. A plain state read —
+it works before `init` and is unaffected by the client being closed/disabled
+(unlike the three mutators above, it never returns a `disabled` status; there
+is nothing to be disabled about a getter).
+
+The server derives a workflow as **abandoned** after 30 minutes without a new
+stamped event — computed on read, never stored, and requiring no action from
+the SDK. A workflow that later receives another stamped event (even one sent
+well past the 30-minute mark) simply reads as active again.
+
+### Workflows are request-scoped, not global
+
+The active workflow is a plain field, `Scope.workflow` — there is **no
+separate module-level workflow state**. It lives on the exact same per-scope
+`contextvars.ContextVar` as `tags`/`user`/`breadcrumbs` (see
+[Isolation semantics](#isolation-semantics--contextvars-not-thread-locals)
+below), so the same rules apply, concretely:
+
+- Push a scope per request/task (`with sauron.scope():`) so
+  `start_workflow`'s `already_active` check — and every stamp it produces —
+  is evaluated **per request**, not against whatever the previous request left
+  on the shared global scope. Skipping this leaks exactly like an un-scoped
+  `set_tag` would: concurrent requests share one workflow, and one request's
+  `start_workflow` can stamp another's errors.
+- A `threading.Thread` or a `ThreadPoolExecutor` submission starts with a
+  **fresh, empty context** — it does not inherit the spawning thread's pushed
+  scope — so a workflow started on the request thread is invisible to code
+  that runs on a worker thread/executor. Propagate it explicitly (pass the
+  `ActiveWorkflow`/`workflow_id` in) or run the work with
+  `contextvars.copy_context().run(...)`.
+- `asyncio.create_task` / `TaskGroup` **does** copy the current context at
+  creation time: a workflow started before spawning a child task is visible
+  inside it, while a workflow started **inside** a child task stays local to
+  that task and is invisible to its parent or to sibling tasks.
 
 ### `add_breadcrumb`
 
@@ -641,15 +792,24 @@ for multi-tenant dispatch. It takes the same keyword options as `init` (minus
 `dsn`, which is a required positional here), starts its own transport thread,
 and is not registered with `atexit`, so you must `close()` it yourself.
 
-Attributes: `dsn` (a parsed `Dsn`), `release`, `sample_rate`,
-`enabled` (flipped to `False` after `close()` or a hard `401`/`403`).
+Attributes: `dsn` (a parsed `Dsn`), `release`, `sample_rate`, `enabled` (a
+read-only property — assigning to it raises `AttributeError`). `enabled` is
+`True` only when the client has not been `close()`d **and** its transport has
+not auto-disabled itself; a `401`/`403` disables the transport permanently
+for the process (see [Retry vs drop](#transport--delivery)), so `enabled` can
+flip to `False` mid-session with no `close()` call from you — check it (or
+`get_client()`) after `flush()`/`track()` calls if you want to detect a
+revoked key without waiting for a log line.
 
 Methods mirror the module-level functions — `track`, `capture_exception`,
-`capture_message`, `identify`, `track_transaction`, `add_breadcrumb`, `flush`,
-`close` — with one addition: `Client.capture_exception` accepts an extra
-keyword-only `mechanism: Optional[Mapping[str, Any]]` that overrides the default
+`capture_message`, `identify`, `track_transaction`, `start_workflow`,
+`end_workflow`, `cancel_workflow`, `add_breadcrumb`, `flush`, `close` — with
+one addition: `Client.capture_exception` accepts an extra keyword-only
+`mechanism: Optional[Mapping[str, Any]]` that overrides the default
 `{"type": "generic", "handled": True}`. The auto-capture hooks use it to mark
-uncaught crashes `handled=False`.
+uncaught crashes `handled=False`. (`get_workflow`, like `get_current_scope`,
+has no `Client` counterpart — it reads the active scope directly and needs no
+client at all.)
 
 ```python
 from sauron import Client
@@ -670,7 +830,8 @@ sauron.Scope(max_breadcrumbs: int = 100) -> Scope
 ```
 
 One layer of ambient signal context. Attributes: `user`, `tags`, `contexts`,
-`extra`, `breadcrumbs`, `max_breadcrumbs`.
+`extra`, `breadcrumbs`, `max_breadcrumbs`, `workflow` (the active
+`ActiveWorkflow`, or `None` — see [`start_workflow`](#start_workflow)).
 
 | Method | Signature | Description |
 | --- | --- | --- |
@@ -680,10 +841,11 @@ One layer of ambient signal context. Attributes: `user`, `tags`, `contexts`,
 | `set_context` | `(key: str, value: Any) -> Scope` | Set one context block. |
 | `set_extra` | `(key: str, value: Any) -> Scope` | Set one extra key. |
 | `add_breadcrumb` | `(crumb: Mapping[str, Any]) -> Scope` | Append a **pre-built** crumb dict, trimming to `max_breadcrumbs`. |
-| `clear` | `() -> None` | Reset user/tags/contexts/extra/breadcrumbs. |
+| `clear` | `() -> None` | Reset user/tags/contexts/extra/breadcrumbs/workflow. |
 | `clone` | `() -> Scope` | An independent copy (what `push_scope` uses). |
 | `apply_to_error` | `(item: Dict[str, Any]) -> None` | Stamp scope state onto an error item in place. |
 | `apply_to_event` | `(item: Dict[str, Any]) -> None` | Stamp scope tags/contexts/extra onto an analytics item in place. |
+| `apply_workflow` | `(item: Dict[str, Any]) -> None` | Stamp `workflow_id`/`workflow_name` onto an item in place when a workflow is active; omits both keys otherwise. Called from the client's single dispatch chokepoint for error/event/transaction items, not from `apply_to_error`/`apply_to_event` directly. |
 
 The mutators return `self`, so they chain:
 
@@ -729,11 +891,11 @@ print(dsn.envelope_url)  # https://ingest.sauron.example:8443/api/7/envelope
 ### `SDK_NAME`, `SDK_VERSION`
 
 Module constants (`str`) reported in the envelope header's `sdk` block:
-`"sauron-python"` and `"1.2.0"`.
+`"sauron-python"` and `"1.3.0"`.
 
 ```python
 import sauron
-print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.2.0
+print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.3.0
 ```
 
 ## Scope & metadata
@@ -792,6 +954,14 @@ The active scope lives in a `contextvars.ContextVar`. Concretely:
   pushed scope. Pass what you need explicitly, or run the work with
   `contextvars.copy_context().run(...)`. The same applies to
   `ThreadPoolExecutor`, which does not copy the submitter's context.
+- **Workflows**: `Scope.workflow` (see [`start_workflow`](#start_workflow)) is
+  governed by the exact same two rules above, not a separate mechanism —
+  `start_workflow`/`end_workflow`/`cancel_workflow` **assign** `scope.workflow`
+  on whichever `Scope` is currently active, which is a *mutation* like
+  `set_tag`, not a rebind. Push a scope per request so `already_active` and
+  every stamp it produces are evaluated against that request only; skip the
+  push and every concurrent caller shares (and can clobber) the one workflow
+  living on the global scope.
 
 ### Thread safety and fork safety
 
@@ -1111,7 +1281,7 @@ lifespan runs per worker).
 | Nothing arrives, no error, `init` returned `None` | No DSN was supplied — the SDK is in disabled no-op mode | Pass a DSN. Run with `debug=True` to see `[sauron] no DSN configured; SDK disabled`. |
 | Nothing arrives, requests reach a proxy but never the ingest | The DSN cannot express a path prefix — ingest **must** be exposed at `/api/{environment_id}/envelope` on the host root | Fix the proxy/route so `POST /api/{environment_id}/envelope` on the DSN host reaches the ingest. Events dropped this way look delivered client-side. |
 | `DsnError` at startup | Malformed DSN (bad protocol, missing key/host/environment id, or a password component) | Use `https://<public_key>@<host>/<environment_id>`, key only, no secret. |
-| Events stop arriving after a while | A `401`/`403` disabled the client permanently and cleared the queue | Fix the public key, then re-`init`. `debug=True` logs `auth rejected (status=...), disabling`. |
+| Events stop arriving after a while | A `401`/`403` disabled the client permanently and cleared the queue (`Client.enabled`/`get_client().enabled` flips to `False`, with no `close()` call from you) | Fix the public key, then re-`init`. `debug=True` logs `auth rejected (status=...), disabling`. |
 | A short-lived script sends nothing | The process exited before the 5s flush tick | Call `sauron.flush()` or `sauron.close()` before exit (the `atexit` hook also closes, but only on a clean interpreter shutdown). |
 | Nothing sends under gunicorn/uWSGI | `init` ran in the pre-fork parent, so the worker has no transport thread | `init` in `post_fork` / `@postfork` / the ASGI `lifespan`. |
 | `capture_exception()` returned `None` | No active exception, `sample_rate` dropped it, or the client is closed/disabled | Pass the exception explicitly; raise `sample_rate`; check `sauron.get_client()`. |
