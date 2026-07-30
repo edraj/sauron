@@ -19,6 +19,8 @@ diesel::table! {
         tags -> Jsonb,
         contexts -> Jsonb,
         extra -> Jsonb,
+        workflow_id -> Nullable<Text>,
+        workflow_name -> Nullable<Text>,
     }
 }
 
@@ -37,15 +39,26 @@ diesel::table! {
 }
 
 diesel::table! {
-    environments (id) {
+    app_environments (id) {
         id -> Uuid,
         app_id -> Uuid,
-        name -> Text,
         created_at -> Timestamptz,
         public_key -> Text,
         ingest_enabled -> Bool,
         is_default -> Bool,
         retired_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
+        environment_id -> Uuid,
+    }
+}
+
+diesel::table! {
+    environments (id) {
+        id -> Uuid,
+        project_id -> Uuid,
+        name -> Text,
+        retired_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
 }
@@ -83,6 +96,8 @@ diesel::table! {
         handled -> Nullable<Bool>,
         title -> Nullable<Text>,
         culprit -> Nullable<Text>,
+        workflow_id -> Nullable<Text>,
+        workflow_name -> Nullable<Text>,
     }
 }
 
@@ -287,6 +302,29 @@ diesel::table! {
 }
 
 diesel::table! {
+    workflows (id) {
+        id -> Uuid,
+        app_id -> Uuid,
+        environment_id -> Uuid,
+        workflow_id -> Text,
+        name -> Text,
+        session_id -> Nullable<Text>,
+        distinct_id -> Nullable<Text>,
+        device_key -> Nullable<Text>,
+        release -> Nullable<Text>,
+        status -> Text,
+        cancel_reason -> Nullable<Text>,
+        started_at -> Timestamptz,
+        ended_at -> Nullable<Timestamptz>,
+        last_event_at -> Timestamptz,
+        events_count -> Int4,
+        errors_count -> Int4,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     transactions (id) {
         id -> Uuid,
         app_id -> Uuid,
@@ -305,6 +343,8 @@ diesel::table! {
         ip_address -> Nullable<Text>,
         occurred_at -> Timestamptz,
         received_at -> Timestamptz,
+        workflow_id -> Nullable<Text>,
+        workflow_name -> Nullable<Text>,
     }
 }
 
@@ -427,14 +467,16 @@ diesel::table! {
 }
 
 diesel::joinable!(analytics_events -> apps (app_id));
-diesel::joinable!(analytics_events -> environments (environment_id));
+diesel::joinable!(analytics_events -> app_environments (environment_id));
 diesel::joinable!(sessions -> apps (app_id));
 diesel::joinable!(devices -> apps (app_id));
 diesel::joinable!(transactions -> apps (app_id));
 diesel::joinable!(apps -> projects (project_id));
-diesel::joinable!(environments -> apps (app_id));
+diesel::joinable!(app_environments -> apps (app_id));
+diesel::joinable!(app_environments -> environments (environment_id));
+diesel::joinable!(environments -> projects (project_id));
 diesel::joinable!(error_events -> apps (app_id));
-diesel::joinable!(error_events -> environments (environment_id));
+diesel::joinable!(error_events -> app_environments (environment_id));
 diesel::joinable!(error_events -> issues (issue_id));
 diesel::joinable!(event_users -> apps (app_id));
 diesel::joinable!(identities -> apps (app_id));
@@ -455,9 +497,12 @@ diesel::joinable!(alert_rules -> organizations (org_id));
 diesel::joinable!(alert_rule_channels -> alert_rules (rule_id));
 diesel::joinable!(alert_rule_channels -> notification_channels (channel_id));
 diesel::joinable!(alert_events -> organizations (org_id));
+diesel::joinable!(workflows -> apps (app_id));
+diesel::joinable!(workflows -> app_environments (environment_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
+    app_environments,
     apps,
     environments,
     error_events,
@@ -484,4 +529,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     alert_rules,
     alert_rule_channels,
     alert_events,
+    workflows,
 );

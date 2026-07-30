@@ -13,7 +13,7 @@
     selectionToScopes,
     type ScopeSelection,
   } from '../../models/scope-tree';
-  import type { App, Environment, Project, Role } from '../../models';
+  import type { App, AppEnvironment, Project, Role } from '../../models';
 
   interface Props {
     open: boolean;
@@ -25,7 +25,7 @@
     /** Environments per app, keyed by app id — see ScopeTree's own doc comment.
         Owned by the parent (Members.svelte) so the same cache can be reused by
         the grant form, the edit dialog, and the members table. */
-    envsByApp: Record<string, Environment[]>;
+    envsByApp: Record<string, AppEnvironment[]>;
     loadingEnvApps: Set<string>;
     onopenapp: (appId: string) => void;
     onclose: () => void;

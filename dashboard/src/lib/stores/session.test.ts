@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { App, Environment } from '../models';
+import type { App, AppEnvironment } from '../models';
 
 vi.mock('../api/orgs', () => ({
   getAccess: vi.fn(),
@@ -73,10 +73,15 @@ function makeApp(id: string, overrides: Partial<App> = {}): App {
   };
 }
 
-function makeEnv(id: string, overrides: Partial<Environment> = {}): Environment {
+function makeEnv(id: string, overrides: Partial<AppEnvironment> = {}): AppEnvironment {
   return {
+    // `id` is the ENROLLMENT id — the one the store selects on, persists and
+    // sends as `?environment_id=`. `environment_id` names the project-level
+    // catalogue entry this app is enrolled in, and is deliberately different
+    // here so a test that confuses the two fails.
     id,
     app_id: 'app-1',
+    environment_id: `cat-${id}`,
     name: id,
     created_at: '2026-01-01T00:00:00Z',
     public_key: `pk_${id}`,

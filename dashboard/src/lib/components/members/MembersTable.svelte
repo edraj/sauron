@@ -4,7 +4,7 @@
   import Button from '../ui/Button.svelte';
   import { sessionStore } from '../../stores/session.svelte';
   import { initials } from '../../utils/format';
-  import type { App, Environment, Member, MemberGrant, ScopeType } from '../../models';
+  import type { App, AppEnvironment, Member, MemberGrant, ScopeType } from '../../models';
 
   interface Props {
     grouped: Member[];
@@ -13,7 +13,7 @@
         whose row has been expanded somewhere in the scope tree this session —
         see ScopeTree's doc comment — so an env chip falls back to a truncated
         id until then, same as a genuinely deleted target would. */
-    envsByApp?: Record<string, Environment[]>;
+    envsByApp?: Record<string, AppEnvironment[]>;
     /** Names for the projects an app grant can hang off. Optional — without it
         an app chip just drops its project prefix instead of breaking. */
     projectsById?: Record<string, { name: string }>;
@@ -43,7 +43,7 @@
   }: Props = $props();
 
   const envsById = $derived.by(() => {
-    const map: Record<string, Environment> = {};
+    const map: Record<string, AppEnvironment> = {};
     for (const list of Object.values(envsByApp)) for (const e of list) map[e.id] = e;
     return map;
   });

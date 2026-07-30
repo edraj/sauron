@@ -117,7 +117,10 @@
         </Card>
       {/if}
 
-      <EnvironmentsCard appId={app.id} />
+      <!-- Environments are owned by the project now, so the card needs the app's
+           project id as well: creating one is a catalogue write under
+           `/v1/projects/{project_id}/environments`, not an app write. -->
+      <EnvironmentsCard appId={app.id} projectId={app.project_id} />
 
       {#if canDelete}
         <Card title="Delete app">

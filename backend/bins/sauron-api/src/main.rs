@@ -202,19 +202,38 @@ async fn main() -> anyhow::Result<()> {
                 .patch(routes::apps::update_app)
                 .delete(routes::apps::delete_app),
         )
+        // The catalogue: environments as a project defines them. There is no
+        // POST under `/v1/apps/{app_id}/environments` any more — an app does not
+        // get to invent an environment its siblings have never heard of.
         .route(
-            "/v1/apps/{app_id}/environments",
-            get(routes::environments::list_environments)
-                .post(routes::environments::create_environment),
+            "/v1/projects/{project_id}/environments",
+            get(routes::environments::list_project_environments)
+                .post(routes::environments::create_project_environment),
         )
         .route(
             "/v1/environments/{env_id}",
-            patch(routes::environments::update_environment)
-                .delete(routes::environments::retire_environment),
+            patch(routes::environments::update_project_environment)
+                .delete(routes::environments::retire_project_environment),
+        )
+        // Enrollments: one app's membership in one environment, which is what
+        // carries the ingest key and the per-app switches.
+        .route(
+            "/v1/apps/{app_id}/environments",
+            get(routes::environments::list_app_environments),
+        )
+        // No DELETE here on purpose. Withdrawing one app from an environment
+        // would be a one-way door: enrollment happens only when an environment
+        // or an app is created, so there is no path back short of retiring the
+        // environment project-wide and recreating it, which re-keys every
+        // sibling app. `PATCH { ingest_enabled: false }` expresses the same
+        // intent — "this app should not report here" — and is reversible.
+        .route(
+            "/v1/app-environments/{id}",
+            patch(routes::environments::update_app_environment),
         )
         .route(
-            "/v1/environments/{env_id}/rotate-key",
-            post(routes::environments::rotate_environment_key),
+            "/v1/app-environments/{id}/rotate-key",
+            post(routes::environments::rotate_app_environment_key),
         )
         .route(
             "/v1/apps/{app_id}/first-event",
