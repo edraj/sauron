@@ -458,6 +458,19 @@ export interface IssueDetail extends Issue {
   series: SeriesPoint[];
 }
 
+/**
+ * Occurrence totals for one issue under the active occurrence filters.
+ *
+ * Distinct from `Issue.times_seen`/`users_seen`, which are all-time and
+ * app-wide (`users_seen` is a HyperLogLog estimate); these are exact counts
+ * over the selected range and filters, so the two will legitimately differ.
+ */
+export interface IssueEventStats {
+  events: number;
+  users: number;
+  sessions: number;
+}
+
 // ---------------------------------------------------------------------------
 // Analytics
 // ---------------------------------------------------------------------------

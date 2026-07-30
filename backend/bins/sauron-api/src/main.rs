@@ -249,6 +249,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/issues/{issue_id}/events",
             get(routes::issues::events),
         )
+        .route(
+            "/v1/apps/{app_id}/issues/{issue_id}/events/stats",
+            get(routes::issues::event_stats),
+        )
         // --- analytics (app-scoped) ---
         .route(
             "/v1/apps/{app_id}/events/top",

@@ -3,6 +3,7 @@ import type {
   ErrorEvent,
   Issue,
   IssueDetail,
+  IssueEventStats,
   IssueStats,
   IssueStatus,
 } from '../models';
@@ -53,18 +54,50 @@ export async function updateIssueStatus(
   return data;
 }
 
+export interface ListIssueEventsParams {
+  filters?: string[];
+  q?: string;
+  sinceDays?: number;
+  limit?: number;
+}
+
 export async function listIssueEvents(
   appId: string,
   issueId: string,
-  opts: { filters?: string[]; q?: string; sinceDays?: number; limit?: number } = {},
+  opts: ListIssueEventsParams = {},
 ): Promise<ErrorEvent[]> {
-  const p = new URLSearchParams();
-  for (const f of opts.filters ?? []) p.append('filter', f);
-  if (opts.q) p.set('q', opts.q);
-  if (opts.sinceDays != null) p.set('since_days', String(opts.sinceDays));
+  const p = occurrenceParams(opts);
   p.set('limit', String(opts.limit ?? 50));
   const { data } = await api.get<ErrorEvent[]>(
     `/v1/apps/${appId}/issues/${issueId}/events?${p.toString()}`,
   );
   return data;
+}
+
+/**
+ * Totals for every occurrence matching `opts` — not just the page
+ * `listIssueEvents` returns, which is capped at 50 rows with no pagination.
+ *
+ * Shares `occurrenceParams` with the list on purpose: these counts are rendered
+ * as a description of those rows, so the two requests must be built from one
+ * encoder or a filter added to one alone would make them quietly disagree.
+ */
+export async function getIssueEventStats(
+  appId: string,
+  issueId: string,
+  opts: ListIssueEventsParams = {},
+): Promise<IssueEventStats> {
+  const p = occurrenceParams(opts);
+  const { data } = await api.get<IssueEventStats>(
+    `/v1/apps/${appId}/issues/${issueId}/events/stats?${p.toString()}`,
+  );
+  return data;
+}
+
+function occurrenceParams(opts: ListIssueEventsParams): URLSearchParams {
+  const p = new URLSearchParams();
+  for (const f of opts.filters ?? []) p.append('filter', f);
+  if (opts.q) p.set('q', opts.q);
+  if (opts.sinceDays != null) p.set('since_days', String(opts.sinceDays));
+  return p;
 }

@@ -2197,6 +2197,31 @@ pub async fn list_error_events_for_issue(
     since: Option<chrono::DateTime<chrono::Utc>>,
     limit: i64,
 ) -> QueryResult<Vec<ErrorEvent>> {
+    error_events_for_issue_query(&scope, issue_id, filters, q, since)
+        .select(ErrorEvent::as_select())
+        .order(error_events::occurred_at.desc())
+        .limit(limit)
+        .load(conn)
+        .await
+}
+
+/// The shared `WHERE` clause behind both the occurrences list and its
+/// [`error_event_stats_for_issue`] counts, returned unselected and unordered so
+/// each caller can append its own projection.
+///
+/// Extracted so the two CANNOT drift. The stat strip above the occurrences
+/// table claims to describe the rows below it; if these predicates were written
+/// twice, any future filter added to one and forgotten in the other would show
+/// a user count that silently disagrees with the visible rows — and the
+/// `workflow`/`Neq` arm below is exactly the kind of subtlety a second copy
+/// would get wrong.
+fn error_events_for_issue_query<'a>(
+    scope: &'a ReadScope,
+    issue_id: Uuid,
+    filters: &[ParsedFilter],
+    q: Option<&str>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> error_events::BoxedQuery<'a, diesel::pg::Pg> {
     let mut query = error_events::table
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::issue_id.eq(issue_id))
@@ -2266,11 +2291,49 @@ pub async fn list_error_events_for_issue(
         );
     }
     crate::scope_env!(query, error_events, &scope.env)
-        .select(ErrorEvent::as_select())
-        .order(error_events::occurred_at.desc())
-        .limit(limit)
-        .load(conn)
-        .await
+}
+
+/// Occurrence totals for one issue over the same predicate the list uses.
+///
+/// HOT-TIER ONLY. `count(DISTINCT …)` is holistic, not additive, so it cannot
+/// be split at the tier watermark and summed the way `tier_read.rs` merges
+/// per-day counts — the same reason transaction percentiles stay on Postgres.
+/// Once partitions age out to Parquet, a wide range under-reports here exactly
+/// as it already does for the per-environment `users_seen` in `list_issues`.
+pub async fn error_event_stats_for_issue(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    issue_id: Uuid,
+    filters: &[ParsedFilter],
+    q: Option<&str>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> QueryResult<IssueEventStatsRow> {
+    // `distinct_id`/`session_id` are both nullable: an anonymous occurrence and
+    // a session-less one contribute a NULL, which `count(DISTINCT …)` skips.
+    // That is the intent — "3 users" should not count "no user" as a user.
+    let (events, users, sessions) =
+        error_events_for_issue_query(&scope, issue_id, filters, q, since)
+            .select((
+                diesel::dsl::count_star(),
+                sql::<BigInt>("count(DISTINCT error_events.distinct_id)"),
+                sql::<BigInt>("count(DISTINCT error_events.session_id)"),
+            ))
+            .get_result::<(i64, i64, i64)>(conn)
+            .await?;
+    Ok(IssueEventStatsRow {
+        events,
+        users,
+        sessions,
+    })
+}
+
+/// Counts behind the occurrences stat strip. Raw-shape row, so it lives here
+/// beside `IssueStatsRow` rather than in `models.rs`.
+#[derive(Debug, serde::Serialize)]
+pub struct IssueEventStatsRow {
+    pub events: i64,
+    pub users: i64,
+    pub sessions: i64,
 }
 
 /// Reads `error_events` filtered only by `issue_id` — no `app_id: Uuid`
