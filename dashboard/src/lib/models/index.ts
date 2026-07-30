@@ -429,6 +429,8 @@ export interface ErrorEvent {
   sdk: unknown;
   ip_address: string | null;
   screen?: string | null;
+  session_id: string | null;
+  device_key: string | null;
   occurred_at: string;
   received_at: string;
   stacktrace_symbolicated?: SymbolicatedFrame[] | null;
@@ -803,6 +805,57 @@ export interface ScreenDetail {
   stats: ScreenStats;
   recent_events: AnalyticsEvent[];
   recent_exceptions: ErrorEvent[];
+}
+
+// ---------------------------------------------------------------------------
+// Workflows — named, bounded spans of activity an app can declare via
+// startWorkflow()/endWorkflow(). Entirely optional: an app that never calls
+// them has no rows anywhere below.
+// ---------------------------------------------------------------------------
+
+/** One row per workflow name — the rollup `GET /v1/apps/{app_id}/workflows` returns. */
+export interface WorkflowRow {
+  name: string;
+  started: number;
+  completed: number;
+  cancelled: number;
+  abandoned: number;
+  active: number;
+  unique_users: number;
+  /** `null` when no run in the window has finished yet — duration describes finished runs only. */
+  median_duration_ms: number | null;
+  p95_duration_ms: number | null;
+  last_seen: string;
+}
+
+/**
+ * The effective status of a workflow run, derived server-side at read time —
+ * never stored. An `active` run with no activity for 30 minutes reads as
+ * `abandoned`; a later stamped event revives it. Never compute staleness
+ * client-side.
+ */
+export type WorkflowStatus = 'active' | 'completed' | 'cancelled' | 'abandoned';
+
+/** One individual run of a workflow name — a row from `.../workflows/{name}/runs`. */
+export interface WorkflowRun {
+  workflow_id: string;
+  session_id: string | null;
+  distinct_id: string | null;
+  status: WorkflowStatus;
+  started_at: string;
+  ended_at: string | null;
+  duration_ms: number | null;
+  events_count: number;
+  errors_count: number;
+}
+
+/** One workflow span within a session — feeds the session timeline lane. */
+export interface WorkflowSpan {
+  workflow_id: string;
+  name: string;
+  status: WorkflowStatus;
+  started_at: string;
+  ended_at: string | null;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,12 @@
 """Minimal server-side Sauron example (SDK 0.3.0 surface).
 
-One simulated request that demonstrates:
+Two simulated requests that demonstrate:
 
 * a **per-request scope** (``with sauron.scope():``) that sets a user + a tag,
   isolated from any other concurrent request;
+* a **workflow** (``start_workflow``/``end_workflow``/``cancel_workflow``)
+  bounding each request's checkout flow — every event/error captured while it
+  is active is stamped with its ``workflow_id``;
 * an **``add_breadcrumb``** recorded just before a deliberately-captured
   exception (the breadcrumb, scoped user, and tag ride along on the error);
 * a product-analytics **event** and an **identify**;
@@ -44,6 +47,13 @@ def handle_request() -> None:
         sauron.set_user({"id": DISTINCT_ID, "email": "demo@example.com"})
         sauron.set_tag("route", "/checkout")
 
+        # A named workflow bounds this request's checkout flow. Every
+        # event/error/transaction captured while it is active is stamped
+        # with its workflow_id/workflow_name (identify is the one exception
+        # — it is never stamped).
+        workflow = sauron.start_workflow("checkout")
+        print(f"started workflow: {workflow.status.value} ({workflow.workflow_id})")
+
         # Breadcrumbs form a trail that attaches to the next captured error.
         sauron.add_breadcrumb(
             category="cart",
@@ -53,14 +63,16 @@ def handle_request() -> None:
         )
 
         # Product-analytics event. distinct_id is required by the wire contract.
+        # Carries workflow_id/workflow_name while "checkout" is active.
         sauron.track(
             "checkout_completed",
             distinct_id=DISTINCT_ID,
             properties={"cart_value": 42.5, "currency": "USD"},
         )
 
-        # Deliberately fail and report it. The scoped user + tag and the
-        # breadcrumb above are stamped onto the error item automatically.
+        # Deliberately fail and report it. The scoped user + tag, the
+        # breadcrumb above, and the active workflow are all stamped onto the
+        # error item automatically.
         try:
             raise ValueError("deliberate failure for the example")
         except ValueError:
@@ -79,6 +91,32 @@ def handle_request() -> None:
             url="/checkout",
         )
 
+        # The checkout completed successfully — end the workflow. Emits
+        # $workflow_end with duration_ms and clears it.
+        ended = sauron.end_workflow("checkout")
+        print(f"ended workflow: {ended.status.value}")
+
+
+def handle_abandoned_checkout() -> None:
+    """A second request where the shopper backs out mid-checkout.
+
+    Demonstrates the cancel path: ``cancel_workflow`` closes the span with a
+    caller-supplied reason instead of ``end_workflow``'s implicit "completed".
+    """
+    with sauron.scope():
+        sauron.set_user({"id": DISTINCT_ID, "email": "demo@example.com"})
+        sauron.set_tag("route", "/checkout")
+
+        sauron.start_workflow("checkout")
+        sauron.track(
+            "checkout_started",
+            distinct_id=DISTINCT_ID,
+            properties={"cart_value": 18.0, "currency": "USD"},
+        )
+
+        cancelled = sauron.cancel_workflow("checkout", reason="user_navigated_away")
+        print(f"cancelled workflow: {cancelled.status.value}")
+
 
 def main() -> int:
     dsn = os.environ.get("SAURON_DSN")
@@ -90,6 +128,7 @@ def main() -> int:
     )
 
     handle_request()
+    handle_abandoned_checkout()
 
     # Drain the buffer synchronously, then stop the background thread. (atexit
     # also flushes, but short-lived processes should shut down explicitly.)

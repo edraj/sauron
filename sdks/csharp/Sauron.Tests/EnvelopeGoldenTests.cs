@@ -25,7 +25,7 @@ public class EnvelopeGoldenTests
     {
       "header": {
         "dsn": "https://pk_test@localhost:8081/1",
-        "sdk": { "name": "sauron-dotnet", "version": "1.2.0" },
+        "sdk": { "name": "sauron-dotnet", "version": "1.3.0" },
         "sent_at": "2026-07-12T10:30:00.123Z",
         "release": "svc@1.4.2"
       },
@@ -230,13 +230,13 @@ public class EnvelopeGoldenTests
     }
 
     [Fact]
-    public void SdkHeader_ReportsVersion_1_2_0()
+    public void SdkHeader_ReportsVersion_1_3_0()
     {
         string actual = JsonSerializer.Serialize(BuildGoldenEnvelope(), SauronJson.Options);
         using var doc = JsonDocument.Parse(actual);
         var sdk = doc.RootElement.GetProperty("header").GetProperty("sdk");
         Assert.Equal("sauron-dotnet", sdk.GetProperty("name").GetString());
-        Assert.Equal("1.2.0", sdk.GetProperty("version").GetString());
+        Assert.Equal("1.3.0", sdk.GetProperty("version").GetString());
     }
 
     [Fact]

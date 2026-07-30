@@ -74,7 +74,14 @@ class InitStatusStore {
   }
 }
 
-export type LogKind = 'system' | 'error' | 'warning' | 'event' | 'identify' | 'breadcrumb';
+export type LogKind =
+  | 'system'
+  | 'error'
+  | 'warning'
+  | 'event'
+  | 'identify'
+  | 'breadcrumb'
+  | 'workflow';
 
 export interface LogEntry {
   id: number;

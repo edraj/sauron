@@ -2,6 +2,33 @@
 
 All notable changes to `@edraj/sauron-node` are documented here.
 
+## 1.3.0
+
+### Added
+
+- **Workflows** — bound a named span of activity with `startWorkflow(name,
+  { force? })` / `endWorkflow(name?)` / `cancelWorkflow(name?, { reason? })`,
+  and read the active one with `getWorkflow()`. Every event, error and
+  transaction captured while a workflow is active is stamped with its
+  `workflow_id` / `workflow_name`, so the dashboard can group a whole flow
+  (`checkout`, `password_reset`, …) as one unit. The three lifecycle events
+  `$workflow_start` / `$workflow_end` / `$workflow_cancel` are emitted
+  automatically, carrying `duration_ms` (and `reason` on cancel).
+- New exported types: `WorkflowStatus`, `WorkflowResult`, `ActiveWorkflow`.
+- `SauronClient.isEnabled()` — `false` once the transport has auto-disabled
+  itself on a 401/403.
+
+Workflows are entirely **optional**: an app that never calls them emits
+byte-identical telemetry to 1.2.0 — the two fields are omitted from the wire
+JSON, never sent as `null`.
+
+The active workflow is **request-scoped**, held on the current `Scope` and
+isolated by the same `AsyncLocalStorage` that already isolates
+`user`/`tags`/`breadcrumbs`. Concurrent requests never observe or clobber each
+other's workflow. None of the three methods ever throws — each returns one of
+six statuses (`ok`, `already_active`, `not_active`, `name_mismatch`,
+`invalid_name`, `disabled`).
+
 ## 1.2.0
 
 - **Breaking: the `environment` option has been removed.** An environment is now

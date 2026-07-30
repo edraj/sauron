@@ -1,6 +1,6 @@
 {
   "name": "@edraj/sauron-browser",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Sauron browser SDK: automatic error reporting + product analytics for the web.",
   "homepage": "https://github.com/edraj/sauron/tree/main/sdks/js#readme",
   "repository": {

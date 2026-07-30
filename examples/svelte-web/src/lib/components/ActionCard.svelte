@@ -57,6 +57,10 @@
     --accent: var(--primary);
     --accent-soft: var(--primary-soft);
   }
+  .card.workflow {
+    --accent: var(--primary);
+    --accent-soft: var(--primary-soft);
+  }
 
   .card-head {
     display: flex;

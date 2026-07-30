@@ -29,6 +29,7 @@ from ._scope import (
     push_scope,
     scope,
 )
+from ._workflow import ActiveWorkflow, WorkflowResult, WorkflowStatus
 
 __all__ = [
     "init",
@@ -49,6 +50,10 @@ __all__ = [
     "pop_scope",
     "get_current_scope",
     "get_global_scope",
+    "start_workflow",
+    "end_workflow",
+    "cancel_workflow",
+    "get_workflow",
     "flush",
     "close",
     "get_client",
@@ -59,6 +64,9 @@ __all__ = [
     "parse_dsn",
     "SDK_NAME",
     "SDK_VERSION",
+    "WorkflowStatus",
+    "WorkflowResult",
+    "ActiveWorkflow",
 ]
 
 # The process-wide active client. ``None`` until ``init`` succeeds.
@@ -252,6 +260,46 @@ def track_transaction(
             url=url,
             distinct_id=distinct_id,
         )
+
+
+# -- workflows (operate on the active scope; see sauron/_scope.py) ---------
+
+
+def start_workflow(name: str, *, force: bool = False) -> WorkflowResult:
+    """Start a named workflow. No-op (returns ``disabled``) before ``init``
+    / when disabled. See :meth:`Client.start_workflow`."""
+    if _client is not None:
+        return _client.start_workflow(name, force=force)
+    return WorkflowResult(WorkflowStatus.DISABLED)
+
+
+def end_workflow(name: Optional[str] = None) -> WorkflowResult:
+    """End the active workflow (or the one named ``name``). No-op (returns
+    ``disabled``) before ``init`` / when disabled. See
+    :meth:`Client.end_workflow`."""
+    if _client is not None:
+        return _client.end_workflow(name)
+    return WorkflowResult(WorkflowStatus.DISABLED)
+
+
+def cancel_workflow(
+    name: Optional[str] = None, *, reason: Optional[str] = None
+) -> WorkflowResult:
+    """Cancel the active workflow (or the one named ``name``). No-op
+    (returns ``disabled``) before ``init`` / when disabled. See
+    :meth:`Client.cancel_workflow`."""
+    if _client is not None:
+        return _client.cancel_workflow(name, reason=reason)
+    return WorkflowResult(WorkflowStatus.DISABLED)
+
+
+def get_workflow() -> Optional[ActiveWorkflow]:
+    """The active workflow on the current scope, or ``None``.
+
+    A plain state read (like :func:`get_current_scope`) — works before
+    ``init`` and is unaffected by the client being disabled.
+    """
+    return get_current_scope().workflow
 
 
 # -- scope + breadcrumbs (operate on the active scope) ---------------------

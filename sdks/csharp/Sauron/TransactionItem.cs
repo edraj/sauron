@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Sauron;
 
 /// <summary>
@@ -23,6 +25,20 @@ internal sealed class TransactionItem
     public string? Url { get; set; }
     public string? DistinctId { get; set; }
     public string? SessionId { get; set; }
+
+    // Id/name of the bounding workflow (StartWorkflow/EndWorkflow/CancelWorkflow), if any.
+    // Omitted (never `null`) when no workflow is active.
+    //
+    // ALWAYS SET AS A PAIR, never one without the other. The server guards on
+    // `if let (Some(id), Some(name))` (backend/crates/sauron-pipeline/src/process.rs), so an
+    // id without a name — or a name without an id — is SILENTLY dropped from every workflow
+    // query, with nothing erroring. SauronClient.StampWorkflow is the only assignment site
+    // and always sets both from a single non-null ActiveWorkflow; keep it that way.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WorkflowId { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WorkflowName { get; set; }
 
     public string Timestamp { get; set; } = string.Empty;
 }

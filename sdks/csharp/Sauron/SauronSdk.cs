@@ -83,6 +83,26 @@ public static class SauronSdk
         string? distinctId = null)
         => Current?.TrackTransaction(name, durationMs, op, status, httpMethod, httpStatus, url, distinctId);
 
+    // ---- Workflows -------------------------------------------------------
+
+    /// <summary>Start a named workflow. See <see cref="SauronClient.StartWorkflow"/>.</summary>
+    public static WorkflowResult StartWorkflow(string name, bool force = false)
+        => Current?.StartWorkflow(name, force) ?? new WorkflowResult(WorkflowStatus.Disabled);
+
+    /// <summary>End the active workflow. See <see cref="SauronClient.EndWorkflow"/>.</summary>
+    public static WorkflowResult EndWorkflow(string? name = null)
+        => Current?.EndWorkflow(name) ?? new WorkflowResult(WorkflowStatus.Disabled);
+
+    /// <summary>Cancel the active workflow. See <see cref="SauronClient.CancelWorkflow"/>.</summary>
+    public static WorkflowResult CancelWorkflow(string? name = null, string? reason = null)
+        => Current?.CancelWorkflow(name, reason) ?? new WorkflowResult(WorkflowStatus.Disabled);
+
+    /// <summary>
+    /// The workflow currently bounding the active scope, or <c>null</c> if none. Ambient and
+    /// process-scope-based like the rest of the scope API: readable even before <see cref="Init(string)"/>.
+    /// </summary>
+    public static ActiveWorkflow? GetWorkflow() => ScopeManager.Current.Workflow;
+
     // ---- Scope API -----------------------------------------------------
 
     /// <summary>Set the user on the active scope (global when no scope is pushed). <c>null</c> clears it.</summary>

@@ -13,6 +13,7 @@
   import BreadcrumbTrail from '../lib/components/BreadcrumbTrail.svelte';
   import KeyValueList from '../lib/components/KeyValueList.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
+  import DataTable from '../lib/components/DataTable.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import { OCCURRENCE_FIELDS, encodeFilters, type Filter } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -124,6 +125,31 @@
   );
   const latestEvent = $derived(issue?.latest_event ?? null);
   const latestEventType = $derived(latestEvent?.exception_type ?? issue?.type ?? '');
+
+  // Prefer a name a human recognises, falling back to the id the link points at.
+  function userLabel(ev: ErrorEvent): string {
+    return ev.event_user?.email ?? ev.event_user?.username ?? ev.distinct_id ?? 'anonymous';
+  }
+
+  function nested(ctx: Record<string, unknown> | null, group: string, key: string): string | null {
+    const g = ctx?.[group];
+    if (g == null || typeof g !== 'object') return null;
+    const v = (g as Record<string, unknown>)[key];
+    return typeof v === 'string' && v !== '' ? v : null;
+  }
+
+  // Mirrors how the pipeline derives `device_key` (sauron-pipeline enrich.rs), so
+  // the label always describes the device its link resolves to.
+  function deviceLabel(ev: ErrorEvent): string | null {
+    const c = ev.context;
+    const hardware = [nested(c, 'device', 'family'), nested(c, 'device', 'model')]
+      .filter(Boolean)
+      .join(' ');
+    if (hardware) return hardware;
+    const os = [nested(c, 'os', 'name'), nested(c, 'os', 'version')].filter(Boolean).join(' ');
+    if (os) return os;
+    return nested(c, 'runtime', 'name') ?? nested(c, 'ua', 'name');
+  }
 </script>
 
 <AppShell requireApp>
@@ -274,20 +300,66 @@
           {:else if occurrences.length === 0}
             <p class="faint">No occurrences match this filter.</p>
           {:else}
-            <ul class="occ-list">
-              {#each occurrences as ev (ev.id)}
-                <li class="occ">
-                  <LevelBadge level={ev.level} />
-                  <span class="occ-time">{relativeTime(ev.occurred_at)}</span>
-                  <span class="occ-msg mono">{ev.message ?? ev.exception_value ?? ''}</span>
-                  {#if ev.tags && Object.keys(ev.tags).length > 0}
-                    <span class="occ-tags mono">
-                      {Object.entries(ev.tags).map(([k, v]) => `${k}=${v}`).join(' · ')}
-                    </span>
-                  {/if}
-                </li>
-              {/each}
-            </ul>
+            <DataTable class="occ-table">
+              {#snippet head()}
+                <tr>
+                  <th>Time</th>
+                  <th>User</th>
+                  <th>Session</th>
+                  <th>Device</th>
+                </tr>
+              {/snippet}
+              {#snippet children()}
+                {#each occurrences as ev (ev.id)}
+                  <tr>
+                    <td title={formatDateTime(ev.occurred_at)}>
+                      <span class="cell-muted">{relativeTime(ev.occurred_at)}</span>
+                    </td>
+                    <td>
+                      {#if ev.distinct_id}
+                        <a
+                          class="link trunc"
+                          href={`#/persons/${encodeURIComponent(ev.distinct_id)}`}
+                          title={userLabel(ev)}
+                        >
+                          {userLabel(ev)}
+                        </a>
+                      {:else}
+                        <span class="faint">anonymous</span>
+                      {/if}
+                    </td>
+                    <td>
+                      {#if ev.session_id}
+                        <a
+                          class="link cell-mono trunc"
+                          href={`#/sessions/${encodeURIComponent(ev.session_id)}`}
+                          title={ev.session_id}
+                        >
+                          {ev.session_id}
+                        </a>
+                      {:else}
+                        <span class="faint">—</span>
+                      {/if}
+                    </td>
+                    <td>
+                      {#if ev.device_key}
+                        <a
+                          class="link trunc"
+                          href={`#/devices/${encodeURIComponent(ev.device_key)}`}
+                          title={deviceLabel(ev) ?? ev.device_key}
+                        >
+                          {deviceLabel(ev) ?? ev.device_key}
+                        </a>
+                      {:else if deviceLabel(ev)}
+                        <span class="trunc">{deviceLabel(ev)}</span>
+                      {:else}
+                        <span class="faint">—</span>
+                      {/if}
+                    </td>
+                  </tr>
+                {/each}
+              {/snippet}
+            </DataTable>
           {/if}
         </Card>
       </div>
@@ -597,10 +669,26 @@
     }
   }
 
-  .occ-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-  .occ { display: flex; align-items: center; gap: 10px; font-size: 12.5px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--surface-2); }
-  .occ-time { color: var(--text-muted); white-space: nowrap; }
-  .occ-msg { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .occ-tags { color: var(--primary); white-space: nowrap; }
   .faint { color: var(--text-muted); font-size: 12.5px; }
+
+  :global(.occ-table) {
+    margin-top: 8px;
+  }
+  /* Ids can be long; keep each identity column bounded so no single cell pushes
+     the table into horizontal scroll. */
+  .trunc {
+    display: inline-block;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+  .link {
+    color: var(--primary);
+    text-decoration: none;
+  }
+  .link:hover {
+    text-decoration: underline;
+  }
 </style>

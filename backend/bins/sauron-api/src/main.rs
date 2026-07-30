@@ -302,6 +302,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/sessions/{session_id}",
             get(routes::sessions::detail),
         )
+        .route(
+            "/v1/apps/{app_id}/sessions/{session_id}/workflows",
+            get(routes::workflows::session_spans),
+        )
         // --- devices (app-scoped) ---
         .route("/v1/apps/{app_id}/devices", get(routes::devices::list))
         .route("/v1/apps/{app_id}/device", get(routes::devices::detail))
@@ -322,6 +326,16 @@ async fn main() -> anyhow::Result<()> {
             patch(routes::funnels::update_saved).delete(routes::funnels::delete_saved),
         )
         .route("/v1/apps/{app_id}/journeys", get(routes::journeys::explore))
+        // --- workflows (app-scoped) ---
+        .route("/v1/apps/{app_id}/workflows", get(routes::workflows::list))
+        .route(
+            "/v1/apps/{app_id}/workflows/{name}",
+            get(routes::workflows::detail),
+        )
+        .route(
+            "/v1/apps/{app_id}/workflows/{name}/runs",
+            get(routes::workflows::runs),
+        )
         // --- uptime monitors (project-scoped) ---
         .route(
             "/v1/projects/{project_id}/monitors",

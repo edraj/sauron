@@ -128,13 +128,22 @@ import { init, captureException } from '@edraj/sauron-browser'; // named
 
 The facade carries `init`, `captureException`, `captureMessage`, `track`,
 `trackTransaction`, `identify`, `addBreadcrumb`, `setUser`, `setTag`, `setTags`,
-`setContext`, `setExtra`, `setScreen`, `getScreen`, `flush`, `close` and
+`setContext`, `setExtra`, `setScreen`, `getScreen`, `startWorkflow`,
+`endWorkflow`, `cancelWorkflow`, `getWorkflow`, `flush`, `close` and
 `getClient`.
 
 Before `init()` every capture, analytics and scope function is a silent no-op,
-`getScreen()` returns `null`, and `flush()`/`close()` resolve to `false`.
-Nothing throws. After `close()` the capture and scope functions stay no-ops
-(the client is disabled) and the screen is reset to `null`.
+`getScreen()`/`getWorkflow()` return `null`, `startWorkflow`/`endWorkflow`/
+`cancelWorkflow` resolve to `{ status: 'disabled' }`, and `flush()`/`close()`
+resolve to `false`. Nothing throws. After `close()` the capture and scope
+functions stay no-ops (the client is disabled) and the screen and active
+workflow are reset to `null`.
+
+The same disabled state is also reached **automatically, mid-session**, the
+moment the gateway answers a delivery with `401`/`403` (a revoked or invalid
+DSN key) — no call to `close()`/`disable()` required. Check
+[`isEnabled()`](#sauronclient) rather than assuming the SDK is live just
+because you never explicitly disabled it.
 
 ### `init(options)`
 
@@ -350,6 +359,142 @@ Returns the current screen name, or `null` when none was ever set (and after
 if (Sauron.getScreen() !== '/checkout') Sauron.setScreen('/checkout');
 ```
 
+### `startWorkflow(name, options?)`
+
+```ts
+function startWorkflow(name: string, options?: { force?: boolean }): WorkflowResult
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string` | — (required) | Workflow name. Trimmed; rejected if empty after trimming or longer than 120 characters. |
+| `options.force` | `boolean` | `false` | Replace an already-active workflow instead of rejecting the call. |
+
+Starts a named, explicitly-bounded span of activity — e.g. `checkout`,
+`onboarding` — and mints a fresh **client-generated UUID** as its
+`workflowId`/wire `workflow_id`. While a workflow is active, every subsequent
+`track`, `captureException`, `captureMessage` and `trackTransaction` call is
+additionally stamped with `workflow_id` + `workflow_name`, alongside whatever
+else it already carries. `startWorkflow` itself emits a reserved
+`$workflow_start` event, stamped with the *new* workflow.
+
+Workflows are entirely optional: an app that never calls `startWorkflow`
+behaves exactly as before — no `workflow_id`/`workflow_name` fields are ever
+added to any item.
+
+Returns a `WorkflowResult`:
+
+| `status` | Meaning |
+| --- | --- |
+| `'ok'` | Started (or replaced, with `force`). `workflowId` is the new id. |
+| `'already_active'` | Another workflow is already active and `force` was not set. Nothing changed. |
+| `'invalid_name'` | `name` was empty after trimming, or over 120 characters. Nothing changed. |
+| `'disabled'` | Called before `init()`, after the client was closed/disabled, or after the transport auto-disabled itself on a `401`/`403` — also returned if an unexpected internal error occurred. Nothing changed. |
+
+With `force: true`, the previously-active workflow is closed first — emitting
+`$workflow_cancel` for it with `reason: 'superseded'` — and then the new one
+starts. Without `force`, an active workflow simply blocks the call (logged as
+a warning in `debug` mode). Telemetry never throws: every precondition failure
+returns a status instead.
+
+`'disabled'` always means *nothing changed*, so it is never worth retrying
+blindly. If the workflow started but its `$workflow_start` event could not be
+delivered, you still get `'ok'` and a `workflowId` — the workflow is live and
+stamping is active, and the server materializes the workflow from the first
+stamped event it receives regardless.
+
+```ts
+const result = Sauron.startWorkflow('checkout');
+if (result.status === 'ok') {
+  console.log('workflow id', result.workflowId);
+}
+
+// Force-replace whatever workflow (if any) is currently active:
+Sauron.startWorkflow('checkout', { force: true });
+```
+
+### `endWorkflow(name?)`
+
+```ts
+function endWorkflow(name?: string): WorkflowResult
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string` | current workflow | If given, must match the active workflow's name or the call is rejected. |
+
+Ends the active workflow: emits `$workflow_end` carrying `duration_ms` (the
+time since `startWorkflow`), then clears the active workflow.
+
+| `status` | Meaning |
+| --- | --- |
+| `'ok'` | Ended. `workflowId` is the id that was closed. |
+| `'not_active'` | No workflow is active. Nothing changed. |
+| `'name_mismatch'` | `name` was given but does not match the active workflow. Nothing changed. |
+| `'disabled'` | Called before `init()`, after the client was closed/disabled, or after the transport auto-disabled itself on a `401`/`403` — also returned if an unexpected internal error occurred. Nothing changed. |
+
+A `name` that is itself malformed — empty, whitespace-only, or over 120
+characters — reports `'name_mismatch'`, not `'invalid_name'`: it cannot match
+the active workflow, and the call named a workflow that is not the active one.
+`'invalid_name'` is reserved for `startWorkflow`, where the name is the thing
+being created rather than a guard on which workflow to close.
+
+`'ok'` always means the workflow really is closed locally, even in the rare
+case where the `$workflow_end` event itself could not be delivered — so it is
+never correct to see `'ok'` and still have `getWorkflow()` return non-null.
+
+```ts
+Sauron.startWorkflow('checkout');
+// ... later
+Sauron.endWorkflow(); // { status: 'ok', workflowId: '...' }
+```
+
+### `cancelWorkflow(name?, options?)`
+
+```ts
+function cancelWorkflow(name?: string, options?: { reason?: string }): WorkflowResult
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string` | current workflow | If given, must match the active workflow's name or the call is rejected. |
+| `options.reason` | `string` | `'user'` | Free-form cancellation reason. Trimmed and capped at 120 characters. |
+
+Cancels the active workflow: emits `$workflow_cancel` carrying `duration_ms`
+and `reason`, then clears the active workflow. Same status values and
+preconditions as `endWorkflow` (`'ok'` / `'not_active'` / `'name_mismatch'` /
+`'disabled'`), including the rule that a malformed `name` reports
+`'name_mismatch'`. `startWorkflow(..., { force: true })` uses this internally
+with `reason: 'superseded'` when it replaces an active workflow.
+
+```ts
+Sauron.cancelWorkflow(); // reason defaults to 'user'
+Sauron.cancelWorkflow('checkout', { reason: 'payment declined' });
+```
+
+### `getWorkflow()`
+
+```ts
+function getWorkflow(): ActiveWorkflow | null
+```
+
+Returns the active workflow — `{ workflowId, name, startedAt }` — or `null`
+when none is active (including before `init()`, and after `close()`, which
+resets it).
+
+A workflow with no stamped activity for 30 minutes is surfaced as `abandoned`
+when queried on the dashboard/API. That status is derived on read from the
+last stamped event's timestamp — it is never stored, so there is nothing for
+the client to do; an "abandoned" workflow that later receives another stamped
+event simply reads as active again.
+
+```ts
+const active = Sauron.getWorkflow();
+if (active) {
+  console.log(`${active.name} running for`, Date.now() - Date.parse(active.startedAt), 'ms');
+}
+```
+
 ### `addBreadcrumb(breadcrumb, hint?)`
 
 ```ts
@@ -537,16 +682,24 @@ an instance from `init()` or `getClient()` — do not construct it yourself.
 | `dsn` | `readonly Dsn` | The parsed DSN. |
 | `install()` | `(): void` | Install integrations + start the transport. Called by `init()`; a second call is a no-op. |
 | `getScope()` | `(): Scope` | The mutable scope (user, breadcrumbs, tags, contexts, extra). |
-| `isEnabled()` | `(): boolean` | `false` once disabled by a 401/403 or by `teardown()`. |
+| `isEnabled()` | `(): boolean` | `false` once the client has been explicitly `disable()`d/`teardown()`'d/`close()`d, **or** the transport has auto-disabled itself on a `401`/`403`. Computed from the transport's own state on every call, so a mid-session `401`/`403` flips this to `false` immediately — without the app ever calling `disable()`/`close()`. |
 | `getDistinctId()` | `(): string \| null` | User id when identified, else the anonymous id (minting one if needed). |
 | `getAnonymousId()` | `(): string \| null` | The anonymous id, or `null` if one was never needed. |
 | `makeEnvelope(items)` | `(items: EnvelopeItem[]): Envelope` | Stamp a fresh envelope (new `sent_at`, current context) around `items`. |
 | `addBreadcrumb(crumb, hint?)` | `(Breadcrumb, Hint?): void` | Full-shape breadcrumb, runs `beforeBreadcrumb`. |
-| `captureItem(item, hint?)` | `(EnvelopeItem, Hint?): void` | Sampling + enrichment + `beforeSend` + enqueue. |
+| `captureItem(item, hint?)` | `(EnvelopeItem, Hint?): void` | Sampling + enrichment + workflow stamping + `beforeSend` + enqueue. |
 | `flush(timeoutMs?)` | `(number?): Promise<boolean>` | Same as the module-level `flush`. |
 | `disable()` | `(): void` | Stop accepting and sending; drops pending work. |
 | `teardown()` | `(): void` | Restore globals and stop timers/listeners without flushing. |
 | `close(timeoutMs?)` | `(number?): Promise<boolean>` | Flush, then `teardown()`. |
+
+> **Workflow stamping happens inside `captureItem`.** That is why `track`,
+> `captureException`, `captureMessage` and `trackTransaction` all pick up the active
+> workflow automatically. If you hand-build an item and pass it to `captureItem` yourself,
+> your own `workflow_id` / `workflow_name` win — the SDK will not overwrite them. Set
+> **both or neither**: the server treats them as a pair and silently drops the attribution
+> if only one is present, so the SDK logs a warning in that case. `identify` and
+> breadcrumb-batch items are never stamped — the server has no workflow columns for them.
 
 ```ts
 import { getClient } from '@edraj/sauron-browser';
@@ -665,7 +818,7 @@ The SDK identity embedded in `header.sdk` of every envelope.
 
 All wire-contract and option types are exported for your own typing:
 
-- Enums / unions: `Level`, `ItemType`, `TransactionOp`.
+- Enums / unions: `Level`, `ItemType`, `TransactionOp`, `WorkflowStatus`.
 - Item shapes: `Frame`, `Mechanism`, `ExceptionValue`, `Breadcrumb`, `ErrorItem`,
   `EventItem`, `IdentifyItem`, `BreadcrumbBatchItem`, `TransactionItem`,
   `EnvelopeItem`.
@@ -673,7 +826,8 @@ All wire-contract and option types are exported for your own typing:
   `UserContext`, `Context`, `SdkInfo`, `EnvelopeHeader`, `Envelope`.
 - Input / option shapes: `Hint`, `UserInput`, `BeforeSend`, `BeforeBreadcrumb`,
   `TransportOptions`, `InitOptions`, `CaptureOptions`, `TrackOptions`,
-  `ResolvedOptions`, `BreadcrumbInput`, `TransactionInput`, `Dsn`.
+  `ResolvedOptions`, `BreadcrumbInput`, `TransactionInput`, `Dsn`,
+  `WorkflowResult`, `ActiveWorkflow`.
 
 ```ts
 import type { EnvelopeItem, Hint, InitOptions } from '@edraj/sauron-browser';
@@ -858,7 +1012,7 @@ the next page load.
 | --- | --- | --- |
 | Nothing arrives, no client-side errors | The gateway is not exposed at `/api/{environment_id}/envelope` on the host root. A DSN cannot express a path prefix, so the SDK posts to the root path and a proxy that serves ingest under a sub-path silently 404s. | Expose ingest at `/api/{environment_id}/envelope` on the DSN host root. |
 | Nothing arrives | `init()` was never called, or was called after the failing code ran. | Call `init()` first, as early in the page as possible. |
-| `[sauron] client disabled` in the console | The gateway returned 401/403 — wrong, revoked or foreign-project public key. | Fix the DSN key/project; re-`init()` after correcting. |
+| `[sauron] client disabled` in the console, or `isEnabled()` unexpectedly `false` mid-session | The gateway returned 401/403 — wrong, revoked or foreign-project public key. `isEnabled()` flips to `false` automatically; nothing else changes. | Fix the DSN key/project; re-`init()` after correcting. |
 | `DsnError` thrown at `init()` | Malformed DSN: bad protocol, missing public key, a password component, or a missing environment-id path segment. | Use `https://<public_key>@<host>/<environment_id>`. |
 | Only some errors show up | `sampleRate` below 1 (errors and messages are sampled; events, identifies and transactions are not). | Set `sampleRate: 1`. |
 | Errors arrive with no breadcrumbs | `maxBreadcrumbs: 0`, or `beforeBreadcrumb` returned `null`. | Raise `maxBreadcrumbs`; check the hook. |

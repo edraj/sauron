@@ -32,6 +32,8 @@ field, and buttons wired to the SDK:
 | **track: screen_viewed** | `Sauron.track` for the demo screen |
 | **setScreen (navigate)** | v0.2.0 screen API — `Sauron.setScreen(...)` toggling `Home ⇄ Checkout` |
 | **identify** | `Sauron.identify(distinctId, traits:)` + `setUser` |
+| **Workflow: complete a checkout** | `Sauron.startWorkflow('checkout')` → two `track()` calls + one `captureException` inside the span → `Sauron.endWorkflow()` |
+| **Workflow: start then cancel** | `Sauron.startWorkflow('onboarding')` → one `track()` call → `Sauron.cancelWorkflow(reason:)` |
 | **Flush now** | `Sauron.flush()` — drains batched + queued envelopes |
 
 Every action is appended to an in-app **activity log**, and a footer points you
@@ -50,6 +52,30 @@ that screen (read it back via `Sauron.screen`).
 - **Explicit** — this demo's home route is unnamed, so it calls
   `Sauron.setScreen('Home')` in `initState`, and the **setScreen (navigate)**
   button toggles `Home ⇄ Checkout` to show change detection.
+
+### Workflows
+
+A workflow is a named, explicitly-bounded span you declare around a multi-step
+flow; while it's active, every captured error/event/transaction is stamped
+with its `workflow_id`/`workflow_name` automatically. Entirely optional — the
+demo works identically if you never tap these buttons.
+
+- **Workflow: complete a checkout** (`_runWorkflowDemo` in `lib/main.dart`) — a
+  genuine bounded span: `Sauron.startWorkflow('checkout')`, two `track()` calls
+  (`checkout_started`, `payment_info_entered`), a `captureException` for a
+  declined-card error, a final `checkout_completed` track, then
+  `Sauron.endWorkflow()`. All three events and the error land under one
+  `workflow_id` on the dashboard.
+- **Workflow: start then cancel** (`_cancelWorkflowDemo`) — the abandonment
+  path: `Sauron.startWorkflow('onboarding')`, one `track()` call, then
+  `Sauron.cancelWorkflow(reason: 'user closed the wizard')`. Cancelling
+  explicitly records the run as cancelled rather than leaving it to read as
+  `abandoned` after 30 minutes of no further activity.
+
+Both buttons log the returned `WorkflowResult.status` (`ok`, `alreadyActive`,
+etc.) to the activity log, so tapping "complete a checkout" twice in a row
+without ending the first surfaces `alreadyActive` instead of silently
+overwriting it.
 
 ## Showcase funnels, journeys & performance
 

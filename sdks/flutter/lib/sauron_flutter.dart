@@ -42,3 +42,8 @@ export 'src/types.dart'
         StackFrame,
         isObfuscatedDartTrace,
         sauronIso;
+export 'src/workflow.dart'
+    show
+        ActiveWorkflow,
+        WorkflowResult,
+        WorkflowStatus;

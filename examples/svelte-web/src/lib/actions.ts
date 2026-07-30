@@ -10,7 +10,13 @@
 import { Sauron } from '@edraj/sauron-browser';
 import { activity, config } from './store.svelte';
 
-export type ActionCategory = 'error' | 'warning' | 'event' | 'identify' | 'breadcrumb';
+export type ActionCategory =
+  | 'error'
+  | 'warning'
+  | 'event'
+  | 'identify'
+  | 'breadcrumb'
+  | 'workflow';
 
 export interface DemoAction {
   id: string;
@@ -206,6 +212,89 @@ export const actions: DemoAction[] = [
         'breadcrumb',
         'Added 2 breadcrumbs, then captured an error',
         'The error is delivered with its breadcrumb trail attached',
+      );
+    },
+  },
+  {
+    id: 'workflow-checkout',
+    title: 'Workflow: complete a checkout',
+    description:
+      'Opens a named workflow, runs a realistic checkout inside it, then ends it. Every event and error emitted in between is stamped with the same workflow_id — on the dashboard the whole span groups under one run.',
+    category: 'workflow',
+    cta: 'Run workflow',
+    run() {
+      const started = Sauron.startWorkflow('checkout');
+      if (started.status !== 'ok') {
+        activity.push(
+          'workflow',
+          `startWorkflow → ${started.status}`,
+          started.status === 'already_active'
+            ? 'A workflow is already running — cancel it first, or pass { force: true }'
+            : 'Not started (SDK not connected?)',
+        );
+        return;
+      }
+      activity.push(
+        'workflow',
+        "startWorkflow('checkout')",
+        `$workflow_start emitted · workflow_id = ${started.workflowId}`,
+      );
+
+      // Everything below falls INSIDE the span, so it is stamped automatically
+      // — no workflow argument is threaded through any of these calls.
+      Sauron.track('checkout_started', { items: 2 });
+      Sauron.track('payment_info_entered', { method: 'card' });
+
+      // A real checkout hits a snag: the error is stamped with the workflow
+      // too, so the issue can be traced back to the run it happened in.
+      try {
+        throw new Error('Card declined by gateway (demo, inside workflow)');
+      } catch (err) {
+        Sauron.captureException(err, { tags: { step: 'payment' } });
+      }
+
+      // ...the shopper retries and succeeds.
+      const cartValue = randomCartValue();
+      Sauron.track('checkout_completed', { cart_value: cartValue, currency: 'USD' });
+
+      const ended = Sauron.endWorkflow();
+      activity.push(
+        'workflow',
+        `endWorkflow() → ${ended.status}`,
+        '$workflow_end emitted with duration_ms · 3 events + 1 error stamped with this run',
+      );
+    },
+  },
+  {
+    id: 'workflow-cancel',
+    title: 'Workflow: start then cancel',
+    description:
+      'Opens an onboarding workflow, tracks one step, then abandons it with cancelWorkflow() and a reason. The run is recorded as cancelled rather than left to time out as abandoned.',
+    category: 'workflow',
+    cta: 'Cancel workflow',
+    run() {
+      const started = Sauron.startWorkflow('onboarding');
+      if (started.status !== 'ok') {
+        activity.push(
+          'workflow',
+          `startWorkflow → ${started.status}`,
+          'A workflow is already running — finish or cancel it first',
+        );
+        return;
+      }
+      activity.push(
+        'workflow',
+        "startWorkflow('onboarding')",
+        `$workflow_start emitted · workflow_id = ${started.workflowId}`,
+      );
+
+      Sauron.track('onboarding_step_viewed', { step: 1, name: 'connect_data_source' });
+
+      const cancelled = Sauron.cancelWorkflow(undefined, { reason: 'user closed the wizard' });
+      activity.push(
+        'workflow',
+        `cancelWorkflow() → ${cancelled.status}`,
+        "$workflow_cancel emitted with reason = 'user closed the wizard'",
       );
     },
   },

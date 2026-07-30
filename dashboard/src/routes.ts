@@ -18,6 +18,7 @@ import DevicesInventory from './pages/DevicesInventory.svelte';
 import DeviceDetail from './pages/DeviceDetail.svelte';
 import ScreensList from './pages/ScreensList.svelte';
 import ScreenDetail from './pages/ScreenDetail.svelte';
+import WorkflowsList from './pages/WorkflowsList.svelte';
 import FunnelBuilder from './pages/FunnelBuilder.svelte';
 import JourneyExplorer from './pages/JourneyExplorer.svelte';
 import Monitors from './pages/Monitors.svelte';
@@ -74,6 +75,7 @@ export const routes = {
   '/devices/:key': guarded(DeviceDetail as Component<never>),
   '/screens': guarded(ScreensList as Component<never>),
   '/screens/:name': guarded(ScreenDetail as Component<never>),
+  '/workflows': guarded(WorkflowsList as Component<never>),
 
   // Analyze
   '/funnels': guarded(FunnelBuilder as Component<never>),

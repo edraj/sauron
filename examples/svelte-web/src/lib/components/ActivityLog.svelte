@@ -126,6 +126,10 @@
     --accent: var(--primary);
     --accent-soft: var(--primary-soft);
   }
+  li.workflow {
+    --accent: var(--primary);
+    --accent-soft: var(--primary-soft);
+  }
   li.system {
     --accent: var(--neutral);
     --accent-soft: var(--neutral-soft);

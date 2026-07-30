@@ -52,6 +52,7 @@
   import User from '@lucide/svelte/icons/user';
   import Users from '@lucide/svelte/icons/users';
   import Waypoints from '@lucide/svelte/icons/waypoints';
+  import Workflow from '@lucide/svelte/icons/workflow';
   import X from '@lucide/svelte/icons/x';
   import Zap from '@lucide/svelte/icons/zap';
 
@@ -100,6 +101,7 @@
     user: User,
     users: Users,
     waypoints: Waypoints,
+    workflow: Workflow,
     x: X,
     zap: Zap,
   } satisfies Record<string, Component>;

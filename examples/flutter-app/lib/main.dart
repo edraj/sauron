@@ -324,6 +324,96 @@ class _DemoHomePageState extends State<DemoHomePage> {
     _record('identify("$id") with trait plan=pro', Icons.person_outline);
   }
 
+  // ---- workflows --------------------------------------------------------------
+
+  /// A genuine bounded span: `startWorkflow` opens it, a realistic checkout
+  /// runs inside it (two events + a captured error), then `endWorkflow`
+  /// closes it. Every item emitted between start and end is stamped with the
+  /// same `workflow_id` automatically — no workflow argument is threaded
+  /// through any of the calls below.
+  void _runWorkflowDemo() {
+    final WorkflowResult started = Sauron.startWorkflow('checkout');
+    if (started.status != WorkflowStatus.ok) {
+      _record(
+        'startWorkflow("checkout") → ${started.status.name}'
+        ' — ${started.status == WorkflowStatus.alreadyActive ? 'a workflow is already running; end or cancel it first' : 'not started (SDK not connected?)'}',
+        Icons.error_outline,
+      );
+      return;
+    }
+    _record(
+      'startWorkflow("checkout") → \$workflow_start · workflow_id=${started.workflowId}',
+      Icons.play_circle_outline,
+    );
+
+    Sauron.track('checkout_started', properties: <String, Object?>{'items': 2});
+    Sauron.track(
+      'payment_info_entered',
+      properties: <String, Object?>{'method': 'card'},
+    );
+
+    // A real checkout hits a snag — the error is stamped with the workflow
+    // too, so it can be traced back to the run it happened in.
+    try {
+      throw const FormatException(
+        'Sauron demo: card declined by gateway (inside a workflow)',
+      );
+    } on FormatException catch (error, stackTrace) {
+      Sauron.captureException(
+        error,
+        stackTrace: stackTrace,
+        tags: <String, String>{'step': 'payment'},
+      );
+    }
+
+    // ...the shopper retries and succeeds.
+    final double cartValue =
+        double.parse((_random.nextDouble() * 200 + 5).toStringAsFixed(2));
+    Sauron.track(
+      'checkout_completed',
+      properties: <String, Object?>{'cart_value': cartValue, 'currency': 'USD'},
+    );
+
+    final WorkflowResult ended = Sauron.endWorkflow();
+    _record(
+      'endWorkflow() → ${ended.status.name} — 3 events + 1 error stamped '
+      'with this run',
+      Icons.stop_circle_outlined,
+    );
+  }
+
+  /// The cancel path: start an onboarding workflow, track one step, then
+  /// abandon it explicitly with `cancelWorkflow` and a reason — rather than
+  /// leaving it to read as `abandoned` after 30 minutes of no activity.
+  void _cancelWorkflowDemo() {
+    final WorkflowResult started = Sauron.startWorkflow('onboarding');
+    if (started.status != WorkflowStatus.ok) {
+      _record(
+        'startWorkflow("onboarding") → ${started.status.name}'
+        ' — ${started.status == WorkflowStatus.alreadyActive ? 'finish or cancel the active workflow first' : 'not started (SDK not connected?)'}',
+        Icons.error_outline,
+      );
+      return;
+    }
+    _record(
+      'startWorkflow("onboarding") → \$workflow_start · workflow_id=${started.workflowId}',
+      Icons.play_circle_outline,
+    );
+
+    Sauron.track(
+      'onboarding_step_viewed',
+      properties: <String, Object?>{'step': 1, 'name': 'connect_data_source'},
+    );
+
+    final WorkflowResult cancelled =
+        Sauron.cancelWorkflow(null, 'user closed the wizard');
+    _record(
+      'cancelWorkflow(reason: "user closed the wizard") → '
+      '${cancelled.status.name}',
+      Icons.cancel_outlined,
+    );
+  }
+
   /// Records a breadcrumb, then crashes — the crash envelope carries the
   /// breadcrumb trail so you can see what led up to it in the dashboard.
   void _breadcrumbThenThrow() {
@@ -507,6 +597,31 @@ class _DemoHomePageState extends State<DemoHomePage> {
                 'attaches a plan=pro trait.',
             buttonLabel: 'Identify',
             onPressed: _identify,
+          ),
+          const SizedBox(height: 24),
+          const _SectionHeader('Workflows'),
+          _ActionTile(
+            icon: Icons.route_outlined,
+            title: 'Workflow: complete a checkout',
+            caption:
+                'Opens a named workflow, runs a realistic checkout inside it '
+                '(2 events + 1 captured error), then ends it. Everything in '
+                'between shares one workflow_id, so the whole span groups '
+                'together on the dashboard.',
+            buttonLabel: 'Run workflow',
+            onPressed: _runWorkflowDemo,
+          ),
+          _ActionTile(
+            icon: Icons.cancel_outlined,
+            title: 'Workflow: start then cancel',
+            caption:
+                'Opens an onboarding workflow, tracks one step, then abandons '
+                'it with cancelWorkflow() and a reason — recorded as '
+                'cancelled instead of left to read as abandoned after 30 '
+                'minutes of inactivity.',
+            buttonLabel: 'Cancel workflow',
+            tone: _Tone.danger,
+            onPressed: _cancelWorkflowDemo,
           ),
           const SizedBox(height: 24),
           const _SectionHeader('Transport'),

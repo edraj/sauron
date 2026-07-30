@@ -197,6 +197,26 @@ public sealed class SauronClient : IDisposable
         if (string.IsNullOrEmpty(distinctId))
             throw new ArgumentException("distinctId is required.", nameof(distinctId));
 
+        TrackCore(@event, distinctId, properties, tags, contexts, extra);
+    }
+
+    /// <summary>
+    /// Build and dispatch an event item. Shared by the public <see cref="Track"/> (which
+    /// validates its arguments first) and the internal workflow lifecycle emitters, which
+    /// deliberately pass an EMPTY <paramref name="distinctId"/> when no user is in scope —
+    /// see <see cref="WorkflowDistinctId"/> for why that is correct rather than degraded.
+    /// </summary>
+    private void TrackCore(
+        string @event,
+        string distinctId,
+        IReadOnlyDictionary<string, object?>? properties,
+        IReadOnlyDictionary<string, object?>? tags = null,
+        IReadOnlyDictionary<string, object?>? contexts = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
+    {
+        if (!_enabled || _transport is null)
+            return;
+
         var item = new EventItem
         {
             Name = @event,
@@ -269,13 +289,16 @@ public sealed class SauronClient : IDisposable
     }
 
     /// <summary>
-    /// Single chokepoint before an item is buffered: run <c>BeforeSend</c> (drop on null,
-    /// replace on non-null), then enqueue. Keeps every dispatch path uniform.
+    /// Single chokepoint before an item is buffered: stamp the active workflow (if any),
+    /// run <c>BeforeSend</c> (drop on null, replace on non-null), then enqueue. Keeps every
+    /// dispatch path uniform and is why a future capture path can't forget to stamp.
     /// </summary>
     private void Dispatch(object item)
     {
         if (_transport is null)
             return;
+
+        StampWorkflow(item);
 
         if (_options.BeforeSend is not null)
         {
@@ -301,6 +324,35 @@ public sealed class SauronClient : IDisposable
     {
         if (_options.Debug)
             Console.Error.WriteLine($"[sauron] {message}");
+    }
+
+    /// <summary>
+    /// Stamp <c>workflow_id</c>/<c>workflow_name</c> from the active scope onto the item —
+    /// error, event, and transaction items only. Never <c>IdentifyItem</c>: the server has
+    /// no workflow columns for it. Reads <see cref="ScopeManager.Current"/> directly (not a
+    /// static field), so concurrent requests never stamp each other's workflow.
+    /// </summary>
+    private static void StampWorkflow(object item)
+    {
+        var wf = ScopeManager.Current.Workflow;
+        if (wf is null)
+            return;
+
+        switch (item)
+        {
+            case EventItem e:
+                e.WorkflowId = wf.WorkflowId;
+                e.WorkflowName = wf.Name;
+                break;
+            case ErrorItem er:
+                er.WorkflowId = wf.WorkflowId;
+                er.WorkflowName = wf.Name;
+                break;
+            case TransactionItem t:
+                t.WorkflowId = wf.WorkflowId;
+                t.WorkflowName = wf.Name;
+                break;
+        }
     }
 
     /// <summary>
@@ -439,6 +491,209 @@ public sealed class SauronClient : IDisposable
         Dispatch(item);
     }
 
+    // ---- Workflows -------------------------------------------------------
+
+    /// <summary>
+    /// Start a named workflow on the active scope, stamping subsequently tracked
+    /// events/errors/transactions with its id/name until <see cref="EndWorkflow"/> /
+    /// <see cref="CancelWorkflow"/>. <paramref name="force"/> supersedes an already-active
+    /// workflow (emitting <c>$workflow_cancel</c> with <c>reason: "superseded"</c> for it
+    /// first); otherwise an active workflow makes this a no-op returning
+    /// <see cref="WorkflowStatus.AlreadyActive"/>.
+    /// </summary>
+    /// <remarks>
+    /// The workflow id is a fresh client-generated UUID — the server rolls counters up on
+    /// <c>(app_id, workflow_id)</c> app-wide, so a deterministic or reused id would merge
+    /// counts from unrelated environments/sessions into one row.
+    /// </remarks>
+    public WorkflowResult StartWorkflow(string name, bool force = false)
+    {
+        try
+        {
+            if (!Enabled)
+                return new WorkflowResult(WorkflowStatus.Disabled);
+
+            var normalized = WorkflowNames.Normalize(name);
+            if (normalized is null)
+            {
+                Log($"StartWorkflow: invalid name '{name}'");
+                return new WorkflowResult(WorkflowStatus.InvalidName);
+            }
+
+            var scope = ScopeManager.Current;
+            var active = scope.Workflow;
+            if (active is not null && !force)
+            {
+                Log($"StartWorkflow(\"{normalized}\"): \"{active.Name}\" is already active; pass force: true to replace it");
+                return new WorkflowResult(WorkflowStatus.AlreadyActive);
+            }
+
+            // Mint the replacement BEFORE closing the one being superseded. Both operations
+            // here are effectively infallible in .NET, but the ordering rule is the point:
+            // if construction threw after the supersede-cancel had already reached the wire,
+            // the outer catch would return Disabled ("nothing changed") while the old
+            // workflow was cancelled server-side AND still sitting in scope.Workflow — every
+            // later item would then stamp a workflow the server has recorded as cancelled.
+            // Minting first makes the only throwing step precede any observable side effect.
+            var workflow = new ActiveWorkflow(Guid.NewGuid().ToString(), normalized, DateTimeOffset.UtcNow);
+
+            if (active is not null)
+            {
+                try
+                {
+                    EmitWorkflowClose(active, WorkflowEvents.Cancel, "superseded");
+                }
+                catch (Exception ex)
+                {
+                    Log($"StartWorkflow: superseding {WorkflowEvents.Cancel} emit threw: {ex.Message}");
+                }
+            }
+
+            // Set state BEFORE emitting so $workflow_start is itself stamped with it (via
+            // the Dispatch chokepoint). A failure emitting from here on still returns Ok
+            // with the id: the workflow IS live, and the server materializes the row from
+            // the first stamped event it actually receives — a lost $workflow_start is
+            // recoverable, a lost local id is not.
+            scope.Workflow = workflow;
+            try
+            {
+                EmitWorkflowStart(workflow);
+            }
+            catch (Exception ex)
+            {
+                Log($"StartWorkflow: {WorkflowEvents.Start} emit threw: {ex.Message}");
+            }
+            return new WorkflowResult(WorkflowStatus.Ok, workflow.WorkflowId);
+        }
+        catch (Exception ex)
+        {
+            Log($"StartWorkflow threw: {ex.Message}");
+            return new WorkflowResult(WorkflowStatus.Disabled);
+        }
+    }
+
+    /// <summary>
+    /// End the active workflow (or the one named <paramref name="name"/>, if given).
+    /// Emits <c>$workflow_end</c> with <c>duration_ms</c> and clears the state. A no-op
+    /// returning <see cref="WorkflowStatus.NotActive"/> / <see cref="WorkflowStatus.NameMismatch"/>
+    /// when the precondition fails.
+    /// </summary>
+    public WorkflowResult EndWorkflow(string? name = null) => CloseWorkflow(WorkflowEvents.End, name, reason: null);
+
+    /// <summary>
+    /// Cancel the active workflow (or the one named <paramref name="name"/>, if given).
+    /// Emits <c>$workflow_cancel</c> with <c>duration_ms</c> and <paramref name="reason"/>
+    /// (default <c>"user"</c>, trimmed and capped at 120 chars) and clears the state.
+    /// </summary>
+    public WorkflowResult CancelWorkflow(string? name = null, string? reason = null)
+        => CloseWorkflow(WorkflowEvents.Cancel, name, reason);
+
+    /// <summary>The workflow currently bounding the active scope, or <c>null</c> if none.</summary>
+    public ActiveWorkflow? GetWorkflow() => ScopeManager.Current.Workflow;
+
+    /// <summary>Shared precondition + close logic for <see cref="EndWorkflow"/>/<see cref="CancelWorkflow"/>.</summary>
+    private WorkflowResult CloseWorkflow(string eventName, string? name, string? reason)
+    {
+        try
+        {
+            if (!Enabled)
+                return new WorkflowResult(WorkflowStatus.Disabled);
+
+            var scope = ScopeManager.Current;
+            var active = scope.Workflow;
+            if (active is null)
+                return new WorkflowResult(WorkflowStatus.NotActive);
+
+            // An explicit name that fails normalization (blank, > 120) also reports
+            // NameMismatch here — InvalidName is reachable only from StartWorkflow.
+            if (name is not null && WorkflowNames.Normalize(name) != active.Name)
+            {
+                Log($"{eventName}: \"{name}\" does not match active workflow \"{active.Name}\"");
+                return new WorkflowResult(WorkflowStatus.NameMismatch);
+            }
+
+            var workflowId = active.WorkflowId;
+            try
+            {
+                EmitWorkflowClose(active, eventName, reason);
+            }
+            catch (Exception ex)
+            {
+                Log($"{eventName}: emit threw: {ex.Message}");
+            }
+            finally
+            {
+                // Clear even if the emit threw — the caller asked to end/cancel and must
+                // never observe the workflow "stuck" active afterwards.
+                scope.Workflow = null;
+            }
+            return new WorkflowResult(WorkflowStatus.Ok, workflowId);
+        }
+        catch (Exception ex)
+        {
+            Log($"{eventName} threw: {ex.Message}");
+            return new WorkflowResult(WorkflowStatus.Disabled);
+        }
+    }
+
+    /// <summary>Emit <c>$workflow_start</c> for a freshly-started workflow.</summary>
+    private void EmitWorkflowStart(ActiveWorkflow workflow)
+    {
+        TrackCore(WorkflowEvents.Start, WorkflowDistinctId(), new Dictionary<string, object?>
+        {
+            ["workflow_id"] = workflow.WorkflowId,
+            ["workflow_name"] = workflow.Name,
+        });
+    }
+
+    /// <summary>
+    /// Emit the closing lifecycle event (<c>$workflow_end</c>/<c>$workflow_cancel</c>) for
+    /// <paramref name="active"/> while it is STILL the active workflow (so the Dispatch
+    /// chokepoint stamps this very item with it). Does not mutate scope state — the caller
+    /// owns clearing/replacing it, so the transition never observes a half-mutated scope.
+    /// </summary>
+    private void EmitWorkflowClose(ActiveWorkflow active, string eventName, string? reason)
+    {
+        var properties = new Dictionary<string, object?>
+        {
+            ["workflow_id"] = active.WorkflowId,
+            ["workflow_name"] = active.Name,
+            ["duration_ms"] = Math.Max(0, (DateTimeOffset.UtcNow - active.StartedAt).TotalMilliseconds),
+        };
+        if (eventName == WorkflowEvents.Cancel)
+            properties["reason"] = WorkflowNames.NormalizeReason(reason);
+
+        TrackCore(eventName, WorkflowDistinctId(), properties);
+    }
+
+    /// <summary>
+    /// Distinct id for an internally-emitted workflow lifecycle event: the scoped user id
+    /// when there is one, otherwise the EMPTY STRING.
+    /// </summary>
+    /// <remarks>
+    /// Empty is correct here, not a degraded fallback, and must not be replaced with a
+    /// synthetic id (an <c>anon_*</c> value, the device id, or a <c>"system"</c> sentinel).
+    /// The server is built for it:
+    /// <list type="bullet">
+    /// <item>the <c>bump_workflow</c> call sites in
+    /// <c>backend/crates/sauron-pipeline/src/process.rs</c> (~:381 and ~:440) pass
+    /// <c>Some(distinct_id.as_str()).filter(|s| !s.is_empty())</c>, so an empty value lands
+    /// as SQL <c>NULL</c> on the <c>workflows</c> row;</item>
+    /// <item><c>WORKFLOW_OUTCOME_SELECT</c> in <c>backend/crates/sauron-db/src/repo.rs</c>
+    /// (~:3162) computes <c>COUNT(DISTINCT w.distinct_id) AS unique_users</c>, and
+    /// <c>COUNT(DISTINCT ...)</c> skips NULLs.</item>
+    /// </list>
+    /// So an anonymous run contributes nothing to <c>unique_users</c>. Any synthetic id
+    /// would instead fabricate a user per run — worst of all a per-workflow one, since
+    /// <c>workflow_id</c> is a fresh UUID every time. <c>AnalyticsItem.distinct_id</c> is a
+    /// required <c>String</c> on the wire (<c>backend/crates/sauron-core/src/envelope.rs</c>
+    /// ~:226), so the field is still sent — just empty. This is why the lifecycle emitters
+    /// call <see cref="TrackCore"/> rather than the public <see cref="Track"/>, whose
+    /// non-empty-distinctId guard applies to ordinary caller events only.
+    /// </remarks>
+    private static string WorkflowDistinctId()
+        => ScopeManager.Current.User?.Id is { Length: > 0 } uid ? uid : string.Empty;
+
     /// <summary>Flush buffered items immediately (async).</summary>
     public Task FlushAsync() => _transport?.FlushAsync() ?? Task.CompletedTask;
 
@@ -454,5 +709,18 @@ public sealed class SauronClient : IDisposable
         // dispatch onto a disposed client.
         _autoCapture?.Dispose();
         _transport?.Dispose();
+
+        // Drop any workflow left un-ended on the process-wide scope. Deliberately NOT an
+        // auto-emitted $workflow_cancel: an abandoned workflow is a legitimate outcome the
+        // server derives on read (30 min), and fabricating a cancel would misreport it.
+        //
+        // Global only — never ScopeManager.Current: at dispose time "current" is whatever
+        // async-local scope the disposing thread happens to be in, which has nothing to do
+        // with the client being torn down. A workflow on a pushed scope needs no cleanup,
+        // since that scope is discarded when its `using` block exits. Without this, a
+        // Close()-then-Init() config reload would leave a stale workflow on Global and the
+        // next StartWorkflow would return AlreadyActive against a brand-new client.
+        // (Symmetric with the constructor, which already seeds ScopeManager.Global.)
+        ScopeManager.Global.Workflow = null;
     }
 }

@@ -38,7 +38,7 @@ internal sealed class EnvelopeHeader
 internal static class SauronSdkMeta
 {
     public const string Name = "sauron-dotnet";
-    public const string Version = "1.2.0";
+    public const string Version = "1.3.0";
 }
 
 internal sealed class SdkInfo
@@ -83,6 +83,22 @@ internal sealed class EventItem
     public Dictionary<string, object?> Properties { get; set; } = new();
     public string Timestamp { get; set; } = string.Empty;
     public string? SessionId { get; set; }
+
+    // Id/name of the bounding workflow (StartWorkflow/EndWorkflow/CancelWorkflow), if any.
+    // Omitted (never `null`) when no workflow is active — an app that never calls the
+    // workflow API must serialize byte-identically to before these fields existed.
+    //
+    // ALWAYS SET AS A PAIR, never one without the other. The server guards on
+    // `if let (Some(id), Some(name))` (backend/crates/sauron-pipeline/src/process.rs), so an
+    // id without a name — or a name without an id — is SILENTLY dropped from every workflow
+    // query, with nothing erroring. SauronClient.StampWorkflow is the only assignment site
+    // and always sets both from a single non-null ActiveWorkflow; keep it that way.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WorkflowId { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WorkflowName { get; set; }
+
     public string? Screen { get; set; }
 
     // Dev-owned metadata scopes. Omitted from the wire when null (empty) despite the
@@ -122,6 +138,22 @@ internal sealed class ErrorItem
     public List<string>? Fingerprint { get; set; }
     public UserInfo? User { get; set; }
     public string? SessionId { get; set; }
+
+    // Id/name of the bounding workflow (StartWorkflow/EndWorkflow/CancelWorkflow), if any.
+    // Omitted (never `null`) when no workflow is active — an app that never calls the
+    // workflow API must serialize byte-identically to before these fields existed.
+    //
+    // ALWAYS SET AS A PAIR, never one without the other. The server guards on
+    // `if let (Some(id), Some(name))` (backend/crates/sauron-pipeline/src/process.rs), so an
+    // id without a name — or a name without an id — is SILENTLY dropped from every workflow
+    // query, with nothing erroring. SauronClient.StampWorkflow is the only assignment site
+    // and always sets both from a single non-null ActiveWorkflow; keep it that way.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WorkflowId { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WorkflowName { get; set; }
+
     public string? Screen { get; set; }
 }
 

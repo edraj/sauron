@@ -75,4 +75,25 @@ describe('beforeSend', () => {
 
     expect(seen.sort()).toEqual(['error', 'event', 'identify', 'transaction']);
   });
+
+  it('a throwing beforeSend does not propagate into the caller, and the item is still sent unmodified', async () => {
+    // The SDK's no-throw guarantee: a user-supplied hook blowing up must
+    // never break the caller's captureException/track/etc, and telemetry
+    // must not be silently dropped just because the hook errored.
+    const beforeSend = (): EnvelopeItem | null => {
+      throw new Error('customer hook exploded');
+    };
+    const client = newClient(fake.fetchImpl, { beforeSend });
+
+    expect(() => client.captureException(new Error('boom'))).not.toThrow();
+    expect(() => client.track('signup', 'u1', { plan: 'pro' })).not.toThrow();
+    await client.flush();
+
+    expect(fake.calls).toHaveLength(1);
+    const types = fake.calls[0].envelope.items.map((i) => i.type);
+    expect(types.sort()).toEqual(['error', 'event']);
+    const eventItem = fake.calls[0].envelope.items.find((i) => i.type === 'event') as any;
+    expect(eventItem.name).toBe('signup');
+    expect(eventItem.properties.plan).toBe('pro');
+  });
 });

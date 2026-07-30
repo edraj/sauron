@@ -3402,6 +3402,8 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "diesel",
+ "diesel-async",
  "sauron-core",
  "sauron-db",
  "sauron-redis",

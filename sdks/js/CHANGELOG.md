@@ -2,6 +2,17 @@
 
 All notable changes to `@edraj/sauron-browser` are documented here.
 
+## 1.3.0
+
+- **Workflows** — bound a named span of activity with start / end / cancel, and
+  read the active one back. Every event, error and transaction captured while a
+  workflow is active is stamped with its `workflow_id` / `workflow_name`, so the
+  dashboard can group a whole flow (`checkout`, `password_reset`, …) as one unit.
+  Entirely optional: an app that never starts a workflow behaves exactly as before.
+- **`beforeSend` can no longer throw into your app.** A hook that raises is logged
+  and the item is sent unmodified, rather than the exception escaping through the
+  capture call. Returning `null` still drops the item as before.
+
 ## 1.2.0
 
 - **Breaking: the `environment` option has been removed.** An environment is now

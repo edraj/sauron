@@ -113,7 +113,7 @@ describe('buildEnvelope', () => {
     init({ dsn: 'https://pk_test@localhost:9/1' });
     const built = getClient()!.makeEnvelope([]);
     expect(built.header.sdk).toEqual({ name: SDK_NAME, version: SDK_VERSION });
-    expect(SDK_VERSION).toBe('1.2.0');
+    expect(SDK_VERSION).toBe('1.3.0');
   });
 
   it('never carries an environment key on the header (removed: environment is now proven by the ingest key)', () => {

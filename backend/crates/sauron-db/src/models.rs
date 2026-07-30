@@ -361,6 +361,15 @@ pub struct ErrorEvent {
     pub handled: Option<bool>,
 }
 
+/// **`Insertable`-only, on purpose.** Diesel's `Insertable` maps fields to
+/// columns by NAME, so this struct's field order is free to differ from
+/// `schema.rs`'s column order — and it does: `workflow_id`/`workflow_name` sit
+/// beside `screen` here for readability, while `schema.rs` appends them last
+/// (a later migration added them). Do NOT add `Queryable` to this struct:
+/// that derive decodes POSITIONALLY, so the very field order that is harmless
+/// today would silently bind each field to whatever column occupies its index
+/// and return garbage — compiling cleanly, with `check_for_backend` none the
+/// wiser. Read rows into `ErrorEvent` instead.
 #[derive(Debug, Insertable)]
 #[diesel(table_name = error_events)]
 pub struct NewErrorEvent {
@@ -386,6 +395,12 @@ pub struct NewErrorEvent {
     pub session_id: Option<String>,
     pub device_key: Option<String>,
     pub screen: Option<String>,
+    /// The workflow this occurrence was stamped as belonging to, if any —
+    /// `None` for every app that never calls `startWorkflow` (byte-identical
+    /// to the pre-workflows column). See `bump_workflow`/
+    /// `apply_workflow_lifecycle` in `repo.rs` for the rollup this feeds.
+    pub workflow_id: Option<String>,
+    pub workflow_name: Option<String>,
     /// Ingest-time pre-symbolication (lean, no context); null when unresolved.
     pub stacktrace_symbolicated: Option<Value>,
     /// pending | symbolicated | partial | no_artifacts | not_applicable.
@@ -436,6 +451,9 @@ pub struct AnalyticsEvent {
     pub extra: Value,
 }
 
+/// **`Insertable`-only, on purpose** — see [`NewErrorEvent`]'s doc comment for
+/// why the field order here may differ from `schema.rs`'s column order and why
+/// adding `Queryable` to this struct would turn that into a silent-garbage bug.
 #[derive(Debug, Insertable)]
 #[diesel(table_name = analytics_events)]
 pub struct NewAnalyticsEvent {
@@ -452,6 +470,10 @@ pub struct NewAnalyticsEvent {
     pub occurred_at: DateTime<Utc>,
     pub device_key: Option<String>,
     pub screen: Option<String>,
+    /// See `NewErrorEvent::workflow_id`'s doc comment — same optional stamp,
+    /// same guarantee.
+    pub workflow_id: Option<String>,
+    pub workflow_name: Option<String>,
     pub tags: Value,
     pub contexts: Value,
     pub extra: Value,
@@ -609,6 +631,9 @@ pub struct Transaction {
     pub received_at: DateTime<Utc>,
 }
 
+/// **`Insertable`-only, on purpose** — see [`NewErrorEvent`]'s doc comment for
+/// why the field order here may differ from `schema.rs`'s column order and why
+/// adding `Queryable` to this struct would turn that into a silent-garbage bug.
 #[derive(Debug, Insertable)]
 #[diesel(table_name = transactions)]
 pub struct NewTransaction {
@@ -625,6 +650,12 @@ pub struct NewTransaction {
     pub distinct_id: Option<String>,
     pub session_id: Option<String>,
     pub device_key: Option<String>,
+    /// See `NewErrorEvent::workflow_id`'s doc comment — same optional stamp,
+    /// same guarantee. Placed here (there is no `screen` field on
+    /// transactions to sit next to) rather than at the end, so it stays
+    /// grouped with the other identity/attribution fields.
+    pub workflow_id: Option<String>,
+    pub workflow_name: Option<String>,
     pub release: Option<String>,
     pub ip_address: Option<String>,
     pub occurred_at: DateTime<Utc>,

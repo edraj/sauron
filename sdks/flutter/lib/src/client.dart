@@ -19,6 +19,7 @@ import 'transport/queue.dart';
 import 'transport/transport.dart';
 import 'types.dart';
 import 'util/uuid.dart';
+import 'workflow.dart';
 
 /// The engine behind the [Sauron] facade: owns the scope, sampling, the
 /// `beforeSend` hook, context, and the transport.
@@ -53,6 +54,29 @@ class SauronClient {
   /// The current screen name, or null if none set.
   String? get screen => _currentScreen;
 
+  /// The currently active workflow, stamped onto every item constructed while
+  /// it is set. One workflow at a time — scoped to this client (not a module
+  /// global), matching every other piece of per-client state here.
+  ///
+  /// **Stamping is LEAF-SITE by deliberate choice, and that is a maintenance
+  /// hazard worth knowing about.** `workflow_id`/`workflow_name` are written
+  /// inline at each of the three item-construction sites below
+  /// ([captureException], [track], [trackTransaction]) rather than at a single
+  /// choke point. [_dispatch] is the only door to the transport and would be
+  /// the natural choke point, but by the time an item reaches it the item is
+  /// already constructed and every field is `final` — stamping there would
+  /// require a `copyWith` on all item classes purely for this.
+  ///
+  /// The cost of that choice: **a future capture path that builds its own item
+  /// will silently ship unstamped, and no test will fail.** If you add one,
+  /// stamp it here too — or take the `copyWith` redesign and move stamping
+  /// into [_dispatch]. [identify] is the one construction site deliberately
+  /// left unstamped (the server has no workflow columns for identify items).
+  ActiveWorkflow? _currentWorkflow;
+
+  /// The active workflow, or null if none.
+  ActiveWorkflow? get workflow => _currentWorkflow;
+
   final Scope _scope;
   final DeviceContextProvider _deviceContext = DeviceContextProvider();
   final DartStackTraceParser _parser = const DartStackTraceParser();
@@ -63,9 +87,17 @@ class SauronClient {
   SauronTransport? _transport;
   bool _closed = false;
 
-  /// Whether the SDK is configured and active. Becomes false once [close] has
-  /// run — a closed client is terminal and cannot be restarted.
-  bool get isEnabled => _dsn != null && !_closed;
+  /// Whether the SDK is configured and actively able to deliver.
+  ///
+  /// False when the DSN never parsed, once [close] has run (a closed client is
+  /// terminal), **and** once the transport has disabled itself after the
+  /// gateway rejected the key with a 401/403. That last case matters: the
+  /// transport silently drops everything from then on, so a client that still
+  /// reported `true` would let callers — and `startWorkflow` in particular —
+  /// believe state they set locally had reached the server. `_transport` is
+  /// null until [bootstrap] runs, which is not a disabled state.
+  bool get isEnabled =>
+      _dsn != null && !_closed && (_transport?.isEnabled ?? true);
 
   // ---- lifecycle -------------------------------------------------------------
 
@@ -173,6 +205,9 @@ class SauronClient {
       level: level,
       breadcrumbs: _scope.breadcrumbs,
       sessionId: sessionId,
+      // Leaf-site workflow stamp 1 of 3 — see the note on [_currentWorkflow].
+      workflowId: _currentWorkflow?.workflowId,
+      workflowName: _currentWorkflow?.name,
       screen: screen ?? _currentScreen,
       rawStacktrace: obfuscated ? rawTrace : null,
       debugMeta: obfuscated ? DebugMeta.fromTrace(rawTrace) : null,
@@ -204,6 +239,9 @@ class SauronClient {
         timestamp: DateTime.now().toUtc(),
         distinctId: _scope.distinctId,
         sessionId: sessionId,
+        // Leaf-site workflow stamp 2 of 3 — see the note on [_currentWorkflow].
+        workflowId: _currentWorkflow?.workflowId,
+        workflowName: _currentWorkflow?.name,
         screen: screen ?? _currentScreen,
         properties: properties,
         tags: _mergeTags(tags),
@@ -221,6 +259,174 @@ class SauronClient {
     }
     _currentScreen = name;
     track(r'$screen', properties: <String, Object?>{'screen': name});
+  }
+
+  // ---- workflows --------------------------------------------------------------
+
+  /// Starts a named workflow. While active, its id/name are stamped onto every
+  /// captured error/event/transaction, and a `$workflow_start` analytics event
+  /// is emitted carrying it.
+  ///
+  /// Returns:
+  /// - `disabled` — the client is not enabled (before init, after [close], or
+  ///   the transport auto-disabled itself). No state is mutated.
+  /// - `invalidName` — [name] is empty after trimming, or over 120 chars.
+  /// - `alreadyActive` — another workflow is already active and [force] is
+  ///   `false`. No-op other than a debug-log warning.
+  /// - `ok` — the workflow started. If [force] is `true` and a workflow was
+  ///   already active, it is first closed with a `$workflow_cancel` carrying
+  ///   `reason: 'superseded'`.
+  WorkflowResult startWorkflow(String name, {bool force = false}) {
+    try {
+      if (!isEnabled) {
+        return const WorkflowResult(WorkflowStatus.disabled);
+      }
+      final String? normalized = normalizeWorkflowName(name);
+      if (normalized == null) {
+        _log('startWorkflow: invalid name "$name"');
+        return const WorkflowResult(WorkflowStatus.invalidName);
+      }
+
+      final ActiveWorkflow? active = _currentWorkflow;
+      if (active != null && !force) {
+        _log(
+          'startWorkflow("$normalized"): "${active.name}" is already '
+          'active; pass force: true to replace it',
+        );
+        return const WorkflowResult(WorkflowStatus.alreadyActive);
+      }
+
+      // Mint the replacement BEFORE superseding the old workflow. If the id or
+      // timestamp were computed after the `$workflow_cancel` below, a throw in
+      // between would leave `_currentWorkflow` pointing at a workflow the
+      // server has already been told is cancelled, while the outer catch
+      // returned `disabled` claiming nothing happened — the same half-mutated
+      // lie item 15 forbids, one statement over. Minting first means every
+      // throw site from here on is either before any mutation (outer catch,
+      // `disabled` is honest) or after both (guarded, returns `ok`).
+      final ActiveWorkflow started = ActiveWorkflow(
+        workflowId: generateUuidV4(),
+        name: normalized,
+        startedAt: DateTime.now().toUtc(),
+      );
+
+      if (active != null) {
+        // Best-effort: a throwing beforeSend/transport must not stop the new
+        // workflow from starting below, and must not surface as `disabled`
+        // (nothing about *this* call's own precondition failed).
+        try {
+          _emitWorkflowClose(active, r'$workflow_cancel', reason: 'superseded');
+        } on Object catch (error) {
+          _log('startWorkflow: superseding cancel emit threw: $error');
+        }
+      }
+
+      // Set state BEFORE emitting so $workflow_start is itself stamped with it.
+      _currentWorkflow = started;
+      try {
+        track(
+          r'$workflow_start',
+          properties: <String, Object?>{
+            'workflow_id': started.workflowId,
+            'workflow_name': started.name,
+          },
+        );
+      } on Object catch (error) {
+        _log('startWorkflow: start emit threw: $error');
+        // Fall through to `ok` anyway — the workflow IS live locally, and the
+        // server materializes the row from the first stamped event via its
+        // own upsert. A lost $workflow_start is recoverable; a lost local id
+        // is not (see the class doc on WorkflowStatus.disabled).
+      }
+      return WorkflowResult(WorkflowStatus.ok, started.workflowId);
+    } on Object catch (error) {
+      // Reaching here means something threw BEFORE `_currentWorkflow` was
+      // set above (both emits have their own catch) — so state was never
+      // half-mutated and `disabled` is accurate.
+      _log('startWorkflow threw: $error');
+      return const WorkflowResult(WorkflowStatus.disabled);
+    }
+  }
+
+  /// Ends the active workflow (or the one named [name], if given). Emits
+  /// `$workflow_end` with `duration_ms` and clears the state.
+  ///
+  /// Returns `notActive` when no workflow is active, `nameMismatch` when
+  /// [name] is given and does not match the active workflow's name (or fails
+  /// normalization itself), `disabled` when the client is not enabled, else
+  /// `ok`.
+  WorkflowResult endWorkflow([String? name]) =>
+      _closeWorkflow(r'$workflow_end', name: name);
+
+  /// Cancels the active workflow (or the one named [name], if given). Emits
+  /// `$workflow_cancel` with `duration_ms` and `reason` (default `'user'`,
+  /// trimmed and capped at 120 chars) and clears the state.
+  ///
+  /// Same precondition/status semantics as [endWorkflow].
+  WorkflowResult cancelWorkflow([String? name, String? reason]) =>
+      _closeWorkflow(r'$workflow_cancel', name: name, reason: reason);
+
+  /// Shared precondition + close logic for [endWorkflow]/[cancelWorkflow].
+  WorkflowResult _closeWorkflow(
+    String eventName, {
+    String? name,
+    String? reason,
+  }) {
+    try {
+      if (!isEnabled) {
+        return const WorkflowResult(WorkflowStatus.disabled);
+      }
+      final ActiveWorkflow? active = _currentWorkflow;
+      if (active == null) {
+        return const WorkflowResult(WorkflowStatus.notActive);
+      }
+      if (name != null && normalizeWorkflowName(name) != active.name) {
+        _log(
+          '$eventName: "$name" does not match active workflow "${active.name}"',
+        );
+        return const WorkflowResult(WorkflowStatus.nameMismatch);
+      }
+      final String workflowId = active.workflowId;
+      // The emit is guarded + the clear is in a `finally` relative to it, so
+      // this always returns `ok` once we get this far — a throwing
+      // beforeSend/transport must not leave the workflow stuck "active"
+      // locally forever, nor report `disabled` for what is, from the
+      // caller's point of view, a successful close.
+      try {
+        _emitWorkflowClose(active, eventName, reason: reason);
+      } on Object catch (error) {
+        _log('$eventName emit threw: $error');
+      } finally {
+        _currentWorkflow = null;
+      }
+      return WorkflowResult(WorkflowStatus.ok, workflowId);
+    } on Object catch (error) {
+      // Reaching here means something threw BEFORE the guarded emit block
+      // above (which never rethrows) — so no state was touched.
+      _log('$eventName threw: $error');
+      return const WorkflowResult(WorkflowStatus.disabled);
+    }
+  }
+
+  /// Emits the closing lifecycle event for [active] while it is STILL the
+  /// active workflow (so `track()`/the capture-site stamping picks it up).
+  /// Clearing [_currentWorkflow] is the caller's responsibility.
+  void _emitWorkflowClose(
+    ActiveWorkflow active,
+    String eventName, {
+    String? reason,
+  }) {
+    final int elapsedMs =
+        DateTime.now().toUtc().difference(active.startedAt).inMilliseconds;
+    final Map<String, Object?> properties = <String, Object?>{
+      'workflow_id': active.workflowId,
+      'workflow_name': active.name,
+      'duration_ms': elapsedMs < 0 ? 0 : elapsedMs,
+    };
+    if (eventName == r'$workflow_cancel') {
+      properties['reason'] = normalizeWorkflowReason(reason);
+    }
+    track(eventName, properties: properties);
   }
 
   /// Records a performance [TransactionItem]: one timed operation
@@ -252,6 +458,9 @@ class SauronClient {
         url: url,
         distinctId: _scope.distinctId,
         sessionId: sessionId,
+        // Leaf-site workflow stamp 3 of 3 — see the note on [_currentWorkflow].
+        workflowId: _currentWorkflow?.workflowId,
+        workflowName: _currentWorkflow?.name,
         timestamp: DateTime.now().toUtc(),
       ),
     );
@@ -312,6 +521,10 @@ class SauronClient {
     _transport = null;
     // Anything still waiting on a transport will never be sent.
     _pending.clear();
+    // Clear (not cancel) any active workflow — an abandoned workflow is a
+    // legitimate server-derived outcome (30 min of inactivity, computed on
+    // read); fabricating a $workflow_cancel here would misreport it.
+    _currentWorkflow = null;
   }
 
   void _uninstallIntegrations() {
@@ -351,11 +564,29 @@ class SauronClient {
   Map<String, Object?> _mergeExtra(Map<String, Object?>? call) =>
       <String, Object?>{..._scope.extra, if (call != null) ...call};
 
+  /// The single door to the transport — every captured item passes through
+  /// here, and `bootstrap`'s replay of `_pending` only re-delivers items that
+  /// already came through it.
+  ///
+  /// It is deliberately **not** where `workflow_id`/`workflow_name` are
+  /// stamped: items arrive fully constructed with `final` fields, so stamping
+  /// here would need a `copyWith` on every item class. See the note on
+  /// [_currentWorkflow] for the consequence a new capture path must respect.
   void _dispatch(EnvelopeItem item) {
     EnvelopeItem outgoing = item;
     final BeforeSendCallback? beforeSend = options.beforeSend;
     if (beforeSend != null) {
-      final Object? processed = beforeSend(item);
+      Object? processed;
+      try {
+        processed = beforeSend(item);
+      } on Object catch (error) {
+        // A throwing beforeSend must not propagate into host code — telemetry
+        // never throws is a guarantee this SDK makes. Treat it as if the hook
+        // had returned the item unchanged (NOT as a drop — that's the
+        // deliberate `return null` case handled below).
+        _log('beforeSend threw, dispatching "${item.type}" unmodified: $error');
+        processed = item;
+      }
       if (processed == null) {
         _log('${item.type} dropped by beforeSend.');
         return;
