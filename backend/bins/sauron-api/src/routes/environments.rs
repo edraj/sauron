@@ -543,4 +543,3 @@ pub async fn rotate_app_environment_key(
     }
     Ok(Json(updated))
 }
-

@@ -2056,9 +2056,13 @@ impl TestServer {
     async fn seed_env_lifecycle_fixture(&self) -> EnvLifecycleFixture {
         let suffix = Uuid::new_v4().simple().to_string();
         let mut conn = self.conn().await;
-        let org = repo::create_org(&mut conn, "env lifecycle org", &format!("env-life-{suffix}"))
-            .await
-            .expect("create org");
+        let org = repo::create_org(
+            &mut conn,
+            "env lifecycle org",
+            &format!("env-life-{suffix}"),
+        )
+        .await
+        .expect("create org");
         let user = repo::create_user(
             &mut conn,
             &format!("env-life-{suffix}@example.test"),
@@ -2111,7 +2115,8 @@ async fn create_project_http(h: &TestServer, bearer: &str, org_id: Uuid, name: &
         )
         .await;
     assert_eq!(resp.status().as_u16(), 200, "create project {name}");
-    let body: serde_json::Value = serde_json::from_str(&resp.text().await.expect("project body")).expect("project json");
+    let body: serde_json::Value =
+        serde_json::from_str(&resp.text().await.expect("project body")).expect("project json");
     body["id"].as_str().expect("project id").parse().unwrap()
 }
 
@@ -2125,12 +2130,17 @@ async fn create_app_http(h: &TestServer, bearer: &str, project_id: Uuid, name: &
         )
         .await;
     assert_eq!(resp.status().as_u16(), 200, "create app {name}");
-    let body: serde_json::Value = serde_json::from_str(&resp.text().await.expect("app body")).expect("app json");
+    let body: serde_json::Value =
+        serde_json::from_str(&resp.text().await.expect("app body")).expect("app json");
     body["id"].as_str().expect("app id").parse().unwrap()
 }
 
 /// The app's enrollments as `(environment name, enrollment row)`.
-async fn enrollments(h: &TestServer, bearer: &str, app_id: Uuid) -> Vec<(String, serde_json::Value)> {
+async fn enrollments(
+    h: &TestServer,
+    bearer: &str,
+    app_id: Uuid,
+) -> Vec<(String, serde_json::Value)> {
     let body = h
         .get_json(&format!("/v1/apps/{app_id}/environments"), bearer)
         .await;
@@ -2341,7 +2351,8 @@ async fn retiring_an_environment_is_guarded_then_cascades_to_every_app() {
             )
             .await;
         assert_eq!(resp.status().as_u16(), 200, "create staging");
-        let body: serde_json::Value = serde_json::from_str(&resp.text().await.expect("env body")).expect("env json");
+        let body: serde_json::Value =
+            serde_json::from_str(&resp.text().await.expect("env body")).expect("env json");
         body["id"].as_str().unwrap().to_string()
     };
 
