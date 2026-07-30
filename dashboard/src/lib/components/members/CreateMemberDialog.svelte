@@ -13,7 +13,7 @@
     selectionToScopes,
     type ScopeSelection,
   } from '../../models/scope-tree';
-  import type { App, Project, Role } from '../../models';
+  import type { App, Environment, Project, Role } from '../../models';
 
   interface Props {
     open: boolean;
@@ -22,6 +22,12 @@
     roles: Role[];
     projects: Project[];
     appsByProject: Record<string, App[]>;
+    /** Environments per app, keyed by app id — see ScopeTree's own doc comment.
+        Owned by the parent (Members.svelte) so the same cache can be reused by
+        the grant form, the edit dialog, and the members table. */
+    envsByApp: Record<string, Environment[]>;
+    loadingEnvApps: Set<string>;
+    onopenapp: (appId: string) => void;
     onclose: () => void;
     oncreated: () => void;
   }
@@ -33,6 +39,9 @@
     roles,
     projects,
     appsByProject,
+    envsByApp,
+    loadingEnvApps,
+    onopenapp,
     onclose,
     oncreated,
   }: Props = $props();
@@ -42,7 +51,7 @@
   let roleId = $state('');
   // Fresh arrays — EMPTY_SELECTION's are frozen, and $state proxies what it is
   // handed. Nothing is preselected: the org tick is the broadest grant there is.
-  let selection = $state<ScopeSelection>({ ...EMPTY_SELECTION, projects: [], apps: [] });
+  let selection = $state<ScopeSelection>({ ...EMPTY_SELECTION, projects: [], apps: [], envs: [] });
   let saving = $state(false);
   let error = $state<string | null>(null);
   /** Set once the account exists. The dialog switches to the reveal panel. */
@@ -51,6 +60,14 @@
   const projectOfApp = $derived.by(() => {
     const map: Record<string, string> = {};
     for (const p of projects) for (const a of appsByProject[p.id] ?? []) map[a.id] = p.id;
+    return map;
+  });
+
+  const appOfEnv = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const [appId, envs] of Object.entries(envsByApp)) {
+      for (const e of envs) map[e.id] = appId;
+    }
     return map;
   });
 
@@ -66,7 +83,7 @@
       email = '';
       name = '';
       roleId = roles[0]?.id ?? '';
-      selection = { ...EMPTY_SELECTION, projects: [], apps: [] };
+      selection = { ...EMPTY_SELECTION, projects: [], apps: [], envs: [] };
       tempPassword = null;
       error = null;
     });
@@ -85,7 +102,7 @@
         email: email.trim(),
         name: name.trim(),
         role_id: roleId,
-        scopes: selectionToScopes(selection, orgId, projectOfApp),
+        scopes: selectionToScopes(selection, orgId, projectOfApp, appOfEnv),
       });
       // Reveal, do not close. This is the only time this value exists.
       tempPassword = result.temp_password;
@@ -143,6 +160,9 @@
           {orgName}
           {projects}
           {appsByProject}
+          {envsByApp}
+          {loadingEnvApps}
+          {onopenapp}
           value={selection}
           disabled={saving}
           onchange={(next) => (selection = next)}

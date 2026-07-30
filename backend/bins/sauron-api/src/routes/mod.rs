@@ -56,30 +56,22 @@ pub(crate) fn clamp_offset(offset: i64) -> i64 {
     offset.clamp(0, MAX_LIST_OFFSET)
 }
 
-/// Authorize `required` on an app and return the caller's full effective
-/// permission set there.
-///
-/// Handlers that gate on a second permission (e.g. `source:read` deciding
-/// whether to include source context) previously called `authorize_app` twice,
-/// which re-ran the app, ancestry and grant lookups — six queries where two
-/// suffice. Resolve once, then test additional permissions against the returned
-/// set.
-pub(crate) async fn authorize_app_perms(
-    conn: &mut AsyncPgConnection,
-    user_id: Uuid,
-    app_id: Uuid,
-    required: &str,
-) -> Result<std::collections::HashSet<String>, ApiError> {
-    let (project_id, org_id) = sauron_db::repo::app_ancestry(conn, app_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let perms =
-        sauron_auth::effective_at(conn, user_id, org_id, Some(project_id), Some(app_id)).await?;
-    if !perms.contains(required) {
-        return Err(ApiError::Auth(sauron_auth::AuthError::Forbidden));
-    }
-    Ok(perms)
-}
+// `authorize_app_perms` lived here: it authorized a permission on an app and
+// returned the caller's whole effective set, so a handler gating on a *second*
+// permission (`source:read`, deciding whether to include source context) paid
+// one ancestry+grant resolution instead of two. Deleted in Slice 3 Task 6 (fix
+// round 1), and not merely because it became unused: it resolved permissions
+// through `sauron_auth::effective_at`, which hardcodes `env: None`, and
+// `rbac::grant_applies`'s `Scope::Env` arm is `Some(e) == env` — so an
+// environment-scoped grant could never satisfy it. Its two callers
+// (`issues::detail` / `issues::events`) therefore returned `403` to an
+// env-scoped caller even for their own environment: they could list issues but
+// not open one. `scope::authorized_read_scope_with_perms` replaces it, keeping
+// the single-resolution property (see `rbac::authorize_env_read_inner`) while
+// evaluating the second permission at the environment the read resolved to.
+// Recorded here rather than silently removed so a future handler with the same
+// two-permission shape reaches for the env-aware helper instead of
+// reintroducing this one.
 
 /// Build a URL-safe slug from a display name, with a short random suffix so the
 /// (unique) slug never collides.

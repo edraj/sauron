@@ -99,18 +99,14 @@ pub async fn access(
     // the dashboard hits on every page load and org switch.
     let parsed = grants_from_rows(rows);
     let mut permissions: Vec<String> =
-        sauron_auth::rbac::effective_permissions(&parsed, org_id, None, None)
+        sauron_auth::rbac::effective_permissions(&parsed, org_id, None, None, None)
             .into_iter()
             .collect();
     permissions.sort();
     let grants: Vec<GrantView> = parsed
         .into_iter()
         .map(|g| {
-            let (scope_type, scope_id) = match g.scope {
-                sauron_auth::rbac::Scope::Org(id) => ("org", id),
-                sauron_auth::rbac::Scope::Project(id) => ("project", id),
-                sauron_auth::rbac::Scope::App(id) => ("app", id),
-            };
+            let (scope_type, scope_id) = g.scope.parts();
             GrantView {
                 scope_type: scope_type.to_string(),
                 scope_id,
@@ -228,7 +224,7 @@ fn normalize_scopes(
     let mut seen: HashSet<(String, Uuid)> = HashSet::with_capacity(requested.len());
     let mut out = Vec::with_capacity(requested.len());
     for s in requested {
-        if !matches!(s.scope_type.as_str(), "org" | "project" | "app") {
+        if !matches!(s.scope_type.as_str(), "org" | "project" | "app" | "env") {
             return Err(ApiError::BadRequest("invalid scope_type".into()));
         }
         if seen.insert((s.scope_type.clone(), s.scope_id)) {
@@ -262,6 +258,11 @@ async fn validate_scopes_in_org(
         .filter(|s| s.scope_type == "app")
         .map(|s| s.scope_id)
         .collect();
+    let env_ids: Vec<Uuid> = scopes
+        .iter()
+        .filter(|s| s.scope_type == "env")
+        .map(|s| s.scope_id)
+        .collect();
 
     let projects_here: HashSet<Uuid> = if project_ids.is_empty() {
         HashSet::new()
@@ -283,6 +284,22 @@ async fn validate_scopes_in_org(
             .map(|(app_id, project_id, _)| (app_id, project_id))
             .collect()
     };
+    // Envs are matched through their app's project's org, exactly like apps
+    // above — `scope_id` has no foreign key, so this filter is the only thing
+    // stopping a caller-supplied env id from another tenant from resolving
+    // here at all. One batched query regardless of how many env scopes the
+    // request carries, keeping the documented two-query budget (one for
+    // apps, one for envs).
+    let env_parents: HashMap<Uuid, (Uuid, Uuid)> = if env_ids.is_empty() {
+        HashMap::new()
+    } else {
+        repo::env_ancestries(conn, &env_ids)
+            .await?
+            .into_iter()
+            .filter(|(_, _, _, owner_org)| *owner_org == org_id)
+            .map(|(env_id, app_id, project_id, _)| (env_id, (project_id, app_id)))
+            .collect()
+    };
 
     scopes
         .iter()
@@ -294,6 +311,7 @@ async fn validate_scopes_in_org(
                 Ok(ResolvedScope {
                     scope: Scope::Org(s.scope_id),
                     project_of_app: None,
+                    app_of_env: None,
                 })
             }
             "project" => {
@@ -303,12 +321,22 @@ async fn validate_scopes_in_org(
                 Ok(ResolvedScope {
                     scope: Scope::Project(s.scope_id),
                     project_of_app: None,
+                    app_of_env: None,
                 })
             }
             "app" => match app_parents.get(&s.scope_id) {
                 Some(project_id) => Ok(ResolvedScope {
                     scope: Scope::App(s.scope_id),
                     project_of_app: Some(*project_id),
+                    app_of_env: None,
+                }),
+                None => Err(not_in_org()),
+            },
+            "env" => match env_parents.get(&s.scope_id) {
+                Some((project_id, app_id)) => Ok(ResolvedScope {
+                    scope: Scope::Env(s.scope_id),
+                    project_of_app: Some(*project_id),
+                    app_of_env: Some(*app_id),
                 }),
                 None => Err(not_in_org()),
             },
@@ -352,35 +380,40 @@ async fn check_batch_escalation(
     })
 }
 
-/// Validate that a scope target belongs to `org_id`, returning the app's
-/// parent project when the scope is an app (which `scope_parts` needs).
+/// Validate that a scope target belongs to `org_id`, returning
+/// `(project_of_app, app_of_env)` — the ancestry `scope_parts` needs — for
+/// the scope types that have any.
 ///
 /// This is the cross-tenant boundary for grants: without it a caller could
-/// name a project or app in someone else's org and have a grant created
-/// against it. The single-scope counterpart of `validate_scopes_in_org`, for
-/// the handlers that edit one grant at a time.
+/// name a project, app, or env in someone else's org and have a grant
+/// created against it. The single-scope counterpart of
+/// `validate_scopes_in_org`, for the handlers that edit one grant at a time.
 async fn validate_scope_in_org(
     conn: &mut sauron_db::AsyncPgConnection,
     org_id: Uuid,
     scope_type: &str,
     scope_id: Uuid,
-) -> Result<Option<Uuid>, ApiError> {
+) -> Result<(Option<Uuid>, Option<Uuid>), ApiError> {
     let not_in_org = || ApiError::BadRequest("scope target is not in this org".into());
     match scope_type {
         "org" => {
             if scope_id != org_id {
                 return Err(not_in_org());
             }
-            Ok(None)
+            Ok((None, None))
         }
         "project" => {
             if repo::project_org(conn, scope_id).await? != Some(org_id) {
                 return Err(not_in_org());
             }
-            Ok(None)
+            Ok((None, None))
         }
         "app" => match repo::app_ancestry(conn, scope_id).await? {
-            Some((project_id, o)) if o == org_id => Ok(Some(project_id)),
+            Some((project_id, o)) if o == org_id => Ok((Some(project_id), None)),
+            _ => Err(not_in_org()),
+        },
+        "env" => match repo::env_ancestry(conn, scope_id).await? {
+            Some((app_id, project_id, o)) if o == org_id => Ok((Some(project_id), Some(app_id))),
             _ => Err(not_in_org()),
         },
         _ => Err(ApiError::BadRequest("invalid scope_type".into())),
@@ -608,14 +641,31 @@ pub async fn delete_grant(
     // permissions you do not hold yourself at that scope. Without this, an Admin
     // (member:manage but not org:manage) could delete the Owner's grant and
     // evict them from their own org.
-    let project_of_app = if grant.scope_type == "app" {
-        repo::app_ancestry(&mut conn, grant.scope_id)
-            .await?
-            .map(|(project_id, _)| project_id)
-    } else {
-        None
+    let (project_of_app, app_of_env) = match grant.scope_type.as_str() {
+        "app" => (
+            repo::app_ancestry(&mut conn, grant.scope_id)
+                .await?
+                .map(|(project_id, _)| project_id),
+            None,
+        ),
+        "env" => match repo::env_ancestry(&mut conn, grant.scope_id).await? {
+            Some((app_id, project_id, _)) => (Some(project_id), Some(app_id)),
+            None => (None, None),
+        },
+        _ => (None, None),
     };
-    let (scope_project, scope_app) = scope_parts(&grant.scope_type, grant.scope_id, project_of_app);
+    // `effective_at` takes (project, app) only — it has no env parameter (see
+    // its doc comment) — so an env grant is evaluated at its parent app, the
+    // most precise level available here. That still correctly recognizes an
+    // org/project/app-scoped remover, which is the case this guard exists
+    // for; the one gap is a remover who holds the required permission *only*
+    // on this exact environment, who would need it at the parent app too.
+    let (scope_project, scope_app, _scope_env) = scope_parts(
+        &grant.scope_type,
+        grant.scope_id,
+        project_of_app,
+        app_of_env,
+    );
     let remover =
         sauron_auth::effective_at(&mut conn, auth.user_id, org_id, scope_project, scope_app)
             .await?;
@@ -768,7 +818,7 @@ pub async fn update_grant_handler(
         .unwrap_or_else(|| grant.scope_type.clone());
     let new_scope_id = req.scope_id.unwrap_or(grant.scope_id);
 
-    if !matches!(new_scope_type.as_str(), "org" | "project" | "app") {
+    if !matches!(new_scope_type.as_str(), "org" | "project" | "app" | "env") {
         return Err(ApiError::BadRequest("invalid scope_type".into()));
     }
 
@@ -784,7 +834,7 @@ pub async fn update_grant_handler(
     }
 
     // New scope must be inside this org. Shared helper from Task 4 Step 3a.
-    let new_project_of_app =
+    let (new_project_of_app, new_app_of_env) =
         validate_scope_in_org(&mut conn, org_id, &new_scope_type, new_scope_id).await?;
 
     // Both directions, mirroring create_grant + delete_grant: the caller must
@@ -797,19 +847,38 @@ pub async fn update_grant_handler(
     let old_perms = role_permissions(&old_role.permissions);
     let new_perms = role_permissions(&new_role.permissions);
 
-    let old_project_of_app = if grant.scope_type == "app" {
-        repo::app_ancestry(&mut conn, grant.scope_id)
-            .await?
-            .map(|(project_id, _)| project_id)
-    } else {
-        None
+    let (old_project_of_app, old_app_of_env) = match grant.scope_type.as_str() {
+        "app" => (
+            repo::app_ancestry(&mut conn, grant.scope_id)
+                .await?
+                .map(|(project_id, _)| project_id),
+            None,
+        ),
+        "env" => match repo::env_ancestry(&mut conn, grant.scope_id).await? {
+            Some((app_id, project_id, _)) => (Some(project_id), Some(app_id)),
+            None => (None, None),
+        },
+        _ => (None, None),
     };
-    let (old_sp, old_sa) = scope_parts(&grant.scope_type, grant.scope_id, old_project_of_app);
+    // Same caveat as delete_grant: effective_at has no env parameter, so an
+    // env-scoped grant (old or new) is evaluated at its parent app, the most
+    // precise level available here.
+    let (old_sp, old_sa, _old_se) = scope_parts(
+        &grant.scope_type,
+        grant.scope_id,
+        old_project_of_app,
+        old_app_of_env,
+    );
     let caller_at_old =
         sauron_auth::effective_at(&mut conn, auth.user_id, org_id, old_sp, old_sa).await?;
     check_no_escalation(&caller_at_old, &old_perms).map_err(ApiError::Auth)?;
 
-    let (new_sp, new_sa) = scope_parts(&new_scope_type, new_scope_id, new_project_of_app);
+    let (new_sp, new_sa, _new_se) = scope_parts(
+        &new_scope_type,
+        new_scope_id,
+        new_project_of_app,
+        new_app_of_env,
+    );
     let caller_at_new =
         sauron_auth::effective_at(&mut conn, auth.user_id, org_id, new_sp, new_sa).await?;
     check_no_escalation(&caller_at_new, &new_perms).map_err(ApiError::Auth)?;

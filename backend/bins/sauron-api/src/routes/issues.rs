@@ -29,8 +29,8 @@ pub struct ListQuery {
     #[serde(default)]
     pub offset: i64,
     // `environment_id` is deliberately NOT a field here — it is read from the
-    // raw query string via `RawQuery` + `scope::read_scope_raw` instead of
-    // this `Query<T>` extractor. See `routes::scope`'s module docs for why:
+    // raw query string via `RawQuery` + `scope::authorized_read_scope` instead
+    // of this `Query<T>` extractor. See `routes::scope`'s module docs for why:
     // an `Option<String>` field on this struct would go through
     // `axum_extra::extract::Query` (needed for this struct's own `Vec<String>`
     // `filter` field), whose codec silently collapses `?environment_id=` to
@@ -52,12 +52,18 @@ pub async fn list(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<Issue>>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::ISSUE_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let filters = sauron_db::filter::parse_filters(&q.filter, sauron_db::filter::ISSUE_FILTERS)?;
     let search = q.q.as_deref().filter(|s| !s.is_empty());
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 3650));
     let limit = q.limit.clamp(1, 200);
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
         repo::list_issues(
             &mut conn,
@@ -90,17 +96,25 @@ pub async fn detail(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<IssueDetail>, ApiError> {
     let mut conn = db(&state).await?;
-    // One ancestry+grant resolution covers both permission checks.
-    let perms =
-        super::authorize_app_perms(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
+    // One ancestry+grant resolution authorizes the read, resolves its scope,
+    // and answers the second permission question at that same scope.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::ISSUE_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     // Viewing de-obfuscated source code needs source:read; symbol/file/line don't.
+    // Evaluated at the resolved environment, not app-wide — an env-scoped
+    // caller holds `source:read` (if at all) on their environment.
     let include_source = perms.contains(perm::SOURCE_READ);
 
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
-    let issue = repo::get_issue(&mut conn, scope, issue_id)
+    let issue = repo::get_issue(&mut conn, scope.clone(), issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let mut latest_event = repo::latest_error_event(&mut conn, scope, issue_id).await?;
+    let mut latest_event = repo::latest_error_event(&mut conn, scope.clone(), issue_id).await?;
     let since = Utc::now() - Duration::days(30);
     let series = repo::issue_occurrence_series(&mut conn, scope, issue_id, since).await?;
     drop(conn); // release the pooled conn; symbolication checks out its own
@@ -171,14 +185,21 @@ pub async fn events(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<ErrorEvent>>, ApiError> {
     let mut conn = db(&state).await?;
-    // One ancestry+grant resolution covers both permission checks.
-    let perms =
-        super::authorize_app_perms(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
+    // One ancestry+grant resolution authorizes the read, resolves its scope,
+    // and answers the second permission question at that same scope.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::ISSUE_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    // Evaluated at the resolved environment — see `detail`'s comment above.
     let include_source = perms.contains(perm::SOURCE_READ);
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     // Confirm the issue belongs to this app before returning its events (prevents
     // reading another app's events by passing a foreign issue_id).
-    repo::get_issue(&mut conn, scope, issue_id)
+    repo::get_issue(&mut conn, scope.clone(), issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     let filters =
@@ -239,9 +260,15 @@ pub async fn stats(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<IssueStats>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::ISSUE_READ).await?;
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
-    let counts = repo::issue_stats(&mut conn, scope).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::ISSUE_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let counts = repo::issue_stats(&mut conn, scope.clone()).await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
     let series = repo::error_series(&mut conn, scope, since).await?;
     Ok(Json(IssueStats { counts, series }))

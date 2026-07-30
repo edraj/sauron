@@ -1,20 +1,23 @@
 //! HTTP-layer parsing of the `environment_id` query parameter into
-//! `sauron_db::scope::ReadScope`/`EnvFilter` — the wire contract for every
-//! environment-scoped read.
+//! `sauron_db::scope::ReadScope`/`EnvFilter`, and — via
+//! [`authorized_read_scope`] — the single call every environment-scoped
+//! handler makes to turn that parameter into an authorized read.
 //!
-//! | value | meaning |
-//! |---|---|
-//! | absent | every environment, including unattributed rows |
-//! | `?environment_id=<uuid>` | that environment only |
-//! | `?environment_id=none` | rows with `environment_id IS NULL` |
-//! | anything else (including empty, i.e. `?environment_id=`) | `400` — **never** a silent fallback to "all" |
+//! | value | meaning | reach required |
+//! |---|---|---|
+//! | absent | every environment the caller may read (auto-narrowed to a `Subset` for a partial-reach caller) | any reach on the app |
+//! | `?environment_id=<uuid>` | that environment only | a grant reaching that specific environment (app-wide or that env's own) |
+//! | `?environment_id=none` | rows with `environment_id IS NULL` | app-wide reach — unattributed rows belong to no single environment |
+//! | anything else (including empty, i.e. `?environment_id=`) | `400` — **never** a silent fallback to "all" | n/a |
 //!
 //! A malformed value must be a `400`, not a silent fallback to `All`: falling
 //! back would show the caller MORE data than they asked for, which is the
-//! wrong direction to fail on a scoping parameter (and Slice 3 makes this an
-//! access boundary, not just a display nicety).
+//! wrong direction to fail on a scoping parameter. The reach column is what
+//! Slice 3 added: `environment_id` is now an access boundary enforced by
+//! [`sauron_auth::authorize_env_read`], not just a display filter — see
+//! [`authorized_read_scope`].
 //!
-//! ## The extractor trap, and why callers use [`read_scope_raw`]
+//! ## The extractor trap, and why callers use [`raw_environment_id`]
 //!
 //! `?environment_id=` — the parameter present with an **empty** value — is
 //! wire-indistinguishable from "absent" to some deserializers but not others:
@@ -38,13 +41,14 @@
 //! query string (via `axum::extract::RawQuery`, upstream of any `Query`
 //! codec), so presence/absence/emptiness is decided the same way regardless
 //! of which extractor a handler's *other* query parameters go through.
-//! [`read_scope_raw`] is [`read_scope`] wired to that source; every
-//! environment-scoped handler should call it (with `RawQuery`) instead of
-//! `read_scope` (with a `Query<T>`-deserialized `Option<String>` field) so a
-//! future route gets this right by construction rather than by remembering
-//! to.
+//! [`authorized_read_scope`] is built on that source; every environment-scoped
+//! handler calls it (passing `RawQuery`'s inner `Option<&str>`) rather than
+//! feeding a `Query<T>`-deserialized `Option<String>` field into `parse_env`
+//! by hand, so a future route gets this right by construction rather than by
+//! remembering to.
 
 use sauron_db::scope::{EnvFilter, ReadScope};
+use sauron_db::AsyncPgConnection;
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -73,16 +77,11 @@ pub fn raw_environment_id(raw_query: Option<&str>) -> Option<String> {
 ///
 /// **Syntax only.** A `One(uuid)` is only validated as a well-formed UUID —
 /// this does not check that the environment exists, or that it belongs to the
-/// `app_id` the caller is also passing. A foreign or made-up UUID therefore
-/// currently ANDs against `app_id` in the query and matches nothing, i.e. it
-/// narrows to zero rows rather than leaking another app's/environment's data.
-/// That is the safe direction, which is why this is a note rather than a bug
-/// fix here — but Slice 3 makes `environment_id` an RBAC access boundary, at
-/// which point "matches nothing" is not the same guarantee as "caller is not
-/// permitted to ask": this will need an existence + app-ownership check
-/// (e.g. resolving `One(uuid)` against `environments` scoped by `app_id`)
-/// before it can be trusted as a real boundary rather than a filter that
-/// happens to match nothing.
+/// `app_id` the caller is also passing. The existence + app-ownership check
+/// this doc comment used to ask Slice 3 for now happens in
+/// `sauron_auth::rbac::resolve_env_filter` (via [`authorized_read_scope`]):
+/// a `One(uuid)` naming an environment that doesn't exist, or belongs to a
+/// different app, is refused with a `403`, not silently narrowed to zero rows.
 pub fn parse_env(raw: Option<&str>) -> Result<EnvFilter, ApiError> {
     match raw {
         None => Ok(EnvFilter::All),
@@ -95,23 +94,57 @@ pub fn parse_env(raw: Option<&str>) -> Result<EnvFilter, ApiError> {
     }
 }
 
-/// Build a [`ReadScope`] for `app_id` from the raw `environment_id` query
-/// parameter. The one call every scopeable handler in this crate makes.
-pub fn read_scope(app_id: Uuid, raw: Option<&str>) -> Result<ReadScope, ApiError> {
-    Ok(ReadScope::new(app_id, parse_env(raw)?))
+/// Authorize an environment-scoped read and produce its `ReadScope` in one
+/// call, sourcing `environment_id` from the raw query string.
+///
+/// This supersedes calling `authorize_app` and a hand-built `ReadScope`
+/// separately. Both orderings of that pair were correct, but only if both
+/// were present — and the whole history of this feature is defects where two
+/// things that had to agree were maintained by hand (this module's own
+/// `?environment_id=` extractor-trap regression, documented above, is one of
+/// them). One call cannot half-happen.
+///
+/// `raw_query` is `axum::extract::RawQuery`'s inner `Option<&str>` — every
+/// caller must extract it via `RawQuery`, not read `environment_id` off a
+/// `Query<T>`-deserialized struct field, for the same reason
+/// [`raw_environment_id`] exists (see the module docs' "extractor trap"
+/// section).
+pub async fn authorized_read_scope(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    permission: &str,
+    raw_query: Option<&str>,
+) -> Result<ReadScope, ApiError> {
+    let requested = parse_env(raw_environment_id(raw_query).as_deref())?;
+    let scope =
+        sauron_auth::authorize_env_read(conn, user_id, app_id, permission, requested).await?;
+    Ok(scope)
 }
 
-/// [`read_scope`], but sourcing `environment_id` from the raw query string
-/// (via [`raw_environment_id`]) instead of a `Query<T>`-deserialized field.
+/// [`authorized_read_scope`], plus the caller's effective permission set at the
+/// **resolved** scope — for the two handlers that gate a second capability on
+/// top of the read itself (`issues::detail`/`issues::events`, and `source:read`).
 ///
-/// This is the one every environment-scoped handler in `analytics.rs` and
-/// `issues.rs` calls, passing the `axum::extract::RawQuery`'s inner
-/// `Option<String>` (`.as_deref()`'d). See the module docs for why: those two
-/// files import `axum_extra::extract::Query` (for `Vec<String>` filter
-/// fields), whose codec silently turns `?environment_id=` into "absent"
-/// instead of the `400` a scoping parameter must get.
-pub fn read_scope_raw(app_id: Uuid, raw_query: Option<&str>) -> Result<ReadScope, ApiError> {
-    read_scope(app_id, raw_environment_id(raw_query).as_deref())
+/// Use this instead of pairing [`authorized_read_scope`] with a separate
+/// permission lookup. The separate lookup it replaces (`super::authorize_app_perms`,
+/// now deleted) resolved permissions at `env: None`, which no environment-scoped
+/// grant can ever satisfy — so those handlers `403`'d an env-scoped caller even
+/// on their own environment. See `sauron_auth::authorize_env_read_with_perms`
+/// for the full account; the ordering guarantee is that authorization happens
+/// first, and the permission set is computed only after the scope is resolved.
+pub async fn authorized_read_scope_with_perms(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    permission: &str,
+    raw_query: Option<&str>,
+) -> Result<(ReadScope, std::collections::HashSet<String>), ApiError> {
+    let requested = parse_env(raw_environment_id(raw_query).as_deref())?;
+    let resolved =
+        sauron_auth::authorize_env_read_with_perms(conn, user_id, app_id, permission, requested)
+            .await?;
+    Ok(resolved)
 }
 
 /// Reject `environment_id` outright rather than silently ignoring it.
@@ -205,20 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn read_scope_carries_the_app_id_through() {
-        let app_id = Uuid::from_u128(1);
-        let scope = read_scope(app_id, None).unwrap();
-        assert_eq!(scope.app_id, app_id);
-        assert_eq!(scope.env, EnvFilter::All);
-    }
-
-    #[test]
-    fn read_scope_rejects_malformed_same_as_parse_env() {
-        let app_id = Uuid::from_u128(1);
-        assert!(read_scope(app_id, Some("nope")).is_err());
-    }
-
-    #[test]
     fn reject_environment_id_passes_when_absent() {
         assert!(reject_environment_id(None).is_ok());
     }
@@ -278,23 +297,6 @@ mod tests {
         assert_eq!(
             raw_environment_id(Some(&format!("environment_id={id}"))),
             Some(id.to_string())
-        );
-    }
-
-    #[test]
-    fn raw_environment_id_feeds_read_scope_raw_the_same_way_parse_env_expects() {
-        let app_id = Uuid::from_u128(1);
-        // Absent -> All.
-        assert_eq!(read_scope_raw(app_id, None).unwrap().env, EnvFilter::All);
-        // Present-but-empty -> rejected, matching the malformed case.
-        assert!(read_scope_raw(app_id, Some("environment_id=")).is_err());
-        // A real value -> One(id).
-        let id = Uuid::from_u128(2);
-        assert_eq!(
-            read_scope_raw(app_id, Some(&format!("environment_id={id}")))
-                .unwrap()
-                .env,
-            EnvFilter::One(id)
         );
     }
 }

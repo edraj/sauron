@@ -100,38 +100,50 @@ pub fn drops_org_manage(old: &[String], new: &[String]) -> bool {
     old.iter().any(|p| p == perm::ORG_MANAGE) && !new.iter().any(|p| p == perm::ORG_MANAGE)
 }
 
-/// Split a grant's scope into the `(project, app)` pair `effective_at` expects.
+/// Split a grant's scope into the `(project, app, env)` triple `effective_at`
+/// expects.
 ///
 /// `project_of_app` is the app's parent project, when the scope is an app and
-/// the ancestry lookup succeeded. Unknown scope types fall back to org scope —
-/// the narrowest authority — so a bad column value cannot widen permissions.
+/// the ancestry lookup succeeded. `app_of_env` is the environment's parent
+/// app, when the scope is an env and the ancestry lookup succeeded. Unknown
+/// scope types fall back to org scope — the narrowest authority — so a bad
+/// column value cannot widen permissions.
 pub fn scope_parts(
     scope_type: &str,
     scope_id: Uuid,
     project_of_app: Option<Uuid>,
-) -> (Option<Uuid>, Option<Uuid>) {
+    app_of_env: Option<Uuid>,
+) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>) {
     match scope_type {
-        "project" => (Some(scope_id), None),
-        "app" => (project_of_app, Some(scope_id)),
-        _ => (None, None),
+        "project" => (Some(scope_id), None, None),
+        "app" => (project_of_app, Some(scope_id), None),
+        "env" => (project_of_app, app_of_env, Some(scope_id)),
+        _ => (None, None, None),
     }
 }
 
-/// A scope a batch grant will be written at, with the app's parent
-/// project already resolved by the caller.
+/// A scope a batch grant will be written at, with its ancestry already
+/// resolved by the caller.
+///
+/// `project_of_app` is an app scope's parent project, or an env scope's
+/// parent project (two hops up). `app_of_env` is an env scope's parent app.
+/// Both are `None` for scopes where they do not apply (org, project, and the
+/// app case of `app_of_env`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedScope {
     pub scope: Scope,
     pub project_of_app: Option<Uuid>,
+    pub app_of_env: Option<Uuid>,
 }
 
 impl ResolvedScope {
-    /// The (project, app) pair `effective_permissions` expects.
-    pub fn target(self) -> (Option<Uuid>, Option<Uuid>) {
+    /// The (project, app, env) triple `effective_permissions` expects.
+    pub fn target(self) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>) {
         match self.scope {
-            Scope::Org(_) => (None, None),
-            Scope::Project(p) => (Some(p), None),
-            Scope::App(a) => (self.project_of_app, Some(a)),
+            Scope::Org(_) => (None, None, None),
+            Scope::Project(p) => (Some(p), None, None),
+            Scope::App(a) => (self.project_of_app, Some(a), None),
+            Scope::Env(e) => (self.project_of_app, self.app_of_env, Some(e)),
         }
     }
 }
@@ -149,8 +161,8 @@ pub fn check_no_escalation_at_scopes(
     required: &[String],
 ) -> Result<(), Scope> {
     for resolved in scopes {
-        let (project, app) = resolved.target();
-        let caller = effective_permissions(caller_grants, org, project, app);
+        let (project, app, env) = resolved.target();
+        let caller = effective_permissions(caller_grants, org, project, app, env);
         if check_no_escalation(&caller, required).is_err() {
             return Err(resolved.scope);
         }
@@ -249,6 +261,7 @@ mod tests {
         ResolvedScope {
             scope,
             project_of_app: None,
+            app_of_env: None,
         }
     }
 
@@ -256,6 +269,15 @@ mod tests {
         ResolvedScope {
             scope: Scope::App(app),
             project_of_app: Some(project),
+            app_of_env: None,
+        }
+    }
+
+    fn env_under(env: Uuid, project: Uuid, app: Uuid) -> ResolvedScope {
+        ResolvedScope {
+            scope: Scope::Env(env),
+            project_of_app: Some(project),
+            app_of_env: Some(app),
         }
     }
 
@@ -449,34 +471,65 @@ mod tests {
     fn scope_parts_maps_each_scope_type() {
         let id = Uuid::new_v4();
         let project = Uuid::new_v4();
-        assert_eq!(scope_parts("org", id, None), (None, None));
-        assert_eq!(scope_parts("project", id, None), (Some(id), None));
+        let app = Uuid::new_v4();
+        assert_eq!(scope_parts("org", id, None, None), (None, None, None));
         assert_eq!(
-            scope_parts("app", id, Some(project)),
-            (Some(project), Some(id))
+            scope_parts("project", id, None, None),
+            (Some(id), None, None)
+        );
+        assert_eq!(
+            scope_parts("app", id, Some(project), None),
+            (Some(project), Some(id), None)
         );
         // An app whose ancestry lookup failed still scopes to the app itself.
-        assert_eq!(scope_parts("app", id, None), (None, Some(id)));
+        assert_eq!(scope_parts("app", id, None, None), (None, Some(id), None));
+        // An env carries both its parent project and parent app when the
+        // ancestry lookup succeeded.
+        assert_eq!(
+            scope_parts("env", id, Some(project), Some(app)),
+            (Some(project), Some(app), Some(id))
+        );
+        // An env whose ancestry lookup failed still scopes to the env itself.
+        assert_eq!(scope_parts("env", id, None, None), (None, None, Some(id)));
         // Unknown scope types degrade to org scope, the narrowest grant of
         // authority, so a bad value cannot widen anyone's effective permissions.
-        assert_eq!(scope_parts("nonsense", id, None), (None, None));
+        assert_eq!(scope_parts("nonsense", id, None, None), (None, None, None));
     }
 
     #[test]
     fn resolved_scope_target_mirrors_scope_parts() {
         let id = Uuid::new_v4();
         let project = Uuid::new_v4();
-        assert_eq!(at(Scope::Org(id)).target(), scope_parts("org", id, None));
+        let app = Uuid::new_v4();
+        assert_eq!(
+            at(Scope::Org(id)).target(),
+            scope_parts("org", id, None, None)
+        );
         assert_eq!(
             at(Scope::Project(id)).target(),
-            scope_parts("project", id, None)
+            scope_parts("project", id, None, None)
         );
         assert_eq!(
             app_under(id, project).target(),
-            scope_parts("app", id, Some(project))
+            scope_parts("app", id, Some(project), None)
         );
         // An app whose ancestry lookup failed still scopes to the app itself.
-        assert_eq!(at(Scope::App(id)).target(), scope_parts("app", id, None));
+        assert_eq!(
+            at(Scope::App(id)).target(),
+            scope_parts("app", id, None, None)
+        );
+        // An env whose ancestry lookup failed still scopes to the env itself.
+        assert_eq!(
+            at(Scope::Env(id)).target(),
+            scope_parts("env", id, None, None)
+        );
+        // An env scope with both ancestors resolved carries them through, same
+        // as the app case above — `validate_scopes_in_org`'s env arm relies on
+        // exactly this.
+        assert_eq!(
+            env_under(id, project, app).target(),
+            scope_parts("env", id, Some(project), Some(app))
+        );
     }
 
     #[test]

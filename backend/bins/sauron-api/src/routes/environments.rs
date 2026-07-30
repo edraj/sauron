@@ -1,8 +1,13 @@
 //! Environment management: create, rename, mute, promote, rotate, retire.
 //!
-//! Environments are app-scoped resources, so every check resolves through
-//! `authorize_app` against the parent app. The `env:*` permissions name what is
-//! being managed, not a new scope level — `Scope::Env` arrives in Slice 3.
+//! Every *mutation* here resolves through `authorize_app` against the parent
+//! app — the `env:*` permissions name what is being managed, and there is no
+//! scenario yet where creating, renaming, or retiring an environment is
+//! itself scoped narrower than its app. `list_environments` is the exception:
+//! it is a discovery endpoint (see `routes::projects::list_apps` for the same
+//! pattern one level up), so it resolves the caller's env-scoped `Reach`
+//! instead and can be satisfied by an env-scoped grant that `authorize_app`
+//! never could.
 
 /// Cap on a stored environment name. Was 64 when the value arrived from the
 /// envelope; kept at 64 now that it is admin-supplied so existing rows stay valid.
@@ -61,13 +66,16 @@ mod tests {
     }
 }
 
-use axum::extract::{Path, Query, State};
+use std::collections::HashSet;
+
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
 use diesel_async::AsyncConnection;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use sauron_auth::{authorize_app, perm, AuthUser};
+use sauron_auth::rbac::{grants_from_rows, reach_for};
+use sauron_auth::{authorize_app, perm, AuthError, AuthUser};
 use sauron_core::ids;
 use sauron_db::models::Environment;
 use sauron_db::repo;
@@ -88,12 +96,48 @@ pub async fn list_environments(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<ListEnvQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<Environment>>, ApiError> {
+    // This endpoint IS the environment list; scoping the request that
+    // enumerates environments to one of them is circular, so `environment_id`
+    // is rejected rather than silently ignored. Task 14's router-enumeration
+    // test (`http_env_scoping.rs`) treats a `200` on a malformed
+    // `environment_id` on ANY app-scoped GET as the same defect class as the
+    // four `environment_id`-handling regressions this feature has already
+    // had — this handler used to accept no such query at all (unknown query
+    // params are dropped by `axum::extract::Query`'s deserializer, not
+    // rejected), so a bogus value was silently swallowed instead of refused.
+    super::scope::reject_environment_id(
+        super::scope::raw_environment_id(raw_query.as_deref()).as_deref(),
+    )?;
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::ENV_READ).await?;
-    Ok(Json(
-        repo::list_environments(&mut conn, app_id, q.include_retired).await?,
-    ))
+    // Same shape as `list_apps`, one level down: `authorize_app` gates on a
+    // fixed (org, project, app, None) target that an env-scoped grant can
+    // never satisfy, so an env-scoped member would 403 from the very endpoint
+    // that populates their environment picker.
+    let (project_id, org_id) = repo::app_ancestry(&mut conn, app_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let rows = repo::user_grants_in_org(&mut conn, auth.user_id, org_id).await?;
+    if rows.is_empty() {
+        return Err(ApiError::Auth(AuthError::Forbidden));
+    }
+    let grants = grants_from_rows(rows);
+    let reach = reach_for(&grants, perm::ENV_READ);
+    let all = repo::list_environments(&mut conn, app_id, q.include_retired).await?;
+    if reach.org || reach.projects.contains(&project_id) || reach.apps.contains(&app_id) {
+        return Ok(Json(all));
+    }
+
+    let allowed: HashSet<Uuid> = reach.envs.into_iter().collect();
+    let mine: Vec<Environment> = all
+        .into_iter()
+        .filter(|e| allowed.contains(&e.id))
+        .collect();
+    if mine.is_empty() {
+        return Err(ApiError::Auth(AuthError::Forbidden));
+    }
+    Ok(Json(mine))
 }
 
 #[derive(Deserialize)]

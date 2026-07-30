@@ -142,27 +142,31 @@ describe('computeScopeParams', () => {
 // touches `scopeKey` at all and so never re-fetches on an environment switch.
 // Precedent: `../models/permissions.test.ts` already parses source off disk
 // for the same reason (there, Rust; here, Svelte).
+//
+// Task 14 (F6): the target set below used to be a hand-written
+// `TELEMETRY_PAGES` array that was — by construction — exactly the set of
+// pages containing the string "scopeKey". That made the `missing` assertion
+// `[]` for free and the companion "list is non-empty" assertion a tautology
+// over a `const` defined three lines above: the array could never fail no
+// matter what any page's source said. The target set is now DERIVED from the
+// filesystem (every `.svelte` file under `dashboard/src/pages/`) minus an
+// explicit, individually-justified non-telemetry allow-list, so a page added
+// to `pages/` tomorrow that is not on the allow-list is automatically
+// enforced — the developer must consciously either wire it to `scopeKey` or
+// add it to the allow-list with a reason, rather than the test silently
+// growing or shrinking around whatever already happens to be true.
 // ---------------------------------------------------------------------------
 
-const TELEMETRY_PAGES = [
-  'Overview',
-  'Issues',
-  'IssueDetail',
-  'Events',
-  'Performance',
-  'SessionsList',
-  'SessionDetail',
-  'UsersExplorer',
-  'PersonProfile',
-  'DevicesInventory',
-  'DeviceDetail',
-  'ScreensList',
-  'ScreenDetail',
-  'FunnelBuilder',
-  'JourneyExplorer',
-];
-
 const PAGES_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../pages');
+
+/** Every page component's name (no extension) in `dashboard/src/pages/`. */
+function listAllPageNames(): string[] {
+  const suffix = '.svelte';
+  return fs
+    .readdirSync(PAGES_DIR)
+    .filter((f: string) => f.endsWith(suffix))
+    .map((f: string) => f.slice(0, -suffix.length));
+}
 
 function readPageSource(name: string): string {
   const file = path.join(PAGES_DIR, `${name}.svelte`);
@@ -170,24 +174,60 @@ function readPageSource(name: string): string {
     return fs.readFileSync(file, 'utf-8');
   } catch (err) {
     throw new Error(
-      `scope.test.ts could not read telemetry page "${file}" (${
+      `scope.test.ts could not read page "${file}" (${
         err instanceof Error ? err.message : String(err)
       }). This test must fail rather than silently skip a page that was renamed or moved.`,
     );
   }
 }
 
+/**
+ * Pages that are genuinely not app-scoped telemetry reads — org/account/auth
+ * chrome, or a resource with no `environment_id` dimension at all. Each entry
+ * carries its own reason: a page landing here for the wrong reason is exactly
+ * how F6 (and the four backend `environment_id` regressions before it)
+ * happened — a hand-maintained list nobody re-checks against the thing it
+ * claims to describe.
+ */
+const NON_TELEMETRY_PAGES = new Set([
+  'Alerts', // org-scoped alert rules/channels, not app-scoped telemetry
+  'ChangePassword', // account settings, no app/environment dimension
+  'Docs', // static documentation
+  'Login', // pre-auth
+  'Members', // org membership management
+  'MonitorDetail', // uptime monitor detail, project-scoped not environment-scoped
+  'Monitors', // uptime monitors list, project-scoped not environment-scoped
+  // Polls `apps::first_event` by the app's own id, deliberately NOT scoped to
+  // sessionStore.currentEnvId — see scope.ts's UI_ONLY_EXCLUSIONS comment.
+  'Onboarding',
+  'Projects', // org-scoped project list
+  'Register', // pre-auth
+  'SettingsApp', // app configuration (name, environments, keys), not telemetry
+  'SourceMaps', // symbol artifacts — app-wide config; backend rejects environment_id
+  'Storage', // admin storage report, org-scoped
+]);
+
+const ALL_PAGES = listAllPageNames();
+const TELEMETRY_PAGES = ALL_PAGES.filter((name) => !NON_TELEMETRY_PAGES.has(name));
+
 describe('telemetry pages observe scopeKey', () => {
-  it('every listed page references sessionStore.scopeKey somewhere in its effects', () => {
+  it('every page not on the non-telemetry allow-list references sessionStore.scopeKey somewhere in its effects', () => {
     const missing = TELEMETRY_PAGES.filter((name) => !readPageSource(name).includes('scopeKey'));
     expect(missing, `pages missing a scopeKey reference: ${missing.join(', ')}`).toEqual([]);
   });
 
-  it('the list itself is non-empty (guards the parser/path against silently matching nothing)', () => {
+  it('the derived set is non-empty and strictly smaller than the full page list (guards the parser against silently matching nothing, or the allow-list against silently excluding everything)', () => {
     expect(TELEMETRY_PAGES.length).toBeGreaterThan(0);
+    expect(TELEMETRY_PAGES.length).toBeLessThan(ALL_PAGES.length);
   });
 
-  // FunnelBuilder is the one page (of 24) whose *recompute* effect tracks
+  it('every allow-listed page name still exists on disk (catches a renamed/deleted page going silently unenforced)', () => {
+    const present = new Set(ALL_PAGES);
+    const stale = [...NON_TELEMETRY_PAGES].filter((name) => !present.has(name));
+    expect(stale, `allow-listed page(s) no longer on disk: ${stale.join(', ')}`).toEqual([]);
+  });
+
+  // FunnelBuilder is the one page whose *recompute* effect tracks
   // `currentEnvId` directly instead of `scopeKey` — an intentional exception,
   // not a gap this suite should paper over with a bare skip. It still passes
   // the coarse "somewhere in the file" check above, because its sibling

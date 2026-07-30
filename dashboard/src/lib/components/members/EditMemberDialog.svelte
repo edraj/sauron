@@ -20,7 +20,7 @@
     type RoleBlock,
   } from '../../models/grant-plan';
   import { EMPTY_SELECTION } from '../../models/scope-tree';
-  import type { App, Member, MemberGrant, Project, Role } from '../../models';
+  import type { App, Environment, Member, MemberGrant, Project, Role, ScopeType } from '../../models';
 
   interface Props {
     open: boolean;
@@ -30,6 +30,12 @@
     roles: Role[];
     projects: Project[];
     appsByProject: Record<string, App[]>;
+    /** Environments per app, keyed by app id — see ScopeTree's own doc comment.
+        Owned by the parent (Members.svelte) so the same cache can be reused by
+        the grant form, the create dialog, and the members table. */
+    envsByApp: Record<string, Environment[]>;
+    loadingEnvApps: Set<string>;
+    onopenapp: (appId: string) => void;
     /** Every grant in the org — the sole-owner pre-flight needs the whole set,
         not just this member's. */
     orgGrants: MemberGrant[];
@@ -49,6 +55,9 @@
     roles,
     projects,
     appsByProject,
+    envsByApp,
+    loadingEnvApps,
+    onopenapp,
     orgGrants,
     ready,
     onclose,
@@ -99,13 +108,30 @@
     return map;
   });
 
+  const appOfEnv = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const [appId, envs] of Object.entries(envsByApp)) {
+      for (const e of envs) map[e.id] = appId;
+    }
+    return map;
+  });
+
+  const envNames = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const list of Object.values(envsByApp)) for (const e of list) map[e.id] = e.name;
+    return map;
+  });
+
   const knownProjects = $derived(new Set(projects.map((p) => p.id)));
   const knownApps = $derived(new Set(Object.keys(appNames)));
+  const knownEnvs = $derived(new Set(Object.keys(appOfEnv)));
 
   const currentGrants = $derived(member?.grants ?? []);
 
   const plan = $derived<GrantPlan>(
-    member ? planGrantChanges(blocks, currentGrants, orgId, projectOfApp) : { additions: [], revocations: [] },
+    member
+      ? planGrantChanges(blocks, currentGrants, orgId, projectOfApp, appOfEnv)
+      : { additions: [], revocations: [] },
   );
 
   const emptyKeys = $derived(new Set(emptyBlockKeys(blocks)));
@@ -130,7 +156,7 @@
     const id = `${member.user_id}#${reseedToken}`;
     untrack(() => {
       if (id === seededFor) return;
-      blocks = grantsToBlocks(member!.grants, orgId, knownProjects, knownApps);
+      blocks = grantsToBlocks(member!.grants, orgId, knownProjects, knownApps, knownEnvs);
       nextKey = blocks.length;
       results = null;
       progress = '';
@@ -146,6 +172,49 @@
       seededFor = '';
       results = null;
       progress = '';
+    });
+  });
+
+  // Environments are loaded lazily per app (see envsByApp's doc comment on
+  // ScopeTree), so an env-scoped grant seeded before its owning app's
+  // environments were fetched cannot be placed by grantsToBlocks — its
+  // scope_id isn't in knownEnvs yet — and lands in `unmatched` instead. The
+  // moment that app's environments do load (the admin expanded its row, or
+  // the shared cache already had them from an earlier dialog this session),
+  // promote any now-resolvable unmatched grant into a real tree tick instead
+  // of leaving it stuck as an opaque chip forever. This reacts only to data
+  // already fetched for a twisty that opened anyway — no extra request.
+  //
+  // Only `envsByApp` is a tracked read; `blocks` is read and written inside
+  // `untrack` so this effect does not re-trigger itself when it moves a grant.
+  $effect(() => {
+    const apps = envsByApp;
+    untrack(() => {
+      let anyMoved = false;
+      const nextBlocks = blocks.map((b) => {
+        if (b.unmatched.length === 0) return b;
+        const stillUnmatched: MemberGrant[] = [];
+        const newlyKnown: string[] = [];
+        for (const g of b.unmatched) {
+          const owningApp =
+            g.scope_type === 'env'
+              ? Object.entries(apps).find(([, envs]) => envs.some((e) => e.id === g.scope_id))
+              : undefined;
+          if (owningApp) {
+            newlyKnown.push(g.scope_id);
+            anyMoved = true;
+          } else {
+            stillUnmatched.push(g);
+          }
+        }
+        if (newlyKnown.length === 0) return b;
+        return {
+          ...b,
+          unmatched: stillUnmatched,
+          selection: { ...b.selection, envs: [...b.selection.envs, ...newlyKnown] },
+        };
+      });
+      if (anyMoved) blocks = nextBlocks;
     });
   });
 
@@ -166,7 +235,7 @@
       {
         key: `new-${nextKey}`,
         roleId: free.id,
-        selection: { ...EMPTY_SELECTION, projects: [], apps: [] },
+        selection: { ...EMPTY_SELECTION, projects: [], apps: [], envs: [] },
         unmatched: [],
       },
     ];
@@ -195,25 +264,34 @@
     return rolesById[id]?.name ?? 'Unknown role';
   }
 
+  /** An env's own name, prefixed with its app's name when known — mirrors the
+      "App: Project / Name" composition one level down. `scope_id` carries no
+      FK, so a deleted/invisible env or app falls back to a truncated id. */
+  function envLabel(envId: string): string {
+    const name = envNames[envId] ?? envId.slice(0, 8);
+    const appId = appOfEnv[envId];
+    const appName = appId !== undefined ? appNames[appId] : undefined;
+    return appName ? `${appName} / ${name}` : name;
+  }
+
+  /** Shared by scopeLabel (MemberGrant) and every place below that names a
+      ScopeRef out of a GrantPlan — kept in one place so a fifth scope level
+      only needs one new branch, not three kept in sync by hand. */
+  function scopeRefLabel(s: { scope_type: ScopeType; scope_id: string }): string {
+    if (s.scope_type === 'org') return orgName;
+    if (s.scope_type === 'project') return projectNames[s.scope_id] ?? s.scope_id.slice(0, 8);
+    if (s.scope_type === 'app') return appNames[s.scope_id] ?? s.scope_id.slice(0, 8);
+    if (s.scope_type === 'env') return envLabel(s.scope_id);
+    return s.scope_id.slice(0, 8);
+  }
+
   function scopeLabel(g: MemberGrant): string {
-    if (g.scope_type === 'org') return orgName;
-    if (g.scope_type === 'project') return projectNames[g.scope_id] ?? g.scope_id.slice(0, 8);
-    return appNames[g.scope_id] ?? g.scope_id.slice(0, 8);
+    return scopeRefLabel(g);
   }
 
   const addSummary = $derived(
     plan.additions
-      .flatMap((a) =>
-        a.scopes.map((s) => {
-          const name =
-            s.scope_type === 'org'
-              ? orgName
-              : s.scope_type === 'project'
-                ? (projectNames[s.scope_id] ?? s.scope_id.slice(0, 8))
-                : (appNames[s.scope_id] ?? s.scope_id.slice(0, 8));
-          return `${roleName(a.roleId)} on ${name}`;
-        }),
-      )
+      .flatMap((a) => a.scopes.map((s) => `${roleName(a.roleId)} on ${scopeRefLabel(s)}`))
       .join(', '),
   );
 
@@ -254,15 +332,7 @@
     for (const add of plan.additions) {
       done += 1;
       progress = `Applying ${done} of ${total}…`;
-      const label = `Grant ${roleName(add.roleId)} on ${add.scopes
-        .map((s) =>
-          s.scope_type === 'org'
-            ? orgName
-            : s.scope_type === 'project'
-              ? (projectNames[s.scope_id] ?? s.scope_id.slice(0, 8))
-              : (appNames[s.scope_id] ?? s.scope_id.slice(0, 8)),
-        )
-        .join(', ')}`;
+      const label = `Grant ${roleName(add.roleId)} on ${add.scopes.map(scopeRefLabel).join(', ')}`;
       try {
         await createGrant(orgId, {
           email: member.email,
@@ -436,6 +506,9 @@
               {orgName}
               {projects}
               {appsByProject}
+              {envsByApp}
+              {loadingEnvApps}
+              {onopenapp}
               value={block.selection}
               disabled={saving}
               onchange={(next) => setSelection(block.key, next)}

@@ -32,6 +32,10 @@ export interface CanScope {
   org?: string | null;
   project?: string | null;
   app?: string | null;
+  // Deliberately not defaulted from `currentEnvId` the way org/project/app are
+  // — see `can()`'s doc comment. Omit it entirely unless the check really is
+  // an environment-scoped one.
+  env?: string | null;
 }
 
 /**
@@ -106,19 +110,53 @@ class SessionStore {
   // Permission check
   //
   // True iff any grant for the current org matches one of the supplied scopes
-  // (falling back to the current selection) and contains `perm`. An org-scoped
-  // grant cascades to every project/app beneath it.
+  // (falling back to the current selection for org/project/app) and contains
+  // `perm`. This is the client mirror of the backend's `grant_applies` /
+  // `effective_permissions` (sauron-auth/src/rbac.rs) — a UI convenience that
+  // must never be MORE permissive than the server. Cascade: an org grant
+  // satisfies everything below it; a project grant satisfies its apps and
+  // their environments (not sibling projects); an app grant satisfies that
+  // app and every environment under it; an env grant satisfies only that one
+  // environment. A grant narrower than the check being made can never satisfy
+  // it — an env grant does NOT satisfy an app/project/org-level check.
+  //
+  // `env` is the one exception to the "falls back to the current selection"
+  // rule. org/project/app default from `currentOrgId`/`currentProjectId`/
+  // `currentAppId` because nearly every call site IS asking about the
+  // currently-selected org/project/app. That is not true of `env`: the large
+  // majority of `can()` calls (app:update, project:create, member:manage, …)
+  // are not environment-scoped questions at all, and the backend's own
+  // `authorize_org`/`authorize_project`/`authorize_app` always resolve with
+  // `env: None` — an env-scoped grant can NEVER satisfy them, no matter which
+  // environment happens to be selected. If `env` defaulted from
+  // `currentEnvId` here, a narrow env-scoped grant would silently leak into
+  // every one of those unrelated checks just because it happened to name the
+  // currently-selected environment — exactly the wrong-direction
+  // permissiveness this function must never have. A caller that wants an
+  // environment-scoped check must ask for one explicitly:
+  // `can('issue:read', { env: sessionStore.currentEnvId })`.
+  //
+  // `null` ("all environments") and the literal string `'none'`
+  // ("unattributed") are both not a real environment id, so neither can ever
+  // match an env-scoped grant — passing either behaves exactly like omitting
+  // `env` (the check falls back to whatever the org/project/app grants alone
+  // allow). This mirrors the backend's `effective_permissions_for_filter`,
+  // whose `All`/`Unattributed` arms are evaluated at `env: None` for the same
+  // reason: a permission held on one environment must not unlock behavior
+  // across "all" or "unattributed".
   // -------------------------------------------------------------------------
   can(perm: Permission, scope: CanScope = {}): boolean {
     if (!this.access) return false;
     const org = scope.org ?? this.currentOrgId ?? undefined;
     const project = scope.project ?? this.currentProjectId ?? undefined;
     const app = scope.app ?? this.currentAppId ?? undefined;
+    const env = scope.env && scope.env !== 'none' ? scope.env : undefined;
     return this.access.grants.some((g) => {
       const scopeMatch =
         (g.scope_type === 'org' && g.scope_id === org) ||
         (g.scope_type === 'project' && g.scope_id === project) ||
-        (g.scope_type === 'app' && g.scope_id === app);
+        (g.scope_type === 'app' && g.scope_id === app) ||
+        (g.scope_type === 'env' && env !== undefined && g.scope_id === env);
       return scopeMatch && g.permissions.includes(perm);
     });
   }
@@ -127,9 +165,33 @@ class SessionStore {
   // Loading
   // -------------------------------------------------------------------------
 
+  // The promise of a `load()` call currently in flight, or `null` if none is.
+  // `App.svelte`'s post-auth redirect (`push('/issues')`, which mounts a
+  // layout whose `onMount` calls `load()`) and `Login.svelte`'s own forced
+  // `load(true)` right after a successful sign-in can both fire within the
+  // same render pass — without this, both would start their own full
+  // bootstrap chain (`listOrgs` → `loadOrgScope` → `loadProjectApps` →
+  // `loadAppEnvironments`) concurrently, doubling every request in it. Same
+  // precedent as `loadAppEnvironments`'s `environmentsLoadAttemptedFor`
+  // marker (see its own doc comment): stamped synchronously, in `load()`
+  // itself, before the first `await` — assigning it any later would leave a
+  // window where a second call still sees `loadPromise` as `null` and starts
+  // its own chain anyway.
+  private loadPromise: Promise<void> | null = null;
+
   /** Load orgs + the current org's access/projects/apps. Caches after first call. */
   async load(force = false): Promise<void> {
     if (this.loaded && !force) return;
+    if (this.loadPromise) return this.loadPromise;
+    this.loadPromise = this.performLoad();
+    try {
+      await this.loadPromise;
+    } finally {
+      this.loadPromise = null;
+    }
+  }
+
+  private async performLoad(): Promise<void> {
     this.loading = true;
     try {
       const orgs = await listOrgs();
@@ -216,6 +278,15 @@ class SessionStore {
 
   /**
    * Active environments only — a retired one must never be selectable.
+   *
+   * No reach filtering happens here, and none should be added: `listEnvironments`
+   * (`GET /v1/apps/{id}/environments`) is already reach-filtered server-side
+   * (`routes/environments.rs::list_environments`, using `reach_for`/`perm::ENV_READ`)
+   * — a partial-reach caller gets back only the environments they hold a grant
+   * on, a full-reach caller gets the app's complete list. A client-side filter
+   * on top of that would be redundant at best and, the moment its rule drifted
+   * from the backend's, either hide environments the caller can see or (worse)
+   * show ones they can't.
    *
    * Records `environmentsLoadAttemptedFor` synchronously, before the network
    * round-trip, so any concurrent reader of `environments` (namely the

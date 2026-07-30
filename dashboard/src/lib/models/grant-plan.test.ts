@@ -10,6 +10,7 @@ import {
   planStripsLastOrgManage,
   type RoleBlock,
 } from './grant-plan';
+import { selectionToScopes } from './scope-tree';
 import type { MemberGrant, Permission, Role } from './index';
 
 const ORG = 'org-1';
@@ -17,11 +18,15 @@ const P_BILL = 'proj-billing';
 const P_PAY = 'proj-payments';
 const A_WEB = 'app-web';
 const A_IOS = 'app-ios';
+const E_WEB_STAGING = 'env-web-staging';
 
 // app -> project, exactly as the dialog builds it from appsByProject.
 const PROJECT_OF_APP: Record<string, string> = { [A_WEB]: P_BILL, [A_IOS]: P_PAY };
+// env -> app, exactly as the dialog would build it from appsByEnv.
+const APP_OF_ENV: Record<string, string> = { [E_WEB_STAGING]: A_WEB };
 const KNOWN_PROJECTS = new Set([P_BILL, P_PAY]);
 const KNOWN_APPS = new Set([A_WEB, A_IOS]);
+const KNOWN_ENVS = new Set([E_WEB_STAGING]);
 
 let seq = 0;
 function grant(over: Partial<MemberGrant> = {}): MemberGrant {
@@ -130,8 +135,8 @@ describe('grantsToBlocks', () => {
       KNOWN_APPS,
     );
     expect(blocks.map((b) => b.roleId)).toEqual(['r-viewer', 'r-admin']);
-    expect(blocks[0].selection).toEqual({ org: false, projects: [P_PAY], apps: [A_WEB] });
-    expect(blocks[1].selection).toEqual({ org: true, projects: [], apps: [] });
+    expect(blocks[0].selection).toEqual({ org: false, projects: [P_PAY], apps: [A_WEB], envs: [] });
+    expect(blocks[1].selection).toEqual({ org: true, projects: [], apps: [], envs: [] });
   });
 
   it('gives blocks a key that is not the role id, so re-roling keeps tree state', () => {
@@ -189,7 +194,7 @@ describe('planGrantChanges — additions', () => {
 
   it('emits no call for a role whose block is empty', () => {
     const blocks: RoleBlock[] = [
-      { key: 'k0', roleId: 'r-new', selection: { org: false, projects: [], apps: [] }, unmatched: [] },
+      { key: 'k0', roleId: 'r-new', selection: { org: false, projects: [], apps: [], envs: [] }, unmatched: [] },
     ];
     expect(planGrantChanges(blocks, [], ORG, PROJECT_OF_APP).additions).toEqual([]);
   });
@@ -293,8 +298,8 @@ describe('destructive-plan guards', () => {
 
   it('lists blocks left with nothing ticked', () => {
     const blocks: RoleBlock[] = [
-      { key: 'k0', roleId: 'r1', selection: { org: true, projects: [], apps: [] }, unmatched: [] },
-      { key: 'k1', roleId: 'r2', selection: { org: false, projects: [], apps: [] }, unmatched: [] },
+      { key: 'k0', roleId: 'r1', selection: { org: true, projects: [], apps: [], envs: [] }, unmatched: [] },
+      { key: 'k1', roleId: 'r2', selection: { org: false, projects: [], apps: [], envs: [] }, unmatched: [] },
     ];
     expect(emptyBlockKeys(blocks)).toEqual(['k1']);
   });
@@ -304,7 +309,7 @@ describe('destructive-plan guards', () => {
       {
         key: 'k0',
         roleId: 'r1',
-        selection: { org: false, projects: [], apps: [] },
+        selection: { org: false, projects: [], apps: [], envs: [] },
         unmatched: [grant()],
       },
     ];
@@ -388,5 +393,67 @@ describe('humanizeGrantError', () => {
 
   it('passes a message without a scope through untouched', () => {
     expect(humanizeGrantError('you do not have access', NAMES)).toBe('you do not have access');
+  });
+});
+
+describe('environment grants (the fourth level)', () => {
+  it('buckets an env grant into envs, not apps', () => {
+    // grantsToBlocks' final branch used to be a bare `else -> app`, so before
+    // this fix an env grant landed in selection.apps and was re-emitted on
+    // Save as scope_type:'app' carrying an ENVIRONMENT's uuid — writing a
+    // grant that points at nothing.
+    const grants = [grant({ scope_type: 'env', scope_id: E_WEB_STAGING })];
+    const blocks = grantsToBlocks(grants, ORG, KNOWN_PROJECTS, KNOWN_APPS, KNOWN_ENVS);
+    expect(blocks[0].selection.envs).toEqual([E_WEB_STAGING]);
+    expect(blocks[0].selection.apps).toEqual([]);
+    expect(blocks[0].unmatched).toEqual([]);
+  });
+
+  it('is a no-op when an env grant sits UNDER an already-granted app', () => {
+    // The regression this coverage-diff exists to prevent, one level lower
+    // than the app-under-project case it was originally written for.
+    const grants = [
+      grant({ scope_type: 'app', scope_id: A_WEB }),
+      grant({ scope_type: 'env', scope_id: E_WEB_STAGING }),
+    ];
+    const blocks = grantsToBlocks(grants, ORG, KNOWN_PROJECTS, KNOWN_APPS, KNOWN_ENVS);
+    const plan = planGrantChanges(blocks, grants, ORG, PROJECT_OF_APP, APP_OF_ENV);
+    expect(plan.additions).toEqual([]);
+    expect(plan.revocations).toEqual([]);
+  });
+
+  it('is a no-op when an env grant sits under an already-granted project', () => {
+    const grants = [
+      grant({ scope_type: 'project', scope_id: P_BILL }),
+      grant({ scope_type: 'env', scope_id: E_WEB_STAGING }),
+    ];
+    const blocks = grantsToBlocks(grants, ORG, KNOWN_PROJECTS, KNOWN_APPS, KNOWN_ENVS);
+    const plan = planGrantChanges(blocks, grants, ORG, PROJECT_OF_APP, APP_OF_ENV);
+    expect(plan.revocations).toEqual([]);
+  });
+
+  it('still revokes an env grant the user actually unticked', () => {
+    const grants = [grant({ scope_type: 'env', scope_id: E_WEB_STAGING })];
+    const blocks = grantsToBlocks(grants, ORG, KNOWN_PROJECTS, KNOWN_APPS, KNOWN_ENVS);
+    blocks[0].selection = { ...blocks[0].selection, envs: [] };
+    const plan = planGrantChanges(blocks, grants, ORG, PROJECT_OF_APP, APP_OF_ENV);
+    expect(plan.revocations.map((r) => r.id)).toEqual([grants[0].id]);
+  });
+
+  it('collapses an env under a ticked app to a single app scope', () => {
+    const sel = { org: false, projects: [], apps: [A_WEB], envs: [E_WEB_STAGING] };
+    expect(selectionToScopes(sel, ORG, PROJECT_OF_APP, APP_OF_ENV)).toEqual([
+      { scope_type: 'app', scope_id: A_WEB },
+    ]);
+  });
+
+  it('a fifth, unknown scope type lands in unmatched rather than being read as an app', () => {
+    // Pins the actual defect the env branch fixed: an exhaustive if/else-if
+    // chain ending in unmatched, not a bare `else -> app` that silently
+    // mis-buckets whatever scope_type it does not recognise.
+    const grants = [{ ...grant(), scope_type: 'future-level' as never, scope_id: 'x-1' }];
+    const blocks = grantsToBlocks(grants, ORG, KNOWN_PROJECTS, KNOWN_APPS, KNOWN_ENVS);
+    expect(blocks[0].selection.apps).toEqual([]);
+    expect(blocks[0].unmatched).toEqual(grants);
   });
 });

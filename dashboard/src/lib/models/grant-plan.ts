@@ -66,14 +66,25 @@ function scopeKey(scopeType: string, scopeId: string): string {
 /**
  * Seed one block per role the member holds, in first-seen order.
  *
- * `knownProjects` / `knownApps` are the ids the scope tree can actually draw;
- * anything outside them lands in `unmatched` rather than being dropped.
+ * `knownProjects` / `knownApps` / `knownEnvs` are the ids the scope tree can
+ * actually draw; anything outside them lands in `unmatched` rather than
+ * being dropped. `knownEnvs` defaults to empty so existing callers that
+ * predate environments keep compiling — every env grant they hand in simply
+ * lands in `unmatched` until they pass the set.
+ *
+ * The branch below is deliberately exhaustive rather than ending in a bare
+ * `else -> app`: a grant whose `scope_type` matches none of the four known
+ * levels lands in `unmatched` (visible and preserved) instead of being
+ * silently mis-bucketed as an app, carrying a uuid from some other level.
+ * That mis-bucketing is exactly what happened to 'env' before this branch
+ * existed — the bug this shape is built to not repeat for a fifth level.
  */
 export function grantsToBlocks(
   grants: MemberGrant[],
   orgId: string,
   knownProjects: ReadonlySet<string>,
   knownApps: ReadonlySet<string>,
+  knownEnvs: ReadonlySet<string> = new Set(),
 ): RoleBlock[] {
   const byRole = new Map<string, RoleBlock>();
 
@@ -83,7 +94,7 @@ export function grantsToBlocks(
       block = {
         key: `role-${byRole.size}-${g.role_id}`,
         roleId: g.role_id,
-        selection: { ...EMPTY_SELECTION, projects: [], apps: [] },
+        selection: { ...EMPTY_SELECTION, projects: [], apps: [], envs: [] },
         unmatched: [],
       };
       byRole.set(g.role_id, block);
@@ -97,9 +108,14 @@ export function grantsToBlocks(
     } else if (g.scope_type === 'project') {
       if (knownProjects.has(g.scope_id)) block.selection.projects.push(g.scope_id);
       else block.unmatched.push(g);
-    } else {
+    } else if (g.scope_type === 'app') {
       if (knownApps.has(g.scope_id)) block.selection.apps.push(g.scope_id);
       else block.unmatched.push(g);
+    } else if (g.scope_type === 'env') {
+      if (knownEnvs.has(g.scope_id)) block.selection.envs.push(g.scope_id);
+      else block.unmatched.push(g);
+    } else {
+      block.unmatched.push(g);
     }
   }
 
@@ -115,18 +131,36 @@ export function grantsToBlocks(
  * under one role seeds a selection that emits only [project:Billing]. Under
  * exact matching the app grant would fall into the revoke set, meaning merely
  * opening the dialog and pressing Save would delete a grant nobody touched.
+ *
+ * The same reasoning extends one level down for 'env': an env grant is
+ * covered by its app's key, by its app's project's key (via `appOfEnv`), or
+ * by the org key. Without this case, opening the dialog and pressing Save
+ * would revoke every env grant sitting under an already-granted app or
+ * project — the same regression this function exists to prevent, one level
+ * lower.
  */
 function isCovered(
   grant: MemberGrant,
   targets: ReadonlySet<string>,
   orgId: string,
   projectOfApp: Record<string, string>,
+  appOfEnv: Record<string, string>,
 ): boolean {
   if (targets.has(scopeKey('org', orgId))) return true;
   if (targets.has(scopeKey(grant.scope_type, grant.scope_id))) return true;
   if (grant.scope_type === 'app') {
     const parent = projectOfApp[grant.scope_id];
     if (parent !== undefined && targets.has(scopeKey('project', parent))) return true;
+  }
+  if (grant.scope_type === 'env') {
+    const parentApp = appOfEnv[grant.scope_id];
+    if (parentApp !== undefined) {
+      if (targets.has(scopeKey('app', parentApp))) return true;
+      const grandparentProject = projectOfApp[parentApp];
+      if (grandparentProject !== undefined && targets.has(scopeKey('project', grandparentProject))) {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -143,11 +177,12 @@ export function planGrantChanges(
   currentGrants: MemberGrant[],
   orgId: string,
   projectOfApp: Record<string, string>,
+  appOfEnv: Record<string, string> = {},
 ): GrantPlan {
   const targetsByRole = new Map<string, Set<string>>();
   for (const b of blocks) {
     const set = targetsByRole.get(b.roleId) ?? new Set<string>();
-    for (const s of selectionToScopes(b.selection, orgId, projectOfApp)) {
+    for (const s of selectionToScopes(b.selection, orgId, projectOfApp, appOfEnv)) {
       set.add(scopeKey(s.scope_type, s.scope_id));
     }
     targetsByRole.set(b.roleId, set);
@@ -181,7 +216,7 @@ export function planGrantChanges(
   for (const g of currentGrants) {
     if (preserved.has(g.id)) continue;
     const targets = targetsByRole.get(g.role_id);
-    if (targets && isCovered(g, targets, orgId, projectOfApp)) continue;
+    if (targets && isCovered(g, targets, orgId, projectOfApp, appOfEnv)) continue;
     revocations.push(g);
   }
 

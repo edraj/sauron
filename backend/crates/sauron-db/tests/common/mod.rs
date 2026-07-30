@@ -181,6 +181,19 @@ const FUNNEL_STEP_2: &str = "harness.funnel.step2";
 /// possible to assert. If this seed changes shape again, re-derive the
 /// exact offsets from `seed_two_envs`'s own timestamps rather than trusting
 /// the numbers named here or in that test.
+///
+/// **Task 8 moved item 1's offset a second time**, from `now - 45s` to
+/// `now - 30s` (on the error event only — `session_b0` stays at `now - 45s`),
+/// and gave that row an explicit `title`/`culprit` — see
+/// [`issue_shared`](Self::issue_shared)'s own doc comment for why. Consequence:
+/// `shared_distinct_id`'s single most recent `env_b` signal is now that error
+/// event alone (previously a tie with `session_b0`), so `shared_b.last_seen`
+/// / `user_b.last_seen` moved from `now - 45s` to `now - 30s` in
+/// `env_scoping.rs`'s `person_and_device_seen_and_identity_are_derived_per_
+/// environment` and `get_event_user_seen_is_derived_per_environment_not_app_
+/// wide` — both updated there. Nothing else in item 1/2 above changed:
+/// `session_b0` itself, `device_b`'s `now - 10s`, and every row count are
+/// exactly as this comment already described.
 // The three identity-string fields below (`shared_device_key`,
 // `distinct_id_env_b_only`, `device_key_env_b_only` — not the ids/counts, and
 // not `shared_distinct_id`, all of which already have a real reader in this
@@ -200,12 +213,60 @@ const FUNNEL_STEP_2: &str = "harness.funnel.step2";
 // those too.
 pub struct SeedIds {
     pub app_id: Uuid,
+    /// The org `seed_two_envs` creates (previously tracked only internally, on
+    /// `TestDb.org_id`, for `cleanup()`'s own use) — surfaced for Slice 3's
+    /// `role_grants` tests, which need a real `org_id` to insert a grant under.
+    pub org_id: Uuid,
+    /// Email of a real `users` row `seed_two_envs` creates alongside the org
+    /// (added for the same reason as `org_id`, above: Slice 3's `role_grants`
+    /// tests need a real user to grant a role to; `seed_two_envs` did not
+    /// create any user before this). Not otherwise a member of the org — no
+    /// `role_grants` row is seeded for it, so a test that needs one inserts
+    /// its own, as `env_scoping.rs`'s `role_grants_accepts_the_env_scope_type`
+    /// does.
+    pub owner_email: String,
     pub env_a: Uuid,
     pub env_b: Uuid,
     /// Spans all three buckets — 6 total error events, matching `times_seen`.
     pub issue_id: Uuid,
     /// Confined to `env_b` alone — 1 error event, `times_seen == 1`.
     pub issue_env_b_only: Uuid,
+    /// Task 8: the same underlying issue as [`issue_id`](Self::issue_id),
+    /// exposed under this second name because it is what Task 9's tests
+    /// address it by. Two of `issue_id`'s six `error_events` rows carry
+    /// explicit, deliberately different `title`/`culprit` per environment —
+    /// the shape Task 9's per-environment derivation reads:
+    ///   - env_a, `occurred_at = pinned_now + 5s`: `title = "TypeError:
+    ///     staging cart is empty"`, `culprit = "checkout (staging/cart.ts)"`
+    ///     (the `a-er-1` row). **Task 9 moved this offset** from the
+    ///     originally-planned `pinned_now - 240s` — see the inline comment
+    ///     at `a-er-1`'s `seed_error_event` call for why: three of env_a's
+    ///     other rows for this issue tie at the literal `pinned_now`, so a
+    ///     `- 240s` offset was NOT actually env_a's newest occurrence, and
+    ///     the per-environment `title`/`culprit` derivation (newest row by
+    ///     `occurred_at`, no other tiebreaker) silently picked one of those
+    ///     title-less rows instead and fell back to the app-wide string.
+    ///     `+ 5s` makes `a-er-1` the unambiguous newest env_a row for this
+    ///     issue without moving any other row.
+    ///   - env_b, `occurred_at = pinned_now - 30s`: `title = "TypeError:
+    ///     prod cart is empty"`, `culprit = "checkout (prod/cart.ts)"` (the
+    ///     `shared_distinct_id` row, same one F4 pinned for the
+    ///     person/device `last_seen` tests below). This is env_b's ONLY
+    ///     `error_events` row for this issue, so it is unambiguously env_b's
+    ///     newest regardless of the env_a offset above.
+    ///
+    /// `issues.title`/`culprit` for this issue (under `EnvFilter::All`,
+    /// which — unlike `One`/`Unattributed` — reads the stored `issues` row
+    /// rather than deriving from `error_events`) are set directly by the one
+    /// `upsert_issue` call for this issue, independent of either
+    /// `error_events` row's timestamp: the **env_b** strings, `"TypeError:
+    /// prod cart is empty"` / `"checkout (prod/cart.ts)"`. That is the fact
+    /// Task 9's `All`-scope assertions turn on. The other four `error_events`
+    /// rows for this issue (and every other seeded error event) keep
+    /// `title`/`culprit = None`, on purpose — that is the pre-migration-30 /
+    /// not-yet-scoped row shape Task 9's `COALESCE`-to-`issues` fallback has
+    /// to handle too.
+    pub issue_shared: Uuid,
     /// Present in `error_events` and `sessions` in both `env_a` and `env_b`.
     /// Has a real reader already (the committed test's `distinct_envs_for_identity`
     /// guard), unlike the three below — no `#[allow(dead_code)]` needed here.
@@ -238,6 +299,33 @@ pub struct SeedIds {
     /// Duration::seconds(n)`) instead of only a relative ordering. Added for
     /// F4's per-environment `first_seen`/`last_seen` tests, which need to
     /// name precise expected values, not just "earlier than" / "not equal to".
+    pub pinned_now: DateTime<Utc>,
+}
+
+/// The ids [`TestDb::seed_cross_env_session`] created.
+///
+/// Deliberately **separate** from [`SeedIds`]/[`TestDb::seed_two_envs`] — that
+/// fixture is depended on by every other test in this file, and this shape is
+/// a single, deliberately pathological session, not a general-purpose
+/// two-environment seed. It exists to make one specific bug externally
+/// observable: `bump_session`'s `ON CONFLICT` sets `environment_id =
+/// COALESCE(EXCLUDED.environment_id, sessions.environment_id)` (the most
+/// recent non-null value wins) while `errors_count` accumulates across every
+/// call regardless of which environment it carried. So a session can end up
+/// *labelled* one environment while its accumulated `errors_count` was
+/// incremented by a signal from a *different* one — see `bump_session`'s own
+/// doc comment, and Task 10's report
+/// (`.superpowers/sdd/2026-07-29-environment-rbac-scope/task-10-report.md`)
+/// for the read-side consequence and the measurement that decided whether to
+/// fix it.
+pub struct CrossEnvSessionIds {
+    pub app_id: Uuid,
+    pub env_a: Uuid,
+    pub env_b: Uuid,
+    /// The one pathological session: `sessions.environment_id` ends up
+    /// `env_a` (the last `bump_session` call to touch it carried `env_a`),
+    /// but its only `error_events` row is stamped `env_b`.
+    pub session_id: String,
     pub pinned_now: DateTime<Utc>,
 }
 
@@ -398,6 +486,15 @@ impl TestDb {
             .expect("create org");
         let _ = self.org_id.set(org.id);
 
+        // A real `users` row, for tests that need to grant a role to someone
+        // real (Slice 3's `role_grants` env-scope tests) rather than a bare
+        // random uuid that no foreign key would accept. Not itself granted
+        // any role here — that stays the caller's job.
+        let owner_email = format!("harness-owner-{suffix}@example.com");
+        repo::create_user(&mut conn, &owner_email, "harness-hash", "Harness Owner")
+            .await
+            .expect("create harness owner user");
+
         let project = repo::create_project(
             &mut conn,
             org.id,
@@ -464,14 +561,39 @@ impl TestDb {
         // `issue_id` spans all three buckets (6 error events total, matching
         // `times_seen`); `issue_env_b_only` is confined to `env_b` alone (1
         // error event). See `SeedIds`'s doc comment for the exact split.
+        //
+        // Task 8: `title`/`culprit` set here to the env_b string
+        // ("TypeError: prod cart is empty" / "checkout (prod/cart.ts)")
+        // rather than a generic placeholder — this is the one `upsert_issue`
+        // call for this issue (the per-row `seed_error_event` calls below
+        // insert directly and never call `upsert_issue` again), so whatever
+        // is written here is exactly what production's "last occurrence
+        // processed wins" `upsert_issue` semantics would leave on the row if
+        // env_b's occurrence were the one actually processed through the
+        // real ingest path last. This literal is independent of either
+        // `error_events` row's own `occurred_at` (the seed never calls
+        // `upsert_issue` per-row the way real ingest does) — including
+        // `a-er-1`'s Task-9 retime to `pinned_now + 5s`, below, which is
+        // about giving `error_events`' own per-environment derivation an
+        // unambiguous newest row within env_a, not about which environment
+        // "wins" this already-fixed, hardcoded app-wide column.
+        // `times_seen` deliberately stays untouched by this — it is not
+        // derived from these two strings, and a second
+        // `upsert_issue` call here would have incremented it to 7 and broken
+        // every `times_seen == 6` / `issue_id_count.n == 6` assertion in
+        // `env_scoping.rs` for no reason, since both title/culprit-bearing
+        // rows are two of the six already accounted for below, not new
+        // occurrences. No test in `env_scoping.rs` asserted the previous
+        // placeholder string ("harness seeded issue"), so this change moved
+        // no existing assertion.
         let issue_id = repo::upsert_issue(
             &mut conn,
             NewIssue {
                 app_id: app.id,
                 fingerprint: "harness-fingerprint",
                 type_: "Error",
-                title: "harness seeded issue",
-                culprit: "harness::seed_two_envs",
+                title: "TypeError: prod cart is empty",
+                culprit: "checkout (prod/cart.ts)",
                 level: "error",
                 first_seen: far_past(),
                 last_seen: Utc::now(),
@@ -706,8 +828,42 @@ impl TestDb {
             &shared_device_key,
             SCREEN_HOME,
             now,
+            None,
+            None,
         )
         .await;
+        // Task 8: this is `issue_shared`'s env_a occurrence (see `SeedIds`'s
+        // doc comment on `issue_shared`) — `a-er-1` is otherwise a
+        // single-purpose, error-only identity with no other row anywhere in
+        // the seed, so retiming it and giving it a title/culprit touches no
+        // other assertion.
+        //
+        // Task 9 moved the offset a second time, from `now - 240s` to
+        // `now + 5s`, after live-database testing caught a real gap: Task
+        // 8's own `now - 240s` is NOT env_a's newest occurrence for
+        // `issue_id` — three of env_a's other four `error_events` rows for
+        // this issue (the plain `shared_distinct_id` row above, the
+        // `distinct_id_cross_env` row, and `a-er-3`, below) all land on the
+        // literal `now`, strictly *after* `now - 240s`. Task 9's per-
+        // environment `title`/`culprit` derivation picks the single newest
+        // row by `occurred_at DESC LIMIT 1` with no other tiebreaker, so
+        // with the old offset it silently picked one of those three
+        // title-less `now` rows instead of `a-er-1`, `COALESCE`d down to
+        // the app-wide `issues.title`, and made `One(env_a)` and
+        // `One(env_b)` show the byte-identical string — reproduced live:
+        // `issue_title_culprit_and_level_are_derived_per_environment`
+        // failed with `left: "TypeError: prod cart is empty" right:
+        // "TypeError: prod cart is empty"` before this change. Moving
+        // `a-er-1` *forward* past `now` (rather than the three untitled
+        // rows further back) makes it the unambiguous newest env_a row
+        // for this issue while touching only this single, single-purpose
+        // identity — the three other rows, and every identity/last_seen
+        // assertion that depends on them (`shared_distinct_id`'s own
+        // env_a `last_seen` in particular), are untouched. Still
+        // deliberately far from `issue_shared`'s env_b occurrence below
+        // (`now - 30s`) so which one is newer is unambiguous, and well
+        // inside the noon-UTC anchor's day-boundary safety margin (see
+        // `now`'s own doc comment above).
         seed_error_event(
             &mut conn,
             app.id,
@@ -717,7 +873,9 @@ impl TestDb {
             &format!("harness-user-{suffix}-a-er-1"),
             &format!("harness-device-{suffix}-a-er-1"),
             SCREEN_CHECKOUT,
-            now,
+            now + chrono::Duration::seconds(5),
+            Some("TypeError: staging cart is empty"),
+            Some("checkout (staging/cart.ts)"),
         )
         .await;
         seed_error_event(
@@ -735,6 +893,8 @@ impl TestDb {
             &device_key_cross_env,
             SCREEN_HOME,
             now,
+            None,
+            None,
         )
         .await;
         seed_error_event(
@@ -747,6 +907,8 @@ impl TestDb {
             &format!("harness-device-{suffix}-a-er-3"),
             SCREEN_CHECKOUT,
             now,
+            None,
+            None,
         )
         .await;
 
@@ -763,6 +925,23 @@ impl TestDb {
         // fed the LATERAL would have gone undetected. `first_seen` already
         // discriminated without this (env_a's earliest analytics row predates
         // env_b's earliest session by seed construction), but `last_seen` did not.
+        //
+        // Task 8 moved the offset again, from `now - 45s` to `now - 30s`, and
+        // added a title/culprit: this is also `issue_shared`'s env_b
+        // occurrence (see `SeedIds`'s doc comment on `issue_shared`) — the
+        // one and only `error_events` row for this issue in env_b, so it is
+        // unambiguously env_b's newest regardless of env_a's own offset
+        // (`a-er-1`, retimed again by Task 9 — see that row's own comment).
+        // `issues.title`/`culprit` themselves come from the single, literal
+        // `upsert_issue` call above, independent of any row's `occurred_at`;
+        // this row's timestamp only governs the per-environment *derivation*
+        // Task 9 reads (`error_events.title`/`culprit`), not the stored
+        // app-wide column. `session_b0` below is NOT moved —
+        // it stays at `now - 45s` — so this row (not the session) is now
+        // `shared_distinct_id`'s single most recent env_b signal, which bumps
+        // `shared_b.last_seen`/`user_b.last_seen` in `env_scoping.rs` from
+        // `now - 45s` to `now - 30s` (both updated there; see this task's
+        // report for the exact before/after).
         seed_error_event(
             &mut conn,
             app.id,
@@ -772,7 +951,9 @@ impl TestDb {
             &shared_distinct_id,
             &shared_device_key,
             SCREEN_HOME,
-            now - chrono::Duration::seconds(45),
+            now - chrono::Duration::seconds(30),
+            Some("TypeError: prod cart is empty"),
+            Some("checkout (prod/cart.ts)"),
         )
         .await;
         // F4: device_key repointed from this row's "own" `device_key_env_b_only`
@@ -805,6 +986,8 @@ impl TestDb {
             &shared_device_key,
             SCREEN_CHECKOUT,
             now - chrono::Duration::seconds(10),
+            None,
+            None,
         )
         .await;
 
@@ -818,6 +1001,8 @@ impl TestDb {
             &format!("harness-device-{suffix}-none-er-0"),
             SCREEN_HOME,
             now,
+            None,
+            None,
         )
         .await;
 
@@ -964,16 +1149,216 @@ impl TestDb {
 
         SeedIds {
             app_id: app.id,
+            org_id: org.id,
+            owner_email,
             env_a,
             env_b,
             issue_id,
             issue_env_b_only,
+            issue_shared: issue_id,
             shared_distinct_id,
             shared_device_key,
             distinct_id_env_b_only,
             device_key_env_b_only,
             session_only_distinct_id,
             session_only_device_key,
+            pinned_now: now,
+        }
+    }
+
+    /// Seed one org → project → app → two environments, then a single
+    /// pathological `(app_id, session_id)` row — see [`CrossEnvSessionIds`]'s
+    /// own doc comment for why this is its own fixture.
+    ///
+    /// Sequence, mirroring what two real ingested signals for the same
+    /// session id, minutes apart, in two different environments, would leave
+    /// behind:
+    ///
+    /// 1. `bump_session(environment_id: Some(env_b), errors_delta: 1)` — the
+    ///    INSERT branch (first touch of this session id): `environment_id =
+    ///    env_b`, `errors_count = 1`. Immediately followed by the matching
+    ///    `error_events` row real ingest would have written alongside it —
+    ///    `environment_id: Some(env_b)`, `session_id` pointing at this same
+    ///    session — the session's ONLY error occurrence, anywhere.
+    /// 2. `bump_session(environment_id: Some(env_a), errors_delta: 0)` — the
+    ///    ON CONFLICT branch: `errors_count = 1 + 0 = 1` (unchanged — no new
+    ///    error), but `environment_id = COALESCE(Some(env_a),
+    ///    sessions.environment_id) = env_a` (changed — a non-null value always
+    ///    overwrites). This is the "device repointed from staging to prod
+    ///    without a fresh session id" shape `events_for_session`'s doc comment
+    ///    names.
+    ///
+    /// Final state: `sessions.environment_id = env_a`, `sessions.errors_count
+    /// = 1`, and the only `error_events` row for this session carries
+    /// `environment_id = env_b`. A reader that trusts the session's own label
+    /// (`errors_count > 0 AND environment_id = env_a`) counts this session as
+    /// crashed in `env_a`, which never saw the error.
+    pub async fn seed_cross_env_session(&self) -> CrossEnvSessionIds {
+        let mut conn = self.conn().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        let org = repo::create_org(
+            &mut conn,
+            "harness cross-env org",
+            &format!("harness-cross-org-{suffix}"),
+        )
+        .await
+        .expect("create org");
+        let _ = self.org_id.set(org.id);
+
+        let project = repo::create_project(
+            &mut conn,
+            org.id,
+            "harness cross-env project",
+            &format!("harness-cross-project-{suffix}"),
+        )
+        .await
+        .expect("create project");
+
+        let app = repo::create_app(
+            &mut conn,
+            project.id,
+            "harness cross-env app",
+            &format!("harness-cross-app-{suffix}"),
+            "web",
+        )
+        .await
+        .expect("create app");
+
+        let env_a = repo::create_environment(
+            &mut conn,
+            app.id,
+            "env_a",
+            &format!("pk_test_cross_a_{suffix}"),
+            true,
+        )
+        .await
+        .expect("create env_a")
+        .id;
+        let env_b = repo::create_environment(
+            &mut conn,
+            app.id,
+            "env_b",
+            &format!("pk_test_cross_b_{suffix}"),
+            false,
+        )
+        .await
+        .expect("create env_b")
+        .id;
+
+        // Pinned to today's date at a fixed mid-day time-of-day — see
+        // `seed_two_envs`'s own `now` local for why (day-bucket straddling).
+        let now = Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("valid noon time")
+            .and_utc();
+        let error_at = now - chrono::Duration::seconds(120);
+
+        let session_id = format!("harness-session-{suffix}-cross");
+        let distinct_id = format!("harness-user-{suffix}-cross");
+        let device_key = format!("harness-device-{suffix}-cross");
+        let fingerprint = format!("harness-cross-fingerprint-{suffix}");
+
+        let issue_id = repo::upsert_issue(
+            &mut conn,
+            NewIssue {
+                app_id: app.id,
+                fingerprint: &fingerprint,
+                type_: "Error",
+                title: "TypeError: cross-env session error",
+                culprit: "checkout (cross/cart.ts)",
+                level: "error",
+                first_seen: error_at,
+                last_seen: error_at,
+                times_seen: 1,
+            },
+        )
+        .await
+        .expect("upsert issue");
+
+        // 1. Establish the row under env_b, with its one and only error.
+        repo::bump_session(
+            &mut conn,
+            app.id,
+            &session_id,
+            Some(&distinct_id),
+            Some(&device_key),
+            error_at,
+            &json!({}),
+            None,
+            Some(env_b),
+            None,
+            1,
+            1,
+        )
+        .await
+        .expect("bump session (env_b, errors_delta=1)");
+
+        repo::insert_error_event(
+            &mut conn,
+            NewErrorEvent {
+                id: Uuid::new_v4(),
+                app_id: app.id,
+                environment_id: Some(env_b),
+                issue_id,
+                fingerprint: fingerprint.clone(),
+                level: "error".into(),
+                message: "harness cross-env error".into(),
+                exception_type: "HarnessError".into(),
+                exception_value: "seeded".into(),
+                stacktrace: json!([]),
+                breadcrumbs: json!([]),
+                context: json!({}),
+                tags: json!({}),
+                release: None,
+                distinct_id: Some(distinct_id.clone()),
+                event_user: None,
+                sdk: None,
+                ip_address: None,
+                occurred_at: error_at,
+                session_id: Some(session_id.clone()),
+                device_key: Some(device_key.clone()),
+                screen: None,
+                stacktrace_symbolicated: None,
+                symbolication_status: "not_applicable".into(),
+                debug_meta: None,
+                contexts: json!({}),
+                extra: json!({}),
+                handled: Some(true),
+                title: None,
+                culprit: None,
+            },
+        )
+        .await
+        .expect("insert error event");
+
+        // 2. A later, ordinary (no new error) signal from the SAME session
+        // id, this time attributed to env_a. `errors_delta: 0` leaves
+        // `errors_count` at 1 (the env_b error, unchanged); `environment_id`
+        // flips to env_a via `bump_session`'s COALESCE.
+        repo::bump_session(
+            &mut conn,
+            app.id,
+            &session_id,
+            None,
+            None,
+            now,
+            &json!({}),
+            None,
+            Some(env_a),
+            None,
+            1,
+            0,
+        )
+        .await
+        .expect("bump session (env_a, errors_delta=0)");
+
+        CrossEnvSessionIds {
+            app_id: app.id,
+            env_a,
+            env_b,
+            session_id,
             pinned_now: now,
         }
     }
@@ -1075,6 +1460,12 @@ async fn seed_analytics_event(
 
 /// Insert one `error_events` row and register its identity, same rationale as
 /// [`seed_analytics_event`].
+///
+/// `title`/`culprit` default to `None` for every call except the two Task 8
+/// wires deliberately: `None` exercises the pre-migration-30 / not-yet-scoped
+/// row shape Task 9's `COALESCE`-to-`issues` fallback has to handle, so most
+/// of the seed is left that way on purpose rather than backfilled to match
+/// real ingest.
 #[allow(clippy::too_many_arguments)]
 async fn seed_error_event(
     conn: &mut sauron_db::PgConn,
@@ -1086,6 +1477,8 @@ async fn seed_error_event(
     device_key: &str,
     screen: &str,
     occurred_at: DateTime<Utc>,
+    title: Option<&str>,
+    culprit: Option<&str>,
 ) {
     repo::insert_error_event(
         conn,
@@ -1118,6 +1511,8 @@ async fn seed_error_event(
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: title.map(str::to_string),
+            culprit: culprit.map(str::to_string),
         },
     )
     .await

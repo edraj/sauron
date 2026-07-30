@@ -3,8 +3,9 @@ mod common;
 use chrono::{Duration, Utc};
 use common::{count_in_env, count_rows, distinct_envs_for_identity, far_past, TestDb};
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Uuid as SqlUuid};
+use diesel::sql_types::{BigInt, Text, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
+use sauron_auth::{authorize_env_read, perm, AuthError};
 use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewTransaction};
 use sauron_db::scope::{EnvFilter, ReadScope};
 use serde_json::json;
@@ -276,6 +277,8 @@ async fn seed_cross_env_session_child_rows(
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -654,8 +657,27 @@ async fn top_events_counts_only_the_selected_environment() {
     assert_eq!(all_total, 11, "All includes the unattributed row");
 
     // env_a and env_b both hold 5 analytics rows, so this total alone cannot tell a
-    // correct filter from a swapped one. Assert the per-name breakdown differs too:
-    // the seed gives the two environments different event-name mixes.
+    // correct filter from a swapped one. Task 15 (F9,
+    // `.superpowers/sdd/s2-final-review.md`): a bare `assert_ne!(a, b)` here would
+    // pass for ANY difference, including a swapped filter that still produced *some*
+    // other wrong-but-different breakdown — so assert each environment's exact
+    // name→count map instead. Collected into a `BTreeMap` rather than compared as the
+    // raw `ORDER BY count DESC` vecs: several names tie at count 1 within one
+    // environment, and Postgres does not guarantee tie order without a secondary
+    // `ORDER BY` key, which would make a vec-order comparison flaky.
+    let a_map: std::collections::BTreeMap<String, i64> =
+        a.iter().map(|r| (r.name.clone(), r.count)).collect();
+    assert_eq!(
+        a_map,
+        std::collections::BTreeMap::from([
+            ("$screen".to_string(), 1),
+            ("harness.event".to_string(), 1),
+            ("harness.funnel.step1".to_string(), 2),
+            ("harness.funnel.step2".to_string(), 1),
+        ]),
+        "env_a's exact name→count map"
+    );
+
     let b = sauron_db::repo::top_events(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
@@ -664,9 +686,17 @@ async fn top_events_counts_only_the_selected_environment() {
     )
     .await
     .unwrap();
-    assert_ne!(
-        a, b,
-        "env_a and env_b must differ by name mix, not just by total"
+    let b_map: std::collections::BTreeMap<String, i64> =
+        b.iter().map(|r| (r.name.clone(), r.count)).collect();
+    assert_eq!(
+        b_map,
+        std::collections::BTreeMap::from([
+            ("$screen".to_string(), 2),
+            ("harness.funnel.step1".to_string(), 1),
+            ("harness.funnel.step2".to_string(), 2),
+        ]),
+        "env_b's exact name→count map — different keys AND counts from env_a, not just a \
+         different total"
     );
 
     let none = sauron_db::repo::top_events(
@@ -1237,6 +1267,23 @@ async fn user_stats_covers_only_the_selected_environment() {
         "same 5 — all clear far_past()'s bound"
     );
     assert_eq!(a.new_in_range, 5);
+    // Task 15 (F9): `wau`/`mau`/`median_session_ms` each carry their own `{env_sql}`
+    // interpolation (repo.rs) independent of `dau`/`avg_session_ms`'s, and none was
+    // asserted before this — a regression that widened `wau`'s window and dropped its
+    // own `{env_sql}` (or a bind-index slip on `median_session_ms`'s `percentile_cont`
+    // sub-select) would have stayed green. Every seeded row lands within minutes of
+    // `pinned_now`, so `wau`/`mau` (7-/30-day rolling windows off real `now()`, per
+    // the doc comment above — `since` does not bound them) see the identical
+    // identities `dau`'s 1-day window does; `median_session_ms` of env_a's three
+    // symmetric session durations (60000/120000/180000ms) lands on the same 120000
+    // as the mean.
+    assert_eq!(a.wau, 4);
+    assert_eq!(a.mau, 4);
+    assert!(
+        (a.median_session_ms - 120000.0).abs() < 1e-9,
+        "env_a session-duration median: {}",
+        a.median_session_ms
+    );
 
     let b = sauron_db::repo::user_stats(
         &mut conn,
@@ -1257,6 +1304,13 @@ async fn user_stats_covers_only_the_selected_environment() {
     );
     assert_eq!(b.active_in_range, 3);
     assert_eq!(b.new_in_range, 3);
+    assert_eq!(b.wau, 3);
+    assert_eq!(b.mau, 3);
+    assert!(
+        (b.median_session_ms - 400000.0).abs() < 1e-9,
+        "env_b session-duration median (300000/400000/500000ms, symmetric like env_a): {}",
+        b.median_session_ms
+    );
 
     let none = sauron_db::repo::user_stats(
         &mut conn,
@@ -1272,6 +1326,13 @@ async fn user_stats_covers_only_the_selected_environment() {
     );
     assert_eq!(none.active_in_range, 2);
     assert_eq!(none.new_in_range, 2);
+    assert_eq!(none.wau, 2);
+    assert_eq!(none.mau, 2);
+    assert!(
+        (none.median_session_ms - 200000.0).abs() < 1e-9,
+        "the lone unattributed session's own 200000ms duration: {}",
+        none.median_session_ms
+    );
 
     let all = sauron_db::repo::user_stats(&mut conn, ReadScope::all(ids.app_id), far_past())
         .await
@@ -1286,6 +1347,11 @@ async fn user_stats_covers_only_the_selected_environment() {
     );
     assert_eq!(all.active_in_range, 8);
     assert_eq!(all.new_in_range, 8);
+    assert_eq!(
+        all.wau, 7,
+        "same double-counting shape as dau, not 5+3+2=10"
+    );
+    assert_eq!(all.mau, 7);
 
     drop(conn);
     db.cleanup().await;
@@ -1404,6 +1470,17 @@ async fn session_stats_covers_only_the_selected_environment() {
         "the field that actually discriminates: {}",
         a.avg_session_ms
     );
+    // Task 15 (F9): `median_session_ms` carries its own `{env_sql}` interpolation,
+    // separate from `avg_session_ms`'s, and was never asserted before this — a
+    // regression that dropped just this sub-select's predicate would have leaked the
+    // app-wide median (200000ms, the middle of all 7 sessions' durations sorted) into
+    // a One(env_a) read undetected. env_a's three durations (60000/120000/180000ms)
+    // are symmetric, so the median coincides with the mean asserted above.
+    assert!(
+        (a.median_session_ms - 120000.0).abs() < 1e-9,
+        "env_a session-duration median, not the app-wide 200000: {}",
+        a.median_session_ms
+    );
 
     let b = sauron_db::repo::session_stats(
         &mut conn,
@@ -1419,6 +1496,11 @@ async fn session_stats_covers_only_the_selected_environment() {
         "{}",
         b.avg_session_ms
     );
+    assert!(
+        (b.median_session_ms - 400000.0).abs() < 1e-9,
+        "env_b session-duration median (300000/400000/500000ms, symmetric like env_a): {}",
+        b.median_session_ms
+    );
 
     let none = sauron_db::repo::session_stats(
         &mut conn,
@@ -1429,6 +1511,11 @@ async fn session_stats_covers_only_the_selected_environment() {
     .unwrap();
     assert_eq!(none.sessions, 1);
     assert_eq!(none.crashed, 0);
+    assert!(
+        (none.median_session_ms - 200000.0).abs() < 1e-9,
+        "the lone unattributed session's own 200000ms duration: {}",
+        none.median_session_ms
+    );
 
     let all = sauron_db::repo::session_stats(&mut conn, ReadScope::all(ids.app_id), far_past())
         .await
@@ -1438,6 +1525,104 @@ async fn session_stats_covers_only_the_selected_environment() {
         "All must equal the sum of the parts, including unattributed"
     );
     assert_eq!(all.crashed, 2);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `bump_session` folds every signal into one row per `(app_id, session_id)` and
+/// sets `environment_id = COALESCE(EXCLUDED.environment_id, sessions.environment_id)`
+/// — the most recent non-null value wins — while `errors_count` accumulates across
+/// every environment that ever touched this session id. So a session labelled
+/// `env_a` can carry an `errors_count` incremented by an `env_b` error, and
+/// `crashed`/`crashed_sessions` count it under the label's environment even though
+/// that environment never saw the error. See `bump_session`'s own doc comment and
+/// `common::CrossEnvSessionIds`'s doc comment for the exact shape.
+///
+/// MEASURED AND DECLINED — see Task 10's report
+/// (`.superpowers/sdd/2026-07-29-environment-rbac-scope/task-10-report.md`) for the
+/// full `EXPLAIN (ANALYZE, BUFFERS)` numbers. The `EXISTS` semi-join this test
+/// requires (deriving `crashed` from `error_events` instead of the accumulated
+/// `errors_count` column) cost roughly 11x the column predicate's total planning +
+/// execution time on the largest dev app's session table (~1000 sessions), even
+/// with a purpose-built `error_events (app_id, session_id, environment_id)` index
+/// — the index barely moved the number, because the cost is structural: a
+/// correlated per-session subquery re-probed against all 22 `error_events`
+/// partitions (partition pruning cannot help, since neither `session_id` nor
+/// `environment_id` is the partition key). Left `#[ignore]`d rather than deleted so
+/// the documented gap stays visible and re-runnable if a future task revisits this
+/// with a cheaper derivation.
+#[tokio::test]
+#[ignore = "measured+declined: EXISTS semi-join costs ~11x the column predicate on \
+            the dev app even with a dedicated index (structural, not missing-index \
+            cost) — see task-10-report.md. Fix not shipped; bump_session's doc \
+            comment documents the read-side consequence instead."]
+async fn crashed_sessions_are_counted_only_in_the_environment_that_crashed() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_cross_env_session().await;
+    let mut conn = db.conn().await;
+    let since = ids.pinned_now - Duration::days(30);
+
+    // The fixture itself, before trusting any derived count: the row's own
+    // label is env_a, its errors_count is 1, and it is unreachable under
+    // env_b's own scope filter even though env_b is where the error happened
+    // — the exact shape `CrossEnvSessionIds`'s doc comment describes.
+    let labelled_a = sauron_db::repo::get_session(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        &ids.session_id,
+    )
+    .await
+    .unwrap()
+    .expect("session must be visible under env_a, its own label");
+    assert_eq!(labelled_a.environment_id, Some(ids.env_a));
+    assert_eq!(labelled_a.errors_count, 1);
+    assert!(
+        sauron_db::repo::get_session(
+            &mut conn,
+            ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+            &ids.session_id,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "the session's own label is env_a, not env_b, despite env_b owning the error"
+    );
+
+    let a = sauron_db::repo::session_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        since,
+    )
+    .await
+    .unwrap();
+    let b = sauron_db::repo::session_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        since,
+    )
+    .await
+    .unwrap();
+
+    // The shared session errored ONLY in env_b.
+    assert_eq!(b.crashed, 1, "env_b saw the error and must count the crash");
+    assert_eq!(
+        a.crashed, 0,
+        "env_a never saw an error on this session and must not count it as crashed"
+    );
+
+    // Same for the overview card, which reads a different query.
+    let ov_a = sauron_db::repo::overview_totals(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        since,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ov_a.crashed_sessions, 0);
 
     drop(conn);
     db.cleanup().await;
@@ -2603,10 +2788,11 @@ async fn get_event_user_and_get_device_are_scoped_by_membership() {
         (EnvFilter::One(ids.env_b), true),
         (EnvFilter::Unattributed, false),
     ] {
-        let scope = ReadScope::new(ids.app_id, env);
-        let user = sauron_db::repo::get_event_user(&mut conn, scope, &ids.shared_distinct_id)
-            .await
-            .unwrap();
+        let scope = ReadScope::new(ids.app_id, env.clone());
+        let user =
+            sauron_db::repo::get_event_user(&mut conn, scope.clone(), &ids.shared_distinct_id)
+                .await
+                .unwrap();
         assert_eq!(
             user.is_some(),
             expect_present,
@@ -2811,6 +2997,23 @@ async fn events_and_errors_for_person_and_device_are_scoped_directly() {
     // onto `shared_device_key` (see `SeedIds`'s doc comment) — `errors_for_device`
     // reads `error_events` directly by `device_key`, so it picks up both rows.
     assert_eq!(device_errors_b.len(), 2);
+    // Task 15 (F9): no earlier test exercised `errors_for_device` under `All` — add
+    // it. `shared_device_key` has no unattributed `error_events` row (that bucket's
+    // one row is on a different, `none`-prefixed device_key), so `All` must be
+    // exactly env_a's 1 plus env_b's 2, with no double-count and no missing row.
+    let device_errors_all = sauron_db::repo::errors_for_device(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &ids.shared_device_key,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        device_errors_all.len(),
+        3,
+        "All = env_a's 1 + env_b's 2 (repointed); no unattributed errors on this device_key"
+    );
 
     drop(conn);
     db.cleanup().await;
@@ -2898,8 +3101,10 @@ async fn person_and_device_seen_and_identity_are_derived_per_environment() {
     );
     assert_eq!(
         shared_b.last_seen,
-        now - Duration::seconds(45),
-        "env_b's most recent signal is its own error/session tie at now - 45s"
+        now - Duration::seconds(30),
+        "env_b's most recent signal is its own error event, now at now - 30s (Task 8: retimed \
+         off session_b0's now - 45s to also carry issue_shared's env_b title/culprit — see \
+         SeedIds' doc comment)"
     );
     // The whole point: under the old app-wide `eu.first_seen`/`eu.last_seen`
     // read, all four of the values above would have been identical regardless
@@ -3040,7 +3245,11 @@ async fn get_event_user_seen_is_derived_per_environment_not_app_wide() {
     .unwrap()
     .expect("shared_distinct_id must resolve under One(env_b)");
     assert_eq!(user_b.first_seen, now - Duration::seconds(345));
-    assert_eq!(user_b.last_seen, now - Duration::seconds(45));
+    // Task 8 retimed this occurrence from now - 45s to now - 30s (see
+    // SeedIds' doc comment on `issue_shared`) — must agree with
+    // `person_and_device_seen_and_identity_are_derived_per_environment`'s
+    // `shared_b.last_seen`.
+    assert_eq!(user_b.last_seen, now - Duration::seconds(30));
 
     // The whole point: under the old app-wide `eu.first_seen`/`eu.last_seen`
     // read, `user_a` and `user_b` would have been identical regardless of
@@ -3310,6 +3519,8 @@ async fn list_issues_filters_tag_and_free_text_compose_with_scope() {
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -3320,7 +3531,7 @@ async fn list_issues_filters_tag_and_free_text_compose_with_scope() {
     // Plain column filters (level eq, times_seen gt) — bind types Text/BigInt.
     let by_level = sauron_db::repo::list_issues(
         &mut conn,
-        scope_a,
+        scope_a.clone(),
         &[ParsedFilter {
             field: "level",
             op: Op::Eq,
@@ -3345,7 +3556,7 @@ async fn list_issues_filters_tag_and_free_text_compose_with_scope() {
     // tag:eq — own EXISTS sub-bind (Jsonb).
     let by_tag_eq = sauron_db::repo::list_issues(
         &mut conn,
-        scope_a,
+        scope_a.clone(),
         &[ParsedFilter {
             field: "tag",
             op: Op::Eq,
@@ -3363,7 +3574,7 @@ async fn list_issues_filters_tag_and_free_text_compose_with_scope() {
     // tag:contains — two EXISTS sub-binds (Text key, Text ILIKE pattern).
     let by_tag_contains = sauron_db::repo::list_issues(
         &mut conn,
-        scope_a,
+        scope_a.clone(),
         &[ParsedFilter {
             field: "tag",
             op: Op::Contains,
@@ -3479,6 +3690,8 @@ async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own()
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -3519,6 +3732,8 @@ async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own()
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -3666,6 +3881,8 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -3702,6 +3919,8 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -3775,6 +3994,8 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -3977,6 +4198,31 @@ async fn issue_detail_reads_are_scoped_by_environment() {
     .unwrap()
     .expect("issue_id has one env_b error event");
     assert_eq!(latest_b.environment_id, Some(ids.env_b));
+
+    // Task 15 (F9, `.superpowers/sdd/s2-final-review.md`): `latest_b` above scopes to
+    // env_b, where `issue_id` has only ONE occurrence — `ORDER BY occurred_at DESC
+    // LIMIT 1` is trivial there and pins no actual ordering. env_a has FOUR
+    // occurrences for `issue_id`, so scope there instead: the true latest is
+    // `a-er-1` (Task 9's retime to `pinned_now + 5s` — see `SeedIds`' doc comment on
+    // `issue_shared`), strictly after the other three env_a rows, which all land on
+    // the literal `pinned_now`. A regression that picked any of those three instead
+    // (e.g. an unstable tie-break, or a predicate that silently widened past env_a)
+    // would return a row at `pinned_now`, not `pinned_now + 5s`.
+    let latest_a = sauron_db::repo::latest_error_event(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        ids.issue_id,
+    )
+    .await
+    .unwrap()
+    .expect("issue_id has four env_a error events");
+    assert_eq!(latest_a.environment_id, Some(ids.env_a));
+    assert_eq!(
+        latest_a.occurred_at,
+        ids.pinned_now + Duration::seconds(5),
+        "the true latest of env_a's four occurrences, not a tie among the other three"
+    );
+
     let latest_b_only_under_a = sauron_db::repo::latest_error_event(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
@@ -4074,6 +4320,8 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -4112,6 +4360,8 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
             contexts: json!({}),
             extra: json!({"prod_secret": "ACME-INTERNAL-42"}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -4121,9 +4371,10 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
     let scope_b = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b));
 
     // Sanity: the issue really is a genuine env_a member (no filter/q).
-    let plain_a = sauron_db::repo::list_issues(&mut conn, scope_a, &[], None, far_past(), 50, 0)
-        .await
-        .unwrap();
+    let plain_a =
+        sauron_db::repo::list_issues(&mut conn, scope_a.clone(), &[], None, far_past(), 50, 0)
+            .await
+            .unwrap();
     assert!(
         plain_a.iter().any(|i| i.id == issue_id),
         "issue must be a genuine env_a member via its plain occurrence"
@@ -4133,7 +4384,7 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
     // though the issue is a genuine env_a member.
     let by_tag_a = sauron_db::repo::list_issues(
         &mut conn,
-        scope_a,
+        scope_a.clone(),
         &[ParsedFilter {
             field: "tag",
             op: Op::Eq,
@@ -4155,7 +4406,7 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
     // the correct env_b-derived count.
     let by_tag_b = sauron_db::repo::list_issues(
         &mut conn,
-        scope_b,
+        scope_b.clone(),
         &[ParsedFilter {
             field: "tag",
             op: Op::Eq,
@@ -4177,7 +4428,7 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
     // tag:contains — the same predicate's other bind shape.
     let by_tag_contains_a = sauron_db::repo::list_issues(
         &mut conn,
-        scope_a,
+        scope_a.clone(),
         &[ParsedFilter {
             field: "tag",
             op: Op::Contains,
@@ -4364,6 +4615,8 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
             contexts: json!({}),
             extra: json!({}),
             handled: Some(true),
+            title: None,
+            culprit: None,
         },
     )
     .await
@@ -4422,6 +4675,8 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
                 contexts: json!({}),
                 extra: json!({}),
                 handled: Some(true),
+                title: None,
+                culprit: None,
             },
         )
         .await
@@ -4441,9 +4696,10 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
     // would return 0 rows: the paging subquery would pick the 3 noise
     // issues by app-wide `last_seen` alone, and the LATERAL's `HAVING`
     // would then drop all three for having no env_a occurrence.
-    let page = sauron_db::repo::list_issues(&mut conn, scope_a, &[], None, far_past(), 3, 0)
-        .await
-        .unwrap();
+    let page =
+        sauron_db::repo::list_issues(&mut conn, scope_a.clone(), &[], None, far_past(), 3, 0)
+            .await
+            .unwrap();
     let page_ids: std::collections::HashSet<Uuid> = page.iter().map(|i| i.id).collect();
     assert_eq!(
         page_ids, real_members,
@@ -4455,10 +4711,17 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
     // pages, no repeats, page 4 exhausted (empty, not spilling into noise).
     let mut seen_via_paging: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for offset in 0..3i64 {
-        let one =
-            sauron_db::repo::list_issues(&mut conn, scope_a, &[], None, far_past(), 1, offset)
-                .await
-                .unwrap();
+        let one = sauron_db::repo::list_issues(
+            &mut conn,
+            scope_a.clone(),
+            &[],
+            None,
+            far_past(),
+            1,
+            offset,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             one.len(),
             1,
@@ -4474,9 +4737,10 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
         );
     }
     assert_eq!(seen_via_paging, real_members);
-    let exhausted = sauron_db::repo::list_issues(&mut conn, scope_a, &[], None, far_past(), 1, 3)
-        .await
-        .unwrap();
+    let exhausted =
+        sauron_db::repo::list_issues(&mut conn, scope_a.clone(), &[], None, far_past(), 1, 3)
+            .await
+            .unwrap();
     assert!(
         exhausted.is_empty(),
         "offset 3 is past all 3 real members and must come back empty, not noise"
@@ -4517,6 +4781,1420 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
     assert_eq!(
         r1_row.times_seen, 1,
         "r1's displayed count must be its env_a-derived one, not its inflated app-wide 10"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Task 15 (F8, `.superpowers/sdd/s2-final-review.md`): `top_issues`'
+// `EnvFilter::All` and `EnvFilter::Unattributed` branches, neither of which
+// any earlier test executed.
+// ===========================================================================
+
+/// `top_issues`' `EnvFilter::All` arm (repo.rs) is a *separate* boxed-diesel
+/// branch ranking by the stored `issues.times_seen` column — every existing
+/// `top_issues` test scopes with `One`/`Subset`, which take the raw-SQL path
+/// instead, so nothing exercised `All`'s own branch before this. Mirrors
+/// `list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
+/// ranking`'s `r1`/`r2` fixture shape (stored count inflated via repeated
+/// `upsert_issue` calls, independent of the real `error_events` count) but
+/// under `EnvFilter::All` rather than `One(env_a)`: `high_stored_low_real`'s
+/// stored `times_seen` is bumped to 10 via 9 extra upserts while it has only
+/// ONE real `error_events` row; `low_stored_high_real`'s stored `times_seen`
+/// stays at 1 (a single upsert) while it accumulates 5 real occurrences. If
+/// the `All` arm ever derived its ranking/count from `error_events` instead
+/// of trusting the stored column — e.g. accidentally routed through the
+/// raw-SQL branch the other three `EnvFilter` variants share — both the
+/// displayed `times_seen` and the ranking order would flip.
+#[tokio::test]
+async fn top_issues_all_ranks_by_the_stored_times_seen_column() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let high_stored_low_real = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "f8-high-stored-low-real",
+            type_: "Error",
+            title: "f8 high stored, low real",
+            culprit: "harness::f8",
+            level: "error",
+            first_seen: ids.pinned_now,
+            last_seen: ids.pinned_now,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create high_stored_low_real issue");
+    for _ in 0..9 {
+        sauron_db::repo::upsert_issue(
+            &mut conn,
+            sauron_db::models::NewIssue {
+                app_id: ids.app_id,
+                fingerprint: "f8-high-stored-low-real",
+                type_: "Error",
+                title: "f8 high stored, low real",
+                culprit: "harness::f8",
+                level: "error",
+                first_seen: ids.pinned_now,
+                last_seen: ids.pinned_now,
+                times_seen: 1,
+            },
+        )
+        .await
+        .expect("inflate high_stored_low_real's stored times_seen to 10");
+    }
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_a),
+            issue_id: high_stored_low_real,
+            fingerprint: "f8-high-stored-low-real".into(),
+            level: "error".into(),
+            message: "high_stored_low_real's one real occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("f8-high-stored-user".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: ids.pinned_now,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+            title: None,
+            culprit: None,
+        },
+    )
+    .await
+    .expect("insert high_stored_low_real's one error event");
+
+    let low_stored_high_real = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "f8-low-stored-high-real",
+            type_: "Error",
+            title: "f8 low stored, high real",
+            culprit: "harness::f8",
+            level: "error",
+            first_seen: ids.pinned_now,
+            last_seen: ids.pinned_now,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create low_stored_high_real issue");
+    for n in 0..5 {
+        sauron_db::repo::insert_error_event(
+            &mut conn,
+            NewErrorEvent {
+                id: Uuid::new_v4(),
+                app_id: ids.app_id,
+                environment_id: Some(ids.env_a),
+                issue_id: low_stored_high_real,
+                fingerprint: "f8-low-stored-high-real".into(),
+                level: "error".into(),
+                message: format!("low_stored_high_real occurrence {n}"),
+                exception_type: "HarnessError".into(),
+                exception_value: "seeded".into(),
+                stacktrace: json!([]),
+                breadcrumbs: json!([]),
+                context: json!({}),
+                tags: json!({}),
+                release: None,
+                distinct_id: Some(format!("f8-low-stored-user-{n}")),
+                event_user: None,
+                sdk: None,
+                ip_address: None,
+                occurred_at: ids.pinned_now,
+                session_id: None,
+                device_key: None,
+                screen: None,
+                stacktrace_symbolicated: None,
+                symbolication_status: "not_applicable".into(),
+                debug_meta: None,
+                contexts: json!({}),
+                extra: json!({}),
+                handled: Some(true),
+                title: None,
+                culprit: None,
+            },
+        )
+        .await
+        .expect("insert low_stored_high_real occurrence");
+    }
+
+    let top = sauron_db::repo::top_issues(&mut conn, ReadScope::all(ids.app_id), far_past(), 50)
+        .await
+        .unwrap();
+
+    let high_row = top
+        .iter()
+        .find(|i| i.id == high_stored_low_real)
+        .expect("high_stored_low_real appears under All");
+    assert_eq!(
+        high_row.times_seen, 10,
+        "All must show the stored issues.times_seen (10), not the derived real count (1)"
+    );
+    let low_row = top
+        .iter()
+        .find(|i| i.id == low_stored_high_real)
+        .expect("low_stored_high_real appears under All");
+    assert_eq!(
+        low_row.times_seen, 1,
+        "All must show the stored issues.times_seen (1), not the derived real count (5)"
+    );
+
+    // The ranking order itself: high_stored_low_real (stored 10) must rank
+    // strictly ahead of low_stored_high_real (stored 1) under All. If the All
+    // arm ever derived its ranking from error_events instead, the order would
+    // be exactly reversed (1 real occurrence vs. 5).
+    let ranked: Vec<Uuid> = top
+        .iter()
+        .map(|i| i.id)
+        .filter(|id| *id == high_stored_low_real || *id == low_stored_high_real)
+        .collect();
+    assert_eq!(
+        ranked,
+        vec![high_stored_low_real, low_stored_high_real],
+        "top_issues under All must rank by the stored times_seen column (10 ahead of 1), \
+         the reverse of ranking by real error_events count (1 ahead of 5)"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `top_issues`' `EnvFilter::Unattributed` arm shares the raw-SQL path with
+/// `One`/`Subset`, but is the one variant of the three that binds no `$4`
+/// parameter at all — `sql_fragment_for` emits a literal `IS NULL` for
+/// `Unattributed` (see `EnvFilter::sql_fragment_for`'s own doc comment), so a
+/// bind-index regression on this path would surface only as a Postgres
+/// parameter-count error at runtime, and no earlier test ever executed this
+/// branch for `top_issues`. `q_unattributed_only` has 3 real `error_events`
+/// rows, all unattributed, and none anywhere else; the seed's own `issue_id`
+/// has exactly 1 unattributed row (out of 6 total across all three buckets —
+/// see `SeedIds`' doc comment). Ranking by the Unattributed-derived count (3
+/// vs. 1) is the exact reverse of ranking by either the stored `times_seen`
+/// column (`issue_id`=6, `q_unattributed_only`=1) or the real
+/// cross-environment total (`issue_id`=6, `q_unattributed_only`=3) — so this
+/// also proves the branch derives its count from the unattributed rows
+/// alone, not from either of those.
+#[tokio::test]
+async fn top_issues_unattributed_ranks_by_the_unattributed_derived_count() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let q_unattributed_only = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "f8-unattributed-only",
+            type_: "Error",
+            title: "f8 unattributed-only issue",
+            culprit: "harness::f8",
+            level: "error",
+            first_seen: ids.pinned_now,
+            last_seen: ids.pinned_now,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create q_unattributed_only issue");
+    for n in 0..3 {
+        sauron_db::repo::insert_error_event(
+            &mut conn,
+            NewErrorEvent {
+                id: Uuid::new_v4(),
+                app_id: ids.app_id,
+                environment_id: None,
+                issue_id: q_unattributed_only,
+                fingerprint: "f8-unattributed-only".into(),
+                level: "error".into(),
+                message: format!("q_unattributed_only occurrence {n}"),
+                exception_type: "HarnessError".into(),
+                exception_value: "seeded".into(),
+                stacktrace: json!([]),
+                breadcrumbs: json!([]),
+                context: json!({}),
+                tags: json!({}),
+                release: None,
+                distinct_id: Some(format!("f8-unattributed-user-{n}")),
+                event_user: None,
+                sdk: None,
+                ip_address: None,
+                occurred_at: ids.pinned_now,
+                session_id: None,
+                device_key: None,
+                screen: None,
+                stacktrace_symbolicated: None,
+                symbolication_status: "not_applicable".into(),
+                debug_meta: None,
+                contexts: json!({}),
+                extra: json!({}),
+                handled: Some(true),
+                title: None,
+                culprit: None,
+            },
+        )
+        .await
+        .expect("insert q_unattributed_only occurrence");
+    }
+
+    let top = sauron_db::repo::top_issues(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        far_past(),
+        50,
+    )
+    .await
+    .unwrap();
+
+    let q_row = top
+        .iter()
+        .find(|i| i.id == q_unattributed_only)
+        .expect("q_unattributed_only appears under Unattributed");
+    assert_eq!(q_row.times_seen, 3);
+    let issue_id_row = top
+        .iter()
+        .find(|i| i.id == ids.issue_id)
+        .expect("issue_id's one unattributed occurrence appears under Unattributed");
+    assert_eq!(issue_id_row.times_seen, 1);
+    assert!(
+        top.iter().all(|i| i.id != ids.issue_env_b_only),
+        "issue_env_b_only has no unattributed occurrence at all"
+    );
+
+    let ranked: Vec<Uuid> = top
+        .iter()
+        .map(|i| i.id)
+        .filter(|id| *id == q_unattributed_only || *id == ids.issue_id)
+        .collect();
+    assert_eq!(
+        ranked,
+        vec![q_unattributed_only, ids.issue_id],
+        "top_issues under Unattributed must rank by the unattributed-derived count \
+         (3 ahead of 1), the reverse of both the stored times_seen (6 ahead of 1) and \
+         the real cross-environment total (6 ahead of 3)"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Slice 3, Task 2: `role_grants.scope_type` must accept `'env'`, making an
+/// environment a fourth grantable scope level alongside org/project/app.
+/// Before migration 2026-07-29-000029 lands, this insert raises `new row for
+/// relation "role_grants" violates check constraint
+/// "role_grants_scope_type_check"` — the CHECK inherited from
+/// 2026-07-12-000002_projects_apps_rbac only allows `('org', 'project',
+/// 'app')`. `ids.org_id`/`ids.owner_email` are `seed_two_envs`'s own org and a
+/// real `users` row it creates alongside it (see `SeedIds`'s doc comment);
+/// `'Viewer'` is one of the four system preset roles that migration
+/// 2026-07-12-000002 seeds itself (`org_id IS NULL`), so it exists on every
+/// freshly migrated database without this harness seeding it.
+#[tokio::test]
+async fn role_grants_accepts_the_env_scope_type() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let inserted = diesel::sql_query(
+        "INSERT INTO role_grants (org_id, user_id, role_id, scope_type, scope_id)
+         SELECT $1, u.id, r.id, 'env', $2
+         FROM users u, roles r
+         WHERE u.email = $3 AND r.name = 'Viewer'
+         LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ids.org_id)
+    .bind::<diesel::sql_types::Uuid, _>(ids.env_a)
+    .bind::<diesel::sql_types::Text, _>(ids.owner_email.clone())
+    .execute(&mut conn)
+    .await
+    .expect("env-scoped grant must be accepted by the CHECK constraint");
+    assert_eq!(inserted, 1);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Task 4: `EnvFilter::Subset` threaded through every environment-scoped read
+// ===========================================================================
+
+/// `Subset([a, b])` must equal `One(a)` ∪ `One(b)` for counts, and must
+/// EXCLUDE unattributed rows — `= ANY(array)` never matches NULL. If a
+/// function's bind arithmetic is wrong for `Subset`, it either errors at
+/// runtime (bind count mismatch) or silently returns `One`'s answer.
+#[tokio::test]
+async fn subset_equals_the_union_of_its_environments_and_excludes_unattributed() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let since = ids.pinned_now - Duration::days(30);
+
+    let both = ReadScope::new(ids.app_id, EnvFilter::Subset(vec![ids.env_a, ids.env_b]));
+    let only_a = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
+    let only_b = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b));
+    let unattributed = ReadScope::new(ids.app_id, EnvFilter::Unattributed);
+    let all = ReadScope::all(ids.app_id);
+
+    let t_both = sauron_db::repo::overview_totals(&mut conn, both, since)
+        .await
+        .unwrap();
+    let t_a = sauron_db::repo::overview_totals(&mut conn, only_a, since)
+        .await
+        .unwrap();
+    let t_b = sauron_db::repo::overview_totals(&mut conn, only_b, since)
+        .await
+        .unwrap();
+    let t_un = sauron_db::repo::overview_totals(&mut conn, unattributed, since)
+        .await
+        .unwrap();
+    let t_all = sauron_db::repo::overview_totals(&mut conn, all, since)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        t_both.events,
+        t_a.events + t_b.events,
+        "Subset events must be the exact union of its two environments"
+    );
+    assert_eq!(t_both.errors, t_a.errors + t_b.errors);
+    assert_eq!(t_both.sessions, t_a.sessions + t_b.sessions);
+
+    assert!(
+        t_un.events > 0,
+        "seed must contain unattributed rows for this test to mean anything"
+    );
+    assert_eq!(
+        t_all.events,
+        t_both.events + t_un.events,
+        "All = Subset(every env) + Unattributed; Subset must NOT include NULLs"
+    );
+
+    // A single-element Subset must agree exactly with One.
+    let single = ReadScope::new(ids.app_id, EnvFilter::Subset(vec![ids.env_a]));
+    let t_single = sauron_db::repo::overview_totals(&mut conn, single, since)
+        .await
+        .unwrap();
+    assert_eq!(t_single.events, t_a.events);
+    assert_eq!(t_single.errors, t_a.errors);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Every raw-SQL read function must survive `Subset` without a bind mismatch.
+/// A wrong bind index raises `bind message supplies N parameters, but prepared
+/// statement requires M` at runtime — invisible to any unit test. Argument
+/// lists below are each function's REAL signature in `repo.rs`, not the
+/// brief's sketch (which invented arguments several of these functions don't
+/// take, or omitted ones they do): `list_persons` has no `since` parameter;
+/// `list_devices`/`list_sessions` take a trailing filter/search argument the
+/// brief's snippet dropped.
+#[tokio::test]
+async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let since = ids.pinned_now - Duration::days(30);
+    let scope = ReadScope::new(ids.app_id, EnvFilter::Subset(vec![ids.env_a, ids.env_b]));
+
+    sauron_db::repo::list_issues(&mut conn, scope.clone(), &[], None, since, 50, 0)
+        .await
+        .expect("list_issues under Subset");
+    sauron_db::repo::issue_stats(&mut conn, scope.clone())
+        .await
+        .expect("issue_stats under Subset");
+    sauron_db::repo::top_issues(&mut conn, scope.clone(), since, 10)
+        .await
+        .expect("top_issues under Subset");
+    sauron_db::repo::list_persons(&mut conn, scope.clone(), None, 50, 0)
+        .await
+        .expect("list_persons under Subset");
+    sauron_db::repo::list_devices(&mut conn, scope.clone(), since, 50, 0, None)
+        .await
+        .expect("list_devices under Subset");
+    sauron_db::repo::list_sessions(&mut conn, scope.clone(), since, 50, 0, None, None)
+        .await
+        .expect("list_sessions under Subset");
+    sauron_db::repo::session_stats(&mut conn, scope.clone(), since)
+        .await
+        .expect("session_stats under Subset");
+    sauron_db::repo::user_stats(&mut conn, scope.clone(), since)
+        .await
+        .expect("user_stats under Subset");
+    sauron_db::repo::active_user_series(&mut conn, scope.clone(), since)
+        .await
+        .expect("active_user_series under Subset");
+    sauron_db::repo::session_duration_series(&mut conn, scope.clone(), since)
+        .await
+        .expect("session_duration_series under Subset");
+    sauron_db::repo::session_duration_histogram(&mut conn, scope.clone(), since)
+        .await
+        .expect("session_duration_histogram under Subset");
+    sauron_db::repo::journey_graph(&mut conn, scope.clone(), since, 20)
+        .await
+        .expect("journey_graph under Subset");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Task 5: `env_ids_for_app` — every environment of an app, retired or not
+// ===========================================================================
+
+/// `env_ids_for_app` must return both seeded environments, and must keep
+/// returning a retired one — unlike `list_environments`, which excludes
+/// retired rows because they must not be *selectable*. `resolve_env_filter`
+/// (Slice 3 Task 5, `sauron-auth`) relies on this: a caller's readable
+/// `Subset` must be able to contain a retired environment id, or an app's
+/// history would narrow the moment an environment was retired.
+#[tokio::test]
+async fn env_ids_for_app_includes_a_retired_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // Both live environments are present before either is touched.
+    let mut before = sauron_db::repo::env_ids_for_app(&mut conn, ids.app_id)
+        .await
+        .expect("env_ids_for_app before retiring");
+    before.sort();
+    let mut want = vec![ids.env_a, ids.env_b];
+    want.sort();
+    assert_eq!(before, want);
+
+    // `env_b` is not the app's default (seed_two_envs makes env_a the
+    // default), so it is retireable without first promoting another.
+    sauron_db::repo::retire_environment(&mut conn, ids.env_b)
+        .await
+        .expect("retire env_b");
+
+    let mut after = sauron_db::repo::env_ids_for_app(&mut conn, ids.app_id)
+        .await
+        .expect("env_ids_for_app after retiring");
+    after.sort();
+    assert_eq!(
+        after, want,
+        "a retired environment must still be included — its history stays readable"
+    );
+
+    // `list_environments(include_retired = false)` is the function this is
+    // deliberately NOT — it must now exclude env_b, or the two functions would
+    // be indistinguishable and the retired-inclusion behavior above would be
+    // accidental rather than intentional.
+    let selectable = sauron_db::repo::list_environments(&mut conn, ids.app_id, false)
+        .await
+        .expect("list_environments live-only");
+    assert!(
+        selectable.iter().all(|e| e.id != ids.env_b),
+        "list_environments must exclude the retired environment"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Task 5 review fix round 1: `authorize_env_read` — DB-backed coverage for
+// the wrapper itself, not just the pure `resolve_env_filter` core
+// ===========================================================================
+//
+// `resolve_env_filter` is exhaustively unit-tested (no database needed —
+// that is the whole point of splitting it out). Nothing before this section
+// actually drove `authorize_env_read` end to end: its app-wide fast path
+// (which deliberately *skips* the `env_ids_for_app` query), its
+// `AuthError::NotFound` branch, and its argument wiring into
+// `resolve_env_filter` had zero direct coverage. These seven tests close
+// that gap against a real Postgres connection. `sauron-auth` has no
+// `tests/` integration harness of its own (no `tests/` directory, no
+// dev-dependency on anything that could seed a database), so — per this
+// round's instructions — they live here instead, alongside the harness that
+// already exists (`sauron-db/tests/common/mod.rs`'s `TestDb`/
+// `seed_two_envs`). `sauron-db/Cargo.toml` gained a `[dev-dependencies]`
+// section with `sauron-auth` to make `authorize_env_read` callable from this
+// file; see that Cargo.toml's comment for why the resulting dev-dependency
+// cycle (sauron-auth -> sauron-db normally, sauron-db -> sauron-auth in
+// dev-dependencies only) is fine.
+
+/// Insert one `role_grants` row at an arbitrary scope, for a caller shaped
+/// however a test needs. `role_name` must be one of the four system presets
+/// (`"Owner"`, `"Admin"`, `"Developer"`, `"Viewer"`) — seeded by migration
+/// 2026-07-12-000002 with `org_id IS NULL`, so every freshly migrated
+/// ephemeral database already has them; nothing here creates a role. Mirrors
+/// `role_grants_accepts_the_env_scope_type`'s raw-SQL shape above, generalized
+/// over scope and taking a resolved `user_id` instead of an email since
+/// several of the tests below need more than one caller.
+async fn grant_role(
+    conn: &mut sauron_db::PgConn,
+    org_id: Uuid,
+    user_id: Uuid,
+    role_name: &str,
+    scope_type: &str,
+    scope_id: Uuid,
+) {
+    let inserted = diesel::sql_query(
+        "INSERT INTO role_grants (org_id, user_id, role_id, scope_type, scope_id)
+         SELECT $1, $2, r.id, $3, $4
+         FROM roles r
+         WHERE r.name = $5
+         LIMIT 1",
+    )
+    .bind::<SqlUuid, _>(org_id)
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<Text, _>(scope_type)
+    .bind::<SqlUuid, _>(scope_id)
+    .bind::<Text, _>(role_name)
+    .execute(conn)
+    .await
+    .expect("insert role grant");
+    assert_eq!(
+        inserted, 1,
+        "role grant insert must affect exactly one row -- role_name must be a real preset"
+    );
+}
+
+/// The app-wide fast path (`authorize_env_read`'s early return for an
+/// `EnvFilter::All` request from a caller with app/project/org reach) must
+/// answer `Ok(EnvFilter::All)` WITHOUT ever running the `env_ids_for_app`
+/// lookup below it — that is its entire reason to exist ("today's callers
+/// pay exactly today's cost", per its own doc comment).
+///
+/// Equality of the *result* alone cannot prove that: `resolve_env_filter`'s
+/// own app-wide branch also answers the bare `EnvFilter::All` sentinel for an
+/// `All` request (`if app_wide { match requested { EnvFilter::All =>
+/// Ok(EnvFilter::All), ... } }` in rbac.rs) — it never consults
+/// `app_env_ids` for that arm either. So a caller with genuine app-wide
+/// reach gets `Ok(All)` whether the fast path fires or whether the code fell
+/// through to the full `resolve_env_filter` call; output-equality alone
+/// cannot tell those two cases apart.
+///
+/// What DOES tell them apart is denying the lookup a table to query: this
+/// test renames `environments` out from under the connection before calling
+/// `authorize_env_read`, and renames it back immediately after regardless of
+/// outcome. If `env_ids_for_app`'s `SELECT ... FROM environments` ran at
+/// all, it would hit `relation "environments" does not exist` and
+/// `authorize_env_read` would come back `Err(AuthError::Internal)` instead
+/// of `Ok`. Only a genuinely skipped lookup can return `Ok` here. The app
+/// has two real environments (from `seed_two_envs`) the whole time this
+/// runs, so this is not "the lookup would have found nothing anyway" — there
+/// was something real to find, and the test proves it was never looked for.
+#[tokio::test]
+async fn authorize_env_read_fast_path_never_queries_environments() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let user = sauron_db::repo::find_user_by_email(&mut conn, &ids.owner_email)
+        .await
+        .expect("query owner")
+        .expect("seed_two_envs must create the owner user");
+
+    grant_role(&mut conn, ids.org_id, user.id, "Viewer", "app", ids.app_id).await;
+
+    diesel::sql_query("ALTER TABLE environments RENAME TO environments_hidden_for_test")
+        .execute(&mut conn)
+        .await
+        .expect("hide the environments table for the duration of the call");
+
+    let result = authorize_env_read(
+        &mut conn,
+        user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::All,
+    )
+    .await;
+
+    diesel::sql_query("ALTER TABLE environments_hidden_for_test RENAME TO environments")
+        .execute(&mut conn)
+        .await
+        .expect("restore the environments table");
+
+    let scope = result.expect(
+        "app-wide EnvFilter::All must succeed without ever touching `environments` -- an \
+         Err here means the fast path fell through to env_ids_for_app, which just hit a \
+         table that did not exist",
+    );
+    assert_eq!(scope.app_id, ids.app_id);
+    assert_eq!(scope.env, EnvFilter::All);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The narrowing path, end to end: a caller holding only an `env`-scoped
+/// grant, asking for `EnvFilter::All`, gets back `Subset([their one
+/// environment])` — not `All` (they have no app-wide reach) and not
+/// `Forbidden` (they do have real reach, just a narrower one).
+#[tokio::test]
+async fn env_scoped_caller_asking_for_all_gets_subset_of_their_own_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let user = sauron_db::repo::find_user_by_email(&mut conn, &ids.owner_email)
+        .await
+        .expect("query owner")
+        .expect("seed_two_envs must create the owner user");
+    grant_role(&mut conn, ids.org_id, user.id, "Viewer", "env", ids.env_a).await;
+
+    let scope = authorize_env_read(
+        &mut conn,
+        user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::All,
+    )
+    .await
+    .expect("env-scoped caller has real reach and must not be refused");
+
+    assert_eq!(scope.app_id, ids.app_id);
+    assert_eq!(scope.env, EnvFilter::Subset(vec![ids.env_a]));
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// An env-scoped caller asking for a *sibling* environment they hold no
+/// grant on must be refused outright — `Forbidden`, not an empty result set.
+/// A caller who could tell "zero rows" apart from "not allowed to ask" would
+/// learn something about the sibling environment's existence they should
+/// not.
+#[tokio::test]
+async fn env_scoped_caller_asking_for_sibling_environment_is_forbidden() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let user = sauron_db::repo::find_user_by_email(&mut conn, &ids.owner_email)
+        .await
+        .expect("query owner")
+        .expect("seed_two_envs must create the owner user");
+    grant_role(&mut conn, ids.org_id, user.id, "Viewer", "env", ids.env_a).await;
+
+    let result = authorize_env_read(
+        &mut conn,
+        user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::One(ids.env_b),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(AuthError::Forbidden)),
+        "expected Forbidden for a sibling environment, got {result:?}"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// An env-scoped caller asking for the unattributed bucket
+/// (`?environment_id=none`) must be refused — only app-wide reach may read
+/// rows with no environment at all. `Forbidden`, not an empty result:
+/// "matches nothing" and "you may not ask" are different answers, and only
+/// the second is true here.
+#[tokio::test]
+async fn env_scoped_caller_asking_for_unattributed_is_forbidden() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let user = sauron_db::repo::find_user_by_email(&mut conn, &ids.owner_email)
+        .await
+        .expect("query owner")
+        .expect("seed_two_envs must create the owner user");
+    grant_role(&mut conn, ids.org_id, user.id, "Viewer", "env", ids.env_a).await;
+
+    let result = authorize_env_read(
+        &mut conn,
+        user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::Unattributed,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(AuthError::Forbidden)),
+        "expected Forbidden for Unattributed from an env-scoped caller, got {result:?}"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// A caller who holds no `role_grants` row anywhere in the org gets
+/// `Forbidden`, not a panic and not a silently empty scope.
+/// `seed_two_envs`'s own owner user is exactly this shape by construction
+/// (see `SeedIds`'s doc comment: "Not otherwise a member of the org") until
+/// a test grants it something, so this test grants it nothing.
+#[tokio::test]
+async fn caller_with_no_grants_in_org_is_forbidden() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let user = sauron_db::repo::find_user_by_email(&mut conn, &ids.owner_email)
+        .await
+        .expect("query owner")
+        .expect("seed_two_envs must create the owner user");
+
+    let result = authorize_env_read(
+        &mut conn,
+        user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::All,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(AuthError::Forbidden)),
+        "expected Forbidden for a caller with zero grants, got {result:?}"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// A nonexistent `app_id` must fail the `app_ancestry` lookup with
+/// `NotFound` — distinct from `Forbidden`, and reached before any grant is
+/// even fetched. No grant is inserted for this test; if one were needed for
+/// it to pass, that would itself mean `NotFound` was not really reached
+/// first.
+#[tokio::test]
+async fn nonexistent_app_id_yields_not_found_not_forbidden() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let user = sauron_db::repo::find_user_by_email(&mut conn, &ids.owner_email)
+        .await
+        .expect("query owner")
+        .expect("seed_two_envs must create the owner user");
+
+    let result = authorize_env_read(
+        &mut conn,
+        user.id,
+        Uuid::new_v4(),
+        perm::ISSUE_READ,
+        EnvFilter::All,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(AuthError::NotFound)),
+        "expected NotFound for a nonexistent app_id, got {result:?}"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `authorize_env_read` maps every `EnvDenied` variant to the single
+/// `AuthError::Forbidden` on purpose (see its own doc comment: distinguishing
+/// them over HTTP would let a caller enumerate environment ids). This drives
+/// all four `EnvDenied`-producing shapes through the real wrapper and checks
+/// each collapses to the same `Forbidden` — not merely that they fail, but
+/// that they fail identically, so nothing downstream of this boundary can
+/// tell them apart.
+#[tokio::test]
+async fn every_env_denied_variant_collapses_to_forbidden() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // Three distinct callers, so each `EnvDenied` case is isolated from the
+    // others' grants rather than accumulating on one user.
+    let app_wide_user = sauron_db::repo::create_user(
+        &mut conn,
+        &format!("harness-appwide-{}@example.com", Uuid::new_v4().simple()),
+        "harness-hash",
+        "App Wide Caller",
+    )
+    .await
+    .expect("create app-wide caller");
+    grant_role(
+        &mut conn,
+        ids.org_id,
+        app_wide_user.id,
+        "Viewer",
+        "app",
+        ids.app_id,
+    )
+    .await;
+
+    let env_scoped_user = sauron_db::repo::create_user(
+        &mut conn,
+        &format!("harness-envscoped-{}@example.com", Uuid::new_v4().simple()),
+        "harness-hash",
+        "Env Scoped Caller",
+    )
+    .await
+    .expect("create env-scoped caller");
+    grant_role(
+        &mut conn,
+        ids.org_id,
+        env_scoped_user.id,
+        "Viewer",
+        "env",
+        ids.env_a,
+    )
+    .await;
+
+    let foreign_reach_user = sauron_db::repo::create_user(
+        &mut conn,
+        &format!("harness-foreign-{}@example.com", Uuid::new_v4().simple()),
+        "harness-hash",
+        "Foreign Reach Caller",
+    )
+    .await
+    .expect("create foreign-reach caller");
+    // A grant that is real (passes the CHECK constraint, joins to a real
+    // role) but scoped to an environment id that belongs to no app at all --
+    // `reach_for` collects it, but intersecting it with this app's own
+    // `app_env_ids` leaves nothing. This is `EnvDenied::NoReach`.
+    grant_role(
+        &mut conn,
+        ids.org_id,
+        foreign_reach_user.id,
+        "Viewer",
+        "env",
+        Uuid::new_v4(),
+    )
+    .await;
+
+    // EnvDenied::EnvNotInApp -- app-wide reach, but the requested
+    // environment id is not one of this app's.
+    let not_in_app = authorize_env_read(
+        &mut conn,
+        app_wide_user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::One(Uuid::new_v4()),
+    )
+    .await;
+    assert!(
+        matches!(not_in_app, Err(AuthError::Forbidden)),
+        "EnvNotInApp must collapse to Forbidden, got {not_in_app:?}"
+    );
+
+    // EnvDenied::EnvNotGranted -- the environment is real and this app's,
+    // but the caller holds no grant on it.
+    let not_granted = authorize_env_read(
+        &mut conn,
+        env_scoped_user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::One(ids.env_b),
+    )
+    .await;
+    assert!(
+        matches!(not_granted, Err(AuthError::Forbidden)),
+        "EnvNotGranted must collapse to Forbidden, got {not_granted:?}"
+    );
+
+    // EnvDenied::UnattributedNeedsAppReach -- env-scoped reach cannot read
+    // the unattributed bucket.
+    let unattributed = authorize_env_read(
+        &mut conn,
+        env_scoped_user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::Unattributed,
+    )
+    .await;
+    assert!(
+        matches!(unattributed, Err(AuthError::Forbidden)),
+        "UnattributedNeedsAppReach must collapse to Forbidden, got {unattributed:?}"
+    );
+
+    // EnvDenied::NoReach -- the caller's only grant contributes nothing to
+    // this app at all.
+    let no_reach = authorize_env_read(
+        &mut conn,
+        foreign_reach_user.id,
+        ids.app_id,
+        perm::ISSUE_READ,
+        EnvFilter::All,
+    )
+    .await;
+    assert!(
+        matches!(no_reach, Err(AuthError::Forbidden)),
+        "NoReach must collapse to Forbidden, got {no_reach:?}"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Task 8: error_events carries the issue strings
+// ===========================================================================
+
+/// Ingest must persist the same title/culprit it hands to `upsert_issue`. If
+/// these are NULL, the per-environment derivation in Task 9 silently falls
+/// back to the app-wide string for every row and the whole fix is inert.
+///
+/// Only two of the seed's seven `error_events` rows carry a title/culprit
+/// (see `SeedIds`' doc comment on `issue_shared`) — the other five are left
+/// `NULL` on purpose, to also exercise the pre-migration-30 row shape Task
+/// 9's `COALESCE` fallback has to handle. This test only needs "at least
+/// one" to prove ingest writes the columns at all; the exact two rows are
+/// pinned down by `issue_shared_carries_different_title_culprit_per_
+/// environment_in_the_seed` below.
+#[tokio::test]
+async fn ingested_error_events_carry_their_own_title_and_culprit() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        #[allow(dead_code)]
+        title: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        #[allow(dead_code)]
+        culprit: Option<String>,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT title, culprit FROM error_events WHERE app_id = $1 AND title IS NOT NULL",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .load(&mut conn)
+    .await
+    .unwrap();
+
+    assert!(
+        !rows.is_empty(),
+        "the seed must write per-occurrence titles, or Task 9 cannot be tested"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Locks down the exact shape `SeedIds`' doc comment on `issue_shared`
+/// promises: two `error_events` rows for the same issue, one per
+/// environment, with different `title`/`culprit` — and that `issues.title`/
+/// `culprit` under `EnvFilter::All` (which reads the stored row directly,
+/// set by the seed's one literal `upsert_issue` call, not a per-environment
+/// derivation; see `get_issue`'s `All`-scope branch) land on the env_b
+/// strings regardless of either row's `occurred_at`. A future seed edit that
+/// drifts an offset or a string without updating the doc comment is caught
+/// here, before it silently invalidates Task 9's own assertions (which
+/// address this fixture by name via `issue_shared`).
+#[tokio::test]
+async fn issue_shared_carries_different_title_culprit_per_environment_in_the_seed() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let now = ids.pinned_now;
+
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        title: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        culprit: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        occurred_at: chrono::DateTime<Utc>,
+    }
+
+    let a: Row = diesel::sql_query(
+        "SELECT title, culprit, occurred_at FROM error_events \
+         WHERE issue_id = $1 AND environment_id = $2 AND title IS NOT NULL",
+    )
+    .bind::<SqlUuid, _>(ids.issue_shared)
+    .bind::<SqlUuid, _>(ids.env_a)
+    .get_result(&mut conn)
+    .await
+    .expect("issue_shared's env_a occurrence carries a title");
+    assert_eq!(a.title.as_deref(), Some("TypeError: staging cart is empty"));
+    assert_eq!(a.culprit.as_deref(), Some("checkout (staging/cart.ts)"));
+    assert_eq!(a.occurred_at, now + Duration::seconds(5));
+
+    let b: Row = diesel::sql_query(
+        "SELECT title, culprit, occurred_at FROM error_events \
+         WHERE issue_id = $1 AND environment_id = $2 AND title IS NOT NULL",
+    )
+    .bind::<SqlUuid, _>(ids.issue_shared)
+    .bind::<SqlUuid, _>(ids.env_b)
+    .get_result(&mut conn)
+    .await
+    .expect("issue_shared's env_b occurrence carries a title");
+    assert_eq!(b.title.as_deref(), Some("TypeError: prod cart is empty"));
+    assert_eq!(b.culprit.as_deref(), Some("checkout (prod/cart.ts)"));
+    assert_eq!(b.occurred_at, now - Duration::seconds(30));
+
+    // Each environment's own newest occurrence is unambiguous WITHIN that
+    // environment (that's what each row's own membership/derivation reads —
+    // see `issue_title_culprit_and_level_are_derived_per_environment`), which
+    // is all Task 9's per-environment derivation needs. `a.occurred_at` and
+    // `b.occurred_at` are NOT required to order any particular way against
+    // each other — they're independent environments — and in fact do not:
+    // `a` (`pinned_now + 5s`, Task 9's retime — see the seed's own comment
+    // on `a-er-1`) is later in wall-clock terms than `b` (`pinned_now -
+    // 30s`), which has no bearing on `issues.title` below (a fixed literal,
+    // not derived from either row's timestamp).
+    assert_ne!(a.occurred_at, b.occurred_at);
+
+    // `EnvFilter::All` reads `issues` directly rather than deriving from
+    // `error_events` (see `get_issue`'s `All`-scope branch) — its
+    // `title`/`culprit` are the seed's one literal `upsert_issue` call,
+    // independent of either row's `occurred_at` above (see that call's own
+    // comment for why: the seed never re-calls `upsert_issue` per-row the
+    // way real ingest does).
+    let issue_all =
+        sauron_db::repo::get_issue(&mut conn, ReadScope::all(ids.app_id), ids.issue_shared)
+            .await
+            .unwrap()
+            .expect("issue_shared exists");
+    assert_eq!(issue_all.title, "TypeError: prod cart is empty");
+    assert_eq!(issue_all.culprit, "checkout (prod/cart.ts)");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// Task 9: title/culprit/level are derived per environment
+// ===========================================================================
+
+/// `upsert_issue`'s `ON CONFLICT (app_id, fingerprint)` has no environment in
+/// the key, so `title`/`culprit`/`level` are whatever the most recent
+/// occurrence in ANY environment wrote. A caller scoped to staging must see
+/// staging's own strings — not production's, sitting beside a correctly
+/// staging-scoped `last_seen` that says the issue has been quiet in staging.
+#[tokio::test]
+async fn issue_title_culprit_and_level_are_derived_per_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let all = sauron_db::repo::get_issue(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::All),
+        ids.issue_shared,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let a = sauron_db::repo::get_issue(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        ids.issue_shared,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let b = sauron_db::repo::get_issue(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+        ids.issue_shared,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // The two environments must disagree — under the old code all three of
+    // these were byte-identical (whichever environment's occurrence was
+    // processed last by `upsert_issue`).
+    assert_ne!(a.title, b.title, "each environment must show its own title");
+    assert_ne!(
+        a.culprit, b.culprit,
+        "each environment must show its own culprit"
+    );
+
+    assert_eq!(a.title, "TypeError: staging cart is empty");
+    assert_eq!(a.culprit, "checkout (staging/cart.ts)");
+    assert_eq!(b.title, "TypeError: prod cart is empty");
+    assert_eq!(b.culprit, "checkout (prod/cart.ts)");
+
+    // `All` keeps reading the durable `issues` column — the fast-path
+    // convention every fix in this series follows. env_b's occurrence is the
+    // newer one, so the stored row carries env_b's string (see `SeedIds`'
+    // doc comment on `issue_shared`).
+    assert_eq!(all.title, b.title, "All must read the stored issues column");
+    assert_eq!(
+        all.culprit, b.culprit,
+        "All must read the stored issues column"
+    );
+
+    // And the staging-scoped title sits beside a staging-scoped last_seen —
+    // the whole point: before this fix, a correct per-environment
+    // `last_seen` sat beside a wrong, other-environment's title/culprit.
+    // `a.last_seen` is `agg.last_seen` (max `occurred_at` over ALL four
+    // env_a occurrences, not just `a-er-1`) — `pinned_now + 5s`, `a-er-1`'s
+    // own retimed offset, since it is the newest of the four (see
+    // `SeedIds`' doc comment on `issue_shared`).
+    assert_eq!(a.last_seen, ids.pinned_now + Duration::seconds(5));
+    assert_eq!(b.last_seen, ids.pinned_now - Duration::seconds(30));
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `issue_stats` counts `FILTER (WHERE level = ...)` over a derived,
+/// per-environment level as of this task — under the old code (a plain
+/// membership `EXISTS` filtering `issues.level`, app-wide) an environment's
+/// fatal/error/warning split reflected whichever environment sent the last
+/// event, so the numbers on the Issues page header disagreed with the list
+/// beneath them. This also exercises that the inner `JOIN LATERAL` replacing
+/// the `EXISTS` preserves membership exactly: `issue_env_b_only` (confined to
+/// `env_b` alone) must count under `One(env_b)` and not under `One(env_a)`,
+/// and every bucket must still sum to `total` (no row double-counted or
+/// silently dropped by the join).
+#[tokio::test]
+async fn issue_stats_level_breakdown_is_per_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let a = sauron_db::repo::issue_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+    )
+    .await
+    .unwrap();
+    let b = sauron_db::repo::issue_stats(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(
+        (a.fatal, a.error, a.warning),
+        (b.fatal, b.error, b.warning),
+        "the level breakdown must differ between environments"
+    );
+    // env_a: only `issue_shared` is a member (1 issue, derived level=error).
+    // env_b: `issue_shared` AND `issue_env_b_only` are both members (2
+    // issues, both derived level=error) — see `SeedIds`' doc comment.
+    assert_eq!(a.total, 1, "env_a has exactly one member issue");
+    assert_eq!(b.total, 2, "env_b has exactly two member issues");
+    assert_eq!(a.error, 1);
+    assert_eq!(b.error, 2);
+    // Each environment's breakdown must sum to the issues it can actually see.
+    assert_eq!(a.fatal + a.error + a.warning + a.info, a.total);
+    assert_eq!(b.fatal + b.error + b.warning + b.info, b.total);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `list_issues` used to filter on the STORED `issues` columns inside its
+/// paging subquery while returning DERIVED values in the outer select list,
+/// so `?level=error` and the level actually shown on the row could disagree.
+/// Filter and display must now agree.
+///
+/// The shared seed's own `issue_shared`/`issue_env_b_only` can't discriminate
+/// this on their own — every seeded `error_events` row hardcodes
+/// `level = "error"`, identical to both issues' stored `issues.level`, so a
+/// `level:eq:error` filter would happen to match under the OLD (stored-column)
+/// code too. So this test builds a bespoke issue, mirroring
+/// `list_issues_filters_tag_and_free_text_compose_with_scope`'s pattern,
+/// whose stored `issues.level` (`"warning"`, set once at creation)
+/// deliberately disagrees with its one real `env_a` occurrence's own
+/// `level` (`"error"`) — the exact shape "last occurrence processed in some
+/// OTHER environment wins the app-wide column" produces in production.
+#[tokio::test]
+async fn list_issues_filters_agree_with_what_it_displays() {
+    use sauron_db::filter::{Op, ParsedFilter};
+
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let now = Utc::now();
+    let issue_id = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "filter-display-agreement-fingerprint",
+            type_: "Error",
+            title: "filter/display agreement test issue",
+            culprit: "harness::filter_display_agreement",
+            // Stored, app-wide level — deliberately "warning", disagreeing
+            // with the one real env_a occurrence's own level below. Stands
+            // in for "some other environment's more-recent occurrence wrote
+            // this app-wide column last."
+            level: "warning",
+            first_seen: now,
+            last_seen: now,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create filter-display-agreement issue");
+    sauron_db::repo::insert_error_event(
+        &mut conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id: ids.app_id,
+            environment_id: Some(ids.env_a),
+            issue_id,
+            fingerprint: "filter-display-agreement-fingerprint".into(),
+            // The real, per-environment level — "error", disagreeing with
+            // the issue's own stored "warning" above.
+            level: "error".into(),
+            message: "filter/display agreement occurrence".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some("filter-display-agreement-user".into()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: now,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+            title: None,
+            culprit: None,
+        },
+    )
+    .await
+    .expect("insert filter-display-agreement occurrence");
+
+    let scope = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
+
+    // The brief's own required shape: filter level=error under One(env_a),
+    // assert the seed produces a matching row and every returned row's
+    // displayed level really is "error".
+    let filters = [ParsedFilter {
+        field: "level",
+        op: Op::Eq,
+        value: "error".to_string(),
+    }];
+    let rows =
+        sauron_db::repo::list_issues(&mut conn, scope.clone(), &filters, None, far_past(), 100, 0)
+            .await
+            .unwrap();
+    assert!(!rows.is_empty(), "the seed must produce a matching row");
+    for r in &rows {
+        assert_eq!(
+            r.level, "error",
+            "every returned row must actually carry the level that was filtered on"
+        );
+    }
+    assert!(
+        rows.iter().any(|r| r.id == issue_id),
+        "level:eq:error must match on the DERIVED (env_a) level, not the stored \
+         issues.level='warning' — under the old, stored-column-filtered code this issue \
+         would have been excluded"
+    );
+
+    // The decisive, discriminating half: level:eq:warning matches the
+    // issue's stored `issues.level`, but env_a has no occurrence whose own
+    // level is "warning" — so under the NEW, derived-value filter this must
+    // NOT match, even though it would have under the old code.
+    let warning_filters = [ParsedFilter {
+        field: "level",
+        op: Op::Eq,
+        value: "warning".to_string(),
+    }];
+    let warning_rows =
+        sauron_db::repo::list_issues(&mut conn, scope, &warning_filters, None, far_past(), 100, 0)
+            .await
+            .unwrap();
+    assert!(
+        warning_rows.iter().all(|r| r.id != issue_id),
+        "level:eq:warning must NOT match on the stored issues.level='warning' — env_a's \
+         only real occurrence has level='error', and the filter must agree with what's \
+         displayed, not with the app-wide column"
     );
 
     drop(conn);

@@ -81,33 +81,27 @@ const APP_SCOPED_URL = /^\/v1\/apps\/[^/]+(?:\/.*)?$/;
 // Within `/v1/apps/{app_id}/...`, these sub-resources are app *configuration*
 // rather than telemetry, and the backend calls `reject_environment_id` (or
 // `reject_environment_id_with_message` — same grep target, its name is a
-// prefix of the former) on all of them — so, unlike the rest of the module's
-// new default-safe posture, this remaining exclusion list is load-bearing and
-// must stay reconciled against the backend by hand. Each entry below is one
-// of the six `reject_environment_id*` call-site groups (or an
-// already-forgiving one kept for symmetry), verified directly against
-// `backend/bins/sauron-api/src/routes/` and `main.rs`'s route table:
+// prefix of the former) on all of them. This array is load-bearing in BOTH
+// directions now, not just backend-to-dashboard: Task 14's
+// `backend/bins/sauron-api/tests/http_env_scoping.rs` reads this exact array
+// out of this file's source (the same way `permissions.test.ts` reads
+// `rbac.rs` in the other direction) and asserts it equals the set of
+// app-scoped GETs that actually 400 on a valid `environment_id` when driven
+// over HTTP — so an entry added here without a matching backend
+// `reject_environment_id*` call, or a backend rejection added without a
+// matching entry here, now fails a test instead of drifting silently. Each
+// entry below is one of the `reject_environment_id*` call-site groups,
+// verified directly against `backend/bins/sauron-api/src/routes/` and
+// `main.rs`'s route table:
 //
 //  - `/v1/apps/{id}` bare (`apps::get_app`) — app metadata (name,
-//    ingest_enabled) has no environment dimension. The handler doesn't parse
-//    a Query extractor at all, so an extra `environment_id` would just be
-//    ignored today, not rejected — excluded anyway so that stays true by
-//    construction rather than by accident.
+//    ingest_enabled) has no environment dimension. Calls
+//    `reject_environment_id`; a 400 without this exclusion.
 //
 //  - `/v1/apps/{id}/environments` (`environments::list_environments`) — this
 //    IS the environment list; scoping the request that enumerates
-//    environments to one of them is circular. Like `get_app`, the handler
-//    doesn't parse `environment_id` at all, so this is precautionary rather
-//    than required.
-//
-//  - `/v1/apps/{id}/first-event` (`apps::first_event`) — the backend *does*
-//    support scoping this one for real (`read_scope`, not
-//    `reject_environment_id`). Excluded anyway: the only call site
-//    (Onboarding.svelte) polls a just-created app by that app's own id, not
-//    necessarily `sessionStore.currentAppId` — the store's `currentEnvId`
-//    can belong to a different app entirely. Attaching it blindly would
-//    scope the poll to an environment that doesn't belong to the app being
-//    onboarded, silently under-reporting "no events yet" forever.
+//    environments to one of them is circular. Calls `reject_environment_id`;
+//    a 400 without this exclusion.
 //
 //  - `/v1/apps/{id}/funnels` (`funnels::list_saved` / `create_saved` /
 //    `update_saved` / `delete_saved`) — saved funnel *definitions* (plural,
@@ -138,15 +132,46 @@ const APP_SCOPED_URL = /^\/v1\/apps\/[^/]+(?:\/.*)?$/;
 //    hand-rolled an inline `raw_environment_id(..).is_some()` check instead of
 //    calling through `routes::scope` at all, which is exactly what made the
 //    grep below miss them — fixed at the source rather than patched here only.
-const APP_CONFIG_SUBPATHS: RegExp[] = [
+//
+// `get_app` and `list_environments` used to parse no `environment_id` at all
+// (an extra query param was silently dropped, not rejected) — Task 14's
+// router-enumeration test caught that as the exact defect class this whole
+// module exists to prevent (a 200 on a malformed `environment_id` looks like
+// a filter was applied and wasn't), so both now call `reject_environment_id`
+// too. This array's comment used to call those two "precautionary rather
+// than required"; that is no longer true, and the wording above has been
+// corrected rather than left stale.
+const BACKEND_REJECTS_ENVIRONMENT_ID: RegExp[] = [
   /^\/v1\/apps\/[^/]+\/?(?:\?.*)?$/,
   /^\/v1\/apps\/[^/]+\/environments(?:[/?].*)?$/,
-  /^\/v1\/apps\/[^/]+\/first-event(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/funnels(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/artifacts(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/errors\/timeseries(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/events\/timeseries(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/transactions\/timeseries(?:[/?].*)?$/,
+];
+
+// `/v1/apps/{id}/first-event` (`apps::first_event`) is different in kind from
+// the array above: the backend *does* support scoping it for real
+// (`read_scope`, not `reject_environment_id` — it would happily narrow on a
+// valid `environment_id`). It is excluded here anyway, for a reason specific
+// to the ONE call site that hits it: `Onboarding.svelte` polls a
+// just-created app by that app's own id, not necessarily
+// `sessionStore.currentAppId` — the store's `currentEnvId` can belong to a
+// different app entirely. Attaching it blindly would scope the poll to an
+// environment that doesn't belong to the app being onboarded, silently
+// under-reporting "no events yet" forever.
+//
+// Kept as a SEPARATE array from `BACKEND_REJECTS_ENVIRONMENT_ID` on purpose:
+// that array is checked against the backend's actual rejection set by
+// `http_env_scoping.rs` (see the comment above it), and `first-event` is not
+// part of that correspondence — folding it in would make the Rust test
+// demand the backend reject a route it correctly narrows on.
+const UI_ONLY_EXCLUSIONS: RegExp[] = [/^\/v1\/apps\/[^/]+\/first-event(?:[/?].*)?$/];
+
+const APP_CONFIG_SUBPATHS: RegExp[] = [
+  ...BACKEND_REJECTS_ENVIRONMENT_ID,
+  ...UI_ONLY_EXCLUSIONS,
 ];
 
 /** True if `url` is a read that environment scoping applies to at all. */

@@ -5,11 +5,13 @@
 //! a database. The `authorize_*` helpers fetch grants and enforce.
 //!
 //! Cascade semantics: to check permission `P` on a resource, we pass the
-//! resource's `(org, project?, app?)` ids. A grant contributes its permissions
-//! when its scope matches one of those ids — so an **org** grant satisfies any
-//! check in the org, a **project** grant satisfies checks on that project and
-//! its apps (but not sibling projects), and an **app** grant satisfies only that
-//! app. The result is a union down the tree with strict sibling isolation.
+//! resource's `(org, project?, app?, env?)` ids. A grant contributes its
+//! permissions when its scope matches one of those ids — so an **org** grant
+//! satisfies any check in the org, a **project** grant satisfies checks on that
+//! project, its apps, and their environments (but not sibling projects), an
+//! **app** grant satisfies that app and every environment under it, and an
+//! **env** grant satisfies only that one environment. The result is a union
+//! down the tree with strict sibling isolation.
 
 use std::collections::HashSet;
 
@@ -17,6 +19,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use sauron_db::models::{App, Project};
+use sauron_db::scope::{EnvFilter, ReadScope};
 use sauron_db::{repo, AsyncPgConnection};
 
 use crate::extractors::AuthError;
@@ -38,9 +41,9 @@ pub mod perm {
     pub const APP_UPDATE: &str = "app:update";
     pub const APP_DELETE: &str = "app:delete";
     /// Environments own the ingest credential, so they carry their own family
-    /// rather than borrowing the app's. These name *what* is managed, not a new
-    /// scope level — checks still resolve against the parent app until Slice 3
-    /// introduces `Scope::Env`.
+    /// rather than borrowing the app's. These name *what* is managed; `Scope::Env`
+    /// is the new *where* it can be granted, but enforcement (the `authorize_*`
+    /// call sites) does not target it at an env yet.
     pub const ENV_READ: &str = "env:read";
     pub const ENV_CREATE: &str = "env:create";
     pub const ENV_UPDATE: &str = "env:update";
@@ -185,6 +188,7 @@ pub enum Scope {
     Org(Uuid),
     Project(Uuid),
     App(Uuid),
+    Env(Uuid),
 }
 
 impl Scope {
@@ -197,6 +201,7 @@ impl Scope {
             Scope::Org(id) => ("org", id),
             Scope::Project(id) => ("project", id),
             Scope::App(id) => ("app", id),
+            Scope::Env(id) => ("env", id),
         }
     }
 }
@@ -208,24 +213,32 @@ pub struct Grant {
     pub permissions: Vec<String>,
 }
 
-fn grant_applies(scope: Scope, org: Uuid, project: Option<Uuid>, app: Option<Uuid>) -> bool {
+fn grant_applies(
+    scope: Scope,
+    org: Uuid,
+    project: Option<Uuid>,
+    app: Option<Uuid>,
+    env: Option<Uuid>,
+) -> bool {
     match scope {
         Scope::Org(o) => o == org,
         Scope::Project(p) => Some(p) == project,
         Scope::App(a) => Some(a) == app,
+        Scope::Env(e) => Some(e) == env,
     }
 }
 
-/// The union of all permissions the user has on the target `(org, project?, app?)`.
+/// The union of all permissions the user has on the target `(org, project?, app?, env?)`.
 pub fn effective_permissions(
     grants: &[Grant],
     org: Uuid,
     project: Option<Uuid>,
     app: Option<Uuid>,
+    env: Option<Uuid>,
 ) -> HashSet<String> {
     let mut set = HashSet::new();
     for g in grants {
-        if grant_applies(g.scope, org, project, app) {
+        if grant_applies(g.scope, org, project, app, env) {
             for p in &g.permissions {
                 set.insert(p.clone());
             }
@@ -241,9 +254,11 @@ pub fn has_permission(
     org: Uuid,
     project: Option<Uuid>,
     app: Option<Uuid>,
+    env: Option<Uuid>,
 ) -> bool {
     grants.iter().any(|g| {
-        grant_applies(g.scope, org, project, app) && g.permissions.iter().any(|p| p == permission)
+        grant_applies(g.scope, org, project, app, env)
+            && g.permissions.iter().any(|p| p == permission)
     })
 }
 
@@ -259,6 +274,7 @@ pub struct Reach {
     pub org: bool,
     pub projects: Vec<Uuid>,
     pub apps: Vec<Uuid>,
+    pub envs: Vec<Uuid>,
 }
 
 /// Callers MUST pass grants already filtered to a single organization (as
@@ -275,6 +291,7 @@ pub fn reach_for(grants: &[Grant], permission: &str) -> Reach {
             Scope::Org(_) => reach.org = true,
             Scope::Project(p) => reach.projects.push(p),
             Scope::App(a) => reach.apps.push(a),
+            Scope::Env(e) => reach.envs.push(e),
         }
     }
     reach
@@ -288,6 +305,7 @@ pub fn grants_from_rows(rows: Vec<(String, Uuid, Value)>) -> Vec<Grant> {
                 "org" => Scope::Org(scope_id),
                 "project" => Scope::Project(scope_id),
                 "app" => Scope::App(scope_id),
+                "env" => Scope::Env(scope_id),
                 _ => return None,
             };
             let permissions = match perms {
@@ -319,7 +337,7 @@ pub async fn require_permission(
         .await
         .map_err(|_| AuthError::Internal)?;
     let grants = grants_from_rows(rows);
-    if has_permission(&grants, permission, org, project, app) {
+    if has_permission(&grants, permission, org, project, app, None) {
         Ok(())
     } else {
         Err(AuthError::Forbidden)
@@ -338,7 +356,7 @@ pub async fn effective_at(
         .await
         .map_err(|_| AuthError::Internal)?;
     let grants = grants_from_rows(rows);
-    Ok(effective_permissions(&grants, org, project, app))
+    Ok(effective_permissions(&grants, org, project, app, None))
 }
 
 /// The user's effective permission set at an org (for `GET /me/access`).
@@ -408,6 +426,326 @@ pub async fn authorize_app(
     )
     .await?;
     Ok(app)
+}
+
+/// [`authorize_app`]'s reach-aware sibling: succeeds when `permission` is held
+/// at org, project, or app scope — exactly what `authorize_app` already
+/// accepts — **or** at any environment under this app. Returns the app.
+///
+/// This exists for **reads that exist so a caller can navigate to their own
+/// environment**, not as a looser drop-in for `authorize_app` generally. An
+/// environment grant is strictly narrower than its app: it must let a caller
+/// fetch the app's metadata (`GET /v1/apps/{id}`, so the dashboard can render
+/// something to navigate into), but it must **not** let them rename, mute, or
+/// delete the app — those stay on `authorize_app`'s strict `env: None`
+/// resolution, which an env-scoped grant's `Scope::Env` arm can never satisfy
+/// (see this module's doc comment on cascade semantics). Call this only at a
+/// site where "read the app so I can get to my environment" is the intent;
+/// every mutation site must keep calling `authorize_app` directly.
+///
+/// Cost: identical to `authorize_app` when the caller already has org/
+/// project/app reach (the overwhelmingly common case) — the environment
+/// lookup below only runs when that first check fails.
+pub async fn authorize_app_reachable(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    permission: &str,
+) -> Result<App, AuthError> {
+    let app = repo::get_app(conn, app_id)
+        .await
+        .map_err(|_| AuthError::Internal)?
+        .ok_or(AuthError::NotFound)?;
+    let (project_id, org_id) = repo::app_ancestry(conn, app_id)
+        .await
+        .map_err(|_| AuthError::Internal)?
+        .ok_or(AuthError::NotFound)?;
+
+    let rows = repo::user_grants_in_org(conn, user_id, org_id)
+        .await
+        .map_err(|_| AuthError::Internal)?;
+    let grants = grants_from_rows(rows);
+
+    // Fast path: same check `authorize_app` makes. Org/project/app-scoped
+    // grants are resolved here and never need the environment lookup below.
+    if has_permission(
+        &grants,
+        permission,
+        org_id,
+        Some(project_id),
+        Some(app_id),
+        None,
+    ) {
+        return Ok(app);
+    }
+
+    // No grant reaches the app itself — the only way left in is a grant on
+    // one of its own environments. `reach_for` is not app-scoped by
+    // construction (an env grant on a DIFFERENT app's environment would also
+    // show up in `reach.envs`), so intersect with this app's actual
+    // environment ids before accepting — the same guard
+    // `resolve_env_filter`'s `an_env_grant_from_another_app_contributes_nothing`
+    // test pins for the read-scope path.
+    let reach = reach_for(&grants, permission);
+    if reach.envs.is_empty() {
+        return Err(AuthError::Forbidden);
+    }
+    let app_env_ids: HashSet<Uuid> = repo::env_ids_for_app(conn, app_id)
+        .await
+        .map_err(|_| AuthError::Internal)?
+        .into_iter()
+        .collect();
+    if reach.envs.iter().any(|e| app_env_ids.contains(e)) {
+        Ok(app)
+    } else {
+        Err(AuthError::Forbidden)
+    }
+}
+
+/// Why an environment-scoped read was refused. Mapped to HTTP by the caller;
+/// kept separate from `AuthError` so the pure decision function stays free of
+/// transport concerns and stays unit-testable without a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvDenied {
+    /// No grant carrying this permission reaches this app or any of its
+    /// environments.
+    NoReach,
+    /// The requested environment id is not one of this app's environments —
+    /// it does not exist, or it belongs to a different app.
+    EnvNotInApp,
+    /// The environment exists on this app, but the caller holds no grant on it.
+    EnvNotGranted,
+    /// `?environment_id=none` selects rows attributed to no environment, which
+    /// only a caller with app-wide reach may read.
+    UnattributedNeedsAppReach,
+}
+
+/// Resolve what the caller asked for into what they are allowed to have.
+///
+/// Pure: no I/O, no clock. `app_env_ids` is every environment of the app,
+/// **including retired ones** — a retired environment's history stays readable
+/// (Slice 1's invariant), so excluding them here would make `Subset` narrower
+/// than the `All` it stands in for.
+///
+/// The order of the checks is load-bearing. Ownership (`EnvNotInApp`) is
+/// tested before grant-holding (`EnvNotGranted`) so that a caller probing for
+/// which environment ids exist learns nothing they could not learn from
+/// `list_environments` — both refusals are a 403 at the HTTP layer.
+pub fn resolve_env_filter(
+    grants: &[Grant],
+    permission: &str,
+    org: Uuid,
+    project: Uuid,
+    app: Uuid,
+    app_env_ids: &[Uuid],
+    requested: EnvFilter,
+) -> Result<EnvFilter, EnvDenied> {
+    let app_wide = has_permission(grants, permission, org, Some(project), Some(app), None);
+
+    if app_wide {
+        return match requested {
+            EnvFilter::All => Ok(EnvFilter::All),
+            EnvFilter::Unattributed => Ok(EnvFilter::Unattributed),
+            EnvFilter::One(id) => {
+                if app_env_ids.contains(&id) {
+                    Ok(EnvFilter::One(id))
+                } else {
+                    Err(EnvDenied::EnvNotInApp)
+                }
+            }
+            // A caller cannot ask for a Subset over the wire; it is only ever
+            // produced here. Treat it as All rather than trusting the input.
+            EnvFilter::Subset(_) => Ok(EnvFilter::All),
+        };
+    }
+
+    let reach = reach_for(grants, permission);
+    let mut readable: Vec<Uuid> = app_env_ids
+        .iter()
+        .copied()
+        .filter(|e| reach.envs.contains(e))
+        .collect();
+    readable.sort();
+    readable.dedup();
+
+    if readable.is_empty() {
+        return Err(EnvDenied::NoReach);
+    }
+
+    match requested {
+        EnvFilter::All | EnvFilter::Subset(_) => Ok(EnvFilter::Subset(readable)),
+        EnvFilter::Unattributed => Err(EnvDenied::UnattributedNeedsAppReach),
+        EnvFilter::One(id) => {
+            if !app_env_ids.contains(&id) {
+                Err(EnvDenied::EnvNotInApp)
+            } else if readable.contains(&id) {
+                Ok(EnvFilter::One(id))
+            } else {
+                Err(EnvDenied::EnvNotGranted)
+            }
+        }
+    }
+}
+
+/// The caller's effective permission set over everything a resolved
+/// [`EnvFilter`] can read — the scope-aware counterpart to
+/// [`effective_permissions`], for a **second** permission question asked at the
+/// same scope as the read itself (today: `source:read` deciding whether an
+/// issue's de-obfuscated source context is included).
+///
+/// Pure. Why each arm is what it is:
+///
+/// - `All` / `Unattributed` — both are only ever resolved for a caller with
+///   app-wide reach, so the question is an app-level one: `env: None`, exactly
+///   what [`effective_at`] has always computed. An environment-scoped grant
+///   deliberately does **not** contribute here: it would let a `source:read`
+///   held on one environment unlock source across every other one.
+/// - `One(id)` — evaluated at that environment. This can only ever *add* to the
+///   app-level answer, never subtract: `grant_applies`'s `Org`/`Project`/`App`
+///   arms ignore the `env` argument entirely, so every grant that satisfied
+///   `env: None` still satisfies `env: Some(id)`.
+/// - `Subset(ids)` — the read spans several environments and a single boolean
+///   gate has to cover all of them, so this is the **intersection**: a
+///   permission counts only if it is held in every environment the response
+///   could draw a row from. Fail-closed, and it cannot leak source from an
+///   environment where the caller lacks the grant. (Anything held app-wide or
+///   above survives the intersection untouched, per the `One` note above.)
+pub fn effective_permissions_for_filter(
+    grants: &[Grant],
+    org: Uuid,
+    project: Uuid,
+    app: Uuid,
+    env: &EnvFilter,
+) -> HashSet<String> {
+    let at = |e: Option<Uuid>| effective_permissions(grants, org, Some(project), Some(app), e);
+    match env {
+        EnvFilter::All | EnvFilter::Unattributed => at(None),
+        EnvFilter::One(id) => at(Some(*id)),
+        EnvFilter::Subset(ids) => {
+            let mut per_env = ids.iter().map(|id| at(Some(*id)));
+            match per_env.next() {
+                Some(first) => per_env.fold(first, |acc, next| {
+                    acc.intersection(&next).cloned().collect()
+                }),
+                // `Subset` is never empty by construction (`resolve_env_filter`
+                // returns `Err(NoReach)` rather than an empty set), so this arm
+                // is unreachable — but an empty set is the fail-closed answer
+                // if it ever became reachable.
+                None => HashSet::new(),
+            }
+        }
+    }
+}
+
+/// Shared core of [`authorize_env_read`] and [`authorize_env_read_with_perms`].
+///
+/// Returns the authorized scope **plus** the grants and ancestry it already had
+/// to load, so a caller that needs a second permission answer at the same scope
+/// can have it without re-running the ancestry and grant queries. That sharing
+/// is the point: `routes::mod::authorize_app_perms` existed precisely because
+/// asking two permission questions used to mean two full resolutions ("six
+/// queries where two suffice", as its doc comment put it), and this keeps that
+/// property while making the second question environment-aware.
+async fn authorize_env_read_inner(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    permission: &str,
+    requested: EnvFilter,
+) -> Result<(ReadScope, Vec<Grant>, Uuid, Uuid), AuthError> {
+    let (project_id, org_id) = repo::app_ancestry(conn, app_id)
+        .await
+        .map_err(|_| AuthError::Internal)?
+        .ok_or(AuthError::NotFound)?;
+
+    let rows = repo::user_grants_in_org(conn, user_id, org_id)
+        .await
+        .map_err(|_| AuthError::Internal)?;
+    let grants = grants_from_rows(rows);
+
+    // Fast path: app-wide reach over every environment needs no environment
+    // lookup at all, so today's callers pay exactly today's cost.
+    if matches!(requested, EnvFilter::All)
+        && has_permission(
+            &grants,
+            permission,
+            org_id,
+            Some(project_id),
+            Some(app_id),
+            None,
+        )
+    {
+        return Ok((
+            ReadScope::new(app_id, EnvFilter::All),
+            grants,
+            org_id,
+            project_id,
+        ));
+    }
+
+    let app_env_ids = repo::env_ids_for_app(conn, app_id)
+        .await
+        .map_err(|_| AuthError::Internal)?;
+
+    let resolved = resolve_env_filter(
+        &grants,
+        permission,
+        org_id,
+        project_id,
+        app_id,
+        &app_env_ids,
+        requested,
+    )
+    .map_err(|_| AuthError::Forbidden)?;
+
+    Ok((ReadScope::new(app_id, resolved), grants, org_id, project_id))
+}
+
+/// Authorize an environment-scoped **read** and produce its `ReadScope`.
+///
+/// Replaces the `authorize_app(...)` + `read_scope_raw(...)` pair. They are one
+/// call because they were two decisions that had to agree, and four separate
+/// defects in this feature came from two things that had to agree by hand.
+///
+/// Cost: identical to `authorize_app` for the overwhelmingly common case —
+/// a caller with app-wide reach asking for every environment never triggers the
+/// `env_ids_for_app` lookup.
+pub async fn authorize_env_read(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    permission: &str,
+    requested: EnvFilter,
+) -> Result<ReadScope, AuthError> {
+    let (scope, ..) =
+        authorize_env_read_inner(conn, user_id, app_id, permission, requested).await?;
+    Ok(scope)
+}
+
+/// [`authorize_env_read`], plus the caller's full effective permission set at
+/// the **resolved** scope — for a handler that gates a second capability on top
+/// of the read itself (`issues::detail`/`issues::events` and `source:read`).
+///
+/// Supersedes `routes::mod::authorize_app_perms` for environment-scoped reads.
+/// That helper resolved permissions through [`effective_at`], which hardcodes
+/// `env: None`; since `grant_applies`'s `Scope::Env` arm is `Some(e) == env`, an
+/// environment-scoped grant could never satisfy it, so those two handlers
+/// returned `403` to an env-scoped caller **even for their own environment** —
+/// they could list issues but not open one. Authorization still happens first
+/// (this returns `Err` before computing any permission set if the caller has no
+/// reach), and the second question is then answered at the scope the read was
+/// actually narrowed to, via [`effective_permissions_for_filter`].
+pub async fn authorize_env_read_with_perms(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    permission: &str,
+    requested: EnvFilter,
+) -> Result<(ReadScope, HashSet<String>), AuthError> {
+    let (scope, grants, org_id, project_id) =
+        authorize_env_read_inner(conn, user_id, app_id, permission, requested).await?;
+    let perms = effective_permissions_for_filter(&grants, org_id, project_id, app_id, &scope.env);
+    Ok((scope, perms))
 }
 
 /// Idempotently sync the seeded preset roles from code (called at startup).
@@ -576,7 +914,7 @@ mod tests {
             grant(Scope::App(app_a1()), &[perm::ISSUE_READ]),
             grant(Scope::App(app_a1()), &[perm::ISSUE_WRITE]),
         ];
-        let eff = effective_permissions(&g, org(), Some(proj_a()), Some(app_a1()));
+        let eff = effective_permissions(&g, org(), Some(proj_a()), Some(app_a1()), None);
         assert!(eff.contains(perm::ISSUE_READ));
         assert!(eff.contains(perm::ISSUE_WRITE));
         assert_eq!(eff.len(), 2);
@@ -585,10 +923,24 @@ mod tests {
     #[test]
     fn permission_match_is_exact_not_prefix_or_substring() {
         let g = vec![grant(Scope::Org(org()), &["issue:rea"])];
-        assert!(!has_permission(&g, perm::ISSUE_READ, org(), None, None));
+        assert!(!has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            None,
+            None,
+            None
+        ));
         let g2 = vec![grant(Scope::Org(org()), &[perm::ISSUE_READ])];
-        assert!(!has_permission(&g2, "issue", org(), None, None));
-        assert!(!has_permission(&g2, "issue:read:extra", org(), None, None));
+        assert!(!has_permission(&g2, "issue", org(), None, None, None));
+        assert!(!has_permission(
+            &g2,
+            "issue:read:extra",
+            org(),
+            None,
+            None,
+            None
+        ));
     }
 
     #[test]
@@ -598,8 +950,15 @@ mod tests {
             preset_grant(Scope::Project(proj_a()), &OWNER),
             preset_grant(Scope::App(app_a1()), &OWNER),
         ];
-        assert!(effective_permissions(&g, org(), None, None).is_empty());
-        assert!(!has_permission(&g, perm::MEMBER_READ, org(), None, None));
+        assert!(effective_permissions(&g, org(), None, None, None).is_empty());
+        assert!(!has_permission(
+            &g,
+            perm::MEMBER_READ,
+            org(),
+            None,
+            None,
+            None
+        ));
     }
 
     // --- org-scope grant cascades to everything -------------------------
@@ -608,13 +967,21 @@ mod tests {
     fn org_grant_applies_at_every_level() {
         let g = vec![preset_grant(Scope::Org(org()), &DEVELOPER)];
         // org-level check
-        assert!(has_permission(&g, perm::ISSUE_READ, org(), None, None));
+        assert!(has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            None,
+            None,
+            None
+        ));
         // project-level check
         assert!(has_permission(
             &g,
             perm::ISSUE_READ,
             org(),
             Some(proj_a()),
+            None,
             None
         ));
         // app-level check
@@ -623,23 +990,39 @@ mod tests {
             perm::ISSUE_WRITE,
             org(),
             Some(proj_a()),
-            Some(app_a1())
+            Some(app_a1()),
+            None
         ));
         // but not a permission the role lacks
-        assert!(!has_permission(&g, perm::ORG_MANAGE, org(), None, None));
+        assert!(!has_permission(
+            &g,
+            perm::ORG_MANAGE,
+            org(),
+            None,
+            None,
+            None
+        ));
     }
 
     #[test]
     fn org_grant_for_a_different_org_never_applies() {
         let other = Uuid::from_u128(999);
         let g = vec![preset_grant(Scope::Org(other), &OWNER)];
-        assert!(!has_permission(&g, perm::ISSUE_READ, org(), None, None));
+        assert!(!has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            None,
+            None,
+            None
+        ));
         assert!(!has_permission(
             &g,
             perm::ISSUE_READ,
             org(),
             Some(proj_a()),
-            Some(app_a1())
+            Some(app_a1()),
+            None
         ));
     }
 
@@ -654,7 +1037,8 @@ mod tests {
             perm::ISSUE_WRITE,
             org(),
             Some(proj_a()),
-            Some(app_a1())
+            Some(app_a1()),
+            None
         ));
         // another app in project A
         assert!(has_permission(
@@ -662,7 +1046,8 @@ mod tests {
             perm::ISSUE_WRITE,
             org(),
             Some(proj_a()),
-            Some(app_a2())
+            Some(app_a2()),
+            None
         ));
         // app in project B — DENIED (sibling isolation)
         assert!(!has_permission(
@@ -670,7 +1055,8 @@ mod tests {
             perm::ISSUE_WRITE,
             org(),
             Some(proj_b()),
-            Some(app_b1())
+            Some(app_b1()),
+            None
         ));
         // project A itself
         assert!(has_permission(
@@ -678,6 +1064,7 @@ mod tests {
             perm::ISSUE_READ,
             org(),
             Some(proj_a()),
+            None,
             None
         ));
         // project B itself — DENIED
@@ -686,10 +1073,18 @@ mod tests {
             perm::ISSUE_READ,
             org(),
             Some(proj_b()),
+            None,
             None
         ));
         // org level — DENIED (project grant doesn't grant org-wide)
-        assert!(!has_permission(&g, perm::ISSUE_READ, org(), None, None));
+        assert!(!has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            None,
+            None,
+            None
+        ));
     }
 
     // --- app-scope grant: that app only ---------------------------------
@@ -702,7 +1097,8 @@ mod tests {
             perm::ISSUE_READ,
             org(),
             Some(proj_a()),
-            Some(app_a1())
+            Some(app_a1()),
+            None
         ));
         // sibling app — DENIED
         assert!(!has_permission(
@@ -710,7 +1106,8 @@ mod tests {
             perm::ISSUE_READ,
             org(),
             Some(proj_a()),
-            Some(app_a2())
+            Some(app_a2()),
+            None
         ));
         // project-level op — DENIED (app grant can't authorize project ops)
         assert!(!has_permission(
@@ -718,10 +1115,18 @@ mod tests {
             perm::ISSUE_READ,
             org(),
             Some(proj_a()),
+            None,
             None
         ));
         // org-level op — DENIED
-        assert!(!has_permission(&g, perm::ISSUE_READ, org(), None, None));
+        assert!(!has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            None,
+            None,
+            None
+        ));
     }
 
     // --- union of multiple grants ---------------------------------------
@@ -734,7 +1139,7 @@ mod tests {
             grant(Scope::Org(org()), &[perm::APP_READ]),
         ];
         // app check sees all three levels unioned
-        let eff = effective_permissions(&g, org(), Some(proj_a()), Some(app_a1()));
+        let eff = effective_permissions(&g, org(), Some(proj_a()), Some(app_a1()), None);
         assert!(eff.contains(perm::ISSUE_READ));
         assert!(eff.contains(perm::EVENT_READ));
         assert!(eff.contains(perm::APP_READ));
@@ -742,14 +1147,14 @@ mod tests {
 
         // a sibling app in the SAME project inherits the project + org grants,
         // but NOT the app_a1-specific grant.
-        let eff2 = effective_permissions(&g, org(), Some(proj_a()), Some(app_a2()));
+        let eff2 = effective_permissions(&g, org(), Some(proj_a()), Some(app_a2()), None);
         assert!(eff2.contains(perm::APP_READ)); // org grant
         assert!(eff2.contains(perm::EVENT_READ)); // project-A grant
         assert!(!eff2.contains(perm::ISSUE_READ)); // app_a1-specific grant does NOT apply
         assert_eq!(eff2.len(), 2);
 
         // an app in a DIFFERENT project inherits only the org grant.
-        let eff3 = effective_permissions(&g, org(), Some(proj_b()), Some(app_b1()));
+        let eff3 = effective_permissions(&g, org(), Some(proj_b()), Some(app_b1()), None);
         assert!(eff3.contains(perm::APP_READ));
         assert!(!eff3.contains(perm::EVENT_READ));
         assert!(!eff3.contains(perm::ISSUE_READ));
@@ -764,16 +1169,25 @@ mod tests {
             perm::ISSUE_READ,
             org(),
             Some(proj_a()),
-            Some(app_a1())
+            Some(app_a1()),
+            None
         ));
         assert!(!has_permission(
             &g,
             perm::ISSUE_WRITE,
             org(),
             Some(proj_a()),
-            Some(app_a1())
+            Some(app_a1()),
+            None
         ));
-        assert!(!has_permission(&g, perm::MEMBER_MANAGE, org(), None, None));
+        assert!(!has_permission(
+            &g,
+            perm::MEMBER_MANAGE,
+            org(),
+            None,
+            None,
+            None
+        ));
     }
 
     #[test]
@@ -785,10 +1199,11 @@ mod tests {
                 p,
                 org(),
                 Some(proj_a()),
-                Some(app_a1())
+                Some(app_a1()),
+                None
             ));
         }
-        assert!(effective_permissions(&g, org(), Some(proj_a()), Some(app_a1())).is_empty());
+        assert!(effective_permissions(&g, org(), Some(proj_a()), Some(app_a1()), None).is_empty());
     }
 
     #[test]
@@ -919,13 +1334,430 @@ mod tests {
         ];
         let grants = grants_from_rows(rows);
         assert_eq!(grants.len(), 3); // bogus dropped
-        assert!(has_permission(&grants, perm::ISSUE_READ, org(), None, None));
+        assert!(has_permission(
+            &grants,
+            perm::ISSUE_READ,
+            org(),
+            None,
+            None,
+            None
+        ));
         assert!(has_permission(
             &grants,
             perm::ISSUE_WRITE,
             org(),
             Some(proj_a()),
-            Some(app_a1())
+            Some(app_a1()),
+            None
         ));
+    }
+
+    // --- Scope::Env and the four-level cascade --------------------------
+
+    fn env_a1p() -> Uuid {
+        Uuid::from_u128(1000)
+    }
+    fn env_a1s() -> Uuid {
+        Uuid::from_u128(1001)
+    }
+
+    /// An app grant covers every environment under it, including ones created
+    /// after the grant was written.
+    #[test]
+    fn app_grant_covers_every_environment_under_it() {
+        let g = vec![preset_grant(Scope::App(app_a1()), &VIEWER)];
+        for env in [env_a1p(), env_a1s()] {
+            assert!(has_permission(
+                &g,
+                perm::ISSUE_READ,
+                org(),
+                Some(proj_a()),
+                Some(app_a1()),
+                Some(env)
+            ));
+        }
+    }
+
+    /// An env grant covers that environment only — not a sibling environment in
+    /// the same app, and not the app-level check itself.
+    #[test]
+    fn env_grant_covers_that_environment_only() {
+        let g = vec![preset_grant(Scope::Env(env_a1p()), &VIEWER)];
+        assert!(has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            Some(proj_a()),
+            Some(app_a1()),
+            Some(env_a1p())
+        ));
+        // sibling environment — DENIED
+        assert!(!has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            Some(proj_a()),
+            Some(app_a1()),
+            Some(env_a1s())
+        ));
+        // app-level check (env = None) — DENIED: an env grant cannot authorize an
+        // app-wide action.
+        assert!(!has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            Some(proj_a()),
+            Some(app_a1()),
+            None
+        ));
+        // project and org level — DENIED
+        assert!(!has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            Some(proj_a()),
+            None,
+            None
+        ));
+        assert!(!has_permission(
+            &g,
+            perm::ISSUE_READ,
+            org(),
+            None,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn org_and_project_grants_still_reach_environments() {
+        let og = vec![preset_grant(Scope::Org(org()), &DEVELOPER)];
+        assert!(has_permission(
+            &og,
+            perm::ISSUE_WRITE,
+            org(),
+            Some(proj_a()),
+            Some(app_a1()),
+            Some(env_a1p())
+        ));
+        let pg = vec![preset_grant(Scope::Project(proj_a()), &DEVELOPER)];
+        assert!(has_permission(
+            &pg,
+            perm::ISSUE_WRITE,
+            org(),
+            Some(proj_a()),
+            Some(app_a1()),
+            Some(env_a1p())
+        ));
+        // sibling project's app+env — DENIED
+        assert!(!has_permission(
+            &pg,
+            perm::ISSUE_WRITE,
+            org(),
+            Some(proj_b()),
+            Some(app_b1()),
+            Some(env_a1p())
+        ));
+    }
+
+    #[test]
+    fn reach_for_collects_environments() {
+        let g = vec![
+            grant(Scope::Env(env_a1p()), &[perm::ISSUE_READ]),
+            grant(Scope::Env(env_a1s()), &[perm::ISSUE_READ]),
+            grant(Scope::Env(Uuid::from_u128(1002)), &[perm::EVENT_READ]),
+        ];
+        let reach = reach_for(&g, perm::ISSUE_READ);
+        assert!(!reach.org);
+        assert!(reach.projects.is_empty());
+        assert!(reach.apps.is_empty());
+        assert_eq!(reach.envs, vec![env_a1p(), env_a1s()]);
+    }
+
+    /// `grants_from_rows` silently drops unknown scope strings (`_ => return None`).
+    /// Adding 'env' to the DB CHECK without this arm makes every environment grant
+    /// vanish at read time with no signal at all. Delete the "env" arm and this
+    /// test fails.
+    #[test]
+    fn grants_from_rows_parses_the_env_scope() {
+        let rows = vec![(
+            "env".to_string(),
+            env_a1p(),
+            serde_json::json!(["issue:read"]),
+        )];
+        let grants = grants_from_rows(rows);
+        assert_eq!(grants.len(), 1, "env scope_type must not be dropped");
+        assert_eq!(grants[0].scope, Scope::Env(env_a1p()));
+    }
+
+    #[test]
+    fn scope_parts_round_trips_env() {
+        assert_eq!(Scope::Env(env_a1p()).parts(), ("env", env_a1p()));
+        let (scope_type, scope_id) = Scope::Env(env_a1p()).parts();
+        let rows = vec![(
+            scope_type.to_string(),
+            scope_id,
+            serde_json::json!(["issue:read"]),
+        )];
+        assert_eq!(grants_from_rows(rows)[0].scope, Scope::Env(env_a1p()));
+    }
+
+    // --- resolve_env_filter: the decision table --------------------------
+
+    fn app_envs() -> Vec<Uuid> {
+        vec![env_a1p(), env_a1s()]
+    }
+
+    fn resolve(grants: &[Grant], requested: EnvFilter) -> Result<EnvFilter, EnvDenied> {
+        resolve_env_filter(
+            grants,
+            perm::ISSUE_READ,
+            org(),
+            proj_a(),
+            app_a1(),
+            &app_envs(),
+            requested,
+        )
+    }
+
+    // --- row 1: app-wide reach resolves exactly as it does today ---------------
+
+    #[test]
+    fn app_wide_reach_passes_every_filter_through_unchanged() {
+        let g = vec![preset_grant(Scope::App(app_a1()), &VIEWER)];
+        assert_eq!(resolve(&g, EnvFilter::All), Ok(EnvFilter::All));
+        assert_eq!(
+            resolve(&g, EnvFilter::One(env_a1p())),
+            Ok(EnvFilter::One(env_a1p()))
+        );
+        assert_eq!(
+            resolve(&g, EnvFilter::Unattributed),
+            Ok(EnvFilter::Unattributed)
+        );
+    }
+
+    #[test]
+    fn org_and_project_reach_are_also_app_wide() {
+        for g in [
+            vec![preset_grant(Scope::Org(org()), &VIEWER)],
+            vec![preset_grant(Scope::Project(proj_a()), &VIEWER)],
+        ] {
+            assert_eq!(resolve(&g, EnvFilter::All), Ok(EnvFilter::All));
+            assert_eq!(
+                resolve(&g, EnvFilter::Unattributed),
+                Ok(EnvFilter::Unattributed)
+            );
+        }
+    }
+
+    /// Even with app-wide reach, an environment id that is not this app's is
+    /// refused — this is the existence + ownership check `parse_env`'s doc comment
+    /// has been asking for since Slice 2.
+    #[test]
+    fn app_wide_reach_still_refuses_a_foreign_environment_id() {
+        let g = vec![preset_grant(Scope::App(app_a1()), &VIEWER)];
+        let foreign = Uuid::from_u128(9999);
+        assert_eq!(
+            resolve(&g, EnvFilter::One(foreign)),
+            Err(EnvDenied::EnvNotInApp)
+        );
+    }
+
+    // --- row 2: partial reach auto-narrows ------------------------------------
+
+    #[test]
+    fn partial_reach_narrows_all_to_the_held_environments() {
+        let g = vec![preset_grant(Scope::Env(env_a1p()), &VIEWER)];
+        assert_eq!(
+            resolve(&g, EnvFilter::All),
+            Ok(EnvFilter::Subset(vec![env_a1p()]))
+        );
+    }
+
+    #[test]
+    fn partial_reach_with_two_environments_narrows_to_both() {
+        let g = vec![
+            preset_grant(Scope::Env(env_a1p()), &VIEWER),
+            preset_grant(Scope::Env(env_a1s()), &VIEWER),
+        ];
+        match resolve(&g, EnvFilter::All) {
+            Ok(EnvFilter::Subset(mut ids)) => {
+                ids.sort();
+                let mut want = vec![env_a1p(), env_a1s()];
+                want.sort();
+                assert_eq!(ids, want);
+            }
+            other => panic!("expected Subset of both environments, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_reach_allows_a_held_environment_and_refuses_a_sibling() {
+        let g = vec![preset_grant(Scope::Env(env_a1p()), &VIEWER)];
+        assert_eq!(
+            resolve(&g, EnvFilter::One(env_a1p())),
+            Ok(EnvFilter::One(env_a1p()))
+        );
+        assert_eq!(
+            resolve(&g, EnvFilter::One(env_a1s())),
+            Err(EnvDenied::EnvNotGranted)
+        );
+    }
+
+    /// Unattributed rows belong to no environment, so they belong to nobody's
+    /// readable set. An env-scoped caller asking for them is refused, not given an
+    /// empty list — "matches nothing" is not "you may not ask".
+    #[test]
+    fn partial_reach_refuses_unattributed() {
+        let g = vec![preset_grant(Scope::Env(env_a1p()), &VIEWER)];
+        assert_eq!(
+            resolve(&g, EnvFilter::Unattributed),
+            Err(EnvDenied::UnattributedNeedsAppReach)
+        );
+    }
+
+    /// An env grant on ANOTHER app's environment must not widen this app's
+    /// readable set. `reach.envs` is intersected with the app's own environments.
+    #[test]
+    fn an_env_grant_from_another_app_contributes_nothing() {
+        let other_app_env = Uuid::from_u128(7777);
+        let g = vec![preset_grant(Scope::Env(other_app_env), &VIEWER)];
+        assert_eq!(resolve(&g, EnvFilter::All), Err(EnvDenied::NoReach));
+    }
+
+    // --- row 3: no reach at all ------------------------------------------------
+
+    #[test]
+    fn no_reach_is_denied_for_every_filter() {
+        let g = vec![preset_grant(Scope::App(app_a2()), &VIEWER)];
+        assert_eq!(resolve(&g, EnvFilter::All), Err(EnvDenied::NoReach));
+        assert_eq!(
+            resolve(&g, EnvFilter::One(env_a1p())),
+            Err(EnvDenied::NoReach)
+        );
+        assert_eq!(
+            resolve(&g, EnvFilter::Unattributed),
+            Err(EnvDenied::NoReach)
+        );
+    }
+
+    /// Holding the wrong permission is the same as holding nothing. A Viewer's
+    /// env grant does not confer `issue:write`.
+    #[test]
+    fn a_grant_lacking_the_permission_confers_no_reach() {
+        let g = vec![preset_grant(Scope::Env(env_a1p()), &VIEWER)];
+        let got = resolve_env_filter(
+            &g,
+            perm::ISSUE_WRITE,
+            org(),
+            proj_a(),
+            app_a1(),
+            &app_envs(),
+            EnvFilter::All,
+        );
+        assert_eq!(got, Err(EnvDenied::NoReach));
+    }
+
+    // --- effective_permissions_for_filter: the second-permission question ----
+    //
+    // These pin the semantics `issues::detail`/`issues::events` depend on for
+    // the `source:read` gate. The bug they exist to prevent recurring is the
+    // fix-round-1 one: resolving that gate at `env: None`, which no
+    // environment-scoped grant can ever satisfy.
+
+    fn perms_for(grants: &[Grant], env: &EnvFilter) -> Vec<String> {
+        let mut v: Vec<String> =
+            effective_permissions_for_filter(grants, org(), proj_a(), app_a1(), env)
+                .into_iter()
+                .collect();
+        v.sort();
+        v
+    }
+
+    /// The regression this whole fix round is about: an env grant MUST
+    /// contribute under `One(that env)`. At `env: None` it contributes nothing,
+    /// which is what made `issues::detail` 403 for an env-scoped caller.
+    #[test]
+    fn an_env_grant_contributes_at_its_own_environment_but_not_app_wide() {
+        let g = vec![grant(
+            Scope::Env(env_a1p()),
+            &[perm::ISSUE_READ, perm::SOURCE_READ],
+        )];
+        assert_eq!(
+            perms_for(&g, &EnvFilter::One(env_a1p())),
+            vec![perm::ISSUE_READ.to_string(), perm::SOURCE_READ.to_string()]
+        );
+        // App-wide (`All`) must NOT pick it up: a source:read held on one
+        // environment cannot unlock source across every other one.
+        assert!(perms_for(&g, &EnvFilter::All).is_empty());
+        assert!(perms_for(&g, &EnvFilter::Unattributed).is_empty());
+        // And not a sibling environment either.
+        assert!(perms_for(&g, &EnvFilter::One(env_a1s())).is_empty());
+    }
+
+    /// Evaluating at an environment can only ADD to the app-level answer, never
+    /// subtract — `grant_applies`'s Org/Project/App arms ignore `env` entirely.
+    /// An app-wide caller asking `?environment_id=X` must not lose anything.
+    #[test]
+    fn app_and_higher_grants_survive_being_evaluated_at_an_environment() {
+        for g in [
+            vec![grant(Scope::App(app_a1()), &[perm::SOURCE_READ])],
+            vec![grant(Scope::Project(proj_a()), &[perm::SOURCE_READ])],
+            vec![grant(Scope::Org(org()), &[perm::SOURCE_READ])],
+        ] {
+            for env in [
+                EnvFilter::All,
+                EnvFilter::Unattributed,
+                EnvFilter::One(env_a1p()),
+                EnvFilter::Subset(vec![env_a1p(), env_a1s()]),
+            ] {
+                assert_eq!(
+                    perms_for(&g, &env),
+                    vec![perm::SOURCE_READ.to_string()],
+                    "an app-or-higher grant must hold at {env:?}"
+                );
+            }
+        }
+    }
+
+    /// `Subset` is the INTERSECTION: a permission counts only where it is held
+    /// in every environment the response could draw a row from. Held on one of
+    /// the two environments is not enough — that would leak source context from
+    /// the environment where the caller lacks the grant.
+    #[test]
+    fn subset_intersects_rather_than_unions_env_specific_permissions() {
+        let g = vec![
+            grant(
+                Scope::Env(env_a1p()),
+                &[perm::ISSUE_READ, perm::SOURCE_READ],
+            ),
+            // Same read permission on the sibling, but NOT source:read.
+            grant(Scope::Env(env_a1s()), &[perm::ISSUE_READ]),
+        ];
+        let both = EnvFilter::Subset(vec![env_a1p(), env_a1s()]);
+        assert_eq!(
+            perms_for(&g, &both),
+            vec![perm::ISSUE_READ.to_string()],
+            "source:read is held on only one of the two environments, so it must \
+             not survive the intersection"
+        );
+        // Narrowed to just the environment that does carry it, it comes back.
+        assert_eq!(
+            perms_for(&g, &EnvFilter::Subset(vec![env_a1p()])),
+            vec![perm::ISSUE_READ.to_string(), perm::SOURCE_READ.to_string()]
+        );
+    }
+
+    #[test]
+    fn no_grants_confer_nothing_at_any_filter() {
+        let g: Vec<Grant> = vec![];
+        for env in [
+            EnvFilter::All,
+            EnvFilter::Unattributed,
+            EnvFilter::One(env_a1p()),
+            EnvFilter::Subset(vec![env_a1p()]),
+        ] {
+            assert!(perms_for(&g, &env).is_empty(), "{env:?}");
+        }
     }
 }

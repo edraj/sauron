@@ -116,7 +116,7 @@ export interface FirstEventStatus {
 // Access control (RBAC)
 // ---------------------------------------------------------------------------
 
-export type ScopeType = 'org' | 'project' | 'app';
+export type ScopeType = 'org' | 'project' | 'app' | 'env';
 
 // Known permission strings. `(string & {})` keeps autocomplete while tolerating
 // any future permission the backend introduces.

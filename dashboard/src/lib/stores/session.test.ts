@@ -107,6 +107,10 @@ function resetStore() {
   // over between tests, unlike every other field reset above.
   (sessionStore as unknown as { environmentsLoadAttemptedFor: string | null }).environmentsLoadAttemptedFor =
     null;
+  // Same reasoning for `loadPromise` (Task 15, Item 3) — every test that sets
+  // it awaits `load()` to completion, which always resets it to `null` itself
+  // (success or failure), but reset it here too rather than rely on that.
+  (sessionStore as unknown as { loadPromise: Promise<void> | null }).loadPromise = null;
 }
 
 beforeEach(() => {
@@ -523,6 +527,81 @@ describe('setApp vs. the Topbar self-heal effect (no duplicate concurrent fetch)
   });
 });
 
+// ---------------------------------------------------------------------------
+// Task 15, Item 3 (`s2-task-13-dupe-fetch-fix.md`'s "out-of-scope finding"):
+// `App.svelte`'s post-auth redirect (`push('/issues')`, which mounts a layout
+// whose `onMount` calls `load()`) and `Login.svelte`'s own forced
+// `load(true)` right after a successful sign-in can both fire within the same
+// render pass, each starting a full bootstrap chain (`listOrgs` →
+// `getAccess`/`listProjects` → …) concurrently. As with the Topbar-effect
+// race above, asserting only the end state passes even with the bug present
+// — a second, concurrent bootstrap is idempotent — so these assert the call
+// count instead.
+// ---------------------------------------------------------------------------
+describe('load() in-flight idempotency (fresh-login double bootstrap)', () => {
+  function mockBootstrapChain() {
+    mockListOrgs.mockResolvedValue([
+      {
+        id: 'org-1',
+        name: 'Org 1',
+        slug: 'org-1',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      },
+    ]);
+    mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
+    mockListProjects.mockResolvedValue([]);
+  }
+
+  it('collapses a concurrent plain call and forced call into a single chain', async () => {
+    mockBootstrapChain();
+
+    // Models the race exactly: `fromAppShellMount` stands in for the layout
+    // `onMount` fired by App.svelte's redirect; `fromLoginSubmit` stands in
+    // for Login.svelte's own `await sessionStore.load(true)` — both start
+    // before either has resolved.
+    const fromAppShellMount = sessionStore.load();
+    const fromLoginSubmit = sessionStore.load(true);
+    await Promise.all([fromAppShellMount, fromLoginSubmit]);
+
+    expect(mockListOrgs).toHaveBeenCalledTimes(1);
+    expect(sessionStore.loaded).toBe(true);
+  });
+
+  it('collapses three overlapping callers, not just two', async () => {
+    mockBootstrapChain();
+
+    await Promise.all([sessionStore.load(), sessionStore.load(), sessionStore.load(true)]);
+
+    expect(mockListOrgs).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts a genuinely new chain once the in-flight one has settled', async () => {
+    mockBootstrapChain();
+
+    await sessionStore.load();
+    expect(mockListOrgs).toHaveBeenCalledTimes(1);
+
+    // Not concurrent this time — the first call fully settled first, so the
+    // in-flight guard must not still be latched.
+    await sessionStore.load(true);
+    expect(mockListOrgs).toHaveBeenCalledTimes(2);
+  });
+
+  it('lets a later caller retry after an in-flight chain fails', async () => {
+    mockListOrgs.mockRejectedValueOnce(new Error('network blip'));
+
+    await expect(sessionStore.load()).rejects.toThrow('network blip');
+    expect(sessionStore.loaded).toBe(false);
+
+    mockBootstrapChain();
+    await sessionStore.load();
+
+    expect(mockListOrgs).toHaveBeenCalledTimes(2);
+    expect(sessionStore.loaded).toBe(true);
+  });
+});
+
 describe('setEnvironment', () => {
   it('sets the literal string "none" with no translation', () => {
     sessionStore.setEnvironment('none');
@@ -535,5 +614,108 @@ describe('setEnvironment', () => {
     sessionStore.setEnvironment(null);
     expect(sessionStore.currentEnvId).toBeNull();
     expect(window.localStorage.getItem(ENV_KEY)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// can(): the client mirror of the backend's `grant_applies` /
+// `effective_permissions` (sauron-auth/src/rbac.rs), extended to the fourth
+// (env) level. These pin the cascade in both directions: a grant at env, app,
+// project, or org level all satisfy an env-scoped check (down), but an env
+// grant must NEVER satisfy an app/project/org-level check (up) — that
+// direction is the actual security-relevant risk (a UI that shows a button
+// which then 403s), not the other one.
+// ---------------------------------------------------------------------------
+describe('can() — environment-scoped checks', () => {
+  beforeEach(() => {
+    sessionStore.currentOrgId = 'org-1';
+    sessionStore.currentProjectId = 'proj-1';
+    sessionStore.currentAppId = 'app-1';
+  });
+
+  it('an env grant satisfies a check for that same environment only', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: ['issue:read'] }],
+    };
+
+    expect(sessionStore.can('issue:read', { env: 'env-1' })).toBe(true);
+    expect(sessionStore.can('issue:read', { env: 'env-2' })).toBe(false);
+  });
+
+  it('an app grant cascades down to satisfy an env-scoped check', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'app', scope_id: 'app-1', permissions: ['issue:read'] }],
+    };
+
+    expect(sessionStore.can('issue:read', { env: 'env-1' })).toBe(true);
+  });
+
+  it('project and org grants also cascade down to an env-scoped check', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'project', scope_id: 'proj-1', permissions: ['issue:read'] }],
+    };
+    expect(sessionStore.can('issue:read', { env: 'env-1' })).toBe(true);
+
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'org', scope_id: 'org-1', permissions: ['issue:read'] }],
+    };
+    expect(sessionStore.can('issue:read', { env: 'env-1' })).toBe(true);
+  });
+
+  it('an env grant does NOT satisfy an app-level check — a narrower grant can never satisfy a wider one', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: ['issue:read'] }],
+    };
+
+    // No `env` in the scope at all — an ordinary app-level check.
+    expect(sessionStore.can('issue:read', { app: 'app-1' })).toBe(false);
+  });
+
+  it('omitting `env` never matches an env grant, even when currentEnvId equals it', () => {
+    // `env` is deliberately not defaulted from `currentEnvId` — see can()'s
+    // doc comment. Most call sites never pass `env` at all, and if it
+    // defaulted from the current selection, any env-scoped grant naming the
+    // selected environment would leak into every one of those unrelated
+    // checks.
+    sessionStore.currentEnvId = 'env-1';
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: ['app:update'] }],
+    };
+
+    expect(sessionStore.can('app:update', { app: 'app-1' })).toBe(false);
+  });
+
+  it('`null` (all environments) and "none" (unattributed) never match an env grant', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: ['issue:read'] }],
+    };
+
+    expect(sessionStore.can('issue:read', { env: null })).toBe(false);
+    expect(sessionStore.can('issue:read', { env: 'none' })).toBe(false);
+  });
+
+  it('an env grant on a different environment does not satisfy the check', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-2', permissions: ['issue:read'] }],
+    };
+
+    expect(sessionStore.can('issue:read', { env: 'env-1' })).toBe(false);
+  });
+
+  it('a permission absent from the matched env grant still denies', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: ['issue:read'] }],
+    };
+
+    expect(sessionStore.can('issue:write', { env: 'env-1' })).toBe(false);
   });
 });

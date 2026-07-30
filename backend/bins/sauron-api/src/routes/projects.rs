@@ -62,6 +62,22 @@ pub async fn list_projects(
                 .map(|(_, project_id, _)| project_id),
         );
     }
+    // Same lift, one level further down: an env-only grant (no ancestor org/
+    // project/app grant) must still surface its project in the switcher, or
+    // there is no path from login to the one app that grant is for. One
+    // batched `env_ancestries` call, not one query per environment — filtered
+    // to this org exactly like the app lift above, so a stray env grant
+    // belonging to another org (should never happen, `role_grants.scope_id`
+    // has no FK, so "should" is doing work) still cannot widen this list.
+    if !reach.envs.is_empty() {
+        let env_ancestries = repo::env_ancestries(&mut conn, &reach.envs).await?;
+        project_ids.extend(
+            env_ancestries
+                .into_iter()
+                .filter(|(_, _, _, ancestor_org)| *ancestor_org == org_id)
+                .map(|(_, _, project_id, _)| project_id),
+        );
+    }
     project_ids.sort();
     project_ids.dedup();
     Ok(Json(
@@ -160,7 +176,21 @@ pub async fn list_apps(
         ));
     }
 
-    let allowed: HashSet<Uuid> = reach.apps.into_iter().collect();
+    let mut allowed: HashSet<Uuid> = reach.apps.into_iter().collect();
+    // Same lift as `list_projects` above, one level down: an env-only grant
+    // must surface its own parent app in the switcher. Filtered to THIS
+    // project — an env grant whose app belongs to a sibling project must not
+    // widen this listing, mirroring the app-grant sibling-isolation the
+    // `reach.projects.contains(&project_id)` fast path above already relies on.
+    if !reach.envs.is_empty() {
+        let env_ancestries = repo::env_ancestries(&mut conn, &reach.envs).await?;
+        allowed.extend(
+            env_ancestries
+                .into_iter()
+                .filter(|(_, _, ancestor_project, _)| *ancestor_project == project_id)
+                .map(|(_, app_id, _, _)| app_id),
+        );
+    }
     let apps = repo::list_apps_for_project(&mut conn, project_id)
         .await?
         .into_iter()

@@ -81,6 +81,8 @@ diesel::table! {
         contexts -> Jsonb,
         extra -> Jsonb,
         handled -> Nullable<Bool>,
+        title -> Nullable<Text>,
+        culprit -> Nullable<Text>,
     }
 }
 

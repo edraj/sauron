@@ -3317,6 +3317,7 @@ dependencies = [
  "diesel-async",
  "diesel_migrations",
  "percent-encoding",
+ "sauron-auth",
  "sauron-core",
  "sauron-query",
  "scoped-futures",

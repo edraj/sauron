@@ -916,6 +916,29 @@ pub async fn app_ancestries(
         .await
 }
 
+/// `(env_id, app_id, project_id, org_id)` for each of `ids` that resolves —
+/// the batched `env_ancestry`, mirroring `app_ancestries` exactly so
+/// validating a batch of scopes that mixes apps and envs still costs one
+/// query per kind. Ids that are not environments are simply absent from the
+/// result.
+pub async fn env_ancestries(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid, Uuid, Uuid)>> {
+    environments::table
+        .inner_join(apps::table.on(apps::id.eq(environments::app_id)))
+        .inner_join(projects::table.on(projects::id.eq(apps::project_id)))
+        .filter(environments::id.eq_any(ids.to_vec()))
+        .select((
+            environments::id,
+            environments::app_id,
+            apps::project_id,
+            projects::org_id,
+        ))
+        .load(conn)
+        .await
+}
+
 // --- environments -----------------------------------------------------------
 
 /// Cap on how many live environments an app may hold. Creation is now an
@@ -1184,6 +1207,21 @@ pub async fn env_ancestry(
         .optional()
 }
 
+/// Every environment id of an app, **including retired ones**.
+///
+/// Retired environments are included deliberately: their history stays
+/// readable (an app's data does not disappear because an environment was
+/// retired), so a caller's readable subset must be able to contain one.
+/// `list_environments` excludes them because they must not be *selectable*;
+/// that is a different question from whether they are *readable*.
+pub async fn env_ids_for_app(conn: &mut AsyncPgConnection, app_id: Uuid) -> QueryResult<Vec<Uuid>> {
+    environments::table
+        .filter(environments::app_id.eq(app_id))
+        .select(environments::id)
+        .load(conn)
+        .await
+}
+
 // ===========================================================================
 // Issues & error events (app-scoped)
 // ===========================================================================
@@ -1394,13 +1432,51 @@ impl From<IssueRow> for Issue {
 ///    the same request can therefore report different numbers for the same
 ///    issue even setting the first two discrepancies aside.
 ///
-/// Not scoped by environment even under `One`/`Unattributed`: the
-/// `level`/`status`/`type`/`culprit`/`times_seen`/`users_seen` *filters*
-/// still compare against the issue's own app-wide columns — they are
-/// issue-level attributes with no per-environment meaning to narrow to
-/// (`issue_stats` makes the identical call for `status`/`level`). Only the
-/// `tag`/`q` filters, the four returned aggregate values, and the `since`
-/// membership check are environment-derived.
+/// **Task 9: `title`/`culprit`/`level` are now derived per environment too**,
+/// the same shape as the four aggregate values above. A second `LEFT JOIN
+/// LATERAL` (`latest`) beside `agg` selects `title`/`culprit`/`level` from
+/// the single newest `error_events` row in the selected environment
+/// (`ORDER BY e.occurred_at DESC LIMIT 1`); the outer select list reads
+/// `COALESCE(latest.title, i.title)` etc. `LEFT JOIN` + `COALESCE`, not an
+/// inner join: a row written before migration 30 has `title`/`culprit =
+/// NULL` (they were only added then, not backfilled), and must fall back to
+/// the app-wide `issues` column rather than vanishing from the page. The
+/// `latest` LATERAL's own `WHERE e.issue_id = i.id{env}` fragment reuses the
+/// **same bound env value** (`env_bind_idx`, `$3`) `agg` already uses — no
+/// new bind is allocated; see the bind-layout comment below, which this
+/// doesn't change. `error_events.level` is `NOT NULL`, and — because
+/// `agg`'s own `HAVING count(*) > 0` (or the paging subquery's membership
+/// `EXISTS`) already guarantees at least one in-environment row exists —
+/// `latest` always finds a row too; `COALESCE` here is purely for the
+/// `title`/`culprit` legacy-NULL case, not a "no row" case.
+///
+/// **Task 9 also moved four filters onto those derived values.** `level`,
+/// `culprit`, `times_seen`, `users_seen` used to sit inside the paging
+/// subquery, compared against `issues`' stored (app-wide) columns, while the
+/// row displayed the derived ones — so `?level=error` and the level shown on
+/// the row could disagree, the same class of bug the tag/`q` `EXISTS`
+/// fragments had before the S2 Task 10 review fixed *their* environment
+/// leak. Those four now live in the **outer** query, compared against
+/// `latest.level` / `latest.culprit` / `agg.times_seen` / `agg.users_seen`.
+/// `status` and `type` stay in the subquery, comparing against `issues`'
+/// own columns — they are genuinely app-wide attributes with no
+/// per-environment meaning (`issue_stats` makes the identical call for
+/// `status`), so there is no derived value to move them to. `tag`'s `EXISTS`
+/// fragments are unaffected either way (already environment-scoped, not
+/// stored-column-compared).
+///
+/// **Trade accepted, not overlooked:** moving those four filters out of the
+/// subquery means the subquery can no longer pre-filter on them, so it now
+/// pages a *wider* candidate set (bounded only by `app_id`/`status`/`type`/
+/// `tag`/environment membership) before the outer query narrows it by
+/// `level`/`culprit`/`times_seen`/`users_seen`. A page can therefore come
+/// back with fewer than `limit` rows even when more genuinely-matching
+/// issues exist past `offset` — OFFSET-based paging combined with one of
+/// these four filters is no longer exact beyond the first page. Accepted
+/// because the only real caller, `Issues.svelte`, always requests `limit:
+/// 100` with no `offset` (see `dashboard/src/pages/Issues.svelte`'s `load()`)
+/// — chosen deliberately, not left as an unnoticed regression; revisit if a
+/// second caller ever pages past offset 0 with one of these filters set.
 pub async fn list_issues(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
@@ -1513,7 +1589,7 @@ pub async fn list_issues(
     // subquery's own membership `EXISTS` all need to reference the same
     // bound value too, alongside the LATERAL's own; one bind reused
     // everywhere it's needed, same idiom as reusing `$2` for `since`. Under
-    // `One`, $3 is bound (`scope.env.bind_uuid()` is `Some`) and filters
+    // `One`/`Subset`, $3 is bound (`scope.env.consumes_bind()` is `true`) and filters
     // start at $4; under `Unattributed`, $3 is never referenced in the SQL
     // text at all (a literal `IS NULL` needs no bind) and no bind is pushed
     // for it, so filters start at $3 instead — `next_bind`'s initial value
@@ -1534,23 +1610,33 @@ pub async fn list_issues(
     // `list_persons`' doc comment for the identical situation). So these use
     // bare column names / the literal table name `issues`, never `i.`.
     let env_bind_idx = 3usize;
-    let env_bind_value = scope.env.bind_uuid();
-    let mut next_bind = if env_bind_value.is_some() {
+    let mut next_bind = if scope.env.consumes_bind() {
         4usize
     } else {
         3usize
     };
     let env_sql = scope.env.sql_fragment_for("e", env_bind_idx);
     let member_env_sql = scope.env.sql_fragment_for("m", env_bind_idx);
+    // Task 9: split in two. `filter_sql` stays textually inside the paging
+    // subquery (`status`/`type`/`tag` — genuinely app-wide columns, or
+    // already-environment-scoped `EXISTS`es); `outer_filter_sql` moves to
+    // the outer query, after the `agg`/`latest` LATERALs exist to be
+    // compared against (`level`/`culprit`/`times_seen`/`users_seen` — see
+    // this function's doc comment for why). Both still consume `next_bind`
+    // from the same single counter, in the same `filters` iteration order,
+    // as before — only *where* each fragment's text lands changed, not the
+    // bind numbering, so the bind loop below (which binds by `f.field`/
+    // `f.op`, not by which string it went into) needs no change.
     let mut filter_sql = String::new();
+    let mut outer_filter_sql = String::new();
     for f in filters {
         match (f.field, f.op) {
             ("level", Op::Eq) => {
-                filter_sql += &format!(" AND level = ${next_bind}");
+                outer_filter_sql += &format!(" AND latest.level = ${next_bind}");
                 next_bind += 1;
             }
             ("level", Op::Neq) => {
-                filter_sql += &format!(" AND level <> ${next_bind}");
+                outer_filter_sql += &format!(" AND latest.level <> ${next_bind}");
                 next_bind += 1;
             }
             ("status", Op::Eq) => {
@@ -1574,39 +1660,39 @@ pub async fn list_issues(
                 next_bind += 1;
             }
             ("culprit", Op::Eq) => {
-                filter_sql += &format!(" AND culprit = ${next_bind}");
+                outer_filter_sql += &format!(" AND latest.culprit = ${next_bind}");
                 next_bind += 1;
             }
             ("culprit", Op::Neq) => {
-                filter_sql += &format!(" AND culprit <> ${next_bind}");
+                outer_filter_sql += &format!(" AND latest.culprit <> ${next_bind}");
                 next_bind += 1;
             }
             ("culprit", Op::Contains) => {
-                filter_sql += &format!(" AND culprit ILIKE ${next_bind}");
+                outer_filter_sql += &format!(" AND latest.culprit ILIKE ${next_bind}");
                 next_bind += 1;
             }
             ("times_seen", Op::Eq) => {
-                filter_sql += &format!(" AND times_seen = ${next_bind}");
+                outer_filter_sql += &format!(" AND agg.times_seen = ${next_bind}");
                 next_bind += 1;
             }
             ("times_seen", Op::Gt) => {
-                filter_sql += &format!(" AND times_seen > ${next_bind}");
+                outer_filter_sql += &format!(" AND agg.times_seen > ${next_bind}");
                 next_bind += 1;
             }
             ("times_seen", Op::Lt) => {
-                filter_sql += &format!(" AND times_seen < ${next_bind}");
+                outer_filter_sql += &format!(" AND agg.times_seen < ${next_bind}");
                 next_bind += 1;
             }
             ("users_seen", Op::Eq) => {
-                filter_sql += &format!(" AND users_seen = ${next_bind}");
+                outer_filter_sql += &format!(" AND agg.users_seen = ${next_bind}");
                 next_bind += 1;
             }
             ("users_seen", Op::Gt) => {
-                filter_sql += &format!(" AND users_seen > ${next_bind}");
+                outer_filter_sql += &format!(" AND agg.users_seen > ${next_bind}");
                 next_bind += 1;
             }
             ("users_seen", Op::Lt) => {
-                filter_sql += &format!(" AND users_seen < ${next_bind}");
+                outer_filter_sql += &format!(" AND agg.users_seen < ${next_bind}");
                 next_bind += 1;
             }
             ("tag", Op::Eq) => {
@@ -1649,7 +1735,11 @@ pub async fn list_issues(
     let offset_bind = next_bind;
 
     let sql_text = format!(
-        "SELECT i.id, i.app_id, i.fingerprint, i.type AS type_, i.title, i.culprit, i.level, i.status, \
+        "SELECT i.id, i.app_id, i.fingerprint, i.type AS type_, \
+                COALESCE(latest.title, i.title)     AS title, \
+                COALESCE(latest.culprit, i.culprit) AS culprit, \
+                COALESCE(latest.level, i.level)     AS level, \
+                i.status, \
                 agg.first_seen, agg.last_seen, agg.times_seen, agg.users_seen, \
                 i.assignee_id, i.created_at, i.updated_at, i.last_event_at \
          FROM ( \
@@ -1668,7 +1758,14 @@ pub async fn list_issues(
              WHERE e.issue_id = i.id AND e.occurred_at >= $2{env_sql} \
              HAVING count(*) > 0 \
          ) agg ON TRUE \
-         WHERE agg.last_seen >= $2 \
+         LEFT JOIN LATERAL ( \
+             SELECT e.title, e.culprit, e.level \
+             FROM error_events e \
+             WHERE e.issue_id = i.id{env_sql} \
+             ORDER BY e.occurred_at DESC \
+             LIMIT 1 \
+         ) latest ON TRUE \
+         WHERE agg.last_seen >= $2{outer_filter_sql} \
          ORDER BY agg.last_seen DESC"
     );
 
@@ -1676,9 +1773,7 @@ pub async fn list_issues(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind_value {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     for f in filters {
         stmt = match (f.field, f.op) {
             ("level", Op::Eq)
@@ -1726,6 +1821,12 @@ pub async fn list_issues(
 /// returns `None` either way, so a caller cannot distinguish "wrong id" from
 /// "not in this environment" — the same non-disclosure `get_device`/
 /// `get_event_user` chose.
+///
+/// Task 9: also reuses [`list_issues`]' `title`/`culprit`/`level` derivation
+/// — a second `LEFT JOIN LATERAL` (`latest`), `COALESCE`d against `issues`'
+/// own columns, reusing the identical `$3` env bind `agg` already consumes.
+/// See `list_issues`' doc comment for the full reasoning (legacy-NULL
+/// fallback, why `LEFT JOIN` not inner).
 pub async fn get_issue(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
@@ -1743,7 +1844,11 @@ pub async fn get_issue(
 
     let env_sql = scope.env.sql_fragment_for("e", 3);
     let sql_text = format!(
-        "SELECT i.id, i.app_id, i.fingerprint, i.type AS type_, i.title, i.culprit, i.level, i.status, \
+        "SELECT i.id, i.app_id, i.fingerprint, i.type AS type_, \
+                COALESCE(latest.title, i.title)     AS title, \
+                COALESCE(latest.culprit, i.culprit) AS culprit, \
+                COALESCE(latest.level, i.level)     AS level, \
+                i.status, \
                 agg.first_seen, agg.last_seen, agg.times_seen, agg.users_seen, \
                 i.assignee_id, i.created_at, i.updated_at, i.last_event_at \
          FROM ( \
@@ -1757,15 +1862,20 @@ pub async fn get_issue(
              FROM error_events e \
              WHERE e.issue_id = i.id{env_sql} \
              HAVING count(*) > 0 \
-         ) agg ON TRUE"
+         ) agg ON TRUE \
+         LEFT JOIN LATERAL ( \
+             SELECT e.title, e.culprit, e.level \
+             FROM error_events e \
+             WHERE e.issue_id = i.id{env_sql} \
+             ORDER BY e.occurred_at DESC \
+             LIMIT 1 \
+         ) latest ON TRUE"
     );
     let mut stmt = diesel::sql_query(sql_text)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<SqlUuid, _>(issue_id);
-    if let Some(id) = scope.env.bind_uuid() {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     let row: Option<IssueRow> = stmt.get_result(conn).await.optional()?;
     Ok(row.map(Issue::from))
 }
@@ -1856,7 +1966,7 @@ pub async fn list_error_events_for_issue(
                 .or(sql::<Bool>("error_events.tags::text ILIKE ").bind::<Text, _>(p)),
         );
     }
-    crate::scope_env!(query, error_events, scope.env)
+    crate::scope_env!(query, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)
@@ -1880,7 +1990,7 @@ pub async fn latest_error_event(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::issue_id.eq(issue_id))
         .into_boxed();
-    crate::scope_env!(query, error_events, scope.env)
+    crate::scope_env!(query, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .first(conn)
@@ -1901,7 +2011,7 @@ pub async fn error_events_for_person(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::distinct_id.eq(distinct_id))
         .into_boxed();
-    crate::scope_env!(q, error_events, scope.env)
+    crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)
@@ -2064,7 +2174,6 @@ pub async fn get_event_user(
     scope: ReadScope,
     distinct_id: &str,
 ) -> QueryResult<Option<PersonRow>> {
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
 
     // See `list_persons`' membership `EXISTS` doc comment: each leg is
@@ -2123,9 +2232,7 @@ pub async fn get_event_user(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Text, _>(distinct_id.to_string());
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_result(conn).await.optional()
 }
 
@@ -2142,7 +2249,7 @@ pub async fn events_for_person(
         .filter(analytics_events::app_id.eq(scope.app_id))
         .filter(analytics_events::distinct_id.eq(distinct_id))
         .into_boxed();
-    crate::scope_env!(q, analytics_events, scope.env)
+    crate::scope_env!(q, analytics_events, &scope.env)
         .select(AnalyticsEvent::as_select())
         .order(analytics_events::occurred_at.desc())
         .limit(limit)
@@ -2168,9 +2275,8 @@ pub async fn top_events(
     // $4 in that case and $3 otherwise. Deriving both from the same `EnvFilter`
     // is what keeps the string and the bind sequence in agreement — see
     // `EnvFilter::sql_fragment`'s doc for why only `One` consumes an index.
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
-    let limit_idx = if env_bind.is_some() { 4 } else { 3 };
+    let limit_idx = if scope.env.consumes_bind() { 4 } else { 3 };
 
     let q = format!(
         "SELECT name, count(*)::bigint AS count FROM analytics_events \
@@ -2181,9 +2287,7 @@ pub async fn top_events(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.bind::<BigInt, _>(limit).get_results(conn).await
 }
 
@@ -2201,7 +2305,6 @@ pub async fn event_series(
     name: Option<&str>,
     since: DateTime<Utc>,
 ) -> QueryResult<Vec<SeriesPoint>> {
-    let env_bind = scope.env.bind_uuid();
     match name {
         Some(n) => {
             // $1 app_id, $2 since, $3 name — env takes $4 when it needs a bind.
@@ -2217,9 +2320,7 @@ pub async fn event_series(
                 .bind::<SqlUuid, _>(scope.app_id)
                 .bind::<Timestamptz, _>(since)
                 .bind::<Text, _>(n);
-            if let Some(id) = env_bind {
-                stmt = stmt.bind::<SqlUuid, _>(id);
-            }
+            stmt = crate::bind_env!(stmt, &scope.env);
             stmt.get_results(conn).await
         }
         None => {
@@ -2235,9 +2336,7 @@ pub async fn event_series(
                 .into_boxed()
                 .bind::<SqlUuid, _>(scope.app_id)
                 .bind::<Timestamptz, _>(since);
-            if let Some(id) = env_bind {
-                stmt = stmt.bind::<SqlUuid, _>(id);
-            }
+            stmt = crate::bind_env!(stmt, &scope.env);
             stmt.get_results(conn).await
         }
     }
@@ -2264,9 +2363,7 @@ pub async fn issue_occurrence_series(
     .bind::<SqlUuid, _>(issue_id)
     .bind::<SqlUuid, _>(scope.app_id)
     .bind::<Timestamptz, _>(since);
-    if let Some(id) = scope.env.bind_uuid() {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_results(conn).await
 }
 
@@ -2277,6 +2374,38 @@ pub async fn issue_occurrence_series(
 /// Upsert a session row, folding one signal into it: bump last/first seen and
 /// the event/error counters. `context` snapshots the device/os block (only
 /// written when non-empty). Idempotent per `(app_id, session_id)`.
+///
+/// `environment_id` is `COALESCE(EXCLUDED.environment_id,
+/// sessions.environment_id)` — the most recent non-null value wins — and
+/// `events_count`/`errors_count` accumulate across every environment that
+/// touched this session id. The row's own environment label therefore cannot
+/// disambiguate its counters. Readers that need per-environment truth derive
+/// it from the environment-stamped child tables instead; see
+/// `events_for_session`, which says the same thing for the same reason.
+///
+/// Two readers do NOT do this today: `overview_totals`'s `crashed_sessions`
+/// and `session_stats`'s `crashed` both count `errors_count > 0 AND
+/// environment_id = $env` directly off this row, trusting the label. Task 10
+/// (Slice 3) measured the fix — deriving `crashed` from an `EXISTS` against
+/// `error_events` in the selected environment instead — against the largest
+/// dev app and declined to ship it: the semi-join cost roughly 11x the
+/// column predicate's planning+execution time even with a purpose-built
+/// `error_events (app_id, session_id, environment_id)` index, because the
+/// cost is a correlated per-session subquery re-probed against every
+/// partition of `error_events` (partition pruning cannot help — neither
+/// `session_id` nor `environment_id` is the partition key), not a missing
+/// index. See
+/// `.superpowers/sdd/2026-07-29-environment-rbac-scope/task-10-report.md`
+/// for the full measurement. Until a cheaper derivation exists (e.g. a
+/// per-session/environment crash flag maintained by this function itself,
+/// rather than computed at read time), this is a *mislabelling*, not just an
+/// over-count: a session that errored in `env_a` but was last touched by a
+/// signal from `env_b` shows as crashed under `One(env_b)` (which never saw
+/// the error) and simultaneously invisible — not merely "not crashed" —
+/// under `One(env_a)` (which did), because the row's single label can only
+/// point at one environment at a time. `errors_count` itself never
+/// under-counts (it only grows), but which environment gets credited for it
+/// can be wrong in either direction.
 #[allow(clippy::too_many_arguments)]
 pub async fn bump_session(
     conn: &mut AsyncPgConnection,
@@ -2410,7 +2539,7 @@ pub async fn app_has_events(
             .filter(error_events::app_id.eq(scope.app_id))
             .into_boxed(),
         error_events,
-        scope.env
+        &scope.env
     )))
     .get_result(conn)
     .await?;
@@ -2419,7 +2548,7 @@ pub async fn app_has_events(
             .filter(analytics_events::app_id.eq(scope.app_id))
             .into_boxed(),
         analytics_events,
-        scope.env
+        &scope.env
     )))
     .get_result(conn)
     .await?;
@@ -2431,7 +2560,6 @@ pub async fn error_series(
     scope: ReadScope,
     since: DateTime<Utc>,
 ) -> QueryResult<Vec<SeriesPoint>> {
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
     let q = format!(
         "SELECT date_trunc('day', occurred_at) AS bucket, count(*)::bigint AS count \
@@ -2442,9 +2570,7 @@ pub async fn error_series(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_results(conn).await
 }
 
@@ -2466,7 +2592,7 @@ pub async fn list_sessions(
         .filter(sessions::app_id.eq(scope.app_id))
         .filter(sessions::last_event_at.ge(since))
         .into_boxed();
-    q = crate::scope_env!(q, sessions, scope.env);
+    q = crate::scope_env!(q, sessions, &scope.env);
     if let Some(d) = distinct_id {
         q = q.filter(sessions::distinct_id.eq(d.to_string()));
     }
@@ -2497,7 +2623,7 @@ pub async fn get_session(
         .filter(sessions::app_id.eq(scope.app_id))
         .filter(sessions::session_id.eq(session_id.to_string()))
         .into_boxed();
-    crate::scope_env!(q, sessions, scope.env)
+    crate::scope_env!(q, sessions, &scope.env)
         .select(Session::as_select())
         .first(conn)
         .await
@@ -2520,7 +2646,7 @@ pub async fn events_for_session(
         .filter(analytics_events::app_id.eq(scope.app_id))
         .filter(analytics_events::session_id.eq(session_id.to_string()))
         .into_boxed();
-    crate::scope_env!(q, analytics_events, scope.env)
+    crate::scope_env!(q, analytics_events, &scope.env)
         .select(AnalyticsEvent::as_select())
         .order(analytics_events::occurred_at.asc())
         .limit(limit)
@@ -2539,7 +2665,7 @@ pub async fn errors_for_session(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::session_id.eq(session_id.to_string()))
         .into_boxed();
-    crate::scope_env!(q, error_events, scope.env)
+    crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.asc())
         .limit(limit)
@@ -2558,7 +2684,7 @@ pub async fn transactions_for_session(
         .filter(transactions::app_id.eq(scope.app_id))
         .filter(transactions::session_id.eq(session_id.to_string()))
         .into_boxed();
-    crate::scope_env!(q, transactions, scope.env)
+    crate::scope_env!(q, transactions, &scope.env)
         .select(Transaction::as_select())
         .order(transactions::occurred_at.asc())
         .limit(limit)
@@ -2685,7 +2811,6 @@ pub async fn list_devices(
     // `errors` only under `One`/`Unattributed`, `sessions` always) and the
     // membership `EXISTS` (only emitted when `scope.env != All`). Same idiom
     // as `list_persons`.
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(6);
 
     // See `list_persons`' doc comment: this is a WHERE-clause predicate on the
@@ -2770,7 +2895,11 @@ pub async fn list_devices(
             String::new(),
         )
     } else {
-        let ld_join = device_last_distinct_id_join(scope.env, 6);
+        // `.clone()`, not a move: `env_sql`/the final `bind_env!` call below both
+        // still need `scope.env` after this — `device_last_distinct_id_join` keeps
+        // its pre-existing owned-`EnvFilter` signature (not reshaped to take `&`),
+        // per the rule of adding a clone at the call site instead.
+        let ld_join = device_last_distinct_id_join(scope.env.clone(), 6);
         (
             "COALESCE(ae.cnt, 0)::bigint AS events_count, \
              COALESCE(ee.cnt, 0)::bigint AS errors_count, \
@@ -2833,9 +2962,7 @@ pub async fn list_devices(
         .bind::<Text, _>(pattern)
         .bind::<BigInt, _>(limit)
         .bind::<BigInt, _>(offset);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_results(conn).await
 }
 
@@ -2864,7 +2991,6 @@ pub async fn get_device(
     scope: ReadScope,
     device_key: &str,
 ) -> QueryResult<Option<DeviceRow>> {
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
 
     // See `list_devices`' membership `EXISTS` doc comment: each leg is
@@ -2904,7 +3030,8 @@ pub async fn get_device(
             String::new(),
         )
     } else {
-        let ld_join = device_last_distinct_id_join(scope.env, 3);
+        // `.clone()`, not a move — see `list_devices`' identical call for why.
+        let ld_join = device_last_distinct_id_join(scope.env.clone(), 3);
         (
             "COALESCE(ae.cnt, 0)::bigint AS events_count, \
              COALESCE(ee.cnt, 0)::bigint AS errors_count, \
@@ -2946,9 +3073,7 @@ pub async fn get_device(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Text, _>(device_key.to_string());
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_result(conn).await.optional()
 }
 
@@ -2965,7 +3090,7 @@ pub async fn errors_for_device(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::device_key.eq(device_key.to_string()))
         .into_boxed();
-    crate::scope_env!(q, error_events, scope.env)
+    crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)
@@ -3044,7 +3169,6 @@ pub async fn list_persons(
     // unconditionally. That also means `list_persons` carries none of
     // `list_devices`' tiering blind spot under `All`; it already had it, and
     // still has it, under every scope.
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(5);
 
     // `event_users` carries no `environment_id` at all, so a person's
@@ -3135,9 +3259,7 @@ pub async fn list_persons(
         .bind::<Text, _>(pattern)
         .bind::<BigInt, _>(limit)
         .bind::<BigInt, _>(offset);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_results(conn).await
 }
 
@@ -3213,7 +3335,6 @@ pub async fn overview_totals(
     // join), so `sql_fragment_for` is passed the table's own name rather than a shortened
     // alias — purely for self-documentation, since a bare `sql_fragment` would emit
     // identical SQL here.
-    let env_bind = scope.env.bind_uuid();
     let env_sql_analytics = scope.env.sql_fragment_for("analytics_events", 3);
     let env_sql_errors = scope.env.sql_fragment_for("error_events", 3);
     let env_sql_sessions = scope.env.sql_fragment_for("sessions", 3);
@@ -3233,8 +3354,18 @@ pub async fn overview_totals(
     // today counts as "new" in *neither* environment's window under this reading — their
     // global `first_seen` predates `since` regardless of which environment's membership is
     // checked.
-    let membership_sql = event_user_membership_exists(scope.env, 3);
+    // `.clone()`, not a move: the final `bind_env!` call below still needs
+    // `scope.env` — `event_user_membership_exists` keeps its pre-existing
+    // owned-`EnvFilter` signature (not reshaped to take `&`), per the rule of
+    // adding a clone at the call site instead.
+    let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
 
+    // `crashed_sessions` trusts `sessions.errors_count`/`environment_id` directly —
+    // known to be able to mislabel which environment a crash counts against (not
+    // just over/under by a fixed amount). See `bump_session`'s doc comment for the
+    // mechanism and `.superpowers/sdd/2026-07-29-environment-rbac-scope/
+    // task-10-report.md` for why the `EXISTS`-against-`error_events` fix was
+    // measured and declined rather than shipped.
     let q = format!(
         "SELECT \
            (SELECT count(*) FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2{env_sql_analytics})::bigint AS events, \
@@ -3248,9 +3379,7 @@ pub async fn overview_totals(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_result(conn).await
 }
 
@@ -3303,11 +3432,18 @@ pub async fn top_issues(
     }
 
     let env_bind_idx = 4usize;
-    let env_bind_value = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment_for("e", env_bind_idx);
     let member_env_sql = scope.env.sql_fragment_for("m", env_bind_idx);
+    // Task 9: same `latest` LATERAL as `list_issues`/`get_issue`, reusing
+    // the identical `$4` env bind `agg` already consumes — see
+    // `list_issues`' doc comment for the full title/culprit/level
+    // derivation reasoning.
     let sql_text = format!(
-        "SELECT i.id, i.app_id, i.fingerprint, i.type AS type_, i.title, i.culprit, i.level, i.status, \
+        "SELECT i.id, i.app_id, i.fingerprint, i.type AS type_, \
+                COALESCE(latest.title, i.title)     AS title, \
+                COALESCE(latest.culprit, i.culprit) AS culprit, \
+                COALESCE(latest.level, i.level)     AS level, \
+                i.status, \
                 agg.first_seen, agg.last_seen, agg.times_seen, agg.users_seen, \
                 i.assignee_id, i.created_at, i.updated_at, i.last_event_at \
          FROM ( \
@@ -3324,6 +3460,13 @@ pub async fn top_issues(
              WHERE e.issue_id = i.id AND e.occurred_at >= $2{env_sql} \
              HAVING count(*) > 0 \
          ) agg ON TRUE \
+         LEFT JOIN LATERAL ( \
+             SELECT e.title, e.culprit, e.level \
+             FROM error_events e \
+             WHERE e.issue_id = i.id{env_sql} \
+             ORDER BY e.occurred_at DESC \
+             LIMIT 1 \
+         ) latest ON TRUE \
          WHERE agg.last_seen >= $2 \
          ORDER BY agg.times_seen DESC \
          LIMIT $3"
@@ -3333,9 +3476,7 @@ pub async fn top_issues(
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since)
         .bind::<BigInt, _>(limit);
-    if let Some(id) = env_bind_value {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     let rows: Vec<IssueRow> = stmt.get_results(conn).await?;
     Ok(rows.into_iter().map(Issue::from).collect())
 }
@@ -3364,42 +3505,75 @@ pub struct IssueStatsRow {
     pub info: i64,
 }
 
-/// `issues` carries no `environment_id`; under `One`/`Unattributed` an issue
-/// counts only if it has at least one occurrence in that environment — a
-/// plain membership `EXISTS` over `error_events`, no LATERAL/aggregation
-/// needed. Unlike `list_issues`, this doesn't need to derive `times_seen`/
-/// `users_seen`/`first_seen`/`last_seen`: `status`/`level` are issue-level
-/// attributes, not per-environment ones, so counting *which issues qualify*
-/// is the whole job here.
+/// `issues` carries no `environment_id`. Under `EnvFilter::All` this reads
+/// `issues` directly and is unchanged — same query this function ran before
+/// Slice 2/Task 9, no join.
+///
+/// Under `One`/`Subset`/`Unattributed`, Task 9 replaced the plain membership
+/// `EXISTS` with an **inner** `JOIN LATERAL` (`lvl`) that derives each
+/// issue's `level` from its single newest `error_events` row in the selected
+/// environment (`ORDER BY e.occurred_at DESC LIMIT 1`) — the identical
+/// `latest` shape `list_issues`/`get_issue`/`top_issues` use, minus
+/// `title`/`culprit` (unneeded here). The `level` `FILTER (WHERE ...)`
+/// clauses move onto `lvl.level`, so the fatal/error/warning/info split
+/// matches this environment's own occurrences, not whichever environment
+/// last overwrote `issues.level`. The join is deliberately **inner, not
+/// left**: an issue with no occurrence in this environment has nothing to
+/// derive a level from and must not be counted at all — exactly what the
+/// membership `EXISTS` it replaces was already doing. `status` stays
+/// app-wide (`i.status`) in both branches — issue triage is an app-wide act
+/// by design, not a per-environment one, same call `list_issues` makes for
+/// the identical two columns.
 pub async fn issue_stats(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
 ) -> QueryResult<IssueStatsRow> {
-    // $1 app_id — env takes $2 when it needs a bind, reused inside the
-    // membership `EXISTS` (omitted entirely under `All`, same reasoning as
-    // `list_devices`' membership check).
+    if matches!(scope.env, EnvFilter::All) {
+        return diesel::sql_query(
+            "SELECT count(*)::bigint AS total, \
+               count(*) FILTER (WHERE status='unresolved')::bigint AS unresolved, \
+               count(*) FILTER (WHERE status='resolved')::bigint AS resolved, \
+               count(*) FILTER (WHERE status='ignored')::bigint AS ignored, \
+               count(*) FILTER (WHERE level='fatal')::bigint AS fatal, \
+               count(*) FILTER (WHERE level='error')::bigint AS error, \
+               count(*) FILTER (WHERE level='warning')::bigint AS warning, \
+               count(*) FILTER (WHERE level IN ('info','debug'))::bigint AS info \
+             FROM issues WHERE app_id=$1",
+        )
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .get_result(conn)
+        .await;
+    }
+
+    // $1 app_id, $2 env — always consumed here (`One`/`Subset` bind it;
+    // `Unattributed`'s `IS NULL` fragment needs no bind, and `bind_env!`
+    // below correspondingly binds nothing for it), reused by `lvl`'s own
+    // `WHERE` fragment, same one-bind-reused-everywhere idiom as
+    // `list_issues`.
     let env_sql = scope.env.sql_fragment_for("e", 2);
-    let membership_sql = if matches!(scope.env, EnvFilter::All) {
-        String::new()
-    } else {
-        format!(" AND EXISTS (SELECT 1 FROM error_events e WHERE e.issue_id = issues.id{env_sql})")
-    };
     let mut stmt = diesel::sql_query(format!(
         "SELECT count(*)::bigint AS total, \
-           count(*) FILTER (WHERE status='unresolved')::bigint AS unresolved, \
-           count(*) FILTER (WHERE status='resolved')::bigint AS resolved, \
-           count(*) FILTER (WHERE status='ignored')::bigint AS ignored, \
-           count(*) FILTER (WHERE level='fatal')::bigint AS fatal, \
-           count(*) FILTER (WHERE level='error')::bigint AS error, \
-           count(*) FILTER (WHERE level='warning')::bigint AS warning, \
-           count(*) FILTER (WHERE level IN ('info','debug'))::bigint AS info \
-         FROM issues WHERE app_id=$1{membership_sql}"
+           count(*) FILTER (WHERE i.status='unresolved')::bigint AS unresolved, \
+           count(*) FILTER (WHERE i.status='resolved')::bigint AS resolved, \
+           count(*) FILTER (WHERE i.status='ignored')::bigint AS ignored, \
+           count(*) FILTER (WHERE lvl.level='fatal')::bigint AS fatal, \
+           count(*) FILTER (WHERE lvl.level='error')::bigint AS error, \
+           count(*) FILTER (WHERE lvl.level='warning')::bigint AS warning, \
+           count(*) FILTER (WHERE lvl.level IN ('info','debug'))::bigint AS info \
+         FROM issues i \
+         JOIN LATERAL ( \
+             SELECT e.level \
+             FROM error_events e \
+             WHERE e.issue_id = i.id{env_sql} \
+             ORDER BY e.occurred_at DESC \
+             LIMIT 1 \
+         ) lvl ON TRUE \
+         WHERE i.app_id=$1"
     ))
     .into_boxed()
     .bind::<SqlUuid, _>(scope.app_id);
-    if let Some(id) = scope.env.bind_uuid() {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_result(conn).await
 }
 
@@ -3476,7 +3650,7 @@ pub async fn list_analytics_events(
     // Non-widening matters beyond tidiness: Slice 3 makes the environment scope an
     // access boundary, at which point a filter that could widen past it would be a
     // data leak rather than a wrong result.
-    query = crate::scope_env!(query, analytics_events, scope.env);
+    query = crate::scope_env!(query, analytics_events, &scope.env);
     if let Some(s) = since {
         query = query.filter(analytics_events::occurred_at.ge(s));
     }
@@ -3591,8 +3765,7 @@ pub async fn funnel(
     // funnel past the selected environment instead of erroring. `s0` has no table alias
     // (bare `analytics_events`); `s{i>0}` aliases it `a` — `sql_fragment` (unqualified) is
     // right for the former, `sql_fragment_for("a", ..)` for the rest.
-    let env_bind = scope.env.bind_uuid();
-    let base_idx = if env_bind.is_some() { 4 } else { 3 };
+    let base_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let env_sql_bare = scope.env.sql_fragment(3);
     let env_sql_aliased = scope.env.sql_fragment_for("a", 3);
 
@@ -3628,9 +3801,7 @@ pub async fn funnel(
         .into_boxed::<diesel::pg::Pg>()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        query = query.bind::<SqlUuid, _>(id);
-    }
+    query = crate::bind_env!(query, &scope.env);
     for step in steps {
         query = query.bind::<Text, _>(step.clone());
     }
@@ -3693,9 +3864,8 @@ pub async fn journey_graph(
     // $1 app_id, $2 since — env takes $3 when it needs a bind, which pushes depth/max_rows
     // from $3/$4 to $4/$5. Both indices are derived from the same `env_bind`/`env_sql` pair
     // so the string and the bind chain can't drift apart.
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
-    let depth_idx = if env_bind.is_some() { 4 } else { 3 };
+    let depth_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let max_rows_idx = depth_idx + 1;
 
     let q = format!(
@@ -3722,9 +3892,7 @@ pub async fn journey_graph(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     let row: JourneyGraphRow = stmt
         .bind::<BigInt, _>(depth)
         .bind::<BigInt, _>(JOURNEY_MAX_ROWS)
@@ -3783,7 +3951,6 @@ pub async fn performance_summary(
     // ...)` optional-filter idiom — left untouched). Env is appended AFTER those, at the
     // next free index ($5), rather than interleaved among them, so $3/$4 never renumber and
     // there's no collision to reason about.
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(5);
     let q = format!(
         "SELECT name, op, count(*)::bigint AS count, \
@@ -3805,9 +3972,7 @@ pub async fn performance_summary(
         .bind::<Timestamptz, _>(since)
         .bind::<Nullable<Text>, _>(op)
         .bind::<Nullable<Text>, _>(device_key);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_results(conn).await
 }
 
@@ -3832,7 +3997,6 @@ pub async fn performance_series(
 ) -> QueryResult<Vec<PerfSeriesPoint>> {
     // Same shape as `performance_summary`: env appended after the pre-existing $3/$4
     // optional-filter idiom, at the next free index ($5), so those two never renumber.
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(5);
     let q = format!(
         "SELECT date_trunc('hour', occurred_at) AS bucket, \
@@ -3850,9 +4014,7 @@ pub async fn performance_series(
         .bind::<Timestamptz, _>(since)
         .bind::<Nullable<Text>, _>(name)
         .bind::<Nullable<Text>, _>(op);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_results(conn).await
 }
 
@@ -3901,9 +4063,10 @@ pub async fn user_stats(
     scope: ReadScope,
     since: DateTime<Utc>,
 ) -> QueryResult<UserStats> {
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
-    let membership_sql = event_user_membership_exists(scope.env, 3);
+    // `.clone()`, not a move — the final `bind_env!` call below still needs
+    // `scope.env`; see `overview_totals`'s identical call for why.
+    let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
     let q = format!(
         "SELECT \
            (SELECT count(*) FROM event_users WHERE app_id=$1{membership_sql})::bigint AS total_users, \
@@ -3933,9 +4096,7 @@ pub async fn user_stats(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_result(conn).await
 }
 
@@ -3980,7 +4141,6 @@ pub async fn active_user_series(
     scope: ReadScope,
     since: DateTime<Utc>,
 ) -> QueryResult<Vec<UserSeriesPoint>> {
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
     let active_q = format!(
         "SELECT date_trunc('day', occurred_at) AS bucket, count(DISTINCT distinct_id)::bigint AS count \
@@ -3997,12 +4157,14 @@ pub async fn active_user_series(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        active_stmt = active_stmt.bind::<SqlUuid, _>(id);
-    }
+    active_stmt = crate::bind_env!(active_stmt, &scope.env);
     let active: Vec<SeriesPoint> = active_stmt.get_results(conn).await?;
 
-    let membership_sql = event_user_membership_exists(scope.env, 3);
+    // `.clone()`, not a move: the second `bind_env!` call below (for
+    // `new_stmt`) still needs `scope.env` — see `overview_totals`'s identical
+    // call for why `event_user_membership_exists` itself is not reshaped to
+    // take `&EnvFilter` instead.
+    let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
     let new_q = format!(
         "SELECT date_trunc('day', first_seen) AS bucket, count(*)::bigint AS count \
          FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql} \
@@ -4012,9 +4174,7 @@ pub async fn active_user_series(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        new_stmt = new_stmt.bind::<SqlUuid, _>(id);
-    }
+    new_stmt = crate::bind_env!(new_stmt, &scope.env);
     let new: Vec<SeriesPoint> = new_stmt.get_results(conn).await?;
 
     Ok(merge_user_series(active, new))
@@ -4076,7 +4236,10 @@ pub async fn session_stats(
 ) -> QueryResult<SessionStats> {
     // $1 app_id, $2 since, reused across all four sub-selects, all against `sessions` — env
     // takes $3 when it needs a bind, reused the same way.
-    let env_bind = scope.env.bind_uuid();
+    //
+    // `crashed` has the same known mislabelling gap as `overview_totals`'
+    // `crashed_sessions` — see `bump_session`'s doc comment and
+    // `.superpowers/sdd/2026-07-29-environment-rbac-scope/task-10-report.md`.
     let env_sql = scope.env.sql_fragment(3);
     let q = format!(
         "SELECT \
@@ -4091,9 +4254,7 @@ pub async fn session_stats(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_result(conn).await
 }
 
@@ -4102,7 +4263,6 @@ pub async fn session_duration_series(
     scope: ReadScope,
     since: DateTime<Utc>,
 ) -> QueryResult<Vec<SeriesAvgPoint>> {
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
     let q = format!(
         "SELECT date_trunc('day', started_at) AS bucket, \
@@ -4114,9 +4274,7 @@ pub async fn session_duration_series(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_results(conn).await
 }
 
@@ -4125,7 +4283,6 @@ pub async fn session_duration_histogram(
     scope: ReadScope,
     since: DateTime<Utc>,
 ) -> QueryResult<Vec<HistoBucket>> {
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(3);
     let q = format!(
         "SELECT bucket, count(*)::bigint AS count FROM ( \
@@ -4143,9 +4300,7 @@ pub async fn session_duration_histogram(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     let rows: Vec<HistoBucket> = stmt.get_results(conn).await?;
     Ok(order_histogram(rows))
 }
@@ -4445,9 +4600,8 @@ pub async fn screen_list(
     // takes $4 when it needs a bind, which pushes limit/offset from $4/$5 to
     // $5/$6. Both indices derive from the same `env_bind`/`env_sql` pair, the
     // same "trailing-index shift" idiom `top_events`/`journey_graph` use.
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(4);
-    let limit_idx = if env_bind.is_some() { 5 } else { 4 };
+    let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
     let offset_idx = limit_idx + 1;
     let q = format!(
         "{} \
@@ -4468,9 +4622,7 @@ pub async fn screen_list(
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since)
         .bind::<Text, _>(q_pattern);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.bind::<BigInt, _>(limit)
         .bind::<BigInt, _>(offset)
         .get_results(conn)
@@ -4486,7 +4638,6 @@ pub async fn screen_stats(
     // $1 app_id, $2 since, $3 name (SCREEN_PRED_EXACT's own bind) — env takes
     // $4 when it needs a bind. No trailing binds after it, so unlike
     // `screen_list` nothing needs to shift.
-    let env_bind = scope.env.bind_uuid();
     let env_sql = scope.env.sql_fragment(4);
     let q = format!(
         "{} \
@@ -4508,9 +4659,7 @@ pub async fn screen_stats(
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since)
         .bind::<Text, _>(name);
-    if let Some(id) = env_bind {
-        stmt = stmt.bind::<SqlUuid, _>(id);
-    }
+    stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_result(conn).await
 }
 
@@ -4527,7 +4676,7 @@ pub async fn recent_events_for_screen(
         .filter(analytics_events::occurred_at.ge(since))
         .filter(analytics_events::name.ne("$screen"))
         .into_boxed();
-    crate::scope_env!(q, analytics_events, scope.env)
+    crate::scope_env!(q, analytics_events, &scope.env)
         .select(AnalyticsEvent::as_select())
         .order(analytics_events::occurred_at.desc())
         .limit(limit)
@@ -4547,7 +4696,7 @@ pub async fn recent_exceptions_for_screen(
         .filter(error_events::screen.eq(screen))
         .filter(error_events::occurred_at.ge(since))
         .into_boxed();
-    crate::scope_env!(q, error_events, scope.env)
+    crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)

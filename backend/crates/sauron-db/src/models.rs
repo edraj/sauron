@@ -353,6 +353,15 @@ pub struct NewErrorEvent {
     pub extra: Value,
     /// Whether the SDK saw this error caught (`Some(true)`) or uncaught (`Some(false)`).
     pub handled: Option<bool>,
+    /// The per-occurrence `build_title`/`build_culprit` strings computed at
+    /// ingest, immediately before `upsert_issue` (which is where the same
+    /// values currently overwrite the app-wide `issues` row regardless of
+    /// environment). `None` for rows written before this column existed —
+    /// never backfilled; the read path falls back to the app-wide `issues`
+    /// column for those. `Some("")` for `culprit` is a real value — the
+    /// occurrence had no exception, not "unknown" — see `build_culprit`.
+    pub title: Option<String>,
+    pub culprit: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

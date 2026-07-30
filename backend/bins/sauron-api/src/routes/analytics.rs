@@ -25,8 +25,8 @@ pub struct RangeQuery {
     pub limit: i64,
     pub name: Option<String>,
     // `environment_id` is deliberately NOT a field here — it is read from the
-    // raw query string via `RawQuery` + `scope::read_scope_raw` instead of
-    // this `Query<T>` extractor. See `routes::scope`'s module docs for why:
+    // raw query string via `RawQuery` + `scope::authorized_read_scope` instead
+    // of this `Query<T>` extractor. See `routes::scope`'s module docs for why:
     // an `Option<String>` field on this struct would go through
     // `axum_extra::extract::Query` (needed for other handlers' `Vec<String>`
     // fields), whose codec silently collapses `?environment_id=` to `None`.
@@ -47,10 +47,16 @@ pub async fn top_events(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<EventCount>>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
     let limit = q.limit.clamp(1, 100);
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
         repo::top_events(&mut conn, scope, since, limit).await?,
     ))
@@ -64,9 +70,15 @@ pub async fn event_series(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<SeriesPoint>>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
         repo::event_series(&mut conn, scope, q.name.as_deref(), since).await?,
     ))
@@ -103,12 +115,18 @@ pub async fn person(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<PersonProfile>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let limit = q.limit.clamp(1, 200);
 
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
-    let user = repo::get_event_user(&mut conn, scope, &distinct_id).await?;
-    let events = repo::events_for_person(&mut conn, scope, &distinct_id, limit).await?;
+    let user = repo::get_event_user(&mut conn, scope.clone(), &distinct_id).await?;
+    let events = repo::events_for_person(&mut conn, scope.clone(), &distinct_id, limit).await?;
     let errors = repo::error_events_for_person(&mut conn, scope, &distinct_id, limit).await?;
 
     Ok(Json(PersonProfile {
@@ -146,9 +164,15 @@ pub async fn persons_list(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<PersonRow>>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let search = q.search.as_deref().filter(|s| !s.is_empty());
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
         repo::list_persons(
             &mut conn,
@@ -195,13 +219,19 @@ pub async fn events_list(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<AnalyticsEvent>>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let filters = sauron_db::filter::parse_filters(&q.filter, sauron_db::filter::EVENT_FILTERS)?;
     let search = q.q.as_deref().filter(|s| !s.is_empty());
     // Free-text search scans jsonb::text, which no index can serve; keep the
     // window bounded rather than defaulting to effectively all history.
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
     Ok(Json(
         repo::list_analytics_events(
             &mut conn,
@@ -239,14 +269,20 @@ pub async fn overview(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Overview>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
-    let totals = repo::overview_totals(&mut conn, scope, since).await?;
-    let events_series = repo::event_series(&mut conn, scope, None, since).await?;
-    let errors_series = repo::error_series(&mut conn, scope, since).await?;
-    let top_issues = repo::top_issues(&mut conn, scope, since, 5).await?;
+    let totals = repo::overview_totals(&mut conn, scope.clone(), since).await?;
+    let events_series = repo::event_series(&mut conn, scope.clone(), None, since).await?;
+    let errors_series = repo::error_series(&mut conn, scope.clone(), since).await?;
+    let top_issues = repo::top_issues(&mut conn, scope.clone(), since, 5).await?;
     let top_events = repo::top_events(&mut conn, scope, since, 5).await?;
 
     let error_rate = {
@@ -302,11 +338,17 @@ pub async fn users_summary(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<UsersAnalytics>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
-    let stats = repo::user_stats(&mut conn, scope, since).await?;
+    let stats = repo::user_stats(&mut conn, scope.clone(), since).await?;
     let series = repo::active_user_series(&mut conn, scope, since).await?;
     let stickiness = stickiness(stats.dau, stats.mau);
 
@@ -336,12 +378,18 @@ pub async fn sessions_summary(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<SessionsAnalytics>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
-    let scope = super::scope::read_scope_raw(app_id, raw_query.as_deref())?;
-    let stats = repo::session_stats(&mut conn, scope, since).await?;
-    let duration_series = repo::session_duration_series(&mut conn, scope, since).await?;
+    let stats = repo::session_stats(&mut conn, scope.clone(), since).await?;
+    let duration_series = repo::session_duration_series(&mut conn, scope.clone(), since).await?;
     let duration_histogram = repo::session_duration_histogram(&mut conn, scope, since).await?;
 
     Ok(Json(SessionsAnalytics {

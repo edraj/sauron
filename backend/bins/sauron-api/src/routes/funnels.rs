@@ -2,7 +2,7 @@
 //! people progressed through each step (each step counted at-or-after the
 //! previous step's time), plus conversion ratios.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,10 +22,10 @@ pub struct FunnelReq {
     pub since_days: i64,
 }
 
-#[derive(Deserialize)]
-pub struct FunnelQuery {
-    pub environment_id: Option<String>,
-}
+// No bespoke query struct for `compute`: it takes only `environment_id`,
+// which comes from `RawQuery` + `scope::authorized_read_scope`, not a
+// `Query<T>` extractor. See `routes::scope`'s module docs for the extractor
+// trap this avoids.
 
 fn default_days() -> i64 {
     30
@@ -51,7 +51,7 @@ pub async fn compute(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
-    Query(q): Query<FunnelQuery>,
+    RawQuery(raw_query): RawQuery,
     Json(req): Json<FunnelReq>,
 ) -> Result<Json<FunnelResult>, ApiError> {
     if req.steps.len() < 2 {
@@ -64,10 +64,16 @@ pub async fn compute(
     }
 
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::EVENT_READ).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
     let since = Utc::now() - Duration::days(req.since_days.clamp(1, 365));
 
-    let scope = super::scope::read_scope(app_id, q.environment_id.as_deref())?;
     let rows = repo::funnel(&mut conn, scope, &req.steps, since).await?;
     // rows come back ordered by step; index defensively by step id.
     let mut counts = vec![0i64; req.steps.len()];

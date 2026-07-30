@@ -228,6 +228,14 @@ async fn process_error(
             symbolication_status,
             debug_meta,
             handled: handled_of(exc),
+            // Same strings just handed to `upsert_issue` above (still in
+            // scope — only borrowed there, not moved). Persisting them here
+            // is what lets a later environment-scoped read derive title/
+            // culprit from this occurrence instead of the app-wide `issues`
+            // row, which `upsert_issue` overwrites from whichever
+            // environment's occurrence lands last.
+            title: Some(title),
+            culprit: Some(culprit),
         },
     )
     .await?;

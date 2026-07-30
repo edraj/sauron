@@ -19,9 +19,28 @@
   const appItems = $derived(
     sessionStore.apps.map((a) => ({ id: a.id, name: a.name, icon: appTypeIcon(a.app_type) })),
   );
+  // `sessionStore.environments` is already reach-filtered server-side (Task 7
+  // of the env-RBAC slice; see `loadAppEnvironments`'s doc comment in
+  // session.svelte.ts) — for a partial-reach member it is only the
+  // environments they hold a grant on, not the app's full list. This mapping
+  // must NOT grow a client-side filter on top of that: the backend has
+  // already applied the only filtering rule that matters, and a second,
+  // independent one here would just be a second place for that rule to drift.
+  //
   // `''` means "all environments" and `'none'` means "unattributed" — both
   // pseudo-entries bracket the live list. `currentEnvId` is `null` for "all",
   // so the trigger's `currentId` below maps that back to `''` to match.
+  //
+  // The "All environments" label is intentionally NOT reworded to something
+  // like "All my environments" for a partial-reach member, even though
+  // selecting it resolves server-side to a `Subset` rather than a literal
+  // `All` (`resolve_env_filter`'s row 2). The list directly above this entry
+  // in the same dropdown is already exactly that caller's reach-filtered set
+  // — there is nothing else "all" could plausibly mean in context, the same
+  // way an "All projects" list elsewhere in this app doesn't get relabeled
+  // for a member who can only see some of them. Rewording would only be
+  // warranted if this entry could show environments beyond what is listed
+  // right below it, which by construction it cannot.
   const envItems = $derived([
     { id: '', name: 'All environments' },
     ...sessionStore.environments.map((e) => ({ id: e.id, name: e.name })),

@@ -28,6 +28,8 @@ export interface ScopeSelection {
   projects: string[];
   /** App ids ticked individually. */
   apps: string[];
+  /** Env ids ticked individually. */
+  envs: string[];
 }
 
 // One shared instance is safe because it is frozen and can never diverge.
@@ -37,31 +39,38 @@ Object.freeze(NO_IDS);
 /**
  * Frozen so a caller that assigns it directly and then pushes gets a loud
  * TypeError instead of silently poisoning the shared default for every later
- * form. Copy it (`{ ...EMPTY_SELECTION, projects: [] }`) before mutating.
+ * form. Copy it (`{ ...EMPTY_SELECTION, projects: [], apps: [], envs: [] }`)
+ * before mutating.
  */
 export const EMPTY_SELECTION: ScopeSelection = Object.freeze({
   org: false,
   projects: NO_IDS,
   apps: NO_IDS,
+  envs: NO_IDS,
 });
 
 /**
  * Collapse a selection to the minimum set of grants that covers it.
  *
- * A ticked org supersedes everything, and a ticked project supersedes its own
- * apps. Resolving the second case needs the parent of each app, which the
- * selection alone does not carry — hence the optional `projectOfApp` map from
- * app id to project id. Pass it whenever the tree is known (the picker always
- * knows it); without it every ticked app is emitted, which is redundant but
- * never wrong, since the backend de-duplicates and a narrower grant beside a
- * wider one grants nothing extra.
+ * A ticked org supersedes everything, a ticked project supersedes its own
+ * apps, and a ticked app supersedes its own envs. Resolving the app case
+ * needs the parent of each app, which the selection alone does not carry —
+ * hence the optional `projectOfApp` map from app id to project id. The env
+ * case needs the equivalent `appOfEnv` map from env id to app id, walked one
+ * further step to that app's project via `projectOfApp`. Pass both whenever
+ * the tree is known (the picker always knows them); without them every
+ * ticked app/env is emitted, which is redundant but never wrong, since the
+ * backend de-duplicates and a narrower grant beside a wider one grants
+ * nothing extra.
  *
- * Emission order is stable: org, then projects in the given order, then apps.
+ * Emission order is stable: org, then projects in the given order, then
+ * apps, then envs.
  */
 export function selectionToScopes(
   sel: ScopeSelection,
   orgId: string,
   projectOfApp?: Record<string, string>,
+  appOfEnv?: Record<string, string>,
 ): ScopeRef[] {
   if (sel.org) {
     return [{ scope_type: 'org', scope_id: orgId }];
@@ -73,10 +82,19 @@ export function selectionToScopes(
     scope_id: id,
   }));
 
+  const tickedApps = new Set(sel.apps);
   for (const appId of sel.apps) {
     const parent = projectOfApp?.[appId];
     if (parent !== undefined && tickedProjects.has(parent)) continue;
     scopes.push({ scope_type: 'app', scope_id: appId });
+  }
+
+  for (const envId of sel.envs) {
+    const parentApp = appOfEnv?.[envId];
+    if (parentApp !== undefined && tickedApps.has(parentApp)) continue;
+    const grandparentProject = parentApp !== undefined ? projectOfApp?.[parentApp] : undefined;
+    if (grandparentProject !== undefined && tickedProjects.has(grandparentProject)) continue;
+    scopes.push({ scope_type: 'env', scope_id: envId });
   }
 
   return scopes;
@@ -103,7 +121,9 @@ export function projectCheckState(
 /** True when nothing is selected — submit must be disabled, the API rejects an
  * empty `scopes` with a 400. */
 export function isEmptySelection(sel: ScopeSelection): boolean {
-  return !sel.org && sel.projects.length === 0 && sel.apps.length === 0;
+  return (
+    !sel.org && sel.projects.length === 0 && sel.apps.length === 0 && sel.envs.length === 0
+  );
 }
 
 /**
@@ -120,15 +140,18 @@ export function describeSelection(
   orgId: string,
   orgName: string,
   projectOfApp?: Record<string, string>,
+  appOfEnv?: Record<string, string>,
 ): string {
   if (isEmptySelection(sel)) return 'Nothing selected yet.';
   if (sel.org) return `Full access to ${orgName}`;
-  const scopes = selectionToScopes(sel, orgId, projectOfApp);
+  const scopes = selectionToScopes(sel, orgId, projectOfApp, appOfEnv);
   const projectCount = scopes.filter((s) => s.scope_type === 'project').length;
-  const appCount = scopes.length - projectCount;
+  const envCount = scopes.filter((s) => s.scope_type === 'env').length;
+  const appCount = scopes.length - projectCount - envCount;
   const parts: string[] = [];
   if (projectCount) parts.push(`${projectCount} project${projectCount === 1 ? '' : 's'}`);
   if (appCount) parts.push(`${appCount} app${appCount === 1 ? '' : 's'}`);
+  if (envCount) parts.push(`${envCount} environment${envCount === 1 ? '' : 's'}`);
   return parts.join(', ');
 }
 
@@ -136,14 +159,23 @@ export function describeSelection(
  * True when this row is already covered by an ancestor tick and must render
  * dimmed and disabled — ticking it would add a grant that changes nothing.
  *
- * For `level: 'project'` the `projectId` is the row's own id; for `'app'` it is
- * the id of the project the app sits under.
+ * `parentId`'s meaning depends on `level`: for `'project'` it is the row's
+ * own id (unused below, since a project is never implied by another
+ * project); for `'app'` it is the id of the project the app sits under; for
+ * `'env'` it is the id of the app the env sits under, and `grandparentId` is
+ * that app's project — an env is implied by its app, its project, or the org.
  */
 export function isImpliedByAncestor(
   sel: ScopeSelection,
-  level: 'project' | 'app',
-  projectId: string,
+  level: 'project' | 'app' | 'env',
+  parentId: string,
+  grandparentId?: string,
 ): boolean {
   if (sel.org) return true;
-  return level === 'app' && sel.projects.includes(projectId);
+  if (level === 'project') return false;
+  if (level === 'app') return sel.projects.includes(parentId);
+  return (
+    sel.apps.includes(parentId) ||
+    (grandparentId !== undefined && sel.projects.includes(grandparentId))
+  );
 }
