@@ -12,6 +12,7 @@ function grant(overrides: Partial<MemberGrant>): MemberGrant {
     scope_type: 'org',
     scope_id: 'o1',
     is_active: true,
+    credentials_invalidated_at: null,
     ...overrides,
   };
 }

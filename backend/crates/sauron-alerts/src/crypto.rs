@@ -6,7 +6,9 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 const NONCE_LEN: usize = 12;
 
@@ -109,6 +111,90 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     hex::encode(outer.finalize())
 }
 
+/// How long an unsubscribe link stays valid.
+///
+/// A compile-time constant, not an env var: every send mints a fresh token so
+/// links in live mail always work, and the only thing this bounds is a token
+/// forwarded into an archive becoming a permanent silencer of someone else's
+/// uptime alerts.
+pub const UNSUB_TOKEN_TTL_DAYS: i64 = 90;
+
+const UNSUB_KEY_DOMAIN: &[u8] = b"sauron-unsub-key-v1";
+const UNSUB_MSG_PREFIX: &str = "sauron-unsub-v1";
+/// Half of a SHA-256 in hex. Enough to make forgery infeasible without making
+/// the URL unwieldy in a mail client that wraps long lines.
+const UNSUB_SIG_HEX_LEN: usize = 32;
+
+/// Days since the Unix epoch, the unit `issued_day` is measured in.
+pub fn days_since_epoch(now: DateTime<Utc>) -> i64 {
+    now.timestamp().div_euclid(86_400)
+}
+
+/// Derive the unsubscribe signing key from the notification secret.
+///
+/// Never sign with `notify_key` directly: it is the AES-GCM key that encrypts
+/// stored channel secrets, so it cannot be rotated to invalidate outstanding
+/// links without making every stored webhook URL and relay password
+/// undecryptable.
+pub fn derive_unsub_key(notify_key: &[u8]) -> String {
+    hmac_sha256_hex(notify_key, UNSUB_KEY_DOMAIN)
+}
+
+/// `{subscription_id}.{issued_day}.{first 32 hex chars of the HMAC}`.
+pub fn unsubscribe_token(key: &[u8], sub_id: Uuid, user_id: Uuid, issued_day: i64) -> String {
+    let msg = format!("{UNSUB_MSG_PREFIX}:{sub_id}:{user_id}:{issued_day}");
+    let sig = hmac_sha256_hex(key, msg.as_bytes());
+    format!("{sub_id}.{issued_day}.{}", &sig[..UNSUB_SIG_HEX_LEN])
+}
+
+/// Verify a token and return the subscription it names.
+///
+/// `owner_of` resolves a subscription id to its owner's user id — the owner is
+/// inside the signed message, so verification cannot be completed without it,
+/// and passing it as a closure keeps this function free of `sauron-db`. It is
+/// called at most once, after the token's shape has already been validated, so
+/// a garbage token costs no database round trip.
+///
+/// `today` is `days_since_epoch(Utc::now())` at the call site, threaded in so
+/// the expiry branch is testable without a clock.
+pub fn verify_unsubscribe_token(
+    key: &[u8],
+    token: &str,
+    today: i64,
+    owner_of: impl FnOnce(Uuid) -> Option<Uuid>,
+) -> Option<Uuid> {
+    let mut parts = token.split('.');
+    let sub_id: Uuid = parts.next()?.parse().ok()?;
+    let issued_day: i64 = parts.next()?.parse().ok()?;
+    let sig = parts.next()?;
+    if parts.next().is_some() || sig.len() != UNSUB_SIG_HEX_LEN {
+        return None;
+    }
+    // A future-dated token means a forged `issued_day`; an old one means a
+    // link that has been sitting in an archive.
+    if issued_day > today || today - issued_day > UNSUB_TOKEN_TTL_DAYS {
+        return None;
+    }
+    let user_id = owner_of(sub_id)?;
+    let msg = format!("{UNSUB_MSG_PREFIX}:{sub_id}:{user_id}:{issued_day}");
+    let expected = hmac_sha256_hex(key, msg.as_bytes());
+    ct_eq(sig.as_bytes(), &expected.as_bytes()[..UNSUB_SIG_HEX_LEN]).then_some(sub_id)
+}
+
+/// Constant-time byte comparison. `==` on `&[u8]` short-circuits on the first
+/// differing byte, which leaks the length of a correct prefix to anyone who can
+/// time the endpoint.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +240,124 @@ mod tests {
     fn short_blob_rejected() {
         let c = SecretCipher::new("k");
         assert!(c.decrypt(&[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn unsubscribe_token_round_trips_for_its_own_subscription() {
+        let key = derive_unsub_key(b"notify-secret");
+        let sub = uuid::Uuid::from_u128(1);
+        let user = uuid::Uuid::from_u128(2);
+        let day = 20_000;
+        let token = unsubscribe_token(key.as_bytes(), sub, user, day);
+        assert_eq!(
+            verify_unsubscribe_token(key.as_bytes(), &token, day, |id| {
+                (id == sub).then_some(user)
+            }),
+            Some(sub)
+        );
+    }
+
+    #[test]
+    fn a_token_signed_with_another_key_never_verifies() {
+        let a = derive_unsub_key(b"key-a");
+        let b = derive_unsub_key(b"key-b");
+        let sub = uuid::Uuid::from_u128(1);
+        let user = uuid::Uuid::from_u128(2);
+        let token = unsubscribe_token(a.as_bytes(), sub, user, 20_000);
+        assert_eq!(
+            verify_unsubscribe_token(b.as_bytes(), &token, 20_000, |_| Some(user)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_token_for_one_subscription_does_not_verify_against_another() {
+        let key = derive_unsub_key(b"notify-secret");
+        let user = uuid::Uuid::from_u128(2);
+        let token = unsubscribe_token(key.as_bytes(), uuid::Uuid::from_u128(1), user, 20_000);
+        // The stored token names subscription 1, but the row it points at is
+        // owned by a different user — the HMAC covers the pair, so the swap is
+        // detected rather than silently accepted.
+        assert_eq!(
+            verify_unsubscribe_token(key.as_bytes(), &token, 20_000, |_| Some(
+                uuid::Uuid::from_u128(999)
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn tokens_expire_and_are_not_accepted_from_the_future() {
+        let key = derive_unsub_key(b"notify-secret");
+        let sub = uuid::Uuid::from_u128(1);
+        let user = uuid::Uuid::from_u128(2);
+        let old = unsubscribe_token(key.as_bytes(), sub, user, 20_000);
+        assert_eq!(
+            verify_unsubscribe_token(key.as_bytes(), &old, 20_000 + 91, |_| Some(user)),
+            None,
+            "91 days old is past UNSUB_TOKEN_TTL_DAYS"
+        );
+        assert_eq!(
+            verify_unsubscribe_token(key.as_bytes(), &old, 20_000 + 90, |_| Some(user)),
+            Some(sub),
+            "exactly 90 days old still works"
+        );
+        let future = unsubscribe_token(key.as_bytes(), sub, user, 20_050);
+        assert_eq!(
+            verify_unsubscribe_token(key.as_bytes(), &future, 20_000, |_| Some(user)),
+            None,
+            "a token dated in the future is a forged issued_day"
+        );
+    }
+
+    #[test]
+    fn malformed_tokens_are_rejected_without_panicking() {
+        let key = derive_unsub_key(b"notify-secret");
+        for bad in [
+            "",
+            ".",
+            "a.b",
+            "a.b.c",
+            "....",
+            "zzz.20000.deadbeef",
+            &"x".repeat(4096),
+        ] {
+            assert_eq!(
+                verify_unsubscribe_token(key.as_bytes(), bad, 20_000, |_| Some(
+                    uuid::Uuid::from_u128(2)
+                )),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn ct_eq_compares_the_whole_buffer_and_refuses_length_mismatches() {
+        // The design requires the signature comparison to be constant-time, and
+        // the only way that property can regress silently is someone replacing
+        // the loop with `a == b`. These assertions pin the two observable
+        // consequences: a length mismatch is refused without indexing past the
+        // end, and a difference in the LAST byte is still caught (a
+        // short-circuiting prefix compare would pass every earlier byte and is
+        // exactly what leaks the length of a correct prefix to a timing
+        // attacker).
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"abcdef", b"abcdef"));
+        assert!(!ct_eq(b"abcdef", b"abcde"), "a prefix is not a match");
+        assert!(!ct_eq(b"abcde", b"abcdef"));
+        assert!(!ct_eq(b"abcdef", b"abcdeg"), "the last byte still decides");
+        assert!(!ct_eq(b"abcdef", b"zbcdef"), "the first byte still decides");
+    }
+
+    #[test]
+    fn the_derived_key_is_domain_separated_from_the_notify_key() {
+        // NOTIFY_SECRET_KEY is documented as the AES-GCM key that encrypts
+        // stored channel secrets, so "rotate it to invalidate outstanding
+        // links" is not available — rotating it makes every stored Slack
+        // webhook URL and SMTP password undecryptable. Domain separation at
+        // least keeps the two uses independent.
+        let raw = b"notify-secret";
+        assert_ne!(derive_unsub_key(raw), String::from_utf8_lossy(raw));
+        assert_eq!(derive_unsub_key(raw).len(), 64, "hex sha256");
     }
 }

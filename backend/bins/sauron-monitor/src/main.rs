@@ -315,6 +315,11 @@ async fn notify_transition(
             return;
         }
     };
+    // BEFORE the rule lookup, deliberately. A project whose admin configured no
+    // monitor alert rule is exactly the deployment where a personal uptime
+    // subscription is the point, and the `rules.is_empty()` early return below
+    // used to make that case enqueue nothing, forever, with no log line.
+    enqueue_personal_uptime(notifier, m, status, cause, incident_id, trigger).await;
     let rules = match repo::alert_rules_for_monitor(&mut conn, m.project_id, trigger).await {
         Ok(r) => r,
         Err(e) => {
@@ -323,6 +328,10 @@ async fn notify_transition(
         }
     };
     if rules.is_empty() {
+        // Everything below is rule-specific, so returning here is correct NOW —
+        // the personal uptime enqueue already ran above and no longer depends on
+        // an admin having configured a rule.
+        drop(conn);
         return;
     }
     // Load each rule's channels up front, while the connection is still held.
@@ -460,5 +469,179 @@ async fn fire_webhook(
             break;
         }
         tokio::time::sleep(backoff).await;
+    }
+}
+
+/// Enqueue a `notification_queue` row for every personal uptime subscription on
+/// this monitor's project whose owner still reaches it.
+///
+/// Ordering around Redis is the difference between safe and a prober outage.
+/// `RedisStore` is built with `set_response_timeout(None)`, and a command
+/// issued against a dead Redis is measured at 9-19s. `notify_transition` is
+/// `tokio::spawn`ed per transition, this pool is `monitor_max_concurrency + 8`
+/// and `monitor_batch` is 100, so a network fault that both degrades Redis and
+/// flips many monitors could pin up to 100 connections for 19s each and starve
+/// `record_check_and_state` — uptime probing would die precisely when it
+/// matters. So: load under a connection, DROP it, run the Redis claim under a
+/// 250ms timeout, then re-acquire for the INSERT.
+async fn enqueue_personal_uptime(
+    notifier: &Notifier,
+    m: &Monitor,
+    status: &str,
+    cause: Option<&str>,
+    incident_id: Option<uuid::Uuid>,
+    trigger: &str,
+) {
+    let mut conn = match sauron_db::conn(&notifier.pool).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "uptime subscriptions: no db connection");
+            return;
+        }
+    };
+    let subs = match repo::uptime_subscriptions_for_project(&mut conn, m.project_id).await {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => {
+            drop(conn);
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "uptime subscriptions: load failed");
+            drop(conn);
+            return;
+        }
+    };
+    let org_id = match repo::project_org(&mut conn, m.project_id).await {
+        Ok(Some(o)) => o,
+        _ => {
+            warn!(project = %m.project_id, "uptime subscriptions: project has no org");
+            drop(conn);
+            return;
+        }
+    };
+    let user_ids: Vec<uuid::Uuid> = subs.iter().map(|s| s.user_id).collect();
+    let grant_rows = match repo::grants_for_users_in_org(&mut conn, &user_ids, org_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "uptime subscriptions: grant load failed");
+            drop(conn);
+            return;
+        }
+    };
+    // Released before anything touches Redis.
+    drop(conn);
+
+    // Authorize before enqueueing so the drain is not handed rows it will only
+    // discard. It re-checks anyway — this is the first of two, and the second
+    // is the one that survives a revocation between here and delivery.
+    let mut prepared: Vec<(uuid::Uuid, String, i32)> = Vec::new();
+    for s in &subs {
+        let rows: Vec<(String, uuid::Uuid, serde_json::Value)> = grant_rows
+            .iter()
+            .filter(|(u, _, _, _)| *u == s.user_id)
+            .map(|(_, t, id, p)| (t.clone(), *id, p.clone()))
+            .collect();
+        let reach = sauron_auth::rbac::reach_for(
+            &sauron_auth::rbac::grants_from_rows(rows),
+            sauron_auth::rbac::perm::MONITOR_READ,
+        );
+        let covered = sauron_alerts::subscription::covers(
+            &reach,
+            &sauron_alerts::subscription::QueueTarget {
+                project_id: m.project_id,
+                app_id: None,
+                env_enrollments: &[],
+                includes_unattributed: false,
+            },
+        );
+        if !covered {
+            continue;
+        }
+        // Dedup per incident so a flapping monitor cannot re-alert for the same
+        // outage; recovery keys on the transition itself.
+        let dedup = match incident_id {
+            Some(id) => format!("sub:{}:incident:{}:{}", s.id, id, trigger),
+            None => format!("sub:{}:monitor:{}:{}", s.id, m.id, trigger),
+        };
+        prepared.push((s.id, dedup, s.throttle_seconds));
+    }
+    if prepared.is_empty() {
+        return;
+    }
+
+    let mut claimed: Vec<(uuid::Uuid, String)> = Vec::new();
+    for (sub_id, dedup, throttle) in prepared {
+        if throttle <= 0 {
+            claimed.push((sub_id, dedup));
+            continue;
+        }
+        let redis_key = format!("sauron:notify:{sub_id}:{dedup}");
+        let ok = match tokio::time::timeout(
+            Duration::from_millis(250),
+            notifier.redis.set_nx_ex(&redis_key, "1", throttle as u64),
+        )
+        .await
+        {
+            Ok(Ok(true)) => true,
+            Ok(Ok(false)) => false,
+            // Redis unreachable or slow: fall through to the durable check.
+            _ => match sauron_db::conn(&notifier.pool).await {
+                Ok(mut c) => !repo::notification_recently_queued(&mut c, sub_id, &dedup, throttle)
+                    .await
+                    .unwrap_or(false),
+                Err(_) => false,
+            },
+        };
+        if ok {
+            claimed.push((sub_id, dedup));
+        }
+    }
+    if claimed.is_empty() {
+        return;
+    }
+
+    let down = trigger == "monitor_down";
+    let title = if down {
+        format!("Monitor down: {}", m.name)
+    } else {
+        format!("Monitor recovered: {}", m.name)
+    };
+    let body = if down {
+        format!(
+            "{} ({}) is {} — {}",
+            m.name,
+            m.target,
+            status,
+            cause.unwrap_or("check failed")
+        )
+    } else {
+        format!("{} ({}) recovered and is UP again.", m.name, m.target)
+    };
+    let severity = if down { "critical" } else { "info" };
+
+    let rows: Vec<repo::QueueInsert> = claimed
+        .iter()
+        .map(|(sub_id, dedup)| repo::QueueInsert {
+            subscription_id: *sub_id,
+            project_id: m.project_id,
+            app_id: None,
+            includes_unattributed: false,
+            kind: "uptime",
+            dedup_key: dedup,
+            severity,
+            title: &title,
+            body: &body,
+            link: None,
+            env_enrollments: Vec::new(),
+        })
+        .collect();
+
+    match sauron_db::conn(&notifier.pool).await {
+        Ok(mut c) => match repo::enqueue_notifications(&mut c, &rows).await {
+            Ok(n) if n > 0 => info!(enqueued = n, "personal uptime notifications enqueued"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "enqueueing personal uptime notifications failed"),
+        },
+        Err(e) => warn!(error = %e, "uptime subscriptions: no db connection for enqueue"),
     }
 }

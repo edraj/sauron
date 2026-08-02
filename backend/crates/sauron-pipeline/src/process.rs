@@ -14,11 +14,47 @@ use sauron_redis::{keys, RedisStore};
 
 use crate::enrich::enrich_context;
 
+/// Whether `event_users.identified_at` exists, probed once per process.
+///
+/// An RPM upgrade installs new binaries against an old schema (SETUP.md §11),
+/// so this worker must degrade rather than write to a column that is not
+/// there. One ERROR at first contact, then silence: a log line per ingested
+/// event would drown the deployment it is trying to warn.
+#[cfg(not(test))]
+static IDENTIFIED_COLUMN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(not(test))]
+async fn identified_column_present(conn: &mut AsyncPgConnection) -> bool {
+    if let Some(v) = IDENTIFIED_COLUMN.get() {
+        return *v;
+    }
+    let present = repo::probe_event_users_identified(conn).await.is_ok();
+    if !present {
+        tracing::error!(
+            "event_users.identified_at is missing — run sauron-migrate (see \
+             packaging/rpm/SETUP.md §11). Active-user identification will not be \
+             recorded for the lifetime of this process, and it cannot be \
+             reconstructed afterwards."
+        );
+    }
+    *IDENTIFIED_COLUMN.get_or_init(|| present)
+}
+
+/// Tests get an un-latched probe on purpose. Each test owns its own ephemeral
+/// database and one of them deliberately drops the column, so a process-global
+/// latch would leak one test's answer into another's depending on the order
+/// the runner happened to pick.
+#[cfg(test)]
+async fn identified_column_present(conn: &mut AsyncPgConnection) -> bool {
+    repo::probe_event_users_identified(conn).await.is_ok()
+}
+
 /// Process one job end to end: dispatch by item type.
 pub async fn process_job(
     pool: &PgPool,
     redis: &RedisStore,
     sym: &crate::symbolize::SymbolizeCtx,
+    masks: &crate::mask::MaskSet,
     job: IngestJob,
 ) -> anyhow::Result<()> {
     let mut conn = sauron_db::conn(pool).await?;
@@ -27,7 +63,11 @@ pub async fn process_job(
     // has any say in which environment a signal lands in.
     let environment_id = Some(job.environment_id);
 
-    let context = enrich_context(&job);
+    let mut context = enrich_context(&job);
+    // The enriched-only surface. `error_events.context` and `sessions.context`
+    // are both written from this value, and the ingest edge physically cannot
+    // see it — the `woothee` ua block and `device_key` are derived right here.
+    crate::mask::apply_context(masks, &mut context);
 
     match job.item.clone() {
         sauron_core::EnvelopeItem::Error(e) => {
@@ -173,6 +213,15 @@ async fn process_error(
 
     let user = e.user.as_ref().or(job.context.user.as_ref());
     let distinct = distinct_id(user);
+    // The SAME equality test `process_event` runs, computed here while `user`
+    // is still borrowable. On this path it is trivially true whenever
+    // `distinct` is `Some` — `distinct` is derived from `user.id` — and that
+    // is the point: an earlier draft passed `identified = true`
+    // unconditionally here, which made the two paths disagree for no benefit
+    // and let one error envelope carrying any `user.id` flag that id.
+    let context_user_matches = user
+        .and_then(|u| u.id.as_deref())
+        .is_some_and(|id| !id.is_empty() && Some(id) == distinct.as_deref());
     let event_user = user.and_then(|u| serde_json::to_value(u).ok());
     let stacktrace = exc
         .map(|x| serde_json::to_value(&x.stacktrace).unwrap_or_else(|_| json!([])))
@@ -293,7 +342,26 @@ async fn process_error(
                 let _ = repo::set_issue_users_seen(&mut conn, issue_id, count).await;
             }
         }
-        let _ = repo::touch_event_user(&mut conn, job.app_id, &did).await;
+        // Was `let _ = …`; see `process_event`'s identical comment.
+        if let Err(e) = repo::touch_event_user(&mut conn, job.app_id, &did).await {
+            tracing::warn!(
+                app_id = %job.app_id,
+                error = %e,
+                "touch_event_user failed; event_users.last_seen did not advance"
+            );
+        }
+        if context_user_matches && identified_column_present(&mut conn).await {
+            if let Err(e) = repo::mark_event_user_identified(
+                &mut conn,
+                job.app_id,
+                &did,
+                repo::IDENTIFIED_SOURCE_CONTEXT_USER,
+            )
+            .await
+            {
+                tracing::warn!(app_id = %job.app_id, error = %e, "marking an identified user failed");
+            }
+        }
     }
 
     Ok(())
@@ -389,7 +457,38 @@ async fn process_event(
     }
 
     if !distinct_id.is_empty() {
-        let _ = repo::touch_event_user(conn, job.app_id, &distinct_id).await;
+        // Was `let _ = …`. Swallowing this is how a deployment-wide stall of
+        // `event_users.first_seen`/`last_seen` became invisible: no dead
+        // letter, no metric, no log.
+        if let Err(e) = repo::touch_event_user(conn, job.app_id, &distinct_id).await {
+            tracing::warn!(
+                app_id = %job.app_id,
+                error = %e,
+                "touch_event_user failed; event_users.last_seen did not advance"
+            );
+        }
+        // An envelope-scoped `context.user.id` identifies this person only
+        // when it IS the id the signal was filed under. Server SDKs take an
+        // explicit distinctId that may differ from any scope user, and
+        // marking that one identified would flag an id nobody claimed.
+        let context_user_matches = job
+            .context
+            .user
+            .as_ref()
+            .and_then(|u| u.id.as_deref())
+            .is_some_and(|id| !id.is_empty() && id == distinct_id);
+        if context_user_matches && identified_column_present(conn).await {
+            if let Err(e) = repo::mark_event_user_identified(
+                conn,
+                job.app_id,
+                &distinct_id,
+                repo::IDENTIFIED_SOURCE_CONTEXT_USER,
+            )
+            .await
+            {
+                tracing::warn!(app_id = %job.app_id, error = %e, "marking an identified user failed");
+            }
+        }
     }
 
     // The three reserved lifecycle events drive a `workflows` status
@@ -453,6 +552,19 @@ async fn process_identify(
 ) -> anyhow::Result<()> {
     let traits = object_or_empty(id.traits);
     repo::upsert_event_user(conn, job.app_id, &id.distinct_id, &traits).await?;
+    // Identified by construction: identify() IS the caller naming a person.
+    if !id.distinct_id.is_empty() && identified_column_present(conn).await {
+        if let Err(e) = repo::mark_event_user_identified(
+            conn,
+            job.app_id,
+            &id.distinct_id,
+            repo::IDENTIFIED_SOURCE_IDENTIFY,
+        )
+        .await
+        {
+            tracing::warn!(app_id = %job.app_id, error = %e, "marking an identified user failed");
+        }
+    }
     if let Some(anon) = id.anonymous_id {
         if !anon.is_empty() {
             let _ = repo::insert_identity(conn, job.app_id, &anon, &id.distinct_id).await;
@@ -719,7 +831,12 @@ mod workflow_pipeline_tests {
     /// It does NOT run its own stale-database reaper, but its database names
     /// are deliberately shaped so `sauron-db`'s reaper collects them; see
     /// [`PipelineTestDb::setup`].
-    struct PipelineTestDb {
+    ///
+    /// `pub(super)` so the identification tests in `identity_pipeline_tests`
+    /// can reuse it. A second hand-rolled ephemeral-database harness in the
+    /// same file would drift from this one's load-bearing database-name shape
+    /// (see `setup`).
+    pub(super) struct PipelineTestDb {
         pool: sauron_db::PgPool,
         admin_url: String,
         db_name: String,
@@ -730,7 +847,7 @@ mod workflow_pipeline_tests {
     }
 
     impl PipelineTestDb {
-        async fn setup() -> Option<Self> {
+        pub(super) async fn setup() -> Option<Self> {
             let admin_url = std::env::var("TEST_DATABASE_URL").ok()?;
             // Name shape is load-bearing, in two independent ways:
             //
@@ -773,13 +890,19 @@ mod workflow_pipeline_tests {
             })
         }
 
-        async fn conn(&self) -> sauron_db::PgConn {
+        pub(super) async fn conn(&self) -> sauron_db::PgConn {
             sauron_db::conn(&self.pool).await.expect("checkout")
+        }
+
+        /// `process_error` re-acquires its own connection after symbolication,
+        /// so it needs the pool rather than a checked-out connection.
+        pub(super) fn pool(&self) -> &sauron_db::PgPool {
+            &self.pool
         }
 
         /// Takes `&self`, not `self`, so `Drop` still runs afterwards and can
         /// see the `cleaned_up` flag this sets.
-        async fn cleanup(&self) {
+        pub(super) async fn cleanup(&self) {
             sauron_db::drop_database(&self.admin_url, &self.db_name)
                 .await
                 .expect("drop ephemeral pipeline test database");
@@ -984,6 +1107,314 @@ mod workflow_pipeline_tests {
 
         assert_eq!(row.status, "completed", "status");
         assert_eq!(row.events_count, 3, "events_count");
+
+        drop(conn);
+        db.cleanup().await;
+    }
+}
+
+#[cfg(test)]
+mod identity_pipeline_tests {
+    use super::workflow_pipeline_tests::PipelineTestDb;
+    use super::{process_error, process_event, process_identify};
+    use chrono::Utc;
+    use diesel::sql_types::{Nullable, Text, Uuid as SqlUuid};
+    use diesel_async::RunQueryDsl;
+    use sauron_core::envelope::{
+        AnalyticsItem, EnvelopeContext, EnvelopeItem, ErrorItem, EventUser, IdentifyItem,
+        IngestJob, Level,
+    };
+    use sauron_db::models::NewAppEnvironment;
+    use sauron_db::repo;
+    use sauron_redis::RedisStore;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    struct Fixture {
+        app_id: Uuid,
+        job: IngestJob,
+    }
+
+    async fn seed(db: &PipelineTestDb, scope_user_id: Option<&str>) -> Fixture {
+        let mut conn = db.conn().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let org = repo::create_org(&mut conn, "id org", &format!("id-org-{suffix}"))
+            .await
+            .expect("create org");
+        let project = repo::create_project(
+            &mut conn,
+            org.id,
+            "id project",
+            &format!("id-project-{suffix}"),
+        )
+        .await
+        .expect("create project");
+        let app = repo::create_app(
+            &mut conn,
+            project.id,
+            "id app",
+            &format!("id-app-{suffix}"),
+            "web",
+        )
+        .await
+        .expect("create app");
+        let env = repo::create_project_environment(&mut conn, project.id, "production")
+            .await
+            .expect("create catalogue env");
+        let environment_id = repo::create_app_environments(
+            &mut conn,
+            &[NewAppEnvironment {
+                app_id: app.id,
+                environment_id: env.id,
+                public_key: &format!("pk_id_{suffix}"),
+                is_default: true,
+            }],
+        )
+        .await
+        .expect("enroll")
+        .remove(0)
+        .id;
+        drop(conn);
+
+        // One literal, never `default()` + field assignment: clippy's
+        // `field_reassign_with_default` is warn-by-default and every task here
+        // gates on `-D warnings`.
+        let context = EnvelopeContext {
+            user: scope_user_id.map(|id| EventUser {
+                id: Some(id.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        Fixture {
+            app_id: app.id,
+            job: IngestJob {
+                app_id: app.id,
+                project_id: project.id,
+                org_id: org.id,
+                environment_id,
+                release: None,
+                received_at: Utc::now(),
+                ip: None,
+                user_agent: None,
+                context,
+                sdk: None,
+                // Never read: every call below passes its item explicitly.
+                item: EnvelopeItem::Identify(IdentifyItem {
+                    distinct_id: "unused".to_string(),
+                    anonymous_id: None,
+                    traits: json!({}),
+                    timestamp: Utc::now(),
+                }),
+            },
+        }
+    }
+
+    fn event(distinct_id: &str) -> AnalyticsItem {
+        AnalyticsItem {
+            name: "app.opened".to_string(),
+            distinct_id: distinct_id.to_string(),
+            properties: json!({}),
+            timestamp: Utc::now(),
+            session_id: None,
+            workflow_id: None,
+            workflow_name: None,
+            screen: None,
+            tags: json!({}),
+            contexts: json!({}),
+            extra: json!({}),
+        }
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct SourceRow {
+        #[diesel(sql_type = Nullable<Text>)]
+        identified_source: Option<String>,
+    }
+
+    async fn source_of(
+        conn: &mut sauron_db::PgConn,
+        app_id: Uuid,
+        distinct_id: &str,
+    ) -> Option<String> {
+        let row: SourceRow = diesel::sql_query(
+            "SELECT identified_source FROM event_users WHERE app_id = $1 AND distinct_id = $2",
+        )
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Text, _>(distinct_id)
+        .get_result(conn)
+        .await
+        .expect("event_users row must exist");
+        row.identified_source
+    }
+
+    #[tokio::test]
+    async fn process_identify_marks_the_user_identified() {
+        let Some(db) = PipelineTestDb::setup().await else {
+            eprintln!("TEST_DATABASE_URL unset — skipping");
+            return;
+        };
+        let f = seed(&db, None).await;
+        let mut conn = db.conn().await;
+        process_identify(
+            &mut conn,
+            &f.job,
+            IdentifyItem {
+                distinct_id: "u-42".to_string(),
+                anonymous_id: None,
+                traits: json!({ "plan": "pro" }),
+                timestamp: Utc::now(),
+            },
+        )
+        .await
+        .expect("process identify");
+        assert_eq!(
+            source_of(&mut conn, f.app_id, "u-42").await.as_deref(),
+            Some("identify"),
+        );
+        drop(conn);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn process_event_marks_identified_only_when_the_envelope_user_id_matches() {
+        let Some(db) = PipelineTestDb::setup().await else {
+            eprintln!("TEST_DATABASE_URL unset — skipping");
+            return;
+        };
+
+        // Case 1: scope user id == the event's distinct_id -> flagged.
+        let f = seed(&db, Some("u-match")).await;
+        let mut conn = db.conn().await;
+        process_event(&mut conn, &f.job, None, json!({}), event("u-match"))
+            .await
+            .expect("matching event");
+        assert_eq!(
+            source_of(&mut conn, f.app_id, "u-match").await.as_deref(),
+            Some("context_user"),
+        );
+
+        // Case 2: scope user id present but different -> NOT flagged. Server
+        // SDKs take an explicit distinctId that may differ from any scope
+        // user; marking THAT one identified would be wrong.
+        process_event(&mut conn, &f.job, None, json!({}), event("u-other"))
+            .await
+            .expect("mismatched event");
+        assert_eq!(source_of(&mut conn, f.app_id, "u-other").await, None);
+        drop(conn);
+
+        // Case 3: no scope user at all -> NOT flagged.
+        let g = seed(&db, None).await;
+        let mut conn = db.conn().await;
+        process_event(&mut conn, &g.job, None, json!({}), event("u-anon"))
+            .await
+            .expect("userless event");
+        assert_eq!(source_of(&mut conn, g.app_id, "u-anon").await, None);
+
+        drop(conn);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn process_error_runs_the_same_identification_test_as_process_event() {
+        let Some(db) = PipelineTestDb::setup().await else {
+            eprintln!("TEST_DATABASE_URL unset — skipping");
+            return;
+        };
+        let Ok(redis_url) = std::env::var("TEST_REDIS_URL") else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            db.cleanup().await;
+            return;
+        };
+        let redis = RedisStore::connect(&redis_url)
+            .await
+            .expect("connect redis");
+        // `SymbolizeCtx` derives only `Clone` and its `presence` field is
+        // private, so `new` is the only constructor. `SymbolBlobCache::connect`
+        // with a `None` url returns a disabled cache, which is what this test
+        // wants: no error here carries a stack trace, so symbolication has
+        // nothing to do and must not reach out to anything.
+        let sym = crate::symbolize::SymbolizeCtx::new(
+            std::sync::Arc::new(sauron_symbols::Symbolicator::new(1 << 20)),
+            sauron_redis::SymbolBlobCache::connect(None, 1 << 20).await,
+            100,
+            1 << 20,
+        );
+
+        let f = seed(&db, Some("u-err")).await;
+        let conn = db.conn().await;
+        // Field-by-field: `ErrorItem` derives `Debug, Clone, Serialize,
+        // Deserialize` and no `Default`, and `event_id`/`timestamp`/
+        // `breadcrumbs` are not `Option` — their serde defaults do nothing for
+        // a Rust literal.
+        let item = ErrorItem {
+            event_id: Uuid::new_v4(),
+            level: Level::Error,
+            timestamp: Utc::now(),
+            exception: None,
+            message: Some("boom".to_string()),
+            breadcrumbs: vec![],
+            tags: json!({}),
+            contexts: json!({}),
+            extra: json!({}),
+            fingerprint: None,
+            user: None,
+            session_id: None,
+            workflow_id: None,
+            workflow_name: None,
+            screen: None,
+            raw_stacktrace: None,
+            debug_meta: None,
+        };
+        process_error(&redis, db.pool(), &sym, conn, &f.job, None, json!({}), item)
+            .await
+            .expect("process error");
+
+        let mut conn = db.conn().await;
+        assert_eq!(
+            source_of(&mut conn, f.app_id, "u-err").await.as_deref(),
+            Some("context_user"),
+            "the error path runs the same equality test, so the two can never disagree"
+        );
+        drop(conn);
+        db.cleanup().await;
+    }
+
+    /// The §2.4 contract, and the only thing that pins it: with the column
+    /// gone, an ordinary event must still advance `last_seen` and must not
+    /// return an error (which `worker.rs` would turn into a dead letter).
+    #[tokio::test]
+    async fn event_users_maintenance_survives_a_missing_identified_at_column() {
+        let Some(db) = PipelineTestDb::setup().await else {
+            eprintln!("TEST_DATABASE_URL unset — skipping");
+            return;
+        };
+        let f = seed(&db, Some("u-nocol")).await;
+        let mut conn = db.conn().await;
+        diesel::sql_query("ALTER TABLE event_users DROP COLUMN identified_at")
+            .execute(&mut conn)
+            .await
+            .expect("drop the column to simulate an un-migrated deployment");
+
+        process_event(&mut conn, &f.job, None, json!({}), event("u-nocol"))
+            .await
+            .expect("an un-migrated schema must not fail the job");
+
+        #[derive(diesel::QueryableByName)]
+        struct Seen {
+            #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+            last_seen: chrono::DateTime<Utc>,
+        }
+        let row: Seen = diesel::sql_query(
+            "SELECT last_seen FROM event_users WHERE app_id = $1 AND distinct_id = $2",
+        )
+        .bind::<SqlUuid, _>(f.app_id)
+        .bind::<Text, _>("u-nocol")
+        .get_result(&mut conn)
+        .await
+        .expect("touch_event_user must still have created the row");
+        assert!(row.last_seen <= Utc::now());
 
         drop(conn);
         db.cleanup().await;

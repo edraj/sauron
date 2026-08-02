@@ -512,6 +512,7 @@ Chip: Tag   =   key=region   value=eu
     { id: 'funnels', label: 'Funnels', icon: 'funnel' },
     { id: 'verify', label: 'Verify setup', icon: 'circle-check' },
     { id: 'search', label: 'Search & filtering', icon: 'search' },
+    { id: 'privacy-inspector', label: 'Privacy inspector', icon: 'shield-alert' },
     { id: 'troubleshooting', label: 'Troubleshooting', icon: 'life-buoy' },
   ];
   // "How it works under the hood" — every feature + its internals.
@@ -527,9 +528,9 @@ Chip: Tag   =   key=region   value=eu
   ];
   // Section anchors in document order — drives scroll-spy highlighting.
   const sectionIds = [
-    'dsn', 'concepts', 'quickstart', 'funnels', 'verify', 'search', 'troubleshooting',
-    'architecture', 'grouping', 'analytics-internals', 'queries', 'tiering', 'uptime', 'rbac',
-    'sdk-internals',
+    'dsn', 'concepts', 'quickstart', 'funnels', 'verify', 'search', 'privacy-inspector',
+    'troubleshooting', 'architecture', 'grouping', 'analytics-internals', 'queries', 'tiering',
+    'uptime', 'rbac', 'sdk-internals',
   ];
 
   // --- "under the hood" content (accurate to the shipped backend) ----------
@@ -573,8 +574,34 @@ GROUP BY name, op`;
     { q: '3 · Message', a: 'No usable frames falls back to the type plus a normalized message; no exception at all hashes just the message.' },
   ];
 
+  // The five-step flow of the Privacy page (Manage → Privacy). Steps 4 and 5
+  // are one dialog in the UI but two decisions for the reader, and conflating
+  // them is how someone confirms a mask they never read the blast radius of.
+  const inspectorRows = [
+    {
+      q: '1 · Create a policy',
+      a: 'Privacy → Policy. Track literal key names (email, phone) — case-insensitive, exact, at any depth; not patterns. A policy sits on a project, an app, or one environment: the most specific one wins whole, and a narrower one subtracts its scope from the parent, which is how you exclude one noisy environment.',
+    },
+    {
+      q: '2 · Run a scan',
+      a: 'From the Scans tab, or on the policy schedule. It reads a bounded recent window of the telemetry columns and records where tracked keys appear. Nothing runs until an operator sets INSPECTOR_ENABLED — a scan that stays queued is usually that, not a bug.',
+    },
+    {
+      q: '3 · Review findings',
+      a: 'A finding is a location — table, column, JSON path — plus the value type and a shape-only preview. The value itself is never stored. Reveal returns one raw value and writes an audit row before it answers. Detection is best-effort: it greps the JSON text for the quoted key name, so unicode-escaped, base64 or URL-encoded payloads are not found.',
+    },
+    {
+      q: '4 · Preview a mask',
+      a: 'The dialog counts the affected rows against a frozen target list, adds the companion columns a mask must also rewrite, and shows every place a mask does not reach. The count expires, so what you confirm is what was counted — read the panel here, not after.',
+    },
+    {
+      q: '5 · Confirm with the app slug',
+      a: 'Typing the app slug is what enables the button: the realistic mistake is masking the wrong app, not a mis-click. The pass then rewrites hot rows in batches and the key is enforced on every future event for that app. Cancelling stops it where it is; it does not put anything back.',
+    },
+  ];
+
   const presetRows = [
-    { q: 'Owner', a: 'All 23 permissions.' },
+    { q: 'Owner', a: 'All 30 permissions.' },
     { q: 'Admin', a: 'Everything except org:manage.' },
     { q: 'Developer', a: 'Read/write issues, events, funnels, artifacts, source maps and monitors; create and update apps.' },
     { q: 'Viewer', a: 'Read-only across the board.' },
@@ -1132,6 +1159,34 @@ GROUP BY name, op`;
 
         </section>
 
+        <!-- Privacy inspector -->
+        <section id="privacy-inspector" class="doc-sec">
+          <Card>
+            {#snippet header()}
+              <div class="card-h">
+                <Icon name="shield-alert" size={16} /><h3>Privacy inspector</h3>
+              </div>
+            {/snippet}
+            <p class="muted concept-lead">
+              <b>Manage → Privacy</b> finds developer-supplied PII sitting in the telemetry JSON
+              columns, proves what it found <b>without storing a second copy of it</b>, masks it in
+              hot Postgres, and enforces that mask on all future ingest. It needs
+              <code class="ic">pii:read</code>; masking needs <code class="ic">pii:manage</code>.
+              Owner and Admin hold both; Developer and Viewer hold neither.
+            </p>
+            {@render defRows(inspectorRows)}
+            <p class="faint fine">
+              Two things not to get wrong, because neither is recoverable.
+              <b>Masking rewrites rows in hot Postgres only</b> — cold Parquet, the Redis ingest
+              stream and DLQ, alerts that already sent, backups and replicas all still hold the
+              original bytes, and the dialog names all twelve places before it lets you confirm.
+              And <b>a mask cannot be undone</b>: there is no reverse operation anywhere in the
+              product. Masking a key an app sends as its identity also stops future
+              <a href="#/active-users">active-users</a> identification through it, permanently.
+            </p>
+          </Card>
+        </section>
+
         <!-- Troubleshooting -->
         <section id="troubleshooting" class="doc-sec">
     <Card>
@@ -1339,7 +1394,7 @@ GROUP BY name, op`;
               <div class="card-h"><Icon name="lock" size={16} /><h3>Access control</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              Fine-grained RBAC: <b>23 atomic permissions</b> (<code class="ic">issue:read</code>,
+              Fine-grained RBAC: <b>30 atomic permissions</b> (<code class="ic">issue:read</code>,
               <code class="ic">funnel:write</code>, <code class="ic">source:read</code>, …) bundle
               into <b>roles</b>, which are <b>granted</b> at a scope — org, project, or app. Your
               effective permissions are the <b>union</b> of every grant that applies, cascading down
@@ -1371,10 +1426,12 @@ GROUP BY name, op`;
               scope in place, or adds another grant alongside the ones they already hold — each
               grant saves independently. Deactivate is a <b>login kill switch, not a removal</b>:
               every grant stays intact, the row stays listed with a "Deactivated" badge, and
-              Reactivate restores normal sign-in. Their refresh tokens are revoked immediately, though
-              an access token already issued keeps working until it expires (up to 15 minutes by
-              default). Deactivating yourself, a member who also belongs to another organization, or
-              the last holder of <code class="ic">org:manage</code> is refused with an explanation
+              Reactivate restores normal sign-in. Their sessions are revoked immediately, and any
+              access token already issued stops working within a few seconds — every API replica
+              refreshes its revoked-session list on the
+              <code class="ic">AUTH_REVOCATION_POLL_SECS</code> interval (5 seconds by default).
+              Deactivating yourself, a member who also belongs to another organization, or the
+              last holder of <code class="ic">org:manage</code> is refused with an explanation
               instead.
             </p>
             <p class="faint fine">
@@ -1384,6 +1441,25 @@ GROUP BY name, op`;
               from the server's own definitions on every restart, so an edit would silently revert.
               You can't grant a role, edit one, or mint a custom one with permissions you don't
               already hold at that scope, so access can never escalate itself.
+            </p>
+            <p class="muted concept-lead">
+              Every signed-in user has an <b>Account</b> page listing the devices their
+              account is signed in on — device, address, when they signed in and when the
+              session was last used. The session they are currently using is badged
+              <b>This device</b> and cannot be signed out from there; <b>Log out</b> in the
+              top bar is that verb. <b>Sign out other devices</b> ends every session but
+              the current one. "Show recent sign-outs" reveals the last 30 days of ended
+              sessions with the reason each one ended, which is how a user learns that
+              something other than themselves closed a session.
+            </p>
+            <p class="faint fine">
+              An admin holding <code class="ic">member:credential</code> can sign a member
+              out of every device from the Members page. That permission is carved out of
+              <code class="ic">member:manage</code> rather than added beside it, so a role
+              can administer membership without also holding the verbs that act on someone's
+              credentials. The admin surface deliberately shows no per-device detail —
+              only the one coarse verb. Signing someone out does not deactivate them and
+              does not force a password change.
             </p>
           </Card>
         </section>

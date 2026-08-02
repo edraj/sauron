@@ -137,7 +137,8 @@ unparseable value silently falls back too, so a typo'd number is never fatal.
 
 All binaries share one `Config` struct but read only the subset they need. **Used by**
 below names the services that actually consume each variable: `api` (`sauron-api`),
-`ingest`, `monitor`, `alerts`, `tier`, `migrate`, `dashboard`.
+`ingest`, `monitor`, `alerts`, `tier`, `inspector` (`sauron-inspector`), `migrate`,
+`dashboard`.
 
 Docker Compose reads these from a `.env` file at the repo root — copy
 [`.env.example`](.env.example) and edit. RPM installs read them from
@@ -165,6 +166,7 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | `SAURON_DEV` | `1`/`true` relaxes the rule above: a short `JWT_SECRET` is accepted, and a missing one falls back to a compiled-in insecure key. **Local development only** — it makes tokens forgeable. | `false` | api, monitor, alerts |
 | `JWT_ACCESS_TTL_SECS` | Access-token lifetime. | `900` (15 min) | api |
 | `JWT_REFRESH_TTL_SECS` | Refresh-token lifetime. | `2592000` (30 days) | api |
+| `AUTH_REVOCATION_POLL_SECS` | How often each API replica refreshes its revoked-session snapshot. **This is the real kill latency**: a session ended by a logout, a "sign out other devices", an admin force-logout, a deactivation or a password change stops working on a replica at its next poll. Clamped to `1`-`60`. | `5` | api |
 
 ### Dashboard API
 
@@ -172,7 +174,8 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | --- | --- | --- | --- |
 | `API_PORT` | TCP port `sauron-api` binds. | `8080` | api |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated browser origins allowed to call the API. Must list the origin the dashboard is actually served from. | `http://localhost:3000` | api |
-| `API_TRUST_FORWARDED_HEADERS` | Honour `X-Forwarded-For` / `X-Real-IP` when identifying the caller. Enable **only** behind a reverse proxy you control that overwrites the header — it is client-controlled otherwise. While it is off *and* a proxy is in front, every request looks like it came from the proxy, so the per-IP auth limits (10 registrations/hour, 60 logins/min) throttle the whole deployment instead of each client. | `false` | api |
+| `DASHBOARD_URL` | Browser-facing origin of the **dashboard**, used to build links inside emails (`https://host/#/reset-password?token=...`). In the shipped nginx topology this is **not** the API's origin — nginx serves the SPA and does not proxy the API — so nothing can derive it. Unset means any email containing a link refuses to render, with an error naming this variable; it does not break anything else. **No default anywhere**, deliberately: a plausible-looking fallback would send mail whose links point at the recipient's own machine while every server-side signal reported success. | unset | api |
+| `API_TRUST_FORWARDED_HEADERS` | Honour `X-Forwarded-For` / `X-Real-IP` when identifying the caller. Enable **only** behind a reverse proxy you control that overwrites the header — it is client-controlled otherwise, so turning it on without such a proxy lets a caller pick a fresh rate-limit bucket per request. While it is off *and* a proxy is in front, every request looks like it came from the proxy, so the per-IP limits throttle the whole deployment instead of each client: 10 registrations/hour, 60 logins/min, and 60/min on each of `/v1/auth/forgot-password` and `/v1/auth/reset-password`. Those two windows are 60 seconds rather than an hour precisely so a shared bucket self-heals within a minute; the per-address (3/hour) and per-link (10/hour) budgets are what carry the anti-abuse weight. `password_reset_tokens.requested_from` is also the proxy's address while this is off — a column full of one LAN address is the shipped topology, not a finding. | `false` | api |
 
 ### Ingest gateway
 
@@ -205,15 +208,49 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | `ALERTS_DELIVER_TIMEOUT_MS` | Per-delivery HTTP/SMTP timeout. | `10000` | alerts |
 | `ALERTS_ALLOW_PRIVATE` | Allow delivering to private/loopback targets — an internal webhook or LAN SMTP relay. SSRF guard, same shape as the monitor flag. | `false` | alerts |
 | `ALERT_EVENT_RETENTION_DAYS` | How long `alert_events` rows are kept. The table records *every* evaluation, including suppressed ones, so it needs a reaper. | `90` | alerts |
+| `NOTIFY_SUBS_TICK_SECS` | How often per-user notification subscriptions are evaluated. Clamped to `30`–`3600`. | `120` | alerts |
+| `NOTIFY_SUBS_BATCH` | Rows one notification-drain pass claims at a time. Clamped to `1`–`5000`. | `200` | alerts |
+| `NOTIFY_SUBS_MAX_PROBES_PER_ORG` | Per-organization probe ceiling per tick; orgs are processed in rotating order so a clip moves around. Clamped to `1`–`1000`. | `50` | alerts |
+| `NOTIFY_DRAIN_BUDGET_MS` | Wall-clock budget for one drain pass, so a backlog cannot stall the tick. Clamped to `500`–`60000`. | `10000` | alerts |
+| `NOTIFY_MAX_EMAILS_PER_USER_PER_HOUR` | Above this, a user's notifications are merged into one digest instead of being dropped. Clamped to `1`–`1000`. | `20` | alerts |
+| `NOTIFY_QUEUE_RETENTION_DAYS` | How long finished `notification_queue` rows are kept. Pending and claimed rows are never pruned. Clamped to `1`–`365`. | `14` | alerts |
 
 > Monitor up/down alerts fire inline from `sauron-monitor`; only the metric rules need
 > the `sauron-alerts` service. Without it those rules are creatable in the UI but never evaluate.
+
+### Transactional email
+
+Deployment-level mail addressed to a **person** — password resets today, digests
+later. Separate from the notification channels above: those carry an org's own
+SMTP credentials, so routing a user's reset link through one would tell that org's
+admin the user asked for a reset, and would strand a user who belongs to no org
+entirely. Leaving `SMTP_HOST` unset **disables password reset** and degrades
+nothing else — the API boots and serves normally, and logs one INFO line saying
+why. Only `sauron-api` reads these; it is also the only process that drains the
+queue.
+
+| Variable | What it does | Default | Used by |
+| --- | --- | --- | --- |
+| `SMTP_HOST` | Relay hostname. Unset ⇒ transactional email is disabled. | unset | api |
+| `SMTP_PORT` | Relay port. Also picks the default TLS mode. | `587` | api |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | AUTH credentials. On an RPM install the password belongs in `/etc/sauron/secret.env`, not `api.env`. | unset | api |
+| `SMTP_FROM` | Envelope From. **Required** once `SMTP_HOST` is set; a bare address, exactly one `@`, no display name. | unset | api |
+| `SMTP_FROM_NAME` | Display name lettre encodes into the From header. | `Sauron` | api |
+| `SMTP_TLS` | `implicit`/`smtps`, `starttls`/`required`, or `none`/`plain`. Unset follows the port. `none` sends the password and every reset link in cleartext and is accepted **only** when the relay resolves to loopback — checked at boot against the configured name and again at connect against the resolved address. | `implicit` at port 465, else `starttls` | api |
+| `SMTP_ALLOW_PRIVATE` | Allow a relay on a private/LAN address past the SSRF guard. Read on its own; it does **not** inherit `ALERTS_ALLOW_PRIVATE`, which unlocks private delivery for *user-supplied* webhook URLs — a strictly larger surface. | `false` | api |
+| `SMTP_TIMEOUT_MS` | Per socket operation. The whole send, DNS included, is bounded at 3× this and capped at 60s. Clamped to `1000`–`60000`. | `10000` | api |
+| `SMTP_SINK` | Write mail to the log instead of sending it. Rows are recorded `status='sink'`, never `'sent'`. Read on its own; it does **not** inherit `SAURON_DEV`. The **body** is logged only when `SAURON_DEV=1` as well — a logged body is a working account-takeover URL in your log aggregator. | `false` | api |
+| `MAIL_DRAIN_TICK_SECS` | Outbox drain cadence. Clamped to `10`–`3600`. | `60` | api |
+| `MAIL_OUTBOX_RETENTION_DAYS` | How long delivered/failed outbox rows are kept before the reaper deletes them. | `30` | api |
+
+> Emails containing a link also need [`DASHBOARD_URL`](#dashboard-api). Without it
+> the message refuses to render rather than sending a link to nowhere.
 
 ### Hot/cold tiering
 
 | Variable | What it does | Default | Used by |
 | --- | --- | --- | --- |
-| `TIER_HOT_DAYS` | Age at which a partition is exported to Parquet and becomes eligible to leave Postgres. | `30` | tier |
+| `TIER_HOT_DAYS` | Age at which a partition is exported to Parquet and becomes eligible to leave Postgres. **Three binaries derive their own boundary from this**, so it is a shared setting rather than a tier knob: on an RPM host it lives in `/etc/sauron/sauron.env`, not `tier.env`. A divergence means the PII masker rewriting rows in a partition the tier worker has already exported — Postgres masked, Parquet raw, and the later drop destroys the only masked copy. | `30` | tier, inspector, api |
 | `TIER_GRANULARITY` | Partition granularity. | `day` | tier |
 | `TIER_COLD_PATH` | Directory holding the cold Parquet files. `sauron-api` must be able to **read the same path** — it answers cross-tier queries from it. | `/var/lib/sauron/cold` | tier, api |
 | `TIER_DROP_LAG_HOURS` | Grace period between exporting a partition and dropping it from Postgres. | `24` | tier |
@@ -225,6 +262,49 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | Variable | What it does | Default | Used by |
 | --- | --- | --- | --- |
 | `SEARCH_SCAN_CLAMP_DAYS` | Window an unindexed search query (wildcard, substring, or free-text match) is clamped to. Defaults to `TIER_HOT_DAYS`: clamping a scan further back than the tier worker's hot window buys nothing, since older rows are already gone from Postgres — so the default is simultaneously the honest cost bound and the honest coverage bound. | `TIER_HOT_DAYS` (`30`) | api |
+
+### PII inspector
+
+Finds developer-supplied personal data in the telemetry `jsonb` columns, masks it
+irreversibly in **hot Postgres**, and enforces the mask on future ingest. Masking
+does **not** reach cold Parquet, the Redis dead-letter queue or anything already
+delivered by an alert — every surface says so, and so does this table.
+
+`INSPECTOR_ENABLED` is off by default because the scanner reads the same
+partitions the ingest path writes. `sauron-inspector` opens its own 4-connection
+pool: raise Postgres `max_connections` to at least 150 before enabling it, or
+exhaustion surfaces as `sauron-api` 500s and `sauron-ingest` returning 202 and
+then dropping the event. The three keys marked *shared* below are read by more
+than one binary and, on an RPM host, live in `/etc/sauron/sauron.env` rather than
+`inspector.env` — the units that need them never load `inspector.env`.
+
+| Variable | What it does | Default | Used by |
+| --- | --- | --- | --- |
+| `INSPECTOR_ENABLED` | Master switch. While false the binary starts, logs one line and idles — it never reads a telemetry row. | `false` | inspector |
+| `INSPECTOR_TICK_SECS` | Scheduler cadence. This loop only claims *due* policies, so it is never blocked by a running scan. Clamped to `5`–`3600`. | `30` | inspector |
+| `INSPECTOR_BATCH_ROWS` | Rows read per phase-1 batch. The `LIMIT` sits on an index-bounded inner window, so this bounds rows **scanned**, not rows matched. Raising it lengthens the gap between heartbeats and between inter-batch pauses. | `5000` | inspector |
+| `INSPECTOR_BATCH_PAUSE_MS` | Sleep between scan batches. This plus the batch size *is* the duty cycle that keeps the ingest working set resident in the buffer cache. | `200` | inspector |
+| `INSPECTOR_LEASE_SECS` | A scan whose heartbeat is older than this is re-claimable by another worker. Set below the slowest single unit and you get needless re-claims. | `120` | inspector |
+| `INSPECTOR_MAX_ATTEMPTS` | After this many claims a scan finalizes as `failed`, so one poison unit cannot loop forever. | `3` | inspector |
+| `INSPECTOR_STATEMENT_TIMEOUT_MS` | Per-connection `statement_timeout`, set at checkout and `RESET` before the connection returns to the pool. | `30000` | inspector |
+| `INSPECTOR_WINDOW_DAYS` | Scan window ceiling. Defaults to `SEARCH_SCAN_CLAMP_DAYS`, which itself defaults to `TIER_HOT_DAYS` — nothing older is in Postgres anyway, so a larger value buys coverage that does not exist. | `SEARCH_SCAN_CLAMP_DAYS` (`30`) | inspector |
+| `INSPECTOR_DETECTOR_WINDOW_DAYS` | Window for detector mode, which drops the SQL prefilter and walks every string leaf of every row: roughly 20× the CPU and 20× the bytes shipped out of Postgres. On a 30M-row app that is the difference between a scan that finishes overnight and one still running at noon. | `7` | inspector |
+| `INSPECTOR_MAX_PHASE2_ROWS_PER_UNIT` | Phase-2 rows per unit before counts become **lower bounds** and the scan is reported `partial` rather than `full`. | `200000` | inspector |
+| `INSPECTOR_DEFAULT_SWEEP_ROWS` | Truncation point for the default-partition sweep. Those rows are never tiered and never dropped, so on a deployment that had data before the partitioning migration this child can be very large. | `50000` | inspector |
+| `INSPECTOR_CATCHUP_GRACE_HOURS` | A missed scheduled run older than this is **skipped, not replayed**. A 03:00 scan firing at 09:00 on a Monday is precisely the production load spike the schedule existed to avoid. | `6` | inspector |
+| `INSPECTOR_SCAN_KEEP` | Scans retained per policy. Their findings are deleted in bounded batches before the parent row goes. | `20` | inspector |
+| `INSPECTOR_FINDING_RETENTION_DAYS` | Finding retention. A nightly scan producing 33k findings is 12M rows a year without this. | `90` | inspector |
+| `INSPECTOR_MASK_BATCH` | Rows rewritten per retro-mask batch. Halved automatically when any target carries a wildcard, because the array rebuild re-serializes the whole array per row. | `2000` | inspector |
+| `INSPECTOR_MASK_PAUSE_MS` | Sleep between mask batches. A 2000-row batch is ≈0.37 s of write on `error_events` (13 index updates per row), so 200 ms is a ≈65% duty cycle. Raise it if ingest latency moves during a mask. | `200` | inspector |
+| `INSPECTOR_CLAIM_STALE_SECS` | A mask action claimed longer ago than this is re-claimable — this is the crash-resume mechanism. The cursor is durable, so a re-claim never double-counts. | `300` | inspector |
+| `INSPECTOR_PREVIEW_GC_DAYS` | Abandoned preview retention. Previews are not audit-relevant. | `7` | inspector |
+| `INSPECTOR_AUDIT_RETENTION_DAYS` | Mask-audit retention. **`0` = never prune**, which is the default: the table grows per human action, not per rule evaluation, and it is the record a compliance question is answered from. | `0` (never) | inspector |
+| `INSPECTOR_AUDIT_PII_DAYS` | Age at which staff emails and `confirm_source` are nulled on audit rows, keeping the counts and targets. Without it the privacy feature is the only un-erasable store of staff PII in the schema, because deleting a user is this product's de-facto erasure mechanism everywhere else. | `730` | inspector |
+| `INSPECTOR_MASK_MAX_ROWS` | The affected-row ceiling a mask confirm refuses above — raise it explicitly rather than by accident. | `20000000` | api |
+| `INSPECTOR_PREVIEW_TTL_SECS` | Preview freshness, measured from the preview **completing**, not from the request — otherwise a queued preview can expire before it is readable. Confirming with a stale preview is refused. | `900` | api |
+| `INSPECTOR_EXPORT_MAX_ROWS` | Buffered findings-CSV ceiling. A buffered export cannot be truncated honestly, so above this the route answers `400` rather than shipping a silent prefix. | `50000` | api |
+| `INSPECTOR_POLICY_CACHE_SECS` | *Shared.* How long a mask takes to reach every ingest replica: the enforcer's per-app cache TTL, and the number the dashboard states to the operator in words. Raising it delays enforcement; lowering it adds one indexed query per app per interval on the ingest pool. | `30` | ingest, api |
+| `INSPECTOR_TAIL_SWEEP_SECS` | *Shared.* How far back the retro-mask's tail sweep re-checks. Clamped at load to at least **4×** `INSPECTOR_POLICY_CACHE_SECS`: a sweep shorter than the cache TTL closes nothing, and rows written in that window stay raw forever because the retro-mask is a one-shot job. | `120` (≥ 4× cache TTL) | inspector, api |
 
 ### Source maps & symbolication
 

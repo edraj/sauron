@@ -116,6 +116,28 @@ type RetriableConfig = InternalAxiosRequestConfig & { _retry?: boolean };
 // Response interceptor — normalize errors, refresh-and-replay on 401.
 // ---------------------------------------------------------------------------
 
+/**
+ * With `responseType: 'blob'` (the CSV export) an ERROR body is a Blob too, so
+ * `normalizeError`'s `response.data as ApiErrorEnvelope` read yields
+ * `undefined` and the message degrades to axios's generic "Request failed with
+ * status code 403".
+ *
+ * This belongs in the interceptor, not in the caller: every branch of the
+ * handler below ends in `Promise.reject(normalizeError(error))`, so by the time
+ * a caller's `catch` runs there is no `error.response` left to re-read. Doing
+ * it here also means every future blob-returning endpoint gets the fix free.
+ */
+export async function unwrapBlobErrorBody(error: AxiosError): Promise<void> {
+  const data = error.response?.data as unknown;
+  if (!(data instanceof Blob)) return;
+  try {
+    const text = await data.text();
+    (error.response as { data: unknown }).data = JSON.parse(text);
+  } catch {
+    /* not JSON — leave the Blob in place */
+  }
+}
+
 api.interceptors.response.use(
   (response) => response,
   async (error: AxiosError<ApiErrorEnvelope>) => {
@@ -125,6 +147,9 @@ api.interceptors.response.use(
     if (!error.response) {
       return Promise.reject(normalizeError(error));
     }
+
+    // Must run before the branching below: see `unwrapBlobErrorBody`.
+    await unwrapBlobErrorBody(error);
 
     const status = error.response.status;
     const url = original?.url ?? '';

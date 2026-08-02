@@ -724,3 +724,147 @@ describe('can() — environment-scoped checks', () => {
     expect(sessionStore.can('issue:write', { env: 'env-1' })).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// can(`level`): the UP direction of the cascade, which the block above pins
+// only for env grants. `level` names how far down the tree the check is
+// allowed to look, mirroring which ids the matching backend helper passes to
+// `has_permission`: `authorize_org` resolves at `(org, None, None, None)`, so
+// a project- or app-scoped grant carrying `member:manage` can never satisfy
+// it. Before `level` existed, `can()` ORed all three and lit UI the server
+// answers with 403 — the exact wrong-direction permissiveness the store's own
+// doc comment says it must never have.
+// ---------------------------------------------------------------------------
+describe('can() — scope level truncation', () => {
+  beforeEach(() => {
+    sessionStore.currentOrgId = 'org-1';
+    sessionStore.currentProjectId = 'proj-1';
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.currentEnvId = null;
+  });
+
+  it('level org ignores a project grant', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'project', scope_id: 'proj-1', permissions: ['member:manage'] }],
+    };
+
+    // Default level is 'app', which is today's (looser) behaviour — pinned so
+    // the ~40 pre-existing call sites are provably unaffected by this change.
+    expect(sessionStore.can('member:manage')).toBe(true);
+    expect(sessionStore.can('member:manage', { level: 'org' })).toBe(false);
+  });
+
+  it('level org ignores an app grant', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'app', scope_id: 'app-1', permissions: ['org:manage'] }],
+    };
+
+    expect(sessionStore.can('org:manage', { level: 'org' })).toBe(false);
+  });
+
+  it('level project ignores an app grant but honours a project grant', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'app', scope_id: 'app-1', permissions: ['monitor:read'] }],
+    };
+    expect(sessionStore.can('monitor:read', { level: 'project' })).toBe(false);
+
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'project', scope_id: 'proj-1', permissions: ['monitor:read'] }],
+    };
+    expect(sessionStore.can('monitor:read', { level: 'project' })).toBe(true);
+  });
+
+  it('an org grant satisfies every level', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'org', scope_id: 'org-1', permissions: ['issue:read'] }],
+    };
+
+    for (const level of ['org', 'project', 'app'] as const) {
+      expect(sessionStore.can('issue:read', { level })).toBe(true);
+    }
+    expect(sessionStore.can('issue:read', { level: 'env', env: 'env-1' })).toBe(true);
+  });
+
+  it('an env grant satisfies no level above env', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: ['issue:read'] }],
+    };
+
+    for (const level of ['org', 'project', 'app'] as const) {
+      expect(sessionStore.can('issue:read', { level, env: 'env-1' })).toBe(false);
+    }
+    expect(sessionStore.can('issue:read', { level: 'env', env: 'env-1' })).toBe(true);
+  });
+
+  it('null access denies at every level', () => {
+    sessionStore.access = null;
+
+    for (const level of ['org', 'project', 'app', 'env'] as const) {
+      expect(sessionStore.can('issue:read', { level, env: 'env-1' })).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// accessError: "the permission fetch failed" must stay distinguishable from
+// "this member genuinely holds no grants". Both leave `access` null and `can()`
+// returning false for everything, but only one is a retryable error — and now
+// that nav visibility and every button's enabled state derive from `can()`,
+// collapsing the two renders a network blip as a wholly convincing "you have
+// no permissions" UI. Same invariant `environmentsError` exists for.
+// ---------------------------------------------------------------------------
+describe('accessError', () => {
+  function mockOrgOnly() {
+    mockListOrgs.mockResolvedValue([
+      {
+        id: 'org-1',
+        name: 'Org 1',
+        slug: 'org-1',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      },
+    ]);
+    mockListProjects.mockResolvedValue([]);
+  }
+
+  it('is set when getAccess fails, and access stays null', async () => {
+    mockOrgOnly();
+    mockGetAccess.mockRejectedValueOnce(new Error('network'));
+
+    await sessionStore.load(true);
+
+    expect(sessionStore.accessError).toBe(true);
+    expect(sessionStore.access).toBe(null);
+    // The rest of the bootstrap must still complete — a failed access fetch
+    // is not a failed load.
+    expect(sessionStore.loaded).toBe(true);
+  });
+
+  it('is cleared by a later successful fetch', async () => {
+    mockOrgOnly();
+    mockGetAccess.mockRejectedValueOnce(new Error('network'));
+    await sessionStore.load(true);
+    expect(sessionStore.accessError).toBe(true);
+
+    mockGetAccess.mockResolvedValueOnce({ permissions: [], grants: [] });
+    await sessionStore.load(true);
+
+    expect(sessionStore.accessError).toBe(false);
+  });
+
+  it('stays false for a member who legitimately holds no grants', async () => {
+    mockOrgOnly();
+    mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
+
+    await sessionStore.load(true);
+
+    expect(sessionStore.accessError).toBe(false);
+    expect(sessionStore.can('issue:read')).toBe(false);
+  });
+});

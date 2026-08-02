@@ -18,6 +18,7 @@ sauron-ingest
 sauron-monitor
 sauron-alerts
 sauron-tier
+sauron-inspector
 sauron-migrate
 
 # --- sauron-cli ---

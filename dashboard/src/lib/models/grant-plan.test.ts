@@ -41,6 +41,7 @@ function grant(over: Partial<MemberGrant> = {}): MemberGrant {
     scope_type: 'org',
     scope_id: ORG,
     is_active: true,
+    credentials_invalidated_at: null,
     ...over,
   };
 }

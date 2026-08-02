@@ -1,15 +1,14 @@
 <script lang="ts">
   import { location } from 'svelte-spa-router';
-  import { sessionStore } from '../../stores/session.svelte';
   import EyeMark from '../EyeMark.svelte';
   import Icon, { type IconName } from '../ui/Icon.svelte';
+  import { canAccessPage, resolvePageAccess } from '../../models/page-access';
 
   interface NavItem {
     href: string;
     label: string;
     icon: IconName;
     match: (path: string) => boolean;
-    show?: () => boolean;
   }
 
   interface NavGroup {
@@ -29,10 +28,8 @@
     {
       label: 'Uptime',
       items: [
-        { href: '#/monitors', label: 'Monitors', icon: 'life-buoy', match: (p) => p.startsWith('/monitors'),
-          show: () => sessionStore.can('monitor:read') },
-        { href: '#/alerts', label: 'Alerts', icon: 'bell', match: (p) => p.startsWith('/alerts'),
-          show: () => sessionStore.can('alert:read') },
+        { href: '#/monitors', label: 'Monitors', icon: 'life-buoy', match: (p) => p.startsWith('/monitors') },
+        { href: '#/alerts', label: 'Alerts', icon: 'bell', match: (p) => p.startsWith('/alerts') },
       ],
     },
     {
@@ -49,6 +46,7 @@
     {
       label: 'Analyze',
       items: [
+        { href: '#/active-users', label: 'Active users', icon: 'users', match: (p) => p.startsWith('/active-users') },
         { href: '#/funnels', label: 'Funnels', icon: 'funnel', match: (p) => p.startsWith('/funnels') },
         { href: '#/journeys', label: 'Journeys', icon: 'waypoints', match: (p) => p.startsWith('/journeys') },
       ],
@@ -56,18 +54,31 @@
     {
       label: 'Manage',
       items: [
+        { href: '#/account', label: 'Account', icon: 'user', match: (p) => p.startsWith('/account') },
         { href: '#/projects', label: 'Projects', icon: 'folders', match: (p) => p.startsWith('/projects') || p.startsWith('/apps') },
-        { href: '#/members', label: 'Members', icon: 'key-round', match: (p) => p.startsWith('/members'), show: () => sessionStore.can('member:read') },
+        { href: '#/members', label: 'Members', icon: 'key-round', match: (p) => p.startsWith('/members') },
         { href: '#/settings', label: 'App settings', icon: 'settings', match: (p) => p.startsWith('/settings') },
-        { href: '#/source-maps', label: 'Source Maps', icon: 'braces', match: (p) => p.startsWith('/source-maps'), show: () => sessionStore.can('artifact:write') },
-        { href: '#/storage', label: 'Storage', icon: 'server', match: (p) => p.startsWith('/storage'), show: () => sessionStore.can('org:manage') },
+        { href: '#/source-maps', label: 'Source Maps', icon: 'braces', match: (p) => p.startsWith('/source-maps') },
+        { href: '#/storage', label: 'Storage', icon: 'server', match: (p) => p.startsWith('/storage') },
+        { href: '#/inspector', label: 'Privacy', icon: 'shield-alert', match: (p) => p.startsWith('/inspector') },
       ],
     },
   ];
 
+  // Visibility comes from PAGE_ACCESS, not a per-item `show` predicate.
+  // Predicates only ever got written for the items someone remembered: 13 of
+  // the 20 below had none, so a member without `event:read` was shown eleven
+  // pages that could only ever render an error. One table also means this list
+  // and routes.ts can no longer drift, which page-access.test.ts enforces.
+  //
+  // `item.href` is '#/issues'; slice(1) yields the '/issues' the table is
+  // keyed by.
   const visibleGroups = $derived(
     groups
-      .map((g) => ({ ...g, items: g.items.filter((i) => !i.show || i.show()) }))
+      .map((g) => ({
+        ...g,
+        items: g.items.filter((i) => canAccessPage(resolvePageAccess(i.href.slice(1)))),
+      }))
       .filter((g) => g.items.length > 0),
   );
 </script>

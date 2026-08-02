@@ -26,6 +26,8 @@
   import Compass from '@lucide/svelte/icons/compass';
   import Copy from '@lucide/svelte/icons/copy';
   import Diamond from '@lucide/svelte/icons/diamond';
+  import Download from '@lucide/svelte/icons/download';
+  import EyeOff from '@lucide/svelte/icons/eye-off';
   import Folders from '@lucide/svelte/icons/folders';
   import Funnel from '@lucide/svelte/icons/funnel';
   import Globe from '@lucide/svelte/icons/globe';
@@ -45,6 +47,7 @@
   import Search from '@lucide/svelte/icons/search';
   import Server from '@lucide/svelte/icons/server';
   import Settings from '@lucide/svelte/icons/settings';
+  import ShieldAlert from '@lucide/svelte/icons/shield-alert';
   import Smartphone from '@lucide/svelte/icons/smartphone';
   import Sun from '@lucide/svelte/icons/sun';
   import Terminal from '@lucide/svelte/icons/terminal';
@@ -75,6 +78,8 @@
     compass: Compass,
     copy: Copy,
     diamond: Diamond,
+    download: Download,
+    'eye-off': EyeOff,
     folders: Folders,
     funnel: Funnel,
     globe: Globe,
@@ -94,6 +99,7 @@
     search: Search,
     server: Server,
     settings: Settings,
+    'shield-alert': ShieldAlert,
     smartphone: Smartphone,
     sun: Sun,
     terminal: Terminal,

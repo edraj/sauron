@@ -32,10 +32,13 @@ export const ALL_PERMISSIONS: Permission[] = [
   'project:delete',
   'member:read',
   'member:manage',
+  'member:credential',
   'role:manage',
   'org:manage',
   'alert:read',
   'alert:write',
+  'pii:read',
+  'pii:manage',
 ];
 
 export interface PermissionGroup {
@@ -62,9 +65,10 @@ export const PERMISSION_GROUPS: PermissionGroup[] = [
     permissions: ['project:read', 'project:create', 'project:update', 'project:delete'],
   },
   { label: 'Alerting', permissions: ['alert:read', 'alert:write'] },
+  { label: 'Privacy', permissions: ['pii:read', 'pii:manage'] },
   {
     label: 'Organization',
-    permissions: ['member:read', 'member:manage', 'role:manage', 'org:manage'],
+    permissions: ['member:read', 'member:manage', 'member:credential', 'role:manage', 'org:manage'],
   },
 ];
 
@@ -92,8 +96,11 @@ export const PERMISSION_LABELS: Record<string, string> = {
   'project:delete': 'Delete projects',
   'member:read': 'View members',
   'member:manage': 'Add, edit, and deactivate members',
+  'member:credential': 'Reset passwords and sign out devices',
   'role:manage': 'Create and edit roles',
   'org:manage': 'Manage organization settings',
   'alert:read': 'View alert rules and channels',
   'alert:write': 'Create and edit alert rules and channels',
+  'pii:read': 'View PII scan findings, the mask audit trail, and reveal single values',
+  'pii:manage': 'Configure scans and permanently mask values (irreversible)',
 };

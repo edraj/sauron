@@ -144,7 +144,13 @@
   </div>
 
   <div class="analytics-head">
-    <h2 class="section-title">Audience</h2>
+    <div>
+      <h2 class="section-title">Audience</h2>
+      <p class="muted sub">
+        This app only. <a href="#/active-users">Combined active users</a> counts people
+        across several apps at once.
+      </p>
+    </div>
     <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
   </div>
 
@@ -153,6 +159,10 @@
       <StatTile label="Total users" value={compactNumber(analytics.stats.total_users)} tone="primary" sub="all time" />
       <StatTile label="Active" value={compactNumber(analytics.stats.active_in_range)} sub={`last ${sinceDays}d`} />
       <StatTile label="New" value={compactNumber(analytics.stats.new_in_range)} sub={`last ${sinceDays}d`} />
+      <!-- `stats.dau` has always been in the payload and in the `UserStats`
+           model; the tile was simply never rendered, which is why this page
+           shows a stickiness ratio whose numerator is invisible. -->
+      <StatTile label="DAU" value={compactNumber(analytics.stats.dau)} sub="24h" />
       <StatTile label="WAU" value={compactNumber(analytics.stats.wau)} sub="7-day" />
       <StatTile label="MAU" value={compactNumber(analytics.stats.mau)} sub="30-day" />
       <StatTile label="Stickiness" value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />

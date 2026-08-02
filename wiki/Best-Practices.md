@@ -120,6 +120,38 @@ null`) that runs before each crumb is stored — use it to redact `data` or drop
 crumbs. The cheapest PII policy of all is to never put secrets into event properties,
 traits, tags, or breadcrumbs to begin with.
 
+### Keep PII out of telemetry in the first place
+
+`beforeSend` is a net, not a plan. These three habits are what keep you from needing
+it — and from needing the **[Privacy Inspector](Privacy-Inspector.md)**, whose mask
+reaches hot Postgres and future ingest and *nothing else*.
+
+- **Use a stable opaque id, not an email.** `distinct_id` and `context.user.id` are
+  copied onto every signal a person generates, indexed, exported to cold Parquet, and
+  used to merge people across apps. An email there is PII in the highest-fanout field
+  in the product, and it is the field you can least afford to mask later: masking an
+  identity key stops future identification through it permanently, and nothing can
+  reconstruct the split afterwards (see
+  **[Active Users](Active-Users.md#two-things-that-silently-change-these-numbers)**).
+  Send `u_8412`, keep the email in your own database.
+- **Put customer data in `extra`, never in the exception message.**
+  `error_events.title` is derived server-side from `exception_type`,
+  `exception_value` and `message`, and it is the most-read string in the product —
+  it is what the Issues list, alert emails, Slack messages and the issue detail
+  header all show. A name or an order email inside
+  `raise ValueError(f"no card for {user.email}")` therefore lands in the issue title,
+  in every alert that already went out, and — when the error carries no usable stack
+  frames — in the grouping fingerprint as well. Raise
+  `ValueError("no card for user")` and attach the specifics with `setExtra` /
+  `extra=` — `extra` is designed for exactly this, and it is maskable, whereas an
+  already-delivered alert is not.
+- **Scan before your first production release, not after an incident.** A scan is
+  read-only, it needs no code change, and it takes minutes. Running one on staging
+  while the schema is still small tells you which key names your SDK integration is
+  actually sending — which is usually a shorter and more surprising list than anyone
+  expects. Finding out afterwards means the bytes are already in cold Parquet, in the
+  Redis stream and in delivered alerts, where no mask reaches them.
+
 ---
 
 ## 3. Sampling

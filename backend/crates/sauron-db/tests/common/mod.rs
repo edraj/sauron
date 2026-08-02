@@ -1102,6 +1102,11 @@ impl TestDb {
             now,
             0,
             0,
+            // `false`, not `true`. This identity is present only as a
+            // `sessions` row; nothing ever called identify() for it, and
+            // `the_harness_seeds_guests_not_identified_users` asserts the whole
+            // seed leaves ZERO identified rows on `ids.app_id`.
+            false,
         )
         .await;
         seed_session(
@@ -1502,7 +1507,17 @@ async fn seed_analytics_event(
     // events_delta=1, errors_delta=0: this is an analytics event, not an
     // error — see `note_identity`'s doc comment for why the two callers pass
     // different values here.
-    note_identity(conn, app_id, distinct_id, device_key, occurred_at, 1, 0).await;
+    note_identity(
+        conn,
+        app_id,
+        distinct_id,
+        device_key,
+        occurred_at,
+        1,
+        0,
+        false,
+    )
+    .await;
 }
 
 /// Insert one `error_events` row and register its identity, same rationale as
@@ -1570,7 +1585,17 @@ async fn seed_error_event(
     // `devices.errors_count` (and, for `event_users`-adjacent callers,
     // would-be person-level error counts) must fold in, and must NOT fold
     // into `devices.events_count` — see `note_identity`'s doc comment.
-    note_identity(conn, app_id, distinct_id, device_key, occurred_at, 0, 1).await;
+    note_identity(
+        conn,
+        app_id,
+        distinct_id,
+        device_key,
+        occurred_at,
+        0,
+        1,
+        false,
+    )
+    .await;
 }
 
 /// Insert one `transactions` row. Unlike analytics/error events, transactions
@@ -1687,6 +1712,11 @@ async fn seed_session(
 /// put a direct read of it back for the `All` scope (see `list_devices`'s doc
 /// comment) — a device seeded with a session-only identity and zero
 /// analytics/error activity would have shown `events_count: 1`, not `0`.
+// The `identified` flag takes this to 8 parameters, one past clippy's
+// threshold. Same allow its two callers (`seed_analytics_event`,
+// `seed_error_event`) already carry: collapsing the deltas into a struct would
+// hide exactly the per-caller asymmetry the doc comment above exists to pin.
+#[allow(clippy::too_many_arguments)]
 async fn note_identity(
     conn: &mut sauron_db::PgConn,
     app_id: Uuid,
@@ -1695,10 +1725,32 @@ async fn note_identity(
     at: DateTime<Utc>,
     events_delta: i64,
     errors_delta: i64,
+    // `//`, not `///`: rustc rejects a doc comment on a function parameter
+    // outright ("documentation comments cannot be applied to function
+    // parameters"). `identified` says whether this seed models an `identify()`
+    // call or an ordinary signal. The ordinary path must go through a plain
+    // touch: `upsert_event_user` is the identify() write shape, and using it
+    // for every seeded row silently hands every test merge-across-apps
+    // semantics it never asked for.
+    identified: bool,
 ) {
-    repo::upsert_event_user(conn, app_id, distinct_id, &json!({}))
+    if identified {
+        repo::upsert_event_user(conn, app_id, distinct_id, &json!({}))
+            .await
+            .expect("upsert event user");
+        repo::mark_event_user_identified(
+            conn,
+            app_id,
+            distinct_id,
+            repo::IDENTIFIED_SOURCE_IDENTIFY,
+        )
         .await
-        .expect("upsert event user");
+        .expect("mark event user identified");
+    } else {
+        repo::touch_event_user(conn, app_id, distinct_id)
+            .await
+            .expect("touch event user");
+    }
     repo::bump_device(
         conn,
         app_id,
@@ -1814,4 +1866,149 @@ pub async fn distinct_envs_for_identity(
 /// indistinguishable from a failing assertion.
 pub fn far_past() -> DateTime<Utc> {
     Utc::now() - chrono::Duration::days(3650)
+}
+
+/// Flag `distinct_id` on `app_id` as identified, exactly as `identify()` does
+/// on the live path. The only way a harness-seeded identity becomes a `'u:'`
+/// key.
+pub async fn seed_identified_user(conn: &mut sauron_db::PgConn, app_id: Uuid, distinct_id: &str) {
+    repo::touch_event_user(conn, app_id, distinct_id)
+        .await
+        .expect("create the event_users row");
+    repo::mark_event_user_identified(conn, app_id, distinct_id, repo::IDENTIFIED_SOURCE_IDENTIFY)
+        .await
+        .expect("mark identified");
+}
+
+/// One `analytics_events` row and NOTHING else — no `event_users` row, no
+/// device bump. `active_users_combined` reads raw signal and joins
+/// `event_users` separately, so its tests have to control the two independently
+/// or they cannot express "active but never identified".
+pub async fn seed_signal_event(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    env: Option<Uuid>,
+    distinct_id: &str,
+    occurred_at: DateTime<Utc>,
+) {
+    repo::insert_analytics_event(
+        conn,
+        NewAnalyticsEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: env,
+            name: "signal".to_string(),
+            distinct_id: distinct_id.to_string(),
+            properties: json!({}),
+            context: json!({}),
+            session_id: None,
+            release: None,
+            ip_address: None,
+            occurred_at,
+            device_key: None,
+            screen: None,
+            workflow_id: None,
+            workflow_name: None,
+            tags: json!({}),
+            contexts: json!({}),
+            extra: json!({}),
+        },
+    )
+    .await
+    .expect("insert signal analytics event");
+}
+
+/// One `error_events` row and nothing else. `distinct_id` is `Option` so a
+/// test can seed the NULL case the union has to exclude.
+pub async fn seed_signal_error(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    env: Option<Uuid>,
+    issue_id: Uuid,
+    distinct_id: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) {
+    repo::insert_error_event(
+        conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: env,
+            issue_id,
+            fingerprint: "harness-fingerprint".to_string(),
+            level: "error".into(),
+            message: "signal error".into(),
+            exception_type: "HarnessError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: distinct_id.map(|s| s.to_string()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            workflow_id: None,
+            workflow_name: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: None,
+            title: None,
+            culprit: None,
+        },
+    )
+    .await
+    .expect("insert signal error event");
+}
+
+/// Insert one minimal `error_events` row carrying a chosen `extra` document.
+///
+/// `issue_id` and `fingerprint` are NOT NULL on `error_events` (and `issue_id`
+/// carries an FK to `issues`), so a row cannot be seeded with them left out —
+/// the insert is rejected outright before any mask assertion runs. One issue
+/// per app is upserted on a fixed fingerprint so repeated calls reuse the same
+/// parent row rather than inflating `issues`.
+pub async fn seed_error_event_with_extra(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    occurred_at: DateTime<Utc>,
+    extra: &serde_json::Value,
+) {
+    let issue_id = repo::upsert_issue(
+        conn,
+        NewIssue {
+            app_id,
+            fingerprint: "mask-harness-fingerprint",
+            type_: "error",
+            title: "mask harness",
+            culprit: "mask harness",
+            level: "error",
+            first_seen: occurred_at,
+            last_seen: occurred_at,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("seed issue for error event");
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query(
+            "INSERT INTO error_events (id, app_id, issue_id, fingerprint, level, occurred_at, received_at, extra) \
+             VALUES (gen_random_uuid(), $1, $2, 'mask-harness-fingerprint', 'error', $3, $3, $4)",
+        )
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<SqlUuid, _>(issue_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(occurred_at)
+        .bind::<diesel::sql_types::Jsonb, _>(extra),
+        conn,
+    )
+    .await
+    .expect("seed error event");
 }

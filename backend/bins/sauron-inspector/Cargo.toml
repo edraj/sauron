@@ -1,0 +1,26 @@
+[package]
+name = "sauron-inspector-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sauron-inspector"
+path = "src/main.rs"
+
+# No Redis and NO DuckDB, deliberately: this binary must not inherit the
+# unbundled libduckdb constraint across a fourth build path.
+[dependencies]
+sauron-core = { workspace = true }
+sauron-db = { workspace = true }
+sauron-inspector = { workspace = true }
+sauron-tier = { workspace = true }
+sauron-telemetry = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

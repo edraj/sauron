@@ -6,6 +6,7 @@ pub mod guard;
 pub mod jwt;
 pub mod password;
 pub mod rbac;
+pub mod revocations;
 
 pub use extractors::{AuthError, AuthUser};
 // No flattened re-export of `guard`: every caller already imports it as
@@ -20,3 +21,4 @@ pub use rbac::{
     authorize_org, authorize_project, effective_at, effective_at_org, ensure_preset_roles, perm,
     require_permission,
 };
+pub use revocations::SessionRevocations;

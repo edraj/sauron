@@ -229,6 +229,53 @@ pub async fn events(
     Ok(Json(events))
 }
 
+/// Totals for the occurrences the sibling `events` route would list.
+///
+/// A separate route rather than an envelope around `events` for two reasons:
+/// the list response is `Vec<ErrorEvent>` and several SDK-adjacent callers
+/// already parse it as a bare array, and the counts skip symbolication
+/// entirely, so making them their own request keeps the cheap query cheap.
+///
+/// Reuses `EventsQuery` so `filter`/`q`/`since_days` are parsed by the exact
+/// same code as the list; `limit` is accepted and ignored, since a total that
+/// stopped at the page size would be worse than useless.
+pub async fn event_stats(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<EventsQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<repo::IssueEventStatsRow>, ApiError> {
+    let mut conn = db(&state).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::ISSUE_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    // Same cross-app guard as `events`: never let a foreign issue_id disclose
+    // another app's counts.
+    repo::get_issue(&mut conn, scope.clone(), issue_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let filters =
+        sauron_db::filter::parse_filters(&q.filter, sauron_db::filter::ERROR_EVENT_FILTERS)?;
+    let search = q.q.as_deref().filter(|s| !s.is_empty());
+    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 3650));
+    let stats = repo::error_event_stats_for_issue(
+        &mut conn,
+        scope,
+        issue_id,
+        &filters,
+        search,
+        Some(since),
+    )
+    .await?;
+    Ok(Json(stats))
+}
+
 // ---------------------------------------------------------------------------
 // Exceptions dashboard header — status/level breakdown + occurrence series.
 // ---------------------------------------------------------------------------

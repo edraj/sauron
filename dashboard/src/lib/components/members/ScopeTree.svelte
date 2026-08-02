@@ -25,6 +25,20 @@
     loadingEnvApps?: Set<string>;
     value: ScopeSelection;
     disabled?: boolean;
+    /**
+     * Whether the "entire org" row is offered. Defaults to true so Members and
+     * EditMember are unchanged; the subscription dialog passes false, because
+     * one org tick would fan a subscription out to every app in the org.
+     */
+    allowOrg?: boolean;
+    /**
+     * Whether the environment level is offered under each app. Defaults to
+     * true. The subscription dialog passes false: these rows are
+     * `AppEnvironment.id` — ENROLLMENT ids — while a subscription stores
+     * CATALOGUE ids in its own chip row, and rendering both with identical
+     * labels would put two id spaces in one form.
+     */
+    allowEnv?: boolean;
     onchange: (next: ScopeSelection) => void;
     /**
      * Fired when an app row's disclosure opens and `envsByApp` has no entry
@@ -45,6 +59,8 @@
     loadingEnvApps = new Set<string>(),
     value,
     disabled = false,
+    allowOrg = true,
+    allowEnv = true,
     onchange,
     onopenapp,
   }: Props = $props();
@@ -179,14 +195,16 @@
 
 <div class="scope-tree" class:disabled role="group" aria-label="Access scope">
   <div class="tree">
-    <div class="row">
-      <span class="twisty-gap"></span>
-      <label class="node">
-        <input type="checkbox" checked={value.org} {disabled} onchange={toggleOrg} />
-        <span class="n-name">{orgName}</span>
-        <span class="n-hint">entire org</span>
-      </label>
-    </div>
+    {#if allowOrg}
+      <div class="row">
+        <span class="twisty-gap"></span>
+        <label class="node">
+          <input type="checkbox" checked={value.org} {disabled} onchange={toggleOrg} />
+          <span class="n-name">{orgName}</span>
+          <span class="n-hint">entire org</span>
+        </label>
+      </div>
+    {/if}
 
     {#each projects as project (project.id)}
       {@const apps = appsOf(project.id)}
@@ -234,22 +252,29 @@
           {@const envs = envsOf(app.id)}
           {@const envsLoading = loadingEnvApps.has(app.id)}
           <div class="row lvl-2" class:implied={appImplied}>
-            <!-- Always rendered, unlike the project twisty above: an app's env
-                 count is unknown until fetched, so the disclosure can't be
-                 conditionally hidden the way an empty project's can. -->
-            <button
-              type="button"
-              class="twisty"
-              aria-expanded={appOpen}
-              aria-label={`${appOpen ? 'Collapse' : 'Expand'} ${app.name}`}
-              onclick={() => toggleOpenApp(app.id)}
-            >
-              {#if envsLoading}
-                <Spinner size={11} stroke={1.5} />
-              {:else}
-                <Icon name={appOpen ? 'chevron-down' : 'chevron-right'} size={13} />
-              {/if}
-            </button>
+            {#if allowEnv}
+              <!-- Always rendered when environments are offered, unlike the
+                   project twisty above: an app's env count is unknown until
+                   fetched, so the disclosure can't be conditionally hidden the
+                   way an empty project's can. With `allowEnv = false` there is
+                   nothing to disclose, and an expander that opens onto nothing
+                   reads as a broken control. -->
+              <button
+                type="button"
+                class="twisty"
+                aria-expanded={appOpen}
+                aria-label={`${appOpen ? 'Collapse' : 'Expand'} ${app.name}`}
+                onclick={() => toggleOpenApp(app.id)}
+              >
+                {#if envsLoading}
+                  <Spinner size={11} stroke={1.5} />
+                {:else}
+                  <Icon name={appOpen ? 'chevron-down' : 'chevron-right'} size={13} />
+                {/if}
+              </button>
+            {:else}
+              <span class="twisty-gap"></span>
+            {/if}
             <label class="node">
               <input
                 type="checkbox"
@@ -259,13 +284,15 @@
                 onchange={() => toggleApp(app.id, project.id)}
               />
               <span class="n-name">{app.name}</span>
-              {#if envs.length}
+              <!-- An env count under an app whose environments are not
+                   selectable is a promise the tree does not keep. -->
+              {#if allowEnv && envs.length}
                 <span class="n-hint">{envs.length} env{envs.length === 1 ? '' : 's'}</span>
               {/if}
             </label>
           </div>
 
-          {#if appOpen}
+          {#if allowEnv && appOpen}
             {#if envs.length}
               {#each envs as env (env.id)}
                 {@const envImplied = isImpliedByAncestor(value, 'env', app.id, project.id)}

@@ -15,7 +15,14 @@ use uuid::Uuid;
 /// No longer `Copy`: `Subset` owns a `Vec`. That is deliberate — every
 /// `ReadScope`-taking function had to be revisited when the variant landed,
 /// and a silent `Copy` would have let some of them keep the old semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` is here for exactly one caller: the active-users Redis cache
+/// key hashes a JSON document containing the RESOLVED filter. JSON because it
+/// is self-delimiting — `Subset(Vec<Uuid>)` is a variable-length nesting
+/// inside a variable-length list, and a naive join lets two distinct
+/// selections flatten to the same bytes. A collision there is a cross-tenant
+/// data leak, not a staleness bug.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum EnvFilter {
     /// Every environment, including rows with none. The picker's default, and
     /// what an absent `environment_id` query parameter means.

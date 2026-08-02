@@ -1,0 +1,18 @@
+[package]
+name = "sauron-mail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Deliberately NOT sauron-db. Keeping the data layer out is what lets this stay a
+# leaf crate anything can link — including a future digest worker that must not
+# drag the alerting engine in to send one message.
+sauron-core = { workspace = true }
+sauron-monitor-core = { workspace = true }
+
+lettre = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

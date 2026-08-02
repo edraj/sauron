@@ -2,6 +2,30 @@
 
 All notable changes to `@edraj/sauron-browser` are documented here.
 
+## 1.4.0
+
+### Changed
+
+- The anonymous id is now persisted in `localStorage` under `sauron.anon_id`
+  instead of being re-minted in memory on every page load. **Every web app's
+  reported active-user count drops sharply and permanently on the day this is
+  adopted** — the old behaviour counted page loads, not people (a 5-10x
+  inflation, all of it in the "guest" half of the Active Users report). The
+  drop is a data artifact, not a regression.
+- The anonymous id is a durable first-party identifier stored on the user's
+  terminal. That is a retention and consent consequence, not just an
+  implementation detail.
+
+### Added
+
+- `reset()` — clears the scope user and mints a fresh anonymous id.
+  **Call it on logout.** `setUser(null)` now calls it for you. Without it, the
+  next anonymous visitor on a shared browser reuses the persisted id and a
+  later `identify()` aliases their activity to the previous account,
+  server-side, permanently.
+- `anonymous_id` is sent on the identify item only when the anonymous id was
+  actually used as a `distinct_id` in this browser session.
+
 ## 1.3.0
 
 - **Workflows** — bound a named span of activity with start / end / cancel, and

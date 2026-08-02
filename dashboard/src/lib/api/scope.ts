@@ -141,6 +141,36 @@ const APP_SCOPED_URL = /^\/v1\/apps\/[^/]+(?:\/.*)?$/;
 // too. This array's comment used to call those two "precautionary rather
 // than required"; that is no longer true, and the wording above has been
 // corrected rather than left stale.
+//
+//  - `/v1/apps/{id}/inspector/policy` (`inspector::effective_policy`) — the
+//    PII inspector is APP-scoped. Findings carry their own environment
+//    dimension inside the payload (`env_scope` plus `environment_id`), and
+//    MASKING cannot be limited to one environment at all: the pipeline
+//    enforcer keys on `app_id` alone, and a policy that masks in prod but not
+//    staging is a footgun that produces exactly the leak the feature exists to
+//    prevent. It calls `reject_environment_id_with_message` with that reason.
+//
+//  - `/v1/apps/{id}/inspector/mask-actions`
+//    (`inspector::list_app_mask_actions`) and
+//    `/v1/apps/{id}/inspector/masked-keys`
+//    (`inspector::list_app_masked_keys`) — the same app-scoped rule, the same
+//    message, the same helper. A mask action's `targets` name a table, a
+//    column and a json path and nothing else, and `inspector_masked_keys` has
+//    no environment column at all, so there is no environment dimension to
+//    narrow on: accepting the parameter would report a filter that was never
+//    applied. Added in the same change that MOUNTED both routes, because the
+//    Rust contract test enumerates `main.rs` and an entry added here ahead of
+//    its route fails that test exactly as loudly as a missing one does.
+//    `POST /v1/apps/{id}/inspector/mask-preview` rejects `environment_id` too
+//    and is deliberately NOT listed HERE: `http_env_scoping.rs`'s
+//    `app_scoped_get_route_templates()` only collects `.route(...)` calls
+//    containing `get(`, and
+//    `the_backend_rejection_set_matches_the_dashboard_exclusion_list` asserts
+//    that collected set EQUALS this array. A POST-only path here would sit in
+//    `expected` and could never appear in `rejecting`, so the contract test
+//    would fail on a perfectly correct handler. Every entry that IS listed has
+//    a GET. It is excluded from SCOPING all the same, one array down — see
+//    `NON_GET_BACKEND_REJECTIONS`.
 const BACKEND_REJECTS_ENVIRONMENT_ID: RegExp[] = [
   /^\/v1\/apps\/[^/]+\/?(?:\?.*)?$/,
   /^\/v1\/apps\/[^/]+\/environments(?:[/?].*)?$/,
@@ -149,6 +179,9 @@ const BACKEND_REJECTS_ENVIRONMENT_ID: RegExp[] = [
   /^\/v1\/apps\/[^/]+\/errors\/timeseries(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/events\/timeseries(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/transactions\/timeseries(?:[/?].*)?$/,
+  /^\/v1\/apps\/[^/]+\/inspector\/policy(?:[/?].*)?$/,
+  /^\/v1\/apps\/[^/]+\/inspector\/mask-actions(?:[/?].*)?$/,
+  /^\/v1\/apps\/[^/]+\/inspector\/masked-keys(?:[/?].*)?$/,
 ];
 
 // `/v1/apps/{id}/first-event` (`apps::first_event`) is different in kind from
@@ -169,9 +202,28 @@ const BACKEND_REJECTS_ENVIRONMENT_ID: RegExp[] = [
 // demand the backend reject a route it correctly narrows on.
 const UI_ONLY_EXCLUSIONS: RegExp[] = [/^\/v1\/apps\/[^/]+\/first-event(?:[/?].*)?$/];
 
+// App-scoped routes the backend rejects `environment_id` on that have NO `get(`
+// handler, so they cannot live in `BACKEND_REJECTS_ENVIRONMENT_ID` without
+// failing `http_env_scoping.rs`'s equality assertion (see the note at the end of
+// that array's comment). They still have to be excluded from scoping, because
+// the exclusion list is what `shouldScopeUrl` reads — being absent from it is
+// not "unchecked", it is "scoped".
+//
+// Measured, before this array existed: with an environment selected (the
+// default — `resolveCurrentEnvironment` auto-selects one), the MaskDialog's
+// first call went out as
+// `POST /v1/apps/{id}/inspector/mask-preview?environment_id=…` and came back
+// 400 "the inspector is app-scoped; masking cannot be limited to one
+// environment". The dialog then sat on "Counting affected rows…" forever with
+// an empty app slug, so masking was unreachable from the UI entirely.
+const NON_GET_BACKEND_REJECTIONS: RegExp[] = [
+  /^\/v1\/apps\/[^/]+\/inspector\/mask-preview(?:[/?].*)?$/,
+];
+
 const APP_CONFIG_SUBPATHS: RegExp[] = [
   ...BACKEND_REJECTS_ENVIRONMENT_ID,
   ...UI_ONLY_EXCLUSIONS,
+  ...NON_GET_BACKEND_REJECTIONS,
 ];
 
 /** True if `url` is a read that environment scoping applies to at all. */
@@ -201,3 +253,29 @@ export function computeScopeParams(
   if (envId === null) return undefined;
   return { environment_id: envId };
 }
+
+// ---------------------------------------------------------------------------
+// Project-scoped routes.
+//
+// `APP_SCOPED_URL` above only matches `/v1/apps/...`, so nothing under
+// `/v1/projects/...` is ever scoped by the interceptor — that part is safe by
+// construction and this array changes no behaviour here. What it does is close
+// the same two-directional gap for a NEW route family: the active-users
+// endpoints are the first telemetry reads outside `/v1/apps/{id}/…`, so they
+// sit outside the only mechanised check that a telemetry GET resolves
+// environment scoping rather than accepting-and-ignoring it.
+// `backend/bins/sauron-api/tests/http_env_scoping.rs` reads THIS array's
+// literal source and asserts it equals the set of project-scoped GETs that
+// actually 400 on a valid `environment_id`.
+//
+// Only the rejecting routes belong here. `/v1/projects/{id}` and
+// `/v1/projects/{id}/apps` neither narrow nor reject — they are ordinary
+// configuration reads with no environment dimension and no `Query` field for
+// one — so listing them would make the Rust test demand a rejection the
+// backend does not perform.
+export const PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID: RegExp[] = [
+  /^\/v1\/projects\/[^/]+\/active-users(?:[/?].*)?$/,
+  /^\/v1\/projects\/[^/]+\/active-users\.csv(?:[/?].*)?$/,
+  /^\/v1\/projects\/[^/]+\/environments(?:[/?].*)?$/,
+  /^\/v1\/projects\/[^/]+\/monitors(?:[/?].*)?$/,
+];

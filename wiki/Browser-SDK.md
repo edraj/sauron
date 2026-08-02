@@ -67,6 +67,7 @@ before init).
 | `captureMessage` | `captureMessage(message: string, level?: Level, hint?: Hint): void` — default level `info` |
 | `identify` | `identify(id: string, traits?: Record<string, unknown>): void` |
 | `setUser` | `setUser(user: UserInput): void` — pass `null` to clear |
+| `reset` | `reset(): void` — **call on logout.** Clears the scope user and mints a fresh anonymous id |
 | `setTag` / `setTags` | `setTag(key: string, value: string): void` · `setTags(tags: Record<string, string>): void` |
 | `setContext` | `setContext(name: string, block: Record<string, unknown>): void` — replace a named block |
 | `setExtra` | `setExtra(key: string, value: unknown): void` |
@@ -109,6 +110,32 @@ Sauron.setUser({ id: 'u_123', email: 'ada@example.com' });
 
 The scope's user (from `setUser`) and its tags are stamped onto captured errors and
 events (via the `user`/`tags` item fields).
+
+### Reset on logout — MUST CALL
+
+```ts
+Sauron.reset();        // on logout
+Sauron.setUser(null);  // equivalent: setUser(null) calls reset() for you
+```
+
+The anonymous id is persisted in `localStorage` under `sauron.anon_id` and
+survives page loads, tabs and browser restarts. That is what makes the Active
+Users report count people rather than page loads — and it is also a durable
+first-party identifier stored on the user's terminal, so it is a retention and
+consent question for your privacy notice, not just an implementation detail.
+
+Because it is durable, **not calling `reset()` on logout aliases the next
+person to the last one**. `identify()` sends the current anonymous id as
+`anonymous_id`, and the server records that alias permanently. On a shared or
+kiosk browser, the next anonymous visitor reuses the stored `sauron.anon_id`,
+and their activity is merged into the previous account server-side, forever.
+There is no server-side undo.
+
+`reset()` does NOT clear the device id (`sauron.device_id`) — that identifies
+the browser installation, not the person.
+
+See [Active Users](Active-Users.md) for what the identified/guest split means
+once these ids reach the backend.
 
 ### Tags, contexts & extra
 

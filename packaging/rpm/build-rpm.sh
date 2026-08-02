@@ -46,6 +46,16 @@ name=sauron
 version="$(awk -F'"' '/^version *= *"/{print $2; exit}' backend/Cargo.toml)"
 [ -n "$version" ] || { echo "could not read version from backend/Cargo.toml" >&2; exit 1; }
 
+# The tarball is named from Cargo.toml but rpmbuild resolves Source0 from the spec's
+# Version:. If the two drift, staging "succeeds" and rpmbuild then fails with an
+# opaque "Bad file: .../sauron-<specver>.tar.gz: No such file". Fail here instead.
+spec_version="$(awk '/^Version:/{print $2; exit}' packaging/rpm/sauron.spec)"
+if [ "$version" != "$spec_version" ]; then
+    echo "version mismatch: backend/Cargo.toml is $version but packaging/rpm/sauron.spec is $spec_version" >&2
+    echo "bump both (plus dashboard/package.json) so Source0 resolves" >&2
+    exit 1
+fi
+
 topdir="${RPMBUILD_TOPDIR:-$HOME/rpmbuild}"
 mkdir -p "$topdir"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
 
@@ -103,6 +113,7 @@ install -m0644 packaging/rpm/systemd/sauron-monitor.service  "$topdir/SOURCES/"
 install -m0644 packaging/rpm/systemd/sauron-tier.service     "$topdir/SOURCES/"
 install -m0644 packaging/rpm/systemd/sauron-migrate.service  "$topdir/SOURCES/"
 install -m0644 packaging/rpm/systemd/sauron-alerts.service   "$topdir/SOURCES/"
+install -m0644 packaging/rpm/systemd/sauron-inspector.service "$topdir/SOURCES/"
 install -m0644 packaging/rpm/sysusers/sauron.conf            "$topdir/SOURCES/sauron.sysusers"
 install -m0644 packaging/rpm/tmpfiles/sauron.conf            "$topdir/SOURCES/sauron.tmpfiles"
 install -m0644 packaging/rpm/config/sauron.env              "$topdir/SOURCES/"
@@ -112,6 +123,7 @@ install -m0644 packaging/rpm/config/monitor.env            "$topdir/SOURCES/"
 install -m0644 packaging/rpm/config/tier.env              "$topdir/SOURCES/"
 install -m0644 packaging/rpm/config/dashboard.env         "$topdir/SOURCES/"
 install -m0644 packaging/rpm/config/alerts.env            "$topdir/SOURCES/"
+install -m0644 packaging/rpm/config/inspector.env        "$topdir/SOURCES/"
 install -m0644 packaging/rpm/nginx/sauron-dashboard.conf    "$topdir/SOURCES/"
 install -m0755 packaging/rpm/scripts/sauron-dashboard-config "$topdir/SOURCES/"
 

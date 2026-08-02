@@ -11,6 +11,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::jwt::{Claims, JwtKeys};
+use crate::revocations::SessionRevocations;
 
 /// The only paths a temp-password holder may reach.
 ///
@@ -56,6 +57,14 @@ pub enum AuthError {
     /// The caller holds a temp password and must replace it before doing
     /// anything else.
     PasswordChangeRequired,
+    /// The password was correct, but an admin invalidated this credential and
+    /// the replacement has not been chosen yet. Only ever returned *after* a
+    /// successful password verification — placing it before would answer in
+    /// microseconds for a reset-pending account and in tens of milliseconds for
+    /// every other one, handing back the enumeration oracle `spend_dummy_verify`
+    /// was written to close, and leaking to anyone who can type an address that
+    /// a particular person is mid-lockout.
+    PasswordResetRequired,
     NotFound,
     Internal,
 }
@@ -88,6 +97,11 @@ impl AuthError {
                 StatusCode::FORBIDDEN,
                 "password_change_required",
                 "you must change your password before continuing",
+            ),
+            AuthError::PasswordResetRequired => (
+                StatusCode::FORBIDDEN,
+                "password_reset_required",
+                "an administrator reset this password — check your email for the link",
             ),
             AuthError::NotFound => (StatusCode::NOT_FOUND, "not_found", "resource not found"),
             AuthError::Internal => (
@@ -122,6 +136,7 @@ impl<S> FromRequestParts<S> for AuthUser
 where
     S: Send + Sync,
     JwtKeys: FromRef<S>,
+    SessionRevocations: FromRef<S>,
 {
     type Rejection = AuthError;
 
@@ -140,6 +155,25 @@ where
             .decode_access(token)
             .map_err(|_| AuthError::InvalidToken)?;
         let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AuthError::InvalidToken)?;
+
+        // Before the password gate, not after: a revoked session must 401 on
+        // EVERY path including `/v1/auth/password`, or a revoked temp-password
+        // holder could still change the password. `AuthError::InvalidToken` is
+        // the right code and needs no dashboard change — the 401 interceptor
+        // calls `runRefreshOnce()`, whose refresh row is also revoked, so
+        // `/v1/auth/refresh` 401s and `onRefreshFailure()` sends the user to
+        // `#/login`.
+        //
+        // A token with no `sid` predates migration 000035 and is accepted
+        // unchanged; that cannot last more than `JWT_ACCESS_TTL_SECS` past the
+        // deploy, because `validate_exp` is on and every login and refresh mints
+        // one. Rejecting them instead would sign out every logged-in user at
+        // deploy.
+        if let Some(sid) = claims.sid {
+            if SessionRevocations::from_ref(state).contains(&sid) {
+                return Err(AuthError::InvalidToken);
+            }
+        }
 
         // A temp password may do exactly one thing: become a real one.
         // Enforcing this in the extractor rather than in the dashboard is the
@@ -184,6 +218,13 @@ mod tests {
             "/v1/projects",
             "/v1/admin/storage",
             "/v1/auth/passwordx",
+            // Deliberately unauthenticated, so `password_change_gate` is never
+            // reached for either and neither must ever need the allowlist. A
+            // future change that bolts an extractor onto one of them turns this
+            // red instead of silently 403ing every reset for exactly the
+            // population that needs one.
+            "/v1/auth/forgot-password",
+            "/v1/auth/reset-password",
         ] {
             assert!(
                 !password_change_allowed_path(p),
@@ -224,5 +265,24 @@ mod tests {
         // The dashboard routes on these codes; a rename is a breaking change.
         assert_eq!(c1, "account_deactivated");
         assert_eq!(c2, "password_change_required");
+    }
+
+    #[test]
+    fn password_reset_required_maps_to_403_with_its_own_code() {
+        let (status, code, message) = AuthError::PasswordResetRequired.parts();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // The dashboard's `isPasswordResetRequired` branches on this exact
+        // string to swap the login form for the emailed-link panel. A rename
+        // would otherwise only be caught by a human clicking through a
+        // locked-out login.
+        assert_eq!(code, "password_reset_required");
+        assert_eq!(
+            message,
+            "an administrator reset this password — check your email for the link"
+        );
+        // Must not collide with the temp-password gate: the two names invite
+        // exactly this confusion and the two panels say opposite things.
+        assert_ne!(code, AuthError::PasswordChangeRequired.parts().1);
+        assert_ne!(code, AuthError::AccountDeactivated.parts().1);
     }
 }

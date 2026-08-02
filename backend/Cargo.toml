@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "bins/*"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 rust-version = "1.82"
@@ -21,6 +21,8 @@ sauron-tier = { path = "crates/sauron-tier" }
 sauron-symbols = { path = "crates/sauron-symbols" }
 sauron-alerts = { path = "crates/sauron-alerts" }
 sauron-query = { path = "crates/sauron-query" }
+sauron-mail = { path = "crates/sauron-mail" }
+sauron-inspector = { path = "crates/sauron-inspector" }
 
 # --- async runtime / http ---
 # Scoped tokio features (was "full") — only what the workspace actually uses:

@@ -12,6 +12,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-sauron}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sauron}
       POSTGRES_DB: ${POSTGRES_DB:-sauron}
+    # Peak pooled demand is api 16 + ingest 8 + alerts 8 + tier 4 + monitor
+    # (50 + 8) + inspector 4 = 98, against a stock max_connections of 100 with
+    # 3 reserved for superusers. Exhaustion surfaces as API 500s and ingest
+    # 202-then-drop, not as an inspector error, so give it real headroom.
+    command: postgres -c max_connections=200
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -107,6 +112,12 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       NOTIFY_SECRET_KEY: ${NOTIFY_SECRET_KEY:-}
       ALERTS_TICK_SECS: ${ALERTS_TICK_SECS:-30}
+      NOTIFY_SUBS_TICK_SECS: ${NOTIFY_SUBS_TICK_SECS:-120}
+      NOTIFY_SUBS_BATCH: ${NOTIFY_SUBS_BATCH:-200}
+      NOTIFY_SUBS_MAX_PROBES_PER_ORG: ${NOTIFY_SUBS_MAX_PROBES_PER_ORG:-50}
+      NOTIFY_DRAIN_BUDGET_MS: ${NOTIFY_DRAIN_BUDGET_MS:-10000}
+      NOTIFY_MAX_EMAILS_PER_USER_PER_HOUR: ${NOTIFY_MAX_EMAILS_PER_USER_PER_HOUR:-20}
+      NOTIFY_QUEUE_RETENTION_DAYS: ${NOTIFY_QUEUE_RETENTION_DAYS:-14}
       ALERTS_DELIVER_TIMEOUT_MS: ${ALERTS_DELIVER_TIMEOUT_MS:-10000}
       ALERTS_ALLOW_PRIVATE: ${ALERTS_ALLOW_PRIVATE:-false}
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
@@ -127,11 +138,42 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       JWT_ACCESS_TTL_SECS: "900"
       JWT_REFRESH_TTL_SECS: "2592000"
+      AUTH_REVOCATION_POLL_SECS: "5"
       API_PORT: "8080"
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:10002}
       # Off by default (port published directly). Behind a reverse proxy set
       # this to true, or the per-IP auth limits apply deployment-wide.
       API_TRUST_FORWARDED_HEADERS: ${API_TRUST_FORWARDED_HEADERS:-false}
+      # Browser-facing origin of the dashboard, used to build links inside emails.
+      # DELIBERATELY NO FALLBACK. Mirroring CORS_ALLOWED_ORIGINS' `:-http://localhost:10002`
+      # is the obvious move and is exactly the behaviour this design rejects: the
+      # URL would render, the message would send, the row would reach 'sent' —
+      # every server-side signal reporting success while the recipient's browser
+      # hits their own machine. Unset must produce the loud error naming the variable.
+      DASHBOARD_URL: ${DASHBOARD_URL:-}
+      # Deployment-level SMTP relay. Unset disables password reset; it does not
+      # break the API.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-Sauron}
+      SMTP_TLS: ${SMTP_TLS:-}
+      SMTP_ALLOW_PRIVATE: ${SMTP_ALLOW_PRIVATE:-false}
+      SMTP_TIMEOUT_MS: ${SMTP_TIMEOUT_MS:-10000}
+      SMTP_SINK: ${SMTP_SINK:-false}
+      MAIL_DRAIN_TICK_SECS: ${MAIL_DRAIN_TICK_SECS:-60}
+      MAIL_OUTBOX_RETENTION_DAYS: ${MAIL_OUTBOX_RETENTION_DAYS:-30}
+      # Shared with `inspector` (and TIER_HOT_DAYS with `tier`). Compose has no
+      # shared env file, so these are repeated per service reading the SAME
+      # variable: the API states the enforcement delay to the operator in words
+      # and the inspector derives the hot boundary it is allowed to rewrite, so
+      # a divergence here is a UI that lies and a masker that rewrites rows the
+      # tier worker has already exported to Parquet.
+      TIER_HOT_DAYS: ${TIER_HOT_DAYS:-30}
+      INSPECTOR_POLICY_CACHE_SECS: ${INSPECTOR_POLICY_CACHE_SECS:-30}
+      INSPECTOR_TAIL_SWEEP_SECS: ${INSPECTOR_TAIL_SWEEP_SECS:-120}
       TIER_COLD_PATH: /cold
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     ports:
@@ -160,6 +202,54 @@ services:
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     volumes:
       - colddata:/cold
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  # PII inspector: scans the telemetry jsonb columns for developer-supplied
+  # personal data, retro-masks it in hot Postgres, and reaps its own audit rows.
+  # OFF unless INSPECTOR_ENABLED is set — it reads the same partitions the ingest
+  # path writes. No Redis and no JWT_SECRET: it serves no HTTP and decrypts
+  # nothing, so it holds no secret at all.
+  inspector:
+    build:
+      context: ./backend
+      args:
+        BIN: sauron-inspector
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
+      INSPECTOR_ENABLED: ${INSPECTOR_ENABLED:-false}
+      INSPECTOR_TICK_SECS: ${INSPECTOR_TICK_SECS:-30}
+      INSPECTOR_BATCH_ROWS: ${INSPECTOR_BATCH_ROWS:-5000}
+      INSPECTOR_BATCH_PAUSE_MS: ${INSPECTOR_BATCH_PAUSE_MS:-200}
+      INSPECTOR_LEASE_SECS: ${INSPECTOR_LEASE_SECS:-120}
+      INSPECTOR_MAX_ATTEMPTS: ${INSPECTOR_MAX_ATTEMPTS:-3}
+      INSPECTOR_STATEMENT_TIMEOUT_MS: ${INSPECTOR_STATEMENT_TIMEOUT_MS:-30000}
+      # Deliberately blank rather than `:-30`. Unset, the binary inherits
+      # SEARCH_SCAN_CLAMP_DAYS, which itself inherits TIER_HOT_DAYS — a literal
+      # 30 here would keep scanning 30 days on a deployment that lowered
+      # TIER_HOT_DAYS, reporting coverage for days Postgres no longer holds.
+      INSPECTOR_WINDOW_DAYS: ${INSPECTOR_WINDOW_DAYS:-}
+      INSPECTOR_DETECTOR_WINDOW_DAYS: ${INSPECTOR_DETECTOR_WINDOW_DAYS:-7}
+      INSPECTOR_MAX_PHASE2_ROWS_PER_UNIT: ${INSPECTOR_MAX_PHASE2_ROWS_PER_UNIT:-200000}
+      INSPECTOR_DEFAULT_SWEEP_ROWS: ${INSPECTOR_DEFAULT_SWEEP_ROWS:-50000}
+      INSPECTOR_CATCHUP_GRACE_HOURS: ${INSPECTOR_CATCHUP_GRACE_HOURS:-6}
+      INSPECTOR_SCAN_KEEP: ${INSPECTOR_SCAN_KEEP:-20}
+      INSPECTOR_FINDING_RETENTION_DAYS: ${INSPECTOR_FINDING_RETENTION_DAYS:-90}
+      INSPECTOR_MASK_BATCH: ${INSPECTOR_MASK_BATCH:-2000}
+      INSPECTOR_MASK_PAUSE_MS: ${INSPECTOR_MASK_PAUSE_MS:-200}
+      INSPECTOR_CLAIM_STALE_SECS: ${INSPECTOR_CLAIM_STALE_SECS:-300}
+      INSPECTOR_PREVIEW_GC_DAYS: ${INSPECTOR_PREVIEW_GC_DAYS:-7}
+      INSPECTOR_AUDIT_RETENTION_DAYS: ${INSPECTOR_AUDIT_RETENTION_DAYS:-0}
+      INSPECTOR_AUDIT_PII_DAYS: ${INSPECTOR_AUDIT_PII_DAYS:-730}
+      # Shared with `api` (and TIER_HOT_DAYS with `tier`) — same variable on
+      # every service so the three cannot drift. See the note on `api`.
+      TIER_HOT_DAYS: ${TIER_HOT_DAYS:-30}
+      INSPECTOR_POLICY_CACHE_SECS: ${INSPECTOR_POLICY_CACHE_SECS:-30}
+      INSPECTOR_TAIL_SWEEP_SECS: ${INSPECTOR_TAIL_SWEEP_SECS:-120}
+      RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     depends_on:
       migrate:
         condition: service_completed_successfully

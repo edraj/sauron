@@ -1,6 +1,7 @@
 //! The ingest worker: a pool of tasks consuming the Redis stream consumer
 //! group, processing each job, and acking (or dead-lettering) it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -10,6 +11,7 @@ use sauron_core::envelope::IngestJob;
 use sauron_db::PgPool;
 use sauron_redis::RedisStore;
 
+use crate::mask::PolicyCache;
 use crate::process::process_job;
 use crate::symbolize::SymbolizeCtx;
 
@@ -33,6 +35,7 @@ pub async fn spawn_workers(
     redis: RedisStore,
     concurrency: usize,
     sym: SymbolizeCtx,
+    policies: Arc<PolicyCache>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     redis.ensure_group().await?;
     let mut handles = Vec::with_capacity(concurrency);
@@ -40,11 +43,19 @@ pub async fn spawn_workers(
         let pool = pool.clone();
         let redis = redis.clone();
         let sym = sym.clone();
+        let policies = policies.clone();
         let consumer = format!("worker-{i}");
         info!(consumer, "starting ingest worker");
         handles.push(tokio::spawn(async move {
             loop {
-                worker_loop(pool.clone(), redis.clone(), sym.clone(), consumer.clone()).await;
+                worker_loop(
+                    pool.clone(),
+                    redis.clone(),
+                    sym.clone(),
+                    policies.clone(),
+                    consumer.clone(),
+                )
+                .await;
                 warn!(consumer, "ingest worker exited; restarting");
                 tokio::time::sleep(RESPAWN_BACKOFF).await;
             }
@@ -53,7 +64,13 @@ pub async fn spawn_workers(
     Ok(handles)
 }
 
-async fn worker_loop(pool: PgPool, redis: RedisStore, sym: SymbolizeCtx, consumer: String) {
+async fn worker_loop(
+    pool: PgPool,
+    redis: RedisStore,
+    sym: SymbolizeCtx,
+    policies: Arc<PolicyCache>,
+    consumer: String,
+) {
     // Each worker owns a dedicated blocking connection so its BLOCK read never
     // stalls the shared command path.
     let mut blocking = match redis.blocking_connection().await {
@@ -79,7 +96,7 @@ async fn worker_loop(pool: PgPool, redis: RedisStore, sym: SymbolizeCtx, consume
                         n = claimed.len(),
                         "reclaimed stale stream entries"
                     );
-                    process_entries(&pool, &redis, &sym, &consumer, claimed).await;
+                    process_entries(&pool, &redis, &sym, &policies, &consumer, claimed).await;
                 }
                 Ok(_) => {}
                 Err(e) => warn!(consumer, error = %e, "PEL reclaim failed"),
@@ -133,7 +150,7 @@ async fn worker_loop(pool: PgPool, redis: RedisStore, sym: SymbolizeCtx, consume
             }
         };
 
-        process_entries(&pool, &redis, &sym, &consumer, entries).await;
+        process_entries(&pool, &redis, &sym, &policies, &consumer, entries).await;
     }
 }
 
@@ -151,22 +168,39 @@ async fn process_entries(
     pool: &PgPool,
     redis: &RedisStore,
     sym: &SymbolizeCtx,
+    policies: &PolicyCache,
     consumer: &str,
     entries: Vec<(String, String)>,
 ) {
     for (id, payload) in entries {
         match serde_json::from_str::<IngestJob>(&payload) {
-            Ok(job) => match process_job(pool, redis, sym, job).await {
-                Ok(()) => {
-                    let _ = redis.ack(&id).await;
+            Ok(mut job) => {
+                // Resolve the app's mask set ONCE per job, then mask the owned wire
+                // payload before anything is persisted or re-queued.
+                let set = policies.get(job.app_id).await;
+                crate::mask::apply_wire(&set, &mut job);
+                // Capture the MASKED payload now: at the call site below `job` has
+                // already been moved into `process_job(...)` before the Err arm runs,
+                // and `process_entries` returns () so `?` is not usable here.
+                let masked_payload =
+                    serde_json::to_string(&job).unwrap_or_else(|_| payload.clone());
+                match process_job(pool, redis, sym, &set, job).await {
+                    Ok(()) => {
+                        let _ = redis.ack(&id).await;
+                    }
+                    Err(e) => {
+                        warn!(consumer, id, error = %e, "job processing failed; dead-lettering");
+                        // Dead-letter the MASKED job. `sauron:ingest:dlq` is XADD with
+                        // no MAXLEN and no TTL and no reaper exists, so a raw
+                        // dead-letter is permanent.
+                        let _ = redis.dead_letter(&id, &masked_payload).await;
+                    }
                 }
-                Err(e) => {
-                    warn!(consumer, id, error = %e, "job processing failed; dead-lettering");
-                    let _ = redis.dead_letter(&id, &payload).await;
-                }
-            },
+            }
             Err(e) => {
                 warn!(consumer, id, error = %e, "malformed job; dead-lettering");
+                // A payload that fails to DESERIALIZE still dead-letters raw — a
+                // small, permanent, named hole. §1 of the design lists it.
                 let _ = redis.dead_letter(&id, &payload).await;
             }
         }

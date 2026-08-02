@@ -1,10 +1,20 @@
 <script lang="ts">
   import Card from '../ui/Card.svelte';
   import Badge from '../ui/Badge.svelte';
-  import Button from '../ui/Button.svelte';
+  import RowActionsMenu from '../ui/RowActionsMenu.svelte';
   import { sessionStore } from '../../stores/session.svelte';
   import { initials } from '../../utils/format';
-  import type { App, AppEnvironment, Member, MemberGrant, ScopeType } from '../../models';
+  import { canCancelPasswordReset, canResetMemberPassword } from '../../models/password-reset';
+  import { lockTitle } from '../../models/page-access';
+  import Icon from '../ui/Icon.svelte';
+  import type {
+    App,
+    AppEnvironment,
+    Member,
+    MemberGrant,
+    Permission,
+    ScopeType,
+  } from '../../models';
 
   interface Props {
     grouped: Member[];
@@ -17,15 +27,33 @@
     /** Names for the projects an app grant can hang off. Optional — without it
         an app chip just drops its project prefix instead of breaking. */
     projectsById?: Record<string, { name: string }>;
-    canManage: boolean;
+    /** Missing permission for member administration, or `null` if allowed.
+        A lock rather than a boolean so each control can say WHY it is off. */
+    manageLock: Permission | null;
     /** Grant id mid-removal, if any — only that chip shows busy styling, but
         every chip is disabled while it's in flight since deleteGrant() only
         allows one removal at a time. */
     removingId: string | null;
     /** User id whose active/inactive toggle is in flight. */
     togglingUserId: string | null;
+    /** `member:credential`, NOT `manageLock`. A custom role can hold
+        `member:manage` without it — that is the whole point of the carve-out —
+        and showing the button to that role means every click 403s. */
+    revokeLock: Permission | null;
+    /** User id whose force-logout is in flight. */
+    revokingUserId: string | null;
+    onrevokesessions: (member: Member) => void;
     onedit: (userId: string) => void;
     ontoggle: (member: Member) => void;
+    /** Id of the signed-in user, for the self-check the server also makes. */
+    currentUserId: string;
+    /** `member:credential` AND `member:manage` — the server requires both, so a
+        menu gating on either one alone offers an action the server refuses.
+        Holds whichever of the two is missing. */
+    credentialLock: Permission | null;
+    /** ONE callback rather than two, so the table cannot offer a member both a
+        reset and a cancel. */
+    onresetpassword: (member: Member, action: 'reset' | 'cancel') => void;
     onremovegrant: (grantId: string) => void;
   }
 
@@ -34,11 +62,17 @@
     appsById,
     envsByApp = {},
     projectsById = {},
-    canManage,
+    manageLock,
     removingId,
     togglingUserId,
+    revokeLock,
+    revokingUserId,
+    onrevokesessions,
     onedit,
     ontoggle,
+    currentUserId,
+    credentialLock,
+    onresetpassword,
     onremovegrant,
   }: Props = $props();
 
@@ -90,7 +124,7 @@
           <th>Member</th>
           <th>Role</th>
           <th>Scope</th>
-          {#if canManage}<th class="col-act"></th>{/if}
+          <th class="col-act"></th>
         </tr>
       </thead>
       <tbody>
@@ -103,6 +137,12 @@
                   <span class="m-name-row">
                     <span class="m-name">{member.name || member.email}</span>
                     {#if !member.is_active}<Badge tone="warning" size="sm">Deactivated</Badge>{/if}
+                    {#if member.credentials_invalidated_at}
+                      <!-- An account nobody can sign in to is a state the table has
+                           to show without being opened: the admin who forced it may
+                           not be the one fielding "I can't log in". -->
+                      <Badge tone="warning" size="sm">Reset pending</Badge>
+                    {/if}
                   </span>
                   {#if member.name}<span class="m-email">{member.email}</span>{/if}
                 </div>
@@ -120,40 +160,115 @@
                 {#each member.grants as grant (grant.id)}
                   <span class="scope-chip">
                     <Badge tone={scopeTone(grant.scope_type)} size="sm">{scopeLabel(grant)}</Badge>
-                    {#if canManage}
-                      <button
-                        type="button"
-                        class="chip-remove"
-                        class:removing={removingId === grant.id}
-                        aria-label={`Remove ${scopeLabel(grant)} access`}
-                        title="Remove access"
-                        disabled={removingId !== null}
-                        onclick={() => onremovegrant(grant.id)}
-                      >
-                        ×
-                      </button>
-                    {/if}
+                    <button
+                      type="button"
+                      class="chip-remove"
+                      class:removing={removingId === grant.id}
+                      aria-label={`Remove ${scopeLabel(grant)} access`}
+                      title={manageLock ? lockTitle(manageLock) : 'Remove access'}
+                      disabled={removingId !== null || manageLock !== null}
+                      onclick={() => onremovegrant(grant.id)}
+                    >
+                      ×
+                    </button>
                   </span>
                 {/each}
               </div>
             </td>
-            {#if canManage}
               <td class="col-act">
-                <div class="row-actions">
-                  <Button variant="ghost" size="sm" onclick={() => onedit(member.user_id)}>
-                    Edit
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    loading={togglingUserId === member.user_id}
-                    onclick={() => ontoggle(member)}
-                  >
-                    {member.is_active ? 'Deactivate' : 'Reactivate'}
-                  </Button>
-                </div>
+                <RowActionsMenu label={`Actions for ${member.email}`}>
+                  {#snippet children(close)}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      class="ram-item"
+                      disabled={manageLock !== null}
+                      title={manageLock ? lockTitle(manageLock) : undefined}
+                      onclick={() => {
+                        close();
+                        onedit(member.user_id);
+                      }}
+                    >
+                      {#if manageLock}<span class="ram-lock" aria-hidden="true"
+                          ><Icon name="lock" size={12} /></span
+                        >{/if}Edit
+                    </button>
+                    <!-- The helpers are called with `true` for the permission
+                         so they answer only the member-state question (self?
+                         active? reset already pending?). Permission is applied
+                         as a lock below instead, so the item stays visible and
+                         explains itself rather than vanishing. -->
+                    {#if canResetMemberPassword(member, currentUserId, true)}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        class="ram-item"
+                        disabled={credentialLock !== null}
+                        title={credentialLock ? lockTitle(credentialLock) : undefined}
+                        onclick={() => {
+                          close();
+                          onresetpassword(member, 'reset');
+                        }}
+                      >
+                        {#if credentialLock}<span class="ram-lock" aria-hidden="true"
+                            ><Icon name="lock" size={12} /></span
+                          >{/if}Reset password
+                      </button>
+                    {:else if canCancelPasswordReset(member, currentUserId, true)}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        class="ram-item"
+                        disabled={credentialLock !== null}
+                        title={credentialLock ? lockTitle(credentialLock) : undefined}
+                        onclick={() => {
+                          close();
+                          onresetpassword(member, 'cancel');
+                        }}
+                      >
+                        {#if credentialLock}<span class="ram-lock" aria-hidden="true"
+                            ><Icon name="lock" size={12} /></span
+                          >{/if}Cancel password reset
+                      </button>
+                    {/if}
+                    <!-- Signing yourself out of every device from the members
+                         table is not a permission question — the server refuses
+                         it outright — so this stays an `{#if}`, not a lock. -->
+                    {#if member.user_id !== currentUserId}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        class="ram-item"
+                        disabled={revokingUserId === member.user_id || revokeLock !== null}
+                        title={revokeLock ? lockTitle(revokeLock) : undefined}
+                        onclick={() => {
+                          close();
+                          onrevokesessions(member);
+                        }}
+                      >
+                        {#if revokeLock}<span class="ram-lock" aria-hidden="true"
+                            ><Icon name="lock" size={12} /></span
+                          >{/if}Sign out all devices
+                      </button>
+                    {/if}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      class="ram-item danger"
+                      disabled={togglingUserId === member.user_id || manageLock !== null}
+                      title={manageLock ? lockTitle(manageLock) : undefined}
+                      onclick={() => {
+                        close();
+                        ontoggle(member);
+                      }}
+                    >
+                      {#if manageLock}<span class="ram-lock" aria-hidden="true"
+                          ><Icon name="lock" size={12} /></span
+                        >{/if}{member.is_active ? 'Deactivate' : 'Reactivate'}
+                    </button>
+                  {/snippet}
+                </RowActionsMenu>
               </td>
-            {/if}
           </tr>
         {/each}
       </tbody>
@@ -196,12 +311,6 @@
     text-align: right;
     width: 1%;
     white-space: nowrap;
-  }
-  .row-actions {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 8px;
   }
   .member-cell {
     display: flex;

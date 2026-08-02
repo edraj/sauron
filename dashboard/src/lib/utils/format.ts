@@ -129,6 +129,45 @@ export function formatDateTime(input: string | number | Date | null | undefined)
   });
 }
 
+/**
+ * Absolute date-time down to the second — for rows where the exact instant is
+ * the point, like an issue's occurrence list.
+ *
+ * Deliberately NOT folded into `formatDateTime`: that one backs the summary
+ * fields ("First seen", "Last seen") and a dozen tooltips, where a trailing
+ * `:07` is noise. Two call sites with genuinely different precision needs.
+ */
+export function formatDateTimeSeconds(input: string | number | Date | null | undefined): string {
+  return absolute(input, {});
+}
+
+/**
+ * Same instant, plus the viewer's timezone — tooltip-only, where there is room
+ * to spell out which clock the column is showing before someone lines these
+ * timestamps up against a server log.
+ */
+export function formatDateTimeZone(input: string | number | Date | null | undefined): string {
+  return absolute(input, { timeZoneName: 'short' });
+}
+
+function absolute(
+  input: string | number | Date | null | undefined,
+  extra: Intl.DateTimeFormatOptions,
+): string {
+  if (input === null || input === undefined) return '—';
+  const d = new Date(input);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    ...extra,
+  });
+}
+
 export function formatTime(input: string | number | Date | null | undefined): string {
   if (input === null || input === undefined) return '—';
   const d = new Date(input);

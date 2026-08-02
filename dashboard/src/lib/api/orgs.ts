@@ -6,6 +6,7 @@ import type {
   CreateMemberResult,
   CreateRolePayload,
   MemberGrant,
+  MemberPasswordResetResult,
   Organization,
   Role,
   UpdateGrantPayload,
@@ -78,6 +79,25 @@ export async function setMemberActive(
   isActive: boolean,
 ): Promise<void> {
   await api.patch(`/v1/orgs/${orgId}/members/${userId}`, { is_active: isActive });
+}
+
+/**
+ * Goes through `api`, not `bareClient`: it needs the bearer.
+ *
+ * `action: 'reset'` is destructive — it stops the member's current password
+ * authenticating. `'cancel'` is its undo and is the only one of the two that
+ * works on a deployment with no SMTP configured.
+ */
+export async function resetMemberPassword(
+  orgId: string,
+  userId: string,
+  action: 'reset' | 'cancel',
+): Promise<MemberPasswordResetResult> {
+  const { data } = await api.post<MemberPasswordResetResult>(
+    `/v1/orgs/${orgId}/members/${userId}/password-reset`,
+    { action },
+  );
+  return data;
 }
 
 export async function updateGrant(

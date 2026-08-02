@@ -206,10 +206,11 @@ impl AlertEngine {
                 Err(e) => {
                     // Config-level errors (SSRF-blocked, bad address) won't heal
                     // with retries; only transient transport errors are retried.
-                    let transient = e.contains("request failed")
-                        || e.contains("HTTP 5")
-                        || e.contains("HTTP 429")
-                        || e.contains("smtp send failed");
+                    // The four substrings moved into `sauron-mail` alongside the
+                    // errors that produce them, because "improving" one of those
+                    // error strings would otherwise stop every alert email
+                    // retrying with nothing failing to compile.
+                    let transient = sauron_mail::is_transient(&e);
                     last_err = e;
                     if !transient || attempt == self.max_attempts {
                         break;
@@ -276,5 +277,45 @@ impl AlertEngine {
         if let Err(e) = repo::insert_alert_event(conn, ev).await {
             warn!(error = %e, "failed to record alert event");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sauron_mail::{is_transient, MailError};
+
+    /// The retry decision for alert email is made by substring-matching an error
+    /// string produced in a different crate. Nothing about that coupling is
+    /// visible to the compiler, so it is pinned from both sides: this is the
+    /// `sauron-alerts` half, and `sauron_mail::smtp`'s
+    /// `is_transient_matches_the_four_substrings_alerting_relies_on` is the other.
+    #[test]
+    fn every_mail_error_variant_keeps_the_retry_behaviour_it_had_before_the_move() {
+        // Retried, exactly as before the transport moved crates.
+        assert!(is_transient(
+            &MailError::Send("connection reset".into()).to_string()
+        ));
+        assert!(is_transient(
+            &MailError::DeadlineExceeded(30_000).to_string()
+        ));
+        // Still retried. Splitting SMTP 4xx from 5xx for the alerting path is a
+        // deliberate follow-up with its own decision, NOT a side effect of this
+        // refactor — a permanently misconfigured email channel burning three
+        // attempts is the behaviour that exists today.
+        assert!(is_transient(
+            &MailError::Rejected("550 no such user".into()).to_string()
+        ));
+
+        // Never retried: configuration faults that will not heal.
+        assert!(!is_transient(
+            &MailError::InvalidFrom("x@".into()).to_string()
+        ));
+        assert!(!is_transient(
+            &MailError::InvalidRecipient("x@".into()).to_string()
+        ));
+        assert!(!is_transient(
+            &MailError::Blocked("blocked".into()).to_string()
+        ));
+        assert!(!is_transient(&MailError::Build("bad".into()).to_string()));
     }
 }

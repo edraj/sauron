@@ -11,6 +11,8 @@
 <script lang="ts">
   import Icon from '../ui/Icon.svelte';
   import type { IconName } from '../ui/Icon.svelte';
+  import type { Permission } from '../../models';
+  import { lockTitle } from '../../models/page-access';
 
   interface Item {
     id: string;
@@ -29,6 +31,13 @@
     /** Trailing create action label (omit, or omit onCreate, to hide it). */
     createLabel?: string;
     onCreate?: () => void;
+    /**
+     * The permission the user is missing for the create action, or `null` if
+     * they may use it. Non-null keeps the item visible but disabled with a
+     * lock, rather than dropping it — the same rule `Button.lockedReason`
+     * follows, so a capability is never silently absent.
+     */
+    createLocked?: Permission | null;
     ariaLabel: string;
   }
 
@@ -40,6 +49,7 @@
     onSelect,
     createLabel,
     onCreate,
+    createLocked = null,
     ariaLabel,
   }: Props = $props();
 
@@ -194,8 +204,19 @@
     </ul>
     {#if createLabel && onCreate}
       <div class="sep"></div>
-      <button type="button" class="create" role="menuitem" onclick={create}>
-        <span class="plus" aria-hidden="true">+</span>{createLabel}
+      <button
+        type="button"
+        class="create"
+        role="menuitem"
+        disabled={createLocked !== null}
+        title={createLocked ? lockTitle(createLocked) : undefined}
+        onclick={create}
+      >
+        {#if createLocked}
+          <span class="plus" aria-hidden="true"><Icon name="lock" size={12} /></span>
+        {:else}
+          <span class="plus" aria-hidden="true">+</span>
+        {/if}{createLabel}
       </button>
     {/if}
   </div>
@@ -330,13 +351,19 @@
     cursor: pointer;
     transition: background 0.1s ease, color 0.1s ease;
   }
-  .create:hover,
-  .create:focus-visible {
+  .create:not(:disabled):hover,
+  .create:not(:disabled):focus-visible {
     background: var(--surface-2);
     color: var(--text);
     outline: none;
   }
+  .create:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
   .plus {
+    display: inline-flex;
+    align-items: center;
     font-size: 15px;
     line-height: 1;
     color: var(--text-faint);

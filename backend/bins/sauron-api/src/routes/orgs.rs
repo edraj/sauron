@@ -2,9 +2,11 @@
 //! dashboard uses to gate its UI.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -18,7 +20,13 @@ use sauron_auth::rbac::{grants_from_rows, Scope};
 use sauron_auth::{authorize_org, perm, AuthError, AuthUser};
 use sauron_db::models::{NewRoleGrant, Organization, Role};
 use sauron_db::repo;
+use sauron_db::AsyncPgConnection;
+use sauron_mail::MailKind;
 
+use super::auth::{
+    client_addr, rate_limit, render_password_reset_mail, reset_link, ResetMailVars, ResetMode,
+    ADMIN_RESET_PER_CALLER_PER_HOUR, ADMIN_RESET_PER_TARGET_PER_HOUR, ADMIN_RESET_TTL_SECS,
+};
 use super::{db, slugify};
 use crate::error::ApiError;
 use crate::AppState;
@@ -133,6 +141,14 @@ pub struct MemberGrant {
     pub scope_type: String,
     pub scope_id: Uuid,
     pub is_active: bool,
+    /// Non-null while an admin-forced reset is outstanding on this account.
+    ///
+    /// `GET /v1/orgs/{org}/members` is the only place the dashboard learns
+    /// anything about a member's account state, and without this field the
+    /// cancel action exists on the server and is unreachable from the UI —
+    /// which is the same as not existing, since the admin who needs it is
+    /// looking at a members table, not at `curl`.
+    pub credentials_invalidated_at: Option<DateTime<Utc>>,
 }
 
 pub async fn list_members(
@@ -145,17 +161,20 @@ pub async fn list_members(
     let rows = repo::list_org_grants(&mut conn, org_id).await?;
     let members = rows
         .into_iter()
-        .map(|(g, email, name, role_name, is_active)| MemberGrant {
-            id: g.id,
-            user_id: g.user_id,
-            email,
-            name,
-            role_id: g.role_id,
-            role_name,
-            scope_type: g.scope_type,
-            scope_id: g.scope_id,
-            is_active,
-        })
+        .map(
+            |(g, email, name, role_name, is_active, credentials_invalidated_at)| MemberGrant {
+                id: g.id,
+                user_id: g.user_id,
+                email,
+                name,
+                role_id: g.role_id,
+                role_name,
+                scope_type: g.scope_type,
+                scope_id: g.scope_id,
+                is_active,
+                credentials_invalidated_at,
+            },
+        )
         .collect();
     Ok(Json(members))
 }
@@ -686,12 +705,100 @@ pub async fn delete_grant(
     }
 
     repo::delete_grant(&mut conn, org_id, grant_id).await?;
+    // A daily sweep alone leaves a 24-hour window in which a revoked member
+    // keeps receiving telemetry by email. Run it here, after the grant change
+    // has committed, for the paths a human actually takes.
+    if let Err(e) =
+        sauron_alerts::sweep::sweep_user_subscriptions(&mut conn, grant.user_id, org_id).await
+    {
+        tracing::warn!(error = ?e, "notification subscription sweep failed after grant delete");
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]
 pub struct SetMemberActiveReq {
     pub is_active: bool,
+}
+
+/// The guard stack every destructive admin action against another member's
+/// *account* must pass, in order, before it touches anything.
+///
+/// Returns the target's grant rows in this org so callers do not re-query — the
+/// same rows the escalation check reads, which is why the membership test and
+/// the escalation input are one query rather than two.
+///
+/// Exactly one of the six guards is waivable, because exactly one caller
+/// genuinely differs: `set_member_active` passes `allow_self: true` and keeps
+/// its own narrower 409, because self-*reactivation* is legal there and the
+/// refusal it does need ("you cannot deactivate your own account") is not the
+/// sentence below. `allow_self` stays a parameter rather than a hard-coded
+/// refusal because self-target is an *ergonomic* rule about which surface owns a
+/// verb, and a future admin action may legitimately want the other answer. The
+/// cross-org refusal is not a parameter: that is a blast-radius boundary, and a
+/// flag there is an invitation — the next slice wanting the easy answer sets it
+/// to `true` and the refusal quietly stops applying to the account it most
+/// protects.
+///
+/// The last-`org:manage` guard deliberately stays **outside** this helper. That
+/// concern is specific to deactivation: it is irreversible without an admin,
+/// whereas a forced logout is reversible by the victim simply logging in again
+/// and so cannot orphan an org.
+async fn guard_member_admin_action(
+    conn: &mut AsyncPgConnection,
+    caller_id: Uuid,
+    org_id: Uuid,
+    target_user_id: Uuid,
+    allow_self: bool,
+) -> Result<Vec<(String, Uuid, Value)>, ApiError> {
+    // Org-scoped by construction, so a project-scoped Admin cannot reach it.
+    authorize_org(conn, caller_id, org_id, perm::MEMBER_MANAGE).await?;
+
+    let _user = repo::get_user(conn, target_user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    // The target must actually be a member of this org, or any admin could act
+    // on any account in the deployment by guessing a uuid. The rows are also
+    // what the escalation check below reads, so this is one query, not two.
+    let target_grants = repo::user_grants_in_org(conn, target_user_id, org_id).await?;
+    if target_grants.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+
+    // Refused before anything else so it always gets the explanatory 409 rather
+    // than tripping one of the general guards below.
+    if !allow_self && target_user_id == caller_id {
+        return Err(ApiError::Conflict(
+            "use your account page to manage your own sessions".into(),
+        ));
+    }
+
+    // You may not act on someone who outranks you — the same rule delete_grant
+    // and update_grant_handler already apply to a single grant, and this is
+    // strictly more severe than either: it reaches the whole account rather than
+    // one scope. Without it an Admin (member:manage, no org:manage) could work
+    // through every Owner in turn.
+    //
+    // The target's side is the union over every grant they hold here, not their
+    // org-scoped subset, because the account is not scoped either. The caller's
+    // side is deliberately their *org*-scope permissions: an account-global act
+    // takes org-level standing, which a project grant does not confer.
+    let target_perms = union_permissions(&grants_from_rows(target_grants.clone()));
+    let caller = sauron_auth::effective_at_org(conn, caller_id, org_id).await?;
+    check_no_escalation(&caller, &target_perms).map_err(ApiError::Auth)?;
+
+    // member:manage is org-scoped; the account is global. An org-A admin acting
+    // on a member who is also an org-B Owner is reaching outside their blast
+    // radius, and no caller of this helper has a reason to.
+    if repo::count_user_grants_outside_org(conn, target_user_id, org_id).await? > 0 {
+        return Err(ApiError::Conflict(
+            "this member belongs to another organization and cannot be administered from here"
+                .into(),
+        ));
+    }
+
+    Ok(target_grants)
 }
 
 /// Enable or disable a member's ability to log in.
@@ -706,56 +813,25 @@ pub async fn set_member_active(
     Json(req): Json<SetMemberActiveReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_MANAGE).await?;
 
-    let _user = repo::get_user(&mut conn, user_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    // `allow_self: true`, and the self-check stays BELOW this call. Both halves
+    // are load-bearing. The self-check this endpoint has always carried is
+    // guarded by `!req.is_active`, so self-REACTIVATION succeeds today; passing
+    // `false` here would refuse it with the helper's generic "use your account
+    // page to manage your own sessions", which is not advice about a
+    // reactivation and which `Members.svelte`'s `toggleActive` prints verbatim.
+    // And hoisting the self-check above this call would answer a caller holding
+    // no `member:manage` in this org with 409 instead of 403 -- deciding
+    // something about the target before authorizing the caller at all.
+    let _target_grants =
+        guard_member_admin_action(&mut conn, auth.user_id, org_id, user_id, true).await?;
 
-    // The target must actually be a member of this org, or any admin could
-    // toggle any account in the deployment by guessing a uuid. The rows are
-    // also what the escalation check below reads, so this is one query, not two.
-    let target_grants = repo::user_grants_in_org(&mut conn, user_id, org_id).await?;
-    if target_grants.is_empty() {
-        return Err(ApiError::NotFound);
-    }
-
-    // Refuse a self-deactivation before anything else, so it always gets the
-    // explanatory 409 rather than tripping one of the general guards below.
+    // Self-deactivation gets its own 409 rather than the helper's generic one,
+    // because the honest advice differs: there is no "manage your own sessions"
+    // answer to "I tried to disable my own login".
     if !req.is_active && user_id == auth.user_id {
         return Err(ApiError::Conflict(
             "you cannot deactivate your own account".into(),
-        ));
-    }
-
-    // You may not flip is_active on someone who outranks you — the same rule
-    // delete_grant and update_grant_handler already apply to a single grant,
-    // and this is strictly more severe than either: it reaches the whole
-    // account rather than one scope. Without it an Admin (member:manage, no
-    // org:manage) could deactivate every Owner in turn and orphan the org
-    // permanently. Reactivation needs it too: switching someone's login back on
-    // hands their authority back, which is a grant of authority.
-    //
-    // The target's side is the union over every grant they hold here, not their
-    // org-scoped subset, because is_active is not scoped either. The caller's
-    // side is deliberately their *org*-scope permissions: an account-global act
-    // takes org-level standing, which a project grant does not confer.
-    let target_perms = union_permissions(&grants_from_rows(target_grants));
-    let caller = sauron_auth::effective_at_org(&mut conn, auth.user_id, org_id).await?;
-    check_no_escalation(&caller, &target_perms).map_err(ApiError::Auth)?;
-
-    // member:manage is org-scoped; is_active is account-global. Both directions
-    // are out of bounds for a member of another org: deactivating locks them
-    // out of an org this caller has no authority over, and reactivating
-    // overrides that org's decision to lock them out.
-    if repo::count_user_grants_outside_org(&mut conn, user_id, org_id).await? > 0 {
-        return Err(ApiError::Conflict(
-            if req.is_active {
-                "this member belongs to another organization and cannot be reactivated from here"
-            } else {
-                "this member belongs to another organization and cannot be deactivated from here"
-            }
-            .into(),
         ));
     }
 
@@ -775,14 +851,382 @@ pub async fn set_member_active(
 
     repo::set_user_active(&mut conn, user_id, req.is_active).await?;
     if !req.is_active {
-        repo::revoke_all_refresh_tokens_for_user_with_reason(
+        // Session-aware, not token-only. `AuthUser` reads claims, not
+        // `users.is_active`, so a token-only revoke leaves the deactivated
+        // member with full API access for up to 900 seconds — making the most
+        // severe admin action the weakest one, next to a reversible "Sign out"
+        // in the same UI that takes effect in about five. It would also leave
+        // their `auth_sessions` rows live for up to 30 days, so their own
+        // session list would report devices that cannot actually refresh.
+        let revoked = repo::revoke_sessions_for_user(
             &mut conn,
             user_id,
+            None,
             repo::REVOKE_DEACTIVATED,
+            Some(auth.user_id),
+        )
+        .await?;
+        state.revocations.mark_revoked(&revoked);
+    }
+    // A deactivated member's QUEUED mask actions must not execute. Confirm
+    // re-authorizes, but the action then sits in `pending` — with one slot per
+    // worker and a 200 ms inter-batch pause, a backlog can be hours deep — and
+    // deactivation revokes refresh tokens while touching nothing queued. The
+    // worker re-checks authorization at claim too; this is the fast path so the
+    // action never runs at all.
+    if !req.is_active {
+        let cancelled = repo::cancel_pending_mask_actions_for_user(&mut conn, user_id).await?;
+        if cancelled > 0 {
+            tracing::info!(
+                user_id = %user_id,
+                cancelled,
+                "cancelled queued PII mask actions for a deactivated member"
+            );
+        }
+    }
+    // A daily sweep alone leaves a 24-hour window in which a revoked member
+    // keeps receiving telemetry by email. Run it here, after the grant change
+    // has committed, for the paths a human actually takes.
+    if let Err(e) = sauron_alerts::sweep::sweep_user_subscriptions(&mut conn, user_id, org_id).await
+    {
+        tracing::warn!(
+            error = ?e,
+            "notification subscription sweep failed after member active change"
+        );
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Sign a member out of every device.
+///
+/// Gated on **both** `member:credential` (checked here, first) and
+/// `member:manage` (re-checked inside the shared guard stack). That is the
+/// carve-out working as intended: `member:credential` narrows `member:manage`,
+/// it does not stand in for it, and a role that can end a member's sessions
+/// without otherwise being able to see or administer that member is not a shape
+/// anyone asked for.
+///
+/// Deliberately omits the last-`org:manage` guard `set_member_active` carries:
+/// deactivation is irreversible without an admin, whereas a forced logout is
+/// reversible by the victim simply logging in again, so it cannot orphan an org.
+///
+/// Does **not** set `must_change_password` — "force login" is not "force
+/// password reset", and `repo::set_user_password` clears that flag
+/// unconditionally anyway — and does not touch `is_active`.
+///
+/// `allow_self` is `false`: this endpoint passes `except: None`, so a
+/// self-target would log the admin out of the page they are standing on. "Sign
+/// out my other devices" is a different verb, lives on `/account`, and spares
+/// the current session.
+pub async fn revoke_member_sessions(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((org_id, user_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_CREDENTIAL).await?;
+    let _target_grants =
+        guard_member_admin_action(&mut conn, auth.user_id, org_id, user_id, false).await?;
+
+    let ids = repo::revoke_sessions_for_user(
+        &mut conn,
+        user_id,
+        None,
+        repo::REVOKE_ADMIN,
+        Some(auth.user_id),
+    )
+    .await?;
+    drop(conn);
+
+    state.revocations.mark_revoked(&ids);
+    tracing::warn!(
+        actor = %auth.user_id,
+        %user_id,
+        %org_id,
+        revoked = ids.len(),
+        "admin revoked all sessions for a member"
+    );
+    Ok(Json(
+        serde_json::json!({ "ok": true, "revoked": ids.len() }),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct ResetMemberPasswordReq {
+    /// `"reset"` or `"cancel"`. The default is the forward action; an
+    /// unrecognised value is a 400, never a silent reset.
+    ///
+    /// This `#[serde(default)]` only covers `{}` — a body that parses but omits
+    /// the key. It does **not** cover a body-less `POST`, because `Json`
+    /// rejects that before serde is ever called. The handler takes
+    /// `Option<Json<…>>` for that case; see its signature.
+    #[serde(default = "default_reset_action")]
+    pub action: String,
+}
+
+fn default_reset_action() -> String {
+    "reset".to_string()
+}
+
+impl Default for ResetMemberPasswordReq {
+    fn default() -> Self {
+        Self {
+            action: default_reset_action(),
+        }
+    }
+}
+
+/// Force a password reset on a member, or cancel one already forced.
+///
+/// `reset` is destructive and says so: the target's current password stops
+/// authenticating at the login form, every session ends within a few seconds,
+/// and the emailed link is the only way back in. There is deliberately no
+/// second, non-destructive "just send them a link" mode — shipping both puts an
+/// admin holding a suspected leak in front of two adjacent buttons, one of
+/// which stops the leaked password and one of which looks like it does.
+///
+/// `cancel` is the undo. It exists because this action is destructive *and*
+/// gated on a mail relay the deployment may have misconfigured; without an undo
+/// that does not itself depend on the relay, one bounced message is an account
+/// nobody can reach.
+///
+/// There is deliberately no last-`org:manage` guard: a forced reset removes
+/// nobody's permission — the target regains their account by using the link —
+/// so an org can never be orphaned by it.
+pub async fn reset_member_password(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Path((org_id, user_id)): Path<(Uuid, Uuid)>,
+    // `Option<Json<…>>`, not `Json<…>`, and that is the whole reason the
+    // body-less `curl -X POST` documented above works. A bare `Json` extractor
+    // rejects a request with no `content-type: application/json` with 415 and an
+    // empty body with 400 — both *before* serde runs, so `#[serde(default)]`
+    // never gets a chance. axum 0.8's `OptionalFromRequest for Json` hands back
+    // `Ok(None)` when the header is absent, which is exactly the shape an
+    // operator's `curl` sends. Body-consuming extractors must stay last.
+    req: Option<Json<ResetMemberPasswordReq>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let req = req.map(|Json(r)| r).unwrap_or_default();
+
+    let mut conn = db(&state).await?;
+    // `member:credential` in ADDITION to `member:manage`, which
+    // `guard_member_admin_action` demands as its first step. `member:manage` is
+    // the routine permission for handing out and revoking grants; forcing a
+    // reset combined with control of the mail relay is a path to account
+    // takeover, and an org that hands out the former has not agreed to the
+    // latter. The narrower permission never stands in for the broader one.
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_CREDENTIAL).await?;
+
+    let cancel = match req.action.as_str() {
+        "reset" => false,
+        "cancel" => true,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "action must be \"reset\" or \"cancel\"".into(),
+            ))
+        }
+    };
+
+    // Resolved BEFORE anything is applied, and that ordering is the whole
+    // guarantee: a destructive change must never land when the message carrying
+    // its remedy cannot be sent. `cancel` is deliberately exempt — gating the
+    // undo on the same configuration that motivates it would make it
+    // unreachable in precisely the deployment that needs it. The response never
+    // carries the token or the link under any condition: that link is an
+    // account-takeover primitive, and `member:credential` lets its holder deny
+    // a member their account, not sign in as them.
+    let mail_and_url = if cancel {
+        None
+    } else {
+        let mail = state.mail.as_ref().cloned().ok_or_else(|| {
+            ApiError::Unavailable(
+                "unavailable",
+                "SMTP is not configured on this server".into(),
+            )
+        })?;
+        let url = state
+            .cfg
+            .require_dashboard_url()
+            .map_err(|e| ApiError::Unavailable("unavailable", e.to_string()))?
+            .to_string();
+        Some((mail, url))
+    };
+
+    // `member:credential` is in the Admin preset, not just Owner, and an
+    // unbounded loop here is an unbounded mail bomb aimed at one member's inbox
+    // and an unbounded re-lock of an account somebody is trying to recover.
+    rate_limit(
+        &state,
+        &format!("sauron:auth:adminreset:{}", auth.user_id),
+        ADMIN_RESET_PER_CALLER_PER_HOUR,
+        3600,
+    )
+    .await?;
+    if !cancel {
+        // `cancel` spends the per-caller bucket ONLY. It sends no mail and can
+        // only ever restore access, so charging it to the per-target bucket
+        // would mean an admin who forced five resets in an hour cannot undo the
+        // fifth — a limiter blocking the remedy for the thing it was limiting.
+        rate_limit(
+            &state,
+            &format!("sauron:auth:adminreset:target:{user_id}"),
+            ADMIN_RESET_PER_TARGET_PER_HOUR,
+            3600,
         )
         .await?;
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+
+    // Carries the whole shared stack: `member:manage`, user-exists 404,
+    // grant-in-this-org 404, self-target 409, no-escalation against the
+    // target's full union with the caller's org-scope set, and the
+    // unconditional cross-org refusal. `allow_self` is false: resetting
+    // yourself is redundant (`/v1/auth/password` exists) and it lets an admin
+    // lock themselves out over a relay they may have just broken, leaving
+    // nobody with standing to cancel it. No local copy of any of those checks
+    // is added here — a second copy of the cross-org rule is one more place for
+    // the two to drift apart.
+    let _target_grants =
+        guard_member_admin_action(&mut conn, auth.user_id, org_id, user_id, false).await?;
+
+    let user = repo::get_user(&mut conn, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Same spirit as `create_grant`'s refusal to grant to an inactive account:
+    // a deactivated user's authority never grows.
+    if !user.is_active {
+        return Err(ApiError::Conflict(
+            "reactivate this member before resetting their password".into(),
+        ));
+    }
+
+    if cancel {
+        repo::set_user_credentials_invalidated(&mut conn, user_id, None).await?;
+        // Killing the outstanding links is the other half of a cancel. Leaving
+        // them live means the mail everyone had written off can be delivered a
+        // day later, and whoever opens it sets a password for an account whose
+        // owner has been using their old one since — a second, unannounced
+        // sign-out days after the incident was closed.
+        //
+        // `must_change_password` is deliberately NOT cleared. Cancelling
+        // restores the ability to sign in; it does not pretend the admin never
+        // had a reason. It may also have been set long before this reset, by
+        // `create_member`'s reveal-once temp password, and cancel has no way to
+        // tell the two apart.
+        repo::invalidate_password_reset_tokens_for_user(
+            &mut conn,
+            user_id,
+            repo::RESET_INVALIDATED_SUPERSEDED,
+        )
+        .await?;
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "action": "cancel",
+            "expires_at": serde_json::Value::Null,
+        })));
+    }
+
+    let (mail, dashboard_url) = mail_and_url.expect("the reset branch always resolves mail config");
+
+    // Gates before revoke, and fail-safe in that direction: `routes::auth::refresh`
+    // re-reads `user.must_change_password` and bakes it into the next access
+    // token, so even if the revocation write fails the target's next refresh
+    // mints a gated token within one access-token lifetime. The reverse order
+    // leaves a window with sessions killed and no gate.
+    repo::set_user_must_change_password(&mut conn, user_id, true).await?;
+    repo::set_user_credentials_invalidated(&mut conn, user_id, Some(Utc::now())).await?;
+
+    // `actor` is the admin, which is the only way `auth_sessions.revoked_by`
+    // ever records who forced the reset — `password_reset_tokens.initiated_by`
+    // answers that for the link, but not for the sessions.
+    let ids = repo::revoke_sessions_for_user(
+        &mut conn,
+        user_id,
+        None,
+        repo::REVOKE_RESET_FORCED,
+        Some(auth.user_id),
+    )
+    .await?;
+    // Turns the dialog's "within a few seconds" into a statement about this
+    // replica rather than about its next poll.
+    state.revocations.mark_revoked(&ids);
+
+    // Unlike self-service, an admin trigger supersedes outstanding links: this
+    // is an authoritative act by an identified principal, the admin means *this*
+    // link now, and a re-issue after a bounce must not leave two live links.
+    repo::invalidate_password_reset_tokens_for_user(
+        &mut conn,
+        user_id,
+        repo::RESET_INVALIDATED_SUPERSEDED,
+    )
+    .await?;
+
+    let raw = sauron_core::ids::opaque_token();
+    let expires_at = Utc::now() + chrono::Duration::seconds(ADMIN_RESET_TTL_SECS);
+    repo::insert_password_reset_token(
+        &mut conn,
+        user_id,
+        sauron_auth::hash_token(&raw),
+        sauron_auth::hash_token(&user.password_hash),
+        expires_at,
+        ResetMode::Admin.as_str(),
+        Some(auth.user_id),
+        // Populated here and not on the self-service path's behalf: self-service
+        // rows only ever record an anonymous stranger's proxy address, so admin
+        // rows are the half of the audit trail that matters.
+        Some(client_addr(&headers, &peer, &state)),
+    )
+    .await?;
+
+    let org = repo::get_org(&mut conn, org_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let org_name = org.name.clone();
+    let display_name = if user.name.trim().is_empty() {
+        user.email.clone()
+    } else {
+        user.name.clone()
+    };
+    let email = user.email.clone();
+
+    // `MailSender` checks out its own pooled connection; see the identical drop
+    // and its full reasoning in `routes::auth::forgot_password`.
+    drop(conn);
+
+    let content = render_password_reset_mail(ResetMailVars {
+        mode: ResetMode::Admin,
+        display_name: &display_name,
+        reset_url: &reset_link(&dashboard_url, &raw),
+        org_name: &org_name,
+    })
+    // Unreachable rather than merely unlikely, and that is what makes it safe to
+    // discover this late: the only fallible step is `Cta::new` refusing a
+    // non-http(s) href, and the precondition block above already took
+    // `require_dashboard_url()`'s `Ok`, which is only ever returned for a URL
+    // that starts with `http://` or `https://`. If that invariant is ever
+    // broken, this must NOT become a 503: by here the account is already locked
+    // and a 503 claims nothing was applied.
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // The recipient is known here, so this path uses `enqueue` rather than
+    // `enqueue_or_discard` — there is no branch to hide. The TTL passed here
+    // becomes the mail row's own expires_at, so the message and the link it
+    // carries die together.
+    mail.enqueue(
+        MailKind::PasswordReset,
+        &email,
+        &content,
+        Some(user_id),
+        std::time::Duration::from_secs(ADMIN_RESET_TTL_SECS as u64),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "action": "reset",
+        "expires_at": expires_at.to_rfc3339(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -914,6 +1358,14 @@ pub async fn update_grant_handler(
         other => ApiError::from(other),
     })?;
 
+    // A daily sweep alone leaves a 24-hour window in which a revoked member
+    // keeps receiving telemetry by email. Run it here, after the grant change
+    // has committed, for the paths a human actually takes.
+    if let Err(e) =
+        sauron_alerts::sweep::sweep_user_subscriptions(&mut conn, grant.user_id, org_id).await
+    {
+        tracing::warn!(error = ?e, "notification subscription sweep failed after grant update");
+    }
     Ok(Json(serde_json::json!({ "id": updated.id })))
 }
 

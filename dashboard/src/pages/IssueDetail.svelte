@@ -17,11 +17,22 @@
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import { OCCURRENCE_FIELDS, encodeFilters, type Filter } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import { getIssue, updateIssueStatus, listIssueEvents } from '../lib/api/issues';
+  import { lockedBy } from '../lib/models/page-access';
+  import {
+    getIssue,
+    updateIssueStatus,
+    listIssueEvents,
+    getIssueEventStats,
+  } from '../lib/api/issues';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
-  import { relativeTime, formatDateTime } from '../lib/utils/format';
-  import type { IssueDetail, IssueStatus, ErrorEvent } from '../lib/models';
+  import {
+    relativeTime,
+    formatDateTime,
+    formatDateTimeSeconds,
+    formatDateTimeZone,
+  } from '../lib/utils/format';
+  import type { IssueDetail, IssueEventStats, IssueStatus, ErrorEvent } from '../lib/models';
 
   interface Props {
     params?: { id?: string };
@@ -34,7 +45,11 @@
   let updating = $state(false);
 
   const issueId = $derived(params?.id ?? '');
-  const canWrite = $derived(sessionStore.can('issue:write', { app: sessionStore.currentAppId }));
+  // issues.rs:153 uses the STRICT `authorize_app`, so an env-scoped grant that
+  // can read this issue still cannot resolve it.
+  const writeLock = $derived(
+    lockedBy('issue:write', { app: sessionStore.currentAppId, level: 'app' }),
+  );
 
   async function load(appId: string, id: string) {
     loading = true;
@@ -63,22 +78,39 @@
   let occFilters = $state<Filter[]>([]);
   let occSearch = $state('');
   let occSince = $state(3650);
+  let occStats = $state<IssueEventStats | null>(null);
   let occTimer: ReturnType<typeof setTimeout> | undefined;
 
   async function loadOccurrences(appId: string, id: string, enc: string[], term: string, since: number) {
     occLoading = true;
+    const params = { filters: enc, q: term || undefined, sinceDays: since };
     try {
-      occurrences = await listIssueEvents(appId, id, {
-        filters: enc,
-        q: term || undefined,
-        sinceDays: since,
-        limit: 50,
-      });
+      // Issued together so the counts and the rows they describe swap in on the
+      // same frame; resolving them separately would briefly caption the new
+      // rows with the previous filter's totals.
+      //
+      // `allSettled`, NOT `all`: the counts run `count(DISTINCT …)` over the
+      // whole matched range while the list just reads 50 indexed rows, so the
+      // stats call is by far the likelier of the two to time out on a large
+      // issue. Under `all`, that would reject the pair and blank a perfectly
+      // good occurrence table. Losing the stat strip is the acceptable
+      // degradation here; losing the rows is not.
+      const [rows, stats] = await Promise.allSettled([
+        listIssueEvents(appId, id, { ...params, limit: 50 }),
+        getIssueEventStats(appId, id, params),
+      ]);
+      occurrences = rows.status === 'fulfilled' ? rows.value : [];
+      occStats = stats.status === 'fulfilled' ? stats.value : null;
     } catch {
       occurrences = [];
+      occStats = null;
     } finally {
       occLoading = false;
     }
+  }
+
+  function plural(n: number, word: string): string {
+    return `${n.toLocaleString()} ${n === 1 ? word : `${word}s`}`;
   }
 
   $effect(() => {
@@ -125,6 +157,45 @@
   );
   const latestEvent = $derived(issue?.latest_event ?? null);
   const latestEventType = $derived(latestEvent?.exception_type ?? issue?.type ?? '');
+
+  const eventMeta = $derived.by(() => {
+    const ev = latestEvent;
+    if (!ev) return '';
+    const body = (ev.exception_value ?? ev.message ?? '').trim();
+    // `join` rather than a template: a message-only event has no
+    // `exception_type`, and an exception with no value has no body. Either
+    // interpolated blind leaves a dangling ": ".
+    return [latestEventType, body].filter(Boolean).join(': ');
+  });
+
+  /**
+   * Whether the red subtitle on "Latest event" merely repeats the page <h1>.
+   *
+   * It usually does: the heading renders `issue.title`, which the pipeline
+   * builds as `"{type}: {value}"` with the value truncated to 200 chars
+   * (sauron-pipeline `build_title`), and the subtitle is that same pair at full
+   * length.
+   *
+   * Hence prefix rather than equality — that 200-char cap means the two are
+   * rarely byte-identical, and a strict `===` would essentially never fire on
+   * the long messages where the duplication is most glaring. The length floor
+   * keeps a short heading like "Error" from suppressing an "Error: connection
+   * refused" subtitle that does carry new information.
+   */
+  const metaRedundant = $derived.by(() => {
+    const title = squash(issue?.title ?? '');
+    const meta = squash(eventMeta);
+    if (!title || !meta) return false;
+    return title === meta || (meta.startsWith(title) && title.length >= MIN_SHARED_PREFIX);
+  });
+
+  const MIN_SHARED_PREFIX = 60;
+
+  // Titles round-trip through Postgres and JSON; compare on collapsed
+  // whitespace so a stray newline in a message doesn't defeat the match.
+  function squash(s: string): string {
+    return s.replace(/\s+/g, ' ').trim();
+  }
 
   // Prefer a name a human recognises, falling back to the id the link points at.
   function userLabel(ev: ErrorEvent): string {
@@ -175,25 +246,38 @@
         <h1 class="issue-title">{issue.title}</h1>
         {#if issue.culprit}<p class="culprit mono">{issue.culprit}</p>{/if}
       </div>
-      {#if canWrite}
         <div class="actions">
           {#if issue.status !== 'resolved'}
-            <Button variant="primary" loading={updating} onclick={() => setStatus('resolved')}>
+            <Button
+              variant="primary"
+              loading={updating}
+              lockedReason={writeLock}
+              onclick={() => setStatus('resolved')}
+            >
               Resolve
             </Button>
           {/if}
           {#if issue.status !== 'ignored'}
-            <Button variant="secondary" loading={updating} onclick={() => setStatus('ignored')}>
+            <Button
+              variant="secondary"
+              loading={updating}
+              lockedReason={writeLock}
+              onclick={() => setStatus('ignored')}
+            >
               Ignore
             </Button>
           {/if}
           {#if issue.status !== 'unresolved'}
-            <Button variant="subtle" loading={updating} onclick={() => setStatus('unresolved')}>
+            <Button
+              variant="subtle"
+              loading={updating}
+              lockedReason={writeLock}
+              onclick={() => setStatus('unresolved')}
+            >
               Unresolve
             </Button>
           {/if}
         </div>
-      {/if}
     </header>
 
     <div class="issue-body">
@@ -207,9 +291,9 @@
             {#snippet header()}
               <div class="event-head">
                 <h3 class="card-title-inline">Latest event</h3>
-                <span class="event-meta mono">
-                  {latestEventType}: {latestEvent.exception_value ?? latestEvent.message ?? ''}
-                </span>
+                {#if !metaRedundant}
+                  <span class="event-meta mono">{eventMeta}</span>
+                {/if}
               </div>
             {/snippet}
             <div class="event-body">
@@ -289,6 +373,17 @@
         {/if}
 
         <Card title="Occurrences">
+          {#snippet actions()}
+            {#if occStats}
+              <span class="occ-stats" title="Across the selected range and filters">
+                {plural(occStats.events, 'event')}
+                <span class="sep">·</span>
+                {plural(occStats.users, 'user')}
+                <span class="sep">·</span>
+                {plural(occStats.sessions, 'session')}
+              </span>
+            {/if}
+          {/snippet}
           <FilterBar
             fields={OCCURRENCE_FIELDS}
             bind:filters={occFilters}
@@ -312,8 +407,8 @@
               {#snippet children()}
                 {#each occurrences as ev (ev.id)}
                   <tr>
-                    <td title={formatDateTime(ev.occurred_at)}>
-                      <span class="cell-muted">{relativeTime(ev.occurred_at)}</span>
+                    <td title={`${relativeTime(ev.occurred_at)} · ${formatDateTimeZone(ev.occurred_at)}`}>
+                      <span class="cell-time">{formatDateTimeSeconds(ev.occurred_at)}</span>
                     </td>
                     <td>
                       {#if ev.distinct_id}
@@ -670,6 +765,23 @@
   }
 
   .faint { color: var(--text-muted); font-size: 12.5px; }
+
+  .occ-stats {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .occ-stats .sep {
+    opacity: 0.5;
+    margin: 0 2px;
+  }
+  /* Tabular figures so the stamps form a straight column, and no wrapping —
+     a date-time broken across two lines is unreadable at a glance. */
+  .cell-time {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
 
   :global(.occ-table) {
     margin-top: 8px;

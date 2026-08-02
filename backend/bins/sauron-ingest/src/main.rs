@@ -93,10 +93,24 @@ async fn main() -> anyhow::Result<()> {
         cfg.symbols_max_uncompressed_mb * 1024 * 1024,
     );
 
+    // One cache per process, shared by every worker task. `sauron-ingest` never
+    // reads `inspector.env`, which is why INSPECTOR_POLICY_CACHE_SECS lives in
+    // `sauron.env` — the "about 30 seconds" the API reports to the UI would
+    // otherwise silently diverge from what the enforcer actually uses.
+    let policies = std::sync::Arc::new(sauron_pipeline::mask::PolicyCache::new(
+        pool.clone(),
+        cfg.inspector_policy_cache_secs,
+    ));
+
     // Spawn the co-located worker pool.
-    let _workers =
-        sauron_pipeline::spawn_workers(pool.clone(), redis.clone(), cfg.worker_concurrency, sym)
-            .await?;
+    let _workers = sauron_pipeline::spawn_workers(
+        pool.clone(),
+        redis.clone(),
+        cfg.worker_concurrency,
+        sym,
+        policies,
+    )
+    .await?;
 
     let port = cfg.ingest_port;
     let max_body = cfg.ingest_max_body_bytes;

@@ -82,6 +82,16 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
     pub is_active: bool,
     pub must_change_password: bool,
+    /// Set when an admin forced a password reset and the replacement has not
+    /// been chosen yet; `login` refuses on it *after* the Argon2 verification.
+    ///
+    /// `#[serde(skip_serializing)]` because `User` is returned by `/v1/me` and
+    /// inside `AuthResponse`, and a caller holding either has by definition just
+    /// authenticated — so the field could only ever be null there. A
+    /// permanently-null key in the public user object is noise someone will
+    /// eventually build a client behaviour on.
+    #[serde(skip_serializing)]
+    pub credentials_invalidated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Insertable)]
@@ -491,6 +501,13 @@ pub struct EventUser {
     pub last_seen: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Non-NULL means this distinct_id names a person. Every read tests
+    /// `IS NOT NULL` only — the timestamp itself is informational.
+    pub identified_at: Option<DateTime<Utc>>,
+    /// Which of `identify` / `context_user` / `backfill` set the flag. The
+    /// only thing that makes a poisoned `context_user` cohort repairable
+    /// without also clearing real identify() rows.
+    pub identified_source: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -510,15 +527,75 @@ pub struct RefreshToken {
     pub created_at: DateTime<Utc>,
     /// Why this token was revoked — see [`crate::repo::REVOKE_ROTATED`].
     pub revoked_reason: Option<String>,
+    /// The `auth_sessions` row this token belongs to. Nullable because rows
+    /// minted before migration 000035, and rows whose session the 30-day reaper
+    /// has deleted, both have none — and the FK is ON DELETE SET NULL precisely
+    /// so a reap cannot take the replay-detection history with it.
+    pub session_id: Option<Uuid>,
 }
 
-#[derive(Debug, Insertable)]
-#[diesel(table_name = refresh_tokens)]
-pub struct NewRefreshToken {
+/// A login that survives refresh-token rotation.
+///
+/// No `Serialize`, on purpose — the same discipline `RefreshToken` follows. The
+/// API returns a hand-built `SessionView`; letting the model reach the wire is
+/// how `revoked_by` (which admin ended your session) leaks to the member it was
+/// used against.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = auth_sessions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AuthSession {
+    pub id: Uuid,
     pub user_id: Uuid,
-    pub token_hash: String,
+    pub created_at: DateTime<Utc>,
+    /// Stamped on rotation, not per request — so this is accurate only to within
+    /// `JWT_ACCESS_TTL_SECS`. Writing it on every request would turn a read-only
+    /// auth path into a write on every API call.
+    pub last_used_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub user_agent: Option<String>,
+    pub ip: Option<String>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_reason: Option<String>,
+    pub revoked_by: Option<Uuid>,
+}
+
+/// A password-reset link.
+///
+/// Deliberately derives no `Serialize`, exactly like [`RefreshToken`]:
+/// `token_hash` and `password_fingerprint` must never leave the process, and no
+/// endpoint returns this row.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = password_reset_tokens)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct PasswordResetToken {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub token_hash: String,
+    pub password_fingerprint: String,
+    /// `"self"` or `"admin"` — see the CHECK in migration 000036.
+    pub mode: String,
+    pub initiated_by: Option<Uuid>,
+    pub requested_from: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub invalidated_at: Option<DateTime<Utc>>,
+    pub invalidated_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert-only. Must never gain `Queryable`: that derive decodes positionally,
+/// so a struct whose field order differs from the `table!` block would bind
+/// `mode` to `password_fingerprint` and still compile.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = password_reset_tokens)]
+pub struct NewPasswordResetToken {
+    pub user_id: Uuid,
+    pub token_hash: String,
+    pub password_fingerprint: String,
+    pub mode: String,
+    pub initiated_by: Option<Uuid>,
+    pub requested_from: Option<String>,
+    pub expires_at: DateTime<Utc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -876,6 +953,457 @@ pub struct NewAlertEvent<'a> {
     pub body: &'a str,
     pub error: Option<&'a str>,
     pub attempts: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Transactional email outbox
+// ---------------------------------------------------------------------------
+
+/// One rendered, queued message.
+///
+/// Derives neither `Serialize` nor `Debug`, deliberately. No `Serialize`, so a
+/// pending row's body cannot reach an API view struct by someone adding
+/// `#[derive(Serialize)]` upstream. `QueryableByName` because the claim is a
+/// `sql_query` with `RETURNING *`.
+#[derive(Clone, Queryable, Selectable, QueryableByName)]
+#[diesel(table_name = mail_outbox)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct MailOutbox {
+    pub id: Uuid,
+    pub kind: String,
+    pub recipient: String,
+    pub recipient_key: String,
+    pub subject: String,
+    pub body_text: String,
+    pub body_html: String,
+    pub status: String,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub user_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub sent_at: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for MailOutbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A pending body is a live credential — a working password-reset URL.
+        // One `warn!(row = ?r, ...)` in the drain loop would otherwise write it
+        // to the journal, where it outlives the row and reaches a broader reader
+        // set than the database does. Same precedent as `SecretCipher`.
+        f.debug_struct("MailOutbox")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("recipient", &self.recipient)
+            .field("status", &self.status)
+            .field("attempts", &self.attempts)
+            .field("body_text", &"<redacted>")
+            .field("body_html", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Insert side of [`MailOutbox`]. `Insertable` only — a `Queryable` derive here
+/// would decode positionally against a seventeen-column table and silently bind
+/// `subject` into `recipient_key`.
+#[derive(Insertable)]
+#[diesel(table_name = mail_outbox)]
+pub struct NewMailOutbox<'a> {
+    pub kind: &'a str,
+    pub recipient: &'a str,
+    pub recipient_key: &'a str,
+    pub subject: &'a str,
+    pub body_text: &'a str,
+    pub body_html: &'a str,
+    pub user_id: Option<Uuid>,
+}
+
+// ---------------------------------------------------------------------------
+// Personal notification subscriptions (S3)
+// ---------------------------------------------------------------------------
+
+/// One row per `(user, scope, kind)`. `scope_id` is polymorphic with no FK, so
+/// a row can outlive its target and every read path must tolerate an
+/// unresolvable id.
+///
+/// `QueryableByName` as well as `Queryable`, for the same reason
+/// [`NotificationQueueItem`] carries it: `upsert_subscription` is one
+/// data-modifying CTE ending in `SELECT * FROM up`, and `diesel::sql_query`
+/// decodes by column NAME, which plain `Queryable` cannot do.
+#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize)]
+#[diesel(table_name = notification_subscriptions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct NotificationSubscription {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub org_id: Uuid,
+    pub scope_type: String,
+    pub scope_id: Uuid,
+    pub kind: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+    pub disabled_at: Option<DateTime<Utc>>,
+    pub conditions: Value,
+    pub delivery: String,
+    pub throttle_seconds: i32,
+    pub quiet_start_min: Option<i16>,
+    pub quiet_end_min: Option<i16>,
+    pub quiet_tz: String,
+    pub last_evaluated_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insertable only. Deliberately NOT `Queryable`: that derive decodes
+/// positionally, so a field order that drifts from the `table!` block would
+/// bind values to the wrong columns without a compile error.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = notification_subscriptions)]
+pub struct NewNotificationSubscription<'a> {
+    pub user_id: Uuid,
+    pub org_id: Uuid,
+    pub scope_type: &'a str,
+    pub scope_id: Uuid,
+    pub kind: &'a str,
+    pub conditions: &'a Value,
+    pub delivery: &'a str,
+    pub throttle_seconds: i32,
+    pub quiet_start_min: Option<i16>,
+    pub quiet_end_min: Option<i16>,
+    pub quiet_tz: &'a str,
+}
+
+/// `environment_id` here is a **catalogue** `environments.id`, never an
+/// `app_environments` enrollment id.
+#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize)]
+#[diesel(table_name = notification_subscription_envs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct NotificationSubscriptionEnv {
+    pub subscription_id: Uuid,
+    pub environment_id: Uuid,
+}
+
+/// `QueryableByName` as well as `Queryable`, because the drain's claim is a
+/// `sql_query ... RETURNING *`.
+#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize)]
+#[diesel(table_name = notification_queue)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct NotificationQueueItem {
+    pub id: Uuid,
+    pub subscription_id: Uuid,
+    pub user_id: Uuid,
+    pub org_id: Uuid,
+    pub project_id: Uuid,
+    pub app_id: Option<Uuid>,
+    pub includes_unattributed: bool,
+    pub kind: String,
+    pub dedup_key: String,
+    pub severity: String,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub link: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub deliver_after: DateTime<Utc>,
+    pub status: String,
+    pub attempts: i16,
+    pub message_id: Option<Uuid>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable only, for the tests that seed the queue directly. The production
+/// enqueue path is `repo::enqueue_notifications`, one data-modifying CTE.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = notification_queue)]
+pub struct NewNotificationQueueItem<'a> {
+    pub subscription_id: Uuid,
+    pub user_id: Uuid,
+    pub org_id: Uuid,
+    pub project_id: Uuid,
+    pub app_id: Option<Uuid>,
+    pub includes_unattributed: bool,
+    pub kind: &'a str,
+    pub dedup_key: &'a str,
+    pub severity: &'a str,
+    pub title: Option<&'a str>,
+    pub body: Option<&'a str>,
+    pub link: Option<&'a str>,
+    pub deliver_after: DateTime<Utc>,
+}
+
+/// `environment_id` here is an **enrollment** `app_environments.id`.
+#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize)]
+#[diesel(table_name = notification_queue_envs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct NotificationQueueEnv {
+    pub queue_id: Uuid,
+    pub environment_id: Uuid,
+}
+
+// --- PII inspector ----------------------------------------------------------
+
+/// `QueryableByName` as well as `Queryable`: `claim_due_policies` and
+/// `effective_policy_for_app` are raw `sql_query`s (the scheduling arithmetic
+/// and the precedence `ORDER BY CASE` have no diesel DSL equivalent), and
+/// `sql_query` loads by column NAME, which `Queryable` cannot do.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[diesel(table_name = inspector_policies)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct InspectorPolicy {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub target_type: String,
+    pub target_id: Uuid,
+    pub enabled: bool,
+    pub tracked_keys: Value,
+    pub detectors: Value,
+    pub scan_columns: Option<Value>,
+    pub rollups: Value,
+    pub window_days: i32,
+    pub schedule_enabled: bool,
+    pub schedule_days: i16,
+    #[serde(serialize_with = "ser_time")]
+    pub schedule_time: chrono::NaiveTime,
+    pub schedule_tz: String,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_scan_id: Option<Uuid>,
+    pub last_skip_reason: String,
+    pub created_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// `chrono::NaiveTime`'s default Serialize emits `03:00:00`; the dashboard's
+/// `<input type="time">` round-trips `HH:MM`. Pinning the format here rather
+/// than reformatting in three call sites keeps the wire shape single-sourced.
+fn ser_time<S: serde::Serializer>(t: &chrono::NaiveTime, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&t.format("%H:%M").to_string())
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = inspector_policies)]
+pub struct NewInspectorPolicy<'a> {
+    pub org_id: Uuid,
+    pub target_type: &'a str,
+    pub target_id: Uuid,
+    pub enabled: bool,
+    pub tracked_keys: &'a Value,
+    pub detectors: &'a Value,
+    pub scan_columns: Option<&'a Value>,
+    pub rollups: &'a Value,
+    pub window_days: i32,
+    pub schedule_enabled: bool,
+    pub schedule_days: i16,
+    pub schedule_time: chrono::NaiveTime,
+    pub schedule_tz: &'a str,
+    pub created_by: Option<Uuid>,
+}
+
+/// PATCH body lowered to a diesel changeset. Deliberately NOT `Queryable`:
+/// `Insertable`/`AsChangeset` map by name, `Queryable` decodes positionally,
+/// so adding it would silently bind each field to whatever column occupies
+/// its index.
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = inspector_policies)]
+pub struct InspectorPolicyPatch<'a> {
+    pub enabled: Option<bool>,
+    pub tracked_keys: Option<&'a Value>,
+    pub detectors: Option<&'a Value>,
+    pub scan_columns: Option<Option<&'a Value>>,
+    pub rollups: Option<&'a Value>,
+    pub window_days: Option<i32>,
+    pub schedule_enabled: Option<bool>,
+    pub schedule_days: Option<i16>,
+    pub schedule_time: Option<chrono::NaiveTime>,
+    pub schedule_tz: Option<&'a str>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[diesel(table_name = inspector_scans)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct InspectorScan {
+    pub id: Uuid,
+    pub policy_id: Uuid,
+    pub org_id: Uuid,
+    pub trigger_type: String,
+    pub requested_by: Option<Uuid>,
+    pub status: String,
+    pub coverage: String,
+    pub coverage_note: String,
+    pub window_from: DateTime<Utc>,
+    pub window_to: DateTime<Utc>,
+    pub params: Value,
+    pub targets: Value,
+    pub units_total: i32,
+    pub units_done: i32,
+    pub cursor: Value,
+    pub rows_scanned: i64,
+    pub findings_count: i32,
+    pub findings_reaped_at: Option<DateTime<Utc>>,
+    pub worker_id: Option<String>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub attempts: i32,
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+    pub error: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = inspector_scans)]
+pub struct NewInspectorScan<'a> {
+    pub policy_id: Uuid,
+    pub org_id: Uuid,
+    pub trigger_type: &'a str,
+    pub requested_by: Option<Uuid>,
+    pub window_from: DateTime<Utc>,
+    pub window_to: DateTime<Utc>,
+    pub params: &'a Value,
+    pub targets: &'a Value,
+    pub units_total: i32,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = inspector_findings)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct InspectorFinding {
+    pub id: Uuid,
+    pub scan_id: Uuid,
+    pub org_id: Uuid,
+    pub app_id: Uuid,
+    pub environment_id: Option<Uuid>,
+    pub env_scope: String,
+    pub source_table: String,
+    pub source_column: String,
+    pub key_path: String,
+    pub matched_key: String,
+    pub detector: String,
+    pub value_type: String,
+    pub match_count: i64,
+    pub match_count_exact: bool,
+    pub sample_preview: String,
+    pub sample_row_id: Option<Uuid>,
+    pub sample_occurred_at: Option<DateTime<Utc>>,
+    pub partition_kind: String,
+    pub first_seen_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[diesel(table_name = inspector_mask_actions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct InspectorMaskAction {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub app_id: Uuid,
+    pub kind: String,
+    pub finding_id: Option<Uuid>,
+    pub scan_id: Option<Uuid>,
+    pub targets: Value,
+    pub status: String,
+    pub requested_by: Option<Uuid>,
+    pub requested_by_email: String,
+    pub cancelled_by: Option<Uuid>,
+    pub cancelled_by_email: String,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub requested_at: DateTime<Utc>,
+    pub previewed_at: Option<DateTime<Utc>>,
+    pub confirmed_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub confirm_source: String,
+    pub estimated_rows: i64,
+    pub rows_scanned: i64,
+    pub rows_masked: i64,
+    pub cold_rows_skipped: i64,
+    pub cold_boundary_at: Option<DateTime<Utc>>,
+    pub day_cursor: Option<chrono::NaiveDate>,
+    pub cursor_occurred_at: Option<DateTime<Utc>>,
+    pub cursor_id: Option<Uuid>,
+    pub phase: String,
+    pub worker_id: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub vacuum_advised: bool,
+    pub error: String,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = inspector_mask_actions)]
+pub struct NewInspectorMaskAction<'a> {
+    pub org_id: Uuid,
+    pub app_id: Uuid,
+    pub kind: &'a str,
+    pub finding_id: Option<Uuid>,
+    pub scan_id: Option<Uuid>,
+    pub targets: &'a Value,
+    pub requested_by: Option<Uuid>,
+    pub requested_by_email: &'a str,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = inspector_masked_keys)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct InspectorMaskedKey {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub target_table: String,
+    pub target_column: String,
+    pub json_path: String,
+    pub created_at: DateTime<Utc>,
+    pub created_by: Option<Uuid>,
+    pub source_action_id: Option<Uuid>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = inspector_masked_keys)]
+pub struct NewInspectorMaskedKey<'a> {
+    pub app_id: Uuid,
+    pub target_table: &'a str,
+    pub target_column: &'a str,
+    pub json_path: &'a str,
+    pub created_by: Option<Uuid>,
+    pub source_action_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = inspector_reveal_audit)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct InspectorRevealAudit {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub org_id: Uuid,
+    pub finding_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+    pub user_email: String,
+    pub source_table: String,
+    pub source_column: String,
+    pub key_path: String,
+    pub request_source: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = inspector_reveal_audit)]
+pub struct NewInspectorRevealAudit<'a> {
+    pub app_id: Uuid,
+    pub org_id: Uuid,
+    pub finding_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+    pub user_email: &'a str,
+    pub source_table: &'a str,
+    pub source_column: &'a str,
+    pub key_path: &'a str,
+    pub request_source: &'a str,
 }
 
 #[cfg(test)]

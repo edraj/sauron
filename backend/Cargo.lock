@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "crebain"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3199,17 +3199,18 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sauron-alerts"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "chrono",
  "getrandom 0.3.4",
  "hex",
- "lettre",
  "reqwest",
+ "sauron-auth",
  "sauron-core",
  "sauron-db",
+ "sauron-mail",
  "sauron-monitor-core",
  "sauron-redis",
  "serde",
@@ -3223,13 +3224,15 @@ dependencies = [
 
 [[package]]
 name = "sauron-alerts-bin"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
  "sauron-alerts",
+ "sauron-auth",
  "sauron-core",
  "sauron-db",
+ "sauron-mail",
  "sauron-redis",
  "sauron-telemetry",
  "serde_json",
@@ -3240,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-api"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3254,6 +3257,8 @@ dependencies = [
  "sauron-auth",
  "sauron-core",
  "sauron-db",
+ "sauron-inspector",
+ "sauron-mail",
  "sauron-redis",
  "sauron-symbols",
  "sauron-telemetry",
@@ -3266,11 +3271,12 @@ dependencies = [
  "tracing",
  "uuid",
  "validator",
+ "woothee",
 ]
 
 [[package]]
 name = "sauron-auth"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3293,7 +3299,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-core"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3308,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-db"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3317,8 +3323,10 @@ dependencies = [
  "diesel-async",
  "diesel_migrations",
  "percent-encoding",
+ "sauron-alerts",
  "sauron-auth",
  "sauron-core",
+ "sauron-inspector",
  "sauron-query",
  "scoped-futures",
  "serde",
@@ -3331,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-ingest"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3354,8 +3362,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "sauron-inspector"
+version = "1.2.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "sauron-inspector-bin"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "sauron-core",
+ "sauron-db",
+ "sauron-inspector",
+ "sauron-telemetry",
+ "sauron-tier",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sauron-mail"
+version = "1.2.0"
+dependencies = [
+ "lettre",
+ "sauron-core",
+ "sauron-monitor-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sauron-migrate"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "sauron-db",
@@ -3366,12 +3414,13 @@ dependencies = [
 
 [[package]]
 name = "sauron-monitor"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
  "reqwest",
  "sauron-alerts",
+ "sauron-auth",
  "sauron-core",
  "sauron-db",
  "sauron-monitor-core",
@@ -3385,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-monitor-core"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "reqwest",
@@ -3398,7 +3447,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-pipeline"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3406,6 +3455,7 @@ dependencies = [
  "diesel-async",
  "sauron-core",
  "sauron-db",
+ "sauron-inspector",
  "sauron-redis",
  "sauron-symbols",
  "serde",
@@ -3418,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-query"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "percent-encoding",
@@ -3429,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-redis"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -3446,7 +3496,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-symbols"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "addr2line",
  "gimli",
@@ -3463,7 +3513,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-symcli"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -3472,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-telemetry"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -3480,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-tier"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3492,7 +3542,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-tier-bin"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",

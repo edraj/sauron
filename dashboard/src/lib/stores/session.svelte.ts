@@ -28,6 +28,22 @@ function writeStored(key: string, id: string | null): void {
   else window.localStorage.removeItem(key);
 }
 
+/**
+ * How far down the scope cascade a check may look, mirroring which ids the
+ * matching backend helper passes to `has_permission` (sauron-auth/src/rbac.rs).
+ *
+ * - `'org'`     — org grants only. `authorize_org` resolves at
+ *                 `(org, None, None, None)`, so no narrower grant can satisfy it.
+ * - `'project'` — org + project grants (`authorize_project`).
+ * - `'app'`     — org + project + app grants (`authorize_app`).
+ * - `'env'`     — all four (`authorize_env_read`); needs an explicit `env`.
+ *
+ * Defaults to `'env'` when the caller passes an explicit `env`, otherwise to
+ * `'app'` — so every call site written before this existed keeps its exact
+ * previous behaviour, and an explicit `level` always wins over that default.
+ */
+export type CanLevel = 'org' | 'project' | 'app' | 'env';
+
 export interface CanScope {
   org?: string | null;
   project?: string | null;
@@ -36,6 +52,7 @@ export interface CanScope {
   // — see `can()`'s doc comment. Omit it entirely unless the check really is
   // an environment-scoped one.
   env?: string | null;
+  level?: CanLevel;
 }
 
 /**
@@ -67,6 +84,16 @@ class SessionStore {
 
   // Access grants for the current org — drives every permission check.
   access = $state<AccessResponse | null>(null);
+  // True iff the most recent `getAccess` for the current org failed. Distinct
+  // from "loaded and genuinely holds no grants" (a real state where this stays
+  // `false` and `access` is an empty grant list) — exactly the distinction
+  // `environmentsError` exists for, and for a sharper reason: page visibility
+  // and every button's enabled state now derive from `can()`, which answers
+  // `false` for everything while `access` is null. Collapsing the two would
+  // render a transient network failure as a fully convincing "you have no
+  // permissions" dashboard. Cleared at the start of every attempt, so a stale
+  // `true` from a previous org never leaks into the next.
+  accessError = $state(false);
 
   loaded = $state(false);
   loading = $state(false);
@@ -147,10 +174,25 @@ class SessionStore {
   // -------------------------------------------------------------------------
   can(perm: Permission, scope: CanScope = {}): boolean {
     if (!this.access) return false;
+    // An explicit `env` argument IS the caller opting into an env-scoped
+    // question, so it defaults the level — that is what every pre-existing
+    // `can(p, { env })` call site already meant. An explicit `level` overrides
+    // it, which is what lets `{ level: 'org', env }` correctly refuse to match
+    // an env grant.
+    const level: CanLevel = scope.level ?? (scope.env !== undefined ? 'env' : 'app');
     const org = scope.org ?? this.currentOrgId ?? undefined;
-    const project = scope.project ?? this.currentProjectId ?? undefined;
-    const app = scope.app ?? this.currentAppId ?? undefined;
-    const env = scope.env && scope.env !== 'none' ? scope.env : undefined;
+    // A level above a given scope type zeroes that id out, exactly as the
+    // backend passes `None` for every scope below the one it authorizes at.
+    // Leaving the id populated is what made `can()` more permissive than the
+    // server: a project-scoped `member:manage` grant lit a button that
+    // `authorize_org` then answered with 403.
+    const project =
+      level === 'org' ? undefined : (scope.project ?? this.currentProjectId ?? undefined);
+    const app =
+      level === 'org' || level === 'project'
+        ? undefined
+        : (scope.app ?? this.currentAppId ?? undefined);
+    const env = level === 'env' && scope.env && scope.env !== 'none' ? scope.env : undefined;
     return this.access.grants.some((g) => {
       const scopeMatch =
         (g.scope_type === 'org' && g.scope_id === org) ||
@@ -201,6 +243,7 @@ class SessionStore {
         this.apps = [];
         this.environments = [];
         this.access = null;
+        this.accessError = false;
         this.currentOrgId = null;
         this.currentProjectId = null;
         this.currentAppId = null;
@@ -220,8 +263,15 @@ class SessionStore {
 
   /** Load access + projects for an org, then resolve the current project + apps. */
   private async loadOrgScope(orgId: string): Promise<void> {
+    this.accessError = false;
     const [access, projects] = await Promise.all([
-      getAccess(orgId).catch(() => null),
+      getAccess(orgId).then(
+        (a) => a,
+        () => {
+          this.accessError = true;
+          return null;
+        },
+      ),
       listProjects(orgId).catch(() => [] as Project[]),
     ]);
     this.access = access;
@@ -503,6 +553,7 @@ class SessionStore {
     this.environments = [];
     this.environmentsError = false;
     this.access = null;
+    this.accessError = false;
     this.currentOrgId = null;
     this.currentProjectId = null;
     this.currentAppId = null;

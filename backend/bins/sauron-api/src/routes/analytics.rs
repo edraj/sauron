@@ -346,9 +346,10 @@ pub async fn users_summary(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let now = Utc::now();
+    let since = now - Duration::days(q.since_days.clamp(1, 365));
 
-    let stats = repo::user_stats(&mut conn, scope.clone(), since).await?;
+    let stats = repo::user_stats(&mut conn, scope.clone(), since, now).await?;
     let series = repo::active_user_series(&mut conn, scope, since).await?;
     let stickiness = stickiness(stats.dau, stats.mau);
 

@@ -1,5 +1,7 @@
 //! HTTP route handlers, grouped by domain, plus shared helpers.
 
+pub mod account;
+pub mod active_users;
 pub mod admin;
 pub mod analytics;
 pub mod apps;
@@ -8,9 +10,11 @@ pub mod auth;
 pub mod devices;
 pub mod environments;
 pub mod funnels;
+pub mod inspector;
 pub mod issues;
 pub mod journeys;
 pub mod monitors;
+pub mod notification_prefs;
 pub mod notifications;
 pub mod orgs;
 pub mod performance;
@@ -92,25 +96,182 @@ pub(crate) fn slugify(name: &str) -> String {
     format!("{base}-{}", sauron_core::ids::random_hex(3))
 }
 
-/// Issue an access token and a persisted (rotating) refresh token for a user.
+/// Everything a token mint needs to know about *where* it is happening.
+///
+/// A struct rather than three more positional parameters: seven arguments sits
+/// on `clippy::too_many_arguments`' threshold, and
+/// `Option<Uuid>, Option<String>, Option<String>` in a row is a call-site
+/// transposition waiting to happen.
+pub(crate) struct SessionContext {
+    /// `None` starts a new session; `Some` continues one across a rotation.
+    pub session_id: Option<Uuid>,
+    pub user_agent: Option<String>,
+    pub ip: Option<String>,
+}
+
+/// Longest user agent stored. Long enough for every real browser string, short
+/// enough that a caller cannot use the header as free storage.
+pub(crate) const MAX_USER_AGENT_LEN: usize = 400;
+
+/// The request's `User-Agent`, trimmed, non-empty, and bounded.
+///
+/// Truncation is by `chars`, not bytes: slicing a UTF-8 string mid-codepoint
+/// panics, and the header is caller-controlled.
+pub(crate) fn sanitize_ua(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.chars().take(MAX_USER_AGENT_LEN).collect())
+}
+
+/// A caller address, canonicalised, or `None` if it is not an address at all.
+///
+/// With `API_TRUST_FORWARDED_HEADERS=1` this value comes from a
+/// client-controlled `X-Forwarded-For`, so parsing it as an `IpAddr` and storing
+/// the canonical form (else NULL) removes an arbitrary-string-into-the-database
+/// vector. It is also what makes the stored value safe to render unmasked on the
+/// owner's own account page.
+pub(crate) fn sanitize_ip(raw: &str) -> Option<String> {
+    raw.parse::<std::net::IpAddr>().ok().map(|a| a.to_string())
+}
+
+/// Issue an access token and a persisted (rotating) refresh token for a user,
+/// starting or continuing the caller's session.
+///
+/// The order is deliberate and **changed** from the original: the session row is
+/// written first and the JWT is minted last, so a token is never handed out for
+/// a session that failed to persist. The session id is generated in Rust rather
+/// than by the database default because the JWT needs it, and a `RETURNING`
+/// round trip would not be atomic with the token insert.
 pub(crate) async fn issue_tokens(
     state: &AppState,
     conn: &mut AsyncPgConnection,
     user_id: Uuid,
-    user_agent: Option<String>,
+    sess: SessionContext,
     must_change_password: bool,
 ) -> Result<TokenPair, ApiError> {
-    let (access, exp) = state
-        .keys
-        .issue_access(user_id, must_change_password)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let continuing = sess.session_id.is_some();
+    let session_id = sess.session_id.unwrap_or_else(Uuid::new_v4);
     let raw = sauron_core::ids::opaque_token();
     let hash = sauron_auth::hash_token(&raw);
     let expires_at = Utc::now() + Duration::seconds(state.cfg.jwt_refresh_ttl_secs);
-    sauron_db::repo::insert_refresh_token(conn, user_id, hash, expires_at, user_agent).await?;
+
+    let rows = sauron_db::repo::start_or_continue_session(
+        conn,
+        session_id,
+        user_id,
+        hash,
+        expires_at,
+        sess.user_agent,
+        sess.ip,
+    )
+    .await?;
+    if rows == 0 {
+        // Continuing: the session was revoked (or re-owned) between the caller
+        // presenting its refresh token and this write. That is a 401, and it is
+        // the guard that stops the 10-second refresh-race window from
+        // resurrecting a session the user just killed.
+        // Starting: a fresh INSERT with a brand-new uuid cannot conflict, so
+        // zero rows means something is genuinely wrong.
+        return Err(if continuing {
+            ApiError::Auth(sauron_auth::AuthError::InvalidToken)
+        } else {
+            ApiError::Internal("new session insert affected no rows".into())
+        });
+    }
+
+    let (access, exp) = state
+        .keys
+        .issue_access(user_id, must_change_password, Some(session_id))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(TokenPair {
         access_token: access,
         refresh_token: raw,
         expires_at: exp,
     })
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+    use axum::http::header::USER_AGENT;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn sanitize_ua_trims_rejects_empty_and_truncates() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(sanitize_ua(&headers), None);
+
+        headers.insert(USER_AGENT, "   ".parse().unwrap());
+        assert_eq!(sanitize_ua(&headers), None);
+
+        headers.insert(USER_AGENT, "  Mozilla/5.0  ".parse().unwrap());
+        assert_eq!(sanitize_ua(&headers).as_deref(), Some("Mozilla/5.0"));
+
+        let long = "a".repeat(MAX_USER_AGENT_LEN + 50);
+        headers.insert(USER_AGENT, long.parse().unwrap());
+        assert_eq!(
+            sanitize_ua(&headers).map(|s| s.len()),
+            Some(MAX_USER_AGENT_LEN)
+        );
+    }
+
+    #[test]
+    fn sanitize_ip_stores_only_a_canonical_address() {
+        // Not cosmetic: with API_TRUST_FORWARDED_HEADERS=1 this value comes from
+        // a client-controlled X-Forwarded-For, so parsing it removes an
+        // arbitrary-string-into-the-database vector.
+        assert_eq!(sanitize_ip("203.0.113.7").as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            sanitize_ip("2001:0db8:0000:0000:0000:0000:0000:0001").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(sanitize_ip("not-an-ip"), None);
+        assert_eq!(sanitize_ip(""), None);
+        assert_eq!(sanitize_ip("203.0.113.7, 198.51.100.1"), None);
+    }
+}
+
+#[cfg(test)]
+mod revocation_call_site_tests {
+    /// `auth_sessions` and `refresh_tokens` must never disagree, so every site
+    /// in this crate that ends someone's tokens goes through a session-aware
+    /// repo function. A sixth site added later would desync the two tables
+    /// silently: the session list would show rows with no token behind them, and
+    /// the revocation snapshot would never learn about them.
+    ///
+    /// The needle is assembled at runtime so this test does not match its own
+    /// source file.
+    #[test]
+    fn no_session_blind_mass_revoke_remains_in_this_crate() {
+        let needle = format!("revoke_all_{}", "refresh_tokens_for_user");
+        let mut offenders = Vec::new();
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).expect("read source file");
+                for (i, line) in src.lines().enumerate() {
+                    if line.contains(&needle) && !line.trim_start().starts_with("//") {
+                        offenders.push(format!("{}:{}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these call sites revoke tokens without revoking their sessions: {offenders:?}"
+        );
+    }
 }

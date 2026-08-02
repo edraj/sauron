@@ -1,7 +1,7 @@
 import { buildContext } from './context.js';
 import { parseDsn, type Dsn } from './dsn.js';
 import { buildEnvelope } from './envelope.js';
-import { getDeviceId, getSessionId } from './identity.js';
+import { getAnonymousId, getDeviceId, getSessionId, resetAnonymousId } from './identity.js';
 import { installConsole } from './integrations/console.js';
 import { installDom } from './integrations/dom.js';
 import { installFetch } from './integrations/fetch.js';
@@ -44,7 +44,6 @@ export class SauronClient {
 
   private enabled = true;
   private installed = false;
-  private anonymousId: string | null = null;
   private beaconCleanup: (() => void) | null = null;
 
   constructor(options: ResolvedOptions) {
@@ -128,21 +127,42 @@ export class SauronClient {
     return this.enabled && this.transport.isEnabled();
   }
 
+  /**
+   * Whether the anonymous id has actually been USED as a `distinct_id` in this
+   * browser session.
+   *
+   * A persisted id that has never been observed anonymously must not create a
+   * permanent `identities` alias row on the server: aliasing is a durable
+   * server-side binding of this browser profile to a named user, and an
+   * identify() on a first-ever page load has no anonymous history to link.
+   */
+  private anonUsed = false;
+
   /** The current distinct id: the user id when identified, else an anon id. */
   getDistinctId(): string | null {
     const user = this.scope.getUser();
     if (user.id) return user.id;
-    return this.ensureAnonymousId();
+    this.anonUsed = true;
+    return getAnonymousId();
   }
 
-  /** The anonymous id, or null if one was never needed. */
+  /** The anonymous id, or null when it was never actually used as an identity. */
   getAnonymousId(): string | null {
-    return this.anonymousId;
+    return this.anonUsed ? getAnonymousId() : null;
   }
 
-  private ensureAnonymousId(): string {
-    if (!this.anonymousId) this.anonymousId = `anon_${uuidv4()}`;
-    return this.anonymousId;
+  /**
+   * Forget the current person: clear the scope user and mint a fresh anonymous
+   * id.
+   *
+   * MUST BE CALLED ON LOGOUT. Without it, the next anonymous visitor on this
+   * browser reuses the persisted anon id, and a later identify() aliases their
+   * activity to the previous account server-side, permanently.
+   */
+  reset(): void {
+    this.scope.setUser(null);
+    resetAnonymousId();
+    this.anonUsed = false;
   }
 
   /** Stamp a fresh envelope (new `sent_at`, current context) around `items`. */

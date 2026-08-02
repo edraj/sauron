@@ -9,6 +9,23 @@ See also: **[Getting Started](Getting-Started.md)** ·
 **[Architecture](Architecture.md)** (the queries behind these screens) ·
 **[Ingest Wire Contract](Ingest-Wire-Contract.md)**.
 
+## Signing in
+
+### Forgot your password
+
+The sign-in page carries a **Forgot your password?** link. Enter your address and
+Sauron emails a link that expires in **1 hour**. The page shows the same
+confirmation whether or not an account exists for that address — deliberately,
+so nobody can use it to discover who has an account here.
+
+Opening the link lets you choose a new password. Doing so signs you out of every
+device, including the one you are on, and returns you to the sign-in page. Reset
+links are single-use, and a link stops working the moment the account's password
+changes for any other reason.
+
+If nothing arrives: check your spam folder, then try again in a little while.
+Three requests per address per hour are allowed.
+
 ## Monitor
 
 - **Overview** — the app's health at a glance: signal volume, top issues, and recent
@@ -121,6 +138,29 @@ to find events by them, see **[Search & Filtering](Search.md)**.
   perform.
 - **App settings** — per-app configuration, including **Settings → Environments**:
   create/rename/retire environments and copy, rotate, or mute each one's **DSN**.
+
+### Resetting a member's password
+
+The row action menu on the members table carries **Reset password** for anyone
+who is not you and is not deactivated. It needs both `member:credential` and
+`member:manage`.
+
+**This is a lockout, in the dialog's own words:** the member will not be able to
+sign in until they use the emailed link. Their current password stops working
+immediately and they are signed out of every device within a few seconds. The
+link expires in 24 hours. The row then shows a **Reset pending** badge, visible
+to anyone who can read the members list, so whoever fields "I can't log in" has
+the answer without asking.
+
+If the mail does not arrive, come back to the same menu — the item has become
+**Cancel password reset**. Cancelling lets them sign in with their existing
+password again, kills any link already sent, and still asks them to choose a new
+password on their next sign-in. Cancel works even when SMTP is unconfigured;
+**Reset password** refuses with a 503 and changes nothing, naming the missing
+setting.
+
+A member who also holds grants in another organization cannot be reset from
+here, and neither can you reset yourself — use Change password for that.
 
 ## Docs
 

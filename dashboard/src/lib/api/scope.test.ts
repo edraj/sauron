@@ -198,9 +198,30 @@ function readPageSource(name: string): string {
  * claims to describe.
  */
 const NON_TELEMETRY_PAGES = new Set([
+  'Account', // the caller's own profile and sessions, no app/environment dimension
+  // Project-scoped and deliberately multi-app: its own picker chooses an
+  // environment PER app, and the backend route rejects `environment_id`
+  // outright (it is in `PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID` above). Keying
+  // its load effect on `scopeKey` would refire on every Topbar app/environment
+  // switch and re-request a selection the Topbar had no part in choosing; it
+  // tracks `currentProjectId` instead, which is the only Topbar dimension that
+  // does change what the page may read.
+  'ActiveUsers',
   'Alerts', // org-scoped alert rules/channels, not app-scoped telemetry
   'ChangePassword', // account settings, no app/environment dimension
   'Docs', // static documentation
+  'ForgotPassword', // pre-auth
+  // The three app-scoped inspector GETs it reads are all in
+  // `BACKEND_REJECTS_ENVIRONMENT_ID` above — a policy, its mask audit trail
+  // and its masked-key set belong to the whole app, and the backend 400s on an
+  // `environment_id` it cannot honour. Keying its load effect on `scopeKey`
+  // would refire the whole page on every Topbar ENVIRONMENT switch to fetch
+  // byte-identical data, and each of those reloads would wipe a half-typed
+  // policy edit. It tracks `currentAppId`, the only dimension that changes
+  // what it may read. (Findings themselves DO carry an environment_id; it is
+  // rendered per row rather than filtered on, so the page shows the whole app
+  // exactly as the scan produced it.)
+  'Inspector',
   'Login', // pre-auth
   'Members', // org membership management
   'MonitorDetail', // uptime monitor detail, project-scoped not environment-scoped
@@ -210,9 +231,16 @@ const NON_TELEMETRY_PAGES = new Set([
   'Onboarding',
   'Projects', // org-scoped project list
   'Register', // pre-auth
+  // Reached from an emailed link, so it must render for a signed-out visitor
+  // AND for a signed-in one; either way it reads no telemetry.
+  'ResetPassword',
   'SettingsApp', // app configuration (name, environments, keys), not telemetry
   'SourceMaps', // symbol artifacts — app-wide config; backend rejects environment_id
   'Storage', // admin storage report, org-scoped
+  // Same shape as ResetPassword: reached from an emailed link, must render for
+  // a signed-out visitor AND a signed-in one, and POSTs a single opaque token.
+  // It reads no telemetry and has no app or environment dimension to scope to.
+  'Unsubscribe',
 ]);
 
 const ALL_PAGES = listAllPageNames();
@@ -248,5 +276,45 @@ describe('telemetry pages observe scopeKey', () => {
   it('FunnelBuilder tracks currentEnvId (not scopeKey) in its recompute effect, by design', () => {
     const src = readPageSource('FunnelBuilder');
     expect(src).toContain('sessionStore.currentEnvId');
+  });
+});
+
+import { PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID } from './scope';
+
+describe('PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID', () => {
+  it('covers both active-users routes as separate entries', () => {
+    const matches = (url: string) =>
+      PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID.some((re) => re.test(url));
+    expect(matches('/v1/projects/p1/active-users')).toBe(true);
+    expect(matches('/v1/projects/p1/active-users?from=x')).toBe(true);
+    expect(matches('/v1/projects/p1/active-users.csv')).toBe(true);
+  });
+
+  it('does not claim the two project routes that neither narrow nor reject', () => {
+    const matches = (url: string) =>
+      PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID.some((re) => re.test(url));
+    expect(matches('/v1/projects/p1')).toBe(false);
+    expect(matches('/v1/projects/p1/apps')).toBe(false);
+  });
+
+  it('is sorted, because the Rust reconciliation test compares sorted lists', () => {
+    const sources = PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID.map((re) => re.source);
+    expect([...sources].sort()).toEqual(sources);
+  });
+});
+
+describe('non-GET backend rejections', () => {
+  // POST /inspector/mask-preview 400s on any environment_id, but it has no GET
+  // handler so it cannot sit in the array `http_env_scoping.rs` compares
+  // against. Absent from the exclusion union it is SCOPED, which is how the
+  // mask dialog came to 400 on its first call for every user with an
+  // environment selected.
+  it('does not scope the inspector mask-preview POST', () => {
+    expect(shouldScopeUrl('/v1/apps/app-1/inspector/mask-preview')).toBe(false);
+    expect(computeScopeParams('/v1/apps/app-1/inspector/mask-preview', 'env-1')).toBeUndefined();
+  });
+
+  it('still scopes ordinary app telemetry reads', () => {
+    expect(shouldScopeUrl('/v1/apps/app-1/inspector')).toBe(true);
   });
 });
