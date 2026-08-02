@@ -1,6 +1,8 @@
 // Pure decision logic for the PII inspector. No Svelte, no DOM — vitest is
 // node-only in this repo, so anything that needs a test lives here.
 
+import type { InspectorTrackedKey } from './index';
+
 export interface MaskTargetView {
   table: string;
   column: string;
@@ -160,6 +162,82 @@ export function maskConfirmReady(
   const ageSecs = (Date.now() - Date.parse(preview.previewed_at)) / 1000;
   if (!Number.isFinite(ageSecs) || ageSecs > ttlSecs) return false;
   return preview.estimated_rows <= maxRows;
+}
+
+/**
+ * Turn a free-typed key list into the wire shape.
+ *
+ * Separators are commas AND any whitespace, because the realistic input is a
+ * paste from a spec document rather than a tidy CSV.
+ *
+ * Lowercasing here is not cosmetic: the backend's `normalize_key` is trim +
+ * lowercase applied at policy write AND at match time, so sending `Email`
+ * stores `email` and the chip list would render a key the user never typed.
+ * Doing it up front keeps the optimistic UI honest.
+ *
+ * Deduping is ours alone — `parse_tracked_keys` happily stores the same key
+ * twice, which does not error but does double that key's reported match count.
+ */
+export function parseKeyInput(raw: string): InspectorTrackedKey[] {
+  const seen = new Set<string>();
+  const out: InspectorTrackedKey[] = [];
+  for (const piece of raw.split(/[\s,]+/)) {
+    const key = piece.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    // `scope: 'any'` matches the key at any depth, which is what the existing
+    // add-a-key form on this tab sends. `top` is not offered at creation
+    // time: narrowing to top level is an optimisation you make after a scan
+    // shows where the key actually lives, not a first guess.
+    out.push({ key, scope: 'any' });
+  }
+  return out;
+}
+
+/**
+ * The enrollment the environment picker should start on.
+ *
+ * A `<select>` whose bound value matches no `<option>` renders with
+ * `selectedIndex === -1` — visually BLANK. Pairing that with a "just use the
+ * first one" fallback in the submit path is the silent-mismatch bug this
+ * codebase keeps re-learning: the control shows nothing, the request carries
+ * production, and the policy lands on an environment the operator never saw
+ * named. Seeding the bound value instead keeps the visible choice and the
+ * submitted id the same fact.
+ *
+ * Returns `null` for an app with no live enrollments, which is a real state —
+ * every environment retired — and must disable the scope rather than guess.
+ */
+export function defaultEnvEnrollmentId(
+  envs: { id: string; is_default: boolean }[],
+): string | null {
+  if (envs.length === 0) return null;
+  return (envs.find((e) => e.is_default) ?? envs[0]).id;
+}
+
+/**
+ * Why the create button is disabled, or `null` when it may be pressed.
+ *
+ * Mirrors the two hard 400s in `create_policy`/`normalize_matchers` so the
+ * form explains itself instead of round-tripping to an error toast. The
+ * matcher-less message repeats the BACKEND's reasoning rather than saying
+ * "required": a policy with neither keys nor detectors is not merely invalid,
+ * it scans nothing and finishes `succeeded` with `coverage='full'` and zero
+ * findings — a confident false negative, which is the worst thing a privacy
+ * scan can emit.
+ */
+export function createPolicyBlockedReason(
+  targetId: string | null,
+  keys: InspectorTrackedKey[],
+  detectors: string[],
+): string | null {
+  // Names the field's own visible label ("Target"), not an internal concept —
+  // a reason that points at a control the user cannot find is not a reason.
+  if (!targetId) return 'Choose the target this policy covers.';
+  if (keys.length === 0 && detectors.length === 0) {
+    return 'Add at least one tracked key or enable one detector — a policy with neither scans nothing and reports no findings, which reads as "clean".';
+  }
+  return null;
 }
 
 export function csvFilename(

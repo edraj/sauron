@@ -8,7 +8,7 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.2.0
+Version:        1.2.1
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
@@ -265,6 +265,16 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Sun Aug 02 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.2.1-1
+- Privacy policies can be created from the dashboard. The Privacy page's Policy
+  tab now carries a create form (scope, target, tracked keys, detectors); it
+  previously pointed at an organization settings screen that does not exist, so
+  no role — including Owner — could create a policy from the UI at all. The API
+  and permissions were already correct; only the UI was missing.
+- Chart bars label themselves on hover: the count sits above the bar and the
+  date beneath the axis, replacing a pair of overlapping tooltips that showed
+  the same two values twice.
+
 * Sat Aug 01 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.2.0-1
 - Session management: a login now has an identity that survives refresh-token
   rotation. Users can see and end their own sessions from the new Account page;

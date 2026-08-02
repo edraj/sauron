@@ -30,7 +30,14 @@
     nextRuns,
   } from '../lib/models/inspector-schedule';
   import { groupFindings, formatMatchCount, findingBadges } from '../lib/models/inspector-findings';
-  import { csvFilename, UNREACHABLE_COPY } from '../lib/models/inspector';
+  import {
+    csvFilename,
+    UNREACHABLE_COPY,
+    parseKeyInput,
+    createPolicyBlockedReason,
+    defaultEnvEnrollmentId,
+  } from '../lib/models/inspector';
+  import { DETECTORS, SUGGESTED_KEYS } from '../lib/constants/inspectorDetectors';
   import type {
     EffectivePolicy,
     InspectorFinding,
@@ -67,6 +74,51 @@
   );
   const policy = $derived(effective?.policy ?? null);
   const groups = $derived(groupFindings(findings));
+
+  // --- create-policy form -------------------------------------------------
+  // Only reachable when no policy covers this app; `create_policy` is
+  // org-scoped on the wire (POST /v1/orgs/{org}/inspector/policies) with the
+  // project / app / environment named in the body.
+  type TargetType = 'project' | 'app' | 'app_env';
+  const TARGET_TYPES: { value: TargetType; label: string; hint: string }[] = [
+    { value: 'project', label: 'Project', hint: 'Covers every app in this project' },
+    { value: 'app', label: 'App', hint: 'Covers this app, in every environment' },
+    { value: 'app_env', label: 'Environment', hint: 'Covers one environment of this app' },
+  ];
+  let newTargetType = $state<TargetType>('app');
+  let newEnvId = $state('');
+  let newKeyInput = $state(SUGGESTED_KEYS.join(', '));
+  let newDetectors = $state<string[]>([]);
+
+  const orgId = $derived(sessionStore.currentOrgId);
+  // Retired enrollments are hidden from every other picker in the app; a
+  // policy scoped to one would inspect an environment that cannot ingest.
+  const envOptions = $derived(sessionStore.environments.filter((e) => e.retired_at === null));
+  const newKeys = $derived(parseKeyInput(newKeyInput));
+  const newTargetId = $derived(
+    newTargetType === 'project'
+      ? sessionStore.currentProjectId
+      : newTargetType === 'app'
+        ? sessionStore.currentAppId
+        : // `app_env` takes the ENROLLMENT id (`app_environments.id`), which is
+          // what `AppEnvironment.id` holds — NOT its `environment_id`.
+          //
+          // Read STRAIGHT off the bound value, with no "or the first one"
+          // fallback: a fallback here is what let a blank picker submit
+          // production. The seeding effect below is what guarantees this is
+          // non-empty, so the id sent is always the one on screen.
+          newEnvId || null,
+  );
+
+  // Seed (and re-seed) the environment picker so its bound value always names
+  // a real option. Writes only when the current value is NOT in the list, so
+  // it converges after one pass instead of fighting the user's selection on
+  // every keystroke elsewhere in the form.
+  $effect(() => {
+    if (envOptions.some((e) => e.id === newEnvId)) return;
+    newEnvId = defaultEnvEnrollmentId(envOptions) ?? '';
+  });
+  const createBlocked = $derived(createPolicyBlockedReason(newTargetId, newKeys, newDetectors));
 
   // `quiet` exists because the poll below re-enters this function every three
   // seconds while a scan runs: without it the whole tab body would be replaced
@@ -278,10 +330,150 @@
     <Card>
       <h3>Inspection</h3>
       {#if !policy}
+        <!-- This used to be a bare EmptyState reading "Create one from the
+             organization settings" — a dead pointer: there is no org settings
+             screen, and `createPolicy` had no call site anywhere in the
+             dashboard, so no role could create a policy at all. The form is
+             here, where the wall is. -->
         <EmptyState
           title="No policy covers this app"
-          description="Create one from the organization settings, scoped to the project, the app, or one environment."
+          description="Nothing is being inspected for personal data yet. Create a policy to start."
         />
+        <form
+          class="create"
+          onsubmit={(e: SubmitEvent) => {
+            e.preventDefault();
+            if (createBlocked || !orgId || !newTargetId) return;
+            void act(async () => {
+              await inspectorApi.createPolicy(orgId, {
+                target_type: newTargetType,
+                target_id: newTargetId,
+                tracked_keys: newKeys,
+                detectors: newDetectors,
+              });
+              // Only reset once the server has accepted it — clearing on a 409
+              // ("a policy already exists for this target") would discard the
+              // keys the user typed along with the error they need to act on.
+              newKeyInput = SUGGESTED_KEYS.join(', ');
+              newDetectors = [];
+              newTargetType = 'app';
+            });
+          }}
+        >
+          <fieldset class="field">
+            <legend>Scope</legend>
+            <p class="caveat">
+              The most specific policy covering an app wins whole. A narrower one subtracts its
+              scope from the parent, which is how you exclude one noisy environment.
+            </p>
+            <div class="chips">
+              {#each TARGET_TYPES as t (t.value)}
+                <Button
+                  size="sm"
+                  variant={newTargetType === t.value ? 'primary' : 'ghost'}
+                  lockedReason={manageLock}
+                  disabled={t.value === 'app_env' && envOptions.length === 0}
+                  title={t.value === 'app_env' && envOptions.length === 0
+                    ? 'This app has no active environments'
+                    : t.hint}
+                  onclick={() => (newTargetType = t.value)}
+                >
+                  {t.label}
+                </Button>
+              {/each}
+            </div>
+          </fieldset>
+
+          <fieldset class="field">
+            <legend>Target</legend>
+            {#if newTargetType === 'app_env'}
+              <!-- `env.id` is the app_environments ENROLLMENT id, not the
+                   catalogue `environment_id` — `validate_scope_in_org` matches
+                   `app_environments.id` for app_env, and sending the catalogue
+                   id would 404 with no hint as to why. -->
+              <select
+                class="sel"
+                aria-label="Target environment"
+                disabled={manageLock !== null}
+                title={manageLock ? lockTitle(manageLock) : undefined}
+                bind:value={newEnvId}
+              >
+                {#each envOptions as env (env.id)}
+                  <option value={env.id}>{env.name}{env.is_default ? ' (default)' : ''}</option>
+                {/each}
+              </select>
+            {:else}
+              <p class="target">
+                <Badge>{newTargetType === 'project' ? 'project' : 'app'}</Badge>
+                {newTargetType === 'project'
+                  ? (sessionStore.currentProject?.name ?? 'this project')
+                  : (sessionStore.currentApp?.name ?? 'this app')}
+              </p>
+            {/if}
+          </fieldset>
+
+          <fieldset class="field">
+            <legend>Tracked keys</legend>
+            <p class="caveat">
+              Literal key names, matched case-insensitively and exactly at any depth.
+              <code>Email</code> matches <code>email</code>; <code>user_email</code> does not.
+              Separate with commas or spaces.
+            </p>
+            <Input
+              bind:value={newKeyInput}
+              disabled={manageLock !== null}
+              placeholder="email, phone, password, token"
+            />
+            {#if newKeys.length > 0}
+              <div class="chips">
+                {#each newKeys as k (k.key)}<Badge>{k.key}</Badge>{/each}
+              </div>
+            {/if}
+          </fieldset>
+
+          <fieldset class="field">
+            <legend>Detectors</legend>
+            <p class="caveat">
+              Match by value SHAPE rather than key name — they find PII under a key you did not
+              think to track. They read more rows than a key list does, so a scan takes longer.
+            </p>
+            <div class="dets">
+              {#each DETECTORS as d (d.id)}
+                <label class="det" title={d.hint}>
+                  <input
+                    type="checkbox"
+                    disabled={manageLock !== null}
+                    checked={newDetectors.includes(d.id)}
+                    onchange={(e: Event) => {
+                      const on = (e.currentTarget as HTMLInputElement).checked;
+                      newDetectors = on
+                        ? [...newDetectors, d.id]
+                        : newDetectors.filter((x) => x !== d.id);
+                    }}
+                  />
+                  <span>{d.label}</span>
+                </label>
+              {/each}
+            </div>
+          </fieldset>
+
+          {#if createBlocked && manageLock === null}
+            <p class="caveat blocked">{createBlocked}</p>
+          {/if}
+          <div class="actions">
+            <Button
+              type="submit"
+              variant="primary"
+              lockedReason={manageLock}
+              disabled={createBlocked !== null}
+            >
+              Create policy
+            </Button>
+            <span class="caveat">
+              Scanning is scheduled separately — a new policy runs when you start a scan.
+            </span>
+          </div>
+        </form>
       {:else}
         <p>
           Scope: <Badge>{policy.target_type}</Badge>
@@ -701,5 +893,57 @@
   }
   .headline {
     font-weight: 600;
+  }
+  .create {
+    display: grid;
+    gap: 18px;
+    margin-top: 4px;
+  }
+  /* fieldset/legend carry the grouping for a screen reader; the browser
+     default border and inline legend are reset so it reads as a plain
+     section, matching every other block on this tab. */
+  .create .field {
+    border: none;
+    padding: 0;
+    margin: 0;
+    min-width: 0;
+  }
+  .create legend {
+    padding: 0;
+    margin-bottom: 4px;
+    font-size: 13.5px;
+    font-weight: 600;
+  }
+  .target {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    font-size: 13.5px;
+  }
+  .dets {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 6px 12px;
+  }
+  .det {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .det input {
+    cursor: pointer;
+  }
+  .blocked {
+    color: var(--error);
+    margin: 0;
+  }
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
   }
 </style>

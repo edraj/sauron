@@ -5,6 +5,9 @@ import {
   expandCompanionTargets,
   maskConfirmReady,
   csvFilename,
+  parseKeyInput,
+  createPolicyBlockedReason,
+  defaultEnvEnrollmentId,
 } from './inspector';
 
 describe('UNREACHABLE_COPY', () => {
@@ -143,5 +146,100 @@ describe('csvFilename', () => {
     expect(csvFilename('findings', 'my-app', '2026-07-01', '2026-08-01')).toBe(
       'sauron-inspector-findings_my-app_2026-07-01_2026-08-01.csv',
     );
+  });
+});
+
+describe('parseKeyInput', () => {
+  // The Policy tab's existing "add a key" form lowercases a single key before
+  // sending it, because the backend lowercases at write and the matcher
+  // compares lowercased. The create form takes a whole list at once and must
+  // do the same, or the policy round-trips with keys the user did not type.
+  it('lowercases every key', () => {
+    expect(parseKeyInput('Email, Phone')).toEqual([
+      { key: 'email', scope: 'any' },
+      { key: 'phone', scope: 'any' },
+    ]);
+  });
+
+  it('splits on commas, whitespace and newlines alike', () => {
+    // Paste from a spec doc is the realistic input, not a tidy CSV.
+    expect(parseKeyInput('email, phone\ntoken  password').map((k) => k.key)).toEqual([
+      'email',
+      'phone',
+      'token',
+      'password',
+    ]);
+  });
+
+  it('drops empties and collapses separator runs', () => {
+    expect(parseKeyInput(' , ,email,,  ,')).toEqual([{ key: 'email', scope: 'any' }]);
+  });
+
+  it('dedupes case-insensitively, keeping first occurrence', () => {
+    // A duplicate is not a 400 — it is a policy that lists the same key twice
+    // and reports doubled match counts.
+    expect(parseKeyInput('email, EMAIL, Email').map((k) => k.key)).toEqual(['email']);
+  });
+
+  it('is empty for blank input', () => {
+    expect(parseKeyInput('   \n  ')).toEqual([]);
+    expect(parseKeyInput('')).toEqual([]);
+  });
+});
+
+describe('createPolicyBlockedReason', () => {
+  // Mirrors the backend's two hard 400s so the button explains itself instead
+  // of round-tripping to an error toast.
+  it('is null when a target and at least one key are chosen', () => {
+    expect(createPolicyBlockedReason('app-1', parseKeyInput('email'), [])).toBeNull();
+  });
+
+  it('accepts a detector-only policy', () => {
+    // normalize_matchers takes EITHER — keys or detectors.
+    expect(createPolicyBlockedReason('app-1', [], ['email'])).toBeNull();
+  });
+
+  it('names the missing target', () => {
+    expect(createPolicyBlockedReason('', parseKeyInput('email'), [])).toMatch(/target/i);
+    expect(createPolicyBlockedReason(null, parseKeyInput('email'), [])).toMatch(/target/i);
+  });
+
+  it('explains that a matcher-less policy is a false negative, not just invalid', () => {
+    // The backend rejects this precisely because a policy with neither scans
+    // nothing and reports zero findings with full coverage. The UI must give
+    // the same reason, not a generic "required field".
+    const why = createPolicyBlockedReason('app-1', [], []);
+    expect(why).toBeTruthy();
+    expect(why).toMatch(/tracked key|detector/i);
+  });
+});
+
+describe('defaultEnvEnrollmentId', () => {
+  // Regression: the picker used to start on `''`, which matches no <option>,
+  // so the select rendered BLANK while the submit path fell back to the first
+  // enrollment — a policy created against an environment the operator was
+  // never shown.
+  it('prefers the default enrollment over document order', () => {
+    expect(
+      defaultEnvEnrollmentId([
+        { id: 'staging-enrollment', is_default: false },
+        { id: 'prod-enrollment', is_default: true },
+      ]),
+    ).toBe('prod-enrollment');
+  });
+
+  it('falls back to the first when none is marked default', () => {
+    expect(
+      defaultEnvEnrollmentId([
+        { id: 'a', is_default: false },
+        { id: 'b', is_default: false },
+      ]),
+    ).toBe('a');
+  });
+
+  it('is null when every environment is retired', () => {
+    // A real state, not an impossible one — the scope must be disabled rather
+    // than silently target something.
+    expect(defaultEnvEnrollmentId([])).toBeNull();
   });
 });
