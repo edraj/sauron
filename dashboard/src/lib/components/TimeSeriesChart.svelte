@@ -62,11 +62,17 @@
 {:else}
   <div class="chart">
     <div class="plot" style="height:{height}px" style:--bar-color={color}>
+      <!-- `role="img"` + `aria-label` rather than `title`: `title` renders the
+           browser's own dark tooltip, which duplicated the styled one on every
+           hover (the bar read "10 · Jul 29" above and "Jul 29 · 10" below at
+           the same time). `aria-label` keeps the same text as the accessible
+           name without drawing a second box. -->
       {#each data as point (point.bucket)}
-        <div class="col" title={`${tooltip(point.bucket)} · ${format(point.count)}`}>
+        <div class="col" role="img" aria-label={`${tooltip(point.bucket)} · ${format(point.count)}`}>
           <div class="bar" style="height:{barHeight(point.count)}%">
-            <span class="tip">{format(point.count)} · {label(point.bucket)}</span>
+            <span class="tip tip-value">{format(point.count)}</span>
           </div>
+          <span class="tip tip-date">{label(point.bucket)}</span>
         </div>
       {/each}
     </div>
@@ -92,6 +98,7 @@
     border-bottom: 1px solid var(--border);
   }
   .col {
+    position: relative;
     flex: 1;
     min-width: 3px;
     height: 100%;
@@ -114,9 +121,11 @@
   .col:hover .bar {
     filter: brightness(1.18);
   }
+  /* Two labels per bar: the count above it, the date beneath the axis line.
+     Both are absolutely positioned so appearing on hover never reflows the
+     chart, and both are centred on the bar so they read as one pair. */
   .tip {
     position: absolute;
-    bottom: calc(100% + 6px);
     left: 50%;
     transform: translateX(-50%);
     padding: 4px 8px;
@@ -131,6 +140,21 @@
     transition: opacity 0.12s ease;
     z-index: 2;
     box-shadow: var(--shadow);
+  }
+  /* Anchored to the BAR, so it tracks the bar's top rather than floating at a
+     fixed height — the number sits just above however tall the bar is. */
+  .tip-value {
+    bottom: calc(100% + 6px);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Anchored to the COLUMN, whose bottom is the axis line, so every date sits
+     on one baseline instead of stepping up and down with the bars. It overlays
+     the axis row on hover; that row is static text, and overlaying keeps the
+     layout from shifting. */
+  .tip-date {
+    top: calc(100% + 6px);
+    color: var(--text-muted);
   }
   .col:hover .tip {
     opacity: 1;
