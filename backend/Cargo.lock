@@ -3206,10 +3206,11 @@ dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "hex",
- "lettre",
  "reqwest",
+ "sauron-auth",
  "sauron-core",
  "sauron-db",
+ "sauron-mail",
  "sauron-monitor-core",
  "sauron-redis",
  "serde",
@@ -3228,8 +3229,10 @@ dependencies = [
  "anyhow",
  "chrono",
  "sauron-alerts",
+ "sauron-auth",
  "sauron-core",
  "sauron-db",
+ "sauron-mail",
  "sauron-redis",
  "sauron-telemetry",
  "serde_json",
@@ -3254,6 +3257,8 @@ dependencies = [
  "sauron-auth",
  "sauron-core",
  "sauron-db",
+ "sauron-inspector",
+ "sauron-mail",
  "sauron-redis",
  "sauron-symbols",
  "sauron-telemetry",
@@ -3266,6 +3271,7 @@ dependencies = [
  "tracing",
  "uuid",
  "validator",
+ "woothee",
 ]
 
 [[package]]
@@ -3317,8 +3323,10 @@ dependencies = [
  "diesel-async",
  "diesel_migrations",
  "percent-encoding",
+ "sauron-alerts",
  "sauron-auth",
  "sauron-core",
+ "sauron-inspector",
  "sauron-query",
  "scoped-futures",
  "serde",
@@ -3354,6 +3362,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "sauron-inspector"
+version = "1.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "sauron-inspector-bin"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "sauron-core",
+ "sauron-db",
+ "sauron-inspector",
+ "sauron-telemetry",
+ "sauron-tier",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sauron-mail"
+version = "1.1.0"
+dependencies = [
+ "lettre",
+ "sauron-core",
+ "sauron-monitor-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sauron-migrate"
 version = "1.1.0"
 dependencies = [
@@ -3372,6 +3420,7 @@ dependencies = [
  "chrono",
  "reqwest",
  "sauron-alerts",
+ "sauron-auth",
  "sauron-core",
  "sauron-db",
  "sauron-monitor-core",
@@ -3406,6 +3455,7 @@ dependencies = [
  "diesel-async",
  "sauron-core",
  "sauron-db",
+ "sauron-inspector",
  "sauron-redis",
  "sauron-symbols",
  "serde",

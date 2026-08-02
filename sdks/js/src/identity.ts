@@ -18,6 +18,20 @@ import { uuidv4 } from './utils.js';
 export const DEVICE_ID_KEY = 'sauron.device_id';
 /** sessionStorage key holding the per-session id. */
 export const SESSION_ID_KEY = 'sauron.session_id';
+/**
+ * localStorage key holding the durable anonymous id.
+ *
+ * It used to live in a field on the client, re-minted on every page load, so
+ * `track()` sent a new `distinct_id` each time and active users for any web app
+ * counted PAGE LOADS, not people — a systematic 5-10x inflation, all of it
+ * landing in the guest half of the report.
+ *
+ * Persisting it is a retention and consent consequence, not just an
+ * implementation detail: the anon id becomes a durable first-party identifier
+ * stored on the user's terminal. It is also why `reset()` exists — see
+ * `SauronClient.reset`.
+ */
+export const ANON_ID_KEY = 'sauron.anon_id';
 
 /** The minimal Web Storage surface we need (a subset of `Storage`). */
 interface WebStorageLike {
@@ -69,6 +83,7 @@ function persistentId(cached: string | null, storage: WebStorageLike | null, key
 
 let deviceId: string | null = null;
 let sessionId: string | null = null;
+let anonymousId: string | null = null;
 
 /** The stable device id (persisted in localStorage; per-process fallback). */
 export function getDeviceId(): string {
@@ -82,8 +97,59 @@ export function getSessionId(): string {
   return sessionId;
 }
 
+/** The stable anonymous id (persisted in localStorage; per-process fallback). */
+export function getAnonymousId(): string {
+  if (anonymousId) return anonymousId;
+  const storage = webStorage('localStorage');
+  if (storage) {
+    try {
+      const existing = storage.getItem(ANON_ID_KEY);
+      if (existing) {
+        anonymousId = existing;
+        return anonymousId;
+      }
+    } catch {
+      /* fall through and generate */
+    }
+  }
+  const fresh = `anon_${uuidv4()}`;
+  if (storage) {
+    try {
+      storage.setItem(ANON_ID_KEY, fresh);
+    } catch {
+      /* best effort — degrade to the in-memory value */
+    }
+  }
+  anonymousId = fresh;
+  return anonymousId;
+}
+
+/**
+ * Mint and persist a fresh anonymous id.
+ *
+ * MUST be reachable from application code. A persisted anon id plus
+ * `process_identify`'s `identities(app_id, alias_id, distinct_id)` insert means
+ * one `identify()` permanently binds this browser profile to a named user
+ * server-side — so on a kiosk or a shared machine, person B's anonymous
+ * activity would be aliased to person A's account, forever, with no escape
+ * hatch.
+ */
+export function resetAnonymousId(): string {
+  anonymousId = null;
+  const storage = webStorage('localStorage');
+  if (storage) {
+    try {
+      storage.removeItem(ANON_ID_KEY);
+    } catch {
+      /* best effort */
+    }
+  }
+  return getAnonymousId();
+}
+
 /** Drop the in-memory memoization (used by tests and teardown). */
 export function resetIdentity(): void {
   deviceId = null;
   sessionId = null;
+  anonymousId = null;
 }

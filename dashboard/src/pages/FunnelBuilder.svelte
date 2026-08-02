@@ -14,6 +14,7 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import FunnelChart from '../lib/components/FunnelChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { lockedBy, lockTitle } from '../lib/models/page-access';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { topEvents } from '../lib/api/events';
   import {
@@ -41,7 +42,10 @@
 
   let saved = $state<SavedFunnel[]>([]);
   let loadedId = $state<string | null>(null);
-  const canWrite = $derived(sessionStore.can('funnel:write'));
+  // funnels.rs:204,232,257 authorize at the app.
+  const writeLock = $derived(
+    lockedBy('funnel:write', { app: sessionStore.currentAppId, level: 'app' }),
+  );
 
   // Save / edit dialog
   let showDetailsDialog = $state(false);
@@ -329,9 +333,14 @@
                 </button>
                 <div class="sf-actions">
                   <button type="button" title="Duplicate" onclick={() => duplicateFunnel(f)}><Icon name="copy" size={14} /></button>
-                  {#if canWrite}
-                    <button type="button" title="Delete" onclick={() => openDeleteConfirm(f)}><Icon name="x" size={14} /></button>
-                  {/if}
+                  <button
+                    type="button"
+                    title={writeLock ? lockTitle(writeLock) : 'Delete'}
+                    disabled={writeLock !== null}
+                    onclick={() => openDeleteConfirm(f)}
+                  >
+                    <Icon name={writeLock ? 'lock' : 'x'} size={14} />
+                  </button>
                 </div>
               </li>
             {/each}
@@ -369,13 +378,11 @@
           <Button variant="primary" onclick={onCompute} disabled={steps.length < 2} loading={computing}>
             Compute funnel
           </Button>
-          {#if canWrite}
-            {#if loadedId}
-              <Button variant="secondary" size="sm" onclick={openUpdateDialog} disabled={steps.length < 2}>Update</Button>
-              <Button variant="secondary" size="sm" onclick={openSaveDialog} disabled={steps.length < 2}>Save as new</Button>
-            {:else}
-              <Button variant="secondary" size="sm" onclick={openSaveDialog} disabled={steps.length < 2}>Save template</Button>
-            {/if}
+          {#if loadedId}
+            <Button variant="secondary" size="sm" onclick={openUpdateDialog} disabled={steps.length < 2} lockedReason={writeLock}>Update</Button>
+            <Button variant="secondary" size="sm" onclick={openSaveDialog} disabled={steps.length < 2} lockedReason={writeLock}>Save as new</Button>
+          {:else}
+            <Button variant="secondary" size="sm" onclick={openSaveDialog} disabled={steps.length < 2} lockedReason={writeLock}>Save template</Button>
           {/if}
           {#if steps.length < 2}
             <span class="faint hint">Need at least 2 steps</span>

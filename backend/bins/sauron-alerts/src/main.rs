@@ -16,6 +16,9 @@
 //!
 //! A rule's evaluation failure is logged and skipped; it never stops the loop.
 
+mod drain;
+mod subs;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,10 +67,58 @@ async fn main() -> anyhow::Result<()> {
     // Dated so the first tick prunes: a fresh deploy should reclaim whatever
     // accumulated while nothing was reaping, not wait an hour to start.
     let mut last_prune = Utc::now() - chrono::Duration::days(1);
+    let mut last_subs_eval = Utc::now() - chrono::Duration::days(1);
+    // NOT dated into the past like the others: the sweep is the expensive
+    // whole-table pass, and running it during boot — before the process has
+    // even proven it can reach Postgres — buys nothing. The synchronous sweeps
+    // in `routes/orgs.rs` already cover every deliberate grant change; this slot
+    // exists only for the paths nobody remembered.
+    let mut last_sweep = Utc::now();
+    let mut tick_counter: u64 = 0;
     loop {
+        tick_counter = tick_counter.wrapping_add(1);
         if let Err(e) = evaluate_all(&pool, &redis, &engine).await {
             warn!(error = %e, "alert evaluation tick failed");
         }
+
+        // 120s by default, deliberately slower than the 30s org tick: personal
+        // email does not need 30s latency, and cadence is the single largest
+        // cost lever in this subsystem.
+        let subs_tick = cfg.notify_subs_tick_secs.clamp(30, 3600) as i64;
+        if (Utc::now() - last_subs_eval).num_seconds() >= subs_tick {
+            if let Err(e) = subs::evaluate_subscriptions(&pool, &redis, &cfg, tick_counter).await {
+                warn!(error = %e, "subscription evaluation tick failed");
+            }
+            last_subs_eval = Utc::now();
+        }
+
+        // Every tick, not on the subscription cadence, so `immediate` really is
+        // immediate.
+        if let Err(e) = drain::drain_notification_queue(&pool, &cfg).await {
+            warn!(error = %e, "notification drain failed");
+        }
+
+        // The daily backstop for revocations no handler caught: a role's
+        // permission list edited, a project deleted, an app removed. The
+        // synchronous sweeps in `routes/orgs.rs` close the 24-hour window for
+        // the three deliberate grant-mutation paths; this closes it for
+        // everything else.
+        if (Utc::now() - last_sweep).num_hours() >= 24 {
+            match sauron_db::conn(&pool).await {
+                Ok(mut conn) => {
+                    match sauron_alerts::sweep::sweep_revoked_subscriptions(&mut conn).await {
+                        Ok(n) if n > 0 => {
+                            info!(disabled = n, "subscriptions disabled: owner lost reach")
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "revocation sweep failed"),
+                    }
+                }
+                Err(e) => warn!(error = %e, "revocation sweep: no database connection"),
+            }
+            last_sweep = Utc::now();
+        }
+
         // `alert_events` gains a row per evaluation — including every suppressed
         // one — so without a reaper a throttled rule grows it without bound.
         if (Utc::now() - last_prune).num_minutes() >= 60 {
@@ -78,6 +129,31 @@ async fn main() -> anyhow::Result<()> {
                         Ok(n) if n > 0 => info!(pruned = n, "pruned old alert events"),
                         Ok(_) => {}
                         Err(e) => warn!(error = %e, "pruning alert events failed"),
+                    }
+                    // A queue's reaper runs in the process that DRAINS it, and
+                    // `notification_queue` is drained right here.
+                    match repo::prune_notification_queue(
+                        &mut conn,
+                        cfg.notify_queue_retention_days.clamp(1, 365) as i32,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => info!(pruned = n, "pruned finished notifications"),
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "pruning notification queue failed"),
+                    }
+                    // No graceful shutdown exists anywhere in this codebase, so
+                    // a process killed mid-drain leaves rows `claimed` forever.
+                    match repo::requeue_stuck_notifications(
+                        &mut conn,
+                        repo::STUCK_CLAIM_SECS,
+                        repo::MAX_QUEUE_ATTEMPTS,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => info!(requeued = n, "requeued stuck notifications"),
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "requeueing stuck notifications failed"),
                     }
                 }
                 Err(e) => warn!(error = %e, "prune: no database connection"),
@@ -168,6 +244,20 @@ async fn evaluate_rule(
         _ => None,
     };
 
+    // The admin-facing input is an environment NAME, which is the right thing
+    // to type into a rule dialog — but `error_events.environment_id` holds an
+    // `app_environments` ENROLLMENT id, and before this the count compared it
+    // against the project-level catalogue, so every environment-filtered rule
+    // in the product had been counting zero since migration 33. Resolve here,
+    // once, and pass ids down. A misspelled name resolves to an empty set and
+    // keeps counting zero — now deliberately, and visibly, rather than by
+    // accident.
+    let env_ids: Option<Vec<uuid::Uuid>> = match cond.filters.environment.as_deref() {
+        Some(name) => Some(repo::enrollment_ids_for_env_name(&mut conn, &app_ids, name).await?),
+        None => None,
+    };
+    let env_ids_ref = env_ids.as_deref();
+
     match trigger {
         TriggerType::IssueNew | TriggerType::IssueRegression => {
             let issues = if trigger == TriggerType::IssueNew {
@@ -177,6 +267,7 @@ async fn evaluate_rule(
                     since,
                     now,
                     cond.filters.level.as_deref(),
+                    20,
                 )
                 .await?
             } else {
@@ -186,6 +277,7 @@ async fn evaluate_rule(
                     since,
                     now,
                     cond.filters.level.as_deref(),
+                    20,
                 )
                 .await?
             };
@@ -220,7 +312,7 @@ async fn evaluate_rule(
                 from,
                 now,
                 cond.filters.level.as_deref(),
-                cond.filters.environment.as_deref(),
+                env_ids_ref,
                 tag.as_ref(),
             )
             .await?;
@@ -250,7 +342,7 @@ async fn evaluate_rule(
                 from,
                 now,
                 cond.filters.level.as_deref(),
-                cond.filters.environment.as_deref(),
+                env_ids_ref,
                 tag.as_ref(),
             )
             .await?;
@@ -260,7 +352,7 @@ async fn evaluate_rule(
                 prev_from,
                 from,
                 cond.filters.level.as_deref(),
-                cond.filters.environment.as_deref(),
+                env_ids_ref,
                 tag.as_ref(),
             )
             .await?;
@@ -296,7 +388,7 @@ async fn evaluate_rule(
                 from,
                 now,
                 cond.filters.event_name.as_deref(),
-                cond.filters.environment.as_deref(),
+                env_ids_ref,
                 tag.as_ref(),
             )
             .await?;

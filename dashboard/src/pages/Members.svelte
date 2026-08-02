@@ -3,7 +3,6 @@
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
-  import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
@@ -11,12 +10,23 @@
   import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
   import CreateMemberDialog from '../lib/components/members/CreateMemberDialog.svelte';
   import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
+  import ResetPasswordDialog from '../lib/components/members/ResetPasswordDialog.svelte';
   import MembersTable from '../lib/components/members/MembersTable.svelte';
   import ScopeTree from '../lib/components/members/ScopeTree.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import { listMembers, listRoles, createGrant, deleteGrant, setMemberActive } from '../lib/api/orgs';
+  import { lockedBy } from '../lib/models/page-access';
+  import { authStore } from '../lib/stores/auth.svelte';
+  import {
+    listMembers,
+    listRoles,
+    createGrant,
+    deleteGrant,
+    setMemberActive,
+    resetMemberPassword,
+  } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
   import { listEnvironments } from '../lib/api/environments';
+  import { revokeMemberSessions } from '../lib/api/account';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
   import {
@@ -107,6 +117,14 @@
   let editingMemberId = $state<string | null>(null);
   let togglingUserId = $state<string | null>(null);
   let deactivateTarget = $state<Member | null>(null);
+  let revokingUserId = $state<string | null>(null);
+  let pendingRevoke = $state<Member | null>(null);
+
+  // One piece of state for both directions: the table never offers a member
+  // both a reset and a cancel, so a second flag could only ever disagree with
+  // the row that opened the dialog.
+  let resetTarget = $state<{ member: Member; action: 'reset' | 'cancel' } | null>(null);
+  let resetBusy = $state(false);
 
   // One row per person: this recomputes fresh Member/grant objects every time
   // `members` is reloaded, so anything derived from it (below) is never a
@@ -140,9 +158,22 @@
     return counts;
   });
 
-  const canManage = $derived(sessionStore.can('member:manage'));
-  const canReadMembers = $derived(sessionStore.can('member:read'));
-  const canManageRoles = $derived(sessionStore.can('role:manage'));
+  // Every members/roles endpoint resolves through `authorize_org`
+  // (orgs.rs:160,552,809,1020,1399), which no project- or app-scoped grant can
+  // satisfy — hence `level: 'org'` on all of these. Without it, a member whose
+  // grant carries `member:manage` at project scope saw every control here lit
+  // and got a 403 from each one.
+  const manageLock = $derived(lockedBy('member:manage', { level: 'org' }));
+  // Deliberately not `manageLock`: a custom role may hold `member:manage`
+  // without `member:credential`, and showing this button to that role means
+  // every click 403s.
+  const revokeLock = $derived(lockedBy('member:credential', { level: 'org' }));
+  const roleManageLock = $derived(lockedBy('role:manage', { level: 'org' }));
+  // Password reset re-checks BOTH server-side (orgs.rs:1020 + 755), so report
+  // whichever is missing — `member:credential` first, since it is the narrower
+  // one deliberately carved out of `member:manage`.
+  const credentialLock = $derived(revokeLock ?? manageLock);
+  const canReadMembers = $derived(sessionStore.can('member:read', { level: 'org' }));
 
   const projectOfApp = $derived.by(() => {
     const map: Record<string, string> = {};
@@ -332,6 +363,55 @@
     deactivateTarget = null;
     if (member) await toggleActive(member);
   }
+
+  async function confirmPasswordReset() {
+    const org = sessionStore.currentOrg;
+    const target = resetTarget;
+    if (!org || !target) return;
+    resetBusy = true;
+    try {
+      await resetMemberPassword(org.id, target.member.user_id, target.action);
+      toastStore.success(
+        target.action === 'reset'
+          ? `${target.member.email} has been emailed a link to set a new password.`
+          : `${target.member.email} can sign in with their existing password again.`,
+      );
+      resetTarget = null;
+      await load(org.id);
+    } catch (err) {
+      // The backend's 409s carry the actionable text (self, inactive,
+      // cross-org) and its 503 names the missing setting — surface both
+      // verbatim, exactly as toggleActive already does.
+      toastStore.error(errorMessage(err));
+    } finally {
+      resetBusy = false;
+    }
+  }
+
+  function requestRevokeSessions(member: Member) {
+    pendingRevoke = member;
+  }
+
+  async function confirmRevokeSessions() {
+    const member = pendingRevoke;
+    pendingRevoke = null;
+    const org = sessionStore.currentOrg;
+    if (!member || !org) return;
+    revokingUserId = member.user_id;
+    try {
+      const n = await revokeMemberSessions(org.id, member.user_id);
+      toastStore.success(
+        `${member.email} was signed out of ${n === 1 ? '1 device' : `${n} devices`}.`,
+      );
+    } catch (err) {
+      // The backend's 403/404/409s carry the actionable text (outranks you,
+      // not a member here, belongs to another organization, self-target) —
+      // surface it verbatim.
+      toastStore.error(errorMessage(err));
+    } finally {
+      revokingUserId = null;
+    }
+  }
 </script>
 
 <AppShell requireProject={false}>
@@ -342,28 +422,24 @@
     </div>
   </div>
 
-  {#if !canReadMembers}
-    <Card>
-      <EmptyState
-        title="No access"
-        description="You don't have permission to view members of this organization."
-        icon="lock"
-      />
-    </Card>
-  {:else if loading}
+  <!-- The `member:read` gate is AppShell's now: it resolves /members through
+       PAGE_ACCESS and renders PermissionDenied instead of this page, so the
+       bespoke "No access" card that used to live here would be unreachable. -->
+  {#if loading}
     <div class="center"><Spinner size={26} /></div>
   {:else if error}
     <Card><p class="err-msg">{error}</p></Card>
   {:else}
     <div class="stack">
-      {#if canManage}
       <Card>
         {#snippet header()}
           <h3 class="card-title-inline">Grant access</h3>
           <p class="muted grant-sub">For someone who already has an account, here or in another org.</p>
         {/snippet}
         {#snippet actions()}
-          <Button variant="primary" onclick={() => (createOpen = true)}>Create member</Button>
+          <Button variant="primary" lockedReason={manageLock} onclick={() => (createOpen = true)}>
+            Create member
+          </Button>
         {/snippet}
         <form class="grant-form" onsubmit={submitGrant}>
           <div class="gf-row">
@@ -390,27 +466,40 @@
               {loadingEnvApps}
               onopenapp={ensureEnvsLoaded}
               value={grantSelection}
-              disabled={granting}
+              disabled={granting || manageLock !== null}
               onchange={(next) => (grantSelection = next)}
             />
           </div>
           <div class="gf-actions">
-            <Button type="submit" variant="primary" loading={granting} disabled={!canGrant}>Grant</Button>
+            <Button
+              type="submit"
+              variant="primary"
+              loading={granting}
+              disabled={!canGrant}
+              lockedReason={manageLock}
+            >
+              Grant
+            </Button>
           </div>
         </form>
       </Card>
-    {/if}
 
     <MembersTable
       {grouped}
       {appsById}
       {envsByApp}
       {projectsById}
-      {canManage}
+      {manageLock}
       {removingId}
       {togglingUserId}
+      {revokeLock}
+      {revokingUserId}
+      onrevokesessions={requestRevokeSessions}
       onedit={(userId) => (editingMemberId = userId)}
       ontoggle={requestToggle}
+      currentUserId={authStore.user?.id ?? ''}
+      {credentialLock}
+      onresetpassword={(m, a) => (resetTarget = { member: m, action: a })}
       onremovegrant={removeGrant}
     />
 
@@ -419,9 +508,14 @@
         <h3 class="card-title-inline">Roles</h3>
       {/snippet}
       {#snippet actions()}
-        {#if canManageRoles}
-          <Button variant="secondary" size="sm" onclick={openNewRole}>New role</Button>
-        {/if}
+        <Button
+          variant="secondary"
+          size="sm"
+          lockedReason={roleManageLock}
+          onclick={openNewRole}
+        >
+          New role
+        </Button>
       {/snippet}
 
       <ul class="role-list">
@@ -434,11 +528,13 @@
             </div>
             <div class="r-actions">
               <span class="r-count muted">{role.permissions.length} permissions</span>
+              <!-- A system role opens read-only for anyone, so it is never
+                   locked; only editing a custom role needs `role:manage`. -->
               <Button
                 variant="ghost"
                 size="sm"
                 onclick={() => openEditRole(role)}
-                disabled={!canManageRoles && !role.is_system}
+                lockedReason={role.is_system ? null : roleManageLock}
               >
                 {role.is_system ? 'View' : 'Edit'}
               </Button>
@@ -500,6 +596,28 @@
       danger
       onconfirm={confirmDeactivate}
       oncancel={() => (deactivateTarget = null)}
+    />
+  {/if}
+
+  {#if resetTarget}
+    <ResetPasswordDialog
+      member={resetTarget.member}
+      action={resetTarget.action}
+      busy={resetBusy}
+      onconfirm={confirmPasswordReset}
+      oncancel={() => (resetTarget = null)}
+    />
+  {/if}
+
+  {#if pendingRevoke}
+    <ConfirmDialog
+      open
+      title="Sign out all sessions"
+      message={`${pendingRevoke.name || pendingRevoke.email} will be signed out on every device and will have to log in again. Their account stays active.`}
+      confirmLabel="Sign out"
+      danger
+      onconfirm={() => void confirmRevokeSessions()}
+      oncancel={() => (pendingRevoke = null)}
     />
   {/if}
 </AppShell>

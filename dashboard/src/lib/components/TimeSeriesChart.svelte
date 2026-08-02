@@ -9,6 +9,19 @@
     emptyLabel?: string;
     format?: (n: number) => string;
     showTotal?: boolean;
+    /**
+     * Override how a bucket is rendered on the axis AND in the tooltip.
+     *
+     * The default path parses `bucket` as a Date and renders it in the
+     * VIEWER's zone. That is correct for the timestamp buckets every existing
+     * caller passes, and wrong for a pure `YYYY-MM-DD` calendar day: parsing
+     * is UTC, rendering is not, so in `America/New_York` the bar for
+     * `2026-07-31` is labelled "Jul 30" and its tooltip reads "Jul 30, 2026,
+     * 08:00 PM" — a time of day on a bucket that has none. The active-users
+     * page passes `utcDayLabel` so its chart, its CSV and its filename cannot
+     * disagree about which day a number belongs to.
+     */
+    label?: (bucket: string) => string;
   }
 
   let {
@@ -18,6 +31,7 @@
     emptyLabel = 'No data in this range',
     format = (n: number) => n.toLocaleString(),
     showTotal = true,
+    label: labelProp,
   }: Props = $props();
 
   const max = $derived(data.length ? Math.max(...data.map((d) => d.count), 1) : 1);
@@ -30,9 +44,16 @@
   }
 
   function label(bucket: string): string {
+    if (labelProp) return labelProp(bucket);
     const d = new Date(bucket);
     if (Number.isNaN(d.getTime())) return bucket;
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
+
+  // The hover title uses the same function when the prop is supplied;
+  // `formatDateTime` would put a time of day on a calendar-day bucket.
+  function tooltip(bucket: string): string {
+    return labelProp ? labelProp(bucket) : formatDateTime(bucket);
   }
 </script>
 
@@ -42,7 +63,7 @@
   <div class="chart">
     <div class="plot" style="height:{height}px" style:--bar-color={color}>
       {#each data as point (point.bucket)}
-        <div class="col" title={`${formatDateTime(point.bucket)} · ${format(point.count)}`}>
+        <div class="col" title={`${tooltip(point.bucket)} · ${format(point.count)}`}>
           <div class="bar" style="height:{barHeight(point.count)}%">
             <span class="tip">{format(point.count)} · {label(point.bucket)}</span>
           </div>

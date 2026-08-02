@@ -14,6 +14,7 @@ sauron-core = { workspace = true }
 sauron-db = { workspace = true }
 sauron-monitor-core = { workspace = true }
 sauron-alerts = { workspace = true }
+sauron-auth = { workspace = true }
 sauron-redis = { workspace = true }
 sauron-telemetry = { workspace = true }
 tokio = { workspace = true }

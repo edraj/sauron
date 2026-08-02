@@ -1,13 +1,18 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { onMount } from 'svelte';
-  import { push } from 'svelte-spa-router';
+  // Aliased: an unqualified `location` import shadows `window.location`, and
+  // the two `location.reload()` retry handlers below would then be called on a
+  // Svelte store instead of the browser global.
+  import { push, location as routePath } from 'svelte-spa-router';
   import Sidebar from './Sidebar.svelte';
   import Topbar from './Topbar.svelte';
   import Spinner from '../ui/Spinner.svelte';
   import EmptyState from '../ui/EmptyState.svelte';
   import Button from '../ui/Button.svelte';
+  import PermissionDenied from '../PermissionDenied.svelte';
   import { sessionStore } from '../../stores/session.svelte';
+  import { canAccessPage, resolvePageAccess } from '../../models/page-access';
   import { errorMessage } from '../../api/client';
 
   interface Props {
@@ -46,6 +51,16 @@
   // permission for, so show a dead-end state instead of redirecting there.
   const noAccess = $derived(needsScope && !canOnboard);
 
+  // The page-level permission gate. Deliberately resolved here rather than as a
+  // router condition: a failed condition fires `conditionsFailed`, which
+  // navigates — and a deep link the user cannot open should keep its URL and
+  // explain itself, not silently land them somewhere else.
+  //
+  // Gated on `loaded` so the check never runs against an empty grant list
+  // mid-bootstrap, which would flash the denied state on every cold load.
+  const pageAccess = $derived(resolvePageAccess($routePath));
+  const pageDenied = $derived(sessionStore.loaded && !canAccessPage(pageAccess));
+
   $effect(() => {
     if (needsScope && canOnboard) push('/onboarding');
   });
@@ -73,12 +88,31 @@
         </EmptyState>
       {:else if !sessionStore.loaded}
         <div class="shell-loading"><Spinner size={26} /></div>
+      {:else if sessionStore.accessError}
+        <!-- Ranked above every permission-derived state below. When the access
+             fetch fails, `can()` answers false for everything, so the nav
+             empties and every action locks — indistinguishable from a real
+             no-grants account unless we say so here. -->
+        <EmptyState
+          title="Couldn't load permissions"
+          description="We couldn't check what you have access to, so the dashboard is showing nothing rather than guessing. This is usually temporary."
+          icon="triangle-alert"
+        >
+          {#snippet action()}
+            <Button variant="primary" onclick={() => location.reload()}>Retry</Button>
+          {/snippet}
+        </EmptyState>
       {:else if noAccess}
         <EmptyState
           title="No apps available"
           description="You don't have access to any app in this organization yet. Ask an administrator to grant you access."
           icon="lock"
         />
+      {:else if pageDenied && pageAccess}
+        <!-- Ranked BELOW `noAccess` on purpose: a member with zero reachable
+             projects is better served by "No apps available" than by a
+             technically-correct "requires event:read". -->
+        <PermissionDenied access={pageAccess} />
       {:else}
         {@render children()}
       {/if}

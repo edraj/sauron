@@ -195,6 +195,37 @@ the full dataset.
 - **Share a filtered view.** On Exceptions and Events the filters live in the
   URL — copy the address bar to hand someone the exact same view.
 
+## What a privacy mask does to search
+
+The **[Privacy Inspector](Privacy-Inspector.md)** rewrites a masked value to the
+JSON string `"****"` and keeps the key. Search has no special case for that, on
+purpose: a masked row is not hidden and not excluded — it simply no longer
+*contains* what you are looking for, so it stops matching and nothing says why.
+
+For a column that has been masked:
+
+- **Free-text stops matching.** The `::text ILIKE '%term%'` scan over
+  `tags`/`contexts`/`extra`/`properties` sees `"****"`, not the old value.
+- **`Tag =` stops matching.** JSONB containment (`tags @> {"key":"value"}`)
+  compares against the stored value, which is now `"****"`.
+- **Number filters stop matching.** The masked value is a **string**, whatever
+  it used to be: `extra.cart_value_cents: 4200` becomes `"****"`, so `>` / `<`
+  and any range comparison against the old value never match again.
+- **Finding a person by email stops working on `event_user`.**
+  `error_events.event_user` is the per-event snapshot of the person (`user.id`,
+  `user.email`) and is the column behind the `user.` search dimension. Once it
+  is masked, a search for `*@acme.com` over that dimension returns nothing for
+  masked rows.
+- **The Users box loses masked traits.** That box searches the whole traits
+  blob — `event_users.properties` — so a masked trait is no longer findable
+  there either.
+
+Masking is not retroactive across the whole dataset: it covers hot Postgres and
+all future ingest, and it stops at the tiering boundary. A term that matches
+older rows and nothing recent (or the reverse) may be a mask, not a data gap —
+**Manage → Privacy → Audit** is where you find out. The full list of what a mask
+does and does not reach is on **[Privacy Inspector](Privacy-Inspector.md)**.
+
 ---
 
 Related: **[Dashboard](Dashboard.md)** · **[Architecture](Architecture.md)** ·

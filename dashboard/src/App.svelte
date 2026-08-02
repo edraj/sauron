@@ -8,7 +8,17 @@
 
   let booted = $state(false);
 
-  const PUBLIC_ROUTES = ['/login', '/register'];
+  // '/reset-password' is DELIBERATELY absent. This array feeds the $effect
+  // below that pushes authenticated users to /issues, and a logged-in user
+  // clicking their own reset link would be bounced off it before they could use
+  // it. It is neither listed here nor guarded in routes.ts, so it simply
+  // renders for everyone. '/forgot-password' IS listed: an authenticated user
+  // who lands there wants Change password instead.
+  //
+  // Note `$location` from svelte-spa-router excludes the query string, so the
+  // comparison is '/reset-password' even with ?token=… — which is exactly why
+  // omitting it here is load-bearing rather than accidental.
+  const PUBLIC_ROUTES = ['/login', '/register', '/forgot-password'];
 
   onMount(async () => {
     await authStore.boot();

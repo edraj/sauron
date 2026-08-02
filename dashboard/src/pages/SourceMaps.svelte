@@ -8,6 +8,7 @@
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { lockedBy } from '../lib/models/page-access';
   import { toastStore } from '../lib/stores/toast.svelte';
   import {
     listArtifacts,
@@ -19,6 +20,13 @@
   let artifacts = $state<SymbolArtifact[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  // artifacts.rs:89,222 — both upload and delete authorize at the app. Listing
+  // needs only `issue:read` (artifacts.rs:189), which is why the list itself
+  // stays readable while these two lock.
+  const writeLock = $derived(
+    lockedBy('artifact:write', { app: sessionStore.currentAppId, level: 'app' }),
+  );
 
   // Upload form (JS source maps; Dart symbols upload via the CLI).
   let release = $state('');
@@ -121,7 +129,12 @@
           <input type="file" accept=".map,application/json" onchange={onFile} />
         </label>
         <div class="actions">
-          <Button variant="primary" disabled={!file || uploading} onclick={upload}>
+          <Button
+            variant="primary"
+            disabled={!file || uploading}
+            lockedReason={writeLock}
+            onclick={upload}
+          >
             {uploading ? 'Uploading…' : 'Upload'}
           </Button>
         </div>
@@ -171,7 +184,9 @@
               <td class="num">{fmtBytes(a.uncompressed_size)}</td>
               <td class="cell-muted">{fmtDate(a.created_at)}</td>
               <td>
-                <Button variant="ghost" size="sm" onclick={() => remove(a.id)}>Delete</Button>
+                <Button variant="ghost" size="sm" lockedReason={writeLock} onclick={() => remove(a.id)}>
+                  Delete
+                </Button>
               </td>
             </tr>
           {/each}

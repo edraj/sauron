@@ -171,6 +171,33 @@ export interface FirstEventStatus {
   events: boolean;
 }
 
+/**
+ * One row of GET /v1/me/sessions — a login of the current user that has
+ * survived refresh-token rotation.
+ *
+ * NOT `AuthSession`: that name is taken above by the login *response*, and
+ * shadowing it compiles while silently changing the auth store's types.
+ *
+ * `revoked_by` is deliberately absent — the API never serializes it, because it
+ * would tell a member which admin signed them out.
+ */
+export interface AccountSession {
+  id: string;
+  created_at: string;
+  last_used_at: string;
+  expires_at: string;
+  /** Marked server-side; the dashboard has no JWT decoder and should not gain one. */
+  current: boolean;
+  user_agent: string | null;
+  browser: string | null;
+  os: string | null;
+  device_kind: string | null;
+  ip: string | null;
+  /** Only ever set on rows returned with `?include_revoked=1`. */
+  revoked_at: string | null;
+  revoked_reason: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Access control (RBAC)
 // ---------------------------------------------------------------------------
@@ -203,10 +230,13 @@ export type Permission =
   | 'project:delete'
   | 'member:read'
   | 'member:manage'
+  | 'member:credential'
   | 'role:manage'
   | 'org:manage'
   | 'alert:read'
   | 'alert:write'
+  | 'pii:read'
+  | 'pii:manage'
   | (string & {});
 
 // One entry in the `grants` array of GET /v1/orgs/{org}/access — the scoped set
@@ -245,6 +275,10 @@ export interface MemberGrant {
   scope_type: ScopeType;
   scope_id: string;
   is_active: boolean;
+  /** Non-null while an admin-forced reset is outstanding. Comes from
+      `GET /v1/orgs/{org}/members`, the only place the dashboard learns anything
+      about a member's account state. */
+  credentials_invalidated_at: string | null;
 }
 
 /**
@@ -259,6 +293,10 @@ export interface Member {
   email: string;
   name: string | null;
   is_active: boolean;
+  /** Non-null while an admin-forced reset is outstanding. Comes from
+      `GET /v1/orgs/{org}/members`, the only place the dashboard learns anything
+      about a member's account state. */
+  credentials_invalidated_at: string | null;
   grants: MemberGrant[];
 }
 
@@ -276,6 +314,14 @@ export interface CreateMemberResult {
       keeps working after a partial upgrade; nothing here reads it. */
   grant_id?: string;
   temp_password: string;
+}
+
+export interface MemberPasswordResetResult {
+  ok: boolean;
+  action: 'reset' | 'cancel';
+  /** RFC 3339 when the link expires; null for `cancel`. Never a token — the
+      server refuses to return the link under any condition. */
+  expires_at: string | null;
 }
 
 /** One entry in the scope picker: the org, a project, or an app. */
@@ -327,6 +373,7 @@ export function groupMembers(grants: MemberGrant[]): Member[] {
         email: g.email,
         name: g.name,
         is_active: g.is_active,
+        credentials_invalidated_at: g.credentials_invalidated_at,
         grants: [g],
       });
     }
@@ -1020,4 +1067,263 @@ export interface AlertMeta {
   severities: AlertSeverity[];
   metrics: string[];
   template_vars: Record<string, string[]>;
+  subscription_kinds: SubscriptionKindMeta[];
+}
+
+export type SubscriptionKind =
+  | 'uptime'
+  | 'error_spike'
+  | 'error_new_issue'
+  | 'error_regression';
+
+export type SubscriptionDelivery = 'immediate' | 'hourly' | 'daily';
+
+export interface SubscriptionConditions {
+  window_seconds: number;
+  factor: number;
+  min_count: number;
+  level: string | null;
+}
+
+export interface NotificationSubscription {
+  id: string;
+  scope_type: 'project' | 'app';
+  scope_id: string;
+  /** Best effort: `scope_id` has no foreign key, so a row can outlive its target. */
+  scope_name: string | null;
+  project_id: string | null;
+  kind: SubscriptionKind;
+  enabled: boolean;
+  disabled_reason: 'unsubscribed' | 'access_revoked' | null;
+  /** CATALOGUE environment ids (`environments.id`), never enrollment ids. */
+  environment_ids: string[];
+  conditions: Partial<SubscriptionConditions>;
+  delivery: SubscriptionDelivery;
+  /** What the user will actually get once the per-hour cap is applied. */
+  effective_delivery: SubscriptionDelivery;
+  throttle_seconds: number;
+  quiet_start_min: number | null;
+  quiet_end_min: number | null;
+  quiet_tz: string;
+  created_at: string;
+}
+
+export interface NotificationQueueItem {
+  id: string;
+  kind: SubscriptionKind;
+  severity: AlertSeverity;
+  title: string | null;
+  body: string | null;
+  link: string | null;
+  status: string;
+  occurred_at: string;
+  sent_at: string | null;
+}
+
+export interface SubscriptionKindMeta {
+  key: SubscriptionKind;
+  scope_types: ('project' | 'app')[];
+  env_filter: boolean;
+  defaults: Partial<SubscriptionConditions>;
+  clamps: Record<string, [number, number]>;
+}
+
+// ---------------------------------------------------------------------------
+// Combined active users (project-scoped)
+// ---------------------------------------------------------------------------
+
+export interface ReportWindow {
+  from: string;
+  to: string;
+}
+
+export interface ActiveUserPoint {
+  /** A UTC calendar day, `YYYY-MM-DD`. Never a timestamp. */
+  day: string;
+  active_total: number;
+  active_identified: number;
+  active_guest: number;
+}
+
+export interface SelectionView {
+  app_id: string;
+  app_name: string;
+  /**
+   * The filter the server ACTUALLY applied: `all` | `one` | `subset` |
+   * `unattributed`. `subset` means the caller's grants reach only some of the
+   * app's environments, so the number covers fewer environments than the
+   * picker's "All environments" suggests — the page must say so.
+   */
+  resolved: 'all' | 'one' | 'subset' | 'unattributed';
+  environment_ids: string[];
+  environment_labels: string[];
+}
+
+export interface ActiveUsersReport {
+  requested: ReportWindow;
+  effective: ReportWindow;
+  truncated: boolean;
+  /** A full sentence, rendered verbatim. */
+  truncation_reason: string | null;
+  selections: SelectionView[];
+  series: ActiveUserPoint[];
+  /** The last COMPLETE UTC day, or null when the window contains only today. */
+  latest: ActiveUserPoint | null;
+}
+
+// ---------------------------------------------------------------------------
+// PII inspector
+// ---------------------------------------------------------------------------
+
+export interface InspectorTrackedKey {
+  key: string;
+  scope: 'any' | 'top';
+}
+
+export interface InspectorPolicy {
+  id: string;
+  org_id: string;
+  target_type: 'project' | 'app' | 'app_env';
+  target_id: string;
+  enabled: boolean;
+  tracked_keys: InspectorTrackedKey[];
+  detectors: string[];
+  scan_columns: string[] | null;
+  rollups: string[];
+  window_days: number;
+  schedule_enabled: boolean;
+  /** 7-bit weekday mask; bit 0 is Sunday, matching Postgres's EXTRACT(DOW). */
+  schedule_days: number;
+  /** `HH:MM` local wall clock. */
+  schedule_time: string;
+  schedule_tz: string;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_scan_id: string | null;
+  last_skip_reason: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InspectorScan {
+  id: string;
+  policy_id: string;
+  org_id: string;
+  trigger_type: 'scheduled' | 'manual';
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  coverage: 'full' | 'partial';
+  coverage_note: string;
+  window_from: string;
+  window_to: string;
+  units_total: number;
+  units_done: number;
+  rows_scanned: number;
+  findings_count: number;
+  findings_reaped_at: string | null;
+  attempts: number;
+  cancel_requested_at: string | null;
+  error: string;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+}
+
+export interface InspectorFinding {
+  id: string;
+  scan_id: string;
+  org_id: string;
+  app_id: string;
+  environment_id: string | null;
+  env_scope: 'enrollment' | 'unattributed' | 'no_env_column';
+  source_table: string;
+  source_column: string;
+  key_path: string;
+  matched_key: string;
+  detector: string;
+  value_type: string;
+  match_count: number;
+  match_count_exact: boolean;
+  /** Shape-only. NEVER the value — the findings table has no value column. */
+  sample_preview: string;
+  sample_row_id: string | null;
+  sample_occurred_at: string | null;
+  partition_kind: 'ranged' | 'default' | 'rollup';
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  created_at: string;
+}
+
+export interface InspectorMaskAction {
+  id: string;
+  org_id: string;
+  app_id: string;
+  kind: 'preview' | 'mask';
+  finding_id: string | null;
+  scan_id: string | null;
+  targets: { table: string; column: string; path: string }[];
+  status:
+    | 'preview'
+    | 'previewed'
+    | 'pending'
+    | 'running'
+    | 'cancelling'
+    | 'done'
+    | 'failed'
+    | 'cancelled';
+  requested_by_email: string;
+  cancelled_by_email: string;
+  cancelled_at: string | null;
+  requested_at: string;
+  previewed_at: string | null;
+  confirmed_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  confirm_source: string;
+  estimated_rows: number;
+  rows_scanned: number;
+  rows_masked: number;
+  cold_rows_skipped: number;
+  cold_boundary_at: string | null;
+  phase: string;
+  vacuum_advised: boolean;
+  error: string;
+}
+
+export interface InspectorMaskedKey {
+  id: string;
+  app_id: string;
+  target_table: string;
+  target_column: string;
+  json_path: string;
+  created_at: string;
+  source_action_id: string | null;
+}
+
+export interface EffectivePolicy {
+  policy: InspectorPolicy | null;
+  masked_keys: InspectorMaskedKey[];
+  /** Read from the server, never hardcoded — the UI states this number. */
+  enforcement_latency_secs: number;
+  hot_window_days: number;
+}
+
+export interface FindingsPage {
+  findings: InspectorFinding[];
+  coverage: 'full' | 'partial';
+  coverage_note: string;
+  detection_caveat: string;
+}
+
+export interface RevealResult {
+  path: string;
+  value: unknown;
+  type: string;
+}
+
+export interface MaskPreviewStart {
+  action: InspectorMaskAction;
+  app_slug: string;
+  preview_ttl_secs: number;
+  mask_max_rows: number;
+  enforcement_latency_secs: number;
 }

@@ -1,0 +1,18 @@
+[package]
+name = "sauron-inspector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Deliberately pure: no diesel, no axum, no tokio, no DuckDB. Every decision
+# in this slice lives here so it is unit-tested without a database — CI runs
+# `cargo test --workspace` with no Postgres, and the DB harness SKIPS.
+# `chrono` is here for the unit decomposition in `units.rs`, which is a pure
+# function of (pairs, tables, window) and must be callable from BOTH the
+# worker and `sauron-db` — see Task 22.
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

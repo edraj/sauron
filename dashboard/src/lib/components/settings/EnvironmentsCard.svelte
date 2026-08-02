@@ -8,7 +8,7 @@
   import CopyButton from '../ui/CopyButton.svelte';
   import ConfirmDialog from '../ui/ConfirmDialog.svelte';
   import Modal from '../ui/Modal.svelte';
-  import { sessionStore } from '../../stores/session.svelte';
+  import { lockedBy } from '../../models/page-access';
   import { toastStore } from '../../stores/toast.svelte';
   import { errorMessage } from '../../api/client';
   import { buildDsn, relativeTime, formatDateTime } from '../../utils/format';
@@ -67,17 +67,18 @@
   // keeps these reactive to org/app switches. See the AppShell fix for the bug
   // this avoids.
   //
-  // Catalogue actions resolve through the backend's `authorize_project`, so they
-  // are asked at project scope; enrollment actions resolve through
-  // `authorize_app` and are asked at app scope. (`can()` ORs across scope types
-  // and always falls back to `currentAppId` for `app`, so a purely app-scoped
-  // grant can still light up a catalogue button here — the backend is the
-  // authority and answers those with a 403.)
-  const canCreate = $derived(sessionStore.can('env:create', { project: projectId }));
-  const canRename = $derived(sessionStore.can('env:update', { project: projectId }));
-  const canRetire = $derived(sessionStore.can('env:delete', { project: projectId }));
-  const canUpdate = $derived(sessionStore.can('env:update', { app: appId }));
-  const canRotate = $derived(sessionStore.can('env:rotate_key', { app: appId }));
+  // Catalogue actions resolve through the backend's `authorize_project`, so
+  // they are asked at project scope (environments.rs:213,285,323); enrollment
+  // actions resolve through `authorize_app` and are asked at app scope
+  // (environments.rs:444,525). The explicit `level` is what makes those two
+  // statements true: without it `can()` also ORs in `currentAppId`, so a purely
+  // app-scoped grant lit up catalogue buttons the backend then answered with a
+  // 403. That caveat used to be documented here as unavoidable; it isn't.
+  const createLock = $derived(lockedBy('env:create', { project: projectId, level: 'project' }));
+  const renameLock = $derived(lockedBy('env:update', { project: projectId, level: 'project' }));
+  const retireLock = $derived(lockedBy('env:delete', { project: projectId, level: 'project' }));
+  const updateLock = $derived(lockedBy('env:update', { app: appId, level: 'app' }));
+  const rotateLock = $derived(lockedBy('env:rotate_key', { app: appId, level: 'app' }));
 
   const active = $derived(envs.filter((e) => !e.retired_at));
   const retired = $derived(envs.filter((e) => e.retired_at));
@@ -264,16 +265,15 @@
 
 <Card title="Environments">
   {#snippet actions()}
-    {#if canCreate}
-      <Button
-        variant="secondary"
-        size="sm"
-        title="Adds the environment to every app in this project"
-        onclick={() => (creating = true)}
-      >
-        New environment
-      </Button>
-    {/if}
+    <Button
+      variant="secondary"
+      size="sm"
+      title="Adds the environment to every app in this project"
+      lockedReason={createLock}
+      onclick={() => (creating = true)}
+    >
+      New environment
+    </Button>
   {/snippet}
 
   <p class="scope-note muted">
@@ -305,55 +305,57 @@
           </div>
 
           <div class="row-actions">
-            {#if canRename}
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busyId === env.id}
+              lockedReason={renameLock}
+              title="Renames this environment for every app in the project"
+              onclick={() => {
+                renaming = env;
+                renameValue = env.name;
+              }}
+            >
+              Rename
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busyId === env.id}
+              lockedReason={updateLock}
+              onclick={() => toggleIngest(env)}
+            >
+              {env.ingest_enabled ? 'Mute ingest' : 'Resume ingest'}
+            </Button>
+            {#if !env.is_default}
               <Button
                 variant="ghost"
                 size="sm"
                 disabled={busyId === env.id}
-                title="Renames this environment for every app in the project"
-                onclick={() => {
-                  renaming = env;
-                  renameValue = env.name;
-                }}
+                lockedReason={updateLock}
+                onclick={() => promote(env)}
               >
-                Rename
+                Make default
               </Button>
             {/if}
-            {#if canUpdate}
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busyId === env.id}
+              lockedReason={rotateLock}
+              onclick={() => (confirmRotate = env)}
+            >
+              Rotate key
+            </Button>
+            <!-- `is_default` / `active.length` are business rules, not
+                 permissions: an environment that cannot be retired by anyone
+                 should not render a locked button implying a missing grant. -->
+            {#if !env.is_default && active.length > 1}
               <Button
                 variant="ghost"
                 size="sm"
                 disabled={busyId === env.id}
-                onclick={() => toggleIngest(env)}
-              >
-                {env.ingest_enabled ? 'Mute ingest' : 'Resume ingest'}
-              </Button>
-              {#if !env.is_default}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={busyId === env.id}
-                  onclick={() => promote(env)}
-                >
-                  Make default
-                </Button>
-              {/if}
-            {/if}
-            {#if canRotate}
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={busyId === env.id}
-                onclick={() => (confirmRotate = env)}
-              >
-                Rotate key
-              </Button>
-            {/if}
-            {#if canRetire && !env.is_default && active.length > 1}
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={busyId === env.id}
+                lockedReason={retireLock}
                 title="Retires this environment for every app in the project"
                 onclick={() => (confirmRetire = env)}
               >

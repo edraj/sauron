@@ -2,6 +2,7 @@
   import { push } from 'svelte-spa-router';
   import { authStore } from '../../stores/auth.svelte';
   import { sessionStore } from '../../stores/session.svelte';
+  import { lockedBy } from '../../models/page-access';
   import { themeStore } from '../../stores/theme.svelte';
   import { initials, appTypeIcon } from '../../utils/format';
   import Icon from '../ui/Icon.svelte';
@@ -60,9 +61,14 @@
     }
   });
 
-  // "+ New …" affordances mirror the Projects page, where creation actually happens.
-  const canCreateProject = $derived(sessionStore.can('project:create'));
-  const canCreateApp = $derived(sessionStore.can('app:create'));
+  // "+ New …" affordances mirror the Projects page, where creation actually
+  // happens. Levels match the endpoints: projects.rs:102 authorizes creation at
+  // the org, projects.rs:239 authorizes app creation at the project — neither
+  // can be satisfied by a grant narrower than that.
+  const createProjectLock = $derived(lockedBy('project:create', { level: 'org' }));
+  const createAppLock = $derived(
+    lockedBy('app:create', { project: sessionStore.currentProjectId, level: 'project' }),
+  );
 </script>
 
 <header class="topbar">
@@ -87,8 +93,9 @@
           items={projectItems}
           currentId={sessionStore.currentProjectId}
           onSelect={(id) => void sessionStore.setProject(id)}
-          createLabel={canCreateProject ? 'New project' : undefined}
-          onCreate={canCreateProject ? () => push('/projects') : undefined}
+          createLabel="New project"
+          onCreate={() => push('/projects')}
+          createLocked={createProjectLock}
           ariaLabel="Switch project"
         />
       </div>
@@ -102,8 +109,9 @@
         items={appItems}
         currentId={sessionStore.currentAppId}
         onSelect={(id) => void sessionStore.setApp(id)}
-        createLabel={canCreateApp ? 'New app' : undefined}
-        onCreate={canCreateApp ? () => push('/projects') : undefined}
+        createLabel="New app"
+        onCreate={() => push('/projects')}
+        createLocked={createAppLock}
         ariaLabel="Switch app"
       />
     {/if}

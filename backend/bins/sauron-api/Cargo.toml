@@ -17,6 +17,13 @@ sauron-telemetry.workspace = true
 sauron-tier.workspace = true
 sauron-symbols.workspace = true
 sauron-alerts.workspace = true
+sauron-mail.workspace = true
+# `routes/inspector.rs` parses a policy's matcher fields with the SAME pure
+# functions the worker's enqueue uses. A hand-rolled copy in the handler is how
+# a policy the API accepted comes to freeze a scan with no matchers at all,
+# which then finishes `succeeded`, `coverage='full'`, zero findings — a
+# confident false negative, the worst thing this feature can emit.
+sauron-inspector.workspace = true
 diesel.workspace = true
 diesel-async.workspace = true
 tokio.workspace = true
@@ -29,13 +36,16 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+woothee.workspace = true
 validator.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
 # Drives the real, compiled `sauron-api` binary over HTTP in
-# `tests/http_env_scoping.rs` — the only way to exercise the actual extractor
-# stack a `parse_env` unit test cannot see. No "json" feature: the test only
-# asserts on status codes.
-reqwest.workspace = true
+# `tests/http_env_scoping.rs`, `tests/http_workflows.rs`,
+# `tests/http_mail_outbox.rs` and `tests/http_sessions.rs` — the only way to
+# exercise the actual extractor stack a unit test cannot see. The "json" feature
+# is test-only: reqwest is not a normal dependency of this crate, so nothing in
+# the shipped binary gains it.
+reqwest = { workspace = true, features = ["json"] }

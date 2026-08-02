@@ -54,7 +54,7 @@ use uuid::Uuid;
 
 use sauron_auth::{perm, JwtKeys};
 use sauron_db::models::{
-    NewAnalyticsEvent, NewAppEnvironment, NewErrorEvent, NewIssue, NewRoleGrant,
+    NewAnalyticsEvent, NewAppEnvironment, NewErrorEvent, NewInspectorPolicy, NewIssue, NewRoleGrant,
 };
 use sauron_db::repo;
 
@@ -115,8 +115,30 @@ fn swap_database(url: &str, new_db: &str) -> String {
 /// theory (another process could grab it before `sauron-api` binds); fine in
 /// practice for a single, serially-run test.
 fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Every port this process has already handed out.
+    static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+    let issued = ISSUED.get_or_init(|| Mutex::new(HashSet::new()));
+    for _ in 0..100 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        // `insert` returns false if we have issued this port before. The probe
+        // listener is dropped on return so the child can bind, and the kernel is
+        // then free to hand the same port to the next caller — which is exactly
+        // what happens, because tests in one binary run on parallel threads and
+        // two `TestServer::start()` calls race here. The loser's `sauron-api`
+        // died with "Address already in use" and the harness reported it as
+        // "exited early", which reads like a product fault rather than a
+        // harness one. The probe bind still rules out ports held by other
+        // processes; the set rules out the ones we handed to ourselves.
+        if issued.lock().expect("port registry").insert(port) {
+            return port;
+        }
+    }
+    panic!("no unused ephemeral port after 100 attempts");
 }
 
 /// A fresh, migrated, ephemeral database plus a real spawned `sauron-api`
@@ -394,6 +416,9 @@ impl Drop for TestServer {
 /// different scopes.
 struct EnvScopedFixture {
     org_id: Uuid,
+    /// The project the app hangs off — needed by the project-scoped route
+    /// enumeration below, which cannot derive it from `app_id`.
+    project_id: Uuid,
     app_id: Uuid,
     granted_env: Uuid,
     other_env: Uuid,
@@ -698,23 +723,24 @@ impl TestServer {
 
         let keys = JwtKeys::new(JWT_SECRET, 900);
         let (owner_token, _) = keys
-            .issue_access(owner.id, false)
+            .issue_access(owner.id, false, None)
             .expect("issue owner access token");
         let (member_token, _) = keys
-            .issue_access(member.id, false)
+            .issue_access(member.id, false, None)
             .expect("issue member access token");
         let (source_member_token, _) = keys
-            .issue_access(source_member.id, false)
+            .issue_access(source_member.id, false, None)
             .expect("issue source_member access token");
         let (nav_member_token, _) = keys
-            .issue_access(nav_member.id, false)
+            .issue_access(nav_member.id, false, None)
             .expect("issue nav_member access token");
         let (org_owner_token, _) = keys
-            .issue_access(org_owner.id, false)
+            .issue_access(org_owner.id, false, None)
             .expect("issue org_owner access token");
 
         EnvScopedFixture {
             org_id: org.id,
+            project_id: project.id,
             app_id: app.id,
             granted_env,
             other_env,
@@ -1014,7 +1040,7 @@ async fn empty_environment_id_returns_400_over_http_not_all_environments() {
     // --- mint an access token the spawned server will accept ---------------
     let keys = JwtKeys::new(JWT_SECRET, 900);
     let (token, _exp) = keys
-        .issue_access(user_id, false)
+        .issue_access(user_id, false, None)
         .expect("issue access token");
     let bearer = token.as_str();
 
@@ -2059,6 +2085,205 @@ async fn the_backend_rejection_set_matches_the_dashboard_exclusion_list() {
     h.shutdown().await;
 }
 
+/// Every `.route("...", ...)` path in `main.rs`'s literal source that sits
+/// under `/v1/projects/{project_id}` and attaches a `get(...)` handler — the
+/// project-scoped twin of [`app_scoped_get_route_templates`], parsed out of
+/// the same real router for the same reason.
+fn project_scoped_get_route_templates() -> Vec<String> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs");
+    let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!("project_scoped_get_route_templates: could not read {path}: {e}")
+    });
+    let bytes = src.as_bytes();
+
+    let marker = ".route(";
+    let mut templates = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = src[search_from..].find(marker) {
+        let open_paren = search_from + rel + marker.len() - 1;
+        let mut depth = 0i32;
+        let mut i = open_paren;
+        let mut close_paren = None;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_paren = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let close_paren = close_paren.unwrap_or_else(|| {
+            panic!("project_scoped_get_route_templates: unbalanced parens in {path}")
+        });
+        let args = &src[open_paren + 1..close_paren];
+        if let Some(q1) = args.find('"') {
+            if let Some(q2_rel) = args[q1 + 1..].find('"') {
+                let route_path = &args[q1 + 1..q1 + 1 + q2_rel];
+                let is_project_scoped = route_path == "/v1/projects/{project_id}"
+                    || route_path.starts_with("/v1/projects/{project_id}/");
+                let has_get = {
+                    let a = args.as_bytes();
+                    (0..a.len().saturating_sub(3)).any(|idx| {
+                        &a[idx..idx + 4] == b"get(" && (idx == 0 || !is_ident_byte(a[idx - 1]))
+                    })
+                };
+                if is_project_scoped && has_get {
+                    templates.push(route_path.to_string());
+                }
+            }
+        }
+        search_from = close_paren + 1;
+    }
+    templates
+}
+
+/// `dashboard/src/lib/api/scope.ts`'s `PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID`,
+/// read out of that file's literal source rather than hand-copied.
+fn read_dashboard_project_exclusions() -> Vec<String> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../dashboard/src/lib/api/scope.ts"
+    );
+    let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!("read_dashboard_project_exclusions: could not read {path}: {e}")
+    });
+    let marker = "const PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID: RegExp[] = [";
+    let body_start = src
+        .find(marker)
+        .map(|i| i + marker.len())
+        .unwrap_or_else(|| panic!("read_dashboard_project_exclusions: {marker:?} not in {path}"));
+    let body_end = src[body_start..]
+        .find("];")
+        .map(|i| body_start + i)
+        .unwrap_or_else(|| panic!("read_dashboard_project_exclusions: unterminated array"));
+    let body = &src[body_start..body_end];
+
+    const PREFIX: &str = "/^\\/v1\\/projects\\/[^/]+";
+    const SUFFIX: &str = "(?:[/?].*)?$/";
+
+    let mut templates = Vec::new();
+    for raw_line in body.lines() {
+        let line = raw_line.trim().trim_end_matches(',').trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let rest = line.strip_prefix(PREFIX).unwrap_or_else(|| {
+            panic!(
+                "read_dashboard_project_exclusions: entry {line:?} does not start with \
+                 {PREFIX:?} — this parser's assumptions are stale; update it to match scope.ts"
+            )
+        });
+        let segment = rest.strip_suffix(SUFFIX).unwrap_or_else(|| {
+            panic!(
+                "read_dashboard_project_exclusions: entry {line:?} does not end with {SUFFIX:?} \
+                 — update this parser to match scope.ts"
+            )
+        });
+        // `\/` -> `/` and `\.` -> `.`: the `.csv` route is the first entry in
+        // either array whose literal segment contains a regex metacharacter.
+        templates.push(format!(
+            "/v1/projects/{{project_id}}{}",
+            segment.replace("\\/", "/").replace("\\.", ".")
+        ));
+    }
+    templates.sort();
+    templates
+}
+
+/// Concrete request path for a project-scoped template, plus whatever
+/// non-`environment_id` query parameters the route needs just to get past its
+/// OWN `Query<T>` extraction — without them a missing-required-field 400 would
+/// be indistinguishable from an `environment_id` rejection.
+fn build_project_request_path(template: &str, project_id: Uuid, app_id: Uuid) -> String {
+    let mut path = template.replace("{project_id}", &project_id.to_string());
+    // `if let`, not the `while let` its app-scoped sibling uses: this branch
+    // has no substitution table to iterate towards, it only ever panics, and
+    // `-D warnings` rejects a `while` whose body cannot reach a second
+    // iteration (`clippy::never_loop`).
+    if let Some(start) = path.find('{') {
+        let end = path[start..]
+            .find('}')
+            .map(|e| start + e)
+            .unwrap_or_else(|| {
+                panic!("build_project_request_path: unbalanced '{{' in {template:?}")
+            });
+        let param = path[start + 1..end].to_string();
+        panic!(
+            "build_project_request_path: template {template:?} has an unhandled path parameter \
+             {{{param}}} — add a substitution rather than sending the literal text"
+        );
+    }
+    let extra_query: Option<String> = match template {
+        "/v1/projects/{project_id}/active-users" | "/v1/projects/{project_id}/active-users.csv" => {
+            Some(format!(
+                "from=2026-05-01T00:00:00Z&to=2026-05-08T00:00:00Z&selection={app_id}"
+            ))
+        }
+        _ => None,
+    };
+    if let Some(q) = extra_query {
+        path.push('?');
+        path.push_str(&q);
+    }
+    path
+}
+
+/// The set of `/v1/projects/{id}/…` GETs that reject `environment_id` outright
+/// must equal `scope.ts`'s `PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID`.
+///
+/// The active-users routes are the first telemetry reads outside
+/// `/v1/apps/{id}/…`, so `APP_SCOPED_URL` never matches them and
+/// `app_scoped_get_route_templates` never enumerates them. Compensating with
+/// one bespoke case in a new file would mean the next author never learns to
+/// replicate it; this makes `reject_environment_id` mandatory-by-test for
+/// every future project-scoped telemetry route.
+#[tokio::test]
+async fn the_project_rejection_set_matches_the_dashboard_project_exclusion_list() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_env_scoping");
+        return;
+    };
+    let f = h.seed_env_scoped_fixture().await;
+
+    let templates = project_scoped_get_route_templates();
+    assert!(
+        templates.len() >= 4,
+        "project_scoped_get_route_templates() returned only {} route(s): {templates:?} — a test \
+         that silently enumerates too few routes passes forever and guards nothing.",
+        templates.len(),
+    );
+
+    let mut rejecting = Vec::new();
+    for template in &templates {
+        let base = build_project_request_path(template, f.project_id, f.app_id);
+        // A rejecting route 400s even on a perfectly VALID value.
+        let path = with_environment_id(&base, &f.granted_env.to_string());
+        // `org_owner_token` holds the Owner preset at org scope, so a non-400
+        // here is about environment handling and never about permissions.
+        let status = h.get_status(&path, &f.org_owner_token).await;
+        if status == 400 {
+            rejecting.push(template.clone());
+        }
+    }
+    rejecting.sort();
+    rejecting.dedup();
+
+    let expected = read_dashboard_project_exclusions();
+    assert_eq!(
+        rejecting, expected,
+        "the backend's project-scoped rejecting-route set and \
+         dashboard/src/lib/api/scope.ts's PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID have diverged"
+    );
+
+    h.shutdown().await;
+}
+
 // ===========================================================================
 // Environments are defined per PROJECT (migration 2026-07-30-000033)
 // ===========================================================================
@@ -2122,7 +2347,7 @@ impl TestServer {
 
         let keys = JwtKeys::new(JWT_SECRET, 900);
         let (token, _exp) = keys
-            .issue_access(user.id, false)
+            .issue_access(user.id, false, None)
             .expect("issue access token");
         EnvLifecycleFixture {
             org_id: org.id,
@@ -2542,6 +2767,347 @@ async fn rotating_one_apps_key_leaves_its_siblings_alone() {
     assert_eq!(
         before_b, after_b,
         "rotating one app's key must not disturb a sibling sharing the environment"
+    );
+
+    h.shutdown().await;
+}
+
+/// Everything the inspector-listing test needs. Built separately from
+/// [`EnvScopedFixture`] because no persona there carries `pii:read`, and
+/// bolting it on would change the permission set the issue/event-scoping tests
+/// above have always exercised.
+struct InspectorPolicyFixture {
+    org_id: Uuid,
+    app_id: Uuid,
+    /// The `app_env` policy's target — an ENROLLMENT id, not a catalogue id.
+    enrollment_id: Uuid,
+    /// `pii:read` at APP scope on `app_id`.
+    app_member_token: String,
+    /// `pii:read` at PROJECT scope on the app's parent project.
+    project_member_token: String,
+    /// `pii:read` at ENV scope on `enrollment_id` only.
+    env_member_token: String,
+    app_policy_id: Uuid,
+    env_policy_id: Uuid,
+    /// A second app in the same org, with its own policy, that none of the
+    /// three members may see. Without it a filter that returns everything
+    /// passes every assertion below.
+    other_app_policy_id: Uuid,
+}
+
+impl TestServer {
+    async fn seed_inspector_policy_fixture(&self) -> InspectorPolicyFixture {
+        let mut conn = self.conn().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        let org = repo::create_org(&mut conn, "pii org", &format!("pii-org-{suffix}"))
+            .await
+            .expect("create org");
+        let project = repo::create_project(
+            &mut conn,
+            org.id,
+            "pii project",
+            &format!("pii-project-{suffix}"),
+        )
+        .await
+        .expect("create project");
+        let app = repo::create_app(
+            &mut conn,
+            project.id,
+            "pii app",
+            &format!("pii-app-{suffix}"),
+            "web",
+        )
+        .await
+        .expect("create app");
+        let enrollment_id = seed_env(
+            &mut conn,
+            project.id,
+            app.id,
+            "prod",
+            &format!("pk_pii_{suffix}"),
+            true,
+        )
+        .await;
+
+        // The negative control: a sibling app whose policy must stay invisible.
+        let other_app = repo::create_app(
+            &mut conn,
+            project.id,
+            "pii other app",
+            &format!("pii-other-app-{suffix}"),
+            "web",
+        )
+        .await
+        .expect("create other app");
+
+        let role = repo::create_role(
+            &mut conn,
+            org.id,
+            "pii reader",
+            "pii:read only",
+            json!([perm::PII_READ]),
+        )
+        .await
+        .expect("create pii role");
+
+        let member = |scope_type: &'static str, scope_id: Uuid, tag: &'static str| {
+            let email = format!("pii-{tag}-{suffix}@example.test");
+            let role_id = role.id;
+            let org_id = org.id;
+            async move {
+                let mut c = self.conn().await;
+                let u = repo::create_user(&mut c, &email, "unused-password-hash", "PII Member")
+                    .await
+                    .expect("create user");
+                repo::create_grant(
+                    &mut c,
+                    NewRoleGrant {
+                        org_id,
+                        user_id: u.id,
+                        role_id,
+                        scope_type: scope_type.to_string(),
+                        scope_id,
+                    },
+                )
+                .await
+                .expect("create grant");
+                u.id
+            }
+        };
+
+        let app_member = member("app", app.id, "app").await;
+        let project_member = member("project", project.id, "project").await;
+        let env_member = member("env", enrollment_id, "env").await;
+
+        let mut conn = self.conn().await;
+        let keys = json!([{"key": "email", "scope": "any"}]);
+        let empty = json!([]);
+        let rollups = json!(["issues", "event_users"]);
+        let at = chrono::NaiveTime::from_hms_opt(3, 0, 0).expect("03:00 is a valid time");
+        let policy = |target_type: &'static str, target_id: Uuid| {
+            let (keys, empty, rollups) = (&keys, &empty, &rollups);
+            NewInspectorPolicy {
+                org_id: org.id,
+                target_type,
+                target_id,
+                enabled: true,
+                tracked_keys: keys,
+                detectors: empty,
+                scan_columns: None,
+                rollups,
+                window_days: 30,
+                schedule_enabled: false,
+                schedule_days: 0,
+                schedule_time: at,
+                schedule_tz: "UTC",
+                created_by: None,
+            }
+        };
+
+        let app_policy = repo::create_inspector_policy(&mut conn, policy("app", app.id))
+            .await
+            .expect("create app policy");
+        let env_policy = repo::create_inspector_policy(&mut conn, policy("app_env", enrollment_id))
+            .await
+            .expect("create app_env policy");
+        let other_app_policy =
+            repo::create_inspector_policy(&mut conn, policy("app", other_app.id))
+                .await
+                .expect("create other-app policy");
+        drop(conn);
+
+        let jwt = JwtKeys::new(JWT_SECRET, 900);
+        let tok = |id: Uuid| jwt.issue_access(id, false, None).expect("issue token").0;
+
+        InspectorPolicyFixture {
+            org_id: org.id,
+            app_id: app.id,
+            enrollment_id,
+            app_member_token: tok(app_member),
+            project_member_token: tok(project_member),
+            env_member_token: tok(env_member),
+            app_policy_id: app_policy.id,
+            env_policy_id: env_policy.id,
+            other_app_policy_id: other_app_policy.id,
+        }
+    }
+}
+
+/// `GET /v1/orgs/{org}/inspector/policies` must list exactly the policies the
+/// caller can open by id.
+///
+/// The two surfaces are guarded by different code — the list filters on
+/// `reach_for(PII_READ)`, `get_policy` calls `authorize_policy` — and they
+/// drifted apart in the narrowing direction: an app-scoped member could `GET`
+/// the `app_env` policy under their own app and never see it listed, and a
+/// project-scoped member could open the app policy and never see it listed.
+///
+/// Silent omission is the dangerous half. An `app_env` policy SUBTRACTS from a
+/// coarser policy's scan targets (`sauron_inspector::targets::resolve_targets`),
+/// so a member who sees only the app-level policy reads its findings as
+/// covering the whole app when an environment underneath was scanned by a
+/// different policy — the confident-false-picture failure the inspector exists
+/// to prevent. Each assertion below pairs the list against the by-id fetch, so
+/// the two can never drift again without this test going red.
+#[tokio::test]
+async fn the_inspector_policy_list_matches_what_the_caller_can_open_by_id() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("skipping: TEST_DATABASE_URL unset");
+        return;
+    };
+    let f = h.seed_inspector_policy_fixture().await;
+    let path = format!("/v1/orgs/{}/inspector/policies", f.org_id);
+
+    let listed = |body: &serde_json::Value| -> HashSet<Uuid> {
+        body.as_array()
+            .expect("the policy list is a JSON array")
+            .iter()
+            .map(|p| {
+                p["id"]
+                    .as_str()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .expect("every listed policy carries a uuid id")
+            })
+            .collect()
+    };
+
+    // -- app-scoped member -------------------------------------------------
+    // `authorize_policy`'s `app_env` arm resolves the enrollment to its parent
+    // app and calls `authorize_app`, so this member can open BOTH.
+    let ids = listed(&h.get_json(&path, &f.app_member_token).await);
+    assert!(
+        ids.contains(&f.app_policy_id),
+        "app-scoped member cannot see their own app's policy: {ids:?}"
+    );
+    assert!(
+        ids.contains(&f.env_policy_id),
+        "app-scoped member cannot see the app_env policy under their own app — \
+         they will read the app policy's findings as covering the whole app"
+    );
+    assert!(
+        !ids.contains(&f.other_app_policy_id),
+        "app-scoped member can see a sibling app's policy"
+    );
+    for (id, label) in [
+        (f.app_policy_id, "app policy"),
+        (f.env_policy_id, "app_env policy"),
+    ] {
+        h.assert_status(
+            &format!("/v1/inspector/policies/{id}"),
+            &f.app_member_token,
+            200,
+            &format!("app-scoped member opening the {label} by id"),
+        )
+        .await;
+    }
+
+    // -- project-scoped member ---------------------------------------------
+    // `authorize_app` accepts a grant at the app's PARENT PROJECT, so both the
+    // app policy and the app_env policy under it are open-able.
+    let ids = listed(&h.get_json(&path, &f.project_member_token).await);
+    assert!(
+        ids.contains(&f.app_policy_id),
+        "project-scoped member cannot see an app policy inside their project"
+    );
+    assert!(
+        ids.contains(&f.env_policy_id),
+        "project-scoped member cannot see an app_env policy inside their project"
+    );
+    assert!(
+        ids.contains(&f.other_app_policy_id),
+        "the sibling app is in the SAME project, so a project grant does reach it"
+    );
+    h.assert_status(
+        &format!("/v1/inspector/policies/{}", f.env_policy_id),
+        &f.project_member_token,
+        200,
+        "project-scoped member opening the app_env policy by id",
+    )
+    .await;
+
+    // -- env-scoped member -------------------------------------------------
+    // Deliberately WIDER than `authorize_policy`: an env grant cannot satisfy
+    // `authorize_app` (`grant_applies` compares `Scope::Env` against the
+    // check's `env`, which `authorize_app` passes as `None`), but the holder
+    // still gets to see that their app has a policy at all. Pinned so the
+    // asymmetry is a decision on record rather than an accident.
+    let ids = listed(&h.get_json(&path, &f.env_member_token).await);
+    assert!(
+        ids.contains(&f.env_policy_id),
+        "env-scoped member cannot see the policy on their own enrollment"
+    );
+    assert!(
+        ids.contains(&f.app_policy_id),
+        "env-scoped member cannot see their app's policy"
+    );
+    assert!(
+        !ids.contains(&f.other_app_policy_id),
+        "env-scoped member can see a sibling app's policy"
+    );
+
+    // The `project` arm stays strict on purpose: `authorize_project` resolves
+    // at `(org, project, None, None)`, which no app- or env-scoped grant can
+    // satisfy, so widening it would list rows that 403 on open.
+    let mut conn = h.conn().await;
+    let project_policy = {
+        let keys = json!([{"key": "email", "scope": "any"}]);
+        let empty = json!([]);
+        let rollups = json!(["issues", "event_users"]);
+        let project_id = repo::app_ancestries(&mut conn, &[f.app_id])
+            .await
+            .expect("app ancestry")
+            .first()
+            .map(|(_, project_id, _)| *project_id)
+            .expect("the app resolves to a project");
+        repo::create_inspector_policy(
+            &mut conn,
+            NewInspectorPolicy {
+                org_id: f.org_id,
+                target_type: "project",
+                target_id: project_id,
+                enabled: true,
+                tracked_keys: &keys,
+                detectors: &empty,
+                scan_columns: None,
+                rollups: &rollups,
+                window_days: 30,
+                schedule_enabled: false,
+                schedule_days: 0,
+                schedule_time: chrono::NaiveTime::from_hms_opt(3, 0, 0).expect("valid time"),
+                schedule_tz: "UTC",
+                created_by: None,
+            },
+        )
+        .await
+        .expect("create project policy")
+    };
+    drop(conn);
+
+    let ids = listed(&h.get_json(&path, &f.app_member_token).await);
+    assert!(
+        !ids.contains(&project_policy.id),
+        "an app-scoped grant must not list a PROJECT policy it cannot open"
+    );
+    h.assert_status(
+        &format!("/v1/inspector/policies/{}", project_policy.id),
+        &f.app_member_token,
+        403,
+        "app-scoped member opening a project policy by id",
+    )
+    .await;
+
+    // The enrollment id is the app_env policy's target: if this ever became a
+    // catalogue id the two lookups would silently stop matching.
+    let mut conn = h.conn().await;
+    let resolved = repo::app_id_for_enrollment(&mut conn, f.enrollment_id)
+        .await
+        .expect("resolve enrollment");
+    drop(conn);
+    assert_eq!(
+        resolved,
+        Some(f.app_id),
+        "the app_env policy's target must be an ENROLLMENT id"
     );
 
     h.shutdown().await;

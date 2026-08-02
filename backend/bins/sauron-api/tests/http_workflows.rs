@@ -43,8 +43,30 @@ fn swap_database(url: &str, new_db: &str) -> String {
 
 /// See `tests/http_env_scoping.rs`'s identical helper for the full reasoning.
 fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Every port this process has already handed out.
+    static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+    let issued = ISSUED.get_or_init(|| Mutex::new(HashSet::new()));
+    for _ in 0..100 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        // `insert` returns false if we have issued this port before. The probe
+        // listener is dropped on return so the child can bind, and the kernel is
+        // then free to hand the same port to the next caller — which is exactly
+        // what happens, because tests in one binary run on parallel threads and
+        // two `TestServer::start()` calls race here. The loser's `sauron-api`
+        // died with "Address already in use" and the harness reported it as
+        // "exited early", which reads like a product fault rather than a
+        // harness one. The probe bind still rules out ports held by other
+        // processes; the set rules out the ones we handed to ourselves.
+        if issued.lock().expect("port registry").insert(port) {
+            return port;
+        }
+    }
+    panic!("no unused ephemeral port after 100 attempts");
 }
 
 /// Percent-encode a path *segment* the hard way (no `url`/`percent_encoding`
@@ -375,10 +397,10 @@ impl TestServer {
 
         let keys = JwtKeys::new(JWT_SECRET, 900);
         let (owner_token, _) = keys
-            .issue_access(owner.id, false)
+            .issue_access(owner.id, false, None)
             .expect("issue owner access token");
         let (no_event_read_token, _) = keys
-            .issue_access(no_event_read.id, false)
+            .issue_access(no_event_read.id, false, None)
             .expect("issue no_event_read access token");
 
         WorkflowFixture {

@@ -8,6 +8,7 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import EnvironmentsCard from '../lib/components/settings/EnvironmentsCard.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { lockedBy } from '../lib/models/page-access';
   import { getApp, updateApp, deleteApp } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
@@ -21,8 +22,16 @@
   let confirmDelete = $state(false);
   let deleting = $state(false);
 
-  const canUpdate = $derived(app ? sessionStore.can('app:update', { app: app.id }) : false);
-  const canDelete = $derived(app ? sessionStore.can('app:delete', { app: app.id }) : false);
+  // apps.rs:71,106 both use the STRICT `authorize_app`: an env-scoped grant can
+  // read the app (apps.rs:44 uses `authorize_app_reachable`) but must not be
+  // able to rename, mute or delete it. `level: 'app'` is what enforces that
+  // asymmetry client-side.
+  const updateLock = $derived(
+    app ? lockedBy('app:update', { app: app.id, level: 'app' }) : 'app:update',
+  );
+  const deleteLock = $derived(
+    app ? lockedBy('app:delete', { app: app.id, level: 'app' }) : 'app:delete',
+  );
 
   async function load(appId: string) {
     loading = true;
@@ -100,30 +109,28 @@
     </EmptyState>
   {:else}
     <div class="settings-stack">
-      {#if canUpdate}
-        <Card title="Ingest">
+      <Card title="Ingest">
           <p class="card-desc muted">
             {app.ingest_enabled
               ? 'This app is accepting events. Disable to stop ingesting without deleting the app.'
               : 'Ingest is paused. Enable to resume accepting events.'}
           </p>
-          <Button
-            variant={app.ingest_enabled ? 'secondary' : 'primary'}
-            loading={togglingIngest}
-            onclick={toggleIngest}
-          >
-            {app.ingest_enabled ? 'Disable ingest' : 'Enable ingest'}
-          </Button>
-        </Card>
-      {/if}
+        <Button
+          variant={app.ingest_enabled ? 'secondary' : 'primary'}
+          loading={togglingIngest}
+          lockedReason={updateLock}
+          onclick={toggleIngest}
+        >
+          {app.ingest_enabled ? 'Disable ingest' : 'Enable ingest'}
+        </Button>
+      </Card>
 
       <!-- Environments are owned by the project now, so the card needs the app's
            project id as well: creating one is a catalogue write under
            `/v1/projects/{project_id}/environments`, not an app write. -->
       <EnvironmentsCard appId={app.id} projectId={app.project_id} />
 
-      {#if canDelete}
-        <Card title="Delete app">
+      <Card title="Delete app">
           <p class="card-desc muted">
             Permanently delete this app and all of its issues and events. This can't be undone.
           </p>
@@ -136,10 +143,15 @@
               </div>
             </div>
           {:else}
-            <Button variant="danger" onclick={() => (confirmDelete = true)}>Delete app</Button>
+            <Button
+              variant="danger"
+              lockedReason={deleteLock}
+              onclick={() => (confirmDelete = true)}
+            >
+              Delete app
+            </Button>
           {/if}
-        </Card>
-      {/if}
+      </Card>
     </div>
   {/if}
 </AppShell>

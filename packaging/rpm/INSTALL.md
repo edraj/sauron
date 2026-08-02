@@ -63,12 +63,15 @@ sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm
 ## What gets installed
 
 ```
-/usr/bin/sauron-{api,ingest,monitor,tier,migrate,symcli}   /usr/bin/crebain
-/usr/lib/systemd/system/sauron-{api,ingest,monitor,tier,migrate}.service
+/usr/bin/sauron-{api,ingest,monitor,alerts,tier,inspector,migrate,symcli}   /usr/bin/crebain
+/usr/lib/systemd/system/sauron-{api,ingest,monitor,alerts,tier,inspector,migrate}.service
 /usr/lib64/sauron/libduckdb.so  vendored DuckDB library (sauron-tier links it)
 /etc/ld.so.conf.d/sauron.conf   puts /usr/lib64/sauron on the loader path (ldconfig runs on install)
-/etc/sauron/sauron.env          shared: DATABASE_URL, REDIS_URL, RUST_LOG
-/etc/sauron/{api,ingest,monitor,tier,dashboard}.env
+/etc/sauron/sauron.env          shared by every unit: DATABASE_URL, REDIS_URL, RUST_LOG,
+                                and the settings MORE THAN ONE binary reads —
+                                TIER_HOT_DAYS, INSPECTOR_POLICY_CACHE_SECS,
+                                INSPECTOR_TAIL_SWEEP_SECS
+/etc/sauron/{api,ingest,monitor,alerts,tier,inspector,dashboard}.env
 /etc/sauron/secret.env          JWT_SECRET, auto-generated on first install (0640 root:sauron)
 /var/lib/sauron/  /var/lib/sauron/cold        owned by the sauron user
 /usr/share/sauron/dashboard/    static SPA

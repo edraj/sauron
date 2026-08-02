@@ -17,6 +17,7 @@
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import { OCCURRENCE_FIELDS, encodeFilters, type Filter } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { lockedBy } from '../lib/models/page-access';
   import {
     getIssue,
     updateIssueStatus,
@@ -44,7 +45,11 @@
   let updating = $state(false);
 
   const issueId = $derived(params?.id ?? '');
-  const canWrite = $derived(sessionStore.can('issue:write', { app: sessionStore.currentAppId }));
+  // issues.rs:153 uses the STRICT `authorize_app`, so an env-scoped grant that
+  // can read this issue still cannot resolve it.
+  const writeLock = $derived(
+    lockedBy('issue:write', { app: sessionStore.currentAppId, level: 'app' }),
+  );
 
   async function load(appId: string, id: string) {
     loading = true;
@@ -241,25 +246,38 @@
         <h1 class="issue-title">{issue.title}</h1>
         {#if issue.culprit}<p class="culprit mono">{issue.culprit}</p>{/if}
       </div>
-      {#if canWrite}
         <div class="actions">
           {#if issue.status !== 'resolved'}
-            <Button variant="primary" loading={updating} onclick={() => setStatus('resolved')}>
+            <Button
+              variant="primary"
+              loading={updating}
+              lockedReason={writeLock}
+              onclick={() => setStatus('resolved')}
+            >
               Resolve
             </Button>
           {/if}
           {#if issue.status !== 'ignored'}
-            <Button variant="secondary" loading={updating} onclick={() => setStatus('ignored')}>
+            <Button
+              variant="secondary"
+              loading={updating}
+              lockedReason={writeLock}
+              onclick={() => setStatus('ignored')}
+            >
               Ignore
             </Button>
           {/if}
           {#if issue.status !== 'unresolved'}
-            <Button variant="subtle" loading={updating} onclick={() => setStatus('unresolved')}>
+            <Button
+              variant="subtle"
+              loading={updating}
+              lockedReason={writeLock}
+              onclick={() => setStatus('unresolved')}
+            >
               Unresolve
             </Button>
           {/if}
         </div>
-      {/if}
     </header>
 
     <div class="issue-body">

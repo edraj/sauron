@@ -1,6 +1,21 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    auth_sessions (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        created_at -> Timestamptz,
+        last_used_at -> Timestamptz,
+        expires_at -> Timestamptz,
+        user_agent -> Nullable<Text>,
+        ip -> Nullable<Text>,
+        revoked_at -> Nullable<Timestamptz>,
+        revoked_reason -> Nullable<Text>,
+        revoked_by -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
     analytics_events (id) {
         id -> Uuid,
         app_id -> Uuid,
@@ -140,6 +155,12 @@ diesel::table! {
         last_seen -> Timestamptz,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        // Appended, never inserted mid-list: `models::EventUser` derives
+        // `Queryable`, which decodes POSITIONALLY, and `ALTER TABLE … ADD
+        // COLUMN` appends physically. A field inserted in the middle here
+        // would silently bind every later column to the wrong one.
+        identified_at -> Nullable<Timestamptz>,
+        identified_source -> Nullable<Text>,
     }
 }
 
@@ -219,6 +240,24 @@ diesel::table! {
         user_agent -> Nullable<Text>,
         created_at -> Timestamptz,
         revoked_reason -> Nullable<Text>,
+        session_id -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
+    password_reset_tokens (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        token_hash -> Text,
+        password_fingerprint -> Text,
+        mode -> Text,
+        initiated_by -> Nullable<Uuid>,
+        requested_from -> Nullable<Text>,
+        expires_at -> Timestamptz,
+        consumed_at -> Nullable<Timestamptz>,
+        invalidated_at -> Nullable<Timestamptz>,
+        invalidated_reason -> Nullable<Text>,
+        created_at -> Timestamptz,
     }
 }
 
@@ -257,6 +296,7 @@ diesel::table! {
         updated_at -> Timestamptz,
         is_active -> Bool,
         must_change_password -> Bool,
+        credentials_invalidated_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -466,6 +506,242 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    mail_outbox (id) {
+        id -> Uuid,
+        kind -> Text,
+        recipient -> Text,
+        recipient_key -> Text,
+        subject -> Text,
+        body_text -> Text,
+        body_html -> Text,
+        status -> Text,
+        attempts -> Int4,
+        max_attempts -> Int4,
+        next_attempt_at -> Timestamptz,
+        expires_at -> Timestamptz,
+        last_error -> Nullable<Text>,
+        user_id -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        sent_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    notification_subscriptions (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        org_id -> Uuid,
+        scope_type -> Text,
+        scope_id -> Uuid,
+        kind -> Text,
+        enabled -> Bool,
+        disabled_reason -> Nullable<Text>,
+        disabled_at -> Nullable<Timestamptz>,
+        conditions -> Jsonb,
+        delivery -> Text,
+        throttle_seconds -> Int4,
+        quiet_start_min -> Nullable<Int2>,
+        quiet_end_min -> Nullable<Int2>,
+        quiet_tz -> Text,
+        last_evaluated_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    notification_subscription_envs (subscription_id, environment_id) {
+        subscription_id -> Uuid,
+        environment_id -> Uuid,
+    }
+}
+
+diesel::table! {
+    notification_queue (id) {
+        id -> Uuid,
+        subscription_id -> Uuid,
+        user_id -> Uuid,
+        org_id -> Uuid,
+        project_id -> Uuid,
+        app_id -> Nullable<Uuid>,
+        includes_unattributed -> Bool,
+        kind -> Text,
+        dedup_key -> Text,
+        severity -> Text,
+        title -> Nullable<Text>,
+        body -> Nullable<Text>,
+        link -> Nullable<Text>,
+        occurred_at -> Timestamptz,
+        deliver_after -> Timestamptz,
+        status -> Text,
+        attempts -> Int2,
+        message_id -> Nullable<Uuid>,
+        claimed_at -> Nullable<Timestamptz>,
+        sent_at -> Nullable<Timestamptz>,
+        finished_at -> Nullable<Timestamptz>,
+        error -> Nullable<Text>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    notification_queue_envs (queue_id, environment_id) {
+        queue_id -> Uuid,
+        environment_id -> Uuid,
+    }
+}
+
+diesel::table! {
+    inspector_policies (id) {
+        id -> Uuid,
+        org_id -> Uuid,
+        target_type -> Text,
+        target_id -> Uuid,
+        enabled -> Bool,
+        tracked_keys -> Jsonb,
+        detectors -> Jsonb,
+        scan_columns -> Nullable<Jsonb>,
+        rollups -> Jsonb,
+        window_days -> Int4,
+        schedule_enabled -> Bool,
+        schedule_days -> Int2,
+        schedule_time -> Time,
+        schedule_tz -> Text,
+        next_run_at -> Nullable<Timestamptz>,
+        last_run_at -> Nullable<Timestamptz>,
+        last_scan_id -> Nullable<Uuid>,
+        last_skip_reason -> Text,
+        created_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    inspector_scans (id) {
+        id -> Uuid,
+        policy_id -> Uuid,
+        org_id -> Uuid,
+        trigger_type -> Text,
+        requested_by -> Nullable<Uuid>,
+        status -> Text,
+        coverage -> Text,
+        coverage_note -> Text,
+        window_from -> Timestamptz,
+        window_to -> Timestamptz,
+        params -> Jsonb,
+        targets -> Jsonb,
+        units_total -> Int4,
+        units_done -> Int4,
+        cursor -> Jsonb,
+        rows_scanned -> Int8,
+        findings_count -> Int4,
+        findings_reaped_at -> Nullable<Timestamptz>,
+        worker_id -> Nullable<Text>,
+        heartbeat_at -> Nullable<Timestamptz>,
+        attempts -> Int4,
+        cancel_requested_at -> Nullable<Timestamptz>,
+        error -> Text,
+        started_at -> Nullable<Timestamptz>,
+        finished_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    inspector_findings (id) {
+        id -> Uuid,
+        scan_id -> Uuid,
+        org_id -> Uuid,
+        app_id -> Uuid,
+        environment_id -> Nullable<Uuid>,
+        env_scope -> Text,
+        source_table -> Text,
+        source_column -> Text,
+        key_path -> Text,
+        matched_key -> Text,
+        detector -> Text,
+        value_type -> Text,
+        match_count -> Int8,
+        match_count_exact -> Bool,
+        sample_preview -> Text,
+        sample_row_id -> Nullable<Uuid>,
+        sample_occurred_at -> Nullable<Timestamptz>,
+        partition_kind -> Text,
+        first_seen_at -> Nullable<Timestamptz>,
+        last_seen_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    inspector_mask_actions (id) {
+        id -> Uuid,
+        org_id -> Uuid,
+        app_id -> Uuid,
+        kind -> Text,
+        finding_id -> Nullable<Uuid>,
+        scan_id -> Nullable<Uuid>,
+        targets -> Jsonb,
+        status -> Text,
+        requested_by -> Nullable<Uuid>,
+        requested_by_email -> Text,
+        cancelled_by -> Nullable<Uuid>,
+        cancelled_by_email -> Text,
+        cancelled_at -> Nullable<Timestamptz>,
+        requested_at -> Timestamptz,
+        previewed_at -> Nullable<Timestamptz>,
+        confirmed_at -> Nullable<Timestamptz>,
+        started_at -> Nullable<Timestamptz>,
+        finished_at -> Nullable<Timestamptz>,
+        confirm_source -> Text,
+        estimated_rows -> Int8,
+        rows_scanned -> Int8,
+        rows_masked -> Int8,
+        cold_rows_skipped -> Int8,
+        cold_boundary_at -> Nullable<Timestamptz>,
+        day_cursor -> Nullable<Date>,
+        cursor_occurred_at -> Nullable<Timestamptz>,
+        cursor_id -> Nullable<Uuid>,
+        phase -> Text,
+        worker_id -> Nullable<Text>,
+        claimed_at -> Nullable<Timestamptz>,
+        vacuum_advised -> Bool,
+        error -> Text,
+    }
+}
+
+diesel::table! {
+    inspector_masked_keys (id) {
+        id -> Uuid,
+        app_id -> Uuid,
+        target_table -> Text,
+        target_column -> Text,
+        json_path -> Text,
+        created_at -> Timestamptz,
+        created_by -> Nullable<Uuid>,
+        source_action_id -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
+    inspector_reveal_audit (id) {
+        id -> Uuid,
+        app_id -> Uuid,
+        org_id -> Uuid,
+        finding_id -> Nullable<Uuid>,
+        user_id -> Nullable<Uuid>,
+        user_email -> Text,
+        source_table -> Text,
+        source_column -> Text,
+        key_path -> Text,
+        request_source -> Text,
+        created_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(analytics_events -> apps (app_id));
 diesel::joinable!(analytics_events -> app_environments (environment_id));
 diesel::joinable!(sessions -> apps (app_id));
@@ -483,7 +759,16 @@ diesel::joinable!(identities -> apps (app_id));
 diesel::joinable!(issues -> apps (app_id));
 diesel::joinable!(issues -> users (assignee_id));
 diesel::joinable!(projects -> organizations (org_id));
+// Deliberately the only association declared for this table. diesel allows one association per
+// table pair, no query in this slice joins auth_sessions to refresh_tokens in the DSL (all
+// multi-table work is raw CTEs), and `revoked_by` would need a second users association diesel
+// cannot express -- an unused joinable is a future ambiguous-join trap.
+diesel::joinable!(auth_sessions -> users (user_id));
 diesel::joinable!(refresh_tokens -> users (user_id));
+// Only the user_id FK. `password_reset_tokens` has two FKs to `users` and
+// `joinable!` accepts one per table pair, so a future query for the initiating
+// admin's email needs an explicit `.on(...)` rather than a second line here.
+diesel::joinable!(password_reset_tokens -> users (user_id));
 diesel::joinable!(role_grants -> organizations (org_id));
 diesel::joinable!(role_grants -> roles (role_id));
 diesel::joinable!(role_grants -> users (user_id));
@@ -499,9 +784,28 @@ diesel::joinable!(alert_rule_channels -> notification_channels (channel_id));
 diesel::joinable!(alert_events -> organizations (org_id));
 diesel::joinable!(workflows -> apps (app_id));
 diesel::joinable!(workflows -> app_environments (environment_id));
+diesel::joinable!(mail_outbox -> users (user_id));
+diesel::joinable!(notification_subscriptions -> users (user_id));
+diesel::joinable!(notification_subscriptions -> organizations (org_id));
+diesel::joinable!(notification_subscription_envs -> notification_subscriptions (subscription_id));
+diesel::joinable!(notification_queue -> notification_subscriptions (subscription_id));
+diesel::joinable!(notification_queue_envs -> notification_queue (queue_id));
+// No `joinable!` for the nullable `created_by`/`requested_by` FKs to `users`:
+// that matches `alert_rules.created_by`, which has none. An unused association
+// is a future ambiguous-join trap.
+diesel::joinable!(inspector_policies -> organizations (org_id));
+diesel::joinable!(inspector_scans -> inspector_policies (policy_id));
+diesel::joinable!(inspector_scans -> organizations (org_id));
+diesel::joinable!(inspector_findings -> inspector_scans (scan_id));
+diesel::joinable!(inspector_findings -> apps (app_id));
+diesel::joinable!(inspector_mask_actions -> organizations (org_id));
+diesel::joinable!(inspector_mask_actions -> apps (app_id));
+diesel::joinable!(inspector_masked_keys -> apps (app_id));
+diesel::joinable!(inspector_reveal_audit -> apps (app_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
+    auth_sessions,
     app_environments,
     apps,
     environments,
@@ -512,6 +816,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     organizations,
     projects,
     refresh_tokens,
+    password_reset_tokens,
     role_grants,
     roles,
     users,
@@ -530,4 +835,15 @@ diesel::allow_tables_to_appear_in_same_query!(
     alert_rule_channels,
     alert_events,
     workflows,
+    mail_outbox,
+    notification_subscriptions,
+    notification_subscription_envs,
+    notification_queue,
+    notification_queue_envs,
+    inspector_policies,
+    inspector_scans,
+    inspector_findings,
+    inspector_mask_actions,
+    inspector_masked_keys,
+    inspector_reveal_audit,
 );

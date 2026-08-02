@@ -66,6 +66,11 @@ export function setScreen(name: string): void {
 export function identify(id: string, traits: Record<string, unknown> = {}): void {
   const client = getClient();
   if (!client) return;
+  // `null` unless the anon id was actually used as a distinct_id in this
+  // browser session. `process_identify` inserts a permanent
+  // `identities(app_id, alias_id, distinct_id)` row for any non-empty
+  // anonymous_id, and that row is now a LIVE signal (the 000038 backfill reads
+  // it), so a speculative alias is a durable server-side mis-merge.
   const anonymousId = client.getAnonymousId();
   client.getScope().setUser({ id, traits });
   const item: IdentifyItem = {

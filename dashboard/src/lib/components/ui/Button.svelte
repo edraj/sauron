@@ -1,6 +1,9 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import Spinner from './Spinner.svelte';
+  import Icon from './Icon.svelte';
+  import type { Permission } from '../../models';
+  import { lockTitle } from '../../models/page-access';
 
   type Variant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'subtle';
   type Size = 'sm' | 'md' | 'lg';
@@ -14,6 +17,16 @@
     loading?: boolean;
     fullWidth?: boolean;
     title?: string;
+    /**
+     * The permission the user is missing, or `null` if they may act — the
+     * shape `lockedBy()` returns, so a call site never needs a ternary.
+     *
+     * Non-null disables the button, prefixes a lock glyph, and sets a title
+     * naming the permission. Prefer this over hiding the control: a user who
+     * cannot see a capability cannot learn it exists or ask for it, and a
+     * plain `disabled` never explains itself.
+     */
+    lockedReason?: Permission | null;
     onclick?: (event: MouseEvent) => void;
     children: Snippet;
   }
@@ -27,11 +40,18 @@
     loading = false,
     fullWidth = false,
     title,
+    lockedReason = null,
     onclick,
     children,
   }: Props = $props();
 
-  const isDisabled = $derived(disabled || loading);
+  // Folding the lock into `isDisabled` also routes a locked `href` button
+  // through the <button> branch below, which matters: an <a> cannot be
+  // disabled, so a locked link would otherwise stay fully clickable.
+  const isDisabled = $derived(disabled || loading || lockedReason !== null);
+  // The lock reason outranks a caller-supplied title — why you cannot act
+  // matters more than whatever hint it replaces.
+  const resolvedTitle = $derived(lockedReason ? lockTitle(lockedReason) : title);
 </script>
 
 {#if href && !isDisabled}
@@ -39,7 +59,7 @@
     class="btn {variant} {size}"
     class:full={fullWidth}
     {href}
-    {title}
+    title={resolvedTitle}
     {onclick}
   >
     {@render children()}
@@ -50,14 +70,17 @@
     class:full={fullWidth}
     class:is-loading={loading}
     {type}
-    {title}
+    title={resolvedTitle}
     disabled={isDisabled}
     onclick={onclick}
   >
     {#if loading}
       <span class="spin"><Spinner size={size === 'sm' ? 14 : 16} /></span>
     {/if}
-    <span class="label" class:hidden={loading}>{@render children()}</span>
+    <span class="label" class:hidden={loading}>
+      {#if lockedReason}<span class="lock" aria-hidden="true"><Icon name="lock" size={13} /></span
+        >{/if}{@render children()}
+    </span>
   </button>
 {/if}
 
@@ -167,5 +190,11 @@
 
   .label.hidden {
     visibility: hidden;
+  }
+
+  .lock {
+    display: inline-flex;
+    vertical-align: -2px;
+    margin-right: 5px;
   }
 </style>

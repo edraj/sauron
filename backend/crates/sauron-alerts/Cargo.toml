@@ -10,10 +10,11 @@ sauron-core = { workspace = true }
 sauron-db = { workspace = true }
 sauron-redis = { workspace = true }
 sauron-monitor-core = { workspace = true }
+sauron-auth = { workspace = true }
+sauron-mail = { workspace = true }
 
 tokio = { workspace = true }
 reqwest = { workspace = true }
-lettre = { workspace = true }
 aes-gcm = { workspace = true }
 
 serde = { workspace = true }

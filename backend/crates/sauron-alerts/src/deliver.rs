@@ -4,11 +4,7 @@
 
 use std::time::Duration;
 
-use lettre::message::header::ContentType;
-use lettre::message::Mailbox;
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::transport::smtp::client::TlsParameters;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use sauron_mail::{MailBody, OutgoingMail, SmtpParams, SmtpTls};
 use serde_json::json;
 
 use crate::channel::{Destination, UrlFormat};
@@ -141,63 +137,52 @@ async fn deliver_email(
     message: &str,
     opts: &DeliverOpts,
 ) -> Result<(), String> {
-    let from: Mailbox = e
-        .from
-        .parse()
-        .map_err(|_| format!("invalid from address: {}", e.from))?;
-    let subject = render::email_subject(ctx);
-    let body = render::email_body(ctx, message);
-
-    let mut builder = Message::builder().from(from).subject(subject);
-    for rcpt in &e.to {
-        let mbox: Mailbox = rcpt
-            .parse()
-            .map_err(|_| format!("invalid recipient: {rcpt}"))?;
-        builder = builder.to(mbox);
-    }
-    let email = builder
-        .header(ContentType::TEXT_PLAIN)
-        .body(body)
-        .map_err(|err| format!("email build failed: {err}"))?;
-
-    // SSRF: resolve the relay ONCE, validate it, and connect to that exact
-    // address. TLS still validates the certificate against the configured
-    // hostname, so pinning the IP costs no authenticity — it only removes the
-    // second, unchecked resolution lettre would otherwise perform.
-    let connect_host = if opts.allow_private {
-        e.host.clone()
-    } else {
-        let addrs = sauron_monitor_core::ssrf::resolve_checked(&e.host, false).await?;
-        addrs
-            .first()
-            .map(|a| a.ip().to_string())
-            .ok_or_else(|| format!("{} did not resolve", e.host))?
+    // Everything this function used to do by hand — SSRF resolution, IP pinning,
+    // TLS selection, credential wiring, message building — now happens once in
+    // `sauron-mail`, so the reset-mail path and the alert path cannot drift apart
+    // on any of it. The one behaviour that CHANGES here is the total deadline:
+    // lettre applies its timeout per socket operation, so before this a
+    // tarpitting relay could hold one alert delivery indefinitely.
+    let params = SmtpParams {
+        host: e.host.clone(),
+        port: e.port,
+        username: e.username.clone(),
+        password: e.password.clone(),
+        // Only ever Implicit or StartTls here, so this path's "never cleartext"
+        // guarantee is preserved exactly — `SmtpTls::None` is unreachable from a
+        // notification channel.
+        tls: if e.implicit_tls {
+            SmtpTls::Implicit
+        } else {
+            SmtpTls::StartTls
+        },
+        allow_private: opts.allow_private,
+        // Unreachable rather than merely unset: the `tls` above is only ever
+        // Implicit or StartTls, so the cleartext branch this waives never runs on
+        // this path. A per-org notification channel must not be able to opt its
+        // own delivery out of TLS.
+        insecure_plaintext: false,
+        op_timeout: opts.timeout,
+        total_deadline: std::cmp::min(opts.timeout * 3, Duration::from_secs(60)),
+        sink: false,
+        sink_log_body: false,
     };
 
-    // Implicit TLS (SMTPS) vs STARTTLS. We never fall back to cleartext:
-    // `Tls::Wrapper` handshakes immediately and `Tls::Required` aborts if the
-    // server will not upgrade.
-    let tls_params = TlsParameters::new(e.host.clone())
-        .map_err(|err| format!("smtp tls setup failed: {err}"))?;
-    let tls = if e.implicit_tls {
-        lettre::transport::smtp::client::Tls::Wrapper(tls_params)
-    } else {
-        lettre::transport::smtp::client::Tls::Required(tls_params)
+    let mail = OutgoingMail {
+        from_address: e.from.clone(),
+        from_name: None,
+        to: e.to.clone(),
+        reply_to: None,
+        subject: render::email_subject(ctx),
+        // Text, not Alternative: alert mail stays byte-identical to what it has
+        // always been. Rendering it through the new HTML layout is an obvious
+        // follow-up and an obvious way to break six channel kinds at once.
+        body: MailBody::Text(render::email_body(ctx, message)),
     };
 
-    let mut tb = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(connect_host)
-        .tls(tls)
-        .port(e.port)
-        .timeout(Some(opts.timeout));
-    if let (Some(u), Some(p)) = (e.username.clone(), e.password.clone()) {
-        tb = tb.credentials(Credentials::new(u, p));
-    }
-    let transport = tb.build();
-    transport
-        .send(email)
+    sauron_mail::send(&params, &mail)
         .await
-        .map(|_| ())
-        .map_err(|err| format!("smtp send failed: {err}"))
+        .map_err(|err| err.to_string())
 }
 
 /// Minimal path-segment encoder for the few characters Matrix room ids contain

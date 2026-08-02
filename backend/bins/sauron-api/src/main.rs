@@ -5,9 +5,12 @@
 //! caller's org/project membership.
 
 mod admin_storage;
+mod csv;
 mod error;
+mod mail;
 mod routes;
 mod symbolicate;
+mod tasks;
 mod tier_read;
 
 use std::net::SocketAddr;
@@ -24,7 +27,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Hard ceiling on a JSON request body. Large binary uploads go through the
 /// separately-merged artifact routes, which carry their own raised limit.
@@ -34,6 +37,21 @@ const API_JSON_BODY_LIMIT: usize = 1024 * 1024;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Requests admitted concurrently before the service starts shedding load.
 const MAX_INFLIGHT_REQUESTS: usize = 512;
+/// How often the outbox is expired, scrubbed and pruned. A compile-time constant
+/// rather than a variable: three files of documentation for a number nobody tunes
+/// is how a config surface becomes unmaintainable.
+const MAIL_HYGIENE_INTERVAL: Duration = Duration::from_secs(900);
+/// How long a reset row survives, consumed or not.
+///
+/// This table is the only audit trail the deployment has that an admin forced a
+/// reset on someone — there is no `audit_events` table — so this constant also
+/// caps how far back that question can be answered. A compile-time constant
+/// rather than an env var: a handful of tiny short-lived rows do not justify
+/// three files of documentation.
+const PASSWORD_RESET_RETENTION_DAYS: i64 = 30;
+/// Footer line on every product email. Deliberately says nothing about why the
+/// recipient is receiving it — each sender's own footnotes do that.
+const MAIL_FOOTER: &str = "Sent by Sauron. This mailbox is not monitored.";
 
 use sauron_auth::JwtKeys;
 use sauron_core::Config;
@@ -52,6 +70,29 @@ pub struct AppState {
     pub symbolicator: Arc<sauron_symbols::Symbolicator>,
     /// Alert dispatch (channel secret crypto + SSRF-safe delivery).
     pub alerts: sauron_alerts::AlertEngine,
+    /// Revoked sessions this replica knows about. Read by the `AuthUser`
+    /// extractor on every authenticated request; refreshed by the
+    /// `revocation-poll` background task.
+    pub revocations: sauron_auth::SessionRevocations,
+    /// `None` when SMTP is unconfigured. Every caller must degrade rather than
+    /// fail: the API has to boot and serve everything else on a deployment with
+    /// no relay. An unauthenticated route's response must be identical either
+    /// way — a response that distinguishes configured from unconfigured is a
+    /// config oracle handed to anyone on the internet.
+    pub mail: Option<crate::mail::MailSender>,
+    /// Admission gate for the active-users report — the heaviest query in the
+    /// product, runnable by the lowest-privileged role. Three permits, and a
+    /// 503 rather than a queue: the DB pool is 16 for the whole process, so
+    /// queueing here would surface as pool-checkout 500s on unrelated
+    /// endpoints, including /v1/auth/login and /health.
+    pub active_users_gate: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Whether `event_users.identified_at` exists, probed once at boot.
+    ///
+    /// Probed rather than assumed because RPM upgrades do not re-run
+    /// `sauron-migrate`. Refusing to START would be an unnecessary
+    /// deployment-wide outage over one endpoint, so this only turns the
+    /// active-users routes into a 503 that names the fix.
+    pub event_users_identified: bool,
 }
 
 impl FromRef<AppState> for JwtKeys {
@@ -60,10 +101,18 @@ impl FromRef<AppState> for JwtKeys {
     }
 }
 
+impl FromRef<AppState> for sauron_auth::SessionRevocations {
+    fn from_ref(state: &AppState) -> sauron_auth::SessionRevocations {
+        state.revocations.clone()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     sauron_telemetry::init("sauron-api");
-    let cfg = Config::from_env()?;
+    // Behind an Arc from the start: the background tasks below capture settings
+    // out of it, and the state build would otherwise move it first.
+    let cfg = Arc::new(Config::from_env()?);
 
     let pool = sauron_db::build_pool(&cfg.database_url, 16)?;
     let redis = RedisStore::connect(&cfg.redis_url).await?;
@@ -79,11 +128,24 @@ async fn main() -> anyhow::Result<()> {
     // Allow artifact uploads well above axum's 2 MB default body limit.
     let artifact_body_limit = (cfg.symbols_max_artifact_mb + 8) * 1024 * 1024;
 
-    // Keep the seeded preset roles in sync with code.
-    {
+    // Keep the seeded preset roles in sync with code, and learn once whether
+    // the schema is ahead of or behind this binary.
+    let event_users_identified = {
         let mut conn = sauron_db::conn(&pool).await?;
         sauron_auth::ensure_preset_roles(&mut conn).await?;
-    }
+        let present = sauron_db::repo::probe_event_users_identified(&mut conn)
+            .await
+            .is_ok();
+        drop(conn);
+        if !present {
+            tracing::error!(
+                "event_users.identified_at is missing — run sauron-migrate (see \
+                 packaging/rpm/SETUP.md §11). GET /v1/projects/{{project_id}}/active-users \
+                 will return 503 schema_migration_required until it is applied."
+            );
+        }
+        present
+    };
 
     let port = cfg.api_port;
     let origins: Vec<HeaderValue> = cfg
@@ -109,15 +171,195 @@ async fn main() -> anyhow::Result<()> {
         cfg.alerts_deliver_timeout_ms,
     );
 
+    // The pool is moved into the state below; the hygiene task needs its own
+    // handle.
+    let hygiene_pool = pool.clone();
+
+    let branding = sauron_mail::Branding {
+        product_name: "Sauron".to_string(),
+        // `.ok()` on purpose: an unset DASHBOARD_URL disables link-bearing mail
+        // at render time with a message naming the variable, rather than
+        // preventing the process from booting.
+        dashboard_url: cfg.require_dashboard_url().ok().map(|s| s.to_string()),
+        footer: MAIL_FOOTER.to_string(),
+    };
+
+    let mail = match cfg.require_smtp() {
+        Err(e) => {
+            // Two very different situations reach here, and logging them at the
+            // same level buried the second one. Nothing configured is the
+            // ordinary state of a deployment that never wanted transactional
+            // email — one INFO line, not a warning and not a failure. But a
+            // relay that WAS configured and then refused (a bad SMTP_FROM, a
+            // cleartext relay off-box) is a misconfiguration whose entire
+            // visible symptom is that password reset silently never arrives.
+            // That one an operator has to be able to find, and an INFO line
+            // identical to "you didn't set this up" is not findable.
+            if std::env::var("SMTP_HOST").is_ok_and(|v| !v.trim().is_empty()) {
+                warn!(reason = %e, "SMTP_HOST is set but the relay was refused; password reset and every other transactional email is DISABLED");
+            } else {
+                info!(reason = %e, "transactional email disabled");
+            }
+            None
+        }
+        Ok(s) => {
+            let mut params = sauron_mail::SmtpParams::from_settings(s);
+            // Two explicit variables, because logs are routinely shipped to an
+            // aggregator with a broader reader set and a longer retention than the
+            // database. RUST_LOG is no gate: the shipped default is
+            // `info,sauron=debug` and EnvFilter matches targets by prefix.
+            params.sink_log_body = s.sink && cfg.dev_mode;
+            if s.sink {
+                tracing::warn!(
+                    log_bodies = params.sink_log_body,
+                    "SMTP_SINK=1: transactional email is written to the log and NEVER \
+                     transmitted; rows are recorded as status='sink'"
+                );
+            }
+            Some(mail::MailSender::new(
+                pool.clone(),
+                params,
+                s.from_address.clone(),
+                s.from_name.clone(),
+                branding,
+            ))
+        }
+    };
+
+    // The drain only exists where a relay does.
+    if let Some(sender) = mail.clone() {
+        let tick = Duration::from_secs(cfg.mail_drain_tick_secs);
+        tasks::supervise("mail_drain", tick, move || {
+            let s = sender.clone();
+            async move {
+                s.drain_once().await;
+                Ok(())
+            }
+        });
+    }
+
+    // UNCONDITIONAL, and that is the whole point of splitting it out. An operator
+    // who enables SMTP, sends reset mail, then unsets SMTP_HOST — rotating
+    // relays, cutting cost, or responding to an incident — would otherwise leave
+    // every pending row, each holding a working reset URL, in Postgres
+    // permanently, backed up and replicated, with no code path that will ever
+    // touch it again.
+    let retention_days = cfg.mail_outbox_retention_days;
+    tasks::supervise("mail_hygiene", MAIL_HYGIENE_INTERVAL, move || {
+        let p = hygiene_pool.clone();
+        async move { mail::hygiene(&p, retention_days).await }
+    });
+
     let state = AppState {
         pool,
         redis,
         keys,
-        cfg: Arc::new(cfg),
+        cfg: cfg.clone(),
         symbols,
         symbolicator,
         alerts,
+        revocations: sauron_auth::SessionRevocations::new(),
+        mail,
+        active_users_gate: Arc::new(tokio::sync::Semaphore::new(3)),
+        event_users_identified,
     };
+
+    // Floored at 900 on purpose. The correctness argument — "a token minted
+    // before a revocation older than the access TTL has already expired on its
+    // own exp" — only holds if the TTL never DECREASES. An operator hardening
+    // 900 -> 120 and restarting leaves pre-restart tokens alive for 900s against
+    // a 240s window: ~11 minutes of accepted-but-revoked access, with no error
+    // and no log. Clamped above because JWT_ACCESS_TTL_SECS is an unvalidated
+    // i64 from the environment; `parse()` has no floor, no ceiling and no sign
+    // check, and a negative value cast to u64 wraps to ~1.8e19.
+    let revocation_window_secs = state.cfg.jwt_access_ttl_secs.clamp(900, 86_400) + 120;
+    let revocation_poll = Duration::from_secs(state.cfg.auth_revocation_poll_secs.clamp(1, 60));
+
+    // Deliberately NOT preceded by a synchronous `revocations.refresh(..).await?`
+    // before the listener binds — see tasks.rs. The snapshot starts empty and the
+    // supervisor retries; one poll interval of stale revocation data on a cold
+    // start is strictly smaller than the 900-second window that exists today.
+    {
+        let revocations = state.revocations.clone();
+        let pool = state.pool.clone();
+        tasks::supervise("revocation-poll", revocation_poll, move || {
+            let revocations = revocations.clone();
+            let pool = pool.clone();
+            async move {
+                revocations.refresh(&pool, revocation_window_secs).await?;
+                Ok(())
+            }
+        });
+    }
+
+    {
+        // `auth_sessions` is a permanent per-user record of where and on what
+        // device someone signed in, and its partial index is proportional to
+        // lifetime logins, not to live sessions — nothing writes `revoked_at`
+        // when a session merely expires. The reaper lives here because the rule
+        // is that a table's reaper runs in the process that owns its write path.
+        let pool = state.pool.clone();
+        tasks::supervise(
+            "auth-session-reaper",
+            Duration::from_secs(86_400),
+            move || {
+                let pool = pool.clone();
+                async move {
+                    let mut conn = sauron_db::conn(&pool).await?;
+                    let deleted = sauron_db::repo::prune_auth_sessions(
+                        &mut conn,
+                        sauron_db::repo::AUTH_SESSION_RETENTION_DAYS,
+                    )
+                    .await?;
+                    // The API pool is 16 for the whole process; never hold a slot
+                    // across work that does not need one.
+                    drop(conn);
+                    if deleted > 0 {
+                        tracing::info!(deleted, "pruned expired and long-revoked auth_sessions");
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    {
+        // Lives here, not in `sauron-alerts`. packaging/rpm/SETUP.md's shipped
+        // install line is
+        // `systemctl enable --now sauron-api sauron-ingest sauron-monitor sauron-tier`,
+        // there is no preset file under packaging/rpm/, and `%systemd_post` falls
+        // through to the distro default of `disable` — so on every RPM deployment a
+        // reaper in that binary would simply never run, while this table's write
+        // path is an unauthenticated endpoint. The rule is that a table's reaper
+        // lives in the process that owns its write path.
+        //
+        // Deleting these rows disables nothing: unlike `refresh_tokens`, whose
+        // revoked rows are load-bearing for replay detection, nothing reads a dead
+        // reset row.
+        let pool = state.pool.clone();
+        tasks::supervise(
+            "password_reset_reaper",
+            Duration::from_secs(3600),
+            move || {
+                let pool = pool.clone();
+                async move {
+                    let mut conn = sauron_db::conn(&pool).await?;
+                    let removed = sauron_db::repo::prune_password_reset_tokens(
+                        &mut conn,
+                        PASSWORD_RESET_RETENTION_DAYS,
+                    )
+                    .await?;
+                    // Checked out, worked, dropped — the API pool is 16 for the
+                    // whole process and this loop must not hold one between ticks.
+                    drop(conn);
+                    if removed > 0 {
+                        tracing::info!(removed, "pruned expired password reset tokens");
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
 
     // Symbol-artifact routes carry large binary uploads, so they get their own
     // raised body limit (merged separately from the JSON API).
@@ -141,18 +383,50 @@ async fn main() -> anyhow::Result<()> {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        // In BOTH shipped topologies the dashboard origin is not the API
+        // origin (nginx serves the SPA on :80 with API_BASE_URL elsewhere; dev
+        // is :3000 vs :8090), so without this
+        // `res.headers['content-disposition']` is `undefined` in the browser
+        // and every CSV download silently falls back to a generic filename —
+        // a bug that reproduces in dev AND in production.
+        .expose_headers([header::CONTENT_DISPOSITION]);
 
     let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health))
         // --- auth ---
         .route("/v1/auth/register", post(routes::auth::register))
         .route("/v1/auth/login", post(routes::auth::login))
         .route("/v1/auth/refresh", post(routes::auth::refresh))
         .route("/v1/auth/logout", post(routes::auth::logout))
+        // Unauthenticated by design: the reset token travels in the body/URL
+        // fragment, never as a bearer, so `password_change_gate` is never
+        // reached and the extractor's allowlist stays exactly two paths.
+        .route(
+            "/v1/auth/forgot-password",
+            post(routes::auth::forgot_password),
+        )
+        .route(
+            "/v1/auth/reset-password",
+            post(routes::auth::reset_password),
+        )
         // Path must match the extractor's forced-change allowlist exactly.
         .route("/v1/auth/password", post(routes::auth::change_password))
         .route("/v1/me", get(routes::auth::me))
+        // --- the caller's own account ---
+        // Not `/v1/sessions` — that name is taken by product telemetry
+        // (`GET /v1/apps/{app_id}/sessions`). None of these match
+        // `/v1/apps/{app_id}/...`, so `routes::scope::reject_environment_id` is
+        // not required and the env-scoping router enumeration does not see them.
+        .route("/v1/me/sessions", get(routes::account::list_sessions))
+        .route(
+            "/v1/me/sessions/{session_id}",
+            delete(routes::account::revoke_session),
+        )
+        .route(
+            "/v1/me/sessions/revoke-others",
+            post(routes::account::revoke_other_sessions),
+        )
         // --- orgs, members, grants, roles ---
         .route(
             "/v1/orgs",
@@ -166,6 +440,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/orgs/{org_id}/members/{user_id}",
             patch(routes::orgs::set_member_active),
+        )
+        .route(
+            "/v1/orgs/{org_id}/members/{user_id}/password-reset",
+            post(routes::orgs::reset_member_password),
+        )
+        .route(
+            "/v1/orgs/{org_id}/members/{user_id}/revoke-sessions",
+            post(routes::orgs::revoke_member_sessions),
         )
         .route("/v1/orgs/{org_id}/grants", post(routes::orgs::create_grant))
         .route(
@@ -359,6 +641,18 @@ async fn main() -> anyhow::Result<()> {
             "/v1/monitors/{monitor_id}/incidents",
             get(routes::monitors::incidents),
         )
+        // --- combined active users (project-scoped) ---
+        .route(
+            "/v1/projects/{project_id}/active-users",
+            get(routes::active_users::active_users),
+        )
+        // A separate route, not `?format=csv`: browsers download GETs, the view
+        // must stay bookmarkable, and one handler returning two content types
+        // collapses its success type to `Response` for both.
+        .route(
+            "/v1/projects/{project_id}/active-users.csv",
+            get(routes::active_users::active_users_csv),
+        )
         // --- performance (app-scoped) ---
         .route(
             "/v1/apps/{app_id}/performance/summary",
@@ -398,6 +692,87 @@ async fn main() -> anyhow::Result<()> {
             get(routes::notifications::list_history),
         )
         .route("/v1/alert-meta", get(routes::notifications::meta))
+        .route(
+            "/v1/me/notification-subscriptions",
+            get(routes::notification_prefs::list_subscriptions)
+                .post(routes::notification_prefs::create_subscription),
+        )
+        .route(
+            "/v1/me/notification-subscriptions/{id}",
+            patch(routes::notification_prefs::patch_subscription)
+                .delete(routes::notification_prefs::delete_subscription_route),
+        )
+        .route(
+            "/v1/me/notifications",
+            get(routes::notification_prefs::list_notifications),
+        )
+        .route(
+            "/v1/notifications/unsubscribe",
+            post(routes::notification_prefs::unsubscribe),
+        )
+        // --- pii inspector ---
+        .route(
+            "/v1/orgs/{org_id}/inspector/policies",
+            get(routes::inspector::list_policies).post(routes::inspector::create_policy),
+        )
+        .route(
+            "/v1/inspector/policies/{policy_id}",
+            get(routes::inspector::get_policy)
+                .patch(routes::inspector::patch_policy)
+                .delete(routes::inspector::delete_policy),
+        )
+        .route(
+            "/v1/apps/{app_id}/inspector/policy",
+            get(routes::inspector::effective_policy),
+        )
+        .route(
+            "/v1/inspector/policies/{policy_id}/scans",
+            get(routes::inspector::list_scans).post(routes::inspector::start_scan),
+        )
+        .route(
+            "/v1/inspector/scans/{scan_id}",
+            get(routes::inspector::get_scan),
+        )
+        .route(
+            "/v1/inspector/scans/{scan_id}/cancel",
+            post(routes::inspector::cancel_scan),
+        )
+        .route(
+            "/v1/inspector/scans/{scan_id}/findings",
+            get(routes::inspector::list_findings),
+        )
+        .route(
+            "/v1/inspector/findings/{finding_id}/reveal",
+            post(routes::inspector::reveal_finding),
+        )
+        .route(
+            "/v1/apps/{app_id}/inspector/mask-preview",
+            post(routes::inspector::mask_preview),
+        )
+        .route(
+            "/v1/apps/{app_id}/inspector/mask-actions",
+            get(routes::inspector::list_app_mask_actions),
+        )
+        .route(
+            "/v1/apps/{app_id}/inspector/masked-keys",
+            get(routes::inspector::list_app_masked_keys),
+        )
+        .route(
+            "/v1/inspector/mask-actions/{action_id}",
+            get(routes::inspector::get_mask_action_handler),
+        )
+        .route(
+            "/v1/inspector/mask-actions/{action_id}/confirm",
+            post(routes::inspector::confirm_mask),
+        )
+        .route(
+            "/v1/inspector/mask-actions/{action_id}/cancel",
+            post(routes::inspector::cancel_mask),
+        )
+        .route(
+            "/v1/orgs/{org_id}/inspector/mask-actions",
+            get(routes::inspector::list_org_mask_actions),
+        )
         // --- storage & records (org:manage required) ---
         .route("/v1/admin/storage", get(routes::admin::storage))
         // A JSON API body never legitimately reaches megabytes; the artifact
@@ -451,4 +826,15 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// ALWAYS 200. `packaging/rpm/SETUP.md` documents `curl -fsS .../health` and
+/// `tests/http_env_scoping.rs` polls it for readiness; both read a non-2xx as
+/// "the API is down", which a stalled reaper is not. The task list is the signal;
+/// the status code is not.
+async fn health() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "tasks": tasks::snapshot(),
+    }))
 }

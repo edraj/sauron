@@ -8,6 +8,9 @@
 //! Module map:
 //! - [`channel`] — kinds, config/secret validation, typed destinations.
 //! - [`rule`]    — trigger types + pure condition evaluation.
+//! - [`subscription`] — personal subscriptions: kinds, conditions, probe
+//!   coalescing, quiet hours, and the delivery-time coverage predicate.
+//! - [`sweep`]   — self-disable personal subscriptions whose owner lost reach.
 //! - [`render`]  — per-channel payloads + safe `{{var}}` templates.
 //! - [`crypto`]  — AES-GCM at-rest secret encryption + HMAC signing.
 //! - [`net`]     — SSRF-safe, IP-pinned outbound HTTP.
@@ -25,6 +28,8 @@ pub mod engine;
 pub mod net;
 pub mod render;
 pub mod rule;
+pub mod subscription;
+pub mod sweep;
 
 pub use channel::{ChannelKind, Destination};
 pub use crypto::SecretCipher;

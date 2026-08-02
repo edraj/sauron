@@ -2,9 +2,9 @@
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { getMonitor, getMonitorChecks, updateMonitor, deleteMonitor } from '../lib/api/monitors';
-  import { MONITOR_INTERVALS, formatInterval } from '../lib/constants/monitorIntervals';
+  import { MONITOR_INTERVALS } from '../lib/constants/monitorIntervals';
   import type { MonitorDetail, MonitorCheck } from '../lib/models';
-  import { sessionStore } from '../lib/stores/session.svelte';
+  import { lockedBy, lockTitle } from '../lib/models/page-access';
   import StatusPill from '../lib/components/ui/StatusPill.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -30,8 +30,9 @@
   let pausing = $state(false);
   let savingInterval = $state(false);
 
-  const canWrite = $derived(
-    sessionStore.can('monitor:write', { project: detail?.monitor.project_id }),
+  // monitors.rs:191,223 authorize at the project.
+  const writeLock = $derived(
+    lockedBy('monitor:write', { project: detail?.monitor.project_id, level: 'project' }),
   );
 
   // Sort by timestamp ourselves rather than trusting the API's order: the newest-
@@ -126,14 +127,14 @@
           <CopyButton value={detail.monitor.target} size="sm" />
         </div>
       </div>
-      {#if canWrite}
         <div class="actions">
-          <Button variant="secondary" loading={pausing} onclick={togglePause}>
+          <Button variant="secondary" loading={pausing} lockedReason={writeLock} onclick={togglePause}>
             {detail.monitor.status === 'paused' ? 'Resume' : 'Pause'}
           </Button>
-          <Button variant="danger" onclick={() => (confirmOpen = true)}>Delete</Button>
+          <Button variant="danger" lockedReason={writeLock} onclick={() => (confirmOpen = true)}>
+            Delete
+          </Button>
         </div>
-      {/if}
     </header>
 
     {#if error}
@@ -147,14 +148,14 @@
       <StatTile label="Uptime 24h" value={fmtPct(detail.uptime.h24)} tone={pctTone(detail.uptime.h24)} />
       <StatTile label="Uptime 7d" value={fmtPct(detail.uptime.d7)} tone={pctTone(detail.uptime.d7)} />
       <StatTile label="Uptime 30d" value={fmtPct(detail.uptime.d30)} tone={pctTone(detail.uptime.d30)} />
-      {#if canWrite}
         <div class="interval-tile">
           <span class="it-label">Interval</span>
           <div class="control select" class:busy={savingInterval}>
             <select
               aria-label="Check interval"
               value={detail.monitor.interval_seconds}
-              disabled={savingInterval}
+              disabled={savingInterval || writeLock !== null}
+              title={writeLock ? lockTitle(writeLock) : undefined}
               onchange={changeInterval}
             >
               {#each MONITOR_INTERVALS as opt (opt.seconds)}
@@ -170,9 +171,6 @@
             </span>
           </div>
         </div>
-      {:else}
-        <StatTile label="Interval" value={formatInterval(detail.monitor.interval_seconds)} />
-      {/if}
     </StatTiles>
 
     <div class="section">

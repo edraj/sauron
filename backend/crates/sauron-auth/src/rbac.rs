@@ -55,6 +55,14 @@ pub mod perm {
     pub const PROJECT_DELETE: &str = "project:delete";
     pub const MEMBER_READ: &str = "member:read";
     pub const MEMBER_MANAGE: &str = "member:manage";
+    /// Act on a member's *credentials*: end all of their sessions, and (in the
+    /// password-reset slice) force a reset. Carved out of `MEMBER_MANAGE`
+    /// rather than added beside it — "administer this org's membership" should
+    /// not automatically confer the two verbs that take a person out of their
+    /// own account, because control of the mail relay plus a forced reset is a
+    /// path to account takeover. Routes gated on this ALSO re-check
+    /// `MEMBER_MANAGE`; it narrows that permission, it does not stand in for it.
+    pub const MEMBER_CREDENTIAL: &str = "member:credential";
     pub const ROLE_MANAGE: &str = "role:manage";
     pub const ORG_MANAGE: &str = "org:manage";
     /// View alert rules, notification channels (secrets always redacted), and
@@ -62,9 +70,16 @@ pub mod perm {
     pub const ALERT_READ: &str = "alert:read";
     /// Create/update/delete channels + rules, and send channel test messages.
     pub const ALERT_WRITE: &str = "alert:write";
+    /// Read PII scan findings, scans, masked-key lists and the mask audit trail,
+    /// and reveal a single raw value. Bulk PII disclosure — Owner and Admin only.
+    pub const PII_READ: &str = "pii:read";
+    /// Create/edit inspector policies, run scans, and execute an irreversible
+    /// mask. Bulk destruction — Owner and Admin only, never inherited by the role
+    /// every engineer gets by default.
+    pub const PII_MANAGE: &str = "pii:manage";
 
     /// Every permission, in canonical order.
-    pub const ALL: [&str; 27] = [
+    pub const ALL: [&str; 30] = [
         ISSUE_READ,
         ISSUE_WRITE,
         EVENT_READ,
@@ -88,10 +103,13 @@ pub mod perm {
         PROJECT_DELETE,
         MEMBER_READ,
         MEMBER_MANAGE,
+        MEMBER_CREDENTIAL,
         ROLE_MANAGE,
         ORG_MANAGE,
         ALERT_READ,
         ALERT_WRITE,
+        PII_READ,
+        PII_MANAGE,
     ];
 }
 
@@ -135,9 +153,12 @@ pub const ADMIN: PresetRole = PresetRole {
         perm::PROJECT_DELETE,
         perm::MEMBER_READ,
         perm::MEMBER_MANAGE,
+        perm::MEMBER_CREDENTIAL,
         perm::ROLE_MANAGE,
         perm::ALERT_READ,
         perm::ALERT_WRITE,
+        perm::PII_READ,
+        perm::PII_MANAGE,
     ],
 };
 
@@ -809,17 +830,61 @@ mod tests {
         for p in perm::ALL {
             assert!(OWNER.permissions.contains(&p), "Owner missing {p}");
         }
-        assert_eq!(OWNER.permissions.len(), 27);
+        assert_eq!(OWNER.permissions.len(), 30);
     }
 
     #[test]
     fn admin_is_all_except_org_manage() {
         assert!(!ADMIN.permissions.contains(&perm::ORG_MANAGE));
-        assert_eq!(ADMIN.permissions.len(), 26);
+        assert_eq!(ADMIN.permissions.len(), 29);
         for p in perm::ALL {
             if p != perm::ORG_MANAGE {
                 assert!(ADMIN.permissions.contains(&p), "Admin missing {p}");
             }
+        }
+    }
+
+    /// Counts alone cannot tell a Developer that accidentally gained a
+    /// permission from a Developer that legitimately stayed at 18. Pin
+    /// membership, because the failure the counts miss is a Developer who can
+    /// sign any member out of their account.
+    #[test]
+    fn member_credential_reaches_only_owner_and_admin() {
+        assert!(OWNER.permissions.contains(&perm::MEMBER_CREDENTIAL));
+        assert!(ADMIN.permissions.contains(&perm::MEMBER_CREDENTIAL));
+        assert!(!DEVELOPER.permissions.contains(&perm::MEMBER_CREDENTIAL));
+        assert!(!VIEWER.permissions.contains(&perm::MEMBER_CREDENTIAL));
+    }
+
+    /// `member:credential` is carved OUT of `member:manage`, so it must never
+    /// be granted to a role that cannot administer members at all.
+    #[test]
+    fn member_credential_never_appears_without_member_manage() {
+        for preset in PRESETS {
+            if preset.permissions.contains(&perm::MEMBER_CREDENTIAL) {
+                assert!(
+                    preset.permissions.contains(&perm::MEMBER_MANAGE),
+                    "{} has member:credential without member:manage",
+                    preset.name
+                );
+            }
+        }
+    }
+
+    /// A count assertion that still passes is no evidence the pair landed in the
+    /// right presets: the temptation on a red count is to edit the number until
+    /// the suite is green, which is exactly how `pii:manage` ends up in Developer.
+    #[test]
+    fn pii_permissions_are_owner_and_admin_only() {
+        for p in [perm::PII_READ, perm::PII_MANAGE] {
+            assert!(OWNER.permissions.contains(&p), "Owner missing {p}");
+            assert!(ADMIN.permissions.contains(&p), "Admin missing {p}");
+            assert!(
+                !DEVELOPER.permissions.contains(&p),
+                "Developer must not hold {p}"
+            );
+            assert!(!VIEWER.permissions.contains(&p), "Viewer must not hold {p}");
+            assert!(perm::ALL.contains(&p), "{p} missing from perm::ALL");
         }
     }
 
@@ -872,7 +937,7 @@ mod tests {
     fn all_permissions_are_unique() {
         let set: HashSet<_> = perm::ALL.iter().collect();
         assert_eq!(set.len(), perm::ALL.len(), "duplicate in perm::ALL");
-        assert_eq!(perm::ALL.len(), 27);
+        assert_eq!(perm::ALL.len(), 30);
     }
 
     #[test]

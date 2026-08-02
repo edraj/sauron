@@ -1,6 +1,7 @@
 <script lang="ts">
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { lockedBy } from '../lib/models/page-access';
   import {
     listChannels,
     createChannel,
@@ -48,7 +49,9 @@
   let notice = $state<string | null>(null);
 
   const orgId = $derived(sessionStore.currentOrgId);
-  const canWrite = $derived(sessionStore.can('alert:write'));
+  // notifications.rs:113,187,260,272,443,522,580 all use `authorize_org`, so a
+  // project- or app-scoped `alert:write` grant cannot satisfy any of them.
+  const writeLock = $derived(lockedBy('alert:write', { level: 'org' }));
 
   // --- channel form ---------------------------------------------------------
   let showChannelForm = $state(false);
@@ -397,8 +400,10 @@
           A channel is where an alert is delivered. Secrets are encrypted at rest and never
           returned by the API.
         </p>
-        {#if canWrite && !showChannelForm}
-          <Button variant="primary" onclick={() => (showChannelForm = true)}>New channel</Button>
+        {#if !showChannelForm}
+          <Button variant="primary" lockedReason={writeLock} onclick={() => (showChannelForm = true)}>
+            New channel
+          </Button>
         {/if}
       </div>
 
@@ -544,8 +549,8 @@
           icon="bell"
         >
           {#snippet action()}
-            {#if canWrite && !showChannelForm}
-              <Button variant="primary" onclick={() => (showChannelForm = true)}>
+            {#if !showChannelForm}
+              <Button variant="primary" lockedReason={writeLock} onclick={() => (showChannelForm = true)}>
                 New channel
               </Button>
             {/if}
@@ -580,27 +585,26 @@
                   </Badge>
                 </td>
                 <td class="num actions">
-                  {#if canWrite}
-                    <Button
-                      size="sm"
-                      loading={testingId === c.id}
-                      onclick={() => runTest(c)}
-                      title="Send a test notification"
-                    >
-                      Test
-                    </Button>
-                    <Button size="sm" onclick={() => toggleChannel(c)}>
-                      {c.enabled ? 'Disable' : 'Enable'}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onclick={() =>
-                        (confirmDelete = { kind: 'channel', id: c.id, name: c.name })}
-                    >
-                      Delete
-                    </Button>
-                  {/if}
+                  <Button
+                    size="sm"
+                    loading={testingId === c.id}
+                    lockedReason={writeLock}
+                    onclick={() => runTest(c)}
+                    title="Send a test notification"
+                  >
+                    Test
+                  </Button>
+                  <Button size="sm" lockedReason={writeLock} onclick={() => toggleChannel(c)}>
+                    {c.enabled ? 'Disable' : 'Enable'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    lockedReason={writeLock}
+                    onclick={() => (confirmDelete = { kind: 'channel', id: c.id, name: c.name })}
+                  >
+                    Delete
+                  </Button>
                 </td>
               </tr>
             {/each}
@@ -614,9 +618,10 @@
           A rule decides when to notify and which channels to fan out to. Repeat alerts for the
           same cause are suppressed for the throttle window.
         </p>
-        {#if canWrite && !showRuleForm}
+        {#if !showRuleForm}
           <Button
             variant="primary"
+            lockedReason={writeLock}
             disabled={channels.length === 0}
             title={channels.length === 0 ? 'Create a channel first' : undefined}
             onclick={() => (showRuleForm = true)}
@@ -787,8 +792,10 @@
           icon="bell"
         >
           {#snippet action()}
-            {#if canWrite && !showRuleForm && channels.length > 0}
-              <Button variant="primary" onclick={() => (showRuleForm = true)}>New rule</Button>
+            {#if !showRuleForm && channels.length > 0}
+              <Button variant="primary" lockedReason={writeLock} onclick={() => (showRuleForm = true)}>
+                New rule
+              </Button>
             {/if}
           {/snippet}
         </EmptyState>
@@ -821,18 +828,17 @@
                   </Badge>
                 </td>
                 <td class="num actions">
-                  {#if canWrite}
-                    <Button size="sm" onclick={() => toggleRule(r)}>
-                      {r.enabled ? 'Disable' : 'Enable'}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onclick={() => (confirmDelete = { kind: 'rule', id: r.id, name: r.name })}
-                    >
-                      Delete
-                    </Button>
-                  {/if}
+                  <Button size="sm" lockedReason={writeLock} onclick={() => toggleRule(r)}>
+                    {r.enabled ? 'Disable' : 'Enable'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    lockedReason={writeLock}
+                    onclick={() => (confirmDelete = { kind: 'rule', id: r.id, name: r.name })}
+                  >
+                    Delete
+                  </Button>
                 </td>
               </tr>
             {/each}

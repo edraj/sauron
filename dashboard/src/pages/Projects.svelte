@@ -9,6 +9,7 @@
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { lockedBy, lockTitle } from '../lib/models/page-access';
   import { createProject, updateProject, deleteProject } from '../lib/api/projects';
   import { listApps, createApp } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
@@ -41,7 +42,9 @@
   let newAppType = $state<AppType>('web');
   let creatingApp = $state(false);
 
-  const canCreateProject = $derived(sessionStore.can('project:create'));
+  // projects.rs:102 authorizes creation at the org — a project- or app-scoped
+  // grant carrying `project:create` cannot satisfy it, hence `level: 'org'`.
+  const createProjectLock = $derived(lockedBy('project:create', { level: 'org' }));
 
   async function toggleProject(projectId: string) {
     openProject[projectId] = !openProject[projectId];
@@ -158,11 +161,13 @@
       <h1 class="page-title">Projects</h1>
       <p class="muted sub">Group your apps by product or team. Each app holds its own DSN.</p>
     </div>
-    {#if canCreateProject}
-      <Button variant="primary" onclick={() => (showNewProject = !showNewProject)}>
-        {showNewProject ? 'Cancel' : 'New project'}
-      </Button>
-    {/if}
+    <Button
+      variant="primary"
+      lockedReason={createProjectLock}
+      onclick={() => (showNewProject = !showNewProject)}
+    >
+      {showNewProject ? 'Cancel' : 'New project'}
+    </Button>
   </div>
 
   {#if showNewProject}
@@ -182,18 +187,23 @@
         icon="folders"
       >
         {#snippet action()}
-          {#if canCreateProject}
-            <Button variant="primary" onclick={() => (showNewProject = true)}>New project</Button>
-          {/if}
+          <Button
+            variant="primary"
+            lockedReason={createProjectLock}
+            onclick={() => (showNewProject = true)}
+          >
+            New project
+          </Button>
         {/snippet}
       </EmptyState>
     </Card>
   {:else}
     <div class="project-list">
       {#each sessionStore.projects as project (project.id)}
-        {@const canUpdate = sessionStore.can('project:update', { project: project.id })}
-        {@const canDelete = sessionStore.can('project:delete', { project: project.id })}
-        {@const canCreateApp = sessionStore.can('app:create', { project: project.id })}
+        <!-- projects.rs:146,162,239 all authorize at the project. -->
+        {@const updateLock = lockedBy('project:update', { project: project.id, level: 'project' })}
+        {@const deleteLock = lockedBy('project:delete', { project: project.id, level: 'project' })}
+        {@const createAppLock = lockedBy('app:create', { project: project.id, level: 'project' })}
         <Card padding="none" class="project-card">
           <div class="project-row">
             <button
@@ -228,16 +238,22 @@
 
             {#if renamingId !== project.id}
               <div class="p-actions">
-                {#if canUpdate}
-                  <Button variant="ghost" size="sm" onclick={() => startRename(project.id, project.name)}>
-                    Rename
-                  </Button>
-                {/if}
-                {#if canDelete}
-                  <Button variant="ghost" size="sm" onclick={() => (confirmDeleteId = project.id)}>
-                    Delete
-                  </Button>
-                {/if}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  lockedReason={updateLock}
+                  onclick={() => startRename(project.id, project.name)}
+                >
+                  Rename
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  lockedReason={deleteLock}
+                  onclick={() => (confirmDeleteId = project.id)}
+                >
+                  Delete
+                </Button>
               </div>
             {/if}
           </div>
@@ -293,7 +309,6 @@
                   <p class="no-apps muted">No apps in this project yet.</p>
                 {/each}
 
-                {#if canCreateApp}
                   {#if newAppFor === project.id}
                     <form class="new-app-form" onsubmit={(e) => submitNewApp(e, project.id)}>
                       <Input bind:value={newAppName} placeholder="App name" required />
@@ -308,9 +323,17 @@
                       <Button variant="ghost" size="sm" onclick={() => (newAppFor = null)}>Cancel</Button>
                     </form>
                   {:else}
-                    <button class="add-app" onclick={() => startNewApp(project.id)}>+ New app</button>
+                    <button
+                      class="add-app"
+                      disabled={createAppLock !== null}
+                      title={createAppLock ? lockTitle(createAppLock) : undefined}
+                      onclick={() => startNewApp(project.id)}
+                    >
+                      {#if createAppLock}<span class="add-lock" aria-hidden="true"
+                          ><Icon name="lock" size={12} /></span
+                        >{:else}+&nbsp;{/if}New app
+                    </button>
                   {/if}
-                {/if}
               {/if}
             </div>
           {/if}
@@ -508,8 +531,17 @@
     font-weight: 540;
     transition: all 0.13s ease;
   }
-  .add-app:hover {
+  .add-app:not(:disabled):hover {
     color: var(--text);
     border-color: var(--text-faint);
+  }
+  .add-app:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+  .add-lock {
+    display: inline-flex;
+    vertical-align: -2px;
+    margin-right: 6px;
   }
 </style>

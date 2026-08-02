@@ -2,6 +2,7 @@
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { lockedBy } from '../lib/models/page-access';
   import { listMonitors, createMonitor } from '../lib/api/monitors';
   import { MONITOR_INTERVALS } from '../lib/constants/monitorIntervals';
   import type { MonitorListItem } from '../lib/models';
@@ -31,7 +32,8 @@
   let saving = $state(false);
 
   const projectId = $derived(sessionStore.currentProjectId);
-  const canWrite = $derived(sessionStore.can('monitor:write', { project: projectId }));
+  // monitors.rs:99,191,223 authorize at the project.
+  const writeLock = $derived(lockedBy('monitor:write', { project: projectId, level: 'project' }));
 
   async function load() {
     if (!projectId) { loading = false; return; }
@@ -89,8 +91,8 @@
         <p class="sub muted">Track availability and latency for your HTTP and TCP endpoints.</p>
       </div>
       <div class="controls">
-        {#if canWrite && !showForm}
-          <Button variant="primary" onclick={openForm}>New monitor</Button>
+        {#if !showForm}
+          <Button variant="primary" lockedReason={writeLock} onclick={openForm}>New monitor</Button>
         {/if}
         <RefreshButton onclick={refresh} loading={refreshing} />
       </div>
@@ -178,8 +180,8 @@
         icon="zap"
       >
         {#snippet action()}
-          {#if canWrite && !showForm}
-            <Button variant="primary" onclick={openForm}>New monitor</Button>
+          {#if !showForm}
+            <Button variant="primary" lockedReason={writeLock} onclick={openForm}>New monitor</Button>
           {/if}
         {/snippet}
       </EmptyState>

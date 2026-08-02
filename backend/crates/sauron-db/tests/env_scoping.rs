@@ -1249,10 +1249,15 @@ async fn user_stats_covers_only_the_selected_environment() {
     let ids = db.seed_two_envs().await;
     let mut conn = db.conn().await;
 
+    // `Utc::now()` preserves the pre-re-anchoring behaviour these assertions
+    // were written against (every seeded row lands within minutes of it).
+    // `user_stats_dau_wau_are_anchored_to_the_supplied_now` is the one that
+    // pins a fixed instant.
     let a = sauron_db::repo::user_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         far_past(),
+        Utc::now(),
     )
     .await
     .unwrap();
@@ -1296,6 +1301,7 @@ async fn user_stats_covers_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         far_past(),
+        Utc::now(),
     )
     .await
     .unwrap();
@@ -1323,6 +1329,7 @@ async fn user_stats_covers_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
         far_past(),
+        Utc::now(),
     )
     .await
     .unwrap();
@@ -1341,9 +1348,14 @@ async fn user_stats_covers_only_the_selected_environment() {
         none.median_session_ms
     );
 
-    let all = sauron_db::repo::user_stats(&mut conn, ReadScope::all(ids.app_id), far_past())
-        .await
-        .unwrap();
+    let all = sauron_db::repo::user_stats(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         all.dau, 7,
         "NOT env_a+env_b+unattributed (9) — shared_distinct_id/distinct_id_cross_env double-count across environments"
@@ -5374,7 +5386,7 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     sauron_db::repo::session_stats(&mut conn, scope.clone(), since)
         .await
         .expect("session_stats under Subset");
-    sauron_db::repo::user_stats(&mut conn, scope.clone(), since)
+    sauron_db::repo::user_stats(&mut conn, scope.clone(), since, Utc::now())
         .await
         .expect("user_stats under Subset");
     sauron_db::repo::active_user_series(&mut conn, scope.clone(), since)
@@ -6635,6 +6647,856 @@ async fn an_ingest_key_proves_both_its_app_and_its_environment() {
             .is_some(),
         "retiring one app's enrollment must not revoke a sibling's key"
     );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The 000038 backfill, run against the three row shapes it has to
+/// discriminate. It reads the statement out of the migration file rather than
+/// re-typing it, because a hand-copy would keep passing after the shipped SQL
+/// changed — the same source-not-copy rule `http_env_scoping.rs` follows for
+/// the route table.
+///
+/// The statement is re-run here rather than observed during `TestDb::setup()`
+/// because migrations run against an empty database: at the moment 000038
+/// executes for real there is nothing to back-fill, so its own run proves
+/// nothing.
+#[tokio::test]
+async fn migration_000038_backfills_only_rows_with_traits_or_an_alias() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let with_traits = format!("backfill-traits-{}", Uuid::new_v4().simple());
+    let with_alias = format!("backfill-alias-{}", Uuid::new_v4().simple());
+    let bare = format!("backfill-bare-{}", Uuid::new_v4().simple());
+
+    sauron_db::repo::upsert_event_user(
+        &mut conn,
+        ids.app_id,
+        &with_traits,
+        &json!({ "plan": "pro" }),
+    )
+    .await
+    .expect("seed the traits-bearing row");
+    sauron_db::repo::touch_event_user(&mut conn, ids.app_id, &with_alias)
+        .await
+        .expect("seed the alias-bearing row");
+    sauron_db::repo::insert_identity(&mut conn, ids.app_id, "anon_abc", &with_alias)
+        .await
+        .expect("seed the identities alias");
+    sauron_db::repo::touch_event_user(&mut conn, ids.app_id, &bare)
+        .await
+        .expect("seed the bare row");
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/2026-08-01-000038_event_users_identified/up.sql"
+    );
+    let src =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("could not read {path}: {e}"));
+    let begin = src
+        .find("-- BACKFILL-BEGIN")
+        .unwrap_or_else(|| panic!("{path} lost its -- BACKFILL-BEGIN sentinel"));
+    let end = src
+        .find("-- BACKFILL-END")
+        .unwrap_or_else(|| panic!("{path} lost its -- BACKFILL-END sentinel"));
+    let backfill = &src[begin + "-- BACKFILL-BEGIN".len()..end];
+    diesel::sql_query(backfill)
+        .execute(&mut conn)
+        .await
+        .expect("run the 000038 backfill statement");
+
+    #[derive(QueryableByName)]
+    struct FlagRow {
+        #[diesel(sql_type = Text)]
+        distinct_id: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        identified_source: Option<String>,
+    }
+    let rows: Vec<FlagRow> = diesel::sql_query(
+        "SELECT distinct_id, identified_source FROM event_users \
+         WHERE app_id = $1 AND distinct_id = ANY($2) ORDER BY distinct_id",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .bind::<diesel::sql_types::Array<Text>, _>(vec![
+        with_traits.clone(),
+        with_alias.clone(),
+        bare.clone(),
+    ])
+    .load(&mut conn)
+    .await
+    .expect("read back the three rows");
+
+    let flagged: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.identified_source.is_some())
+        .map(|r| r.distinct_id.as_str())
+        .collect();
+    let mut expected = vec![with_alias.as_str(), with_traits.as_str()];
+    expected.sort();
+    let mut got = flagged.clone();
+    got.sort();
+    assert_eq!(
+        got, expected,
+        "exactly the traits-bearing and alias-bearing rows are backfilled; {bare} must stay a guest"
+    );
+    for r in &rows {
+        if r.identified_source.is_some() {
+            assert_eq!(
+                r.identified_source.as_deref(),
+                Some("backfill"),
+                "the backfill must stamp its own source so a poisoned cohort stays repairable"
+            );
+        }
+    }
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// First-write-wins, and an unidentified touch can never clear the flag.
+/// This is the property the whole guest/identified split rests on: a single
+/// anonymous event arriving after an identify() must not move a person back
+/// into the guest column, retroactively, for every day already reported.
+#[tokio::test]
+async fn identified_at_is_first_write_wins_and_never_cleared() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let did = format!("first-write-{}", Uuid::new_v4().simple());
+    sauron_db::repo::touch_event_user(&mut conn, ids.app_id, &did)
+        .await
+        .expect("create the row");
+
+    let n = sauron_db::repo::mark_event_user_identified(
+        &mut conn,
+        ids.app_id,
+        &did,
+        sauron_db::repo::IDENTIFIED_SOURCE_IDENTIFY,
+    )
+    .await
+    .expect("first mark");
+    assert_eq!(n, 1, "the first mark writes the flag");
+
+    let n = sauron_db::repo::mark_event_user_identified(
+        &mut conn,
+        ids.app_id,
+        &did,
+        sauron_db::repo::IDENTIFIED_SOURCE_CONTEXT_USER,
+    )
+    .await
+    .expect("second mark");
+    assert_eq!(
+        n, 0,
+        "a later mark is a primary-key no-op, not an overwrite"
+    );
+
+    sauron_db::repo::touch_event_user(&mut conn, ids.app_id, &did)
+        .await
+        .expect("anonymous touch after identification");
+
+    #[derive(QueryableByName)]
+    struct SourceRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        identified_source: Option<String>,
+    }
+    let row: SourceRow = diesel::sql_query(
+        "SELECT identified_source FROM event_users WHERE app_id = $1 AND distinct_id = $2",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .bind::<Text, _>(did.as_str())
+    .get_result(&mut conn)
+    .await
+    .expect("read back");
+    assert_eq!(
+        row.identified_source.as_deref(),
+        Some("identify"),
+        "the original source survives both a losing mark and a later anonymous touch"
+    );
+
+    assert!(
+        sauron_db::repo::probe_event_users_identified(&mut conn)
+            .await
+            .is_ok(),
+        "the probe must succeed against a migrated schema"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Every identity `seed_two_envs()` produces is a GUEST unless a test asks
+/// otherwise. Left as it was — `note_identity` calling `upsert_event_user`,
+/// the identify() write shape — every seeded distinct_id would key as
+/// `'u:'‖distinct_id`, merge across apps, drive `active_guest` to zero in
+/// every test, and make the two anonymity tests below inexpressible against
+/// the harness at all. The split would look correct and be untested.
+#[tokio::test]
+async fn the_harness_seeds_guests_not_identified_users() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let row: CountRow = diesel::sql_query(
+        "SELECT count(*)::bigint AS n FROM event_users \
+         WHERE app_id = $1 AND identified_at IS NOT NULL",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .get_result(&mut conn)
+    .await
+    .expect("count identified");
+    assert_eq!(row.n, 0, "the ordinary event seed must not identify anyone");
+
+    common::seed_identified_user(&mut conn, ids.app_id, &ids.shared_distinct_id).await;
+    let row: CountRow = diesel::sql_query(
+        "SELECT count(*)::bigint AS n FROM event_users \
+         WHERE app_id = $1 AND identified_at IS NOT NULL",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .get_result(&mut conn)
+    .await
+    .expect("count identified after an explicit identify seed");
+    assert_eq!(row.n, 1, "an explicit identify seed is the only way in");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+// ===========================================================================
+// active_users_combined
+// ===========================================================================
+
+use sauron_db::repo::AppEnvScope;
+
+/// A second app in the same project, with one environment enrollment.
+/// Returns `(app_id, env_id, issue_id)`.
+async fn second_app(
+    conn: &mut sauron_db::PgConn,
+    project_id: Uuid,
+    label: &str,
+) -> (Uuid, Uuid, Uuid) {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app =
+        sauron_db::repo::create_app(conn, project_id, label, &format!("{label}-{suffix}"), "web")
+            .await
+            .expect("create second app");
+    let env = sauron_db::repo::create_project_environment(conn, project_id, &format!("e-{suffix}"))
+        .await
+        .expect("create catalogue env");
+    let enrollment = sauron_db::repo::create_app_environments(
+        conn,
+        &[sauron_db::models::NewAppEnvironment {
+            app_id: app.id,
+            environment_id: env.id,
+            public_key: &format!("pk_{label}_{suffix}"),
+            is_default: true,
+        }],
+    )
+    .await
+    .expect("enroll second app")
+    .remove(0)
+    .id;
+    let issue = sauron_db::repo::upsert_issue(
+        conn,
+        sauron_db::models::NewIssue {
+            app_id: app.id,
+            fingerprint: "second-app-fingerprint",
+            type_: "Error",
+            title: "seeded",
+            culprit: "seeded",
+            level: "error",
+            first_seen: far_past(),
+            last_seen: far_past(),
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("create second app issue");
+    (app.id, enrollment, issue)
+}
+
+fn day_at(day: &str, hhmmss: &str) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(&format!("{day}T{hhmmss}Z"))
+        .expect("valid RFC3339")
+        .with_timezone(&Utc)
+}
+
+fn window(from_day: &str, to_day: &str) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+    (day_at(from_day, "00:00:00"), day_at(to_day, "00:00:00"))
+}
+
+#[tokio::test]
+async fn active_users_combined_merges_identified_users_across_apps() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let (app_b, env_b2, _issue_b) = second_app(&mut conn, ids.project_id, "merge-b").await;
+
+    let did = format!("person-{}", Uuid::new_v4().simple());
+    common::seed_identified_user(&mut conn, ids.app_id, &did).await;
+    common::seed_identified_user(&mut conn, app_b, &did).await;
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &did,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+    common::seed_signal_event(
+        &mut conn,
+        app_b,
+        Some(env_b2),
+        &did,
+        day_at("2026-05-04", "21:00:00"),
+    )
+    .await;
+
+    let (from, to) = window("2026-05-04", "2026-05-05");
+    let rows = sauron_db::repo::active_users_combined(
+        &mut conn,
+        &[
+            AppEnvScope {
+                app_id: ids.app_id,
+                env: EnvFilter::One(ids.env_a),
+            },
+            AppEnvScope {
+                app_id: app_b,
+                env: EnvFilter::One(env_b2),
+            },
+        ],
+        from,
+        to,
+    )
+    .await
+    .expect("query");
+
+    assert_eq!(rows.len(), 1, "one day in the window");
+    assert_eq!(rows[0].active_total, 1, "one person, not two");
+    assert_eq!(rows[0].active_identified, 1);
+    assert_eq!(rows[0].active_guest, 0);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The anti-test for the `'a:'‖app_id‖':'` prefix. Without `app_id` in the
+/// guest key this silently returns 1, and the number would then change
+/// depending on which OTHER apps happened to be selected.
+#[tokio::test]
+async fn active_users_combined_keeps_anonymous_ids_app_local() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let (app_b, env_b2, _issue_b) = second_app(&mut conn, ids.project_id, "guest-b").await;
+
+    let did = format!("anon-{}", Uuid::new_v4().simple());
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &did,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+    common::seed_signal_event(
+        &mut conn,
+        app_b,
+        Some(env_b2),
+        &did,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+
+    let (from, to) = window("2026-05-04", "2026-05-05");
+    let rows = sauron_db::repo::active_users_combined(
+        &mut conn,
+        &[
+            AppEnvScope {
+                app_id: ids.app_id,
+                env: EnvFilter::One(ids.env_a),
+            },
+            AppEnvScope {
+                app_id: app_b,
+                env: EnvFilter::One(env_b2),
+            },
+        ],
+        from,
+        to,
+    )
+    .await
+    .expect("query");
+
+    assert_eq!(
+        rows[0].active_total, 2,
+        "identical strings, two apps, no merge"
+    );
+    assert_eq!(rows[0].active_identified, 0);
+    assert_eq!(rows[0].active_guest, 2);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Under-merging is intentional and has to stay pinned: identified in one app
+/// only means two keys, one in each bucket.
+#[tokio::test]
+async fn active_users_combined_does_not_merge_an_identified_id_with_an_unidentified_copy() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let (app_b, env_b2, _issue_b) = second_app(&mut conn, ids.project_id, "half-b").await;
+
+    let did = format!("half-{}", Uuid::new_v4().simple());
+    common::seed_identified_user(&mut conn, ids.app_id, &did).await;
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &did,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+    common::seed_signal_event(
+        &mut conn,
+        app_b,
+        Some(env_b2),
+        &did,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+
+    let (from, to) = window("2026-05-04", "2026-05-05");
+    let rows = sauron_db::repo::active_users_combined(
+        &mut conn,
+        &[
+            AppEnvScope {
+                app_id: ids.app_id,
+                env: EnvFilter::One(ids.env_a),
+            },
+            AppEnvScope {
+                app_id: app_b,
+                env: EnvFilter::One(env_b2),
+            },
+        ],
+        from,
+        to,
+    )
+    .await
+    .expect("query");
+
+    assert_eq!(rows[0].active_total, 2);
+    assert_eq!(rows[0].active_identified, 1);
+    assert_eq!(rows[0].active_guest, 1);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The one invariant the page renders as three tiles side by side. If the two
+/// halves were ever computed as separate subqueries this would start drifting.
+#[tokio::test]
+async fn active_users_combined_split_always_sums_to_the_total() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let (app_b, env_b2, issue_b) = second_app(&mut conn, ids.project_id, "sum-b").await;
+
+    for i in 0..5 {
+        let did = format!("mix-{i}-{}", Uuid::new_v4().simple());
+        if i % 2 == 0 {
+            common::seed_identified_user(&mut conn, ids.app_id, &did).await;
+            common::seed_identified_user(&mut conn, app_b, &did).await;
+        }
+        common::seed_signal_event(
+            &mut conn,
+            ids.app_id,
+            Some(ids.env_a),
+            &did,
+            day_at("2026-05-04", "01:00:00"),
+        )
+        .await;
+        common::seed_signal_error(
+            &mut conn,
+            app_b,
+            Some(env_b2),
+            issue_b,
+            Some(&did),
+            day_at("2026-05-05", "01:00:00"),
+        )
+        .await;
+    }
+
+    let (from, to) = window("2026-05-04", "2026-05-07");
+    let rows = sauron_db::repo::active_users_combined(
+        &mut conn,
+        &[
+            AppEnvScope {
+                app_id: ids.app_id,
+                env: EnvFilter::One(ids.env_a),
+            },
+            AppEnvScope {
+                app_id: app_b,
+                env: EnvFilter::One(env_b2),
+            },
+        ],
+        from,
+        to,
+    )
+    .await
+    .expect("query");
+
+    assert_eq!(rows.len(), 3, "three whole days in [from, to)");
+    for r in &rows {
+        assert_eq!(
+            r.active_total,
+            r.active_identified + r.active_guest,
+            "day {} does not add up",
+            r.day
+        );
+    }
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Mixed `One`/`All` selection, so the bind-index walk is the thing under
+/// test: deriving the env bind from anything but `consumes_bind()` silently
+/// pairs an environment with the wrong app.
+#[tokio::test]
+async fn active_users_combined_respects_per_app_environment_filters() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let (app_b, env_b2, _issue_b) = second_app(&mut conn, ids.project_id, "envfilter-b").await;
+
+    let only_in_env_b = format!("only-b-{}", Uuid::new_v4().simple());
+    let in_env_a = format!("in-a-{}", Uuid::new_v4().simple());
+    let in_app_b = format!("in-appb-{}", Uuid::new_v4().simple());
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_b),
+        &only_in_env_b,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &in_env_a,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+    common::seed_signal_event(
+        &mut conn,
+        app_b,
+        Some(env_b2),
+        &in_app_b,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+
+    let (from, to) = window("2026-05-04", "2026-05-05");
+    let rows = sauron_db::repo::active_users_combined(
+        &mut conn,
+        &[
+            AppEnvScope {
+                app_id: ids.app_id,
+                env: EnvFilter::One(ids.env_a),
+            },
+            AppEnvScope {
+                app_id: app_b,
+                env: EnvFilter::All,
+            },
+        ],
+        from,
+        to,
+    )
+    .await
+    .expect("query");
+
+    // env_a's identity plus app B's, but NOT the env_b-only one. The harness's
+    // own seeded env_a rows land far in the past, outside this window.
+    assert_eq!(
+        rows[0].active_total, 2,
+        "the env_b-only identity must not appear"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// UTC calendar days, proven independent of the session `TimeZone` GUC — the
+/// exact hazard `date_trunc('day', timestamptz)` has.
+#[tokio::test]
+async fn active_user_days_are_utc_calendar_days() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    diesel::sql_query("SET TimeZone = 'America/New_York'")
+        .execute(&mut conn)
+        .await
+        .expect("move the session clock off UTC");
+
+    let did = format!("midnight-{}", Uuid::new_v4().simple());
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &did,
+        day_at("2026-05-04", "23:30:00"),
+    )
+    .await;
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &did,
+        day_at("2026-05-05", "00:30:00"),
+    )
+    .await;
+
+    let (from, to) = window("2026-05-04", "2026-05-06");
+    let rows = sauron_db::repo::active_users_combined(
+        &mut conn,
+        &[AppEnvScope {
+            app_id: ids.app_id,
+            env: EnvFilter::One(ids.env_a),
+        }],
+        from,
+        to,
+    )
+    .await
+    .expect("query");
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].day.to_string(), "2026-05-04");
+    assert_eq!(rows[0].active_total, 1);
+    assert_eq!(rows[1].day.to_string(), "2026-05-05");
+    assert_eq!(rows[1].active_total, 1);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// A gap day is present with three zeros, not absent. The CSV's row count is
+/// checked against this grid.
+#[tokio::test]
+async fn active_users_combined_returns_zero_rows_for_days_with_no_signal() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let did = format!("gap-{}", Uuid::new_v4().simple());
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &did,
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &did,
+        day_at("2026-05-06", "09:00:00"),
+    )
+    .await;
+
+    let (from, to) = window("2026-05-04", "2026-05-07");
+    let rows = sauron_db::repo::active_users_combined(
+        &mut conn,
+        &[AppEnvScope {
+            app_id: ids.app_id,
+            env: EnvFilter::One(ids.env_a),
+        }],
+        from,
+        to,
+    )
+    .await
+    .expect("query");
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[1].day.to_string(), "2026-05-05");
+    assert_eq!(rows[1].active_total, 0);
+    assert_eq!(rows[1].active_identified, 0);
+    assert_eq!(rows[1].active_guest, 0);
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The empty string is a REAL value on this wire — server SDKs deliberately
+/// let the three `$workflow_*` events through with one — so it has to be
+/// excluded explicitly, not assumed away.
+#[tokio::test]
+async fn active_users_combined_excludes_empty_and_null_distinct_ids() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    common::seed_signal_event(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        "",
+        day_at("2026-05-04", "09:00:00"),
+    )
+    .await;
+    common::seed_signal_error(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        ids.issue_id,
+        None,
+        day_at("2026-05-04", "10:00:00"),
+    )
+    .await;
+
+    let (from, to) = window("2026-05-04", "2026-05-05");
+    let rows = sauron_db::repo::active_users_combined(
+        &mut conn,
+        &[AppEnvScope {
+            app_id: ids.app_id,
+            env: EnvFilter::One(ids.env_a),
+        }],
+        from,
+        to,
+    )
+    .await
+    .expect("query");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].active_total, 0,
+        "neither an empty nor a NULL distinct_id is a person"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The batched `env_ids_for_app`, keyed so a caller can build a per-app map.
+/// A FLAT set of these ids is meaningless — `role_grants.scope_id` for
+/// `scope_type='env'` holds an `app_environments.id`, which is per-app — and
+/// handing the union to `resolve_env_filter` breaks both of its decisions in
+/// the granting direction.
+#[tokio::test]
+async fn env_ids_for_apps_keys_every_enrollment_by_its_app() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let (app_b, env_b2, _issue_b) = second_app(&mut conn, ids.project_id, "envids-b").await;
+
+    let mut rows = sauron_db::repo::env_ids_for_apps(&mut conn, &[ids.app_id, app_b])
+        .await
+        .expect("query");
+    rows.sort();
+
+    assert!(rows.contains(&(ids.app_id, ids.env_a)));
+    assert!(rows.contains(&(ids.app_id, ids.env_b)));
+    assert!(rows.contains(&(app_b, env_b2)));
+    assert!(
+        !rows.contains(&(ids.app_id, env_b2)),
+        "app B's enrollment must never be attributed to app A"
+    );
+
+    assert!(
+        sauron_db::repo::env_ids_for_apps(&mut conn, &[])
+            .await
+            .expect("empty input")
+            .is_empty(),
+        "an empty input must not produce a query with an empty ANY()"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// Impossible to write before the re-anchoring, which is the point: the three
+/// windows were three separate `now()` calls evaluated by Postgres inside one
+/// statement, so they were three different instants and no test could place a
+/// row relative to them without freezing the server clock.
+#[tokio::test]
+async fn user_stats_dau_wau_are_anchored_to_the_supplied_now() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    // A FRESH app, not the harness app: `seed_two_envs` pins every signal row to
+    // TODAY at noon UTC, and the three windows are lower-bounded only
+    // (`occurred_at >= now - interval`, no upper bound). Against the harness app
+    // those rows sit two months *after* `pinned`, so they fall inside all three
+    // windows and `dau` reads 4 instead of 0 — the assertions below then measure
+    // the harness's seed, not the anchoring.
+    let (app, env, _issue) = second_app(&mut conn, ids.project_id, "anchored").await;
+
+    let pinned = day_at("2026-05-10", "12:00:00");
+    let did = format!("anchored-{}", Uuid::new_v4().simple());
+    common::seed_signal_event(&mut conn, app, Some(env), &did, pinned - Duration::days(2)).await;
+
+    let s = sauron_db::repo::user_stats(
+        &mut conn,
+        ReadScope::new(app, EnvFilter::One(env)),
+        far_past(),
+        pinned,
+    )
+    .await
+    .expect("user_stats");
+
+    // This app has no other signal at all, so only the row seeded above can fall
+    // inside any of the three windows.
+    assert_eq!(
+        s.dau, 0,
+        "two days before `now` is outside the 1-day window"
+    );
+    assert_eq!(s.wau, 1, "…inside the 7-day window");
+    assert_eq!(s.mau, 1, "…and inside the 30-day window");
 
     drop(conn);
     db.cleanup().await;

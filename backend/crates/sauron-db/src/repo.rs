@@ -5,10 +5,13 @@ use chrono::{DateTime, Utc};
 use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::sql_types::{
-    Array, BigInt, Bool, Double, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+    Array, BigInt, Bool, Date, Double, Integer, Jsonb, Nullable, SmallInt, Text, Timestamptz,
+    Uuid as SqlUuid,
 };
 use diesel::upsert::excluded;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use sauron_inspector::targets::{PolicyNode, PolicyTargetType, ScanPair};
+use sauron_inspector::units::{tables_for, units_for};
 use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -153,6 +156,12 @@ pub async fn set_user_active(
 /// Set a new password and clear the forced-change flag. Always clears it: the
 /// only way to reach this is the self-service change endpoint, where the user
 /// chose the password themselves.
+///
+/// It also clears `credentials_invalidated_at`, so the invariant is "any
+/// successful password write clears the invalidation" rather than "the writes
+/// somebody happened to think of clear it". A future third writer inherits the
+/// rule; the failure it prevents is an account locked out by a column nothing
+/// left will ever reset.
 pub async fn set_user_password(
     conn: &mut AsyncPgConnection,
     user_id: Uuid,
@@ -162,28 +171,330 @@ pub async fn set_user_password(
         .set((
             users::password_hash.eq(password_hash),
             users::must_change_password.eq(false),
+            users::credentials_invalidated_at.eq(None::<DateTime<Utc>>),
             users::updated_at.eq(Utc::now()),
         ))
         .execute(conn)
         .await
 }
 
-pub async fn insert_refresh_token(
+/// Mint a refresh token, starting a new session or continuing an existing one.
+///
+/// One data-modifying CTE rather than a transaction: `conn.transaction`'s
+/// diesel-async 0.9 signature needs async closures (Rust 1.85) and this
+/// workspace's MSRV is 1.82 per `packaging/rpm/sauron.spec`. Postgres runs both
+/// statements atomically within the one statement anyway.
+///
+/// Returns the number of refresh-token rows inserted: `1` on success, `0` when
+/// the session exists but is revoked or belongs to somebody else.
+///
+/// Three things in the SQL are load-bearing.
+///
+/// **`WHERE auth_sessions.revoked_at IS NULL` is the only thing stopping the
+/// rotation grace window from resurrecting a killed session.**
+/// `REFRESH_RACE_GRACE` is 10 seconds and exists because two dashboard tabs
+/// share one localStorage refresh token. Concretely: session B rotates at T (old
+/// token -> `rotated`); the user revokes B at T+2s; B's other tab presents the
+/// old token at T+3s. The reason *is* `rotated`, it *is* inside the grace, and
+/// `user_has_active_refresh_token` is *true* because the spared session A is
+/// live — so the race path runs. Postgres's `DO UPDATE ... WHERE` skips the
+/// update, `RETURNING` yields nothing, the outer INSERT inserts nothing, and
+/// this returns 0. A Rust-side pre-check would be a TOCTOU race and must not be
+/// substituted; if a refactor moves the session upsert out of this CTE, the hole
+/// silently reopens.
+///
+/// **The COALESCE order is inverted from the obvious.** `EXCLUDED` holds the
+/// *current rotator's* values, so `COALESCE(EXCLUDED.x, auth_sessions.x)` would
+/// overwrite the row every 15 minutes. The UI renders these beside `created_at`
+/// as login-time facts, and the sole justification for returning an unmasked IP
+/// is "was that login me?" — so if an attacker steals a refresh token and
+/// rotates it, last-writer-wins would destroy the original login IP and user
+/// agent and leave the row visually unchanged. If a "currently seen from" value
+/// is ever wanted, it gets its own columns and its own label.
+///
+/// **`user_id = $2` in the WHERE is defensive**: it makes a mis-threaded
+/// `session_id` fail rather than cross-link two users' tokens.
+///
+/// The outer INSERT deliberately omits `user_agent`. Writing the sanitized UA to
+/// `refresh_tokens` on every rotation (~96 times a day per session) persists
+/// ~120 bytes nothing reads — `list_auth_sessions` never touches that table and the
+/// same string is already on the session row — on the workspace's
+/// fastest-growing never-pruned table.
+pub async fn start_or_continue_session(
     conn: &mut AsyncPgConnection,
+    session_id: Uuid,
     user_id: Uuid,
     token_hash: String,
     expires_at: DateTime<Utc>,
     user_agent: Option<String>,
+    ip: Option<String>,
 ) -> QueryResult<usize> {
-    diesel::insert_into(refresh_tokens::table)
-        .values(NewRefreshToken {
-            user_id,
-            token_hash,
-            expires_at,
-            user_agent,
-        })
-        .execute(conn)
-        .await
+    diesel::sql_query(
+        "WITH s AS ( \
+           INSERT INTO auth_sessions (id, user_id, expires_at, user_agent, ip) \
+           VALUES ($1,$2,$3,$4,$5) \
+           ON CONFLICT (id) DO UPDATE \
+              SET last_used_at = now(), \
+                  expires_at   = EXCLUDED.expires_at, \
+                  user_agent   = COALESCE(auth_sessions.user_agent, EXCLUDED.user_agent), \
+                  ip           = COALESCE(auth_sessions.ip, EXCLUDED.ip) \
+            WHERE auth_sessions.revoked_at IS NULL AND auth_sessions.user_id = $2 \
+           RETURNING id) \
+         INSERT INTO refresh_tokens (user_id, token_hash, expires_at, session_id) \
+         SELECT $2,$6,$3,s.id FROM s",
+    )
+    .bind::<SqlUuid, _>(session_id)
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<Timestamptz, _>(expires_at)
+    .bind::<Nullable<Text>, _>(user_agent)
+    .bind::<Nullable<Text>, _>(ip)
+    .bind::<Text, _>(token_hash)
+    .execute(conn)
+    .await
+}
+
+/// One id returned by a revoke CTE. The primary query must always be
+/// `SELECT id FROM s` — see the note on [`revoke_session`].
+#[derive(Debug, QueryableByName)]
+pub struct RevokedSessionRow {
+    #[diesel(sql_type = SqlUuid)]
+    pub id: Uuid,
+}
+
+/// End one session the caller owns. Returns the ids actually revoked (0 or 1).
+///
+/// **The `auth_sessions` UPDATE must be the row-count-bearing statement.**
+/// Postgres reports the command tag of the *outer* statement, so the obvious
+/// shape — `WITH s AS (UPDATE auth_sessions ... RETURNING id) UPDATE
+/// refresh_tokens ... FROM s`, read with `.execute()` — returns the number of
+/// *token* rows touched. A live session that currently has no live refresh token
+/// would then revoke successfully in the database while the handler answered
+/// 404, and because the handler only updates its in-process snapshot on the
+/// success branch, the killed session's access token would keep working for the
+/// full 900s. That state is reachable and is *created* by this slice, because
+/// deactivation used to kill tokens without touching sessions. So: session
+/// UPDATE in one CTE arm, token UPDATE in a second, `SELECT id FROM s` as the
+/// primary query. Data-modifying CTE arms execute exactly once and to completion
+/// whether or not the primary query reads them, which is why the token arm can
+/// be a bare `RETURNING r.id` nobody selects.
+///
+/// `user_id = $2` is the ownership check. It is why the handler needs no
+/// separate SELECT, why there is no window between check and write, and why one
+/// user can never revoke another's session by guessing a uuid. An empty result
+/// means absent, already revoked, or someone else's — all mapped to 404, never
+/// 403, so the response cannot be used to probe which session ids exist.
+pub async fn revoke_session(
+    conn: &mut AsyncPgConnection,
+    session_id: Uuid,
+    user_id: Uuid,
+    reason: &str,
+    actor: Option<Uuid>,
+) -> QueryResult<Vec<Uuid>> {
+    let rows: Vec<RevokedSessionRow> = diesel::sql_query(
+        "WITH s AS ( \
+           UPDATE auth_sessions SET revoked_at = now(), revoked_reason = $3, revoked_by = $4 \
+            WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL \
+           RETURNING id), \
+         t AS ( \
+           UPDATE refresh_tokens r SET revoked_at = now(), revoked_reason = $3 \
+             FROM s WHERE r.session_id = s.id AND r.revoked_at IS NULL \
+           RETURNING r.id) \
+         SELECT id FROM s",
+    )
+    .bind::<SqlUuid, _>(session_id)
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<Text, _>(reason)
+    .bind::<Nullable<SqlUuid>, _>(actor)
+    .get_results(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
+}
+
+/// End every live session for a user, optionally sparing one. Returns the ids
+/// revoked, which the caller must hand to the in-process revocation snapshot or
+/// the kill is invisible until the next poll.
+///
+/// The token arm expresses the sparing rule **directly** rather than as
+/// `session_id IN (SELECT id FROM s)`. The `IN` form silently skips live tokens
+/// whose session was already revoked — reachable, because the refresh race path
+/// issues a new token without revoking the presented one (so one session can
+/// hold two live tokens) and `logout` revokes one hash while revoking the
+/// session. Those leftovers are inert for minting, but they make
+/// `user_has_active_refresh_token` return true after an account-wide kill,
+/// weakening the invariant the grace window depends on. `IS DISTINCT FROM` also
+/// gives the right NULL semantics: session-less legacy tokens are still killed
+/// by "revoke others", which is correct — a user asking to kill their other
+/// devices means those too.
+pub async fn revoke_sessions_for_user(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    except: Option<Uuid>,
+    reason: &str,
+    actor: Option<Uuid>,
+) -> QueryResult<Vec<Uuid>> {
+    let rows: Vec<RevokedSessionRow> = diesel::sql_query(
+        "WITH s AS ( \
+           UPDATE auth_sessions SET revoked_at = now(), revoked_reason = $2, revoked_by = $3 \
+            WHERE user_id = $1 AND revoked_at IS NULL \
+              AND ($4::uuid IS NULL OR id <> $4) \
+           RETURNING id), \
+         t AS ( \
+           UPDATE refresh_tokens r SET revoked_at = now(), revoked_reason = $2 \
+            WHERE r.user_id = $1 AND r.revoked_at IS NULL \
+              AND ($4::uuid IS NULL OR r.session_id IS DISTINCT FROM $4) \
+           RETURNING r.id) \
+         SELECT id FROM s",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<Text, _>(reason)
+    .bind::<Nullable<SqlUuid>, _>(actor)
+    .bind::<Nullable<SqlUuid>, _>(except)
+    .get_results(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
+}
+
+/// Revoke one refresh token by hash and take its session with it. Returns the
+/// session id if one was ended.
+///
+/// Today's `logout` revokes the token and leaves the session live in the owner's
+/// list forever — dead token, live row. The `AND revoked_at IS NULL` guard is a
+/// small, deliberate behaviour change from `revoke_refresh_token`: without it,
+/// logging out with an already-rotated token rewrites `revoked_reason` from
+/// `rotated` to `logout`, and the 10-second grace window (which fires only on
+/// `rotated`) stops firing for the other tab. This does not widen logout's
+/// authorization surface — whoever holds the raw refresh token could already
+/// revoke it.
+pub async fn revoke_refresh_token_and_session(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+    reason: &str,
+) -> QueryResult<Option<Uuid>> {
+    let rows: Vec<RevokedSessionRow> = diesel::sql_query(
+        "WITH t AS ( \
+           UPDATE refresh_tokens SET revoked_at = now(), revoked_reason = $2 \
+            WHERE token_hash = $1 AND revoked_at IS NULL \
+           RETURNING session_id), \
+         s AS ( \
+           UPDATE auth_sessions a SET revoked_at = now(), revoked_reason = $2 \
+             FROM t WHERE a.id = t.session_id AND a.revoked_at IS NULL \
+           RETURNING a.id) \
+         SELECT id FROM s",
+    )
+    .bind::<Text, _>(token_hash)
+    .bind::<Text, _>(reason)
+    .get_results(conn)
+    .await?;
+    Ok(rows.into_iter().next().map(|r| r.id))
+}
+
+/// Ceiling on how many session rows one account may render. A real account has
+/// single-digit live sessions; this exists so a pathological one cannot turn a
+/// user-facing page into an unbounded scan.
+pub const MAX_SESSIONS_LISTED: i64 = 200;
+
+/// How long a revoked or long-expired session row is kept.
+///
+/// A compile-time constant, not an environment variable: three files of
+/// documentation for a value nobody tunes is how a config surface becomes
+/// unmaintainable.
+pub const AUTH_SESSION_RETENTION_DAYS: i64 = 30;
+
+/// The caller's own sessions, live first.
+///
+/// Named `list_auth_sessions` rather than `list_sessions`: this module already
+/// owns an analytics `list_sessions` over the unrelated `sessions` table, and a
+/// same-name collision does not compile.
+///
+/// **Never touches `refresh_tokens`.** That is the structural reason
+/// `token_hash` cannot leak through the session endpoint: the column is not in
+/// this query's source table, so no careless `select()` can reach it.
+pub async fn list_auth_sessions(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    include_revoked: bool,
+) -> QueryResult<Vec<AuthSession>> {
+    let now = Utc::now();
+    let mut rows = auth_sessions::table
+        .filter(auth_sessions::user_id.eq(user_id))
+        .filter(auth_sessions::revoked_at.is_null())
+        .filter(auth_sessions::expires_at.gt(now))
+        .select(AuthSession::as_select())
+        .order(auth_sessions::last_used_at.desc())
+        .limit(MAX_SESSIONS_LISTED)
+        .load(conn)
+        .await?;
+
+    if include_revoked {
+        // Served by `auth_sessions_revoked_idx`. The reaper is what keeps that
+        // partial index small enough that this needs no `user_id` support: the
+        // whole index is the last 30 days of revocations.
+        let cutoff = now - chrono::Duration::days(AUTH_SESSION_RETENTION_DAYS);
+        let revoked = auth_sessions::table
+            .filter(auth_sessions::user_id.eq(user_id))
+            .filter(auth_sessions::revoked_at.ge(cutoff))
+            .select(AuthSession::as_select())
+            .order(auth_sessions::revoked_at.desc())
+            .limit(MAX_SESSIONS_LISTED)
+            .load(conn)
+            .await?;
+        rows.extend(revoked);
+    }
+    Ok(rows)
+}
+
+/// Session ids revoked within the last `window_secs`, for the per-replica
+/// revocation snapshot.
+///
+/// The cutoff is computed **in the database**. Computing `Utc::now() - window`
+/// in Rust would make the control depend on API-vs-Postgres clock skew:
+/// `revoked_at` is written by Postgres `now()`, so an API host running ahead by
+/// more than the slack would drop recently-revoked sessions from its snapshot
+/// and silently re-enable their access tokens — invisibly, because the poll
+/// succeeded.
+///
+/// The `LIMIT` is not decoration: without it a plausible
+/// `JWT_ACCESS_TTL_SECS=604800` plus any bulk event (an offboarding script, a
+/// deactivation sweep) has every replica materialising an enormous set 17 280
+/// times a day and swapping it into a lock every authenticated request reads.
+/// The caller logs at ERROR when the limit is hit — a silently truncated
+/// snapshot is a security control that has stopped working while reporting
+/// healthy.
+pub async fn revoked_session_ids(
+    conn: &mut AsyncPgConnection,
+    window_secs: i64,
+) -> QueryResult<Vec<Uuid>> {
+    let rows: Vec<RevokedSessionRow> = diesel::sql_query(
+        "SELECT id FROM auth_sessions \
+          WHERE revoked_at >= now() - ($1 || ' seconds')::interval \
+          LIMIT 50000",
+    )
+    .bind::<Text, _>(window_secs.to_string())
+    .get_results(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
+}
+
+/// Delete `auth_sessions` rows older than `days`.
+///
+/// This table is a permanent per-user record of where and on what device someone
+/// signed in — a new PII class; `refresh_tokens` never had an `ip` column at
+/// all. Nothing writes `revoked_at` when a session merely *expires*, so
+/// `WHERE revoked_at IS NULL` excludes only explicitly-revoked sessions and
+/// every abandoned session would otherwise stay indexed forever.
+///
+/// Deleting a row sets its tokens' `session_id` to NULL rather than deleting
+/// them — that is exactly why the FK is `ON DELETE SET NULL`, and it is what
+/// keeps replay detection intact through a reap.
+pub async fn prune_auth_sessions(conn: &mut AsyncPgConnection, days: i64) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM auth_sessions \
+          WHERE (revoked_at IS NOT NULL AND revoked_at < now() - ($1 || ' days')::interval) \
+             OR expires_at < now() - ($1 || ' days')::interval",
+    )
+    .bind::<Text, _>(days.to_string())
+    .execute(conn)
+    .await
 }
 
 pub async fn find_active_refresh_token(
@@ -213,6 +524,51 @@ pub const REVOKE_REUSE: &str = "reuse";
 pub const REVOKE_DEACTIVATED: &str = "deactivated";
 /// Refresh tokens rotated out because the user changed their own password.
 pub const REVOKE_PASSWORD_CHANGED: &str = "password_changed";
+/// Sessions killed because a reset link was consumed. A deliberate act by the
+/// person who proved control of the mailbox, so it is never a theft signal.
+pub const REVOKE_PASSWORD_RESET: &str = "password_reset";
+/// Sessions killed because an admin forced a password reset on the account.
+pub const REVOKE_RESET_FORCED: &str = "reset_forced";
+/// `password_reset_tokens.invalidated_reason` when a newer admin-initiated
+/// reset replaced this link.
+pub const RESET_INVALIDATED_SUPERSEDED: &str = "superseded";
+/// `password_reset_tokens.invalidated_reason` when the account's password was
+/// set, which kills every sibling link.
+pub const RESET_INVALIDATED_PASSWORD_SET: &str = "password_set";
+/// The owner ended one specific session from their own account page.
+pub const REVOKE_USER_REVOKED: &str = "user_revoked";
+/// The owner pressed "sign out other devices" — every session but the caller's.
+pub const REVOKE_USER_REVOKED_OTHERS: &str = "user_revoked_others";
+/// An administrator with `member:credential` signed a member out of everything.
+pub const REVOKE_ADMIN: &str = "admin_revoked";
+
+/// Reasons that mean a human deliberately ended the session. Presenting a token
+/// revoked for one of these is NOT evidence of theft and must not trip the
+/// family kill in `refresh`.
+///
+/// Without this, a device killed by "sign out other devices" presents its dead
+/// token on its existing 15-minute timer, lands in the reuse branch, and kills
+/// the user's WHOLE family — including the session they explicitly chose to
+/// keep. The symptom reads as "sign out other devices logs me out too, about
+/// fifteen minutes later", which looks like a flaky bug rather than a design
+/// fault.
+///
+/// This is "deliberate, not theft" — not "every reason". `REVOKE_ROTATED` and
+/// `REVOKE_REUSE` must never appear here: rotation would take the early-return
+/// path on every ordinary refresh and break the 10-second multi-tab grace
+/// window, and reuse is the theft signal itself. `REVOKE_LOGOUT` and
+/// `REVOKE_PASSWORD_CHANGED` stay out too — a token surfacing after either is
+/// exactly the replay the alarm exists for.
+///
+/// Adding a reason that `auth_sessions_revoked_reason_check` does not already
+/// list ALSO needs a widening migration, or the revoke path 500s.
+pub const DELIBERATE_REVOKE_REASONS: [&str; 5] = [
+    REVOKE_USER_REVOKED,
+    REVOKE_USER_REVOKED_OTHERS,
+    REVOKE_ADMIN,
+    REVOKE_PASSWORD_RESET,
+    REVOKE_RESET_FORCED,
+];
 
 pub async fn revoke_refresh_token(
     conn: &mut AsyncPgConnection,
@@ -230,16 +586,19 @@ pub async fn revoke_refresh_token(
 
 /// Revocation metadata for a token hash, whatever its state.
 ///
-/// Returns `(user_id, revoked_at, revoked_reason)`. The handler needs all three
-/// to tell a benign concurrent refresh from a genuine replay.
+/// Returns `(user_id, session_id, revoked_at, revoked_reason)`. The handler
+/// needs all four: the first three to tell a benign concurrent refresh from a
+/// genuine replay, and `session_id` because the race path holds only the hash
+/// and must continue the *same* session rather than starting a new one.
 pub async fn refresh_token_revocation(
     conn: &mut AsyncPgConnection,
     token_hash: &str,
-) -> QueryResult<Option<(Uuid, Option<DateTime<Utc>>, Option<String>)>> {
+) -> QueryResult<Option<(Uuid, Option<Uuid>, Option<DateTime<Utc>>, Option<String>)>> {
     refresh_tokens::table
         .filter(refresh_tokens::token_hash.eq(token_hash))
         .select((
             refresh_tokens::user_id,
+            refresh_tokens::session_id,
             refresh_tokens::revoked_at,
             refresh_tokens::revoked_reason,
         ))
@@ -250,8 +609,15 @@ pub async fn refresh_token_revocation(
 
 /// Whether the user still holds any usable refresh token.
 ///
-/// After a family kill there are none, which is what stops the grace window
-/// from resurrecting a session that was just revoked for replay.
+/// After a family kill there are none, which is what stops the grace window from
+/// resurrecting a session that was just revoked for replay.
+///
+/// That rationale stops holding the moment one session can be revoked while
+/// others live: with a second session alive this returns true even though the
+/// session being resurrected is dead. The real guard is now
+/// `WHERE auth_sessions.revoked_at IS NULL` inside
+/// [`start_or_continue_session`]; this check is a cheap first filter, not the
+/// thing standing between a revoked session and a fresh token.
 pub async fn user_has_active_refresh_token(
     conn: &mut AsyncPgConnection,
     user_id: Uuid,
@@ -318,6 +684,250 @@ pub async fn revoke_all_refresh_tokens_for_user_with_reason(
     ))
     .execute(conn)
     .await
+}
+
+// ===========================================================================
+// Password reset tokens
+// ===========================================================================
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_password_reset_token(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    token_hash: String,
+    password_fingerprint: String,
+    expires_at: DateTime<Utc>,
+    mode: &str,
+    initiated_by: Option<Uuid>,
+    requested_from: Option<String>,
+) -> QueryResult<PasswordResetToken> {
+    diesel::insert_into(password_reset_tokens::table)
+        .values(NewPasswordResetToken {
+            user_id,
+            token_hash,
+            password_fingerprint,
+            mode: mode.to_string(),
+            initiated_by,
+            requested_from,
+            expires_at,
+        })
+        .returning(PasswordResetToken::as_returning())
+        .get_result(conn)
+        .await
+}
+
+/// Does this address already hold a self-service reset link that still works?
+///
+/// Keyed on the EMAIL, not on a user id, so it is one statement against one
+/// index whether or not the account exists. `forgot_password` is built so that
+/// both branches do identical work — an existence check that ran only on the
+/// found branch would hand back the enumeration oracle that route's preflight
+/// exists to close.
+///
+/// Scoped to the self-service mode on purpose. An admin-initiated link lives for
+/// 24h, and treating one as "you already have a link" would mute a whole day of
+/// self-service mail for someone whose admin link may have gone astray.
+///
+/// The mode is `"self"`, matching the table's CHECK constraint —
+/// `ResetMode::SelfService.as_str()`, NOT the variant's name. Spelling it
+/// `"self_service"` compiles, matches nothing, and silently turns the send cap
+/// in `forgot_password` into a no-op that mails on every request.
+pub async fn has_live_self_service_reset_token(
+    conn: &mut AsyncPgConnection,
+    email: &str,
+) -> QueryResult<bool> {
+    let email = email.to_lowercase();
+    password_reset_tokens::table
+        .inner_join(users::table)
+        .filter(users::email.eq(email))
+        .filter(password_reset_tokens::mode.eq("self"))
+        .filter(password_reset_tokens::consumed_at.is_null())
+        .filter(password_reset_tokens::invalidated_at.is_null())
+        .filter(password_reset_tokens::expires_at.gt(Utc::now()))
+        .select(password_reset_tokens::id)
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map(|row| row.is_some())
+}
+
+/// The cheap pre-check, before any Argon2 work. Sibling of
+/// [`find_active_refresh_token`].
+pub async fn find_live_password_reset_token(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+) -> QueryResult<Option<PasswordResetToken>> {
+    password_reset_tokens::table
+        .filter(password_reset_tokens::token_hash.eq(token_hash))
+        .filter(password_reset_tokens::consumed_at.is_null())
+        .filter(password_reset_tokens::invalidated_at.is_null())
+        .filter(password_reset_tokens::expires_at.gt(Utc::now()))
+        .select(PasswordResetToken::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+#[derive(QueryableByName)]
+struct ConsumedResetRow {
+    #[diesel(sql_type = SqlUuid)]
+    user_id: Uuid,
+    #[diesel(sql_type = Text)]
+    password_fingerprint: String,
+    #[diesel(sql_type = Text)]
+    mode: String,
+}
+
+/// Burn a reset link, atomically. Returns `(user_id, password_fingerprint, mode)`.
+///
+/// Zero rows means somebody else burned it first. This has to be one
+/// `UPDATE … RETURNING` rather than a SELECT then an UPDATE: single-use is the
+/// whole security property, and `conn.transaction` is unavailable (async
+/// closures need Rust 1.85, workspace MSRV is 1.82).
+pub async fn consume_password_reset_token(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+) -> QueryResult<Option<(Uuid, String, String)>> {
+    let row: Option<ConsumedResetRow> = diesel::sql_query(
+        "UPDATE password_reset_tokens SET consumed_at = now() \
+         WHERE token_hash = $1 AND consumed_at IS NULL AND invalidated_at IS NULL \
+           AND expires_at > now() \
+         RETURNING user_id, password_fingerprint, mode",
+    )
+    .bind::<Text, _>(token_hash)
+    .get_result(conn)
+    .await
+    .optional()?;
+    Ok(row.map(|r| (r.user_id, r.password_fingerprint, r.mode)))
+}
+
+/// Kill every outstanding link for a user. Sibling of
+/// [`revoke_all_refresh_tokens_for_user_with_reason`].
+pub async fn invalidate_password_reset_tokens_for_user(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    reason: &str,
+) -> QueryResult<usize> {
+    diesel::update(
+        password_reset_tokens::table
+            .filter(password_reset_tokens::user_id.eq(user_id))
+            .filter(password_reset_tokens::consumed_at.is_null())
+            .filter(password_reset_tokens::invalidated_at.is_null()),
+    )
+    .set((
+        password_reset_tokens::invalidated_at.eq(Utc::now()),
+        password_reset_tokens::invalidated_reason.eq(reason),
+    ))
+    .execute(conn)
+    .await
+}
+
+/// Deletes by `created_at`, not `expires_at`, so a consumed token's audit trace
+/// survives a fixed window regardless of its TTL. This table is the only record
+/// that an admin forced a reset on someone — there is no `audit_events` table.
+pub async fn prune_password_reset_tokens(
+    conn: &mut AsyncPgConnection,
+    older_than_days: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM password_reset_tokens WHERE created_at < now() - ($1 || ' days')::interval",
+    )
+    .bind::<Text, _>(older_than_days.to_string())
+    .execute(conn)
+    .await
+}
+
+/// Set the forced-change flag and nothing else.
+///
+/// Deliberately not routed through [`set_user_password`]: that one clears
+/// `must_change_password`, which would un-gate the very account an admin reset
+/// is trying to gate. The mistake is invisible in review, hence this comment.
+pub async fn set_user_must_change_password(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    must_change: bool,
+) -> QueryResult<usize> {
+    diesel::update(users::table.find(user_id))
+        .set((
+            users::must_change_password.eq(must_change),
+            users::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
+}
+
+/// One function for both directions: `Some(now)` locks the credential, `None`
+/// is the admin's cancel. Two functions would let one of them be added without
+/// the other, and the one that would go missing is the undo.
+pub async fn set_user_credentials_invalidated(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    at: Option<DateTime<Utc>>,
+) -> QueryResult<usize> {
+    diesel::update(users::table.find(user_id))
+        .set((
+            users::credentials_invalidated_at.eq(at),
+            users::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
+}
+
+/// Compare-and-swap password write. Zero rows means the password moved under us.
+///
+/// The reset handler reads `users.password_hash` to check the link's
+/// fingerprint and writes ~100-200 ms later, with two Argon2 operations in
+/// between. A legitimate user changing their password via `/v1/auth/password`
+/// inside that window would otherwise have it silently clobbered by a stale
+/// link — precisely what `password_fingerprint` exists to prevent. Guarding the
+/// write itself moves the guarantee to the commit point rather than to a read.
+///
+/// The same statement clears `must_change_password` and
+/// `credentials_invalidated_at`, so an account an admin locked is unlocked by
+/// the write that satisfies the demand. A follow-up UPDATE would leave a window
+/// in which the new password is live and `login` still refuses it.
+pub async fn set_user_password_if_hash_matches(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    expected_hash: &str,
+    new_hash: &str,
+) -> QueryResult<usize> {
+    diesel::update(
+        users::table
+            .filter(users::id.eq(user_id))
+            .filter(users::password_hash.eq(expected_hash)),
+    )
+    .set((
+        users::password_hash.eq(new_hash),
+        users::must_change_password.eq(false),
+        users::credentials_invalidated_at.eq(None::<DateTime<Utc>>),
+        users::updated_at.eq(Utc::now()),
+    ))
+    .execute(conn)
+    .await
+}
+
+/// Two zero-row probes, run before `forgot-password` branches on whether the
+/// account exists.
+///
+/// Without it that endpoint is a *perfect* enumeration oracle on any deployment
+/// that upgraded without running `sauron-migrate` — the RPM never re-runs it.
+/// Unknown address: one SELECT against `users`, 200. Known address: an INSERT
+/// against a table that does not exist, 500. This moves the failure ahead of
+/// the branch so it is uniform, and turns a cheerful "we have sent a link"
+/// forever into a loud 500 that pages someone.
+pub async fn password_reset_preflight(conn: &mut AsyncPgConnection) -> QueryResult<()> {
+    password_reset_tokens::table
+        .select(password_reset_tokens::id)
+        .limit(0)
+        .load::<Uuid>(conn)
+        .await?;
+    mail_outbox::table
+        .select(mail_outbox::id)
+        .limit(0)
+        .load::<Uuid>(conn)
+        .await?;
+    Ok(())
 }
 
 // ===========================================================================
@@ -675,12 +1285,26 @@ pub async fn count_org_manage_grants_for_user_excluding_user(
     Ok(row.n)
 }
 
-/// All grants in an org with the user email/name/active-status and role name,
-/// for the members page.
+/// All grants in an org with the user email/name/active-status, role name, and
+/// pending-reset marker, for the members page.
+///
+/// `credentials_invalidated_at` is visible to `member:read`, a wider audience
+/// than `member:credential`. Acceptable: `is_active` is equally an
+/// account-state disclosure and already ships in the same row, and without this
+/// column the cancel action exists on the server and is unreachable from the UI.
 pub async fn list_org_grants(
     conn: &mut AsyncPgConnection,
     org_id: Uuid,
-) -> QueryResult<Vec<(RoleGrant, String, String, String, bool)>> {
+) -> QueryResult<
+    Vec<(
+        RoleGrant,
+        String,
+        String,
+        String,
+        bool,
+        Option<DateTime<Utc>>,
+    )>,
+> {
     role_grants::table
         .inner_join(users::table.on(users::id.eq(role_grants::user_id)))
         .inner_join(roles::table.on(roles::id.eq(role_grants::role_id)))
@@ -691,6 +1315,7 @@ pub async fn list_org_grants(
             users::name,
             roles::name,
             users::is_active,
+            users::credentials_invalidated_at,
         ))
         .order(role_grants::created_at.asc())
         .load(conn)
@@ -768,8 +1393,29 @@ pub async fn rename_project(
         .optional()
 }
 
+/// Delete a project, taking every inspector policy under it with it.
+///
+/// Three levels, because a project owns apps and those apps own enrollments,
+/// and a policy may target any of the three. See [`delete_app`] for why the
+/// polymorphic `target_id` gets no cascade and why this is one CTE.
 pub async fn delete_project(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
-    diesel::delete(projects::table.find(id)).execute(conn).await
+    diesel::sql_query(
+        "WITH orphaned_policies AS ( \
+             DELETE FROM inspector_policies \
+              WHERE (target_type = 'project' AND target_id = $1) \
+                 OR (target_type = 'app' \
+                     AND target_id IN (SELECT id FROM apps WHERE project_id = $1)) \
+                 OR (target_type = 'app_env' \
+                     AND target_id IN ( \
+                           SELECT ae.id FROM app_environments ae \
+                             JOIN apps a ON a.id = ae.app_id \
+                            WHERE a.project_id = $1)) \
+         ) \
+         DELETE FROM projects WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(id)
+    .execute(conn)
+    .await
 }
 
 /// The org that owns a project.
@@ -883,8 +1529,36 @@ pub async fn update_app(
         .optional()
 }
 
+/// Delete an app, taking its inspector policies with it.
+///
+/// `inspector_policies.target_id` is polymorphic (it matches `role_grants`), so
+/// it carries no foreign key and no `ON DELETE CASCADE`. Everything else the
+/// app owns — events, `inspector_findings`, `inspector_masked_keys` — really
+/// does cascade, which made the survivors easy to miss: the policy row stayed,
+/// `GET /v1/orgs/{org}/inspector/policies` kept LISTING it, and
+/// `DELETE /v1/inspector/policies/{id}` answered 404 forever because that
+/// handler authorizes through `authorize_app` against an app that no longer
+/// exists. Visible, and unreachable.
+///
+/// One CTE rather than two statements: `conn.transaction(...)` is blocked by
+/// the MSRV, and a bare pair could delete the app and then fail, leaving
+/// exactly the orphan this exists to prevent. Every arm of a CTE also reads the
+/// SAME snapshot, so the `app_environments` sub-select still sees the
+/// enrollments even though the app delete cascades them away in the same
+/// statement — which is why the `app_env` arm does not need to run first.
 pub async fn delete_app(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
-    diesel::delete(apps::table.find(id)).execute(conn).await
+    diesel::sql_query(
+        "WITH orphaned_policies AS ( \
+             DELETE FROM inspector_policies \
+              WHERE (target_type = 'app' AND target_id = $1) \
+                 OR (target_type = 'app_env' \
+                     AND target_id IN (SELECT id FROM app_environments WHERE app_id = $1)) \
+         ) \
+         DELETE FROM apps WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(id)
+    .execute(conn)
+    .await
 }
 
 /// `(project_id, org_id)` ancestry of an app — for permission resolution.
@@ -937,6 +1611,19 @@ pub async fn env_ancestries(
         ))
         .load(conn)
         .await
+}
+
+/// The app an `app_environments` ENROLLMENT belongs to.
+pub async fn app_id_for_enrollment(
+    conn: &mut AsyncPgConnection,
+    enrollment_id: Uuid,
+) -> QueryResult<Option<Uuid>> {
+    app_environments::table
+        .find(enrollment_id)
+        .select(app_environments::app_id)
+        .first(conn)
+        .await
+        .optional()
 }
 
 // --- environments: the project-level catalogue -------------------------------
@@ -1403,6 +2090,39 @@ pub async fn env_ids_for_app(conn: &mut AsyncPgConnection, app_id: Uuid) -> Quer
         .await
 }
 
+/// `(app_id, app_environments.id)` for every enrollment of every app in
+/// `app_ids` — the batched [`env_ids_for_app`], same semantics INCLUDING
+/// retired enrollments (retired history stays readable, and
+/// `resolve_env_filter` needs the full set for its `EnvNotInApp` check).
+///
+/// Callers MUST fold this into a map keyed by `app_id` and hand
+/// `resolve_env_filter` only that app's slice. `resolve_env_filter` uses
+/// `app_env_ids` for two decisions — the `EnvNotInApp` membership test and
+/// `readable = app_env_ids ∩ reach.envs` — and the union across several apps
+/// breaks both in the same direction, TOWARDS GRANTING. Concretely: a caller
+/// holding an env grant only on app B's staging enrollment, asking for app A,
+/// gets a non-empty `readable` for app A (it contains app B's id), so instead
+/// of `NoReach` → 403, app A resolves to a `Subset` naming an environment that
+/// is not its own and contributes zero rows, silently, inside a combined number
+/// the caller should have been refused outright.
+///
+/// Deliberately unordered and unlimited, unlike `list_app_environments`: this
+/// feeds an authorization decision, and a truncated or filtered input to that
+/// decision is a wrong answer, not a shorter list.
+pub async fn env_ids_for_apps(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid)>> {
+    if app_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    app_environments::table
+        .filter(app_environments::app_id.eq_any(app_ids.to_vec()))
+        .select((app_environments::app_id, app_environments::id))
+        .load(conn)
+        .await
+}
+
 // ===========================================================================
 // Issues & error events (app-scoped)
 // ===========================================================================
@@ -1416,8 +2136,25 @@ pub async fn upsert_issue(conn: &mut AsyncPgConnection, new: NewIssue<'_>) -> Qu
             issues::last_seen.eq(excluded(issues::last_seen)),
             issues::times_seen.eq(issues::times_seen + 1),
             issues::level.eq(excluded(issues::level)),
-            issues::title.eq(excluded(issues::title)),
-            issues::culprit.eq(excluded(issues::culprit)),
+            // Sticky mask guard. `error_events.title` is derived server-side by
+            // `build_title(exc, message)` and has no wire field, so forward
+            // enforcement alone leaves two gaps on the Issues page: PII inside
+            // `exception_type`, which `build_title` also concatenates, and the 30s
+            // policy-cache window. Both restore the raw string on the very next
+            // occurrence. One string compare on a write bounded by DISTINCT
+            // FINGERPRINTS, not by event volume.
+            //
+            // This is permanent: once a fingerprint's title is '****' it stays
+            // '****' forever, even if every subsequent occurrence is benign. That is
+            // the correct trade — a fingerprint is a stable error identity — but it
+            // is a visible regression on the most-looked-at page in the product, and
+            // support will be asked about it. It is in the wiki.
+            issues::title.eq(diesel::dsl::sql::<diesel::sql_types::Text>(
+                "CASE WHEN issues.title = '****' THEN issues.title ELSE excluded.title END",
+            )),
+            issues::culprit.eq(diesel::dsl::sql::<diesel::sql_types::Text>(
+                "CASE WHEN issues.culprit = '****' THEN issues.culprit ELSE excluded.culprit END",
+            )),
             issues::updated_at.eq(Utc::now()),
             // Ingest-side watermark for the regression trigger. Set here and
             // nowhere else: keying regression off `last_seen` (client clock)
@@ -2476,6 +3213,60 @@ pub async fn touch_event_user(
     .bind::<Text, _>(distinct_id)
     .execute(conn)
     .await
+}
+
+/// The three legal values of `event_users.identified_source`, transcribed from
+/// migration `2026-08-01-000038`'s CHECK constraint. Adding a fourth means a
+/// widening migration, not just a constant.
+pub const IDENTIFIED_SOURCE_IDENTIFY: &str = "identify";
+pub const IDENTIFIED_SOURCE_CONTEXT_USER: &str = "context_user";
+pub const IDENTIFIED_SOURCE_BACKFILL: &str = "backfill";
+
+/// Flag `(app_id, distinct_id)` as naming a real person, first-write-wins.
+///
+/// A separate statement rather than a column added to `touch_event_user` /
+/// `upsert_event_user`, and the separation is load-bearing. RPM upgrades do not
+/// re-run `sauron-migrate`, so a new binary can meet an old schema. If the
+/// identification column list rode along inside `touch_event_user`, every
+/// statement would fail with `undefined_column` and `process_event`'s
+/// `let _ = …` would DISCARD the failure — `first_seen`/`last_seen` would
+/// silently stop advancing deployment-wide with no dead letter, no metric and
+/// no log. `process_identify`'s upsert is `.await?`, so the same missing column
+/// would dead-letter every identify() in the window, destroying exactly the
+/// `properties` and `identities` rows the 000038 backfill later depends on.
+///
+/// First-write-wins falls out of the `IS NULL` predicate rather than a
+/// `COALESCE`, so after the first hit this is a primary-key no-op. Returning 0
+/// is the normal steady state and is never an error.
+pub async fn mark_event_user_identified(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    distinct_id: &str,
+    source: &str,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE event_users SET identified_at = now(), identified_source = $3 \
+         WHERE app_id = $1 AND distinct_id = $2 AND identified_at IS NULL",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(distinct_id)
+    .bind::<Text, _>(source)
+    .execute(conn)
+    .await
+}
+
+/// Cheap existence probe for `event_users.identified_at`.
+///
+/// `LIMIT 0` so it costs a parse and nothing else. Callers run it once at boot
+/// and latch the answer: `sauron-ingest` skips identification for the process
+/// lifetime after logging one ERROR, and `sauron-api` turns the active-users
+/// routes into a `503` that names `sauron-migrate` instead of letting a raw
+/// `undefined_column` surface as a 500.
+pub async fn probe_event_users_identified(conn: &mut AsyncPgConnection) -> QueryResult<()> {
+    diesel::sql_query("SELECT identified_at FROM event_users LIMIT 0")
+        .execute(conn)
+        .await
+        .map(|_| ())
 }
 
 pub async fn insert_identity(
@@ -5195,34 +5986,57 @@ pub struct UserStats {
 /// sessions for the two `*_session_ms` fields) and gets the real predicate, reused across
 /// all 8 of those sub-selects via the same bind ($3, only when `scope.env` is `One`) that
 /// `event_user_membership_exists` also reuses for its three `EXISTS` legs.
+///
+/// `now` is supplied by the caller rather than read from the database clock.
+/// The 1/7/30-day literals are NOT the bug and must not become parameters:
+/// `dau`/`wau`/`mau` mean those spans by definition and the dashboard tiles are
+/// literally labelled "7-day"/"30-day", so repointing them at `since_days`
+/// would make a user on the 90-day range read "MAU" as a 90-day count. The bug
+/// was that three separate `now()` calls inside one statement are three
+/// different instants, that this was the last read in the analytics path
+/// anchored to the DATABASE clock, and that it was untestable without freezing
+/// the server clock.
+///
+/// Known limitation, deliberately not fixed here: `user_stats` is HOT-TIER
+/// ONLY, and its 30-day `mau` window is exactly the default `TIER_HOT_DAYS`, so
+/// once `sauron-tier` has run that number silently loses its oldest days.
+/// `GET /v1/projects/{id}/active-users` and its `truncated` flag are the
+/// principled answer; this endpoint keeps the cheap behaviour and says so.
 pub async fn user_stats(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     since: DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> QueryResult<UserStats> {
     let env_sql = scope.env.sql_fragment(3);
     // `.clone()`, not a move — the final `bind_env!` call below still needs
     // `scope.env`; see `overview_totals`'s identical call for why.
     let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
+    // Derived from `consumes_bind()`, never assumed: `All` and `Unattributed`
+    // reserve no bind, so the three cutoffs start at $3 for them and $4 for
+    // `One`/`Subset`. Hardcoding either shifts every cutoff by one and silently
+    // compares a timestamp against a uuid.
+    let n = if scope.env.consumes_bind() { 4 } else { 3 };
+    let (b1, b7, b30) = (n, n + 1, n + 2);
     let q = format!(
         "SELECT \
            (SELECT count(*) FROM event_users WHERE app_id=$1{membership_sql})::bigint AS total_users, \
            (SELECT count(*) FROM event_users WHERE app_id=$1 AND last_seen>=$2{membership_sql})::bigint AS active_in_range, \
            (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql})::bigint AS new_in_range, \
            (SELECT count(DISTINCT distinct_id) FROM ( \
-              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= now() - interval '1 day'{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= ${b1}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
               UNION ALL \
-              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= now() - interval '1 day'{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= ${b1}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
             ) d1)::bigint AS dau, \
            (SELECT count(DISTINCT distinct_id) FROM ( \
-              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= now() - interval '7 days'{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= ${b7}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
               UNION ALL \
-              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= now() - interval '7 days'{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= ${b7}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
             ) d7)::bigint AS wau, \
            (SELECT count(DISTINCT distinct_id) FROM ( \
-              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= now() - interval '30 days'{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= ${b30}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
               UNION ALL \
-              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= now() - interval '30 days'{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= ${b30}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
             ) d30)::bigint AS mau, \
            COALESCE((SELECT avg(EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \
                      FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}), 0)::double precision AS avg_session_ms, \
@@ -5233,7 +6047,13 @@ pub async fn user_stats(
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
         .bind::<Timestamptz, _>(since);
+    // `bind_env!` sits BETWEEN `since` and the three cutoffs so positional
+    // order matches the indices computed above.
     stmt = crate::bind_env!(stmt, &scope.env);
+    stmt = stmt
+        .bind::<Timestamptz, _>(now - chrono::Duration::days(1))
+        .bind::<Timestamptz, _>(now - chrono::Duration::days(7))
+        .bind::<Timestamptz, _>(now - chrono::Duration::days(30));
     stmt.get_result(conn).await
 }
 
@@ -7265,35 +8085,93 @@ pub struct AlertValueRow {
     pub v: Option<f64>,
 }
 
+/// `(enrollment_id, app_id, catalogue_environment_id)` for every LIVE
+/// enrollment of `app_ids`.
+///
+/// This is one of exactly two sanctioned bridges between the two environment
+/// id spaces. A subscription stores CATALOGUE ids (they are the wildcard RBAC
+/// lacks, and stay correct when a new app is auto-enrolled); everything
+/// downstream — event rows, `role_grants.scope_id`, `Reach.envs` — is
+/// ENROLLMENT ids. Mixing them produces a filter that matches nothing, and the
+/// failure is silent at every layer.
+pub async fn live_enrollments_for_apps(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid, Uuid)>> {
+    if app_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    app_environments::table
+        .filter(app_environments::app_id.eq_any(app_ids.to_vec()))
+        .filter(app_environments::retired_at.is_null())
+        .select((
+            app_environments::id,
+            app_environments::app_id,
+            app_environments::environment_id,
+        ))
+        .load(conn)
+        .await
+}
+
+/// The ENROLLMENT ids of the live environment named `name` across `app_ids`.
+///
+/// `retired_at IS NULL` is load-bearing on BOTH tables: `(app_id, name)` is
+/// only unique among LIVE environments, so retiring `staging` and creating a
+/// fresh `staging` leaves two rows with that name. Without these filters the
+/// resolver returns both ids and the count silently includes the retired
+/// environment's events too. The partial unique index guarantees at most one
+/// live match per name, so this is deterministic.
+pub async fn enrollment_ids_for_env_name(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    name: &str,
+) -> QueryResult<Vec<Uuid>> {
+    if app_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    app_environments::table
+        .inner_join(environments::table.on(environments::id.eq(app_environments::environment_id)))
+        .filter(app_environments::app_id.eq_any(app_ids.to_vec()))
+        .filter(app_environments::retired_at.is_null())
+        .filter(environments::retired_at.is_null())
+        .filter(environments::name.eq(name))
+        .select(app_environments::id)
+        .load(conn)
+        .await
+}
+
 /// Count error events across `app_ids` in `(from, to]`, with optional
 /// level/environment/tag filters. All values are bound parameters.
+///
+/// `env_ids` are **enrollment** ids (`app_environments.id`), because that is
+/// what `error_events.environment_id` holds. Callers that start from an
+/// environment *name* resolve it through [`enrollment_ids_for_env_name`]
+/// first. `Some(&[])` short-circuits to zero explicitly rather than by
+/// accident through an empty `ANY()`.
 pub async fn alert_count_errors(
     conn: &mut AsyncPgConnection,
     app_ids: &[Uuid],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     level: Option<&str>,
-    environment: Option<&str>,
+    env_ids: Option<&[Uuid]>,
     tag: Option<&Value>,
 ) -> QueryResult<i64> {
-    // `retired_at IS NULL` is load-bearing: (app_id, name) is only unique among
-    // LIVE environments, so retiring `staging` and creating a fresh `staging`
-    // leaves two rows with that name. Without this filter the subquery returns
-    // both ids and the count silently includes the retired environment's events
-    // too. The partial unique index guarantees at most one live match per name,
-    // so this is deterministic.
+    if env_ids.is_some_and(|e| e.is_empty()) {
+        return Ok(0);
+    }
     let row: AlertCountRow = diesel::sql_query(
         "SELECT count(*) AS n FROM error_events \
          WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
            AND ($4::text IS NULL OR level = $4) \
-           AND ($5::text IS NULL OR environment_id IN (SELECT id FROM environments WHERE name = $5 AND retired_at IS NULL)) \
+           AND ($5::uuid[] IS NULL OR environment_id = ANY($5)) \
            AND ($6::jsonb IS NULL OR tags @> $6)",
     )
     .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
     .bind::<Timestamptz, _>(from)
     .bind::<Timestamptz, _>(to)
     .bind::<Nullable<Text>, _>(level)
-    .bind::<Nullable<Text>, _>(environment)
+    .bind::<Nullable<diesel::sql_types::Array<SqlUuid>>, _>(env_ids.map(|e| e.to_vec()))
     .bind::<Nullable<Jsonb>, _>(tag)
     .get_result(conn)
     .await?;
@@ -7301,38 +8179,81 @@ pub async fn alert_count_errors(
 }
 
 /// Count analytics events across `app_ids` in `(from, to]`, with optional
-/// name/environment/tag filters.
+/// name/environment/tag filters. `env_ids` are **enrollment** ids; see
+/// [`alert_count_errors`].
 pub async fn alert_count_events(
     conn: &mut AsyncPgConnection,
     app_ids: &[Uuid],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     name: Option<&str>,
-    environment: Option<&str>,
+    env_ids: Option<&[Uuid]>,
     tag: Option<&Value>,
 ) -> QueryResult<i64> {
-    // `retired_at IS NULL` is load-bearing: (app_id, name) is only unique among
-    // LIVE environments, so retiring `staging` and creating a fresh `staging`
-    // leaves two rows with that name. Without this filter the subquery returns
-    // both ids and the count silently includes the retired environment's events
-    // too. The partial unique index guarantees at most one live match per name,
-    // so this is deterministic.
+    if env_ids.is_some_and(|e| e.is_empty()) {
+        return Ok(0);
+    }
     let row: AlertCountRow = diesel::sql_query(
         "SELECT count(*) AS n FROM analytics_events \
          WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
            AND ($4::text IS NULL OR name = $4) \
-           AND ($5::text IS NULL OR environment_id IN (SELECT id FROM environments WHERE name = $5 AND retired_at IS NULL)) \
+           AND ($5::uuid[] IS NULL OR environment_id = ANY($5)) \
            AND ($6::jsonb IS NULL OR tags @> $6)",
     )
     .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
     .bind::<Timestamptz, _>(from)
     .bind::<Timestamptz, _>(to)
     .bind::<Nullable<Text>, _>(name)
-    .bind::<Nullable<Text>, _>(environment)
+    .bind::<Nullable<diesel::sql_types::Array<SqlUuid>>, _>(env_ids.map(|e| e.to_vec()))
     .bind::<Nullable<Jsonb>, _>(tag)
     .get_result(conn)
     .await?;
     Ok(row.n)
+}
+
+#[derive(Debug, QueryableByName)]
+pub struct AlertAppCountRow {
+    #[diesel(sql_type = SqlUuid)]
+    pub app_id: Uuid,
+    #[diesel(sql_type = BigInt)]
+    pub n: i64,
+}
+
+/// Per-app error counts over one window — the grouped form the personal
+/// subscription evaluator needs.
+///
+/// A probe deliberately spans every app of every subscription that shares its
+/// condition bucket (keying on a single app id would turn one query over a
+/// 200-app project into 200), so the result has to come back attributed by
+/// app id. Fanning out positionally instead would let a key-collision bug
+/// attribute one app's counts to another user's subscription — a telemetry
+/// leak inside an email.
+pub async fn alert_count_errors_by_app(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    level: Option<&str>,
+    env_ids: Option<&[Uuid]>,
+) -> QueryResult<Vec<(Uuid, i64)>> {
+    if app_ids.is_empty() || env_ids.is_some_and(|e| e.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<AlertAppCountRow> = diesel::sql_query(
+        "SELECT app_id, count(*) AS n FROM error_events \
+         WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
+           AND ($4::text IS NULL OR level = $4) \
+           AND ($5::uuid[] IS NULL OR environment_id = ANY($5)) \
+         GROUP BY app_id",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .bind::<Nullable<Text>, _>(level)
+    .bind::<Nullable<diesel::sql_types::Array<SqlUuid>>, _>(env_ids.map(|e| e.to_vec()))
+    .load(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.app_id, r.n)).collect())
 }
 
 /// A latency metric over transactions in the window. `percentile` is the
@@ -7407,12 +8328,18 @@ pub struct AlertIssueBrief {
 }
 
 /// Issues first seen in `(from, to]` (new-issue trigger). Bounded.
+///
+/// `limit` is a bound parameter rather than a literal 20 because a personal
+/// subscription's probe spans several apps, and a fixed 20 lets one noisy
+/// app starve the rest. Callers pass `n + 1` and treat the extra row as a
+/// truncation sentinel.
 pub async fn alert_new_issues(
     conn: &mut AsyncPgConnection,
     app_ids: &[Uuid],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     level: Option<&str>,
+    limit: i64,
 ) -> QueryResult<Vec<AlertIssueBrief>> {
     diesel::sql_query(
         // `created_at`, not `first_seen`: the latter is the SDK-supplied event
@@ -7424,12 +8351,13 @@ pub async fn alert_new_issues(
         "SELECT id, app_id, title, level, times_seen FROM issues \
          WHERE app_id = ANY($1) AND created_at > $2 AND created_at <= $3 \
            AND ($4::text IS NULL OR level = $4) \
-         ORDER BY created_at DESC LIMIT 20",
+         ORDER BY created_at DESC LIMIT $5",
     )
     .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
     .bind::<Timestamptz, _>(from)
     .bind::<Timestamptz, _>(to)
     .bind::<Nullable<Text>, _>(level)
+    .bind::<BigInt, _>(limit.clamp(1, 201))
     .load(conn)
     .await
 }
@@ -7437,12 +8365,18 @@ pub async fn alert_new_issues(
 /// Resolved/ignored issues that saw new events in `(from, to]` (regression
 /// trigger). `upsert_issue` advances `last_seen` without resetting `status`,
 /// so this catches the recurrence. Bounded.
+///
+/// `limit` is a bound parameter rather than a literal 20 because a personal
+/// subscription's probe spans several apps, and a fixed 20 lets one noisy
+/// app starve the rest. Callers pass `n + 1` and treat the extra row as a
+/// truncation sentinel.
 pub async fn alert_regressed_issues(
     conn: &mut AsyncPgConnection,
     app_ids: &[Uuid],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     level: Option<&str>,
+    limit: i64,
 ) -> QueryResult<Vec<AlertIssueBrief>> {
     diesel::sql_query(
         // `last_event_at` is the ingest-side twin of `last_seen`, advanced only
@@ -7452,12 +8386,3985 @@ pub async fn alert_regressed_issues(
          WHERE app_id = ANY($1) AND status IN ('resolved','ignored') \
            AND last_event_at > $2 AND last_event_at <= $3 \
            AND ($4::text IS NULL OR level = $4) \
-         ORDER BY last_event_at DESC LIMIT 20",
+         ORDER BY last_event_at DESC LIMIT $5",
     )
     .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
     .bind::<Timestamptz, _>(from)
     .bind::<Timestamptz, _>(to)
     .bind::<Nullable<Text>, _>(level)
+    .bind::<BigInt, _>(limit.clamp(1, 201))
     .load(conn)
+    .await
+}
+
+/// [`alert_new_issues`], narrowed to a set of **enrollment** environment ids.
+///
+/// The EXISTS is bounded by the issue's own `first_seen`/`last_event_at`, NOT
+/// by the caller's tick window. Those are two different clocks: the window
+/// comes from the server-clock watermark, while `error_events.occurred_at` is
+/// SDK-supplied. A backdated or offline batch creates an issue whose
+/// `created_at` is inside the window while every one of its events sits
+/// outside it — the window-bounded form returns false, the subscription never
+/// fires, and nothing is logged. The `- interval '1 hour'` absorbs client clock
+/// skew in the direction that matters. Served by
+/// `error_events_issue_env_time_idx (issue_id, environment_id, occurred_at DESC)`
+/// from migration 31, and the `occurred_at` bounds still prune partitions.
+pub async fn alert_new_issues_env(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    level: Option<&str>,
+    env_ids: &[Uuid],
+    limit: i64,
+) -> QueryResult<Vec<AlertIssueBrief>> {
+    if env_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    diesel::sql_query(
+        "SELECT i.id, i.app_id, i.title, i.level, i.times_seen FROM issues i \
+         WHERE i.app_id = ANY($1) AND i.created_at > $2 AND i.created_at <= $3 \
+           AND ($4::text IS NULL OR i.level = $4) \
+           AND EXISTS ( \
+                 SELECT 1 FROM error_events e \
+                  WHERE e.issue_id = i.id \
+                    AND e.environment_id = ANY($5) \
+                    AND e.occurred_at >  i.first_seen - interval '1 hour' \
+                    AND e.occurred_at <= i.last_event_at \
+           ) \
+         ORDER BY i.created_at DESC LIMIT $6",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .bind::<Nullable<Text>, _>(level)
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(env_ids)
+    .bind::<BigInt, _>(limit.clamp(1, 201))
+    .load(conn)
+    .await
+}
+
+/// [`alert_regressed_issues`], narrowed to a set of **enrollment** environment
+/// ids. See [`alert_new_issues_env`] for why the EXISTS uses the issue's own
+/// timestamps rather than the tick window.
+pub async fn alert_regressed_issues_env(
+    conn: &mut AsyncPgConnection,
+    app_ids: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    level: Option<&str>,
+    env_ids: &[Uuid],
+    limit: i64,
+) -> QueryResult<Vec<AlertIssueBrief>> {
+    if env_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    diesel::sql_query(
+        "SELECT i.id, i.app_id, i.title, i.level, i.times_seen FROM issues i \
+         WHERE i.app_id = ANY($1) AND i.status IN ('resolved','ignored') \
+           AND i.last_event_at > $2 AND i.last_event_at <= $3 \
+           AND ($4::text IS NULL OR i.level = $4) \
+           AND EXISTS ( \
+                 SELECT 1 FROM error_events e \
+                  WHERE e.issue_id = i.id \
+                    AND e.environment_id = ANY($5) \
+                    AND e.occurred_at >  i.first_seen - interval '1 hour' \
+                    AND e.occurred_at <= i.last_event_at \
+           ) \
+         ORDER BY i.last_event_at DESC LIMIT $6",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
+    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(to)
+    .bind::<Nullable<Text>, _>(level)
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(env_ids)
+    .bind::<BigInt, _>(limit.clamp(1, 201))
+    .load(conn)
+    .await
+}
+
+// ===========================================================================
+// Transactional email outbox
+// ===========================================================================
+
+/// Queue one rendered message, subject to a per-recipient suppression window,
+/// and optionally throw it away without telling the caller.
+///
+/// One statement, no `conn.transaction`: the dedup probe and the INSERT have to
+/// be atomic, and `INSERT ... SELECT ... WHERE` gives that for free.
+///
+/// `ttl_secs` is the CALLER'S, not the kind's. The only code that knows how long
+/// a body is worth delivering is whatever minted the credential inside it, and
+/// `password_reset` alone spans two token lifetimes an order of magnitude apart.
+///
+/// `dedup_secs` is the only chokepoint where a per-recipient cap can live. The
+/// `status <> 'failed'` term means a permanently-failed attempt does not block a
+/// genuine retry. `0` disables suppression.
+///
+/// `commit` is how the timing oracle is closed. `enqueue` is only reachable when
+/// a user row was found, so without it an existing address pays a render plus a
+/// round trip and an unknown address pays nothing — the same class of gap
+/// `spend_dummy_verify` exists to close on the login path. `commit = false` runs
+/// the same statement, against the same index, over the network, and inserts
+/// nothing. The honest claim is not "identical cost"; it is that the SMTP round
+/// trip is off the request path entirely and the enqueue itself costs one round
+/// trip either way, leaving only a planner-level difference orders of magnitude
+/// below network jitter.
+pub async fn enqueue_mail(
+    conn: &mut AsyncPgConnection,
+    row: NewMailOutbox<'_>,
+    ttl_secs: i64,
+    dedup_secs: i64,
+    commit: bool,
+) -> QueryResult<Option<Uuid>> {
+    #[derive(QueryableByName)]
+    struct Inserted {
+        #[diesel(sql_type = SqlUuid)]
+        id: Uuid,
+    }
+
+    let inserted: Vec<Inserted> = diesel::sql_query(
+        "INSERT INTO mail_outbox (kind, recipient, recipient_key, subject, body_text, \
+                                  body_html, user_id, expires_at) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8::double precision) \
+          WHERE $10 \
+            AND ($9 = 0 OR NOT EXISTS ( \
+                  SELECT 1 FROM mail_outbox \
+                   WHERE kind = $1 AND recipient_key = $3 AND status <> 'failed' \
+                     AND created_at > now() - make_interval(secs => $9::double precision))) \
+         RETURNING id",
+    )
+    .bind::<Text, _>(row.kind)
+    .bind::<Text, _>(row.recipient)
+    .bind::<Text, _>(row.recipient_key)
+    .bind::<Text, _>(row.subject)
+    .bind::<Text, _>(row.body_text)
+    .bind::<Text, _>(row.body_html)
+    .bind::<Nullable<SqlUuid>, _>(row.user_id)
+    .bind::<BigInt, _>(ttl_secs)
+    .bind::<BigInt, _>(dedup_secs)
+    .bind::<Bool, _>(commit)
+    .get_results(conn)
+    .await?;
+
+    Ok(inserted.into_iter().next().map(|r| r.id))
+}
+
+/// Atomically claim due messages and flip them to `sending` so no other drainer
+/// picks the same rows.
+///
+/// Shape copied from `claim_due_monitors`, the concurrency-safe worker pattern
+/// this repository already uses. There are zero advisory locks in this codebase
+/// and this does not introduce the first one: a lock held by a process killed
+/// with SIGKILL has no owner to release it, and nothing here handles SIGTERM.
+///
+/// `expires_at > now()` is what stops a stale message being delivered on
+/// authorization that has since been revoked — a digest rendered at enqueue is a
+/// snapshot, and the drain cannot consult `role_grants` because the body is
+/// already rendered.
+pub async fn claim_due_mail(
+    conn: &mut AsyncPgConnection,
+    batch: i64,
+) -> QueryResult<Vec<MailOutbox>> {
+    diesel::sql_query(
+        "UPDATE mail_outbox SET status = 'sending', attempts = attempts + 1, updated_at = now() \
+         WHERE id IN ( \
+             SELECT id FROM mail_outbox \
+              WHERE status = 'pending' AND next_attempt_at <= now() AND expires_at > now() \
+              ORDER BY next_attempt_at FOR UPDATE SKIP LOCKED LIMIT $1 \
+         ) RETURNING *",
+    )
+    .bind::<BigInt, _>(batch)
+    .get_results(conn)
+    .await
+}
+
+/// Push a claimed row's `updated_at` forward immediately before its send.
+///
+/// This is what makes the stale-row threshold independent of the batch size and
+/// the send concurrency: without it, the last row in a batch can sit for the
+/// whole batch's duration before its send even starts, and the next person to
+/// tune those two numbers without re-deriving the threshold reintroduces a
+/// duplicate reset email.
+pub async fn heartbeat_mail(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE mail_outbox SET updated_at = now() WHERE id = $1 AND status = 'sending'",
+    )
+    .bind::<SqlUuid, _>(id)
+    .execute(conn)
+    .await
+}
+
+/// Complete a claimed row and scrub its body.
+///
+/// The `status = 'sending' AND attempts = $2` fence is load-bearing: without it a
+/// slow drainer whose row was reclaimed underneath it can blank and mark `sent` a
+/// row another drainer is mid-send on. Returns the affected count so the caller
+/// can log a lost claim at `warn!` rather than silently doing nothing.
+///
+/// `sink` writes `status = 'sink'`, never `'sent'` — `sent` is the one observable
+/// this design offers, and a sink row reporting it makes the single place an
+/// operator would look actively lie.
+pub async fn mark_mail_sent(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    attempts: i32,
+    sink: bool,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE mail_outbox \
+            SET status = CASE WHEN $3 THEN 'sink' ELSE 'sent' END, \
+                sent_at = now(), updated_at = now(), \
+                body_text = '', body_html = '', \
+                last_error = CASE WHEN $3 THEN 'delivered to log sink (SMTP_SINK=1)' ELSE NULL END \
+          WHERE id = $1 AND status = 'sending' AND attempts = $2",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Integer, _>(attempts)
+    .bind::<Bool, _>(sink)
+    .execute(conn)
+    .await
+}
+
+/// Record a failed attempt: back to `pending` with backoff, or `failed`.
+///
+/// Ladder: 30/60/120/240/480/900/900 seconds, about 45 minutes of coverage at the
+/// default `max_attempts` of 8. The exponent is clamped at 6 because
+/// `POWER(2, attempts - 1)::int` overflows an `int` once an operator hand-bumps
+/// `max_attempts` past ~38 — and the clamp changes nothing below that, since
+/// `LEAST(900, ...)` has already flattened the ladder by then.
+///
+/// It deliberately does NOT blank the body. Blanking on failure is what made a
+/// misclassification irreversible; the expiry sweep covers the credential
+/// instead, and until `expires_at` passes an operator can requeue the row by hand.
+pub async fn mark_mail_failed(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    attempts: i32,
+    error: &str,
+    permanent: bool,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE mail_outbox \
+            SET status = CASE WHEN $4 OR attempts >= max_attempts THEN 'failed' ELSE 'pending' END, \
+                last_error = $3, \
+                next_attempt_at = now() + make_interval(secs => \
+                    LEAST(900, (30 * POWER(2, LEAST(GREATEST(attempts - 1, 0), 6)))::int)), \
+                updated_at = now() \
+          WHERE id = $1 AND status = 'sending' AND attempts = $2",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Integer, _>(attempts)
+    .bind::<Text, _>(error)
+    .bind::<Bool, _>(permanent)
+    .execute(conn)
+    .await
+}
+
+/// Recover rows orphaned by a process killed mid-send.
+///
+/// Nothing else ever reclaims them: `claim_due_mail` only looks at `pending`.
+///
+/// Three guards, each covering a failure the obvious version has. The
+/// `attempts >= max_attempts` branch exists because the give-up decision
+/// otherwise lives only in `mark_mail_failed`, which a process that crashed or
+/// was OOM-killed never reaches — so a row whose send reliably kills the process
+/// would be claimed, orphaned, requeued and claimed again, forever. Resetting
+/// `next_attempt_at` exists because a requeued row is otherwise immediately
+/// eligible for the very next claim, bypassing the backoff ladder on exactly the
+/// path that most needs it. And the `updated_at` window is what the per-send
+/// heartbeat keeps honest.
+pub async fn requeue_stuck_mail(
+    conn: &mut AsyncPgConnection,
+    stale_secs: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE mail_outbox \
+            SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END, \
+                last_error = CASE WHEN attempts >= max_attempts \
+                             THEN 'orphaned mid-send ' || attempts || ' times; giving up' \
+                             ELSE 'orphaned mid-send; requeued' END, \
+                next_attempt_at = now() + make_interval(secs => \
+                    LEAST(900, (30 * POWER(2, LEAST(GREATEST(attempts - 1, 0), 6)))::int)), \
+                updated_at = now() \
+          WHERE status = 'sending' AND updated_at < now() - make_interval(secs => $1::double precision)",
+    )
+    .bind::<BigInt, _>(stale_secs)
+    .execute(conn)
+    .await
+}
+
+/// Fail every non-terminal row whose own deadline has passed.
+///
+/// Neither this nor [`blank_expired_mail_bodies`] is indexed: the non-terminal
+/// set is small by construction, and every status transition already rewrites two
+/// partial indexes, so a fifth index costs more than these sweeps save.
+pub async fn expire_stale_mail(conn: &mut AsyncPgConnection) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE mail_outbox \
+            SET status = 'failed', last_error = 'expired before delivery', updated_at = now() \
+          WHERE status IN ('pending', 'sending') AND expires_at < now()",
+    )
+    .execute(conn)
+    .await
+}
+
+/// Scrub the body of any row past its own `expires_at`, whatever its status.
+///
+/// Takes no age argument on purpose. The row already carries the only deadline
+/// that means anything, and a second flat constant sitting beside it is the drift
+/// that scrubs a live 24-hour reset link at the one-hour mark — destroying the
+/// manual requeue path while the token it carried stays valid for another 23
+/// hours.
+///
+/// Blanking a row the drain is mid-send on is harmless: `claim_due_mail` returned
+/// the body by value, so the sender is working from its own copy.
+pub async fn blank_expired_mail_bodies(conn: &mut AsyncPgConnection) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE mail_outbox SET body_text = '', body_html = '', updated_at = now() \
+          WHERE (body_text <> '' OR body_html <> '') AND expires_at < now()",
+    )
+    .execute(conn)
+    .await
+}
+
+/// Delete up to `batch` terminal rows older than `older_than_days`. Call in a
+/// loop until it returns 0.
+///
+/// Bounded and non-blocking, unlike `prune_alert_events`, which is an unbounded
+/// DELETE — that one runs in a standalone worker, this one runs inside
+/// `sauron-api`, which serves HTTP from a 16-connection pool. An operator
+/// lowering `MAIL_OUTBOX_RETENTION_DAYS` after a digest run would otherwise hold
+/// one of those 16 for minutes.
+///
+/// The `FOR UPDATE SKIP LOCKED` is also what lets N API instances reap
+/// concurrently without serialising on row locks.
+pub async fn prune_mail_outbox(
+    conn: &mut AsyncPgConnection,
+    older_than_days: i64,
+    batch: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM mail_outbox WHERE id IN ( \
+             SELECT id FROM mail_outbox \
+              WHERE status IN ('sent', 'failed', 'sink') \
+                AND created_at < now() - ($1 || ' days')::interval \
+              ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+    )
+    .bind::<Text, _>(older_than_days.to_string())
+    .bind::<BigInt, _>(batch)
+    .execute(conn)
+    .await
+}
+
+/// `(pending_count, age_of_oldest_pending_row_in_seconds)`.
+///
+/// The only queue-depth signal this slice ships, and it is logged
+/// unconditionally: there is no metrics endpoint and no admin view, so without it
+/// a stalled queue is invisible until a user reports that password reset does not
+/// work.
+pub async fn mail_outbox_depth(conn: &mut AsyncPgConnection) -> QueryResult<(i64, Option<i64>)> {
+    #[derive(QueryableByName)]
+    struct Depth {
+        #[diesel(sql_type = BigInt)]
+        pending: i64,
+        #[diesel(sql_type = Nullable<BigInt>)]
+        oldest_secs: Option<i64>,
+    }
+
+    let row: Depth = diesel::sql_query(
+        "SELECT count(*)::bigint AS pending, \
+                (EXTRACT(EPOCH FROM (now() - min(created_at))))::bigint AS oldest_secs \
+           FROM mail_outbox WHERE status = 'pending'",
+    )
+    .get_result(conn)
+    .await?;
+    Ok((row.pending, row.oldest_secs))
+}
+
+#[cfg(test)]
+mod revocation_reason_tests {
+    use super::*;
+
+    /// Every `REVOKE_*` constant must fall into exactly one of three buckets, so
+    /// that a new reason cannot be added without someone choosing a bucket for
+    /// it. The blanket formulation "everything except REVOKE_REUSE" is actively
+    /// dangerous: it sweeps up `REVOKE_ROTATED` (which would send every ordinary
+    /// rotation down the early-return path and break the 10-second multi-tab
+    /// grace window) and `REVOKE_LOGOUT` (which would disable replay detection
+    /// on exactly the tokens where a replay is most diagnostic).
+    #[test]
+    fn every_revocation_reason_is_classified() {
+        /// Bucket two: `refresh` already handles these in a branch of its own.
+        const HAS_ITS_OWN_BRANCH: [&str; 2] = [REVOKE_ROTATED, REVOKE_DEACTIVATED];
+        /// Bucket three: presenting a token revoked for one of these IS worth
+        /// the theft alarm, so they fall through to the family kill.
+        /// `REVOKE_PASSWORD_CHANGED` belongs here and not in bucket one: the
+        /// user changed their own password, every session died with it, and a
+        /// token surfacing afterwards is exactly the replay the alarm is for.
+        const FALLS_THROUGH_TO_THE_ALARM: [&str; 3] =
+            [REVOKE_REUSE, REVOKE_LOGOUT, REVOKE_PASSWORD_CHANGED];
+
+        const ALL_REASONS: [&str; 10] = [
+            REVOKE_ROTATED,
+            REVOKE_LOGOUT,
+            REVOKE_REUSE,
+            REVOKE_DEACTIVATED,
+            REVOKE_PASSWORD_CHANGED,
+            REVOKE_USER_REVOKED,
+            REVOKE_USER_REVOKED_OTHERS,
+            REVOKE_ADMIN,
+            REVOKE_PASSWORD_RESET,
+            REVOKE_RESET_FORCED,
+        ];
+
+        for reason in ALL_REASONS {
+            let buckets = [
+                DELIBERATE_REVOKE_REASONS.contains(&reason),
+                HAS_ITS_OWN_BRANCH.contains(&reason),
+                FALLS_THROUGH_TO_THE_ALARM.contains(&reason),
+            ]
+            .into_iter()
+            .filter(|hit| *hit)
+            .count();
+            assert_eq!(
+                buckets, 1,
+                "{reason} must belong to exactly one bucket, not {buckets}"
+            );
+        }
+    }
+
+    /// The cheapest possible defence against the deploy coupling: a reason the
+    /// `auth_sessions_revoked_reason_check` CHECK does not list makes the revoke
+    /// path 500 in production, and nothing else in the build would notice.
+    #[test]
+    fn every_reason_that_can_revoke_a_session_is_in_the_check_constraint() {
+        const UP_SQL: &str =
+            include_str!("../../../migrations/2026-08-01-000035_auth_sessions/up.sql");
+
+        // Every assertion below is scoped to the CHECK body, never to the whole
+        // file. up.sql's prose comment names 'rotated' twice -- explaining why
+        // it is EXCLUDED -- and names several of the accepted reasons as well,
+        // so matching the file would test the comment: the positive assertions
+        // would pass even against an empty constraint, and the negative one
+        // would fail against a correct one.
+        const MARKER: &str = "CONSTRAINT auth_sessions_revoked_reason_check CHECK (";
+        let start = UP_SQL
+            .find(MARKER)
+            .expect("up.sql declares auth_sessions_revoked_reason_check by name")
+            + MARKER.len();
+        let after = &UP_SQL[start..];
+        let end = after
+            .find(");")
+            .expect("the CHECK is the last item in CREATE TABLE auth_sessions");
+        let check = &after[..end];
+
+        for reason in [
+            REVOKE_LOGOUT,
+            REVOKE_REUSE,
+            REVOKE_DEACTIVATED,
+            REVOKE_PASSWORD_CHANGED,
+            REVOKE_USER_REVOKED,
+            REVOKE_USER_REVOKED_OTHERS,
+            REVOKE_ADMIN,
+            REVOKE_PASSWORD_RESET,
+            REVOKE_RESET_FORCED,
+        ] {
+            assert!(
+                check.contains(&format!("'{reason}'")),
+                "'{reason}' is missing from auth_sessions_revoked_reason_check; the revoke path \
+                 will 500 in production"
+            );
+        }
+
+        // A rotation revokes a token, never a session. Listing it would make the
+        // database stop catching that bug.
+        assert!(
+            !check.contains(&format!("'{REVOKE_ROTATED}'")),
+            "'{REVOKE_ROTATED}' must NOT be accepted by auth_sessions_revoked_reason_check"
+        );
+    }
+}
+
+#[cfg(test)]
+mod password_reset_reason_tests {
+    use super::*;
+
+    #[test]
+    fn reset_reasons_have_their_wire_values() {
+        // These four strings are written into `auth_sessions.revoked_reason`
+        // (CHECK-constrained by migration 000035) and into
+        // `password_reset_tokens.invalidated_reason`. A rename is a schema
+        // change, not a refactor.
+        assert_eq!(REVOKE_PASSWORD_RESET, "password_reset");
+        assert_eq!(REVOKE_RESET_FORCED, "reset_forced");
+        assert_eq!(RESET_INVALIDATED_SUPERSEDED, "superseded");
+        assert_eq!(RESET_INVALIDATED_PASSWORD_SET, "password_set");
+    }
+
+    #[test]
+    fn both_reset_revoke_reasons_are_deliberate() {
+        // Missing from this list, the target's still-live refresh token lands
+        // in `refresh`'s reuse branch and fires a family kill — the exact
+        // poisoning bug routes/auth.rs:388-397 records as having happened once
+        // already with routine deactivations.
+        assert!(DELIBERATE_REVOKE_REASONS.contains(&REVOKE_PASSWORD_RESET));
+        assert!(DELIBERATE_REVOKE_REASONS.contains(&REVOKE_RESET_FORCED));
+    }
+}
+
+// ===========================================================================
+// Personal notification subscriptions (S3)
+//
+// Two environment id spaces meet in this section and confusing them produces a
+// subscription that matches nothing, silently:
+//   * `notification_subscription_envs.environment_id` is a CATALOGUE id
+//     (`environments.id`, project-level since migration 33).
+//   * `notification_queue_envs.environment_id`, `error_events.environment_id`
+//     and `role_grants.scope_id` for `scope_type='env'` are ENROLLMENT ids
+//     (`app_environments.id`).
+// `live_enrollments_for_apps` is the only sanctioned bridge.
+// ===========================================================================
+
+/// Create or update a subscription and replace its environment set, in ONE
+/// data-modifying CTE.
+///
+/// One statement means atomicity without `conn.transaction`, which the MSRV
+/// blocks. A two-statement version could leave the parent updated and the child
+/// rows stale — and a stale-empty child set is read everywhere downstream as
+/// "all environments", which WIDENS the subscription rather than narrowing it.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_subscription(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+    scope_type: &str,
+    scope_id: Uuid,
+    kind: &str,
+    conditions: &Value,
+    delivery: &str,
+    throttle_seconds: i32,
+    quiet_start_min: Option<i16>,
+    quiet_end_min: Option<i16>,
+    quiet_tz: &str,
+    env_ids: &[Uuid],
+) -> QueryResult<NotificationSubscription> {
+    diesel::sql_query(
+        "WITH up AS ( \
+             INSERT INTO notification_subscriptions \
+                 (user_id, org_id, scope_type, scope_id, kind, conditions, delivery, \
+                  throttle_seconds, quiet_start_min, quiet_end_min, quiet_tz, \
+                  enabled, disabled_reason, disabled_at, last_evaluated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, NULL, NULL, now()) \
+             ON CONFLICT (user_id, scope_type, scope_id, kind) DO UPDATE SET \
+                 org_id = EXCLUDED.org_id, \
+                 conditions = EXCLUDED.conditions, \
+                 delivery = EXCLUDED.delivery, \
+                 throttle_seconds = EXCLUDED.throttle_seconds, \
+                 quiet_start_min = EXCLUDED.quiet_start_min, \
+                 quiet_end_min = EXCLUDED.quiet_end_min, \
+                 quiet_tz = EXCLUDED.quiet_tz, \
+                 enabled = true, \
+                 disabled_reason = NULL, \
+                 disabled_at = NULL, \
+                 updated_at = now() \
+             RETURNING * \
+         ), del AS ( \
+             DELETE FROM notification_subscription_envs \
+              WHERE subscription_id = (SELECT id FROM up) \
+                AND environment_id <> ALL($12) \
+         ), ins AS ( \
+             INSERT INTO notification_subscription_envs (subscription_id, environment_id) \
+             SELECT (SELECT id FROM up), e FROM unnest($12::uuid[]) AS e \
+             ON CONFLICT DO NOTHING \
+         ) \
+         SELECT * FROM up",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<SqlUuid, _>(org_id)
+    .bind::<Text, _>(scope_type)
+    .bind::<SqlUuid, _>(scope_id)
+    .bind::<Text, _>(kind)
+    .bind::<Jsonb, _>(conditions)
+    .bind::<Text, _>(delivery)
+    .bind::<Integer, _>(throttle_seconds)
+    .bind::<Nullable<SmallInt>, _>(quiet_start_min)
+    .bind::<Nullable<SmallInt>, _>(quiet_end_min)
+    .bind::<Text, _>(quiet_tz)
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(env_ids)
+    .get_result(conn)
+    .await
+}
+
+pub async fn list_subscriptions_for_user(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> QueryResult<Vec<NotificationSubscription>> {
+    notification_subscriptions::table
+        .filter(notification_subscriptions::user_id.eq(user_id))
+        .order(notification_subscriptions::created_at.asc())
+        .select(NotificationSubscription::as_select())
+        .load(conn)
+        .await
+}
+
+pub async fn get_subscription(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<NotificationSubscription>> {
+    notification_subscriptions::table
+        .find(id)
+        .select(NotificationSubscription::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Owner-scoped delete. `user_id` is part of the predicate rather than checked
+/// by the caller so a missing check cannot delete someone else's row; the
+/// handler turns a zero row count into 404, never 403, so a non-owner learns
+/// nothing about whether the id exists.
+pub async fn delete_subscription(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    user_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::delete(
+        notification_subscriptions::table
+            .filter(notification_subscriptions::id.eq(id))
+            .filter(notification_subscriptions::user_id.eq(user_id)),
+    )
+    .execute(conn)
+    .await
+}
+
+/// Owner-driven enable/disable. Re-enabling always clears `disabled_reason`:
+/// re-granting access does not silently resurrect a subscription, the user
+/// turns it back on themselves, and at that moment the reason is stale.
+pub async fn set_subscription_enabled(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    user_id: Uuid,
+    enabled: bool,
+) -> QueryResult<usize> {
+    diesel::update(
+        notification_subscriptions::table
+            .filter(notification_subscriptions::id.eq(id))
+            .filter(notification_subscriptions::user_id.eq(user_id)),
+    )
+    .set((
+        notification_subscriptions::enabled.eq(enabled),
+        notification_subscriptions::disabled_reason.eq::<Option<String>>(if enabled {
+            None
+        } else {
+            Some("unsubscribed".into())
+        }),
+        notification_subscriptions::disabled_at.eq::<Option<DateTime<Utc>>>(if enabled {
+            None
+        } else {
+            Some(Utc::now())
+        }),
+        notification_subscriptions::updated_at.eq(Utc::now()),
+    ))
+    .execute(conn)
+    .await
+}
+
+/// System-driven disable: the unsubscribe link (`'unsubscribed'`) and the
+/// revocation sweep (`'access_revoked'`). Not owner-scoped, because neither
+/// caller is the owner acting through the UI.
+pub async fn disable_subscription(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    reason: &str,
+) -> QueryResult<usize> {
+    diesel::update(notification_subscriptions::table.find(id))
+        .set((
+            notification_subscriptions::enabled.eq(false),
+            notification_subscriptions::disabled_reason.eq(Some(reason.to_string())),
+            notification_subscriptions::disabled_at.eq(Some(Utc::now())),
+            notification_subscriptions::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
+}
+
+/// `(subscription_id, catalogue_environment_id)` for many subscriptions at
+/// once — the evaluator resolves every subscription's environment set in one
+/// query, never one per subscription.
+pub async fn subscription_envs_for(
+    conn: &mut AsyncPgConnection,
+    subscription_ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid)>> {
+    if subscription_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    notification_subscription_envs::table
+        .filter(notification_subscription_envs::subscription_id.eq_any(subscription_ids.to_vec()))
+        .select((
+            notification_subscription_envs::subscription_id,
+            notification_subscription_envs::environment_id,
+        ))
+        .load(conn)
+        .await
+}
+
+/// Live CATALOGUE environment ids of a project — what a subscription's
+/// `environment_ids` are validated against, and what the dashboard's chip row
+/// offers.
+pub async fn live_catalogue_envs_for_project(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+) -> QueryResult<Vec<Uuid>> {
+    environments::table
+        .filter(environments::project_id.eq(project_id))
+        .filter(environments::retired_at.is_null())
+        .order(environments::name.asc())
+        .select(environments::id)
+        .load(conn)
+        .await
+}
+
+#[derive(Debug, QueryableByName)]
+struct BoolRow {
+    #[diesel(sql_type = Bool)]
+    ok: bool,
+}
+
+/// Whether `tz` is a zone this Postgres knows.
+///
+/// Validated at write time so a typo is a 400 rather than a row the enqueue
+/// then has to defend against. The enqueue re-checks anyway: a zone that
+/// validated here can vanish with an OS tzdata update, and
+/// `now() AT TIME ZONE 'Missing/Zone'` raises, which would kill the whole
+/// batch over one bad row.
+pub async fn timezone_exists(conn: &mut AsyncPgConnection, tz: &str) -> QueryResult<bool> {
+    let row: BoolRow =
+        diesel::sql_query("SELECT EXISTS(SELECT 1 FROM pg_timezone_names WHERE name = $1) AS ok")
+            .bind::<Text, _>(tz)
+            .get_result(conn)
+            .await?;
+    Ok(row.ok)
+}
+
+/// Every enabled subscription of the given kinds, in one query, served by
+/// `notification_subscriptions_kind_idx (kind) WHERE enabled`.
+pub async fn enabled_subscriptions_by_kinds(
+    conn: &mut AsyncPgConnection,
+    kinds: &[&str],
+) -> QueryResult<Vec<NotificationSubscription>> {
+    if kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    notification_subscriptions::table
+        .filter(notification_subscriptions::enabled.eq(true))
+        .filter(
+            notification_subscriptions::kind
+                .eq_any(kinds.iter().map(|k| k.to_string()).collect::<Vec<_>>()),
+        )
+        .select(NotificationSubscription::as_select())
+        .load(conn)
+        .await
+}
+
+/// Enabled uptime subscriptions on exactly this project.
+///
+/// The prober calls this from `notify_transition`; the caller still runs the
+/// coverage predicate against freshly loaded grants, because a subscription's
+/// owner may have lost project reach since it was created.
+pub async fn uptime_subscriptions_for_project(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+) -> QueryResult<Vec<NotificationSubscription>> {
+    notification_subscriptions::table
+        .filter(notification_subscriptions::enabled.eq(true))
+        .filter(notification_subscriptions::kind.eq("uptime"))
+        .filter(notification_subscriptions::scope_type.eq("project"))
+        .filter(notification_subscriptions::scope_id.eq(project_id))
+        .select(NotificationSubscription::as_select())
+        .load(conn)
+        .await
+}
+
+/// Every subscription a user holds inside one org — what the synchronous
+/// revocation sweep re-evaluates after a grant change commits.
+pub async fn subscriptions_for_user_in_org(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+) -> QueryResult<Vec<NotificationSubscription>> {
+    notification_subscriptions::table
+        .filter(notification_subscriptions::user_id.eq(user_id))
+        .filter(notification_subscriptions::org_id.eq(org_id))
+        .filter(notification_subscriptions::enabled.eq(true))
+        .select(NotificationSubscription::as_select())
+        .load(conn)
+        .await
+}
+
+/// `(project_id, app_id)` for every app under any of `project_ids` — the
+/// batched `list_apps_for_project`.
+///
+/// The evaluation pass resolves N project-scoped subscriptions per tick. Calling
+/// `list_apps_for_project` once each is N round trips against a pool of 8 shared
+/// with the drain, which is precisely the per-subscription blow-up the probe
+/// coalescing exists to prevent; doing it in the resolution loop would put the
+/// cost back one layer down.
+pub async fn apps_for_projects(
+    conn: &mut AsyncPgConnection,
+    project_ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid)>> {
+    if project_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    apps::table
+        .filter(apps::project_id.eq_any(project_ids.to_vec()))
+        .select((apps::project_id, apps::id))
+        .load(conn)
+        .await
+}
+
+/// Advance the watermark on a batch of subscriptions in one statement.
+pub async fn touch_subscriptions_evaluated(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+    at: DateTime<Utc>,
+) -> QueryResult<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    diesel::update(
+        notification_subscriptions::table
+            .filter(notification_subscriptions::id.eq_any(ids.to_vec())),
+    )
+    .set(notification_subscriptions::last_evaluated_at.eq(at))
+    .execute(conn)
+    .await
+}
+
+/// One row to enqueue. The environment list is **enrollment** ids
+/// (`app_environments.id`) — what the events the body was computed from
+/// actually carry, and what the drain's coverage check compares against
+/// `Reach.envs`.
+#[derive(Debug, Clone)]
+pub struct QueueInsert<'a> {
+    pub subscription_id: Uuid,
+    pub project_id: Uuid,
+    /// `None` for uptime.
+    pub app_id: Option<Uuid>,
+    pub includes_unattributed: bool,
+    pub kind: &'a str,
+    pub dedup_key: &'a str,
+    pub severity: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub link: Option<&'a str>,
+    pub env_enrollments: Vec<Uuid>,
+}
+
+/// Insert a batch of notifications and their environment child rows in ONE
+/// data-modifying CTE, computing `deliver_after` in SQL.
+///
+/// `deliver_after` HAS to be computed here: the workspace has no `chrono-tz`
+/// (adding one is a workspace-dependency edit affecting every crate), so
+/// nothing in Rust can produce a subscription's local wall-clock time.
+///
+/// The `pg_timezone_names` lookup is not paranoia. A zone that validated at
+/// write time can vanish with an OS tzdata update, and
+/// `now() AT TIME ZONE 'Missing/Zone'` RAISES — one bad row would kill the
+/// whole batch. Falling back to UTC is visible in the account card (which
+/// renders the effective zone) rather than silent.
+///
+/// The env rows are in the same statement because a queue row with a stale-empty
+/// env list is read downstream as "the body spans everything", so a partial
+/// failure would WIDEN a row's implied scope instead of narrowing it.
+pub async fn enqueue_notifications(
+    conn: &mut AsyncPgConnection,
+    rows: &[QueueInsert<'_>],
+) -> QueryResult<i64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let sub_ids: Vec<Uuid> = rows.iter().map(|r| r.subscription_id).collect();
+    let project_ids: Vec<Uuid> = rows.iter().map(|r| r.project_id).collect();
+    let app_ids: Vec<Option<Uuid>> = rows.iter().map(|r| r.app_id).collect();
+    let unattributed: Vec<bool> = rows.iter().map(|r| r.includes_unattributed).collect();
+    let kinds: Vec<String> = rows.iter().map(|r| r.kind.to_string()).collect();
+    let dedups: Vec<String> = rows.iter().map(|r| r.dedup_key.to_string()).collect();
+    let severities: Vec<String> = rows.iter().map(|r| r.severity.to_string()).collect();
+    let titles: Vec<String> = rows.iter().map(|r| r.title.to_string()).collect();
+    let bodies: Vec<String> = rows.iter().map(|r| r.body.to_string()).collect();
+    let links: Vec<Option<String>> = rows.iter().map(|r| r.link.map(String::from)).collect();
+
+    // Parallel arrays of (dedup_key, enrollment_id). `dedup_key` embeds the
+    // subscription id, so it is unique within one batch and can join the child
+    // rows back to their parent without a second round trip.
+    let mut env_keys: Vec<String> = Vec::new();
+    let mut env_ids: Vec<Uuid> = Vec::new();
+    for r in rows {
+        for e in &r.env_enrollments {
+            env_keys.push(r.dedup_key.to_string());
+            env_ids.push(*e);
+        }
+    }
+
+    let row: AlertCountRow = diesel::sql_query(
+        "WITH v AS ( \
+             SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::bool[], $5::text[], \
+                                  $6::text[], $7::text[], $8::text[], $9::text[], $10::text[]) \
+                    AS t(subscription_id, project_id, app_id, includes_unattributed, kind, \
+                         dedup_key, severity, title, body, link) \
+         ), j AS ( \
+             SELECT v.*, s.user_id, s.org_id, s.delivery, s.quiet_start_min, s.quiet_end_min, \
+                    COALESCE((SELECT n.name FROM pg_timezone_names n WHERE n.name = s.quiet_tz), \
+                             'UTC') AS tz \
+               FROM v JOIN notification_subscriptions s ON s.id = v.subscription_id \
+         ), b AS ( \
+             SELECT j.*, \
+                    CASE j.delivery \
+                      WHEN 'hourly' THEN date_trunc('hour', now()) + interval '1 hour' \
+                      WHEN 'daily'  THEN (date_trunc('day', now() AT TIME ZONE j.tz) \
+                                          + interval '1 day') AT TIME ZONE j.tz \
+                      ELSE now() \
+                    END AS base \
+               FROM j \
+         ), q AS ( \
+             SELECT b.*, \
+                    (EXTRACT(HOUR FROM (b.base AT TIME ZONE b.tz)) * 60 \
+                     + EXTRACT(MINUTE FROM (b.base AT TIME ZONE b.tz)))::int AS local_min, \
+                    date_trunc('day', b.base AT TIME ZONE b.tz) AS local_day \
+               FROM b \
+         ), ins AS ( \
+             INSERT INTO notification_queue \
+                 (subscription_id, user_id, org_id, project_id, app_id, includes_unattributed, \
+                  kind, dedup_key, severity, title, body, link, deliver_after) \
+             SELECT q.subscription_id, q.user_id, q.org_id, q.project_id, q.app_id, \
+                    q.includes_unattributed, q.kind, q.dedup_key, q.severity, q.title, q.body, \
+                    q.link, \
+                    CASE \
+                      WHEN q.quiet_start_min IS NULL THEN q.base \
+                      WHEN q.quiet_start_min = q.quiet_end_min THEN q.base \
+                      WHEN q.quiet_start_min < q.quiet_end_min THEN \
+                        CASE WHEN q.local_min >= q.quiet_start_min \
+                              AND q.local_min <  q.quiet_end_min \
+                             THEN (q.local_day + make_interval(mins => q.quiet_end_min)) \
+                                  AT TIME ZONE q.tz \
+                             ELSE q.base END \
+                      ELSE \
+                        CASE WHEN q.local_min >= q.quiet_start_min \
+                             THEN (q.local_day + interval '1 day' \
+                                   + make_interval(mins => q.quiet_end_min)) AT TIME ZONE q.tz \
+                             WHEN q.local_min < q.quiet_end_min \
+                             THEN (q.local_day + make_interval(mins => q.quiet_end_min)) \
+                                  AT TIME ZONE q.tz \
+                             ELSE q.base END \
+                    END \
+               FROM q \
+             ON CONFLICT (subscription_id, dedup_key) WHERE status IN ('pending','claimed') \
+             DO NOTHING \
+             RETURNING id, dedup_key \
+         ), envs AS ( \
+             INSERT INTO notification_queue_envs (queue_id, environment_id) \
+             SELECT ins.id, e.env_id \
+               FROM ins JOIN unnest($11::text[], $12::uuid[]) AS e(dk, env_id) \
+                 ON e.dk = ins.dedup_key \
+             ON CONFLICT DO NOTHING \
+             RETURNING queue_id \
+         ) \
+         SELECT count(*) AS n FROM ins",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(sub_ids)
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(project_ids)
+    .bind::<diesel::sql_types::Array<Nullable<SqlUuid>>, _>(app_ids)
+    .bind::<diesel::sql_types::Array<Bool>, _>(unattributed)
+    .bind::<diesel::sql_types::Array<Text>, _>(kinds)
+    .bind::<diesel::sql_types::Array<Text>, _>(dedups)
+    .bind::<diesel::sql_types::Array<Text>, _>(severities)
+    .bind::<diesel::sql_types::Array<Text>, _>(titles)
+    .bind::<diesel::sql_types::Array<Text>, _>(bodies)
+    .bind::<diesel::sql_types::Array<Nullable<Text>>, _>(links)
+    .bind::<diesel::sql_types::Array<Text>, _>(env_keys)
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(env_ids)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
+/// Durable throttle backstop: was a notification with this dedup key enqueued
+/// for this subscription within the last `within_seconds`?
+///
+/// Used when Redis is unavailable. Extending the key with the subscription id
+/// is what gives per-RECIPIENT throttling with no new infrastructure — the org
+/// engine's equivalent (`alert_recently_sent`) is per rule.
+pub async fn notification_recently_queued(
+    conn: &mut AsyncPgConnection,
+    subscription_id: Uuid,
+    dedup_key: &str,
+    within_seconds: i32,
+) -> QueryResult<bool> {
+    if within_seconds <= 0 {
+        return Ok(false);
+    }
+    let cutoff = Utc::now() - chrono::Duration::seconds(within_seconds as i64);
+    let n: i64 = notification_queue::table
+        .filter(notification_queue::subscription_id.eq(subscription_id))
+        .filter(notification_queue::dedup_key.eq(dedup_key))
+        .filter(notification_queue::created_at.gt(cutoff))
+        .count()
+        .get_result(conn)
+        .await?;
+    Ok(n > 0)
+}
+
+/// How long a `claimed` row may sit before the requeue reclaims it.
+pub const STUCK_CLAIM_SECS: i64 = 900;
+/// How many claims a row gets before it is abandoned as `failed`.
+pub const MAX_QUEUE_ATTEMPTS: i16 = 3;
+
+/// Claim due notifications for exclusive delivery.
+///
+/// The `status = 'claimed'` write is the entire point and is the one thing that
+/// cannot be copied from `claim_due_monitors` without thinking. THAT query's
+/// exclusivity comes from its SET clause — `next_check_at = now() + …` moves
+/// the row out of the inner SELECT's predicate at commit. `FOR UPDATE SKIP
+/// LOCKED` alone only skips rows locked by an UNCOMMITTED transaction; once one
+/// replica commits, another replica's next pass re-selects the same rows and
+/// mails them again. A `claimed` state that leaves the partial index is what
+/// makes the claim real, and `attempts` is what makes a crash between claim and
+/// terminal status recoverable instead of an infinite redelivery loop.
+pub async fn claim_due_notifications(
+    conn: &mut AsyncPgConnection,
+    batch: i64,
+) -> QueryResult<Vec<NotificationQueueItem>> {
+    diesel::sql_query(
+        "UPDATE notification_queue \
+            SET status = 'claimed', claimed_at = now(), attempts = attempts + 1 \
+          WHERE id IN ( \
+              SELECT id FROM notification_queue \
+               WHERE status = 'pending' AND deliver_after <= now() \
+               ORDER BY deliver_after \
+               FOR UPDATE SKIP LOCKED \
+               LIMIT $1 \
+          ) RETURNING *",
+    )
+    .bind::<BigInt, _>(batch.clamp(1, 5000))
+    .load(conn)
+    .await
+}
+
+/// Stamp one delivered message across every row it carried.
+pub async fn mark_notifications_sent(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+    message_id: Uuid,
+) -> QueryResult<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    diesel::sql_query(
+        "UPDATE notification_queue \
+            SET status = 'sent', message_id = $2, sent_at = now(), finished_at = now() \
+          WHERE id = ANY($1)",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(ids)
+    .bind::<SqlUuid, _>(message_id)
+    .execute(conn)
+    .await
+}
+
+/// Terminally drop rows and BLANK their content in the same statement.
+///
+/// A dropped row's title/body/link have no further purpose and must not sit at
+/// rest for the retention window outside the reader's authorization — which,
+/// for `dropped_no_access`, is exactly the authorization that just failed.
+pub async fn drop_notifications(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+    status: &str,
+) -> QueryResult<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    diesel::sql_query(
+        "UPDATE notification_queue \
+            SET status = $2, title = NULL, body = NULL, link = NULL, finished_at = now() \
+          WHERE id = ANY($1)",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(ids)
+    .bind::<Text, _>(status)
+    .execute(conn)
+    .await
+}
+
+/// Record a delivery failure without blanking the body, so a later requeue can
+/// still send it — but only while there is a retry left.
+///
+/// The attempts guard is load-bearing and is the ONLY thing that terminates a
+/// deterministic failure. `requeue_stuck_notifications` cannot help here: it
+/// matches `WHERE status = 'claimed' AND claimed_at < …`, and a row this
+/// function returns to `pending` is neither. A render that fails on its own
+/// content — a `format!` that panics on a malformed body, an outbox that
+/// rejects the row every time — would otherwise be re-claimed, re-failed and
+/// re-queued forever, which is exactly the infinite redelivery loop
+/// `MAX_QUEUE_ATTEMPTS` exists to stop.
+///
+/// `attempts` was already incremented by the claim, so `>= max_attempts` here
+/// means "this was the last try".
+pub async fn fail_notifications(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+    error: &str,
+    max_attempts: i16,
+) -> QueryResult<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    diesel::sql_query(
+        "UPDATE notification_queue \
+            SET status      = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'pending' END, \
+                finished_at = CASE WHEN attempts >= $3 THEN now() ELSE NULL END, \
+                claimed_at  = NULL, \
+                error       = $2 \
+          WHERE id = ANY($1)",
+    )
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(ids)
+    .bind::<Text, _>(error)
+    .bind::<SmallInt, _>(max_attempts.max(1))
+    .execute(conn)
+    .await
+}
+
+/// Return abandoned `claimed` rows to `pending`, or give up on them.
+///
+/// There is no graceful shutdown anywhere in this codebase, so a process killed
+/// mid-drain leaves rows `claimed` forever. `attempts >= max_attempts` is what
+/// makes the give-up decision reachable rather than looping.
+pub async fn requeue_stuck_notifications(
+    conn: &mut AsyncPgConnection,
+    stale_secs: i64,
+    max_attempts: i16,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE notification_queue \
+            SET status      = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'pending' END, \
+                finished_at = CASE WHEN attempts >= $2 THEN now() ELSE NULL END, \
+                error       = CASE WHEN attempts >= $2 \
+                                   THEN 'abandoned after repeated claims' ELSE error END, \
+                claimed_at  = NULL \
+          WHERE status = 'claimed' AND claimed_at < now() - make_interval(secs => $1)",
+    )
+    .bind::<BigInt, _>(stale_secs.max(60))
+    .bind::<SmallInt, _>(max_attempts.max(1))
+    .execute(conn)
+    .await
+}
+
+/// Delete terminal rows past retention.
+///
+/// `alert_events` is append-only audit and prunes on `created_at`; this is a
+/// WORK QUEUE. Pruning on `created_at` with no status guard would destroy
+/// still-`pending` rows — precisely the evidence of the outage that made them
+/// pile up — and none of the other indexes leads with `created_at`, so the
+/// hourly DELETE would seq-scan a churned heap.
+/// `notification_queue_finished_idx` serves this predicate directly.
+pub async fn prune_notification_queue(
+    conn: &mut AsyncPgConnection,
+    retention_days: i32,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM notification_queue \
+          WHERE finished_at IS NOT NULL \
+            AND finished_at < now() - make_interval(days => $1)",
+    )
+    .bind::<Integer, _>(retention_days.clamp(1, 365))
+    .execute(conn)
+    .await
+}
+
+#[derive(Debug, QueryableByName)]
+struct QueueDepthRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    oldest: Option<DateTime<Utc>>,
+}
+
+/// `(pending depth, oldest pending deliver_after)`.
+///
+/// Nothing else in the system would reveal a backlog: `status='sent'` means only
+/// "handed to the outbox", so a stalled outbox and a healthy one look identical
+/// from here.
+pub async fn notification_queue_depth(
+    conn: &mut AsyncPgConnection,
+) -> QueryResult<(i64, Option<DateTime<Utc>>)> {
+    let row: QueueDepthRow = diesel::sql_query(
+        "SELECT count(*) AS n, min(deliver_after) AS oldest \
+           FROM notification_queue WHERE status = 'pending'",
+    )
+    .get_result(conn)
+    .await?;
+    Ok((row.n, row.oldest))
+}
+
+/// `(queue_id, enrollment_environment_id)` for many queued rows at once.
+pub async fn queue_envs_for(
+    conn: &mut AsyncPgConnection,
+    queue_ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid)>> {
+    if queue_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    notification_queue_envs::table
+        .filter(notification_queue_envs::queue_id.eq_any(queue_ids.to_vec()))
+        .select((
+            notification_queue_envs::queue_id,
+            notification_queue_envs::environment_id,
+        ))
+        .load(conn)
+        .await
+}
+
+/// `(project_id, org_id)` for many projects at once.
+///
+/// The drain re-derives every queued row's org from its project rather than
+/// trusting the denormalized `notification_queue.org_id`. `reach_for`'s org arm
+/// is `Scope::Org(_) => reach.org = true` and never compares the org id, so if a
+/// row's stored `org_id` ever diverged from the true owner of its `project_id`,
+/// `reach.org` would go true and the coverage test would accept a foreign
+/// tenant's project. The column stays for indexing and the sweep; it is no
+/// longer the tenant boundary.
+pub async fn project_org_batch(
+    conn: &mut AsyncPgConnection,
+    project_ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid)>> {
+    if project_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    projects::table
+        .filter(projects::id.eq_any(project_ids.to_vec()))
+        .select((projects::id, projects::org_id))
+        .load(conn)
+        .await
+}
+
+/// `(user_id, scope_type, scope_id, permissions)` for many users in ONE org.
+///
+/// The batched form of `user_grants_in_org`. Filtered to a single organization
+/// for the reason `reach_for`'s doc comment records: its org arm does not
+/// compare the grant's org id, so an unfiltered list would leak another org's
+/// visibility.
+pub async fn grants_for_users_in_org(
+    conn: &mut AsyncPgConnection,
+    user_ids: &[Uuid],
+    org_id: Uuid,
+) -> QueryResult<Vec<(Uuid, String, Uuid, Value)>> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    role_grants::table
+        .inner_join(roles::table.on(roles::id.eq(role_grants::role_id)))
+        .filter(role_grants::user_id.eq_any(user_ids.to_vec()))
+        .filter(role_grants::org_id.eq(org_id))
+        .select((
+            role_grants::user_id,
+            role_grants::scope_type,
+            role_grants::scope_id,
+            roles::permissions,
+        ))
+        .load(conn)
+        .await
+}
+
+/// How many distinct MESSAGES this user received in the trailing hour.
+///
+/// `COUNT(DISTINCT message_id)`, not a row count: one legitimate grouped email
+/// carrying 25 issue rows would otherwise report 25 against a cap of 20 and
+/// degrade the user to digests on their first normal delivery.
+pub async fn sent_messages_last_hour(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> QueryResult<i64> {
+    let row: AlertCountRow = diesel::sql_query(
+        "SELECT count(DISTINCT message_id) AS n FROM notification_queue \
+          WHERE user_id = $1 AND status = 'sent' AND sent_at > now() - interval '1 hour'",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .get_result(conn)
+    .await?;
+    Ok(row.n)
+}
+
+/// A user's own notification history, newest first.
+///
+/// Ownership alone is NOT a sufficient gate — the caller must still run the
+/// coverage predicate against freshly loaded grants and drop non-covered rows,
+/// because a row written with a title and body at enqueue time would otherwise
+/// let a member whose grant was revoked read exactly the issue titles and counts
+/// the drain refused to mail them.
+pub async fn notification_history_for_user(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    limit: i64,
+) -> QueryResult<Vec<NotificationQueueItem>> {
+    notification_queue::table
+        .filter(notification_queue::user_id.eq(user_id))
+        .order(notification_queue::created_at.desc())
+        .limit(limit.clamp(1, 200))
+        .select(NotificationQueueItem::as_select())
+        .load(conn)
+        .await
+}
+
+/// Projects by id, unfiltered by org — a best-effort display lookup for
+/// polymorphic `scope_id`s the caller has already authorized.
+pub async fn list_projects_by_ids(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+) -> QueryResult<Vec<Project>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    projects::table
+        .filter(projects::id.eq_any(ids.to_vec()))
+        .select(Project::as_select())
+        .load(conn)
+        .await
+}
+
+/// Apps by id — the display counterpart to [`list_projects_by_ids`].
+pub async fn apps_by_ids(conn: &mut AsyncPgConnection, ids: &[Uuid]) -> QueryResult<Vec<App>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    apps::table
+        .filter(apps::id.eq_any(ids.to_vec()))
+        .select(App::as_select())
+        .load(conn)
+        .await
+}
+
+/// Every enabled subscription, for the daily revocation sweep.
+///
+/// The daily pass is the backstop for the paths nobody remembered — a role's
+/// permission list edited, a project deleted. The synchronous sweeps in
+/// `routes/orgs.rs` cover the three deliberate grant-mutation sites and close
+/// the 24-hour window for them.
+pub async fn enabled_subscriptions_all(
+    conn: &mut AsyncPgConnection,
+) -> QueryResult<Vec<NotificationSubscription>> {
+    notification_subscriptions::table
+        .filter(notification_subscriptions::enabled.eq(true))
+        .select(NotificationSubscription::as_select())
+        .load(conn)
+        .await
+}
+
+// ===========================================================================
+// Combined active users (project-scoped, multi-app)
+// ===========================================================================
+
+/// One resolved `(app, environment filter)` pair.
+///
+/// Deliberately NOT `ReadScope`. `ReadScope` is singular by contract and ~36
+/// read functions take it, so adding a plural variant of it would let a caller
+/// hand a multi-app scope to a single-app query and get a silently wrong
+/// number back.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppEnvScope {
+    pub app_id: Uuid,
+    pub env: EnvFilter,
+}
+
+/// One UTC calendar day of the combined report. The three counts are exact:
+/// `active_total == active_identified + active_guest` always.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct ActiveUserDay {
+    #[diesel(sql_type = diesel::sql_types::Date)]
+    pub day: chrono::NaiveDate,
+    #[diesel(sql_type = BigInt)]
+    pub active_total: i64,
+    #[diesel(sql_type = BigInt)]
+    pub active_identified: i64,
+    #[diesel(sql_type = BigInt)]
+    pub active_guest: i64,
+}
+
+/// Distinct active identities per UTC day over `[from, to)`, combined across
+/// `scopes` and split into identified / guest.
+///
+/// # The identity key
+///
+/// `'u:'‖distinct_id` when some selected app has `identified_at IS NOT NULL`
+/// for that id, `'a:'‖app_id‖':'‖distinct_id` otherwise. Joining on
+/// `distinct_id` alone was rejected: the count for {A,B} would then change
+/// depending on whether C was also selected, and a metric that is not stable
+/// under widening the selection is unexplainable.
+///
+/// Cross-app merging is EXACT STRING EQUALITY on `distinct_id`. If app A calls
+/// someone `u-42` and app B calls them `auth0|abc`, this counts two people
+/// where there is one. There is no server-side fix short of an
+/// identity-resolution table; the guest column is what makes the limitation
+/// legible instead of hidden.
+///
+/// # Why `days` exists
+///
+/// An earlier draft joined `event_users` directly against `signal`. Because the
+/// projected key depends on `eu`, Postgres cannot push the `DISTINCT` below the
+/// join — the outer side is every matching raw event row across up to 20
+/// selections and up to 92 days, with no LIMIT, and the text key
+/// `'u:'||distinct_id` is materialized once per event row before the dedup
+/// sort. Interposing `days` collapses the join input by the average
+/// events-per-user-per-day factor (typically 10-1000x) with a HashAggregate
+/// over three narrow columns, and makes the `event_users` join cost
+/// proportional to the ANSWER rather than to the input. `event_users` is the
+/// table dominated by anonymous-id churn and it has no reaper, so this matters;
+/// and the tier clamp does not save the naive shape on a deployment that never
+/// enabled `sauron-tier`, which is exactly the deployment with the most rows.
+///
+/// # Why the split cannot fail to add up
+///
+/// `identified` is a property of the KEY, not of the row. A `'u:'` key exists
+/// only because some selected app has `identified_at IS NOT NULL` for that
+/// `distinct_id`; an `'a:'` key exists only where no selected app does. The
+/// prefix therefore determines the flag, so carrying `identified` inside the
+/// `DISTINCT` cannot split one key across both buckets and cannot change the
+/// cardinality `active_total` counts. Two `count(*) FILTER` clauses over one
+/// already-deduplicated set is the only shape with that property — computing
+/// the halves as separate subqueries and adding them would reintroduce a total
+/// that does not match its parts.
+///
+/// # Binds
+///
+/// `$1` from, `$2` to, then per scope in order `app_id` and — ONLY when
+/// `env.consumes_bind()` — the environment bind. Deriving that index from
+/// anything else is the documented easiest way to get `EnvFilter` wrong, and
+/// here it silently pairs an environment with the wrong app.
+pub async fn active_users_combined(
+    conn: &mut AsyncPgConnection,
+    scopes: &[AppEnvScope],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> QueryResult<Vec<ActiveUserDay>> {
+    if scopes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut legs: Vec<String> = Vec::with_capacity(scopes.len() * 2);
+    let mut next = 3usize;
+    for s in scopes {
+        let app_bind = next;
+        next += 1;
+        let env_bind = next;
+        let env_a = s.env.sql_fragment_for("analytics_events", env_bind);
+        let env_e = s.env.sql_fragment_for("error_events", env_bind);
+        if s.env.consumes_bind() {
+            next += 1;
+        }
+        legs.push(format!(
+            "SELECT app_id, occurred_at, distinct_id FROM analytics_events \
+             WHERE app_id = ${app_bind} AND occurred_at >= $1 AND occurred_at < $2{env_a} \
+               AND distinct_id IS NOT NULL AND distinct_id <> ''"
+        ));
+        legs.push(format!(
+            "SELECT app_id, occurred_at, distinct_id FROM error_events \
+             WHERE app_id = ${app_bind} AND occurred_at >= $1 AND occurred_at < $2{env_e} \
+               AND distinct_id IS NOT NULL AND distinct_id <> ''"
+        ));
+    }
+    let signal = legs.join(" UNION ALL ");
+
+    // `::timestamp` on both generate_series bounds is a disambiguation, not
+    // decoration: `generate_series(date, date, interval)` has no exact
+    // overload, and letting Postgres pick between the timestamp and timestamptz
+    // forms would make the grid's boundaries depend on the session TimeZone —
+    // the very dependency `AT TIME ZONE 'UTC'` exists to remove.
+    let q = format!(
+        "WITH signal AS ({signal}), \
+         days AS ( \
+           SELECT DISTINCT app_id, distinct_id, (occurred_at AT TIME ZONE 'UTC')::date AS day \
+             FROM signal \
+         ), \
+         keyed AS ( \
+           SELECT DISTINCT \
+                  CASE WHEN eu.distinct_id IS NOT NULL \
+                       THEN 'u:' || d.distinct_id \
+                       ELSE 'a:' || d.app_id::text || ':' || d.distinct_id END AS identity_key, \
+                  (eu.distinct_id IS NOT NULL) AS identified, \
+                  d.day \
+             FROM days d \
+             LEFT JOIN event_users eu \
+               ON eu.app_id = d.app_id AND eu.distinct_id = d.distinct_id \
+              AND eu.identified_at IS NOT NULL \
+         ), \
+         per_day AS ( \
+           SELECT day, \
+                  count(*)::bigint                               AS active_total, \
+                  count(*) FILTER (WHERE identified)::bigint     AS active_identified, \
+                  count(*) FILTER (WHERE NOT identified)::bigint AS active_guest \
+             FROM keyed GROUP BY day \
+         ), \
+         grid AS ( \
+           SELECT generate_series( \
+                    ($1 AT TIME ZONE 'UTC')::date::timestamp, \
+                    (($2 - interval '1 microsecond') AT TIME ZONE 'UTC')::date::timestamp, \
+                    interval '1 day')::date AS day \
+         ) \
+         SELECT g.day AS day, \
+                COALESCE(p.active_total, 0)::bigint      AS active_total, \
+                COALESCE(p.active_identified, 0)::bigint AS active_identified, \
+                COALESCE(p.active_guest, 0)::bigint      AS active_guest \
+           FROM grid g \
+           LEFT JOIN per_day p ON p.day = g.day \
+          ORDER BY g.day"
+    );
+
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<Timestamptz, _>(from)
+        .bind::<Timestamptz, _>(to);
+    for s in scopes {
+        stmt = stmt.bind::<SqlUuid, _>(s.app_id);
+        stmt = crate::bind_env!(stmt, &s.env);
+    }
+    stmt.load(conn).await
+}
+
+// ===========================================================================
+// PII inspector: policies + scheduling
+// ===========================================================================
+
+/// The next due instant for a policy row aliased `p`.
+///
+/// All timezone arithmetic is Postgres's, because `chrono-tz` is not a
+/// workspace dependency: Rust cannot resolve `Europe/Paris` at all, and adding
+/// it is a workspace edit plus ~1 MB of tz data in every binary. There is also
+/// no cron parser anywhere in the repo and no cron crate in Cargo.lock, so the
+/// cadence is a 7-bit weekday mask plus a local wall-clock TIME — trivially
+/// testable in SQL with `(days >> dow) & 1`, and a 1:1 map to a row of
+/// checkboxes.
+///
+/// Eight days of candidates always covers a once-a-week schedule. Candidates
+/// are built as LOCAL timestamps and converted back with `AT TIME ZONE`, so
+/// Postgres resolves DST: on spring-forward a 02:30 schedule resolves to a
+/// valid instant, on fall-back to the first occurrence. Never zero runs,
+/// never double runs.
+///
+/// The update target MUST be aliased (`UPDATE inspector_policies AS p`) —
+/// this fragment references `p.*`, and the pattern it copies
+/// (`claim_due_monitors`) aliases nothing. The inner sub-select gets its own
+/// alias so the two scopes cannot collide.
+pub const NEXT_RUN_SQL: &str = "(SELECT min(ts) FROM ( \
+     SELECT ((date_trunc('day', now() AT TIME ZONE p.schedule_tz) \
+              + (d || ' day')::interval + p.schedule_time) \
+             AT TIME ZONE p.schedule_tz) AS ts \
+     FROM generate_series(0, 8) d) c \
+   WHERE ((p.schedule_days >> EXTRACT(DOW FROM (c.ts AT TIME ZONE p.schedule_tz))::int) & 1) = 1 \
+     AND c.ts > now())";
+
+/// Recompute `next_run_at`. Called after EVERY schedule-field write so the
+/// materialized due time is never stale.
+pub async fn reschedule_policy(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<DateTime<Utc>>> {
+    let sql = format!(
+        "UPDATE inspector_policies AS p SET next_run_at = CASE \
+           WHEN p.enabled AND p.schedule_enabled AND p.schedule_days <> 0 THEN {NEXT_RUN_SQL} \
+           ELSE NULL END \
+         WHERE p.id = $1 RETURNING p.next_run_at"
+    );
+    #[derive(QueryableByName)]
+    struct NextRow {
+        #[diesel(sql_type = Nullable<Timestamptz>)]
+        next_run_at: Option<DateTime<Utc>>,
+    }
+    let row: Option<NextRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(id)
+        .get_result(conn)
+        .await
+        .optional()?;
+    Ok(row.and_then(|r| r.next_run_at))
+}
+
+/// Claim due policies, advancing `next_run_at` in the same statement.
+///
+/// `FOR UPDATE SKIP LOCKED` is the only concurrency primitive this repository
+/// uses — there are zero advisory locks, deliberately, because a lock held by
+/// a process that took a SIGKILL has nobody to release it and there is no
+/// shutdown handler anywhere. The claim ALWAYS advances `next_run_at`, so a
+/// row can never get stuck permanently due; the worker then decides whether to
+/// actually start a scan.
+pub async fn claim_due_policies(
+    conn: &mut AsyncPgConnection,
+    batch: i64,
+) -> QueryResult<Vec<InspectorPolicy>> {
+    let sql = format!(
+        "UPDATE inspector_policies AS p \
+         SET next_run_at = {NEXT_RUN_SQL}, last_run_at = now() \
+         WHERE p.id IN ( \
+           SELECT q.id FROM inspector_policies q \
+           WHERE q.enabled AND q.schedule_enabled AND q.schedule_days <> 0 \
+             AND q.next_run_at IS NOT NULL AND q.next_run_at <= now() \
+           ORDER BY q.next_run_at FOR UPDATE SKIP LOCKED LIMIT $1 \
+         ) RETURNING p.*"
+    );
+    diesel::sql_query(sql)
+        .bind::<BigInt, _>(batch)
+        .get_results(conn)
+        .await
+}
+
+/// Whether `(target_type, target_id)` actually lives in `org_id`.
+///
+/// `inspector_policies.target_id` has NO foreign key (it is polymorphic, like
+/// `role_grants`), so without this any authenticated user can mint an org
+/// where they hold `org:manage` (`POST /v1/orgs` requires only `AuthUser`),
+/// POST a policy naming a victim's `app_id`, and have the worker scan the
+/// victim's `error_events` into rows carrying the attacker's `org_id` — which
+/// is exactly what every list query filters on.
+///
+/// Called on every policy create and PATCH, AND again in the worker when the
+/// scan is claimed, because grants outlive targets.
+pub async fn validate_scope_in_org(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    target_type: &str,
+    target_id: Uuid,
+) -> QueryResult<bool> {
+    // An unknown target_type is a hard false, never a permissive default.
+    let sql = match target_type {
+        "project" => "SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1 AND org_id = $2) AS ok",
+        "app" => {
+            "SELECT EXISTS (SELECT 1 FROM apps a JOIN projects p ON p.id = a.project_id \
+             WHERE a.id = $1 AND p.org_id = $2) AS ok"
+        }
+        // For app_env the id is an app_environments ENROLLMENT id.
+        "app_env" => {
+            "SELECT EXISTS (SELECT 1 FROM app_environments ae \
+             JOIN apps a ON a.id = ae.app_id JOIN projects p ON p.id = a.project_id \
+             WHERE ae.id = $1 AND p.org_id = $2) AS ok"
+        }
+        _ => return Ok(false),
+    };
+    #[derive(QueryableByName)]
+    struct OkRow {
+        #[diesel(sql_type = Bool)]
+        ok: bool,
+    }
+    let row: OkRow = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(target_id)
+        .bind::<SqlUuid, _>(org_id)
+        .get_result(conn)
+        .await?;
+    Ok(row.ok)
+}
+
+/// Whether Postgres recognises this IANA timezone name.
+///
+/// The name is bound, never interpolated, and a failure is a plain `false`
+/// rather than an error: `SET`-style timezone errors abort the surrounding
+/// statement, and this runs inside a request handler that must answer 400.
+pub async fn timezone_is_valid(conn: &mut AsyncPgConnection, tz: &str) -> bool {
+    #[derive(QueryableByName)]
+    struct TsRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamp)]
+        #[allow(dead_code)]
+        t: chrono::NaiveDateTime,
+    }
+    diesel::sql_query("SELECT now() AT TIME ZONE $1 AS t")
+        .bind::<Text, _>(tz)
+        .get_result::<TsRow>(conn)
+        .await
+        .is_ok()
+}
+
+pub async fn create_inspector_policy(
+    conn: &mut AsyncPgConnection,
+    new: NewInspectorPolicy<'_>,
+) -> QueryResult<InspectorPolicy> {
+    diesel::insert_into(inspector_policies::table)
+        .values(&new)
+        .returning(InspectorPolicy::as_returning())
+        .get_result(conn)
+        .await
+}
+
+pub async fn get_inspector_policy(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<InspectorPolicy>> {
+    inspector_policies::table
+        .find(id)
+        .select(InspectorPolicy::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+pub async fn list_inspector_policies_for_org(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+) -> QueryResult<Vec<InspectorPolicy>> {
+    inspector_policies::table
+        .filter(inspector_policies::org_id.eq(org_id))
+        .select(InspectorPolicy::as_select())
+        .order(inspector_policies::created_at.desc())
+        .load(conn)
+        .await
+}
+
+pub async fn patch_inspector_policy(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    patch: InspectorPolicyPatch<'_>,
+) -> QueryResult<Option<InspectorPolicy>> {
+    diesel::update(inspector_policies::table.find(id))
+        .set(patch)
+        .returning(InspectorPolicy::as_returning())
+        .get_result(conn)
+        .await
+        .optional()
+}
+
+pub async fn delete_inspector_policy(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
+    diesel::delete(inspector_policies::table.find(id))
+        .execute(conn)
+        .await
+}
+
+/// The policy that governs `app_id`: most specific wins, whole row.
+///
+/// `app_env` beats `app` beats `project`, and `UNIQUE (target_type, target_id)`
+/// means there is exactly one candidate per level, so the ranking is a
+/// database fact rather than an ordering problem. An `app_env` row is only
+/// preferred when the app has exactly one live enrollment; with several, the
+/// app-level answer is the honest one for an app-scoped question.
+pub async fn effective_policy_for_app(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Option<InspectorPolicy>> {
+    diesel::sql_query(
+        "SELECT p.* FROM inspector_policies p \
+         WHERE (p.target_type = 'app' AND p.target_id = $1) \
+            OR (p.target_type = 'project' \
+                AND p.target_id = (SELECT project_id FROM apps WHERE id = $1)) \
+            OR (p.target_type = 'app_env' \
+                AND p.target_id IN (SELECT id FROM app_environments WHERE app_id = $1)) \
+         ORDER BY CASE p.target_type \
+                    WHEN 'app_env' THEN 0 WHEN 'app' THEN 1 ELSE 2 END, p.created_at \
+         LIMIT 1",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .get_result(conn)
+    .await
+    .optional()
+}
+
+/// Every policy row whose node falls strictly UNDER `(target_type, target_id)`,
+/// enabled or not.
+///
+/// Enabled-or-not is the point: "most specific wins, whole row" applies to
+/// EXCLUSION as well as configuration. A disabled child policy is how an admin
+/// excludes one noisy environment, and a parent that keeps walking it would
+/// persist that environment's key paths for 90 days while the UI showed it as
+/// excluded.
+pub async fn list_inspector_policies_under(
+    conn: &mut AsyncPgConnection,
+    target_type: &str,
+    target_id: Uuid,
+) -> QueryResult<Vec<(String, Uuid)>> {
+    #[derive(QueryableByName)]
+    struct NodeRow {
+        #[diesel(sql_type = Text)]
+        target_type: String,
+        #[diesel(sql_type = SqlUuid)]
+        target_id: Uuid,
+    }
+    let sql = match target_type {
+        "project" => {
+            "SELECT p.target_type, p.target_id FROM inspector_policies p \
+             WHERE (p.target_type = 'app' \
+                    AND p.target_id IN (SELECT id FROM apps WHERE project_id = $1)) \
+                OR (p.target_type = 'app_env' \
+                    AND p.target_id IN (SELECT ae.id FROM app_environments ae \
+                                        JOIN apps a ON a.id = ae.app_id \
+                                        WHERE a.project_id = $1))"
+        }
+        "app" => {
+            "SELECT p.target_type, p.target_id FROM inspector_policies p \
+             WHERE p.target_type = 'app_env' \
+               AND p.target_id IN (SELECT id FROM app_environments WHERE app_id = $1)"
+        }
+        // Nothing is narrower than an app_env node.
+        _ => return Ok(Vec::new()),
+    };
+    let rows: Vec<NodeRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(target_id)
+        .load(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.target_type, r.target_id))
+        .collect())
+}
+
+/// Expand a policy node into ordered `(app_id, app_env_id|NULL)` pairs.
+///
+/// The NULL pair is the unattributed bucket and is only emitted for app- and
+/// project-scoped nodes: `EnvFilter::Subset` uses `= ANY`, which never matches
+/// NULL, so those rows are unreachable from an env-scoped policy. If a
+/// deployment runs mostly `app_env` policies those rows go silently unscanned,
+/// which is what the effective-policy endpoint surfaces.
+pub async fn scan_pairs_for_node(
+    conn: &mut AsyncPgConnection,
+    target_type: &str,
+    target_id: Uuid,
+) -> QueryResult<Vec<(Uuid, Option<Uuid>)>> {
+    #[derive(QueryableByName)]
+    struct PairRow {
+        #[diesel(sql_type = SqlUuid)]
+        app_id: Uuid,
+        #[diesel(sql_type = Nullable<SqlUuid>)]
+        env_id: Option<Uuid>,
+    }
+    let sql = match target_type {
+        "project" => {
+            "SELECT a.id AS app_id, ae.id AS env_id FROM apps a \
+             LEFT JOIN app_environments ae ON ae.app_id = a.id AND ae.retired_at IS NULL \
+             WHERE a.project_id = $1 ORDER BY a.id, ae.id"
+        }
+        "app" => {
+            "SELECT a.id AS app_id, ae.id AS env_id FROM apps a \
+             LEFT JOIN app_environments ae ON ae.app_id = a.id AND ae.retired_at IS NULL \
+             WHERE a.id = $1 ORDER BY ae.id"
+        }
+        "app_env" => {
+            "SELECT ae.app_id AS app_id, ae.id AS env_id FROM app_environments ae \
+             WHERE ae.id = $1"
+        }
+        _ => return Ok(Vec::new()),
+    };
+    let rows: Vec<PairRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(target_id)
+        .load(conn)
+        .await?;
+    let mut out: Vec<(Uuid, Option<Uuid>)> =
+        rows.into_iter().map(|r| (r.app_id, r.env_id)).collect();
+    // The unattributed bucket, once per app, for app/project nodes only.
+    if target_type != "app_env" {
+        let apps: Vec<Uuid> = {
+            let mut a: Vec<Uuid> = out.iter().map(|(app, _)| *app).collect();
+            a.sort_unstable();
+            a.dedup();
+            a
+        };
+        for app in apps {
+            out.push((app, None));
+        }
+    }
+    Ok(out)
+}
+
+// ===========================================================================
+// PII inspector: scans
+// ===========================================================================
+
+/// Insert a scan. A `UniqueViolation` here is the partial unique index
+/// `inspector_scans_active_key` refusing a second queued/running scan for the
+/// policy — the handler answers 409 with the active scan id, never 500.
+pub async fn insert_inspector_scan(
+    conn: &mut AsyncPgConnection,
+    new: NewInspectorScan<'_>,
+) -> QueryResult<InspectorScan> {
+    diesel::insert_into(inspector_scans::table)
+        .values(&new)
+        .returning(InspectorScan::as_returning())
+        .get_result(conn)
+        .await
+}
+
+pub async fn active_scan_for_policy(
+    conn: &mut AsyncPgConnection,
+    policy_id: Uuid,
+) -> QueryResult<Option<InspectorScan>> {
+    inspector_scans::table
+        .filter(inspector_scans::policy_id.eq(policy_id))
+        .filter(inspector_scans::status.eq_any(vec!["queued", "running"]))
+        .select(InspectorScan::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Claim one scan, copying `claim_due_monitors` verbatim in shape.
+///
+/// This is what makes N replicas safe, unlike `sauron-alerts` (no claim) and
+/// `sauron-tier` (a watermark row with no locking). Re-claiming a `running`
+/// row whose heartbeat expired IS the crash-resume mechanism; the caller
+/// finalizes the scan as `failed` once `attempts > inspector_max_attempts` so
+/// one poison unit cannot loop forever.
+///
+/// THE OWNER MUST BE ABLE TO RE-CLAIM ITS OWN RUNNING SCAN. The executor does
+/// ONE unit per tick and re-enters, and every flush refreshes `heartbeat_at`
+/// — so with only the two arms above, a scan the worker itself is mid-way
+/// through is not claimable again until its own lease expires. That is one
+/// unit per `INSPECTOR_LEASE_SECS`, and since each of those claims also
+/// increments `attempts`, a scan dies at `INSPECTOR_MAX_ATTEMPTS` after four
+/// units no matter how many it has. Observed directly: a 17-unit scan sat at
+/// `units_done = 1` for a full 45-second drive. The third arm is what makes
+/// "run one unit, flush, yield, re-enter" actually advance; `attempts` stays
+/// honest because `flush_scan_unit` resets it whenever a unit completes, so
+/// it counts claims SINCE THE LAST PROGRESS rather than claims in total.
+pub async fn claim_one_scan(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    lease_secs: i64,
+) -> QueryResult<Option<InspectorScan>> {
+    diesel::sql_query(
+        "UPDATE inspector_scans SET status='running', worker_id=$1, heartbeat_at=now(), \
+                attempts=attempts+1, started_at=COALESCE(started_at, now()) \
+         WHERE id IN (SELECT id FROM inspector_scans \
+                      WHERE status='queued' \
+                         OR (status='running' AND worker_id = $1) \
+                         OR (status='running' AND heartbeat_at < now() - make_interval(secs => $2)) \
+                      ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) \
+         RETURNING *",
+    )
+    .bind::<Text, _>(worker_id)
+    .bind::<BigInt, _>(lease_secs)
+    .get_result(conn)
+    .await
+    .optional()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_scan(
+    conn: &mut AsyncPgConnection,
+    scan_id: Uuid,
+    worker_id: &str,
+    status: &str,
+    coverage: &str,
+    coverage_note: &str,
+    error: &str,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_scans SET status=$3, coverage=$4, coverage_note=$5, error=$6, \
+                finished_at=now(), heartbeat_at=now() \
+         WHERE id=$1 AND worker_id=$2",
+    )
+    .bind::<SqlUuid, _>(scan_id)
+    .bind::<Text, _>(worker_id)
+    .bind::<Text, _>(status)
+    .bind::<Text, _>(coverage)
+    .bind::<Text, _>(coverage_note)
+    .bind::<Text, _>(error)
+    .execute(conn)
+    .await
+}
+
+/// Ask a running scan to stop. The worker observes this on the `RETURNING` of
+/// the next flush — a write it was making anyway.
+pub async fn request_scan_cancel(
+    conn: &mut AsyncPgConnection,
+    scan_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_scans SET cancel_requested_at = COALESCE(cancel_requested_at, now()) \
+         WHERE id = $1 AND status IN ('queued','running')",
+    )
+    .bind::<SqlUuid, _>(scan_id)
+    .execute(conn)
+    .await
+}
+
+pub async fn get_inspector_scan(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<InspectorScan>> {
+    inspector_scans::table
+        .find(id)
+        .select(InspectorScan::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+pub async fn list_scans_for_policy(
+    conn: &mut AsyncPgConnection,
+    policy_id: Uuid,
+    limit: i64,
+) -> QueryResult<Vec<InspectorScan>> {
+    inspector_scans::table
+        .filter(inspector_scans::policy_id.eq(policy_id))
+        .select(InspectorScan::as_select())
+        .order(inspector_scans::created_at.desc())
+        .limit(limit.clamp(1, 200))
+        .load(conn)
+        .await
+}
+
+/// One unit's aggregated result, ready to be folded into `inspector_findings`.
+#[derive(Debug, Clone)]
+pub struct FindingDelta {
+    pub org_id: Uuid,
+    pub app_id: Uuid,
+    pub environment_id: Option<Uuid>,
+    pub env_scope: String,
+    pub source_table: String,
+    pub source_column: String,
+    pub key_path: String,
+    pub matched_key: String,
+    pub detector: String,
+    pub value_type: String,
+    pub match_count: i64,
+    pub match_count_exact: bool,
+    pub sample_preview: String,
+    pub sample_row_id: Option<Uuid>,
+    pub sample_occurred_at: Option<DateTime<Utc>>,
+    pub partition_kind: String,
+    pub first_seen_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FlushOutcome {
+    /// How many rows the CTE actually INSERTED (as opposed to updated).
+    pub new_findings: i64,
+    /// Set once an operator has asked the scan to stop.
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+}
+
+/// Persist one unit's findings AND advance the cursor in ONE data-modifying
+/// CTE. There is no `conn.transaction` in this repository (MSRV 1.82).
+///
+/// Four properties are load-bearing:
+///
+/// `attempts = 0`. `claim_one_scan` increments `attempts` on every claim, and
+/// the executor re-claims its own running scan once per unit, so without this
+/// reset a healthy multi-unit scan trips `INSPECTOR_MAX_ATTEMPTS` and is
+/// finalized `failed` after four units. Resetting it HERE — on the one write
+/// that only happens when a unit actually completed — is what makes the
+/// counter mean "claims since the last progress", which is the thing
+/// `attempts > inspector_max_attempts` is trying to detect. A unit that keeps
+/// failing never reaches this statement, so the poison-unit guard still fires.
+///
+/// ATOMICITY. The deltas and the cursor advance in one commit, so a SIGKILL
+/// between them is impossible and re-running the lost range re-adds exact
+/// counts from the last durable cursor. Counts stay correct without
+/// `GREATEST`-style deduplication — which would be correct across re-runs but
+/// WRONG across units, which must sum.
+///
+/// THE `worker_id` FENCE. A worker stalled past the lease (GC, IO) can have
+/// its scan reclaimed while still alive, and `match_count +
+/// excluded.match_count` would then double-count. A flush that affects zero
+/// rows returns `None` and the caller MUST abort the unit. Any refactor that
+/// drops the fence silently corrupts counts.
+///
+/// `findings_count` READS THE CTE, NOT THE TABLE. Postgres executes all
+/// sub-statements of a data-modifying `WITH` against one snapshot and
+/// documents that they cannot see one another's effects, so
+/// `(SELECT count(*) FROM inspector_findings WHERE scan_id = $1)` here counts
+/// the table as of BEFORE `f` ran: the counter is permanently one flush
+/// behind, the final flush's findings are never counted, and a single-unit
+/// scan reports 0 while `GET /findings` returns rows. It is also an aggregate
+/// over the whole finding set on every flush — hundreds of millions of index
+/// tuples over a scan, on the connection that is supposed to be duty-cycled.
+#[allow(clippy::too_many_arguments)]
+pub async fn flush_scan_unit(
+    conn: &mut AsyncPgConnection,
+    scan_id: Uuid,
+    worker_id: &str,
+    cursor: &Value,
+    units_done: i32,
+    rows_delta: i64,
+    deltas: &[FindingDelta],
+) -> QueryResult<Option<FlushOutcome>> {
+    // Columnar unnest: one bound array per column keeps the statement text
+    // constant regardless of how many findings a unit produced, so Postgres
+    // reuses the plan instead of parsing a fresh VALUES list every flush.
+    let org_ids: Vec<Uuid> = deltas.iter().map(|d| d.org_id).collect();
+    let app_ids: Vec<Uuid> = deltas.iter().map(|d| d.app_id).collect();
+    let env_ids: Vec<Option<Uuid>> = deltas.iter().map(|d| d.environment_id).collect();
+    let env_scopes: Vec<String> = deltas.iter().map(|d| d.env_scope.clone()).collect();
+    let tables: Vec<String> = deltas.iter().map(|d| d.source_table.clone()).collect();
+    let columns: Vec<String> = deltas.iter().map(|d| d.source_column.clone()).collect();
+    let paths: Vec<String> = deltas.iter().map(|d| d.key_path.clone()).collect();
+    let keys: Vec<String> = deltas.iter().map(|d| d.matched_key.clone()).collect();
+    let dets: Vec<String> = deltas.iter().map(|d| d.detector.clone()).collect();
+    let types: Vec<String> = deltas.iter().map(|d| d.value_type.clone()).collect();
+    let counts: Vec<i64> = deltas.iter().map(|d| d.match_count).collect();
+    let exacts: Vec<bool> = deltas.iter().map(|d| d.match_count_exact).collect();
+    let previews: Vec<String> = deltas.iter().map(|d| d.sample_preview.clone()).collect();
+    let row_ids: Vec<Option<Uuid>> = deltas.iter().map(|d| d.sample_row_id).collect();
+    let occurred: Vec<Option<DateTime<Utc>>> =
+        deltas.iter().map(|d| d.sample_occurred_at).collect();
+    let kinds: Vec<String> = deltas.iter().map(|d| d.partition_kind.clone()).collect();
+    let firsts: Vec<Option<DateTime<Utc>>> = deltas.iter().map(|d| d.first_seen_at).collect();
+    let lasts: Vec<Option<DateTime<Utc>>> = deltas.iter().map(|d| d.last_seen_at).collect();
+
+    #[derive(QueryableByName)]
+    struct FlushRow {
+        #[diesel(sql_type = BigInt)]
+        inserted: i64,
+        #[diesel(sql_type = Nullable<Timestamptz>)]
+        cancel_requested_at: Option<DateTime<Utc>>,
+    }
+
+    let row: Option<FlushRow> = diesel::sql_query(
+        "WITH me AS (SELECT id FROM inspector_scans WHERE id = $1 AND worker_id = $2), \
+         f AS ( \
+           INSERT INTO inspector_findings ( \
+             scan_id, org_id, app_id, environment_id, env_scope, source_table, source_column, \
+             key_path, matched_key, detector, value_type, match_count, match_count_exact, \
+             sample_preview, sample_row_id, sample_occurred_at, partition_kind, \
+             first_seen_at, last_seen_at) \
+           SELECT $1, u.org_id, u.app_id, u.env_id, u.env_scope, u.src_table, u.src_column, \
+                  u.key_path, u.matched_key, u.detector, u.value_type, u.match_count, u.exact, \
+                  u.preview, u.row_id, u.occurred, u.kind, u.first_seen, u.last_seen \
+           FROM unnest($6::uuid[], $7::uuid[], $8::uuid[], $9::text[], $10::text[], $11::text[], \
+                       $12::text[], $13::text[], $14::text[], $15::text[], $16::bigint[], \
+                       $17::bool[], $18::text[], $19::uuid[], $20::timestamptz[], $21::text[], \
+                       $22::timestamptz[], $23::timestamptz[]) \
+                AS u(org_id, app_id, env_id, env_scope, src_table, src_column, key_path, \
+                     matched_key, detector, value_type, match_count, exact, preview, row_id, \
+                     occurred, kind, first_seen, last_seen) \
+           WHERE EXISTS (SELECT 1 FROM me) \
+           ON CONFLICT (scan_id, app_id, env_scope, \
+                        COALESCE(environment_id,'00000000-0000-0000-0000-000000000000'::uuid), \
+                        source_table, source_column, key_path, detector) \
+           DO UPDATE SET \
+             match_count = inspector_findings.match_count + excluded.match_count, \
+             last_seen_at = GREATEST(inspector_findings.last_seen_at, excluded.last_seen_at), \
+             first_seen_at = LEAST(inspector_findings.first_seen_at, excluded.first_seen_at), \
+             match_count_exact = inspector_findings.match_count_exact AND excluded.match_count_exact \
+           RETURNING (xmax = 0) AS inserted \
+         ) \
+         UPDATE inspector_scans SET \
+           cursor = $3, units_done = $4, \
+           rows_scanned = rows_scanned + $5, \
+           findings_count = findings_count + \
+               (SELECT count(*) FROM f WHERE inserted)::int, \
+           attempts = 0, \
+           heartbeat_at = now() \
+         WHERE id = $1 AND worker_id = $2 \
+         RETURNING (SELECT count(*) FROM f WHERE inserted)::bigint AS inserted, \
+                   cancel_requested_at",
+    )
+    .bind::<SqlUuid, _>(scan_id)
+    .bind::<Text, _>(worker_id)
+    .bind::<Jsonb, _>(cursor)
+    .bind::<Integer, _>(units_done)
+    .bind::<BigInt, _>(rows_delta)
+    .bind::<Array<SqlUuid>, _>(org_ids)
+    .bind::<Array<SqlUuid>, _>(app_ids)
+    .bind::<Array<Nullable<SqlUuid>>, _>(env_ids)
+    .bind::<Array<Text>, _>(env_scopes)
+    .bind::<Array<Text>, _>(tables)
+    .bind::<Array<Text>, _>(columns)
+    .bind::<Array<Text>, _>(paths)
+    .bind::<Array<Text>, _>(keys)
+    .bind::<Array<Text>, _>(dets)
+    .bind::<Array<Text>, _>(types)
+    .bind::<Array<BigInt>, _>(counts)
+    .bind::<Array<Bool>, _>(exacts)
+    .bind::<Array<Text>, _>(previews)
+    .bind::<Array<Nullable<SqlUuid>>, _>(row_ids)
+    .bind::<Array<Nullable<Timestamptz>>, _>(occurred)
+    .bind::<Array<Text>, _>(kinds)
+    .bind::<Array<Nullable<Timestamptz>>, _>(firsts)
+    .bind::<Array<Nullable<Timestamptz>>, _>(lasts)
+    .get_result(conn)
+    .await
+    .optional()?;
+
+    Ok(row.map(|r| FlushOutcome {
+        new_findings: r.inserted,
+        cancel_requested_at: r.cancel_requested_at,
+    }))
+}
+
+// ===========================================================================
+// PII inspector: findings + reveal
+// ===========================================================================
+
+/// Findings for a scan, biggest first, keyset-paginated on
+/// `(match_count DESC, id)`. OFFSET is not offered: Postgres must walk and
+/// discard every skipped row, so deep paging over a 33k-finding scan turns a
+/// cheap request into a full ordered scan.
+pub async fn list_findings_for_scan(
+    conn: &mut AsyncPgConnection,
+    scan_id: Uuid,
+    limit: i64,
+    after: Option<(i64, Uuid)>,
+) -> QueryResult<Vec<InspectorFinding>> {
+    let limit = limit.clamp(1, 1_000);
+    match after {
+        Some((count, id)) => {
+            inspector_findings::table
+                .filter(inspector_findings::scan_id.eq(scan_id))
+                .filter(
+                    inspector_findings::match_count
+                        .lt(count)
+                        .or(inspector_findings::match_count
+                            .eq(count)
+                            .and(inspector_findings::id.gt(id))),
+                )
+                .select(InspectorFinding::as_select())
+                .order((
+                    inspector_findings::match_count.desc(),
+                    inspector_findings::id.asc(),
+                ))
+                .limit(limit)
+                .load(conn)
+                .await
+        }
+        None => {
+            inspector_findings::table
+                .filter(inspector_findings::scan_id.eq(scan_id))
+                .select(InspectorFinding::as_select())
+                .order((
+                    inspector_findings::match_count.desc(),
+                    inspector_findings::id.asc(),
+                ))
+                .limit(limit)
+                .load(conn)
+                .await
+        }
+    }
+}
+
+pub async fn count_findings_for_scan(
+    conn: &mut AsyncPgConnection,
+    scan_id: Uuid,
+) -> QueryResult<i64> {
+    inspector_findings::table
+        .filter(inspector_findings::scan_id.eq(scan_id))
+        .count()
+        .get_result(conn)
+        .await
+}
+
+pub async fn get_inspector_finding(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<InspectorFinding>> {
+    inspector_findings::table
+        .find(id)
+        .select(InspectorFinding::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// One live single-row read behind `POST /findings/{id}/reveal`.
+///
+/// `table` and `column` are `&'static str`s from `sauron_inspector::columns`,
+/// never caller bytes — SQL identifiers cannot be bound, so the caller MUST
+/// have resolved them through the inventory first.
+///
+/// The `app_id` predicate is not redundant: without it the tenant decision
+/// rests entirely on `inspector_findings.app_id` being correct, a
+/// worker-written value with no constraint tying it to the row
+/// `sample_row_id` points at. Any attribution bug would convert silently into
+/// cross-tenant raw-PII disclosure. `occurred_at` is mandatory for a
+/// partitioned source so the query prunes to one child.
+///
+/// `None` is a 410 Gone: the partition was dropped by `sauron-tier`, the
+/// rollup row was replaced, or the locator points at another tenant. Nothing
+/// is persisted by this call.
+pub async fn reveal_one_value(
+    conn: &mut AsyncPgConnection,
+    table: &'static str,
+    column: &'static str,
+    row_id: Uuid,
+    occurred_at: Option<DateTime<Utc>>,
+    app_id: Uuid,
+) -> QueryResult<Option<Value>> {
+    #[derive(QueryableByName)]
+    struct ValRow {
+        #[diesel(sql_type = Nullable<Jsonb>)]
+        v: Option<Value>,
+    }
+    // `to_jsonb` normalizes the TEXT columns into the same shape as the jsonb
+    // ones so the handler has one extraction path instead of two.
+    let sql = match occurred_at {
+        Some(_) => format!(
+            "SELECT to_jsonb({column}) AS v FROM {table} \
+             WHERE id = $1 AND occurred_at = $2 AND app_id = $3"
+        ),
+        None => {
+            format!("SELECT to_jsonb({column}) AS v FROM {table} WHERE id = $1 AND app_id = $3")
+        }
+    };
+    let q = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(row_id)
+        .bind::<Nullable<Timestamptz>, _>(occurred_at)
+        .bind::<SqlUuid, _>(app_id);
+    let row: Option<ValRow> = q.get_result(conn).await.optional()?;
+    Ok(row.and_then(|r| r.v))
+}
+
+/// Record who revealed what, BEFORE the value is returned, so a failure to
+/// audit is a failure to reveal.
+pub async fn insert_reveal_audit(
+    conn: &mut AsyncPgConnection,
+    new: NewInspectorRevealAudit<'_>,
+) -> QueryResult<usize> {
+    diesel::insert_into(inspector_reveal_audit::table)
+        .values(&new)
+        .execute(conn)
+        .await
+}
+
+/// The email to denormalize into an audit row. `SET NULL` on the FK loses the
+/// identity, so the trail carries a snapshot.
+pub async fn user_email(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> QueryResult<Option<String>> {
+    users::table
+        .find(user_id)
+        .select(users::email)
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// A real `(id, occurred_at)` locator for `app_id`, for tests and for the
+/// storage report's sanity checks. Returns `None` on an app with no errors.
+pub async fn first_error_event_locator(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Option<(Uuid, DateTime<Utc>)>> {
+    #[derive(QueryableByName)]
+    struct LocRow {
+        #[diesel(sql_type = SqlUuid)]
+        id: Uuid,
+        #[diesel(sql_type = Timestamptz)]
+        occurred_at: DateTime<Utc>,
+    }
+    let row: Option<LocRow> = diesel::sql_query(
+        "SELECT id, occurred_at FROM error_events WHERE app_id = $1 ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .get_result(conn)
+    .await
+    .optional()?;
+    Ok(row.map(|r| (r.id, r.occurred_at)))
+}
+
+// ===========================================================================
+// PII inspector: mask actions (audit + queue + cursor + progress meter)
+// ===========================================================================
+
+pub async fn insert_mask_action(
+    conn: &mut AsyncPgConnection,
+    new: NewInspectorMaskAction<'_>,
+) -> QueryResult<InspectorMaskAction> {
+    diesel::insert_into(inspector_mask_actions::table)
+        .values(&new)
+        .returning(InspectorMaskAction::as_returning())
+        .get_result(conn)
+        .await
+}
+
+pub async fn get_mask_action(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<InspectorMaskAction>> {
+    inspector_mask_actions::table
+        .find(id)
+        .select(InspectorMaskAction::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// The ceiling is 100_000, matching `list_mask_actions_for_org`, and it is not
+/// cosmetic. `list_app_mask_actions` hands this function
+/// `INSPECTOR_EXPORT_MAX_ROWS` (50_000 by default) for a CSV export and then
+/// refuses the export if the row count comes back AT that ceiling — a guard
+/// that a clamp of 1_000 makes unreachable, so every app with more than a
+/// thousand audit rows would download the newest 1_000 with a 200 and a
+/// friendly filename. That is the silent prefix the export guard exists to
+/// refuse, arriving by the other door; the JSON path is unaffected because the
+/// handler clamps it to `MAX_LIMIT` (500) before it ever gets here.
+pub async fn list_mask_actions_for_app(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    limit: i64,
+) -> QueryResult<Vec<InspectorMaskAction>> {
+    inspector_mask_actions::table
+        .filter(inspector_mask_actions::app_id.eq(app_id))
+        .select(InspectorMaskAction::as_select())
+        .order(inspector_mask_actions::requested_at.desc())
+        .limit(limit.clamp(1, 100_000))
+        .load(conn)
+        .await
+}
+
+pub async fn list_mask_actions_for_org(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    limit: i64,
+) -> QueryResult<Vec<InspectorMaskAction>> {
+    inspector_mask_actions::table
+        .filter(inspector_mask_actions::org_id.eq(org_id))
+        .select(InspectorMaskAction::as_select())
+        .order(inspector_mask_actions::requested_at.desc())
+        .limit(limit.clamp(1, 100_000))
+        .load(conn)
+        .await
+}
+
+/// Claim one action for the given slot.
+///
+/// `kind` selects the SLOT, never the phase: previews and masks are two
+/// independent claim slots, because a single FIFO lets a multi-hour mask
+/// starve every preview past its 15-minute TTL and confirm — which requires
+/// `previewed` — becomes permanently impossible on a busy app.
+///
+/// `LIMIT 1` is deliberate for masks: masking is heavy write and one action at
+/// a time per worker IS the throttle; N workers take N different actions.
+/// Re-claiming a stale row is the crash-resume mechanism.
+pub async fn claim_mask_action(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    worker_id: &str,
+    stale_secs: i64,
+) -> QueryResult<Option<InspectorMaskAction>> {
+    let sql = if kind == "preview" {
+        "UPDATE inspector_mask_actions SET phase='counting', claimed_at=now(), worker_id=$1, \
+                started_at=COALESCE(started_at, now()) \
+         WHERE id IN (SELECT id FROM inspector_mask_actions \
+                      WHERE kind='preview' AND status='preview' \
+                        AND (claimed_at IS NULL OR claimed_at < now() - make_interval(secs => $2)) \
+                      ORDER BY requested_at FOR UPDATE SKIP LOCKED LIMIT 1) \
+         RETURNING *"
+    } else {
+        "UPDATE inspector_mask_actions SET status='running', claimed_at=now(), worker_id=$1, \
+                started_at=COALESCE(started_at, now()) \
+         WHERE id IN (SELECT id FROM inspector_mask_actions \
+                      WHERE kind='mask' \
+                        AND (status='pending' \
+                             OR (status IN ('running','cancelling') \
+                                 AND claimed_at < now() - make_interval(secs => $2))) \
+                      ORDER BY requested_at FOR UPDATE SKIP LOCKED LIMIT 1) \
+         RETURNING *"
+    };
+    diesel::sql_query(sql)
+        .bind::<Text, _>(worker_id)
+        .bind::<BigInt, _>(stale_secs)
+        .get_result(conn)
+        .await
+        .optional()
+}
+
+/// A preview finished counting. `previewed_at` is stamped HERE, not at
+/// request time, because the TTL must run from the moment the numbers became
+/// readable.
+pub async fn finish_preview(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    worker_id: &str,
+    estimated_rows: i64,
+    cold_rows_skipped: i64,
+    cold_boundary_at: Option<DateTime<Utc>>,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions \
+         SET status='previewed', phase='finished', previewed_at=now(), finished_at=now(), \
+             estimated_rows=$3, cold_rows_skipped=$4, cold_boundary_at=$5 \
+         WHERE id=$1 AND worker_id=$2 AND kind='preview' AND status='preview'",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(worker_id)
+    .bind::<BigInt, _>(estimated_rows)
+    .bind::<BigInt, _>(cold_rows_skipped)
+    .bind::<Nullable<Timestamptz>, _>(cold_boundary_at)
+    .execute(conn)
+    .await
+}
+
+/// Promote `previewed` -> `pending` and hand the row to the mask slot.
+///
+/// Every gate is IN THE STATEMENT rather than in the handler, so a
+/// double-clicked confirm, a concurrent second confirm and a stale preview all
+/// resolve to "0 rows updated" instead of racing. `targets` is deliberately
+/// not a parameter: it was frozen at preview, so a confirm can never widen
+/// what was counted and shown.
+///
+/// `cold_rows_skipped=0` is not tidying. Preview and mask are the SAME row, and
+/// `finish_preview` SETs that column while the mask executor ADDs to it once
+/// per skipped day — so without the reset every confirmed action reports the
+/// cold rows twice. MEASURED: a 2800-row cold window came back as 5600 on a
+/// `done` action. It is the number the Audit column, the audit CSV and the
+/// MaskDialog all present as "rows we could not reach", next to `rows_masked`;
+/// an operator reads it and acts on it, so it has to have exactly one writer.
+pub async fn confirm_mask_action(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    confirm_source: &str,
+    preview_ttl_secs: i64,
+    max_rows: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions \
+         SET kind='mask', status='pending', phase='idle', confirmed_at=now(), \
+             confirm_source=$2, finished_at=NULL, claimed_at=NULL, worker_id=NULL, \
+             cold_rows_skipped=0 \
+         WHERE id=$1 AND kind='preview' AND status='previewed' \
+           AND previewed_at IS NOT NULL \
+           AND previewed_at > now() - make_interval(secs => $3) \
+           AND estimated_rows <= $4",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(confirm_source)
+    .bind::<BigInt, _>(preview_ttl_secs)
+    .bind::<BigInt, _>(max_rows)
+    .execute(conn)
+    .await
+}
+
+/// Ask a queued or running mask to stop.
+///
+/// `running -> cancelling` is allowed; the batch loop observes it on the
+/// `RETURNING status` of a write it was making anyway and lands in terminal
+/// `cancelled` with the cursor and counters already durable. A terminal action
+/// updates zero rows and the handler answers 409.
+pub async fn cancel_mask_action(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    cancelled_by: Option<Uuid>,
+    cancelled_by_email: &str,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions \
+         SET status = CASE WHEN status = 'running' THEN 'cancelling' ELSE 'cancelled' END, \
+             cancelled_by=$2, cancelled_by_email=$3, cancelled_at=now(), \
+             finished_at = CASE WHEN status = 'running' THEN finished_at ELSE now() END \
+         WHERE id=$1 AND status IN ('preview','previewed','pending','running')",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Nullable<SqlUuid>, _>(cancelled_by)
+    .bind::<Text, _>(cancelled_by_email)
+    .execute(conn)
+    .await
+}
+
+/// Deactivating a member must also stop the destruction they queued.
+///
+/// Confirm re-authorizes, but the action then sits in `pending` — with one
+/// slot per worker and a 200 ms inter-batch pause, a backlog can be hours
+/// deep. A member whose account was deactivated (which revokes refresh tokens
+/// and touches nothing queued) must not have their queued destruction execute.
+pub async fn cancel_pending_mask_actions_for_user(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions \
+         SET status='cancelled', cancelled_at=now(), finished_at=now(), \
+             error='requester was deactivated before the action ran' \
+         WHERE requested_by=$1 AND status IN ('preview','previewed','pending')",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .execute(conn)
+    .await
+}
+
+pub async fn set_mask_phase(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    worker_id: &str,
+    phase: &str,
+    day_cursor: Option<chrono::NaiveDate>,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions \
+         SET phase=$3, day_cursor=$4, cursor_occurred_at=NULL, cursor_id=NULL \
+         WHERE id=$1 AND worker_id=$2",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(worker_id)
+    .bind::<Text, _>(phase)
+    .bind::<Nullable<Date>, _>(day_cursor)
+    .execute(conn)
+    .await
+}
+
+pub async fn fail_mask_action(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    reason: &str,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions SET status='failed', phase='finished', \
+                finished_at=now(), error=$2 \
+         WHERE id=$1 AND status NOT IN ('done','failed','cancelled')",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(reason)
+    .execute(conn)
+    .await
+}
+
+/// `cold_boundary_at` is re-recorded HERE, not only at preview, so the audit
+/// shows what execution actually skipped rather than what the preview
+/// predicted — `sauron-tier` defers the drop to a later cycle than the export,
+/// so the boundary genuinely moves during a multi-hour pass.
+pub async fn finish_mask_action(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    worker_id: &str,
+    status: &str,
+    vacuum_advised: bool,
+    cold_boundary_at: Option<DateTime<Utc>>,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions SET status=$3, phase='finished', finished_at=now(), \
+                vacuum_advised=$4, cold_boundary_at=COALESCE($5, cold_boundary_at) \
+         WHERE id=$1 AND (worker_id=$2 OR worker_id IS NULL)",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(worker_id)
+    .bind::<Text, _>(status)
+    .bind::<Bool, _>(vacuum_advised)
+    .bind::<Nullable<Timestamptz>, _>(cold_boundary_at)
+    .execute(conn)
+    .await
+}
+
+/// Register mask targets for forward enforcement.
+///
+/// `ON CONFLICT DO NOTHING` against `inspector_masked_keys_key` is what makes
+/// re-masking the same finding idempotent — an operator who runs the same mask
+/// twice must not end up with two rows the enforcer walks twice per event.
+pub async fn insert_masked_keys(
+    conn: &mut AsyncPgConnection,
+    rows: &[NewInspectorMaskedKey<'_>],
+) -> QueryResult<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    diesel::insert_into(inspector_masked_keys::table)
+        .values(rows)
+        .on_conflict((
+            inspector_masked_keys::app_id,
+            inspector_masked_keys::target_table,
+            inspector_masked_keys::target_column,
+            inspector_masked_keys::json_path,
+        ))
+        .do_nothing()
+        .execute(conn)
+        .await
+}
+
+/// The enforcer's cache-miss load. One indexed read per app per 30 seconds.
+pub async fn masked_keys_for_app(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Vec<InspectorMaskedKey>> {
+    inspector_masked_keys::table
+        .filter(inspector_masked_keys::app_id.eq(app_id))
+        .select(InspectorMaskedKey::as_select())
+        .order(inspector_masked_keys::created_at.asc())
+        .load(conn)
+        .await
+}
+
+/// Same rows, for the read-only "Forward enforcement" card on the Policy tab.
+pub async fn list_masked_keys(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Vec<InspectorMaskedKey>> {
+    masked_keys_for_app(conn, app_id).await
+}
+
+// ===========================================================================
+// PII inspector: mask + count batches
+// ===========================================================================
+
+use sauron_inspector::targets::{TargetColumn, TargetTable};
+
+/// Keyset position within one day's partition. The zero value starts a day.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BatchCursor {
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchOutcome {
+    pub rows_scanned: i64,
+    pub rows_masked: i64,
+    /// `None` when the batch came back short — the day is finished.
+    pub next_cursor: Option<BatchCursor>,
+    /// Observed on a write the worker was making anyway. `cancelling` is how
+    /// an operator stops a multi-hour grind at 3am without hand-written SQL.
+    pub status: String,
+}
+
+#[derive(QueryableByName)]
+struct BatchRow {
+    #[diesel(sql_type = BigInt)]
+    scanned: i64,
+    #[diesel(sql_type = BigInt)]
+    masked: i64,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    cur_occurred_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    cur_id: Option<Uuid>,
+    #[diesel(sql_type = Text)]
+    status: String,
+}
+
+fn to_outcome(r: BatchRow, limit: i64) -> BatchOutcome {
+    BatchOutcome {
+        rows_scanned: r.scanned,
+        rows_masked: r.masked,
+        next_cursor: if r.scanned >= limit {
+            Some(BatchCursor {
+                occurred_at: r.cur_occurred_at,
+                id: r.cur_id,
+            })
+        } else {
+            None
+        },
+        status: r.status,
+    }
+}
+
+/// One day-bounded, keyset-paginated mask batch over a jsonb path.
+///
+/// The day window appears TWICE on purpose. Joining `sel` on `(id,
+/// occurred_at)` does NOT reproduce `update_event_symbolication`'s pruning:
+/// that function compares `occurred_at` to a BOUND SCALAR PARAMETER, which is
+/// eligible for runtime pruning; comparing it to a CTE column gives the
+/// planner no pruning key and it plans one `Update` node per child.
+///
+/// `coalesce(col, '{}'::jsonb)` is required because `jsonb_set` returns NULL
+/// if any argument is NULL, and a NULL written into a `NOT NULL DEFAULT '{}'`
+/// column is the single most likely implementation bug in this slice.
+/// `create_missing => false` leaves a row lacking the path untouched.
+///
+/// The cursor and both counters advance in the same commit as the data change,
+/// so a SIGKILL loses at most one batch and can never double-count.
+///
+/// `{c} #> $6 <> '"****"'::jsonb` is what makes that last clause TRUE, and it
+/// is the same guard `mask_batch_text` already carries as `{c} <> '****'`.
+/// Resume is per DAY — the executor re-enters `day_cursor` from the top of the
+/// day and nothing reads the persisted keyset cursor back — so without it a
+/// crash, or a cancel followed by a re-queue, re-selects every row the previous
+/// pass already masked (`'"****"'` IS NOT NULL, so the bare null check still
+/// matches) and inflates the counters. MEASURED: a SIGKILL 850 rows into a
+/// 3000-row pass finished `done` reporting `rows_masked = 3550` against 3000
+/// actually-masked rows — an audit number an operator reads, overstating what
+/// was destroyed by 18%.
+#[allow(clippy::too_many_arguments)]
+pub async fn mask_batch_jsonb(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    day: chrono::NaiveDate,
+    path: &[String],
+    cursor: BatchCursor,
+    limit: i64,
+    action_id: Uuid,
+    worker_id: &str,
+) -> QueryResult<Option<BatchOutcome>> {
+    // Identifiers are &'static str from the TargetTable/TargetColumn enums,
+    // never caller bytes: SQL identifiers cannot be bound, and the worker
+    // reads `targets` back out of Postgres in a different process from the one
+    // that validated it.
+    let (t, c) = (table.as_sql(), column.as_sql());
+    let sql = format!(
+        "WITH sel AS ( \
+           SELECT id, occurred_at FROM {t} \
+           WHERE app_id=$1 AND occurred_at >= $2 AND occurred_at < $3 \
+             AND ($4::timestamptz IS NULL OR (occurred_at, id) > ($4, $5)) \
+             AND {c} #> $6 IS NOT NULL AND {c} #> $6 <> '\"****\"'::jsonb \
+           ORDER BY occurred_at, id LIMIT $7), \
+         upd AS ( \
+           UPDATE {t} e \
+           SET {c} = jsonb_set(coalesce(e.{c}, '{{}}'::jsonb), $6, '\"****\"'::jsonb, false) \
+           FROM sel WHERE e.id = sel.id AND e.occurred_at = sel.occurred_at \
+             AND e.occurred_at >= $2 AND e.occurred_at < $3 \
+           RETURNING 1 AS one) \
+         UPDATE inspector_mask_actions SET \
+           cursor_occurred_at = (SELECT max(occurred_at) FROM sel), \
+           cursor_id = (SELECT id FROM sel ORDER BY occurred_at DESC, id DESC LIMIT 1), \
+           rows_masked = rows_masked + (SELECT count(*) FROM upd), \
+           rows_scanned = rows_scanned + (SELECT count(*) FROM sel), \
+           claimed_at = now() \
+         WHERE id = $8 AND worker_id = $9 \
+         RETURNING (SELECT count(*) FROM sel)::bigint AS scanned, \
+                   (SELECT count(*) FROM upd)::bigint AS masked, \
+                   cursor_occurred_at AS cur_occurred_at, cursor_id AS cur_id, status"
+    );
+    let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let hi = lo + chrono::Duration::days(1);
+    let row: Option<BatchRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(lo)
+        .bind::<Timestamptz, _>(hi)
+        .bind::<Nullable<Timestamptz>, _>(cursor.occurred_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor.id)
+        .bind::<Array<Text>, _>(path.to_vec())
+        .bind::<BigInt, _>(limit)
+        .bind::<SqlUuid, _>(action_id)
+        .bind::<Text, _>(worker_id)
+        .get_result(conn)
+        .await
+        .optional()?;
+    Ok(row.map(|r| to_outcome(r, limit)))
+}
+
+/// `EXPLAIN` for the same statement, so the pruning regression is a test and
+/// not a code review.
+#[allow(clippy::too_many_arguments)]
+pub async fn explain_mask_batch_jsonb(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    day: chrono::NaiveDate,
+    path: &[String],
+    cursor: BatchCursor,
+    limit: i64,
+) -> QueryResult<String> {
+    let (t, c) = (table.as_sql(), column.as_sql());
+    let sql = format!(
+        "EXPLAIN WITH sel AS ( \
+           SELECT id, occurred_at FROM {t} \
+           WHERE app_id=$1 AND occurred_at >= $2 AND occurred_at < $3 \
+             AND ($4::timestamptz IS NULL OR (occurred_at, id) > ($4, $5)) \
+             AND {c} #> $6 IS NOT NULL AND {c} #> $6 <> '\"****\"'::jsonb \
+           ORDER BY occurred_at, id LIMIT $7) \
+         UPDATE {t} e \
+         SET {c} = jsonb_set(coalesce(e.{c}, '{{}}'::jsonb), $6, '\"****\"'::jsonb, false) \
+         FROM sel WHERE e.id = sel.id AND e.occurred_at = sel.occurred_at \
+           AND e.occurred_at >= $2 AND e.occurred_at < $3"
+    );
+    #[derive(QueryableByName)]
+    struct PlanRow {
+        #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
+        plan: String,
+    }
+    let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let hi = lo + chrono::Duration::days(1);
+    let rows: Vec<PlanRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(lo)
+        .bind::<Timestamptz, _>(hi)
+        .bind::<Nullable<Timestamptz>, _>(cursor.occurred_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor.id)
+        .bind::<Array<Text>, _>(path.to_vec())
+        .bind::<BigInt, _>(limit)
+        .load(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.plan)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// The wildcard lowering: rebuild the array, per element.
+///
+/// `WITH ORDINALITY` + `ORDER BY ord` is required because `jsonb_agg` order is
+/// NOT guaranteed, and `coalesce(..., '[]')` is required because `jsonb_agg`
+/// over an empty array returns NULL. The rebuild re-serializes the whole array
+/// per row, so it is measurably more expensive than the `jsonb_set` case —
+/// the caller halves the batch size when any target carries a wildcard.
+///
+/// The already-masked guard sits on the ELEMENT, not the row: an array with one
+/// unmasked element must still be selected, and a fully masked one must not be
+/// re-counted after a resume. See `mask_batch_jsonb` for why.
+#[allow(clippy::too_many_arguments)]
+pub async fn mask_batch_jsonb_wildcard(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    day: chrono::NaiveDate,
+    sub_path: &[String],
+    cursor: BatchCursor,
+    limit: i64,
+    action_id: Uuid,
+    worker_id: &str,
+) -> QueryResult<Option<BatchOutcome>> {
+    let (t, c) = (table.as_sql(), column.as_sql());
+    let sql = format!(
+        "WITH sel AS ( \
+           SELECT id, occurred_at FROM {t} \
+           WHERE app_id=$1 AND occurred_at >= $2 AND occurred_at < $3 \
+             AND ($4::timestamptz IS NULL OR (occurred_at, id) > ($4, $5)) \
+             AND jsonb_typeof({c}) = 'array' \
+             AND EXISTS (SELECT 1 FROM jsonb_array_elements({c}) el \
+                         WHERE el #> $6 IS NOT NULL AND el #> $6 <> '\"****\"'::jsonb) \
+           ORDER BY occurred_at, id LIMIT $7), \
+         upd AS ( \
+           UPDATE {t} e \
+           SET {c} = coalesce(( \
+               SELECT jsonb_agg( \
+                        CASE WHEN el #> $6 IS NOT NULL \
+                             THEN jsonb_set(el, $6, '\"****\"'::jsonb, false) ELSE el END \
+                        ORDER BY ord) \
+               FROM jsonb_array_elements(e.{c}) WITH ORDINALITY AS t(el, ord)), '[]'::jsonb) \
+           FROM sel WHERE e.id = sel.id AND e.occurred_at = sel.occurred_at \
+             AND e.occurred_at >= $2 AND e.occurred_at < $3 \
+           RETURNING 1 AS one) \
+         UPDATE inspector_mask_actions SET \
+           cursor_occurred_at = (SELECT max(occurred_at) FROM sel), \
+           cursor_id = (SELECT id FROM sel ORDER BY occurred_at DESC, id DESC LIMIT 1), \
+           rows_masked = rows_masked + (SELECT count(*) FROM upd), \
+           rows_scanned = rows_scanned + (SELECT count(*) FROM sel), \
+           claimed_at = now() \
+         WHERE id = $8 AND worker_id = $9 \
+         RETURNING (SELECT count(*) FROM sel)::bigint AS scanned, \
+                   (SELECT count(*) FROM upd)::bigint AS masked, \
+                   cursor_occurred_at AS cur_occurred_at, cursor_id AS cur_id, status"
+    );
+    let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let hi = lo + chrono::Duration::days(1);
+    let row: Option<BatchRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(lo)
+        .bind::<Timestamptz, _>(hi)
+        .bind::<Nullable<Timestamptz>, _>(cursor.occurred_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor.id)
+        .bind::<Array<Text>, _>(sub_path.to_vec())
+        .bind::<BigInt, _>(limit)
+        .bind::<SqlUuid, _>(action_id)
+        .bind::<Text, _>(worker_id)
+        .get_result(conn)
+        .await
+        .optional()?;
+    Ok(row.map(|r| to_outcome(r, limit)))
+}
+
+/// TEXT columns take the WHOLE value. No partial redaction: the workspace has
+/// no direct regex dependency and partial masking leaves recoverable residue.
+#[allow(clippy::too_many_arguments)]
+pub async fn mask_batch_text(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    day: chrono::NaiveDate,
+    cursor: BatchCursor,
+    limit: i64,
+    action_id: Uuid,
+    worker_id: &str,
+) -> QueryResult<Option<BatchOutcome>> {
+    let (t, c) = (table.as_sql(), column.as_sql());
+    let sql = format!(
+        "WITH sel AS ( \
+           SELECT id, occurred_at FROM {t} \
+           WHERE app_id=$1 AND occurred_at >= $2 AND occurred_at < $3 \
+             AND ($4::timestamptz IS NULL OR (occurred_at, id) > ($4, $5)) \
+             AND {c} IS NOT NULL AND {c} <> '****' \
+           ORDER BY occurred_at, id LIMIT $6), \
+         upd AS ( \
+           UPDATE {t} e SET {c} = '****' \
+           FROM sel WHERE e.id = sel.id AND e.occurred_at = sel.occurred_at \
+             AND e.occurred_at >= $2 AND e.occurred_at < $3 \
+           RETURNING 1 AS one) \
+         UPDATE inspector_mask_actions SET \
+           cursor_occurred_at = (SELECT max(occurred_at) FROM sel), \
+           cursor_id = (SELECT id FROM sel ORDER BY occurred_at DESC, id DESC LIMIT 1), \
+           rows_masked = rows_masked + (SELECT count(*) FROM upd), \
+           rows_scanned = rows_scanned + (SELECT count(*) FROM sel), \
+           claimed_at = now() \
+         WHERE id = $7 AND worker_id = $8 \
+         RETURNING (SELECT count(*) FROM sel)::bigint AS scanned, \
+                   (SELECT count(*) FROM upd)::bigint AS masked, \
+                   cursor_occurred_at AS cur_occurred_at, cursor_id AS cur_id, status"
+    );
+    let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let hi = lo + chrono::Duration::days(1);
+    let row: Option<BatchRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(lo)
+        .bind::<Timestamptz, _>(hi)
+        .bind::<Nullable<Timestamptz>, _>(cursor.occurred_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor.id)
+        .bind::<BigInt, _>(limit)
+        .bind::<SqlUuid, _>(action_id)
+        .bind::<Text, _>(worker_id)
+        .get_result(conn)
+        .await
+        .optional()?;
+    Ok(row.map(|r| to_outcome(r, limit)))
+}
+
+/// The `_default` phase, against the child BY NAME.
+///
+/// `repo::list_child_partitions` excludes `{table}_default` by design, so
+/// those rows are never tiered and never dropped — they are the longest-lived
+/// PII in the system. Rows CANNOT be in the default partition inside a covered
+/// range (Postgres rejects `CREATE TABLE ... PARTITION OF ...` if the default
+/// holds a conflicting row); they are there because their `occurred_at` is
+/// OUTSIDE every explicit range — clock-skewed clients, offline queues.
+///
+/// Bounded by the same `>= now() - tier_hot_days` predicate as every other
+/// phase: without it this would happily rewrite rows years older than the hot
+/// window, contradicting the hot/cold rule and the `cold_rows_skipped` number.
+///
+/// Carries the same already-masked guard as `mask_batch_jsonb`, for the same
+/// reason: this phase is re-entered whole on every resume.
+#[allow(clippy::too_many_arguments)]
+pub async fn mask_default_partition_batch(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    lo_bound: DateTime<Utc>,
+    path: &[String],
+    cursor: BatchCursor,
+    limit: i64,
+    action_id: Uuid,
+    worker_id: &str,
+) -> QueryResult<Option<BatchOutcome>> {
+    // The child name is derived internally from our own suffix, never input.
+    let child = format!("{}_default", table.as_sql());
+    let c = column.as_sql();
+    let sql = format!(
+        "WITH sel AS ( \
+           SELECT id, occurred_at FROM {child} \
+           WHERE app_id=$1 AND occurred_at >= $2 \
+             AND ($3::timestamptz IS NULL OR (occurred_at, id) > ($3, $4)) \
+             AND {c} #> $5 IS NOT NULL AND {c} #> $5 <> '\"****\"'::jsonb \
+           ORDER BY occurred_at, id LIMIT $6), \
+         upd AS ( \
+           UPDATE {child} e \
+           SET {c} = jsonb_set(coalesce(e.{c}, '{{}}'::jsonb), $5, '\"****\"'::jsonb, false) \
+           FROM sel WHERE e.id = sel.id AND e.occurred_at = sel.occurred_at \
+           RETURNING 1 AS one) \
+         UPDATE inspector_mask_actions SET \
+           cursor_occurred_at = (SELECT max(occurred_at) FROM sel), \
+           cursor_id = (SELECT id FROM sel ORDER BY occurred_at DESC, id DESC LIMIT 1), \
+           rows_masked = rows_masked + (SELECT count(*) FROM upd), \
+           rows_scanned = rows_scanned + (SELECT count(*) FROM sel), \
+           claimed_at = now() \
+         WHERE id = $7 AND worker_id = $8 \
+         RETURNING (SELECT count(*) FROM sel)::bigint AS scanned, \
+                   (SELECT count(*) FROM upd)::bigint AS masked, \
+                   cursor_occurred_at AS cur_occurred_at, cursor_id AS cur_id, status"
+    );
+    let row: Option<BatchRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(lo_bound)
+        .bind::<Nullable<Timestamptz>, _>(cursor.occurred_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor.id)
+        .bind::<Array<Text>, _>(path.to_vec())
+        .bind::<BigInt, _>(limit)
+        .bind::<SqlUuid, _>(action_id)
+        .bind::<Text, _>(worker_id)
+        .get_result(conn)
+        .await
+        .optional()?;
+    Ok(row.map(|r| to_outcome(r, limit)))
+}
+
+/// One keyset pass over a non-partitioned companion table, filtered on
+/// `app_id`. No day loop — these are orders of magnitude smaller than the
+/// event tables. `path` empty means the column is TEXT and takes `'****'`.
+///
+/// The cursor is `ORDER BY id DESC LIMIT 1`, not `max(id)`: Postgres ships no
+/// `max(uuid)` aggregate, so `max(id)` is not a slower spelling of the same
+/// thing — it is a hard `function max(uuid) does not exist` on the very first
+/// rollup batch, at 3am, in an unattended worker.
+///
+/// The jsonb match excludes an already-masked value exactly as the TEXT match
+/// excludes `'****'`; without it the two branches disagree about whether a
+/// re-run double-counts. See `mask_batch_jsonb`.
+#[allow(clippy::too_many_arguments)]
+pub async fn mask_rollup_batch(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    path: &[String],
+    after_id: Option<Uuid>,
+    limit: i64,
+    action_id: Uuid,
+    worker_id: &str,
+) -> QueryResult<Option<BatchOutcome>> {
+    let (t, c) = (table.as_sql(), column.as_sql());
+    let set_expr = if path.is_empty() {
+        format!("{c} = '****'")
+    } else {
+        format!("{c} = jsonb_set(coalesce(e.{c}, '{{}}'::jsonb), $3, '\"****\"'::jsonb, false)")
+    };
+    let match_expr = if path.is_empty() {
+        format!("{c} IS NOT NULL AND {c} <> '****'")
+    } else {
+        format!("{c} #> $3 IS NOT NULL AND {c} #> $3 <> '\"****\"'::jsonb")
+    };
+    let sql = format!(
+        "WITH sel AS ( \
+           SELECT id FROM {t} \
+           WHERE app_id=$1 AND ($2::uuid IS NULL OR id > $2) AND {match_expr} \
+           ORDER BY id LIMIT $4), \
+         upd AS (UPDATE {t} e SET {set_expr} FROM sel WHERE e.id = sel.id RETURNING 1 AS one) \
+         UPDATE inspector_mask_actions SET \
+           cursor_id = (SELECT id FROM sel ORDER BY id DESC LIMIT 1), cursor_occurred_at = NULL, \
+           rows_masked = rows_masked + (SELECT count(*) FROM upd), \
+           rows_scanned = rows_scanned + (SELECT count(*) FROM sel), \
+           claimed_at = now() \
+         WHERE id = $5 AND worker_id = $6 \
+         RETURNING (SELECT count(*) FROM sel)::bigint AS scanned, \
+                   (SELECT count(*) FROM upd)::bigint AS masked, \
+                   cursor_occurred_at AS cur_occurred_at, cursor_id AS cur_id, status"
+    );
+    let row: Option<BatchRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Nullable<SqlUuid>, _>(after_id)
+        .bind::<Array<Text>, _>(path.to_vec())
+        .bind::<BigInt, _>(limit)
+        .bind::<SqlUuid, _>(action_id)
+        .bind::<Text, _>(worker_id)
+        .get_result(conn)
+        .await
+        .optional()?;
+    Ok(row.map(|r| to_outcome(r, limit)))
+}
+
+/// The tail sweep closes the enforcement race between "mask applied" and
+/// "every pipeline replica's policy cache refreshed".
+///
+/// Keyed on `received_at`, NOT `occurred_at`: `occurred_at` is the CLIENT's
+/// timestamp (`process.rs` sets `occurred_at: ev.timestamp`), so a mobile SDK
+/// offline queue or a skewed clock flushes events whose `occurred_at` is days
+/// old — those rows land in a partition the day loop already swept and would
+/// never be revisited. The `occurred_at` range stays for PRUNING only, because
+/// `error_events.received_at` has no index.
+///
+/// Carries the same already-masked guard as `mask_batch_jsonb`: the sweep runs
+/// again in full whenever the action is resumed.
+#[allow(clippy::too_many_arguments)]
+pub async fn mask_tail_sweep_batch(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    lo: DateTime<Utc>,
+    hi: DateTime<Utc>,
+    received_since: DateTime<Utc>,
+    path: &[String],
+    cursor: BatchCursor,
+    limit: i64,
+    action_id: Uuid,
+    worker_id: &str,
+) -> QueryResult<Option<BatchOutcome>> {
+    let (t, c) = (table.as_sql(), column.as_sql());
+    let sql = format!(
+        "WITH sel AS ( \
+           SELECT id, occurred_at FROM {t} \
+           WHERE app_id=$1 AND occurred_at >= $2 AND occurred_at < $3 \
+             AND received_at >= $4 \
+             AND ($5::timestamptz IS NULL OR (occurred_at, id) > ($5, $6)) \
+             AND {c} #> $7 IS NOT NULL AND {c} #> $7 <> '\"****\"'::jsonb \
+           ORDER BY occurred_at, id LIMIT $8), \
+         upd AS ( \
+           UPDATE {t} e \
+           SET {c} = jsonb_set(coalesce(e.{c}, '{{}}'::jsonb), $7, '\"****\"'::jsonb, false) \
+           FROM sel WHERE e.id = sel.id AND e.occurred_at = sel.occurred_at \
+             AND e.occurred_at >= $2 AND e.occurred_at < $3 \
+           RETURNING 1 AS one) \
+         UPDATE inspector_mask_actions SET \
+           cursor_occurred_at = (SELECT max(occurred_at) FROM sel), \
+           cursor_id = (SELECT id FROM sel ORDER BY occurred_at DESC, id DESC LIMIT 1), \
+           rows_masked = rows_masked + (SELECT count(*) FROM upd), \
+           rows_scanned = rows_scanned + (SELECT count(*) FROM sel), \
+           claimed_at = now() \
+         WHERE id = $9 AND worker_id = $10 \
+         RETURNING (SELECT count(*) FROM sel)::bigint AS scanned, \
+                   (SELECT count(*) FROM upd)::bigint AS masked, \
+                   cursor_occurred_at AS cur_occurred_at, cursor_id AS cur_id, status"
+    );
+    let row: Option<BatchRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(lo)
+        .bind::<Timestamptz, _>(hi)
+        .bind::<Timestamptz, _>(received_since)
+        .bind::<Nullable<Timestamptz>, _>(cursor.occurred_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor.id)
+        .bind::<Array<Text>, _>(path.to_vec())
+        .bind::<BigInt, _>(limit)
+        .bind::<SqlUuid, _>(action_id)
+        .bind::<Text, _>(worker_id)
+        .get_result(conn)
+        .await
+        .optional()?;
+    Ok(row.map(|r| to_outcome(r, limit)))
+}
+
+/// Preview counting: the identical day loop with `count(*)` instead of UPDATE.
+///
+/// Run on the INSPECTOR's pool, never the API's. Counting `col #> path IS NOT
+/// NULL` over an app's hot window is a Parallel Append seq scan — 184 ms per
+/// 210k rows measured — with no index that can serve it, since the tags GIN is
+/// `jsonb_path_ops` and answers `@>` only. On the API's 16-connection pool
+/// that is how the whole dashboard goes down.
+pub async fn count_batch_jsonb(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    day: chrono::NaiveDate,
+    path: &[String],
+) -> QueryResult<i64> {
+    let (t, c) = (table.as_sql(), column.as_sql());
+    let sql = format!(
+        "SELECT count(*)::bigint AS n FROM {t} \
+         WHERE app_id=$1 AND occurred_at >= $2 AND occurred_at < $3 AND {c} #> $4 IS NOT NULL"
+    );
+    let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let hi = lo + chrono::Duration::days(1);
+    let row: CountRow = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(lo)
+        .bind::<Timestamptz, _>(hi)
+        .bind::<Array<Text>, _>(path.to_vec())
+        .get_result(conn)
+        .await?;
+    Ok(row.n)
+}
+
+pub async fn count_batch_text(
+    conn: &mut AsyncPgConnection,
+    table: TargetTable,
+    column: TargetColumn,
+    app_id: Uuid,
+    day: chrono::NaiveDate,
+) -> QueryResult<i64> {
+    let (t, c) = (table.as_sql(), column.as_sql());
+    let sql = format!(
+        "SELECT count(*)::bigint AS n FROM {t} \
+         WHERE app_id=$1 AND occurred_at >= $2 AND occurred_at < $3 \
+           AND {c} IS NOT NULL AND {c} <> '****'"
+    );
+    let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let hi = lo + chrono::Duration::days(1);
+    let row: CountRow = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(lo)
+        .bind::<Timestamptz, _>(hi)
+        .get_result(conn)
+        .await?;
+    Ok(row.n)
+}
+
+/// How many rows have a SQL NULL in a jsonb column. Exists so the "jsonb_set
+/// returns NULL if any argument is NULL" bug is a test rather than a
+/// production incident.
+pub async fn count_null_column(
+    conn: &mut AsyncPgConnection,
+    table: &'static str,
+    column: &'static str,
+    app_id: Uuid,
+) -> QueryResult<i64> {
+    let sql =
+        format!("SELECT count(*)::bigint AS n FROM {table} WHERE app_id=$1 AND {column} IS NULL");
+    let row: CountRow = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .get_result(conn)
+        .await?;
+    Ok(row.n)
+}
+
+// ===========================================================================
+// PII inspector: session settings + retention
+// ===========================================================================
+
+/// Bound every statement this connection runs.
+///
+/// MUST be paired with [`reset_statement_timeout`] before `drop(conn)`:
+/// deadpool's recycle does NOT reset session state, so a leaked `SET` silently
+/// poisons a later checkout in the same process — an API request that has
+/// nothing to do with the inspector then fails at 30 seconds with a message
+/// nobody can trace. This is the ONLY place the setting is written; never an
+/// ad-hoc `SET` at a call site.
+///
+/// The value is formatted, not bound, because `SET` does not take parameters.
+/// It is an `i64` from `Config`, never caller input.
+pub async fn set_statement_timeout(conn: &mut AsyncPgConnection, ms: u64) -> QueryResult<()> {
+    conn.batch_execute(&format!("SET statement_timeout = {ms}"))
+        .await
+}
+
+pub async fn reset_statement_timeout(conn: &mut AsyncPgConnection) -> QueryResult<()> {
+    conn.batch_execute("RESET statement_timeout").await
+}
+
+/// Keep the newest `keep` scans per policy.
+///
+/// Findings are deleted in BOUNDED batches before the parent row is dropped.
+/// The house prune idiom has no LIMIT, and an unbounded cascading DELETE of up
+/// to 660k findings is a bloat and lock spike — a nightly scan producing 33k
+/// findings is 12M rows a year, which is the exact failure `alert_events`'
+/// reaper doc comment warns about.
+pub async fn prune_inspector_scans(
+    conn: &mut AsyncPgConnection,
+    keep: i64,
+    batch: i64,
+) -> QueryResult<usize> {
+    // Findings first, in batches, so the cascade never has to.
+    loop {
+        let n = diesel::sql_query(
+            "DELETE FROM inspector_findings WHERE ctid IN ( \
+               SELECT f.ctid FROM inspector_findings f \
+               WHERE f.scan_id IN ( \
+                 SELECT id FROM ( \
+                   SELECT id, row_number() OVER (PARTITION BY policy_id ORDER BY created_at DESC) rn \
+                   FROM inspector_scans) r WHERE r.rn > $1) \
+               LIMIT $2)",
+        )
+        .bind::<BigInt, _>(keep)
+        .bind::<BigInt, _>(batch)
+        .execute(conn)
+        .await?;
+        if n == 0 {
+            break;
+        }
+    }
+    diesel::sql_query(
+        "DELETE FROM inspector_scans WHERE id IN ( \
+           SELECT id FROM ( \
+             SELECT id, row_number() OVER (PARTITION BY policy_id ORDER BY created_at DESC) rn \
+             FROM inspector_scans) r WHERE r.rn > $1)",
+    )
+    .bind::<BigInt, _>(keep)
+    .execute(conn)
+    .await
+}
+
+/// Age out findings, stamping the owning scan so a scan row's
+/// `findings_count` and its empty finding list never silently disagree.
+pub async fn prune_inspector_findings(
+    conn: &mut AsyncPgConnection,
+    days: i64,
+    batch: i64,
+) -> QueryResult<usize> {
+    let mut total = 0usize;
+    loop {
+        let n = diesel::sql_query(
+            "WITH doomed AS ( \
+               SELECT ctid, scan_id FROM inspector_findings \
+               WHERE created_at < now() - ($1 || ' days')::interval LIMIT $2), \
+             stamped AS ( \
+               UPDATE inspector_scans s SET findings_reaped_at = now() \
+               WHERE s.id IN (SELECT scan_id FROM doomed) AND s.findings_reaped_at IS NULL \
+               RETURNING 1) \
+             DELETE FROM inspector_findings f \
+             WHERE f.ctid IN (SELECT ctid FROM doomed)",
+        )
+        .bind::<BigInt, _>(days)
+        .bind::<BigInt, _>(batch)
+        .execute(conn)
+        .await?;
+        total += n;
+        if n == 0 {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Delete inspector policies whose target no longer resolves.
+///
+/// [`delete_app`] and [`delete_project`] stop NEW orphans; this repairs the
+/// ones already on disk, and covers the paths those two do not own — an app or
+/// project removed by a direct SQL delete, and an enrollment retired out from
+/// under an `app_env` policy.
+///
+/// `NOT EXISTS` against the right table per `target_type`, never a bare `NOT IN
+/// (SELECT ...)`: a single NULL in the subquery makes `NOT IN` return NULL for
+/// every row, which silently deletes NOTHING and would leave this looking like
+/// it ran clean. `target_type` is `TEXT` + CHECK constrained to exactly these
+/// three, so an unrecognized value cannot exist — but the match is written
+/// exhaustively anyway so a fourth type added later fails closed (kept, not
+/// deleted) rather than being reaped by a wildcard.
+pub async fn prune_orphaned_inspector_policies(
+    conn: &mut AsyncPgConnection,
+    batch: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM inspector_policies p \
+          WHERE p.id IN ( \
+            SELECT id FROM inspector_policies q \
+             WHERE (q.target_type = 'project' \
+                    AND NOT EXISTS (SELECT 1 FROM projects x WHERE x.id = q.target_id)) \
+                OR (q.target_type = 'app' \
+                    AND NOT EXISTS (SELECT 1 FROM apps x WHERE x.id = q.target_id)) \
+                OR (q.target_type = 'app_env' \
+                    AND NOT EXISTS ( \
+                          SELECT 1 FROM app_environments x WHERE x.id = q.target_id)) \
+             LIMIT $1)",
+    )
+    .bind::<BigInt, _>(batch)
+    .execute(conn)
+    .await
+}
+
+/// Abandoned previews are not audit-relevant, so this ALWAYS runs.
+pub async fn prune_mask_previews(conn: &mut AsyncPgConnection, days: i64) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM inspector_mask_actions \
+         WHERE kind='preview' AND status IN ('preview','previewed','failed','cancelled') \
+           AND requested_at < now() - ($1 || ' days')::interval",
+    )
+    .bind::<BigInt, _>(days)
+    .execute(conn)
+    .await
+}
+
+/// Prune terminal MASK actions, and ONLY when explicitly enabled.
+///
+/// `days = 0` means never. This table grows per human action, not per rule
+/// evaluation, and it is the record a compliance question is answered from.
+pub async fn prune_mask_actions(
+    conn: &mut AsyncPgConnection,
+    days: i64,
+    batch: i64,
+) -> QueryResult<usize> {
+    if days <= 0 {
+        return Ok(0);
+    }
+    diesel::sql_query(
+        "DELETE FROM inspector_mask_actions WHERE ctid IN ( \
+           SELECT ctid FROM inspector_mask_actions \
+           WHERE kind='mask' AND status IN ('done','failed','cancelled') \
+             AND requested_at < now() - ($1 || ' days')::interval \
+           LIMIT $2)",
+    )
+    .bind::<BigInt, _>(days)
+    .bind::<BigInt, _>(batch)
+    .execute(conn)
+    .await
+}
+
+/// Null the staff identities on old audit rows, keeping counts and targets.
+///
+/// Everywhere else in this schema a user row cascades (`refresh_tokens`,
+/// `role_grants`), so deleting a user IS the product's de-facto erasure
+/// mechanism. `ON DELETE SET NULL` plus a denormalized email breaks that by
+/// design — deliberately, so the trail survives — which makes this the only
+/// un-erasable store of staff PII in the product unless it is aged out.
+pub async fn pseudonymize_mask_actions(
+    conn: &mut AsyncPgConnection,
+    days: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions \
+         SET requested_by_email='', cancelled_by_email='', confirm_source='' \
+         WHERE requested_at < now() - ($1 || ' days')::interval \
+           AND (requested_by_email <> '' OR cancelled_by_email <> '' OR confirm_source <> '')",
+    )
+    .bind::<BigInt, _>(days)
+    .execute(conn)
+    .await
+}
+
+/// Record why a scheduled run was not started. Kept as its own statement so
+/// the reason is a plain `&str` rather than a lifetime inside the patch
+/// struct, and so the write is one round trip.
+pub async fn record_policy_skip(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    reason: &str,
+) -> QueryResult<usize> {
+    diesel::sql_query("UPDATE inspector_policies SET last_skip_reason = $2 WHERE id = $1")
+        .bind::<SqlUuid, _>(id)
+        .bind::<Text, _>(reason)
+        .execute(conn)
+        .await
+}
+
+/// Point a policy at the scan it most recently started.
+pub async fn record_policy_scan(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    scan_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_policies SET last_scan_id = $2, last_skip_reason = '' WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<SqlUuid, _>(scan_id)
+    .execute(conn)
+    .await
+}
+
+/// Why an enqueue did or did not produce a scan.
+///
+/// An enum rather than a bool because the two callers need different
+/// answers from the same logic: the scheduler logs and moves on, the API
+/// turns each arm into a distinct status code.
+// `InspectorScan` is 432 bytes, so `clippy::large_enum_variant` (a `-D
+// warnings` gate here) wants the payload boxed. Suppressed rather than
+// satisfied: exactly one of these is constructed per enqueue — a rare,
+// once-per-scan operation — and it is returned by value and immediately
+// destructured. Boxing would buy a heap allocation per scan and force the
+// scan row through a `Deref` at both call sites in exchange for nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum EnqueueOutcome {
+    Queued(InspectorScan),
+    /// The partial unique index refused a second active scan.
+    AlreadyActive,
+    /// The target is no longer inside the policy's org.
+    TargetGone,
+    /// Neither tracked keys nor detectors: it would report a confident false
+    /// negative, which is the worst thing a privacy scan can emit.
+    NoMatchers,
+    /// Every target pair is covered by a more specific policy.
+    FullySubtracted,
+}
+
+/// Freeze a policy into a scan row. The ONLY way a scan is created.
+///
+/// Re-validates the target against the org even though the API already did:
+/// `inspector_policies.target_id` has no FK, and grants outlive targets.
+pub async fn enqueue_scan_for_policy(
+    conn: &mut AsyncPgConnection,
+    cfg: &sauron_core::Config,
+    policy: &InspectorPolicy,
+    trigger: &str,
+    requested_by: Option<Uuid>,
+) -> anyhow::Result<EnqueueOutcome> {
+    if !validate_scope_in_org(conn, policy.org_id, &policy.target_type, policy.target_id).await? {
+        return Ok(EnqueueOutcome::TargetGone);
+    }
+    let Some(level) = PolicyTargetType::from_sql(&policy.target_type) else {
+        return Ok(EnqueueOutcome::TargetGone);
+    };
+
+    let keys = sauron_inspector::matching::parse_tracked_keys(&policy.tracked_keys);
+    let dets = sauron_inspector::detect::parse_detectors(&policy.detectors);
+    if keys.is_empty() && dets.is_empty() {
+        return Ok(EnqueueOutcome::NoMatchers);
+    }
+
+    // Detector mode changes the cost model by an order of magnitude — no
+    // prefilter, every row shipped out of Postgres, every string leaf walked —
+    // so it gets its own much shorter window.
+    let window_days = if dets.is_empty() {
+        policy.window_days as i64
+    } else {
+        cfg.inspector_detector_window_days
+    }
+    .min(cfg.inspector_window_days);
+
+    let to = Utc::now();
+    let from = to - chrono::Duration::days(window_days);
+
+    let pairs: Vec<ScanPair> = scan_pairs_for_node(conn, &policy.target_type, policy.target_id)
+        .await?
+        .into_iter()
+        .map(|(app_id, app_env_id)| ScanPair { app_id, app_env_id })
+        .collect();
+    let narrower: Vec<PolicyNode> =
+        list_inspector_policies_under(conn, &policy.target_type, policy.target_id)
+            .await?
+            .into_iter()
+            .filter_map(|(t, id)| {
+                PolicyTargetType::from_sql(&t).map(|tt| PolicyNode {
+                    target_type: tt,
+                    target_id: id,
+                })
+            })
+            .collect();
+    let node = PolicyNode {
+        target_type: level,
+        target_id: policy.target_id,
+    };
+    let resolved = sauron_inspector::targets::resolve_targets(node, &pairs, &narrower);
+    if resolved.pairs.is_empty() {
+        return Ok(EnqueueOutcome::FullySubtracted);
+    }
+
+    let tables = tables_for(&policy.rollups);
+    let units = units_for(&resolved.pairs, &tables, from, to, level);
+
+    let params = serde_json::json!({
+        "tracked_keys": policy.tracked_keys,
+        "detectors": policy.detectors,
+        "scan_columns": policy.scan_columns,
+        "rollups": policy.rollups,
+        "tables": tables,
+        "level": policy.target_type,
+    });
+    let targets_json = serde_json::Value::Array(
+        resolved
+            .pairs
+            .iter()
+            .map(|p| serde_json::json!([p.app_id, p.app_env_id]))
+            .collect(),
+    );
+
+    let scan = match insert_inspector_scan(
+        conn,
+        crate::models::NewInspectorScan {
+            policy_id: policy.id,
+            org_id: policy.org_id,
+            trigger_type: trigger,
+            requested_by,
+            window_from: from,
+            window_to: to,
+            params: &params,
+            targets: &targets_json,
+            units_total: units.len() as i32,
+        },
+    )
+    .await
+    {
+        Ok(s) => s,
+        // The partial unique index refusing a second active scan is the
+        // arbiter, not a handler check, so two schedulers racing produce one.
+        Err(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        )) => return Ok(EnqueueOutcome::AlreadyActive),
+        Err(e) => return Err(e.into()),
+    };
+
+    if resolved.subtracted > 0 || resolved.truncated {
+        let note = format!(
+            "{} target pair(s) excluded by a more specific policy{}",
+            resolved.subtracted,
+            if resolved.truncated {
+                "; target list truncated at the cap"
+            } else {
+                ""
+            }
+        );
+        note_scan_coverage(conn, scan.id, "partial", &note).await?;
+    }
+    record_policy_scan(conn, policy.id, scan.id).await?;
+    Ok(EnqueueOutcome::Queued(scan))
+}
+
+/// Record a coverage downgrade on a scan without touching its status.
+pub async fn note_scan_coverage(
+    conn: &mut AsyncPgConnection,
+    scan_id: Uuid,
+    coverage: &str,
+    note: &str,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_scans SET coverage=$2, \
+                coverage_note = CASE WHEN coverage_note = '' THEN $3 \
+                                     ELSE coverage_note || '; ' || $3 END \
+         WHERE id=$1",
+    )
+    .bind::<SqlUuid, _>(scan_id)
+    .bind::<Text, _>(coverage)
+    .bind::<Text, _>(note)
+    .execute(conn)
+    .await
+}
+
+/// One phase-1 page. THREE statement shapes, because the tables genuinely
+/// differ and one shape produces `column "occurred_at" does not exist`.
+///
+/// `Ranged` is the partitioned case: an INDEX-BOUNDED inner window, then the
+/// prefilter on the outer statement. Both halves matter. Putting the LIMIT on
+/// the same statement as the ILIKE bounds MATCHES, not SCANNED ROWS — and the
+/// design's premise is that the prefilter eliminates 95-99% of rows, so such a
+/// statement must scan the ENTIRE app-day range to emit fewer than `limit`
+/// rows. Three consequences, all bad: no heartbeat and no inter-batch pause
+/// for the whole scan (so the duty cycle is fiction); `statement_timeout`
+/// aborts somewhere around 2-3M rows per app-day; and on abort THE CURSOR
+/// NEVER ADVANCES, so the retry replays the identical statement and
+/// `INSPECTOR_MAX_ATTEMPTS` permanently fails the scan. The
+/// `(app_id, environment_id, occurred_at)` predicate matches
+/// `error_events_app_env_time_users_idx` /
+/// `analytics_events_app_env_time_users_idx` exactly.
+///
+/// `DefaultChild` reads `{table}_default` BY NAME with no time predicate: the
+/// rows are in that child precisely because their `occurred_at` is outside
+/// every explicit range, so a windowed query cannot see them. The child name
+/// is derived from our own suffix, never from input — the same construction
+/// `mask_default_partition_batch` uses.
+///
+/// `Rollup` reads a non-partitioned companion with an `id` keyset and NO time
+/// and NO environment predicate. `issues`, `event_users` and `identities`
+/// have neither column, and `inspector_policies.rollups` defaults to
+/// `["issues","event_users"]` — so a shared shape here fails on the shipped
+/// default policy, not on some exotic configuration.
+///
+/// Column names are `&'static str`s from the inventory; every value is bound.
+#[derive(Debug, Clone, Copy)]
+pub enum ScanShape {
+    Ranged {
+        env_id: Option<Uuid>,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    },
+    DefaultChild,
+    Rollup,
+}
+
+/// Keyset position. `occurred_at` is `None` for a rollup, which has none.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanCursor {
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub id: Option<Uuid>,
+}
+
+pub struct ScanRow {
+    pub id: Uuid,
+    /// `None` on a rollup. `inspector_findings.first_seen_at` /
+    /// `last_seen_at` / `sample_occurred_at` are nullable for this reason.
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub columns: Vec<(String, Value)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_window_rows(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    cols: &[&'static str],
+    app_id: Uuid,
+    shape: ScanShape,
+    cursor: ScanCursor,
+    limit: i64,
+    patterns: &[String],
+    text_patterns: &[String],
+) -> QueryResult<Vec<ScanRow>> {
+    // The identifiers come from the inventory in `sauron-inspector`; refuse
+    // anything else rather than interpolating it. `table` is always the PARENT
+    // name even for the default child, so this check is never bypassed.
+    if sauron_inspector::columns::table_class(table).is_none()
+        || cols
+            .iter()
+            .any(|c| sauron_inspector::columns::find(table, c).is_none())
+    {
+        return Ok(Vec::new());
+    }
+    let payload = cols
+        .iter()
+        .map(|c| format!("'{c}', to_jsonb(e.{c})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // A TEXT column holds no JSON, so the quoted `%"email"%` pattern the jsonb
+    // columns use matches nothing in it — which is how ten `default_on` TEXT
+    // columns come to report zero findings with `coverage='full'`. Each column
+    // gets the pattern array for its own kind.
+    // Both pattern arrays are ALWAYS bound, so the statement must ALWAYS
+    // mention both. Postgres derives a prepared statement's parameter count
+    // from the highest `$n` it can see and answers `bind message supplies 9
+    // parameters, but prepared statement requires 4` otherwise. Two ways to
+    // hit that without this floor: a detector-only policy (no prefilter at
+    // all, both arrays empty) and any all-jsonb column set (`$6` never
+    // referenced), which is `analytics_events`' entire default set.
+    const PARAM_FLOOR: &str = " AND ($5::text[] IS NOT NULL OR $6::text[] IS NOT NULL OR TRUE)";
+    let ilike = if patterns.is_empty() && text_patterns.is_empty() {
+        PARAM_FLOOR.to_string()
+    } else {
+        let ors = cols
+            .iter()
+            .map(|c| {
+                let is_text = sauron_inspector::columns::find(table, c)
+                    .map(|e| e.kind == sauron_inspector::columns::ColumnKind::Text)
+                    .unwrap_or(false);
+                if is_text {
+                    format!("e.{c} ILIKE ANY($6)")
+                } else {
+                    format!("e.{c}::text ILIKE ANY($5)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!("{PARAM_FLOOR} AND ({ors})")
+    };
+
+    // The inert value bound to `$3`/`$4` on the two shapes that have no time
+    // predicate. It must be a timestamp POSTGRES CAN REPRESENT:
+    // `DateTime::<Utc>::MIN_UTC` is the year -262144 and Postgres' floor is
+    // 4713 BC, so binding it fails the whole statement with `timestamp out of
+    // range` before the server ever sees it — which took out every
+    // `DefaultChild` and `Rollup` unit, i.e. the `_default` sweep and the
+    // shipped `["issues","event_users"]` rollups. Both parameters are
+    // neutralized by an `IS NULL OR TRUE` on those shapes, so the value is
+    // never compared against anything and the epoch is as good as any.
+    const INERT_TS: DateTime<Utc> = DateTime::<Utc>::UNIX_EPOCH;
+
+    let (sql, env_id, lo, hi) = match shape {
+        ScanShape::Ranged { env_id, from, to } => (
+            // `env_id = NULL` is THE UNATTRIBUTED BUCKET, not "no filter".
+            // `scan_pairs_for_node` emits one `(app, NULL)` pair per app
+            // precisely because `EnvFilter::Subset` uses `= ANY`, which never
+            // matches NULL, so those rows are unreachable from an env-scoped
+            // policy — and `accumulate` labels this unit `env_scope =
+            // 'unattributed'`. Spelling it `$2 IS NULL OR ...` instead makes
+            // that unit read EVERY row of the app-day a second time: counts
+            // double, enrollment rows are relabelled `unattributed`, and a
+            // project policy walks the very environment a narrower policy
+            // subtracted. Both arms stay indexable on
+            // `(app_id, environment_id, occurred_at DESC)`.
+            format!(
+                "WITH win AS ( \
+                   SELECT id, occurred_at FROM {table} \
+                   WHERE app_id = $1 \
+                     AND (environment_id = $2 \
+                          OR ($2::uuid IS NULL AND environment_id IS NULL)) \
+                     AND occurred_at >= $3 AND occurred_at < $4 \
+                     AND ($7::timestamptz IS NULL OR (occurred_at, id) > ($7, $8)) \
+                   ORDER BY occurred_at, id LIMIT $9) \
+                 SELECT e.id, e.occurred_at, jsonb_build_object({payload}) AS payload \
+                 FROM {table} e JOIN win ON e.id = win.id AND e.occurred_at = win.occurred_at \
+                 WHERE e.occurred_at >= $3 AND e.occurred_at < $4{ilike} \
+                 ORDER BY e.occurred_at, e.id"
+            ),
+            env_id,
+            from,
+            to,
+        ),
+        ScanShape::DefaultChild => {
+            let child = format!("{table}_default");
+            (
+                format!(
+                    "WITH win AS ( \
+                       SELECT id, occurred_at FROM {child} \
+                       WHERE app_id = $1 AND ($2::uuid IS NULL OR TRUE) \
+                         AND ($3::timestamptz IS NULL OR TRUE) \
+                         AND ($4::timestamptz IS NULL OR TRUE) \
+                         AND ($7::timestamptz IS NULL OR (occurred_at, id) > ($7, $8)) \
+                       ORDER BY occurred_at, id LIMIT $9) \
+                     SELECT e.id, e.occurred_at, jsonb_build_object({payload}) AS payload \
+                     FROM {child} e JOIN win ON e.id = win.id AND e.occurred_at = win.occurred_at \
+                     WHERE TRUE{ilike} \
+                     ORDER BY e.occurred_at, e.id"
+                ),
+                None,
+                INERT_TS,
+                INERT_TS,
+            )
+        }
+        // No `occurred_at`, no `environment_id`, no window CTE: these tables
+        // are orders of magnitude smaller than the event tables and one `id`
+        // keyset walks them.
+        ScanShape::Rollup => (
+            format!(
+                "SELECT e.id, NULL::timestamptz AS occurred_at, \
+                        jsonb_build_object({payload}) AS payload \
+                 FROM {table} e \
+                 WHERE e.app_id = $1 AND ($2::uuid IS NULL OR TRUE) \
+                   AND ($3::timestamptz IS NULL OR TRUE) \
+                   AND ($4::timestamptz IS NULL OR TRUE) \
+                   AND ($7::timestamptz IS NULL OR TRUE) \
+                   AND ($8::uuid IS NULL OR e.id > $8){ilike} \
+                 ORDER BY e.id LIMIT $9"
+            ),
+            None,
+            INERT_TS,
+            INERT_TS,
+        ),
+    };
+    // Every shape binds all nine parameters in the same order, with the
+    // irrelevant ones neutralized by an `IS NULL OR TRUE`. Postgres rejects a
+    // statement whose parameter count does not match the bind list, and a
+    // per-shape bind list is a fourth thing to keep in sync.
+
+    #[derive(QueryableByName)]
+    struct RawRow {
+        #[diesel(sql_type = SqlUuid)]
+        id: Uuid,
+        #[diesel(sql_type = Nullable<Timestamptz>)]
+        occurred_at: Option<DateTime<Utc>>,
+        #[diesel(sql_type = Jsonb)]
+        payload: Value,
+    }
+    let rows: Vec<RawRow> = diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Nullable<SqlUuid>, _>(env_id)
+        .bind::<Timestamptz, _>(lo)
+        .bind::<Timestamptz, _>(hi)
+        .bind::<Array<Text>, _>(patterns.to_vec())
+        .bind::<Array<Text>, _>(text_patterns.to_vec())
+        .bind::<Nullable<Timestamptz>, _>(cursor.occurred_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor.id)
+        .bind::<BigInt, _>(limit)
+        .load(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ScanRow {
+            id: r.id,
+            occurred_at: r.occurred_at,
+            columns: r
+                .payload
+                .as_object()
+                .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Whether `user_id` is active AND holds `permission` on `app_id`.
+///
+/// Re-evaluated at claim time, in the worker's process, because confirm's
+/// authorization can be hours old by the time a queued action runs.
+/// Deliberately does NOT accept an env-scoped grant: masking is app-scoped, and
+/// `authorize_app` — which this mirrors — never resolves an env grant either.
+pub async fn user_is_active_with_app_permission(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    permission: &str,
+) -> QueryResult<bool> {
+    #[derive(QueryableByName)]
+    struct OkRow {
+        #[diesel(sql_type = Bool)]
+        ok: bool,
+    }
+    let row: OkRow = diesel::sql_query(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM role_grants g \
+           JOIN roles r ON r.id = g.role_id \
+           JOIN users u ON u.id = g.user_id \
+           JOIN apps a ON a.id = $2 \
+           JOIN projects p ON p.id = a.project_id \
+           WHERE g.user_id = $1 AND u.is_active \
+             AND r.permissions @> to_jsonb(ARRAY[$3::text]) \
+             AND ( (g.scope_type = 'org' AND g.scope_id = p.org_id) \
+                OR (g.scope_type = 'project' AND g.scope_id = p.id) \
+                OR (g.scope_type = 'app' AND g.scope_id = a.id) ) \
+         ) AS ok",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(permission)
+    .get_result(conn)
+    .await?;
+    Ok(row.ok)
+}
+
+/// Fold the rows a day skipped for being at or below the tier boundary would
+/// have masked into the audit row, so a `done` action with a small
+/// `rows_masked` is explicable.
+///
+/// ROWS, not days. The column, the CSV header, the Audit tab column and the
+/// MaskDialog all say rows, and a day count sitting in a column called
+/// `cold_rows_skipped` next to `rows_masked` is a number an operator will
+/// read as rows and act on.
+pub async fn add_cold_skip(
+    conn: &mut AsyncPgConnection,
+    action_id: Uuid,
+    rows: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE inspector_mask_actions SET cold_rows_skipped = cold_rows_skipped + $2 WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(action_id)
+    .bind::<BigInt, _>(rows)
+    .execute(conn)
     .await
 }

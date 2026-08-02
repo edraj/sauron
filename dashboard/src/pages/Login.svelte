@@ -6,11 +6,15 @@
   import { authStore } from '../lib/stores/auth.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { errorMessage } from '../lib/api/client';
+  import { isPasswordResetRequired } from '../lib/models/password-reset';
 
   let email = $state('');
   let password = $state('');
   let submitting = $state(false);
   let error = $state<string | null>(null);
+  /** The address the caller typed, held only once a reset refusal proves they
+      know its password. */
+  let resetRequiredFor = $state<string | null>(null);
 
   async function submit(event: SubmitEvent) {
     event.preventDefault();
@@ -32,6 +36,15 @@
       const canOnboard = sessionStore.projects.length === 0 && sessionStore.can('project:create');
       push(canOnboard ? '/onboarding' : '/overview');
     } catch (err) {
+      // Rendering this as a red form error is not enough. The target of an
+      // admin-forced reset would otherwise see "an administrator reset this
+      // password" in the same box as a typo'd password, from the same screen
+      // they have just been told to stop using. The store branches the same way
+      // on password_change_required.
+      if (isPasswordResetRequired(err)) {
+        resetRequiredFor = email.trim();
+        return;
+      }
       error = errorMessage(err);
     } finally {
       submitting = false;
@@ -40,31 +53,45 @@
 </script>
 
 <AuthLayout title="Sign in" subtitle="Welcome back. Watch every error and event.">
-  <form onsubmit={submit} class="form">
-    {#if error}<div class="alert" role="alert">{error}</div>{/if}
-    <Input
-      label="Email"
-      type="email"
-      bind:value={email}
-      placeholder="you@company.com"
-      autocomplete="email"
-      required
-    />
-    <Input
-      label="Password"
-      type="password"
-      bind:value={password}
-      placeholder="••••••••"
-      autocomplete="current-password"
-      required
-    />
-    <Button type="submit" variant="primary" size="lg" fullWidth loading={submitting}>
-      Sign in
-    </Button>
-  </form>
+  {#if resetRequiredFor}
+    <div class="panel" role="status">
+      <p>
+        An administrator reset the password for this account. We have emailed
+        <strong>{resetRequiredFor}</strong> a link to set a new one.
+      </p>
+      <p class="muted">
+        Nothing arrived? Check your spam folder, or ask the administrator to send it again.
+      </p>
+    </div>
+  {:else}
+    <form onsubmit={submit} class="form">
+      {#if error}<div class="alert" role="alert">{error}</div>{/if}
+      <Input
+        label="Email"
+        type="email"
+        bind:value={email}
+        placeholder="you@company.com"
+        autocomplete="email"
+        required
+      />
+      <Input
+        label="Password"
+        type="password"
+        bind:value={password}
+        placeholder="••••••••"
+        autocomplete="current-password"
+        required
+      />
+      <Button type="submit" variant="primary" size="lg" fullWidth loading={submitting}>
+        Sign in
+      </Button>
+    </form>
+  {/if}
 
   {#snippet footer()}
     <span>New to Sauron? <a href="#/register">Create an account</a></span>
+    <span class="sep" aria-hidden="true">·</span>
+    <span><a href="#/forgot-password">Forgot your password?</a></span>
   {/snippet}
 </AuthLayout>
 
@@ -81,5 +108,24 @@
     border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
     color: var(--error);
     font-size: 13px;
+  }
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .muted {
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  /* This is the only auth page whose footer carries two links, and `.auth-foot`
+     is a plain block with no gap — so without a separator the two render 4px
+     apart in the identical link colour, and "Create an account Forgot your
+     password?" reads as one phrase with no clickable boundary. Measured. */
+  .sep {
+    margin: 0 6px;
+    color: var(--text-muted);
   }
 </style>

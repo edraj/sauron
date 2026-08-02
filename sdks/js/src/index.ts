@@ -110,9 +110,27 @@ export function addBreadcrumb(breadcrumb: BreadcrumbInput, hint?: Hint): void {
   addBreadcrumbApi(breadcrumb, hint);
 }
 
-/** Set (or clear, with `null`) the current user. */
+/**
+ * Set (or clear, with `null`) the current user.
+ *
+ * `setUser(null)` is a logout, so it also rotates the anonymous id — otherwise
+ * the next anonymous visitor on this browser inherits the previous person's
+ * durable id and a later identify() aliases them together server-side.
+ */
 export function setUser(user: UserInput): void {
+  if (user === null) {
+    getClient()?.reset();
+    return;
+  }
   getClient()?.getScope().setUser(user);
+}
+
+/**
+ * Forget the current person: clears the scope user and mints a fresh anonymous
+ * id. Call this on logout.
+ */
+export function reset(): void {
+  getClient()?.reset();
 }
 
 /** Set a single scope tag (lifted onto later errors/events). */
@@ -160,6 +178,7 @@ export const Sauron = {
   identify,
   addBreadcrumb,
   setUser,
+  reset,
   setTag,
   setTags,
   setContext,

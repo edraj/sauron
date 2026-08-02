@@ -68,6 +68,12 @@ scope and resolved as a union down the tree.
 - **[Best Practices](Best-Practices.md)** — event naming, PII scrubbing via `beforeSend`,
   sampling, tags vs context, `distinct_id`/identify, and flush/shutdown for short-lived
   processes.
+- **[Notifications](Notifications.md)** — personal email notifications you subscribe
+  yourself to: uptime, error spikes, new issues and regressions, with environment
+  filters, throttling, digests, quiet hours and one-click unsubscribe.
+- **[Privacy Inspector](Privacy-Inspector.md)** — find developer-supplied PII in your
+  telemetry, mask it in hot Postgres and on all future ingest, and the plainly-stated
+  list of places a mask does **not** reach.
 - **[Troubleshooting](Troubleshooting.md)** — nothing showing up, disabled no-op mode,
   gzip/retry/queue behavior, scope-leak pitfalls, and the version check.
 
@@ -78,6 +84,9 @@ scope and resolved as a union down the tree.
 - **[Dashboard](Dashboard.md)** — a tour of the dashboard sections: Overview,
   Exceptions, Performance, Events, Sessions, Users, Devices, Screens, Funnels,
   Journeys, and the Manage section.
+- **[Active Users](Active-Users.md)** — combined daily active users across
+  several apps, the identified/guest split and what it can and cannot merge,
+  and the CSV export.
 - **[Search & Filtering](Search.md)** — the free-text search boxes and the
   structured `field · op · value` filters on each list, which columns each one
   matches, and how it works (case-insensitive `ILIKE`, no full-text engine).

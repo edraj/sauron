@@ -1,0 +1,68 @@
+-- Substitute `analytics_events_app_env_time_idx` (migration 25) with a variant
+-- carrying `distinct_id` in its INCLUDE payload.
+--
+-- MEASURED BEFORE WRITTEN, and the measurement CORRECTED the hypothesis this
+-- migration was proposed on. Read this before touching either index.
+--
+-- The hypothesis was: "the existing index gives a perfect index cond but
+-- carries no payload, so every matching row costs a heap fetch of a ~1-2 KB
+-- tuple." That is NOT what happens. Heap fetches are ZERO both before and
+-- after, because the planner never chooses `analytics_events_app_env_time_idx`
+-- for this statement at all. A payload-less index scan would have to visit the
+-- heap once per matching row just to read `distinct_id`, which costs more than
+-- reading the partition outright -- so the planner picks a Parallel Seq Scan,
+-- and keeps avoiding this index even with `enable_seqscan` and
+-- `enable_bitmapscan` off (it reaches for `..._app_id_device_key_idx`
+-- instead). An index the planner declines is an index whose heap-fetch count
+-- is definitionally zero; "heap fetches dominate" was the wrong gate.
+--
+-- What the payload actually buys is an Index Only Scan where the plan was a
+-- full partition scan. Measured against the real dev database (212,415
+-- analytics_events / 210,146 error_events, one app+environment owning ~99% of
+-- both, `EnvFilter::One` over a 30-day window, after VACUUM ANALYZE) by
+-- building this exact index on the hot leaf partition with CREATE INDEX
+-- CONCURRENTLY and then dropping it again -- 3 runs each way, whole statement,
+-- both tables:
+--
+--   before   105,288 shared buffers (99,058 of them physical reads)  229-232 ms
+--   after      4,452 shared buffers (0 reads)                          60-63 ms
+--
+-- 23.6x fewer buffers, 3.8x faster. The index measured 17 MB against a 559 MB
+-- partition heap, which is why it stays resident in a 128 MB shared_buffers
+-- when the heap cannot -- the physical reads go to zero, not just the CPU.
+--
+-- Corroboration that this is the mechanism and not a cache artifact: the
+-- `EnvFilter::All` shape ALREADY plans as an Index Only Scan today, on
+-- `analytics_events_app_distinct_time_idx (app_id, distinct_id, occurred_at)`,
+-- with Heap Fetches: 0 and 5,772 buffers. `One(env)` was the only selection
+-- shape without a covering index. This gives it one.
+--
+-- This ADDS ZERO INDEXES. It widens one existing btree's leaves by one short
+-- text column -- the same class of change migration 28 measured at 1-6% on
+-- `error_events` -- and `INCLUDE` on a partitioned parent is already proven here
+-- (migrations 28 and 31). New name, per the rule that an index name an earlier
+-- migration took is never reused; replace-don't-accumulate, per the rule
+-- migrations 28 and 31 each invoked.
+--
+-- OPERATIONAL PRECONDITION, not merely "expect read latency":
+-- **STOP sauron-ingest OR DRAIN THE STREAM BEFORE RUNNING THIS.**
+-- `analytics_events` is a partitioned parent; DROP INDEX + CREATE INDEX apply
+-- synchronously across every child inside this migration's single transaction
+-- (CONCURRENTLY is unavailable inside one), holding locks that block every
+-- INSERT. With TIER_GRANULARITY=day and TIER_PARTITION_AHEAD=7 that is ~37
+-- synchronous child builds. While the pipeline is blocked on the lock the
+-- Redis stream keeps growing, and `xadd_job(&payload, 1_000_000)` issues
+-- `XADD … MAXLEN ~ 1000000`, which trims by ID regardless of the consumer
+-- group's pending list — the oldest, still-undelivered entries are trimmed
+-- away. That is PERMANENT SILENT EVENT LOSS, not backpressure.
+--
+-- Split from 000040 deliberately: doing both partitioned parents in one
+-- transaction would block both ingest write paths at once. Run them in
+-- separate windows, with a pause between.
+--
+-- MUST RUN BEFORE RESTARTING sauron-api (packaging/rpm/SETUP.md §11) — not
+-- for correctness (the query works without it) but because the pre-substitution
+-- plan is what the measurement in the slice report was taken against.
+DROP INDEX IF EXISTS analytics_events_app_env_time_idx;
+CREATE INDEX analytics_events_app_env_time_users_idx
+    ON analytics_events (app_id, environment_id, occurred_at DESC) INCLUDE (distinct_id);

@@ -612,6 +612,57 @@ pub async fn list_history(
     Ok(Json(json!(rows)))
 }
 
+/// Per-kind metadata for personal notification subscriptions.
+///
+/// Published here rather than hardcoded in Svelte for the same reason
+/// `trigger_types` is: a kind added to `SubKind` without a matching dashboard
+/// edit shows up as a missing option, not as a silently wrong form.
+fn subscription_kinds_meta() -> serde_json::Value {
+    use sauron_alerts::subscription::{SubConditions, SubKind};
+    serde_json::Value::Array(
+        SubKind::ALL
+            .iter()
+            .map(|k| {
+                let scope_types = if k.allows_app_scope() {
+                    json!(["project", "app"])
+                } else {
+                    json!(["project"])
+                };
+                let (defaults, clamps) = match k {
+                    SubKind::Uptime => (json!({}), json!({})),
+                    SubKind::ErrorSpike => (
+                        json!({
+                            "window_seconds": SubConditions::DEFAULT_WINDOW_SECONDS,
+                            "factor": SubConditions::DEFAULT_FACTOR,
+                            "min_count": SubConditions::DEFAULT_MIN_COUNT,
+                            "level": serde_json::Value::Null,
+                        }),
+                        json!({
+                            "window_seconds": [
+                                SubConditions::MIN_WINDOW_SECONDS,
+                                SubConditions::MAX_WINDOW_SECONDS
+                            ],
+                            "factor": [SubConditions::MIN_FACTOR, SubConditions::MAX_FACTOR],
+                            "min_count": [
+                                SubConditions::MIN_MIN_COUNT,
+                                SubConditions::MAX_MIN_COUNT
+                            ],
+                        }),
+                    ),
+                    _ => (json!({ "level": "error" }), json!({})),
+                };
+                json!({
+                    "key": k.as_str(),
+                    "scope_types": scope_types,
+                    "env_filter": k.supports_env_filter(),
+                    "defaults": defaults,
+                    "clamps": clamps,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Static metadata the rule-builder UI needs: trigger types, channel kinds,
 /// comparators, and the template variables each trigger exposes.
 ///
@@ -645,5 +696,43 @@ pub async fn meta(
             "event_threshold": ["count", "threshold", "window_minutes", "event_name"],
             "perf_degradation": ["value_ms", "threshold_ms", "metric", "window_minutes"],
         },
+        "subscription_kinds": subscription_kinds_meta(),
     })))
+}
+
+#[cfg(test)]
+mod meta_tests {
+    use super::*;
+
+    /// The house convention is to publish enum/option metadata from
+    /// `/v1/alert-meta` rather than hardcode lists in Svelte, so the dialog's
+    /// conditional fields and its per-kind "the environment filter does not
+    /// apply" notice both come from here.
+    #[test]
+    fn subscription_kinds_metadata_matches_the_enum() {
+        let meta = subscription_kinds_meta();
+        let arr = meta.as_array().expect("an array");
+        assert_eq!(arr.len(), 4);
+
+        let uptime = arr.iter().find(|k| k["key"] == "uptime").expect("uptime");
+        assert_eq!(uptime["env_filter"], serde_json::json!(false));
+        assert_eq!(uptime["scope_types"], serde_json::json!(["project"]));
+
+        let spike = arr
+            .iter()
+            .find(|k| k["key"] == "error_spike")
+            .expect("spike");
+        assert_eq!(spike["env_filter"], serde_json::json!(true));
+        assert_eq!(spike["scope_types"], serde_json::json!(["project", "app"]));
+        assert_eq!(spike["defaults"]["window_seconds"], serde_json::json!(900));
+        assert_eq!(spike["defaults"]["factor"], serde_json::json!(3.0));
+        assert_eq!(spike["defaults"]["min_count"], serde_json::json!(10));
+        assert_eq!(spike["clamps"]["factor"], serde_json::json!([1.5, 100.0]));
+
+        let new_issue = arr
+            .iter()
+            .find(|k| k["key"] == "error_new_issue")
+            .expect("new issue");
+        assert_eq!(new_issue["defaults"]["level"], serde_json::json!("error"));
+    }
 }

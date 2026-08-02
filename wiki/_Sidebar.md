@@ -19,10 +19,13 @@
 
 - [Framework Integrations](Framework-Integrations.md)
 - [Best Practices](Best-Practices.md)
+- [Notifications](Notifications.md)
+- [Privacy Inspector](Privacy-Inspector.md)
 - [Troubleshooting](Troubleshooting.md)
 
 **Reference**
 
 - [Examples](Examples.md)
 - [Dashboard](Dashboard.md)
+- [Active Users](Active-Users.md)
 - [Search & Filtering](Search.md)

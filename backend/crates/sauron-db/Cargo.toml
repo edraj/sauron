@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 sauron-core.workspace = true
 sauron-query.workspace = true
+sauron-inspector = { workspace = true }
 diesel.workspace = true
 diesel-async.workspace = true
 deadpool.workspace = true
@@ -33,3 +34,13 @@ tracing.workspace = true
 # already has the `TestDb`/`seed_two_envs` harness `authorize_env_read`'s
 # DB-backed tests need.
 sauron-auth.workspace = true
+# Same dev-only cycle, for the same reason. `deliver_after` is computed in SQL
+# because the workspace has no `chrono-tz` and nothing in Rust can turn
+# `(now, tz)` into a subscription's local wall clock, so the SQL `CASE` and
+# `sauron_alerts::subscription::in_quiet_hours` are two implementations of one
+# predicate. Two implementations drift silently and the symptom of the drift is
+# somebody's phone at 04:00, so `tests/notifications.rs` pins them to each other
+# over a shared table — which needs `sauron-alerts` here. It must stay a DEV
+# dependency: `sauron-alerts` depends on `sauron-db` normally, so a plain
+# dependency is a real cycle Cargo rejects.
+sauron-alerts.workspace = true
