@@ -141,7 +141,11 @@ async fn run_request_rate(
         peak.clone(),
     ));
 
-    // --- per-second offered rates across the whole user pool (items/sec) ---
+    // --- per-second offered rates across the whole user pool (REQUESTS/sec) ---
+    // One due item here is one envelope, i.e. one request, regardless of
+    // `--batch-items`: batching changes how many signals a request carries, not
+    // how many requests are offered. `--rps` therefore keeps meaning requests
+    // per second; a batched run pushes N× the items at the same request rate.
     let mut events_rate = if cfg.event_interval.is_some() {
         cfg.users as f64 * cfg.events_per_min as f64 / 60.0
     } else {
@@ -193,6 +197,7 @@ async fn run_request_rate(
                 let sender = sender.clone();
                 let mtx = mtx.clone();
                 let gzip = cfg.gzip;
+                let shape = cfg.shape;
                 tokio::spawn(async move {
                     let _inflight = _inflight;
                     let _permit = permit;
@@ -201,10 +206,15 @@ async fn run_request_rate(
                         Kind::Identify => generator::identify_envelope(&u),
                         Kind::Event => {
                             u.advance_screen(seq);
-                            generator::event_envelope(&u, seq)
+                            generator::event_envelope(&u, seq, shape)
                         }
-                        Kind::Issue => generator::issue_envelope(&u, seq),
+                        Kind::Issue => generator::issue_envelope(&u, seq, shape),
                     };
+                    // Counted from the envelope's actual items, so a batched
+                    // envelope contributes all `batch_items × 2` of them — the
+                    // per-type item totals stay honest while `requests` (one
+                    // per Sample) keeps counting REQUESTS, which is what the
+                    // offered rate and `--rps` are expressed in.
                     let counts = ItemCounts::of(&env);
                     let body = match transport::encode(&env, gzip) {
                         Ok(b) => b,
@@ -320,6 +330,7 @@ async fn hold_one(
     key: String,
     app_id: String,
     gzip: bool,
+    shape: generator::Shape,
     deadline: tokio::time::Instant,
     inflight: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
@@ -362,7 +373,7 @@ async fn hold_one(
                 seq += 1;
                 let mut user = VirtualUser::new(i);
                 user.advance_screen(seq);
-                let env = generator::event_envelope(&user, seq);
+                let env = generator::event_envelope(&user, seq, shape);
                 let counts = ItemCounts::of(&env);
                 let body = match transport::encode(&env, gzip) {
                     Ok(b) => b,
@@ -484,6 +495,7 @@ async fn run_live_sockets(
                         key.clone(),
                         app_id.clone(),
                         gzip,
+                        cfg.shape,
                         deadline,
                         inflight.clone(),
                         peak.clone(),
@@ -567,6 +579,7 @@ mod tests {
             gzip: false,
             events_per_min: 600,
             issues_per_min: 60,
+            shape: crate::generator::Shape::default(),
             report_path: None,
             max_inflight: 4,
             ramp: Duration::from_millis(100),
@@ -668,6 +681,7 @@ mod tests {
             gzip: false,
             events_per_min: 0,
             issues_per_min: 0,
+            shape: crate::generator::Shape::default(),
             report_path: None,
             max_inflight: 40,
             ramp: Duration::from_millis(100),
@@ -749,6 +763,7 @@ mod tests {
             gzip: false,
             events_per_min: 600,
             issues_per_min: 60,
+            shape: crate::generator::Shape::default(),
             report_path: None,
             max_inflight: 4,
             ramp: Duration::from_millis(50),

@@ -190,12 +190,38 @@ fn spawn_ingest(
         // INGEST_UDS_PATH is unset.
         .env("INGEST_PORT", icfg.ingest_port.to_string())
         .env("INGEST_RATE_LIMIT_PER_MIN", icfg.rate_limit.to_string())
-        .env("WORKER_CONCURRENCY", "8")
+        // Defaults to 8, but overridable from crebain's own environment so a
+        // run can sweep the worker/pool pair. The two move together: workers
+        // beyond the pool size just queue on connection checkout.
+        .env(
+            "WORKER_CONCURRENCY",
+            std::env::var("WORKER_CONCURRENCY").unwrap_or_else(|_| "8".to_string()),
+        )
+        .env(
+            "INGEST_DB_POOL",
+            std::env::var("INGEST_DB_POOL").unwrap_or_else(|_| "8".to_string()),
+        )
+        // Same pass-through, so the batched write path and the per-item one can
+        // be compared on a single binary. Unset means batching, which is the
+        // shipped default.
+        .env(
+            "INGEST_BATCH_WRITES",
+            std::env::var("INGEST_BATCH_WRITES").unwrap_or_else(|_| "1".to_string()),
+        )
+        .env(
+            "INGEST_BATCH_SIZE",
+            std::env::var("INGEST_BATCH_SIZE").unwrap_or_else(|_| "50".to_string()),
+        )
         .env(
             "RUST_LOG",
             std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()),
         )
-        .stdout(Stdio::null())
+        // Inherited, NOT nulled. `sauron-telemetry` installs a
+        // `tracing_subscriber::fmt` layer, which writes to STDOUT — so nulling
+        // it discarded every warning the ingest emitted during a run. A batch
+        // write path that failed and silently fell back to per-item processing
+        // looked, from out here, exactly like one that worked.
+        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     if icfg.transport == Transport::Uds {

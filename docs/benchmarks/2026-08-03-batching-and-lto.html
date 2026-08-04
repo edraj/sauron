@@ -1,0 +1,346 @@
+<title>Sauron ingest &mdash; batching + LTO, measured</title>
+<style>
+  :root {
+    --ground:#F2F5F7; --card:#FFFFFF; --ink:#171B23; --slate:#5C6779; --faint:#8A94A4;
+    --line:#DDE3EA; --line-2:#EDF1F5;
+    --measure:#14666F; --measure-w:#DCEDEF;
+    --deficit:#A63A3A; --deficit-w:#F6E3E1;
+    --flag:#8A5A12; --flag-w:#FBF0DC;
+    --shadow:0 1px 2px rgba(23,27,35,.05), 0 8px 24px -16px rgba(23,27,35,.28);
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono","Cascadia Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#0E1116; --card:#161B22; --ink:#E6EAF0; --slate:#98A3B4; --faint:#6B7688;
+      --line:#262D38; --line-2:#1D242D;
+      --measure:#4CC2CD; --measure-w:#123135;
+      --deficit:#EE7A72; --deficit-w:#3A1E1C;
+      --flag:#E0B368; --flag-w:#332916;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:#0E1116; --card:#161B22; --ink:#E6EAF0; --slate:#98A3B4; --faint:#6B7688;
+    --line:#262D38; --line-2:#1D242D;
+    --measure:#4CC2CD; --measure-w:#123135;
+    --deficit:#EE7A72; --deficit-w:#3A1E1C;
+    --flag:#E0B368; --flag-w:#332916;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+  }
+  :root[data-theme="light"] {
+    --ground:#F2F5F7; --card:#FFFFFF; --ink:#171B23; --slate:#5C6779; --faint:#8A94A4;
+    --line:#DDE3EA; --line-2:#EDF1F5;
+    --measure:#14666F; --measure-w:#DCEDEF;
+    --deficit:#A63A3A; --deficit-w:#F6E3E1;
+    --flag:#8A5A12; --flag-w:#FBF0DC;
+    --shadow:0 1px 2px rgba(23,27,35,.05), 0 8px 24px -16px rgba(23,27,35,.28);
+  }
+
+  body { background:var(--ground); color:var(--ink); font-family:var(--sans);
+         line-height:1.6; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:920px; margin:0 auto; padding:56px 24px 96px;
+           display:flex; flex-direction:column; gap:44px; }
+
+  .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.14em;
+              text-transform:uppercase; color:var(--faint); }
+  h1 { font-family:var(--serif); font-weight:600; font-size:clamp(30px,4.6vw,46px);
+        line-height:1.12; letter-spacing:-.015em; text-wrap:balance; margin:.28em 0 0; }
+  .standfirst { font-family:var(--serif); font-size:clamp(17px,2.1vw,20px);
+                 color:var(--slate); max-width:60ch; margin-top:.6em; }
+  h2 { font-family:var(--serif); font-weight:600; font-size:25px; letter-spacing:-.01em;
+        margin:0; text-wrap:balance; }
+  h2 .n { font-family:var(--mono); font-size:12px; color:var(--faint);
+           letter-spacing:.1em; margin-right:.7em; vertical-align:.28em; }
+  p { margin:0; max-width:66ch; }
+  section { display:flex; flex-direction:column; gap:14px; }
+  a { color:var(--measure); }
+  code { font-family:var(--mono); font-size:.88em;
+          background:var(--line-2); padding:.1em .34em; border-radius:3px; }
+
+  .prov { display:grid; grid-template-columns:repeat(auto-fit,minmax(132px,1fr));
+           gap:1px; background:var(--line); border:1px solid var(--line);
+           border-radius:8px; overflow:hidden; }
+  .prov div { background:var(--card); padding:11px 13px; }
+  .prov dt { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+              text-transform:uppercase; color:var(--faint); }
+  .prov dd { font-family:var(--mono); font-size:13px; margin:3px 0 0;
+              font-variant-numeric:tabular-nums; }
+
+  .scroll { overflow-x:auto; border:1px solid var(--line); border-radius:8px;
+             background:var(--card); box-shadow:var(--shadow); }
+  table { border-collapse:collapse; width:100%; min-width:520px; }
+  thead th { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+              text-transform:uppercase; color:var(--faint); font-weight:500;
+              text-align:right; padding:11px 16px; border-bottom:1px solid var(--line);
+              white-space:nowrap; }
+  thead th:first-child { text-align:left; }
+  tbody th { text-align:left; font-weight:500; font-size:14.5px; padding:12px 16px;
+              border-bottom:1px solid var(--line-2); vertical-align:top; }
+  tbody td { padding:12px 16px; border-bottom:1px solid var(--line-2);
+              text-align:right; white-space:nowrap; vertical-align:top; }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom:none; }
+  .num { font-family:var(--mono); font-size:14px; font-variant-numeric:tabular-nums; }
+  .before { color:var(--deficit); }
+  .after  { color:var(--measure); font-weight:600; }
+  .note { font-size:12.5px; color:var(--faint); font-weight:400; margin-top:2px;
+           white-space:normal; max-width:34ch; line-height:1.45; }
+  .pill { font-family:var(--mono); font-size:12.5px; font-variant-numeric:tabular-nums;
+           padding:3px 9px; border-radius:11px; display:inline-block; font-weight:600; }
+  .pill.up   { background:var(--measure-w); color:var(--measure); }
+  .pill.down { background:var(--deficit-w); color:var(--deficit); }
+  .pill.flat { background:var(--line-2); color:var(--faint); }
+
+  figure { margin:0; background:var(--card); border:1px solid var(--line);
+            border-radius:8px; padding:18px 16px 8px; box-shadow:var(--shadow); }
+  svg { display:block; width:100%; height:auto; }
+  .grid { stroke:var(--line-2); stroke-width:1; }
+  .ax { font-family:var(--mono); font-size:10px; fill:var(--faint); }
+  .ln-b { fill:none; stroke:var(--measure); stroke-width:2.4;
+           stroke-linejoin:round; stroke-linecap:round; }
+  .ln-a { fill:none; stroke:var(--deficit); stroke-width:2.4;
+           stroke-linejoin:round; stroke-linecap:round; }
+  figcaption { display:flex; flex-wrap:wrap; gap:18px; padding:12px 2px 8px;
+                font-size:13px; color:var(--slate); }
+  .key { display:flex; align-items:center; gap:7px; }
+  .sw { width:16px; height:3px; border-radius:2px; flex:none; }
+
+  .flag { border-left:3px solid var(--flag); background:var(--flag-w);
+           padding:16px 20px; border-radius:0 8px 8px 0;
+           display:flex; flex-direction:column; gap:10px; }
+  .flag h3 { font-family:var(--serif); font-size:18px; margin:0; font-weight:600; }
+  .flag p { font-size:14.5px; }
+
+  pre { font-family:var(--mono); font-size:12.5px; line-height:1.7; margin:0;
+         background:var(--card); border:1px solid var(--line); border-radius:8px;
+         padding:16px 18px; overflow-x:auto; color:var(--slate); }
+  ul { margin:0; padding-left:1.15em; max-width:66ch; }
+  li { margin-bottom:.5em; }
+  li::marker { color:var(--faint); }
+  footer { border-top:1px solid var(--line); padding-top:20px; font-size:13px;
+            color:var(--faint); display:flex; flex-direction:column; gap:8px; }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">Sauron &middot; ingest write path &middot; 3 August 2026</div>
+    <h1>Batching the inserts made the write path 13&times; faster. Only after something else was fixed.</h1>
+    <p class="standfirst">A follow-up to the write-path baseline. Two changes were asked
+    for &mdash; batch the per-event inserts, turn on LTO. Measuring them turned up a third
+    thing that mattered more than either.</p>
+  </header>
+
+  <dl class="prov">
+    <div><dt>Baseline</dt><dd>2026-08-03</dd></div>
+    <div><dt>Commit</dt><dd>07dbc13 +9&nbsp;dirty</dd></div>
+    <div><dt>Box</dt><dd>20&nbsp;cores / 62&nbsp;GB</dd></div>
+    <div><dt>Stores</dt><dd>postgres:16, redis:7</dd></div>
+    <div><dt>Runs</dt><dd>60&nbsp;s &times; 7</dd></div>
+    <div><dt>Workers</dt><dd>8, pool&nbsp;8</dd></div>
+    <div><dt>Batch size</dt><dd>50 entries</dd></div>
+    <div><dt>Offered</dt><dd>4,083&nbsp;rps</dd></div>
+  </dl>
+
+  <section>
+    <h2><span class="n">01</span>Write-path throughput</h2>
+    <p>The number the previous report said to compare: <strong>items actually written to
+    Postgres per second</strong>. Everything below is a 60-second run at the same offered
+    rate, on the same box, against the same containers.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Measure</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+      <tbody><tr><th scope="row">Rows written to Postgres<div class="note">errors + analytics + transactions, 60&nbsp;s</div></th><td class="num before">26,300</td><td class="num after">359,825</td><td class="delta"><span class="pill up">+1,268%</span></td></tr><tr><th scope="row">Write-path throughput (items/s)</th><td class="num before">438.3</td><td class="num after">5,997.1</td><td class="delta"><span class="pill up">+1,268%</span></td></tr><tr><th scope="row">Batching alone, no LTO<div class="note">isolates the write path from the compiler</div></th><td class="num before">438.3</td><td class="num after">5,996.6</td><td class="delta"><span class="pill up">+1,268%</span></td></tr><tr><th scope="row">LTO alone, per-item path<div class="note">isolates the compiler from the write path</div></th><td class="num before">438.3</td><td class="num after">542.8</td><td class="delta"><span class="pill up">+23.8%</span></td></tr></tbody>
+    </table></div>
+    <p>The two isolating rows are the point: batching on its own accounts for essentially
+    all of it. LTO on its own moves throughput by a quarter, and for a reason worth
+    naming &mdash; it made the <em>old</em> path fractionally quicker at losing a race it
+    was always going to lose.</p>
+  </section>
+
+  <figure>
+    <svg viewBox="0 0 760 300" role="img" aria-label="Cumulative rows written over 60 seconds: the batched path climbs steadily to about 351,000 while the per-item path flattens below 26,000.">
+      <line x1="64" y1="266.0" x2="744" y2="266.0" class="grid"/><text x="56" y="270.0" class="ax" text-anchor="end">0</text><line x1="64" y1="203.5" x2="744" y2="203.5" class="grid"/><text x="56" y="207.5" class="ax" text-anchor="end">90k</text><line x1="64" y1="141.0" x2="744" y2="141.0" class="grid"/><text x="56" y="145.0" class="ax" text-anchor="end">180k</text><line x1="64" y1="78.5" x2="744" y2="78.5" class="grid"/><text x="56" y="82.5" class="ax" text-anchor="end">270k</text><line x1="64" y1="16.0" x2="744" y2="16.0" class="grid"/><text x="56" y="20.0" class="ax" text-anchor="end">360k</text><text x="64.0" y="290" class="ax" text-anchor="middle">0s</text><text x="234.0" y="290" class="ax" text-anchor="middle">15s</text><text x="404.0" y="290" class="ax" text-anchor="middle">30s</text><text x="574.0" y="290" class="ax" text-anchor="middle">45s</text><text x="744.0" y="290" class="ax" text-anchor="middle">60s</text>
+      <polyline class="ln-b" points="76.7,266.0 89.4,262.5 102.2,258.4 115.0,254.3 127.8,250.3 140.5,245.6 153.5,238.6 166.3,233.9 179.2,229.2 192.1,224.4 204.9,219.7 217.8,214.9 230.7,210.2 243.7,205.4 256.6,200.7 269.7,195.9 282.7,191.1 295.8,186.2 308.9,181.4 322.0,176.5 335.2,171.7 348.4,166.8 361.7,162.0 375.0,157.1 388.3,152.2 401.7,147.2 415.1,142.3 428.3,137.5 442.4,132.3 456.8,127.0 470.8,121.8 484.9,116.6 500.0,111.1 515.1,105.6 530.0,100.1 544.3,94.9 558.8,89.7 572.7,84.5 586.2,79.5 599.9,74.5 613.6,69.4 627.5,64.3 641.4,59.2 655.3,54.1 669.0,49.1 683.2,43.8 697.6,38.5 712.1,33.2 726.6,27.9 742.1,22.2"/>
+      <polyline class="ln-a" points="76.7,266.0 89.6,265.8 102.2,265.6 115.0,265.0 127.8,263.4 140.6,261.5 153.3,259.6 166.1,258.7 178.9,258.4 191.7,258.2 204.4,257.9 217.2,257.7 229.9,257.5 242.7,257.2 255.5,257.0 268.4,256.8 281.1,256.5 294.0,256.3 306.8,256.1 319.6,255.8 332.5,255.6 345.2,255.3 358.0,255.1 370.7,254.8 383.5,254.6 396.1,254.4 408.7,254.1 421.6,253.9 434.5,253.6 447.3,253.4 460.1,253.2 472.9,252.9 485.7,252.7 498.3,252.5 511.1,252.3 523.9,252.0 536.7,251.8 549.4,251.6 562.1,251.3 575.0,251.1 587.7,250.9 600.6,250.6 613.3,250.4 626.1,250.2 638.9,249.9 651.7,249.7 664.6,249.4 677.4,249.2 690.1,249.0 702.9,248.7 715.7,248.5 728.5,248.2 741.3,248.0"/>
+    </svg>
+    <figcaption>
+      <span class="key"><span class="sw" style="background:var(--measure)"></span>Batched &mdash; 351,093 rows</span>
+      <span class="key"><span class="sw" style="background:var(--deficit)"></span>Per-item &mdash; 25,934 rows</span>
+      <span class="key" style="color:var(--faint)">Cumulative rows, sampled once a second</span>
+    </figcaption>
+  </figure>
+
+  <section>
+    <h2><span class="n">02</span>The thing that was actually in the way</h2>
+    <p>Batching alone, measured first, made throughput <em>worse</em> &mdash; about a
+    quarter of the per-item path. Postgres explained why:</p>
+    <pre>ERROR:  deadlock detected
+DETAIL: Process A: UPDATE issues SET users_seen = t.n FROM unnest(...)
+        Process B: INSERT INTO "issues" ... ON CONFLICT ("app_id","fingerprint") DO UPDATE</pre>
+    <p>Two statements on the same rows, one ordering its locks by
+    <code>(app_id, fingerprint)</code> and the other by <code>id</code>. No sort order
+    reconciles those. Under eight workers nearly every batch lost the race, rolled back,
+    and replayed item by item &mdash; doing the work twice and reporting success.</p>
+    <p><strong>This was in the baseline too.</strong> The 350&nbsp;items/s measured on
+    3&nbsp;August was largely this, not the insert count.</p>
+
+    <div class="flag">
+      <h3>Why nobody had seen it</h3>
+      <p><code>crebain</code>'s harness sent the ingest's <strong>stdout</strong> to
+      <code>/dev/null</code>, and <code>tracing_subscriber</code> writes there by default.
+      Every warning the ingest emitted during an isolated benchmark run &mdash; for the
+      whole life of the tool &mdash; was discarded. A write path failing on every single
+      batch looked, from outside, exactly like one that worked: rows still landed,
+      <code>crebain</code> still reported 100% accepted and zero errors.</p>
+      <p>Deadlocks self-heal, which is what made this survivable and invisible at the same
+      time. The harness now inherits stdout.</p>
+    </div>
+
+    <p><code>users_seen</code> is a HyperLogLog <em>estimate</em> whose authoritative copy
+    lives in Redis; Postgres keeps a denormalized copy so the Issues page can sort by it.
+    It now writes only when <code>PFADD</code> reports the estimate actually moved, and at
+    most once per issue per five seconds. Redis stays exact and immediate. Both write
+    paths got the fix.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">03</span>Postgres round-trips per item</h2>
+    <p>The mechanism the batching was aimed at. Each per-item statement ran outside a
+    transaction, so every one was its own commit and its own WAL flush.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Measure</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+      <tbody><tr><th scope="row">Postgres transactions per item<div class="note"><code>xact_commit</code> &divide; rows written</div></th><td class="num before">11.84</td><td class="num after">0.33</td><td class="delta"><span class="pill up">+97.2%</span></td></tr><tr><th scope="row">&hellip; at the saturating rate</th><td class="num before">11.84</td><td class="num after">0.15</td><td class="delta"><span class="pill up">+98.7%</span></td></tr></tbody>
+    </table></div>
+    <p>Roughly twelve commits per item became roughly one commit per three items &mdash;
+    a batch of 50 entries now costs two statements against <code>issues</code> plus one
+    transaction covering every row it writes.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">04</span>CPU per item</h2>
+    <p>The baseline's headline finding was that ingest held 0.89 of 20 cores and would not
+    use more. It still won't &mdash; but it now does an order of magnitude more work with it.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Measure</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+      <tbody><tr><th scope="row">CPU-seconds per 1,000 items</th><td class="num before">2.302</td><td class="num after">0.159</td><td class="delta"><span class="pill up">+93.1%</span></td></tr><tr><th scope="row">Batching alone, no LTO</th><td class="num before">2.302</td><td class="num after">0.181</td><td class="delta"><span class="pill up">+92.2%</span></td></tr><tr><th scope="row">LTO alone, at equal work<div class="note">both runs drained the same load, so this is a clean compiler comparison</div></th><td class="num before">0.181</td><td class="num after">0.159</td><td class="delta"><span class="pill up">+11.9%</span></td></tr></tbody>
+    </table></div>
+    <p>The last row is the honest LTO number. Both of those runs drained the identical
+    load, so throughput cannot distinguish them and CPU can: the same work, ~12% cheaper.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">05</span>Where the ceiling went</h2>
+    <p>At the baseline's offered rate the batched path now absorbs everything the load
+    generator can produce, so that rate no longer measures anything. Pushed over a Unix
+    socket at 10,081&nbsp;rps &mdash; clean, no transport errors &mdash; it saturates here:</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Measure</th><th>Per-item</th><th>Batched</th><th>Change</th></tr></thead>
+      <tbody><tr><th scope="row">Write-path throughput (items/s)<div class="note">60&nbsp;s at 10,081&nbsp;rps over a Unix socket, 0 transport errors</div></th><td class="num before">345.6</td><td class="num after">8,014.8</td><td class="delta"><span class="pill up">+2,219%</span></td></tr><tr><th scope="row">CPU-seconds per 1,000 items</th><td class="num before">4.36</td><td class="num after">0.20</td><td class="delta"><span class="pill up">+95.3%</span></td></tr></tbody>
+    </table></div>
+    <p>At 20,000&nbsp;rps the edge gives out first &mdash; 10.8% transport errors and p99
+    climbing from 11&nbsp;ms to 388&nbsp;ms &mdash; while the worker keeps up with whatever
+    survives. <strong>The bottleneck has moved off the write path.</strong> The next
+    profitable thing to measure is the accept path, not the database.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">06</span>LTO: what it bought at runtime</h2>
+    <p>Microbenchmarks, <code>lto = "fat"</code> + <code>codegen-units = 1</code> against
+    the previously shipped profile. Median of 200k iterations.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Measure</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+      <tbody><tr><th scope="row">JSON tax per envelope (ns)<div class="note">all four <code>serde_json</code> passes</div></th><td class="num before">29,929</td><td class="num after">26,512</td><td class="delta"><span class="pill up">+11.4%</span></td></tr><tr><th scope="row"><code>fingerprint()</code> (ns)</th><td class="num before">499</td><td class="num after">408</td><td class="delta"><span class="pill up">+18.2%</span></td></tr><tr><th scope="row">Mask round-trip (ns)<div class="note">only runs on apps with masked keys configured</div></th><td class="num before">1,279</td><td class="num after">967</td><td class="delta"><span class="pill up">+24.4%</span></td></tr></tbody>
+    </table></div>
+    <p>Real, and still not where the time goes. At the saturating rate the process spends
+    205&nbsp;&micro;s of CPU per item; the JSON passes are 13.3&nbsp;&micro;s of that, about
+    6.5%. This is why the earlier answer on explicit SIMD holds &mdash; hand-vectorising a
+    fifteenth of the CPU on a path that is not CPU-bound buys nothing measurable.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">07</span>LTO: what it cost to build</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Measure</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+      <tbody><tr><th scope="row">Cold build, wall-clock (s)</th><td class="num before">87.3</td><td class="num after">120.3</td><td class="delta"><span class="pill down">-37.9%</span></td></tr><tr><th scope="row">Cold build, CPU-seconds<div class="note">less total work, but on a longer critical path</div></th><td class="num before">532.2</td><td class="num after">372.2</td><td class="delta"><span class="pill up">+30.1%</span></td></tr><tr><th scope="row"><code>sauron-ingest</code> binary (bytes)</th><td class="num before">9,178,864</td><td class="num after">7,167,576</td><td class="delta"><span class="pill up">+21.9%</span></td></tr></tbody>
+    </table></div>
+    <p>The wall/CPU split is the interesting part. One codegen unit per crate cannot spread
+    across 20 cores, so the final link serializes: less total work on a longer critical
+    path. On a shared CI runner the CPU number is the one that matters; on a laptop, the
+    wall number is.</p>
+    <p>Worth knowing separately: <code>packaging/rpm/sauron.spec</code> appended
+    <code>-Ccodegen-units=16</code> to <code>RUSTFLAGS</code>, and RUSTFLAGS beats the
+    profile. Setting <code>codegen-units = 1</code> in <code>Cargo.toml</code> alone would
+    have been a no-op for every RPM ever built. That override is gone, so packaged
+    binaries now match what is measured here.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">08</span>The edge, unchanged by design</h2>
+    <p>None of this touches the accept path, and it shows. The small p99 rise is the
+    worker now competing for the same box rather than idling behind a stalled queue.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Measure</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+      <tbody><tr><th scope="row">Edge p50 (ms)</th><td class="num before">1.20</td><td class="num after">1.39</td><td class="delta"><span class="pill down">-15.8%</span></td></tr><tr><th scope="row">Edge p99 (ms)</th><td class="num before">2.59</td><td class="num after">3.68</td><td class="delta"><span class="pill down">-42.1%</span></td></tr><tr><th scope="row">Accepted req/s</th><td class="num before">4,083</td><td class="num after">4,083</td><td class="delta"><span class="pill flat">—</span></td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2><span class="n">09</span>A correction to the previous report</h2>
+    <p>The 3&nbsp;August page reported a &ldquo;Redis backlog&rdquo; of 480,648 entries
+    growing linearly, taken from <code>XLEN</code>. That was wrong.
+    <code>XACK</code> does not remove entries from a stream &mdash; only <code>MAXLEN</code>
+    trimming does &mdash; so <code>XLEN</code> measures retained stream length, not
+    unprocessed work. It reads about 480,000 in every run here, including the ones that
+    drain completely.</p>
+    <p>The conclusion it supported still holds, because it never rested on that number:
+    rows-written-versus-offered is the sound measure, and it said the same thing. Backlog
+    has been dropped from this report rather than restated.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">10</span>What would undercut these numbers</h2>
+    <ul>
+      <li><strong>The generator makes 5 fingerprints and 1 device key for 5,000 users.</strong>
+      That concentrates contention onto a handful of rows far harder than real traffic
+      would. It is what exposed the deadlock &mdash; useful &mdash; but it also means the
+      batched path's advantage here is, if anything, understated: the folding it does is
+      worth more when a batch spans many distinct sessions and devices.</li>
+      <li><strong>Postgres, Redis and the load generator share one box</strong> (load
+      average ~4 from unrelated containers). Absolute figures are pessimistic; the ratios
+      are sound because every run paid the same tax.</li>
+      <li><strong>Both 4,083&nbsp;rps batched runs saturated</strong>, so the LTO-on-batching
+      throughput comparison reads 0% and means &ldquo;could not be measured here&rdquo;, not
+      &ldquo;no effect&rdquo;. The CPU-per-item row is the one to read.</li>
+      <li><strong>Batch size 50 was inherited, not chosen.</strong> It was the
+      <code>XREADGROUP</code> count from when entries were written individually. It is now
+      <code>INGEST_BATCH_SIZE</code> and is the largest untuned lever left.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2><span class="n">11</span>Reproducing this</h2>
+    <pre>INGEST_BATCH_WRITES=0|1   # per-item or batched, same binary
+INGEST_BATCH_SIZE=50      # entries per XREADGROUP, and per batched write
+WORKER_CONCURRENCY=8 INGEST_DB_POOL=8
+
+cargo test -p sauron-pipeline          # incl. the batch/per-item equivalence test
+cargo bench -p sauron-core --bench json_tax
+scratchpad/drive2.sh &lt;tag&gt; &lt;build-dir&gt; &lt;batch 0|1&gt; 4000 60</pre>
+    <p>Hold offered rate, duration and worker count fixed, then diff three numbers:
+    <strong>items/s written</strong>, <strong>transactions per item</strong>, and
+    <strong>CPU-seconds per 1,000 items</strong>. Do not compare accepted req/s &mdash; it
+    was never the constraint, and at these rates it is the generator's limit rather than
+    the server's.</p>
+  </section>
+
+  <footer>
+    <div>Measured 3 August 2026 on the working tree, uncommitted. Instrumented by
+    <code>scratchpad/drive2.sh</code>; row counts sampled from the ephemeral bench database
+    once a second, round-trips from <code>pg_stat_database</code>, CPU from
+    <code>/proc/&lt;pid&gt;/stat</code>.</div>
+    <div>Companion to <em>The edge accepts 8,083 items a second. Postgres receives 350.</em>
+    (3 August 2026).</div>
+  </footer>
+
+</div>

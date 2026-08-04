@@ -2133,7 +2133,19 @@ pub async fn upsert_issue(conn: &mut AsyncPgConnection, new: NewIssue<'_>) -> Qu
         .on_conflict((issues::app_id, issues::fingerprint))
         .do_update()
         .set((
-            issues::last_seen.eq(excluded(issues::last_seen)),
+            // GREATEST/LEAST rather than a bare `excluded.*` overwrite, so the
+            // stored window does not depend on the order occurrences happen to
+            // be processed in. A bare overwrite let a late-arriving OLDER
+            // occurrence drag `last_seen` backwards, and it is also what made
+            // this statement disagree with the batched path (which folds a
+            // whole batch before writing, and therefore has no processing order
+            // to inherit). Both spellings now agree and both are order-free.
+            issues::last_seen.eq(sql::<Timestamptz>(
+                "GREATEST(issues.last_seen, excluded.last_seen)",
+            )),
+            issues::first_seen.eq(sql::<Timestamptz>(
+                "LEAST(issues.first_seen, excluded.first_seen)",
+            )),
             issues::times_seen.eq(issues::times_seen + 1),
             issues::level.eq(excluded(issues::level)),
             // Sticky mask guard. `error_events.title` is derived server-side by

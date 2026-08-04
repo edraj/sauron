@@ -24,7 +24,7 @@ use crate::enrich::enrich_context;
 static IDENTIFIED_COLUMN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 #[cfg(not(test))]
-async fn identified_column_present(conn: &mut AsyncPgConnection) -> bool {
+pub(crate) async fn identified_column_present(conn: &mut AsyncPgConnection) -> bool {
     if let Some(v) = IDENTIFIED_COLUMN.get() {
         return *v;
     }
@@ -45,7 +45,7 @@ async fn identified_column_present(conn: &mut AsyncPgConnection) -> bool {
 /// latch would leak one test's answer into another's depending on the order
 /// the runner happened to pick.
 #[cfg(test)]
-async fn identified_column_present(conn: &mut AsyncPgConnection) -> bool {
+pub(crate) async fn identified_column_present(conn: &mut AsyncPgConnection) -> bool {
     repo::probe_event_users_identified(conn).await.is_ok()
 }
 
@@ -337,7 +337,16 @@ async fn process_error(
     // Affected-user count via HyperLogLog.
     if let Some(did) = distinct {
         let key = keys::issue_users(&issue_id.to_string());
-        if redis.pf_add(&key, &did).await.is_ok() {
+        // Only when the HyperLogLog actually changed. Recomputing and re-writing
+        // an unchanged `users_seen` on every occurrence put an `UPDATE issues`
+        // in the hot path of every error event, competing with the issue upsert
+        // for the same row.
+        // Both conditions matter: `pf_add` false means the estimate did not
+        // move, and the gate means an issue's denormalized copy is refreshed at
+        // most once per interval. Together they take this `UPDATE issues` off
+        // the per-event path, where it deadlocked against the issue upsert.
+        if redis.pf_add(&key, &did).await.unwrap_or(false) && crate::batch::users_seen_due(issue_id)
+        {
             if let Ok(count) = redis.pf_count(&key).await {
                 let _ = repo::set_issue_users_seen(&mut conn, issue_id, count).await;
             }
@@ -662,7 +671,7 @@ async fn process_transaction(
 
 // --- helpers --------------------------------------------------------------
 
-fn distinct_id(user: Option<&EventUser>) -> Option<String> {
+pub(crate) fn distinct_id(user: Option<&EventUser>) -> Option<String> {
     user.and_then(|u| u.id.clone()).filter(|s| !s.is_empty())
 }
 
@@ -670,7 +679,7 @@ fn distinct_id(user: Option<&EventUser>) -> Option<String> {
 /// default for an omitted key) becomes an empty object so the column is never
 /// NULL; any other value passes through verbatim. The backend does not merge —
 /// the SDK ships the already-merged effective scope.
-fn object_or_empty(v: Value) -> Value {
+pub(crate) fn object_or_empty(v: Value) -> Value {
     if v.is_null() {
         json!({})
     } else {
@@ -685,12 +694,12 @@ fn object_or_empty(v: Value) -> Value {
 /// here — `unwrap_or(true)` would file every pre-upgrade crash as handled, and
 /// `unwrap_or(false)` would report every unknown as a crash. Both `handled =
 /// true` and `handled = false` filters must exclude unknown rows.
-fn handled_of(exc: Option<&ExceptionInfo>) -> Option<bool> {
+pub(crate) fn handled_of(exc: Option<&ExceptionInfo>) -> Option<bool> {
     exc.and_then(|x| x.mechanism.as_ref())
         .and_then(|m| m.handled)
 }
 
-fn build_title(exc: Option<&ExceptionInfo>, message: Option<&str>) -> String {
+pub(crate) fn build_title(exc: Option<&ExceptionInfo>, message: Option<&str>) -> String {
     match exc {
         Some(x) => {
             let value = x.value.as_deref().unwrap_or("").trim();
@@ -704,7 +713,7 @@ fn build_title(exc: Option<&ExceptionInfo>, message: Option<&str>) -> String {
     }
 }
 
-fn build_culprit(exc: Option<&ExceptionInfo>) -> String {
+pub(crate) fn build_culprit(exc: Option<&ExceptionInfo>) -> String {
     let Some(x) = exc else {
         return String::new();
     };
@@ -729,7 +738,7 @@ fn build_culprit(exc: Option<&ExceptionInfo>) -> String {
 
 /// Truncate `s` to at most `max` chars (char-boundary safe). Shared by
 /// `build_title` to cap stored issue titles/messages at a fixed length.
-fn truncate(s: &str, max: usize) -> &str {
+pub(crate) fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((idx, _)) => &s[..idx],
         None => s,
@@ -809,7 +818,7 @@ mod tests {
 /// to this module, so this test lives here (same module) rather than as a
 /// separate `tests/` integration file, which could not see it.
 #[cfg(test)]
-mod workflow_pipeline_tests {
+pub(crate) mod workflow_pipeline_tests {
     use super::process_event;
     use chrono::{DateTime, Duration, Utc};
     use diesel::sql_types::{Integer, Text, Uuid as SqlUuid};
@@ -836,7 +845,7 @@ mod workflow_pipeline_tests {
     /// can reuse it. A second hand-rolled ephemeral-database harness in the
     /// same file would drift from this one's load-bearing database-name shape
     /// (see `setup`).
-    pub(super) struct PipelineTestDb {
+    pub(crate) struct PipelineTestDb {
         pool: sauron_db::PgPool,
         admin_url: String,
         db_name: String,
@@ -847,7 +856,7 @@ mod workflow_pipeline_tests {
     }
 
     impl PipelineTestDb {
-        pub(super) async fn setup() -> Option<Self> {
+        pub(crate) async fn setup() -> Option<Self> {
             let admin_url = std::env::var("TEST_DATABASE_URL").ok()?;
             // Name shape is load-bearing, in two independent ways:
             //
@@ -890,19 +899,19 @@ mod workflow_pipeline_tests {
             })
         }
 
-        pub(super) async fn conn(&self) -> sauron_db::PgConn {
+        pub(crate) async fn conn(&self) -> sauron_db::PgConn {
             sauron_db::conn(&self.pool).await.expect("checkout")
         }
 
         /// `process_error` re-acquires its own connection after symbolication,
         /// so it needs the pool rather than a checked-out connection.
-        pub(super) fn pool(&self) -> &sauron_db::PgPool {
+        pub(crate) fn pool(&self) -> &sauron_db::PgPool {
             &self.pool
         }
 
         /// Takes `&self`, not `self`, so `Drop` still runs afterwards and can
         /// see the `cleaned_up` flag this sets.
-        pub(super) async fn cleanup(&self) {
+        pub(crate) async fn cleanup(&self) {
             sauron_db::drop_database(&self.admin_url, &self.db_name)
                 .await
                 .expect("drop ephemeral pipeline test database");

@@ -16,6 +16,10 @@ pub struct ReportMeta {
     pub events_per_min: u32,
     pub issues_per_min: u32,
     pub gzip: bool,
+    /// Workload-shape knobs the run used. Recorded so two reports in a matrix
+    /// can never be compared without seeing that one of them was batched or
+    /// workflow-tagged and the other wasn't.
+    pub shape: crate::generator::Shape,
     pub generated_at: String,
     pub ncpus: usize,
 }
@@ -28,6 +32,27 @@ const PLOT_LEFT: f64 = 56.0;
 const PLOT_RIGHT: f64 = 704.0;
 const PLOT_TOP: f64 = 16.0;
 const PLOT_BOTTOM: f64 = 220.0;
+
+/// The workload-shape suffix for the report's meta line. Empty for a default
+/// run, so historical reports keep reading exactly as they did — and a shaped
+/// run says so, loudly, right next to the numbers it changes.
+fn shape_note(shape: &crate::generator::Shape) -> String {
+    let mut out = String::new();
+    if shape.workflow_ratio > 0.0 {
+        out.push_str(&format!(
+            " · workflows {:.0}% of ticks",
+            shape.workflow_ratio * 100.0
+        ));
+    }
+    if shape.batch_items > 1 {
+        out.push_str(&format!(
+            " · batch {} ticks/envelope ({} items/request)",
+            shape.batch_items,
+            shape.batch_items * crate::generator::ITEMS_PER_TICK
+        ));
+    }
+    out
+}
 
 /// Map a time value (0..=x_max) to an x pixel; x_max ≤ 0 pins to the left edge.
 fn map_x(t: f64, x_max: f64, left: f64, right: f64) -> f64 {
@@ -401,7 +426,7 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>crebain report — {mode}</title><style>{css}</style></head><body>\
          <header><h1>crebain <span>benchmark report</span></h1>\
-         <p class=\"meta\">{mode} · {users} users · {dur}s · events {epm}/min · issues {ipm}/min · gzip {gz} · {gen}</p>\
+         <p class=\"meta\">{mode} · {users} users · {dur}s · events {epm}/min · issues {ipm}/min · gzip {gz}{shape} · {gen}</p>\
          </header>\
          <section class=\"cards\">{cards}</section>\
          <section class=\"charts\">{rps}{cum}{interval}{resources}</section>\
@@ -416,6 +441,7 @@ pub fn render(summary: &Summary, expected: &Expected, meta: &ReportMeta) -> Stri
         epm = meta.events_per_min,
         ipm = meta.issues_per_min,
         gz = if meta.gzip { "on" } else { "off" },
+        shape = shape_note(&meta.shape),
         gen = esc(&meta.generated_at),
         cards = cards,
         rps = rps_chart,
@@ -529,6 +555,7 @@ mod tests {
             events_per_min: 10,
             issues_per_min: 10,
             gzip: true,
+            shape: crate::generator::Shape::default(),
             generated_at: "2026-07-15 00:00:00 UTC".into(),
             ncpus: 8,
         }
@@ -603,5 +630,36 @@ mod tests {
         );
         assert!(html.contains("no data"));
         assert!(html.starts_with("<!doctype html>"));
+    }
+
+    #[test]
+    fn header_records_a_non_default_workload_shape() {
+        let s = summary(vec![tp(1.0, 300, 295, 5, None, None)]);
+        let expected = crate::cli::Expected {
+            requests: 1000.0,
+            duration_secs: 3.0,
+        };
+
+        // A default run's header must read exactly as it always has, so old
+        // reports stay directly comparable.
+        let html = render(&s, &expected, &meta());
+        assert!(!html.contains("workflows"));
+        assert!(!html.contains("ticks/envelope"));
+
+        // A shaped run must say so, or a benchmark matrix silently compares
+        // two different workloads.
+        let shaped = ReportMeta {
+            shape: crate::generator::Shape {
+                workflow_ratio: 0.5,
+                batch_items: 7,
+            },
+            ..meta()
+        };
+        let html = render(&s, &expected, &shaped);
+        assert!(html.contains("workflows 50% of ticks"), "{html}");
+        assert!(
+            html.contains("batch 7 ticks/envelope (14 items/request)"),
+            "{html}"
+        );
     }
 }

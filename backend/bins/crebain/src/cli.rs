@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 
+use crate::generator;
+
 /// crebain — a load/benchmark generator for the Sauron ingest write path.
 ///
 /// Two modes: point at a running ingest edge with --dsn, or spin up a fully
@@ -40,6 +42,18 @@ pub struct Args {
     #[arg(long = "issues-per-min", default_value_t = 10)]
     pub issues_per_min: u32,
 
+    /// Fraction (0.0..=1.0) of generated ticks that carry a workflow tag.
+    /// The backend's per-item `bump_workflow` upsert only runs for tagged
+    /// items, so at the default 0.0 that path never executes.
+    #[arg(long = "workflow-ratio", default_value_t = 0.0)]
+    pub workflow_ratio: f64,
+
+    /// Ticks coalesced into ONE envelope (each tick contributes 2 items).
+    /// This multiplies items per REQUEST, not the request rate:
+    /// --events-per-min/--issues-per-min/--rps keep counting requests.
+    #[arg(long = "batch-items", default_value_t = 1)]
+    pub batch_items: usize,
+
     /// Send envelopes uncompressed (gzip is on by default).
     #[arg(long)]
     pub no_gzip: bool,
@@ -72,6 +86,16 @@ pub struct Args {
     /// Per-app rate limit for the bench ingest (high, so it doesn't throttle).
     #[arg(long = "rate-limit", default_value_t = 100_000_000)]
     pub rate_limit: u32,
+
+    /// Seconds to keep the ingest alive AFTER the load stops, so the worker can
+    /// drain what is still queued.
+    ///
+    /// Without this the run is torn down the instant the last request is sent,
+    /// and every event still on the stream counts as "accepted but never
+    /// written" — indistinguishable from an event the stream silently trimmed.
+    /// Draining first is what separates backlog from loss.
+    #[arg(long = "drain-secs", default_value_t = 0)]
+    pub drain_secs: u64,
 
     /// Keep the bench database after the run instead of dropping it.
     #[arg(long)]
@@ -125,6 +149,9 @@ pub struct RunConfig {
     pub gzip: bool,
     pub events_per_min: u32,
     pub issues_per_min: u32,
+    /// Workload-shape knobs handed to the envelope builders (workflow tagging
+    /// ratio + ticks per envelope). Defaults reproduce the historical workload.
+    pub shape: generator::Shape,
     pub report_path: Option<std::path::PathBuf>,
     /// Max concurrent in-flight requests (= worker-pool size). The connection ceiling.
     pub max_inflight: usize,
@@ -157,6 +184,7 @@ pub struct IsolatedConfig {
     pub ingest_port: u16,
     pub ingest_bin: Option<String>,
     pub rate_limit: u32,
+    pub drain_secs: u64,
     pub keep: bool,
     pub transport: Transport,
     /// Unix-domain-socket path the spawned ingest listens on when `transport`
@@ -177,7 +205,10 @@ impl RunConfig {
         let minutes = self.duration.as_secs_f64() / 60.0;
         let events = n * self.events_per_min as f64 * minutes;
         let errors = n * self.issues_per_min as f64 * minutes;
-        // one request per identify (N) + one per event tick + one per issue tick.
+        // one request per identify (N) + one per event send + one per issue send.
+        // `--batch-items` does NOT enter this: it multiplies the ITEMS a request
+        // carries, never the number of requests, so `events_per_min` and `--rps`
+        // keep meaning requests per minute / per second exactly as before.
         let requests = n + events + errors;
         Expected {
             requests,
@@ -201,6 +232,29 @@ impl Args {
         }
         if self.max_inflight == 0 {
             anyhow::bail!("--max-inflight must be at least 1");
+        }
+        // `contains` is false for NaN too, so a `--workflow-ratio nan` is caught
+        // here rather than silently tagging nothing.
+        if !(0.0..=1.0).contains(&self.workflow_ratio) {
+            anyhow::bail!(
+                "--workflow-ratio must be between 0.0 and 1.0 (got {})",
+                self.workflow_ratio
+            );
+        }
+        if self.batch_items == 0 {
+            anyhow::bail!("--batch-items must be at least 1");
+        }
+        // The edge answers HTTP 400 `too_many_items` above its cap, so an
+        // over-large batch would benchmark rejections instead of ingest. Reject
+        // it at parse time, where the operator can still see why.
+        if self.batch_items > generator::MAX_BATCH_ITEMS {
+            anyhow::bail!(
+                "--batch-items must be at most {} — each tick contributes {} items and the ingest \
+                 rejects envelopes carrying more than {} items",
+                generator::MAX_BATCH_ITEMS,
+                generator::ITEMS_PER_TICK,
+                generator::MAX_ENVELOPE_ITEMS
+            );
         }
 
         let dsn = self.dsn.or_else(|| env_nonempty("CREBAIN_DSN"));
@@ -245,6 +299,7 @@ impl Args {
                     ingest_port: self.ingest_port,
                     ingest_bin: self.ingest_bin,
                     rate_limit: self.rate_limit,
+                    drain_secs: self.drain_secs,
                     keep: self.keep,
                     transport: self.transport,
                     uds_path: uds_path.clone(),
@@ -260,6 +315,10 @@ impl Args {
             gzip: !self.no_gzip,
             events_per_min: self.events_per_min,
             issues_per_min: self.issues_per_min,
+            shape: generator::Shape {
+                workflow_ratio: self.workflow_ratio,
+                batch_items: self.batch_items,
+            },
             report_path: self.report,
             max_inflight: self.max_inflight,
             ramp: Duration::from_secs(self.ramp),
@@ -298,6 +357,7 @@ mod tests {
             gzip: true,
             events_per_min: 10,
             issues_per_min: 10,
+            shape: generator::Shape::default(),
             report_path: None,
             max_inflight: 8192,
             ramp: Duration::from_secs(5),
@@ -401,6 +461,84 @@ mod tests {
         ])
         .unwrap();
         assert!(args.resolve().is_err());
+    }
+
+    #[test]
+    fn workload_shape_defaults_to_the_historical_workload() {
+        let args =
+            Args::try_parse_from(["crebain", "--isolated", "--database-url", "postgres://x/y"])
+                .unwrap();
+        let (cfg, _m) = args.resolve().unwrap();
+        assert_eq!(cfg.shape, generator::Shape::default());
+        assert_eq!(cfg.shape.workflow_ratio, 0.0);
+        assert_eq!(cfg.shape.batch_items, 1);
+    }
+
+    #[test]
+    fn workload_shape_flows_into_runconfig() {
+        let args = Args::try_parse_from([
+            "crebain",
+            "--isolated",
+            "--database-url",
+            "postgres://x/y",
+            "--workflow-ratio",
+            "0.3",
+            "--batch-items",
+            "25",
+        ])
+        .unwrap();
+        let (cfg, _m) = args.resolve().unwrap();
+        assert_eq!(cfg.shape.workflow_ratio, 0.3);
+        assert_eq!(cfg.shape.batch_items, 25);
+        // Batching must not silently inflate the request model.
+        assert_eq!(cfg.expected().requests.round() as u64, 21_000);
+    }
+
+    #[test]
+    fn rejects_out_of_range_workflow_ratio() {
+        // `=` form for the negative case: bare `-0.1` looks like a flag to clap.
+        for bad in [
+            "--workflow-ratio=1.5",
+            "--workflow-ratio=-0.1",
+            "--workflow-ratio=nan",
+        ] {
+            let args = Args::try_parse_from([
+                "crebain",
+                "--isolated",
+                "--database-url",
+                "postgres://x/y",
+                bad,
+            ])
+            .unwrap();
+            assert!(args.resolve().is_err(), "{bad} was accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_batch_items_outside_the_edge_cap() {
+        for bad in ["0", "501"] {
+            let args = Args::try_parse_from([
+                "crebain",
+                "--isolated",
+                "--database-url",
+                "postgres://x/y",
+                "--batch-items",
+                bad,
+            ])
+            .unwrap();
+            assert!(args.resolve().is_err(), "--batch-items {bad} was accepted");
+        }
+        // ...and the largest envelope that still fits is allowed.
+        let args = Args::try_parse_from([
+            "crebain",
+            "--isolated",
+            "--database-url",
+            "postgres://x/y",
+            "--batch-items",
+            "500",
+        ])
+        .unwrap();
+        assert!(args.resolve().is_ok());
     }
 
     #[test]

@@ -17,3 +17,10 @@ anyhow.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# Per-event CPU baseline for the ingest write path. `harness = false` because
+# this is a plain `fn main()` — deliberately not criterion, which would add ~30
+# crates to the lockfile just to take a measurement.
+[[bench]]
+name = "json_tax"
+harness = false

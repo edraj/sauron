@@ -1,0 +1,359 @@
+<style>
+  :root {
+    --ground:#F2F5F7; --card:#FFFFFF; --ink:#171B23; --slate:#5C6779; --faint:#8A94A4;
+    --line:#DDE3EA; --line-2:#EDF1F5;
+    --measure:#14666F; --measure-w:#DCEDEF;
+    --deficit:#A63A3A; --deficit-w:#F6E3E1;
+    --flag:#8A5A12; --flag-w:#FBF0DC;
+    --shadow:0 1px 2px rgba(23,27,35,.05), 0 8px 24px -16px rgba(23,27,35,.28);
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono","Cascadia Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#0E1116; --card:#161B22; --ink:#E6EAF0; --slate:#98A3B4; --faint:#6B7688;
+      --line:#262D38; --line-2:#1D242D;
+      --measure:#4CC2CD; --measure-w:#123135;
+      --deficit:#EE7A72; --deficit-w:#3A1E1C;
+      --flag:#E0B368; --flag-w:#332916;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:#0E1116; --card:#161B22; --ink:#E6EAF0; --slate:#98A3B4; --faint:#6B7688;
+    --line:#262D38; --line-2:#1D242D;
+    --measure:#4CC2CD; --measure-w:#123135;
+    --deficit:#EE7A72; --deficit-w:#3A1E1C;
+    --flag:#E0B368; --flag-w:#332916;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+  }
+  :root[data-theme="light"] {
+    --ground:#F2F5F7; --card:#FFFFFF; --ink:#171B23; --slate:#5C6779; --faint:#8A94A4;
+    --line:#DDE3EA; --line-2:#EDF1F5;
+    --measure:#14666F; --measure-w:#DCEDEF;
+    --deficit:#A63A3A; --deficit-w:#F6E3E1;
+    --flag:#8A5A12; --flag-w:#FBF0DC;
+    --shadow:0 1px 2px rgba(23,27,35,.05), 0 8px 24px -16px rgba(23,27,35,.28);
+  }
+
+  body { background:var(--ground); color:var(--ink); font-family:var(--sans);
+         line-height:1.6; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:920px; margin:0 auto; padding:56px 24px 96px;
+           display:flex; flex-direction:column; gap:44px; }
+
+  .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.14em;
+              text-transform:uppercase; color:var(--faint); }
+  h1 { font-family:var(--serif); font-weight:600; font-size:clamp(30px,4.6vw,46px);
+        line-height:1.12; letter-spacing:-.015em; text-wrap:balance; margin:.28em 0 0; }
+  .standfirst { font-family:var(--serif); font-size:clamp(17px,2.1vw,20px);
+                 color:var(--slate); max-width:60ch; margin-top:.6em; }
+  h2 { font-family:var(--serif); font-weight:600; font-size:25px; letter-spacing:-.01em;
+        margin:0; text-wrap:balance; }
+  h2 .n { font-family:var(--mono); font-size:12px; color:var(--faint);
+           letter-spacing:.1em; margin-right:.7em; vertical-align:.28em; }
+  p { margin:0; max-width:66ch; }
+  section { display:flex; flex-direction:column; gap:14px; }
+  a { color:var(--measure); }
+  code { font-family:var(--mono); font-size:.88em;
+          background:var(--line-2); padding:.1em .34em; border-radius:3px; }
+
+  .prov { display:grid; grid-template-columns:repeat(auto-fit,minmax(132px,1fr));
+           gap:1px; background:var(--line); border:1px solid var(--line);
+           border-radius:8px; overflow:hidden; }
+  .prov div { background:var(--card); padding:11px 13px; }
+  .prov dt { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+              text-transform:uppercase; color:var(--faint); }
+  .prov dd { font-family:var(--mono); font-size:13px; margin:3px 0 0;
+              font-variant-numeric:tabular-nums; }
+
+  .scroll { overflow-x:auto; border:1px solid var(--line); border-radius:8px;
+             background:var(--card); box-shadow:var(--shadow); }
+  table { border-collapse:collapse; width:100%; min-width:520px; }
+  thead th { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+              text-transform:uppercase; color:var(--faint); font-weight:500;
+              text-align:right; padding:11px 16px; border-bottom:1px solid var(--line);
+              white-space:nowrap; }
+  thead th:first-child { text-align:left; }
+  tbody th { text-align:left; font-weight:500; font-size:14.5px; padding:12px 16px;
+              border-bottom:1px solid var(--line-2); vertical-align:top; }
+  tbody td { padding:12px 16px; border-bottom:1px solid var(--line-2);
+              text-align:right; white-space:nowrap; vertical-align:top; }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom:none; }
+  .num { font-family:var(--mono); font-size:14px; font-variant-numeric:tabular-nums; }
+  .before { color:var(--deficit); }
+  .after  { color:var(--measure); font-weight:600; }
+  .note { font-size:12.5px; color:var(--faint); font-weight:400; margin-top:2px;
+           white-space:normal; max-width:34ch; line-height:1.45; }
+  .pill { font-family:var(--mono); font-size:12.5px; font-variant-numeric:tabular-nums;
+           padding:3px 9px; border-radius:11px; display:inline-block; font-weight:600; }
+  .pill.up   { background:var(--measure-w); color:var(--measure); }
+  .pill.down { background:var(--deficit-w); color:var(--deficit); }
+  .pill.flat { background:var(--line-2); color:var(--faint); }
+
+  figure { margin:0; background:var(--card); border:1px solid var(--line);
+            border-radius:8px; padding:18px 16px 8px; box-shadow:var(--shadow); }
+  svg { display:block; width:100%; height:auto; }
+  .grid { stroke:var(--line-2); stroke-width:1; }
+  .ax { font-family:var(--mono); font-size:10px; fill:var(--faint); }
+  .ln-b { fill:none; stroke:var(--measure); stroke-width:2.4;
+           stroke-linejoin:round; stroke-linecap:round; }
+  .ln-a { fill:none; stroke:var(--deficit); stroke-width:2.4;
+           stroke-linejoin:round; stroke-linecap:round; }
+  figcaption { display:flex; flex-wrap:wrap; gap:18px; padding:12px 2px 8px;
+                font-size:13px; color:var(--slate); }
+  .key { display:flex; align-items:center; gap:7px; }
+  .sw { width:16px; height:3px; border-radius:2px; flex:none; }
+
+  .flag { border-left:3px solid var(--flag); background:var(--flag-w);
+           padding:16px 20px; border-radius:0 8px 8px 0;
+           display:flex; flex-direction:column; gap:10px; }
+  .flag h3 { font-family:var(--serif); font-size:18px; margin:0; font-weight:600; }
+  .flag p { font-size:14.5px; }
+
+  pre { font-family:var(--mono); font-size:12.5px; line-height:1.7; margin:0;
+         background:var(--card); border:1px solid var(--line); border-radius:8px;
+         padding:16px 18px; overflow-x:auto; color:var(--slate); }
+  ul { margin:0; padding-left:1.15em; max-width:66ch; }
+  li { margin-bottom:.5em; }
+  li::marker { color:var(--faint); }
+  footer { border-top:1px solid var(--line); padding-top:20px; font-size:13px;
+            color:var(--faint); display:flex; flex-direction:column; gap:8px; }
+
+  .dot-b { fill:var(--deficit); }
+  .dot-a { fill:var(--measure); }
+  .span  { stroke:var(--line); stroke-width:2.5; stroke-linecap:round; }
+  .lede { font-family:var(--serif); font-size:19px; color:var(--slate); }
+</style>
+<style>td.hi{outline:1px solid var(--measure);outline-offset:-3px;border-radius:3px}</style>
+<title>Tier 3: the knobs and the cliff</title>
+<div class="wrap">
+<header>
+<div class="eyebrow">Sauron &middot; ingest &middot; 4 August 2026 &middot; report 5</div>
+<h1>Tier&nbsp;3: two knobs, one wire format, and a benchmark that was lying about saturation</h1>
+<p class="standfirst">The largest number in this report required no code at all.
+Sweeping <code>WORKER_CONCURRENCY</code> and <code>INGEST_BATCH_SIZE</code>
+<em>together</em> &mdash; they interact, and sweeping either alone gets the wrong
+answer &mdash; found <strong>+142%</strong> of write throughput sitting
+in two environment variables. The code change that follows, enqueueing one
+stream entry per envelope instead of one per item, cuts stream entries by
+<strong>90%</strong> and edge latency by
+<strong>13%</strong>, and only shows its real value past
+capacity, where the old shape loses <strong>21%</strong> of accepted
+events to a silent trim and the new one loses <strong>0.0%</strong>.
+Getting there meant fixing the measurement twice: the &ldquo;saturated&rdquo;
+point was not saturated, and a flat 25% &ldquo;loss&rdquo; turned out to be an
+item-mix accounting error.</p></header>
+<dl class="prov">
+<div><dt>host</dt><dd>20 cores &middot; Linux 7.0.12</dd></div>
+<div><dt>runs</dt><dd>3&times;3 at each of three offered rates</dd></div>
+<div><dt>duration</dt><dd>60&thinsp;s + drain &middot; interleaved</dd></div>
+<div><dt>workload</dt><dd>60% workflow-tagged &middot; 15 items/envelope</dd></div>
+<div><dt>settings</dt><dd>both arms: 8 workers &middot; pool 8 &middot; batch 200</dd></div>
+<div><dt>baseline</dt><dd>the Tier&nbsp;2 build</dd></div>
+</dl>
+
+<section><h2><span class="n">01</span>What changed</h2>
+<p>Two defaults, one wire format, one round-trip cut &mdash; and two repairs to
+things the wire-format change quietly broke.</p>
+<ul>
+<li><strong>New defaults.</strong> <code>WORKER_CONCURRENCY</code> 4&nbsp;&rarr;&nbsp;8
+and <code>INGEST_BATCH_SIZE</code> 50&nbsp;&rarr;&nbsp;200. Both dated from a
+write path that no longer exists: 50 was chosen when one entry was one statement,
+and 4 was last measured when an item cost ~10 transactions.</li>
+<li><strong>One stream entry per envelope.</strong> The edge built an
+<code>IngestJob</code> per item, each carrying its own copy of the tenancy ids,
+release, ip, user agent, sdk block and the unbounded <code>context</code> map.
+At 15 items per envelope that is 15 copies
+serialized, stored, read back and parsed for something the envelope stated once.
+The worker expands an <code>IngestBatch</code> back into per-item jobs, so
+nothing past the decode changed.</li>
+<li><strong>The edge, from four sequential Redis waits to two.</strong>
+<code>INCR</code> key limit &rarr; <code>GET</code> dsn cache &rarr;
+<code>INCR</code> app limit &rarr; <code>XADD</code>, each waiting on the one
+before it because it needed its answer. A process-local cache in front of
+<code>resolve_env</code> removes the middle wait and makes the app id known
+before the second limiter, so both counters go out in one pipeline.</li>
+<li><strong>The bind-parameter ceiling, which the fold silently broke.</strong>
+<code>insert_into(&hellip;).values(&amp;rows)</code> binds every column of every
+row, and Postgres refuses past 65,535 parameters. That was unreachable while one
+entry meant one item, because <code>INGEST_BATCH_SIZE</code> capped both. An
+entry may now carry up to 1,000 items, so 200 entries is up to 200,000 rows. The
+inserts chunk internally, inside the same transaction, so it is still one commit
+however many statements it takes.</li>
+<li><strong>The batch is bounded in ITEMS, not entries.</strong> This one was
+found by the benchmark, not by reading. <code>INGEST_BATCH_SIZE</code> counts
+entries, and while an entry was an item that was also an item bound. Folding an
+envelope into one entry quietly multiplied the batch by the envelope size: at
+twice capacity, peak resident memory went from <strong>214&nbsp;MB to
+2,164&nbsp;MB</strong> &mdash; tenfold, from a knob nobody touched, on a
+workload nobody changed. <code>INGEST_BATCH_ITEMS</code> (default 1,000) is now
+the budget, and each worker converts it into an entry count using a moving
+average of the envelope size it has actually been seeing. That brought the same
+run back to 833&nbsp;MB with the throughput intact.</li>
+<li><strong><code>MAXLEN</code> is configurable.</strong> It was a literal at the
+call site &mdash; a data-loss control with no way to buy headroom. Default
+unchanged; <code>INGEST_STREAM_MAXLEN</code> now raises it.</li>
+</ul></section>
+
+<section><h2><span class="n">02</span>The knobs interact, so sweeping one is worse than useless</h2>
+<p>Nine points, one 60&thinsp;s run each, on the unmodified Tier&nbsp;2 build.
+The best combination is worth <strong>+142%</strong> over the shipped
+one.</p>
+<figure><svg viewBox="0 0 660 230" role="img" aria-label="Items written per second for each combination of worker count and batch size. The shipped 4 workers at batch 50 is the second lowest at 7,845; 16 workers at batch 50 is the lowest."><line class="grid" x1="40" y1="190" x2="620" y2="190"/><rect class="dot-b" x="64.2" y="128.9" width="41.6" height="61.1" rx="2"/><text class="ax" x="85.0" y="123.9" text-anchor="middle">4</text><rect class="dot-b" x="112.5" y="111.7" width="41.6" height="78.3" rx="2"/><text class="ax" x="133.3" y="106.7" text-anchor="middle">8</text><rect class="dot-b" x="160.8" y="142.2" width="41.6" height="47.8" rx="2"/><text class="ax" x="181.6" y="137.2" text-anchor="middle">16</text><rect class="dot-b" x="257.5" y="89.4" width="41.6" height="100.6" rx="2"/><text class="ax" x="278.3" y="84.4" text-anchor="middle">4</text><rect class="dot-a" x="305.8" y="42.1" width="41.6" height="147.9" rx="2"/><text class="ax" x="326.6" y="37.1" text-anchor="middle">8</text><rect class="dot-b" x="354.2" y="43.2" width="41.6" height="146.8" rx="2"/><text class="ax" x="375.0" y="38.2" text-anchor="middle">16</text><rect class="dot-b" x="450.8" y="74.9" width="41.6" height="115.1" rx="2"/><text class="ax" x="471.6" y="69.9" text-anchor="middle">4</text><rect class="dot-b" x="499.2" y="44.0" width="41.6" height="146.0" rx="2"/><text class="ax" x="520.0" y="39.0" text-anchor="middle">8</text><rect class="dot-b" x="547.5" y="41.7" width="41.6" height="148.3" rx="2"/><text class="ax" x="568.3" y="36.7" text-anchor="middle">16</text><text class="ax" x="136.7" y="206.0" text-anchor="middle">batch 50</text><text class="ax" x="330.0" y="206.0" text-anchor="middle">batch 200</text><text class="ax" x="523.3" y="206.0" text-anchor="middle">batch 500</text></svg><figcaption><span class="key">items written per second &middot; bars labelled with WORKER_CONCURRENCY &middot; one 60&thinsp;s run each</span></figcaption></figure>
+<table><thead><tr><th></th><th class="num">batch 50</th><th class="num">batch 200</th>
+<th class="num">batch 500</th></tr></thead><tbody><tr><th>4 workers <em>(shipped)</em></th><td class="num">7,845<div class="note">+0% &middot; 69 MB</div></td><td class="num">12,910<div class="note">+65% &middot; 158 MB</div></td><td class="num">14,775<div class="note">+88% &middot; 288 MB</div></td></tr><tr><th>8 workers</th><td class="num">10,050<div class="note">+28% &middot; 83 MB</div></td><td class="num hi">18,987<div class="note">+142% &middot; 184 MB</div></td><td class="num">18,733<div class="note">+139% &middot; 366 MB</div></td></tr><tr><th>16 workers</th><td class="num">6,141<div class="note">-22% &middot; 102 MB</div></td><td class="num">18,836<div class="note">+140% &middot; 237 MB</div></td><td class="num">19,029<div class="note">+143% &middot; 405 MB</div></td></tr></tbody></table>
+<p class="lede">Read the batch-50 column downward. Going from 4 workers to 16
+makes throughput <strong>-22%</strong> &mdash; <em>worse</em>. A
+one-dimensional sweep of <code>WORKER_CONCURRENCY</code> at the shipped batch
+size would have concluded that the concurrency knob was already at its optimum
+and moved on. It is only at a batch size nobody had changed that the concurrency
+knob does anything at all, because with 50-entry batches the workers spend their
+time contending on commits rather than amortizing them.</p>
+<p>The highlighted cell is what ships, and it is <em>not</em> the largest number
+in the table. 4 of the nine points land within 1.6% of
+each other at the top, which is noise &mdash; and all of them are demand-limited,
+because 19,029 items/s <em>is</em> the offered rate
+(19,199 items/s). Every one of them absorbed everything it was given,
+so the honest reading is &ldquo;these four are indistinguishable&rdquo; rather
+than &ldquo;this one won&rdquo;, and +142% is a floor on the gap, not a
+measurement of a ceiling. What separates them is the third column of each cell:
+8 workers at a batch of 200 does it in
+184&nbsp;MB where 16/500 needs
+405&nbsp;MB. Same throughput, less than half the memory.</p>
+<p>Each cell is also a single 60&thinsp;s run, which justifies changing a default
+and not much more.</p></section>
+
+<section><h2><span class="n">03</span>Two corrections to the measurement, before any result</h2>
+<p><strong>The saturated point was not saturated.</strong> The first matrix
+offered 1,600&nbsp;req/s and reported both builds writing an identical ~19,000
+items/s. That looked like a null result for the code change. It was: at the new
+defaults both builds wrote <em>100% of every countable item</em>, so the row was
+measuring the load generator. A third arm at 3,200&nbsp;req/s
+(&sect;05) is the one that actually exceeds capacity.</p>
+<p><strong>A flat 25% &ldquo;loss&rdquo; that never happened.</strong> The
+loader compared crebain&rsquo;s <code>total</code> item count against rows in
+<code>error_events</code>, <code>analytics_events</code> and
+<code>transactions</code>, and reported 25.2% of accepted items missing. The
+figure was identical to three significant figures across both builds and all six
+runs &mdash; which is the tell. <code>total</code> includes breadcrumb batches
+and <code>identify()</code> calls, neither of which writes a row to any of those
+three tables. Comparing like with like, the shortfall is exactly zero. A loss
+number that does not move when the build does is not measuring the build.</p>
+<p><strong>And a drain phase, so backlog and loss can be told apart.</strong>
+crebain used to tear the ingest down the instant the last request was sent.
+Anything still queued then counted as never written &mdash; indistinguishable
+from an entry Redis had trimmed away. <code>--drain-secs</code> holds the ingest
+open afterwards; every loss figure below is measured after the worker was given
+time to finish.</p></section>
+
+<section><h2><span class="n">04</span>At a load both builds absorb</h2>
+<p>1,600&nbsp;req/s, 60&thinsp;s, 30&thinsp;s drain. Throughput is null here by
+construction; what this arm measures is the cost of moving the same events.</p>
+<table><thead><tr><th>metric</th><th class="num">before</th><th class="num">after</th><th>&Delta;</th></tr></thead>
+<tbody><tr><th>stream entries at peak<div class="note">The unit <code>MAXLEN</code> counts. One envelope is now one entry instead of 15.</div></th><td class="num before">1,000,002</td><td class="num after">100,998</td><td><span class="pill up">-89.9%</span></td></tr><tr><th>edge p50 (ms)<div class="note">Two sequential Redis waits removed from every request.</div></th><td class="num before">1.73</td><td class="num after">1.19</td><td><span class="pill up">-31.4%</span></td></tr><tr><th>edge p99 (ms)<div class="note"></div></th><td class="num before">6.61</td><td class="num after">5.45</td><td><span class="pill flat">-17.5% ~</span></td></tr><tr><th>Redis round trips / request<div class="note">From <code>total_reads_processed</code>. Under load Redis coalesces several clients&rsquo; commands into one read, so this understates the per-request saving &mdash; see the sustainable table.</div></th><td class="num before">5.8</td><td class="num after">5.4</td><td><span class="pill up">-7.9%</span></td></tr><tr><th>CPU-s per 1k items<div class="note">ingest process, utime+stime, pid resolved by executable.</div></th><td class="num before">0.1266</td><td class="num after">0.1164</td><td><span class="pill up">-8.1%</span></td></tr><tr><th>peak Redis memory (MB)<div class="note">Whole instance, sampled once a second.</div></th><td class="num before">3,874</td><td class="num after">3,684</td><td><span class="pill up">-4.9%</span></td></tr><tr><th>peak ingest RSS (MB)<div class="note">The batch is now bounded in items, so this no longer scales with envelope size &mdash; see &sect;06.</div></th><td class="num before">186</td><td class="num after">703</td><td><span class="pill flat">+277.3% ~</span></td></tr><tr><th>items written / s<div class="note">Expected null: both builds absorb 100% of this load, so this row measures the load generator.</div></th><td class="num before">18,885</td><td class="num after">18,963</td><td><span class="pill flat">+0.4% ~</span></td></tr><tr><th>Postgres commits / item<div class="note"><code>INGEST_BATCH_SIZE</code> counts ENTRIES. Folding 15 items into one entry makes a 200-entry read a smaller batch in items whenever the worker is caught up &mdash; see &sect;05.</div></th><td class="num before">0.072</td><td class="num after">0.099</td><td><span class="pill flat">+37.1% ~</span></td></tr></tbody></table>
+<p>The last row is a regression, and an instructive one.
+<code>INGEST_BATCH_SIZE</code> counts <em>entries</em>. When an entry was one
+item, a 200-entry read was a 200-item batch. Now one entry is
+15 items &mdash; but only if 15&times;200 items
+are actually waiting. At a load the worker keeps up with, there is nothing
+queued, so each read returns a handful of entries and the fixed per-batch cost is
+amortized over fewer items than before. &sect;05 is where the stream is deep and
+the same knob works the other way.</p></section>
+
+<section><h2><span class="n">05</span>Past capacity, which is what the change is for</h2>
+<p>3,200&nbsp;req/s &mdash; roughly twice what this configuration drains &mdash;
+for 60&thinsp;s, then a 60&thinsp;s drain. The producer is ahead of the consumer
+throughout, so a backlog builds; the question is what the backlog is made of.</p>
+<figure><svg viewBox="0 0 660 240" role="img" aria-label="Rows landing in Postgres during a 60-second run at twice capacity plus a 60-second drain."><line class="grid" x1="40" y1="200" x2="620" y2="200"/><line class="grid" x1="329.7" y1="40" x2="329.7" y2="200"/><text class="ax" x="333.7" y="34">load stops</text><path class="ln-a" d="M40.0,200.0 L45.7,198.4 L51.4,196.5 L57.2,194.5 L63.1,192.5 L69.0,190.5 L74.9,188.7 L80.9,186.7 L86.9,185.0 L93.0,183.3 L99.0,181.8 L105.2,180.3 L111.6,179.5 L117.5,178.5 L123.5,177.2 L129.6,175.6 L135.6,173.9 L141.8,172.1 L147.8,170.4 L153.8,168.9 L159.9,168.2 L166.2,167.1 L172.8,165.7 L179.3,164.5 L185.9,163.1 L192.4,161.6 L198.9,160.4 L205.5,158.9 L212.3,157.5 L218.9,156.0 L225.5,154.5 L232.1,153.0 L238.7,151.4 L245.5,149.9 L252.1,148.9 L258.8,147.2 L265.5,145.7 L272.1,144.1 L278.8,142.4 L285.6,140.6 L292.4,139.3 L299.3,137.7 L306.1,136.0 L312.9,134.2 L319.7,132.4 L326.7,131.1 L333.6,129.9 L340.2,127.9 L347.0,125.7 L353.7,123.7 L360.5,121.6 L367.3,120.2 L374.1,118.0 L380.8,115.9 L387.7,114.0 L394.5,112.4 L401.3,110.4 L408.3,108.5 L415.9,106.6 L423.3,104.8 L430.9,103.4 L438.3,101.5 L445.7,99.4 L452.6,97.2 L459.7,95.5 L466.6,93.7 L473.7,91.5 L480.7,89.2 L487.7,87.2 L494.4,85.9 L501.6,83.8 L508.8,82.1 L515.6,82.1 L522.5,82.1 L529.4,82.1 L536.1,82.1 L542.7,82.1 L549.5,82.1 L556.1,82.1 L562.7,82.1 L569.4,82.1 L576.0,82.1 L582.6,82.1 L589.1,82.1 L595.6,82.1 L603.7,82.1 L610.2,82.1 L616.7,82.1"/><path class="ln-b" d="M40.0,200.0 L45.7,198.8 L51.5,196.6 L57.4,194.6 L63.3,192.5 L69.3,190.4 L75.3,188.4 L81.1,185.8 L87.3,183.0 L93.4,180.1 L99.6,177.9 L106.1,174.8 L112.4,172.0 L118.7,169.3 L125.0,166.5 L131.5,163.4 L138.1,160.2 L144.7,157.1 L151.3,154.0 L158.2,151.2 L165.0,148.4 L171.7,146.9 L178.5,143.9 L185.4,140.7 L192.2,137.8 L199.0,136.5 L205.9,133.6 L212.8,130.8 L219.7,128.3 L226.3,127.1 L233.2,124.5 L240.3,121.5 L247.5,118.7 L254.6,116.4 L261.7,113.5 L268.9,110.7 L276.3,108.4 L283.4,106.2 L291.8,104.2 L300.1,102.2 L308.6,100.2 L316.8,98.2 L324.5,95.1 L332.1,91.9 L339.5,89.2 L346.4,87.0 L353.5,83.7 L361.1,80.3 L368.1,77.7 L375.4,74.3 L382.6,71.6 L390.4,69.7 L398.7,66.1 L406.5,62.5 L414.3,59.9 L422.4,56.2 L430.7,52.4 L438.7,51.9 L446.6,51.9 L454.2,51.9 L461.6,51.9 L468.7,51.9 L475.7,51.9 L482.6,51.9 L489.5,51.9 L496.4,51.9 L503.4,51.9 L510.2,51.9 L517.1,51.9 L524.0,51.9 L531.0,51.9 L538.0,51.9 L544.9,51.9 L551.8,51.9 L558.8,51.9 L565.8,51.9 L572.8,51.9 L579.7,51.9 L586.5,51.9 L593.2,51.9 L600.1,51.9 L606.7,51.9 L613.4,51.9 L620.0,51.9"/><text class="ax" x="40" y="216">0&thinsp;s</text><text class="ax" x="620" y="216" text-anchor="end">120&thinsp;s</text></svg><figcaption><span class="key"><span class="sw" style="background:var(--deficit)"></span>before</span><span class="key"><span class="sw" style="background:var(--measure)"></span>after</span><span class="key">rows in Postgres &middot; one run each at 2&times; capacity</span></figcaption></figure>
+<table><thead><tr><th>metric</th><th class="num">before</th><th class="num">after</th><th>&Delta;</th></tr></thead>
+<tbody><tr><th>items accepted but never written (%)<div class="note">After a 60&thinsp;s drain, so this is loss, not backlog. The edge answered <code>202</code> to every one of them.</div></th><td class="num before">21.0%</td><td class="num after">0.0%</td><td><span class="pill up">-100.0%</span></td></tr><tr><th>items written / s<div class="note">Drain rate while the producer is ahead.</div></th><td class="num before">17,636</td><td class="num after">27,635</td><td><span class="pill up">+56.7%</span></td></tr><tr><th>stream entries at peak<div class="note">The cap is 1,000,000. Reaching it is what destroys the entries above.</div></th><td class="num before">1,000,002</td><td class="num after">196,995</td><td><span class="pill up">-80.3%</span></td></tr><tr><th>Postgres commits / item<div class="note">A deep stream means full reads, and an entry now carries a whole envelope &mdash; so the same item budget arrives in far fewer batches.</div></th><td class="num before">0.052</td><td class="num after">0.017</td><td><span class="pill up">-67.0%</span></td></tr><tr><th>edge p50 (ms)<div class="note"></div></th><td class="num before">2.72</td><td class="num after">1.95</td><td><span class="pill up">-28.4%</span></td></tr><tr><th>peak Redis memory (MB)<div class="note">HIGHER after, and that is the point: the before arm&rsquo;s smaller footprint is what discarding a fifth of the data looks like.</div></th><td class="num before">3,931</td><td class="num after">5,243</td><td><span class="pill flat">+33.4% ~</span></td></tr><tr><th>peak ingest RSS (MB)<div class="note">The cost of holding a real backlog instead of losing it. Budgeted by <code>INGEST_BATCH_ITEMS</code>, not by envelope size &mdash; before that knob existed this row read 2,164&nbsp;MB.</div></th><td class="num before">217</td><td class="num after">833</td><td><span class="pill flat">+283.7% ~</span></td></tr></tbody></table>
+<p class="lede">This is the row that matters: <strong>21.0%</strong> of
+accepted events never reached Postgres on the old wire format, against
+<strong>0.0%</strong> on the new one. Nothing logged it. The edge
+answered <code>202</code> to every single one, truthfully &mdash; it really did
+accept them. They were destroyed later, by <code>XADD MAXLEN</code>, because a
+backlog of the same telemetry is 15&times; fewer entries when an
+envelope travels as one entry, and the cap counts entries.</p></section>
+
+<section><h2><span class="n">06</span>What this cost</h2>
+<ul>
+<li><strong>Revocation is no longer instant.</strong> Rotating a key, disabling
+an app or deleting an environment all <code>DEL</code> the Redis cache entry
+today, so the next request re-resolves. A process-local copy cannot be
+invalidated that way: a revoked key keeps ingesting on each replica for up to the
+cache TTL. The default is 5&thinsp;s and
+<code>INGEST_DSN_CACHE_SECS=0</code> disables the cache entirely &mdash; the
+pipelined limiter still applies, so that setting costs one round trip, not the
+change. Only positive results are cached in process; unknown keys still go to
+Redis, whose negative cache is what keeps them off Postgres.</li>
+<li><strong>An envelope is now all-or-nothing.</strong> A single unserializable
+item used to be skipped while its neighbours landed. The hole is narrower than it
+sounds &mdash; every field came from JSON that parsed moments earlier, and JSON
+that parsed cannot produce the map keys or non-finite floats that make
+<code>to_string</code> fail &mdash; and the answer, <code>accepted: 0</code> and
+an SDK retry, is correct if it ever does.</li>
+<li><strong>Memory is now a budget rather than an accident.</strong> The ingest
+holds more at over-capacity than it used to &mdash;
+217&nbsp;MB against 833&nbsp;MB &mdash; because it is holding
+a real backlog instead of letting Redis throw a fifth of it away. That is a
+choice, and it has a dial: <code>INGEST_BATCH_ITEMS=200</code> reproduces the
+old footprint at the old throughput.</li>
+<li><strong>The ack owes a whole entry now.</strong> One entry carries many
+items, so acking on the first would retire it while its siblings were still
+unwritten &mdash; a crash there would be silent partial loss. The ack moved to
+the last item of each entry, and a failing item writes to the dead-letter queue
+<em>without</em> acking. A crash mid-entry therefore replays the envelope:
+duplicate writes rather than a silent hole, which is the trade the rest of this
+worker already makes.</li>
+</ul></section>
+
+<section><h2><span class="n">07</span>Verification</h2>
+<p>The equivalence test &mdash; the same signals written per-item and as a batch,
+then every row, counter and timestamp compared &mdash; still passes unchanged;
+the fold happens before it, at the decode. What is new is the pair of tests that
+pin the wire format on both sides of a deploy: the current shape must not parse
+as a legacy single-item job (it would silently lose every item but the first) and
+the legacy shape must not parse as the current one (it would dead-letter real,
+already-accepted telemetry, permanently &mdash; the DLQ has no reaper). The
+worker tries the current shape and falls back, so those two assertions are what
+make the fallback unambiguous rather than lucky.</p>
+<pre>cargo test -p sauron-core       45 passed
+cargo test -p sauron-pipeline   19 passed
+cargo test -p sauron-redis       4 passed   (verified non-skipping with --nocapture)
+cargo test -p sauron-db        145 passed
+cargo clippy --workspace --all-targets   clean</pre>
+<p>The Redis suite reports 0.00&thinsp;s, which is also what it reports when
+<code>TEST_REDIS_URL</code> is unset and every test returns early while still
+printing <code>ok</code>. It was re-run with <code>--nocapture</code> to confirm
+the skip message never appears.</p></section>
+
+<section><h2><span class="n">08</span>What is still on the table</h2>
+<ul>
+<li><strong>A backlog metric, and an alert.</strong> Still the highest-value item
+and still not done. &sect;05 shows the failure is reachable in sixty seconds of
+ordinary overload, and raising <code>INGEST_STREAM_MAXLEN</code> moves the cliff
+without removing it. The metric must come from stream offsets &mdash;
+<code>XLEN</code> counts acked-but-untrimmed entries and reads near the cap
+regardless.</li>
+<li><strong>The new defaults were swept on the pre-fold build.</strong> 8
+workers and a 200-entry ceiling were measured when an entry was an item. The
+item budget makes the ceiling mostly moot, but the pair deserves re-sweeping on
+the folded wire format before anyone treats 1,000 items as optimal rather than
+merely safe.</li>
+<li><strong>The sweep is one run per point.</strong> It justifies the new
+defaults; the exact optimum deserves repeats, and the top group is
+demand-limited rather than measured.</li>
+<li><strong>The lifecycle and identify tails</strong> are still per-item &mdash;
+genuinely rare, and the lifecycle path is an ordered state machine rather than a
+commutative counter, so it is not a like-for-like fold.</li>
+</ul></section>
+
+<footer>
+<div>Generated from the raw run files; every percentage in this document is
+computed by <code>gen_t3_report.py</code>, none transcribed.</div>
+<div>Before = the Tier&nbsp;2 build. After = the same tree plus the envelope
+fold, the two-round-trip edge and the insert chunking. Both arms driven by one
+crebain binary, at identical settings.</div>
+</footer>
+</div>

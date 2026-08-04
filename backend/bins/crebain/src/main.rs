@@ -134,10 +134,22 @@ async fn isolated_body(
             print_target(&target);
             let target_pid = guard.child_pid();
             // engine::run is safe to cancel mid-flight (it just aborts user tasks).
-            tokio::select! {
+            let ran = tokio::select! {
                 r = engine::run(cfg, &target, target_pid, plan) => Some(r),
                 _ = cancel.changed() => None,
+            };
+            // Hold the ingest open so the worker can finish draining what is
+            // still queued. Tearing down the instant the last request is sent
+            // makes a backlog indistinguishable from data the stream trimmed
+            // away — both show up only as rows that never arrived.
+            if ran.is_some() && icfg.drain_secs > 0 {
+                eprintln!("crebain: draining for {}s", icfg.drain_secs);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(icfg.drain_secs)) => {}
+                    _ = cancel.changed() => {}
+                }
             }
+            ran
         }
     }
 }
@@ -159,6 +171,7 @@ fn finish(ran: Option<Result<Summary>>, cfg: &RunConfig, mode_label: &str) -> Re
                     events_per_min: cfg.events_per_min,
                     issues_per_min: cfg.issues_per_min,
                     gzip: cfg.gzip,
+                    shape: cfg.shape,
                     generated_at: chrono::Utc::now()
                         .format("%Y-%m-%d %H:%M:%S UTC")
                         .to_string(),
@@ -224,6 +237,22 @@ fn print_banner(cfg: &RunConfig, mode: &Mode) {
     eprintln!("  events/user  {}/min", cfg.events_per_min);
     eprintln!("  issues/user  {}/min", cfg.issues_per_min);
     eprintln!("  gzip         {}", if cfg.gzip { "on" } else { "off" });
+    // Only shown when dialled away from the historical workload, so a default
+    // run's banner still reads exactly as it always has — and so a non-default
+    // run is impossible to mistake for a comparable baseline in a captured log.
+    if cfg.shape.workflow_ratio > 0.0 {
+        eprintln!(
+            "  workflows    {:.0}% of ticks",
+            cfg.shape.workflow_ratio * 100.0
+        );
+    }
+    if cfg.shape.batch_items > 1 {
+        eprintln!(
+            "  batch        {} ticks/envelope ({} items/request; --rps is still REQUESTS/s)",
+            cfg.shape.batch_items,
+            cfg.shape.batch_items * generator::ITEMS_PER_TICK
+        );
+    }
 }
 
 fn print_target(t: &Target) {

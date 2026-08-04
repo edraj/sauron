@@ -1,0 +1,330 @@
+<style>
+  :root {
+    --ground:#F2F5F7; --card:#FFFFFF; --ink:#171B23; --slate:#5C6779; --faint:#8A94A4;
+    --line:#DDE3EA; --line-2:#EDF1F5;
+    --measure:#14666F; --measure-w:#DCEDEF;
+    --deficit:#A63A3A; --deficit-w:#F6E3E1;
+    --flag:#8A5A12; --flag-w:#FBF0DC;
+    --shadow:0 1px 2px rgba(23,27,35,.05), 0 8px 24px -16px rgba(23,27,35,.28);
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono","Cascadia Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#0E1116; --card:#161B22; --ink:#E6EAF0; --slate:#98A3B4; --faint:#6B7688;
+      --line:#262D38; --line-2:#1D242D;
+      --measure:#4CC2CD; --measure-w:#123135;
+      --deficit:#EE7A72; --deficit-w:#3A1E1C;
+      --flag:#E0B368; --flag-w:#332916;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:#0E1116; --card:#161B22; --ink:#E6EAF0; --slate:#98A3B4; --faint:#6B7688;
+    --line:#262D38; --line-2:#1D242D;
+    --measure:#4CC2CD; --measure-w:#123135;
+    --deficit:#EE7A72; --deficit-w:#3A1E1C;
+    --flag:#E0B368; --flag-w:#332916;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+  }
+  :root[data-theme="light"] {
+    --ground:#F2F5F7; --card:#FFFFFF; --ink:#171B23; --slate:#5C6779; --faint:#8A94A4;
+    --line:#DDE3EA; --line-2:#EDF1F5;
+    --measure:#14666F; --measure-w:#DCEDEF;
+    --deficit:#A63A3A; --deficit-w:#F6E3E1;
+    --flag:#8A5A12; --flag-w:#FBF0DC;
+    --shadow:0 1px 2px rgba(23,27,35,.05), 0 8px 24px -16px rgba(23,27,35,.28);
+  }
+
+  body { background:var(--ground); color:var(--ink); font-family:var(--sans);
+         line-height:1.6; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:920px; margin:0 auto; padding:56px 24px 96px;
+           display:flex; flex-direction:column; gap:44px; }
+
+  .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.14em;
+              text-transform:uppercase; color:var(--faint); }
+  h1 { font-family:var(--serif); font-weight:600; font-size:clamp(30px,4.6vw,46px);
+        line-height:1.12; letter-spacing:-.015em; text-wrap:balance; margin:.28em 0 0; }
+  .standfirst { font-family:var(--serif); font-size:clamp(17px,2.1vw,20px);
+                 color:var(--slate); max-width:60ch; margin-top:.6em; }
+  h2 { font-family:var(--serif); font-weight:600; font-size:25px; letter-spacing:-.01em;
+        margin:0; text-wrap:balance; }
+  h2 .n { font-family:var(--mono); font-size:12px; color:var(--faint);
+           letter-spacing:.1em; margin-right:.7em; vertical-align:.28em; }
+  p { margin:0; max-width:66ch; }
+  section { display:flex; flex-direction:column; gap:14px; }
+  a { color:var(--measure); }
+  code { font-family:var(--mono); font-size:.88em;
+          background:var(--line-2); padding:.1em .34em; border-radius:3px; }
+
+  .prov { display:grid; grid-template-columns:repeat(auto-fit,minmax(132px,1fr));
+           gap:1px; background:var(--line); border:1px solid var(--line);
+           border-radius:8px; overflow:hidden; }
+  .prov div { background:var(--card); padding:11px 13px; }
+  .prov dt { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+              text-transform:uppercase; color:var(--faint); }
+  .prov dd { font-family:var(--mono); font-size:13px; margin:3px 0 0;
+              font-variant-numeric:tabular-nums; }
+
+  .scroll { overflow-x:auto; border:1px solid var(--line); border-radius:8px;
+             background:var(--card); box-shadow:var(--shadow); }
+  table { border-collapse:collapse; width:100%; min-width:520px; }
+  thead th { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+              text-transform:uppercase; color:var(--faint); font-weight:500;
+              text-align:right; padding:11px 16px; border-bottom:1px solid var(--line);
+              white-space:nowrap; }
+  thead th:first-child { text-align:left; }
+  tbody th { text-align:left; font-weight:500; font-size:14.5px; padding:12px 16px;
+              border-bottom:1px solid var(--line-2); vertical-align:top; }
+  tbody td { padding:12px 16px; border-bottom:1px solid var(--line-2);
+              text-align:right; white-space:nowrap; vertical-align:top; }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom:none; }
+  .num { font-family:var(--mono); font-size:14px; font-variant-numeric:tabular-nums; }
+  .before { color:var(--deficit); }
+  .after  { color:var(--measure); font-weight:600; }
+  .note { font-size:12.5px; color:var(--faint); font-weight:400; margin-top:2px;
+           white-space:normal; max-width:34ch; line-height:1.45; }
+  .pill { font-family:var(--mono); font-size:12.5px; font-variant-numeric:tabular-nums;
+           padding:3px 9px; border-radius:11px; display:inline-block; font-weight:600; }
+  .pill.up   { background:var(--measure-w); color:var(--measure); }
+  .pill.down { background:var(--deficit-w); color:var(--deficit); }
+  .pill.flat { background:var(--line-2); color:var(--faint); }
+
+  figure { margin:0; background:var(--card); border:1px solid var(--line);
+            border-radius:8px; padding:18px 16px 8px; box-shadow:var(--shadow); }
+  svg { display:block; width:100%; height:auto; }
+  .grid { stroke:var(--line-2); stroke-width:1; }
+  .ax { font-family:var(--mono); font-size:10px; fill:var(--faint); }
+  .ln-b { fill:none; stroke:var(--measure); stroke-width:2.4;
+           stroke-linejoin:round; stroke-linecap:round; }
+  .ln-a { fill:none; stroke:var(--deficit); stroke-width:2.4;
+           stroke-linejoin:round; stroke-linecap:round; }
+  figcaption { display:flex; flex-wrap:wrap; gap:18px; padding:12px 2px 8px;
+                font-size:13px; color:var(--slate); }
+  .key { display:flex; align-items:center; gap:7px; }
+  .sw { width:16px; height:3px; border-radius:2px; flex:none; }
+
+  .flag { border-left:3px solid var(--flag); background:var(--flag-w);
+           padding:16px 20px; border-radius:0 8px 8px 0;
+           display:flex; flex-direction:column; gap:10px; }
+  .flag h3 { font-family:var(--serif); font-size:18px; margin:0; font-weight:600; }
+  .flag p { font-size:14.5px; }
+
+  pre { font-family:var(--mono); font-size:12.5px; line-height:1.7; margin:0;
+         background:var(--card); border:1px solid var(--line); border-radius:8px;
+         padding:16px 18px; overflow-x:auto; color:var(--slate); }
+  ul { margin:0; padding-left:1.15em; max-width:66ch; }
+  li { margin-bottom:.5em; }
+  li::marker { color:var(--faint); }
+  footer { border-top:1px solid var(--line); padding-top:20px; font-size:13px;
+            color:var(--faint); display:flex; flex-direction:column; gap:8px; }
+
+  .dot-b { fill:var(--deficit); }
+  .dot-a { fill:var(--measure); }
+  .span  { stroke:var(--line); stroke-width:2.5; stroke-linecap:round; }
+  .lede { font-family:var(--serif); font-size:19px; color:var(--slate); }
+</style>
+<title>Tier 2: the workflow cliff</title>
+<div class="wrap">
+<header>
+<div class="eyebrow">Sauron &middot; ingest &middot; 3 August 2026 &middot; report 4</div>
+<h1>Tier&nbsp;2: the cliff the benchmark could not see</h1>
+<p class="standfirst">Two edits: fold the per-item workflow upserts into one
+statement, and stop the edge waiting once per envelope <em>item</em> for Redis.
+Neither could be measured first, because the load generator emitted no
+workflows at all and two-item envelopes &mdash; so three previous reports scored
+a workload in which both changes were structurally invisible. Fixing the
+instrument first, the fold is worth <strong>+157%</strong> of write
+throughput at the shipped default. And a sweep that changes no code at all found
+<strong>+64%</strong> sitting in an environment variable. Checking
+this round&rsquo;s numbers also turned up a defect in the benchmark harness that
+invalidates the CPU and memory rows of all three previous reports.</p></header>
+<dl class="prov">
+<div><dt>host</dt><dd>20 cores &middot; Linux 7.0.12</dd></div>
+<div><dt>runs</dt><dd>3&times;3 saturated &middot; 3&times;3 sustainable</dd></div>
+<div><dt>duration</dt><dd>60&thinsp;s each &middot; interleaved</dd></div>
+<div><dt>workload</dt><dd>60% workflow-tagged &middot; 15 items/envelope</dd></div>
+<div><dt>settings</dt><dd>8 workers &middot; pool 8 &middot; batch 50</dd></div>
+<div><dt>baseline</dt><dd>the Tier&nbsp;1 build</dd></div>
+</dl>
+
+<section><h2><span class="n">01</span>What changed</h2>
+<p>Two edits to the product, and one to the thing that measures it.</p>
+<ul>
+<li><strong>The workflow fold.</strong> <code>batch.rs</code> stage&nbsp;7 replayed
+<code>repo::bump_workflow</code> once per item carrying a workflow tag &mdash; one
+statement, and because diesel-async runs outside an explicit transaction, one
+commit and one round trip each. For an app that tags its traffic, the batched
+write path amortized everything else and then paid <code>batch_size</code>
+single-row upserts anyway. Now folded by <code>(app_id, workflow_id)</code> and
+written as one <code>unnest</code> upsert.</li>
+<li><strong>The edge&rsquo;s XADDs.</strong> <code>sauron-ingest</code> enqueued one
+item per <code>XADD</code>, awaiting each. A 16-item envelope paid 16 sequential
+network waits for commands that were always issued back-to-back with nothing
+decided in between. Now one pipelined round trip.</li>
+<li><strong>The instrument.</strong> <code>crebain</code> gained
+<code>--workflow-ratio</code> and <code>--batch-items</code>. Both default to
+today&rsquo;s behaviour, so old benchmark commands reproduce old workloads.</li>
+</ul></section>
+
+<section><h2><span class="n">02</span>Why the previous three reports could not have found this</h2>
+<p>The generator hardcoded <code>workflow_id: None</code> on every item it
+built, and shipped envelopes of one or two items. So the per-item workflow
+upsert never executed during a benchmark, and the edge never enqueued enough
+items in one request for the round trips to matter.</p>
+<p>That is a specific and repeatable failure: a load generator that does not
+generate a signal makes the code handling that signal <em>invisible</em>, not
+merely under-weighted. Nothing in the previous reports was wrong &mdash; they
+measured what they drove. They just could not have found this, and neither
+could any amount of re-reading the numbers.</p>
+<div class="flag"><h3>The measurement had to come before the optimisation</h3>
+<p>The order here was: teach the generator to produce the traffic, confirm the
+traffic lands (22,030 workflow rows in a smoke run, 16 items per envelope), and
+only then measure. Had the edits landed first, the benchmark would have
+reported a clean 0% and both would have looked worthless.</p></div></section>
+
+<section><h2><span class="n">03</span>The free +64%: a config sweep, no code</h2>
+<p><code>INGEST_BATCH_SIZE</code> is env-overridable and has sat at
+<strong>50</strong> since before the batched write path existed, when it only
+bounded how long a worker went between Redis reads. Under batching it is the
+amortization factor for every statement. Swept on the <em>before</em> build:</p>
+<div class="scroll"><table>
+<thead><tr><th>INGEST_BATCH_SIZE</th><th>items written / s</th><th>commits / item</th><th>vs 50</th></tr></thead>
+<tbody><tr><th>50 <em>(shipped default)</em></th><td class="num">2,564</td><td class="num">1.445</td><td>&mdash;</td></tr><tr><th>200</th><td class="num">4,209</td><td class="num">1.309</td><td><span class="pill up">+64.1%</span></td></tr><tr><th>500</th><td class="num">4,090</td><td class="num">1.288</td><td><span class="pill up">+59.5%</span></td></tr><tr><th>1000</th><td class="num">4,047</td><td class="num">1.274</td><td><span class="pill up">+57.8%</span></td></tr><tr><th>2000</th><td class="num">3,060</td><td class="num">1.278</td><td><span class="pill up">+19.3%</span></td></tr></tbody></table></div>
+<figure><svg viewBox="0 0 640 200" role="img" aria-label="Items written per second by INGEST_BATCH_SIZE; 50 is the lowest at 2,564 and 200 the highest at 4,209."><line class="grid" x1="34" y1="166" x2="606" y2="166"/><rect class="dot-b" x="59.7" y="75.7" width="62.9" height="90.3" rx="2"/><text class="ax" x="91.2" y="69.7" text-anchor="middle">2,564</text><rect class="dot-a" x="174.1" y="17.8" width="62.9" height="148.2" rx="2"/><text class="ax" x="205.6" y="11.8" text-anchor="middle">4,209</text><rect class="dot-b" x="288.5" y="22.0" width="62.9" height="144.0" rx="2"/><text class="ax" x="320.0" y="16.0" text-anchor="middle">4,090</text><rect class="dot-b" x="402.9" y="23.5" width="62.9" height="142.5" rx="2"/><text class="ax" x="434.4" y="17.5" text-anchor="middle">4,047</text><rect class="dot-b" x="517.3" y="58.3" width="62.9" height="107.7" rx="2"/><text class="ax" x="548.8" y="52.3" text-anchor="middle">3,060</text><text class="ax" x="91.2" y="181.0" text-anchor="middle">50</text><text class="ax" x="205.6" y="181.0" text-anchor="middle">200</text><text class="ax" x="320.0" y="181.0" text-anchor="middle">500</text><text class="ax" x="434.4" y="181.0" text-anchor="middle">1000</text><text class="ax" x="548.8" y="181.0" text-anchor="middle">2000</text></svg><figcaption><span class="key">items written per second &middot; INGEST_BATCH_SIZE along the axis &middot; one 60&thinsp;s run each</span></figcaption></figure>
+<p><strong>200 is the knee</strong>; 200&ndash;1000 is a plateau and 2000
+regresses. One run per point &mdash; enough to establish a 64% step,
+not enough to rank 200 against 500.</p>
+<p>Note what <em>doesn&rsquo;t</em> move: <code>commits/item</code> falls only from
+1.445 to 1.278 while throughput jumps
+64%. That is the workflow cliff&rsquo;s fingerprint &mdash; those commits
+are per <em>item</em>, so no batch size can amortize them. Batch size and the
+fold attack different terms, which is why the next section is not redundant
+with this one.</p></section>
+
+<section><h2><span class="n">04</span>The fold, at saturation</h2>
+<p>Offered load is 11,668 items/s, which neither build can drain,
+so what is measured here is capacity. Three runs per arm, interleaved
+before/after/before/&hellip; rather than grouped, because this machine&rsquo;s state
+drifts across back-to-back runs and grouping would put that drift inside the
+comparison.</p>
+<div class="scroll"><table>
+<thead><tr><th>at saturation</th><th>before</th><th>after</th><th>&Delta;</th></tr></thead>
+<tbody><tr><th>items written / s<div class="note">The drain rate. Offered load is 11,668 items/s &mdash; 3.2&times; the before arm and 1.2&times; the after arm &mdash; so this is capacity, not demand.</div></th><td class="num before">3,701</td><td class="num after">9,504</td><td><span class="pill up">+156.8%</span></td></tr><tr><th>Postgres commits / item<div class="note">diesel-async runs outside an explicit transaction, so one statement is one commit.</div></th><td class="num before">1.408</td><td class="num after">0.252</td><td><span class="pill up">-82.1%</span></td></tr><tr><th>CPU-s per 1k items<div class="note">ingest process, utime+stime from /proc &mdash; resolved by executable this time, see &sect;06.</div></th><td class="num before">0.2989</td><td class="num after">0.1370</td><td><span class="pill up">-54.2%</span></td></tr><tr><th>peak RSS (MB)<div class="note">A bigger fold holds more rows before flushing.</div></th><td class="num before">75.8</td><td class="num after">81.4</td><td><span class="pill flat">+7.3% ~</span></td></tr><tr><th>edge p50 (ms)<div class="note">Edge latency at saturation, where the queue is already full.</div></th><td class="num before">2.13</td><td class="num after">1.26</td><td><span class="pill up">-40.9%</span></td></tr><tr><th>edge p99 (ms)<div class="note"></div></th><td class="num before">4.14</td><td class="num after">2.85</td><td><span class="pill up">-31.1%</span></td></tr></tbody></table></div>
+<figure><svg viewBox="0 0 640 220" role="img" aria-label="Rows landing in Postgres over one 60-second saturated run. The after build&rsquo;s line rises more steeply throughout."><line class="grid" x1="36" y1="184" x2="604" y2="184"/><line class="grid" x1="36" y1="36" x2="604" y2="36"/><path class="ln-a" d="M36.0,183.9 L46.7,181.2 L57.4,178.5 L68.1,175.9 L78.9,173.2 L89.7,170.4 L100.5,168.8 L111.3,167.9 L122.0,167.2 L132.8,166.4 L143.4,165.6 L154.3,164.7 L165.0,163.9 L175.8,163.1 L186.5,162.2 L197.4,161.3 L208.2,160.5 L218.9,159.7 L229.8,158.9 L240.4,158.0 L251.3,157.2 L262.1,156.3 L272.9,155.4 L283.9,154.6 L294.9,153.8 L305.8,152.9 L316.6,152.0 L327.5,151.3 L338.2,150.6 L349.5,149.9 L360.5,149.1 L371.6,148.3 L382.6,147.5 L393.5,146.8 L404.3,145.9 L415.2,145.0 L426.1,144.2 L437.0,143.3 L447.9,142.5 L458.7,141.7 L469.9,140.8 L480.9,139.9 L491.8,139.1 L502.6,138.3 L513.6,137.4 L524.5,136.5 L535.5,135.7 L546.6,134.8 L557.7,134.0 L568.6,133.2 L579.7,132.3 L590.7,131.5 L601.5,130.7"/><path class="ln-b" d="M36.0,184.0 L46.7,182.7 L57.4,181.5 L68.0,180.1 L78.8,175.5 L89.6,170.9 L100.5,168.2 L111.3,165.4 L122.0,162.8 L132.7,160.1 L143.4,157.4 L154.3,154.7 L165.4,151.9 L176.3,149.2 L187.3,146.5 L198.2,143.7 L209.2,141.0 L220.2,138.2 L231.3,135.4 L242.6,132.6 L254.0,129.8 L265.1,127.0 L276.4,124.1 L287.6,121.3 L298.8,118.5 L310.1,115.8 L321.5,112.9 L333.2,110.9 L344.5,109.3 L355.9,107.1 L367.3,104.5 L378.8,102.0 L390.3,98.9 L401.9,95.7 L413.4,92.7 L425.1,89.8 L436.8,86.6 L448.6,83.6 L460.5,80.4 L472.3,77.3 L484.1,74.5 L495.7,72.8 L507.5,69.7 L519.6,66.4 L531.8,63.1 L543.6,60.0 L555.5,56.8 L567.7,53.6 L579.7,50.6 L591.8,47.5 L604.0,44.4"/><text class="ax" x="36" y="28">598,498 rows</text><text class="ax" x="36" y="199">0&thinsp;s</text><text class="ax" x="604" y="199" text-anchor="end">60&thinsp;s</text></svg><figcaption><span class="key"><span class="sw" style="background:var(--deficit)"></span>before</span><span class="key"><span class="sw" style="background:var(--measure)"></span>after</span><span class="key">rows in Postgres, one saturated run each</span></figcaption></figure>
+<div class="flag"><h3>+157% is a floor, not a ceiling</h3>
+<p>The offered rate is 3.2&times; what the before build drains but only
+1.2&times; what the after build drains &mdash; the after arm absorbs
+81% of everything sent to it, so it
+is close to being limited by demand rather than by itself. Its true capacity is
+somewhere above the figure in this table. Sizing the gap properly needs a
+higher offered rate than these runs used.</p></div>
+<p class="lede">Greyed pills mark rows where the two sets of runs overlap. A
+mean difference smaller than the run-to-run spread is not a result, and is not
+reported as one.</p></section>
+
+<section><h2><span class="n">05</span>The pipeline, at sustainable load</h2>
+<p>Offered load here is 1,182 items/s, below both builds&rsquo;
+capacity, so nothing backs up and latency means something. This is where the edge change shows: the
+<code>XADD</code> <em>commands</em> are identical in both arms &mdash; the same
+number, with the same arguments &mdash; and only the number of times the edge
+waits for the network changes.</p>
+<div class="scroll"><table>
+<thead><tr><th>at sustainable load</th><th>before</th><th>after</th><th>&Delta;</th></tr></thead>
+<tbody><tr><th>Redis round trips / request<div class="note">Measured from <code>total_reads_processed</code>, not derived. <code>INFO commandstats</code> counts COMMANDS and shows nothing here.</div></th><td class="num before">19.3</td><td class="num after">11.0</td><td><span class="pill up">-43.0%</span></td></tr><tr><th>edge p50 (ms)<div class="note">The round trips the edge no longer waits for, in wall-clock.</div></th><td class="num before">1.97</td><td class="num after">1.15</td><td><span class="pill up">-41.5%</span></td></tr><tr><th>edge p99 (ms)<div class="note"></div></th><td class="num before">3.27</td><td class="num after">1.95</td><td><span class="pill up">-40.5%</span></td></tr><tr><th>edge max (ms)<div class="note"></div></th><td class="num before">27.72</td><td class="num after">28.17</td><td><span class="pill flat">+1.6% ~</span></td></tr><tr><th>items written / s<div class="note">Expected null: offered load is below both builds&rsquo; capacity, so there is no backlog to drain faster.</div></th><td class="num before">1,439</td><td class="num after">1,439</td><td><span class="pill up">+0.0%</span></td></tr><tr><th>Postgres commits / item<div class="note">The fold applies at any load.</div></th><td class="num before">2.204</td><td class="num after">1.255</td><td><span class="pill up">-43.1%</span></td></tr><tr><th>XADD commands<div class="note">Unchanged on purpose &mdash; the same commands are sent, in one round trip instead of N.</div></th><td class="num before">120,179</td><td class="num after">120,179</td><td><span class="pill flat">+0.0% ~</span></td></tr></tbody></table></div>
+<div class="flag"><h3><code>INFO commandstats</code> cannot see this change</h3>
+<p>It counts commands, and the command count is deliberately unchanged. The
+round-trip figures above come from <code>total_reads_processed</code> in
+<code>INFO stats</code>, which counts read events &mdash; one per pipelined batch.
+Had this report leaned on <code>commandstats</code>, as the Tier&nbsp;1 one had to
+for breadcrumbs, the edge change would have scored exactly zero.</p></div>
+</section>
+
+<section><h2><span class="n">06</span>A correction to the previous three reports</h2>
+<p>While checking this round&rsquo;s numbers, the CPU column came back as exactly
+zero against 3.3&thinsp;MB of resident memory &mdash; which is not a plausible
+server, it is a <code>bash</code> process. The harness had been resolving the
+process to sample with:</p>
+<pre>INGEST_PID=$(pgrep -f "$INGEST_BIN" | head -1)</pre>
+<p>That path string also appears in this script&rsquo;s own argv, in the wrapper
+shell&rsquo;s, and in crebain&rsquo;s &mdash; crebain is launched with
+<code>--ingest-bin &lt;path&gt;</code>. <code>pgrep</code> lists ascending by pid,
+and crebain is the <em>parent</em> that spawns the ingest, so its pid always
+sorted first. <strong>The CPU and RSS columns of reports 1&ndash;3 measured the
+load generator.</strong></p>
+<p>Sampling both processes at once shows they are nowhere near
+interchangeable:</p>
+<div class="scroll"><table>
+<thead><tr><th>at 800 req/s</th><th>CPU-s</th><th>peak RSS</th></tr></thead>
+<tbody>
+<tr><th>ingest (what was wanted)</th><td class="num after">23.3</td><td class="num after">59.9 MB</td></tr>
+<tr><th>crebain (what was measured)</th><td class="num before">5.4</td><td class="num before">15.6 MB</td></tr>
+</tbody></table></div>
+<p>Resolution is now by <em>executable</em> &mdash; <code>pgrep -x</code> plus a
+<code>readlink /proc/&lt;pid&gt;/exe</code> comparison, which is also what
+distinguishes the before build from the after build when both binaries share a
+filename &mdash; and the harness aborts the run if it resolves to nothing, because
+an all-zero CPU column is indistinguishable from an infinitely fast server.
+crebain is now sampled into its own columns so the two can never be silently
+swapped again.</p>
+<p>What survives: every throughput, round-trip, commit and row-count figure in
+those reports, which came from Postgres and Redis rather than from
+<code>/proc</code>. That includes the soak&rsquo;s central finding of silently
+trimmed events. What does not: their CPU-per-event and RSS rows. The soak&rsquo;s
+&ldquo;RSS 45&thinsp;MB&nbsp;&rarr;&nbsp;461&thinsp;MB&rdquo; was crebain&rsquo;s
+memory &mdash; in-flight requests piling up in the client as the server slowed,
+which is a symptom of the collapse rather than evidence about its cause.</p>
+</section>
+
+<section><h2><span class="n">07</span>Verification</h2>
+<p>The existing equivalence test drives the same signals through
+<code>process_job</code> (per-item) and <code>process_batch</code> (folded) into
+two apps and compares what lands. It covered issues, sessions, devices and
+<code>event_users</code> &mdash; not workflows, which is exactly the table this
+round moved into the batched path.</p>
+<p>It now does, and the fixture was built around one specific trap. The
+conflict arm reads
+<code>COALESCE(workflows.session_id, EXCLUDED.session_id)</code> &mdash; the
+row&rsquo;s existing value first &mdash; so under sequential upserts the
+<em>first</em> non-null value sticks. The session fold next to it is written
+<code>COALESCE(EXCLUDED.x, sessions.x)</code>, where the <em>last</em> wins. A
+fold copied from its neighbour would be wrong in a way no counter, timestamp or
+row count would reveal. The fixture puts a workflow&rsquo;s first signal on one
+session and its later signals on another, and pins the result.</p>
+<pre>cargo test -p sauron-pipeline   16 passed   (2.56s, both TEST_ URLs set)
+cargo test -p sauron-redis       3 passed   (0.24s)
+cargo clippy --workspace --all-targets   clean</pre>
+<p>The timings matter: a run of this suite that finishes in 0.00&thinsp;s is one
+where the database-backed tests silently skipped on unset
+<code>TEST_DATABASE_URL</code>/<code>TEST_REDIS_URL</code> while still printing
+<code>ok</code>.</p></section>
+
+<section><h2><span class="n">08</span>What is still on the table</h2>
+<ul>
+<li><strong>A backlog metric, and an alert.</strong> Still the highest-value item
+and still not done. <code>MAXLEN ~1,000,000</code> is hardcoded at the
+<code>xadd_job</code> call site, and every saturated run in this report crossed
+it &mdash; Redis trimmed unread entries while the edge went on truthfully
+reporting <code>100% accepted</code>. Must be derived from stream offsets;
+<code>XLEN</code> reads near the cap regardless.</li>
+<li><strong>One stream entry per envelope.</strong> Every item re-serializes the
+whole shared header &mdash; ids, release, ip, user agent, sdk, and the full
+context blob. At 15 items per envelope that is
+15 copies into Redis and 15 parses back out.
+The largest byte-level win left, and a wire-format change.</li>
+<li><strong>Ship a better <code>INGEST_BATCH_SIZE</code> default.</strong> The
+sweep above is one run per point; it justifies a change but the exact value
+deserves repeats.</li>
+<li><strong>The lifecycle and identify tails</strong> are still per-item. They are
+genuinely rare, unlike the workflow bumps, and the lifecycle path is an ordered
+state machine rather than a commutative counter &mdash; not a like-for-like fold.</li>
+</ul></section>
+
+<footer>
+<div>Generated from the raw run files; every percentage in this document is
+computed by <code>gen_t2_report.py</code>, none transcribed.</div>
+<div>Before = the Tier&nbsp;1 build. After = the same tree plus the workflow fold
+and the pipelined edge enqueue. Both driven by one crebain binary.</div>
+</footer>
+</div>

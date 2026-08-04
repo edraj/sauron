@@ -165,22 +165,122 @@ impl RedisStore {
         Ok(count as u64 <= limit as u64)
     }
 
+    /// Apply several fixed-window counters in ONE round trip.
+    ///
+    /// The ingest edge checks two of these per request — one per key, one per
+    /// app — and they were two sequential Redis waits because the second one's
+    /// key was not known until the first had returned and the DSN had been
+    /// resolved. Once the app is resolved from a process-local cache both keys
+    /// are known up front, and nothing is decided between them, so the waits
+    /// were the only thing two round trips bought.
+    ///
+    /// Every counter is incremented even when an earlier one is already over
+    /// its limit. That is deliberate and matches the sequential version's
+    /// observable behaviour closely enough: a fixed window counts attempts, and
+    /// a rejected request having also counted against the app's window is the
+    /// safe direction to err in.
+    ///
+    /// The expiry costs a second round trip, but only on the request that opens
+    /// a window — one in `limit`, not one in one.
+    pub async fn rate_limit_ok_many(
+        &self,
+        counters: &[(&str, u32)],
+        window_secs: u64,
+    ) -> anyhow::Result<Vec<bool>> {
+        if counters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut c = self.conn.clone();
+        let mut pipe = redis::pipe();
+        for (key, _) in counters {
+            pipe.cmd("INCR").arg(*key);
+        }
+        let counts: Vec<i64> = pipe.query_async(&mut c).await?;
+
+        let fresh: Vec<&str> = counters
+            .iter()
+            .zip(&counts)
+            .filter(|(_, n)| **n == 1)
+            .map(|((key, _), _)| *key)
+            .collect();
+        if !fresh.is_empty() {
+            let mut exp = redis::pipe();
+            for key in &fresh {
+                exp.cmd("EXPIRE").arg(*key).arg(window_secs);
+            }
+            // A counter that outlives its window would rate-limit the app
+            // forever, so this failing is worth surfacing rather than ignoring
+            // — the caller treats it the same way it treats any limiter error.
+            exp.query_async::<()>(&mut c).await?;
+        }
+
+        Ok(counters
+            .iter()
+            .zip(counts)
+            .map(|((_, limit), n)| n as u64 <= *limit as u64)
+            .collect())
+    }
+
     // --- ingest stream ----------------------------------------------------
 
     /// Enqueue a JSON job onto the ingest stream (trimmed to ~`maxlen`).
     pub async fn xadd_job(&self, payload: &str, maxlen: usize) -> anyhow::Result<String> {
-        let mut c = self.conn.clone();
-        let id: String = redis::cmd("XADD")
-            .arg(keys::INGEST_STREAM)
-            .arg("MAXLEN")
-            .arg("~")
-            .arg(maxlen)
-            .arg("*")
-            .arg("d")
-            .arg(payload)
-            .query_async(&mut c)
+        let mut ids = self
+            .xadd_jobs(std::slice::from_ref(&payload), maxlen)
             .await?;
-        Ok(id)
+        // Exactly one command went out, so exactly one reply came back; the
+        // per-entry error is flattened into the outer one for this shape.
+        Ok(ids.remove(0)?)
+    }
+
+    /// Enqueue many jobs in ONE round trip.
+    ///
+    /// One `XADD` per payload, pipelined. The commands were always issued
+    /// back-to-back with nothing decided in between, so this changes only how
+    /// many times the caller waits for the network — an envelope carrying N
+    /// items used to pay N sequential round trips.
+    ///
+    /// **The ingest edge no longer calls this with more than one payload.** It
+    /// now enqueues an envelope as a single entry carrying every item, which
+    /// subsumes the saving this method was written for and adds the ones
+    /// pipelining could not reach: the envelope header is serialized, stored
+    /// and parsed once instead of N times, and `MAXLEN` counts one entry rather
+    /// than N. Kept because the many-payload shape is still the correct
+    /// primitive for any caller that has genuinely independent jobs to enqueue.
+    ///
+    /// Deliberately NOT `.atomic()`: a plain pipeline is a batched send, not
+    /// `MULTI`/`EXEC`, so entries from concurrent requests still interleave in
+    /// the stream exactly as they did when this was a loop of awaits. The
+    /// stream has no ordering requirement across envelopes, and making it a
+    /// transaction would make a single bad entry discard the whole envelope.
+    ///
+    /// Returns one entry per payload, in order, so a caller can still report
+    /// exactly which items were accepted: `ignore_errors` keeps a rejected
+    /// `XADD` from discarding its neighbours' replies, which is what the
+    /// sequential loop did. The outer `Err` is transport failure, where
+    /// nothing is known to have landed.
+    pub async fn xadd_jobs(
+        &self,
+        payloads: &[&str],
+        maxlen: usize,
+    ) -> anyhow::Result<Vec<redis::RedisResult<String>>> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        pipe.ignore_errors();
+        for payload in payloads {
+            pipe.cmd("XADD")
+                .arg(keys::INGEST_STREAM)
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(maxlen)
+                .arg("*")
+                .arg("d")
+                .arg(*payload);
+        }
+        let mut c = self.conn.clone();
+        Ok(pipe.query_async(&mut c).await?)
     }
 
     /// Ensure the consumer group exists (idempotent; ignores BUSYGROUP).
@@ -278,8 +378,37 @@ impl RedisStore {
         Ok(())
     }
 
+    /// Acknowledge a whole batch. `XACK` is variadic, so N entries cost one
+    /// round trip instead of N — which matters once the write path stops being
+    /// the bottleneck and per-entry Redis chatter becomes visible.
+    pub async fn ack_many(&self, ids: &[String]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut c = self.conn.clone();
+        let mut cmd = redis::cmd("XACK");
+        cmd.arg(keys::INGEST_STREAM).arg(keys::CONSUMER_GROUP);
+        for id in ids {
+            cmd.arg(id);
+        }
+        cmd.query_async::<i64>(&mut c).await?;
+        Ok(())
+    }
+
     /// Dead-letter a permanently failing job, then ack it off the main stream.
     pub async fn dead_letter(&self, id: &str, payload: &str) -> anyhow::Result<()> {
+        self.dlq_push(payload).await?;
+        self.ack(id).await
+    }
+
+    /// Write to the dead-letter queue WITHOUT acking the stream entry.
+    ///
+    /// One stream entry now carries a whole envelope, so a single item failing
+    /// must not retire the entry its untouched siblings are still waiting in.
+    /// The caller acks once, after the last item of the entry has been handled;
+    /// until then a crash costs a redelivery (duplicate writes) rather than
+    /// silently dropping the remainder of the envelope.
+    pub async fn dlq_push(&self, payload: &str) -> anyhow::Result<()> {
         let mut c = self.conn.clone();
         redis::cmd("XADD")
             .arg(keys::INGEST_DLQ)
@@ -288,19 +417,42 @@ impl RedisStore {
             .arg(payload)
             .query_async::<()>(&mut c)
             .await?;
-        self.ack(id).await
+        Ok(())
     }
 
     // --- affected-user HyperLogLog ---------------------------------------
 
-    pub async fn pf_add(&self, key: &str, member: &str) -> anyhow::Result<()> {
+    /// Add a member, returning whether the estimate actually CHANGED.
+    ///
+    /// The bool is what makes the caller's follow-up `PFCOUNT` + `issues
+    /// .users_seen` write skippable. `PFADD` replies 1 only when the register
+    /// was modified, so once a person has been seen on an issue every later
+    /// occurrence answers 0 and there is nothing to recompute. Discarding this
+    /// meant re-writing an unchanged count on every single error event, and
+    /// that `UPDATE issues` deadlocked against the issue upsert often enough to
+    /// dominate the write path.
+    pub async fn pf_add(&self, key: &str, member: &str) -> anyhow::Result<bool> {
+        self.pf_add_many(key, std::slice::from_ref(&member)).await
+    }
+
+    /// The batched form. `PFADD` is variadic and replies 1 when ANY register
+    /// moved, which is exactly the per-ISSUE signal the caller acts on — so a
+    /// whole batch's members for one issue collapse into a single round trip
+    /// without changing the answer. Members need not be distinct.
+    ///
+    /// Empty `members` returns false rather than issuing `PFADD key` with no
+    /// arguments, which Redis rejects.
+    pub async fn pf_add_many(&self, key: &str, members: &[&str]) -> anyhow::Result<bool> {
+        if members.is_empty() {
+            return Ok(false);
+        }
         let mut c = self.conn.clone();
-        redis::cmd("PFADD")
+        let added: i64 = redis::cmd("PFADD")
             .arg(key)
-            .arg(member)
-            .query_async::<i64>(&mut c)
+            .arg(members)
+            .query_async(&mut c)
             .await?;
-        Ok(())
+        Ok(added == 1)
     }
 
     pub async fn pf_count(&self, key: &str) -> anyhow::Result<i64> {
@@ -319,21 +471,32 @@ impl RedisStore {
         cap: isize,
         ttl_secs: u64,
     ) -> anyhow::Result<()> {
+        // One round trip, not three. The three commands were always issued
+        // back-to-back against the same key with nothing decided in between, so
+        // pipelining changes only how many times the worker waits for the
+        // network.
+        //
+        // Deliberately NOT `.atomic()`. A plain pipeline is a batched send, not
+        // `MULTI`/`EXEC` — other clients still interleave between these three,
+        // exactly as they could when this was three separate awaits. That keeps
+        // the observable behaviour identical to what it replaced. Interleaving
+        // is harmless here: concurrent pushes to one key just mean `LTRIM` runs
+        // twice against the same cap, which is idempotent.
         let mut c = self.conn.clone();
-        redis::cmd("LPUSH")
+        redis::pipe()
+            .cmd("LPUSH")
             .arg(key)
             .arg(json)
-            .query_async::<i64>(&mut c)
-            .await?;
-        redis::cmd("LTRIM")
+            .ignore()
+            .cmd("LTRIM")
             .arg(key)
             .arg(0)
             .arg(cap - 1)
-            .query_async::<()>(&mut c)
-            .await?;
-        redis::cmd("EXPIRE")
+            .ignore()
+            .cmd("EXPIRE")
             .arg(key)
             .arg(ttl_secs)
+            .ignore()
             .query_async::<()>(&mut c)
             .await?;
         Ok(())
@@ -422,5 +585,256 @@ impl SymbolBlobCache {
         {
             tracing::debug!(error = %e, "symbol blob cache put failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod hll_tests {
+    use super::*;
+
+    async fn store() -> Option<RedisStore> {
+        let url = std::env::var("TEST_REDIS_URL").ok()?;
+        RedisStore::connect(&url).await.ok()
+    }
+
+    /// The batched write path folds a whole batch's members for one issue into
+    /// a single `PFADD`. If the slice were sent as ONE argument instead of many
+    /// the call would still succeed, still return 1, and still leave a usable
+    /// HyperLogLog — it would just be counting the concatenation as one person.
+    /// Nothing downstream could tell. So the count is asserted, not the reply.
+    #[tokio::test]
+    async fn pf_add_many_counts_each_member_separately() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:hll:{}", uuid::Uuid::new_v4());
+
+        assert!(
+            redis.pf_add_many(&key, &["a", "b", "c"]).await.unwrap(),
+            "first insert must report the estimate moved"
+        );
+        assert_eq!(
+            redis.pf_count(&key).await.unwrap(),
+            3,
+            "three distinct members must count as three, not as one concatenated blob"
+        );
+
+        // The whole point of the bool: a batch of people already seen must do
+        // no `issues.users_seen` write at all.
+        assert!(
+            !redis.pf_add_many(&key, &["a", "b"]).await.unwrap(),
+            "re-adding known members must report no change"
+        );
+        assert!(
+            redis.pf_add_many(&key, &["a", "d"]).await.unwrap(),
+            "one new member among known ones must report a change"
+        );
+        assert_eq!(redis.pf_count(&key).await.unwrap(), 4);
+
+        // The single-member form is the same call, and must still agree.
+        assert!(!redis.pf_add(&key, "a").await.unwrap());
+        assert!(redis.pf_add(&key, "e").await.unwrap());
+        assert_eq!(redis.pf_count(&key).await.unwrap(), 5);
+
+        // Empty is a no-op, not a malformed `PFADD key` with no arguments.
+        assert!(!redis.pf_add_many(&key, &[]).await.unwrap());
+        assert_eq!(redis.pf_count(&key).await.unwrap(), 5);
+
+        let mut c = redis.conn.clone();
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// The breadcrumb push became one pipeline instead of three awaits. A
+    /// pipeline that silently dropped a command would still return `Ok(())`,
+    /// so all three effects are asserted: the entry is at the head, the list
+    /// is capped, and the key carries a TTL.
+    #[tokio::test]
+    async fn push_breadcrumbs_pushes_trims_and_expires_in_one_pipeline() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:bc:{}", uuid::Uuid::new_v4());
+        let mut c = redis.conn.clone();
+
+        for i in 0..5 {
+            redis
+                .push_breadcrumbs(&key, &format!("[{i}]"), 3, 60)
+                .await
+                .unwrap();
+        }
+
+        let len: i64 = redis::cmd("LLEN")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(len, 3, "LTRIM must hold the list at the cap");
+
+        let head: String = redis::cmd("LINDEX")
+            .arg(&key)
+            .arg(0)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            head, "[4]",
+            "LPUSH must put the newest breadcrumb at the head"
+        );
+        let tail: String = redis::cmd("LINDEX")
+            .arg(&key)
+            .arg(2)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            tail, "[2]",
+            "the three most recent must survive, oldest-first at the tail"
+        );
+
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(
+            (1..=60).contains(&ttl),
+            "EXPIRE must be applied; got TTL {ttl}"
+        );
+
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A pipelined `XADD` batch must land every entry, in order, and report one
+    /// result per payload — the edge counts those results to tell the SDK how
+    /// many items it accepted, so a reply vector that is short, reordered, or
+    /// collapsed to a single verdict would silently mis-report delivery.
+    #[tokio::test]
+    async fn xadd_jobs_enqueues_every_payload_in_order() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let mut c = redis.conn.clone();
+        // The stream name is a const, so isolate by draining it first rather
+        // than by using a unique key.
+        let _: () = redis::cmd("DEL")
+            .arg(keys::INGEST_STREAM)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+
+        let payloads = ["{\"n\":1}", "{\"n\":2}", "{\"n\":3}"];
+        let results = redis.xadd_jobs(&payloads, 100).await.unwrap();
+        assert_eq!(results.len(), 3, "one result per payload");
+        assert!(results.iter().all(|r| r.is_ok()), "all three accepted");
+
+        let len: i64 = redis::cmd("XLEN")
+            .arg(keys::INGEST_STREAM)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(len, 3, "every payload must reach the stream");
+
+        // Stream order must match argument order: the worker reads entries in
+        // stream order, and an envelope's items are not independent (a
+        // breadcrumb batch preceding its error, for one).
+        let entries: Vec<(String, Vec<String>)> = redis::cmd("XRANGE")
+            .arg(keys::INGEST_STREAM)
+            .arg("-")
+            .arg("+")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let bodies: Vec<&str> = entries.iter().map(|(_, kv)| kv[1].as_str()).collect();
+        assert_eq!(bodies, payloads);
+
+        // Empty is a no-op, not an `XADD` with no field/value pair (which
+        // Redis rejects) and not a spurious entry.
+        assert!(redis.xadd_jobs(&[], 100).await.unwrap().is_empty());
+        let len: i64 = redis::cmd("XLEN")
+            .arg(keys::INGEST_STREAM)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(len, 3);
+
+        let _: () = redis::cmd("DEL")
+            .arg(keys::INGEST_STREAM)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// Two limiters in one round trip must give each key its OWN count and its
+    /// own verdict. Sharing a counter, or returning one verdict for both, would
+    /// make an app inherit its key's traffic (or the reverse) and start
+    /// rejecting at half the configured rate.
+    #[tokio::test]
+    async fn pipelined_rate_limits_are_independent_and_expire() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let mut c = redis.conn.clone();
+        let a = format!("sauron:test:rl:a:{}", uuid::Uuid::new_v4());
+        let b = format!("sauron:test:rl:b:{}", uuid::Uuid::new_v4());
+
+        // First call opens both windows: counts are 1, both under their limits.
+        let v = redis
+            .rate_limit_ok_many(&[(a.as_str(), 2), (b.as_str(), 100)], 60)
+            .await
+            .unwrap();
+        assert_eq!(v, vec![true, true]);
+
+        // The window must actually expire. A counter with no TTL never resets,
+        // which rate-limits the app permanently after `limit` requests.
+        for key in [&a, &b] {
+            let ttl: i64 = redis::cmd("TTL")
+                .arg(key)
+                .query_async(&mut c)
+                .await
+                .unwrap();
+            assert!((1..=60).contains(&ttl), "EXPIRE must be applied; got {ttl}");
+        }
+
+        // Second call: `a` reaches its limit of 2 and is still allowed.
+        let v = redis
+            .rate_limit_ok_many(&[(a.as_str(), 2), (b.as_str(), 100)], 60)
+            .await
+            .unwrap();
+        assert_eq!(v, vec![true, true]);
+
+        // Third: `a` is over, `b` is nowhere near. Independent verdicts.
+        let v = redis
+            .rate_limit_ok_many(&[(a.as_str(), 2), (b.as_str(), 100)], 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            vec![false, true],
+            "each key must be judged on its own count"
+        );
+
+        let count: i64 = redis::cmd("GET").arg(&b).query_async(&mut c).await.unwrap();
+        assert_eq!(count, 3, "the second key must have its own counter");
+
+        assert!(redis.rate_limit_ok_many(&[], 60).await.unwrap().is_empty());
+
+        let _: () = redis::cmd("DEL")
+            .arg(&a)
+            .arg(&b)
+            .query_async(&mut c)
+            .await
+            .unwrap();
     }
 }
