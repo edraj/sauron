@@ -152,7 +152,6 @@ async fn upsert_issues_chunk(
 /// every realistic one — still issue exactly one statement.
 const INSERT_CHUNK: usize = 1_000;
 
-
 pub async fn insert_error_events(
     conn: &mut AsyncPgConnection,
     rows: &[NewErrorEvent],
@@ -233,7 +232,9 @@ pub async fn bump_sessions(
     // Sorted by `(app_id, session_id)` so every concurrent batch takes these row locks in
     // the same order — see the module's ordering rule.
     let mut ix: Vec<usize> = (0..rows.len()).collect();
-    ix.sort_unstable_by(|&a, &b| (rows[a].app_id, &rows[a].session_id).cmp(&(rows[b].app_id, &rows[b].session_id)));
+    ix.sort_unstable_by(|&a, &b| {
+        (rows[a].app_id, &rows[a].session_id).cmp(&(rows[b].app_id, &rows[b].session_id))
+    });
     diesel::sql_query(
         "INSERT INTO sessions \
            (app_id, session_id, distinct_id, device_key, started_at, last_event_at, \
@@ -296,17 +297,16 @@ pub struct DeviceBump {
 
 /// Fold N device bumps into `devices`, one statement. Conflict arm copied from
 /// [`crate::repo::bump_device`].
-pub async fn bump_devices(
-    conn: &mut AsyncPgConnection,
-    rows: &[DeviceBump],
-) -> QueryResult<usize> {
+pub async fn bump_devices(conn: &mut AsyncPgConnection, rows: &[DeviceBump]) -> QueryResult<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
     // Sorted by `(app_id, device_key)` so every concurrent batch takes these row locks in
     // the same order — see the module's ordering rule.
     let mut ix: Vec<usize> = (0..rows.len()).collect();
-    ix.sort_unstable_by(|&a, &b| (rows[a].app_id, &rows[a].device_key).cmp(&(rows[b].app_id, &rows[b].device_key)));
+    ix.sort_unstable_by(|&a, &b| {
+        (rows[a].app_id, &rows[a].device_key).cmp(&(rows[b].app_id, &rows[b].device_key))
+    });
     diesel::sql_query(
         "INSERT INTO devices \
            (app_id, device_key, family, model, os_name, os_version, arch, browser, \
@@ -333,14 +333,42 @@ pub async fn bump_devices(
             updated_at = now()",
     )
     .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
-    .bind::<Array<Text>, _>(ix.iter().map(|&i| rows[i].device_key.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].family.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].model.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].os_name.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].os_version.clone()).collect::<Vec<_>>())
+    .bind::<Array<Text>, _>(
+        ix.iter()
+            .map(|&i| rows[i].device_key.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].family.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].model.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].os_name.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].os_version.clone())
+            .collect::<Vec<_>>(),
+    )
     .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].arch.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].browser.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].distinct_id.clone()).collect::<Vec<_>>())
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].browser.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].distinct_id.clone())
+            .collect::<Vec<_>>(),
+    )
     .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].first_at).collect::<Vec<_>>())
     .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].last_at).collect::<Vec<_>>())
     .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].events_delta).collect::<Vec<_>>())
@@ -421,13 +449,41 @@ pub async fn bump_workflows(
             updated_at    = now()",
     )
     .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
-    .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].environment_id).collect::<Vec<_>>())
-    .bind::<Array<Text>, _>(ix.iter().map(|&i| rows[i].workflow_id.clone()).collect::<Vec<_>>())
-    .bind::<Array<Text>, _>(ix.iter().map(|&i| rows[i].workflow_name.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].session_id.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].distinct_id.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].device_key.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].release.clone()).collect::<Vec<_>>())
+    .bind::<Array<SqlUuid>, _>(
+        ix.iter()
+            .map(|&i| rows[i].environment_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Text>, _>(
+        ix.iter()
+            .map(|&i| rows[i].workflow_id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Text>, _>(
+        ix.iter()
+            .map(|&i| rows[i].workflow_name.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].session_id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].distinct_id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].device_key.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<Text>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].release.clone())
+            .collect::<Vec<_>>(),
+    )
     .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].first_at).collect::<Vec<_>>())
     .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].last_at).collect::<Vec<_>>())
     .bind::<Array<Integer>, _>(ix.iter().map(|&i| rows[i].events_delta).collect::<Vec<_>>())
@@ -490,7 +546,11 @@ pub async fn mark_event_users_identified(
     )
     .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].0).collect::<Vec<_>>())
     .bind::<Array<Text>, _>(ix.iter().map(|&i| rows[i].1.clone()).collect::<Vec<_>>())
-    .bind::<Array<Text>, _>(ix.iter().map(|&i| rows[i].2.to_string()).collect::<Vec<_>>())
+    .bind::<Array<Text>, _>(
+        ix.iter()
+            .map(|&i| rows[i].2.to_string())
+            .collect::<Vec<_>>(),
+    )
     .execute(conn)
     .await
 }
