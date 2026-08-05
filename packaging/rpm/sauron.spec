@@ -8,7 +8,7 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.2.1
+Version:        1.3.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
@@ -115,12 +115,17 @@ mkdir -p _libduckdb
 cp -p %{SOURCE50} _libduckdb/libduckdb.so
 export DUCKDB_LIB_DIR="$PWD/_libduckdb"
 
-# redhat-rpm-config injects RUSTFLAGS with -Cdebuginfo=2 -Ccodegen-units=1
-# -Cstrip=none: that generates debuginfo we discard (debug_package is %%{nil}),
-# forces slow single-unit codegen, and defeats the release `strip`. Append
-# last-wins overrides to restore fast, stripped codegen while keeping the
-# hardening/link flags redhat-rpm-config also set.
-export RUSTFLAGS="${RUSTFLAGS:-} -Cdebuginfo=0 -Ccodegen-units=16 -Cstrip=symbols"
+# redhat-rpm-config injects RUSTFLAGS with -Cdebuginfo=2 -Cstrip=none: that
+# generates debuginfo we discard (debug_package is %%{nil}) and defeats the
+# release `strip`. Append last-wins overrides to undo both while keeping the
+# hardening/link flags redhat-rpm-config also sets.
+#
+# `-Ccodegen-units=16` used to be appended here too, for build speed. It is not
+# any more: RUSTFLAGS wins over the profile, so it silently overrode
+# `codegen-units = 1` in backend/Cargo.toml and shipped RPM binaries that were
+# optimized differently from every binary the project benchmarks. Restoring it
+# would reintroduce that divergence, not just speed the build up.
+export RUSTFLAGS="${RUSTFLAGS:-} -Cdebuginfo=0 -Cstrip=symbols"
 
 (cd backend && cargo build --release --workspace)
 
@@ -265,6 +270,30 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Tue Aug 04 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.3.0-1
+- Ingest write throughput. The worker used to spend roughly ten Postgres
+  transactions and a stack of sequential Redis round trips on every single
+  event; it now batches the writes, folds the workflow bump into the same
+  transaction, sends breadcrumbs and HLL updates as pipelines, and commits once
+  per batch instead of once per item. Measured end to end on the same hardware,
+  the write path drains several times faster than 1.2.1 at the same load.
+- An envelope is one Redis stream entry, not one entry per item. The header is
+  serialized, stored and parsed once rather than N times, and stream trimming
+  counts whole envelopes. Under sustained overload — where the stream is deep
+  enough for MAXLEN to trim — accepted items were being discarded silently;
+  holding an envelope together removes that loss at twice rated capacity.
+- Retuned ingest defaults: WORKER_CONCURRENCY is 8 (was 4) and a batch reads up
+  to 200 stream entries (was 50). The two knobs interact, so they were swept
+  together — raising the worker count alone made throughput worse. New
+  INGEST_BATCH_ITEMS (default 1000) bounds a batch in items rather than
+  entries, which is what actually governs memory now that one entry can carry a
+  whole envelope. INGEST_DB_POOL must stay >= WORKER_CONCURRENCY.
+- RPM binaries are built with the optimization settings the project benchmarks.
+  The spec appended -Ccodegen-units=16 to RUSTFLAGS for build speed, and
+  RUSTFLAGS wins over the profile, so it silently overrode codegen-units = 1
+  from backend/Cargo.toml — every shipped RPM was compiled differently from
+  every binary that had been measured.
+
 * Sun Aug 02 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.2.1-1
 - Privacy policies can be created from the dashboard. The Privacy page's Policy
   tab now carries a create form (scope, target, tracked keys, detectors); it

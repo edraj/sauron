@@ -4,6 +4,7 @@
 //! [`pool`], the [`repo`]sitory functions both binaries call, and the embedded
 //! migrations run at startup.
 
+pub mod batch;
 pub mod filter;
 pub mod models;
 pub mod pool;

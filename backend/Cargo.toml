@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "bins/*"]
 
 [workspace.package]
-version = "1.2.1"
+version = "1.3.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 rust-version = "1.82"
@@ -130,6 +130,17 @@ anyhow = "1"
 # Strip symbol tables from release binaries → smaller binaries and RPMs.
 # (debuginfo is already suppressed by `%global debug_package %{nil}` in the spec,
 # and release builds carry no `-g` debug info, so nothing diagnostic is lost.)
-# Deliberately NOT setting `lto` or `codegen-units = 1`: those shave a little more
-# size but SLOW the compile substantially, which is the opposite of the goal here.
 strip = true
+# Cross-crate inlining. The ingest path threads `serde_json`, `chrono`, `uuid`
+# and `diesel` through generic call chains that stop optimizing at every crate
+# boundary without this; `codegen-units = 1` is what lets the fat LTO pass see
+# the whole program rather than 16 independently-optimized slices.
+#
+# The trade is compile time, and it is not small — the measured before/after on
+# both axes is in `docs/benchmarks/`. Note the runtime gain is CPU headroom,
+# not throughput: ingest is I/O-bound, so this buys cycles back rather than
+# events per second. `packaging/rpm/sauron.spec` used to force
+# `-Ccodegen-units=16` through RUSTFLAGS, which silently overrode this line;
+# that override is gone, so packaged binaries now match what is benchmarked.
+lto = "fat"
+codegen-units = 1

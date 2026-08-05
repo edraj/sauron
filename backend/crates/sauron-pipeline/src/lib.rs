@@ -4,6 +4,7 @@
 //!
 //! [`IngestJob`]: sauron_core::envelope::IngestJob
 
+pub mod batch;
 pub mod enrich;
 pub mod mask;
 pub mod process;

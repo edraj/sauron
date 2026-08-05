@@ -1,0 +1,296 @@
+<style>
+  :root {
+    --ground:#F2F5F7; --card:#FFFFFF; --ink:#171B23; --slate:#5C6779; --faint:#8A94A4;
+    --line:#DDE3EA; --line-2:#EDF1F5;
+    --measure:#14666F; --measure-w:#DCEDEF;
+    --deficit:#A63A3A; --deficit-w:#F6E3E1;
+    --flag:#8A5A12; --flag-w:#FBF0DC;
+    --shadow:0 1px 2px rgba(23,27,35,.05), 0 8px 24px -16px rgba(23,27,35,.28);
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono","Cascadia Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#0E1116; --card:#161B22; --ink:#E6EAF0; --slate:#98A3B4; --faint:#6B7688;
+      --line:#262D38; --line-2:#1D242D;
+      --measure:#4CC2CD; --measure-w:#123135;
+      --deficit:#EE7A72; --deficit-w:#3A1E1C;
+      --flag:#E0B368; --flag-w:#332916;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:#0E1116; --card:#161B22; --ink:#E6EAF0; --slate:#98A3B4; --faint:#6B7688;
+    --line:#262D38; --line-2:#1D242D;
+    --measure:#4CC2CD; --measure-w:#123135;
+    --deficit:#EE7A72; --deficit-w:#3A1E1C;
+    --flag:#E0B368; --flag-w:#332916;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+  }
+  :root[data-theme="light"] {
+    --ground:#F2F5F7; --card:#FFFFFF; --ink:#171B23; --slate:#5C6779; --faint:#8A94A4;
+    --line:#DDE3EA; --line-2:#EDF1F5;
+    --measure:#14666F; --measure-w:#DCEDEF;
+    --deficit:#A63A3A; --deficit-w:#F6E3E1;
+    --flag:#8A5A12; --flag-w:#FBF0DC;
+    --shadow:0 1px 2px rgba(23,27,35,.05), 0 8px 24px -16px rgba(23,27,35,.28);
+  }
+
+  body { background:var(--ground); color:var(--ink); font-family:var(--sans);
+         line-height:1.6; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:920px; margin:0 auto; padding:56px 24px 96px;
+           display:flex; flex-direction:column; gap:44px; }
+
+  .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.14em;
+              text-transform:uppercase; color:var(--faint); }
+  h1 { font-family:var(--serif); font-weight:600; font-size:clamp(30px,4.6vw,46px);
+        line-height:1.12; letter-spacing:-.015em; text-wrap:balance; margin:.28em 0 0; }
+  .standfirst { font-family:var(--serif); font-size:clamp(17px,2.1vw,20px);
+                 color:var(--slate); max-width:60ch; margin-top:.6em; }
+  h2 { font-family:var(--serif); font-weight:600; font-size:25px; letter-spacing:-.01em;
+        margin:0; text-wrap:balance; }
+  h2 .n { font-family:var(--mono); font-size:12px; color:var(--faint);
+           letter-spacing:.1em; margin-right:.7em; vertical-align:.28em; }
+  p { margin:0; max-width:66ch; }
+  section { display:flex; flex-direction:column; gap:14px; }
+  a { color:var(--measure); }
+  code { font-family:var(--mono); font-size:.88em;
+          background:var(--line-2); padding:.1em .34em; border-radius:3px; }
+
+  .prov { display:grid; grid-template-columns:repeat(auto-fit,minmax(132px,1fr));
+           gap:1px; background:var(--line); border:1px solid var(--line);
+           border-radius:8px; overflow:hidden; }
+  .prov div { background:var(--card); padding:11px 13px; }
+  .prov dt { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+              text-transform:uppercase; color:var(--faint); }
+  .prov dd { font-family:var(--mono); font-size:13px; margin:3px 0 0;
+              font-variant-numeric:tabular-nums; }
+
+  .scroll { overflow-x:auto; border:1px solid var(--line); border-radius:8px;
+             background:var(--card); box-shadow:var(--shadow); }
+  table { border-collapse:collapse; width:100%; min-width:520px; }
+  thead th { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+              text-transform:uppercase; color:var(--faint); font-weight:500;
+              text-align:right; padding:11px 16px; border-bottom:1px solid var(--line);
+              white-space:nowrap; }
+  thead th:first-child { text-align:left; }
+  tbody th { text-align:left; font-weight:500; font-size:14.5px; padding:12px 16px;
+              border-bottom:1px solid var(--line-2); vertical-align:top; }
+  tbody td { padding:12px 16px; border-bottom:1px solid var(--line-2);
+              text-align:right; white-space:nowrap; vertical-align:top; }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom:none; }
+  .num { font-family:var(--mono); font-size:14px; font-variant-numeric:tabular-nums; }
+  .before { color:var(--deficit); }
+  .after  { color:var(--measure); font-weight:600; }
+  .note { font-size:12.5px; color:var(--faint); font-weight:400; margin-top:2px;
+           white-space:normal; max-width:34ch; line-height:1.45; }
+  .pill { font-family:var(--mono); font-size:12.5px; font-variant-numeric:tabular-nums;
+           padding:3px 9px; border-radius:11px; display:inline-block; font-weight:600; }
+  .pill.up   { background:var(--measure-w); color:var(--measure); }
+  .pill.down { background:var(--deficit-w); color:var(--deficit); }
+  .pill.flat { background:var(--line-2); color:var(--faint); }
+
+  figure { margin:0; background:var(--card); border:1px solid var(--line);
+            border-radius:8px; padding:18px 16px 8px; box-shadow:var(--shadow); }
+  svg { display:block; width:100%; height:auto; }
+  .grid { stroke:var(--line-2); stroke-width:1; }
+  .ax { font-family:var(--mono); font-size:10px; fill:var(--faint); }
+  .ln-b { fill:none; stroke:var(--measure); stroke-width:2.4;
+           stroke-linejoin:round; stroke-linecap:round; }
+  .ln-a { fill:none; stroke:var(--deficit); stroke-width:2.4;
+           stroke-linejoin:round; stroke-linecap:round; }
+  figcaption { display:flex; flex-wrap:wrap; gap:18px; padding:12px 2px 8px;
+                font-size:13px; color:var(--slate); }
+  .key { display:flex; align-items:center; gap:7px; }
+  .sw { width:16px; height:3px; border-radius:2px; flex:none; }
+
+  .flag { border-left:3px solid var(--flag); background:var(--flag-w);
+           padding:16px 20px; border-radius:0 8px 8px 0;
+           display:flex; flex-direction:column; gap:10px; }
+  .flag h3 { font-family:var(--serif); font-size:18px; margin:0; font-weight:600; }
+  .flag p { font-size:14.5px; }
+
+  pre { font-family:var(--mono); font-size:12.5px; line-height:1.7; margin:0;
+         background:var(--card); border:1px solid var(--line); border-radius:8px;
+         padding:16px 18px; overflow-x:auto; color:var(--slate); }
+  ul { margin:0; padding-left:1.15em; max-width:66ch; }
+  li { margin-bottom:.5em; }
+  li::marker { color:var(--faint); }
+  footer { border-top:1px solid var(--line); padding-top:20px; font-size:13px;
+            color:var(--faint); display:flex; flex-direction:column; gap:8px; }
+
+  .dot-b { fill:var(--deficit); }
+  .dot-a { fill:var(--measure); }
+  .span  { stroke:var(--line); stroke-width:2.5; stroke-linecap:round; }
+  .lede { font-family:var(--serif); font-size:19px; color:var(--slate); }
+</style>
+<div class="wrap">
+<header>
+<div class="eyebrow">Sauron &middot; ingest &middot; 3 August 2026 &middot; report 3 of 3</div>
+<h1>Tier&nbsp;1: taking the round trips out of the worker</h1>
+<p class="standfirst">Batching moved the bottleneck off the write path but left
+its own tail behind &mdash; a Redis round trip per error event, a triple round
+trip per breadcrumb, and two full copies of every job made to protect a branch
+that already had them. Four edits, 228 lines. At saturation the worker writes
+<strong>18.5%</strong> more per second on <strong>18.6%</strong> less CPU; at
+half load, over sixty seconds, it does nothing at all. Then the runs were
+extended to ten minutes, and one of them silently lost <strong>47%</strong> of
+the events the edge had already acknowledged. That finding is not about
+Tier&nbsp;1, and it outranks it.</p></header>
+<dl class="prov">
+<div><dt>host</dt><dd>20 cores &middot; Linux 7.0.12</dd></div>
+<div><dt>runs</dt><dd>2&times;2 at 4k &middot; 3&times;3 at 10k</dd></div>
+<div><dt>duration</dt><dd>60&thinsp;s each &middot; 600&thinsp;s soak</dd></div>
+<div><dt>workers</dt><dd>8 &middot; pool 8 &middot; batch 50</dd></div>
+<div><dt>baseline</dt><dd>the LTO+batched build</dd></div>
+<div><dt>redis noise</dt><dd>0.3 cmd/s idle</dd></div>
+</dl>
+<section><h2><span class="n">01</span>What changed</h2>
+<p>Four edits, all in the worker. None touch SQL, the schema, or the accept
+path. The arithmetic below is per batch of <code>B</code> entries containing
+<code>E</code> error events across <code>I</code> distinct issues and
+<code>C</code> breadcrumb batches.</p>
+<div class="scroll"><table><thead><tr><th>edit</th><th>per batch, before</th><th>per batch, after</th><th>at 10k</th></tr></thead><tbody><tr><th>Group <code>PFADD</code> by issue<div class="note"><code>PFADD</code> is variadic and its reply &mdash; did any register move &mdash; is already per key, so N members for one issue answer the same question in one call that N calls did.</div></th><td class="num before">E</td><td class="num after">I</td><td><span class="pill up">&minus;65%</span></td></tr><tr><th>Pipeline the breadcrumb push<div class="note"><code>LPUSH</code>&thinsp;+&thinsp;<code>LTRIM</code>&thinsp;+&thinsp;<code>EXPIRE</code> were three awaits against one key with nothing decided in between.</div></th><td class="num before">3C</td><td class="num after">C</td><td><span class="pill up">&minus;67%</span></td></tr><tr><th>Delete the retry deep-clone<div class="note"><code>process_batch</code> borrows the batch, so the original was still owned and usable by the fallback. The copy guarded nothing.</div></th><td class="num before">B jobs</td><td class="num after">0</td><td><span class="pill up">&minus;100%</span></td></tr><tr><th>Make <code>masked_payload</code> lazy<div class="note">A full <code>to_string</code> of every job, built eagerly for a dead-letter branch that the batch path never reaches.</div></th><td class="num before">B</td><td class="num after">0</td><td><span class="pill up">&minus;100%</span></td></tr></tbody></table></div>
+<p class="note" style="max-width:66ch">The last two columns of the first row are
+measured; the rest are structural. Round trips, not commands &mdash; Redis
+<code>INFO commandstats</code> counts commands, so the pipelined breadcrumb
+still reports three and its saving has to be derived.</p></section>
+<section><h2><span class="n">02</span>Worker Redis round trips</h2>
+<p>The direct measurement, and the one with almost no run-to-run noise. Edge
+traffic (<code>INCR</code>, <code>GET</code>, <code>XADD</code>) is untouched by
+design and is excluded; this is what the worker itself waits on.</p>
+<div class="scroll"><table><thead><tr><th>per item written</th><th>before</th><th>after</th><th>change</th></tr></thead><tbody><tr><th>at 4,083 rps (TCP)</th><td class="num before">1.479</td><td class="num after">0.671</td><td><span class="pill up">-54.6%</span></td></tr><tr><th>at 10,081 rps (UDS, saturated)</th><td class="num before">1.388</td><td class="num after">0.504</td><td><span class="pill up">-63.7%</span></td></tr></tbody></table></div>
+<div class="scroll"><table><thead><tr><th>PFADD calls per error event</th><th>before</th><th>after</th><th>change</th></tr></thead><tbody><tr><th>at 4,083 rps<div class="note">5.4 errors per batch at this rate, spread over ~2.7 issues.</div></th><td class="num before">1.000</td><td class="num after">0.497</td><td><span class="pill up">-50.3%</span></td></tr><tr><th>at 10,081 rps<div class="note">12.4 errors per batch, still ~4.3 issues &mdash; fuller batches, bigger win.</div></th><td class="num before">1.000</td><td class="num after">0.351</td><td><span class="pill up">-64.9%</span></td></tr></tbody></table></div>
+<p>The saving scales with how full the batches are, which means it grows exactly
+when the system is under pressure. That is the opposite of the usual shape,
+where optimisations help least when you need them most.</p></section>
+<section><h2><span class="n">03</span>Throughput at saturation</h2>
+<p>At 10,081&thinsp;rps over a Unix socket the offered load is roughly
+15,100&thinsp;items/s and neither build keeps up, so this measures the ceiling
+rather than the offered rate. Three runs per build, alternated.</p>
+<figure><svg viewBox="0 0 700 132" role="img" aria-label="items per second, three runs per build"><line class="grid" x1="46.0" y1="18" x2="46.0" y2="92"/><text class="ax" x="46.0" y="108" text-anchor="middle">6,500</text><line class="grid" x1="167.6" y1="18" x2="167.6" y2="92"/><text class="ax" x="167.6" y="108" text-anchor="middle">7,200</text><line class="grid" x1="289.2" y1="18" x2="289.2" y2="92"/><text class="ax" x="289.2" y="108" text-anchor="middle">7,900</text><line class="grid" x1="410.8" y1="18" x2="410.8" y2="92"/><text class="ax" x="410.8" y="108" text-anchor="middle">8,600</text><line class="grid" x1="532.4" y1="18" x2="532.4" y2="92"/><text class="ax" x="532.4" y="108" text-anchor="middle">9,300</text><line class="grid" x1="654.0" y1="18" x2="654.0" y2="92"/><text class="ax" x="654.0" y="108" text-anchor="middle">10,000</text><text class="ax" x="38" y="44" text-anchor="end">before</text><line class="span" x1="91.8" y1="40" x2="290.8" y2="40"/><circle class="dot-b" cx="271.4" cy="40" r="5.5"/><circle class="dot-b" cx="290.8" cy="40" r="5.5"/><circle class="dot-b" cx="91.8" cy="40" r="5.5"/><text class="ax" x="38" y="78" text-anchor="end">after</text><line class="span" x1="365.8" y1="74" x2="603.1" y2="74"/><circle class="dot-a" cx="405.9" cy="74" r="5.5"/><circle class="dot-a" cx="603.1" cy="74" r="5.5"/><circle class="dot-a" cx="365.8" cy="74" r="5.5"/><text class="ax" x="350" y="126" text-anchor="middle">items written per second</text></svg>
+<figcaption><div class="key"><span class="sw" style="background:var(--deficit)"></span>
+before &mdash; batched + LTO</div><div class="key">
+<span class="sw" style="background:var(--measure)"></span>after &mdash; Tier 1</div>
+</figcaption></figure>
+<div class="scroll"><table><thead><tr><th>10,081 rps, UDS</th><th>before</th><th>after</th><th>change</th></tr></thead><tbody><tr><th>items/s written</th><td class="num before">7,490</td><td class="num after">8,873</td><td><span class="pill up">+18.5%</span></td></tr><tr><th>CPU-seconds per 1k items</th><td class="num before">0.2169</td><td class="num after">0.1766</td><td><span class="pill up">-18.6%</span></td></tr><tr><th>Postgres txns per item<div class="note">Not a target. Falls out of fuller batches.</div></th><td class="num before">0.1524</td><td class="num after">0.1450</td><td><span class="pill up">-4.9%</span></td></tr><tr><th>edge p50</th><td class="num before">2.97 ms</td><td class="num after">2.83 ms</td><td><span class="pill flat">-4.8%</span></td></tr><tr><th>edge p99</th><td class="num before">9.24 ms</td><td class="num after">9.18 ms</td><td><span class="pill flat">-0.7%</span></td></tr></tbody></table></div>
+<p>Individual runs vary by about 15% within each build, which is more than some
+of these differences. So the throughput and CPU claims do not rest on the means:
+they rest on the two sets not overlapping. The slowest Tier&nbsp;1 run
+(8,341 items/s) still beats the fastest baseline run
+(7,909) by 5.5%. The same holds for CPU, in
+the other direction. Rows whose runs <em>do</em> overlap are greyed out
+throughout this report.</p></section>
+<section><h2><span class="n">04</span>The null result at half load</h2>
+<p>At 4,083&thinsp;rps both builds absorb the entire offered load, so there is
+no backlog to drain and no throughput to win. Round trips still fall by half.
+Nothing else moves.</p>
+<div class="scroll"><table><thead><tr><th>4,083 rps, TCP</th><th>before</th><th>after</th><th>change</th></tr></thead><tbody><tr><th>items/s written<div class="note">Both builds keep up perfectly. This row cannot show a win.</div></th><td class="num before">6,122</td><td class="num after">6,122</td><td><span class="pill flat">-0.0%</span></td></tr><tr><th>CPU-seconds per 1k items<div class="note">Within-build spread (4% and 8%) exceeds the difference. No signal.</div></th><td class="num before">0.1577</td><td class="num after">0.1617</td><td><span class="pill flat">+2.6%</span></td></tr><tr><th>worker Redis round trips per item</th><td class="num before">1.479</td><td class="num after">0.671</td><td><span class="pill up">-54.6%</span></td></tr><tr><th>Postgres txns per item<div class="note">Runs span 0.220&ndash;0.348 regardless of build. Noise.</div></th><td class="num before">0.2680</td><td class="num after">0.2970</td><td><span class="pill flat">+10.8%</span></td></tr><tr><th>edge p99<div class="note">Overlapping. These edits are worker-side.</div></th><td class="num before">2.85 ms</td><td class="num after">3.06 ms</td><td><span class="pill flat">+7.0%</span></td></tr></tbody></table></div>
+<p>Removing half the worker's Redis round trips buys nothing measurable when the
+worker is not the constraint. A report showing only the saturated column would
+imply a speed-up this change does not deliver at ordinary load.</p>
+<p>That conclusion held for exactly as long as the runs were sixty seconds
+long. See section&nbsp;05.</p></section>
+<section><h2><span class="n">05</span>Ten minutes instead of sixty seconds</h2>
+<p>The 60-second runs showed peak RSS rising, separated from the noise but
+small. A minute cannot distinguish allocator growth from a leak, so both builds
+were re-run for ten minutes at 4,083&thinsp;rps &mdash; the rate at which
+section&nbsp;04 found nothing. The result is the most important thing in this
+report, and it is not the throughput number.</p>
+<div class="scroll"><table><thead><tr><th>600&thinsp;s run</th>
+<th>peak RSS</th><th>items/s</th><th>delivered</th><th>max latency</th></tr></thead>
+<tbody><tr><th>baseline &middot; run 1</th><td class="num">463.2 MB</td><td class="num">3,263</td><td class="num before">53.3%</td><td class="num before">3,381 ms</td></tr><tr><th>baseline &middot; run 2</th><td class="num">118.5 MB</td><td class="num">6,052</td><td class="num before">98.8%</td><td class="num before">419 ms</td></tr><tr><th>baseline &middot; run 3</th><td class="num">50.5 MB</td><td class="num">6,124</td><td class="num after">100.0%</td><td class="num after">87 ms</td></tr><tr><th>Tier 1 &middot; run 1</th><td class="num">48.2 MB</td><td class="num">6,124</td><td class="num after">100.0%</td><td class="num after">87 ms</td></tr><tr><th>Tier 1 &middot; run 2</th><td class="num">58.1 MB</td><td class="num">6,124</td><td class="num after">100.0%</td><td class="num after">161 ms</td></tr></tbody></table></div>
+<div class="scroll"><table><thead><tr><th>600 s at 4,083 rps</th><th>before</th><th>after</th><th>change</th></tr></thead><tbody><tr><th>events delivered, worst run<div class="note">Written to Postgres as a share of what the edge accepted with a 202.</div></th><td class="num before">53.3%</td><td class="num after">100.0%</td><td><span class="pill up">+87.5%</span></td></tr><tr><th>events delivered, median run</th><td class="num before">98.8%</td><td class="num after">100.0%</td><td><span class="pill up">+1.2%</span></td></tr><tr><th>peak RSS, worst run</th><td class="num before">463.2 MB</td><td class="num after">58.1 MB</td><td><span class="pill up">-87.5%</span></td></tr><tr><th>peak RSS, median run</th><td class="num before">118.5 MB</td><td class="num after">53.2 MB</td><td><span class="pill up">-55.1%</span></td></tr><tr><th>max request latency, worst run</th><td class="num before">3,381 ms</td><td class="num after">161 ms</td><td><span class="pill up">-95.2%</span></td></tr><tr><th>sustained items/s, median run<div class="note">Offered load is 6,124 items/s. Both medians keep up.</div></th><td class="num before">6,052</td><td class="num after">6,124</td><td><span class="pill up">+1.2%</span></td></tr></tbody></table></div>
+<div class="flag"><h3>One run silently lost 47% of the events it had accepted</h3>
+<p>In the first baseline soak the worker fell behind at about the five-minute
+mark, RSS jumped from 45&thinsp;MB to 461&thinsp;MB, one request stalled for
+3.4&thinsp;seconds, and write throughput dropped to roughly a tenth. The backlog
+then passed the stream's <code>MAXLEN</code> of one million and Redis began
+trimming unread entries. <strong>53.3% of accepted events reached
+Postgres.</strong> The ingest logged not one warning, and <code>crebain</code>
+reported <code>100% accepted, 0&nbsp;errors</code> throughout &mdash; because
+from the edge's point of view that was entirely true.</p>
+<p><strong>This is not a Tier&nbsp;1 result and must not be read as one.</strong>
+It happened once in three baseline runs; the third baseline run was clean
+(50&thinsp;MB, 100% delivered) and
+indistinguishable from Tier&nbsp;1. With three runs against two, and the bad
+runs clustered at the start of the sequence, the build is only one of several
+candidate explanations &mdash; accumulated machine state across back-to-back
+ten-minute runs is another, and I did not control for it. Tier&nbsp;1 has not
+been shown to fix this, and has not been shown to be free of it.</p></div>
+<p>What the soak does establish, independent of which build is at fault, is that
+the ingest has an intermittent degradation mode that ends in silent data loss,
+and that nothing in the system reports it. The <code>MAXLEN</code> trim is the
+mechanism that converts &ldquo;the worker is behind&rdquo; into &ldquo;the events
+are gone&rdquo;, and it is unconditional and unalarmed. A backlog metric would be
+worth more than the next round of round-trip removal.</p>
+<p>The narrower lesson is about method, and it indicts all three of these
+reports: <strong>every benchmark in this series before now was sixty seconds
+long</strong> &mdash; and sixty seconds is shorter than the time this failure
+takes to appear.</p></section>
+<section><h2><span class="n">06</span>Correctness</h2>
+<p>Grouping <code>PFADD</code> is the only edit that could be silently wrong. If
+the member slice were sent as one argument instead of many, the call would still
+succeed, still reply 1, and still leave a working HyperLogLog &mdash; it would
+just be counting a concatenation as one person, and every downstream check would
+stay green.</p>
+<div class="scroll"><table><thead><tr><th>gate</th><th>before</th><th>after</th><th>change</th></tr></thead><tbody><tr><th>Cardinality assertion<div class="note">New test adds three members, asserts <code>PFCOUNT</code> is 3, then re-adds known members and asserts the reply reports no change. Asserts the count, not the reply.</div></th><td class="num before">absent</td><td class="num after">passing</td><td><span class="pill up">new</span></td></tr><tr><th>Batch/per-item equivalence<div class="note">Same signals through both paths into two apps, diffed across issues, events, sessions, devices and users.</div></th><td class="num before">skipped</td><td class="num after">passing</td><td><span class="pill up">fixed</span></td></tr><tr><th>Pipeline suite / clippy<div class="note">16 tests, workspace-wide clippy with <code>--all-targets</code>.</div></th><td class="num before">green</td><td class="num after">green</td><td><span class="pill flat">&plusmn;0%</span></td></tr></tbody></table></div>
+<div class="flag"><h3>The equivalence test was reporting <code>ok</code> without running</h3>
+<p>It guards on <code>TEST_REDIS_URL</code> and returns early when unset,
+printing a skip notice to stderr that <code>cargo test</code> hides on success.
+The first Tier&nbsp;1 run showed 16 passed in 0.00&thinsp;s &mdash; the same
+line a real pass produces. Re-run with the variable set, the suite takes
+0.58&thinsp;s and the test genuinely exercises both write paths. Every earlier
+&ldquo;equivalence verified&rdquo; claim made without those variables set was
+worth nothing.</p></div></section>
+<section><h2><span class="n">07</span>What it cost</h2>
+<div class="scroll"><table><thead><tr><th>cost</th><th>before</th><th>after</th><th>change</th></tr></thead><tbody><tr><th>binary size<div class="note">Six kilobytes. The grouping map and the pipeline builder.</div></th><td class="num before">6.836 MB</td><td class="num after">6.842 MB</td><td><span class="pill down">+0.1%</span></td></tr><tr><th>Lines changed<div class="note">Two files; no SQL, no schema, no migration, no change to the accept path.</div></th><td class="num before">&mdash;</td><td class="num after">+228 / &minus;34</td><td><span class="pill flat">&mdash;</span></td></tr><tr><th>New public API<div class="note"><code>RedisStore::pf_add_many</code>. <code>pf_add</code> now delegates to it, so both forms share one implementation.</div></th><td class="num before">&mdash;</td><td class="num after">1 method</td><td><span class="pill flat">&mdash;</span></td></tr></tbody></table></div></section>
+<section><h2><span class="n">08</span>What this did not touch</h2>
+<ul>
+<li><strong>The workflow fold.</strong> <code>acc.workflows</code> is still a
+plain <code>Vec</code> replayed one autocommit at a time, so an app that stamps
+signals with a workflow id gets one sequential Postgres round trip per signal
+&mdash; against frequently the same row. It is gated on the id being present, so
+it costs nothing today, and <code>crebain</code> generates no workflows, which is
+why no benchmark here or in the previous two reports can see it. It is a cliff,
+not a slope.</li>
+<li><strong>The accept path.</strong> Still 3&thinsp;+&thinsp;N sequential Redis
+round trips per request, no in-process DSN cache, two SHA-256 hashes of the same
+key, a full header-map clone. Untouched deliberately: the previous report's claim
+that the edge saturates at 20k rps has not been re-checked over UDS, and the
+1M-concurrency work already established that an apparent accept-rate collapse can
+be the generator's ephemeral-port wall rather than the server.</li>
+<li><strong><code>INGEST_BATCH_SIZE</code>.</strong> Still the inherited 50, still
+never tuned. It now matters more than it did: every saving in this report scales
+with how full a batch is.</li>
+<li><strong>The mechanism behind section&nbsp;05.</strong> Not established, and
+not attributed. It appeared once in three baseline runs and zero times in two
+Tier&nbsp;1 runs, which is enough to take seriously and nowhere near enough to
+blame a build. Characterising it needs runs long enough and repeated enough to
+get a rate, in randomised build order, on a machine returned to a known state
+between runs &mdash; plus a heap profile while it is happening.</li>
+<li><strong>The <code>MAXLEN</code> policy.</strong> The stream trims at one
+million entries with nothing watching. That is what turns a slow worker into
+lost data, on any build. A backlog metric derived from stream offsets &mdash;
+<em>not</em> from <code>XLEN</code>, which counts acked entries and reads near
+the cap regardless &mdash; and an alert on it, is the highest-value item on this
+list.</li>
+</ul></section>
+<section><h2><span class="n">09</span>Reproducing</h2>
+<pre>WORKER_CONCURRENCY=8 INGEST_DB_POOL=8 INGEST_BATCH_SIZE=50 \
+crebain --isolated --keep \
+        --ingest-bin target/release/sauron-ingest \
+        --users 5000 --rps 10081 --duration 60 --transport uds
+
+# round trips: INFO commandstats deltas around the run.
+# Breadcrumbs stay 3 commands after pipelining -- derive, do not read.
+
+# the equivalence test only runs with BOTH set:
+TEST_DATABASE_URL=... TEST_REDIS_URL=... cargo test -p sauron-pipeline
+TEST_REDIS_URL=...                       cargo test -p sauron-redis</pre>
+<p class="note" style="max-width:66ch">Redis was idle at 0.3 commands/second
+with no benchmark running, all of it <code>PING</code>, so the commandstats
+deltas are the benchmark and nothing else. Set <code>INGEST_BATCH_WRITES=0</code>
+to fall back to the per-item path in the same binary.</p></section>
+</div>

@@ -361,6 +361,121 @@ pub struct IngestJob {
     pub item: EnvelopeItem,
 }
 
+/// What the ingest edge actually enqueues: ONE envelope's shared tenancy and
+/// request context, and every item that envelope carried.
+///
+/// The edge used to enqueue one [`IngestJob`] per item, which meant an SDK
+/// sending 8 items in a batch had `app_id`, `project_id`, `org_id`,
+/// `environment_id`, `release`, `received_at`, `ip`, `user_agent`, `context`
+/// and `sdk` serialized, stored, read back and parsed **eight times over** —
+/// once per item — for information the envelope only ever stated once. The
+/// context block in particular is unbounded: it carries whatever `device`,
+/// `os`, `app` and `runtime` maps the SDK attached.
+///
+/// That duplication was not only CPU. Stream entries are the unit
+/// `MAXLEN ~ 1_000_000` counts, so N-times-larger, N-times-more-numerous
+/// entries meant the trim threshold represented N times fewer real events —
+/// and [the silent-loss soak] showed the trim is unalarmed and unconditional.
+/// One entry per envelope makes the same cap cover the same traffic for
+/// roughly `items_per_envelope` times longer.
+///
+/// Expanded back into per-item [`IngestJob`]s by the worker, so everything
+/// downstream of the decode is untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestBatch {
+    pub app_id: Uuid,
+    pub project_id: Uuid,
+    pub org_id: Uuid,
+    pub environment_id: Uuid,
+    #[serde(default)]
+    pub release: Option<String>,
+    pub received_at: DateTime<Utc>,
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub context: EnvelopeContext,
+    #[serde(default)]
+    pub sdk: Option<SdkInfo>,
+    /// Never empty — the edge does not enqueue an envelope with no items.
+    pub items: Vec<EnvelopeItem>,
+}
+
+impl IngestBatch {
+    /// Expand into the per-item jobs the rest of the pipeline is written
+    /// against.
+    ///
+    /// The shared header is cloned per item here, which is the same total copy
+    /// the edge used to make — but in process, against an already-parsed
+    /// structure, instead of through `serde_json::to_string`, a Redis round
+    /// trip and `serde_json::from_str`.
+    pub fn into_jobs(mut self) -> Vec<IngestJob> {
+        let items = std::mem::take(&mut self.items);
+        let n = items.len();
+        let mut out = Vec::with_capacity(n);
+        for (i, item) in items.into_iter().enumerate() {
+            // The final item MOVES the header instead of copying it, so a
+            // single-item envelope — still the common case for an SDK that does
+            // not batch — expands without allocating at all.
+            if i + 1 == n {
+                out.push(IngestJob {
+                    app_id: self.app_id,
+                    project_id: self.project_id,
+                    org_id: self.org_id,
+                    environment_id: self.environment_id,
+                    release: self.release.take(),
+                    received_at: self.received_at,
+                    ip: self.ip.take(),
+                    user_agent: self.user_agent.take(),
+                    context: std::mem::take(&mut self.context),
+                    sdk: self.sdk.take(),
+                    item,
+                });
+                break;
+            }
+            out.push(IngestJob {
+                app_id: self.app_id,
+                project_id: self.project_id,
+                org_id: self.org_id,
+                environment_id: self.environment_id,
+                release: self.release.clone(),
+                received_at: self.received_at,
+                ip: self.ip.clone(),
+                user_agent: self.user_agent.clone(),
+                context: self.context.clone(),
+                sdk: self.sdk.clone(),
+                item,
+            });
+        }
+        out
+    }
+}
+
+impl From<IngestJob> for IngestBatch {
+    /// Wrap a legacy single-item job.
+    ///
+    /// The stream outlives a deploy: entries written by the previous binary are
+    /// still pending when the new one starts reading, and the PEL can hand one
+    /// back minutes later. The worker decodes into this shape either way rather
+    /// than carrying two code paths past the parse.
+    fn from(j: IngestJob) -> IngestBatch {
+        IngestBatch {
+            app_id: j.app_id,
+            project_id: j.project_id,
+            org_id: j.org_id,
+            environment_id: j.environment_id,
+            release: j.release,
+            received_at: j.received_at,
+            ip: j.ip,
+            user_agent: j.user_agent,
+            context: j.context,
+            sdk: j.sdk,
+            items: vec![j.item],
+        }
+    }
+}
+
 impl EventUser {
     /// The stable analytics identity for this user, if any.
     pub fn distinct_id(&self) -> Option<&str> {
@@ -656,5 +771,123 @@ mod tests {
             "absent field must not serialize"
         );
         assert!(back.get("workflow_name").is_none());
+    }
+
+    fn item(name: &str) -> EnvelopeItem {
+        serde_json::from_str(&format!(
+            r#"{{"type":"event","name":"{name}","distinct_id":"u1",
+                 "timestamp":"2026-07-29T00:00:00Z"}}"#
+        ))
+        .expect("fixture parses")
+    }
+
+    fn batch(items: Vec<EnvelopeItem>) -> IngestBatch {
+        IngestBatch {
+            app_id: Uuid::from_u128(1),
+            project_id: Uuid::from_u128(2),
+            org_id: Uuid::from_u128(3),
+            environment_id: Uuid::from_u128(4),
+            release: Some("1.2.3".to_string()),
+            received_at: Utc::now(),
+            ip: Some("10.0.0.1".to_string()),
+            user_agent: Some("ua/1".to_string()),
+            context: EnvelopeContext {
+                device: serde_json::json!({"model": "pixel"}),
+                ..Default::default()
+            },
+            sdk: Some(SdkInfo {
+                name: "sauron.javascript".to_string(),
+                version: "0.1.0".to_string(),
+            }),
+            items,
+        }
+    }
+
+    /// Every item must come out carrying the SAME header the envelope stated
+    /// once. This is the whole safety argument for enqueueing one entry
+    /// instead of N: the worker has to reconstruct what the edge used to write.
+    #[test]
+    fn expanding_a_batch_gives_every_item_the_shared_header() {
+        let b = batch(vec![item("a"), item("b"), item("c")]);
+        let (app, ip, ctx, at) = (b.app_id, b.ip.clone(), b.context.clone(), b.received_at);
+        let jobs = b.into_jobs();
+
+        assert_eq!(jobs.len(), 3);
+        for j in &jobs {
+            assert_eq!(j.app_id, app);
+            assert_eq!(j.ip, ip);
+            assert_eq!(j.received_at, at);
+            assert_eq!(j.release.as_deref(), Some("1.2.3"));
+            assert_eq!(j.user_agent.as_deref(), Some("ua/1"));
+            assert_eq!(
+                j.sdk.as_ref().map(|s| s.name.as_str()),
+                Some("sauron.javascript")
+            );
+            // The last item MOVES the context rather than cloning it. If that
+            // move ever took the value from under its siblings this is what
+            // would catch it.
+            assert_eq!(
+                serde_json::to_value(&j.context).unwrap(),
+                serde_json::to_value(&ctx).unwrap(),
+            );
+        }
+        let names: Vec<&str> = jobs
+            .iter()
+            .map(|j| match &j.item {
+                EnvelopeItem::Event(e) => e.name.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(names, ["a", "b", "c"], "order must be preserved");
+    }
+
+    #[test]
+    fn expanding_a_single_item_batch_yields_one_job() {
+        let jobs = batch(vec![item("solo")]).into_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].context.device,
+            serde_json::json!({"model": "pixel"})
+        );
+    }
+
+    /// A stream entry written by the previous binary must still be readable.
+    /// The two shapes are distinguished by `item` vs `items`, and neither
+    /// struct will parse the other's payload — which is exactly what makes the
+    /// worker's try-then-fall-back decode unambiguous.
+    #[test]
+    fn a_legacy_single_item_job_round_trips_through_the_batch_shape() {
+        let job = batch(vec![item("legacy")]).into_jobs().remove(0);
+        let wire = serde_json::to_string(&job).expect("serializes");
+
+        assert!(
+            serde_json::from_str::<IngestBatch>(&wire).is_err(),
+            "the legacy shape must NOT parse as a batch, or the fallback would never run"
+        );
+
+        let back = IngestBatch::from(
+            serde_json::from_str::<IngestJob>(&wire).expect("legacy shape still parses"),
+        );
+        assert_eq!(back.items.len(), 1);
+        assert_eq!(back.app_id, job.app_id);
+        assert_eq!(back.ip, job.ip);
+        assert_eq!(back.release, job.release);
+        assert_eq!(back.received_at, job.received_at);
+    }
+
+    #[test]
+    fn the_batch_shape_does_not_parse_as_a_legacy_job() {
+        let wire = serde_json::to_string(&batch(vec![item("a"), item("b")])).expect("serializes");
+        assert!(
+            serde_json::from_str::<IngestJob>(&wire).is_err(),
+            "a batch must not silently decode as a single job and lose its other items"
+        );
+        assert_eq!(
+            serde_json::from_str::<IngestBatch>(&wire)
+                .expect("parses")
+                .items
+                .len(),
+            2
+        );
     }
 }

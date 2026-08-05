@@ -4,8 +4,10 @@
 //! envelope, and enqueues each item onto the Redis ingest stream. Worker tasks
 //! (spawned here, co-located) drain the stream and write durable rows.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -23,7 +25,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use sauron_core::envelope::{Envelope, IngestJob};
+use sauron_core::envelope::{Envelope, IngestBatch};
 use sauron_core::Config;
 use sauron_db::models::EnvRef;
 use sauron_db::PgPool;
@@ -34,6 +36,111 @@ struct AppState {
     pool: PgPool,
     redis: RedisStore,
     cfg: Arc<Config>,
+    dsn: Arc<DsnCache>,
+}
+
+/// Process-local, short-TTL cache of resolved ingest keys.
+///
+/// `resolve_env` already caches in Redis, but that is still a network round
+/// trip on **every single request**, and it is the round trip that has to
+/// finish before the app's rate-limit key is even known. Holding the answer in
+/// process removes it and collapses the two limiter `INCR`s into one pipelined
+/// round trip, taking the steady-state edge from four sequential Redis waits to
+/// two.
+///
+/// ## The cost, stated plainly
+///
+/// Revocation is currently PROMPT: rotating a key, disabling an app or deleting
+/// an environment all `DEL` the Redis cache entry (see
+/// `sauron-api/src/routes/environments.rs` and `apps.rs`), so the next request
+/// re-resolves. A process-local copy cannot be invalidated that way, so a
+/// revoked key keeps ingesting for up to `ttl` on each replica. The default is
+/// therefore deliberately small, and `INGEST_DSN_CACHE_SECS=0` disables the
+/// cache entirely for deployments that need revocation to remain immediate —
+/// the pipelined limiter still applies, so that setting costs one round trip,
+/// not the whole change.
+///
+/// Only POSITIVE results are cached here. Unknown keys keep going to Redis,
+/// whose 30-second negative cache is what stops them reaching Postgres, and a
+/// key created moments after being rejected still starts working on schedule.
+struct DsnCache {
+    ttl: Duration,
+    /// Bounded so a deployment with a pathological number of live keys cannot
+    /// grow this without limit. Entries are only ever inserted for keys that
+    /// resolved, so in practice the bound is the number of environments.
+    inner: RwLock<HashMap<String, (Instant, EnvRef)>>,
+}
+
+/// Beyond this many live entries the cache stops accepting new ones rather than
+/// growing. Far above any realistic environment count.
+const DSN_CACHE_MAX: usize = 10_000;
+
+/// Entries the ingest stream is trimmed to.
+///
+/// This is a DATA-LOSS control, not a tuning knob: when the worker falls behind
+/// far enough for the backlog to reach it, Redis discards the oldest entries —
+/// including ones no worker has read. Nothing logs it, nothing alerts on it,
+/// and the edge has already told the SDK `202`. A soak caught it destroying
+/// 47% of accepted events, and a 60-second saturation run reproduces it.
+///
+/// It was a literal at the call site, so an operator with the memory to spare
+/// had no way to buy headroom. Default unchanged; `INGEST_STREAM_MAXLEN` now
+/// raises it. Note the trim is `~` (approximate) — Redis trims at node
+/// boundaries, so the stream sits slightly above whatever is set here.
+///
+/// Sizing it is a function of RATE, not of events: one entry now holds a whole
+/// envelope, so the same cap covers roughly `items_per_envelope` times more
+/// telemetry than it did when each item was its own entry.
+fn stream_maxlen() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("INGEST_STREAM_MAXLEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1_000_000)
+    })
+}
+
+impl DsnCache {
+    fn new(ttl_secs: u64) -> DsnCache {
+        DsnCache {
+            ttl: Duration::from_secs(ttl_secs),
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        !self.ttl.is_zero()
+    }
+
+    fn get(&self, key: &str) -> Option<EnvRef> {
+        if !self.enabled() {
+            return None;
+        }
+        let map = self.inner.read().ok()?;
+        let (at, env) = map.get(key)?;
+        (at.elapsed() < self.ttl).then(|| env.clone())
+    }
+
+    fn put(&self, key: &str, env: &EnvRef) {
+        if !self.enabled() {
+            return;
+        }
+        let Ok(mut map) = self.inner.write() else {
+            return;
+        };
+        if map.len() >= DSN_CACHE_MAX && !map.contains_key(key) {
+            // Drop everything expired before refusing. Doing it only when the
+            // cap is reached keeps the hot path a plain hash lookup instead of
+            // a scan.
+            map.retain(|_, (at, _)| at.elapsed() < self.ttl);
+            if map.len() >= DSN_CACHE_MAX {
+                return;
+            }
+        }
+        map.insert(key.to_string(), (Instant::now(), env.clone()));
+    }
 }
 
 #[derive(Deserialize)]
@@ -75,7 +182,14 @@ async fn main() -> anyhow::Result<()> {
     raise_nofile();
     let cfg = Config::from_env()?;
 
-    let pool = sauron_db::build_pool(&cfg.database_url, 8)?;
+    // Pool size must be >= WORKER_CONCURRENCY or the workers queue on
+    // checkout rather than on Postgres, and raising the worker count alone
+    // does nothing. Env-overridable so the two can be swept together.
+    let pool_size: usize = std::env::var("INGEST_DB_POOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let pool = sauron_db::build_pool(&cfg.database_url, pool_size)?;
     let redis = RedisStore::connect(&cfg.redis_url).await?;
 
     // Shared symbolication resources for the hybrid write path (isolated cache +
@@ -116,10 +230,20 @@ async fn main() -> anyhow::Result<()> {
     let max_body = cfg.ingest_max_body_bytes;
     let uds_path = cfg.ingest_uds_path.clone();
     let backlog = cfg.ingest_backlog;
+    // Short by design: this is the window in which a revoked key still ingests
+    // on this replica. See `DsnCache`. `0` disables the cache and restores
+    // immediate revocation at the cost of one Redis round trip per request.
+    let dsn_ttl: u64 = std::env::var("INGEST_DSN_CACHE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    info!(dsn_cache_secs = dsn_ttl, "ingest key cache");
+
     let state = AppState {
         pool,
         redis,
         cfg: Arc::new(cfg),
+        dsn: Arc::new(DsnCache::new(dsn_ttl)),
     };
 
     let cors = CorsLayer::new()
@@ -192,56 +316,86 @@ async fn ingest(
         return error(StatusCode::UNAUTHORIZED, "missing_key", "no ingest key");
     };
 
-    // 2. Rate-limit the KEY before resolving it. An unknown key would otherwise
-    //    miss the DSN cache on every request and hit Postgres unauthenticated,
-    //    letting anyone drain the small ingest pool with garbage keys.
-    match state
-        .redis
-        .rate_limit_ok(
-            &keys::key_rate_limit(&key),
-            state.cfg.ingest_rate_limit_per_min,
-            60,
-        )
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return rate_limited(),
-        Err(e) => warn!(error = %e, "key rate limit check failed; allowing"),
-    }
+    // 2-4. Rate-limit the key, resolve the environment, rate-limit the app.
+    //
+    // Three sequential Redis waits, because each step's input came out of the
+    // one before it. The middle one is removable: `resolve_env`'s answer is the
+    // same for ~every request in a window, so a short process-local cache turns
+    // it into a hash lookup — and once the app is known WITHOUT asking Redis,
+    // the two limiter counters can go out together in one pipeline.
+    //
+    // Steady state is therefore ONE round trip here, against three before. The
+    // cold path below is unchanged, including the property that matters: an
+    // unknown key is rate-limited before anything can reach Postgres.
+    let key_rl = keys::key_rate_limit(&key);
+    let limit = state.cfg.ingest_rate_limit_per_min;
 
-    // 3. Resolve the environment (cache → Postgres). Unknown keys are negatively
-    //    cached inside `resolve_env` so a repeat miss never reaches the database.
-    let env = match resolve_env(&state, &key).await {
-        Ok(Some(e)) if e.env_ingest_enabled && e.app_ingest_enabled => e,
-        Ok(Some(_)) => return error(StatusCode::FORBIDDEN, "ingest_disabled", "ingest disabled"),
-        Ok(None) => {
-            return error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_key",
-                "unknown ingest key",
-            )
+    let env = if let Some(env) = state.dsn.get(&key) {
+        let app_rl = keys::rate_limit(&env.app_id.to_string());
+        match state
+            .redis
+            .rate_limit_ok_many(&[(key_rl.as_str(), limit), (app_rl.as_str(), limit)], 60)
+            .await
+        {
+            Ok(verdicts) if verdicts.iter().any(|ok| !ok) => return rate_limited(),
+            Ok(_) => {}
+            // Same fail-open as the sequential version. A limiter that cannot
+            // reach Redis must not take ingest down with it.
+            Err(e) => warn!(error = %e, "rate limit check failed; allowing"),
         }
-        Err(e) => {
-            warn!(error = %e, "environment resolution failed");
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "resolution failed",
-            );
+        // Re-checked on every request, not just on the miss: a cached entry
+        // whose app was disabled mid-TTL must still be refused.
+        if !(env.env_ingest_enabled && env.app_ingest_enabled) {
+            return error(StatusCode::FORBIDDEN, "ingest_disabled", "ingest disabled");
         }
+        env
+    } else {
+        // Rate-limit the KEY before resolving it. An unknown key would otherwise
+        // miss the DSN cache on every request and hit Postgres unauthenticated,
+        // letting anyone drain the small ingest pool with garbage keys.
+        match state.redis.rate_limit_ok(&key_rl, limit, 60).await {
+            Ok(true) => {}
+            Ok(false) => return rate_limited(),
+            Err(e) => warn!(error = %e, "key rate limit check failed; allowing"),
+        }
+
+        // Resolve the environment (cache → Postgres). Unknown keys are negatively
+        // cached inside `resolve_env` so a repeat miss never reaches the database.
+        let env = match resolve_env(&state, &key).await {
+            Ok(Some(e)) if e.env_ingest_enabled && e.app_ingest_enabled => e,
+            Ok(Some(_)) => {
+                return error(StatusCode::FORBIDDEN, "ingest_disabled", "ingest disabled")
+            }
+            Ok(None) => {
+                return error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_key",
+                    "unknown ingest key",
+                )
+            }
+            Err(e) => {
+                warn!(error = %e, "environment resolution failed");
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "resolution failed",
+                );
+            }
+        };
+
+        // Rate limit (fixed 60s window, per app).
+        let app_rl = keys::rate_limit(&env.app_id.to_string());
+        match state.redis.rate_limit_ok(&app_rl, limit, 60).await {
+            Ok(true) => {}
+            Ok(false) => return rate_limited(),
+            Err(e) => warn!(error = %e, "rate limit check failed; allowing"),
+        }
+
+        // Cached only after it has passed every check, so a disabled app is
+        // never the thing held in process.
+        state.dsn.put(&key, &env);
+        env
     };
-
-    // 4. Rate limit (fixed 60s window, per app).
-    let rl_key = keys::rate_limit(&env.app_id.to_string());
-    match state
-        .redis
-        .rate_limit_ok(&rl_key, state.cfg.ingest_rate_limit_per_min, 60)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return rate_limited(),
-        Err(e) => warn!(error = %e, "rate limit check failed; allowing"),
-    }
 
     // 5. Parse the (already-decompressed) envelope.
     let envelope: Envelope = match serde_json::from_slice(&body) {
@@ -259,40 +413,63 @@ async fn ingest(
         );
     }
 
-    // 6. Enqueue one job per item.
+    // 6. Enqueue the envelope as ONE stream entry.
+    //
+    // This used to be one entry per item, and then — once the round trips were
+    // pipelined — one entry per item sent in a single round trip. Both shapes
+    // wrote the envelope header (tenancy, release, ip, user agent, sdk, and the
+    // unbounded `context` block) once PER ITEM, for information the envelope
+    // states once. An 8-item batch paid 8x the serialization, 8x the bytes in
+    // Redis, 8x the parse in the worker, and — because `MAXLEN` counts entries,
+    // not events — consumed the stream's 1,000,000-entry budget 8x faster.
+    //
+    // The worker expands this back into per-item jobs, so nothing downstream of
+    // the decode changed.
     let ip = client_ip(&headers, &state.cfg);
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let received_at = Utc::now();
-    let mut accepted = 0usize;
+    let n = envelope.items.len();
+    let batch = IngestBatch {
+        app_id: env.app_id,
+        project_id: env.project_id,
+        org_id: env.org_id,
+        environment_id: env.env_id,
+        release: envelope.header.release,
+        received_at: Utc::now(),
+        ip,
+        user_agent,
+        context: envelope.context,
+        sdk: Some(envelope.header.sdk),
+        items: envelope.items,
+    };
 
-    for item in envelope.items {
-        let job = IngestJob {
-            app_id: env.app_id,
-            project_id: env.project_id,
-            org_id: env.org_id,
-            environment_id: env.env_id,
-            release: envelope.header.release.clone(),
-            received_at,
-            ip: ip.clone(),
-            user_agent: user_agent.clone(),
-            context: envelope.context.clone(),
-            sdk: Some(envelope.header.sdk.clone()),
-            item,
-        };
-        match serde_json::to_string(&job) {
-            Ok(payload) => {
-                if let Err(e) = state.redis.xadd_job(&payload, 1_000_000).await {
-                    warn!(error = %e, "failed to enqueue job");
-                } else {
-                    accepted += 1;
-                }
-            }
-            Err(e) => warn!(error = %e, "failed to serialize job"),
+    // An envelope is now all-or-nothing, where before a single unserializable
+    // item was skipped and its neighbours still landed. That is a narrower hole
+    // than it looks: every field here either came from `serde_json::from_slice`
+    // moments ago or was built from a validated header, and JSON that parsed
+    // cannot contain the map keys or non-finite floats that make `to_string`
+    // fail. Reporting `accepted: 0` and letting the SDK retry the whole
+    // envelope is the correct answer if it ever does.
+    let payload = match serde_json::to_string(&batch) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, items = n, "failed to serialize envelope; nothing enqueued");
+            return (StatusCode::ACCEPTED, Json(json!({ "accepted": 0 }))).into_response();
         }
-    }
+    };
+
+    let accepted = match state.redis.xadd_job(&payload, stream_maxlen()).await {
+        Ok(_) => n,
+        // Nothing is known to have landed, so nothing is counted. The SDK sees
+        // `accepted: 0` and retries, which is what it did before for an
+        // envelope whose every XADD failed.
+        Err(e) => {
+            warn!(error = %e, items = n, "failed to enqueue envelope");
+            0
+        }
+    };
 
     (StatusCode::ACCEPTED, Json(json!({ "accepted": accepted }))).into_response()
 }

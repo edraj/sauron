@@ -679,7 +679,13 @@ impl Config {
             jwt_access_ttl_secs: parse("JWT_ACCESS_TTL_SECS", 900),
             jwt_refresh_ttl_secs: parse("JWT_REFRESH_TTL_SECS", 2_592_000),
             auth_revocation_poll_secs: parse("AUTH_REVOCATION_POLL_SECS", 5),
-            worker_concurrency: parse("WORKER_CONCURRENCY", 4),
+            // 8, raised from 4. The two knobs interact, and sweeping either
+            // alone gets the wrong answer: at the old batch size of 50, going
+            // from 4 workers to 16 made throughput WORSE, which is what a
+            // one-dimensional sweep would have concluded. Measured together, 8
+            // workers at a batch of 200 more than doubled the write rate.
+            // `INGEST_DB_POOL` must stay >= this.
+            worker_concurrency: parse("WORKER_CONCURRENCY", 8),
             cors_allowed_origins,
             ingest_rate_limit_per_min: parse("INGEST_RATE_LIMIT_PER_MIN", 6000),
             ingest_max_body_bytes: parse("INGEST_MAX_BODY_BYTES", 1_048_576),
