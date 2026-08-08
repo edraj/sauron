@@ -95,6 +95,14 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://sauron:sauron@localhost:5432/sauron
           TEST_REDIS_URL: redis://localhost:6379
+        # This is the BACKEND-side half of the wire gate: it parses the
+        # COMMITTED `sdks/wire-fixtures/*.json` on a clean checkout (see
+        # `crates/sauron-core/tests/sdk_wire_conformance.rs`), so it catches the
+        # deserializer changing under a fixed SDK output. It cannot catch the
+        # other direction — an SDK whose output drifts leaves this job parsing
+        # the stale committed file and passing. That half is the
+        # `check-wire-fixture.sh` step in each of the five sdk-* jobs below;
+        # neither half is sufficient alone.
         run: cargo test --workspace
 
   dashboard:
@@ -115,8 +123,27 @@ jobs:
       - run: npm run build          # svelte-check + vite build
       - run: npm test               # vitest
 
+  # ---------------------------------------------------------------------------
+  # SDK jobs.
+  #
+  # Every one of the five runs its suite, and every suite REGENERATES
+  # `sdks/wire-fixtures/<sdk>.json` from the envelope its own transport posts.
+  # Each job therefore ends with `.github/scripts/check-wire-fixture.sh`, which
+  # fails if that regeneration differs from the committed file.
+  #
+  # Without that step the regeneration was thrown away and CI only caught wire
+  # drift on the backend side: an SDK-side regression left its own job green
+  # (it regenerates) and `backend` green (it parses the stale committed file), so
+  # the bug shipped with a passing conformance test on top of it. node, python
+  # and csharp had no CI job at all, so their fixtures were never regenerated
+  # anywhere.
+  #
+  # The gate step must run AFTER the suite and is deliberately not
+  # `continue-on-error` — see the script for what a diff means.
+  # ---------------------------------------------------------------------------
+
   sdk-js:
-    name: web SDK — test · build
+    name: web SDK — test · build · wire fixture
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -131,13 +158,108 @@ jobs:
           cache-dependency-path: sdks/js/package-lock.json
       - run: npm ci
       - run: npm test
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh js
       - run: npm run build
       - name: typecheck (report-only)
         continue-on-error: true
         run: npm run typecheck
 
+  sdk-node:
+    name: node SDK — test · build · wire fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdks/node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/node/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh node
+      - run: npm run build
+      - name: typecheck (report-only)
+        continue-on-error: true
+        run: npm run typecheck
+
+  sdk-python:
+    name: python SDK — test · wire fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned rather than "3.x": the fixture normalizer pins
+          # `context.runtime.version`, but a floating interpreter is still one
+          # more thing that can move under a byte-comparison gate for no reason.
+          python-version: '3.12'
+      # The package has no runtime dependencies (stdlib urllib + threading); the
+      # `test` extra is just pytest. Installed as editable so `import sauron`
+      # resolves to the source under test, not a built copy.
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest -q
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh python
+
+  sdk-csharp:
+    name: dotnet SDK — test · wire fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdks/csharp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          # Three DIFFERENT constraints are in play here and the previous version
+          # of this comment reasoned about only one of them, which is why this job
+          # could not run at all:
+          #
+          #  1. WHAT IS COMPILED — `net8.0`, pinned by both .csproj files.
+          #  2. WHAT IT RUNS ON — `RollForward: Major` in Sauron.Tests.csproj lets
+          #     the net8.0 test host run on a newer runtime; installing 8.0.x
+          #     means it does not have to.
+          #  3. WHAT READS THE SOLUTION — nothing above says anything about this,
+          #     and it is the one that mattered. `sdks/csharp` contains only
+          #     `Sauron.slnx` (the XML solution format): no `.sln`, no root
+          #     `.csproj`. `.slnx` is unreadable before SDK **9.0.200**, so with
+          #     only 8.0.x installed a bare `dotnet test` here died with
+          #     `MSB1003: Specify a project or solution file` — measured against
+          #     9.0.119, which reproduces it — BEFORE reaching the wire-fixture
+          #     gate below. One of the five wire gates therefore never executed.
+          #
+          # `sdks/csharp/global.json` is what makes (3) binding rather than
+          # advisory: absent it the muxer simply takes the highest SDK the runner
+          # image happens to ship, so a future image preinstalling 9.0.2xx+ would
+          # have made this job pass BY ACCIDENT — indistinguishable from not
+          # pinning. With global.json a too-old SDK fails naming the version it
+          # wanted and the file that asked for it, instead of MSB1003.
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      # Resolves `Sauron.slnx` → both projects, per sdks/csharp/global.json.
+      - run: dotnet test
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh csharp
+
   sdk-flutter:
-    name: flutter SDK — analyze · test
+    name: flutter SDK — analyze · test · wire fixture
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -154,6 +276,16 @@ jobs:
         continue-on-error: true
         run: flutter analyze
       - run: flutter test
+      # NOTE: `channel: stable` is unpinned, so this is the one gate that a
+      # Flutter release — not a repo change — could trip, if a new `package:test`
+      # changes the stack depth `captureException` records (the frame COUNT is
+      # kept on purpose; only frame identity strings are normalized). If that
+      # happens the failure is loud and the fix is one regenerate-and-commit, not
+      # a mystery. Pinning `flutter-version` here would remove that at the cost
+      # of no longer testing against current stable.
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh flutter
 
   packaging:
     name: packaging — spec lint · source RPM
