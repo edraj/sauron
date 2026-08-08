@@ -6,6 +6,7 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
@@ -15,11 +16,10 @@
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import DurationHistogram from '../lib/components/DurationHistogram.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { listSessions, getSessionAnalytics } from '../lib/api/sessions';
-  import { errorMessage } from '../lib/api/client';
   import {
-    relativeTime,
-    formatDateTime,
     formatDuration,
     durationBetween,
     compactNumber,
@@ -32,12 +32,19 @@
   let offset = $state(0);
   let search = $state('');
 
-  let sessions = $state<Session[]>([]);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached views (lib/stores/cached-view.svelte.ts): cached rows paint instantly on
+  // return, then refresh behind a spinner. Re-exposed under the template's existing
+  // names, so the markup is unchanged.
+  const sessionsView = new CachedView<Session[]>();
+  const analyticsView = new CachedView<SessionsAnalytics>();
 
-  let analytics = $state<SessionsAnalytics | null>(null);
-  let analyticsError = $state<string | null>(null);
+  const sessions = $derived(sessionsView.data ?? []);
+  const loading = $derived(sessionsView.loading);
+  const error = $derived(sessionsView.error);
+  const revalidating = $derived(sessionsView.revalidating || analyticsView.revalidating);
+
+  const analytics = $derived(analyticsView.data ?? null);
+  const analyticsError = $derived(analyticsView.error);
 
   let refreshing = $state(false);
 
@@ -46,27 +53,23 @@
     (analytics?.duration_series ?? []).map((p) => ({ bucket: p.bucket, count: p.avg_ms })),
   );
 
-  async function loadAnalytics(appId: string, days: number) {
-    analyticsError = null;
-    try {
-      analytics = await getSessionAnalytics(appId, days);
-    } catch (err) {
-      analyticsError = errorMessage(err);
-      analytics = null;
-    }
+  // `scopeKey` belongs in every key: it carries the selected environment, which
+  // the axios interceptor adds to the request but which appears in none of these
+  // arguments. Omit it and one environment's sessions are served as another's.
+  async function loadAnalytics(appId: string, days: number, force = false) {
+    await analyticsView.load(
+      viewKey('sessions.analytics', appId, sessionStore.scopeKey, days),
+      () => getSessionAnalytics(appId, days),
+      force,
+    );
   }
 
-  async function load(appId: string, days: number, off: number) {
-    loading = true;
-    error = null;
-    try {
-      sessions = await listSessions(appId, { since_days: days, limit: LIMIT, offset: off });
-    } catch (err) {
-      error = errorMessage(err);
-      sessions = [];
-    } finally {
-      loading = false;
-    }
+  async function load(appId: string, days: number, off: number, force = false) {
+    await sessionsView.load(
+      viewKey('sessions.list', appId, sessionStore.scopeKey, days, off, LIMIT),
+      () => listSessions(appId, { since_days: days, limit: LIMIT, offset: off }),
+      force,
+    );
   }
 
   async function refresh() {
@@ -74,7 +77,11 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, sinceDays, offset), loadAnalytics(aid, sinceDays)]);
+      // force: an explicit click must reach the network regardless of freshness.
+      await Promise.all([
+        load(aid, sinceDays, offset, true),
+        loadAnalytics(aid, sinceDays, true),
+      ]);
     } finally {
       refreshing = false;
     }
@@ -131,7 +138,7 @@
     <div class="controls">
       <SearchInput bind:value={search} placeholder="Filter session / user / device…" width="280px" />
       <DateRange value={sinceDays} onchange={onRange} />
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
 
@@ -169,7 +176,7 @@
           <Button
             variant="secondary"
             onclick={() =>
-              sessionStore.currentAppId && load(sessionStore.currentAppId, sinceDays, offset)}
+              sessionStore.currentAppId && load(sessionStore.currentAppId, sinceDays, offset, true)}
           >
             Retry
           </Button>
@@ -232,9 +239,7 @@
                   <span class="faint">—</span>
                 {/if}
               </td>
-              <td class="muted" title={formatDateTime(s.started_at)}>
-                {relativeTime(s.started_at)}
-              </td>
+              <td><TimeValue value={s.started_at} /></td>
               <td class="muted">{formatDuration(durationBetween(s.started_at, s.last_event_at))}</td>
               <td class="num">{s.events_count.toLocaleString()}</td>
               <td class="num">

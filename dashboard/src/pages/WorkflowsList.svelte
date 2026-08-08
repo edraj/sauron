@@ -8,6 +8,7 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
@@ -16,7 +17,7 @@
   import { listWorkflows } from '../lib/api/workflows';
   import { errorMessage } from '../lib/api/client';
   import { completionRate, formatDuration } from '../lib/workflows';
-  import { compactNumber, formatPercent, relativeTime } from '../lib/utils/format';
+  import { compactNumber, formatPercent } from '../lib/utils/format';
   import type { WorkflowRow } from '../lib/models';
 
   const LIMIT = 50;
@@ -191,7 +192,7 @@
               <td class="num">{formatDuration(r.median_duration_ms)}</td>
               <td class="num">{formatDuration(r.p95_duration_ms)}</td>
               <td class="num">{compactNumber(r.unique_users)}</td>
-              <td class="num">{relativeTime(r.last_seen)}</td>
+              <td class="num"><TimeValue value={r.last_seen} /></td>
             </tr>
           {/each}
         {/snippet}

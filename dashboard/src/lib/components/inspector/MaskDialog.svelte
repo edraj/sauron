@@ -17,6 +17,7 @@
   import * as inspectorApi from '../../api/inspector';
   import { errorMessage } from '../../api/client';
   import { toastStore } from '../../stores/toast.svelte';
+  import { lockedBy, lockTitle } from '../../models/page-access';
   import {
     UNREACHABLE_COPY,
     describeTarget,
@@ -32,6 +33,13 @@
     ondone: () => void;
   }
   const { appId, finding, onclose, ondone }: Props = $props();
+
+  // Both endpoints this dialog calls — mask_preview and the mask confirm — use
+  // `authorize_app(PII_MANAGE)`, so the lock is derived here rather than
+  // inherited from the opener in Inspector.svelte. Defence in depth: the dialog
+  // is only reachable through a locked button today, but the destructive
+  // control must state its own requirement rather than trust one step upstream.
+  const manageLock = $derived(lockedBy('pii:manage', { app: appId, level: 'app' }));
 
   // $state.raw: the action is replaced wholesale on every poll, and deep
   // proxying it means `action === previous` never matches, which would restart
@@ -103,6 +111,14 @@
     // half-typed confirmation by re-running this effect.
     const id = untrack(() => appId);
     const f = untrack(() => finding);
+    // Don't spend a request on a call the server will 403: say which permission
+    // is missing instead of surfacing a bare error.
+    const lock = untrack(() => manageLock);
+    if (lock) {
+      error = lockTitle(lock);
+      starting = false;
+      return;
+    }
     void (async () => {
       try {
         const started = await inspectorApi.maskPreview(id, { finding_id: f.id });
@@ -247,7 +263,12 @@
 
   {#snippet footer()}
     <Button onclick={onclose}>Cancel</Button>
-    <Button variant="danger" disabled={!ready || submitting} onclick={confirm}>
+    <Button
+      variant="danger"
+      disabled={!ready || submitting}
+      lockedReason={manageLock}
+      onclick={confirm}
+    >
       {submitting ? 'Queuing…' : 'Mask permanently in hot Postgres'}
     </Button>
   {/snippet}

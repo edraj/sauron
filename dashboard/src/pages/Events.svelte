@@ -8,6 +8,7 @@
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import BarList from '../lib/components/BarList.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -22,7 +23,6 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { topEvents, eventSeries, listEvents } from '../lib/api/events';
   import { errorMessage } from '../lib/api/client';
-  import { relativeTime, formatDateTime } from '../lib/utils/format';
   import type { AnalyticsEvent, SeriesPoint, TopEvent } from '../lib/models';
 
   const STREAM_LIMIT = 50;
@@ -351,9 +351,7 @@
                     <span class="faint">—</span>
                   {/if}
                 </td>
-                <td class="muted" title={formatDateTime(ev.occurred_at)}>
-                  {relativeTime(ev.occurred_at)}
-                </td>
+                <td><TimeValue value={ev.occurred_at} muted /></td>
               </tr>
               {#if expandedId === ev.id}
                 <tr class="detail-row">

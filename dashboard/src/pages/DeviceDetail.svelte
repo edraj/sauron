@@ -13,10 +13,12 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { getDevice } from '../lib/api/devices';
   import { errorMessage } from '../lib/api/client';
-  import { relativeTime, formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
+  import { relativeTime, formatTimestamp, formatDuration, durationBetween } from '../lib/utils/format';
+  import { timeFormatStore } from '../lib/stores/time-format.svelte';
   import type { DeviceDetail, ErrorEvent, Session } from '../lib/models';
 
   interface Props {
@@ -103,8 +105,16 @@
         value={device.errors_count.toLocaleString()}
         tone={device.errors_count > 0 ? 'error' : 'neutral'}
       />
-      <StatTile label="First seen" value={formatDateTime(device.first_seen)} />
-      <StatTile label="Last seen" value={relativeTime(device.last_seen)} sub={formatDateTime(device.last_seen)} />
+      <StatTile
+        label="First seen"
+        value={timeFormatStore.mode === 'relative' ? relativeTime(device.first_seen) : formatTimestamp(device.first_seen)}
+        sub={timeFormatStore.mode === 'relative' ? formatTimestamp(device.first_seen) : relativeTime(device.first_seen)}
+      />
+      <StatTile
+        label="Last seen"
+        value={timeFormatStore.mode === 'relative' ? relativeTime(device.last_seen) : formatTimestamp(device.last_seen)}
+        sub={timeFormatStore.mode === 'relative' ? formatTimestamp(device.last_seen) : relativeTime(device.last_seen)}
+      />
     </StatTiles>
 
     <div class="grid">
@@ -137,9 +147,7 @@
                       {s.session_id}
                     </a>
                   </td>
-                  <td class="cell-muted" title={formatDateTime(s.started_at)}>
-                    {relativeTime(s.started_at)}
-                  </td>
+                  <td><TimeValue value={s.started_at} /></td>
                   <td class="cell-muted">{formatDuration(sessionDuration(s))}</td>
                   <td class="num">{s.events_count.toLocaleString()}</td>
                   <td class="num">
@@ -214,9 +222,7 @@
                   <a class="crash" href={`#/issues/${e.issue_id}`}>
                     <div class="crash-top">
                       <LevelBadge level={e.level} size="sm" />
-                      <span class="crash-time" title={formatDateTime(e.occurred_at)}>
-                        {relativeTime(e.occurred_at)}
-                      </span>
+                      <span class="crash-time"><TimeValue value={e.occurred_at} asText /></span>
                     </div>
                     <span class="crash-title mono">{errorTitle(e)}</span>
                   </a>

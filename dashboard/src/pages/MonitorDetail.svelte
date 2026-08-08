@@ -47,8 +47,15 @@
   async function load() {
     loading = true; error = null;
     try {
-      detail = await getMonitor(params.id);
-      checks = await getMonitorChecks(params.id, 24);
+      // Issued together: neither call feeds the other, so awaiting them in
+      // sequence just added a serial round trip to every load and every refresh
+      // after a pause/interval change. `all`, not `allSettled` — the page cannot
+      // render without either half, so a rejection should surface as the error
+      // it is.
+      [detail, checks] = await Promise.all([
+        getMonitor(params.id),
+        getMonitorChecks(params.id, 24),
+      ]);
     } catch (e) { error = (e as Error).message; }
     finally { loading = false; }
   }

@@ -150,6 +150,29 @@ export function formatDateTimeZone(input: string | number | Date | null | undefi
   return absolute(input, { timeZoneName: 'short' });
 }
 
+/**
+ * `yyyy-MM-DD HH:mm:ss` in the viewer's local time — the absolute half of the
+ * TimeValue toggle.
+ *
+ * Deliberately NOT `toLocaleString`: the other three absolute formatters here
+ * are locale-formatted ("Aug 6, 2026, 02:15:07 PM"), which is right for prose
+ * but wrong for a value someone is lining up against a log line. This one is
+ * fixed-width and sortable, so a column of them reads as a column.
+ *
+ * Local rather than UTC because `relativeTime` and `formatDateTime` are both
+ * local: toggling changes precision, never the instant's apparent value.
+ */
+export function formatTimestamp(input: string | number | Date | null | undefined): string {
+  if (input === null || input === undefined) return '—';
+  const d = new Date(input);
+  if (Number.isNaN(d.getTime())) return '—';
+  const p = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  );
+}
+
 function absolute(
   input: string | number | Date | null | undefined,
   extra: Intl.DateTimeFormatOptions,
@@ -175,12 +198,23 @@ export function formatTime(input: string | number | Date | null | undefined): st
   return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+/**
+ * Hoisted out of `compactNumber`. Constructing an `Intl.NumberFormat` is the
+ * expensive part — it resolves locale data — while `.format()` on an existing
+ * one is cheap. This function is called once per numeric cell, so a 50-row
+ * table built one formatter per cell and threw all of them away. The locale is
+ * the hardcoded 'en' below, so a single module-level instance is safe: there is
+ * no per-call input that could select a different one.
+ */
+const COMPACT_NUMBER_FORMAT = new Intl.NumberFormat('en', {
+  notation: 'compact',
+  maximumFractionDigits: 1,
+});
+
 /** Compact number: 1_234 -> "1.2k". */
 export function compactNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) return '0';
-  return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(
-    value,
-  );
+  return COMPACT_NUMBER_FORMAT.format(value);
 }
 
 export function plural(count: number, singular: string, pluralForm?: string): string {

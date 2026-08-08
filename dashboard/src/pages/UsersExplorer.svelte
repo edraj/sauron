@@ -13,13 +13,14 @@
   import DateRange from '../lib/components/DateRange.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import UserActivityChart from '../lib/components/UserActivityChart.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { listPersons } from '../lib/api/persons';
   import { getUserAnalytics } from '../lib/api/users';
   import { errorMessage } from '../lib/api/client';
   import {
-    relativeTime,
-    formatDateTime,
     initials,
     hueFromString,
     compactNumber,
@@ -34,9 +35,15 @@
   let query = $state('');
   let offset = $state(0);
 
-  let rows = $state<PersonRow[]>([]);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): rows already fetched paint
+  // instantly on return, then refresh behind a spinner instead of a skeleton.
+  // Re-exposed under the names the template already used, so the markup is
+  // unchanged apart from the refresh indicator.
+  const view = new CachedView<PersonRow[]>();
+  const rows = $derived(view.data ?? []);
+  const revalidating = $derived(view.revalidating);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
 
   let debounce: ReturnType<typeof setTimeout> | undefined;
 
@@ -51,7 +58,7 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, query, offset), loadAnalytics(aid, sinceDays)]);
+      await Promise.all([load(aid, query, offset, true), loadAnalytics(aid, sinceDays)]);
     } finally {
       refreshing = false;
     }
@@ -84,21 +91,22 @@
     }, 250);
   }
 
-  async function load(appId: string, q: string, off: number) {
-    loading = true;
-    error = null;
-    try {
-      rows = await listPersons(appId, {
+  // `scopeKey` must be in the key: it carries the selected environment, which the
+  // axios interceptor adds to the request but which appears in none of these
+  // arguments. Omit it and one environment's rows are served as another's.
+  //
+  // `force` bypasses the fresh-window short-circuit — an explicit Refresh or
+  // Retry means "go to the network now".
+  async function load(appId: string, q: string, off: number, force = false) {
+    await view.load(
+      viewKey('persons.list', appId, sessionStore.scopeKey, q, off, LIMIT),
+      () => listPersons(appId, {
         search: q || undefined,
         limit: LIMIT,
         offset: off,
-      });
-    } catch (err) {
-      error = errorMessage(err);
-      rows = [];
-    } finally {
-      loading = false;
-    }
+      }),
+      force,
+    );
   }
 
   $effect(() => {
@@ -139,7 +147,7 @@
     </div>
     <div class="controls">
       <SearchInput bind:value={searchTerm} oninput={onSearch} placeholder="Search users…" width="300px" />
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
 
@@ -252,12 +260,8 @@
               <td class="num">
                 <span class:err={row.errors_count > 0}>{row.errors_count.toLocaleString()}</span>
               </td>
-              <td class="when muted" title={formatDateTime(row.first_seen)}>
-                {relativeTime(row.first_seen)}
-              </td>
-              <td class="when muted" title={formatDateTime(row.last_seen)}>
-                {relativeTime(row.last_seen)}
-              </td>
+              <td class="when"><TimeValue value={row.first_seen} muted /></td>
+              <td class="when"><TimeValue value={row.last_seen} muted /></td>
             </tr>
           {/each}
         {/snippet}

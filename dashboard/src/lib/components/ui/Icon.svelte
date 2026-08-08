@@ -35,6 +35,7 @@
   import Inbox from '@lucide/svelte/icons/inbox';
   import Info from '@lucide/svelte/icons/info';
   import KeyRound from '@lucide/svelte/icons/key-round';
+  import Layers from '@lucide/svelte/icons/layers';
   import LayoutDashboard from '@lucide/svelte/icons/layout-dashboard';
   import LayoutPanelTop from '@lucide/svelte/icons/layout-panel-top';
   import LifeBuoy from '@lucide/svelte/icons/life-buoy';
@@ -48,6 +49,7 @@
   import Server from '@lucide/svelte/icons/server';
   import Settings from '@lucide/svelte/icons/settings';
   import ShieldAlert from '@lucide/svelte/icons/shield-alert';
+  import ShieldCheck from '@lucide/svelte/icons/shield-check';
   import Smartphone from '@lucide/svelte/icons/smartphone';
   import Sun from '@lucide/svelte/icons/sun';
   import Terminal from '@lucide/svelte/icons/terminal';
@@ -87,6 +89,7 @@
     inbox: Inbox,
     info: Info,
     'key-round': KeyRound,
+    layers: Layers,
     'layout-dashboard': LayoutDashboard,
     'layout-panel-top': LayoutPanelTop,
     'life-buoy': LifeBuoy,
@@ -100,6 +103,7 @@
     server: Server,
     settings: Settings,
     'shield-alert': ShieldAlert,
+    'shield-check': ShieldCheck,
     smartphone: Smartphone,
     sun: Sun,
     terminal: Terminal,

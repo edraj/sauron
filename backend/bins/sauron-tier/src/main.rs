@@ -35,8 +35,33 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn cycle(pool: &PgPool, cfg: &Config, gran: Granularity) -> anyhow::Result<()> {
+    // Resolve the rotation age once per cycle, not once per process. The value is
+    // operator-tunable at runtime (`runtime_settings['tier.hot_days']`), so a
+    // process-start read would mean a change only took effect on restart — and
+    // this worker is the component that actually moves data, so its reading of
+    // the setting IS the deployment's hot/cold boundary.
+    //
+    // Once per cycle rather than once per table so every table in a single cycle
+    // uses the same cutoff. Re-reading per table would let a mid-cycle edit tier
+    // `error_events` at 30 days and `analytics_events` at 7 in the same pass.
+    let mut c = conn(pool).await?;
+    let hot_days = repo::effective_tier_hot_days(&mut c, cfg.tier_hot_days).await?;
+    // Housekeeping: expired pins are already ignored by `is_range_pinned`, so this
+    // only reclaims rows.
+    if let Err(e) = repo::purge_expired_tier_pins(&mut c).await {
+        warn!(error = %e, "purging expired tier pins failed");
+    }
+    drop(c);
+    if hot_days != cfg.tier_hot_days {
+        info!(
+            configured = cfg.tier_hot_days,
+            effective = hot_days,
+            "rotation age overridden by runtime setting"
+        );
+    }
+
     for t in TIERED_TABLES {
-        if let Err(e) = tier_table(pool, cfg, gran, t).await {
+        if let Err(e) = tier_table(pool, cfg, gran, t, hot_days).await {
             warn!(table = t.name, error = %e, "tiering table failed");
         }
     }
@@ -48,6 +73,7 @@ async fn tier_table(
     cfg: &Config,
     gran: Granularity,
     t: &TieredTable,
+    hot_days: i64,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     let mut c = conn(pool).await?;
@@ -69,7 +95,7 @@ async fn tier_table(
     }
 
     // 2. Eligibility cutoff: partitions whose END <= (now - hot_days) may tier.
-    let cutoff = now - chrono::Duration::days(cfg.tier_hot_days);
+    let cutoff = now - chrono::Duration::days(hot_days);
     let cold_dir = cold_copy_dir(&cfg.tier_cold_path, t.name);
     let base_glob = format!("{}/**/*.parquet", cold_dir);
 
@@ -151,6 +177,17 @@ async fn tier_table(
             };
             let range = bucket_bounds(start, gran);
             if range.end <= w && (now - range.end) >= lag {
+                // A restored range is pinned. Without this check the restore is
+                // undone on the very next cycle: the rows are back in Postgres but
+                // also still in Parquet, so `pg_now == cold_now` and the
+                // late-write guard below does NOT fire — it only retains a
+                // partition that GREW. Checked before the row counts because it is
+                // one indexed query against a tiny table, versus a COUNT(*) on the
+                // partition plus a DuckDB scan of the cold copy.
+                if repo::is_range_pinned(&mut c, t.name, range.start, range.end).await? {
+                    info!(child = %child, "partition pinned (restored data); not dropping");
+                    continue;
+                }
                 // Late-write safety: a client-supplied occurred_at can route a NEW
                 // row into this already-exported-but-not-yet-dropped partition (the
                 // grace window). Such a row is NOT in Parquet, so dropping would lose

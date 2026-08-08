@@ -1,4 +1,7 @@
-//! Shared tracing setup for the Sauron services.
+//! Shared tracing setup for the Sauron services, plus the ingest accounting
+//! counters in [`metrics`].
+
+pub mod metrics;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

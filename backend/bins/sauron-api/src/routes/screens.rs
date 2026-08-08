@@ -94,7 +94,10 @@ pub async fn detail(
         return Err(ApiError::BadRequest("name is required".into()));
     }
     let mut conn = db(&state).await?;
-    let scope = super::scope::authorized_read_scope(
+    // `_with_perms`: `recent_exceptions` below is whole `ErrorEvent` rows, whose
+    // `stacktrace_symbolicated` holds the de-obfuscated source lines
+    // `perm::SOURCE_READ` gates. See `sessions::detail` for the same note.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
         auth.user_id,
         app_id,
@@ -106,8 +109,9 @@ pub async fn detail(
     let stats = repo::screen_stats(&mut conn, scope.clone(), since, &q.name).await?;
     let recent_events =
         repo::recent_events_for_screen(&mut conn, scope.clone(), &q.name, since, 20).await?;
-    let recent_exceptions =
+    let mut recent_exceptions =
         repo::recent_exceptions_for_screen(&mut conn, scope, &q.name, since, 20).await?;
+    crate::symbolicate::gate_source_context(&perms, &mut recent_exceptions);
     Ok(Json(ScreenDetail {
         stats,
         recent_events,

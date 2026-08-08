@@ -1,13 +1,11 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
+  import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
-  import Badge from '../lib/components/ui/Badge.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
-  import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
   import CreateMemberDialog from '../lib/components/members/CreateMemberDialog.svelte';
   import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
   import ResetPasswordDialog from '../lib/components/members/ResetPasswordDialog.svelte';
@@ -108,10 +106,6 @@
   let granting = $state(false);
   let removingId = $state<string | null>(null);
 
-  // Role editor dialog (create + edit + read-only view of system presets)
-  let roleDialogOpen = $state(false);
-  let editingRole = $state<Role | null>(null);
-
   // Create / edit member dialogs.
   let createOpen = $state(false);
   let editingMemberId = $state<string | null>(null);
@@ -138,28 +132,8 @@
     editingMemberId ? (grouped.find((m) => m.user_id === editingMemberId) ?? null) : null,
   );
 
-  // Distinct users per role, not grant count — a person holding the same role
-  // at three scopes must still only count once, since that's what the
-  // "N members hold this role" impact warning in RoleEditorDialog means.
-  const roleMemberCounts = $derived.by(() => {
-    const usersByRole = new Map<string, Set<string>>();
-    for (const m of grouped) {
-      for (const g of m.grants) {
-        let users = usersByRole.get(g.role_id);
-        if (!users) {
-          users = new Set();
-          usersByRole.set(g.role_id, users);
-        }
-        users.add(m.user_id);
-      }
-    }
-    const counts: Record<string, number> = {};
-    for (const [roleId, users] of usersByRole) counts[roleId] = users.size;
-    return counts;
-  });
-
-  // Every members/roles endpoint resolves through `authorize_org`
-  // (orgs.rs:160,552,809,1020,1399), which no project- or app-scoped grant can
+  // Every members endpoint resolves through `authorize_org`
+  // (orgs.rs:160,552,809,1020), which no project- or app-scoped grant can
   // satisfy — hence `level: 'org'` on all of these. Without it, a member whose
   // grant carries `member:manage` at project scope saw every control here lit
   // and got a 403 from each one.
@@ -168,7 +142,6 @@
   // without `member:credential`, and showing this button to that role means
   // every click 403s.
   const revokeLock = $derived(lockedBy('member:credential', { level: 'org' }));
-  const roleManageLock = $derived(lockedBy('role:manage', { level: 'org' }));
   // Password reset re-checks BOTH server-side (orgs.rs:1020 + 755), so report
   // whichever is missing — `member:credential` first, since it is the narrower
   // one deliberately carved out of `member:manage`.
@@ -310,23 +283,6 @@
     }
   }
 
-  function openNewRole() {
-    editingRole = null;
-    roleDialogOpen = true;
-  }
-
-  function openEditRole(role: Role) {
-    editingRole = role;
-    roleDialogOpen = true;
-  }
-
-  function onRoleSaved(saved: Role) {
-    const i = roles.findIndex((r) => r.id === saved.id);
-    if (i >= 0) roles[i] = saved;
-    else roles = [...roles, saved];
-    toastStore.success(`Role "${saved.name}" saved.`);
-  }
-
   async function toggleActive(member: Member) {
     const org = sessionStore.currentOrg;
     if (!org) return;
@@ -414,7 +370,7 @@
   }
 </script>
 
-<AppShell requireProject={false}>
+<AdminShell requireProject={false}>
   <div class="head">
     <div>
       <h1 class="page-title">Members</h1>
@@ -422,9 +378,10 @@
     </div>
   </div>
 
-  <!-- The `member:read` gate is AppShell's now: it resolves /members through
-       PAGE_ACCESS and renders PermissionDenied instead of this page, so the
-       bespoke "No access" card that used to live here would be unreachable. -->
+  <!-- The `member:read` gate is AdminShell's now (which wraps AppShell): it
+       resolves /admin/members through PAGE_ACCESS and renders PermissionDenied
+       instead of this page, so the bespoke "No access" card that used to live
+       here would be unreachable. -->
   {#if loading}
     <div class="center"><Spinner size={26} /></div>
   {:else if error}
@@ -502,59 +459,10 @@
       onresetpassword={(m, a) => (resetTarget = { member: m, action: a })}
       onremovegrant={removeGrant}
     />
-
-    <Card>
-      {#snippet header()}
-        <h3 class="card-title-inline">Roles</h3>
-      {/snippet}
-      {#snippet actions()}
-        <Button
-          variant="secondary"
-          size="sm"
-          lockedReason={roleManageLock}
-          onclick={openNewRole}
-        >
-          New role
-        </Button>
-      {/snippet}
-
-      <ul class="role-list">
-        {#each roles as role (role.id)}
-          <li class="role-row">
-            <div class="r-main">
-              <span class="r-name">{role.name}</span>
-              {#if role.is_system}<Badge tone="neutral" size="sm">system</Badge>{/if}
-              {#if role.description}<span class="r-desc muted">{role.description}</span>{/if}
-            </div>
-            <div class="r-actions">
-              <span class="r-count muted">{role.permissions.length} permissions</span>
-              <!-- A system role opens read-only for anyone, so it is never
-                   locked; only editing a custom role needs `role:manage`. -->
-              <Button
-                variant="ghost"
-                size="sm"
-                onclick={() => openEditRole(role)}
-                lockedReason={role.is_system ? null : roleManageLock}
-              >
-                {role.is_system ? 'View' : 'Edit'}
-              </Button>
-            </div>
-          </li>
-        {/each}
-      </ul>
-    </Card>
     </div>
   {/if}
 
   {#if sessionStore.currentOrg}
-    <RoleEditorDialog
-      open={roleDialogOpen}
-      orgId={sessionStore.currentOrg.id}
-      role={editingRole}
-      memberCount={editingRole ? (roleMemberCounts[editingRole.id] ?? 0) : 0}
-      onclose={() => (roleDialogOpen = false)}
-      onsaved={onRoleSaved}
-    />
     <CreateMemberDialog
       open={createOpen}
       orgId={sessionStore.currentOrg.id}
@@ -620,7 +528,7 @@
       oncancel={() => (pendingRevoke = null)}
     />
   {/if}
-</AppShell>
+</AdminShell>
 
 <style>
   .head {
@@ -637,7 +545,8 @@
   }
   /* Owns the vertical rhythm for the page's cards. Previously each card carried
      its own margin-bottom via :global(), which silently skipped the members
-     table once it moved into its own component and left it stuck to Roles. */
+     table once it moved into its own component and left it stuck to the card
+     below it. */
   .stack {
     display: grid;
     gap: 16px;
@@ -691,48 +600,6 @@
   .card-title-inline {
     font-size: 14.5px;
     font-weight: 620;
-  }
-  .role-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-  }
-  .role-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 11px 0;
-    border-bottom: 1px solid var(--border);
-  }
-  .role-row:last-child {
-    border-bottom: none;
-  }
-  .r-main {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    flex-wrap: wrap;
-    min-width: 0;
-  }
-  .r-name {
-    font-weight: 600;
-    font-size: 13.5px;
-  }
-  .r-desc {
-    font-size: 12.5px;
-  }
-  .r-count {
-    font-size: 12px;
-    white-space: nowrap;
-  }
-  .r-actions {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-shrink: 0;
   }
   .err-msg {
     color: var(--error);

@@ -6,14 +6,15 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { listDevices } from '../lib/api/devices';
-  import { errorMessage } from '../lib/api/client';
-  import { relativeTime, formatDateTime } from '../lib/utils/format';
   import type { DeviceRow } from '../lib/models';
 
   const LIMIT = 50;
@@ -24,10 +25,16 @@
   let search = $state('');
   let offset = $state(0);
 
-  let devices = $state<DeviceRow[]>([]);
-  let loading = $state(true);
+  // Cached view (lib/stores/cached-view.svelte.ts): rows already fetched paint
+  // instantly on return, then refresh behind a spinner instead of a skeleton.
+  // Re-exposed under the names the template already used, so the markup is
+  // unchanged apart from the refresh indicator.
+  const view = new CachedView<DeviceRow[]>();
+  const devices = $derived(view.data ?? []);
+  const revalidating = $derived(view.revalidating);
+  const loading = $derived(view.loading);
   let refreshing = $state(false);
-  let error = $state<string | null>(null);
+  const error = $derived(view.error);
 
   let debounce: ReturnType<typeof setTimeout> | undefined;
 
@@ -44,22 +51,23 @@
     offset = 0;
   }
 
-  async function load(appId: string, days: number, s: string, off: number) {
-    loading = true;
-    error = null;
-    try {
-      devices = await listDevices(appId, {
+  // `scopeKey` must be in the key: it carries the selected environment, which the
+  // axios interceptor adds to the request but which appears in none of these
+  // arguments. Omit it and one environment's rows are served as another's.
+  //
+  // `force` bypasses the fresh-window short-circuit — an explicit Refresh or
+  // Retry means "go to the network now".
+  async function load(appId: string, days: number, s: string, off: number, force = false) {
+    await view.load(
+      viewKey('devices.list', appId, sessionStore.scopeKey, days, s, off, LIMIT),
+      () => listDevices(appId, {
         since_days: days,
         search: s || undefined,
         limit: LIMIT,
         offset: off,
-      });
-    } catch (err) {
-      error = errorMessage(err);
-      devices = [];
-    } finally {
-      loading = false;
-    }
+      }),
+      force,
+    );
   }
 
   $effect(() => {
@@ -78,7 +86,7 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, sinceDays, search, offset)]);
+      await Promise.all([load(aid, sinceDays, search, offset, true)]);
     } finally {
       refreshing = false;
     }
@@ -109,7 +117,7 @@
         placeholder="Search devices…"
         width="240px"
       />
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
 
@@ -184,9 +192,7 @@
           <td class="num">
             <span class:err={d.errors_count > 0}>{d.errors_count.toLocaleString()}</span>
           </td>
-          <td class="cell-muted" title={formatDateTime(d.last_seen)}>
-            {relativeTime(d.last_seen)}
-          </td>
+          <td><TimeValue value={d.last_seen} muted /></td>
         </tr>
       {/each}
     </DataTable>

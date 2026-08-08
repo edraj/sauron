@@ -123,8 +123,19 @@ pub async fn authorized_read_scope(
 }
 
 /// [`authorized_read_scope`], plus the caller's effective permission set at the
-/// **resolved** scope — for the two handlers that gate a second capability on
-/// top of the read itself (`issues::detail`/`issues::events`, and `source:read`).
+/// **resolved** scope — for handlers that gate a second capability on top of the
+/// read itself.
+///
+/// Every current caller gates the same one: `source:read` over the
+/// de-obfuscated source lines in an `ErrorEvent`'s `stacktrace_symbolicated`.
+/// As of this comment there are six: `issues::detail`, `issues::events`,
+/// `sessions::detail`, `devices::detail`, `screens::detail`,
+/// `analytics::person` — `grep -n authorized_read_scope_with_perms
+/// src/routes/*.rs` finds each of them. That grep returns NINE lines, not eight:
+/// the six call sites, this file's doc and definition lines, and `mod.rs:74`,
+/// which is prose in a comment rather than a call site. The last four were added when the gate turned out to be
+/// enforced only on the issues pair while those four returned whole event rows,
+/// context lines included, off `event:read` alone.
 ///
 /// Use this instead of pairing [`authorized_read_scope`] with a separate
 /// permission lookup. The separate lookup it replaces (`super::authorize_app_perms`,

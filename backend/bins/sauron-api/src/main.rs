@@ -460,7 +460,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/v1/orgs/{org_id}/roles/{role_id}",
-            patch(routes::orgs::update_role_handler),
+            patch(routes::orgs::update_role_handler).delete(routes::orgs::delete_role_handler),
         )
         // --- projects (grouping) ---
         .route(
@@ -775,6 +775,13 @@ async fn main() -> anyhow::Result<()> {
         )
         // --- storage & records (org:manage required) ---
         .route("/v1/admin/storage", get(routes::admin::storage))
+        // Deployment-wide rotation policy. Gated on holding org:manage in EVERY
+        // org (see require_deployment_admin) — a single tenant's admin must not be
+        // able to move the hot/cold boundary for everyone.
+        .route(
+            "/v1/admin/tier-policy",
+            get(routes::admin::get_tier_policy).put(routes::admin::set_tier_policy),
+        )
         // A JSON API body never legitimately reaches megabytes; the artifact
         // routes below are merged separately with their own raised limit.
         .layer(DefaultBodyLimit::max(API_JSON_BODY_LIMIT))

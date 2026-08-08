@@ -164,7 +164,13 @@
 
         <div class="form-foot">
           <Button variant="ghost" onclick={closeForm}>Cancel</Button>
-          <Button variant="primary" loading={saving} disabled={!name || !target} onclick={submit}>
+          <Button
+            variant="primary"
+            loading={saving}
+            disabled={!name || !target}
+            lockedReason={writeLock}
+            onclick={submit}
+          >
             Create monitor
           </Button>
         </div>

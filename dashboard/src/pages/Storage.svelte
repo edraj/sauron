@@ -1,7 +1,8 @@
 <script lang="ts">
-  import AppShell from '../lib/components/layout/AppShell.svelte';
-  import { getAdminStorage } from '../lib/api/admin';
-  import type { StorageReport } from '../lib/api/admin';
+  import AdminShell from '../lib/components/layout/AdminShell.svelte';
+  import { getAdminStorage, getTierPolicy, setTierPolicy } from '../lib/api/admin';
+  import type { StorageReport, TierPolicy } from '../lib/api/admin';
+  import Button from '../lib/components/ui/Button.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -13,6 +14,16 @@
   let report = $state<StorageReport | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  // Rotation policy. Loaded separately from the storage report and allowed to
+  // fail on its own: the endpoint requires org:manage in EVERY org, so an admin
+  // of one tenant gets a 403 here while the storage report above still renders.
+  // Treating that as a page-level error would break Storage for them entirely.
+  let policy = $state<TierPolicy | null>(null);
+  let policyError = $state<string | null>(null);
+  let policyBusy = $state(false);
+  let hotDaysInput = $state('');
+  let policySaved = $state(false);
 
   // Which app rows are expanded to show their cold Parquet file inventory.
   let openApp = $state<Record<string, boolean>>({});
@@ -32,6 +43,47 @@
     }
   }
 
+  async function loadPolicy() {
+    policyError = null;
+    try {
+      policy = await getTierPolicy();
+      hotDaysInput = String(policy.effective_hot_days);
+    } catch (e) {
+      policy = null;
+      policyError = (e as Error).message;
+    }
+  }
+
+  async function savePolicy(next: number | null) {
+    policyBusy = true;
+    policyError = null;
+    policySaved = false;
+    try {
+      policy = await setTierPolicy(next);
+      hotDaysInput = String(policy.effective_hot_days);
+      policySaved = true;
+    } catch (e) {
+      policyError = (e as Error).message;
+    } finally {
+      policyBusy = false;
+    }
+  }
+
+  // Parsed once so the button's disabled state and the submit path can never
+  // disagree about whether the input is valid.
+  const parsedHotDays = $derived.by(() => {
+    const t = hotDaysInput.trim();
+    if (!/^\d+$/.test(t)) return null;
+    const n = Number(t);
+    return Number.isSafeInteger(n) ? n : null;
+  });
+  const hotDaysValid = $derived(
+    parsedHotDays !== null && policy !== null && parsedHotDays >= policy.min_hot_days,
+  );
+  const wouldLower = $derived(
+    policy !== null && parsedHotDays !== null && parsedHotDays < policy.effective_hot_days,
+  );
+
   function fmtBytes(n: number): string {
     if (n < 1024) return `${n} B`;
     const u = ['KB', 'MB', 'GB', 'TB'];
@@ -40,10 +92,13 @@
     return `${v.toFixed(1)} ${u[i]}`;
   }
 
-  $effect(() => { void load(); });
+  $effect(() => {
+    void load();
+    void loadPolicy();
+  });
 </script>
 
-<AppShell requireProject={false}>
+<AdminShell requireProject={false}>
   <div class="storage">
     <header class="head">
       <div>
@@ -79,6 +134,126 @@
         <StatTile label="Tables" value={rep.database.tables.length} />
         <StatTile label="Apps" value={rep.apps.length} />
       </StatTiles>
+
+      <div class="section">
+        <Card title="Cold-tier rotation">
+          {#if policyError}
+            <!-- Shown inline, not as a page error: this endpoint needs org:manage in
+                 every org, so a single-tenant admin legitimately gets a 403 while the
+                 rest of this page still works for them. -->
+            <p class="policy-denied muted">{policyError}</p>
+          {:else if policy}
+            {@const pol = policy}
+            <p class="muted policy-lede">
+              Data older than this moves out of Postgres into Parquet. It stays
+              readable — queries span both tiers — but it no longer occupies
+              database storage.
+            </p>
+
+            <div class="policy-row">
+              <label class="policy-field">
+                <span class="policy-label">Rotation age (days)</span>
+                <input
+                  class="policy-input"
+                  type="number"
+                  min={pol.min_hot_days}
+                  step="1"
+                  bind:value={hotDaysInput}
+                  disabled={policyBusy}
+                />
+              </label>
+              <Button
+                variant="primary"
+                disabled={!hotDaysValid || policyBusy}
+                onclick={() => savePolicy(parsedHotDays)}
+              >
+                {policyBusy ? 'Saving…' : 'Apply'}
+              </Button>
+              {#if pol.overridden}
+                <Button variant="secondary" disabled={policyBusy} onclick={() => savePolicy(null)}>
+                  Revert to default ({pol.configured_hot_days}d)
+                </Button>
+              {/if}
+            </div>
+
+            {#if parsedHotDays !== null && !hotDaysValid}
+              <p class="policy-warn" role="alert">
+                Must be a whole number of days, at least {pol.min_hot_days}. A smaller
+                value would put the cutoff at or after now and tier partitions that are
+                still being written to.
+              </p>
+            {:else if wouldLower}
+              <!-- The asymmetry is the single most important thing on this page.
+                   Lowering acts on the next cycle and cannot be undone by raising
+                   the number back. -->
+              <p class="policy-warn" role="alert">
+                <Icon name="triangle-alert" size={14} />
+                Lowering this is one-way. On its next cycle the tier worker will export
+                and then drop everything between {parsedHotDays} and
+                {pol.effective_hot_days} days old. Raising the number afterwards does
+                not bring it back into Postgres — that needs a restore from cold.
+              </p>
+            {/if}
+
+            {#if policySaved}
+              <p class="policy-ok">Saved. Takes effect on the tier worker's next cycle.</p>
+            {/if}
+
+            <dl class="policy-facts">
+              <div>
+                <dt>In force</dt>
+                <dd>{pol.effective_hot_days} days{pol.overridden ? '' : ' (default)'}</dd>
+              </div>
+              <div>
+                <dt>Configured</dt>
+                <dd>{pol.configured_hot_days} days (TIER_HOT_DAYS)</dd>
+              </div>
+            </dl>
+
+            {#if pol.follows_on_restart.length > 0}
+              <details class="policy-detail">
+                <summary>Not every component picks this up immediately</summary>
+                <p class="muted">
+                  Applies without a restart: {pol.follows_immediately.join('; ')}. Still
+                  reading start-time configuration, and so able to disagree about where
+                  the boundary is until restarted:
+                </p>
+                <ul class="muted">
+                  {#each pol.follows_on_restart as c (c)}
+                    <li>{c}</li>
+                  {/each}
+                </ul>
+              </details>
+            {/if}
+
+            {#if pol.pins.length > 0}
+              <div class="policy-pins">
+                <h3 class="pins-title">Restored ranges held in Postgres</h3>
+                <p class="muted">
+                  Each pin keeps a restored range from being re-tiered. Without one, a
+                  restore is undone on the next cycle.
+                </p>
+                <ul class="pin-list">
+                  {#each pol.pins as pin (pin.id)}
+                    <li class:expired={pin.expired}>
+                      <code>{pin.table_name}</code>
+                      {new Date(pin.range_start).toISOString().slice(0, 10)} →
+                      {new Date(pin.range_end).toISOString().slice(0, 10)}
+                      <span class="muted">
+                        {pin.expired ? 'expired' : 'until'}
+                        {new Date(pin.expires_at).toISOString().slice(0, 10)}
+                      </span>
+                      {#if pin.reason}<span class="muted">— {pin.reason}</span>{/if}
+                    </li>
+                  {/each}
+                </ul>
+              </div>
+            {/if}
+          {:else}
+            <div class="center"><Spinner size={20} /></div>
+          {/if}
+        </Card>
+      </div>
 
       <div class="section">
         <Card title="Database tables" padding="none">
@@ -212,9 +387,51 @@
       </div>
     {/if}
   </div>
-</AppShell>
+</AdminShell>
 
 <style>
+  .policy-lede { margin: 0 0 14px; }
+  .policy-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+  .policy-field { display: flex; flex-direction: column; gap: 5px; }
+  .policy-label { font-size: 12px; color: var(--text-muted); }
+  .policy-input {
+    width: 120px;
+    padding: 7px 9px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+  }
+  .policy-warn {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    margin: 12px 0 0;
+    padding: 9px 11px;
+    border: 1px solid var(--warning, var(--border-strong));
+    border-radius: var(--radius);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .policy-ok { margin: 10px 0 0; font-size: 13px; color: var(--success, var(--text)); }
+  .policy-denied { margin: 0; }
+  .policy-facts {
+    display: flex;
+    gap: 26px;
+    margin: 16px 0 0;
+    flex-wrap: wrap;
+  }
+  .policy-facts dt { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
+  .policy-facts dd { margin: 3px 0 0; font-size: 14px; }
+  .policy-detail { margin-top: 14px; font-size: 13px; }
+  .policy-detail summary { cursor: pointer; color: var(--text-muted); }
+  .policy-detail ul { margin: 6px 0 0 18px; }
+  .policy-pins { margin-top: 18px; }
+  .pins-title { margin: 0 0 4px; font-size: 14px; }
+  .pin-list { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+  .pin-list li.expired { opacity: 0.55; }
+
   .storage {
     display: flex;
     flex-direction: column;

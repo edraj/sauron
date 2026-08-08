@@ -1057,6 +1057,43 @@ pub async fn update_role(
     .await
 }
 
+/// Delete a custom role. Scoped by `org_id` as well as `role_id` so a mistaken
+/// call cannot reach across orgs, and filtered on `is_system` so a preset can
+/// never be deleted even if a caller-side check is missed — the same defence in
+/// depth `update_role` uses.
+///
+/// `role_grants.role_id` is ON DELETE CASCADE, so every grant holding this role
+/// disappears with it. Callers must have already counted and confirmed that.
+pub async fn delete_role(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    role_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::delete(
+        roles::table
+            .filter(roles::id.eq(role_id))
+            .filter(roles::org_id.eq(org_id))
+            .filter(roles::is_system.eq(false)),
+    )
+    .execute(conn)
+    .await
+}
+
+/// How many grants currently hold `role_id`. Used to report what a delete
+/// cascaded, since `role_grants.role_id` is ON DELETE CASCADE and the rows are
+/// gone by the time the delete returns.
+pub async fn count_grants_for_role(
+    conn: &mut AsyncPgConnection,
+    role_id: Uuid,
+) -> QueryResult<i64> {
+    let row: GrantCountRow =
+        diesel::sql_query("SELECT count(*)::bigint AS n FROM role_grants WHERE role_id = $1")
+            .bind::<SqlUuid, _>(role_id)
+            .get_result(conn)
+            .await?;
+    Ok(row.n)
+}
+
 /// Idempotently upsert a system preset role (keeps DB in sync with code).
 pub async fn upsert_preset_role(
     conn: &mut AsyncPgConnection,
@@ -7140,6 +7177,199 @@ pub async fn set_dropped_thru(
         .execute(conn)
         .await?;
     Ok(())
+}
+
+// ===========================================================================
+// Runtime settings (operator-tunable, no restart)
+// ===========================================================================
+
+/// Raw value for `key`, or `None` when no row exists.
+///
+/// `None` is the normal, default state and means "use the process's configured
+/// value" — it is not an error and must not be treated as one. Nothing seeds this
+/// table, so every key reads as `None` until an operator sets it.
+pub async fn get_runtime_setting(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+) -> QueryResult<Option<String>> {
+    runtime_settings::table
+        .find(key)
+        .select(runtime_settings::value)
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Value plus when it was last changed, for a UI that shows provenance.
+pub async fn get_runtime_setting_row(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+) -> QueryResult<Option<(String, DateTime<Utc>)>> {
+    runtime_settings::table
+        .find(key)
+        .select((runtime_settings::value, runtime_settings::updated_at))
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Upsert `key`. `updated_by` is the acting user, or `None` for a script.
+pub async fn set_runtime_setting(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+    value: &str,
+    updated_by: Option<Uuid>,
+) -> QueryResult<()> {
+    diesel::insert_into(runtime_settings::table)
+        .values((
+            runtime_settings::key.eq(key),
+            runtime_settings::value.eq(value),
+            runtime_settings::updated_at.eq(Utc::now()),
+            runtime_settings::updated_by.eq(updated_by),
+        ))
+        .on_conflict(runtime_settings::key)
+        .do_update()
+        .set((
+            runtime_settings::value.eq(value),
+            runtime_settings::updated_at.eq(Utc::now()),
+            runtime_settings::updated_by.eq(updated_by),
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Remove `key`, reverting it to the process's configured value.
+pub async fn delete_runtime_setting(conn: &mut AsyncPgConnection, key: &str) -> QueryResult<usize> {
+    diesel::delete(runtime_settings::table.find(key))
+        .execute(conn)
+        .await
+}
+
+/// Total number of orgs in the deployment.
+///
+/// Paired with `orgs_with_permission` to express "administers the whole
+/// deployment" using only the existing grant primitives: a caller who holds
+/// org-scoped `org:manage` in every org that exists is, for practical purposes,
+/// the operator. This deployment has no separate super-admin flag (one was added
+/// and removed), and a deployment-wide setting must not be changeable by an admin
+/// of a single tenant — that would let one tenant force another's data out of
+/// Postgres.
+pub async fn count_all_orgs(conn: &mut AsyncPgConnection) -> QueryResult<i64> {
+    organizations::table.count().get_result(conn).await
+}
+
+/// `runtime_settings` key for the cold-rotation age, in days.
+pub const TIER_HOT_DAYS_KEY: &str = "tier.hot_days";
+
+/// Smallest rotation age an operator may set.
+///
+/// Not zero, and not negative. Zero would make every partition instantly
+/// eligible, so the worker would tier the current day's data out from under live
+/// writes; negative would put the cutoff in the future and tier everything. One
+/// day is the smallest value that still leaves a whole bucket hot, matching the
+/// worker's day granularity.
+pub const TIER_HOT_DAYS_MIN: i64 = 1;
+
+/// The rotation age actually in force: the operator's override when one is set
+/// and valid, otherwise the process's configured value.
+///
+/// Invalid stored values (unparseable, or below `TIER_HOT_DAYS_MIN`) fall back to
+/// `configured` rather than erroring. A malformed row must not be able to stop
+/// tiering deployment-wide or, worse, drive the cutoff to zero — the write path
+/// validates, and this is the second line of defence for a value edited by hand
+/// in psql. The caller is expected to log the fallback; this returns no signal
+/// beyond the value so it stays usable on a hot path.
+pub async fn effective_tier_hot_days(
+    conn: &mut AsyncPgConnection,
+    configured: i64,
+) -> QueryResult<i64> {
+    let raw = get_runtime_setting(conn, TIER_HOT_DAYS_KEY).await?;
+    Ok(match raw.as_deref().map(str::trim).map(str::parse::<i64>) {
+        Some(Ok(v)) if v >= TIER_HOT_DAYS_MIN => v,
+        _ => configured,
+    })
+}
+
+// ===========================================================================
+// Tier pins (protect restored ranges from being re-dropped)
+// ===========================================================================
+
+/// True iff any UNEXPIRED pin overlaps `[start, end)` for `table`.
+///
+/// Overlap, not containment: a pin covering part of a partition still has to
+/// block the drop, because dropping the partition would take the pinned rows
+/// with it. The comparison is the standard half-open overlap test
+/// (`pin.start < end AND pin.end > start`), so a pin that merely abuts the
+/// partition does not block it.
+pub async fn is_range_pinned(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> QueryResult<bool> {
+    let n: i64 = tier_pins::table
+        .filter(tier_pins::table_name.eq(table))
+        .filter(tier_pins::expires_at.gt(Utc::now()))
+        .filter(tier_pins::range_start.lt(end))
+        .filter(tier_pins::range_end.gt(start))
+        .count()
+        .get_result(conn)
+        .await?;
+    Ok(n > 0)
+}
+
+/// Create a pin. Overlapping pins are allowed and are not merged — each records
+/// a separate restore with its own expiry, and the drop check only asks whether
+/// ANY is live, so the longest-lived one wins naturally.
+pub async fn create_tier_pin(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    created_by: Option<Uuid>,
+    reason: Option<&str>,
+) -> QueryResult<TierPin> {
+    diesel::insert_into(tier_pins::table)
+        .values((
+            tier_pins::table_name.eq(table),
+            tier_pins::range_start.eq(start),
+            tier_pins::range_end.eq(end),
+            tier_pins::expires_at.eq(expires_at),
+            tier_pins::created_by.eq(created_by),
+            tier_pins::reason.eq(reason),
+        ))
+        .returning(TierPin::as_returning())
+        .get_result(conn)
+        .await
+}
+
+/// Every pin, newest first, expired ones included — the UI shows expiry so an
+/// operator can tell a lapsed restore from a live one.
+pub async fn list_tier_pins(conn: &mut AsyncPgConnection) -> QueryResult<Vec<TierPin>> {
+    tier_pins::table
+        .select(TierPin::as_select())
+        .order(tier_pins::created_at.desc())
+        .load(conn)
+        .await
+}
+
+/// Drop a pin, making its range immediately eligible for re-tiering. The rows
+/// stay in Parquet, so this frees Postgres space without losing data.
+pub async fn delete_tier_pin(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
+    diesel::delete(tier_pins::table.find(id))
+        .execute(conn)
+        .await
+}
+
+/// Remove pins that expired before `now`. Housekeeping only: `is_range_pinned`
+/// already ignores expired rows, so leaving them costs a little space and
+/// nothing else.
+pub async fn purge_expired_tier_pins(conn: &mut AsyncPgConnection) -> QueryResult<usize> {
+    diesel::delete(tier_pins::table.filter(tier_pins::expires_at.le(Utc::now())))
+        .execute(conn)
+        .await
 }
 
 // ===========================================================================

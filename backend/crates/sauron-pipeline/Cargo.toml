@@ -10,6 +10,9 @@ sauron-db.workspace = true
 sauron-inspector = { workspace = true }
 sauron-redis.workspace = true
 sauron-symbols.workspace = true
+# For the ingest accounting counters the worker increments. `sauron-telemetry`
+# has no in-workspace dependencies, so this adds no cycle.
+sauron-telemetry.workspace = true
 woothee.workspace = true
 serde.workspace = true
 serde_json.workspace = true

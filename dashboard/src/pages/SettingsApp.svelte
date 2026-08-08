@@ -1,12 +1,11 @@
 <script lang="ts">
   import { push } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
+  import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
-  import EnvironmentsCard from '../lib/components/settings/EnvironmentsCard.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { lockedBy } from '../lib/models/page-access';
   import { getApp, updateApp, deleteApp } from '../lib/api/apps';
@@ -74,7 +73,7 @@
       await deleteApp(id);
       sessionStore.removeApp(id);
       toastStore.success('App deleted.');
-      push('/projects');
+      push('/admin/projects');
     } catch (err) {
       toastStore.error(errorMessage(err));
       deleting = false;
@@ -82,7 +81,7 @@
   }
 </script>
 
-<AppShell requireProject={false}>
+<AdminShell requireProject={false}>
   <div class="head">
     <h1 class="page-title">App settings</h1>
     {#if app}
@@ -104,7 +103,7 @@
       icon="package"
     >
       {#snippet action()}
-        <Button variant="primary" onclick={() => push('/projects')}>Go to Projects</Button>
+        <Button variant="primary" onclick={() => push('/admin/projects')}>Go to Projects</Button>
       {/snippet}
     </EmptyState>
   {:else}
@@ -125,11 +124,6 @@
         </Button>
       </Card>
 
-      <!-- Environments are owned by the project now, so the card needs the app's
-           project id as well: creating one is a catalogue write under
-           `/v1/projects/{project_id}/environments`, not an app write. -->
-      <EnvironmentsCard appId={app.id} projectId={app.project_id} />
-
       <Card title="Delete app">
           <p class="card-desc muted">
             Permanently delete this app and all of its issues and events. This can't be undone.
@@ -138,7 +132,7 @@
             <div class="confirm">
               <span class="confirm-text">Delete <strong>{app.name}</strong> and all its data?</span>
               <div class="confirm-actions">
-                <Button variant="danger" loading={deleting} onclick={doDelete}>Yes, delete</Button>
+                <Button variant="danger" loading={deleting} lockedReason={deleteLock} onclick={doDelete}>Yes, delete</Button>
                 <Button variant="ghost" onclick={() => (confirmDelete = false)}>Cancel</Button>
               </div>
             </div>
@@ -154,7 +148,7 @@
       </Card>
     </div>
   {/if}
-</AppShell>
+</AdminShell>
 
 <style>
   .head {

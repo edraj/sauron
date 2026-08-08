@@ -54,11 +54,20 @@
       // Apps are loaded per project up front here (a personal account has far
       // fewer projects than an org member admin screen), but environments stay
       // on-demand: there is no batched org-wide environments endpoint.
-      const next: Record<string, { id: string; name: string }[]> = {};
-      for (const p of projects) {
-        next[p.id] = (await listApps(p.id)).map((a) => ({ id: a.id, name: a.name }));
-      }
-      appsByProject = next;
+      //
+      // Concurrent, not a serial `for…await` — the requests are independent, so
+      // the old loop made load time the SUM of every project's round trip
+      // instead of the slowest one. `Promise.all` also keeps the previous
+      // failure behaviour exactly: the first rejection propagates to the
+      // `catch` below and becomes `loadError`, just as an awaited throw
+      // mid-loop did.
+      const perProject = await Promise.all(
+        projects.map(async (p) => {
+          const apps = await listApps(p.id);
+          return [p.id, apps.map((a) => ({ id: a.id, name: a.name }))] as const;
+        }),
+      );
+      appsByProject = Object.fromEntries(perProject);
     } catch (e) {
       loadError = e instanceof Error ? e.message : 'Could not load subscriptions';
     } finally {

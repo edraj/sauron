@@ -49,33 +49,47 @@
     open = true;
   }
 
-  function onWindowPointerDown(event: PointerEvent) {
+  // Listeners live only while the menu is OPEN, mirroring
+  // SwitcherMenu.svelte:113-140. These used to be `<svelte:window>` bindings,
+  // which attach per component INSTANCE — one of these renders per table row,
+  // so a 50-row members table installed 200 window listeners (including a
+  // capture-phase scroll handler, the one that runs on every scroll frame) for
+  // the sake of at most one open menu. The guards the handlers used to carry
+  // (`if (!open) return`) are now the effect's gate.
+  $effect(() => {
     if (!open) return;
-    const target = event.target as Node | null;
-    if (target && (trigger?.contains(target) || panel?.contains(target))) return;
-    // No focus() on this path: the click has already moved focus somewhere
-    // deliberate, and yanking it back would fight the user.
-    dismiss();
-  }
 
-  function onWindowKeyDown(event: KeyboardEvent) {
-    if (open && event.key === 'Escape') close();
-  }
+    function onPointerDown(event: PointerEvent) {
+      const target = event.target as Node | null;
+      if (target && (trigger?.contains(target) || panel?.contains(target))) return;
+      // No focus() on this path: the click has already moved focus somewhere
+      // deliberate, and yanking it back would fight the user.
+      dismiss();
+    }
 
-  /** Anything that moves the trigger strands the panel, which no longer tracks
-      it. Capture phase, because scroll does not bubble and the scroller here is
-      the table wrapper, not the window. */
-  function onAnyScrollOrResize() {
-    if (open) dismiss();
-  }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') close();
+    }
+
+    /** Anything that moves the trigger strands the panel, which no longer
+        tracks it. Capture phase, because scroll does not bubble and the
+        scroller here is the table wrapper, not the window. */
+    function onAnyScrollOrResize() {
+      dismiss();
+    }
+
+    window.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('scroll', onAnyScrollOrResize, true);
+    window.addEventListener('resize', onAnyScrollOrResize);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('scroll', onAnyScrollOrResize, true);
+      window.removeEventListener('resize', onAnyScrollOrResize);
+    };
+  });
 </script>
-
-<svelte:window
-  onpointerdown={onWindowPointerDown}
-  onkeydown={onWindowKeyDown}
-  onscrollcapture={onAnyScrollOrResize}
-  onresize={onAnyScrollOrResize}
-/>
 
 <div class="ram">
   <button

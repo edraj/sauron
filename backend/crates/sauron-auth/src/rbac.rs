@@ -31,8 +31,17 @@ pub mod perm {
     pub const EVENT_READ: &str = "event:read";
     pub const FUNNEL_WRITE: &str = "funnel:write";
     pub const ARTIFACT_WRITE: &str = "artifact:write";
-    /// View de-obfuscated **source code** (symbolication context lines). Symbol
-    /// names / file / line are visible with `issue:read`; this gates the code.
+    /// View de-obfuscated **source code** (symbolication context lines). This
+    /// gates ONLY the code text; symbol name, filename, lineno and colno stay
+    /// visible without it.
+    ///
+    /// Which permission reveals those depends on the route: `issue:read` on the
+    /// issues surface, and `event:read` alone on `sessions::detail`,
+    /// `devices::detail`, `screens::detail` and `analytics::person` — measured
+    /// 2026-08-08 with a role holding exactly `[event:read]`, which received 200
+    /// plus frame function, filename, `lineno` and `colno` from all four while
+    /// every context line was stripped. Do not read this as "`issue:read` is
+    /// required to see frames".
     pub const SOURCE_READ: &str = "source:read";
     pub const MONITOR_READ: &str = "monitor:read";
     pub const MONITOR_WRITE: &str = "monitor:write";
@@ -745,7 +754,9 @@ pub async fn authorize_env_read(
 
 /// [`authorize_env_read`], plus the caller's full effective permission set at
 /// the **resolved** scope — for a handler that gates a second capability on top
-/// of the read itself (`issues::detail`/`issues::events` and `source:read`).
+/// of the read itself. Every current caller gates `source:read`; see
+/// `sauron-api`'s `routes::scope::authorized_read_scope_with_perms`, the sole
+/// wrapper, for the list.
 ///
 /// Supersedes `routes::mod::authorize_app_perms` for environment-scoped reads.
 /// That helper resolved permissions through [`effective_at`], which hardcodes

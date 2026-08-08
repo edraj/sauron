@@ -11,8 +11,9 @@
   import DateRange from '../lib/components/DateRange.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { listScreens } from '../lib/api/screens';
-  import { errorMessage } from '../lib/api/client';
   import { compactNumber, formatDuration } from '../lib/utils/format';
   import type { ScreenRow } from '../lib/models';
 
@@ -24,10 +25,16 @@
   let search = $state('');
   let offset = $state(0);
 
-  let rows = $state<ScreenRow[]>([]);
-  let loading = $state(true);
+  // Cached view (lib/stores/cached-view.svelte.ts): rows already fetched paint
+  // instantly on return, then refresh behind a spinner instead of a skeleton.
+  // Re-exposed under the names the template already used, so the markup is
+  // unchanged apart from the refresh indicator.
+  const view = new CachedView<ScreenRow[]>();
+  const rows = $derived(view.data ?? []);
+  const revalidating = $derived(view.revalidating);
+  const loading = $derived(view.loading);
   let refreshing = $state(false);
-  let error = $state<string | null>(null);
+  const error = $derived(view.error);
 
   let debounce: ReturnType<typeof setTimeout> | undefined;
 
@@ -44,22 +51,23 @@
     offset = 0;
   }
 
-  async function load(appId: string, days: number, s: string, off: number) {
-    loading = true;
-    error = null;
-    try {
-      rows = await listScreens(appId, {
+  // `scopeKey` must be in the key: it carries the selected environment, which the
+  // axios interceptor adds to the request but which appears in none of these
+  // arguments. Omit it and one environment's rows are served as another's.
+  //
+  // `force` bypasses the fresh-window short-circuit — an explicit Refresh or
+  // Retry means "go to the network now".
+  async function load(appId: string, days: number, s: string, off: number, force = false) {
+    await view.load(
+      viewKey('screens.list', appId, sessionStore.scopeKey, days, s, off, LIMIT),
+      () => listScreens(appId, {
         q: s || undefined,
         sinceDays: days,
         limit: LIMIT,
         offset: off,
-      });
-    } catch (err) {
-      error = errorMessage(err);
-      rows = [];
-    } finally {
-      loading = false;
-    }
+      }),
+      force,
+    );
   }
 
   async function refresh() {
@@ -67,7 +75,7 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, sinceDays, search, offset)]);
+      await Promise.all([load(aid, sinceDays, search, offset, true)]);
     } finally {
       refreshing = false;
     }
@@ -94,7 +102,7 @@
     <div class="controls">
       <DateRange value={sinceDays} onchange={onRange} />
       <SearchInput bind:value={query} oninput={onSearch} placeholder="Search screens…" width="240px" />
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
 

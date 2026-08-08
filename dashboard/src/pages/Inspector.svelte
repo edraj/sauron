@@ -6,7 +6,7 @@
   the sidebar entry's `show` is cosmetic — the endpoint's 403 is the real gate.
 -->
 <script lang="ts">
-  import AppShell from '../lib/components/layout/AppShell.svelte';
+  import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
@@ -15,6 +15,7 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
   import MaskDialog from '../lib/components/inspector/MaskDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -190,7 +191,7 @@
   });
 </script>
 
-<AppShell requireApp>
+<AdminShell requireApp>
   <div class="head">
     <h1>Privacy inspector</h1>
     {#if effective}
@@ -252,7 +253,7 @@
                   <td>{f.key_path || '(whole value)'}</td>
                   <td>{f.value_type}</td>
                   <td class="num">{formatMatchCount(f.match_count, f.match_count_exact)}</td>
-                  <td>{f.last_seen_at ?? '—'}</td>
+                  <td><TimeValue value={f.last_seen_at} /></td>
                   <td>
                     <!-- Badge has no `title` prop, so the consequence text
                          hangs on a wrapping span instead. -->
@@ -605,7 +606,7 @@
           {#each effective?.masked_keys ?? [] as k (k.id)}
             <li>
               <code>{k.target_table}.{k.target_column}{k.json_path ? `.${k.json_path}` : ''}</code>
-              <span class="caveat">since {k.created_at}</span>
+              <span class="caveat">since <TimeValue value={k.created_at} /></span>
             </li>
           {/each}
         </ul>
@@ -646,8 +647,8 @@
           {#snippet children()}
             {#each scans as s (s.id)}
               <tr>
-                <td>{s.started_at ?? '—'}</td>
-                <td>{s.finished_at ?? '—'}</td>
+                <td><TimeValue value={s.started_at} /></td>
+                <td><TimeValue value={s.finished_at} /></td>
                 <td>
                   {#if s.status === 'running' || s.status === 'queued'}
                     <Spinner size={14} />
@@ -725,7 +726,7 @@
                 class="clickable"
                 onclick={() => (expanded = { ...expanded, [a.id]: !expanded[a.id] })}
               >
-                <td>{a.requested_at}</td>
+                <td><TimeValue value={a.requested_at} /></td>
                 <td>{a.requested_by_email || '—'}</td>
                 <td class="num">{a.targets.length}</td>
                 <td><Badge>{a.status}</Badge></td>
@@ -799,7 +800,7 @@
       {/if}
     </Card>
   {/if}
-</AppShell>
+</AdminShell>
 
 {#if maskTargetFinding && appId}
   <MaskDialog

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { push } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
+  import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -151,11 +151,11 @@
 
   async function openAppSettings(projectId: string, appId: string) {
     await sessionStore.selectApp(projectId, appId);
-    push('/settings');
+    push('/admin/settings');
   }
 </script>
 
-<AppShell requireProject={false}>
+<AdminShell requireProject={false}>
   <div class="head">
     <div>
       <h1 class="page-title">Projects</h1>
@@ -317,7 +317,13 @@
                           <option value={t.value}>{t.label}</option>
                         {/each}
                       </select>
-                      <Button type="submit" variant="primary" size="sm" loading={creatingApp}>
+                      <Button
+                        type="submit"
+                        variant="primary"
+                        size="sm"
+                        loading={creatingApp}
+                        lockedReason={createAppLock}
+                      >
                         Create app
                       </Button>
                       <Button variant="ghost" size="sm" onclick={() => (newAppFor = null)}>Cancel</Button>
@@ -341,7 +347,7 @@
       {/each}
     </div>
   {/if}
-</AppShell>
+</AdminShell>
 
 <style>
   .head {

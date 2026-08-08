@@ -13,13 +13,17 @@
     orgId: string;
     /** null = create a new role. */
     role: Role | null;
+    /** Prefill a new role from this one (name, description, permissions).
+        Only takes effect while `role` is null — Copy opens the create path,
+        it never overrides an edit/view. */
+    copyFrom?: Role | null;
     /** How many members hold this role; shown as an impact warning on edit. */
     memberCount?: number;
     onclose: () => void;
     onsaved: (role: Role) => void;
   }
 
-  let { open, orgId, role, memberCount = 0, onclose, onsaved }: Props = $props();
+  let { open, orgId, role, copyFrom = null, memberCount = 0, onclose, onsaved }: Props = $props();
 
   let name = $state('');
   let description = $state('');
@@ -32,15 +36,27 @@
   // revert on the next restart. Show them, never write them.
   const readOnly = $derived(role?.is_system === true);
   const title = $derived(
-    readOnly ? `Role: ${role?.name}` : isEdit ? `Edit ${role?.name}` : 'New role',
+    readOnly
+      ? `Role: ${role?.name}`
+      : isEdit
+        ? `Edit ${role?.name}`
+        : copyFrom
+          ? `New role from ${copyFrom.name}`
+          : 'New role',
   );
 
   // Repopulate whenever the dialog opens on a different role.
+  //
+  // Copy opens the CREATE path (role === null) prefilled from another role, so
+  // submit() still calls createRole and the server's no-escalation check still
+  // applies. The Copy action is disabled when the caller lacks any of these
+  // permissions, so that check cannot fail from here.
   $effect(() => {
     if (!open) return;
-    name = role?.name ?? '';
-    description = role?.description ?? '';
-    permissions = [...(role?.permissions ?? [])];
+    const source = role ?? copyFrom;
+    name = role ? source?.name ?? '' : copyFrom ? `Copy of ${copyFrom.name}` : '';
+    description = source?.description ?? '';
+    permissions = [...(source?.permissions ?? [])];
     error = null;
   });
 

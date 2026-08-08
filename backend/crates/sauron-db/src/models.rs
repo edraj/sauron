@@ -1406,6 +1406,57 @@ pub struct NewInspectorRevealAudit<'a> {
     pub request_source: &'a str,
 }
 
+/// A range sauron-tier must not drop from Postgres, even though it is below the
+/// export watermark and durable in Parquet. Created by a cold-data restore; see
+/// the `tier_pins` migration for why a restore without one is undone on the very
+/// next tier cycle.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = tier_pins)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct TierPin {
+    pub id: Uuid,
+    pub table_name: String,
+    pub range_start: DateTime<Utc>,
+    pub range_end: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub created_by: Option<Uuid>,
+    pub reason: Option<String>,
+}
+
+/// One cold-data restore, from request to completion.
+///
+/// Carries the claim/heartbeat/attempts trio so the executor survives a crash:
+/// a `running` row whose heartbeat has lapsed is re-claimable, and the re-claim
+/// deletes the job's own partial output (by `pin_id`) before re-inserting. That
+/// is what keeps a resumed restore from duplicating rows.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = restore_jobs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct RestoreJob {
+    pub id: Uuid,
+    pub table_name: String,
+    /// `None` restores every app in the range.
+    pub app_id: Option<Uuid>,
+    pub range_start: DateTime<Utc>,
+    pub range_end: DateTime<Utc>,
+    pub status: String,
+    /// Nulled when the pin is purged at expiry — the job history outlives the
+    /// restored data, so `pin_expires_at` is kept separately.
+    pub pin_id: Option<Uuid>,
+    pub pin_expires_at: DateTime<Utc>,
+    pub rows_estimated: i64,
+    pub rows_restored: i64,
+    pub worker_id: Option<String>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub attempts: i32,
+    pub error: String,
+    pub requested_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::mask_ip;

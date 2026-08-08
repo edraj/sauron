@@ -3,6 +3,7 @@
   import EyeMark from '../EyeMark.svelte';
   import Icon, { type IconName } from '../ui/Icon.svelte';
   import { canAccessPage, resolvePageAccess } from '../../models/page-access';
+  import { visibleAdminNav } from '../../models/admin-nav';
 
   interface NavItem {
     href: string;
@@ -29,7 +30,6 @@
       label: 'Uptime',
       items: [
         { href: '#/monitors', label: 'Monitors', icon: 'life-buoy', match: (p) => p.startsWith('/monitors') },
-        { href: '#/alerts', label: 'Alerts', icon: 'bell', match: (p) => p.startsWith('/alerts') },
       ],
     },
     {
@@ -52,15 +52,9 @@
       ],
     },
     {
-      label: 'Manage',
+      label: 'Admin',
       items: [
-        { href: '#/account', label: 'Account', icon: 'user', match: (p) => p.startsWith('/account') },
-        { href: '#/projects', label: 'Projects', icon: 'folders', match: (p) => p.startsWith('/projects') || p.startsWith('/apps') },
-        { href: '#/members', label: 'Members', icon: 'key-round', match: (p) => p.startsWith('/members') },
-        { href: '#/settings', label: 'App settings', icon: 'settings', match: (p) => p.startsWith('/settings') },
-        { href: '#/source-maps', label: 'Source Maps', icon: 'braces', match: (p) => p.startsWith('/source-maps') },
-        { href: '#/storage', label: 'Storage', icon: 'server', match: (p) => p.startsWith('/storage') },
-        { href: '#/inspector', label: 'Privacy', icon: 'shield-alert', match: (p) => p.startsWith('/inspector') },
+        { href: '#/admin', label: 'Admin', icon: 'shield-check', match: (p) => p.startsWith('/admin') },
       ],
     },
   ];
@@ -77,7 +71,22 @@
     groups
       .map((g) => ({
         ...g,
-        items: g.items.filter((i) => canAccessPage(resolvePageAccess(i.href.slice(1)))),
+        items: g.items.filter((i) => {
+          if (!canAccessPage(resolvePageAccess(i.href.slice(1)))) return false;
+          // '/admin' is deliberately PAGE_ACCESS: null — no single permission
+          // expresses "can reach at least one admin child", and a deep link
+          // should still explain itself rather than 404. That makes
+          // canAccessPage(null) unconditionally true, so the generic check
+          // above can't gate THIS item the way it gates every other one —
+          // without its own rule it would violate the invariant this file
+          // states above (no item shown that can only ever render an error)
+          // for every member on a custom role missing all nine admin-child
+          // permissions. `visibleAdminNav()` is the same helper AdminShell's
+          // sub-nav rail already uses, so the sidebar item and the rail
+          // cannot disagree about whether there is anywhere for it to go.
+          if (i.href === '#/admin') return visibleAdminNav().length > 0;
+          return true;
+        }),
       }))
       .filter((g) => g.items.length > 0),
   );
@@ -104,6 +113,10 @@
   </nav>
 
   <div class="bottom">
+    <a class="nav-item" class:active={$location.startsWith('/account')} href="#/account">
+      <span class="ic"><Icon name="user" size={17} /></span>
+      <span class="lb">Account</span>
+    </a>
     <a class="nav-item" class:active={$location.startsWith('/docs')} href="#/docs">
       <span class="ic"><Icon name="book-open" size={17} /></span>
       <span class="lb">Docs</span>

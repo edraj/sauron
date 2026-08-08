@@ -2,6 +2,7 @@
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -14,7 +15,6 @@
   import { toastStore } from '../lib/stores/toast.svelte';
   import { errorMessage } from '../lib/api/client';
   import { listMySessions, revokeMyOtherSessions, revokeMySession } from '../lib/api/account';
-  import { formatDateTime, relativeTime } from '../lib/utils/format';
   import {
     allSameIp,
     describeSession,
@@ -144,7 +144,7 @@
         <dt>Email</dt>
         <dd class="cell-mono">{authStore.user?.email ?? '—'}</dd>
         <dt>Last sign-in</dt>
-        <dd>{authStore.user?.last_login_at ? formatDateTime(authStore.user.last_login_at) : '—'}</dd>
+        <dd><TimeValue value={authStore.user?.last_login_at} /></dd>
       </dl>
       <div class="profile-actions">
         <Button variant="secondary" href="#/change-password">Change password</Button>
@@ -200,8 +200,8 @@
                   </span>
                 </td>
                 <td class="cell-mono cell-muted">{s.ip ?? '—'}</td>
-                <td title={formatDateTime(s.created_at)}>{relativeTime(s.created_at)}</td>
-                <td title={formatDateTime(s.last_used_at)}>{relativeTime(s.last_used_at)}</td>
+                <td><TimeValue value={s.created_at} /></td>
+                <td><TimeValue value={s.last_used_at} /></td>
                 <td class="col-act">
                   {#if !s.current}
                     <Button
@@ -220,10 +220,8 @@
               <tr class="dim">
                 <td>{describeSession(s)}</td>
                 <td class="cell-mono cell-muted">{s.ip ?? '—'}</td>
-                <td title={formatDateTime(s.created_at)}>{relativeTime(s.created_at)}</td>
-                <td title={s.revoked_at ? formatDateTime(s.revoked_at) : ''}>
-                  Signed out {s.revoked_at ? relativeTime(s.revoked_at) : ''}
-                </td>
+                <td><TimeValue value={s.created_at} /></td>
+                <td>Signed out {#if s.revoked_at}<TimeValue value={s.revoked_at} />{/if}</td>
                 <td class="col-act cell-muted">{reasonLabel(s.revoked_reason)}</td>
               </tr>
             {/each}

@@ -10,6 +10,7 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { authStore } from '../lib/stores/auth.svelte';
+  import { lockedBy } from '../lib/models/page-access';
   import { createProject } from '../lib/api/projects';
   import { createApp, getFirstEvent } from '../lib/api/apps';
   import { listEnvironments } from '../lib/api/environments';
@@ -42,6 +43,16 @@
   );
 
   const step = $derived(!project ? 1 : !app ? 2 : 3);
+
+  // projects.rs create_project is `authorize_org(PROJECT_CREATE)`; apps.rs
+  // create_app is `authorize_project(APP_CREATE)`. The two are separate grants,
+  // and step 2 is genuinely reachable without the second one: a member holding
+  // only `project:create` clears step 1 and would otherwise hit a raw 403 here
+  // surfaced as a bare error string naming no permission.
+  const createProjectLock = $derived(lockedBy('project:create', { level: 'org' }));
+  const createAppLock = $derived(
+    project ? lockedBy('app:create', { project: project.id, level: 'project' }) : 'app:create',
+  );
 
   onMount(async () => {
     await sessionStore.load();
@@ -151,7 +162,14 @@
         <form class="create-form" onsubmit={handleCreateProject}>
           {#if projectError}<div class="alert">{projectError}</div>{/if}
           <Input label="Project name" bind:value={projectName} placeholder="Payments" required />
-          <Button type="submit" variant="primary" size="lg" loading={creatingProject} fullWidth>
+          <Button
+            type="submit"
+            variant="primary"
+            size="lg"
+            loading={creatingProject}
+            lockedReason={createProjectLock}
+            fullWidth
+          >
             Create project
           </Button>
         </form>
@@ -182,7 +200,14 @@
               {/each}
             </div>
           </div>
-          <Button type="submit" variant="primary" size="lg" loading={creatingApp} fullWidth>
+          <Button
+            type="submit"
+            variant="primary"
+            size="lg"
+            loading={creatingApp}
+            lockedReason={createAppLock}
+            fullWidth
+          >
             Create app
           </Button>
         </form>

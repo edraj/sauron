@@ -8,10 +8,11 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { getScreenDetail } from '../lib/api/screens';
   import { errorMessage } from '../lib/api/client';
-  import { compactNumber, formatDuration, formatDateTime, relativeTime } from '../lib/utils/format';
+  import { compactNumber, formatDuration } from '../lib/utils/format';
   import type { ScreenDetail } from '../lib/models';
 
   interface Props {
@@ -87,7 +88,7 @@
             {#each detail.recent_events as e (e.id)}
               <li>
                 <span class="mono truncate">{e.name}</span>
-                <span class="faint" title={formatDateTime(e.occurred_at)}>{relativeTime(e.occurred_at)}</span>
+                <span class="faint"><TimeValue value={e.occurred_at} /></span>
               </li>
             {/each}
           </ul>
@@ -103,7 +104,7 @@
                 <button class="link mono truncate" onclick={() => push('/issues/' + x.issue_id)}>
                   {x.exception_type ?? x.message}
                 </button>
-                <span class="faint" title={formatDateTime(x.occurred_at)}>{relativeTime(x.occurred_at)}</span>
+                <span class="faint"><TimeValue value={x.occurred_at} /></span>
               </li>
             {/each}
           </ul>

@@ -154,7 +154,8 @@ pub fn build_debug_meta(dm: Option<&sauron_core::DebugMeta>, raw_stacktrace: &st
     })
 }
 
-/// Time-boxed Dart pre-symbolication. Returns `(lean symbolicated frames, status)`.
+/// Time-boxed Dart pre-symbolication. Returns `(symbolicated frames, status)` — frames carry source context (see the
+/// `Store frames WITH source context` comment at the write); they are not lean.
 pub async fn symbolicate_ingest_dart(
     pool: &PgPool,
     sym: &SymbolizeCtx,
@@ -189,7 +190,8 @@ pub async fn symbolicate_ingest_dart(
     }
 }
 
-/// Time-boxed pre-symbolication. Returns `(lean symbolicated frames, status)` —
+/// Time-boxed pre-symbolication. Returns `(symbolicated frames, status)` — frames carry source context (see the
+/// `Store frames WITH source context` comment at the write); they are not lean —
 /// frames are `None` unless something resolved. Never returns an error.
 pub async fn symbolicate_ingest(
     pool: &PgPool,

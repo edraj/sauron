@@ -8,7 +8,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use sauron_auth::guard::{
@@ -1517,4 +1517,71 @@ pub async fn update_role_handler(
             other => ApiError::from(other),
         })?;
     Ok(Json(updated))
+}
+
+/// Delete a role this org owns.
+///
+/// Presets are refused for the same reason edits are: `ensure_preset_roles`
+/// re-creates them from rbac.rs at every API boot, so a delete would silently
+/// come back on the next restart.
+///
+/// `role_grants.role_id` is ON DELETE CASCADE, so this revokes the role from
+/// every holder at once. The response reports how many grants went with it —
+/// the rows are gone by the time the delete returns, so the count is taken
+/// first.
+pub async fn delete_role_handler(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((org_id, role_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::ROLE_MANAGE).await?;
+
+    let role = repo::get_role(&mut conn, role_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Presets first — their existence is already public via list_roles, so a
+    // clear refusal is correct here, not a 404.
+    if role.is_system {
+        return Err(ApiError::BadRequest(
+            "system roles cannot be deleted".into(),
+        ));
+    }
+    // A role owned by another org is not public; NotFound avoids confirming it
+    // exists.
+    if role.org_id != Some(org_id) {
+        return Err(ApiError::NotFound);
+    }
+
+    let old_perms = role_permissions(&role.permissions);
+
+    // Deleting a role IS removing all of its permissions, so it takes the same
+    // guard the edit path takes: you may not strip a permission you do not
+    // hold. Without this, DELETE achieves in one call the sabotage that
+    // check_role_edit and delete_grant both refuse — an Admin (role:manage,
+    // no org:manage) dissolving a role that confers org:manage.
+    let own = sauron_auth::effective_at_org(&mut conn, auth.user_id, org_id).await?;
+    check_role_edit(&own, &old_perms, &[]).map_err(ApiError::Auth)?;
+
+    // Deleting a role revokes it from every holder at once. If it is the org's
+    // only source of org:manage, that orphans the org exactly as deleting the
+    // last owner grant would. Not redundant with the guard above: that one
+    // stops a caller who lacks org:manage, this one stops an Owner who holds
+    // it and so passes straight through.
+    if old_perms.iter().any(|p| p == perm::ORG_MANAGE) {
+        let remaining =
+            repo::count_org_manage_grants_excluding_role(&mut conn, org_id, role_id).await?;
+        if remaining == 0 {
+            return Err(ApiError::Conflict(
+                "this is the org's last role granting org:manage — grant it elsewhere first".into(),
+            ));
+        }
+    }
+
+    let revoked = repo::count_grants_for_role(&mut conn, role_id).await?;
+    let deleted = repo::delete_role(&mut conn, org_id, role_id).await?;
+    if deleted == 0 {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Json(json!({ "revoked_grants": revoked })))
 }

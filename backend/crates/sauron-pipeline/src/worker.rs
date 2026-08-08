@@ -294,6 +294,11 @@ async fn process_entries(
             Err(e) => {
                 warn!(consumer, id, error = %e, "malformed job; dead-lettering");
                 let _ = redis.dead_letter(&id, &payload).await;
+                // Counted in ENTRIES, not items: the payload did not decode, so
+                // how many items it carried is not knowable here. That is why
+                // there is a separate entries-unit counter at all — folding this
+                // into the item counters would need a number we do not have.
+                sauron_telemetry::metrics::entries_deadlettered(1);
                 continue;
             }
         };
@@ -349,6 +354,12 @@ async fn process_entries(
                     // loss. Loud because duplicates are the visible symptom.
                     warn!(consumer, error = %e, n = ids.len(), "batch ack failed; entries will be redelivered");
                 }
+                // ONE add for the whole batch, of a number already computed
+                // above. The fallback arm below deliberately does NOT do this:
+                // `process_one_by_one` counts per item, so adding `items` here
+                // as well would count a failed batch's work twice and hide real
+                // loss behind an inflated `persisted`.
+                sauron_telemetry::metrics::items_persisted(items as u64);
                 return items;
             }
             Err(e) => {
@@ -392,13 +403,18 @@ async fn process_one_by_one(
         // no TTL and no reaper, so anything written here is permanent and must
         // already be masked.
         let masked_payload = serde_json::to_string(&d.job).unwrap_or_default();
-        if let Err(e) = process_job(pool, redis, sym, &d.masks, d.job).await {
-            warn!(consumer, id = d.id, error = %e, "job processing failed; dead-lettering");
-            // Deliberately NOT `dead_letter`, which acks: one failing item must
-            // not retire the entry while its siblings are still unwritten. A
-            // crash before the tail then replays the whole envelope — duplicate
-            // writes rather than a silent partial loss.
-            let _ = redis.dlq_push(&masked_payload).await;
+        // Counted per ITEM here, which is the granularity this path works at.
+        match process_job(pool, redis, sym, &d.masks, d.job).await {
+            Ok(()) => sauron_telemetry::metrics::items_persisted(1),
+            Err(e) => {
+                warn!(consumer, id = d.id, error = %e, "job processing failed; dead-lettering");
+                // Deliberately NOT `dead_letter`, which acks: one failing item
+                // must not retire the entry while its siblings are still
+                // unwritten. A crash before the tail then replays the whole
+                // envelope — duplicate writes rather than a silent partial loss.
+                let _ = redis.dlq_push(&masked_payload).await;
+                sauron_telemetry::metrics::items_deadlettered(1);
+            }
         }
         // Acked once per ENTRY, after its last item — whether that item landed
         // or dead-lettered. Both outcomes are terminal for the item; what must

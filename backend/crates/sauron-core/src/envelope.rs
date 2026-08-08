@@ -398,7 +398,12 @@ pub struct IngestBatch {
     pub context: EnvelopeContext,
     #[serde(default)]
     pub sdk: Option<SdkInfo>,
-    /// Never empty — the edge does not enqueue an envelope with no items.
+    /// CAN be empty. This previously read "never empty — the edge does not
+    /// enqueue an envelope with no items", which is false: the accept handler
+    /// bounds `items` only from above (`MAX_ENVELOPE_ITEMS`), and `items` is
+    /// `#[serde(default)]` above, so a body with no `items` key is enqueued.
+    /// Measured 2026-08-08 against an isolated ingest: 202 `{"accepted":0}` with
+    /// XLEN +1. Anything expanding this must tolerate zero jobs.
     pub items: Vec<EnvelopeItem>,
 }
 

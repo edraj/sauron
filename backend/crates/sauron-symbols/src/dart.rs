@@ -17,19 +17,28 @@ use object::{Object, ObjectSection};
 use crate::content::SymbolError;
 use crate::js::ResolvedLoc;
 
-/// Resolve each DSO-relative virtual address against the ELF's DWARF. Returns,
-/// per input address, the inline frame chain (innermost first). An address that
-/// resolves to nothing yields an empty inner vec.
+/// Resolve each frame's DSO-relative virtual address against the ELF's DWARF.
+/// Returns exactly one slot per input slot, in the same order — callers pair the
+/// two positionally. Each slot holds that address's inline frame chain (innermost
+/// first); an address that resolves to nothing yields an empty inner vec.
+///
+/// `None` means the frame's address could not be determined at all (see
+/// [`crate::dart_trace::DartFrameRef::lookup_addr`]). Such a slot is not looked
+/// up and comes back empty — the same shape as a miss, which is the honest
+/// answer. It must not be flattened to a placeholder address first: in
+/// `tests/fixtures/sample_zero_base.elf`, whose `.text` starts at 0x0, address 0
+/// resolves to `compute_total` at `sample.c:1`, so a placeholder 0 buys a
+/// confidently wrong frame instead of a missing one.
 ///
 /// The ELF is untrusted (uploaded); `object`/`gimli` are panic-resistant, but we
 /// wrap parsing in `catch_unwind` so a pathological input can never take down an
 /// ingest worker or API handler — it degrades to a clean error instead.
-pub fn resolve(elf: &[u8], addrs: &[u64]) -> Result<Vec<Vec<ResolvedLoc>>, SymbolError> {
+pub fn resolve(elf: &[u8], addrs: &[Option<u64>]) -> Result<Vec<Vec<ResolvedLoc>>, SymbolError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resolve_inner(elf, addrs)))
         .unwrap_or_else(|_| Err(SymbolError::Corrupt("panic while parsing ELF/DWARF".into())))
 }
 
-fn resolve_inner(elf: &[u8], addrs: &[u64]) -> Result<Vec<Vec<ResolvedLoc>>, SymbolError> {
+fn resolve_inner(elf: &[u8], addrs: &[Option<u64>]) -> Result<Vec<Vec<ResolvedLoc>>, SymbolError> {
     let file =
         object::File::parse(elf).map_err(|e| SymbolError::Corrupt(format!("elf parse: {e}")))?;
 
@@ -52,6 +61,13 @@ fn resolve_inner(elf: &[u8], addrs: &[u64]) -> Result<Vec<Vec<ResolvedLoc>>, Sym
 
     let mut out = Vec::with_capacity(addrs.len());
     for &addr in addrs {
+        // No address for this frame — keep its slot (the caller pairs slots to
+        // frames by position) and leave it empty. Deliberately not looked up:
+        // see this function's docs on why a placeholder would be worse.
+        let Some(addr) = addr else {
+            out.push(Vec::new());
+            continue;
+        };
         let mut locs = Vec::new();
         if let Ok(mut iter) = ctx.find_frames(addr).skip_all_loads() {
             while let Ok(Some(frame)) = iter.next() {
@@ -90,7 +106,7 @@ mod tests {
 
     #[test]
     fn resolves_real_dwarf_functions() {
-        let out = resolve(ELF, &[0x400446, 0x400457]).unwrap();
+        let out = resolve(ELF, &[Some(0x400446), Some(0x400457)]).unwrap();
 
         let compute = &out[0];
         assert!(!compute.is_empty(), "compute_total did not resolve");
@@ -110,13 +126,58 @@ mod tests {
 
     #[test]
     fn unknown_address_resolves_empty() {
-        let out = resolve(ELF, &[0xdead_beef]).unwrap();
+        let out = resolve(ELF, &[Some(0xdead_beef)]).unwrap();
         assert!(out[0].is_empty());
+    }
+
+    /// The same tests/fixtures/sample.c, linked so `.text` starts at 0x0:
+    /// `gcc -g -O0 -no-pie -nostdlib -nostartfiles -Wl,--section-start=.text=0x0`
+    /// (the linker warns it cannot find `_start`; harmless, since this ELF is only
+    /// ever parsed for DWARF, never executed). `readelf -S` shows `.text` at
+    /// address 0, `nm` puts `compute_total` at 0x0, and `addr2line -fie` on 0
+    /// prints `compute_total` at `…/sample.c:1`.
+    ///
+    /// Its whole purpose is to make address 0 a *hit*. `sample.elf` above is
+    /// based at 0x400000, so 0 misses there and cannot tell a real guard from an
+    /// absent one.
+    const ZERO_BASE_ELF: &[u8] = include_bytes!("../tests/fixtures/sample_zero_base.elf");
+
+    /// A frame with no determinable address must not borrow address 0's answer.
+    ///
+    /// Both slots go to the same ELF, so the only difference is `Some(0)` vs
+    /// `None`. Substituting 0 for "unknown" is only ever safe if 0 misses, which
+    /// is a property of the uploaded ELF and not of this code — here it hits, and
+    /// the old `unwrap_or(0)` in `engine::symbolicate_dart` therefore did not
+    /// merely lose a frame, it produced a confident wrong one.
+    #[test]
+    fn an_undeterminable_address_is_not_looked_up_as_zero() {
+        let out = resolve(ZERO_BASE_ELF, &[Some(0), None]).unwrap();
+        assert_eq!(
+            out[0].first().and_then(|l| l.name.as_deref()),
+            Some("compute_total"),
+            "fixture precondition: address 0 IS real code in this ELF"
+        );
+        assert!(
+            out[1].is_empty(),
+            "a None slot must resolve to nothing, got {:?}",
+            out[1]
+        );
+    }
+
+    /// The positional contract `engine::symbolicate_dart` pairs against.
+    #[test]
+    fn returns_one_slot_per_input_including_none_slots() {
+        let out = resolve(ELF, &[None, Some(0x400446), None, Some(0x400457)]).unwrap();
+        assert_eq!(out.len(), 4);
+        assert!(out[0].is_empty());
+        assert_eq!(out[1][0].name.as_deref(), Some("compute_total"));
+        assert!(out[2].is_empty());
+        assert_eq!(out[3][0].name.as_deref(), Some("helper_add"));
     }
 
     #[test]
     fn garbage_elf_errors() {
-        assert!(resolve(b"not an elf", &[0]).is_err());
+        assert!(resolve(b"not an elf", &[Some(0)]).is_err());
     }
 
     // Built with `gcc -g -O2 -no-pie`, `scale()` is inlined into `outer()`.
@@ -125,7 +186,7 @@ mod tests {
 
     #[test]
     fn expands_inline_frames() {
-        let out = resolve(INLINE_ELF, &[0x400460]).unwrap();
+        let out = resolve(INLINE_ELF, &[Some(0x400460)]).unwrap();
         let frames = &out[0];
         assert!(
             frames.len() >= 2,

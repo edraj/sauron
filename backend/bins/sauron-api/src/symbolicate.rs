@@ -130,6 +130,30 @@ pub fn strip_source_context(event: &mut ErrorEvent) {
     }
 }
 
+/// Apply [`strip_source_context`] to every event in `events`, unless `perms`
+/// carries `source:read`.
+///
+/// The gate's one entry point for handlers that return a *set* of events.
+/// `strip_source_context` alone is easy to leave uncalled, and it was: four
+/// handlers returned whole `ErrorEvent` rows — with the persisted
+/// `stacktrace_symbolicated` column and its context lines — off `event:read`
+/// alone, while the gate was enforced only on the two issues routes.
+/// Measured before the fix, all four handed `context_line`, `pre_context`,
+/// `post_context` and `context_start_line` to a caller holding `event:read`
+/// and not `source:read` (see `tests/http_source_context.rs`, which fails on
+/// each of them without this call).
+///
+/// Takes the permission set rather than a `bool` so the permission *name* is
+/// checked in one place and a call site cannot invert the condition.
+pub fn gate_source_context(perms: &std::collections::HashSet<String>, events: &mut [ErrorEvent]) {
+    if perms.contains(sauron_auth::perm::SOURCE_READ) {
+        return;
+    }
+    for ev in events.iter_mut() {
+        strip_source_context(ev);
+    }
+}
+
 /// Symbolicate an event in place: sets `stacktrace_symbolicated` (with source
 /// context) + `symbolication_status` on the response copy, and persists a copy
 /// for hot partitions that hadn't been symbolicated yet.
@@ -229,8 +253,10 @@ async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut Er
         return;
     }
 
-    // Persist a lean copy for hot partitions that were previously unresolved —
-    // never write into cold/exported partitions (respects the tiering guard).
+    // Persist for hot partitions that were previously unresolved — never write
+    // into cold/exported partitions (respects the tiering guard). NOT a "lean"
+    // copy: the write below is `serde_json::to_value(&resolved)`, i.e. the full
+    // frames INCLUDING source context. See the comment at the write itself.
     let hot = event.occurred_at > Utc::now() - Duration::days(state.cfg.tier_hot_days);
     let was_unresolved = matches!(
         event.symbolication_status.as_str(),

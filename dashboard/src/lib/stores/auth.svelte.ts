@@ -1,5 +1,6 @@
 import { configureAuthBridge, isNormalizedError } from '../api/client';
 import * as authApi from '../api/auth';
+import { viewCache } from './view-cache';
 import type { LoginPayload, RegisterPayload, User } from '../models';
 
 export type AuthStatus =
@@ -62,9 +63,21 @@ class AuthStore {
     this.user = null;
     this.mustChangePassword = false;
     writeRefreshToken(null);
+    // Every cached view payload belonged to the identity being cleared. Dropping
+    // them here rather than in each page is what makes the guarantee total: this
+    // runs on logout, on a failed refresh, and on a failed boot, so there is no
+    // path that ends a session and leaves rows behind for whoever signs in next
+    // on the same tab.
+    viewCache.clear();
   }
 
   async login(payload: LoginPayload): Promise<void> {
+    // Belt and braces alongside `clearLocal`: nothing currently reaches `login`
+    // without an intervening `clearLocal`, but a sign-in is by definition an
+    // identity change, and this is the one place that is true no matter how the
+    // caller got here. Cheap, and it means a future path that swaps sessions
+    // without logging out first cannot serve the previous user's rows.
+    viewCache.clear();
     const session = await authApi.login(payload);
     this.accessToken = session.access_token;
     this.user = session.user;

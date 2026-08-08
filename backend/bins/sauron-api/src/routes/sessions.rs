@@ -119,7 +119,12 @@ pub async fn detail(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<SessionDetail>, ApiError> {
     let mut conn = db(&state).await?;
-    let scope = super::scope::authorized_read_scope(
+    // `_with_perms` rather than `authorized_read_scope`: the timeline carries
+    // whole `ErrorEvent` rows, whose `stacktrace_symbolicated` holds the
+    // de-obfuscated source lines `perm::SOURCE_READ` gates. Same second
+    // permission question the issues routes ask, answered at the resolved
+    // environment.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
         auth.user_id,
         app_id,
@@ -133,7 +138,11 @@ pub async fn detail(
         .ok_or(ApiError::NotFound)?;
 
     let events = repo::events_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
-    let errors = repo::errors_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
+    let mut errors = repo::errors_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
+    // Before the boxed moves into `TimelineItem::Error` below — the gate works
+    // on `[ErrorEvent]`, and once these are inside the enum they are no longer
+    // a slice.
+    crate::symbolicate::gate_source_context(&perms, &mut errors);
     let txns = repo::transactions_for_session(&mut conn, scope, &session_id, 500).await?;
 
     let mut timeline: Vec<TimelineItem> =

@@ -115,7 +115,11 @@ pub async fn person(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<PersonProfile>, ApiError> {
     let mut conn = db(&state).await?;
-    let scope = super::scope::authorized_read_scope(
+    // `_with_perms`: `errors` below is whole `ErrorEvent` rows (up to `limit`,
+    // which clamps at 200), whose `stacktrace_symbolicated` holds the
+    // de-obfuscated source lines `perm::SOURCE_READ` gates. See
+    // `sessions::detail` for the same note.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
         auth.user_id,
         app_id,
@@ -127,7 +131,8 @@ pub async fn person(
 
     let user = repo::get_event_user(&mut conn, scope.clone(), &distinct_id).await?;
     let events = repo::events_for_person(&mut conn, scope.clone(), &distinct_id, limit).await?;
-    let errors = repo::error_events_for_person(&mut conn, scope, &distinct_id, limit).await?;
+    let mut errors = repo::error_events_for_person(&mut conn, scope, &distinct_id, limit).await?;
+    crate::symbolicate::gate_source_context(&perms, &mut errors);
 
     Ok(Json(PersonProfile {
         distinct_id,

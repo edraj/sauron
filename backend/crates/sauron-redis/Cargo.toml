@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 sauron-core.workspace = true
+# For `metrics::StreamSnapshot`, the shape `stream_stats` fills in. A leaf crate
+# with no in-workspace dependencies of its own, so this adds no cycle.
+sauron-telemetry.workspace = true
 redis.workspace = true
 serde.workspace = true
 serde_json.workspace = true

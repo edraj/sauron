@@ -332,7 +332,14 @@
                   <span class="sf-meta">{f.steps.length} steps{#if f.created_by_name} · {f.created_by_name}{/if}</span>
                 </button>
                 <div class="sf-actions">
-                  <button type="button" title="Duplicate" onclick={() => duplicateFunnel(f)}><Icon name="copy" size={14} /></button>
+                  <button
+                    type="button"
+                    title={writeLock ? lockTitle(writeLock) : 'Duplicate'}
+                    disabled={writeLock !== null}
+                    onclick={() => duplicateFunnel(f)}
+                  >
+                    <Icon name={writeLock ? 'lock' : 'copy'} size={14} />
+                  </button>
                   <button
                     type="button"
                     title={writeLock ? lockTitle(writeLock) : 'Delete'}

@@ -8,6 +8,7 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatusBadge from '../lib/components/StatusBadge.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import StacktraceView from '../lib/components/StacktraceView.svelte';
   import BreadcrumbTrail from '../lib/components/BreadcrumbTrail.svelte';
@@ -28,7 +29,6 @@
   import { toastStore } from '../lib/stores/toast.svelte';
   import {
     relativeTime,
-    formatDateTime,
     formatDateTimeSeconds,
     formatDateTimeZone,
   } from '../lib/utils/format';
@@ -474,11 +474,11 @@
             <div><dt>Users affected</dt><dd>{issue.users_seen.toLocaleString()}</dd></div>
             <div>
               <dt>First seen</dt>
-              <dd title={formatDateTime(issue.first_seen)}>{relativeTime(issue.first_seen)}</dd>
+              <dd><TimeValue value={issue.first_seen} /></dd>
             </div>
             <div>
               <dt>Last seen</dt>
-              <dd title={formatDateTime(issue.last_seen)}>{relativeTime(issue.last_seen)}</dd>
+              <dd><TimeValue value={issue.last_seen} /></dd>
             </div>
             <div><dt>Type</dt><dd class="mono">{issue.type}</dd></div>
             {#if latestEvent?.release}
@@ -497,9 +497,7 @@
             {#if latestEvent}
               <div>
                 <dt>Occurred</dt>
-                <dd title={formatDateTime(latestEvent.occurred_at)}>
-                  {relativeTime(latestEvent.occurred_at)}
-                </dd>
+                <dd><TimeValue value={latestEvent.occurred_at} /></dd>
               </div>
             {/if}
             <div>

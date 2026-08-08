@@ -9,12 +9,14 @@
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { getPerson } from '../lib/api/persons';
   import { errorMessage } from '../lib/api/client';
-  import { relativeTime, formatDateTime, initials } from '../lib/utils/format';
+  import { relativeTime, formatTimestamp, initials } from '../lib/utils/format';
+  import { timeFormatStore } from '../lib/stores/time-format.svelte';
   import type { AnalyticsEvent, ErrorEvent, PersonProfile } from '../lib/models';
 
   interface Props {
@@ -117,8 +119,8 @@
         <div class="id-sub">
           {#if profile.user}
             <span class="muted">
-              First seen {relativeTime(profile.user.first_seen)} · Last seen
-              {relativeTime(profile.user.last_seen)}
+              First seen <TimeValue value={profile.user.first_seen} /> · Last seen
+              <TimeValue value={profile.user.last_seen} />
             </span>
           {:else}
             <span class="muted">Anonymous — no persisted profile record.</span>
@@ -138,13 +140,29 @@
         <StatTile label="Sessions" value={sessionCount > 0 ? sessionCount.toLocaleString() : '—'} />
         <StatTile
           label="First seen"
-          value={profile.user ? relativeTime(profile.user.first_seen) : '—'}
-          sub={profile.user ? formatDateTime(profile.user.first_seen) : undefined}
+          value={profile.user
+            ? timeFormatStore.mode === 'relative'
+              ? relativeTime(profile.user.first_seen)
+              : formatTimestamp(profile.user.first_seen)
+            : '—'}
+          sub={profile.user
+            ? timeFormatStore.mode === 'relative'
+              ? formatTimestamp(profile.user.first_seen)
+              : relativeTime(profile.user.first_seen)
+            : undefined}
         />
         <StatTile
           label="Last seen"
-          value={profile.user ? relativeTime(profile.user.last_seen) : '—'}
-          sub={profile.user ? formatDateTime(profile.user.last_seen) : undefined}
+          value={profile.user
+            ? timeFormatStore.mode === 'relative'
+              ? relativeTime(profile.user.last_seen)
+              : formatTimestamp(profile.user.last_seen)
+            : '—'}
+          sub={profile.user
+            ? timeFormatStore.mode === 'relative'
+              ? formatTimestamp(profile.user.last_seen)
+              : relativeTime(profile.user.last_seen)
+            : undefined}
         />
       </StatTiles>
     </div>
@@ -182,9 +200,7 @@
                           session <Icon name="arrow-up-right" size={14} />
                         </a>
                       {/if}
-                      <span class="tl-time" title={formatDateTime(item.data.occurred_at)}>
-                        {relativeTime(item.data.occurred_at)}
-                      </span>
+                      <span class="tl-time"><TimeValue value={item.data.occurred_at} /></span>
                     </div>
                     {#if item.kind === 'event' && item.data.properties && Object.keys(item.data.properties).length > 0}
                       <div class="tl-props">
