@@ -1,0 +1,131 @@
+{
+  "header": {
+    "dsn": "https://pk_test@localhost:8081/1",
+    "sdk": {
+      "name": "sauron.flutter",
+      "version": "1.4.0"
+    },
+    "sent_at": "2026-07-12T10:30:00.123Z",
+    "release": "app@1.4.2+1402"
+  },
+  "context": {
+    "device": {
+      "family": null,
+      "model": null,
+      "arch": null,
+      "device_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+    },
+    "os": null,
+    "app": {
+      "version": "1.4.2",
+      "build": "1402"
+    },
+    "runtime": {
+      "name": "Dart",
+      "version": "<host>"
+    },
+    "user": {
+      "id": "u_123",
+      "email": null,
+      "traits": {
+        "plan": "pro"
+      }
+    }
+  },
+  "items": [
+    {
+      "type": "identify",
+      "distinct_id": "u_123",
+      "anonymous_id": null,
+      "traits": {
+        "plan": "pro"
+      }
+    },
+    {
+      "type": "event",
+      "name": "checkout_completed",
+      "distinct_id": "u_123",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "properties": {
+        "cart_value": 42.5
+      },
+      "session_id": "sess_fixture",
+      "screen": "/checkout",
+      "tags": {
+        "env": "prod"
+      }
+    },
+    {
+      "type": "transaction",
+      "name": "GET /api/users",
+      "op": "http",
+      "duration_ms": 128.0,
+      "status": "ok",
+      "http_method": "GET",
+      "http_status": 200,
+      "url": "https://api.example.com/api/users",
+      "distinct_id": "u_123",
+      "session_id": "sess_fixture",
+      "timestamp": "2026-07-12T10:30:00.123Z"
+    },
+    {
+      "type": "error",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "level": "error",
+      "exception": {
+        "type": "StateError",
+        "value": "Bad state: x is not valid",
+        "mechanism": {
+          "type": "manual",
+          "handled": true
+        },
+        "stacktrace": [
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": true
+          },
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": true
+          },
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": true
+          },
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": true
+          }
+        ]
+      },
+      "breadcrumbs": [
+        {
+          "type": "navigation",
+          "category": "route",
+          "message": "/settings",
+          "level": "info",
+          "timestamp": "2026-07-12T10:30:00.123Z",
+          "data": {}
+        }
+      ],
+      "fingerprint": null,
+      "session_id": "sess_fixture",
+      "screen": "/checkout",
+      "tags": {
+        "env": "prod"
+      }
+    }
+  ]
+}

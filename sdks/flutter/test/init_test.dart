@@ -68,6 +68,11 @@ void main() {
 
     expect(Sauron.isEnabled, isTrue);
 
+    // An analytics item needs an identity: `distinct_id` is non-`Option` on the
+    // wire, so an unidentified `track` is dropped rather than 400ing the whole
+    // envelope. `setUser` supplies one without emitting an `identify` item, so
+    // `envelopes.single` below still sees exactly one item.
+    Sauron.setUser(const SauronUser(id: 'u_123'));
     Sauron.track('checkout_completed');
     await Sauron.flush();
 

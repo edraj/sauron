@@ -331,6 +331,23 @@ Returns `void`. The event carries the current distinct id, session id and
 screen. Never sampled. The static facade has no `screen:` parameter — use
 `Sauron.client!.track(name, screen: 'Checkout')` for a per-call screen override.
 
+> **Requires an identity.** This SDK has no anonymous id: the distinct id comes
+> from the scope user, which is `null` until `Sauron.identify(...)` (or
+> `Sauron.setUser(...)`) is called. An analytics item built without one is
+> **dropped**, and the first drop prints
+> `[Sauron] dropped analytics item "<name>": no distinct_id …` even with
+> `debug: false`. The same applies to the events the SDK emits through `track`
+> itself — `$screen` from `setScreen` and the `$workflow_*` lifecycle events —
+> so identify before you start tracking, ideally right after login (or with a
+> device-scoped id at startup if you have one).
+>
+> Why dropped rather than sent: `distinct_id` is a required string on the wire, so
+> `null` makes the gateway reject the **entire envelope** with
+> `400 invalid_envelope`, and a 400 is non-retryable. One unidentified event
+> would take every error, transaction and identify batched with it (up to
+> `maxBatchItems`, default 30) down with it — which is what happened through
+> 1.4.0.
+
 ```dart
 Sauron.track(
   'checkout_completed',
@@ -398,6 +415,10 @@ change it emits one `$screen` analytics event with
 every later event/error is stamped with the new screen. `Sauron.screen` reads
 the current value (`null` until set or seeded via `options.screen`).
 
+The `$screen` event goes through `track`, so it needs an identity — see the note
+under [`Sauron.track`](#saurontrack). The screen name itself is still recorded
+and still stamped onto errors when the `$screen` event is dropped.
+
 ```dart
 Sauron.setScreen('Checkout');
 Sauron.setScreen('Checkout'); // no-op, no second $screen event
@@ -438,6 +459,9 @@ Starting, ending, and cancelling a workflow each emit one reserved analytics
 event through `track()` — `$workflow_start`, `$workflow_end`, or
 `$workflow_cancel` — so they show up in Events like anything else. `endWorkflow`
 adds `duration_ms`; `cancelWorkflow` adds both `duration_ms` and `reason`.
+Because they go through `track()`, they need an identity — see the note under
+[`Sauron.track`](#saurontrack). The workflow itself still starts, still returns
+`ok`, and is still stamped onto errors when its lifecycle event is dropped.
 
 All three mutators return a `WorkflowResult { status, workflowId }`. Exactly six
 `WorkflowStatus` values, never a seventh:
@@ -1045,6 +1069,7 @@ Response policy:
 | Requests leave but nothing lands | Your proxy does not expose ingest at `/api/{environment_id}/envelope` on the DSN's host (plus any DSN path prefix) | Route that exact path to the gateway — events otherwise drop silently and look delivered. |
 | Delivery stops permanently mid-session | A `401`/`403` disabled the transport (`Sauron.isEnabled` flips to `false`) | Verify the public key belongs to the project; restart the app after fixing. |
 | Events arrive, errors do not | `sampleRate < 1.0`, or `beforeSend` returned `null` | Pass `sampleRate: 1.0`; log inside `beforeSend`. |
+| Errors arrive, `track`/`$screen`/`$workflow_*` events do not, and the log says `dropped analytics item … no distinct_id` | Nothing has identified the user yet, so the event has no `distinct_id` — a required string on the wire. The item is dropped rather than 400ing the whole envelope | Call `Sauron.identify('<id>')` (or `Sauron.setUser(SauronUser(id: '<id>'))`) before tracking. |
 | No breadcrumbs on errors | `maxBreadcrumbs <= 0` | Set a positive `maxBreadcrumbs`. |
 | Stack traces are hex addresses | Obfuscated AOT build with no symbols uploaded | Upload the `--split-debug-info` output (see above). |
 | Errors from a spawned isolate are missing | Only `Isolate.current` is auto-listened | Call `Sauron.addIsolateErrorListener(isolate)`. |

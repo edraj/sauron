@@ -1,0 +1,146 @@
+{
+  "header": {
+    "dsn": "https://pub123@example.com/42",
+    "sdk": {
+      "name": "sauron-dotnet",
+      "version": "1.3.0"
+    },
+    "sent_at": "2026-07-12T10:30:00.123Z",
+    "release": "svc@1.4.2"
+  },
+  "context": {
+    "device": {
+      "device_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+    },
+    "os": {
+      "name": "\u003Chost\u003E",
+      "version": null
+    },
+    "app": {},
+    "runtime": {
+      "name": "dotnet",
+      "version": "\u003Chost\u003E"
+    },
+    "user": null
+  },
+  "items": [
+    {
+      "type": "identify",
+      "distinct_id": "u_123",
+      "anonymous_id": null,
+      "traits": {
+        "plan": "pro"
+      },
+      "timestamp": "2026-07-12T10:30:00.123Z"
+    },
+    {
+      "type": "event",
+      "name": "checkout_completed",
+      "distinct_id": "u_123",
+      "properties": {
+        "cart_value": 42.5
+      },
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "session_id": null,
+      "screen": null,
+      "tags": {
+        "env": "prod"
+      }
+    },
+    {
+      "type": "error",
+      "event_id": "0123456789abcdef0123456789abcdef",
+      "level": "error",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "exception": {
+        "type": "System.InvalidOperationException",
+        "value": "x is not valid",
+        "mechanism": {
+          "type": "generic",
+          "handled": true
+        },
+        "stacktrace": [
+          {
+            "function": "\u003Cfn\u003E",
+            "module": "\u003Cmodule\u003E",
+            "filename": "\u003Cfile\u003E",
+            "abs_path": "\u003Cfile\u003E",
+            "lineno": 42,
+            "colno": null,
+            "in_app": true
+          }
+        ]
+      },
+      "message": null,
+      "breadcrumbs": [
+        {
+          "type": "navigation",
+          "category": "history",
+          "message": "went to /settings",
+          "level": "info",
+          "timestamp": "2026-07-12T10:30:00.123Z",
+          "data": {
+            "from": "/",
+            "to": "/settings"
+          }
+        }
+      ],
+      "tags": {
+        "env": "prod"
+      },
+      "fingerprint": null,
+      "user": {
+        "id": "u_123",
+        "email": "a@b.co",
+        "username": null
+      },
+      "session_id": null,
+      "screen": null
+    },
+    {
+      "type": "error",
+      "event_id": "0123456789abcdef0123456789abcdef",
+      "level": "warning",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "exception": null,
+      "message": "payment provider returned a soft decline",
+      "breadcrumbs": [
+        {
+          "type": "navigation",
+          "category": "history",
+          "message": "went to /settings",
+          "level": "info",
+          "timestamp": "2026-07-12T10:30:00.123Z",
+          "data": {
+            "from": "/",
+            "to": "/settings"
+          }
+        }
+      ],
+      "tags": {
+        "env": "prod"
+      },
+      "fingerprint": null,
+      "user": {
+        "id": "u_123",
+        "email": "a@b.co",
+        "username": null
+      },
+      "session_id": null,
+      "screen": null
+    },
+    {
+      "type": "transaction",
+      "name": "GET /api/users",
+      "op": "http",
+      "duration_ms": 128.4,
+      "status": "ok",
+      "http_method": "GET",
+      "http_status": 200,
+      "url": "/api/users",
+      "distinct_id": "u_123",
+      "session_id": null,
+      "timestamp": "2026-07-12T10:30:00.123Z"
+    }
+  ]
+}

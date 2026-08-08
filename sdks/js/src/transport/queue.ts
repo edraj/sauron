@@ -98,6 +98,22 @@ export class OfflineQueue {
     return entries;
   }
 
+  /**
+   * Put drained payloads BACK at the head, keeping their relative order.
+   *
+   * The counterpart to {@link drain}: a drain empties the store immediately, so
+   * whatever the caller could not deliver only exists in its local array and is
+   * lost the moment the caller returns. Re-parking at the head (rather than via
+   * {@link enqueue}) keeps the queue oldest-first, which is what the byte-cap
+   * eviction policy assumes — the oldest entry must stay the first one evicted.
+   */
+  requeueFront(payloads: string[]): void {
+    if (!this.storage || payloads.length === 0) return;
+    const entries = [...payloads, ...this.read()];
+    this.evict(entries);
+    this.write(entries);
+  }
+
   /** Non-destructive read of the current entries, oldest first. */
   peek(): string[] {
     return this.read();

@@ -105,11 +105,36 @@ void main() {
       httpClient: httpClient,
     ));
 
+    Sauron.setUser(const SauronUser(id: 'u_123'));
     Sauron.track('checkout_completed');
     await Sauron.flush();
     await settle();
 
     expect(logged, isEmpty);
+  });
+
+  test('warns even with debug off when an item is dropped for no distinct_id',
+      () async {
+    // The ONE thing this SDK says out loud without `debug: true`, and
+    // deliberately so: an unidentified analytics item is DROPPED (its
+    // `distinct_id` is non-`Option` on the wire, and sending `null` would make
+    // the gateway reject the entire envelope). That drop used to be invisible in
+    // every build, which is exactly why it shipped. Printed once per client so a
+    // hot analytics loop cannot flood the log.
+    await Sauron.init(SauronOptions(
+      dsn: 'https://pk_test@localhost:9/1',
+      httpClient: httpClient,
+    ));
+
+    Sauron.track('checkout_completed');
+    Sauron.track('viewed_pricing');
+    await Sauron.flush();
+    await settle();
+
+    expect(logged, hasLength(1));
+    expect(logged.single, contains('dropped analytics item'));
+    expect(logged.single, contains('checkout_completed'));
+    expect(logged.single, contains('identify'));
   });
 
   test('a long value is truncated onto one line', () async {

@@ -55,7 +55,7 @@ Warning: This VM has been configured to produce stack traces that violate the Da
 *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
 pid: 12345, tid: 6789, name 1.ui
 build_id: 'a1b2c3d4e5f6'
-isolate_dso_base: 7f0000000000
+isolate_dso_base: 7f0000000000, vm_dso_base: 7f0000000000
 #00 abs 00007f0000001234 virt 0000000000001234 _kDartIsolateSnapshotInstructions+0x1234
 #01 abs 00007f0000005678 virt 0000000000005678 _kDartIsolateSnapshotInstructions+0x5678
 ''';

@@ -222,6 +222,13 @@ class SauronClient {
   }
 
   /// Records a product-analytics event.
+  ///
+  /// **Requires an identity.** `distinct_id` is a non-`Option` `String` on the
+  /// wire, and this SDK has no anonymous id — [Scope.distinctId] is null until
+  /// [identify] is called. An event built without one is therefore dropped here
+  /// rather than dispatched; see [_dropWithoutIdentity] for why that is the
+  /// lesser evil. This also covers the events the SDK emits through this method
+  /// itself: `$screen` from [setScreen] and the `$workflow_*` lifecycle events.
   void track(
     String name, {
     Map<String, Object?>? properties,
@@ -233,11 +240,16 @@ class SauronClient {
     if (!isEnabled) {
       return;
     }
+    final String? distinctId = _scope.distinctId;
+    if (distinctId == null || distinctId.isEmpty) {
+      _dropWithoutIdentity(name);
+      return;
+    }
     _dispatch(
       EventItem(
         name: name,
         timestamp: DateTime.now().toUtc(),
-        distinctId: _scope.distinctId,
+        distinctId: distinctId,
         sessionId: sessionId,
         // Leaf-site workflow stamp 2 of 3 — see the note on [_currentWorkflow].
         workflowId: _currentWorkflow?.workflowId,
@@ -600,6 +612,41 @@ class SauronClient {
     } else {
       _pending.add(outgoing);
     }
+  }
+
+  /// How many analytics items have been dropped for want of an identity, and
+  /// whether the un-gated explanation has been printed yet.
+  int _droppedWithoutIdentity = 0;
+  bool _identityWarningPrinted = false;
+
+  /// Drop one analytics item that has no `distinct_id`, loudly.
+  ///
+  /// The wire's `AnalyticsItem.distinct_id` is a non-`Option` `String`, so
+  /// sending `null` is not "a null field on one item" — the gateway fails to
+  /// deserialize the ENTIRE envelope (`400 invalid_envelope`), the transport
+  /// classifies 400 as non-retryable and drops the batch, and every unrelated
+  /// error, transaction and identify batched alongside it dies too. Containing
+  /// the failure to the one item that cannot be attributed is strictly less
+  /// destructive.
+  ///
+  /// The first drop prints regardless of [SauronOptions.debug]: this used to be
+  /// completely silent, which is exactly why it survived. Subsequent drops go to
+  /// the debug log so a hot analytics loop cannot flood the console.
+  void _dropWithoutIdentity(String name) {
+    _droppedWithoutIdentity++;
+    final String detail =
+        'dropped analytics item "$name": no distinct_id. This SDK has no '
+        'anonymous id — call Sauron.identify(<id>) before track(), setScreen() '
+        'or startWorkflow(), or these events cannot be attributed to anyone. '
+        'Sending it would make the ingest gateway reject the whole envelope, '
+        'losing every error batched with it. '
+        '(dropped so far: $_droppedWithoutIdentity)';
+    if (!_identityWarningPrinted) {
+      _identityWarningPrinted = true;
+      debugPrint('[Sauron] $detail');
+      return;
+    }
+    _log(detail);
   }
 
   EnvelopeHeader _buildHeader(DateTime sentAt) => EnvelopeHeader(

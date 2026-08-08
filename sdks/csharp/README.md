@@ -1170,6 +1170,21 @@ There is no separate typecheck step — `Nullable` is enabled, so `dotnet build`
 surfaces nullability warnings. The test project has `InternalsVisibleTo` access,
 which is why tests can reference the internal item DTOs directly.
 
+### Why there is a `global.json` here
+
+`global.json` sets an SDK **floor of 9.0.200**, and that floor is about the
+solution format, not the target framework. This directory ships only
+`Sauron.slnx` — the XML solution format — and support for it landed in SDK
+9.0.200. On an older SDK the commands above fail with
+`MSB1003: Specify a project or solution file`, which reads like a missing file
+rather than an SDK that cannot parse the one that is there.
+
+`"rollForward": "latestMajor"` keeps it a floor: a newer SDK (10.x and up) is
+fine and is what most machines will use. The floor is deliberately *not* an
+exact pin — `net8.0` in the two `.csproj` files already pins what gets compiled,
+and `RollForward: Major` pins what the test host may run on. If you do have an
+SDK below the floor, the error names both the version wanted and this file.
+
 ## License
 
 AGPL-3.0-only — GNU Affero General Public License v3.0. See

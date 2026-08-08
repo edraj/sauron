@@ -30,9 +30,17 @@ export interface Mechanism {
   handled: boolean;
 }
 
-/** The exception payload of an error item. */
+/**
+ * The exception payload of an error item.
+ *
+ * `type` is NOT nullable: the backend's `ExceptionInfo.ty` is a non-`Option`
+ * `String` with no serde default, so `null` fails to deserialize and the
+ * gateway 400s the ENTIRE envelope — every other item in the batch with it.
+ * An item with no exception type omits `exception` altogether and carries its
+ * text in {@link ErrorItem.message}.
+ */
 export interface ExceptionValue {
-  type: string | null;
+  type: string;
   value: string | null;
   mechanism: Mechanism;
   stacktrace: Frame[];
@@ -58,8 +66,14 @@ export interface ErrorItem {
   event_id?: string;
   timestamp: string;
   level: Level;
-  exception: ExceptionValue;
-  /** Optional human-readable summary alongside the exception. */
+  /**
+   * The captured exception. OPTIONAL — a message capture omits it entirely and
+   * carries its text in {@link message} instead (the backend's `exception` is
+   * `Option<ExceptionInfo>`, and with no exception it fingerprints off
+   * `message`). Never emit a placeholder here just to fill the field.
+   */
+  exception?: ExceptionValue;
+  /** Human-readable summary; the ONLY text carrier when `exception` is absent. */
   message?: string;
   breadcrumbs: Breadcrumb[];
   fingerprint: string[] | null;
