@@ -174,12 +174,66 @@ Prefer fronting `:8080`/`:8081` with nginx/TLS rather than exposing them directl
 ```bash
 curl -fsS http://localhost:8080/health && echo               # API up
 curl -fsS http://localhost:8081/health && echo               # ingest up
+curl -fsS http://localhost:18081/metrics                      # ingest accounting counters
 curl -fsS http://localhost/config.js                          # dashboard runtime config
 journalctl -u sauron-api -u sauron-ingest --no-pager | tail
 ```
 
 (If a service exposes a different health path, check `journalctl` for the bound
 address logged at startup.)
+
+### Did anything get accepted and then dropped?
+
+`sauron-ingest` answers an SDK `202` the moment an envelope reaches the Redis
+stream, so everything after that point — a trim, an exhausted connection pool, a
+wedged worker — can lose telemetry the SDK was told had arrived. Four counters on
+`/metrics` are the number for that:
+
+```
+sauron_ingest_items_accepted_total       # ITEMS enqueued and answered 202 for
+sauron_ingest_items_persisted_total      # ITEMS actually written to Postgres
+sauron_ingest_items_deadlettered_total   # ITEMS that failed their own write
+sauron_ingest_entries_deadlettered_total # whole ENTRIES whose payload would not decode
+```
+
+`accepted - persisted`, **summed across every replica**, is the loss.
+
+> **Do NOT subtract `deadlettered`.** An earlier version of this section gave the
+> formula as `accepted - persisted - deadlettered`, which treats dead-lettering as
+> a durable outcome. It is not one. `sauron:ingest:dlq` has no reader, no reaper,
+> no `MAXLEN` and no TTL, and the worker acks the stream entry after
+> dead-lettering — so a dead-lettered item is **destroyed**, and the SDK was
+> already told `202`. Measured 2026-08-08 by driving the real worker with Postgres
+> unreachable: 3 items accepted, 0 persisted, 3 dead-lettered, entry acked. The old
+> formula evaluated to `3 - 0 - 3 = 0` and reported no loss for three permanently
+> destroyed events. Treat `deadlettered` as a **named subset of the loss** — it
+> tells you *why* those items are missing, not that they are safe.
+
+Read it as a rate, and mind four things:
+
+* **Sum before subtracting.** The Redis consumer group is shared, so one
+  replica's edge is drained by another replica's workers. A per-host difference
+  is meaningless.
+* **Small negative excursions are redeliveries**, not a bug — a reclaimed
+  unacked entry is written twice. Only a persistently growing positive gap is
+  loss.
+* **`persisted` is not rows.** `identify()` and breadcrumb items legitimately
+  write no event row. Measured on a clean 3,050-item run with no loss at all:
+  2,250 event rows for 3,050 persisted items, so a rows-based check would have
+  reported 26% loss that did not happen.
+* **The `sauron_ingest_stream_*` gauges are in ENTRIES, not items** (one entry is
+  a whole envelope), and `sauron_ingest_stream_unread_trimmed` is a *live* gauge:
+  Redis folds the trimmed gap into `entries-read` as the group catches up, so it
+  falls back to 0 after recovery. The durable record is the item counters.
+
+The endpoint is served on its own loopback listener, `INGEST_METRICS_ADDR`,
+defaulting to `127.0.0.1:<INGEST_PORT + 10000>` — **not** on `:8081`, which
+section 8 tells you to open to the internet for SDKs. Set
+`INGEST_METRICS_ADDR=off` to disable it, or a different `host:port` to move it. A
+metrics listener that cannot bind logs a warning and ingest carries on without
+it, so check for `metrics listening` in `journalctl -u sauron-ingest` before
+concluding the endpoint is broken. `INGEST_METRICS_SAMPLE_SECS` (default 15) is
+how often the Redis-side gauges are refreshed; `0` serves the counters alone.
 
 ## 10. Troubleshooting
 
@@ -190,6 +244,7 @@ address logged at startup.)
 | API 401 / login broken | `secret.env` missing or changed since sessions issued — rotate & restart |
 | Dashboard shows wrong API URL | edit `/etc/sauron/dashboard.env`, re-run `sauron-dashboard-config`, reload nginx, hard-refresh |
 | Ingest 429 | raise `INGEST_RATE_LIMIT_PER_MIN` in `/etc/sauron/ingest.env`, restart |
+| Redis backlog grows / ingest drains far slower than expected | check for a stale `WORKER_CONCURRENCY=4` left in `/etc/sauron/ingest.env` by an upgrade (`%config(noreplace)`); the tuned default is 8. Nothing logs the effective worker count, so the journal will not tell you — read the file. See section 11 |
 | Tier can't write cold | confirm `/var/lib/sauron/cold` is owned by `sauron` (see `tmpfiles`) |
 
 ## 11. Upgrading
@@ -225,7 +280,7 @@ ls /etc/sauron/*.rpmnew 2>/dev/null && diff -u /etc/sauron/api.env /etc/sauron/a
 | `2026-08-01-000036_password_reset` | **Nobody can sign in.** This migration adds `users.credentials_invalidated_at`, and the API selects an explicit column list for the whole user row — so an upgraded binary against an unmigrated database fails `login`, `refresh` and `/v1/me` with a missing-column error. This is a deployment-wide authentication outage, not "the three password-reset routes return 500". |
 | `2026-08-01-000037_notification_subscriptions` | `sauron-alerts` fails its subscription pass every tick. Tick failures are logged-and-swallowed by design, so it does this **quietly, forever**: no personal notification is ever evaluated, enqueued or delivered, and nothing in the dashboard indicates a problem. `POST /v1/me/notification-subscriptions` also 500s. |
 | `2026-08-01-000038_event_users_identified` | `GET /v1/projects/{id}/active-users` returns `503 schema_migration_required`, and `sauron-ingest` records no identification at all. **Not recoverable later** — the backfill only sees stored traits and alias rows, so everyone first active during the gap is filed as a guest forever. Needs a maintenance window: the partial index blocks `event_users` writes while it builds, and that table holds roughly one row per page load per browser app. |
-| `2026-08-01-000039_analytics_active_user_index` | Nothing breaks; the active-users query falls back to a full partition scan — measured at 3.8x the wall time and 23.6x the shared buffers of the index-only plan this migration enables (numbers and method in the migration's own header). **Stop `sauron-ingest` or drain the Redis stream before running.** It drops and rebuilds an index on a partitioned parent inside one transaction, blocking every `analytics_events` INSERT; the stream is trimmed with `XADD MAXLEN ~1000000` regardless of pending deliveries, so a long enough window silently discards undelivered events. |
+| `2026-08-01-000039_analytics_active_user_index` | Nothing breaks; the active-users query falls back to a full partition scan — measured at 3.8x the wall time and 23.6x the shared buffers of the index-only plan this migration enables (numbers and method in the migration's own header). **Stop `sauron-ingest` or drain the Redis stream before running.** It drops and rebuilds an index on a partitioned parent inside one transaction, blocking every `analytics_events` INSERT; the stream is trimmed with `XADD MAXLEN ~1000000` regardless of pending deliveries, so a long enough window silently discards undelivered events. Watch `sauron_ingest_items_accepted_total` minus `sauron_ingest_items_persisted_total` on `/metrics` (section 9) across the window — that gap is the discarded count, and nothing else reports it: measured on an isolated instance, 176,026 of 239,872 accepted items were dropped by a deliberately small trim with **zero WARN or ERROR lines** from the ingest. |
 | `2026-08-01-000040_error_active_user_index` | Same as 000039, for `error_events`. **Run it in a separate window from 000039** — together they block both ingest write paths at once. |
 | `2026-08-01-000041_pii_perms` | Custom roles holding `org:manage` never receive `pii:read`/`pii:manage`; the Owner and Admin presets keep working, so it looks like a role bug rather than a missed migration. |
 | `2026-08-01-000042_inspector_scan` | Every `/v1/inspector/*` route 500s. |
@@ -240,6 +295,22 @@ alone, while `sauron-inspector` and `sauron-api` use the shared declaration in
 partition the tier worker has already exported to Parquet. Do not set
 `INSPECTOR_ENABLED=1` before you have done this.
 
+**Remove the `WORKER_CONCURRENCY=` line from `/etc/sauron/ingest.env` by hand**
+(this one applies to the release that retuned the ingest defaults, independently
+of the inspector). The shipped file no longer declares it, so the binary's tuned
+default of 8 applies — but the same `%config(noreplace)` rule bites: if you ever
+edited that file, rpm keeps your version, stale `WORKER_CONCURRENCY=4` included,
+and ships the new one as `ingest.env.rpmnew`. (A file you never touched *is*
+replaced by the new one, so untouched hosts get the fix for free.) The cost of missing
+this is not an error anywhere — the ingest simply drains at the old rate, which
+measured **12,910 items/s where the tuned default measured 18,987** on the same
+hardware. Nothing logs the effective worker count or pool size, so it looks like
+a slow disk rather than a config line. If you *deliberately* set a value, keep
+`INGEST_DB_POOL` ≥ it, or the surplus workers just queue on connection checkout.
+The worker/batch-size interaction is real — raising the worker count alone
+measured *slower* at the old batch size — so see the tuning note in the README's
+Ingest gateway section before picking a number.
+
 A meaningful `confirm_source` in the mask audit trail requires
 `API_TRUST_FORWARDED_HEADERS=true` behind a proxy that **overwrites**
 `X-Forwarded-For`. With the shipped nginx and the default `false`, every audit
@@ -251,7 +322,9 @@ pooled demand from 94 (`sauron-api` 16 + `sauron-ingest` 8 + `sauron-alerts`
 8 + `sauron-tier` 4 + `sauron-monitor` 50 + 8) to 98 — against a stock
 `max_connections` of 100 with 3 reserved for superusers. Exhaustion does not
 surface as an inspector error: it surfaces as `sauron-api` 500s and
-`sauron-ingest` accepting a 202 and then dropping the event. Check with
+`sauron-ingest` accepting a 202 and then dropping the event — which is visible
+as a growing `sauron_ingest_items_accepted_total` minus
+`sauron_ingest_items_persisted_total` on `/metrics` (section 9). Check with
 `sudo -u postgres psql -c 'SHOW max_connections'` and raise it in
 `postgresql.conf` (the compose stack does this with
 `command: postgres -c max_connections=200`; an RPM host has no such

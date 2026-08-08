@@ -150,6 +150,16 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 > RPM `/etc/sauron/*.env` files pin the direct-bind ports. Where a table default and your
 > deployment disagree, the deployment's env file wins.
 
+> **Upgrading a Compose deployment: four ingest variables now take effect that
+> previously did not.** `INGEST_MAX_BODY_BYTES`, `INGEST_BACKLOG` and
+> `INGEST_DB_POOL` had no entry in the `ingest` service, so setting them in `.env`
+> did nothing; they are now passed through. `INGEST_RATE_LIMIT_PER_MIN` changed
+> from a hard-coded `6000` to a pass-through, so a value in your `.env` now wins
+> where it was previously ignored. The shipped `.env.example` values equal the
+> binary's defaults, so a stock deployment behaves identically — but if you ever
+> set one of these in `.env` believing it worked, it becomes live at your next
+> `docker compose up`. Check those four lines before upgrading.
+
 ### Core
 
 | Variable | What it does | Default | Used by |
@@ -184,10 +194,71 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | `INGEST_PORT` | TCP port `sauron-ingest` binds. | `8081` | ingest |
 | `INGEST_UDS_PATH` | Listen on this Unix-domain socket instead of TCP. | unset (TCP) | ingest |
 | `INGEST_BACKLOG` | TCP `listen()` backlog. Ignored when `INGEST_UDS_PATH` is set. | `4096` | ingest |
-| `WORKER_CONCURRENCY` | Co-located pipeline workers draining the Redis stream (enrich → fingerprint → group). | `4` | ingest |
+| `WORKER_CONCURRENCY` | Co-located pipeline workers draining the Redis stream (enrich → fingerprint → group). **Do not raise this on its own** — it only pays off at a matching `INGEST_BATCH_SIZE`, and at the old batch of 50 raising it made throughput *worse* (see the tuning note below). `INGEST_DB_POOL` must stay ≥ this value. | `8` | ingest |
+| `INGEST_DB_POOL` | Postgres pool size for the worker pool. **Must stay ≥ `WORKER_CONCURRENCY`**, or the surplus workers block on connection checkout instead of on Postgres and the extra concurrency buys nothing. | `8` | ingest |
+| `INGEST_BATCH_SIZE` | Stream entries a worker asks `XREADGROUP` for. Since an envelope became one entry this is only the **ceiling** on a read, not the batch size — `INGEST_BATCH_ITEMS` derives what is actually requested. Clamped to `1`-`2000`. ⚠️ **Not wired into Compose** (see the note under this table). | `200` | ingest |
+| `INGEST_BATCH_ITEMS` | Items a worker aims to hold in one batch. **This is the knob that governs memory**, not `INGEST_BATCH_SIZE`: items are what occupy the resident set and bind query parameters, and one entry can now carry a whole envelope. Clamped to `1`-`20000`. ⚠️ **Not wired into Compose** (see the note under this table). | `1000` | ingest |
 | `INGEST_RATE_LIMIT_PER_MIN` | Envelopes accepted per app per minute. | `6000` | ingest |
 | `INGEST_MAX_BODY_BYTES` | Largest accepted envelope body. | `1048576` (1 MiB) | ingest |
+| `INGEST_STREAM_MAXLEN` | `XADD MAXLEN ~` bound on the Redis ingest stream. **A data-loss control, not a tuning knob**: trimming is applied regardless of pending deliveries, so a stream deep enough to trim discards envelopes the edge already answered `202` to. Raise it to buy headroom; do not lower it to save memory. ⚠️ **Not wired into Compose** — setting it in `.env` has no effect there (see the note under this table), so on Compose the bound is whatever the binary defaults to. | `1000000` | ingest |
 | `INGEST_TRUST_FORWARDED_HEADERS` | Same trust caveat as `API_TRUST_FORWARDED_HEADERS`. While off, client IPs are recorded as `NULL` rather than spoofable values. | `false` | ingest |
+
+> **Four of these are not settable through Compose.** The general rule above —
+> "Compose reads these from a `.env` file at the repo root" — does not hold for
+> every row, because `docker-compose.yml`'s `ingest` service has no `env_file:`
+> key. A variable reaches that container only if the service lists it explicitly.
+> Measured against the shipped file, the service lists `INGEST_PORT`,
+> `INGEST_BACKLOG`, `WORKER_CONCURRENCY`, `INGEST_DB_POOL`,
+> `INGEST_RATE_LIMIT_PER_MIN`, `INGEST_MAX_BODY_BYTES`,
+> `INGEST_TRUST_FORWARDED_HEADERS`, `INGEST_METRICS_ADDR` and
+> `INGEST_METRICS_SAMPLE_SECS`. It does **not** list `INGEST_BATCH_SIZE`,
+> `INGEST_BATCH_ITEMS`, `INGEST_STREAM_MAXLEN` or `INGEST_UDS_PATH` — putting any
+> of those in `.env` is silently inert under Compose. They work on RPM and bare
+> metal, where the process reads its own environment. To use one under Compose,
+> add it to the `ingest` service's `environment:` block first.
+
+#### Tuning the worker pool: the knobs interact
+
+`WORKER_CONCURRENCY` and `INGEST_BATCH_SIZE` cannot be swept one at a time. From
+the 3×3 grid in
+[`docs/benchmarks/2026-08-04-tier3-envelope-fold.html`](docs/benchmarks/2026-08-04-tier3-envelope-fold.html),
+measured 2026-08-04. Each cell is **items written/s · peak ingest RSS**, from one
+60 s run; the bold cell is the shipped pair:
+
+| | batch 50 | batch 200 | batch 500 |
+| --- | --- | --- | --- |
+| **4 workers** | 7,845 · 69 MB | 12,910 · 158 MB | 14,775 · 288 MB |
+| **8 workers** | 10,050 · 83 MB | **18,987 · 184 MB** | 18,733 · 366 MB |
+| **16 workers** | 6,141 · 102 MB | 18,836 · 237 MB | 19,029 · 405 MB |
+
+Read the batch-50 column downward: **going from 4 workers to 16 measured 22%
+slower** (7,845 → 6,141). At 50-entry batches the workers contend on commits
+rather than amortizing them, so a one-dimensional sweep of `WORKER_CONCURRENCY`
+would have concluded the concurrency knob was already optimal.
+
+`INGEST_BATCH_SIZE` has never been pinned in any shipped config, so its default of
+200 was already in force. The worker count *was* pinned to 4, so the effect of
+unpinning it is the batch-200 row: **12,910 → 18,987 items/s, +47%** — a pinned
+deployment was running at 68% of the tuned rate. Do not quote the report's +142%
+for this change alone; that figure bundles the batch 50 → 200 move, which had
+already shipped via the code default.
+
+Three caveats travel with these numbers:
+
+- **The shipped cell is not the largest number in the table.** The top four
+  points fall within 1.6% of each other *and* are all demand-limited — 19,029
+  items/s essentially *is* the offered rate of 19,199 items/s. The honest reading
+  is "these four are indistinguishable", so the gap over the old default is a
+  floor, not a measured ceiling.
+- **8 workers at batch 200 was chosen on memory, not throughput** — 184 MB where
+  16/500 needs 405 MB at the same rate.
+- **One 60 s run per cell**, which the report itself says justifies changing a
+  default and not much more. The grid was also swept on the pre-envelope-fold
+  build; the report's section 08 flags it as deserving a re-sweep.
+
+Raising `WORKER_CONCURRENCY` above 8 requires raising `INGEST_DB_POOL` with it.
+Note also that **nothing logs the effective worker count or pool size**, so
+neither value can be confirmed from a running host's journal.
 
 ### Uptime monitoring
 

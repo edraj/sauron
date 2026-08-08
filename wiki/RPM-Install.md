@@ -82,7 +82,12 @@ sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm
 /usr/libexec/sauron/sauron-dashboard-config
 ```
 
-All `/etc/sauron/*.env` are `%config(noreplace)` — upgrades never overwrite your edits.
+All `/etc/sauron/*.env` are `%config(noreplace)`: a file **you have edited** is kept
+as-is on upgrade and the new one lands beside it as `.rpmnew`. A file you never
+touched is *replaced* by the packaged version. So an upgrade never overwrites your
+edits — but it also never applies a changed default to a file you did edit, which
+is a trap when a release retunes one (see
+[Upgrade / uninstall](#upgrade--uninstall)). Diff any `.rpmnew` after upgrading.
 
 ## 3. Provision PostgreSQL
 
@@ -211,6 +216,7 @@ address logged at startup.)
 | API 401 / login broken | `secret.env` missing or changed since sessions issued — rotate & restart |
 | Dashboard shows wrong API URL | edit `/etc/sauron/dashboard.env`, re-run `sauron-dashboard-config`, reload nginx, hard-refresh |
 | Ingest 429 | raise `INGEST_RATE_LIMIT_PER_MIN` in `/etc/sauron/ingest.env`, restart |
+| Redis backlog grows / ingest drains far slower than expected | check for a stale `WORKER_CONCURRENCY=4` left in `/etc/sauron/ingest.env` by an upgrade; the tuned default is 8. Nothing logs the effective worker count, so read the file rather than the journal |
 | Tier can't write cold | confirm `/var/lib/sauron/cold` is owned by `sauron` (see `tmpfiles`) |
 
 ## Upgrade / uninstall
@@ -222,6 +228,37 @@ sudo dnf remove sauron-server sauron-dashboard sauron-cli sauron
 ```
 
 Removal leaves `/var/lib/sauron` and the `sauron` user in place (standard practice); delete them manually if you want a clean slate.
+
+**An RPM upgrade does not run migrations.** `sauron-migrate.service` has no
+`[Install]` section and `%post` never starts it, so new binaries meet the old
+schema — the symptom is scattered 500s or a feature that silently does nothing,
+not a crash. Run it by hand after every upgrade (see
+[step 7](#7-run-database-migrations)).
+
+### Remove the stale `WORKER_CONCURRENCY` after upgrading
+
+The shipped `ingest.env` no longer declares `WORKER_CONCURRENCY`, so the binary's
+tuned default of **8** applies (it was pinned at 4, which outranked the default —
+the changelog announced 8 while installs kept running 4). Because `ingest.env` is
+`%config(noreplace)`, a host whose operator **ever edited that file** keeps it
+verbatim with the stale `WORKER_CONCURRENCY=4` still winning, and receives the new
+file as `ingest.env.rpmnew`. Delete the line by hand:
+
+```bash
+# Anchored on purpose: the new file mentions WORKER_CONCURRENCY in comments, so an
+# unanchored grep matches 3 lines on a correctly-upgraded host and reads as a problem.
+sudo grep -n '^WORKER_CONCURRENCY=' /etc/sauron/ingest.env   # no output = already fine
+sudo sed -i '/^WORKER_CONCURRENCY=/d' /etc/sauron/ingest.env
+sudo systemctl restart sauron-ingest
+```
+
+Skipping this raises no error anywhere. The ingest just keeps draining at the old
+rate — measured **12,910 items/s against 18,987** for the tuned default on the
+same hardware — and since nothing logs the effective worker count, it presents as
+slow storage rather than a config line. If you deliberately set a value, keep
+`INGEST_DB_POOL` ≥ it, and read the README's Ingest gateway tuning note first:
+the worker count interacts with `INGEST_BATCH_SIZE`, and raising it alone measured
+*slower* at the old batch size.
 
 ### Upgrading to per-app environments
 

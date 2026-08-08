@@ -288,6 +288,16 @@ fi
   INGEST_BATCH_ITEMS (default 1000) bounds a batch in items rather than
   entries, which is what actually governs memory now that one entry can carry a
   whole envelope. INGEST_DB_POOL must stay >= WORKER_CONCURRENCY.
+- The shipped ingest.env no longer pins WORKER_CONCURRENCY, so the retuned
+  default above actually takes effect. It had stayed pinned at 4 in
+  /etc/sauron/ingest.env, which outranks the binary's default — the entry above
+  announced 8 while every RPM install kept running 4. Nothing logs the effective
+  worker count, so this was invisible on a running host.
+  UPGRADE ACTION: ingest.env is %config(noreplace). A host whose operator ever
+  edited it keeps their file verbatim, stale WORKER_CONCURRENCY=4 included, and
+  gets the new one beside it as ingest.env.rpmnew — remove the line by hand.
+  Hosts that never touched the file pick up the change automatically. See
+  SETUP.md section 11.
 - RPM binaries are built with the optimization settings the project benchmarks.
   The spec appended -Ccodegen-units=16 to RUSTFLAGS for build speed, and
   RUSTFLAGS wins over the profile, so it silently overrode codegen-units = 1
