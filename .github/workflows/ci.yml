@@ -143,7 +143,21 @@ jobs:
   # ---------------------------------------------------------------------------
 
   sdk-js:
-    name: web SDK — test · build · wire fixture
+    # ⚠ THIS NAME IS PINNED TO BRANCH PROTECTION — DO NOT EDIT IT.
+    #
+    # `main`'s required status checks name this job by its EXACT display string.
+    # It used to read "web SDK — test · build · wire fixture",
+    # and the trailing " · wire fixture" meant nothing ever reported the required
+    # name: the check sat at "Expected — Waiting for status to be reported"
+    # forever and no PR could merge. Ten green checks, two ghosts, permanently
+    # blocked.
+    #
+    # The job still runs the wire-fixture step; only the label is shorter.
+    #
+    # This pin is TEMPORARY. Once branch protection requires `CI complete`
+    # instead (see the ci-complete job at the bottom of this file), delete this
+    # comment and name the job whatever is clearest.
+    name: web SDK — test · build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -259,7 +273,21 @@ jobs:
         run: bash .github/scripts/check-wire-fixture.sh csharp
 
   sdk-flutter:
-    name: flutter SDK — analyze · test · wire fixture
+    # ⚠ THIS NAME IS PINNED TO BRANCH PROTECTION — DO NOT EDIT IT.
+    #
+    # `main`'s required status checks name this job by its EXACT display string.
+    # It used to read "flutter SDK — analyze · test · wire fixture",
+    # and the trailing " · wire fixture" meant nothing ever reported the required
+    # name: the check sat at "Expected — Waiting for status to be reported"
+    # forever and no PR could merge. Ten green checks, two ghosts, permanently
+    # blocked.
+    #
+    # The job still runs the wire-fixture step; only the label is shorter.
+    #
+    # This pin is TEMPORARY. Once branch protection requires `CI complete`
+    # instead (see the ci-complete job at the bottom of this file), delete this
+    # comment and name the job whatever is clearest.
+    name: flutter SDK — analyze · test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -495,6 +523,12 @@ jobs:
   # the jobs it names instead of in a settings page nobody reads.
   #
   # Set branch protection to require exactly: CI complete
+  #
+  # UNTIL THAT SETTING CHANGES, two job names above are NOT free to rename:
+  # `sdk-js` and `sdk-flutter` are pinned to the stale required-check strings so
+  # the current protection can be satisfied at all. Each carries a warning at its
+  # `name:`. Switching protection to `CI complete` is what unpins them — do that
+  # first, then rename them back to include "· wire fixture" if you want.
   ci-complete:
     name: CI complete
     # `always()` so this still runs when a dependency fails — without it the job
