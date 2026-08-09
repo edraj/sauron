@@ -474,3 +474,100 @@ jobs:
           key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
       - name: Source RPM builds (validates SourceN staging + tarball)
         run: ./packaging/rpm/build-rpm.sh --srpm
+
+  # ---------------------------------------------------------------------------
+  # The single job branch protection should require.
+  #
+  # Required status checks are matched by EXACT DISPLAY NAME, and that coupling
+  # rots silently. This repo shipped with two required checks named
+  #   "flutter SDK — analyze · test"   and   "web SDK — test · build"
+  # while the jobs had since been renamed to
+  #   "flutter SDK — analyze · test · wire fixture"  /  "web SDK — test · build · wire fixture"
+  # Nothing ever reported those names, so both sat at "Expected — Waiting for
+  # status to be reported" forever and the PR could not be merged. Meanwhile the
+  # other seven jobs — including `backend` and `migrations` — were not required
+  # at all, so once the names were corrected a fully red backend would still have
+  # been mergeable.
+  #
+  # Requiring ONE aggregating job removes the coupling: jobs can be added,
+  # renamed or reordered and the gate keeps meaning "everything passed". The only
+  # thing that must stay in sync is the `needs:` list below, which lives next to
+  # the jobs it names instead of in a settings page nobody reads.
+  #
+  # Set branch protection to require exactly: CI complete
+  ci-complete:
+    name: CI complete
+    # `always()` so this still runs when a dependency fails — without it the job
+    # would be skipped and report nothing, which is the same dead end as the
+    # misnamed checks above.
+    if: always()
+    needs:
+      - backend
+      - dashboard
+      - sdk-js
+      - sdk-node
+      - sdk-python
+      - sdk-csharp
+      - sdk-flutter
+      - migrations
+      - packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The `needs:` list above is the new single point of rot: add a job and
+      # forget to list it, and the gate silently stops covering it — the same
+      # shape as the misnamed required checks this job replaced. So the gate
+      # checks its own coverage. Dependency-free on purpose (no PyYAML): the
+      # parse only has to understand this one file's shape.
+      - uses: actions/checkout@v4
+      - name: Gate covers every job
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          src = open('.github/workflows/ci.yml').read()
+          body = src.split('\njobs:\n', 1)[1]
+          jobs = re.findall(r'^  ([A-Za-z0-9_-]+):[ \t]*$', body, re.M)
+          block = re.search(r'^  ci-complete:.*?(?=^  [A-Za-z0-9_-]+:[ \t]*$|\Z)',
+                            body, re.M | re.S).group(0)
+          needs = re.findall(r'^      - ([A-Za-z0-9_-]+)[ \t]*$', block, re.M)
+          expected = [j for j in jobs if j != 'ci-complete']
+          missing = [j for j in expected if j not in needs]
+          unknown = [n for n in needs if n not in jobs]
+          print('jobs   :', ' '.join(expected))
+          print('covered:', ' '.join(needs))
+          if missing:
+              print(f"::error::ci-complete does not depend on: {' '.join(missing)}. "
+                    "Branch protection requires only 'CI complete', so these jobs are "
+                    "currently unguarded — add them to its needs: list.")
+          if unknown:
+              print(f"::error::ci-complete needs a job that does not exist: {' '.join(unknown)}")
+          sys.exit(1 if (missing or unknown) else 0)
+          EOF
+
+      - name: Report every job's result
+        env:
+          RESULTS: |
+            backend     ${{ needs.backend.result }}
+            dashboard   ${{ needs.dashboard.result }}
+            sdk-js      ${{ needs.sdk-js.result }}
+            sdk-node    ${{ needs.sdk-node.result }}
+            sdk-python  ${{ needs.sdk-python.result }}
+            sdk-csharp  ${{ needs.sdk-csharp.result }}
+            sdk-flutter ${{ needs.sdk-flutter.result }}
+            migrations  ${{ needs.migrations.result }}
+            packaging   ${{ needs.packaging.result }}
+        run: printf '%s\n' "$RESULTS"
+
+      # 'skipped' counts as failure too. No job here has a path filter or a
+      # job-level `if:`, so nothing can skip legitimately today — and if someone
+      # adds a conditional job later, blocking is the right default: it forces a
+      # deliberate decision about whether the gate still means what it says,
+      # rather than quietly shrinking coverage.
+      - name: Fail unless every job succeeded
+        if: >-
+          contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
+          || contains(needs.*.result, 'skipped')
+        run: |
+          echo "::error::One or more CI jobs did not succeed — see the results printed above."
+          exit 1
