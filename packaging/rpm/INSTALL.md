@@ -72,7 +72,7 @@ sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm
                                 TIER_HOT_DAYS, INSPECTOR_POLICY_CACHE_SECS,
                                 INSPECTOR_TAIL_SWEEP_SECS
 /etc/sauron/{api,ingest,monitor,alerts,tier,inspector,dashboard}.env
-/etc/sauron/secret.env          JWT_SECRET, auto-generated on first install (0640 root:sauron)
+/etc/sauron/secret.env          JWT_SECRET + NOTIFY_SECRET_KEY, auto-generated on first install (0640 root:sauron). BACK THIS UP: NOTIFY_SECRET_KEY is the only key that decrypts stored notification channels.
 /var/lib/sauron/  /var/lib/sauron/cold        owned by the sauron user
 /usr/share/sauron/dashboard/    static SPA
 /etc/nginx/conf.d/sauron-dashboard.conf

@@ -190,28 +190,27 @@ fn spawn_ingest(
         // INGEST_UDS_PATH is unset.
         .env("INGEST_PORT", icfg.ingest_port.to_string())
         .env("INGEST_RATE_LIMIT_PER_MIN", icfg.rate_limit.to_string())
-        // Defaults to 8, but overridable from crebain's own environment so a
-        // run can sweep the worker/pool pair. The two move together: workers
-        // beyond the pool size just queue on connection checkout.
-        .env(
-            "WORKER_CONCURRENCY",
-            std::env::var("WORKER_CONCURRENCY").unwrap_or_else(|_| "8".to_string()),
-        )
-        .env(
-            "INGEST_DB_POOL",
-            std::env::var("INGEST_DB_POOL").unwrap_or_else(|_| "8".to_string()),
-        )
-        // Same pass-through, so the batched write path and the per-item one can
-        // be compared on a single binary. Unset means batching, which is the
-        // shipped default.
-        .env(
-            "INGEST_BATCH_WRITES",
-            std::env::var("INGEST_BATCH_WRITES").unwrap_or_else(|_| "1".to_string()),
-        )
-        .env(
-            "INGEST_BATCH_SIZE",
-            std::env::var("INGEST_BATCH_SIZE").unwrap_or_else(|_| "50".to_string()),
-        )
+        // --- tuning knobs are NOT set here, and that is the fix ------------
+        //
+        // `WORKER_CONCURRENCY`, `INGEST_DB_POOL`, `INGEST_BATCH_SIZE`,
+        // `INGEST_BATCH_ITEMS`, `INGEST_BATCH_WRITES` and `INGEST_STREAM_MAXLEN`
+        // used to be set with `var(k).unwrap_or(<literal>)`. The child already
+        // inherits this process's environment (nothing calls `env_clear`), so the
+        // `var(k)` half was a no-op — but the literal half was not: it SHADOWED
+        // the binary's own default, and therefore froze at whatever the value was
+        // when the line was written.
+        //
+        // `INGEST_BATCH_SIZE` read "50". The binary's default was retuned to 200,
+        // and this line silently kept every unset run in the WORST cell of the
+        // measured grid: 10,050 items/s at batch 50 against 18,987 at batch 200 —
+        // and at batch 50 raising the worker count makes throughput *worse*, so a
+        // sweep run through this harness would have drawn the opposite conclusion
+        // about the very knob it was sweeping. A D10 soak taken here was
+        // answering a question about a configuration nobody deploys.
+        //
+        // Leaving them unset means an unset run measures the SHIPPED defaults,
+        // and an explicitly exported knob still reaches the child by inheritance,
+        // so sweeps are unaffected. Re-adding a default here re-creates the bug.
         .env(
             "RUST_LOG",
             std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()),

@@ -13,8 +13,9 @@
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { perfSummary, perfSeries } from '../lib/api/performance';
-  import { errorMessage } from '../lib/api/client';
   import { compactNumber, formatMs, formatPercent, latencyTone } from '../lib/utils/format';
   import type { PerfSummaryRow, PerfSeriesPoint } from '../lib/models';
 
@@ -25,30 +26,55 @@
   let sinceDays = $state(7);
   let op = $state<string>('All');
 
-  let rows = $state<PerfSummaryRow[]>([]);
-  let series = $state<PerfSeriesPoint[]>([]);
-  let loading = $state(true);
-  let refreshing = $state(false);
-  let error = $state<string | null>(null);
+  /**
+   * The table and both charts are one payload, not two: they share the same
+   * inputs, the same request round, and — in the pre-cache code — the same
+   * loading/error flags, with a failure clearing both. Caching them as one entry
+   * keeps that all-or-nothing semantics exactly; two views would let the summary
+   * render beside a chart from a failed fetch.
+   */
+  interface PerfPayload {
+    rows: PerfSummaryRow[];
+    series: PerfSeriesPoint[];
+  }
 
-  async function load(appId: string, days: number, opv: string) {
-    loading = true;
-    error = null;
+  const EMPTY: PerfPayload = { rows: [], series: [] };
+
+  // Cached view (lib/stores/cached-view.svelte.ts): cached rows paint instantly on
+  // return, then refresh behind the button's spinner. Re-exposed under the names
+  // the template already used, so the markup is unchanged.
+  const view = new CachedView<PerfPayload>();
+
+  const payload = $derived(view.data ?? EMPTY);
+  const rows = $derived(payload.rows);
+  const series = $derived(payload.series);
+  const loading = $derived(view.loading);
+  const revalidating = $derived(view.revalidating);
+  const error = $derived(view.error);
+
+  let refreshing = $state(false);
+
+  /**
+   * `force` bypasses the fresh-window short-circuit: Refresh and Retry both mean
+   * "go to the network now".
+   *
+   * `scopeKey` is in the key because it carries the selected environment, which
+   * the axios interceptor adds to the request but which appears in none of these
+   * arguments — omit it and one environment's transactions are served as another's.
+   */
+  async function load(appId: string, days: number, opv: string, force = false) {
     const opParam = opv === 'All' ? undefined : opv;
-    try {
-      const [summary, ser] = await Promise.all([
-        perfSummary(appId, { since_days: days, op: opParam }),
-        perfSeries(appId, { since_days: days, op: opParam }),
-      ]);
-      rows = summary;
-      series = ser;
-    } catch (err) {
-      error = errorMessage(err);
-      rows = [];
-      series = [];
-    } finally {
-      loading = false;
-    }
+    await view.load(
+      viewKey('performance.summary', appId, sessionStore.scopeKey, days, opParam),
+      async () => {
+        const [summary, ser] = await Promise.all([
+          perfSummary(appId, { since_days: days, op: opParam }),
+          perfSeries(appId, { since_days: days, op: opParam }),
+        ]);
+        return { rows: summary, series: ser };
+      },
+      force,
+    );
   }
 
   $effect(() => {
@@ -99,7 +125,7 @@
 
   function retry() {
     const aid = sessionStore.currentAppId;
-    if (aid) void load(aid, sinceDays, op);
+    if (aid) void load(aid, sinceDays, op, true);
   }
 
   async function refresh() {
@@ -107,7 +133,8 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, sinceDays, op)]);
+      // force: an explicit click must reach the network regardless of freshness.
+      await load(aid, sinceDays, op, true);
     } finally {
       refreshing = false;
     }
@@ -138,7 +165,15 @@
         {/each}
       </div>
       <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached data, fetching fresh" hint.
+      -->
+      <RefreshButton
+        onclick={refresh}
+        loading={refreshing || revalidating}
+        title={revalidating ? 'Refreshing…' : 'Refresh'}
+      />
     </div>
   </div>
 
@@ -161,7 +196,13 @@
       />
     </Card>
   {:else}
-    <div class="body" class:reloading={loading}>
+    <!--
+      No dim-and-disable while refreshing any more: under stale-while-revalidate
+      `loading` is only ever true with nothing to show, so this branch never saw
+      it, and re-binding it to `revalidating` would grey the page out and swallow
+      clicks on every background refresh. The button's spinner is the indicator.
+    -->
+    <div class="body">
       <StatTiles min={170}>
         <StatTile label="Throughput" value={compactNumber(throughput)} sub="transactions" />
         <StatTile label="Operations" value={rows.length} sub="tracked" />
@@ -298,11 +339,6 @@
     display: flex;
     flex-direction: column;
     gap: 18px;
-    transition: opacity 0.15s ease;
-  }
-  .body.reloading {
-    opacity: 0.6;
-    pointer-events: none;
   }
   .charts {
     display: grid;

@@ -12,7 +12,10 @@
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import NotificationSubscriptions from '../lib/components/account/NotificationSubscriptions.svelte';
   import { authStore } from '../lib/stores/auth.svelte';
+  import { sessionStore } from '../lib/stores/session.svelte';
   import { toastStore } from '../lib/stores/toast.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { errorMessage } from '../lib/api/client';
   import { listMySessions, revokeMyOtherSessions, revokeMySession } from '../lib/api/account';
   import {
@@ -24,9 +27,17 @@
   } from '../lib/models/account-sessions';
   import type { AccountSession } from '../lib/models';
 
-  let sessions = $state<AccountSession[]>([]);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): the cached device list paints
+  // instantly on return, then refreshes behind the Refresh button's spinner.
+  // Re-exposed under the template's existing names, so the markup is unchanged
+  // apart from that button.
+  const sessionsView = new CachedView<AccountSession[]>();
+
+  const sessions = $derived(sessionsView.data ?? []);
+  const loading = $derived(sessionsView.loading);
+  const revalidating = $derived(sessionsView.revalidating);
+  const error = $derived(sessionsView.error);
+
   let showRevoked = $state(false);
   let busy = $state(false);
 
@@ -44,18 +55,34 @@
   const hasCurrent = $derived(hasCurrentSession(sessions));
   const proxied = $derived(allSameIp(sessions));
 
-  async function load() {
-    loading = true;
-    error = null;
-    try {
-      sessions = await listMySessions(showRevoked);
-    } catch (err) {
-      error = errorMessage(err);
-    } finally {
-      loading = false;
-    }
+  /** Every key this page writes, for prefix invalidation after a revoke. */
+  const SESSIONS_VIEW = 'account.sessions';
+
+  /**
+   * `force` bypasses the fresh-window short-circuit: an explicit Refresh click
+   * means "go to the network now", and honouring the cache there makes the
+   * control look broken.
+   *
+   * `scopeKey` is in the key unconditionally, as it is on every other cached
+   * view. It carries the selected environment, which the axios interceptor adds
+   * to requests without it appearing in any caller argument, so leaving it out
+   * is how one scope's rows get served as another's. Keep it here even though
+   * `/v1/me/*` happens not to be environment-scoped today — the cost is one
+   * refetch when the selection changes, and the failure mode it prevents is a
+   * data leak rather than mere staleness.
+   */
+  async function load(force = false) {
+    await sessionsView.load(
+      viewKey(SESSIONS_VIEW, sessionStore.scopeKey, showRevoked),
+      () => listMySessions(showRevoked),
+      force,
+    );
   }
 
+  // Not forced: flipping the toggle should paint a cached list for the new key
+  // instantly. The effect below re-runs on `showRevoked` too, but both calls
+  // resolve to the same cache key and `viewCache.dedupe` collapses them into one
+  // request — where this previously issued two.
   async function toggleHistory() {
     showRevoked = !showRevoked;
     await load();
@@ -84,7 +111,13 @@
         );
       }
       pending = null;
-      await load();
+      // Drop BOTH cached lists, not just the one on screen. A revoke changes
+      // what `include_revoked=0` and `include_revoked=1` each return, so
+      // force-refetching only the visible key would leave the other one holding
+      // pre-revoke rows — and the "Show recent sign-outs" toggle would then
+      // present the session you just killed as still live, for up to a minute.
+      viewCache.invalidate(SESSIONS_VIEW);
+      await load(true);
     } catch (err) {
       // The backend's 409/400/404 bodies carry the actionable text — surface it
       // verbatim rather than a generic failure.
@@ -115,6 +148,10 @@
     }
   }
 
+  // `load()` builds its cache key synchronously, before its first `await`, so
+  // reading `sessionStore.scopeKey` and `showRevoked` in `viewKey(...)` is what
+  // registers them as this effect's dependencies. That is the whole dependency
+  // list — do not "tidy" the key by hoisting it out of `load`.
   $effect(() => {
     void load();
   });
@@ -126,7 +163,13 @@
       <h1 class="page-title">Account</h1>
       <p class="sub muted">Your profile and the devices signed in to it.</p>
     </div>
-    <RefreshButton onclick={() => void load()} loading={loading} />
+    <!--
+      Spins for a background revalidate too, not just an explicit click: that
+      spinner IS the "showing cached data, fetching fresh" hint, and without it
+      the instant paint is indistinguishable from live data. The click forces,
+      because this button is also the only retry affordance on this page.
+    -->
+    <RefreshButton onclick={() => void load(true)} loading={loading || revalidating} />
   </div>
 
   {#if error}

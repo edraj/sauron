@@ -40,6 +40,14 @@ public class GzipTests
     }
 
     [Fact]
+    public void MaybeGzip_NullBody_Throws()
+    {
+        // The contract is non-nullable in both directions; a null must not be laundered
+        // through to the caller's ByteArrayContent.
+        Assert.Throws<ArgumentNullException>(() => Gzip.MaybeGzip(null!, 1024, out _));
+    }
+
+    [Fact]
     public void Transport_LargeBody_GzipsAndSetsContentEncoding()
     {
         var handler = new CapturingHandler();

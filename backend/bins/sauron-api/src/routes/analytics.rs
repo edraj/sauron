@@ -4,7 +4,7 @@
 use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 use axum_extra::extract::Query;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -116,9 +116,11 @@ pub async fn person(
 ) -> Result<Json<PersonProfile>, ApiError> {
     let mut conn = db(&state).await?;
     // `_with_perms`: `errors` below is whole `ErrorEvent` rows (up to `limit`,
-    // which clamps at 200), whose `stacktrace_symbolicated` holds the
-    // de-obfuscated source lines `perm::SOURCE_READ` gates. See
-    // `sessions::detail` for the same note.
+    // which clamps at 200), which carry two further permission questions —
+    // `perm::ISSUE_READ` for the body at all and `perm::SOURCE_READ` for the
+    // de-obfuscated lines inside it. The body gate matters most here: these
+    // rows are already keyed to one identified person, so their payloads are
+    // that person's crash data. See `sessions::detail` for the same note.
     let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
         auth.user_id,
@@ -133,6 +135,7 @@ pub async fn person(
     let events = repo::events_for_person(&mut conn, scope.clone(), &distinct_id, limit).await?;
     let mut errors = repo::error_events_for_person(&mut conn, scope, &distinct_id, limit).await?;
     crate::symbolicate::gate_source_context(&perms, &mut errors);
+    crate::symbolicate::gate_event_body(&perms, &mut errors);
 
     Ok(Json(PersonProfile {
         distinct_id,
@@ -262,6 +265,7 @@ pub struct Overview {
     pub crash_free_sessions: f64,
     pub events_series: Vec<SeriesPoint>,
     pub errors_series: Vec<SeriesPoint>,
+    /// Empty — not absent — for a caller without `issue:read`; see `overview`.
     pub top_issues: Vec<Issue>,
     pub top_events: Vec<EventCount>,
 }
@@ -274,7 +278,14 @@ pub async fn overview(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Overview>, ApiError> {
     let mut conn = db(&state).await?;
-    let scope = super::scope::authorized_read_scope(
+    // `_with_perms`: this response mixes two gates. The aggregates are signal
+    // data (`event:read`, which authorizes the call), but `top_issues` is
+    // `Issue` rows — title, culprit, fingerprint, times_seen — i.e. exactly the
+    // payload `issue:read` is the coarse gate for. Serving them off
+    // `event:read` alone was the inverse of the body leak the same ruling
+    // closed: the coarse gate is not a gate if a composite route routes around
+    // it.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
         auth.user_id,
         app_id,
@@ -282,12 +293,24 @@ pub async fn overview(
         raw_query.as_deref(),
     )
     .await?;
+    let include_issues = perms.contains(perm::ISSUE_READ);
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
     let totals = repo::overview_totals(&mut conn, scope.clone(), since).await?;
     let events_series = repo::event_series(&mut conn, scope.clone(), None, since).await?;
+    // Deliberately `event:read`, even though the sibling `error_timeseries`
+    // route gates the same signal on `issue:read`: both are per-day counts with
+    // no issue identity attached, and the coarse gate is about *which issues
+    // exist*, not *how many errors happened*. The inconsistency is real but
+    // benign; recorded here so it is not "fixed" in the wrong direction.
     let errors_series = repo::error_series(&mut conn, scope.clone(), since).await?;
-    let top_issues = repo::top_issues(&mut conn, scope.clone(), since, 5).await?;
+    // Skipped, not fetched-then-cleared: an omitted query is one fewer round
+    // trip, and there is no way to accidentally serialize what was never read.
+    let top_issues = if include_issues {
+        repo::top_issues(&mut conn, scope.clone(), since, 5).await?
+    } else {
+        Vec::new()
+    };
     let top_events = repo::top_events(&mut conn, scope, since, 5).await?;
 
     let error_rate = {
@@ -313,6 +336,184 @@ pub async fn overview(
         top_issues,
         top_events,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Overview, split into independently-loadable sections
+// ---------------------------------------------------------------------------
+//
+// `overview` above runs FIVE aggregates sequentially on ONE pooled connection
+// and returns nothing until the last finishes, so its latency is their SUM.
+// Measured against the 210k-event app on this machine: ~165 ms for the events
+// count, ~160 ms for the errors count, ~180 ms for top-issues, plus the series —
+// and every one of those scales with the range and the row count, so on a large
+// deployment the page simply sits blank for seconds.
+//
+// The sections below are the same queries, addressable one at a time. Nothing is
+// faster in isolation; what changes is that the browser issues them in PARALLEL,
+// so wall-clock becomes the MAX rather than the sum, and each card paints the
+// moment its own answer lands instead of waiting for the slowest.
+//
+// The split is along the seams that already exist: `overview_totals` is one
+// statement (six sub-selects) and cannot be divided without multiplying round
+// trips, whereas the series pair, top-issues and top-events are separate queries
+// already and cost nothing to separate.
+//
+// `overview` is deliberately KEPT. It is a supported response shape, removing it
+// would be a breaking API change for anyone scripting against it, and it remains
+// the cheaper choice for a caller that genuinely wants all of it in one request
+// (one round trip, one connection checkout, one authorization).
+
+/// Derived scalars that used to be computed inside `overview`.
+///
+/// Kept next to the totals rather than in their own section: both are pure
+/// arithmetic over `totals`, so serving them separately would mean either
+/// re-running that query or making the client duplicate the formulas — and a
+/// crash-free rate computed two ways eventually disagrees.
+#[derive(Serialize)]
+pub struct OverviewTotalsSection {
+    pub totals: repo::OverviewTotals,
+    pub error_rate: f64,
+    pub crash_free_sessions: f64,
+}
+
+#[derive(Serialize)]
+pub struct OverviewSeriesSection {
+    pub events_series: Vec<SeriesPoint>,
+    pub errors_series: Vec<SeriesPoint>,
+}
+
+/// Resolve the read scope for an overview section.
+///
+/// Every section authorizes independently and identically to `overview`'s own
+/// check. That is not redundant work to be optimized away: each section is its
+/// own HTTP request, so each must prove the caller may read this app in this
+/// environment. Sharing a decision across them would mean trusting the client to
+/// tell us it had already been authorized.
+async fn overview_scope(
+    state: &AppState,
+    auth: &AuthUser,
+    app_id: Uuid,
+    raw_query: Option<&str>,
+) -> Result<
+    (
+        sauron_db::scope::ReadScope,
+        std::collections::HashSet<String>,
+    ),
+    ApiError,
+> {
+    let mut conn = db(state).await?;
+    super::scope::authorized_read_scope_with_perms(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query,
+    )
+    .await
+}
+
+fn since_of(q: &RangeQuery) -> DateTime<Utc> {
+    Utc::now() - Duration::days(q.since_days.clamp(1, 365))
+}
+
+/// The KPI tiles: totals plus the two rates derived from them.
+pub async fn overview_totals(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<OverviewTotalsSection>, ApiError> {
+    let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let mut conn = db(&state).await?;
+    let totals = repo::overview_totals(&mut conn, scope, since_of(&q)).await?;
+
+    // Same formulas as `overview`, deliberately not extracted into a shared
+    // helper: they are three lines each and the two call sites are in one file.
+    let error_rate = {
+        let denom = totals.events + totals.errors;
+        if denom > 0 {
+            totals.errors as f64 / denom as f64
+        } else {
+            0.0
+        }
+    };
+    let crash_free_sessions = if totals.sessions > 0 {
+        1.0 - (totals.crashed_sessions as f64 / totals.sessions as f64)
+    } else {
+        1.0
+    };
+    Ok(Json(OverviewTotalsSection {
+        totals,
+        error_rate,
+        crash_free_sessions,
+    }))
+}
+
+/// The two per-day series, together.
+///
+/// One section rather than two because the chart plots them on shared axes: a
+/// request that delivered events without errors would render a graph that is
+/// wrong rather than incomplete, and the two queries are comparable in cost so
+/// there is no fast half to show early.
+pub async fn overview_series(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<OverviewSeriesSection>, ApiError> {
+    let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let since = since_of(&q);
+    let mut conn = db(&state).await?;
+    let events_series = repo::event_series(&mut conn, scope.clone(), None, since).await?;
+    let errors_series = repo::error_series(&mut conn, scope, since).await?;
+    Ok(Json(OverviewSeriesSection {
+        events_series,
+        errors_series,
+    }))
+}
+
+/// Top issues by occurrence count.
+///
+/// Requires `issue:read` IN ADDITION to the `event:read` that authorizes the
+/// call, matching the D4 ruling: these are `Issue` rows — title, culprit,
+/// fingerprint, counts — which is exactly what the coarse gate covers.
+///
+/// Returns 403, where `overview` returns an empty list. The composite route has
+/// to degrade because one missing permission must not fail the whole response;
+/// a section addressed on its own has no such constraint, and an empty array is
+/// indistinguishable from "this app has no issues" — which would leave the UI
+/// showing a reassuring blank card instead of saying the caller cannot see it.
+pub async fn overview_top_issues(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<Issue>>, ApiError> {
+    let (scope, perms) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    if !perms.contains(perm::ISSUE_READ) {
+        return Err(ApiError::Auth(sauron_auth::AuthError::Forbidden));
+    }
+    let mut conn = db(&state).await?;
+    let rows = repo::top_issues(&mut conn, scope, since_of(&q), 5).await?;
+    Ok(Json(rows))
+}
+
+/// Top analytics events by count.
+pub async fn overview_top_events(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<EventCount>>, ApiError> {
+    let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let mut conn = db(&state).await?;
+    let rows = repo::top_events(&mut conn, scope, since_of(&q), 5).await?;
+    Ok(Json(rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +666,15 @@ pub struct DayCountOut {
     pub count: i64,
 }
 
+impl From<sauron_tier::DayCount> for DayCountOut {
+    fn from(d: sauron_tier::DayCount) -> Self {
+        DayCountOut {
+            day: d.day,
+            count: d.count,
+        }
+    }
+}
+
 pub async fn error_timeseries(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -569,4 +779,54 @@ mod stickiness_tests {
     fn zero_mau_is_zero_not_nan() {
         assert_eq!(stickiness(3, 0), 0.0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Active Users — distinct people per UTC day
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct ActiveUsersSeries {
+    /// `DayCountOut`, not `sauron_tier::DayCount`: the tier crate's type is
+    /// deliberately serde-free (it is shared with the worker, which has no HTTP
+    /// surface), and this is the same wire shape the other chart endpoints use.
+    pub series: Vec<DayCountOut>,
+    /// Days deliberately omitted from `series` because their count could not be
+    /// computed exactly. Empty in the default configuration; see
+    /// `tier_read::active_users_by_day`.
+    pub partial_days: Vec<crate::tier_read::PartialDay>,
+}
+
+/// Distinct people per UTC day.
+///
+/// An AGGREGATE, so under the D4 ruling it needs only the `event:read` that
+/// authorizes the call: it exposes no event body and no issue metadata, just a
+/// count per day.
+pub async fn active_users_series(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<ActiveUsersSeries>, ApiError> {
+    let scope = {
+        let mut conn = db(&state).await?;
+        super::scope::authorized_read_scope(
+            &mut conn,
+            auth.user_id,
+            app_id,
+            perm::EVENT_READ,
+            raw_query.as_deref(),
+        )
+        .await?
+    };
+    let to = Utc::now();
+    let from = to - Duration::days(q.since_days.clamp(1, 365));
+    let (series, partial_days) = crate::tier_read::active_users_by_day(&state, scope, from, to)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(ActiveUsersSeries {
+        series: series.into_iter().map(DayCountOut::from).collect(),
+        partial_days,
+    }))
 }

@@ -14,8 +14,9 @@
   import DateRange from '../lib/components/DateRange.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { listWorkflows } from '../lib/api/workflows';
-  import { errorMessage } from '../lib/api/client';
   import { completionRate, formatDuration } from '../lib/workflows';
   import { compactNumber, formatPercent } from '../lib/utils/format';
   import type { WorkflowRow } from '../lib/models';
@@ -29,10 +30,19 @@
   let appliedSearch = $state('');
   let offset = $state(0);
 
-  let rows = $state<WorkflowRow[]>([]);
-  let loading = $state(true);
+  // Cached view (lib/stores/cached-view.svelte.ts): cached rows paint instantly on
+  // return and refresh behind a spinner. Re-exposed under the names the template
+  // already used, so the markup is unchanged apart from the refresh control —
+  // `loading` still means "nothing to show", and `revalidating` is the new
+  // "rows are up, fetching fresh behind them".
+  const view = new CachedView<WorkflowRow[]>();
+
+  const rows = $derived(view.data ?? []);
+  const loading = $derived(view.loading);
+  const revalidating = $derived(view.revalidating);
+  const error = $derived(view.error);
+
   let refreshing = $state(false);
-  let error = $state<string | null>(null);
 
   const totals = $derived(
     rows.reduce(
@@ -57,22 +67,27 @@
     offset = 0;
   }
 
-  async function load(appId: string, days: number, s: string, off: number) {
-    loading = true;
-    error = null;
-    try {
-      rows = await listWorkflows(appId, {
-        since_days: days,
-        search: s || undefined,
-        limit: LIMIT,
-        offset: off,
-      });
-    } catch (err) {
-      error = errorMessage(err);
-      rows = [];
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit: the Refresh button and the
+   * error-state Retry both mean "go to the network now".
+   *
+   * `scopeKey` is in the key because it carries the selected environment, which
+   * the axios interceptor adds to the request but which appears in none of these
+   * arguments — omit it and one environment's workflows would be served as
+   * another's.
+   */
+  async function load(appId: string, days: number, s: string, off: number, force = false) {
+    await view.load(
+      viewKey('workflows.list', appId, sessionStore.scopeKey, days, s, off, LIMIT),
+      () =>
+        listWorkflows(appId, {
+          since_days: days,
+          search: s || undefined,
+          limit: LIMIT,
+          offset: off,
+        }),
+      force,
+    );
   }
 
   async function refresh() {
@@ -80,7 +95,8 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await load(aid, sinceDays, appliedSearch, offset);
+      // force: an explicit click must reach the network regardless of freshness.
+      await load(aid, sinceDays, appliedSearch, offset, true);
     } finally {
       refreshing = false;
     }
@@ -120,7 +136,12 @@
     <div class="controls">
       <DateRange value={sinceDays} onchange={onRange} />
       <SearchInput bind:value={search} oninput={onSearch} placeholder="Search workflows…" width="240px" />
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached rows, fetching fresh" hint, and without it
+        the instant paint is indistinguishable from live data.
+      -->
+      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
 
@@ -132,7 +153,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, sinceDays, appliedSearch, offset);
+              if (aid) load(aid, sinceDays, appliedSearch, offset, true);
             }}
           >
             Retry

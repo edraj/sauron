@@ -69,6 +69,13 @@ export interface TierPin {
   reason: string | null;
   /** Server-computed, so the client never compares against its own clock. */
   expired: boolean;
+  /**
+   * Inside the warning window and not yet lapsed. Surfaced so a restore never
+   * just disappears — the operator gets a chance to extend before the rows go.
+   */
+  expiring_soon: boolean;
+  /** Whole hours until expiry; negative once lapsed. Also server-computed. */
+  expires_in_hours: number;
 }
 
 export interface TierPolicy {
@@ -108,5 +115,94 @@ export async function getTierPolicy(): Promise<TierPolicy> {
  */
 export async function setTierPolicy(hotDays: number | null): Promise<TierPolicy> {
   const { data } = await api.put<TierPolicy>('/v1/admin/tier-policy', { hot_days: hotDays });
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Cold-data restore
+// ---------------------------------------------------------------------------
+
+/** Tables that can be restored from cold. Matches the server allowlist. */
+export const RESTORABLE_TABLES = ['error_events', 'analytics_events', 'transactions'] as const;
+export type RestorableTable = (typeof RESTORABLE_TABLES)[number];
+
+export type RestoreStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export interface RestoreJob {
+  id: string;
+  table_name: string;
+  /** null restores every app in the range. */
+  app_id: string | null;
+  range_start: string;
+  range_end: string;
+  status: RestoreStatus;
+  /** Nulled once the pin is removed — the job history outlives the data. */
+  pin_id: string | null;
+  pin_expires_at: string;
+  rows_estimated: number;
+  rows_restored: number;
+  attempts: number;
+  error: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface CreateRestore {
+  table_name: RestorableTable;
+  app_id?: string | null;
+  range_start: string;
+  range_end: string;
+  /** Defaults to 30 server-side. Max 365. */
+  expires_in_days?: number;
+}
+
+/**
+ * Queue a restore. Returns immediately with a `queued` job — the copy itself
+ * runs in `sauron-tier` and can take minutes, so the caller polls
+ * {@link getRestore} rather than waiting on this request.
+ *
+ * 409 when an active restore already overlaps the range: two overlapping
+ * restores would each insert the same Parquet rows under a different pin, and
+ * because a pin only ever deletes its own rows the duplicates would outlive the
+ * first expiry.
+ */
+export async function createRestore(body: CreateRestore): Promise<RestoreJob> {
+  const { data } = await api.post<RestoreJob>('/v1/admin/restore', body);
+  return data;
+}
+
+export async function listRestores(): Promise<RestoreJob[]> {
+  const { data } = await api.get<RestoreJob[]>('/v1/admin/restore');
+  return data;
+}
+
+export async function getRestore(id: string): Promise<RestoreJob> {
+  const { data } = await api.get<RestoreJob>(`/v1/admin/restore/${id}`);
+  return data;
+}
+
+export interface ReleasedPin {
+  id: string;
+  table_name: string;
+  /** Rows removed from Postgres. They remain in Parquet — this is not deletion. */
+  rows_deleted: number;
+}
+
+/**
+ * Release a pin now, deleting the rows it restored.
+ *
+ * This is NOT a bare "forget the pin": the restored rows would otherwise stay in
+ * Postgres with nothing able to identify them, and be counted on top of the
+ * Parquet copy of the same events.
+ */
+export async function releasePin(id: string): Promise<ReleasedPin> {
+  const { data } = await api.delete<ReleasedPin>(`/v1/admin/tier-pins/${id}`);
+  return data;
+}
+
+/** Push a pin's expiry out, measured from now. The answer to an expiry warning. */
+export async function extendPin(id: string, days: number): Promise<TierPin> {
+  const { data } = await api.post<TierPin>(`/v1/admin/tier-pins/${id}/extend`, { days });
   return data;
 }

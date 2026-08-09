@@ -143,6 +143,11 @@ pub fn strip_source_context(event: &mut ErrorEvent) {
 /// and not `source:read` (see `tests/http_source_context.rs`, which fails on
 /// each of them without this call).
 ///
+/// Layered *under* [`gate_event_body`], not beside it: the body gate decides
+/// whether there are frames at all, this one whether those frames carry source
+/// text. Call both — a handler that calls only this one still hands whole
+/// stack traces to a caller holding half the body pair.
+///
 /// Takes the permission set rather than a `bool` so the permission *name* is
 /// checked in one place and a call site cannot invert the condition.
 pub fn gate_source_context(perms: &std::collections::HashSet<String>, events: &mut [ErrorEvent]) {
@@ -151,6 +156,102 @@ pub fn gate_source_context(perms: &std::collections::HashSet<String>, events: &m
     }
     for ev in events.iter_mut() {
         strip_source_context(ev);
+    }
+}
+
+/// Remove the event **body**, leaving the issue-level shell.
+///
+/// Withheld — the crash payload proper: `stacktrace` and its symbolicated
+/// twin, `breadcrumbs`, `context` (the captured request/runtime blob),
+/// `contexts` and `extra` (dev-supplied, arbitrary, and the most likely place
+/// for a secret to land), `tags` (same family — dev-assignable free-form
+/// key/values), `sdk`, `debug_meta` (whose `raw_stacktrace` IS a stack trace
+/// by another name), `event_user`, and `ip_address`.
+///
+/// Kept — what the occurrences table and the issue header render, all of which
+/// `issue:read` already confers at the issue level: identity/ancestry ids,
+/// `level`, `message`, `exception_type`/`exception_value` (the issue's own
+/// `title` and `culprit` are derived from these), `release`, `distinct_id`,
+/// timestamps, `session_id`, `device_key`, `screen`, `symbolication_status`,
+/// `handled`. `distinct_id` stays on purpose: it is the "user" column of the
+/// occurrences list and is already the *key* of the person routes, whereas
+/// `event_user`'s traits are not.
+///
+/// Fields are nulled rather than the row being dropped, so a coarse-gated
+/// caller still gets the occurrence — "this happened, at this time, on this
+/// release" — instead of an empty list that reads as "no data".
+pub fn strip_event_body(event: &mut ErrorEvent) {
+    event.stacktrace = Value::Null;
+    event.stacktrace_symbolicated = None;
+    event.breadcrumbs = Value::Null;
+    event.context = Value::Null;
+    event.contexts = Value::Null;
+    event.extra = Value::Null;
+    event.tags = Value::Null;
+    event.sdk = None;
+    event.debug_meta = None;
+    event.event_user = None;
+    event.ip_address = None;
+}
+
+/// Whether `perms` may see event bodies at all.
+///
+/// Exposed so a handler can *skip the work* that produces a body it would then
+/// throw away (symbolication is a blob decompress plus a source-map or DWARF
+/// walk) without restating the predicate. Restating it is exactly how the two
+/// halves drift apart, and the drift is silent in the safe direction and a leak
+/// in the other.
+pub fn may_read_event_body(perms: &std::collections::HashSet<String>) -> bool {
+    perms.contains(sauron_auth::perm::ISSUE_READ) && perms.contains(sauron_auth::perm::EVENT_READ)
+}
+
+/// How far a free-text `?q=` may reach for this permission set.
+///
+/// **A search predicate is a read.** Before this existed, `issues::list`,
+/// `issues::events` and `issues::event_stats` — all three authorized on
+/// `issue:read` ALONE — ran an ILIKE over `error_events.contexts::text`,
+/// `extra::text` and `tags::text`, three of the ten columns
+/// [`strip_event_body`] nulls for exactly that caller. Withholding a value from
+/// the response while answering "does it contain this substring?" is not
+/// withholding it: probe `?q=sk_live_a`, `?q=sk_live_ab`, … and the row counts
+/// spell the value out one byte at a time, over the very columns whose docs call
+/// them "the most likely place for a secret to land".
+///
+/// Derived from [`may_read_event_body`] — the SAME predicate [`gate_event_body`]
+/// uses, deliberately not a second copy of "issue:read and event:read". The
+/// invariant is *what you may search is exactly what you may read back*, and it
+/// only holds if one function answers both questions; two copies would drift,
+/// and the drift that matters (searchable wider than readable) is silent.
+pub fn text_search_reach(
+    perms: &std::collections::HashSet<String>,
+) -> sauron_db::repo::TextSearchReach {
+    if may_read_event_body(perms) {
+        sauron_db::repo::TextSearchReach::IncludingBody
+    } else {
+        sauron_db::repo::TextSearchReach::ShellOnly
+    }
+}
+
+/// Apply [`strip_event_body`] to every event in `events` unless `perms` carries
+/// BOTH `issue:read` and `event:read`.
+///
+/// `issue:read` is the coarse gate (the issue list and its metadata);
+/// `event:read` is additionally required for a body. Neither alone is enough —
+/// see `sauron_auth::perm::EVENT_READ`, whose doc records that this reverses the
+/// 2026-08-08 ruling. Six handlers reach a body and each authorizes on only one
+/// of the pair: `issues::detail` and `issues::events` on `issue:read`,
+/// `sessions::detail` / `devices::detail` / `screens::detail` /
+/// `analytics::person` on `event:read`. So every one of them needed this call,
+/// and every one of them was one forgotten line away from a leak — which is why
+/// the check lives here and takes the permission set rather than a `bool`,
+/// exactly as [`gate_source_context`] does after the same mistake was made once
+/// already.
+pub fn gate_event_body(perms: &std::collections::HashSet<String>, events: &mut [ErrorEvent]) {
+    if may_read_event_body(perms) {
+        return;
+    }
+    for ev in events.iter_mut() {
+        strip_event_body(ev);
     }
 }
 
@@ -286,4 +387,246 @@ async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut Er
         event.stacktrace_symbolicated = Some(Value::Array(Vec::new()));
     }
     event.symbolication_status = status.as_str().to_string();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use sauron_auth::perm;
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    /// An event with **every** field populated to something non-null, so the
+    /// census test below can read "was this withheld?" straight off the
+    /// serialized JSON instead of trusting a hand-kept list.
+    fn fully_populated_event() -> ErrorEvent {
+        let now = Utc::now();
+        ErrorEvent {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            environment_id: Some(Uuid::nil()),
+            issue_id: Uuid::nil(),
+            fingerprint: "fp".into(),
+            level: "error".into(),
+            message: "boom".into(),
+            exception_type: "TypeError".into(),
+            exception_value: "undefined is not a function".into(),
+            stacktrace: json!([{ "function": "boom" }]),
+            breadcrumbs: json!([{ "message": "clicked" }]),
+            context: json!({ "request": { "cookies": "session=secret" } }),
+            tags: json!({ "customer": "acme" }),
+            release: Some("1.2.3".into()),
+            distinct_id: Some("person-1".into()),
+            event_user: Some(json!({ "email": "person@example.test" })),
+            sdk: Some(json!({ "name": "sauron.js" })),
+            ip_address: Some("203.0.113.9".into()),
+            occurred_at: now,
+            received_at: now,
+            session_id: Some("session-1".into()),
+            device_key: Some("device-1".into()),
+            screen: Some("Home".into()),
+            stacktrace_symbolicated: Some(json!([{ "function": "boom", "context_line": "x" }])),
+            symbolication_status: "symbolicated".into(),
+            debug_meta: Some(json!({ "raw_stacktrace": "#00 abs 0x1" })),
+            contexts: json!({ "app": { "build": "42" } }),
+            extra: json!({ "api_key": "leak-me" }),
+            handled: Some(true),
+        }
+    }
+
+    fn perms(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Keys of `v` whose value serialized to `null` — i.e. what the gate
+    /// withheld.
+    fn null_keys(v: &Value) -> Vec<String> {
+        let mut ks: Vec<String> = v
+            .as_object()
+            .expect("ErrorEvent serializes to an object")
+            .iter()
+            .filter(|(_, val)| val.is_null())
+            .map(|(k, _)| k.clone())
+            .collect();
+        ks.sort();
+        ks
+    }
+
+    /// The census. Pins BOTH halves of the decision — which fields exist and
+    /// which of them the strip withholds — so adding a field to `ErrorEvent`
+    /// fails here and forces a body/shell ruling on it, rather than defaulting
+    /// it into the shell and leaking silently.
+    #[test]
+    fn strip_event_body_pins_exactly_which_fields_survive() {
+        let mut ev = fully_populated_event();
+        assert!(
+            null_keys(&serde_json::to_value(&ev).expect("serialize")).is_empty(),
+            "the fixture must populate every field, or a withheld key below proves nothing"
+        );
+
+        strip_event_body(&mut ev);
+        let v = serde_json::to_value(&ev).expect("serialize");
+
+        let mut all: Vec<String> = v
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "app_id",
+                "breadcrumbs",
+                "context",
+                "contexts",
+                "debug_meta",
+                "device_key",
+                "distinct_id",
+                "environment_id",
+                "event_user",
+                "exception_type",
+                "exception_value",
+                "extra",
+                "fingerprint",
+                "handled",
+                "id",
+                "ip_address",
+                "issue_id",
+                "level",
+                "message",
+                "occurred_at",
+                "received_at",
+                "release",
+                "screen",
+                "sdk",
+                "session_id",
+                "stacktrace",
+                "stacktrace_symbolicated",
+                "symbolication_status",
+                "tags",
+            ],
+            "a field was added to or removed from `ErrorEvent` — decide whether it is body or \
+             shell and update `strip_event_body` before updating this list"
+        );
+
+        assert_eq!(
+            null_keys(&v),
+            [
+                "breadcrumbs",
+                "context",
+                "contexts",
+                "debug_meta",
+                "event_user",
+                "extra",
+                "ip_address",
+                "sdk",
+                "stacktrace",
+                "stacktrace_symbolicated",
+                "tags",
+            ],
+            "the withheld set changed"
+        );
+
+        // Spot-check the shell by value, not just by non-nullness: the point of
+        // stripping rather than dropping the row is that the occurrence stays
+        // readable.
+        assert_eq!(v["message"], "boom");
+        assert_eq!(v["exception_type"], "TypeError");
+        assert_eq!(v["release"], "1.2.3");
+        assert_eq!(v["distinct_id"], "person-1");
+        assert_eq!(v["session_id"], "session-1");
+        assert_eq!(v["device_key"], "device-1");
+        assert_eq!(v["screen"], "Home");
+        assert_eq!(v["handled"], true);
+    }
+
+    #[test]
+    fn gate_event_body_keeps_the_body_only_for_both_permissions() {
+        let mut events = vec![fully_populated_event(), fully_populated_event()];
+        gate_event_body(&perms(&[perm::ISSUE_READ, perm::EVENT_READ]), &mut events);
+        for ev in &events {
+            assert_eq!(ev.stacktrace, json!([{ "function": "boom" }]));
+            assert!(ev.event_user.is_some());
+        }
+    }
+
+    /// The three failing combinations, each asserted over TWO events — a gate
+    /// written `.iter_mut().take(1)` would still pass on a one-element vec.
+    #[test]
+    fn gate_event_body_strips_when_either_permission_is_missing() {
+        for held in [
+            vec![perm::ISSUE_READ],
+            vec![perm::EVENT_READ],
+            vec![perm::SOURCE_READ],
+            vec![],
+        ] {
+            let mut events = vec![fully_populated_event(), fully_populated_event()];
+            gate_event_body(&perms(&held), &mut events);
+            for (i, ev) in events.iter().enumerate() {
+                assert!(
+                    ev.stacktrace.is_null()
+                        && ev.breadcrumbs.is_null()
+                        && ev.contexts.is_null()
+                        && ev.extra.is_null()
+                        && ev.event_user.is_none()
+                        && ev.stacktrace_symbolicated.is_none(),
+                    "event #{i} kept a body for a caller holding {held:?}"
+                );
+                // Still an occurrence, not a hole.
+                assert_eq!(ev.message, "boom");
+            }
+        }
+    }
+
+    /// `source:read` is layered on top of the body gate, not an escape from it:
+    /// holding it without the pair must still yield no frames at all.
+    #[test]
+    fn source_read_does_not_substitute_for_the_body_pair() {
+        let held = perms(&[perm::ISSUE_READ, perm::SOURCE_READ]);
+        assert!(!may_read_event_body(&held));
+        let mut events = vec![fully_populated_event()];
+        gate_source_context(&held, &mut events);
+        gate_event_body(&held, &mut events);
+        assert!(events[0].stacktrace_symbolicated.is_none());
+    }
+
+    /// The searchable set must move in lockstep with the readable one.
+    ///
+    /// Asserted as an EQUIVALENCE against `strip_event_body`'s own behaviour
+    /// rather than by restating "issue:read and event:read": the whole reason
+    /// `text_search_reach` delegates to `may_read_event_body` is that a second
+    /// copy of the predicate could drift, and a test that also restated it would
+    /// drift with it. The loop covers every subset of the three permissions, so
+    /// a future change to either side that breaks the correspondence fails here.
+    #[test]
+    fn the_searchable_columns_track_the_readable_ones_exactly() {
+        let all = [perm::ISSUE_READ, perm::EVENT_READ, perm::SOURCE_READ];
+        for mask in 0u8..8 {
+            let held: Vec<&str> = all
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, p)| *p)
+                .collect();
+            let p = perms(&held);
+
+            let mut ev = fully_populated_event();
+            gate_event_body(&p, std::slice::from_mut(&mut ev));
+            // `extra`/`contexts`/`tags` are the three columns the payload scan
+            // reads; if the gate nulled them, searching them would answer a
+            // question the response refused to.
+            let body_withheld = ev.extra.is_null() && ev.contexts.is_null() && ev.tags.is_null();
+
+            assert_eq!(
+                text_search_reach(&p) == sauron_db::repo::TextSearchReach::ShellOnly,
+                body_withheld,
+                "permissions {held:?}: free-text reach and the body gate disagree — one of them \
+                 says the payload columns are off limits and the other does not, which is \
+                 exactly the oracle `TextSearchReach` exists to close"
+            );
+        }
+    }
 }

@@ -1,7 +1,21 @@
 <script lang="ts">
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
-  import { getAdminStorage, getTierPolicy, setTierPolicy } from '../lib/api/admin';
-  import type { StorageReport, TierPolicy } from '../lib/api/admin';
+  import {
+    getAdminStorage,
+    getTierPolicy,
+    setTierPolicy,
+    createRestore,
+    listRestores,
+    releasePin,
+    extendPin,
+    RESTORABLE_TABLES,
+  } from '../lib/api/admin';
+  import type {
+    StorageReport,
+    TierPolicy,
+    RestoreJob,
+    RestorableTable,
+  } from '../lib/api/admin';
   import Button from '../lib/components/ui/Button.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
@@ -84,6 +98,121 @@
     policy !== null && parsedHotDays !== null && parsedHotDays < policy.effective_hot_days,
   );
 
+  // -------------------------------------------------------------------------
+  // Cold-data restore
+  // -------------------------------------------------------------------------
+
+  let jobs = $state<RestoreJob[]>([]);
+  let restoreTable = $state<RestorableTable>('error_events');
+  let restoreFrom = $state('');
+  let restoreTo = $state('');
+  let restoreDays = $state('30');
+  let restoreBusy = $state(false);
+  let restoreError = $state<string | null>(null);
+  let pinBusy = $state<string | null>(null);
+
+  /**
+   * True while any job could still change. Drives the poll, so a finished queue
+   * stops hitting the server rather than polling forever at 3s.
+   */
+  const jobsActive = $derived(jobs.some((j) => j.status === 'queued' || j.status === 'running'));
+
+  const restoreRange = $derived.by(() => {
+    if (!restoreFrom || !restoreTo) return null;
+    // Dates are entered as plain days; the API takes half-open [start, end) in
+    // UTC. Adding a day to `to` is what makes the picker inclusive of the last
+    // day, which is what a human means by "the 1st to the 3rd".
+    const start = new Date(`${restoreFrom}T00:00:00Z`);
+    const end = new Date(`${restoreTo}T00:00:00Z`);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+    end.setUTCDate(end.getUTCDate() + 1);
+    if (end <= start) return null;
+    return { start, end };
+  });
+
+  const restoreDaysValid = $derived.by(() => {
+    const t = restoreDays.trim();
+    if (!/^\d+$/.test(t)) return false;
+    const n = Number(t);
+    return n >= 1 && n <= 365;
+  });
+
+  const restoreValid = $derived(restoreRange !== null && restoreDaysValid && !restoreBusy);
+
+  async function loadJobs() {
+    try {
+      jobs = await listRestores();
+    } catch {
+      // Deliberately quiet: the job list is secondary to the policy card, and
+      // the same 403 that hides the policy hides this. `policyError` above
+      // already says so once.
+    }
+  }
+
+  async function submitRestore() {
+    const range = restoreRange;
+    if (!range || !restoreDaysValid) return;
+    restoreBusy = true;
+    restoreError = null;
+    try {
+      await createRestore({
+        table_name: restoreTable,
+        range_start: range.start.toISOString(),
+        range_end: range.end.toISOString(),
+        expires_in_days: Number(restoreDays.trim()),
+      });
+      await loadJobs();
+    } catch (e) {
+      restoreError = (e as Error).message;
+    } finally {
+      restoreBusy = false;
+    }
+  }
+
+  async function doReleasePin(id: string) {
+    pinBusy = id;
+    try {
+      await releasePin(id);
+      await loadPolicy();
+    } catch (e) {
+      policyError = (e as Error).message;
+    } finally {
+      pinBusy = null;
+    }
+  }
+
+  async function doExtendPin(id: string) {
+    pinBusy = id;
+    try {
+      await extendPin(id, 30);
+      await loadPolicy();
+    } catch (e) {
+      policyError = (e as Error).message;
+    } finally {
+      pinBusy = null;
+    }
+  }
+
+  // Poll only while something is in flight. A restore is a background copy that
+  // can take minutes, so the create call returns a queued job and this is what
+  // turns it into visible progress.
+  $effect(() => {
+    if (!jobsActive) return;
+    const t = setInterval(() => {
+      void loadJobs();
+      // The pin appears only once the worker creates it, so the pin list has to
+      // refresh alongside the job or a completed restore shows no protection.
+      void loadPolicy();
+    }, 3000);
+    return () => clearInterval(t);
+  });
+
+  function jobPercent(j: RestoreJob): number {
+    if (j.status === 'succeeded') return 100;
+    if (j.rows_estimated <= 0) return 0;
+    return Math.min(100, Math.round((j.rows_restored / j.rows_estimated) * 100));
+  }
+
   function fmtBytes(n: number): string {
     if (n < 1024) return `${n} B`;
     const u = ['KB', 'MB', 'GB', 'TB'];
@@ -95,6 +224,7 @@
   $effect(() => {
     void load();
     void loadPolicy();
+    void loadJobs();
   });
 </script>
 
@@ -235,15 +365,43 @@
                 </p>
                 <ul class="pin-list">
                   {#each pol.pins as pin (pin.id)}
-                    <li class:expired={pin.expired}>
-                      <code>{pin.table_name}</code>
-                      {new Date(pin.range_start).toISOString().slice(0, 10)} →
-                      {new Date(pin.range_end).toISOString().slice(0, 10)}
-                      <span class="muted">
-                        {pin.expired ? 'expired' : 'until'}
-                        {new Date(pin.expires_at).toISOString().slice(0, 10)}
-                      </span>
-                      {#if pin.reason}<span class="muted">— {pin.reason}</span>{/if}
+                    <li class:expired={pin.expired} class:soon={pin.expiring_soon}>
+                      <div class="pin-main">
+                        <code>{pin.table_name}</code>
+                        {new Date(pin.range_start).toISOString().slice(0, 10)} →
+                        {new Date(pin.range_end).toISOString().slice(0, 10)}
+                        <span class="muted">
+                          {pin.expired ? 'expired' : 'until'}
+                          {new Date(pin.expires_at).toISOString().slice(0, 10)}
+                        </span>
+                        {#if pin.reason}<span class="muted">— {pin.reason}</span>{/if}
+                      </div>
+                      {#if pin.expiring_soon}
+                        <!-- Warn BEFORE the data goes. A restore that simply
+                             vanishes is the same silent disappearance the pin
+                             exists to prevent, just deferred to the expiry. -->
+                        <p class="pin-warn" role="alert">
+                          Expires in {Math.max(0, Math.round(pin.expires_in_hours / 24))} day(s).
+                          The restored rows will be deleted from Postgres; the Parquet
+                          copy is not touched.
+                        </p>
+                      {/if}
+                      <div class="pin-actions">
+                        <Button
+                          variant="secondary"
+                          disabled={pinBusy === pin.id}
+                          onclick={() => doExtendPin(pin.id)}
+                        >
+                          Extend 30 days
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          disabled={pinBusy === pin.id}
+                          onclick={() => doReleasePin(pin.id)}
+                        >
+                          {pinBusy === pin.id ? 'Working…' : 'Release now'}
+                        </Button>
+                      </div>
                     </li>
                   {/each}
                 </ul>
@@ -254,6 +412,83 @@
           {/if}
         </Card>
       </div>
+
+      {#if policy}
+        <div class="section">
+          <Card title="Restore from cold">
+            <p class="muted policy-lede">
+              Copies a range back out of Parquet into Postgres so the rest of the
+              dashboard can query it again. The Parquet copy is never removed, so a
+              restore adds storage rather than moving it — which is why every restore
+              expires.
+            </p>
+
+            <div class="restore-form">
+              <label class="policy-field">
+                <span class="policy-label">Table</span>
+                <select class="policy-input" bind:value={restoreTable} disabled={restoreBusy}>
+                  {#each RESTORABLE_TABLES as t (t)}
+                    <option value={t}>{t}</option>
+                  {/each}
+                </select>
+              </label>
+              <label class="policy-field">
+                <span class="policy-label">From (UTC)</span>
+                <input class="policy-input" type="date" bind:value={restoreFrom} disabled={restoreBusy} />
+              </label>
+              <label class="policy-field">
+                <span class="policy-label">To (inclusive)</span>
+                <input class="policy-input" type="date" bind:value={restoreTo} disabled={restoreBusy} />
+              </label>
+              <label class="policy-field">
+                <span class="policy-label">Keep for (days)</span>
+                <input class="policy-input" type="number" min="1" max="365" bind:value={restoreDays} disabled={restoreBusy} />
+              </label>
+              <Button disabled={!restoreValid} onclick={submitRestore}>
+                {restoreBusy ? 'Queueing…' : 'Restore'}
+              </Button>
+            </div>
+
+            {#if restoreError}
+              <p class="policy-warn" role="alert">{restoreError}</p>
+            {/if}
+            {#if restoreFrom && restoreTo && restoreRange === null}
+              <p class="policy-warn" role="alert">
+                The end date must be on or after the start date.
+              </p>
+            {/if}
+
+            {#if jobs.length > 0}
+              <ul class="job-list">
+                {#each jobs as job (job.id)}
+                  <li>
+                    <div class="job-head">
+                      <code>{job.table_name}</code>
+                      {new Date(job.range_start).toISOString().slice(0, 10)} →
+                      {new Date(job.range_end).toISOString().slice(0, 10)}
+                      <span class="job-status job-{job.status}">{job.status}</span>
+                    </div>
+                    {#if job.status === 'running' || job.status === 'queued'}
+                      <div class="job-bar"><div class="job-fill" style="width:{jobPercent(job)}%"></div></div>
+                      <p class="muted">
+                        {job.rows_restored.toLocaleString()} of
+                        {job.rows_estimated.toLocaleString()} rows
+                      </p>
+                    {:else if job.status === 'succeeded'}
+                      <p class="muted">
+                        Restored {job.rows_restored.toLocaleString()} rows. Held until
+                        {new Date(job.pin_expires_at).toISOString().slice(0, 10)}.
+                      </p>
+                    {:else if job.error}
+                      <p class="policy-warn" role="alert">{job.error}</p>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </Card>
+        </div>
+      {/if}
 
       <div class="section">
         <Card title="Database tables" padding="none">
@@ -430,7 +665,44 @@
   .policy-pins { margin-top: 18px; }
   .pins-title { margin: 0 0 4px; font-size: 14px; }
   .pin-list { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+  .pin-list li { margin-bottom: 10px; }
   .pin-list li.expired { opacity: 0.55; }
+  /* Warning state is a border, not just colour — the row also has to read as
+     "about to change" for anyone who cannot distinguish the hue. */
+  .pin-list li.soon {
+    border-left: 3px solid var(--warning, #b45309);
+    padding-left: 8px;
+    margin-left: -11px;
+  }
+  .pin-main { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+  .pin-warn { margin: 4px 0; font-size: 12px; color: var(--warning, #b45309); }
+  .pin-actions { display: flex; gap: 8px; margin-top: 6px; }
+
+  .restore-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-end;
+    margin: 12px 0;
+  }
+  .job-list { list-style: none; margin: 12px 0 0; padding: 0; font-size: 13px; }
+  .job-list li {
+    padding: 8px 0;
+    border-top: 1px solid var(--border, #2a2a2a);
+  }
+  .job-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+  .job-status { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .job-succeeded { color: var(--success, #15803d); }
+  .job-failed, .job-cancelled { color: var(--danger, #b91c1c); }
+  .job-queued, .job-running { color: var(--muted-fg, #888); }
+  .job-bar {
+    height: 4px;
+    background: var(--border, #2a2a2a);
+    border-radius: 2px;
+    overflow: hidden;
+    margin: 6px 0 4px;
+  }
+  .job-fill { height: 100%; background: var(--accent, #2563eb); transition: width 0.3s; }
 
   .storage {
     display: flex;

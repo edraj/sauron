@@ -249,10 +249,17 @@ known one, so the backend stitches the earlier activity onto the same timeline.
   { "type": "identify", "distinct_id": "user-123", "anonymous_id": "anon_9f3c…", "traits": { "plan": "pro" } }
   ```
 
-- **Flutter** attributes events to the current user's id (`null` until you identify or
-  `setUser`). `identify(distinctId, traits)` sets the user and emits an identify item;
-  set the user as early as you hold an id. (The shipped Flutter path does not auto-fill
-  `anonymous_id`.)
+- **Flutter** (from SDK 1.5.0) behaves like the browser SDK: events before
+  `identify()` are attributed to a persisted `anon_<uuidv4>` kept in the SDK's prefs
+  file, and `identify(distinctId, traits)` emits an identify item carrying that
+  `anonymous_id` so the pre-login activity stitches to the account. Call `reset()` on
+  logout — on a shared device, skipping it merges the next person into the previous
+  one's history permanently.
+
+  Before 1.5.0 the Flutter SDK **dropped** every analytics event sent before
+  `identify()`, so those people were invisible rather than anonymous. Expect a
+  one-time step up in Active Users on the day you adopt 1.5.0; it is the
+  previously-dropped population arriving, not new growth.
 
 **Server SDKs — you own the id.** `track(event, distinctId, …)` takes it explicitly;
 Node's `trackTransaction` (and the transaction path generally) falls back to the scoped

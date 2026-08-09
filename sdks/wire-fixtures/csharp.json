@@ -3,7 +3,7 @@
     "dsn": "https://pub123@example.com/42",
     "sdk": {
       "name": "sauron-dotnet",
-      "version": "1.3.0"
+      "version": "1.4.0"
     },
     "sent_at": "2026-07-12T10:30:00.123Z",
     "release": "svc@1.4.2"

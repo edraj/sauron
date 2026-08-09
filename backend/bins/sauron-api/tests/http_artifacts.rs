@@ -187,6 +187,12 @@ impl TestServer {
             .env("DATABASE_URL", &db_url)
             .env("REDIS_URL", &redis_url)
             .env("JWT_SECRET", JWT_SECRET)
+            // Required and fail-closed since migration 000046: the API refuses to
+            // boot without it (it is the only key that decrypts stored channels).
+            .env(
+                "NOTIFY_SECRET_KEY",
+                "sauron-test-notify-secret-key-0000000000",
+            )
             .env("API_PORT", port.to_string())
             .env("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
             .env("RUST_LOG", "error")
@@ -343,8 +349,19 @@ impl TestServer {
             // `issue:read` is what `list` authorizes against, and one test
             // reads the stored row back through it rather than trusting the
             // upload response alone.
-            "org-wide artifact write + read",
-            json!([perm::ARTIFACT_WRITE, perm::ISSUE_READ]),
+            //
+            // `event:read` is here because these are SYMBOLICATION tests, and a
+            // symbolicated stack trace is an event BODY: bodies require BOTH
+            // halves of the pair (see `sauron_auth::perm::EVENT_READ`), so
+            // without it `issues::detail` would hand this fixture a stripped
+            // `latest_event` and every frame assertion below would fail on a
+            // null `stacktrace_symbolicated`. This role is pinning "a caller
+            // entitled to bodies gets fully symbolicated frames", NOT "the
+            // minimum permission a symbolication read needs" — that second
+            // question is what `http_source_context.rs`'s `issue_only_token`
+            // persona answers, and it asserts the opposite outcome.
+            "org-wide artifact write + issue/event read",
+            json!([perm::ARTIFACT_WRITE, perm::ISSUE_READ, perm::EVENT_READ]),
         )
         .await
         .expect("role");

@@ -12,7 +12,7 @@ pub use layout::{
     ColdFileKey, Granularity,
 };
 pub use merge::{merge_day_counts, DayCount};
-pub use plan::{plan, TierPlan, TimeRange};
+pub use plan::{plan, plan_with_restores, MultiTierPlan, TierPlan, TimeRange};
 
 /// A table that participates in tiering, keyed on its time column.
 #[derive(Debug, Clone, Copy)]

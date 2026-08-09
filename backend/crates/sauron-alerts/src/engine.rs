@@ -39,11 +39,23 @@ impl AlertEngine {
         }
     }
 
-    /// Resolve a stored channel row into a typed destination (decrypting its
-    /// secret bundle).
+    /// Resolve a stored channel row into a typed destination, decrypting both
+    /// its config and its secret bundle.
+    ///
+    /// This is the ONLY place the crate reads a channel's stored payload —
+    /// everything below consumes the typed [`Destination`], never the JSON — so
+    /// it is also the only place that has to know `config` moved behind the
+    /// cipher in migration 000046.
+    ///
+    /// Every decrypt failure is an `Err`, which `deliver_channel` records as a
+    /// `failed` alert_events row. Nothing is ever sent to a destination we could
+    /// only half read: a wrong `NOTIFY_SECRET_KEY` must surface as a delivery
+    /// failure naming the cause, not as a webhook POST to whatever survived.
     pub fn destination(&self, ch: &NotificationChannel) -> Result<Destination, String> {
         let kind =
             ChannelKind::parse(&ch.kind).ok_or_else(|| format!("unknown kind {}", ch.kind))?;
+        let config = crate::crypto::open_channel_config(&self.cipher, ch)
+            .map_err(|e| format!("config decrypt failed: {e}"))?;
         let secret: Value = match &ch.secret_enc {
             Some(blob) => {
                 let plain = self
@@ -54,7 +66,7 @@ impl AlertEngine {
             }
             None => Value::Null,
         };
-        resolve(kind, &ch.config, &secret)
+        resolve(kind, &config, &secret)
     }
 
     /// Fire one rule: throttle on `dedup_key`, then deliver to every attached

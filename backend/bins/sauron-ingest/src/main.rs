@@ -472,6 +472,34 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
     let pool = sauron_db::build_pool(&cfg.database_url, pool_size)?;
+
+    // Does this binary's embedded migration set match what the database has
+    // applied? An upgrade that replaced the binaries without re-running
+    // `sauron-migrate` is otherwise invisible here and far more destructive
+    // than on the API: the edge still answers the SDK `202`, and the worker
+    // then fails every write, so telemetry is DESTROYED while every client
+    // believes it was delivered. One query at boot; refuses to start when the
+    // database is behind (see `sauron_db::require_current_schema`).
+    //
+    // The unreachable-database case is deliberately NOT fatal here, unlike in
+    // `sauron-api`. `build_pool` is lazy and the edge resolves DSNs from Redis,
+    // so today an ingest replica survives a Postgres outage by buffering into
+    // the Redis stream for the workers to drain later. Turning this probe into
+    // an eager connect requirement would throw that away and trade a silent
+    // failure mode for an availability regression. Unknown status therefore
+    // warns and continues; a KNOWN-behind schema still refuses.
+    match sauron_db::conn(&pool).await {
+        Ok(mut conn) => {
+            sauron_db::require_current_schema(&mut conn, "sauron-ingest").await?;
+        }
+        Err(e) => warn!(
+            error = %e,
+            "could not reach Postgres to verify the schema against this binary; starting anyway \
+             (the edge buffers to Redis through a database outage). If this replica was just \
+             upgraded, run sauron-migrate."
+        ),
+    }
+
     let redis = RedisStore::connect(&cfg.redis_url).await?;
 
     // Shared symbolication resources for the hybrid write path (isolated cache +
@@ -711,12 +739,35 @@ async fn ingest(
     //
     // The worker expands this back into per-item jobs, so nothing downstream of
     // the decode changed.
+    let n = envelope.items.len();
+
+    // An envelope with no items is ACCEPTED but not enqueued.
+    //
+    // `items` is `#[serde(default)]` (sauron-core/src/envelope.rs), so a body of
+    // just `{"header":{...}}` parses fine, and the check above bounds the count
+    // only from ABOVE. Measured before this change: such a POST returned 202
+    // `{"accepted":0}` and still moved `XLEN` by 1 — an entry carrying nothing,
+    // occupying one of `INGEST_STREAM_MAXLEN`'s slots, and displacing a real
+    // event once the stream is at its cap. Under load that is not a curiosity:
+    // the trim is silent, so the displaced events are simply gone.
+    //
+    // Returning 202 with the SAME body rather than a 400 is deliberate. Nothing
+    // an SDK can observe changes, so no deployed client alters its behaviour —
+    // and a 4xx here would be read by the retry/queue logic in several of our
+    // own SDKs as a transient send failure worth resending, turning a harmless
+    // no-op into a retry loop. That shape has bitten this project once already
+    // (the 413 wedge).
+    if n == 0 {
+        sauron_telemetry::metrics::items_accepted(0);
+        sauron_telemetry::metrics::empty_envelopes_dropped(1);
+        return (StatusCode::ACCEPTED, Json(json!({ "accepted": 0 }))).into_response();
+    }
+
     let ip = client_ip(&headers, &state.cfg);
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let n = envelope.items.len();
     let batch = IngestBatch {
         app_id: env.app_id,
         project_id: env.project_id,

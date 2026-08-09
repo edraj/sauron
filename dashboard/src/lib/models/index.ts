@@ -943,12 +943,22 @@ export interface Monitor {
   kind: 'http' | 'tcp';
   target: string;
   method: string;
+  /** Probe settings minus `headers` — see `probe_header_names`. */
   config: Record<string, unknown>;
   interval_seconds: number;
   timeout_ms: number;
   failure_threshold: number;
   recovery_threshold: number;
-  webhook_url: string | null;
+  /**
+   * The webhook URL itself is never sent: it is a bearer-equivalent capability
+   * URL and `monitor:read` (which Viewer holds) gates this payload, so the API
+   * redacts it at the serializer and exposes only its existence. Same for the
+   * probe's request headers — names only, never values, because they carry
+   * `Authorization`/`X-Api-Key` straight into the outbound probe. To change
+   * either, PATCH the new value; there is nothing to pre-fill.
+   */
+  has_webhook: boolean;
+  probe_header_names: string[];
   enabled: boolean;
   status: MonitorStatus;
   last_checked_at: string | null;
@@ -1002,8 +1012,27 @@ export interface NotificationChannel {
   org_id: string;
   name: string;
   kind: ChannelKind;
-  /** Non-secret settings (host/port/from/to, room id, chat id, headers…). */
-  config: Record<string, unknown>;
+  /**
+   * A REDACTED projection of the channel's settings, not the stored config.
+   *
+   * The stored value is encrypted at rest and is a credential in its own right
+   * for some kinds — a generic webhook's `url` and its arbitrary `headers` map
+   * (where an `Authorization: Bearer …` lives), and a Slack/Discord
+   * `webhook_url`, which *is* the credential. The API returns presence flags
+   * and a path-less origin in their place (`has_url`, `url_origin`,
+   * `header_names`, `has_webhook_url`) alongside the genuinely non-secret
+   * fields (SMTP host/port/from/to, Matrix homeserver/room, Telegram chat id).
+   *
+   * `null` when the server could not decrypt the row — see `config_error`.
+   */
+  config: Record<string, unknown> | null;
+  /**
+   * The row's stored payload could not be decrypted, i.e. `NOTIFY_SECRET_KEY`
+   * no longer matches the key it was written with. Reads degrade per row rather
+   * than failing the page, so one broken channel can still be deleted; writes to
+   * it are refused outright.
+   */
+  config_error: boolean;
   enabled: boolean;
   /** Whether a secret bundle is stored. The secret itself is never returned. */
   has_secret: boolean;

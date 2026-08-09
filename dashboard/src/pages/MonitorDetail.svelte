@@ -2,6 +2,7 @@
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { getMonitor, getMonitorChecks, updateMonitor, deleteMonitor } from '../lib/api/monitors';
+  import { viewCache } from '../lib/stores/view-cache';
   import { MONITOR_INTERVALS } from '../lib/constants/monitorIntervals';
   import type { MonitorDetail, MonitorCheck } from '../lib/models';
   import { lockedBy, lockTitle } from '../lib/models/page-access';
@@ -35,6 +36,12 @@
     lockedBy('monitor:write', { project: detail?.monitor.project_id, level: 'project' }),
   );
 
+  // Coalesced rather than read straight off the payload: during a rolling
+  // upgrade the SPA can be newer than the API it is talking to, and an API
+  // that predates the credential redaction omits the field entirely — which
+  // would take the whole page down on `.length`, not just hide a chip.
+  const probeHeaders = $derived(detail?.monitor.probe_header_names ?? []);
+
   // Sort by timestamp ourselves rather than trusting the API's order: the newest-
   // first log and the (chronological) availability strip stay correct even if the
   // endpoint's ORDER BY ever changes.
@@ -65,6 +72,11 @@
     pausing = true; error = null;
     try {
       await updateMonitor(params.id, { enabled: detail.monitor.status === 'paused' });
+      // Monitors.svelte serves its list from the view cache, so the status column
+      // there would keep showing the pre-toggle value — with no request in flight
+      // to correct it — for the whole fresh window. Dropping the key is what makes
+      // "Back to Uptime" refetch.
+      viewCache.invalidate('monitors.list');
       await load();
     } catch (e) { error = (e as Error).message; }
     finally { pausing = false; }
@@ -76,6 +88,7 @@
     savingInterval = true; error = null;
     try {
       await updateMonitor(params.id, { interval_seconds: seconds });
+      viewCache.invalidate('monitors.list');
       await load();
     } catch (err) {
       error = (err as Error).message;
@@ -88,6 +101,10 @@
     deleting = true; error = null;
     try {
       await deleteMonitor(params.id);
+      // Must happen before the navigation: Monitors.svelte's effect runs on mount
+      // and would otherwise hit a fresh cache entry that still contains the row we
+      // just deleted, short-circuiting the network entirely.
+      viewCache.invalidate('monitors.list');
       push('/monitors');
     } catch (e) {
       error = (e as Error).message;
@@ -132,6 +149,22 @@
           <span class="kindtag">{detail.monitor.kind}</span>
           <span class="key mono">{detail.monitor.target}</span>
           <CopyButton value={detail.monitor.target} size="sm" />
+          <!--
+            Existence, not value. The API redacts the webhook URL and the probe
+            header values (both are credentials — see the `Monitor` interface in
+            lib/models), so these chips are the only way to confirm from the UI
+            that state-change notification and probe auth are actually wired up.
+          -->
+          {#if detail.monitor.has_webhook}
+            <span class="kindtag" title="A webhook is notified when this monitor changes state">
+              webhook
+            </span>
+          {/if}
+          {#if probeHeaders.length > 0}
+            <span class="kindtag" title={`Probe sends: ${probeHeaders.join(', ')}`}>
+              {probeHeaders.length} header{probeHeaders.length === 1 ? '' : 's'}
+            </span>
+          {/if}
         </div>
       </div>
         <div class="actions">

@@ -64,6 +64,17 @@ pub struct Config {
     pub tier_drop_lag_hours: i64,
     pub tier_tick_secs: u64,
     pub tier_partition_ahead: i64,
+    /// How often `sauron-tier` looks for a queued restore job.
+    ///
+    /// Separate from `tier_tick_secs` (default 3600) on purpose: a restore is
+    /// triggered by a human clicking a button and waiting, so it cannot inherit
+    /// an hourly cadence. The tiering cycle and the restore poller run as two
+    /// independent loops for exactly this reason.
+    pub restore_poll_secs: u64,
+    /// Lease before another worker may re-claim a `running` restore. A restore
+    /// that outlives this without a heartbeat is treated as crashed and
+    /// resumed; the resume deletes its own partial output first.
+    pub restore_lease_secs: i64,
     /// Window a `Cost::Scan` search query (an unindexed wildcard/substring/
     /// free-text match) is clamped to — `sauron_db::query_plan::prepare`.
     /// Defaults to `tier_hot_days`: clamping a scan to more than the tier
@@ -91,9 +102,16 @@ pub struct Config {
     /// Ingest-path symbolication time box; on timeout store raw + `pending`.
     pub symbols_ingest_timeout_ms: u64,
     // --- alerting / notifications ---
-    /// Key material for AES-GCM encryption of notification-channel secrets.
-    /// Falls back to `jwt_secret` when unset (with a startup warning).
-    pub notify_secret_key: Option<String>,
+    /// Validated key material for AES-GCM encryption of notification-channel
+    /// payloads (config AND secret), or the reason it is unusable.
+    ///
+    /// Private on purpose, exactly like [`Config::jwt_secret`]: reach it through
+    /// [`Config::require_notify_secret_key`]. It used to be a bare `Option` that
+    /// every consumer silently fell back to `JWT_SECRET` for, which failed OPEN
+    /// twice over — rotating the JWT signing secret made every stored channel
+    /// secret undecryptable with no error anywhere, and there was no length
+    /// floor at all.
+    notify_secret_key: Result<String, String>,
     /// Metric-rule evaluator cadence.
     pub alerts_tick_secs: u64,
     /// Per-delivery HTTP/SMTP timeout.
@@ -260,6 +278,8 @@ impl std::fmt::Debug for Config {
             .field("tier_cold_path", &self.tier_cold_path)
             .field("tier_drop_lag_hours", &self.tier_drop_lag_hours)
             .field("tier_tick_secs", &self.tier_tick_secs)
+            .field("restore_poll_secs", &self.restore_poll_secs)
+            .field("restore_lease_secs", &self.restore_lease_secs)
             .field("tier_partition_ahead", &self.tier_partition_ahead)
             .field("search_scan_clamp_days", &self.search_scan_clamp_days)
             .field("symbols_cache_mb", &self.symbols_cache_mb)
@@ -278,6 +298,8 @@ impl std::fmt::Debug for Config {
                 "notify_secret_key",
                 &self.notify_secret_key.as_ref().map(|_| R),
             )
+            // `Result::as_ref().map()` above redacts the Ok payload; the Err arm
+            // is a reason string with no secret in it, so it prints as-is.
             .field("alerts_tick_secs", &self.alerts_tick_secs)
             .field("alerts_deliver_timeout_ms", &self.alerts_deliver_timeout_ms)
             .field("alerts_allow_private", &self.alerts_allow_private)
@@ -538,6 +560,29 @@ impl Config {
         }
     }
 
+    /// The notification-channel encryption key, or an error explaining why there
+    /// isn't a usable one. Call this from every service that reads or writes
+    /// notification channels (`sauron-api`, `sauron-monitor`, `sauron-alerts`);
+    /// they must propagate the error and refuse to start.
+    ///
+    /// Fails CLOSED, and the failure mode matters more here than anywhere else
+    /// in this file: this key is the ONLY thing that can decrypt a channel's
+    /// stored config and secret. There is no escrow and no derivation from
+    /// another value — the previous `JWT_SECRET` fallback was exactly that, and
+    /// it turned a routine JWT rotation into silent, total loss of every stored
+    /// channel credential. Lose this key and the ciphertext is unrecoverable:
+    /// the only remedy is to delete and re-create every notification channel.
+    ///
+    /// Recorded rather than raised at load time for the same reason as
+    /// `jwt_secret`: `sauron-ingest`, `sauron-tier` and `sauron-migrate` never
+    /// touch channels and must still boot without it.
+    pub fn require_notify_secret_key(&self) -> anyhow::Result<&str> {
+        match &self.notify_secret_key {
+            Ok(s) => Ok(s.as_str()),
+            Err(reason) => anyhow::bail!("{reason}"),
+        }
+    }
+
     /// The configured SMTP relay, or an error explaining why there isn't one.
     ///
     /// Fails closed at the point of use. Callers must degrade rather than refuse
@@ -595,6 +640,34 @@ impl Config {
             None => Err(
                 "JWT_SECRET is required — generate one with `openssl rand -hex 32` \
                  (set SAURON_DEV=1 to run with an insecure development key)"
+                    .to_string(),
+            ),
+        };
+
+        // Same fail-closed shape as JWT_SECRET, with no fallback of any kind.
+        // The old behaviour — silently derive from JWT_SECRET behind a `warn!` —
+        // is what made this key dangerous: it booted fine, encrypted real
+        // credentials under a key the operator never chose, and then lost them
+        // the next time JWT_SECRET was rotated. The same 32-character floor
+        // applies; there was previously none at all, so a one-character
+        // NOTIFY_SECRET_KEY was accepted.
+        //
+        // No SAURON_DEV escape hatch: a dev-mode default here would be a
+        // *storage* key, so switching in or out of dev mode would silently make
+        // existing rows undecryptable. Local development sets the variable.
+        let notify_secret_key = match var("NOTIFY_SECRET_KEY") {
+            Some(s) if s.len() >= MIN_JWT_SECRET_LEN => Ok(s),
+            Some(_) => Err(format!(
+                "NOTIFY_SECRET_KEY must be at least {MIN_JWT_SECRET_LEN} characters"
+            )),
+            None => Err(
+                "NOTIFY_SECRET_KEY is required — generate one with `openssl rand -hex 32`. \
+                 It must be IDENTICAL across api, monitor and alerts, and it must be backed \
+                 up: it is the only key that can decrypt stored notification-channel \
+                 configs and secrets, and losing it means every channel has to be \
+                 re-created. Upgrading a deployment that relied on the old JWT_SECRET \
+                 fallback? Set NOTIFY_SECRET_KEY to that deployment's existing JWT_SECRET \
+                 value to keep the existing rows readable."
                     .to_string(),
             ),
         };
@@ -711,6 +784,8 @@ impl Config {
             tier_drop_lag_hours: parse("TIER_DROP_LAG_HOURS", 24),
             tier_tick_secs: parse("TIER_TICK_SECS", 3600),
             tier_partition_ahead: parse("TIER_PARTITION_AHEAD", 7),
+            restore_poll_secs: parse("RESTORE_POLL_SECS", 5),
+            restore_lease_secs: parse("RESTORE_LEASE_SECS", 300),
             search_scan_clamp_days,
             symbols_cache_mb: parse("SYMBOLS_CACHE_MB", 256),
             symbols_redis_url: var("SYMBOLS_REDIS_URL"),
@@ -718,7 +793,7 @@ impl Config {
             symbols_max_artifact_mb: parse("SYMBOLS_MAX_ARTIFACT_MB", 128),
             symbols_max_uncompressed_mb: parse("SYMBOLS_MAX_UNCOMPRESSED_MB", 512),
             symbols_ingest_timeout_ms: parse("SYMBOLS_INGEST_TIMEOUT_MS", 150),
-            notify_secret_key: var("NOTIFY_SECRET_KEY"),
+            notify_secret_key,
             alerts_tick_secs: parse("ALERTS_TICK_SECS", 30),
             alert_event_retention_days: parse("ALERT_EVENT_RETENTION_DAYS", 90),
             alerts_deliver_timeout_ms: parse("ALERTS_DELIVER_TIMEOUT_MS", 10_000),
@@ -1112,6 +1187,69 @@ mod tests {
         );
     }
 
+    /// The point of migration 000046's key policy: an absent or too-short
+    /// `NOTIFY_SECRET_KEY` must make the channel-touching services refuse to
+    /// start, and the error must be actionable.
+    ///
+    /// The regression this guards is not "someone deletes the check" — it is
+    /// "someone re-adds the fallback". The previous code booted happily with the
+    /// key unset, derived it from `JWT_SECRET`, and encrypted real SMTP
+    /// passwords and webhook URLs under a key the operator had never chosen; the
+    /// loss only surfaced, silently, at the next JWT rotation.
+    #[test]
+    fn require_notify_secret_key_fails_closed() {
+        let unset = Config {
+            notify_secret_key: Err(
+                "NOTIFY_SECRET_KEY is required — generate one with `openssl rand -hex 32`"
+                    .to_string(),
+            ),
+            ..sample_config()
+        };
+        let err = unset.require_notify_secret_key().unwrap_err().to_string();
+        assert!(err.contains("NOTIFY_SECRET_KEY"), "got: {err}");
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "the error must tell an operator how to produce one; got: {err}"
+        );
+
+        // No fallback: a perfectly good JWT_SECRET does not rescue it.
+        let with_jwt = Config {
+            jwt_secret: Ok("jwt-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            notify_secret_key: Err("unset".to_string()),
+            ..sample_config()
+        };
+        assert!(with_jwt.require_notify_secret_key().is_err());
+
+        let ok = Config {
+            notify_secret_key: Ok("k".repeat(MIN_JWT_SECRET_LEN)),
+            ..sample_config()
+        };
+        assert_eq!(
+            ok.require_notify_secret_key().unwrap(),
+            "k".repeat(MIN_JWT_SECRET_LEN)
+        );
+    }
+
+    /// The floor itself, exercised through the same `match` `from_env` uses.
+    /// There was previously no minimum at all on this variable, so a
+    /// one-character key was accepted and silently became the AES key material.
+    #[test]
+    fn the_notify_key_has_the_same_length_floor_as_the_jwt_secret() {
+        let classify = |v: Option<&str>| -> Result<String, String> {
+            match v.map(str::to_string) {
+                Some(s) if s.len() >= MIN_JWT_SECRET_LEN => Ok(s),
+                Some(_) => Err(format!(
+                    "NOTIFY_SECRET_KEY must be at least {MIN_JWT_SECRET_LEN} characters"
+                )),
+                None => Err("NOTIFY_SECRET_KEY is required".to_string()),
+            }
+        };
+        assert!(classify(None).is_err());
+        assert!(classify(Some("short")).is_err());
+        assert!(classify(Some(&"k".repeat(MIN_JWT_SECRET_LEN - 1))).is_err());
+        assert!(classify(Some(&"k".repeat(MIN_JWT_SECRET_LEN))).is_ok());
+    }
+
     /// A single `debug!(?cfg)` added during an incident must not dump the
     /// Postgres password, the JWT signing key and the SMTP password at once.
     #[test]
@@ -1134,7 +1272,7 @@ mod tests {
             database_url: "postgres://sauron:pg-hunter2@db/sauron".to_string(),
             redis_url: "redis://:redis-hunter2@cache:6379".to_string(),
             jwt_secret: Ok("jwt-hunter2-aaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
-            notify_secret_key: Some("notify-hunter2".to_string()),
+            notify_secret_key: Ok("notify-hunter2-aaaaaaaaaaaaaaaaaaa".to_string()),
             symbols_redis_url: Some("redis://:symbols-hunter2@cache:6379/1".to_string()),
             smtp: Ok(settings),
             ..sample_config()
@@ -1187,6 +1325,8 @@ mod tests {
             tier_drop_lag_hours: 24,
             tier_tick_secs: 3600,
             tier_partition_ahead: 7,
+            restore_poll_secs: 5,
+            restore_lease_secs: 300,
             search_scan_clamp_days: 30,
             symbols_cache_mb: 256,
             symbols_redis_url: None,
@@ -1194,7 +1334,7 @@ mod tests {
             symbols_max_artifact_mb: 128,
             symbols_max_uncompressed_mb: 512,
             symbols_ingest_timeout_ms: 150,
-            notify_secret_key: None,
+            notify_secret_key: Err("unset".to_string()),
             alerts_tick_secs: 30,
             alerts_deliver_timeout_ms: 10_000,
             alerts_allow_private: false,

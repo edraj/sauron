@@ -443,8 +443,12 @@ impl RedisStore {
     }
 
     /// Dead-letter a permanently failing job, then ack it off the main stream.
-    pub async fn dead_letter(&self, id: &str, payload: &str) -> anyhow::Result<()> {
-        self.dlq_push(payload).await?;
+    ///
+    /// The ack is deliberately AFTER the DLQ write and behind `?`: if the DLQ
+    /// write fails, the entry is not acked and is redelivered, rather than
+    /// being retired with no surviving copy anywhere.
+    pub async fn dead_letter(&self, id: &str, payload: &str, maxlen: usize) -> anyhow::Result<()> {
+        self.dlq_push(payload, maxlen).await?;
         self.ack(id).await
     }
 
@@ -455,16 +459,88 @@ impl RedisStore {
     /// The caller acks once, after the last item of the entry has been handled;
     /// until then a crash costs a redelivery (duplicate writes) rather than
     /// silently dropping the remainder of the envelope.
-    pub async fn dlq_push(&self, payload: &str) -> anyhow::Result<()> {
+    /// The DLQ is BOUNDED (`MAXLEN ~`), where it used to be unbounded.
+    ///
+    /// An unbounded dead-letter stream is a slow-motion outage: a poison payload
+    /// or a Postgres outage writes one entry per failing item, forever, until
+    /// Redis hits `maxmemory` — at which point the INGEST stream stops accepting
+    /// writes too and the edge starts refusing live traffic. Bounding the
+    /// wreckage is what keeps a failure of the recovery path from becoming a
+    /// failure of the ingest path.
+    ///
+    /// Trimming is EXACT, unlike `xadd_jobs`, which uses `~`. That difference is
+    /// deliberate and was forced by a test: `MAXLEN ~ n` only evicts whole radix
+    /// nodes, so at realistic dead-letter volumes it evicts nothing at all — 50
+    /// pushes with `MAXLEN ~ 5` left all 50 entries. Approximate trimming buys
+    /// throughput on the hot ingest path, where XADD is the bottleneck; here the
+    /// stream is written only on failure, so the O(n) cost is irrelevant and an
+    /// approximate bound that does not actually bound is strictly worse than an
+    /// exact one.
+    ///
+    /// Errors are the caller's to handle and MUST NOT be discarded — see
+    /// `dlq_write_failures` in `sauron-telemetry`.
+    pub async fn dlq_push(&self, payload: &str, maxlen: usize) -> anyhow::Result<()> {
+        self.dlq_push_to(keys::INGEST_DLQ, payload, maxlen).await
+    }
+
+    /// [`dlq_push`] against an arbitrary key, so a test can exercise the real
+    /// command against a stream of its own instead of the live dead-letter
+    /// queue. Same reasoning as [`stream_stats`]' parameters.
+    pub async fn dlq_push_to(&self, key: &str, payload: &str, maxlen: usize) -> anyhow::Result<()> {
         let mut c = self.conn.clone();
         redis::cmd("XADD")
-            .arg(keys::INGEST_DLQ)
+            .arg(key)
+            .arg("MAXLEN")
+            .arg(maxlen)
             .arg("*")
             .arg("d")
             .arg(payload)
             .query_async::<()>(&mut c)
             .await?;
         Ok(())
+    }
+
+    /// Drop dead-letter entries older than `retention`, returning how many went.
+    ///
+    /// `MAXLEN` alone bounds the stream by COUNT, which is the wrong unit for a
+    /// privacy question. A dead-lettered payload is a copy of a real event — the
+    /// masked copy, but still one that outlives every retention window the
+    /// product otherwise enforces, sitting in Redis where no deletion request
+    /// and no tier rotation reaches it. On a quiet deployment `MAXLEN` would let
+    /// a single entry sit there for years.
+    ///
+    /// `XTRIM MINID` rather than a scan-and-delete: Redis stream ids are
+    /// `<unix-millis>-<seq>`, so an age cutoff IS an id, and the trim is one
+    /// O(deleted) command with no read-back. Exact (no `~`) because the whole
+    /// point is a hard age guarantee.
+    pub async fn dlq_reap(&self, retention: std::time::Duration) -> anyhow::Result<u64> {
+        self.dlq_reap_from(keys::INGEST_DLQ, retention).await
+    }
+
+    /// [`dlq_reap`] against an arbitrary key — see [`dlq_push_to`].
+    pub async fn dlq_reap_from(
+        &self,
+        key: &str,
+        retention: std::time::Duration,
+    ) -> anyhow::Result<u64> {
+        // `SystemTime`, not chrono: this crate deliberately has no date-time
+        // dependency, and a stream id only needs unix millis.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let cutoff_ms = now_ms - retention.as_millis() as i64;
+        if cutoff_ms <= 0 {
+            return Ok(0);
+        }
+        let mut c = self.conn.clone();
+        let removed: i64 = redis::cmd("XTRIM")
+            .arg(key)
+            .arg("MINID")
+            .arg(cutoff_ms)
+            .query_async(&mut c)
+            .await?;
+        Ok(removed.max(0) as u64)
     }
 
     // --- stream observability ---------------------------------------------
@@ -730,6 +806,108 @@ impl SymbolBlobCache {
 #[cfg(test)]
 mod hll_tests {
     use super::*;
+
+    /// The dead-letter queue used to be unbounded, with no MAXLEN, no TTL and
+    /// no reaper — a poison payload or a Postgres outage writes one entry per
+    /// failing item until Redis hits `maxmemory`, at which point the INGEST
+    /// stream stops accepting writes too and the edge refuses live traffic. A
+    /// failure of the recovery path became a failure of the ingest path.
+    #[tokio::test]
+    async fn dlq_push_bounds_the_stream() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:dlq:{}", uuid::Uuid::new_v4());
+        for i in 0..50 {
+            redis
+                .dlq_push_to(&key, &format!("{{\"i\":{i}}}"), 5)
+                .await
+                .unwrap();
+        }
+        let mut c = redis.conn.clone();
+        let len: i64 = redis::cmd("XLEN")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        // EXACTLY 5, not merely "fewer than 50". This assertion is why the DLQ
+        // uses exact trimming: written with `MAXLEN ~ 5` this test failed with
+        // len == 50, because approximate trimming evicts whole radix nodes and
+        // 50 small entries fit in one. An approximate bound that does not bound
+        // is worse than no bound, because it reads as protection.
+        assert_eq!(len, 5, "MAXLEN must bound the DLQ exactly");
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// MAXLEN bounds by COUNT, which is the wrong unit for a privacy question:
+    /// a dead-lettered payload is a copy of a real event that outlives every
+    /// retention window the product enforces, and on a quiet deployment a count
+    /// bound would let one sit there for years.
+    #[tokio::test]
+    async fn dlq_reap_drops_only_entries_older_than_the_retention() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:dlq:{}", uuid::Uuid::new_v4());
+        let mut c = redis.conn.clone();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Explicit ids, so "old" and "new" are facts rather than a sleep: a
+        // stream id IS a unix-millis timestamp, which is the whole reason the
+        // reaper can use XTRIM MINID instead of scanning.
+        for (n, age_ms) in [
+            ("old1", 7_200_000i64),
+            ("old2", 3_700_000),
+            ("new1", 60_000),
+        ] {
+            let _: String = redis::cmd("XADD")
+                .arg(&key)
+                .arg(format!("{}-0", now_ms - age_ms))
+                .arg("d")
+                .arg(n)
+                .query_async(&mut c)
+                .await
+                .unwrap();
+        }
+
+        let removed = redis
+            .dlq_reap_from(&key, std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(
+            removed, 2,
+            "both entries older than an hour, and only those"
+        );
+        let len: i64 = redis::cmd("XLEN")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(len, 1);
+
+        // Idempotent: a second pass with nothing newly aged removes nothing.
+        assert_eq!(
+            redis
+                .dlq_reap_from(&key, std::time::Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            0
+        );
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
 
     async fn store() -> Option<RedisStore> {
         let url = std::env::var("TEST_REDIS_URL").ok()?;

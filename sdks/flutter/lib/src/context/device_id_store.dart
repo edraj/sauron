@@ -1,56 +1,37 @@
-import 'dart:convert';
 import 'dart:io';
 
+import '../util/prefs_store.dart';
 import '../util/uuid.dart';
 
-/// Persists a stable, per-install device identity under the SDK storage dir.
+/// Persists a stable, per-install device identity in the SDK prefs file.
 ///
-/// The value is stored in a tiny JSON prefs file (so more keys can be added
-/// later without a schema change) keyed by [kDeviceIdKey]. The id is generated
-/// once, on first run, and reused for the lifetime of the install. The backend
-/// treats `context.device.device_id` as the stable device identity.
+/// The value lives under [kDeviceIdKey] in the shared [PrefsStore] — a
+/// read-modify-write map, so adding a key here does not disturb the anonymous
+/// id stored beside it. The device id is generated once, on first run, and
+/// reused for the lifetime of the install. The backend treats
+/// `context.device.device_id` as the stable device identity.
 ///
 /// Every operation is defensively guarded: a read/write failure must never
 /// prevent an error from being reported — a fresh id is minted for the current
 /// run instead.
 class DeviceIdStore {
-  DeviceIdStore({this.fileName = 'sauron_prefs.json'});
+  const DeviceIdStore({this.prefs = const PrefsStore()});
 
   /// Prefs key under which the device id lives.
   static const String kDeviceIdKey = 'sauron.device_id';
 
-  /// Prefs file name within the SDK storage directory.
-  final String fileName;
+  /// The prefs file this store reads and writes.
+  final PrefsStore prefs;
 
   /// Returns the persisted device id from [directory], generating and
   /// persisting a fresh UUID on first run. Never throws.
   Future<String> resolve(Directory directory) async {
-    final File file = File('${directory.path}/$fileName');
-    try {
-      if (await file.exists()) {
-        final Object? decoded = jsonDecode(await file.readAsString());
-        if (decoded is Map<String, dynamic>) {
-          final Object? existing = decoded[kDeviceIdKey];
-          if (existing is String && existing.isNotEmpty) {
-            return existing;
-          }
-        }
-      }
-    } on Object {
-      // A corrupt/unreadable prefs file must never crash the host app; fall
-      // through and mint a fresh id below.
+    final Object? existing = (await prefs.read(directory))[kDeviceIdKey];
+    if (existing is String && existing.isNotEmpty) {
+      return existing;
     }
-
     final String id = generateUuidV4();
-    try {
-      await directory.create(recursive: true);
-      await file.writeAsString(
-        jsonEncode(<String, Object?>{kDeviceIdKey: id}),
-        flush: true,
-      );
-    } on Object {
-      // Persistence failure is non-fatal; the id is still valid for this run.
-    }
+    await prefs.merge(directory, <String, Object?>{kDeviceIdKey: id});
     return id;
   }
 }

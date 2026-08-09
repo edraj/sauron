@@ -74,6 +74,8 @@ static ENVELOPES_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static ITEMS_PERSISTED: AtomicU64 = AtomicU64::new(0);
 static ITEMS_DEADLETTERED: AtomicU64 = AtomicU64::new(0);
 static ENTRIES_DEADLETTERED: AtomicU64 = AtomicU64::new(0);
+static EMPTY_ENVELOPES_DROPPED: AtomicU64 = AtomicU64::new(0);
+static DLQ_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Add `n` ITEMS that the edge has enqueued and answered `202` for.
 ///
@@ -93,6 +95,32 @@ pub fn items_accepted(n: u64) {
 #[inline]
 pub fn envelopes_accepted(n: u64) {
     ENVELOPES_ACCEPTED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Add `n` envelopes ACCEPTED (202) but deliberately not enqueued because they
+/// carried no items.
+///
+/// These used to append a stream entry holding nothing, consuming an
+/// `INGEST_STREAM_MAXLEN` slot and — once the stream is at its cap — displacing
+/// a real event through a silent trim. Counted rather than merely skipped so the
+/// volume is visible: a client emitting them in a loop is a bug worth finding,
+/// and after the short-circuit there is no other trace of it.
+#[inline]
+pub fn empty_envelopes_dropped(n: u64) {
+    EMPTY_ENVELOPES_DROPPED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Add `n` failed dead-letter WRITES.
+///
+/// The most serious counter in this module. A non-zero value means an event
+/// failed to persist AND failed to reach the dead-letter queue, so the only
+/// remaining copy is the un-acked stream entry. The worker withholds the ack
+/// when this fires, so the entry is redelivered rather than lost — which means
+/// a sustained non-zero rate also implies duplicate writes for the successful
+/// items sharing those envelopes. Alert on it.
+#[inline]
+pub fn dlq_write_failures(n: u64) {
+    DLQ_WRITE_FAILURES.fetch_add(n, Ordering::Relaxed);
 }
 
 /// Add `n` ITEMS whose entry reached a terminal durable outcome and was acked.
@@ -134,6 +162,11 @@ pub struct Counters {
     pub items_deadlettered: u64,
     /// ENTRIES.
     pub entries_deadlettered: u64,
+    /// ENVELOPES accepted with no items and deliberately not enqueued.
+    pub empty_envelopes_dropped: u64,
+    /// Dead-letter writes that FAILED. Non-zero means an event reached neither
+    /// Postgres nor the DLQ.
+    pub dlq_write_failures: u64,
 }
 
 /// Read every counter.
@@ -144,6 +177,8 @@ pub fn snapshot() -> Counters {
         items_persisted: ITEMS_PERSISTED.load(Ordering::Relaxed),
         items_deadlettered: ITEMS_DEADLETTERED.load(Ordering::Relaxed),
         entries_deadlettered: ENTRIES_DEADLETTERED.load(Ordering::Relaxed),
+        empty_envelopes_dropped: EMPTY_ENVELOPES_DROPPED.load(Ordering::Relaxed),
+        dlq_write_failures: DLQ_WRITE_FAILURES.load(Ordering::Relaxed),
     }
 }
 
@@ -223,12 +258,35 @@ pub fn render_counters(c: &Counters, stream: Option<&StreamSnapshot>) -> String 
         &mut out,
         "sauron_ingest_envelopes_accepted_total",
         "counter",
-        "Envelopes this process enqueued carrying at least one item. Unit: envelopes. A LOWER \
-         BOUND on stream entries appended, not an equality: a zero-item envelope is enqueued \
-         without being counted here. Present so item counts and the entries-unit gauges below \
-         can be related; do not use it to convert one into the other for traffic this process \
-         did not accept.",
+        "Envelopes this process enqueued carrying at least one item. Unit: envelopes. Since the \
+         empty-envelope short-circuit this equals the stream entries this process appended, \
+         because a zero-item envelope no longer appends one - see \
+         sauron_ingest_empty_envelopes_dropped_total. It was previously a LOWER BOUND. Present \
+         so item counts and the entries-unit gauges below can be related; do not use it to \
+         convert one into the other for traffic this process did not accept.",
         c.envelopes_accepted,
+    );
+    metric(
+        &mut out,
+        "sauron_ingest_empty_envelopes_dropped_total",
+        "counter",
+        "Envelopes answered HTTP 202 that carried no items and were deliberately NOT enqueued. \
+         Unit: envelopes. Before this existed such an envelope appended a stream entry holding \
+         nothing, consuming one of INGEST_STREAM_MAXLEN's slots and displacing a real event once \
+         the stream is at its cap - a loss the trim performs silently. A steadily rising value \
+         means a client is posting empty bodies; it is not itself an error.",
+        c.empty_envelopes_dropped,
+    );
+    metric(
+        &mut out,
+        "sauron_ingest_dlq_write_failures_total",
+        "counter",
+        "Dead-letter writes that FAILED. Unit: writes. Non-zero means an event failed to persist \
+         AND failed to reach the dead-letter queue: the only surviving copy is the un-acked \
+         stream entry, which will be redelivered. Because redelivery replays the whole envelope, \
+         a sustained non-zero rate also implies duplicate writes for that envelope's successful \
+         items. This is the counter to alert on.",
+        c.dlq_write_failures,
     );
     metric(
         &mut out,
@@ -351,12 +409,16 @@ mod tests {
             items_persisted: 5,
             items_deadlettered: 1,
             entries_deadlettered: 3,
+            empty_envelopes_dropped: 4,
+            dlq_write_failures: 6,
         };
         let text = render_counters(&c, None);
 
         for (name, value) in [
             ("sauron_ingest_items_accepted_total", 7),
             ("sauron_ingest_envelopes_accepted_total", 2),
+            ("sauron_ingest_empty_envelopes_dropped_total", 4),
+            ("sauron_ingest_dlq_write_failures_total", 6),
             ("sauron_ingest_items_persisted_total", 5),
             ("sauron_ingest_items_deadlettered_total", 1),
             ("sauron_ingest_entries_deadlettered_total", 3),
@@ -390,7 +452,15 @@ mod tests {
             assert!(
                 help_line.contains("Unit: items")
                     || help_line.contains("Unit: entries")
-                    || help_line.contains("Unit: envelopes"),
+                    || help_line.contains("Unit: envelopes")
+                    // "writes" is a genuinely distinct unit, not a synonym for
+                    // one of the above: a FAILED dead-letter write produces no
+                    // entry, so labelling it "entries" to satisfy this list
+                    // would be labelling it wrongly. The list exists to stop
+                    // someone subtracting an entry count from an item count —
+                    // it should enumerate the real units, not force a metric
+                    // into the nearest wrong one.
+                    || help_line.contains("Unit: writes"),
                 "{name} help must state its unit, got: {help_line}"
             );
         }
@@ -418,6 +488,8 @@ mod tests {
                 items_persisted: 5,
                 items_deadlettered: 1,
                 entries_deadlettered: 3,
+                empty_envelopes_dropped: 4,
+                dlq_write_failures: 6,
             },
             Some(&s),
         );
@@ -425,8 +497,8 @@ mod tests {
         let helps: Vec<&str> = text.lines().filter(|l| l.starts_with("# HELP ")).collect();
         assert_eq!(
             helps.len(),
-            11,
-            "expected 5 counters + 6 gauges, got:\n{text}"
+            13,
+            "expected 7 counters + 6 gauges, got:\n{text}"
         );
         for h in &helps {
             assert!(h.contains("Unit: "), "help line states no unit: {h}");

@@ -52,21 +52,15 @@ async fn main() -> anyhow::Result<()> {
         .user_agent("Sauron-Monitor/1.0")
         .build()?;
 
-    let notify_key = match &cfg.notify_secret_key {
-        Some(k) => k.clone(),
-        None => {
-            warn!(
-                "NOTIFY_SECRET_KEY not set; deriving channel-secret key from JWT_SECRET \
-                 (must match sauron-api's derivation or stored secrets will not decrypt)"
-            );
-            cfg.require_jwt_secret()?.to_string()
-        }
-    };
+    // Fail-closed, no JWT_SECRET fallback. The prober is the process most likely
+    // to hold a *different* key than the API (separate unit, separate env file),
+    // and a mismatch is invisible until a monitor transitions and the alert
+    // silently fails to deliver.
     let notifier = Notifier {
         pool: pool.clone(),
         redis,
         engine: Arc::new(AlertEngine::new(
-            SecretCipher::new(&notify_key),
+            SecretCipher::new(cfg.require_notify_secret_key()?),
             cfg.alerts_allow_private,
             cfg.alerts_deliver_timeout_ms,
         )),

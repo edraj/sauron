@@ -114,6 +114,22 @@ Full instructions: **[packaging/rpm/INSTALL.md](packaging/rpm/INSTALL.md)** (bui
 and **[packaging/rpm/SETUP.md](packaging/rpm/SETUP.md)** (configure DB/Redis, migrate,
 enable services, dashboard).
 
+Migrations run automatically on an RPM host: every `sauron-*` daemon unit carries
+`Requires=sauron-migrate.service`, so starting or restarting one applies pending
+migrations first and the daemon refuses to start if that fails. The trade is that a
+Postgres outage longer than `MIGRATE_WAIT_SECS` (default 120) leaves the daemons
+down until someone starts them by hand — systemd never retries a failed *start job*.
+The Compose stack is unaffected; run `make migrate` there.
+
+> **Upgrading to this release is one-way for notification channels.** The first
+> `sauron-api` boot encrypts every channel's config into `config_enc` and blanks the
+> legacy plaintext `config` to `'{}'` (migration `2026-08-09-000046`, a security fix —
+> webhook URLs and `Authorization` headers were previously stored in cleartext). A
+> downgraded binary reads the empty column and every notification delivery silently
+> goes nowhere. `dnf downgrade` does not run `down.sql`, so recovery is to roll
+> forward; a manual `diesel migration revert` of that migration is **unrecoverable**.
+> See [SETUP.md](packaging/rpm/SETUP.md) section 11.
+
 ## Local development (without full compose)
 
 ```bash
@@ -167,12 +183,13 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | `DATABASE_URL` | Postgres connection string, e.g. `postgres://sauron:sauron@localhost:5432/sauron`. The one universally required variable — every binary refuses to start without it. | **required** | all |
 | `REDIS_URL` | Redis backing the ingest stream, DSN cache, rate limiter and HLL counters. | `redis://127.0.0.1:6379` | api, ingest, alerts |
 | `RUST_LOG` | `tracing` filter directive, e.g. `info,sauron=debug`. | `info,sauron=debug` | all |
+| `MIGRATE_WAIT_SECS` | How long `sauron-migrate` waits for Postgres to accept connections before giving up. Only the **connect** is retried — a migration that fails on its own SQL fails immediately and loudly. On an RPM host every `sauron-*` unit has `Requires=sauron-migrate.service`, so exceeding this leaves the daemons **down** (see below). Must stay under the unit's `TimeoutStartSec=300`. | `120` | migrate |
 
 ### Authentication
 
 | Variable | What it does | Default | Used by |
 | --- | --- | --- | --- |
-| `JWT_SECRET` | HS256 signing key for access/refresh tokens, and the fallback source for `NOTIFY_SECRET_KEY`. Must be **≥ 32 characters** — generate with `openssl rand -hex 32`. Fail-closed: the services that mint or verify tokens refuse to start without it. `ingest`, `tier` and `migrate` never read it, so they boot fine without one. | **required** (api, monitor, alerts) | api, monitor, alerts |
+| `JWT_SECRET` | HS256 signing key for access/refresh tokens. Must be **≥ 32 characters** — generate with `openssl rand -hex 32`. Fail-closed: the services that mint or verify tokens refuse to start without it. `ingest`, `tier` and `migrate` never read it, so they boot fine without one. Rotating it logs everyone out and nothing else; it is no longer the fallback source for `NOTIFY_SECRET_KEY`, so it no longer takes stored channel credentials with it. | **required** (api, monitor, alerts) | api, monitor, alerts |
 | `SAURON_DEV` | `1`/`true` relaxes the rule above: a short `JWT_SECRET` is accepted, and a missing one falls back to a compiled-in insecure key. **Local development only** — it makes tokens forgeable. | `false` | api, monitor, alerts |
 | `JWT_ACCESS_TTL_SECS` | Access-token lifetime. | `900` (15 min) | api |
 | `JWT_REFRESH_TTL_SECS` | Refresh-token lifetime. | `2592000` (30 days) | api |
@@ -274,7 +291,7 @@ neither value can be confirmed from a running host's journal.
 
 | Variable | What it does | Default | Used by |
 | --- | --- | --- | --- |
-| `NOTIFY_SECRET_KEY` | AES-GCM key encrypting stored channel secrets (Slack webhook URLs, SMTP passwords). When unset it is **derived from `JWT_SECRET`** — so rotating `JWT_SECRET` then makes every stored channel secret undecryptable. Set it explicitly to decouple the two, and keep it identical across `api`, `monitor` and `alerts` or they can't read each other's secrets. | unset ⇒ derived from `JWT_SECRET` | api, monitor, alerts |
+| `NOTIFY_SECRET_KEY` | AES-256-GCM key encrypting a notification channel's **whole stored payload** — both its secret bundle (SMTP passwords, bot tokens) and its config (webhook URL, request headers, relay host). Must be **≥ 32 characters** — generate with `openssl rand -hex 32`. Fail-closed and with **no fallback**: `api`, `monitor` and `alerts` refuse to start without it, and it must be **byte-identical across all three** or they cannot read each other's channels. See the warning below. | **required** (api, monitor, alerts) | api, monitor, alerts |
 | `ALERTS_TICK_SECS` | How often metric rules (error spike/threshold, event threshold, latency) are evaluated. Clamped to `5`–`3600`. | `30` | alerts |
 | `ALERTS_DELIVER_TIMEOUT_MS` | Per-delivery HTTP/SMTP timeout. | `10000` | alerts |
 | `ALERTS_ALLOW_PRIVATE` | Allow delivering to private/loopback targets — an internal webhook or LAN SMTP relay. SSRF guard, same shape as the monitor flag. | `false` | alerts |
@@ -288,6 +305,25 @@ neither value can be confirmed from a running host's journal.
 
 > Monitor up/down alerts fire inline from `sauron-monitor`; only the metric rules need
 > the `sauron-alerts` service. Without it those rules are creatable in the UI but never evaluate.
+
+> **Back up `NOTIFY_SECRET_KEY`. Losing it is unrecoverable.**
+>
+> It is the *only* thing that can decrypt `notification_channels.config_enc` and
+> `secret_enc`. There is no escrow, no recovery, and no derivation from any other
+> value — deliberately, because the old behaviour (derive it from `JWT_SECRET`
+> whenever it was unset) meant a routine JWT rotation silently destroyed every
+> stored channel credential, and nothing surfaced it until an alert failed to
+> deliver. If the key is lost or changed, the only remedy is to **delete and
+> re-create every notification channel**; the API will report `config_error: true`
+> on the ones it can no longer read, and deliveries will fail with
+> `secret decrypt failed`.
+>
+> **Upgrading from a build that had the `JWT_SECRET` fallback?** Set
+> `NOTIFY_SECRET_KEY` to that deployment's *existing* `JWT_SECRET` value before
+> restarting. That is the key the stored rows were actually encrypted under. It
+> also preserves outstanding unsubscribe links, which are signed with a key
+> derived from the same value. The RPM's `%post` does this for you; Docker and
+> hand-rolled deployments must do it explicitly.
 
 ### Transactional email
 

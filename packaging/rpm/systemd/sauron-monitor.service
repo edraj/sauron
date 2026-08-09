@@ -1,6 +1,22 @@
 [Unit]
 Description=Sauron uptime monitor
 Documentation=file:///usr/share/doc/sauron-server/SETUP.md
+# Requires= is what actually pulls the migrator into the transaction. `After=`
+# alone is PURE ORDERING — it only says "if both units are already being
+# started, run sauron-migrate first"; it never causes it to be started. For a
+# long time these units carried only the After= line below, so migrations
+# simply never ran on `dnf upgrade` and new binaries came up against an old
+# schema, scattering 500s. Do NOT "simplify" this back to After= on its own.
+#
+# Do not weaken it to Wants= either: with Wants=, a FAILED migration still lets
+# this daemon start against the stale schema, which is precisely the bug being
+# fixed. The trade is deliberate and documented in SETUP.md section 11 — if
+# sauron-migrate fails, this unit stays down until the DB is fixed and it is
+# started again.
+#
+# sauron-migrate has no RemainAfterExit, so it re-runs on every start/restart of
+# this unit; a no-op run was measured at ~30 ms.
+Requires=sauron-migrate.service
 After=network-online.target sauron-migrate.service
 Wants=network-online.target
 
@@ -10,9 +26,10 @@ User=sauron
 Group=sauron
 EnvironmentFile=/etc/sauron/sauron.env
 EnvironmentFile=-/etc/sauron/monitor.env
-# Monitor fires up/down alerts inline and derives the channel-secret key from
-# JWT_SECRET when NOTIFY_SECRET_KEY is unset, so it needs the same secret the
-# API uses — otherwise stored channel secrets will not decrypt.
+# Monitor fires up/down alerts inline, so it needs NOTIFY_SECRET_KEY, which
+# lives here and is REQUIRED — this unit refuses to start without it. It must be
+# byte-identical to the API's, or the channels the API wrote cannot be
+# decrypted.
 EnvironmentFile=/etc/sauron/secret.env
 ExecStart=/usr/bin/sauron-monitor
 Restart=on-failure

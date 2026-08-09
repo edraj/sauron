@@ -10,6 +10,13 @@
 - **`beforeSend` can no longer throw into your app.** A hook that raises is logged
   and the item is sent unmodified, rather than the exception escaping through the
   capture call. Returning `null` still drops the item as before.
+- **`Flush`/`FlushAsync` can no longer throw into your app either.** A failure while
+  building or delivering an envelope is logged (with `Debug = true`) instead of
+  propagating out of the flush. Nothing is treated as delivered unless it was: an
+  envelope whose send failed stays queued for the next flush. Concretely, this also
+  fixes `Flush()` after `Close()`, which raised `ObjectDisposedException`, and an
+  unserializable property value (e.g. a reference cycle), which raised `JsonException`
+  and took the rest of the flush with it.
 
 ## 1.2.0
 

@@ -169,8 +169,17 @@ class ViewCache {
    * Share one in-flight request per key. The promise is removed on settle
    * (including rejection) so a failure is immediately retryable rather than
    * every later caller inheriting the same rejected promise.
+   *
+   * `fresh: true` refuses to join an existing flight and starts its own.
+   * Required for anything that must observe state AFTER a mutation: a Refresh
+   * click, or a re-list following a delete. Joining a request that was issued
+   * BEFORE the write returns the pre-write snapshot, and `set` then caches it —
+   * so the deleted row reappears and stays for the whole fresh window. The
+   * shared entry is left alone rather than overwritten, so the earlier caller
+   * still gets the answer it was waiting for.
    */
-  async dedupe<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
+  async dedupe<T>(key: string, fetcher: () => Promise<T>, fresh = false): Promise<T> {
+    if (fresh) return fetcher();
     const running = this.inflight.get(key);
     if (running) return running as Promise<T>;
     const p = fetcher();
@@ -201,6 +210,15 @@ class ViewCache {
         this.entries.delete(key);
         dropped++;
       }
+    }
+    // In-flight requests matching the prefix are dropped too. They were issued
+    // BEFORE the mutation that prompted this call, so their responses describe
+    // the pre-mutation world; leaving them registered lets a later `dedupe`
+    // join one and re-cache exactly the stale data this call just removed.
+    // Only the bookkeeping is discarded — the promise still settles for whoever
+    // is already awaiting it.
+    for (const key of [...this.inflight.keys()]) {
+      if (key.startsWith(prefix)) this.inflight.delete(key);
     }
     return dropped;
   }

@@ -3,7 +3,7 @@
     "dsn": "https://pk_test@localhost:8081/1",
     "sdk": {
       "name": "sauron.flutter",
-      "version": "1.4.0"
+      "version": "1.6.0"
     },
     "sent_at": "2026-07-12T10:30:00.123Z",
     "release": "app@1.4.2+1402"
@@ -34,9 +34,31 @@
   },
   "items": [
     {
+      "type": "event",
+      "name": "viewed_pricing",
+      "distinct_id": "anon_fixture",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "properties": {
+        "plan": "pro"
+      },
+      "session_id": "sess_fixture",
+      "screen": null
+    },
+    {
+      "type": "event",
+      "name": "$screen",
+      "distinct_id": "anon_fixture",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "properties": {
+        "screen": "/checkout"
+      },
+      "session_id": "sess_fixture",
+      "screen": "/checkout"
+    },
+    {
       "type": "identify",
       "distinct_id": "u_123",
-      "anonymous_id": null,
+      "anonymous_id": "anon_fixture",
       "traits": {
         "plan": "pro"
       }

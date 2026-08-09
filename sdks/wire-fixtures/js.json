@@ -3,7 +3,7 @@
     "dsn": "https://pk_test@localhost:8081/1",
     "sdk": {
       "name": "sauron.javascript",
-      "version": "1.3.0"
+      "version": "1.4.0"
     },
     "sent_at": "2026-07-12T10:30:00.123Z",
     "release": "web@1.4.2"

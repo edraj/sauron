@@ -891,11 +891,11 @@ print(dsn.envelope_url)  # https://ingest.sauron.example:8443/api/7/envelope
 ### `SDK_NAME`, `SDK_VERSION`
 
 Module constants (`str`) reported in the envelope header's `sdk` block:
-`"sauron-python"` and `"1.3.0"`.
+`"sauron-python"` and `"1.4.0"`.
 
 ```python
 import sauron
-print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.3.0
+print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.4.0
 ```
 
 ## Scope & metadata

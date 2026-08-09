@@ -7,10 +7,13 @@
 //! results (or 404 for a name that was never seen) — no existing route's
 //! behaviour changes.
 //!
-//! Follows `screens.rs`'s template exactly: `authorized_read_scope` does
-//! authorization AND scope resolution in one call, sourcing `environment_id`
-//! from the raw query string rather than a `Query<T>`-deserialized field (see
+//! Follows `screens.rs`'s template: `authorized_read_scope` does authorization
+//! AND scope resolution in one call, sourcing `environment_id` from the raw
+//! query string rather than a `Query<T>`-deserialized field (see
 //! `routes::scope`'s module docs for why — the "extractor trap" this avoids).
+//! [`detail`] is the one exception, and uses the `_with_perms` variant: its
+//! `top_issues` is issue metadata rather than workflow signal, so it asks a
+//! second permission question. See that function's doc comment.
 
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
@@ -103,6 +106,12 @@ pub struct WorkflowDetailQuery {
 /// that to `ApiError::NotFound`, i.e. a 404, via `ApiError`'s
 /// `From<diesel::result::Error>` impl (see `error.rs`), not the 500 an
 /// unmapped diesel error would otherwise become.
+///
+/// `top_issues` is the one part of this response that is not workflow signal:
+/// `WorkflowIssue` carries an issue id and title, which `issue:read` — the
+/// coarse error gate — is what entitles a caller to. It comes back empty for a
+/// caller holding only `event:read`, the same carve-out `analytics::overview`
+/// makes for its own `top_issues`.
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -111,7 +120,7 @@ pub async fn detail(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<repo::WorkflowDetail>, ApiError> {
     let mut conn = db(&state).await?;
-    let scope = super::scope::authorized_read_scope(
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
         auth.user_id,
         app_id,
@@ -120,7 +129,13 @@ pub async fn detail(
     )
     .await?;
     let since_days = q.since_days.clamp(1, 365);
-    let detail = repo::workflow_detail(&mut conn, scope, &name, since_days).await?;
+    let mut detail = repo::workflow_detail(&mut conn, scope, &name, since_days).await?;
+    // Cleared rather than skipped: `workflow_detail` runs its four queries as
+    // one unit, so there is no query to omit here — unlike `overview`, where
+    // `top_issues` is a separate call.
+    if !perms.contains(perm::ISSUE_READ) {
+        detail.top_issues.clear();
+    }
     Ok(Json(detail))
 }
 

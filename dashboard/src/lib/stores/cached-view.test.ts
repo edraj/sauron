@@ -227,14 +227,86 @@ describe('failure handling', () => {
     expect(v.loading).toBe(false);
   });
 
-  it('a failed refresh KEEPS the data already on screen and sets no error', async () => {
-    // The rule that stops a network blip from blanking a populated table.
-    const v = new CachedView<string[]>();
+  // The two halves of "a failed refresh over good data". These were ONE test
+  // that passed `force = true` while asserting the background contract, so it
+  // asserted that an explicit Refresh fails silently — the exact bug reviewers
+  // then found on eight pages. Splitting them is what makes the distinction
+  // testable at all.
+
+  it('a failed BACKGROUND revalidate keeps the data and stays quiet', async () => {
+    // Nobody asked for this fetch. The screen is still truthful, so blanking a
+    // populated table or shouting about a blip would both be worse than silence.
+    // freshMs = 0 so the entry is never inside the fresh window and a
+    // non-forced load genuinely goes to the network.
+    const v = new CachedView<string[]>(0);
     await v.load('k', () => Promise.resolve(['good']));
-    await v.load('k', () => Promise.reject(new Error('boom')), true);
+    await v.load('k', () => Promise.reject(new Error('boom')));
     expect(v.data).toEqual(['good']);
     expect(v.error).toBeNull();
     expect(v.revalidating).toBe(false);
+    expect(v.loading).toBe(false);
+  });
+
+  it('a failed EXPLICIT refresh keeps the data but reports the failure', async () => {
+    // The user asked for current data and did not get it. Staying silent leaves
+    // stale rows presented as fresh with a spinner that merely stops, which
+    // reads as success.
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.resolve(['good']));
+    await v.load('k', () => Promise.reject(new Error('boom')), true);
+    expect(v.data, 'stale data is better than a blank table').toEqual(['good']);
+    expect(v.error).toBeTruthy();
+    expect(v.revalidating).toBe(false);
+    expect(v.loading).toBe(false);
+  });
+
+  it('a forced fetch refuses to join a flight that started before it', async () => {
+    // A re-list after a delete must not attach to a GET issued before the
+    // delete: that response describes the pre-delete world and `set` would
+    // cache it, putting the deleted row back for the whole fresh window.
+    const v1 = new CachedView<string[]>();
+    const v2 = new CachedView<string[]>();
+    let resolveFirst: (v: string[]) => void = () => {};
+    const first = new Promise<string[]>((r) => {
+      resolveFirst = r;
+    });
+    let secondCalls = 0;
+
+    const p1 = v1.load('k', () => first);
+    const p2 = v2.load(
+      'k',
+      () => {
+        secondCalls++;
+        return Promise.resolve(['after']);
+      },
+      true,
+    );
+    resolveFirst(['before']);
+    await Promise.all([p1, p2]);
+
+    expect(secondCalls, 'the forced fetch issued its own request').toBe(1);
+    expect(v2.data).toEqual(['after']);
+  });
+
+  it('idle() settles a page whose inputs do not exist yet', async () => {
+    // `loading` starts true and only a completed load clears it, so a page that
+    // renders before an app is picked would spin forever on a request never made.
+    const v = new CachedView<string[]>();
+    expect(v.loading).toBe(true);
+    v.idle();
+    expect(v.loading).toBe(false);
+    expect(v.data).toBeUndefined();
+    expect(v.error).toBeNull();
+  });
+
+  it('idle() abandons an in-flight load rather than letting it land', async () => {
+    const v = new CachedView<string[]>();
+    let resolve: (v: string[]) => void = () => {};
+    const p = v.load('k', () => new Promise<string[]>((r) => (resolve = r)));
+    v.idle();
+    resolve(['late']);
+    await p;
+    expect(v.data, 'a response for cleared inputs must not repopulate the page').toBeUndefined();
     expect(v.loading).toBe(false);
   });
 
@@ -356,5 +428,71 @@ describe('data is not deep-proxied', () => {
     await v.load('k', () => Promise.resolve(rows));
     expect(v.data).toBe(rows);
     expect(viewCache.get('k')).toBe(rows);
+  });
+});
+
+describe('errorStatus', () => {
+  /** An axios-shaped rejection as `normalizeError` would have produced it. */
+  const normalized = (status: number, message: string) => ({
+    status,
+    code: status === 403 ? 'forbidden' : 'http_error',
+    message,
+    isNetwork: false,
+  });
+
+  it('carries the HTTP status alongside the message', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(normalized(403, 'filtering by tag requires event:read')));
+    expect(v.error).toBe('filtering by tag requires event:read');
+    // The point of the field: a page can distinguish "permanent, stop offering
+    // Retry" from "transient" without matching on the prose.
+    expect(v.errorStatus).toBe(403);
+  });
+
+  it('reports null for a network failure rather than 0', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject({ status: 0, code: 'network_error', message: 'down', isNetwork: true }));
+    expect(v.error).toBe('down');
+    // `normalizeError` uses 0 as its "never reached the server" sentinel. Leaking
+    // that outward would make every consumer learn the sentinel; `errorStatus`
+    // means "the server answered with this" and nothing else.
+    expect(v.errorStatus).toBeNull();
+  });
+
+  it('reports null for a plain Error, which has no status at all', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(new Error('boom')));
+    expect(v.error).toBe('boom');
+    expect(v.errorStatus).toBeNull();
+  });
+
+  it('clears the status when a later load succeeds', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(normalized(403, 'nope')));
+    expect(v.errorStatus).toBe(403);
+    await v.load('k', async () => ['a'], true);
+    // Both halves of the fact must clear together. A stale 403 left behind here
+    // would keep a page rendering "this filter needs more access" over data that
+    // loaded fine.
+    expect(v.error).toBeNull();
+    expect(v.errorStatus).toBeNull();
+  });
+
+  it('is set on a failed EXPLICIT refresh over good data, next to the kept rows', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', async () => ['a']);
+    await v.load('k', () => Promise.reject(normalized(403, 'nope')), true);
+    expect(v.data).toEqual(['a']);
+    expect(v.errorStatus).toBe(403);
+  });
+
+  it('reset() and idle() clear it', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(normalized(403, 'nope')));
+    v.reset();
+    expect(v.errorStatus).toBeNull();
+    await v.load('k2', () => Promise.reject(normalized(403, 'nope')));
+    v.idle();
+    expect(v.errorStatus).toBeNull();
   });
 });

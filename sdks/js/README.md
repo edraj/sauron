@@ -822,7 +822,7 @@ const appFrames = frames.filter((f) => isInAppFrame(f.filename));
 
 ```ts
 const SDK_NAME: string  // 'sauron.javascript'
-const SDK_VERSION: string // '1.2.0'
+const SDK_VERSION: string // '1.4.0'
 ```
 
 The SDK identity embedded in `header.sdk` of every envelope.
@@ -946,7 +946,7 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.2.0';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.4.0';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42' });
 </script>
 ```

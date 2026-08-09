@@ -16,6 +16,53 @@ use crate::AppState;
 
 const KINDS: [&str; 2] = ["http", "tcp"];
 
+/// Serialize a monitor for API consumption: adds the derived flags that
+/// replace the credentials the model redacts.
+///
+/// `Monitor::webhook_url` is `skip_serializing` and `Monitor::config` is
+/// projected down to `sauron_db::models::PUBLIC_PROBE_CONFIG_KEYS` by the field
+/// serializer (see its doc for why the probe's `headers` and `body` are
+/// credentials and not settings). What a caller legitimately needs is the
+/// *existence* signal, not the value: `has_webhook` answers "is state-change
+/// notification wired up?", `probe_header_names` answers "which headers does
+/// this probe send?" and `has_probe_body` answers "does it POST a payload?" —
+/// none of them hands over a value. Header names are not secrets; their values,
+/// and the body they accompany, are.
+///
+/// These three are the reason the config projection can be an allowlist without
+/// the omission being invisible: a key that vanishes silently is a gap nobody
+/// investigates, so anything dropped for credential reasons gets a signal here.
+///
+/// Deliberately not a masked/partial value. For a Slack hook the host alone
+/// identifies the vendor and the path *is* the secret, and a partial reveal
+/// only invites "show a bit more" drift. Same shape as `channel_view`'s
+/// `has_secret` in `routes/notifications.rs`.
+fn monitor_view(m: &Monitor) -> Value {
+    let mut v = serde_json::to_value(m).unwrap_or_else(|_| json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("has_webhook".into(), json!(m.webhook_url.is_some()));
+        // Sorted so the field is stable across requests — JSON object order
+        // out of `serde_json` follows insertion, and an unstable list would
+        // make the dashboard's cache diff churn for no reason.
+        let mut names: Vec<&str> = m
+            .config
+            .get("headers")
+            .and_then(|h| h.as_object())
+            .map(|h| h.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        names.sort_unstable();
+        o.insert("probe_header_names".into(), json!(names));
+        // Existence only, and read from the ROW rather than from `v`: `config`
+        // in the serialized value has already had `body` removed, so deriving
+        // this from `v` would hard-code `false`.
+        o.insert(
+            "has_probe_body".into(),
+            json!(m.config.get("body").is_some()),
+        );
+    }
+    v
+}
+
 /// Error message for an interval outside the allowed preset set.
 fn invalid_interval_msg() -> String {
     let allowed = sauron_core::MONITOR_INTERVAL_PRESETS
@@ -75,7 +122,7 @@ pub async fn create(
     Path(project_id): Path<Uuid>,
     Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<CreateMonitorReq>,
-) -> Result<Json<Monitor>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     // Monitors have no environment dimension at all (see `RangeQuery`'s doc
     // comment above); rejected here too, matching `list`/`detail`/`checks`/
     // `incidents` in this same file rather than silently discarding it on
@@ -124,7 +171,7 @@ pub async fn create(
         created_by: Some(auth.user_id),
     };
     let m = repo::create_monitor(&mut conn, new).await?;
-    Ok(Json(m))
+    Ok(Json(monitor_view(&m)))
 }
 
 async fn load_authorized(
@@ -158,7 +205,7 @@ pub async fn detail(
     let uptime_30d = repo::uptime_pct(&mut conn, monitor_id, 24 * 30).await?;
     let incidents = repo::list_incidents(&mut conn, monitor_id, 20).await?;
     Ok(Json(json!({
-        "monitor": m,
+        "monitor": monitor_view(&m),
         "uptime": { "h24": uptime_24h, "d7": uptime_7d, "d30": uptime_30d },
         "incidents": incidents,
     })))
@@ -169,7 +216,38 @@ pub struct UpdateMonitorReq {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub interval_seconds: Option<i32>,
+    /// Three-state on purpose: absent = leave the stored URL alone, `null` =
+    /// clear it, a string = replace it. That is what lets an edit form work
+    /// without ever reading the current value back — which it cannot, since
+    /// the model never serializes it.
+    ///
+    /// `deserialize_with` is what makes the middle state reachable: see
+    /// `double_option`. `repo::update_monitor` has always implemented all
+    /// three (it splits the value across a `set_webhook` boolean and a
+    /// nullable bind precisely so `NULL` can mean "write NULL"), but the
+    /// request could only ever express two of them.
+    #[serde(default, deserialize_with = "double_option")]
     pub webhook_url: Option<Option<String>>,
+}
+
+/// Deserialize a field that must distinguish *absent* from *explicitly null*.
+///
+/// Serde collapses a JSON `null` into `None` for a plain `Option<T>`, so a
+/// bare `Option<Option<T>>` field cannot tell the two apart — every `null`
+/// arrives as the outer `None` and is read downstream as "leave it alone".
+/// A client asking to clear its webhook therefore got a 200 and no change.
+/// Deserializing the inner `Option` first and wrapping it in `Some`
+/// unconditionally keeps `null` distinct, and `#[serde(default)]` supplies
+/// the outer `None` for the genuinely-absent case.
+///
+/// This matters more since the URL stopped being serialized: a caller can no
+/// longer re-read the field to notice that its clear was ignored.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(de).map(Some)
 }
 
 pub async fn update(
@@ -178,7 +256,7 @@ pub async fn update(
     Path(monitor_id): Path<Uuid>,
     Query(env): Query<super::scope::RejectEnvQuery>,
     Json(req): Json<UpdateMonitorReq>,
-) -> Result<Json<Monitor>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if let Some(i) = req.interval_seconds {
         if !sauron_core::is_valid_monitor_interval(i) {
@@ -209,7 +287,7 @@ pub async fn update(
     )
     .await?
     .ok_or(ApiError::NotFound)?;
-    Ok(Json(m))
+    Ok(Json(monitor_view(&m)))
 }
 
 pub async fn delete(

@@ -26,6 +26,7 @@
     getIssueEventStats,
   } from '../lib/api/issues';
   import { errorMessage } from '../lib/api/client';
+  import { viewCache } from '../lib/stores/view-cache';
   import { toastStore } from '../lib/stores/toast.svelte';
   import {
     relativeTime,
@@ -140,6 +141,13 @@
       const updated = await updateIssueStatus(aid, current.id, next);
       current.status = updated.status;
       current.updated_at = updated.updated_at;
+      // The Issues list is cached (see lib/stores/view-cache.ts). Without this,
+      // resolving an issue here and navigating back shows it as unresolved for
+      // the rest of the fresh window, with no request in flight to correct it —
+      // the write looks like it silently failed. Prefix-wide on purpose: the
+      // same issue appears under every filter and scope combination.
+      viewCache.invalidate('issues.list');
+      viewCache.invalidate('issues.stats');
       toastStore.success(`Issue marked ${next}.`);
     } catch (err) {
       current.status = previous;

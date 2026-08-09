@@ -44,7 +44,7 @@ Or build a local package and consume it from a local feed:
 cd sdks/csharp
 dotnet pack Sauron/Sauron.csproj -c Release -o ./nupkg
 dotnet nuget add source "$(pwd)/nupkg" --name sauron-local
-dotnet add <your-project>.csproj package Sauron --version 1.2.0
+dotnet add <your-project>.csproj package Sauron --version 1.4.0
 ```
 
 Once published, the install command will be:
@@ -745,6 +745,12 @@ No parameters. Returns a `Task` that completes once the buffered items have been
 serialized into envelopes and the pending queue has been drained (or a transient
 failure has left envelopes queued for later). `SauronSdk.FlushAsync()` returns
 `Task.CompletedTask` before `Init`.
+
+**Never throws.** Delivery problems — network errors, an unserializable property
+value, even flushing after `Close` — are logged (with `Debug = true`) and the task
+completes successfully; telemetry must not fail the app it is observing. Nothing is
+treated as delivered unless it was: an envelope whose send failed stays queued and
+is retried on the next flush.
 
 ```csharp
 await SauronSdk.FlushAsync();

@@ -14,7 +14,13 @@
   import StatusBadge from '../lib/components/StatusBadge.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
-  import { ISSUE_FIELDS, encodeFilters, parseFilters, type Filter } from '../lib/components/filters/filters';
+  import {
+    ISSUE_FIELDS,
+    encodeFilters,
+    gatedFilterFields,
+    parseFilters,
+    type Filter,
+  } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -66,6 +72,32 @@
   const loading = $derived(issuesView.loading);
   const revalidating = $derived(issuesView.revalidating);
   const error = $derived(issuesView.error);
+
+  /**
+   * A 403 while a permission-gated filter is applied: the API refuses to answer
+   * a predicate over a column this role may not read.
+   *
+   * Retrying cannot fix it — the grant will not change between clicks — so the
+   * page offers to drop the chip instead. Requires BOTH conditions: a 403 with
+   * no gated filter applied is a genuine loss of access to the page, and
+   * suggesting "remove the filter" there would send the user chasing a chip that
+   * is not the cause.
+   */
+  const blockedFilterFields = $derived(
+    issuesView.errorStatus === 403 ? gatedFilterFields(filters) : [],
+  );
+
+  /** "Tag", or "Tag and Workflow" — the chip labels, not the wire keys. */
+  const blockedFilterLabels = $derived(
+    blockedFilterFields
+      .map((k) => ISSUE_FIELDS.find((f) => f.key === k)?.label ?? k)
+      .join(' and '),
+  );
+
+  function dropBlockedFilters() {
+    const blocked = new Set(blockedFilterFields);
+    filters = filters.filter((f) => !blocked.has(f.field));
+  }
 
   const stats = $derived(statsView.data ?? null);
   const loadingStats = $derived(statsView.loading);
@@ -209,15 +241,29 @@
     {#if loading}
       <div class="center"><Spinner size={24} /></div>
     {:else if error}
-      <EmptyState title="Couldn't load issues" description={error} icon="triangle-alert">
+      <EmptyState
+        title={blockedFilterFields.length > 0
+          ? 'This filter needs more access'
+          : "Couldn't load issues"}
+        description={error}
+        icon="triangle-alert"
+      >
         {#snippet action()}
-          <Button
-            variant="secondary"
-            onclick={() =>
-              sessionStore.currentAppId && load(sessionStore.currentAppId, appliedSearch, true)}
-          >
-            Retry
-          </Button>
+          {#if blockedFilterFields.length > 0}
+            <!-- Not a Retry: the grant will not change between clicks, so the
+                 only route back to a rendered page is dropping the chip. -->
+            <Button variant="secondary" onclick={dropBlockedFilters}>
+              Remove {blockedFilterLabels} filter{blockedFilterFields.length > 1 ? 's' : ''}
+            </Button>
+          {:else}
+            <Button
+              variant="secondary"
+              onclick={() =>
+                sessionStore.currentAppId && load(sessionStore.currentAppId, appliedSearch, true)}
+            >
+              Retry
+            </Button>
+          {/if}
         {/snippet}
       </EmptyState>
     {:else if issues.length === 0}

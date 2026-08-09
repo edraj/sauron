@@ -42,22 +42,42 @@ one** unit reads (`TIER_HOT_DAYS`, `INSPECTOR_POLICY_CACHE_SECS`,
 `INSPECTOR_TAIL_SWEEP_SECS`); moving one of those into a per-service file lets the
 services that still read the shared copy disagree with the one that does not.
 
-## 4. JWT secret
+## 4. Secrets
 
-`/etc/sauron/secret.env` is generated with a random `JWT_SECRET` on first install.
-Verify it exists:
+`/etc/sauron/secret.env` is generated on first install with a random
+`JWT_SECRET` **and** a random `NOTIFY_SECRET_KEY`. Verify both are present:
 
 ```bash
-sudo test -s /etc/sauron/secret.env && echo "JWT secret present"
+sudo grep -c '^JWT_SECRET=\|^NOTIFY_SECRET_KEY=' /etc/sauron/secret.env   # expect 2
 ```
 
-To rotate it (invalidates existing sessions):
+`sauron-api`, `sauron-monitor` and `sauron-alerts` all refuse to start without
+either one, and all three read this same file, so they cannot disagree.
+
+To rotate `JWT_SECRET` (invalidates existing sessions and nothing else):
 
 ```bash
-sudo sh -c 'umask 077; printf "JWT_SECRET=%s\n" "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n")" > /etc/sauron/secret.env'
+sudo sh -c 'umask 077; sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n")|" /etc/sauron/secret.env'
 sudo chgrp sauron /etc/sauron/secret.env && sudo chmod 0640 /etc/sauron/secret.env
 sudo systemctl restart sauron-api
 ```
+
+Note the `sed -i` — do **not** overwrite the file with `>`, which is what older
+versions of this document told you to do. That would take `NOTIFY_SECRET_KEY`
+with it.
+
+> **`NOTIFY_SECRET_KEY` cannot be rotated, and losing it is unrecoverable.**
+> It is the only key that decrypts `notification_channels.config_enc` and
+> `secret_enc` — the webhook URLs, request headers, SMTP passwords and bot
+> tokens of every configured channel. Back this file up. If the value is lost or
+> changed, the channels cannot be recovered by any means and must be deleted and
+> re-created in the dashboard.
+>
+> **Upgrading from a release before this key was required?** `%post` appends
+> `NOTIFY_SECRET_KEY` set to your existing `JWT_SECRET`, because that is what the
+> older build actually derived the cipher from. Do not "tidy" it to a fresh
+> random value — the services will start cleanly and then fail every delivery
+> with `secret decrypt failed`.
 
 `/etc/sauron/secret.env` is the file for **every** credential the services read
 from the environment, not just `JWT_SECRET`. If you enable transactional email,
@@ -79,6 +99,15 @@ section 6 for enabling it.
 
 ## 5. Run database migrations
 
+Migrations run **automatically**: every `sauron-*` daemon unit carries
+`Requires=sauron-migrate.service` + `After=sauron-migrate.service`, so starting
+any of them applies pending migrations first and refuses to start if that fails.
+`sauron-migrate` has no `RemainAfterExit`, so it re-runs on every daemon start; a
+no-op run costs ~30 ms (measured, 46 migrations already applied).
+
+You can still run it explicitly — useful on a fresh install to see the output
+before anything is serving:
+
 ```bash
 sudo systemctl start sauron-migrate
 journalctl -u sauron-migrate --no-pager | tail
@@ -86,16 +115,48 @@ journalctl -u sauron-migrate --no-pager | tail
 
 Expected: `migrations up to date`. Re-runnable safely (idempotent).
 
+`sauron-migrate` waits up to `MIGRATE_WAIT_SECS` (default **120**, set in
+`/etc/sauron/sauron.env`) for Postgres to accept connections before giving up.
+Only the *connect* is retried — a migration that fails on its own SQL fails
+immediately and loudly. The unit's `TimeoutStartSec=300` is the hard ceiling, so
+keep `MIGRATE_WAIT_SECS` below it.
+
+> **This couples daemon availability to the database.** A Postgres outage longer
+> than `MIGRATE_WAIT_SECS` fails the migrate start job, and a failed *start job*
+> is never retried by `Restart=on-failure` — the daemons stay down with
+> `NRestarts=0` even after Postgres comes back. Recovery is manual:
+> `sudo systemctl start sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier`
+> (plus `sauron-inspector` if enabled). That is the deliberate trade for never
+> running a new binary against an old schema. Size `MIGRATE_WAIT_SECS` to cover
+> your Postgres restart window.
+
 ## 6. Enable and start the services
 
 ```bash
-sudo systemctl enable --now sauron-api sauron-ingest sauron-monitor sauron-tier
+sudo systemctl enable --now sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier
 systemctl --no-pager status 'sauron-*'
 ```
 
 - `sauron-api` → `:8080` (dashboard API)
 - `sauron-ingest` → `:8081` (SDK ingest)
-- `sauron-monitor`, `sauron-tier` → no listener
+- `sauron-monitor`, `sauron-alerts`, `sauron-tier` → no listener
+- `sauron-inspector` → installed but **off**; see below
+
+**Do not omit `sauron-alerts`.** It is the sole owner of metric-rule evaluation
+(error spike/threshold, event threshold, latency) *and* of draining
+`notification_queue`. Without it those rules are creatable in the dashboard and
+simply never fire, and no per-user notification is ever delivered — silently, with
+nothing in the UI indicating a problem. Monitor up/down alerts fire inline from
+`sauron-monitor` and are the only ones that still work.
+
+The shipped vendor preset `/usr/lib/systemd/system-preset/50-sauron.preset`
+enables those same five daemons on **first install**, so on a new host the command
+above is belt-and-braces. Run it anyway on a host installed before the preset
+shipped — that is where the missing `sauron-alerts` lives.
+
+Each of these pulls `sauron-migrate` in first (section 5), so a first start on an
+unconfigured `DATABASE_URL` now fails with a dependency-job error after
+`MIGRATE_WAIT_SECS` instead of starting and serving 500s.
 
 ### Enabling transactional email (optional)
 
@@ -240,6 +301,9 @@ how often the Redis-side gauges are refreshed; `0` serves the counters alone.
 | Symptom | Check |
 |---|---|
 | Service fails immediately | `journalctl -u sauron-<svc> -e` — usually `DATABASE_URL` wrong/unreachable |
+| `A dependency job for sauron-<svc>.service failed` | The migration failed. `journalctl -u sauron-migrate -e`. Postgres unreachable within `MIGRATE_WAIT_SECS` (default 120) or a migration errored. Fix the DB, then start the daemons by hand — a failed *start job* is never auto-retried (section 5) |
+| `systemctl is-active sauron-migrate` says `inactive` | **Normal.** `Type=oneshot` with no `RemainAfterExit`; it is dead between runs. Use `systemctl is-failed sauron-migrate` instead |
+| Metric alert rules never fire / no notification emails | `sauron-alerts` not enabled. `systemctl enable --now sauron-alerts` (section 6). Only monitor up/down alerts work without it, and nothing in the UI flags the gap |
 | `DATABASE_URL is required` | `/etc/sauron/sauron.env` not set or unreadable by the `sauron` user |
 | API 401 / login broken | `secret.env` missing or changed since sessions issued — rotate & restart |
 | Dashboard shows wrong API URL | edit `/etc/sauron/dashboard.env`, re-run `sauron-dashboard-config`, reload nginx, hard-refresh |
@@ -249,19 +313,61 @@ how often the Redis-side gauges are refreshed; `0` serves the counters alone.
 
 ## 11. Upgrading
 
-**Run the migrator by hand after every upgrade.** `dnf upgrade` does not do it:
-`sauron-migrate.service` has no `[Install]` section and `%post` never starts it,
-so a new binary meets whatever schema was there before. The symptom is not a
-crash — it is scattered 500s, or a feature that silently does nothing.
+**Migrations now run automatically on upgrade.** Every `sauron-*` daemon unit
+carries `Requires=sauron-migrate.service` + `After=sauron-migrate.service`, and
+the RPM transaction restarts the daemons, so each restart pulls the migrator and
+waits for it. A daemon whose migration fails does **not** start — that is the
+point: an old schema under a new binary produces scattered 500s or a feature that
+silently does nothing, which is far worse than a unit that is honestly down.
+
+Older releases of this document told you to run the migrator by hand after every
+upgrade, because `sauron-migrate.service` has no `[Install]` section and `%post`
+never starts it. That is still true of the unit, but it no longer matters: the
+`Requires=` is what pulls it in.
+
+Confirm after `dnf upgrade`:
 
 ```bash
-sudo systemctl stop sauron-api sauron-ingest
-sudo systemctl start sauron-migrate
-sudo systemctl start sauron-api sauron-ingest
+systemctl is-active sauron-migrate                  # "inactive" is CORRECT — see below
+systemctl --no-pager status 'sauron-*'
+journalctl -u sauron-migrate --no-pager | tail
 ```
 
-Stop first: `sauron-api` and `sauron-ingest` must not be serving against a schema
-that is halfway through changing.
+`sauron-migrate` is `Type=oneshot` with no `RemainAfterExit`, so it is `inactive
+(dead)` between runs even on a healthy host. `failed` is the state that matters:
+if `systemctl is-failed sauron-migrate` says `failed`, no daemon will start until
+the database is fixed.
+
+### Manual fallback
+
+Still valid, and what to use when the daemons are down and you want the migration
+output on its own:
+
+```bash
+# Stop everything that touches the schema, migrate, then bring it all back.
+sudo systemctl stop sauron-api sauron-ingest sauron-tier sauron-alerts sauron-monitor sauron-inspector
+sudo systemctl start sauron-migrate
+journalctl -u sauron-migrate --no-pager | tail
+sudo systemctl start sauron-api sauron-ingest sauron-tier sauron-alerts sauron-monitor
+sudo systemctl start sauron-inspector      # only if you enabled it (section 6)
+```
+
+The stop list is **all six**, not just `sauron-api` and `sauron-ingest`. Every one
+of them holds its own pool and issues its own queries against the same schema, so
+any left running is a service reading a table mid-change:
+
+- `sauron-tier` runs DDL of its own (partition drops/creates) against the very
+  tables a migration may be altering.
+- `sauron-alerts` evaluates metric rules and drains `notification_queue`; a tick
+  failure is logged-and-swallowed by design, so breakage here is invisible.
+- `sauron-monitor` writes check rows continuously.
+- `sauron-inspector` reads the same partitions the ingest path writes — stop it
+  too if you turned it on; the command is harmless if the unit is not enabled.
+
+`systemctl stop sauron-migrate` is safe and is a no-op: because the oneshot is
+inactive between runs, the `Requires=` from the daemons has nothing to propagate a
+stop to. This only holds while the unit has **no** `RemainAfterExit=yes` — adding
+it would make that one command stop all six daemons.
 
 Then diff the shipped config against yours. `/etc/sauron/*.env` are
 `%config(noreplace)`, so a release that adds new settings leaves them in
@@ -285,6 +391,39 @@ ls /etc/sauron/*.rpmnew 2>/dev/null && diff -u /etc/sauron/api.env /etc/sauron/a
 | `2026-08-01-000041_pii_perms` | Custom roles holding `org:manage` never receive `pii:read`/`pii:manage`; the Owner and Admin presets keep working, so it looks like a role bug rather than a missed migration. |
 | `2026-08-01-000042_inspector_scan` | Every `/v1/inspector/*` route 500s. |
 | `2026-08-01-000043_inspector_mask_audit` | Worse: the ingest pipeline's `masked_keys_for_app` query fails on **every cache miss**, so forward masking is off deployment-wide with only a rate-limited log line. The enforcer fails stale rather than open, so ingest keeps flowing — which is exactly why nobody notices. |
+| `2026-08-08-000044_tier_policy_and_pins` | **All tiering stops.** `runtime_settings` is read by the first `?` in `sauron-tier`'s `cycle()`, so the cycle aborts before any export or any drop — one WARN per tick, hourly by default (`TIER_TICK_SECS`), and no error anywhere else. Cold Parquet stops being written and hot partitions stop being dropped, so the disk grows until it fills. The Storage page's policy card 500s. Operationally free to apply: two new tables (`runtime_settings`, `tier_pins`), no lock on any hot table, nothing seeded — a fresh install behaves exactly as before, since absence of a row means "use the `TIER_HOT_DAYS` env value". |
+| `2026-08-09-000045_cold_restore` | Cold-data restore from the dashboard is dead: the restore executor errors on every poll and the restore endpoints 500. Nothing else degrades. **Requires 000044** (`restore_jobs.pin_id` references `tier_pins`). Cheap to apply: `ADD COLUMN restored_pin_id UUID` with no `DEFAULT` on `error_events`, `analytics_events` and `transactions` is catalog-only on a partitioned parent — no rewrite, no table scan, no index build — plus one new `restore_jobs` table. Safe to run with ingest live. |
+| `2026-08-09-000046_channel_config_enc` | **SECURITY FIX — apply it.** Before this migration a notification channel's `config` sat in **cleartext** in Postgres, in every base backup and in every WAL archive. For the generic webhook kind that blob holds the target URL *and* an arbitrary `headers` map, so a developer's `Authorization: Bearer …` was on disk in the clear; for Slack/Discord the `webhook_url` in `config` **is** the credential. This adds `notification_channels.config_enc`, AES-256-GCM under `NOTIFY_SECRET_KEY`, the same cipher already protecting `secret_enc`. Skipping it: every notification-channel read **and** write 500s and no alert of any kind is delivered — alerting is dead, not degraded. Rotating the exposed webhook URLs and headers after upgrading is the honest follow-up; the migration hides the plaintext, it cannot un-leak it. The row conversion is **not** done by `sauron-migrate` (that binary has neither the cipher nor the key) — it runs in Rust at the first `sauron-api` boot, is idempotent, and aborts startup rather than half-converting. See the downgrade warning below. |
+
+### DOWNGRADE WARNING — this release is one-way for notification channels
+
+**Do not `dnf downgrade` past this release once `sauron-api` has booted on it.**
+
+The first `sauron-api` boot converts every notification channel: it writes the
+AES-256-GCM ciphertext to `config_enc` **and sets `config = '{}'` in the same
+update**. The read rule is "`config_enc` when non-NULL, else `config`", so a
+downgraded binary — which knows nothing about `config_enc` — reads the empty
+legacy column and finds no SMTP host, no Matrix room, no webhook URL and no
+headers. Deliveries do not error: they go **nowhere**, silently, for every
+channel. Nothing in the dashboard says so.
+
+`dnf downgrade` does **not** run `down.sql` — no scriptlet ever invokes a revert —
+so the column and the ciphertext survive the downgrade intact. Recovery is
+therefore to **roll forward**:
+
+```bash
+sudo dnf upgrade sauron-server            # back to the release that has config_enc
+sudo systemctl restart sauron-api
+```
+
+> **Never run `diesel migration revert` on `2026-08-09-000046_channel_config_enc`.
+> It is UNRECOVERABLE.** Its own `down.sql` says so in the first line: the revert
+> drops `config_enc`, and on any converted row that ciphertext is the *only* copy
+> of the destination — `config` is already `'{}'`. The migration cannot decrypt it
+> back, because `NOTIFY_SECRET_KEY` lives outside the database. After a revert
+> every notification channel must be re-created by hand. If the configurations
+> matter, decrypt and write `config` back with a build that still has the cipher
+> **before** reverting.
 
 After upgrading to the release that ships the PII inspector, **remove the
 `TIER_HOT_DAYS=` line from `/etc/sauron/tier.env` by hand.** That file is

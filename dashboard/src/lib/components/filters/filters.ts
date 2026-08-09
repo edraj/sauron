@@ -72,6 +72,32 @@ export const ISSUE_FIELDS: FieldDef[] = [
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
 ];
 
+/**
+ * Filter fields the API refuses outright without `event:read`, rather than
+ * quietly narrowing.
+ *
+ * Mirrors `reject_body_filters` in `backend/bins/sauron-api/src/routes/issues.rs`.
+ * Both entries are predicates over a column this caller may not read, so
+ * answering them at all would turn the filter into an oracle — the backend
+ * returns 403 with the reason instead.
+ *
+ * Needed on the client for one reason: that 403 is **permanent**, so a page
+ * showing the standard Retry button offers a recovery that cannot work. With
+ * this list a page can offer to drop the offending chip instead.
+ *
+ * `workflow` is listed even though `ISSUE_FIELDS` has no workflow chip and the
+ * FilterBar therefore cannot produce one — the filter is still reachable through
+ * a hand-written URL or a saved view, and a list that only covers what the UI
+ * happens to offer today is the kind that goes stale silently.
+ */
+export const PERMISSION_GATED_FILTER_FIELDS = ['tag', 'workflow'] as const;
+
+/** The gated fields present in `filters`, in the order they appear. */
+export function gatedFilterFields(filters: Filter[]): string[] {
+  const gated = new Set<string>(PERMISSION_GATED_FILTER_FIELDS);
+  return [...new Set(filters.filter((f) => gated.has(f.field)).map((f) => f.field))];
+}
+
 // `environment` used to live here as a chip whose options were injected at
 // runtime (loaded from the environments API). It's now scoped globally via
 // the topbar environment switcher instead — see `sessionStore.currentEnvId`

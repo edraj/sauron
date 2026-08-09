@@ -742,6 +742,88 @@ pub struct NewTransaction {
 // Monitors (uptime checks, keyed by project_id)
 // ---------------------------------------------------------------------------
 
+/// The `config` keys a monitor may expose over the API. Everything else is
+/// omitted.
+///
+/// This is an ALLOWLIST, and that is the whole point. It began as a denylist
+/// that stripped exactly `headers` and passed the rest of the object through,
+/// which makes every key added to `config` afterwards public by default — the
+/// same posture that made migration 000019 declare channel `config`
+/// "non-secret" and leak webhook URLs, and the reason
+/// `routes::notifications::redacted_config` is allowlisted per channel kind.
+/// `config` is free-form JSONB with no schema to constrain it, so "default
+/// open" here means the next credential-shaped key ships as a leak.
+///
+/// The list is derived from the only two real consumers, not from guesswork:
+///
+///  * `bins/sauron-monitor`'s `spec_of` is the sole reader of `config`. It
+///    takes `headers`, `body`, `expected_status`, `body_assertion` and
+///    `follow_redirects`, and nothing else — any other key in a stored row is
+///    already dead weight the prober ignores.
+///  * the dashboard reads **no** `config` key at all: `MonitorDetail.svelte`
+///    renders `probe_header_names` and the top-level columns, and there is no
+///    config editor anywhere (`UpdateMonitorReq` cannot even change `config`,
+///    so the field is write-once at create and has no read-back-to-edit use).
+///
+/// So of `spec_of`'s five, three are settings and two are request payload:
+///
+///  * `headers` — excluded, unchanged. `spec_of` copies every entry verbatim
+///    into the outbound probe request, so an `Authorization: Bearer …` here is
+///    a live credential.
+///  * `body` — now also excluded, which **revises** the earlier note that
+///    called it ordinary configuration. It is copied verbatim into the request
+///    for exactly the same reason `headers` is, so a monitor probing an
+///    authenticated endpoint carries the credential in it (`password=…`, an API
+///    key in a JSON body). `monitor:read` is held by the preset Viewer
+///    (`sauron-auth`'s `rbac::VIEWER`), nothing renders the value, and nothing
+///    can edit it — omitting it costs a consumer nothing and keeps a plausible
+///    credential server-side. Its existence signal is `has_probe_body`, derived
+///    in `monitor_view` (`routes/monitors.rs`) alongside `probe_header_names`.
+///
+/// A non-object `config` serializes as `{}` rather than passing through: the
+/// dashboard types the field as `Record<string, unknown>`, and a `null` or a
+/// scalar arriving there would be a type break for no gain.
+pub const PUBLIC_PROBE_CONFIG_KEYS: [&str; 3] =
+    ["expected_status", "body_assertion", "follow_redirects"];
+
+/// Serialize a monitor's `config` down to [`PUBLIC_PROBE_CONFIG_KEYS`].
+pub fn serialize_public_probe_config<S>(config: &Value, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // Builds a map of at most three borrowed-then-cloned values instead of
+    // cloning the whole object the way the strip-one-key version had to, so
+    // the allowlist is also the cheaper path for a config with many keys.
+    let mut out = serde_json::Map::with_capacity(PUBLIC_PROBE_CONFIG_KEYS.len());
+    if let Some(o) = config.as_object() {
+        for key in PUBLIC_PROBE_CONFIG_KEYS {
+            if let Some(v) = o.get(key) {
+                out.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(out).serialize(s)
+}
+
+/// A project's uptime check.
+///
+/// Some of these fields are credentials rather than settings, and all of them
+/// are redacted here at the serializer instead of in any one handler.
+/// `webhook_url` is a bearer-equivalent capability URL — a Slack/Discord/
+/// PagerDuty hook needs no other authentication, so possession is authority —
+/// and `config` is projected down to an allowlist because the probe request it
+/// describes carries the operator's own headers and body (see
+/// [`PUBLIC_PROBE_CONFIG_KEYS`] above). The route that returns
+/// this struct is gated on `monitor:read`, which the preset Viewer role holds
+/// (`sauron-auth`'s `rbac::VIEWER`), so a read-only member could otherwise
+/// read both off the wire. The model layer is the right cut for the same
+/// reason it is for `NotificationChannel::secret_enc` below: a strip in
+/// `detail` alone would leave `create`/`update` echoing the secret back and
+/// would silently re-leak from any future route returning a `Monitor`.
+///
+/// `bins/sauron-monitor` reads the columns straight from Postgres and never
+/// deserializes this struct, so redacting the API serializer costs the prober
+/// nothing.
 #[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize)]
 #[diesel(table_name = monitors)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -752,11 +834,13 @@ pub struct Monitor {
     pub kind: String,
     pub target: String,
     pub method: String,
+    #[serde(serialize_with = "serialize_public_probe_config")]
     pub config: serde_json::Value,
     pub interval_seconds: i32,
     pub timeout_ms: i32,
     pub failure_threshold: i32,
     pub recovery_threshold: i32,
+    #[serde(skip_serializing)]
     pub webhook_url: Option<String>,
     pub enabled: bool,
     pub status: String,
@@ -853,8 +937,20 @@ pub struct NewSymbolArtifact {
 // Alerting: notification channels, rules, deliveries
 // ---------------------------------------------------------------------------
 
-/// A configured delivery destination. `secret_enc` holds the AES-GCM ciphertext
-/// of the channel's secret bundle and is NEVER serialized to API clients.
+/// A configured delivery destination.
+///
+/// BOTH payload columns are ciphertext and NEITHER is serialized to API
+/// clients. `secret_enc` holds the credential bundle; `config_enc` holds the
+/// destination — and the destination is not "non-secret settings" as migration
+/// 000019 assumed: it is the webhook URL, its arbitrary header map (where an
+/// `Authorization: Bearer …` lives), and for Slack/Discord a URL that is itself
+/// the credential.
+///
+/// `config` is the DEPRECATED legacy plaintext. It is read only when
+/// `config_enc` is NULL (rows predating migration 000046) and is blanked to
+/// `{}` the first time the row is written. Reach the real value through
+/// `sauron_alerts::crypto::open_channel_config`, never this field — reading
+/// `config` directly is how a caller silently gets `{}` on a converted row.
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]
 #[diesel(table_name = notification_channels)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -863,7 +959,10 @@ pub struct NotificationChannel {
     pub org_id: Uuid,
     pub name: String,
     pub kind: String,
+    #[serde(skip_serializing)]
     pub config: Value,
+    #[serde(skip_serializing)]
+    pub config_enc: Option<Vec<u8>>,
     #[serde(skip_serializing)]
     pub secret_enc: Option<Vec<u8>>,
     pub enabled: bool,
@@ -872,13 +971,17 @@ pub struct NotificationChannel {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Insert shape for a channel. There is no `config` field on purpose: new rows
+/// only ever carry ciphertext, and the column's `DEFAULT '{}'::jsonb` supplies
+/// the blank legacy value. Omitting it makes "write plaintext" unspellable
+/// rather than merely discouraged.
 #[derive(Debug, Insertable)]
 #[diesel(table_name = notification_channels)]
 pub struct NewNotificationChannel<'a> {
     pub org_id: Uuid,
     pub name: &'a str,
     pub kind: &'a str,
-    pub config: &'a Value,
+    pub config_enc: Option<Vec<u8>>,
     pub secret_enc: Option<Vec<u8>>,
     pub created_by: Option<Uuid>,
 }
@@ -1430,7 +1533,10 @@ pub struct TierPin {
 /// a `running` row whose heartbeat has lapsed is re-claimable, and the re-claim
 /// deletes the job's own partial output (by `pin_id`) before re-inserting. That
 /// is what keeps a resumed restore from duplicating rows.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+/// `QueryableByName` as well as `Queryable`: the claim goes through
+/// `sql_query(... RETURNING *)`, which loads by column name rather than by
+/// position. Same reason `InspectorScan` carries both.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
 #[diesel(table_name = restore_jobs)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct RestoreJob {

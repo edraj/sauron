@@ -478,7 +478,16 @@ async fn deleting_a_pin_unprotects_immediately() {
         .await
         .unwrap());
 
-    assert_eq!(repo::delete_tier_pin(&mut c, pin.id).await.unwrap(), 1);
+    let released = repo::release_tier_pin(&mut c, pin.id).await.unwrap();
+    assert!(
+        released.is_some(),
+        "releasing an existing pin returns what it removed"
+    );
+    assert_eq!(
+        released.unwrap().rows_deleted,
+        0,
+        "no restored rows for this pin"
+    );
     assert!(!repo::is_range_pinned(&mut c, "error_events", start, end)
         .await
         .unwrap());
@@ -487,7 +496,7 @@ async fn deleting_a_pin_unprotects_immediately() {
 }
 
 #[tokio::test]
-async fn purge_removes_only_expired_pins() {
+async fn expiry_removes_only_lapsed_pins() {
     let Some(db) = TestDb::setup().await else {
         return;
     };
@@ -518,7 +527,8 @@ async fn purge_removes_only_expired_pins() {
     .await
     .unwrap();
 
-    assert_eq!(repo::purge_expired_tier_pins(&mut c).await.unwrap(), 1);
+    let expired = repo::expire_tier_pins(&mut c).await.unwrap();
+    assert_eq!(expired.len(), 1, "only the lapsed pin is expired");
     let left = repo::list_tier_pins(&mut c).await.unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].reason.as_deref(), Some("live"));

@@ -96,11 +96,12 @@ async fn deliver_batch(
     // same body whether verification succeeded or not, so the breakage is
     // completely silent. Change one, change the other.
     let unsub_key = {
-        let base = cfg.notify_secret_key.clone().unwrap_or_else(|| {
-            cfg.require_jwt_secret()
-                .map(String::from)
-                .unwrap_or_default()
-        });
+        // No fallback. `main` has already refused to start without
+        // NOTIFY_SECRET_KEY, so this cannot fail in practice — but an
+        // `unwrap_or_default()` here would silently sign with the empty key if
+        // it ever did, and every link minted under it would verify against
+        // nothing forever after.
+        let base = cfg.require_notify_secret_key()?;
         sauron_alerts::crypto::derive_unsub_key(base.as_bytes())
     };
     let today = sauron_alerts::crypto::days_since_epoch(Utc::now());

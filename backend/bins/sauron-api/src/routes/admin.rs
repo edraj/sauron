@@ -93,6 +93,35 @@ pub struct TierPinView {
     /// Precomputed so the client does not have to decide what "expired" means
     /// against its own clock, which can differ from the server's.
     pub expired: bool,
+    /// Within the warning window and not yet lapsed. The UI surfaces these so a
+    /// restore never simply disappears — the whole point of warn-before-expiry
+    /// is that the operator gets a chance to extend before the rows go.
+    pub expiring_soon: bool,
+    /// Whole hours until expiry, negative once lapsed. Server-computed for the
+    /// same clock-skew reason as `expired`.
+    pub expires_in_hours: i64,
+}
+
+/// Matches `PIN_WARN_DAYS` in `sauron-tier`, which does the log-side warning.
+/// Both are 7 to pair with the dashboard's 30-day default pin.
+pub const PIN_WARN_DAYS: i64 = 7;
+
+impl TierPinView {
+    fn from_pin(p: sauron_db::models::TierPin, now: chrono::DateTime<chrono::Utc>) -> Self {
+        let expired = p.expires_at <= now;
+        Self {
+            expiring_soon: !expired && p.expires_at <= now + chrono::Duration::days(PIN_WARN_DAYS),
+            expires_in_hours: (p.expires_at - now).num_hours(),
+            expired,
+            id: p.id,
+            table_name: p.table_name,
+            range_start: p.range_start,
+            range_end: p.range_end,
+            expires_at: p.expires_at,
+            created_at: p.created_at,
+            reason: p.reason,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -152,16 +181,7 @@ pub async fn get_tier_policy(
         ],
         pins: pins
             .into_iter()
-            .map(|p| TierPinView {
-                id: p.id,
-                table_name: p.table_name,
-                range_start: p.range_start,
-                range_end: p.range_end,
-                expires_at: p.expires_at,
-                created_at: p.created_at,
-                reason: p.reason,
-                expired: p.expires_at <= now,
-            })
+            .map(|p| TierPinView::from_pin(p, now))
             .collect(),
     }))
 }
@@ -209,4 +229,217 @@ pub async fn set_tier_policy(
     }
     drop(conn);
     get_tier_policy(auth, State(state)).await
+}
+
+// ===========================================================================
+// Cold-data restore
+// ===========================================================================
+
+/// Default life of a restore pin, and the ceiling an operator may ask for.
+/// A restore is temporary by design: the point is to look at old data for a
+/// while, not to opt a range out of tiering permanently.
+pub const RESTORE_DEFAULT_DAYS: i64 = 30;
+pub const RESTORE_MAX_DAYS: i64 = 365;
+/// Widest single restore. Not a storage limit — a blast-radius limit. Restoring
+/// a year of every app in one job is almost always a mistake, and the range is
+/// the one input where a typo is silent and expensive.
+pub const RESTORE_MAX_RANGE_DAYS: i64 = 400;
+
+#[derive(serde::Serialize)]
+pub struct RestoreJobView {
+    pub id: uuid::Uuid,
+    pub table_name: String,
+    pub app_id: Option<uuid::Uuid>,
+    pub range_start: chrono::DateTime<chrono::Utc>,
+    pub range_end: chrono::DateTime<chrono::Utc>,
+    pub status: String,
+    pub pin_id: Option<uuid::Uuid>,
+    pub pin_expires_at: chrono::DateTime<chrono::Utc>,
+    pub rows_estimated: i64,
+    pub rows_restored: i64,
+    pub attempts: i32,
+    pub error: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<sauron_db::models::RestoreJob> for RestoreJobView {
+    fn from(j: sauron_db::models::RestoreJob) -> Self {
+        Self {
+            id: j.id,
+            table_name: j.table_name,
+            app_id: j.app_id,
+            range_start: j.range_start,
+            range_end: j.range_end,
+            status: j.status,
+            pin_id: j.pin_id,
+            pin_expires_at: j.pin_expires_at,
+            rows_estimated: j.rows_estimated,
+            rows_restored: j.rows_restored,
+            attempts: j.attempts,
+            error: j.error,
+            created_at: j.created_at,
+            started_at: j.started_at,
+            finished_at: j.finished_at,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateRestore {
+    pub table_name: String,
+    /// `None` restores every app in the range.
+    pub app_id: Option<uuid::Uuid>,
+    pub range_start: chrono::DateTime<chrono::Utc>,
+    pub range_end: chrono::DateTime<chrono::Utc>,
+    pub expires_in_days: Option<i64>,
+}
+
+/// Queue a restore of cold data back into Postgres.
+///
+/// Returns immediately with a queued job; `sauron-tier` picks it up within
+/// `RESTORE_POLL_SECS` and the client polls `GET /v1/admin/restore/{id}`. The
+/// copy itself can take minutes on a wide range, which is far past any sensible
+/// request timeout.
+pub async fn create_restore(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<CreateRestore>,
+) -> Result<Json<RestoreJobView>, ApiError> {
+    require_deployment_admin(&state, &auth).await?;
+
+    if !repo::is_restorable_table(&body.table_name) {
+        return Err(ApiError::BadRequest(format!(
+            "table must be one of {}",
+            repo::RESTORABLE_TABLES.join(", ")
+        )));
+    }
+    if body.range_end <= body.range_start {
+        return Err(ApiError::BadRequest(
+            "range_end must be after range_start".to_string(),
+        ));
+    }
+    if (body.range_end - body.range_start) > chrono::Duration::days(RESTORE_MAX_RANGE_DAYS) {
+        return Err(ApiError::BadRequest(format!(
+            "range may not exceed {RESTORE_MAX_RANGE_DAYS} days"
+        )));
+    }
+    let days = body.expires_in_days.unwrap_or(RESTORE_DEFAULT_DAYS);
+    if !(1..=RESTORE_MAX_DAYS).contains(&days) {
+        return Err(ApiError::BadRequest(format!(
+            "expires_in_days must be between 1 and {RESTORE_MAX_DAYS}"
+        )));
+    }
+
+    let mut conn = crate::routes::db(&state).await?;
+    // Two overlapping restores would each insert the same Parquet rows under a
+    // different pin, and because a pin only ever deletes its OWN rows, the
+    // duplicates would outlive the first expiry. Refuse rather than deduplicate.
+    if let Some(existing) = repo::overlapping_active_restore(
+        &mut conn,
+        &body.table_name,
+        body.range_start,
+        body.range_end,
+    )
+    .await?
+    {
+        return Err(ApiError::Conflict(format!(
+            "restore {} already covers an overlapping range for {}",
+            existing.id, existing.table_name
+        )));
+    }
+
+    let job = repo::create_restore_job(
+        &mut conn,
+        &body.table_name,
+        body.app_id,
+        body.range_start,
+        body.range_end,
+        chrono::Utc::now() + chrono::Duration::days(days),
+        Some(auth.user_id),
+    )
+    .await?;
+    Ok(Json(job.into()))
+}
+
+pub async fn list_restores(
+    auth: AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<RestoreJobView>>, ApiError> {
+    require_deployment_admin(&state, &auth).await?;
+    let mut conn = crate::routes::db(&state).await?;
+    let jobs = repo::list_restore_jobs(&mut conn, 50).await?;
+    Ok(Json(jobs.into_iter().map(Into::into).collect()))
+}
+
+pub async fn get_restore(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+) -> Result<Json<RestoreJobView>, ApiError> {
+    require_deployment_admin(&state, &auth).await?;
+    let mut conn = crate::routes::db(&state).await?;
+    match repo::get_restore_job(&mut conn, id).await? {
+        Some(j) => Ok(Json(j.into())),
+        None => Err(ApiError::NotFound),
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct ReleasedPin {
+    pub id: uuid::Uuid,
+    pub table_name: String,
+    /// Rows removed from Postgres. They remain in Parquet — this frees hot
+    /// storage, it does not delete data.
+    pub rows_deleted: i64,
+}
+
+/// Release a pin now: delete the rows it restored and drop the pin.
+///
+/// Deliberately NOT a bare delete of the pin row. See `repo::release_tier_pin`.
+pub async fn release_pin(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+) -> Result<Json<ReleasedPin>, ApiError> {
+    require_deployment_admin(&state, &auth).await?;
+    let mut conn = crate::routes::db(&state).await?;
+    match repo::release_tier_pin(&mut conn, id).await? {
+        Some(e) => Ok(Json(ReleasedPin {
+            id: e.id,
+            table_name: e.table_name,
+            rows_deleted: e.rows_deleted,
+        })),
+        None => Err(ApiError::NotFound),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ExtendPin {
+    pub days: i64,
+}
+
+/// Push a pin's expiry out — the answer to an expiry warning when the
+/// investigation is not finished. Measured from now, not from the current
+/// expiry, so extending a nearly-lapsed pin and a fresh one give the same
+/// predictable result.
+pub async fn extend_pin(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+    Json(body): Json<ExtendPin>,
+) -> Result<Json<TierPinView>, ApiError> {
+    require_deployment_admin(&state, &auth).await?;
+    if !(1..=RESTORE_MAX_DAYS).contains(&body.days) {
+        return Err(ApiError::BadRequest(format!(
+            "days must be between 1 and {RESTORE_MAX_DAYS}"
+        )));
+    }
+    let mut conn = crate::routes::db(&state).await?;
+    let new_expiry = chrono::Utc::now() + chrono::Duration::days(body.days);
+    match repo::extend_tier_pin(&mut conn, id, new_expiry).await? {
+        Some(p) => Ok(Json(TierPinView::from_pin(p, chrono::Utc::now()))),
+        None => Err(ApiError::NotFound),
+    }
 }

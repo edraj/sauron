@@ -1,5 +1,62 @@
 # Changelog
 
+## 1.5.0
+
+*A minor bump, not a patch: 1.4.0 dropped every pre-login analytics event and
+1.5.0 counts them under an anonymous id. Without a version change the two builds
+are indistinguishable in `header.sdk.version`, and the one-time step in Active
+Users described below could not be attributed to an SDK upgrade after the fact.*
+
+- **Anonymous id — `track()` no longer requires `identify()` first.** When no
+  user has been identified, `distinct_id` is now a persisted `anon_<uuidv4>`
+  stored in `<app-support>/sauron/sauron_prefs.json` under `sauron.anon_id` —
+  the same format and key name the browser SDK uses in `localStorage`. This is
+  what lets an unidentified person be counted as a person: Active Users is a
+  distinct count over `distinct_id` per UTC day, and until now every Flutter
+  event before login was dropped, so those people were invisible rather than
+  anonymous.
+
+  **Every Flutter app's reported active-user count rises on the day this is
+  adopted.** That is the previously-dropped population arriving, not a
+  regression. It is a one-time step, not a trend.
+
+  The id is minted once and **adopted verbatim on every later launch** — never
+  re-minted, never reformatted, and an install upgrading from 1.4.0 keeps the
+  device id already in that prefs file untouched. An id that changes shape on
+  upgrade would read as a crowd of new users who never arrived.
+
+  The anonymous id is a durable first-party identifier stored on the user's
+  device. That is a retention and consent consequence, not just an
+  implementation detail — see the README.
+
+- **Added: `Sauron.reset()`. Call it on logout.** It clears the user and mints a
+  fresh anonymous id. Without it the next person to use the device inherits the
+  persisted id, and their first `identify()` aliases the previous person's
+  anonymous activity onto the new account, permanently, server-side. Unlike the
+  browser SDK, `setUser(null)` does *not* do this for you: persisting the new id
+  is asynchronous and `setUser` is not.
+
+- **Added: `Sauron.anonymousId`** — the current anonymous id, or `null` before
+  `init` completes.
+
+- **`identify()` now sends `anonymous_id`**, but only when the anonymous id was
+  actually used as a `distinct_id` first. A first-ever launch that identifies
+  immediately still sends `null`: the server writes a permanent alias row for
+  any non-empty value, and a speculative one mis-merges two people forever.
+
+- **Fixed: the prefs file no longer overwrites itself.** `sauron_prefs.json` was
+  rewritten wholesale by whichever store touched it last, so the second key
+  added to it would have silently deleted the first on the next launch — a
+  churning `device_id` splits the device dimension exactly the way a churning
+  anonymous id splits the user one. Writes now merge, and keys written by a
+  newer SDK version survive a downgrade.
+
+- **Behaviour change:** an analytics item is now dropped only when it is tracked
+  before `await Sauron.init(...)` has finished, which is the one remaining
+  window with no identity of either kind. The unconditional
+  `dropped analytics item … no distinct_id` warning stays, with wording that
+  points at init rather than at `identify`.
+
 ## 1.4.0 - 2026-07-30
 
 - **Workflows** — bound a named span of activity with start / end / cancel, and

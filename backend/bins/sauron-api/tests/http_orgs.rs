@@ -1,5 +1,10 @@
-//! HTTP-level tests for `DELETE /v1/orgs/{org_id}/roles/{role_id}` (Task 2 of
-//! the admin-view-and-role-management plan), driven through the real router.
+//! HTTP-level tests for the org administration surface — role deletion and
+//! grant creation — driven through the real router.
+//!
+//! The first group covers `DELETE /v1/orgs/{org_id}/roles/{role_id}` (Task 2 of
+//! the admin-view-and-role-management plan); the last three cover
+//! `POST /v1/orgs/{org_id}/grants`, whose cross-org refusal is documented at
+//! that handler.
 //!
 //! Before this endpoint, `role:manage` gated role *create* and *update* but
 //! nothing in the stack could ever remove one — custom roles were
@@ -46,6 +51,12 @@ use sauron_db::repo;
 /// Not a real secret — this process and the one it spawns are the only two
 /// parties that ever see it, and both live only for this test's duration.
 const JWT_SECRET: &str = "http-orgs-test-secret-00000000000000000000";
+
+/// Likewise. Required (not optional) since the notification-channel key was
+/// made fail-closed: `sauron-api` refuses to boot without it, so a harness
+/// that omits it dies at startup with a config error rather than anything to
+/// do with the routes under test.
+const NOTIFY_SECRET_KEY: &str = "http-orgs-test-notify-key-00000000000000";
 
 /// See `tests/http_env_scoping.rs`'s identical helper for the full reasoning.
 fn swap_database(url: &str, new_db: &str) -> String {
@@ -132,6 +143,7 @@ impl TestServer {
             .env("DATABASE_URL", &db_url)
             .env("REDIS_URL", &redis_url)
             .env("JWT_SECRET", JWT_SECRET)
+            .env("NOTIFY_SECRET_KEY", NOTIFY_SECRET_KEY)
             .env("API_PORT", port.to_string())
             .env("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
             // Paired with the per-server `X-Forwarded-For` below. Redis (and
@@ -238,6 +250,44 @@ impl TestServer {
         req.send()
             .await
             .unwrap_or_else(|e| panic!("POST {path} failed: {e}"))
+    }
+
+    /// POST `path` and return `(status, body)` — the same both-halves shape as
+    /// `delete_json`, for the grant and member-admin endpoints, where the
+    /// status says which guard fired and the body says why.
+    async fn post_status_json(&self, path: &str, token: &str, body: Value) -> (u16, Value) {
+        let resp = self.post_json(path, Some(token), body).await;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| panic!("POST {path}: failed to read body (status {status}): {e}"));
+        let body = serde_json::from_str(&text).unwrap_or_else(|e| {
+            panic!("POST {path}: expected a JSON body (status {status}): {e}\nbody: {text}")
+        });
+        (status, body)
+    }
+
+    /// PATCH `path` and return `(status, body)`. Only `set_member_active` uses
+    /// this verb, and only the wedge test below drives it.
+    async fn patch_status_json(&self, path: &str, token: &str, body: Value) -> (u16, Value) {
+        let resp = self
+            .client
+            .patch(format!("{}{path}", self.base))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("PATCH {path} failed: {e}"));
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| panic!("PATCH {path}: failed to read body (status {status}): {e}"));
+        let body = serde_json::from_str(&text).unwrap_or_else(|e| {
+            panic!("PATCH {path}: expected a JSON body (status {status}): {e}\nbody: {text}")
+        });
+        (status, body)
     }
 
     /// DELETE `path` and parse the body as JSON regardless of status. Every
@@ -382,6 +432,24 @@ async fn seed_sole_holder(
     role_id: Uuid,
     label: &str,
 ) -> (Uuid, String) {
+    let (email, user_id) = seed_member(server, org_id, role_id, label).await;
+    let access = server.login(&email, PASSWORD).await;
+    (user_id, access)
+}
+
+/// The half of `seed_sole_holder` that stops before logging in, returning
+/// `(email, user_id)`.
+///
+/// The cross-org grant tests below address their target by *email* — that is
+/// the only handle `POST /v1/orgs/{org}/grants` accepts, and reaching any
+/// account in the deployment by email alone is the thing under test — but they
+/// never need that account's token.
+async fn seed_member(
+    server: &TestServer,
+    org_id: Uuid,
+    role_id: Uuid,
+    label: &str,
+) -> (String, Uuid) {
     let mut conn = server.conn().await;
     let email = format!("{label}-{}@example.com", Uuid::new_v4().simple());
     let hash = sauron_auth::hash_password(PASSWORD).expect("hash password");
@@ -402,8 +470,17 @@ async fn seed_sole_holder(
     .expect("grant role");
     drop(conn);
 
-    let access = server.login(&email, PASSWORD).await;
-    (user.id, access)
+    (email, user.id)
+}
+
+/// The orgs `user_id` holds at least one grant in, as ids.
+async fn orgs_of(server: &TestServer, user_id: Uuid) -> Vec<Uuid> {
+    let mut conn = server.conn().await;
+    let orgs = repo::list_orgs_for_user(&mut conn, user_id)
+        .await
+        .expect("list orgs");
+    drop(conn);
+    orgs.into_iter().map(|o| o.id).collect()
 }
 
 #[tokio::test]
@@ -736,6 +813,282 @@ async fn a_caller_without_role_manage_cannot_delete() {
         )
         .await;
     assert_eq!(status, 200, "owner delete body: {body}");
+
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/orgs/{org_id}/grants — the cross-org attach refusal.
+//
+// `create_grant` resolves its target by a global email lookup and there is no
+// invitation step anywhere in the stack, so before the refusal this endpoint
+// let ONE open registration reach a named person inside another tenancy. The
+// payoff was not access — a planted Viewer grant grants the attacker nothing —
+// it was that `guard_member_admin_action` unwaivably refuses to deactivate,
+// force-logout or force-reset a member holding any grant outside the org, so
+// the plant permanently disabled all three incident-response verbs in the
+// victim's REAL org, with no route on either side to undo it.
+//
+// These three tests therefore have to be read as a set: the first pins that the
+// plant is refused, the second pins the consequence that made it worth
+// refusing, and the third pins that the refusal did not also break the ordinary
+// "give an existing member another role" flow the dashboard's Members page runs
+// on. Each has an in-test discriminator so a false pass from some unrelated 409
+// or 403 is visible.
+// ---------------------------------------------------------------------------
+
+/// The regression test for the whole finding.
+///
+/// A freshly registered stranger — Owner of nothing but their own brand-new org
+/// — must not be able to attach a member of someone else's org to it. Every
+/// other gate on the handler passes here by construction: the caller holds
+/// `member:manage` (they are Owner), the target exists and is active, `Viewer`
+/// is a system preset, and the scope is this org, so an Owner granting Viewer
+/// clears the escalation check. Only the target's home org differs.
+///
+/// The discriminator at the end is what makes that claim testable: the same
+/// caller, the same role, the same scope, aimed at somebody who IS already a
+/// member of the attacker's org, must still return 200.
+#[tokio::test]
+async fn a_stranger_org_cannot_attach_an_existing_member_of_another_org() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+
+    // The victim's real employer, and a member of it.
+    let (_home_email, _home_owner_id, home_org) = register_owner(&server, "planthome").await;
+    let viewer = preset_role_id(&server, "Viewer").await;
+    let (alice_email, alice_id) = seed_member(&server, home_org, viewer, "alice").await;
+
+    // The attacker. One open call to /v1/auth/register and they are Owner of a
+    // fresh org — this is the entire privilege the attack requires.
+    let (evil_email, _evil_owner_id, evil_org) = register_owner(&server, "plantevil").await;
+    let evil_access = server.login(&evil_email, PASSWORD).await;
+
+    let (status, body) = server
+        .post_status_json(
+            &format!("/v1/orgs/{evil_org}/grants"),
+            &evil_access,
+            json!({
+                "email": alice_email,
+                "role_id": viewer,
+                "scopes": [{ "scope_type": "org", "scope_id": evil_org }],
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "a stranger's org attached a member of another org by email alone: {body}"
+    );
+
+    // Refused, not merely reported as refused. The grant row is what wedges the
+    // victim's org, so its absence — not the status code — is the property that
+    // matters, and it is asserted against the database rather than the API.
+    let mut conn = server.conn().await;
+    let outside = repo::count_user_grants_outside_org(&mut conn, alice_id, home_org)
+        .await
+        .expect("count grants outside the home org");
+    drop(conn);
+    assert_eq!(
+        outside, 0,
+        "a grant was planted on the victim outside her own org despite the {status}"
+    );
+    assert_eq!(
+        orgs_of(&server, alice_id).await,
+        vec![home_org],
+        "the victim's org membership changed without her involvement"
+    );
+
+    // The discriminator: the refusal is about the target's home org, not about
+    // the caller, the role, or the scope. Same call, a target who already
+    // belongs here, 200.
+    let insider_role = seed_role(&server, evil_org, &[perm::MEMBER_READ]).await;
+    let (bob_email, _bob_id) = seed_member(&server, evil_org, insider_role, "bob").await;
+    let (status, body) = server
+        .post_status_json(
+            &format!("/v1/orgs/{evil_org}/grants"),
+            &evil_access,
+            json!({
+                "email": bob_email,
+                "role_id": viewer,
+                "scopes": [{ "scope_type": "org", "scope_id": evil_org }],
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "granting Viewer to an existing member of this org must still work — \
+         if this fails the 409 above proves nothing about cross-org targets: {body}"
+    );
+
+    server.shutdown().await;
+}
+
+/// The consequence the refusal exists to prevent, end to end.
+///
+/// Before the fix this test failed twice over: the plant returned 200, and all
+/// three of the victim's org's incident-response verbs then returned 409
+/// "this member belongs to another organization and cannot be administered from
+/// here" — permanently, since `delete_grant` authorises against the planted
+/// grant's own org and there is no leave-org route.
+///
+/// It is deliberately redundant with the test above rather than folded into it.
+/// The 409 on the plant is one implementation of the guarantee; this asserts the
+/// guarantee itself, so a future refactor that moves, weakens or routes around
+/// the check from some other direction still trips a test that names the damage.
+///
+/// `password-reset` is driven with `action: "cancel"`, the only branch that does
+/// not require SMTP (the test server has no relay configured) — it runs the same
+/// `guard_member_admin_action` stack, which is the thing under test. It is also
+/// ordered before the deactivation, because that handler refuses on an inactive
+/// account before it reaches the cancel branch.
+#[tokio::test]
+async fn planting_a_grant_cannot_wedge_the_home_orgs_admin_actions() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+
+    let (home_email, _home_owner_id, home_org) = register_owner(&server, "wedgehome").await;
+    let home_access = server.login(&home_email, PASSWORD).await;
+    let viewer = preset_role_id(&server, "Viewer").await;
+    let (alice_email, alice_id) = seed_member(&server, home_org, viewer, "alice").await;
+
+    let (evil_email, _evil_owner_id, evil_org) = register_owner(&server, "wedgeevil").await;
+    let evil_access = server.login(&evil_email, PASSWORD).await;
+    let (status, body) = server
+        .post_status_json(
+            &format!("/v1/orgs/{evil_org}/grants"),
+            &evil_access,
+            json!({
+                "email": alice_email,
+                "role_id": viewer,
+                "scopes": [{ "scope_type": "org", "scope_id": evil_org }],
+            }),
+        )
+        .await;
+    assert_ne!(
+        status, 200,
+        "the plant succeeded, so the wedge assertions below are the real test: {body}"
+    );
+
+    // Her own org can still respond to a compromise of her account.
+    let (status, body) = server
+        .post_status_json(
+            &format!("/v1/orgs/{home_org}/members/{alice_id}/revoke-sessions"),
+            &home_access,
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the victim's org can no longer force-logout its own member: {body}"
+    );
+
+    let (status, body) = server
+        .post_status_json(
+            &format!("/v1/orgs/{home_org}/members/{alice_id}/password-reset"),
+            &home_access,
+            json!({ "action": "cancel" }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the victim's org can no longer reach its own member's credentials: {body}"
+    );
+
+    let (status, body) = server
+        .patch_status_json(
+            &format!("/v1/orgs/{home_org}/members/{alice_id}"),
+            &home_access,
+            json!({ "is_active": false }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the victim's org can no longer deactivate its own member: {body}"
+    );
+
+    server.shutdown().await;
+}
+
+/// The flow the refusal must not break: the Members page adding a second role
+/// to somebody who already works here.
+///
+/// The refusal is scoped to *creating* cross-org state, so it has to be
+/// invisible to every same-org grant — including the second and third one for
+/// the same person, which is the shape `already_a_member` exists to let through.
+///
+/// The re-grant at the end pins a second fact worth having in writing: the
+/// unique key on `role_grants` produces an UPSERT, not a conflict
+/// (`repo::create_grants` is `ON CONFLICT … DO UPDATE`). That is why this
+/// finding needed no migration — "scope the constraint" was the wrong lever —
+/// and if somebody later scopes it anyway, this assertion is what tells them.
+#[tokio::test]
+async fn granting_a_user_who_is_already_a_member_of_this_org_still_works() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+
+    let (owner_email, _owner_id, org_id) = register_owner(&server, "samegrant").await;
+    let owner_access = server.login(&owner_email, PASSWORD).await;
+
+    let first_role = seed_role(&server, org_id, &[perm::MEMBER_READ]).await;
+    let (member_email, member_id) = seed_member(&server, org_id, first_role, "colleague").await;
+    let viewer = preset_role_id(&server, "Viewer").await;
+
+    let (status, body) = server
+        .post_status_json(
+            &format!("/v1/orgs/{org_id}/grants"),
+            &owner_access,
+            json!({
+                "email": member_email,
+                "role_id": viewer,
+                "scopes": [{ "scope_type": "org", "scope_id": org_id }],
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "same-org grant refused: {body}");
+    assert_eq!(
+        body["ids"].as_array().map(|a| a.len()),
+        Some(1),
+        "one scope in, one id out: {body}"
+    );
+
+    let mut conn = server.conn().await;
+    let grants = repo::user_grants_in_org(&mut conn, member_id, org_id)
+        .await
+        .expect("grants in org");
+    drop(conn);
+    assert_eq!(
+        grants.len(),
+        2,
+        "the new role should sit alongside the existing one: {grants:?}"
+    );
+
+    // Idempotent, not a conflict: the same role at the same scope again.
+    let (status, body) = server
+        .post_status_json(
+            &format!("/v1/orgs/{org_id}/grants"),
+            &owner_access,
+            json!({
+                "email": member_email,
+                "role_id": viewer,
+                "scopes": [{ "scope_type": "org", "scope_id": org_id }],
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "re-granting the same role must upsert: {body}");
+
+    let mut conn = server.conn().await;
+    let grants = repo::user_grants_in_org(&mut conn, member_id, org_id)
+        .await
+        .expect("grants in org");
+    drop(conn);
+    assert_eq!(
+        grants.len(),
+        2,
+        "the re-grant duplicated the row instead of upserting: {grants:?}"
+    );
 
     server.shutdown().await;
 }

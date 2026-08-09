@@ -85,8 +85,8 @@ void main() {
     final SauronClient client = await buildClient();
 
     // Deliberately BEFORE identify(): this is the shape that used to poison the
-    // whole envelope. After the guard it is dropped (see the next test), so the
-    // fixture proves the envelope stays parseable either way.
+    // whole envelope. It now ships under the anonymous id, so the fixture also
+    // pins that the backend accepts `anon_*` in a non-`Option` `distinct_id`.
     client.track('viewed_pricing', properties: <String, Object?>{'plan': 'pro'});
     client.setScreen('/checkout'); // SDK-emitted `$screen`
 
@@ -141,10 +141,19 @@ void main() {
 
   test('drops an analytics item with no distinct_id instead of poisoning the '
       'envelope', () async {
-    final SauronClient client = await buildClient();
+    // Deliberately NOT bootstrapped: since the anonymous id landed, this is the
+    // only remaining way to reach an analytics item with no identity of either
+    // kind (bootstrap always resolves one). The guard still has to hold here,
+    // because `distinct_id` is non-`Option` on the wire and one null takes the
+    // whole envelope down.
+    final SauronOptions options = SauronOptions()
+      ..dsn = 'https://pk_test@localhost:8081/1'
+      ..httpClient = httpClient
+      ..gzipThresholdBytes = 1 << 30
+      ..flushInterval = const Duration(hours: 1)
+      ..maxBatchItems = 1000;
+    final SauronClient client = SauronClient(options);
 
-    // No identify() anywhere: `scope.distinctId` is null, so every one of these
-    // would serialize `"distinct_id": null` against a non-`Option` `String`.
     client.track('viewed_pricing');
     client.setScreen('/pricing'); // SDK-emitted `$screen`
     final WorkflowResult started = client.startWorkflow('checkout');
@@ -152,8 +161,10 @@ void main() {
     client.endWorkflow('checkout');
     // An error item has no distinct_id on the wire at all, so it must still be
     // delivered — that is the whole point of dropping per item instead of
-    // failing the batch.
+    // failing the batch. Buffered until bootstrap gives it a transport.
     client.captureException(StateError('boom'));
+
+    await client.bootstrap(queueDirectory: dir);
     await Future<void>.delayed(const Duration(milliseconds: 100));
     await client.flush();
     await client.close();
@@ -177,5 +188,31 @@ void main() {
     expect(items.where((Map<String, Object?> i) => i['type'] == 'event'),
         isEmpty,
         reason: 'analytics items with no identity are dropped at construction');
+  });
+
+  test('an unidentified person is counted under the anonymous id, and '
+      'identify() aliases it', () async {
+    final SauronClient client = await buildClient();
+
+    client.track('viewed_pricing');
+    client.identify('u_123');
+    client.captureException(StateError('boom'));
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    await client.flush();
+    await client.close();
+
+    final List<Map<String, Object?>> items =
+        envelopes.expand(itemsOf).toList();
+    final Map<String, Object?> event = items
+        .firstWhere((Map<String, Object?> i) => i['type'] == 'event');
+    final Map<String, Object?> identify = items
+        .firstWhere((Map<String, Object?> i) => i['type'] == 'identify');
+
+    // The shape Active Users depends on: an unidentified person still produces
+    // one stable `distinct_id` per install, and the alias row that stitches it
+    // to the account is only written because that id was actually used.
+    expect(event['distinct_id'], startsWith('anon_'));
+    expect(identify['anonymous_id'], event['distinct_id']);
+    expect(identify['distinct_id'], 'u_123');
   });
 }

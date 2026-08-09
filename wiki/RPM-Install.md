@@ -20,7 +20,7 @@ and the source RPM in `~/rpmbuild/SRPMS/`. Install only the binary RPMs a given 
 | Artifact | ~Size | What it is |
 |---|---|---|
 | `sauron-*.rpm` | ~25 KB | **Base** — the shared `sauron` system user, `/var/lib/sauron` data dir, and `/etc/sauron/sauron.env`. Auto-pulled as a dependency of server & dashboard. |
-| `sauron-server-*.rpm` | ~31 MB | **Backend** — the `sauron-api` (:8080), `sauron-ingest` (:8081), `sauron-monitor`, `sauron-tier`, and `sauron-migrate` binaries + their systemd units. Large because DuckDB is compiled in statically (no external lib). |
+| `sauron-server-*.rpm` | ~31 MB | **Backend** — the `sauron-api` (:8080), `sauron-ingest` (:8081), `sauron-monitor`, `sauron-alerts`, `sauron-tier`, `sauron-inspector` and `sauron-migrate` binaries + their systemd units and the vendor preset. |
 | `sauron-dashboard-*.rpm` | ~130 KB | **Web UI** — the built Svelte SPA under `/usr/share/sauron/dashboard`, an nginx vhost, and the runtime-config generator. Requires `nginx`. |
 | `sauron-cli-*.rpm` | ~2.6 MB | **Tools** — the `crebain` load/benchmark generator and the `sauron-symcli` symbolication utility. Standalone, no dependencies. |
 | `sauron-*.src.rpm` | ~390 KB | **Source RPM** — bundles the spec + sources; rebuild on any Fedora/RHEL host with `rpmbuild --rebuild sauron-*.src.rpm`. |
@@ -71,11 +71,12 @@ sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm
 ### What gets installed
 
 ```
-/usr/bin/sauron-{api,ingest,monitor,tier,migrate,symcli}   /usr/bin/crebain
-/usr/lib/systemd/system/sauron-{api,ingest,monitor,tier,migrate}.service
-/etc/sauron/sauron.env          shared: DATABASE_URL, REDIS_URL, RUST_LOG
-/etc/sauron/{api,ingest,monitor,tier,dashboard}.env
-/etc/sauron/secret.env          JWT_SECRET, auto-generated on first install (0640 root:sauron)
+/usr/bin/sauron-{api,ingest,monitor,alerts,tier,inspector,migrate,symcli}   /usr/bin/crebain
+/usr/lib/systemd/system/sauron-{api,ingest,monitor,alerts,tier,inspector,migrate}.service
+/usr/lib/systemd/system-preset/50-sauron.preset   enables the five daemons on first install
+/etc/sauron/sauron.env          shared: DATABASE_URL, REDIS_URL, RUST_LOG, TIER_HOT_DAYS, MIGRATE_WAIT_SECS
+/etc/sauron/{api,ingest,monitor,alerts,tier,inspector,dashboard}.env
+/etc/sauron/secret.env          JWT_SECRET + NOTIFY_SECRET_KEY, auto-generated on first install (0640 root:sauron)
 /var/lib/sauron/  /var/lib/sauron/cold        owned by the sauron user
 /usr/share/sauron/dashboard/    static SPA
 /etc/nginx/conf.d/sauron-dashboard.conf
@@ -144,6 +145,14 @@ sudo systemctl restart sauron-api
 
 ## 7. Run database migrations
 
+Migrations run **automatically**. Every `sauron-*` daemon unit carries
+`Requires=sauron-migrate.service` + `After=sauron-migrate.service`, so starting or
+restarting any of them applies pending migrations first — and the daemon refuses
+to start if that fails. `sauron-migrate` is `Type=oneshot` with no
+`RemainAfterExit`, so it re-runs on every daemon start; a no-op run costs ~30 ms.
+
+Running it explicitly still works and is the way to see the output on its own:
+
 ```bash
 sudo systemctl start sauron-migrate
 journalctl -u sauron-migrate --no-pager | tail
@@ -151,16 +160,42 @@ journalctl -u sauron-migrate --no-pager | tail
 
 Expected: `migrations up to date`. Re-runnable safely (idempotent).
 
+`MIGRATE_WAIT_SECS` in `/etc/sauron/sauron.env` (default **120**) is how long the
+migrator waits for Postgres to accept connections before giving up. Only the
+connect is retried; a migration that fails on its own SQL fails immediately. The
+unit's `TimeoutStartSec=300` is the hard ceiling.
+
+> **Availability trade.** A Postgres outage longer than `MIGRATE_WAIT_SECS` fails
+> the migrate start job, and systemd never retries a failed *start job* — the
+> daemons stay down even after the database returns. Recovery is manual:
+> `sudo systemctl start sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier`.
+> This is deliberate: new binaries on an old schema are worse.
+
 ## 8. Enable and start the services
 
 ```bash
-sudo systemctl enable --now sauron-api sauron-ingest sauron-monitor sauron-tier
+sudo systemctl enable --now sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier
 systemctl --no-pager status 'sauron-*'
 ```
 
 - `sauron-api` → `:8080` (dashboard API)
 - `sauron-ingest` → `:8081` (SDK ingest)
-- `sauron-monitor`, `sauron-tier` → no listener
+- `sauron-monitor`, `sauron-alerts`, `sauron-tier` → no listener
+
+**`sauron-alerts` is not optional.** It is the sole owner of metric-rule
+evaluation (error spike/threshold, event threshold, latency) and of draining
+`notification_queue`. Leave it out and those rules stay creatable in the dashboard
+and never fire, and no per-user notification is ever delivered — silently, with
+nothing in the UI indicating a problem. Only `sauron-monitor`'s inline up/down
+alerts survive. Earlier revisions of this page omitted it from the command above;
+if you followed them, enable it now.
+
+The shipped vendor preset (`/usr/lib/systemd/system-preset/50-sauron.preset`)
+already enables those same five on **first install**, so the command above is
+belt-and-braces there; it is still what you run on a host installed before the
+preset shipped. `sauron-inspector` is deliberately `disable`d in the preset — the
+PII inspector is opt-in, see
+[SETUP.md](https://github.com/splimter/sauron/blob/main/packaging/rpm/SETUP.md).
 
 ## 9. Dashboard
 
@@ -212,6 +247,10 @@ address logged at startup.)
 | Symptom | Check |
 |---|---|
 | Service fails immediately | `journalctl -u sauron-<svc> -e` — usually `DATABASE_URL` wrong/unreachable |
+| `A dependency job for sauron-<svc>.service failed` | The migration failed. `journalctl -u sauron-migrate -e`. Either Postgres was unreachable within `MIGRATE_WAIT_SECS` (default 120) or a migration errored. Fix the DB, then start the daemons by hand — systemd never retries a failed *start job* |
+| `systemctl is-active sauron-migrate` says `inactive` | **Normal** — `Type=oneshot`, no `RemainAfterExit`, dead between runs. Use `systemctl is-failed sauron-migrate` |
+| Metric alert rules never fire / no notification emails | `sauron-alerts` not enabled: `sudo systemctl enable --now sauron-alerts` ([step 8](#8-enable-and-start-the-services)). Only monitor up/down alerts work without it, and nothing in the UI flags the gap |
+| Every notification-channel page 500s | Migration `2026-08-09-000046_channel_config_enc` not applied — `notification_channels.config_enc` does not exist. Alerting is dead, not degraded |
 | `DATABASE_URL is required` | `/etc/sauron/sauron.env` not set or unreadable by the `sauron` user |
 | API 401 / login broken | `secret.env` missing or changed since sessions issued — rotate & restart |
 | Dashboard shows wrong API URL | edit `/etc/sauron/dashboard.env`, re-run `sauron-dashboard-config`, reload nginx, hard-refresh |
@@ -229,11 +268,69 @@ sudo dnf remove sauron-server sauron-dashboard sauron-cli sauron
 
 Removal leaves `/var/lib/sauron` and the `sauron` user in place (standard practice); delete them manually if you want a clean slate.
 
-**An RPM upgrade does not run migrations.** `sauron-migrate.service` has no
-`[Install]` section and `%post` never starts it, so new binaries meet the old
-schema — the symptom is scattered 500s or a feature that silently does nothing,
-not a crash. Run it by hand after every upgrade (see
-[step 7](#7-run-database-migrations)).
+**An RPM upgrade now runs migrations automatically.** The transaction restarts the
+daemons, and each daemon carries `Requires=sauron-migrate.service` +
+`After=sauron-migrate.service`, so the migrator runs to completion before any of
+them starts. A daemon whose migration fails does not start — deliberately, because
+new binaries on an old schema produce scattered 500s or a feature that silently
+does nothing, which is worse than a unit that is honestly down.
+
+Earlier revisions of this page told you to run the migrator by hand after every
+upgrade. The unit still has no `[Install]` section and `%post` still never starts
+it, but the `Requires=` is what pulls it in, so that is no longer necessary.
+
+Check it afterwards:
+
+```bash
+systemctl is-failed sauron-migrate                  # "failed" is the state that matters
+systemctl --no-pager status 'sauron-*'
+journalctl -u sauron-migrate --no-pager | tail
+```
+
+`systemctl is-active sauron-migrate` reporting `inactive` is **correct** — the
+oneshot has no `RemainAfterExit`, so it is dead between runs even on a healthy
+host.
+
+Manual fallback, when you want the migration on its own with nothing serving:
+
+```bash
+sudo systemctl stop sauron-api sauron-ingest sauron-tier sauron-alerts sauron-monitor sauron-inspector
+sudo systemctl start sauron-migrate
+journalctl -u sauron-migrate --no-pager | tail
+sudo systemctl start sauron-api sauron-ingest sauron-tier sauron-alerts sauron-monitor
+sudo systemctl start sauron-inspector      # only if you enabled it
+```
+
+Stop **all six**, not just `api` and `ingest`: `sauron-tier` issues its own DDL
+against the same partitioned tables, `sauron-alerts` swallows its tick errors so
+breakage there is invisible, `sauron-monitor` writes check rows continuously, and
+`sauron-inspector` reads the partitions ingest writes. `systemctl stop
+sauron-migrate` is a harmless no-op — the oneshot is inactive between runs, so the
+daemons' `Requires=` has nothing to propagate a stop to.
+
+### DOWNGRADE WARNING — notification channels are one-way from this release
+
+**Do not `dnf downgrade` past this release once `sauron-api` has booted on it.**
+The first boot converts every notification channel: it writes AES-256-GCM
+ciphertext to the new `notification_channels.config_enc` **and sets `config = '{}'`
+in the same update**. A downgraded binary knows nothing about `config_enc`, reads
+the empty legacy column, and finds no SMTP host, no Matrix room, no webhook URL
+and no headers — so every delivery silently goes **nowhere**, for every channel,
+with no error and nothing in the dashboard.
+
+`dnf downgrade` does **not** run `down.sql` (no scriptlet ever invokes a revert),
+so the ciphertext survives intact. Recovery is to roll forward:
+
+```bash
+sudo dnf upgrade sauron-server
+sudo systemctl restart sauron-api
+```
+
+> **Never `diesel migration revert` `2026-08-09-000046_channel_config_enc` — it is
+> UNRECOVERABLE.** Its own `down.sql` opens by saying so. The revert drops
+> `config_enc`, and on a converted row that ciphertext is the only copy of the
+> destination; the migration cannot decrypt it back, because `NOTIFY_SECRET_KEY`
+> lives outside the database. Every channel would have to be re-created by hand.
 
 ### Remove the stale `WORKER_CONCURRENCY` after upgrading
 
@@ -263,10 +360,11 @@ the worker count interacts with `INGEST_BATCH_SIZE`, and raising it alone measur
 ### Upgrading to per-app environments
 
 This release moves the ingest key from the app to the environment — the migration
-drops `apps.public_key`. It is a **breaking schema change**: run `sudo -u sauron
-sauron-migrate` before starting the new binaries, and remember that an RPM upgrade
-does **not** run it for you (see [step 7](#7-run-database-migrations) above and
-the note in the Troubleshooting table).
+drops `apps.public_key`. It is a **breaking schema change**: the migration must
+complete before the new binaries serve. The daemons' `Requires=sauron-migrate`
+guarantees that on a normal restart (see [step 7](#7-run-database-migrations)), but
+for this release do the stop/migrate/start by hand in the order below so the drain
+check happens first.
 
 This is a **stop-the-world cutover, not a rolling upgrade** — once migrated, any
 still-running old binary 500s on every ingest request, because the column its auth
@@ -279,11 +377,11 @@ first, or every in-flight signal is lost.
 
 This sequence **replaces** the generic [Upgrade / uninstall](#upgrade--uninstall)
 recipe above for this release, and the ordering matters: that recipe runs `dnf
-upgrade` before stopping anything, which is backwards here. Packaging's `%postun`
-scriptlet (`%systemd_postun_with_restart`) restarts any of these units that is
-still active the moment the new binaries land, so upgrading before the drain
-check passes force-restarts `sauron-ingest` onto the new binary — mid-drain,
-against an un-migrated database. Stop first, install second:
+upgrade` before stopping anything, which is backwards here. Packaging's
+`%systemd_postun_with_restart` marks any of these units that is still active for
+restart, and the RPM transaction's file trigger restarts them the moment the new
+binaries land — so upgrading before the drain check passes force-restarts
+`sauron-ingest` onto the new binary mid-drain. Stop first, install second:
 
 ```bash
 # 1. Stop routing new traffic to this host (remove it from the load balancer, or
@@ -296,18 +394,21 @@ against an un-migrated database. Stop first, install second:
 #    XADD), so XLEN sits near that cap permanently and would never reach zero.
 redis-cli XINFO GROUPS sauron:ingest:stream   # repeat until pending=0 and lag=0
 
-# 2. Only once drained, stop the two units whose wire format/schema changed:
-sudo systemctl stop sauron-ingest sauron-api
+# 2. Only once drained, stop everything that touches the schema.
+sudo systemctl stop sauron-api sauron-ingest sauron-tier sauron-alerts sauron-monitor sauron-inspector
 
-# 3. Install the new RPMs. Both units are already stopped, so the package's
-#    postun try-restart is a no-op instead of racing the migration below.
+# 3. Install the new RPMs. Every unit is already stopped, so the package's
+#    marked-restart is a no-op instead of racing the migration below.
 sudo dnf upgrade ./sauron-*-*.rpm
 
-# 4. Migrate. RPM upgrades do NOT run this automatically.
-sudo -u sauron sauron-migrate
+# 4. Migrate. (Starting any daemon would also pull this in via Requires=, but
+#    running it alone here gives you the output before anything serves.)
+sudo systemctl start sauron-migrate
+journalctl -u sauron-migrate --no-pager | tail
 
 # 5. Start everything together, then re-admit traffic at the LB/firewall.
 sudo systemctl start sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier
+sudo systemctl start sauron-inspector      # only if you enabled it
 ```
 
 Two reasons the drain matters. `IngestJob` gained a required `environment_id`, so a

@@ -10,8 +10,9 @@
   import StatTile from '../lib/components/StatTile.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { getScreenDetail } from '../lib/api/screens';
-  import { errorMessage } from '../lib/api/client';
   import { compactNumber, formatDuration } from '../lib/utils/format';
   import type { ScreenDetail } from '../lib/models';
 
@@ -22,21 +23,31 @@
 
   const screenName = $derived(decodeURIComponent(params?.name ?? ''));
 
-  let detail = $state<ScreenDetail | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): a screen visited a moment ago
+  // paints instantly on return and refreshes behind the rendered page instead of
+  // blanking to a spinner. Re-exposed under the names the template already used,
+  // so the markup is unchanged.
+  //
+  // `revalidating` is deliberately not surfaced: this page has no RefreshButton
+  // to spin, and the payload is replaced in place when the refresh lands.
+  const view = new CachedView<ScreenDetail>();
 
-  async function load(appId: string, name: string) {
-    loading = true;
-    error = null;
-    try {
-      detail = await getScreenDetail(appId, name);
-    } catch (err) {
-      error = errorMessage(err);
-      detail = null;
-    } finally {
-      loading = false;
-    }
+  const detail = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
+
+  // `scopeKey` belongs in the key: it carries the selected environment, which the
+  // axios interceptor adds to the request but which appears in none of these
+  // arguments. Omit it and one environment's screen would be served as another's.
+  //
+  // `force` bypasses the fresh-window short-circuit, for a call site that means
+  // "go to the network now".
+  async function load(appId: string, name: string, force = false) {
+    await view.load(
+      viewKey('screens.detail', appId, sessionStore.scopeKey, name),
+      () => getScreenDetail(appId, name),
+      force,
+    );
   }
 
   $effect(() => {

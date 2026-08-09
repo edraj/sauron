@@ -457,6 +457,7 @@ diesel::table! {
         name -> Text,
         kind -> Text,
         config -> Jsonb,
+        config_enc -> Nullable<Bytea>,
         secret_enc -> Nullable<Bytea>,
         enabled -> Bool,
         created_by -> Nullable<Uuid>,

@@ -132,6 +132,19 @@ async fn main() -> anyhow::Result<()> {
     // the schema is ahead of or behind this binary.
     let event_users_identified = {
         let mut conn = sauron_db::conn(&pool).await?;
+        // FIRST, before anything else touches a table: does this binary's
+        // embedded migration set match what the database has applied? An
+        // upgrade that skipped `sauron-migrate` otherwise surfaces as a 500 per
+        // request forever, under a boot log that says everything is fine. One
+        // query; refuses to boot when the database is behind (see
+        // `sauron_db::require_current_schema` for why refusing beats degrading,
+        // and for the `SAURON_ALLOW_SCHEMA_DRIFT` escape hatch).
+        //
+        // Ordered ahead of `ensure_preset_roles` on purpose: that call is
+        // itself a schema-dependent write, so on a drifting database it would
+        // otherwise fail first and report a diesel column error instead of the
+        // remedy.
+        sauron_db::require_current_schema(&mut conn, "sauron-api").await?;
         sauron_auth::ensure_preset_roles(&mut conn).await?;
         let present = sauron_db::repo::probe_event_users_identified(&mut conn)
             .await
@@ -154,19 +167,21 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(|o| o.parse().ok())
         .collect();
 
-    // Channel-secret cipher: prefer the dedicated key, fall back to JWT_SECRET.
-    let notify_key = match &cfg.notify_secret_key {
-        Some(k) => k.clone(),
-        None => {
-            tracing::warn!(
-                "NOTIFY_SECRET_KEY not set; deriving channel-secret key from JWT_SECRET \
-                 (rotating JWT_SECRET will invalidate stored channel secrets)"
-            );
-            cfg.require_jwt_secret()?.to_string()
-        }
-    };
+    // The channel cipher. Fail-closed, with no JWT_SECRET fallback: this key
+    // decrypts both halves of every notification channel, and deriving it from
+    // a value operators are told to rotate turned a routine rotation into
+    // silent, total loss of every stored credential.
+    let notify_cipher = sauron_alerts::SecretCipher::new(cfg.require_notify_secret_key()?);
+
+    // Migration 000046 moved `config` behind the cipher; the row conversion
+    // cannot run in SQL (no pgcrypto, and the key lives in the environment) and
+    // must not run in `sauron-migrate` (no cipher there, and RPM upgrades never
+    // re-run it). It happens here, once, idempotently — and a failure takes the
+    // boot with it rather than leaving the table half-converted.
+    sauron_alerts::crypto::seal_legacy_channel_configs(&pool, &notify_cipher).await?;
+
     let alerts = sauron_alerts::AlertEngine::new(
-        sauron_alerts::SecretCipher::new(&notify_key),
+        notify_cipher,
         cfg.alerts_allow_private,
         cfg.alerts_deliver_timeout_ms,
     );
@@ -560,6 +575,30 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/overview",
             get(routes::analytics::overview),
         )
+        // The same data as `/overview`, addressable one section at a time, so the
+        // dashboard can render each card as its own answer lands instead of
+        // waiting on the sum of five sequential aggregates. `/overview` stays for
+        // callers that want one round trip.
+        .route(
+            "/v1/apps/{app_id}/analytics/active-users",
+            get(routes::analytics::active_users_series),
+        )
+        .route(
+            "/v1/apps/{app_id}/overview/totals",
+            get(routes::analytics::overview_totals),
+        )
+        .route(
+            "/v1/apps/{app_id}/overview/series",
+            get(routes::analytics::overview_series),
+        )
+        .route(
+            "/v1/apps/{app_id}/overview/top-issues",
+            get(routes::analytics::overview_top_issues),
+        )
+        .route(
+            "/v1/apps/{app_id}/overview/top-events",
+            get(routes::analytics::overview_top_events),
+        )
         .route(
             "/v1/apps/{app_id}/users/summary",
             get(routes::analytics::users_summary),
@@ -781,6 +820,19 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/tier-policy",
             get(routes::admin::get_tier_policy).put(routes::admin::set_tier_policy),
+        )
+        .route(
+            "/v1/admin/restore",
+            get(routes::admin::list_restores).post(routes::admin::create_restore),
+        )
+        .route("/v1/admin/restore/{id}", get(routes::admin::get_restore))
+        .route(
+            "/v1/admin/tier-pins/{id}",
+            axum::routing::delete(routes::admin::release_pin),
+        )
+        .route(
+            "/v1/admin/tier-pins/{id}/extend",
+            post(routes::admin::extend_pin),
         )
         // A JSON API body never legitimately reaches megabytes; the artifact
         // routes below are merged separately with their own raised limit.

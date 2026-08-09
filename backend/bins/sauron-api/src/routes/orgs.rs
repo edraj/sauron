@@ -471,6 +471,48 @@ pub async fn create_grant(
         ));
     }
 
+    // The same rule as the one above, generalised from deactivated accounts to
+    // every account: this endpoint never leaves anyone belonging to two orgs.
+    //
+    // A grant is how you join an org, and the lookup above is by email with no
+    // org filter, so this handler reaches every account in the deployment.
+    // There is no invitation or consent step anywhere in the stack, and
+    // `/v1/auth/register` is open — so without this check any stranger can
+    // register, become Owner of their own fresh org, and unilaterally attach a
+    // named person in someone else's tenancy to it.
+    //
+    // The damage is not that the stranger gains anything; it is what the victim
+    // loses. `guard_member_admin_action` refuses to deactivate, force-logout or
+    // force-reset any member holding a grant outside the org — deliberately and
+    // unwaivably, because `member:manage` is org-scoped while an account is
+    // global. A planted grant therefore disables all three incident-response
+    // verbs for that person *in their real org*, and neither side can undo it:
+    // `delete_grant` authorises against the grant's own org, so the victim's
+    // admins get 403 and the victim (a Viewer there) has no standing either.
+    // Turning that blast-radius guard into a stranger's lever is the whole
+    // attack, and it costs zero privilege to mount.
+    //
+    // Scoped to *creating* the cross-org state, not to multi-org membership as
+    // such: adding another scope to someone already a member here is untouched,
+    // and an account holding no grants at all can still be attached. What it
+    // does cost is that a genuinely multi-org human — a consultant, or the
+    // deployment admin who holds `org:manage` in every org — can no longer be
+    // added by the org that wants them; they must create the org themselves via
+    // `POST /v1/orgs`, which self-grants Owner. The correct answer is an
+    // invitation the target accepts, which is a feature and a migration, not a
+    // guard, and this is the stopgap that makes the deployment safe meanwhile.
+    let already_a_member = !repo::user_grants_in_org(&mut conn, user.id, org_id)
+        .await?
+        .is_empty();
+    if !already_a_member
+        && repo::count_user_grants_outside_org(&mut conn, user.id, org_id).await? > 0
+    {
+        return Err(ApiError::Conflict(
+            "that account already belongs to another organization and cannot be added from here"
+                .into(),
+        ));
+    }
+
     // One role for the whole batch, so it is loaded and checked once: it must
     // be a preset or belong to this org.
     let role = repo::get_role(&mut conn, req.role_id)
@@ -791,6 +833,13 @@ async fn guard_member_admin_action(
     // member:manage is org-scoped; the account is global. An org-A admin acting
     // on a member who is also an org-B Owner is reaching outside their blast
     // radius, and no caller of this helper has a reason to.
+    //
+    // Because the refusal is unwaivable, whoever can *create* the multi-org
+    // state decides who gets locked out of it, which is why `create_grant`
+    // refuses to attach an account that already belongs elsewhere. The state is
+    // still reachable — self-created orgs (`POST /v1/orgs` self-grants Owner),
+    // rows predating that check, direct database writes — so this stays a real
+    // guard rather than dead code, but no stranger can arrange it any more.
     if repo::count_user_grants_outside_org(conn, target_user_id, org_id).await? > 0 {
         return Err(ApiError::Conflict(
             "this member belongs to another organization and cannot be administered from here"

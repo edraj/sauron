@@ -15,8 +15,10 @@ use sauron_core::Config;
 use sauron_db::{conn, repo, PgPool};
 use sauron_tier::duck::DuckEngine;
 use sauron_tier::{
-    bucket_bounds, cold_copy_dir, partition_suffix, Granularity, TieredTable, TIERED_TABLES,
+    bucket_bounds, cold_copy_dir, cold_partition_glob, partition_suffix, Granularity, TieredTable,
+    TIERED_TABLES,
 };
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,12 +28,32 @@ async fn main() -> anyhow::Result<()> {
     let gran = Granularity::from_str_or(&cfg.tier_granularity, Granularity::Day);
     info!(hot_days = cfg.tier_hot_days, granularity = ?gran, "sauron-tier started");
 
-    loop {
-        if let Err(e) = cycle(&pool, &cfg, gran).await {
-            warn!(error = %e, "tier cycle failed; backing off");
+    // Two independent loops, not one. Tiering runs hourly by default; a restore
+    // is a human waiting on a button and needs a seconds-scale poll. Folding the
+    // restore check into the tier cycle would make "restore" mean "some time in
+    // the next hour", which is not a feature anyone would use.
+    let restore = {
+        let pool = pool.clone();
+        let cfg = cfg.clone();
+        tokio::spawn(async move { restore_loop(pool, cfg).await })
+    };
+
+    let tiering = tokio::spawn(async move {
+        loop {
+            if let Err(e) = cycle(&pool, &cfg, gran).await {
+                warn!(error = %e, "tier cycle failed; backing off");
+            }
+            tokio::time::sleep(Duration::from_secs(cfg.tier_tick_secs)).await;
         }
-        tokio::time::sleep(Duration::from_secs(cfg.tier_tick_secs)).await;
+    });
+
+    // Neither loop returns. If either task dies the process should too, rather
+    // than silently continuing with half its job undone.
+    tokio::select! {
+        r = restore => warn!(?r, "restore loop exited"),
+        r = tiering => warn!(?r, "tiering loop exited"),
     }
+    Ok(())
 }
 
 async fn cycle(pool: &PgPool, cfg: &Config, gran: Granularity) -> anyhow::Result<()> {
@@ -46,10 +68,45 @@ async fn cycle(pool: &PgPool, cfg: &Config, gran: Granularity) -> anyhow::Result
     // `error_events` at 30 days and `analytics_events` at 7 in the same pass.
     let mut c = conn(pool).await?;
     let hot_days = repo::effective_tier_hot_days(&mut c, cfg.tier_hot_days).await?;
-    // Housekeeping: expired pins are already ignored by `is_range_pinned`, so this
-    // only reclaims rows.
-    if let Err(e) = repo::purge_expired_tier_pins(&mut c).await {
-        warn!(error = %e, "purging expired tier pins failed");
+
+    // Warn BEFORE the data goes, not after. A restore that simply vanishes is
+    // the same silent-disappearance failure the pin exists to prevent, just
+    // deferred to the expiry date — so the operator gets a window in which the
+    // pin is visibly about to lapse and can be extended.
+    match repo::pins_expiring_before(&mut c, Utc::now() + chrono::Duration::days(PIN_WARN_DAYS))
+        .await
+    {
+        Ok(soon) => {
+            for pin in soon {
+                warn!(
+                    pin = %pin.id,
+                    table = %pin.table_name,
+                    expires_at = %pin.expires_at,
+                    range_start = %pin.range_start,
+                    range_end = %pin.range_end,
+                    "restored data expires soon; it will be deleted from Postgres (the Parquet copy is untouched)"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "checking for expiring pins failed"),
+    }
+
+    // Expiry DELETES the restored rows, then the pin, as one statement each.
+    // This is not housekeeping: restored rows live in `<table>_default`, which
+    // the drop step never touches, so failing to delete them here would leak
+    // storage AND double-count every chart against the Parquet copy.
+    match repo::expire_tier_pins(&mut c).await {
+        Ok(expired) => {
+            for e in expired {
+                info!(
+                    pin = %e.id,
+                    table = %e.table_name,
+                    rows = e.rows_deleted,
+                    "pin expired; removed restored rows (still durable in Parquet)"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "expiring tier pins failed"),
     }
     drop(c);
     if hot_days != cfg.tier_hot_days {
@@ -212,6 +269,171 @@ async fn tier_table(
         }
     }
     Ok(())
+}
+
+// ===========================================================================
+// Restore executor (Parquet -> Postgres)
+// ===========================================================================
+
+/// How far ahead of expiry a pin starts warning. Paired with the 30-day default
+/// pin the dashboard offers, this gives a week's notice.
+const PIN_WARN_DAYS: i64 = 7;
+
+/// Claims past which a job is declared poison and failed. A restore that has
+/// crashed three times will crash a fourth; looping forever would keep
+/// re-deleting and re-inserting the same rows.
+const RESTORE_MAX_ATTEMPTS: i32 = 3;
+
+async fn restore_loop(pool: PgPool, cfg: Config) {
+    // Distinct per process. The claim's "this worker's own running job" arm
+    // keys on it, so two workers sharing an id would each think the other's job
+    // was theirs to resume.
+    let worker_id = format!("sauron-tier-{}-{}", std::process::id(), Uuid::new_v4());
+    info!(worker = %worker_id, poll_secs = cfg.restore_poll_secs, "restore executor started");
+    loop {
+        match run_one_restore(&pool, &cfg, &worker_id).await {
+            // Did work — look again immediately rather than sleeping, so a
+            // queue of restores drains back to back.
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "restore job failed"),
+        }
+        tokio::time::sleep(Duration::from_secs(cfg.restore_poll_secs)).await;
+    }
+}
+
+/// Claim and run at most one restore. Returns whether a job was claimed.
+async fn run_one_restore(pool: &PgPool, cfg: &Config, worker_id: &str) -> anyhow::Result<bool> {
+    let mut c = conn(pool).await?;
+    let Some(job) = repo::claim_one_restore_job(&mut c, worker_id, cfg.restore_lease_secs).await?
+    else {
+        return Ok(false);
+    };
+
+    // Both of these are already enforced by the `restore_jobs.table_name` CHECK,
+    // but the value is interpolated into SQL downstream and a defence that only
+    // exists in the database is one schema edit away from being gone.
+    if !repo::is_restorable_table(&job.table_name) {
+        repo::finish_restore_job(
+            &mut c,
+            job.id,
+            worker_id,
+            "failed",
+            0,
+            &format!("table {} is not restorable", job.table_name),
+        )
+        .await?;
+        return Ok(true);
+    }
+    if job.attempts > RESTORE_MAX_ATTEMPTS {
+        repo::finish_restore_job(
+            &mut c,
+            job.id,
+            worker_id,
+            "failed",
+            job.rows_restored,
+            &format!("gave up after {} attempts", job.attempts),
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    // The pin is created BEFORE a single row is written, and recorded on the job
+    // in the same breath. Ordering matters: a crash after the pin but before the
+    // rows leaves an empty pin that expires harmlessly, whereas rows written
+    // before their pin existed would carry a NULL marker and become
+    // indistinguishable from genuine late arrivals — unreclaimable, and
+    // double-counted forever.
+    let pin_id = match job.pin_id {
+        Some(existing) => {
+            // Resume path. Delete whatever the crashed attempt managed to
+            // insert; this is exactly what makes a retry idempotent, and it is
+            // safe because the marker can only match rows this job wrote.
+            let removed = repo::delete_restored_rows(
+                &mut c,
+                &job.table_name,
+                existing,
+                job.range_start,
+                job.range_end,
+            )
+            .await?;
+            if removed > 0 {
+                info!(job = %job.id, rows = removed, "resuming restore; discarded partial output");
+            }
+            existing
+        }
+        None => {
+            let pin = repo::create_tier_pin(
+                &mut c,
+                &job.table_name,
+                job.range_start,
+                job.range_end,
+                job.pin_expires_at,
+                job.requested_by,
+                Some("cold restore"),
+            )
+            .await?;
+            repo::set_restore_job_pin(&mut c, job.id, pin.id).await?;
+            pin.id
+        }
+    };
+
+    // One app's cold data is a much smaller glob than every app's, because the
+    // Parquet is hive-partitioned by app_id.
+    let cold_dir = cold_copy_dir(&cfg.tier_cold_path, &job.table_name);
+    let glob = match job.app_id {
+        Some(a) => cold_partition_glob(&cfg.tier_cold_path, &job.table_name, a),
+        None => format!("{cold_dir}/**/*.parquet"),
+    };
+
+    let pg_url = cfg.database_url.clone();
+    let table = job.table_name.clone();
+    let (rs, re, app) = (job.range_start, job.range_end, job.app_id);
+    let glob_c = glob.clone();
+
+    // Estimate first so the UI has a denominator while the insert runs.
+    let estimate = {
+        let glob_e = glob.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+            DuckEngine::open()?.count_restorable(&glob_e, app, rs, re)
+        })
+        .await??
+    };
+    repo::set_restore_job_estimate(&mut c, job.id, estimate).await?;
+    if estimate == 0 {
+        // Nothing in cold for this range. Succeed with zero rather than fail:
+        // "there was nothing there" is a legitimate answer to a restore request,
+        // and the empty pin expires on its own.
+        repo::finish_restore_job(&mut c, job.id, worker_id, "succeeded", 0, "").await?;
+        info!(job = %job.id, "restore found no cold rows for range");
+        return Ok(true);
+    }
+    info!(job = %job.id, table = %table, rows = estimate, "restoring cold rows into Postgres");
+
+    // DuckDB is synchronous and this is the long part. The insert is ONE
+    // statement, so there is no mid-flight progress to report — the heartbeat
+    // below is what keeps another worker from stealing the lease meanwhile.
+    let inserted = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+        DuckEngine::open()?.restore_to_postgres(&pg_url, &table, &glob_c, app, rs, re, pin_id)
+    })
+    .await?;
+
+    match inserted {
+        Ok(n) => {
+            repo::beat_restore_job(&mut c, job.id, worker_id, n).await?;
+            repo::finish_restore_job(&mut c, job.id, worker_id, "succeeded", n, "").await?;
+            info!(job = %job.id, rows = n, estimate, "restore complete");
+        }
+        Err(e) => {
+            // Leave the pin: the next attempt reuses it and deletes whatever this
+            // attempt wrote before the failure. Dropping the pin here would
+            // orphan those rows.
+            repo::finish_restore_job(&mut c, job.id, worker_id, "failed", 0, &e.to_string())
+                .await?;
+            warn!(job = %job.id, error = %e, "restore failed");
+        }
+    }
+    Ok(true)
 }
 
 /// `error_events_2026_05_01` → 2026-05-01T00:00:00Z.

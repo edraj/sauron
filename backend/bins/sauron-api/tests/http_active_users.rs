@@ -117,6 +117,12 @@ impl TestServer {
             .env("DATABASE_URL", &db_url)
             .env("REDIS_URL", &redis_url)
             .env("JWT_SECRET", JWT_SECRET)
+            // Required and fail-closed since migration 000046: the API refuses to
+            // boot without it (it is the only key that decrypts stored channels).
+            .env(
+                "NOTIFY_SECRET_KEY",
+                "sauron-test-notify-secret-key-0000000000",
+            )
             .env("API_PORT", port.to_string())
             .env("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
             .env("RUST_LOG", "error")
@@ -578,6 +584,136 @@ async fn active_users_csv_matches_the_json_route() {
     assert_eq!(
         rows, series_len,
         "the CSV row count must equal the JSON route's series length for the same query"
+    );
+
+    h.shutdown().await;
+}
+
+// --- the APP-scoped cross-tier series (a different endpoint entirely) --------
+//
+// `/v1/apps/{app_id}/analytics/active-users` is not the project report above. It
+// is app-scoped, reads ACROSS the hot/cold tiers (so it keeps answering past the
+// rotation age, where the project report reports `truncated`), and returns
+// `partial_days` for any day it could not count exactly.
+//
+// It had DB-level tests (`sauron-db/tests/active_users.rs`, mutation-checked) but
+// nothing exercising the ROUTE — so the wiring, the permission gate and the
+// environment narrowing were all uncovered until the dashboard started calling it.
+
+/// Insert one analytics event. Raw SQL because this test binary has no access to
+/// the `sauron-db` test-common seeder, and the handful of NOT NULL columns is
+/// smaller than the machinery to share it.
+async fn seed_analytics_event(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    environment_id: Option<Uuid>,
+    distinct_id: &str,
+    occurred_at: chrono::DateTime<Utc>,
+) {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(
+        "INSERT INTO analytics_events \
+         (id, app_id, environment_id, name, distinct_id, properties, context, occurred_at, \
+          received_at, tags, contexts, extra) \
+         VALUES ($1, $2, $3, 'pageview', $4, '{}'::jsonb, '{}'::jsonb, $5, $5, \
+                 '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Uuid, _>(app_id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(environment_id)
+    .bind::<diesel::sql_types::Text, _>(distinct_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(occurred_at)
+    .execute(conn)
+    .await
+    .expect("insert analytics event");
+}
+
+fn at(day: u32, hour: u32) -> chrono::DateTime<Utc> {
+    use chrono::TimeZone;
+    Utc.with_ymd_and_hms(2026, 5, day, hour, 0, 0).unwrap()
+}
+
+#[tokio::test]
+async fn the_app_scoped_active_users_series_is_reachable_and_env_scoped() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping");
+        return;
+    };
+    let f = h.seed_active_users_fixture().await;
+
+    // A SECOND environment on app_a. The fixture's `env_b1` belongs to app_b, so
+    // using it here would have tagged an app_a event with an environment app_a is
+    // not enrolled in — data the ingest cannot produce, and the kind of fixture
+    // that makes a scoping assertion pass for the wrong reason.
+    let env_a2 = {
+        let mut conn = h.conn().await;
+        let s = Uuid::new_v4().simple().to_string();
+        seed_env(
+            &mut conn,
+            f.project_id,
+            f.app_a,
+            &format!("staging-{s}"),
+            &format!("pk_a2_{s}"),
+            false,
+        )
+        .await
+    };
+
+    {
+        let mut conn = h.conn().await;
+        // env_a1: alice twice on day 10 (one person), bob once. env_a2: carol.
+        seed_analytics_event(&mut conn, f.app_a, Some(f.env_a1), "alice", at(10, 9)).await;
+        seed_analytics_event(&mut conn, f.app_a, Some(f.env_a1), "alice", at(10, 17)).await;
+        seed_analytics_event(&mut conn, f.app_a, Some(f.env_a1), "bob", at(10, 12)).await;
+        seed_analytics_event(&mut conn, f.app_a, Some(env_a2), "carol", at(10, 10)).await;
+    }
+
+    // A wide window so the fixed 2026-05 dates fall inside it regardless of when
+    // the suite runs. `since_days` is relative to now, so it must span back to May.
+    let days = (Utc::now().date_naive() - at(10, 0).date_naive()).num_days() + 2;
+    let path = format!(
+        "/v1/apps/{}/analytics/active-users?since_days={days}",
+        f.app_a
+    );
+
+    let v = h.get_json(&path, &f.owner_token).await;
+    let series = v["series"].as_array().expect("series is an array");
+    let day10 = series
+        .iter()
+        .find(|p| p["day"].as_str() == Some("2026-05-10"))
+        .unwrap_or_else(|| panic!("no 2026-05-10 point in {v}"));
+    assert_eq!(
+        day10["count"].as_i64(),
+        Some(3),
+        "three distinct people across both envs despite four events: {v}"
+    );
+    // The field must be present even when empty — the dashboard reads its length
+    // unconditionally, and `undefined.length` is a blank card.
+    assert!(
+        v["partial_days"].is_array(),
+        "partial_days must always be an array: {v}"
+    );
+
+    // Env-scoped member sees only their environment's population. This is the
+    // assertion that would have caught a handler wired to `app_id` alone.
+    let scoped = h.get_json(&path, &f.env_member_token).await;
+    let scoped_day10 = scoped["series"]
+        .as_array()
+        .expect("series")
+        .iter()
+        .find(|p| p["day"].as_str() == Some("2026-05-10"))
+        .unwrap_or_else(|| panic!("no 2026-05-10 point for the env member: {scoped}"));
+    assert_eq!(
+        scoped_day10["count"].as_i64(),
+        Some(2),
+        "alice + bob in env_a1, NOT carol in env_b1: {scoped}"
+    );
+
+    // And it is authorized, not public.
+    let status = h.get_status(&path, &f.outsider_token).await;
+    assert!(
+        status == 403 || status == 404,
+        "a principal with no grant on this app must not read its population; got {status}"
     );
 
     h.shutdown().await;

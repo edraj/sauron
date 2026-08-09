@@ -8,6 +8,8 @@
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
   import { toastStore } from '../lib/stores/toast.svelte';
   import {
@@ -32,9 +34,18 @@
     type UploadForm,
   } from '../lib/models/artifact-upload';
 
-  let artifacts = $state<SymbolArtifact[]>([]);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): the artifact list paints from
+  // cache on return instead of blanking to a spinner, then refreshes behind it.
+  // Re-exposed under the names the template already uses, so the markup is
+  // unchanged.
+  //
+  // `artifacts` is a SHARED reference into the cache — never edit through it
+  // (see `remove` below, which refetches rather than splicing).
+  const view = new CachedView<SymbolArtifact[]>();
+
+  const artifacts = $derived(view.data ?? []);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
 
   // artifacts.rs:89,222 — both upload and delete authorize at the app. Listing
   // needs only `issue:read` (artifacts.rs:189), which is why the list itself
@@ -74,16 +85,20 @@
     if (fileInput) fileInput.value = '';
   }
 
-  async function load(appId: string) {
-    loading = true;
-    error = null;
-    try {
-      artifacts = await listArtifacts(appId);
-    } catch (e) {
-      error = (e as Error).message;
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit — an upload or a delete has
+   * to reach the network, or the list hands back the state from before it.
+   *
+   * `scopeKey` is in the key because it carries the selected environment, which
+   * the axios interceptor puts on the request but which appears in no argument
+   * here. Omit it and one environment's list can be served as another's.
+   */
+  async function load(appId: string, force = false) {
+    await view.load(
+      viewKey('sourcemaps.artifacts', appId, sessionStore.scopeKey),
+      () => listArtifacts(appId),
+      force,
+    );
   }
 
   async function upload() {
@@ -104,7 +119,13 @@
       name = next.name;
       arch = next.arch;
       clearFile();
-      await load(appId);
+      // Prefix-wide, not just this key. The key carries `scopeKey`
+      // (`appId:envId`), so this app has one cache entry PER ENVIRONMENT even
+      // though the endpoint takes no environment argument. A forced reload
+      // refreshes only the entry for the environment currently selected;
+      // switching environments afterwards would paint the pre-mutation copy.
+      viewCache.invalidate('sourcemaps.artifacts');
+      await load(appId, true);
     } catch (e) {
       toastStore.push((e as Error).message, 'error');
     } finally {
@@ -117,7 +138,18 @@
     if (!appId) return;
     try {
       await deleteArtifact(appId, id);
-      artifacts = artifacts.filter((a) => a.id !== id);
+      // Refetch instead of splicing locally: `artifacts` now points at the
+      // cached payload, and editing through that shared reference would corrupt
+      // it for every later reader. `force` so the fresh window can't hand back
+      // the row that was just deleted. Rows stay on screen while it runs (a
+      // cache hit means `loading` never flips), so there is no spinner flash.
+      // Prefix-wide, not just this key. The key carries `scopeKey`
+      // (`appId:envId`), so this app has one cache entry PER ENVIRONMENT even
+      // though the endpoint takes no environment argument. A forced reload
+      // refreshes only the entry for the environment currently selected;
+      // switching environments afterwards would paint the pre-mutation copy.
+      viewCache.invalidate('sourcemaps.artifacts');
+      await load(appId, true);
     } catch (e) {
       toastStore.push((e as Error).message, 'error');
     }
@@ -141,6 +173,10 @@
 
   $effect(() => {
     const appId = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes — it is
+    // part of the cache key, so without this the page would keep showing the
+    // payload fetched under the previous scope.
+    sessionStore.scopeKey;
     if (appId) void load(appId);
   });
 </script>

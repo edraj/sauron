@@ -70,6 +70,13 @@ Object? _normalize(Object? node, [String key = '', String parentKey = '']) {
     if (_hostDerived.contains('$parentKey.$key')) {
       return '<host>';
     }
+    // The anonymous id is a per-install random, like `session_id`. Normalized
+    // by VALUE rather than by key because it appears under two of them
+    // (`distinct_id` and `anonymous_id`) and the identified ids sharing those
+    // keys must survive verbatim — that difference is what the fixture proves.
+    if (node.startsWith('anon_')) {
+      return 'anon_fixture';
+    }
     final String? frame = _frameIdentity[key];
     if (frame != null) {
       return frame;

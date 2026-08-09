@@ -10,8 +10,9 @@
   import SankeyChart from '../lib/components/SankeyChart.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { getJourney } from '../lib/api/journeys';
-  import { errorMessage } from '../lib/api/client';
   import type { Journey } from '../lib/models';
 
   const DEPTHS = [2, 3, 4, 5, 6, 7, 8];
@@ -19,22 +20,34 @@
   let sinceDays = $state(30);
   let depth = $state(5);
 
-  let journey = $state<Journey | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): the cached graph paints
+  // instantly on return, then refreshes behind the "Updating…" indicator.
+  // Re-exposed under the template's existing names, so the markup is unchanged
+  // apart from the two spots that now distinguish "nothing yet" (`loading`)
+  // from "refreshing over data" (`revalidating`).
+  const journeyView = new CachedView<Journey>();
+
+  const journey = $derived(journeyView.data ?? null);
+  const loading = $derived(journeyView.loading);
+  const revalidating = $derived(journeyView.revalidating);
+  const error = $derived(journeyView.error);
+
   let refreshing = $state(false);
 
-  async function load(appId: string, days: number, d: number) {
-    loading = true;
-    error = null;
-    try {
-      journey = await getJourney(appId, { since_days: days, depth: d });
-    } catch (err) {
-      error = errorMessage(err);
-      journey = null;
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit: the Refresh button and the
+   * error-state Retry both mean "go to the network now".
+   *
+   * `scopeKey` is in the key because it carries the selected environment, which
+   * the axios interceptor adds to the request but which appears in none of these
+   * arguments — omit it and one environment's journey would be served as another's.
+   */
+  async function load(appId: string, days: number, d: number, force = false) {
+    await journeyView.load(
+      viewKey('journeys.graph', appId, sessionStore.scopeKey, days, d),
+      () => getJourney(appId, { since_days: days, depth: d }),
+      force,
+    );
   }
 
   $effect(() => {
@@ -62,7 +75,8 @@
 
   function retry() {
     const aid = sessionStore.currentAppId;
-    if (aid) void load(aid, sinceDays, depth);
+    // force: a Retry that honoured the cache would re-show the same failure.
+    if (aid) void load(aid, sinceDays, depth, true);
   }
 
   async function refresh() {
@@ -70,7 +84,8 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, sinceDays, depth)]);
+      // force: an explicit click must reach the network regardless of freshness.
+      await load(aid, sinceDays, depth, true);
     } finally {
       refreshing = false;
     }
@@ -105,7 +120,12 @@
           {/each}
         </div>
       </div>
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached data, fetching fresh" hint, and without it
+        the instant paint is indistinguishable from live data.
+      -->
+      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
 
@@ -131,7 +151,14 @@
     </Card>
   {:else if journey}
     <div class="journey-card">
-      {#if loading}
+      <!--
+        `revalidating`, not `loading`. This sits inside the `journey` branch, and
+        `loading` now means "nothing to show at all" — which can never be true
+        while `journey` is non-null, so keeping `loading` here would leave the
+        indicator permanently dead. `revalidating` is exactly the case it was
+        written for: a graph on screen with a refresh in flight behind it.
+      -->
+      {#if revalidating}
         <div class="reloading"><Spinner size={16} /><span class="faint">Updating…</span></div>
       {/if}
       <Card title="User journeys">

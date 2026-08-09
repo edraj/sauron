@@ -123,6 +123,205 @@ impl DuckEngine {
         Ok(())
     }
 
+    /// Column name + DuckDB-mapped type for one relation, via `DESCRIBE`.
+    fn describe(&self, relation_or_query: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("DESCRIBE {relation_or_query}"))?;
+        let rows = stmt.query_map([], |r| {
+            let name: String = r.get(0)?;
+            let ty: String = r.get(1)?;
+            Ok((name, ty))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Copy `[start, end)` of cold Parquet back into the LIVE Postgres table,
+    /// tagging every row with `pin_id`. Returns the number of rows inserted.
+    ///
+    /// Rows are inserted into the partitioned PARENT, so Postgres routes each to
+    /// whichever partition covers its `occurred_at` — in practice
+    /// `<table>_default`, because a cold range's explicit partition has already
+    /// been dropped. Nothing here creates or attaches a partition; see the
+    /// 000045 migration for why that approach was rejected.
+    ///
+    /// ## Why the column list is computed rather than hardcoded
+    ///
+    /// The Parquet was written by `export_from_postgres` with
+    /// `PARTITION_BY (app_id, year, month)`, which STRIPS those three columns
+    /// out of the files and encodes them in the directory path. Read back with
+    /// `hive_partitioning=true` they come back as VARCHAR, so `app_id` needs an
+    /// explicit cast and `year`/`month` must not be inserted at all — they are
+    /// derived, and no such columns exist in Postgres.
+    ///
+    /// Beyond that, cold Parquet is a historical artifact: files written months
+    /// ago predate every column added since. Intersecting the live Postgres
+    /// column list with what the Parquet actually contains is what lets an old
+    /// export restore into a newer schema, with the missing columns taking their
+    /// Postgres defaults. Hardcoding the list would make the feature break
+    /// silently the first time anyone added a column.
+    ///
+    /// Every shared column is cast to the type Postgres reports, which is what
+    /// converts the hive `app_id` VARCHAR back to a UUID and keeps JSONB columns
+    /// from arriving as text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_to_postgres(
+        &self,
+        pg_url: &str,
+        table: &str,
+        glob: &str,
+        app_id: Option<Uuid>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        pin_id: Uuid,
+    ) -> anyhow::Result<i64> {
+        if !self.any_files_match(glob)? {
+            return Ok(0);
+        }
+        self.conn
+            .execute_batch("INSTALL postgres; LOAD postgres;")?;
+        let _ = self.conn.execute_batch("DETACH DATABASE IF EXISTS pg;");
+        // NOT read-only, unlike the export path: this is the one place that
+        // writes back into Postgres.
+        self.conn
+            .execute_batch(&format!("ATTACH '{pg_url}' AS pg (TYPE postgres);"))?;
+
+        let pg_cols = self.describe(&format!("pg.{table}"))?;
+        let src = format!("read_parquet('{glob}', hive_partitioning=true, union_by_name=true)");
+        let parquet_cols: std::collections::HashSet<String> = self
+            .describe(&format!("(SELECT * FROM {src} LIMIT 0)"))?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+
+        let mut names: Vec<String> = Vec::new();
+        let mut exprs: Vec<String> = Vec::new();
+        for (name, ty) in &pg_cols {
+            // `restored_pin_id` is supplied by us, never read from Parquet —
+            // a re-restore of already-restored data must carry the NEW pin.
+            if name == "restored_pin_id" || !parquet_cols.contains(name) {
+                continue;
+            }
+            names.push(format!("\"{name}\""));
+            exprs.push(format!("CAST(\"{name}\" AS {ty}) AS \"{name}\""));
+        }
+        if names.is_empty() {
+            anyhow::bail!("no columns in common between {table} and its cold Parquet");
+        }
+        names.push("\"restored_pin_id\"".to_string());
+        exprs.push(format!("CAST('{pin_id}' AS UUID) AS \"restored_pin_id\""));
+
+        let app_filter = match app_id {
+            Some(a) => format!(" AND CAST(app_id AS UUID) = CAST('{a}' AS UUID)"),
+            None => String::new(),
+        };
+        let sql = format!(
+            "INSERT INTO pg.{table} ({cols}) \
+             SELECT {exprs} FROM {src} \
+              WHERE occurred_at >= TIMESTAMPTZ '{start}' \
+                AND occurred_at <  TIMESTAMPTZ '{end}'{app_filter}",
+            table = table,
+            cols = names.join(", "),
+            exprs = exprs.join(", "),
+            src = src,
+            start = start.to_rfc3339(),
+            end = end.to_rfc3339(),
+            app_filter = app_filter,
+        );
+        let inserted = self.conn.execute(&sql, [])?;
+        // DETACH so the connection does not hold a Postgres session open past
+        // the restore; DuckDB engines here are short-lived but this one has a
+        // WRITE session, which is worth releasing promptly.
+        let _ = self.conn.execute_batch("DETACH DATABASE IF EXISTS pg;");
+        Ok(inserted as i64)
+    }
+
+    /// Rows available in cold Parquet for `[start, end)`, optionally for one
+    /// app — the denominator for restore progress.
+    pub fn count_restorable(
+        &self,
+        glob: &str,
+        app_id: Option<Uuid>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<i64> {
+        if !self.any_files_match(glob)? {
+            return Ok(0);
+        }
+        let (sql, params): (String, Vec<String>) = match app_id {
+            Some(a) => (
+                "SELECT count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true) \
+                 WHERE occurred_at >= ? AND occurred_at < ? AND CAST(app_id AS UUID) = CAST(? AS UUID)"
+                    .to_string(),
+                vec![
+                    glob.to_string(),
+                    start.to_rfc3339(),
+                    end.to_rfc3339(),
+                    a.to_string(),
+                ],
+            ),
+            None => (
+                "SELECT count(*) FROM read_parquet(?, hive_partitioning=true, union_by_name=true) \
+                 WHERE occurred_at >= ? AND occurred_at < ?"
+                    .to_string(),
+                vec![glob.to_string(), start.to_rfc3339(), end.to_rfc3339()],
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let n: i64 = stmt.query_row(duckdb::params_from_iter(params.iter()), |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// Distinct people per UTC day from cold Parquet.
+    ///
+    /// The cold half of the Active Users series. `TimeZone='UTC'` is pinned in
+    /// [`DuckEngine::open`], so `CAST(occurred_at AS DATE)` here buckets on the
+    /// same day boundary as the hot side's
+    /// `(occurred_at AT TIME ZONE 'UTC')::date`. If those ever disagreed the
+    /// series would show a seam at the watermark that looked like real data.
+    ///
+    /// Empty `distinct_id` excluded, matching `active_users_by_day_hot` — see its
+    /// doc comment for why device_key is not a fallback.
+    ///
+    /// The result is per-day and therefore concatenable with the hot half, which
+    /// a single total would NOT be: `count(DISTINCT …)` cannot be summed across
+    /// tiers without double-counting anyone active on both sides.
+    pub fn distinct_users_by_day(
+        &self,
+        glob: &str,
+        app_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<DayCount>> {
+        if !self.any_files_match(glob)? {
+            return Ok(Vec::new());
+        }
+        let sql = "\
+            SELECT CAST(occurred_at AS DATE) AS day, count(DISTINCT distinct_id) AS cnt \
+            FROM read_parquet(?, hive_partitioning=true, union_by_name=true) \
+            WHERE app_id = ? AND occurred_at >= ? AND occurred_at < ? \
+              AND distinct_id IS NOT NULL AND distinct_id <> '' \
+            GROUP BY 1 ORDER BY 1";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(
+            duckdb::params![glob, app_id.to_string(), from.to_rfc3339(), to.to_rfc3339()],
+            |r| {
+                let day: NaiveDate = r.get(0)?;
+                let cnt: i64 = r.get(1)?;
+                Ok(DayCount { day, count: cnt })
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Count cold rows in `[start, end)` across all apps (verification helper).
     pub fn count_range(
         &self,
