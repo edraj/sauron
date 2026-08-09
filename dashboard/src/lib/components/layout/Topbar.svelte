@@ -94,7 +94,7 @@
           currentId={sessionStore.currentProjectId}
           onSelect={(id) => void sessionStore.setProject(id)}
           createLabel="New project"
-          onCreate={() => push('/projects')}
+          onCreate={() => push('/admin/projects')}
           createLocked={createProjectLock}
           ariaLabel="Switch project"
         />
@@ -110,7 +110,7 @@
         currentId={sessionStore.currentAppId}
         onSelect={(id) => void sessionStore.setApp(id)}
         createLabel="New app"
-        onCreate={() => push('/projects')}
+        onCreate={() => push('/admin/projects')}
         createLocked={createAppLock}
         ariaLabel="Switch app"
       />

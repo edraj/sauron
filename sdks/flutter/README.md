@@ -14,7 +14,9 @@ for a browser page, use `@edraj/sauron-browser`.
 - `track()` / `identify()` / `trackTransaction()` for product analytics and
   latency percentiles.
 - Auto-collects device / OS / runtime context plus a stable, per-install
-  `device_id`. App version/build are supplied by you at init — no plugin needed.
+  `device_id` and [anonymous id](#the-anonymous-id), so unidentified people are
+  still counted as people. App version/build are supplied by you at init — no
+  plugin needed.
 - **Batches → gzips → persists** envelopes to an offline JSONL queue that
   survives app restarts, drains on the flush timer and on app resume, and honors
   the full ingest response policy.
@@ -31,7 +33,7 @@ or, in `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  sauron_flutter: ^1.4.0
+  sauron_flutter: ^1.6.0
 ```
 
 Requires Dart SDK `>=3.4.0 <4.0.0` and Flutter `>=3.19.0`.
@@ -331,6 +333,20 @@ Returns `void`. The event carries the current distinct id, session id and
 screen. Never sampled. The static facade has no `screen:` parameter — use
 `Sauron.client!.track(name, screen: 'Checkout')` for a per-call screen override.
 
+> **No identity needed.** The distinct id is the scope user's `id` when
+> `Sauron.identify(...)` (or `Sauron.setUser(...)`) has named one, and otherwise
+> the persisted [anonymous id](#the-anonymous-id) — so events tracked before
+> login still count, and a later `identify` stitches them onto the account.
+>
+> The one case still **dropped** is an analytics item tracked before
+> `await Sauron.init(...)` has finished, when neither id exists yet. The first
+> drop prints `[Sauron] dropped analytics item "<name>": no distinct_id …` even
+> with `debug: false`. Dropped rather than sent because `distinct_id` is a
+> required string on the wire: `null` makes the gateway reject the **entire
+> envelope** with `400 invalid_envelope`, a 400 is non-retryable, and one such
+> item would take every error, transaction and identify batched with it (up to
+> `maxBatchItems`, default 30) down with it.
+
 ```dart
 Sauron.track(
   'checkout_completed',
@@ -398,6 +414,10 @@ change it emits one `$screen` analytics event with
 every later event/error is stamped with the new screen. `Sauron.screen` reads
 the current value (`null` until set or seeded via `options.screen`).
 
+The `$screen` event goes through `track`, so it needs an identity — see the note
+under [`Sauron.track`](#saurontrack). The screen name itself is still recorded
+and still stamped onto errors when the `$screen` event is dropped.
+
 ```dart
 Sauron.setScreen('Checkout');
 Sauron.setScreen('Checkout'); // no-op, no second $screen event
@@ -438,6 +458,9 @@ Starting, ending, and cancelling a workflow each emit one reserved analytics
 event through `track()` — `$workflow_start`, `$workflow_end`, or
 `$workflow_cancel` — so they show up in Events like anything else. `endWorkflow`
 adds `duration_ms`; `cancelWorkflow` adds both `duration_ms` and `reason`.
+Because they go through `track()`, they need an identity — see the note under
+[`Sauron.track`](#saurontrack). The workflow itself still starts, still returns
+`ok`, and is still stamped onto errors when its lifecycle event is dropped.
 
 All three mutators return a `WorkflowResult { status, workflowId }`. Exactly six
 `WorkflowStatus` values, never a seventh:
@@ -499,9 +522,42 @@ static void identify(String distinctId, {Map<String, Object?>? traits})
 Returns `void`. Emits an `identify` item and updates the scope user, keeping the
 existing `email`. Never sampled.
 
+The item carries `anonymous_id` only when the [anonymous id](#the-anonymous-id)
+was actually used as a `distinct_id` first — that is what tells the server to
+stitch the pre-login activity onto this account. On a first-ever launch with no
+anonymous activity it is `null`, deliberately: the server writes a permanent
+alias row for any non-empty `anonymous_id`, and a speculative one mis-merges two
+people forever.
+
 ```dart
 Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
 ```
+
+### `Sauron.reset`
+
+```dart
+static Future<void> reset()
+```
+
+Clears the scope user and mints a fresh anonymous id, persisting it.
+
+**Call this on logout.** Without it the next person to use the device inherits
+the persisted anonymous id, and their first `identify` aliases that id — and
+with it the previous person's anonymous activity — onto the new account,
+permanently, server-side. Unlike the browser SDK, `setUser(null)` does *not* do
+this for you: persisting the new id is asynchronous and `setUser` is not.
+
+```dart
+await Sauron.reset();
+```
+
+### `Sauron.anonymousId`
+
+```dart
+static String? get anonymousId
+```
+
+The persisted anonymous id, or `null` before `init` has completed.
 
 ### `Sauron.addBreadcrumb`
 
@@ -730,7 +786,7 @@ Everything below is exported from `package:sauron_flutter/sauron_flutter.dart`.
 | `isObfuscatedDartTrace` | `bool isObfuscatedDartTrace(String raw)` | `true` when the trace contains `isolate_dso_base` or `build_id:`. |
 | `sauronIso` | `String sauronIso(DateTime dateTime)` | ISO-8601 UTC with a trailing `Z`. |
 | `kSauronSdkName` | `const String = 'sauron.flutter'` | Sent in `header.sdk.name`. |
-| `kSauronSdkVersion` | `const String = '1.4.0'` | Sent in `header.sdk.version`. |
+| `kSauronSdkVersion` | `const String = '1.6.0'` | Sent in `header.sdk.version`. |
 | `WorkflowStatus` | enum `ok, alreadyActive, notActive, nameMismatch, invalidName, disabled` | Wire values (in lifecycle-adjacent server logs) are snake_case: `already_active`, `not_active`, `name_mismatch`, `invalid_name`. See [Workflows](#sauronstartworkflow--sauronendworkflow--sauroncancelworkflow--sauronworkflow). |
 | `WorkflowResult` | `WorkflowResult(WorkflowStatus status, [String? workflowId])` | `workflowId` is set when `status == ok`. |
 | `ActiveWorkflow` | `ActiveWorkflow({required String workflowId, required String name, required DateTime startedAt})` | What `Sauron.workflow`/`client.workflow` returns; `null` when none is active. |
@@ -781,7 +837,7 @@ Sauron.client!.track(
 user's `id` to `id`, preserves the existing `email`, and preserves existing
 traits when `traits` is `null`. The resulting user is serialized into
 `context.user` on every envelope; `distinct_id` on events/transactions comes
-from `user.id`.
+from `user.id`, falling back to the [anonymous id](#the-anonymous-id).
 
 **Breadcrumbs.** A FIFO ring buffer capped at `maxBreadcrumbs`. A snapshot is
 attached to each `ErrorItem` at capture time; the buffer is not cleared
@@ -945,10 +1001,34 @@ yourself.
   identifier. Every plugin read is guarded — a failure yields `null` fields
   rather than a lost error report.
 
-The stable device id and the per-launch `sessionId` are the only identifiers the
-SDK creates on its own. Everything else about a user comes from your
-`identify` / `setUser` calls, and `beforeSend` is the escape hatch for redacting
-any of it before it leaves the device.
+The device id, the anonymous id and the per-launch `sessionId` are the only
+identifiers the SDK creates on its own. Everything else about a user comes from
+your `identify` / `setUser` calls, and `beforeSend` is the escape hatch for
+redacting any of it before it leaves the device.
+
+### The anonymous id
+
+`distinct_id` falls back to a persisted **anonymous id** whenever no user has
+been identified, so a person who has not logged in is still counted as one
+person rather than dropped.
+
+- **Format** `anon_<uuidv4>`, and **storage** `<app-support>/sauron/sauron_prefs.json`
+  under the key `sauron.anon_id` — the same shape and key name the browser SDK
+  uses in `localStorage`. Active Users is a distinct count over `distinct_id`,
+  so the two client SDKs have to produce ids of the same species.
+- **Minted once, on first run, and adopted verbatim from then on.** It is never
+  re-minted or reformatted on upgrade: rewriting a stored id is
+  indistinguishable downstream from that person uninstalling and a new one
+  appearing, which shows up as a spike of new users that never happened.
+- **Per install, not per device or per person.** Uninstalling resets it, and
+  nothing links it to a hardware identifier.
+- `Sauron.reset()` mints a fresh one — [call it on logout](#sauronreset).
+
+It is a durable first-party identifier stored on the user's device, which is a
+retention and consent consequence, not just an implementation detail. Like the
+device id it is written during `init` on every install, error-tracking-only apps
+included; it only ever leaves the device once something is tracked without an
+identified user.
 
 ## Stack traces & symbolication
 
@@ -1045,6 +1125,8 @@ Response policy:
 | Requests leave but nothing lands | Your proxy does not expose ingest at `/api/{environment_id}/envelope` on the DSN's host (plus any DSN path prefix) | Route that exact path to the gateway — events otherwise drop silently and look delivered. |
 | Delivery stops permanently mid-session | A `401`/`403` disabled the transport (`Sauron.isEnabled` flips to `false`) | Verify the public key belongs to the project; restart the app after fixing. |
 | Events arrive, errors do not | `sampleRate < 1.0`, or `beforeSend` returned `null` | Pass `sampleRate: 1.0`; log inside `beforeSend`. |
+| Errors arrive, `track`/`$screen`/`$workflow_*` events do not, and the log says `dropped analytics item … no distinct_id` | The item was tracked before `init` finished, so there is neither an identified user nor a resolved anonymous id. `distinct_id` is a required string on the wire, so the item is dropped rather than 400ing the whole envelope | `await Sauron.init(...)` before tracking — or track from inside `appRunner`, which only runs once init has completed. |
+| After a logout on a shared device, the next person's pre-login activity is merged into the previous person's account | `setUser(null)` clears the user but keeps the anonymous id, so the next person inherits it and their `identify` aliases it | Call `await Sauron.reset()` on logout — it mints a fresh anonymous id. |
 | No breadcrumbs on errors | `maxBreadcrumbs <= 0` | Set a positive `maxBreadcrumbs`. |
 | Stack traces are hex addresses | Obfuscated AOT build with no symbols uploaded | Upload the `--split-debug-info` output (see above). |
 | Errors from a spawned isolate are missing | Only `Isolate.current` is auto-listened | Call `Sauron.addIsolateErrorListener(isolate)`. |

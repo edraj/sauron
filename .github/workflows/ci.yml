@@ -95,6 +95,14 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://sauron:sauron@localhost:5432/sauron
           TEST_REDIS_URL: redis://localhost:6379
+        # This is the BACKEND-side half of the wire gate: it parses the
+        # COMMITTED `sdks/wire-fixtures/*.json` on a clean checkout (see
+        # `crates/sauron-core/tests/sdk_wire_conformance.rs`), so it catches the
+        # deserializer changing under a fixed SDK output. It cannot catch the
+        # other direction — an SDK whose output drifts leaves this job parsing
+        # the stale committed file and passing. That half is the
+        # `check-wire-fixture.sh` step in each of the five sdk-* jobs below;
+        # neither half is sufficient alone.
         run: cargo test --workspace
 
   dashboard:
@@ -115,7 +123,40 @@ jobs:
       - run: npm run build          # svelte-check + vite build
       - run: npm test               # vitest
 
+  # ---------------------------------------------------------------------------
+  # SDK jobs.
+  #
+  # Every one of the five runs its suite, and every suite REGENERATES
+  # `sdks/wire-fixtures/<sdk>.json` from the envelope its own transport posts.
+  # Each job therefore ends with `.github/scripts/check-wire-fixture.sh`, which
+  # fails if that regeneration differs from the committed file.
+  #
+  # Without that step the regeneration was thrown away and CI only caught wire
+  # drift on the backend side: an SDK-side regression left its own job green
+  # (it regenerates) and `backend` green (it parses the stale committed file), so
+  # the bug shipped with a passing conformance test on top of it. node, python
+  # and csharp had no CI job at all, so their fixtures were never regenerated
+  # anywhere.
+  #
+  # The gate step must run AFTER the suite and is deliberately not
+  # `continue-on-error` — see the script for what a diff means.
+  # ---------------------------------------------------------------------------
+
   sdk-js:
+    # ⚠ THIS NAME IS PINNED TO BRANCH PROTECTION — DO NOT EDIT IT.
+    #
+    # `main`'s required status checks name this job by its EXACT display string.
+    # It used to read "web SDK — test · build · wire fixture",
+    # and the trailing " · wire fixture" meant nothing ever reported the required
+    # name: the check sat at "Expected — Waiting for status to be reported"
+    # forever and no PR could merge. Ten green checks, two ghosts, permanently
+    # blocked.
+    #
+    # The job still runs the wire-fixture step; only the label is shorter.
+    #
+    # This pin is TEMPORARY. Once branch protection requires `CI complete`
+    # instead (see the ci-complete job at the bottom of this file), delete this
+    # comment and name the job whatever is clearest.
     name: web SDK — test · build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -131,12 +172,121 @@ jobs:
           cache-dependency-path: sdks/js/package-lock.json
       - run: npm ci
       - run: npm test
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh js
       - run: npm run build
       - name: typecheck (report-only)
         continue-on-error: true
         run: npm run typecheck
 
+  sdk-node:
+    name: node SDK — test · build · wire fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdks/node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/node/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh node
+      - run: npm run build
+      - name: typecheck (report-only)
+        continue-on-error: true
+        run: npm run typecheck
+
+  sdk-python:
+    name: python SDK — test · wire fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned rather than "3.x": the fixture normalizer pins
+          # `context.runtime.version`, but a floating interpreter is still one
+          # more thing that can move under a byte-comparison gate for no reason.
+          python-version: '3.12'
+      # The package has no runtime dependencies (stdlib urllib + threading); the
+      # `test` extra is just pytest. Installed as editable so `import sauron`
+      # resolves to the source under test, not a built copy.
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest -q
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh python
+
+  sdk-csharp:
+    name: dotnet SDK — test · wire fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdks/csharp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          # Three DIFFERENT constraints are in play here and the previous version
+          # of this comment reasoned about only one of them, which is why this job
+          # could not run at all:
+          #
+          #  1. WHAT IS COMPILED — `net8.0`, pinned by both .csproj files.
+          #  2. WHAT IT RUNS ON — `RollForward: Major` in Sauron.Tests.csproj lets
+          #     the net8.0 test host run on a newer runtime; installing 8.0.x
+          #     means it does not have to.
+          #  3. WHAT READS THE SOLUTION — nothing above says anything about this,
+          #     and it is the one that mattered. `sdks/csharp` contains only
+          #     `Sauron.slnx` (the XML solution format): no `.sln`, no root
+          #     `.csproj`. `.slnx` is unreadable before SDK **9.0.200**, so with
+          #     only 8.0.x installed a bare `dotnet test` here died with
+          #     `MSB1003: Specify a project or solution file` — measured against
+          #     9.0.119, which reproduces it — BEFORE reaching the wire-fixture
+          #     gate below. One of the five wire gates therefore never executed.
+          #
+          # `sdks/csharp/global.json` is what makes (3) binding rather than
+          # advisory: absent it the muxer simply takes the highest SDK the runner
+          # image happens to ship, so a future image preinstalling 9.0.2xx+ would
+          # have made this job pass BY ACCIDENT — indistinguishable from not
+          # pinning. With global.json a too-old SDK fails naming the version it
+          # wanted and the file that asked for it, instead of MSB1003.
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      # Resolves `Sauron.slnx` → both projects, per sdks/csharp/global.json.
+      - run: dotnet test
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh csharp
+
   sdk-flutter:
+    # ⚠ THIS NAME IS PINNED TO BRANCH PROTECTION — DO NOT EDIT IT.
+    #
+    # `main`'s required status checks name this job by its EXACT display string.
+    # It used to read "flutter SDK — analyze · test · wire fixture",
+    # and the trailing " · wire fixture" meant nothing ever reported the required
+    # name: the check sat at "Expected — Waiting for status to be reported"
+    # forever and no PR could merge. Ten green checks, two ghosts, permanently
+    # blocked.
+    #
+    # The job still runs the wire-fixture step; only the label is shorter.
+    #
+    # This pin is TEMPORARY. Once branch protection requires `CI complete`
+    # instead (see the ci-complete job at the bottom of this file), delete this
+    # comment and name the job whatever is clearest.
     name: flutter SDK — analyze · test
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -154,6 +304,180 @@ jobs:
         continue-on-error: true
         run: flutter analyze
       - run: flutter test
+      # NOTE: `channel: stable` is unpinned, so this is the one gate that a
+      # Flutter release — not a repo change — could trip, if a new `package:test`
+      # changes the stack depth `captureException` records (the frame COUNT is
+      # kept on purpose; only frame identity strings are normalized). If that
+      # happens the failure is loud and the fix is one regenerate-and-commit, not
+      # a mystery. Pinning `flutter-version` here would remove that at the cost
+      # of no longer testing against current stable.
+      - name: wire fixture in sync (SDK-side drift gate)
+        working-directory: .
+        run: bash .github/scripts/check-wire-fixture.sh flutter
+
+  # ---------------------------------------------------------------------------
+  # Migration integrity gate.
+  #
+  # Migration 000046 (`channel_config_enc`) existed on disk, applied cleanly
+  # locally, and was invisible to the release build because it was never
+  # tracked by git — `git archive` builds the RPM tarball from the INDEX/HEAD,
+  # not from the working tree, so an untracked directory ships as nothing at
+  # all and the new binaries meet an old schema. Nothing in CI looked at
+  # `backend/migrations` (`grep -n migrations .github/workflows/*.yml` returned
+  # nothing), so the whole class was unguarded.
+  #
+  # Four assertions, all of them shell-only — no toolchain, no database, so
+  # this job is the fastest signal in the matrix and fails before anything
+  # expensive starts.
+  # ---------------------------------------------------------------------------
+  migrations:
+    name: migrations — tracked · paired · ordered · immutable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Check 4 reads the migration trees of every release tag. The default
+          # shallow, tag-less checkout would make it silently skip.
+          fetch-depth: 0
+      - name: Migration integrity guard
+        shell: bash
+        run: |
+          # GitHub runs `run:` under `bash -e`; errexit is wrong here because
+          # the guard deliberately keeps going so one CI run reports EVERY
+          # offending path instead of only the first.
+          set +e
+          set -uo pipefail
+
+          MIG=backend/migrations
+          fail=0
+          note() { printf '%s\n' "$*" >&2; }
+          die()  { note "::error::$*"; fail=1; }
+
+          # ---- 1. every migration on disk is TRACKED in git -----------------
+          # The release tarball is produced from git, not from the working
+          # tree: anything git does not know about does not ship.
+          disk_up=$(find "$MIG" -mindepth 2 -maxdepth 2 -name up.sql | wc -l)
+          tracked_up=$(git ls-files "$MIG" | grep -c '/up\.sql$')
+          note "check 1: up.sql on disk=$disk_up, tracked by git=$tracked_up"
+          if [ "$disk_up" -ne "$tracked_up" ]; then
+            die "migration count mismatch: $disk_up up.sql on disk but only $tracked_up tracked by git. The release tarball is built from git, so the untracked ones will NOT ship and upgraded hosts will run new binaries against an old schema."
+            comm -23 <(find "$MIG" -mindepth 2 -maxdepth 2 -name '*.sql' | sort) \
+                     <(git ls-files "$MIG" | sort) \
+              | while read -r p; do note "::error file=$p::not tracked by git: $p"; done
+          fi
+
+          untracked=$(git status --porcelain --untracked-files=all -- "$MIG" | awk '$1=="??"{print $2}')
+          if [ -n "$untracked" ]; then
+            while read -r p; do
+              die "untracked migration file, invisible to 'git archive' and therefore to the RPM: $p — run 'git add $p'"
+            done <<<"$untracked"
+          fi
+
+          # The root cause of an untracked migration is usually a .gitignore
+          # rule quietly swallowing it: `git add` then succeeds with no output.
+          # --no-index is required, otherwise check-ignore skips already-tracked
+          # paths and the rule stays invisible until someone re-clones.
+          while IFS= read -r p; do
+            if git check-ignore --no-index -q "$p"; then
+              die "migration path matches a .gitignore rule, so 'git add' silently drops it: $p [$(git check-ignore --no-index -v "$p")]"
+            fi
+          done < <(find "$MIG" -mindepth 2 -maxdepth 2 -name '*.sql')
+
+          # ---- 2. every migration has BOTH up.sql and down.sql --------------
+          while IFS= read -r d; do
+            [ -f "$d/up.sql" ]   || die "migration $d is missing up.sql — diesel will not apply it."
+            [ -f "$d/down.sql" ] || die "migration $d is missing down.sql — 'diesel migration revert' and the packaging rollback path both break on it."
+          done < <(find "$MIG" -mindepth 1 -maxdepth 1 -type d | sort)
+
+          # ---- 3. lexicographic name order == sequence-number order ---------
+          # Diesel applies directories in lexicographic DIRECTORY-NAME order,
+          # not by the embedded sequence number. A future-dated prefix
+          # (2026-08-10-000046 landing before a later-authored 2026-08-09-000047)
+          # therefore runs out of order — that is exactly why 000046 had to be
+          # re-dated by hand.
+          prev=0; prevdir=""
+          while IFS= read -r b; do
+            seq=$(printf '%s\n' "$b" | sed -n 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}-\([0-9]\{6\}\)_.*$/\1/p')
+            if [ -z "$seq" ]; then
+              die "migration directory name does not match YYYY-MM-DD-NNNNNN_slug: $MIG/$b"
+              continue
+            fi
+            n=$((10#$seq))
+            if [ "$n" -le "$prev" ]; then
+              die "migration ordering broken: '$b' (sequence $n) sorts lexicographically AFTER '$prevdir' (sequence $prev) but its sequence number is not greater. Diesel applies migrations in directory-name order, so '$b' would run out of sequence. Re-date one of the two so the date prefixes increase in step with the sequence numbers."
+            fi
+            prev=$n; prevdir=$b
+          done < <(cd "$MIG" && find . -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort)
+
+          # ---- 4. a released migration is never edited afterwards -----------
+          # Cheaply expressible because every release is tagged and the tag's
+          # tree carries the migration blobs: compare each released blob hash
+          # against the same path today. Hosts that upgraded from that tag have
+          # already recorded the migration as applied and will never re-run it,
+          # so an edit reaches new installs only — a permanent schema fork.
+          tags=$(git for-each-ref --format='%(refname:short)' refs/tags)
+          if [ -z "$tags" ]; then
+            note "::notice::no release tags in this checkout — skipping the released-migration immutability check"
+          else
+            note "check 4: comparing against release tags: $(echo $tags | tr '\n' ' ')"
+            for t in $tags; do
+              while IFS=$'\t' read -r oldhash path; do
+                [ -n "$path" ] || continue
+                if [ ! -f "$path" ]; then
+                  die "$path shipped in release tag '$t' but has been DELETED. Released migrations are immutable — add a NEW migration that undoes it instead."
+                  continue
+                fi
+                newhash=$(git hash-object -- "$path")
+                if [ "$oldhash" != "$newhash" ]; then
+                  die "$path was EDITED after it shipped in release tag '$t' ($oldhash -> $newhash). Hosts upgraded from '$t' already applied the OLD text and will never re-run it, so this edit only reaches fresh installs. Add a NEW migration instead."
+                fi
+              done < <(git ls-tree -r "$t" -- "$MIG" | awk '$2=="blob"{print $3"\t"$4}')
+            done
+          fi
+
+          # ---- 5. every path the RPM spec references actually EXISTS --------
+          #
+          # Checks 1-3 cannot catch this class, and neither can any `git status`
+          # check, because CI only ever sees TRACKED files: an untracked file is
+          # simply absent from the checkout, so "is it untracked?" is unanswerable
+          # here. The question that IS answerable is "does everything the build
+          # reads exist?".
+          #
+          # This is not hypothetical. `packaging/rpm/systemd/50-sauron.preset`
+          # was added to the spec's %install without being staged. Locally it
+          # built fine, because build-rpm.sh tars the WORKING TREE. From a
+          # release checkout rpmbuild died with
+          #   install: cannot stat 'packaging/rpm/systemd/50-sauron.preset'
+          # in %install, taking every RPM with it. Same shape as the untracked
+          # migration above, one directory over.
+          spec=packaging/rpm/sauron.spec
+          if [ ! -f "$spec" ]; then
+            die "packaging/rpm/sauron.spec is missing"
+          else
+            note "check 5: resolving repo paths referenced by $spec"
+            missing=0
+            # Every bare packaging/... token in the spec: Source lines, install
+            # arguments, anything. Deliberately greedy — a false positive here is
+            # a one-line fix, a false negative is a dead release.
+            # sed, not `tr -d '[:space:]'`: tr would also delete the NEWLINES
+            # between matches and collapse every path into one unopenable token.
+            # The first version of this guard did exactly that and "passed".
+            for ref in $(grep -oE '(^|[[:space:]])packaging/[A-Za-z0-9._/-]+' "$spec" \
+                          | sed 's/^[[:space:]]*//' | sort -u); do
+              if [ ! -e "$ref" ]; then
+                die "$spec references '$ref' but it does not exist in this checkout. If it exists on your machine it is UNTRACKED — run 'git add $ref'. rpmbuild will fail in %install and every RPM with it."
+                missing=1
+              fi
+            done
+            [ "$missing" -eq 0 ] && note "  all spec-referenced packaging paths present"
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            note "MIGRATION GUARD FAILED — see the ::error:: lines above."
+            exit 1
+          fi
+          note "MIGRATION GUARD OK ($disk_up migrations)"
 
   packaging:
     name: packaging — spec lint · source RPM
@@ -178,3 +502,106 @@ jobs:
           key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
       - name: Source RPM builds (validates SourceN staging + tarball)
         run: ./packaging/rpm/build-rpm.sh --srpm
+
+  # ---------------------------------------------------------------------------
+  # The single job branch protection should require.
+  #
+  # Required status checks are matched by EXACT DISPLAY NAME, and that coupling
+  # rots silently. This repo shipped with two required checks named
+  #   "flutter SDK — analyze · test"   and   "web SDK — test · build"
+  # while the jobs had since been renamed to
+  #   "flutter SDK — analyze · test · wire fixture"  /  "web SDK — test · build · wire fixture"
+  # Nothing ever reported those names, so both sat at "Expected — Waiting for
+  # status to be reported" forever and the PR could not be merged. Meanwhile the
+  # other seven jobs — including `backend` and `migrations` — were not required
+  # at all, so once the names were corrected a fully red backend would still have
+  # been mergeable.
+  #
+  # Requiring ONE aggregating job removes the coupling: jobs can be added,
+  # renamed or reordered and the gate keeps meaning "everything passed". The only
+  # thing that must stay in sync is the `needs:` list below, which lives next to
+  # the jobs it names instead of in a settings page nobody reads.
+  #
+  # Set branch protection to require exactly: CI complete
+  #
+  # UNTIL THAT SETTING CHANGES, two job names above are NOT free to rename:
+  # `sdk-js` and `sdk-flutter` are pinned to the stale required-check strings so
+  # the current protection can be satisfied at all. Each carries a warning at its
+  # `name:`. Switching protection to `CI complete` is what unpins them — do that
+  # first, then rename them back to include "· wire fixture" if you want.
+  ci-complete:
+    name: CI complete
+    # `always()` so this still runs when a dependency fails — without it the job
+    # would be skipped and report nothing, which is the same dead end as the
+    # misnamed checks above.
+    if: always()
+    needs:
+      - backend
+      - dashboard
+      - sdk-js
+      - sdk-node
+      - sdk-python
+      - sdk-csharp
+      - sdk-flutter
+      - migrations
+      - packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The `needs:` list above is the new single point of rot: add a job and
+      # forget to list it, and the gate silently stops covering it — the same
+      # shape as the misnamed required checks this job replaced. So the gate
+      # checks its own coverage. Dependency-free on purpose (no PyYAML): the
+      # parse only has to understand this one file's shape.
+      - uses: actions/checkout@v4
+      - name: Gate covers every job
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          src = open('.github/workflows/ci.yml').read()
+          body = src.split('\njobs:\n', 1)[1]
+          jobs = re.findall(r'^  ([A-Za-z0-9_-]+):[ \t]*$', body, re.M)
+          block = re.search(r'^  ci-complete:.*?(?=^  [A-Za-z0-9_-]+:[ \t]*$|\Z)',
+                            body, re.M | re.S).group(0)
+          needs = re.findall(r'^      - ([A-Za-z0-9_-]+)[ \t]*$', block, re.M)
+          expected = [j for j in jobs if j != 'ci-complete']
+          missing = [j for j in expected if j not in needs]
+          unknown = [n for n in needs if n not in jobs]
+          print('jobs   :', ' '.join(expected))
+          print('covered:', ' '.join(needs))
+          if missing:
+              print(f"::error::ci-complete does not depend on: {' '.join(missing)}. "
+                    "Branch protection requires only 'CI complete', so these jobs are "
+                    "currently unguarded — add them to its needs: list.")
+          if unknown:
+              print(f"::error::ci-complete needs a job that does not exist: {' '.join(unknown)}")
+          sys.exit(1 if (missing or unknown) else 0)
+          EOF
+
+      - name: Report every job's result
+        env:
+          RESULTS: |
+            backend     ${{ needs.backend.result }}
+            dashboard   ${{ needs.dashboard.result }}
+            sdk-js      ${{ needs.sdk-js.result }}
+            sdk-node    ${{ needs.sdk-node.result }}
+            sdk-python  ${{ needs.sdk-python.result }}
+            sdk-csharp  ${{ needs.sdk-csharp.result }}
+            sdk-flutter ${{ needs.sdk-flutter.result }}
+            migrations  ${{ needs.migrations.result }}
+            packaging   ${{ needs.packaging.result }}
+        run: printf '%s\n' "$RESULTS"
+
+      # 'skipped' counts as failure too. No job here has a path filter or a
+      # job-level `if:`, so nothing can skip legitimately today — and if someone
+      # adds a conditional job later, blocking is the right default: it forces a
+      # deliberate decision about whether the gate still means what it says,
+      # rather than quietly shrinking coverage.
+      - name: Fail unless every job succeeded
+        if: >-
+          contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
+          || contains(needs.*.result, 'skipped')
+        run: |
+          echo "::error::One or more CI jobs did not succeed — see the results printed above."
+          exit 1

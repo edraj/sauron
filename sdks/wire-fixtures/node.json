@@ -1,0 +1,225 @@
+{
+  "header": {
+    "dsn": "https://pk_test@localhost:8081/1",
+    "sdk": {
+      "name": "sauron-node",
+      "version": "1.4.0"
+    },
+    "sent_at": "2026-07-12T10:30:00.123Z",
+    "release": "svc@1.4.2"
+  },
+  "context": {
+    "device": {
+      "device_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+    },
+    "os": {
+      "name": "<host>",
+      "version": "<host>"
+    },
+    "app": {},
+    "runtime": {
+      "name": "node",
+      "version": "<host>"
+    },
+    "user": null
+  },
+  "items": [
+    {
+      "type": "identify",
+      "distinct_id": "u_123",
+      "anonymous_id": null,
+      "traits": {
+        "plan": "pro"
+      },
+      "timestamp": "2026-07-12T10:30:00.123Z"
+    },
+    {
+      "type": "event",
+      "name": "checkout_completed",
+      "distinct_id": "u_123",
+      "properties": {
+        "cart_value": 42.5
+      },
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "session_id": null,
+      "screen": null,
+      "tags": {
+        "env": "prod"
+      }
+    },
+    {
+      "type": "error",
+      "event_id": "0123456789abcdef0123456789abcdef",
+      "level": "error",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "exception": {
+        "type": "TypeError",
+        "value": "x is not a function",
+        "mechanism": {
+          "type": "generic",
+          "handled": true
+        },
+        "stacktrace": [
+          {
+            "function": "<fn>",
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": null,
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": null,
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": null,
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": null,
+            "module": null,
+            "filename": "<file>",
+            "abs_path": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": true
+          }
+        ]
+      },
+      "message": null,
+      "breadcrumbs": [
+        {
+          "type": "navigation",
+          "category": "history",
+          "message": "went to /settings",
+          "level": "info",
+          "timestamp": "2026-07-12T10:30:00.123Z",
+          "data": {
+            "from": "/",
+            "to": "/settings"
+          }
+        }
+      ],
+      "tags": {
+        "env": "prod"
+      },
+      "fingerprint": null,
+      "user": {
+        "id": "u_123",
+        "email": "a@b.co",
+        "username": null
+      },
+      "session_id": null,
+      "screen": null
+    },
+    {
+      "type": "error",
+      "event_id": "0123456789abcdef0123456789abcdef",
+      "level": "warning",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "exception": {
+        "type": "Message",
+        "value": "payment provider returned a soft decline",
+        "mechanism": {
+          "type": "generic",
+          "handled": true
+        },
+        "stacktrace": []
+      },
+      "message": "payment provider returned a soft decline",
+      "breadcrumbs": [
+        {
+          "type": "navigation",
+          "category": "history",
+          "message": "went to /settings",
+          "level": "info",
+          "timestamp": "2026-07-12T10:30:00.123Z",
+          "data": {
+            "from": "/",
+            "to": "/settings"
+          }
+        }
+      ],
+      "tags": {
+        "env": "prod"
+      },
+      "fingerprint": null,
+      "user": {
+        "id": "u_123",
+        "email": "a@b.co",
+        "username": null
+      },
+      "session_id": null,
+      "screen": null
+    },
+    {
+      "type": "transaction",
+      "name": "GET /api/users",
+      "op": "http",
+      "duration_ms": 128.4,
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "status": "ok",
+      "http_method": "GET",
+      "http_status": 200,
+      "url": "https://api.example.com/api/users",
+      "distinct_id": "u_123"
+    }
+  ]
+}

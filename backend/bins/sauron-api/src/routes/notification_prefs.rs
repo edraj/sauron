@@ -780,10 +780,12 @@ fn generic_unsubscribe_ok() -> Value {
 /// URL and SMTP password undecryptable. Domain separation keeps the two uses
 /// independent.
 ///
-/// The fallback is `require_jwt_secret()`, not the field: `Config::jwt_secret`
-/// is private on purpose (`sauron-core/src/config.rs:20` — "reach it through
-/// `Config::require_jwt_secret`"), so touching it directly is E0616 from
-/// `sauron-api`.
+/// There is NO fallback any more. `NOTIFY_SECRET_KEY` is required and
+/// `sauron-api` refuses to boot without it, so by the time a request reaches
+/// this function the key is present; the `unwrap_or_default()` that used to sit
+/// here would have signed with the empty string, and because this endpoint
+/// returns the same body whatever happened, every link minted under it would
+/// have failed verification in total silence.
 ///
 /// **This expression must stay byte-for-byte identical to `unsub_key` in
 /// `sauron-alerts`' drain (Task 18 Step 5).** The drain mints the tokens and
@@ -792,13 +794,7 @@ fn generic_unsubscribe_ok() -> Value {
 /// endpoint deliberately returns the same body whatever happened — every
 /// unsubscribe silently no-ops with no error anywhere.
 pub(crate) fn unsub_signing_key(state: &AppState) -> String {
-    let base = state.cfg.notify_secret_key.clone().unwrap_or_else(|| {
-        state
-            .cfg
-            .require_jwt_secret()
-            .map(String::from)
-            .unwrap_or_default()
-    });
+    let base = state.cfg.require_notify_secret_key().unwrap_or_default();
     sauron_alerts::crypto::derive_unsub_key(base.as_bytes())
 }
 

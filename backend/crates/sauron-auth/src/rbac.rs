@@ -26,13 +26,50 @@ use crate::extractors::AuthError;
 
 /// Canonical permission strings.
 pub mod perm {
+    /// The **coarse** error gate: the issue list and everything issue-level on
+    /// it — title, culprit, fingerprint, level, status, `times_seen`,
+    /// `users_seen`, first/last seen, occurrence counts and series.
+    ///
+    /// It is deliberately NOT enough to read an event *body*. See
+    /// [`EVENT_READ`].
     pub const ISSUE_READ: &str = "issue:read";
     pub const ISSUE_WRITE: &str = "issue:write";
+    /// Read raw signal (analytics events, sessions, devices, screens, people,
+    /// workflows, funnels, performance) **and**, together with [`ISSUE_READ`],
+    /// the *body* of an error event.
+    ///
+    /// A body is: `stacktrace`, `stacktrace_symbolicated`, `breadcrumbs`,
+    /// `context` (the captured request/runtime payload), `contexts`, `extra`,
+    /// `tags`, `sdk`, `debug_meta`, `event_user` and `ip_address`. Every one of
+    /// those requires BOTH permissions — `issue:read` alone never exposes a
+    /// body, and `event:read` alone never exposes one either. The single
+    /// enforcement point is `sauron-api`'s `symbolicate::gate_event_body`;
+    /// handlers pass it the permission set from
+    /// `routes::scope::authorized_read_scope_with_perms` rather than testing
+    /// the two names themselves.
+    ///
+    /// **This supersedes the 2026-08-08 ruling**, which said `event:read` alone
+    /// kept returning stacktraces, breadcrumbs and frames on `sessions::detail`
+    /// / `devices::detail` / `screens::detail` / `analytics::person` and that
+    /// only source lines were withheld. That measurement was accurate for the
+    /// code of the day; the *policy* it recorded has been reversed. The
+    /// least-disruptive variant lost: a role holding one half of the pair was
+    /// reading crash payloads — request bodies, user identities, dev-supplied
+    /// `extra` — that neither half was meant to confer on its own.
     pub const EVENT_READ: &str = "event:read";
     pub const FUNNEL_WRITE: &str = "funnel:write";
     pub const ARTIFACT_WRITE: &str = "artifact:write";
-    /// View de-obfuscated **source code** (symbolication context lines). Symbol
-    /// names / file / line are visible with `issue:read`; this gates the code.
+    /// View de-obfuscated **source code** (symbolication context lines). This
+    /// gates ONLY the code text; symbol name, filename, lineno and colno stay
+    /// visible without it.
+    ///
+    /// It is the *third* gate on a frame, layered on top of the body gate, not
+    /// an alternative to it: reaching a frame at all needs `issue:read` AND
+    /// `event:read` (see [`EVENT_READ`]), and `source:read` then decides
+    /// whether that frame also carries `context_line` / `pre_context` /
+    /// `post_context` / `context_start_line`. A caller holding `source:read`
+    /// but only one of the body pair still sees no frames — there is nothing
+    /// for the source gate to act on.
     pub const SOURCE_READ: &str = "source:read";
     pub const MONITOR_READ: &str = "monitor:read";
     pub const MONITOR_WRITE: &str = "monitor:write";
@@ -745,7 +782,9 @@ pub async fn authorize_env_read(
 
 /// [`authorize_env_read`], plus the caller's full effective permission set at
 /// the **resolved** scope — for a handler that gates a second capability on top
-/// of the read itself (`issues::detail`/`issues::events` and `source:read`).
+/// of the read itself. Every current caller gates `source:read`; see
+/// `sauron-api`'s `routes::scope::authorized_read_scope_with_perms`, the sole
+/// wrapper, for the list.
 ///
 /// Supersedes `routes::mod::authorize_app_perms` for environment-scoped reads.
 /// That helper resolved permissions through [`effective_at`], which hardcodes

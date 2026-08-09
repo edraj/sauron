@@ -44,7 +44,7 @@ Or build a local package and consume it from a local feed:
 cd sdks/csharp
 dotnet pack Sauron/Sauron.csproj -c Release -o ./nupkg
 dotnet nuget add source "$(pwd)/nupkg" --name sauron-local
-dotnet add <your-project>.csproj package Sauron --version 1.2.0
+dotnet add <your-project>.csproj package Sauron --version 1.4.0
 ```
 
 Once published, the install command will be:
@@ -746,6 +746,12 @@ serialized into envelopes and the pending queue has been drained (or a transient
 failure has left envelopes queued for later). `SauronSdk.FlushAsync()` returns
 `Task.CompletedTask` before `Init`.
 
+**Never throws.** Delivery problems — network errors, an unserializable property
+value, even flushing after `Close` — are logged (with `Debug = true`) and the task
+completes successfully; telemetry must not fail the app it is observing. Nothing is
+treated as delivered unless it was: an envelope whose send failed stays queued and
+is retried on the next flush.
+
 ```csharp
 await SauronSdk.FlushAsync();
 ```
@@ -1169,6 +1175,21 @@ dotnet pack Sauron/Sauron.csproj -c Release -o ./nupkg
 There is no separate typecheck step — `Nullable` is enabled, so `dotnet build`
 surfaces nullability warnings. The test project has `InternalsVisibleTo` access,
 which is why tests can reference the internal item DTOs directly.
+
+### Why there is a `global.json` here
+
+`global.json` sets an SDK **floor of 9.0.200**, and that floor is about the
+solution format, not the target framework. This directory ships only
+`Sauron.slnx` — the XML solution format — and support for it landed in SDK
+9.0.200. On an older SDK the commands above fail with
+`MSB1003: Specify a project or solution file`, which reads like a missing file
+rather than an SDK that cannot parse the one that is there.
+
+`"rollForward": "latestMajor"` keeps it a floor: a newer SDK (10.x and up) is
+fine and is what most machines will use. The floor is deliberately *not* an
+exact pin — `net8.0` in the two `.csproj` files already pins what gets compiled,
+and `RollForward: Major` pins what the test host may run on. If you do have an
+SDK below the floor, the error names both the version wanted and this file.
 
 ## License
 

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  encodeFilters, parseFilters, ISSUE_FIELDS, EVENT_FIELDS, composeTag, splitTag, type Filter,
+  encodeFilters, parseFilters, ISSUE_FIELDS, EVENT_FIELDS, composeTag, splitTag,
+  PERMISSION_GATED_FILTER_FIELDS, gatedFilterFields, type Filter,
 } from './filters';
 
 describe('filters codec', () => {
@@ -69,5 +70,48 @@ describe('tag filter', () => {
       // `contains` is first → it's the default op the FilterBar picks.
       expect(tag?.ops).toEqual(['contains', 'eq']);
     }
+  });
+});
+
+describe('permission-gated filter fields', () => {
+  it('names the fields the API refuses without event:read', () => {
+    // Pinned as a literal rather than derived: this list mirrors
+    // `reject_body_filters` in the backend, and a test that computed it from the
+    // same source it is checking would agree with any drift.
+    expect([...PERMISSION_GATED_FILTER_FIELDS]).toEqual(['tag', 'workflow']);
+  });
+
+  it('picks out the gated fields present in a filter set', () => {
+    const filters: Filter[] = [
+      { field: 'level', op: 'eq', value: 'error' },
+      { field: 'tag', op: 'contains', value: 'customer=acme' },
+    ];
+    expect(gatedFilterFields(filters)).toEqual(['tag']);
+  });
+
+  it('returns nothing when no gated field is applied', () => {
+    // The condition that keeps a genuine loss of page access from being
+    // misreported as a filter problem.
+    expect(gatedFilterFields([{ field: 'status', op: 'eq', value: 'unresolved' }])).toEqual([]);
+  });
+
+  it('deduplicates a field used twice', () => {
+    const filters: Filter[] = [
+      { field: 'tag', op: 'eq', value: 'a=1' },
+      { field: 'tag', op: 'contains', value: 'b' },
+    ];
+    // Two chips, one permission problem — the recovery button must not offer to
+    // "remove Tag and Tag filters".
+    expect(gatedFilterFields(filters)).toEqual(['tag']);
+  });
+
+  it('reports both when both are applied', () => {
+    const filters: Filter[] = [
+      { field: 'workflow', op: 'contains', value: 'Checkout' },
+      { field: 'tag', op: 'eq', value: 'a=1' },
+    ];
+    // Order follows the filter set, not the constant, so the message names them
+    // in the order the user added them.
+    expect(gatedFilterFields(filters)).toEqual(['workflow', 'tag']);
   });
 });

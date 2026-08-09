@@ -15,7 +15,7 @@ function attachCallMeta(item: ErrorItem, hint?: Hint): void {
 }
 
 interface ExtractedError {
-  type: string | null;
+  type: string;
   value: string | null;
   stacktrace: Frame[];
 }
@@ -93,7 +93,21 @@ export function captureException(err: unknown, hint?: Hint): void {
   client.captureItem(item, fullHint);
 }
 
-/** Capture a plain message as an error item at the given `level` (default info). */
+/**
+ * Capture a plain message as an error item at the given `level` (default info).
+ *
+ * The item carries NO `exception` block — a message is not an exception, and the
+ * backend's `ExceptionInfo.ty` is a non-`Option` `String` with no serde default,
+ * so the `{ type: null }` placeholder this used to send failed to deserialize
+ * and 400'd the WHOLE envelope (`invalid_envelope`), taking every unrelated
+ * error and event in the batch with it — silently, because every SDK treats a
+ * 400 as a non-retryable drop.
+ *
+ * Omitting `exception` and setting `message` is python's shape. It also routes
+ * server-side onto the `message\n<normalized message>` fingerprint branch, so
+ * messages group by their text instead of piling into one bucket keyed by a
+ * synthetic exception type.
+ */
 export function captureMessage(message: string, level: Level = 'info', hint?: Hint): void {
   const client = getClient();
   if (!client) return;
@@ -102,12 +116,7 @@ export function captureMessage(message: string, level: Level = 'info', hint?: Hi
     type: 'error',
     timestamp: nowIso(),
     level,
-    exception: {
-      type: null,
-      value: message,
-      mechanism: { type: 'message', handled: true },
-      stacktrace: [],
-    },
+    message,
     breadcrumbs,
     fingerprint: (hint?.fingerprint as string[] | null | undefined) ?? null,
     session_id: getSessionId(),

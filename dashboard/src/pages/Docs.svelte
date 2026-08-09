@@ -7,40 +7,31 @@
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon, { type IconName } from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import { listEnvironments } from '../lib/api/environments';
   import { buildDsn, appTypeIcon, appTypeLabel } from '../lib/utils/format';
-  import type { AppEnvironment } from '../lib/models';
 
   type Platform = 'web' | 'flutter' | 'python' | 'node' | 'csharp';
 
   const app = $derived(sessionStore.currentApp);
   const hasApp = $derived(!!app);
 
-  // The DSN now lives on the app's default environment, not the app itself —
-  // re-fetch whenever the current app changes.
-  let defaultEnv = $state<AppEnvironment | null>(null);
-
-  $effect(() => {
-    const aid = sessionStore.currentAppId;
-    // Clear synchronously, before awaiting. The app name and type badge are derived
-    // straight off the store and update in the same tick as the switch, so holding the
-    // previous app's environment here would render the NEW app's name beside the OLD
-    // app's DSN — a well-formed, copyable credential pointing at the wrong app.
-    defaultEnv = null;
-    if (!aid) return;
-    void (async () => {
-      try {
-        const envs = await listEnvironments(aid);
-        // Discard a response that lost the race: on rapid A -> B -> A switching the
-        // requests can settle out of order, which would otherwise leave the wrong
-        // environment in place permanently rather than only transiently.
-        if (sessionStore.currentAppId !== aid) return;
-        defaultEnv = envs.find((e) => e.is_default) ?? envs[0] ?? null;
-      } catch {
-        if (sessionStore.currentAppId === aid) defaultEnv = null;
-      }
-    })();
-  });
+  // The DSN lives on the app's default environment, not the app itself.
+  //
+  // Read straight off the store rather than re-fetching: `sessionStore.environments`
+  // IS `listEnvironments(currentAppId)` — the store owns that call and Topbar's
+  // self-heal effect (Topbar.svelte:58-61) guarantees it runs for the selected
+  // app, which this page always mounts alongside via AppShell. The private copy
+  // this page used to keep meant a second identical request on every app switch.
+  //
+  // Deriving also retires the whole out-of-order-response guard the fetch needed:
+  // `setApp` clears `environments` to `[]` synchronously before reloading it
+  // (session.svelte.ts:345-347), so on a switch this collapses to `null` in the
+  // same tick as the app name and type badge. The hazard the old comment
+  // described — the NEW app's name beside the OLD app's DSN, a well-formed and
+  // copyable credential pointing at the wrong app — is therefore structurally
+  // unreachable now rather than defended against after the fact.
+  const defaultEnv = $derived(
+    sessionStore.environments.find((e) => e.is_default) ?? sessionStore.environments[0] ?? null,
+  );
 
   // Every snippet is filled in with the selected environment's DSN so it's
   // copy-paste ready. Falls back to an obvious placeholder when no app is
@@ -781,14 +772,14 @@ GROUP BY name, op`;
         </div>
         <p class="muted dsn-env-hint">
           Showing the DSN for the <strong>{defaultEnv?.name ?? 'default'}</strong> environment.
-          Each environment has its own — see <a href="#/settings">Settings → Environments</a>.
+          Each environment has its own — see <a href="#/admin/environments">Environments</a>.
         </p>
       {:else}
         <div class="dsn-empty">
           <span class="ic"><Icon name="key-round" size={18} /></span>
           <p class="muted">
             Snippets use a placeholder DSN.
-            <a href="#/projects">Create or select an app</a> to auto-fill your real key.
+            <a href="#/admin/projects">Create or select an app</a> to auto-fill your real key.
           </p>
         </div>
       {/if}
@@ -1487,12 +1478,12 @@ GROUP BY name, op`;
 
         <!-- Footer links -->
     <div class="foot-links">
-      <a class="fl" href="#/settings">
+      <a class="fl" href="#/admin/settings">
         <span class="fl-ic"><Icon name="settings" size={16} /></span>
         <span class="fl-tx"><b>App settings</b><span class="muted">Copy or rotate your DSN</span></span>
         <Icon name="arrow-right" size={15} />
       </a>
-      <a class="fl" href="#/projects">
+      <a class="fl" href="#/admin/projects">
         <span class="fl-ic"><Icon name="folders" size={16} /></span>
         <span class="fl-tx"><b>Projects & apps</b><span class="muted">Add another platform</span></span>
         <Icon name="arrow-right" size={15} />

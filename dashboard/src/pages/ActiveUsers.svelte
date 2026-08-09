@@ -14,6 +14,8 @@
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { toastStore } from '../lib/stores/toast.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { listEnvironments } from '../lib/api/environments';
   import { downloadActiveUsersCsv, getActiveUsers } from '../lib/api/activeUsers';
   import { errorMessage } from '../lib/api/client';
@@ -45,9 +47,15 @@
   let to = $state(initial.get('to') ?? initialWindow.to);
   let selection = $state<AppEnvSelection>(decodeSelection(initial.getAll('selection')));
 
-  let report = $state<ActiveUsersReport | null>(null);
-  let loading = $state(false);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): the cached report paints
+  // instantly on return, then refreshes behind it. Re-exposed under the names the
+  // template already used, so the markup is unchanged apart from the spinner prop.
+  const view = new CachedView<ActiveUsersReport>();
+
+  const report = $derived(view.data ?? null);
+  const revalidating = $derived(view.revalidating);
+  const error = $derived(view.error);
+
   let refreshing = $state(false);
   let exporting = $state(false);
 
@@ -64,6 +72,16 @@
     return out;
   });
   const selectionValid = $derived(validateSelection(selection));
+
+  // `CachedView` starts out `loading: true`, but this page legitimately sits with
+  // nothing selected and no request in flight — and `reset()` returns it to that
+  // state when the last app is unticked. Gate on the same condition the load
+  // effect uses (`encodeSelection` emits exactly one token per selected app), or
+  // an empty selection renders a spinner that never resolves instead of the
+  // "Pick an app to begin" empty state below it.
+  const hasSelection = $derived(selectionCount(selection) > 0);
+  const loading = $derived(hasSelection && view.loading);
+
   const rangeDays = $derived(
     Math.max(1, Math.round((Date.parse(to) - Date.parse(from)) / 86_400_000)),
   );
@@ -91,17 +109,34 @@
     to = w.to;
   }
 
-  async function load(projectId: string, params: { from: string; to: string; selection: string[] }) {
-    loading = true;
-    error = null;
-    try {
-      report = await getActiveUsers(projectId, params);
-    } catch (err) {
-      error = errorMessage(err);
-      report = null;
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit: an explicit Refresh click
+   * means "go to the network now", cache or not.
+   *
+   * `scopeKey` is in the key per the house rule for every cached view: it carries
+   * the selected environment, which the axios interceptor can add to a request
+   * without it appearing in any caller argument. Here the `selection` tokens
+   * already name each app's environment explicitly, so it is belt-and-braces
+   * rather than the sole guard — but deciding that per page, per endpoint, is
+   * exactly how one environment's numbers end up served as another's.
+   */
+  async function load(
+    projectId: string,
+    params: { from: string; to: string; selection: string[] },
+    force = false,
+  ) {
+    await view.load(
+      viewKey(
+        'active-users.report',
+        projectId,
+        sessionStore.scopeKey,
+        params.from,
+        params.to,
+        params.selection,
+      ),
+      () => getActiveUsers(projectId, params),
+      force,
+    );
   }
 
   async function refresh() {
@@ -109,7 +144,7 @@
     if (!pid || !selectionValid.ok) return;
     refreshing = true;
     try {
-      await load(pid, { from, to, selection: encodeSelection(selection) });
+      await load(pid, { from, to, selection: encodeSelection(selection) }, true);
     } finally {
       refreshing = false;
     }
@@ -148,7 +183,10 @@
     for (const s of encoded) p.append('selection', s);
     void replace(`/active-users?${p.toString()}`);
     if (encoded.length === 0) {
-      report = null;
+      // `reset()`, not just "show nothing": it also bumps the generation, so a
+      // response for the selection the user just cleared cannot land afterwards
+      // and repopulate the page.
+      view.reset();
       return;
     }
     void load(pid, { from: f, to: t, selection: encoded });
@@ -212,7 +250,15 @@
             </button>
           {/each}
         </div>
-        <RefreshButton onclick={refresh} loading={refreshing} />
+        <!--
+          Spins for a background revalidate too, not just an explicit click: that
+          spinner IS the "showing cached numbers, fetching fresh" hint.
+        -->
+        <RefreshButton
+          onclick={refresh}
+          loading={refreshing || revalidating}
+          title={revalidating ? 'Refreshing…' : 'Refresh'}
+        />
         <Button
           variant="secondary"
           onclick={exportCsv}

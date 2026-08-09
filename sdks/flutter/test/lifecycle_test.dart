@@ -57,6 +57,11 @@ void main() {
       ..httpClient = httpClient
       ..gzipThresholdBytes = 1 << 30;
     final SauronClient client = SauronClient(options);
+    // An analytics item needs an identity: `distinct_id` is non-`Option` on the
+    // wire, so `track`/`setScreen`/`startWorkflow` DROP the item when the scope
+    // has no user (sending `null` would 400 the whole envelope). `setUser` sets
+    // it without emitting an extra `identify` item.
+    client.setUser(const SauronUser(id: 'u_123'));
     await client.bootstrap(queueDirectory: dir);
     return client;
   }
@@ -154,6 +159,11 @@ void main() {
       ..httpClient = httpClient
       ..gzipThresholdBytes = 1 << 30;
     final SauronClient client = SauronClient(options);
+    // An analytics item needs an identity: `distinct_id` is non-`Option` on the
+    // wire, so `track`/`setScreen`/`startWorkflow` DROP the item when the scope
+    // has no user (sending `null` would 400 the whole envelope). `setUser` sets
+    // it without emitting an extra `identify` item.
+    client.setUser(const SauronUser(id: 'u_123'));
 
     // No transport yet — this must be buffered, not dropped.
     client.track('early');

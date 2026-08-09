@@ -60,6 +60,53 @@ pub mod keys {
 /// A single stream entry: `(stream_id, payload)`.
 pub type StreamEntry = (String, String);
 
+/// Re-exported so a caller of [`RedisStore::stream_stats`] needs no direct
+/// dependency on `sauron-telemetry`. The struct lives there because that is
+/// where it is rendered, and defining it twice would mean deriving
+/// `unread_trimmed` twice.
+pub use sauron_telemetry::metrics::StreamSnapshot;
+
+/// The `field, value` pairs of an `XINFO` map reply.
+///
+/// Written against both shapes deliberately: RESP2 returns a flat array of
+/// alternating field and value, RESP3 returns a real map, and which one arrives
+/// depends on the connection's protocol rather than on anything this crate
+/// controls.
+fn field_pairs(v: &redis::Value) -> Vec<(String, redis::Value)> {
+    match v {
+        redis::Value::Map(pairs) => pairs
+            .iter()
+            .filter_map(|(k, v)| Some((as_string(k)?, v.clone())))
+            .collect(),
+        redis::Value::Array(flat) => flat
+            .chunks_exact(2)
+            .filter_map(|kv| Some((as_string(&kv[0])?, kv[1].clone())))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn as_string(v: &redis::Value) -> Option<String> {
+    match v {
+        redis::Value::BulkString(b) => String::from_utf8(b.clone()).ok(),
+        redis::Value::SimpleString(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// A non-negative integer from an `XINFO` field, or `None` for nil — which is a
+/// value Redis genuinely returns for `entries-read` and `lag`, and which must
+/// stay distinguishable from zero all the way to the rendered metric.
+fn as_u64(v: &redis::Value) -> Option<u64> {
+    match v {
+        redis::Value::Nil => None,
+        redis::Value::Int(i) => u64::try_from(*i).ok(),
+        redis::Value::BulkString(b) => std::str::from_utf8(b).ok()?.parse().ok(),
+        redis::Value::SimpleString(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct RedisStore {
     conn: ConnectionManager,
@@ -396,8 +443,12 @@ impl RedisStore {
     }
 
     /// Dead-letter a permanently failing job, then ack it off the main stream.
-    pub async fn dead_letter(&self, id: &str, payload: &str) -> anyhow::Result<()> {
-        self.dlq_push(payload).await?;
+    ///
+    /// The ack is deliberately AFTER the DLQ write and behind `?`: if the DLQ
+    /// write fails, the entry is not acked and is redelivered, rather than
+    /// being retired with no surviving copy anywhere.
+    pub async fn dead_letter(&self, id: &str, payload: &str, maxlen: usize) -> anyhow::Result<()> {
+        self.dlq_push(payload, maxlen).await?;
         self.ack(id).await
     }
 
@@ -408,16 +459,180 @@ impl RedisStore {
     /// The caller acks once, after the last item of the entry has been handled;
     /// until then a crash costs a redelivery (duplicate writes) rather than
     /// silently dropping the remainder of the envelope.
-    pub async fn dlq_push(&self, payload: &str) -> anyhow::Result<()> {
+    /// The DLQ is BOUNDED (`MAXLEN ~`), where it used to be unbounded.
+    ///
+    /// An unbounded dead-letter stream is a slow-motion outage: a poison payload
+    /// or a Postgres outage writes one entry per failing item, forever, until
+    /// Redis hits `maxmemory` — at which point the INGEST stream stops accepting
+    /// writes too and the edge starts refusing live traffic. Bounding the
+    /// wreckage is what keeps a failure of the recovery path from becoming a
+    /// failure of the ingest path.
+    ///
+    /// Trimming is EXACT, unlike `xadd_jobs`, which uses `~`. That difference is
+    /// deliberate and was forced by a test: `MAXLEN ~ n` only evicts whole radix
+    /// nodes, so at realistic dead-letter volumes it evicts nothing at all — 50
+    /// pushes with `MAXLEN ~ 5` left all 50 entries. Approximate trimming buys
+    /// throughput on the hot ingest path, where XADD is the bottleneck; here the
+    /// stream is written only on failure, so the O(n) cost is irrelevant and an
+    /// approximate bound that does not actually bound is strictly worse than an
+    /// exact one.
+    ///
+    /// Errors are the caller's to handle and MUST NOT be discarded — see
+    /// `dlq_write_failures` in `sauron-telemetry`.
+    pub async fn dlq_push(&self, payload: &str, maxlen: usize) -> anyhow::Result<()> {
+        self.dlq_push_to(keys::INGEST_DLQ, payload, maxlen).await
+    }
+
+    /// [`dlq_push`] against an arbitrary key, so a test can exercise the real
+    /// command against a stream of its own instead of the live dead-letter
+    /// queue. Same reasoning as [`stream_stats`]' parameters.
+    pub async fn dlq_push_to(&self, key: &str, payload: &str, maxlen: usize) -> anyhow::Result<()> {
         let mut c = self.conn.clone();
         redis::cmd("XADD")
-            .arg(keys::INGEST_DLQ)
+            .arg(key)
+            .arg("MAXLEN")
+            .arg(maxlen)
             .arg("*")
             .arg("d")
             .arg(payload)
             .query_async::<()>(&mut c)
             .await?;
         Ok(())
+    }
+
+    /// Drop dead-letter entries older than `retention`, returning how many went.
+    ///
+    /// `MAXLEN` alone bounds the stream by COUNT, which is the wrong unit for a
+    /// privacy question. A dead-lettered payload is a copy of a real event — the
+    /// masked copy, but still one that outlives every retention window the
+    /// product otherwise enforces, sitting in Redis where no deletion request
+    /// and no tier rotation reaches it. On a quiet deployment `MAXLEN` would let
+    /// a single entry sit there for years.
+    ///
+    /// `XTRIM MINID` rather than a scan-and-delete: Redis stream ids are
+    /// `<unix-millis>-<seq>`, so an age cutoff IS an id, and the trim is one
+    /// O(deleted) command with no read-back. Exact (no `~`) because the whole
+    /// point is a hard age guarantee.
+    pub async fn dlq_reap(&self, retention: std::time::Duration) -> anyhow::Result<u64> {
+        self.dlq_reap_from(keys::INGEST_DLQ, retention).await
+    }
+
+    /// [`dlq_reap`] against an arbitrary key — see [`dlq_push_to`].
+    pub async fn dlq_reap_from(
+        &self,
+        key: &str,
+        retention: std::time::Duration,
+    ) -> anyhow::Result<u64> {
+        // `SystemTime`, not chrono: this crate deliberately has no date-time
+        // dependency, and a stream id only needs unix millis.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let cutoff_ms = now_ms - retention.as_millis() as i64;
+        if cutoff_ms <= 0 {
+            return Ok(0);
+        }
+        let mut c = self.conn.clone();
+        let removed: i64 = redis::cmd("XTRIM")
+            .arg(key)
+            .arg("MINID")
+            .arg(cutoff_ms)
+            .query_async(&mut c)
+            .await?;
+        Ok(removed.max(0) as u64)
+    }
+
+    // --- stream observability ---------------------------------------------
+
+    /// A strictly read-only reading of a stream, its consumer group and a
+    /// dead-letter stream, in ENTRIES.
+    ///
+    /// `XINFO STREAM`, `XINFO GROUPS` and `XLEN` in one pipeline. Nothing is
+    /// written and no key is modified.
+    ///
+    /// Keys and group name are parameters rather than the [`keys`] constants so
+    /// a test can probe a stream of its own and never touch the live ingest one.
+    ///
+    /// A missing stream is not an error: the pipeline ignores per-command
+    /// errors, so a stream that does not exist yet reads back as zeroes with
+    /// `entries_read`/`lag` absent, which is what is actually known about it.
+    ///
+    /// ## Reply size
+    ///
+    /// Measured on redis 7.4.10, against a stream of 3 entries whose payloads
+    /// were 1783 bytes each: plain `XINFO STREAM` replied **3941 bytes**,
+    /// because it echoes `first-entry` and `last-entry` with their full
+    /// payloads — so the worst case is bounded by two
+    /// `INGEST_MAX_BODY_BYTES`, not by anything small. `FULL COUNT 0` is not
+    /// the fix: **6147 bytes** on the same stream, because `COUNT 0` means "no
+    /// limit" and it returns every entry plus the pending-entries list.
+    /// `XINFO GROUPS` was 150 bytes and carries no payload at all.
+    ///
+    /// Hence the caller samples this on a fixed interval rather than per
+    /// scrape.
+    pub async fn stream_stats(
+        &self,
+        stream_key: &str,
+        group: &str,
+        dlq_key: &str,
+    ) -> anyhow::Result<StreamSnapshot> {
+        let mut pipe = redis::pipe();
+        pipe.ignore_errors();
+        pipe.cmd("XINFO").arg("STREAM").arg(stream_key);
+        pipe.cmd("XINFO").arg("GROUPS").arg(stream_key);
+        pipe.cmd("XLEN").arg(dlq_key);
+
+        let mut c = self.conn.clone();
+        let replies: Vec<redis::RedisResult<redis::Value>> = pipe.query_async(&mut c).await?;
+
+        let reply =
+            |i: usize| -> Option<&redis::Value> { replies.get(i).and_then(|r| r.as_ref().ok()) };
+
+        let mut stats = StreamSnapshot::default();
+
+        if let Some(v) = reply(0) {
+            for (field, value) in field_pairs(v) {
+                match field.as_str() {
+                    "length" => stats.length = as_u64(&value).unwrap_or(0),
+                    "entries-added" => stats.entries_added = as_u64(&value).unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+
+        // One group among several; match by name rather than taking the first.
+        if let Some(redis::Value::Array(groups)) = reply(1) {
+            for g in groups {
+                let pairs = field_pairs(g);
+                let is_ours = pairs
+                    .iter()
+                    .any(|(f, v)| f == "name" && as_string(v).as_deref() == Some(group));
+                if !is_ours {
+                    continue;
+                }
+                for (field, value) in pairs {
+                    match field.as_str() {
+                        // Deliberately `as_u64`, which answers `None` for a nil
+                        // reply. Redis really does return nil for both of these
+                        // once its exact bookkeeping is broken — measured on
+                        // 7.4.10: `XDEL` of an undelivered entry nils `lag`,
+                        // and `XGROUP SETID` without `ENTRIESREAD` nils both.
+                        // A nil rendered as 0 would announce "nothing was
+                        // trimmed" using a number Redis refused to give.
+                        "entries-read" => stats.entries_read = as_u64(&value),
+                        "lag" => stats.lag = as_u64(&value),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if let Some(v) = reply(2) {
+            stats.dlq_length = as_u64(v).unwrap_or(0);
+        }
+
+        Ok(stats)
     }
 
     // --- affected-user HyperLogLog ---------------------------------------
@@ -591,6 +806,108 @@ impl SymbolBlobCache {
 #[cfg(test)]
 mod hll_tests {
     use super::*;
+
+    /// The dead-letter queue used to be unbounded, with no MAXLEN, no TTL and
+    /// no reaper — a poison payload or a Postgres outage writes one entry per
+    /// failing item until Redis hits `maxmemory`, at which point the INGEST
+    /// stream stops accepting writes too and the edge refuses live traffic. A
+    /// failure of the recovery path became a failure of the ingest path.
+    #[tokio::test]
+    async fn dlq_push_bounds_the_stream() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:dlq:{}", uuid::Uuid::new_v4());
+        for i in 0..50 {
+            redis
+                .dlq_push_to(&key, &format!("{{\"i\":{i}}}"), 5)
+                .await
+                .unwrap();
+        }
+        let mut c = redis.conn.clone();
+        let len: i64 = redis::cmd("XLEN")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        // EXACTLY 5, not merely "fewer than 50". This assertion is why the DLQ
+        // uses exact trimming: written with `MAXLEN ~ 5` this test failed with
+        // len == 50, because approximate trimming evicts whole radix nodes and
+        // 50 small entries fit in one. An approximate bound that does not bound
+        // is worse than no bound, because it reads as protection.
+        assert_eq!(len, 5, "MAXLEN must bound the DLQ exactly");
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// MAXLEN bounds by COUNT, which is the wrong unit for a privacy question:
+    /// a dead-lettered payload is a copy of a real event that outlives every
+    /// retention window the product enforces, and on a quiet deployment a count
+    /// bound would let one sit there for years.
+    #[tokio::test]
+    async fn dlq_reap_drops_only_entries_older_than_the_retention() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:dlq:{}", uuid::Uuid::new_v4());
+        let mut c = redis.conn.clone();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Explicit ids, so "old" and "new" are facts rather than a sleep: a
+        // stream id IS a unix-millis timestamp, which is the whole reason the
+        // reaper can use XTRIM MINID instead of scanning.
+        for (n, age_ms) in [
+            ("old1", 7_200_000i64),
+            ("old2", 3_700_000),
+            ("new1", 60_000),
+        ] {
+            let _: String = redis::cmd("XADD")
+                .arg(&key)
+                .arg(format!("{}-0", now_ms - age_ms))
+                .arg("d")
+                .arg(n)
+                .query_async(&mut c)
+                .await
+                .unwrap();
+        }
+
+        let removed = redis
+            .dlq_reap_from(&key, std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(
+            removed, 2,
+            "both entries older than an hour, and only those"
+        );
+        let len: i64 = redis::cmd("XLEN")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(len, 1);
+
+        // Idempotent: a second pass with nothing newly aged removes nothing.
+        assert_eq!(
+            redis
+                .dlq_reap_from(&key, std::time::Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            0
+        );
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
 
     async fn store() -> Option<RedisStore> {
         let url = std::env::var("TEST_REDIS_URL").ok()?;
@@ -836,5 +1153,162 @@ mod hll_tests {
             .query_async(&mut c)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stream_stats_tests {
+    use super::*;
+
+    /// Every key this module touches carries a per-test UUID, so it can run
+    /// against a shared Redis without going anywhere near
+    /// `keys::INGEST_STREAM`. That is also why `stream_stats` takes its keys as
+    /// parameters instead of reading the constants.
+    fn unique(kind: &str) -> String {
+        format!("sauron:test:{kind}:{}", uuid::Uuid::new_v4())
+    }
+
+    async fn store() -> Option<RedisStore> {
+        let url = std::env::var("TEST_REDIS_URL").ok()?;
+        RedisStore::connect(&url).await.ok()
+    }
+
+    async fn xadd(redis: &RedisStore, key: &str, n: usize, maxlen: Option<usize>) {
+        let mut c = redis.conn.clone();
+        for i in 0..n {
+            let mut cmd = redis::cmd("XADD");
+            cmd.arg(key);
+            if let Some(m) = maxlen {
+                cmd.arg("MAXLEN").arg(m);
+            }
+            cmd.arg("*").arg("d").arg(format!("payload-{i}"));
+            cmd.query_async::<String>(&mut c).await.unwrap();
+        }
+    }
+
+    async fn read_group(redis: &RedisStore, key: &str, group: &str, count: usize) -> usize {
+        let mut c = redis.conn.clone();
+        let opts = StreamReadOptions::default()
+            .group(group, "test-consumer")
+            .count(count);
+        let reply: StreamReadReply = c.xread_options(&[key], &[">"], &opts).await.unwrap();
+        reply.keys.iter().map(|k| k.ids.len()).sum()
+    }
+
+    /// The whole point of the derived gauge, against a trim we cause on purpose.
+    ///
+    /// Also pins the property that makes it a LIVE gauge and not a ledger: once
+    /// the group reaches the tail, Redis folds the trimmed gap into
+    /// `entries-read` and the gauge reads 0 again. Anyone who later builds the
+    /// loss accounting out of Redis instead of out of our own counters gets a
+    /// failing test here.
+    #[tokio::test]
+    async fn detects_entries_trimmed_before_the_group_read_them() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping detects_entries_trimmed_before_the_group_read_them");
+            return;
+        };
+        let key = unique("stream");
+        let dlq = unique("dlq");
+        let group = "test-workers";
+
+        // 10 entries, group starting at the head, 3 delivered.
+        xadd(&redis, &key, 10, None).await;
+        let mut c = redis.conn.clone();
+        redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&key)
+            .arg(group)
+            .arg("0")
+            .query_async::<()>(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(read_group(&redis, &key, group, 3).await, 3);
+
+        let before = redis.stream_stats(&key, group, &dlq).await.unwrap();
+        assert_eq!(before.entries_added, 10);
+        assert_eq!(before.entries_read, Some(3));
+        assert_eq!(before.lag, Some(7));
+        assert_eq!(
+            before.unread_trimmed(),
+            Some(0),
+            "nothing has been trimmed yet"
+        );
+
+        // One more entry, with an exact MAXLEN of 2 — this is the trim. Six of
+        // the eight entries the group had not been delivered are now gone.
+        xadd(&redis, &key, 1, Some(2)).await;
+
+        let after = redis.stream_stats(&key, group, &dlq).await.unwrap();
+        assert_eq!(after.length, 2, "MAXLEN 2 must leave exactly two entries");
+        assert_eq!(after.entries_added, 11);
+        assert_eq!(after.entries_read, Some(3));
+        assert_eq!(
+            after.lag,
+            Some(2),
+            "a trim does not nil the lag, it silently recomputes it downward — \
+             which is exactly why lag alone is not a loss signal"
+        );
+        assert_eq!(
+            after.unread_trimmed(),
+            Some(6),
+            "11 added - 3 read - 2 still pending = the 6 undelivered entries MAXLEN dropped"
+        );
+
+        // Drain to the tail. Two entries are actually delivered, and Redis
+        // raises entries-read all the way to 11 to close the gap.
+        assert_eq!(read_group(&redis, &key, group, 100).await, 2);
+        let drained = redis.stream_stats(&key, group, &dlq).await.unwrap();
+        assert_eq!(drained.entries_read, Some(11));
+        assert_eq!(drained.lag, Some(0));
+        assert_eq!(
+            drained.unread_trimmed(),
+            Some(0),
+            "the Redis-side gap evaporates on catch-up; the durable loss record is the \
+             item counters, not this gauge"
+        );
+
+        // The DLQ is a separate stream, counted separately.
+        xadd(&redis, &dlq, 2, None).await;
+        let with_dlq = redis.stream_stats(&key, group, &dlq).await.unwrap();
+        assert_eq!(with_dlq.dlq_length, 2);
+
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .arg(&dlq)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        // Printed so a run can prove the body executed rather than taking the
+        // skip path above and still reporting "ok".
+        println!("STREAM_STATS_TRIM_TEST_RAN");
+    }
+
+    /// A stream that does not exist is not an error: the numbers are simply
+    /// zero, and `entries_read`/`lag` are absent because there is no group to
+    /// report them.
+    #[tokio::test]
+    async fn missing_stream_reads_as_zero_with_absent_group_fields() {
+        let Some(redis) = store().await else {
+            eprintln!(
+                "TEST_REDIS_URL unset — skipping missing_stream_reads_as_zero_with_absent_group_fields"
+            );
+            return;
+        };
+        let stats = redis
+            .stream_stats(&unique("stream"), "test-workers", &unique("dlq"))
+            .await
+            .unwrap();
+        assert_eq!(stats.length, 0);
+        assert_eq!(stats.entries_added, 0);
+        assert_eq!(stats.entries_read, None);
+        assert_eq!(stats.lag, None);
+        assert_eq!(stats.dlq_length, 0);
+        assert_eq!(
+            stats.unread_trimmed(),
+            None,
+            "no group means the derived gauge is unknown, not zero"
+        );
+        println!("STREAM_STATS_MISSING_TEST_RAN");
     }
 }

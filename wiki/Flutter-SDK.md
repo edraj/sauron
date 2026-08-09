@@ -85,6 +85,8 @@ The public entry point is the static `Sauron` class:
 | `track` | `Sauron.track(String name, {Map<String, Object?>? properties})` |
 | `captureException` | `Sauron.captureException(Object error, {StackTrace? stackTrace, Mechanism? mechanism, SauronLevel level, String? screen, Map<String, String>? tags, Map<String, Map<String, Object?>>? contexts, Map<String, Object?>? extra})` |
 | `identify` | `Sauron.identify(String distinctId, {Map<String, Object?>? traits})` |
+| `reset` | `Sauron.reset()` → `Future<void>` — **call on logout.** Mints a fresh anonymous id so the next person is not merged into the previous one's history. Skipping it on a shared device is permanent. |
+| `anonymousId` | `Sauron.anonymousId` → `String?` (getter) — the persisted `anon_<uuidv4>` events are attributed to before `identify()` |
 | `setUser` | `Sauron.setUser(SauronUser? user)` — pass `null` to clear |
 | `setTag` / `setTags` | `Sauron.setTag(String key, String value)` · `Sauron.setTags(Map<String, String> values)` |
 | `setContext` | `Sauron.setContext(String name, Map<String, Object?> block)` |

@@ -1,0 +1,203 @@
+{
+  "header": {
+    "dsn": "https://pk_test@localhost:8081/1",
+    "sdk": {
+      "name": "sauron.javascript",
+      "version": "1.4.0"
+    },
+    "sent_at": "2026-07-12T10:30:00.123Z",
+    "release": "web@1.4.2"
+  },
+  "context": {
+    "device": {
+      "device_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+      "family": "<host>",
+      "model": null,
+      "arch": null
+    },
+    "os": {
+      "name": null,
+      "version": null
+    },
+    "app": {
+      "version": "1.4.2",
+      "build": null
+    },
+    "runtime": {
+      "name": null,
+      "version": null
+    },
+    "user": {
+      "id": "u_123",
+      "email": null,
+      "traits": {
+        "plan": "pro"
+      }
+    }
+  },
+  "items": [
+    {
+      "type": "identify",
+      "distinct_id": "u_123",
+      "anonymous_id": null,
+      "traits": {
+        "plan": "pro"
+      }
+    },
+    {
+      "type": "event",
+      "name": "$screen",
+      "distinct_id": "u_123",
+      "session_id": "sess_fixture",
+      "screen": "/checkout",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "properties": {
+        "screen": "/checkout"
+      },
+      "tags": {
+        "env": "prod"
+      }
+    },
+    {
+      "type": "event",
+      "name": "checkout_completed",
+      "distinct_id": "u_123",
+      "session_id": "sess_fixture",
+      "screen": "/checkout",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "properties": {
+        "cart_value": 42.5
+      },
+      "tags": {
+        "env": "prod"
+      }
+    },
+    {
+      "type": "error",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "level": "error",
+      "exception": {
+        "type": "TypeError",
+        "value": "x is not a function",
+        "mechanism": {
+          "type": "generic",
+          "handled": true
+        },
+        "stacktrace": [
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": null,
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": null,
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": null,
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": null,
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": true
+          }
+        ]
+      },
+      "breadcrumbs": [],
+      "fingerprint": null,
+      "session_id": "sess_fixture",
+      "screen": "/checkout",
+      "event_id": "0123456789abcdef0123456789abcdef",
+      "tags": {
+        "env": "prod"
+      },
+      "user": {
+        "id": "u_123",
+        "email": null,
+        "traits": {
+          "plan": "pro"
+        }
+      }
+    },
+    {
+      "type": "error",
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "level": "warning",
+      "message": "payment provider returned a soft decline",
+      "breadcrumbs": [],
+      "fingerprint": null,
+      "session_id": "sess_fixture",
+      "screen": "/checkout",
+      "event_id": "0123456789abcdef0123456789abcdef",
+      "tags": {
+        "env": "prod"
+      },
+      "user": {
+        "id": "u_123",
+        "email": null,
+        "traits": {
+          "plan": "pro"
+        }
+      }
+    },
+    {
+      "type": "transaction",
+      "name": "GET /api/users",
+      "op": "http",
+      "duration_ms": 128.4,
+      "status": "ok",
+      "http_method": "GET",
+      "http_status": 200,
+      "url": "https://api.example.com/api/users",
+      "distinct_id": "u_123",
+      "session_id": "sess_fixture",
+      "timestamp": "2026-07-12T10:30:00.123Z"
+    }
+  ]
+}

@@ -164,6 +164,16 @@ class Sauron {
   static void identify(String distinctId, {Map<String, Object?>? traits}) =>
       _client?.identify(distinctId, traits: traits);
 
+  /// The persisted anonymous id this install reports until [identify] names a
+  /// user, or null before [init] has completed.
+  static String? get anonymousId => _client?.anonymousId;
+
+  /// Forgets the current person: clears the user and mints a fresh anonymous
+  /// id. **Call this on logout** — see [SauronClient.reset].
+  static Future<void> reset() async {
+    await _client?.reset();
+  }
+
   /// Adds a breadcrumb.
   static void addBreadcrumb(Breadcrumb crumb) =>
       _client?.addBreadcrumb(crumb);

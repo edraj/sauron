@@ -1,4 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required for the Sauron SDK to POST envelopes. Declared HERE, in src/main,
+         rather than only in src/debug and src/profile: those source sets are not
+         merged into a release build, so a release APK shipped without this line
+         has no INTERNET permission and every envelope fails to send. It presents
+         as a broken SDK, not as a missing permission, and it stays invisible on a
+         dev device because `flutter run` installs the debug build.
+         Verify with:
+           unzip -p build/app/outputs/flutter-apk/app-release.apk AndroidManifest.xml \
+             | strings -el | grep -c INTERNET      # must be non-zero -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="sauron_flutter_demo"
         android:name="${applicationName}"

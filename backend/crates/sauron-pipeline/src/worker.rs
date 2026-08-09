@@ -12,8 +12,53 @@ use sauron_db::PgPool;
 use sauron_redis::RedisStore;
 
 use crate::mask::PolicyCache;
+
 use crate::process::process_job;
 use crate::symbolize::SymbolizeCtx;
+
+/// Ceiling on dead-letter ENTRIES, mirroring `INGEST_STREAM_MAXLEN`'s shape.
+///
+/// Modest next to the ingest stream's million on purpose: this stream is only
+/// written on failure, so a large number here does not buy headroom, it buys a
+/// longer period of un-noticed breakage before anyone looks. If it is being hit,
+/// the answer is to fix what is failing, not to raise the cap.
+fn dlq_maxlen() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("INGEST_DLQ_MAXLEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(100_000)
+    })
+}
+
+/// How long a dead-lettered payload is retained before the reaper drops it.
+///
+/// A bound in TIME as well as in count, because the entries are masked copies of
+/// real events living outside every retention window the product enforces.
+fn dlq_retention() -> Duration {
+    static D: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        let hours = std::env::var("INGEST_DLQ_RETENTION_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|h| *h > 0)
+            .unwrap_or(24 * 7);
+        Duration::from_secs(hours * 3600)
+    })
+}
+
+/// Trim aged dead-letter entries. Runs on one worker, periodically.
+pub async fn reap_dlq_once(redis: &RedisStore) {
+    match redis.dlq_reap(dlq_retention()).await {
+        Ok(0) => {}
+        Ok(n) => info!(removed = n, "reaped aged dead-letter entries"),
+        // Non-fatal: MAXLEN still bounds the stream, so a failed reap costs
+        // retention accuracy, not unbounded growth.
+        Err(e) => warn!(error = %e, "dead-letter reap failed"),
+    }
+}
 
 /// How long an entry may sit unacked in another consumer's PEL before this
 /// worker claims it. Covers a worker that died mid-job.
@@ -194,6 +239,17 @@ async fn worker_loop(
                 Ok(_) => {}
                 Err(e) => warn!(consumer, error = %e, "PEL reclaim failed"),
             }
+
+            // Age out dead-letter entries on the same tick. Only worker-0 runs
+            // it: `XTRIM MINID` is idempotent, so N workers doing it would be
+            // correct but would be N-1 wasted round trips every 30s forever,
+            // and the log line would appear N times for one logical event.
+            //
+            // Cheap when there is nothing to do — `XTRIM MINID` on a stream
+            // whose oldest entry is newer than the cutoff is O(1).
+            if consumer == "worker-0" {
+                reap_dlq_once(&redis).await;
+            }
         }
 
         let want = sizer.entries();
@@ -293,7 +349,18 @@ async fn process_entries(
             Ok(b) => b,
             Err(e) => {
                 warn!(consumer, id, error = %e, "malformed job; dead-lettering");
-                let _ = redis.dead_letter(&id, &payload).await;
+                // Not discarded: `dead_letter` acks only if the DLQ write
+                // succeeded, so an error here means the entry is still pending
+                // and will be redelivered rather than silently dropped.
+                if let Err(de) = redis.dead_letter(&id, &payload, dlq_maxlen()).await {
+                    error!(consumer, id, error = %de, "DLQ write FAILED for a malformed entry; it stays pending");
+                    sauron_telemetry::metrics::dlq_write_failures(1);
+                }
+                // Counted in ENTRIES, not items: the payload did not decode, so
+                // how many items it carried is not knowable here. That is why
+                // there is a separate entries-unit counter at all — folding this
+                // into the item counters would need a number we do not have.
+                sauron_telemetry::metrics::entries_deadlettered(1);
                 continue;
             }
         };
@@ -349,6 +416,12 @@ async fn process_entries(
                     // loss. Loud because duplicates are the visible symptom.
                     warn!(consumer, error = %e, n = ids.len(), "batch ack failed; entries will be redelivered");
                 }
+                // ONE add for the whole batch, of a number already computed
+                // above. The fallback arm below deliberately does NOT do this:
+                // `process_one_by_one` counts per item, so adding `items` here
+                // as well would count a failed batch's work twice and hide real
+                // loss behind an inflated `persisted`.
+                sauron_telemetry::metrics::items_persisted(items as u64);
                 return items;
             }
             Err(e) => {
@@ -388,22 +461,55 @@ async fn process_one_by_one(
         // eagerly for every entry, this was a whole extra `to_string` per event
         // in the steady state, spent on an arm that almost never runs.
         //
-        // Empty on failure, never the raw wire payload: the DLQ has no MAXLEN,
-        // no TTL and no reaper, so anything written here is permanent and must
-        // already be masked.
+        // Masked, never the raw wire payload: an entry written here is retained
+        // for `INGEST_DLQ_RETENTION_HOURS`, so it is a second copy of the event
+        // living outside every retention window the product otherwise honours.
         let masked_payload = serde_json::to_string(&d.job).unwrap_or_default();
-        if let Err(e) = process_job(pool, redis, sym, &d.masks, d.job).await {
-            warn!(consumer, id = d.id, error = %e, "job processing failed; dead-lettering");
-            // Deliberately NOT `dead_letter`, which acks: one failing item must
-            // not retire the entry while its siblings are still unwritten. A
-            // crash before the tail then replays the whole envelope — duplicate
-            // writes rather than a silent partial loss.
-            let _ = redis.dlq_push(&masked_payload).await;
+        // Set when an item's DLQ write failed. The entry must NOT be acked in
+        // that case: acking would retire the only remaining copy of an event
+        // that is neither in Postgres nor in the DLQ. See below.
+        let mut dlq_write_failed = false;
+        // Counted per ITEM here, which is the granularity this path works at.
+        match process_job(pool, redis, sym, &d.masks, d.job).await {
+            Ok(()) => sauron_telemetry::metrics::items_persisted(1),
+            Err(e) => {
+                warn!(consumer, id = d.id, error = %e, "job processing failed; dead-lettering");
+                // Deliberately NOT `dead_letter`, which acks: one failing item
+                // must not retire the entry while its siblings are still
+                // unwritten. A crash before the tail then replays the whole
+                // envelope — duplicate writes rather than a silent partial loss.
+                match redis.dlq_push(&masked_payload, dlq_maxlen()).await {
+                    Ok(()) => sauron_telemetry::metrics::items_deadlettered(1),
+                    Err(de) => {
+                        // The result used to be discarded with `let _ =`. That
+                        // made the DLQ advisory: Redis rejects the write (OOM,
+                        // a failover mid-command, the stream at a hard limit),
+                        // the entry is acked a few lines below anyway, and the
+                        // event is gone from Postgres, the stream AND the DLQ
+                        // with nothing recording that it existed. Dead-lettering
+                        // is only a safety net if failing to write to it is
+                        // treated as a failure.
+                        error!(
+                            consumer, id = d.id, error = %de,
+                            "DLQ write FAILED; not acking so the entry is redelivered"
+                        );
+                        sauron_telemetry::metrics::dlq_write_failures(1);
+                        dlq_write_failed = true;
+                    }
+                }
+            }
         }
         // Acked once per ENTRY, after its last item — whether that item landed
         // or dead-lettered. Both outcomes are terminal for the item; what must
         // not happen is retiring the entry with items still to come.
-        if d.entry_tail {
+        //
+        // Withheld when a DLQ write failed. The entry stays in the pending list
+        // and is reclaimed later, which re-processes the whole envelope and so
+        // duplicates its already-persisted items. That is the same trade this
+        // path already makes for a crash before the tail, and it is the right
+        // way round: a duplicate is visible and fixable, a silently vanished
+        // event is neither.
+        if d.entry_tail && !dlq_write_failed {
             let _ = redis.ack(&d.id).await;
         }
     }

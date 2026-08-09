@@ -8,6 +8,7 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatusBadge from '../lib/components/StatusBadge.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import StacktraceView from '../lib/components/StacktraceView.svelte';
   import BreadcrumbTrail from '../lib/components/BreadcrumbTrail.svelte';
@@ -25,10 +26,10 @@
     getIssueEventStats,
   } from '../lib/api/issues';
   import { errorMessage } from '../lib/api/client';
+  import { viewCache } from '../lib/stores/view-cache';
   import { toastStore } from '../lib/stores/toast.svelte';
   import {
     relativeTime,
-    formatDateTime,
     formatDateTimeSeconds,
     formatDateTimeZone,
   } from '../lib/utils/format';
@@ -140,6 +141,13 @@
       const updated = await updateIssueStatus(aid, current.id, next);
       current.status = updated.status;
       current.updated_at = updated.updated_at;
+      // The Issues list is cached (see lib/stores/view-cache.ts). Without this,
+      // resolving an issue here and navigating back shows it as unresolved for
+      // the rest of the fresh window, with no request in flight to correct it —
+      // the write looks like it silently failed. Prefix-wide on purpose: the
+      // same issue appears under every filter and scope combination.
+      viewCache.invalidate('issues.list');
+      viewCache.invalidate('issues.stats');
       toastStore.success(`Issue marked ${next}.`);
     } catch (err) {
       current.status = previous;
@@ -474,11 +482,11 @@
             <div><dt>Users affected</dt><dd>{issue.users_seen.toLocaleString()}</dd></div>
             <div>
               <dt>First seen</dt>
-              <dd title={formatDateTime(issue.first_seen)}>{relativeTime(issue.first_seen)}</dd>
+              <dd><TimeValue value={issue.first_seen} /></dd>
             </div>
             <div>
               <dt>Last seen</dt>
-              <dd title={formatDateTime(issue.last_seen)}>{relativeTime(issue.last_seen)}</dd>
+              <dd><TimeValue value={issue.last_seen} /></dd>
             </div>
             <div><dt>Type</dt><dd class="mono">{issue.type}</dd></div>
             {#if latestEvent?.release}
@@ -497,9 +505,7 @@
             {#if latestEvent}
               <div>
                 <dt>Occurred</dt>
-                <dd title={formatDateTime(latestEvent.occurred_at)}>
-                  {relativeTime(latestEvent.occurred_at)}
-                </dd>
+                <dd><TimeValue value={latestEvent.occurred_at} /></dd>
               </div>
             {/if}
             <div>

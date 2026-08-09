@@ -64,7 +64,7 @@ describe('transport POST', () => {
     await client.flush();
 
     const { header, context } = fake.calls[0].envelope;
-    expect(header.sdk).toEqual({ name: 'sauron-node', version: '1.3.0' });
+    expect(header.sdk).toEqual({ name: 'sauron-node', version: '1.4.0' });
     expect(header.dsn).toBe(DSN);
     expect(header.release).toBe('1.2.3');
     expect(typeof header.sent_at).toBe('string');

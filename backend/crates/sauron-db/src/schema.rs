@@ -36,6 +36,7 @@ diesel::table! {
         extra -> Jsonb,
         workflow_id -> Nullable<Text>,
         workflow_name -> Nullable<Text>,
+        restored_pin_id -> Nullable<Uuid>,
     }
 }
 
@@ -113,6 +114,7 @@ diesel::table! {
         culprit -> Nullable<Text>,
         workflow_id -> Nullable<Text>,
         workflow_name -> Nullable<Text>,
+        restored_pin_id -> Nullable<Uuid>,
     }
 }
 
@@ -385,6 +387,7 @@ diesel::table! {
         received_at -> Timestamptz,
         workflow_id -> Nullable<Text>,
         workflow_name -> Nullable<Text>,
+        restored_pin_id -> Nullable<Uuid>,
     }
 }
 
@@ -454,6 +457,7 @@ diesel::table! {
         name -> Text,
         kind -> Text,
         config -> Jsonb,
+        config_enc -> Nullable<Bytea>,
         secret_enc -> Nullable<Bytea>,
         enabled -> Bool,
         created_by -> Nullable<Uuid>,
@@ -803,6 +807,51 @@ diesel::joinable!(inspector_mask_actions -> apps (app_id));
 diesel::joinable!(inspector_masked_keys -> apps (app_id));
 diesel::joinable!(inspector_reveal_audit -> apps (app_id));
 
+diesel::table! {
+    runtime_settings (key) {
+        key -> Text,
+        value -> Text,
+        updated_at -> Timestamptz,
+        updated_by -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
+    tier_pins (id) {
+        id -> Uuid,
+        table_name -> Text,
+        range_start -> Timestamptz,
+        range_end -> Timestamptz,
+        expires_at -> Timestamptz,
+        created_at -> Timestamptz,
+        created_by -> Nullable<Uuid>,
+        reason -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    restore_jobs (id) {
+        id -> Uuid,
+        table_name -> Text,
+        app_id -> Nullable<Uuid>,
+        range_start -> Timestamptz,
+        range_end -> Timestamptz,
+        status -> Text,
+        pin_id -> Nullable<Uuid>,
+        pin_expires_at -> Timestamptz,
+        rows_estimated -> Int8,
+        rows_restored -> Int8,
+        worker_id -> Nullable<Text>,
+        heartbeat_at -> Nullable<Timestamptz>,
+        attempts -> Int4,
+        error -> Text,
+        requested_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+        started_at -> Nullable<Timestamptz>,
+        finished_at -> Nullable<Timestamptz>,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
     auth_sessions,
@@ -846,4 +895,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     inspector_mask_actions,
     inspector_masked_keys,
     inspector_reveal_audit,
+    runtime_settings,
+    tier_pins,
+    restore_jobs,
 );

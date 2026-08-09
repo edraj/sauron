@@ -9,7 +9,7 @@
 
 Name:           sauron
 Version:        1.3.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
 License:        AGPL-3.0-only
@@ -156,6 +156,16 @@ install -Dm0644 %{SOURCE14} %{buildroot}%{_unitdir}/sauron-migrate.service
 install -Dm0644 %{SOURCE15} %{buildroot}%{_unitdir}/sauron-alerts.service
 install -Dm0644 %{SOURCE16} %{buildroot}%{_unitdir}/sauron-inspector.service
 
+# --- systemd preset ---
+# Installed from the unpacked source tree rather than as a SourceN, on purpose:
+# packaging/rpm/build-rpm.sh stages every SourceN into SOURCES by hand, so a new
+# Source line there and no matching line here fails the build with "cannot open".
+# packaging/ is already inside the Source0 tarball (same reason
+# packaging/rpm/binaries.txt is readable in the %%install loop above), so this
+# works in both from-source and --prebuilt mode with no change outside the spec.
+install -Dm0644 packaging/rpm/systemd/50-sauron.preset \
+    %{buildroot}%{_presetdir}/50-sauron.preset
+
 # --- sysusers / tmpfiles ---
 install -Dm0644 %{SOURCE20} %{buildroot}%{_sysusersdir}/sauron.conf
 install -Dm0644 %{SOURCE21} %{buildroot}%{_tmpfilesdir}/sauron.conf
@@ -196,6 +206,15 @@ install -Dm0755 %{SOURCE41} %{buildroot}%{_libexecdir}/sauron/sauron-dashboard-c
 %tmpfiles_create %{_tmpfilesdir}/sauron.conf
 
 %post server
+# On first install only, this runs `systemctl preset` over the listed units, and
+# the answer comes from %%{_presetdir}/50-sauron.preset shipped by this package:
+# the five daemons enabled, sauron-inspector explicitly disabled (opt-in).
+#
+# sauron-migrate.service stays in this list even though it is static (no
+# [Install] section): preset on a static unit is a documented no-op, rc=0, and
+# is-enabled keeps reporting "static". Listing it costs nothing and keeps the
+# %%post/%%preun lists identical to %%files. It is deliberately NOT in the preset
+# file — it is pulled in by every daemon's Requires=sauron-migrate.service.
 %systemd_post sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service sauron-migrate.service
 # Refresh the dynamic linker cache so sauron-tier finds the vendored
 # %%{_libdir}/sauron/libduckdb.so via the ld.so.conf.d drop-in.
@@ -204,14 +223,79 @@ install -Dm0755 %{SOURCE41} %{buildroot}%{_libexecdir}/sauron/sauron-dashboard-c
 if [ "$1" -eq 1 ] && [ ! -s %{_sysconfdir}/sauron/secret.env ]; then
     umask 027
     printf 'JWT_SECRET=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > %{_sysconfdir}/sauron/secret.env
+    printf 'NOTIFY_SECRET_KEY=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> %{_sysconfdir}/sauron/secret.env
     chgrp sauron %{_sysconfdir}/sauron/secret.env 2>/dev/null || :
     chmod 0640 %{_sysconfdir}/sauron/secret.env
 fi
+# UPGRADES from a build that predates the fail-closed notification key.
+#
+# api, monitor and alerts now refuse to start without NOTIFY_SECRET_KEY, so an
+# upgraded host would come back with three dead units. Backfill it with the
+# EXISTING JWT_SECRET, not a fresh random value: older builds derived the
+# channel cipher from JWT_SECRET when the dedicated key was unset, so that is
+# the key every stored channel secret was actually encrypted under. Generating
+# a new one here would boot cleanly and then fail every delivery with
+# "secret decrypt failed" — silent, total loss of every configured channel.
+#
+# The value is captured and TESTED before anything is written. An operator who
+# moved JWT_SECRET into api.env leaves this file with no JWT_SECRET= line, and
+# the unguarded version appended a literal `NOTIFY_SECRET_KEY=` with an empty
+# right-hand side. sauron-core's var() filters empty strings, so
+# require_notify_secret_key() then took the None branch and api, monitor and
+# alerts all refused to start — the exact three-dead-units outcome this backfill
+# exists to prevent. It was also self-masking: the `! grep -q` guard below
+# matches an empty assignment, so re-running %%post could never repair it.
+#
+# When the source value is missing we deliberately write NOTHING and say so.
+# Generating a fresh random key here would be worse than failing: older builds
+# derived the channel cipher from JWT_SECRET, so a new key boots cleanly and
+# then fails every delivery with "secret decrypt failed" — silent, total loss of
+# every configured channel.
+if [ -s %{_sysconfdir}/sauron/secret.env ] && \
+   ! grep -q '^NOTIFY_SECRET_KEY=' %{_sysconfdir}/sauron/secret.env; then
+    sauron_jwt=$(sed -n 's/^JWT_SECRET=//p' %{_sysconfdir}/sauron/secret.env | head -n 1)
+    if [ -n "$sauron_jwt" ]; then
+        umask 027
+        printf 'NOTIFY_SECRET_KEY=%s\n' "$sauron_jwt" >> %{_sysconfdir}/sauron/secret.env
+        chgrp sauron %{_sysconfdir}/sauron/secret.env 2>/dev/null || :
+        chmod 0640 %{_sysconfdir}/sauron/secret.env
+    else
+        echo "sauron: WARNING no JWT_SECRET= in %{_sysconfdir}/sauron/secret.env, so" >&2
+        echo "sauron: NOTIFY_SECRET_KEY could not be backfilled. sauron-api, sauron-monitor" >&2
+        echo "sauron: and sauron-alerts will refuse to start until you add it. Use the SAME" >&2
+        echo "sauron: value older builds encrypted channel secrets under (your previous" >&2
+        echo "sauron: JWT_SECRET) - a fresh random key makes every stored channel secret" >&2
+        echo "sauron: permanently unreadable. See SETUP.md section 6." >&2
+    fi
+    unset sauron_jwt
+fi
 
 %preun server
+# Erase only ($1 -eq 0): `disable --now` each unit. sauron-migrate is listed for
+# symmetry with %%post/%%files; on a static unit disable is a no-op (rc=0), and
+# because it is inactive between runs the --now half is a no-op too.
 %systemd_preun sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service sauron-migrate.service
 
 %postun server
+# sauron-migrate.service is DELIBERATELY ABSENT from this list. Do not "fix" it
+# by adding it — that was tested and it is provably a no-op.
+#
+# On both Fedora and RHEL 9 this macro no longer runs `systemctl try-restart`.
+# It expands to `systemd-update-helper mark-restart-system-units`, i.e.
+# `systemctl set-property <unit> Markers=+needs-restart`, and the transaction
+# file trigger later runs `systemctl reload-or-restart --marked` — try-restart
+# semantics. sauron-migrate has no RemainAfterExit, so between runs it sits in
+# ActiveState=inactive and the marker matches nothing: emulating the full
+# upgrade sequence with migrate marked produced ZERO ExecStart runs on
+# AlmaLinux 9 (systemd 252) and Fedora 41 (systemd 256) alike.
+#
+# Migrations on upgrade are handled instead by Requires=sauron-migrate.service
+# in each of the six daemon units: this macro restarts them, and each restart
+# pulls the migrator in, ordered ahead of the daemon by After=. Verified end to
+# end. Adding migrate here would only work if it also gained
+# RemainAfterExit=yes, and that variant is rejected because it would then run
+# roughly once per boot instead of once per daemon start — see the comment in
+# sauron-migrate.service.
 %systemd_postun_with_restart sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service
 # Rebuild the linker cache after the vendored libduckdb is added/removed.
 /sbin/ldconfig
@@ -245,6 +329,9 @@ fi
 %{_unitdir}/sauron-tier.service
 %{_unitdir}/sauron-inspector.service
 %{_unitdir}/sauron-migrate.service
+# Vendor preset: which daemons `systemctl preset` enables on first install.
+# Not %%config — operator overrides belong in /etc/systemd/system-preset/.
+%{_presetdir}/50-sauron.preset
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/api.env
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/ingest.env
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/monitor.env
@@ -270,6 +357,77 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Sun Aug 09 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.3.0-2
+- SECURITY (migration 2026-08-09-000046_channel_config_enc): a notification
+  channel's `config` was stored in CLEARTEXT in Postgres, and therefore in every
+  base backup and every WAL archive. For the generic webhook kind that blob holds
+  the target URL and an arbitrary `headers` map, so a configured
+  `Authorization: Bearer ...` was on disk in the clear; for Slack and Discord the
+  `webhook_url` in `config` IS the credential. It is now AES-256-GCM ciphertext in
+  a new `notification_channels.config_enc`, under the same NOTIFY_SECRET_KEY that
+  already protected `secret_enc`. Encrypting only the "sensitive leaves" was
+  rejected: `headers` is an arbitrary map, so the sensitive set is not enumerable,
+  and any per-kind allowlist drifts from the resolver — which is how the bug
+  happened.
+  UPGRADE ACTION: rotate the webhook URLs, bot tokens and request headers of every
+  configured channel. The migration hides the plaintext going forward; it cannot
+  un-leak what is already in your backups.
+  The row conversion is NOT done by sauron-migrate — that binary has neither the
+  cipher nor the key. It runs in Rust at the first sauron-api boot, is idempotent,
+  and aborts startup rather than half-converting the table.
+  DOWNGRADE: one-way. That first boot writes `config = '{}'` alongside
+  `config_enc`, and an older binary knows nothing about `config_enc`, so it reads
+  an empty config and every delivery silently goes NOWHERE, for every channel,
+  with no error. `dnf downgrade` does not run down.sql, so the ciphertext survives
+  — recovery is to roll forward (`dnf upgrade sauron-server`, restart sauron-api).
+  NEVER `diesel migration revert` this migration: it drops the only remaining copy
+  of every channel's destination and is UNRECOVERABLE, as its own down.sql says.
+- Migrations now run automatically. Every sauron-* daemon unit gained
+  Requires=sauron-migrate.service alongside the After= it already had; After=
+  on its own is pure ordering and pulled nothing into the transaction, so
+  `dnf upgrade` had never run a migration and new binaries met whatever schema
+  was there before — scattered 500s, or a feature that silently does nothing.
+  A daemon whose migration fails now does not start. That is deliberate.
+  sauron-migrate keeps RemainAfterExit unset so it re-runs on every daemon start
+  (a no-op run measured ~30 ms with all 46 migrations applied) and so that
+  `systemctl stop sauron-migrate` stays a no-op instead of propagating a stop to
+  all six daemons.
+  AVAILABILITY TRADE: a Postgres outage longer than MIGRATE_WAIT_SECS fails the
+  migrate start job, and systemd never retries a failed START job — the daemons
+  stay down after the database returns and must be started by hand. Previously
+  sauron-api crash-looped through such an outage and recovered on its own.
+- New MIGRATE_WAIT_SECS (default 120) in /etc/sauron/sauron.env: how long
+  sauron-migrate waits for Postgres to accept connections before giving up. Only
+  the CONNECT is retried; a migration that fails on its own SQL fails immediately
+  and loudly. sauron-migrate previously made exactly one connection attempt with
+  no timeout at all, so an unreachable host hung indefinitely. The unit now also
+  sets TimeoutStartSec=300 — Type=oneshot defaults to infinity, which with
+  Requires= would stall multi-user.target at boot. Keep MIGRATE_WAIT_SECS below it.
+  sauron.env is %config(noreplace), so on a host you have edited the new commented
+  default lands in sauron.env.rpmnew and the knob is absent from your file; the
+  compiled default of 120 still applies.
+- New vendor preset 50-sauron.preset enables sauron-api, sauron-ingest,
+  sauron-monitor, sauron-alerts and sauron-tier on first install. SETUP.md's
+  enable list had omitted sauron-alerts, so on a doc-following install the alert
+  evaluator was installed, configured and permanently dead: metric rules were
+  creatable in the dashboard and never fired, and notification_queue was never
+  drained, with nothing anywhere reporting it. sauron-inspector is explicitly
+  disabled in the preset — the PII inspector stays opt-in.
+  UPGRADE ACTION: preset only runs on first install, so an existing host must
+  `sudo systemctl enable --now sauron-alerts` by hand.
+- New migration 2026-08-08-000044_tier_policy_and_pins: `runtime_settings`
+  (runtime-tunable cold rotation age, no restart) and `tier_pins` (ranges
+  sauron-tier must not drop). Skipping it stops ALL tiering — `runtime_settings`
+  is the first query in sauron-tier's cycle, so the cycle aborts before any export
+  or drop, one WARN per tick and no other symptom, and the disk grows until it
+  fills. Cheap to apply: two new tables, no lock on any hot table, nothing seeded.
+- New migration 2026-08-09-000045_cold_restore: restore cold Parquet data back
+  into the live tables from the dashboard. Requires 000044. Adds `restore_jobs`
+  and a nullable `restored_pin_id` to error_events, analytics_events and
+  transactions — bare ADD COLUMN with no DEFAULT is catalog-only on a partitioned
+  parent, so there is no rewrite, no table scan and no index build, and it is safe
+  to run with ingest live. Skipping it only breaks the restore endpoints.
+
 * Tue Aug 04 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.3.0-1
 - Ingest write throughput. The worker used to spend roughly ten Postgres
   transactions and a stack of sequential Redis round trips on every single
@@ -288,6 +446,16 @@ fi
   INGEST_BATCH_ITEMS (default 1000) bounds a batch in items rather than
   entries, which is what actually governs memory now that one entry can carry a
   whole envelope. INGEST_DB_POOL must stay >= WORKER_CONCURRENCY.
+- The shipped ingest.env no longer pins WORKER_CONCURRENCY, so the retuned
+  default above actually takes effect. It had stayed pinned at 4 in
+  /etc/sauron/ingest.env, which outranks the binary's default — the entry above
+  announced 8 while every RPM install kept running 4. Nothing logs the effective
+  worker count, so this was invisible on a running host.
+  UPGRADE ACTION: ingest.env is %config(noreplace). A host whose operator ever
+  edited it keeps their file verbatim, stale WORKER_CONCURRENCY=4 included, and
+  gets the new one beside it as ingest.env.rpmnew — remove the line by hand.
+  Hosts that never touched the file pick up the change automatically. See
+  SETUP.md section 11.
 - RPM binaries are built with the optimization settings the project benchmarks.
   The spec appended -Ccodegen-units=16 to RUSTFLAGS for build speed, and
   RUSTFLAGS wins over the profile, so it silently overrode codegen-units = 1

@@ -1,0 +1,32 @@
+# Vendor preset for the Sauron units. Applied by `systemctl preset` via
+# %systemd_post on first install (and never on upgrade, so it cannot undo an
+# operator's own enable/disable).
+#
+# Without this file the distro default policy applies — `disable *` on both
+# Fedora and RHEL — so every sauron unit lands disabled and only the ones a
+# human happens to enable by hand ever run. SETUP.md's enable list named
+# sauron-api, sauron-ingest, sauron-monitor and sauron-tier but NOT
+# sauron-alerts, so on a doc-following install the alert evaluator was
+# installed, configured, and permanently dead: alerts were defined in the
+# dashboard and simply never fired, with nothing anywhere reporting it. This
+# file is the fix — the shipped daemon set is declared in one place instead of
+# being reconstructed from prose.
+enable sauron-api.service
+enable sauron-ingest.service
+enable sauron-monitor.service
+enable sauron-alerts.service
+enable sauron-tier.service
+
+# sauron-inspector stays OFF deliberately — the PII inspector is opt-in. Its
+# extra 4-connection pool pushes a stock Postgres past max_connections, and the
+# resulting failures surface as sauron-api 500s rather than as inspector errors
+# (SETUP.md, "Enabling the PII inspector"). Operators turn it on explicitly:
+# INSPECTOR_ENABLED=1 in /etc/sauron/inspector.env, then
+# `systemctl enable --now sauron-inspector`. Listed explicitly rather than
+# omitted so that the exclusion reads as a decision, not an oversight.
+disable sauron-inspector.service
+
+# sauron-migrate.service is intentionally absent. It is a static unit (no
+# [Install] section) that every daemon pulls in through
+# Requires=sauron-migrate.service, so it can be neither enabled nor disabled
+# and `preset` is a no-op on it.

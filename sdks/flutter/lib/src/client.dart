@@ -5,6 +5,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'context/anonymous_id_store.dart';
 import 'context/device_context.dart';
 import 'dsn.dart';
 import 'envelope.dart';
@@ -79,6 +80,7 @@ class SauronClient {
 
   final Scope _scope;
   final DeviceContextProvider _deviceContext = DeviceContextProvider();
+  final AnonymousIdStore _anonymousIdStore = const AnonymousIdStore();
   final DartStackTraceParser _parser = const DartStackTraceParser();
   final Random _random = Random();
   final List<EnvelopeItem> _pending = <EnvelopeItem>[];
@@ -86,6 +88,27 @@ class SauronClient {
   Dsn? _dsn;
   SauronTransport? _transport;
   bool _closed = false;
+
+  /// The SDK storage directory, once [bootstrap] has resolved it. Held so
+  /// [reset] can persist a fresh anonymous id without resolving it again.
+  Directory? _storageDirectory;
+
+  /// The persisted anonymous id, resolved during [bootstrap] and null until
+  /// then — see [_analyticsDistinctId].
+  String? _anonymousId;
+
+  /// Whether the anonymous id has actually been USED as a `distinct_id`.
+  ///
+  /// A persisted id that was never observed anonymously must not create an
+  /// alias row: the server's `process_identify` inserts a permanent
+  /// `identities(app_id, alias_id, distinct_id)` row for any non-empty
+  /// `anonymous_id`, so an [identify] on a first-ever launch — with no
+  /// anonymous history to link — would durably mis-merge two people.
+  bool _anonymousIdUsed = false;
+
+  /// The persisted anonymous id this install reports as `distinct_id` until
+  /// [identify] names a user. Null before [bootstrap] has run.
+  String? get anonymousId => _anonymousId;
 
   /// Whether the SDK is configured and actively able to deliver.
   ///
@@ -124,6 +147,12 @@ class SauronClient {
       return;
     }
     final Directory dir = queueDirectory ?? await _resolveQueueDirectory();
+    _storageDirectory = dir;
+    // Resolved before the transport exists, so nothing can be captured with a
+    // half-known identity. Awaited separately from the device id below rather
+    // than in parallel: both keys share one prefs file, and two overlapping
+    // read-modify-writes can lose one another (see `PrefsStore`).
+    _anonymousId = await _anonymousIdStore.resolve(dir);
     final EnvelopeQueue queue = EnvelopeQueue(
       directory: dir,
       maxBytes: options.maxQueueBytes,
@@ -221,7 +250,33 @@ class SauronClient {
     _transport?.flush();
   }
 
+  /// The id analytics items are attributed to: the identified user when
+  /// [identify] or [setUser] has named one, else the persisted anonymous id.
+  ///
+  /// Reading this MARKS the anonymous id as used, which is what later makes
+  /// [identify] send `anonymous_id` — see [_anonymousIdUsed]. It is null only
+  /// before [bootstrap] has resolved storage.
+  String? get _analyticsDistinctId {
+    final String? identified = _scope.distinctId;
+    if (identified != null && identified.isNotEmpty) {
+      return identified;
+    }
+    final String? anonymous = _anonymousId;
+    if (anonymous == null) {
+      return null;
+    }
+    _anonymousIdUsed = true;
+    return anonymous;
+  }
+
   /// Records a product-analytics event.
+  ///
+  /// `distinct_id` is the identified user when there is one, otherwise the
+  /// persisted [anonymousId] — see [_analyticsDistinctId]. It is only dropped
+  /// when neither exists, which after [bootstrap] cannot happen; see
+  /// [_dropWithoutIdentity] for why dropping the single item is the lesser
+  /// evil. This also covers the events the SDK emits through this method
+  /// itself: `$screen` from [setScreen] and the `$workflow_*` lifecycle events.
   void track(
     String name, {
     Map<String, Object?>? properties,
@@ -233,11 +288,16 @@ class SauronClient {
     if (!isEnabled) {
       return;
     }
+    final String? distinctId = _analyticsDistinctId;
+    if (distinctId == null || distinctId.isEmpty) {
+      _dropWithoutIdentity(name);
+      return;
+    }
     _dispatch(
       EventItem(
         name: name,
         timestamp: DateTime.now().toUtc(),
-        distinctId: _scope.distinctId,
+        distinctId: distinctId,
         sessionId: sessionId,
         // Leaf-site workflow stamp 2 of 3 — see the note on [_currentWorkflow].
         workflowId: _currentWorkflow?.workflowId,
@@ -456,7 +516,7 @@ class SauronClient {
         httpMethod: httpMethod,
         httpStatus: httpStatus,
         url: url,
-        distinctId: _scope.distinctId,
+        distinctId: _analyticsDistinctId,
         sessionId: sessionId,
         // Leaf-site workflow stamp 3 of 3 — see the note on [_currentWorkflow].
         workflowId: _currentWorkflow?.workflowId,
@@ -467,10 +527,16 @@ class SauronClient {
   }
 
   /// Identifies the current user and records an identify event.
+  ///
+  /// The item carries `anonymous_id` only when the anonymous id was actually
+  /// used as a `distinct_id` first, so the server can stitch that activity onto
+  /// the named user. See [_anonymousIdUsed] for why a speculative alias is
+  /// worse than none.
   void identify(String distinctId, {Map<String, Object?>? traits}) {
     if (!isEnabled) {
       return;
     }
+    final String? aliasOf = _anonymousIdUsed ? _anonymousId : null;
     final SauronUser? existing = _scope.user;
     _scope.user = SauronUser(
       id: distinctId,
@@ -478,14 +544,44 @@ class SauronClient {
       traits: traits ?? existing?.traits ?? const <String, Object?>{},
     );
     _dispatch(
-      IdentifyItem(distinctId: distinctId, traits: traits),
+      IdentifyItem(
+        distinctId: distinctId,
+        anonymousId: aliasOf,
+        traits: traits,
+      ),
     );
+  }
+
+  /// Forgets the current person: clears the scope user and mints a fresh
+  /// anonymous id, persisting it.
+  ///
+  /// **Call this on logout.** Without it the next person to use the device
+  /// inherits the persisted anonymous id, and their first [identify] aliases
+  /// that id — and with it the previous person's anonymous activity — onto the
+  /// new account, permanently, server-side.
+  ///
+  /// Unlike the browser SDK, [setUser] with `null` does NOT do this for you:
+  /// persisting the new id is asynchronous and [setUser] is not, so an
+  /// unawaited file write hidden inside a setter would leave logout's most
+  /// consequential side effect racing app teardown.
+  Future<void> reset() async {
+    _scope.user = null;
+    _anonymousIdUsed = false;
+    final Directory? dir = _storageDirectory;
+    if (dir == null) {
+      // Never bootstrapped: there is no persisted id to replace.
+      return;
+    }
+    _anonymousId = await _anonymousIdStore.mintFresh(dir);
   }
 
   /// Adds a breadcrumb to the current scope.
   void addBreadcrumb(Breadcrumb crumb) => _scope.addBreadcrumb(crumb);
 
   /// Sets (or clears) the current user.
+  ///
+  /// Clearing it stops attributing activity to that user, but keeps the
+  /// anonymous id — on logout call [reset] instead.
   void setUser(SauronUser? user) => _scope.user = user;
 
   /// Sets a single scope tag (last-write-wins by key).
@@ -600,6 +696,44 @@ class SauronClient {
     } else {
       _pending.add(outgoing);
     }
+  }
+
+  /// How many analytics items have been dropped for want of an identity, and
+  /// whether the un-gated explanation has been printed yet.
+  int _droppedWithoutIdentity = 0;
+  bool _identityWarningPrinted = false;
+
+  /// Drop one analytics item that has no `distinct_id`, loudly.
+  ///
+  /// The wire's `AnalyticsItem.distinct_id` is a non-`Option` `String`, so
+  /// sending `null` is not "a null field on one item" — the gateway fails to
+  /// deserialize the ENTIRE envelope (`400 invalid_envelope`), the transport
+  /// classifies 400 as non-retryable and drops the batch, and every unrelated
+  /// error, transaction and identify batched alongside it dies too. Containing
+  /// the failure to the one item that cannot be attributed is strictly less
+  /// destructive.
+  ///
+  /// Since the anonymous id landed, the only way here is to track before
+  /// `Sauron.init` has finished — [bootstrap] resolves an id unconditionally,
+  /// falling back to an in-memory one when storage is unwritable.
+  ///
+  /// The first drop prints regardless of [SauronOptions.debug]: this used to be
+  /// completely silent, which is exactly why it survived. Subsequent drops go to
+  /// the debug log so a hot analytics loop cannot flood the console.
+  void _dropWithoutIdentity(String name) {
+    _droppedWithoutIdentity++;
+    final String detail =
+        'dropped analytics item "$name": no distinct_id. Neither an identified '
+        'user nor an anonymous id exists yet — await Sauron.init(...) before '
+        'track(), setScreen() or startWorkflow(). Sending it would make the '
+        'ingest gateway reject the whole envelope, losing every error batched '
+        'with it. (dropped so far: $_droppedWithoutIdentity)';
+    if (!_identityWarningPrinted) {
+      _identityWarningPrinted = true;
+      debugPrint('[Sauron] $detail');
+      return;
+    }
+    _log(detail);
   }
 
   EnvelopeHeader _buildHeader(DateTime sentAt) => EnvelopeHeader(

@@ -105,11 +105,56 @@ void main() {
       httpClient: httpClient,
     ));
 
+    Sauron.setUser(const SauronUser(id: 'u_123'));
     Sauron.track('checkout_completed');
     await Sauron.flush();
     await settle();
 
     expect(logged, isEmpty);
+  });
+
+  test('an unidentified track is attributed to the anonymous id, silently',
+      () async {
+    // Tracking before identify() used to be dropped with a warning. It is now
+    // ordinary, expected behaviour — an unidentified person is a person — so
+    // the SDK must not editorialize about it on every event.
+    await Sauron.init(SauronOptions(
+      dsn: 'https://pk_test@localhost:9/1',
+      httpClient: httpClient,
+    ));
+
+    Sauron.track('checkout_completed');
+    await Sauron.flush();
+    await settle();
+
+    expect(Sauron.anonymousId, startsWith('anon_'));
+    expect(logged, isEmpty);
+  });
+
+  test('warns even with debug off when an item is dropped for no distinct_id',
+      () async {
+    // The ONE thing this SDK says out loud without `debug: true`, and
+    // deliberately so: an analytics item with no identity of any kind is
+    // DROPPED (its `distinct_id` is non-`Option` on the wire, and sending
+    // `null` would make the gateway reject the entire envelope). That drop used
+    // to be invisible in every build, which is exactly why it shipped. Printed
+    // once per client so a hot analytics loop cannot flood the log.
+    //
+    // Reaching it now takes a client that has not finished starting: after
+    // bootstrap there is always an anonymous id to fall back to.
+    final SauronClient client = SauronClient(SauronOptions(
+      dsn: 'https://pk_test@localhost:9/1',
+      httpClient: httpClient,
+    ));
+
+    client.track('checkout_completed');
+    client.track('viewed_pricing');
+    await settle();
+
+    expect(logged, hasLength(1));
+    expect(logged.single, contains('dropped analytics item'));
+    expect(logged.single, contains('checkout_completed'));
+    expect(logged.single, contains('Sauron.init'));
   });
 
   test('a long value is truncated onto one line', () async {

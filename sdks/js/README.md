@@ -92,7 +92,9 @@ Sauron.init({
   sampleRate: 0.5,
   maxBreadcrumbs: 100,
   beforeSend(item, hint) {
-    if (item.type === 'error' && item.exception.value?.includes('token=')) {
+    // `exception` is optional — a `captureMessage` item has none, and carries
+    // its text in `item.message` instead.
+    if (item.type === 'error' && item.exception?.value?.includes('token=')) {
       return null; // PII escape hatch
     }
     return item;
@@ -221,13 +223,24 @@ function captureMessage(message: string, level?: Level, hint?: Hint): void
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `message` | `string` | — (required) | Becomes `exception.value`; `exception.type` is `null`. |
+| `message` | `string` | — (required) | Becomes the item's `message`. |
 | `level` | `Level` | `'info'` | Severity. |
-| `hint` | `Hint` | `undefined` | Only `fingerprint`, `event_id`, `message`, `tags`, `contexts` and `extra` are read here — unlike `captureException`, `hint.level`, `hint.mechanism` and `hint.screen` are ignored. |
+| `hint` | `Hint` | `undefined` | Only `fingerprint`, `event_id`, `tags`, `contexts` and `extra` are read here — unlike `captureException`, `hint.level`, `hint.mechanism` and `hint.screen` are ignored, and `hint.message` no longer applies because the `message` argument already occupies that field. |
 
-Emits an error item with mechanism `{ type: 'message', handled: true }`, an
-empty stack trace, the current breadcrumb trail and the current screen. Counts
-against `sampleRate` like any other error item. Returns `void`.
+Emits an error item that carries **no `exception` block at all** — a message is
+not an exception — plus the current breadcrumb trail and the current screen.
+Server-side it groups on the message-fallback fingerprint
+(`message` + the message text, normalized), so distinct messages become distinct
+issues instead of piling into one bucket keyed by a synthetic exception type.
+Counts against `sampleRate` like any other error item. Returns `void`.
+
+> Through 1.3.0 this shipped `exception: { type: null, value: message }`. The
+> gateway's exception type is a non-nullable string, so that item failed to
+> deserialize and the whole envelope came back `400 invalid_envelope` — and since
+> a 400 is a non-retryable drop, **every other item batched with it (up to
+> `maxBatch`, default 30) was silently lost too**. If you have a `beforeSend`
+> hook or any code reading `item.exception` on message items, note that the field
+> is now absent and `item.message` carries the text.
 
 ```ts
 Sauron.captureMessage('payment provider returned a soft decline', 'warning', {
@@ -809,7 +822,7 @@ const appFrames = frames.filter((f) => isInAppFrame(f.filename));
 
 ```ts
 const SDK_NAME: string  // 'sauron.javascript'
-const SDK_VERSION: string // '1.2.0'
+const SDK_VERSION: string // '1.4.0'
 ```
 
 The SDK identity embedded in `header.sdk` of every envelope.
@@ -933,7 +946,7 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.2.0';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.4.0';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42' });
 </script>
 ```
@@ -994,9 +1007,16 @@ is parked in the offline queue.
 byte-capped at `maxQueueBytes` (default 1 MiB); the oldest entries are evicted
 first and at least one entry is always kept. It is drained at `init()`, at the
 start of every `flush()`, and on the window `online` event. If a drained
-envelope still fails, it is re-parked and draining stops to avoid a tight loop.
-When `localStorage` is unavailable the queue is disabled and failed envelopes
-are dropped.
+envelope still fails, **it and every envelope behind it are re-parked at the head
+of the queue** (order preserved) and draining stops to avoid a tight loop — a
+single 500 on reconnect costs you nothing. Same on a 401/403: the client
+disables itself but the backlog is kept, so fixing the key and re-`init()`ing
+still delivers it. When `localStorage` is unavailable the queue is disabled and
+failed envelopes are dropped.
+
+> Through 1.3.0 the drain deleted the whole `localStorage` backlog up front and
+> re-parked only the one envelope that failed, so everything queued behind it was
+> lost — the exact reconnect-then-one-500 scenario the queue exists for.
 
 **Page unload.** On `visibilitychange` → `hidden` and on `pagehide`, the pending
 batch is chunked to 1000 items and handed to `navigator.sendBeacon` as an

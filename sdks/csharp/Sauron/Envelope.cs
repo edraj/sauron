@@ -38,7 +38,7 @@ internal sealed class EnvelopeHeader
 internal static class SauronSdkMeta
 {
     public const string Name = "sauron-dotnet";
-    public const string Version = "1.3.0";
+    public const string Version = "1.4.0";
 }
 
 internal sealed class SdkInfo

@@ -8,16 +8,24 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatusBadge from '../lib/components/StatusBadge.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
-  import { ISSUE_FIELDS, encodeFilters, parseFilters, type Filter } from '../lib/components/filters/filters';
+  import {
+    ISSUE_FIELDS,
+    encodeFilters,
+    gatedFilterFields,
+    parseFilters,
+    type Filter,
+  } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { listIssues, getIssueStats } from '../lib/api/issues';
-  import { errorMessage } from '../lib/api/client';
-  import { relativeTime, formatDateTime, compactNumber } from '../lib/utils/format';
+  import { compactNumber } from '../lib/utils/format';
   import type { Issue, IssueStats } from '../lib/models';
 
   // Issues defaults to "All" time (open issues shouldn't drop off the landing
@@ -49,12 +57,51 @@
   let appliedSearch = $state(initial.get('q') ?? '');
   let sinceDays = $state(Number(initial.get('since_days')) || 3650);
 
-  let issues = $state<Issue[]>([]);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Two cached views: the issue list and the stat tiles. Each owns its own
+  // data/loading/revalidating/error state and the stale-while-revalidate policy
+  // (lib/stores/cached-view.svelte.ts); this page only supplies the cache key and
+  // the fetcher.
+  //
+  // Re-exposed under the names the template already used, so the markup did not
+  // change: `loading` still means "nothing to show" and now `revalidating` means
+  // "cached rows are up, refreshing behind them".
+  const issuesView = new CachedView<Issue[]>();
+  const statsView = new CachedView<IssueStats>();
 
-  let stats = $state<IssueStats | null>(null);
-  let loadingStats = $state(true);
+  const issues = $derived(issuesView.data ?? []);
+  const loading = $derived(issuesView.loading);
+  const revalidating = $derived(issuesView.revalidating);
+  const error = $derived(issuesView.error);
+
+  /**
+   * A 403 while a permission-gated filter is applied: the API refuses to answer
+   * a predicate over a column this role may not read.
+   *
+   * Retrying cannot fix it — the grant will not change between clicks — so the
+   * page offers to drop the chip instead. Requires BOTH conditions: a 403 with
+   * no gated filter applied is a genuine loss of access to the page, and
+   * suggesting "remove the filter" there would send the user chasing a chip that
+   * is not the cause.
+   */
+  const blockedFilterFields = $derived(
+    issuesView.errorStatus === 403 ? gatedFilterFields(filters) : [],
+  );
+
+  /** "Tag", or "Tag and Workflow" — the chip labels, not the wire keys. */
+  const blockedFilterLabels = $derived(
+    blockedFilterFields
+      .map((k) => ISSUE_FIELDS.find((f) => f.key === k)?.label ?? k)
+      .join(' and '),
+  );
+
+  function dropBlockedFilters() {
+    const blocked = new Set(blockedFilterFields);
+    filters = filters.filter((f) => !blocked.has(f.field));
+  }
+
+  const stats = $derived(statsView.data ?? null);
+  const loadingStats = $derived(statsView.loading);
+  const revalidatingStats = $derived(statsView.revalidating);
 
   let refreshing = $state(false);
 
@@ -66,33 +113,29 @@
       filters[0].value === 'unresolved',
   );
 
-  async function load(appId: string, q: string) {
-    loading = true;
-    error = null;
-    try {
-      issues = await listIssues(appId, {
-        filters: encodeFilters(filters),
-        q: q || undefined,
-        sinceDays,
-        limit: 100,
-      });
-    } catch (err) {
-      error = errorMessage(err);
-      issues = [];
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit: the Refresh button and the
+   * error-state Retry both mean "go to the network now".
+   *
+   * `scopeKey` is in the key because it carries the selected environment, which
+   * the axios interceptor adds to the request but which appears in none of these
+   * arguments — omit it and one environment's issues would be served as another's.
+   */
+  async function load(appId: string, q: string, force = false) {
+    const enc = encodeFilters(filters);
+    await issuesView.load(
+      viewKey('issues.list', appId, sessionStore.scopeKey, enc, q, sinceDays),
+      () => listIssues(appId, { filters: enc, q: q || undefined, sinceDays, limit: 100 }),
+      force,
+    );
   }
 
-  async function loadStats(appId: string, days: number) {
-    loadingStats = true;
-    try {
-      stats = await getIssueStats(appId, days);
-    } catch {
-      stats = null;
-    } finally {
-      loadingStats = false;
-    }
+  async function loadStats(appId: string, days: number, force = false) {
+    await statsView.load(
+      viewKey('issues.stats', appId, sessionStore.scopeKey, days),
+      () => getIssueStats(appId, days),
+      force,
+    );
   }
 
   async function refresh() {
@@ -100,7 +143,8 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, appliedSearch), loadStats(aid, sinceDays)]);
+      // force: an explicit click must always reach the network, cache or not.
+      await Promise.all([load(aid, appliedSearch, true), loadStats(aid, sinceDays, true)]);
     } finally {
       refreshing = false;
     }
@@ -157,7 +201,16 @@
       <p class="muted sub">Grouped errors across your app, most recent first.</p>
     </div>
     <div class="controls">
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached data, fetching fresh" hint, and without it
+        the instant paint is indistinguishable from live data.
+      -->
+      <RefreshButton
+        onclick={refresh}
+        loading={refreshing || revalidating || revalidatingStats}
+        title={revalidating || revalidatingStats ? 'Refreshing…' : 'Refresh'}
+      />
     </div>
   </div>
 
@@ -188,15 +241,29 @@
     {#if loading}
       <div class="center"><Spinner size={24} /></div>
     {:else if error}
-      <EmptyState title="Couldn't load issues" description={error} icon="triangle-alert">
+      <EmptyState
+        title={blockedFilterFields.length > 0
+          ? 'This filter needs more access'
+          : "Couldn't load issues"}
+        description={error}
+        icon="triangle-alert"
+      >
         {#snippet action()}
-          <Button
-            variant="secondary"
-            onclick={() =>
-              sessionStore.currentAppId && load(sessionStore.currentAppId, appliedSearch)}
-          >
-            Retry
-          </Button>
+          {#if blockedFilterFields.length > 0}
+            <!-- Not a Retry: the grant will not change between clicks, so the
+                 only route back to a rendered page is dropping the chip. -->
+            <Button variant="secondary" onclick={dropBlockedFilters}>
+              Remove {blockedFilterLabels} filter{blockedFilterFields.length > 1 ? 's' : ''}
+            </Button>
+          {:else}
+            <Button
+              variant="secondary"
+              onclick={() =>
+                sessionStore.currentAppId && load(sessionStore.currentAppId, appliedSearch, true)}
+            >
+              Retry
+            </Button>
+          {/if}
         {/snippet}
       </EmptyState>
     {:else if issues.length === 0}
@@ -234,9 +301,7 @@
               <td><StatusBadge status={issue.status} size="sm" /></td>
               <td class="num">{issue.times_seen.toLocaleString()}</td>
               <td class="num">{issue.users_seen.toLocaleString()}</td>
-              <td class="muted" title={formatDateTime(issue.last_seen)}>
-                {relativeTime(issue.last_seen)}
-              </td>
+              <td><TimeValue value={issue.last_seen} muted /></td>
             </tr>
           {/each}
         {/snippet}

@@ -70,7 +70,7 @@
   // above already own that case), so this never fires while noAccess holds.
   $effect(() => {
     if (sessionStore.loaded && !needsScope && requireApp && !sessionStore.currentAppId) {
-      push('/projects');
+      push('/admin/projects');
     }
   });
 </script>

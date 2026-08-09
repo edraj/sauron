@@ -2,6 +2,8 @@
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
   import { listMonitors, createMonitor } from '../lib/api/monitors';
   import { MONITOR_INTERVALS } from '../lib/constants/monitorIntervals';
@@ -16,9 +18,6 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
 
-  let monitors = $state<MonitorListItem[]>([]);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
   let showForm = $state(false);
   let refreshing = $state(false);
 
@@ -35,35 +34,66 @@
   // monitors.rs:99,191,223 authorize at the project.
   const writeLock = $derived(lockedBy('monitor:write', { project: projectId, level: 'project' }));
 
-  async function load() {
-    if (!projectId) { loading = false; return; }
-    loading = true; error = null;
-    try { monitors = await listMonitors(projectId); }
-    catch (e) { error = (e as Error).message; }
-    finally { loading = false; }
+  // Cached view (lib/stores/cached-view.svelte.ts): the list paints instantly when
+  // you come back from a monitor's detail page, then refreshes behind a spinner.
+  // Re-exposed under the names the template already used, so the markup is
+  // unchanged apart from the refresh control.
+  const monitorsView = new CachedView<MonitorListItem[]>();
+
+  const monitors = $derived(monitorsView.data ?? []);
+  const revalidating = $derived(monitorsView.revalidating);
+  const loading = $derived(monitorsView.loading);
+
+  // The create form reports failures through the same banner as the list's own
+  // load error, and a `$derived` cannot be assigned to — so the form keeps its
+  // own state and the template's `error` is the two folded together.
+  let formError = $state<string | null>(null);
+  const error = $derived(formError ?? monitorsView.error);
+
+  /**
+   * `force` bypasses the fresh-window short-circuit: an explicit Refresh, and the
+   * re-list after a successful create, both mean "go to the network now".
+   *
+   * `scopeKey` rides in the key under the project-wide rule even though this
+   * particular request is NOT environment-scoped: `/v1/projects/{id}/monitors` is
+   * listed in `api/scope.ts`'s `PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID`, so the
+   * interceptor never attaches `environment_id` to it. Over-keying costs at worst
+   * one extra fetch; under-keying serves one scope's rows as another's.
+   */
+  async function load(force = false) {
+    const pid = projectId;
+    if (!pid) return;
+    formError = null;
+    await monitorsView.load(
+      viewKey('monitors.list', pid, sessionStore.scopeKey),
+      () => listMonitors(pid),
+      force,
+    );
   }
 
   async function refresh() {
     if (!projectId) return;
     refreshing = true;
-    try { await load(); }
+    try { await load(true); }
     finally { refreshing = false; }
   }
 
-  function openForm() { error = null; showForm = true; }
+  function openForm() { formError = null; showForm = true; }
   function closeForm() { showForm = false; }
 
   async function submit() {
     if (!projectId || !name || !target) return;
-    saving = true; error = null;
+    saving = true; formError = null;
     try {
       await createMonitor(projectId, {
         name, kind, target, method: kind === 'http' ? method : undefined,
         interval_seconds: interval, webhook_url: webhook || undefined,
       });
       showForm = false; name = ''; target = ''; webhook = '';
-      await load();
-    } catch (e) { error = (e as Error).message; }
+      // force: the row we just created must not be hidden behind a cache entry
+      // written a moment before the POST.
+      await load(true);
+    } catch (e) { formError = (e as Error).message; }
     finally { saving = false; }
   }
 
@@ -80,7 +110,19 @@
     return 'var(--error)';
   }
 
-  $effect(() => { if (projectId) void load(); });
+  $effect(() => {
+    // Touched explicitly rather than left to the incidental read inside `load()`:
+    // it is part of the cache key, so the effect that fills that key has to
+    // re-run when it changes.
+    sessionStore.scopeKey;
+    // `idle()` rather than deriving `!!projectId && view.loading`: that
+    // spelling left `loading` false with no data, so the template fell
+    // through to a confident "No monitors yet" while the project selection
+    // was merely absent. `idle()` means "nothing to load", which is the
+    // truth, and it also cancels any in-flight load from the previous project.
+    if (projectId) void load();
+    else monitorsView.idle();
+  });
 </script>
 
 <AppShell>
@@ -94,7 +136,12 @@
         {#if !showForm}
           <Button variant="primary" lockedReason={writeLock} onclick={openForm}>New monitor</Button>
         {/if}
-        <RefreshButton onclick={refresh} loading={refreshing} />
+        <!--
+          Spins for a background revalidate too, not just an explicit click: that
+          spinner IS the "showing cached rows, fetching fresh" hint, and without it
+          the instant paint is indistinguishable from live data.
+        -->
+        <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
       </div>
     </header>
 
@@ -164,7 +211,13 @@
 
         <div class="form-foot">
           <Button variant="ghost" onclick={closeForm}>Cancel</Button>
-          <Button variant="primary" loading={saving} disabled={!name || !target} onclick={submit}>
+          <Button
+            variant="primary"
+            loading={saving}
+            disabled={!name || !target}
+            lockedReason={writeLock}
+            onclick={submit}
+          >
             Create monitor
           </Button>
         </div>

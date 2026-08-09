@@ -61,17 +61,17 @@ impl ResolvedFrame {
         }
     }
 
-    /// A copy with source-context stripped — persisted lean; context is only
-    /// carried in the API response.
-    pub fn without_context(&self) -> ResolvedFrame {
-        ResolvedFrame {
-            context_line: None,
-            pre_context: Vec::new(),
-            post_context: Vec::new(),
-            context_start_line: None,
-            ..self.clone()
-        }
-    }
+    // `without_context()` used to live here and has been DELETED. It had zero
+    // callers, and its doc — "persisted lean; context is only carried in the API
+    // response" — asserted the opposite of what the code does. Both persistence
+    // paths store source context: `sauron-pipeline/src/symbolize.rs` ("Store
+    // frames WITH source context") and `sauron-api/src/symbolicate.rs` ("Persist
+    // WITH context"). A reader who trusted that sentence would conclude the
+    // stored column holds no customer source, which is a large part of why the
+    // `source:read` hole on four handlers looked unreachable.
+    //
+    // Stripping happens on the RESPONSE, in `symbolicate::strip_source_context`.
+    // If lean persistence is ever wanted, write it deliberately with a caller.
 }
 
 /// An artifact candidate for matching (subset of `symbol_artifacts`).
@@ -102,6 +102,14 @@ impl Status {
 
 /// Fetches artifacts + blob bytes for symbolication. `blob` returns the
 /// **decompressed** artifact bytes (source map or Dart ELF).
+///
+/// `release` and `debug_id` arrive **canonical** — [`crate::normalize_release`]
+/// and [`crate::normalize_debug_id`] are applied by the caller (see
+/// [`Symbolicator::symbolicate_js`] / [`Symbolicator::symbolicate_dart`]), which
+/// is the same normalization the upload path applies before storing the column.
+/// Implementations compare them with plain equality and must not re-derive,
+/// re-case or otherwise "fix" them; anything that would need fixing here is a
+/// missing rule in `normalize`, where both sides read it from.
 pub trait BlobFetch {
     fn js_artifacts(&self, release: &str) -> impl Future<Output = Vec<ArtifactRef>> + Send;
     fn dart_symbols(
@@ -133,6 +141,12 @@ impl Symbolicator {
         release: Option<&str>,
         frames: &[RawFrame],
     ) -> (Vec<ResolvedFrame>, Status) {
+        // Trimmed before it is matched, for the reason spelled out in
+        // `crate::normalize`: the upload path trims what it stores, this is
+        // compared to it with plain SQL equality, and an SDK that reads its
+        // release out of a file or an env var at init carries the newline along
+        // — `"1.0.0\n"` would silently match nothing at all.
+        let release = release.map(crate::normalize_release);
         let release = match release {
             Some(r) if !r.is_empty() && !frames.is_empty() => r,
             _ => {
@@ -192,9 +206,21 @@ impl Symbolicator {
             return (Vec::new(), Status::NotApplicable);
         }
 
+        // Canonicalized before the lookup, and on BOTH candidate sources: the
+        // SDK's `debug_meta.build_id` is untrusted wire input, and the trace's own
+        // `build_id:` header is whatever the VM printed. The upload path stores
+        // the lowercased id, so an uppercase report here matched nothing —
+        // silently, as `no_artifacts`. See `crate::normalize`.
+        //
+        // A blank value counts as absent, exactly as it does on the write side
+        // (`blank_to_none`): `debug_meta: {"build_id": " "}` now falls through to
+        // the trace's own header instead of spending a query on a key that
+        // cannot match a stored one (the column is NULL, never empty).
         let did = debug_id
-            .map(str::to_string)
-            .or_else(|| trace.build_id.clone());
+            .map(crate::normalize_debug_id)
+            .filter(|d| !d.is_empty())
+            .or_else(|| trace.build_id.as_deref().map(crate::normalize_debug_id))
+            .filter(|d| !d.is_empty());
         let Some(did) = did else {
             return (dart_passthrough(&trace), Status::NoArtifacts);
         };
@@ -207,15 +233,28 @@ impl Symbolicator {
             return (dart_passthrough(&trace), Status::NoArtifacts);
         };
 
-        let addrs: Vec<u64> = trace
+        // One slot per frame, `None` where the frame's address cannot be
+        // determined — never a stand-in address. `dart::resolve` keeps the slot
+        // and returns it empty, so the positional pairing below still lines frame
+        // i up with frame i's own result and the frame falls through to
+        // `dart_unresolved` at its original position, still showing its raw `abs`
+        // when the trace gave one.
+        let addrs: Vec<Option<u64>> = trace
             .frames
             .iter()
-            .map(|f| f.lookup_addr(trace.dso_base).unwrap_or(0))
+            .map(|f| f.lookup_addr(trace.dso_base))
             .collect();
         let resolved = match crate::dart::resolve(&elf, &addrs) {
             Ok(r) => r,
             Err(_) => return (dart_passthrough(&trace), Status::NoArtifacts),
         };
+        // The pairing below is by position, and `zip` would silently truncate
+        // (dropping trailing frames) if the two lengths ever disagreed.
+        debug_assert_eq!(
+            resolved.len(),
+            trace.frames.len(),
+            "dart::resolve must return one slot per frame"
+        );
 
         let mut out = Vec::with_capacity(trace.frames.len());
         let mut any_resolved = false;
@@ -403,6 +442,154 @@ mod tests {
         }
     }
 
+    /// Answers **only** to the canonical key, and records what it was asked for.
+    ///
+    /// Standing in for the real fetchers, which hand the key to a plain SQL
+    /// equality against a column the upload path stored normalized: if the
+    /// engine passes a non-canonical spelling through, the row is simply not
+    /// found. A permissive mock (like `DartMem`, which ignores the id entirely)
+    /// cannot see that class of bug at all, which is how a write-only
+    /// normalization got shipped in the first place.
+    struct Strict {
+        /// The stored, canonical `symbol_artifacts.debug_id`.
+        stored_debug_id: &'static str,
+        /// The stored, canonical `symbol_artifacts.release`.
+        stored_release: &'static str,
+        blob: Vec<u8>,
+    }
+    impl Strict {
+        fn artifact(&self, name: Option<&str>) -> Vec<ArtifactRef> {
+            vec![ArtifactRef {
+                name: name.map(str::to_string),
+                blob_sha256: content::sha256(&self.blob).to_vec(),
+            }]
+        }
+    }
+    impl BlobFetch for Strict {
+        async fn js_artifacts(&self, release: &str) -> Vec<ArtifactRef> {
+            if release != self.stored_release {
+                return Vec::new();
+            }
+            self.artifact(Some("~/static/app.min.js"))
+        }
+        async fn dart_symbols(&self, debug_id: &str, _arch: Option<&str>) -> Vec<ArtifactRef> {
+            if debug_id != self.stored_debug_id {
+                return Vec::new();
+            }
+            self.artifact(None)
+        }
+        async fn blob(&self, _sha: &[u8]) -> Option<Vec<u8>> {
+            Some(self.blob.clone())
+        }
+    }
+
+    fn strict_dart() -> Strict {
+        Strict {
+            // The lowercase form `build_id_hex`/the upload path produce.
+            stored_debug_id: "ab36961b44baef9d7e3b9296dff3ce3e59be51a3",
+            stored_release: "",
+            blob: include_bytes!("../tests/fixtures/sample.elf").to_vec(),
+        }
+    }
+
+    /// A trace whose one frame resolves to `compute_total` in `sample.elf`, with
+    /// `build_id` interpolated so each test can vary only that.
+    fn dart_trace_with(build_id: &str) -> String {
+        format!(
+            "*** *** ***\n\
+             build_id: '{build_id}'\n\
+             isolate_dso_base: 0, vm_dso_base: 0\n\
+             \x20   #00 abs 0000000000400446 virt 0000000000400446 _kDartIsolateSnapshotInstructions+0x446\n"
+        )
+    }
+
+    /// The read half of the debug-id normalization. `debug_meta.build_id` is
+    /// untrusted wire input; a client reporting the id uppercase used to match a
+    /// stored lowercase id (both sides verbatim), then stopped when the upload
+    /// path alone started lowercasing. Both sides normalize now.
+    #[tokio::test]
+    async fn an_uppercase_debug_meta_build_id_matches_the_lowercase_stored_id() {
+        let fetch = strict_dart();
+        let reported = fetch.stored_debug_id.to_ascii_uppercase();
+        let s = Symbolicator::new(4 << 20);
+        let (out, status) = s
+            // The trace header is deliberately a *different* id: this pins the
+            // `debug_meta` value's own normalization, with no chance of the
+            // fallback below supplying the match instead.
+            .symbolicate_dart(&fetch, &dart_trace_with("unrelated"), Some(&reported), None)
+            .await;
+        assert_eq!(
+            status,
+            Status::Symbolicated,
+            "an uppercase reported build_id must resolve against the lowercase stored id"
+        );
+        assert_eq!(out[0].function.as_deref(), Some("compute_total"));
+    }
+
+    /// Same rule on the other source of the key: the trace's own `build_id:`
+    /// header, used when `debug_meta` carries none.
+    #[tokio::test]
+    async fn an_uppercase_build_id_in_the_trace_itself_is_normalized_too() {
+        let fetch = strict_dart();
+        let s = Symbolicator::new(4 << 20);
+        let trace = dart_trace_with(&fetch.stored_debug_id.to_ascii_uppercase());
+        let (out, status) = s.symbolicate_dart(&fetch, &trace, None, None).await;
+        assert_eq!(
+            status,
+            Status::Symbolicated,
+            "trace fallback must normalize"
+        );
+        assert_eq!(out[0].function.as_deref(), Some("compute_total"));
+    }
+
+    /// A blank reported build_id is absent, not a key. Mirrors `blank_to_none` on
+    /// the write side; before, `" "` won over a perfectly good trace header and
+    /// was looked up verbatim.
+    #[tokio::test]
+    async fn a_blank_reported_build_id_falls_back_to_the_trace() {
+        let fetch = strict_dart();
+        let s = Symbolicator::new(4 << 20);
+        let trace = dart_trace_with(fetch.stored_debug_id);
+        let (_out, status) = s.symbolicate_dart(&fetch, &trace, Some("  "), None).await;
+        assert_eq!(status, Status::Symbolicated);
+    }
+
+    /// The release half of the same asymmetry: the upload path trims what it
+    /// stores, so the lookup has to trim too. An SDK reading its release from a
+    /// file or env var at init is the realistic source of the newline.
+    #[tokio::test]
+    async fn a_release_with_surrounding_whitespace_still_matches() {
+        let raw = br#"{"version":3,"sources":["foo.ts"],"names":["greet"],"mappings":"AAAAA","sourcesContent":["export function greet(){ return 1 }"]}"#.to_vec();
+        let fetch = Strict {
+            stored_debug_id: "",
+            stored_release: "web@1.0.0",
+            blob: raw,
+        };
+        let s = Symbolicator::new(4 << 20);
+        let frames = vec![frame("https://x.io/static/app.min.js", 1, 1)];
+        let (out, status) = s
+            .symbolicate_js(&fetch, Some(" web@1.0.0\n"), &frames)
+            .await;
+        assert_eq!(status, Status::Symbolicated, "release must be trimmed");
+        assert_eq!(out[0].filename.as_deref(), Some("foo.ts"));
+    }
+
+    /// And a whitespace-only release is still "no release", not a lookup for
+    /// `""` — the pre-existing `!r.is_empty()` guard has to see the trimmed form.
+    #[tokio::test]
+    async fn a_whitespace_only_release_is_not_applicable() {
+        let fetch = Strict {
+            stored_debug_id: "",
+            stored_release: "web@1.0.0",
+            blob: Vec::new(),
+        };
+        let s = Symbolicator::new(1 << 20);
+        let (_out, status) = s
+            .symbolicate_js(&fetch, Some("   "), &[frame("a", 1, 1)])
+            .await;
+        assert_eq!(status, Status::NotApplicable);
+    }
+
     fn frame(url: &str, line: u32, col: u32) -> RawFrame {
         RawFrame {
             function: None,
@@ -467,7 +654,7 @@ mod tests {
         let trace = "\
 *** *** ***\n\
 build_id: 'deadbeef'\n\
-isolate_dso_base: 0\n\
+isolate_dso_base: 0, vm_dso_base: 0\n\
     #00 abs 0000000000400446 virt 0000000000400446 _kDartIsolateSnapshotInstructions+0x446\n";
         let fetch = DartMem {
             elf: include_bytes!("../tests/fixtures/sample.elf").to_vec(),
@@ -488,7 +675,7 @@ isolate_dso_base: 0\n\
         // virt 0x400460 is inside scale() inlined into outer() (see dart.rs).
         let trace = "\
 build_id: 'inl'\n\
-isolate_dso_base: 0\n\
+isolate_dso_base: 0, vm_dso_base: 0\n\
     #00 abs 0000000000400460 virt 0000000000400460 sym+0x0\n";
         let fetch = DartMem {
             elf: include_bytes!("../tests/fixtures/sample_inline.elf").to_vec(),
@@ -508,9 +695,101 @@ isolate_dso_base: 0\n\
         assert!(out.iter().all(|f| f.symbolicated));
     }
 
+    /// `tests/fixtures/sample.c` linked with `.text` at 0x0 (see the build
+    /// command in `dart.rs`'s tests). `compute_total` sits at 0x0, `helper_add`
+    /// at 0x11, `main` at 0x30 — verified with `nm`.
+    fn zero_base_elf() -> DartMem {
+        DartMem {
+            elf: include_bytes!("../tests/fixtures/sample_zero_base.elf").to_vec(),
+        }
+    }
+
+    /// One frame whose address cannot be determined: no ` virt …` fragment, and
+    /// an `abs` BELOW `isolate_dso_base`, so the `checked_sub` in
+    /// `DartFrameRef::lookup_addr` returns None.
+    const DART_UNDETERMINABLE: &str = "\
+build_id: 'x'\n\
+isolate_dso_base: 7b9c2b7000, vm_dso_base: 7b9c2b7000\n\
+    #00 abs 0000000000001000 _kDartIsolateSnapshotInstructions+0x1000\n";
+
+    /// A frame with no determinable address must stay unresolved rather than be
+    /// looked up at some stand-in address.
+    ///
+    /// Against an ELF based at 0 this is not a cosmetic difference: with the old
+    /// `lookup_addr(...).unwrap_or(0)` this exact input rendered `compute_total`
+    /// at `sample.c:1` with `symbolicated: true` — and an overall status of
+    /// `symbolicated`, not even `partial`, so nothing downstream flagged it. That
+    /// status is also what `sauron-api`'s `symbolicate_with` fast path keys on: it
+    /// returns early whenever a stored `symbolicated` status already carries
+    /// frames, so a wrong frame stored once is served unexamined thereafter.
+    #[tokio::test]
+    async fn a_frame_with_no_determinable_address_is_not_resolved_at_zero() {
+        let s = Symbolicator::new(4 << 20);
+        let (out, status) = s
+            .symbolicate_dart(&zero_base_elf(), DART_UNDETERMINABLE, Some("x"), None)
+            .await;
+        assert_eq!(out.len(), 1, "the frame must still be reported");
+        assert!(
+            !out[0].symbolicated,
+            "an undeterminable address must not resolve, got {:?}",
+            out[0]
+        );
+        assert_eq!(out[0].function, None);
+        // The raw `abs` is still shown, so the frame stays legible.
+        assert_eq!(out[0].filename.as_deref(), Some("<dart> +0x1000"));
+        assert_eq!(status, Status::NoArtifacts);
+    }
+
+    /// Frame order and per-frame identity survive an undeterminable frame in the
+    /// MIDDLE of the trace. `#00`/`#02` carry `virt` (0x11 → `helper_add`,
+    /// 0x30 → `main`); `#01` cannot be determined. Output is stored crash-last,
+    /// so the trace's `#00` lands at the END.
+    ///
+    /// This is what catches dropping the frame from the address list instead of
+    /// keeping its slot. Measured with that variant in place (release build, so
+    /// the `debug_assert` in `symbolicate_dart` is compiled out): the output came
+    /// back `len=2` with `#01` wearing `main`'s symbols and `#02` gone entirely,
+    /// still reporting `status=symbolicated`. `resolve`'s results are paired to
+    /// frames by position, so a missing slot shifts every later frame by one and
+    /// `zip` silently swallows the tail.
+    #[tokio::test]
+    async fn dart_frame_order_survives_an_undeterminable_middle_frame() {
+        let trace = "\
+build_id: 'x'\n\
+isolate_dso_base: 7b9c2b7000, vm_dso_base: 7b9c2b7000\n\
+    #00 abs 0000007b9c2b7011 virt 0000000000000011 sym+0x11\n\
+    #01 abs 0000000000001000 sym+0x1000\n\
+    #02 abs 0000007b9c2b7030 virt 0000000000000030 sym+0x30\n";
+        let s = Symbolicator::new(4 << 20);
+        let (out, status) = s
+            .symbolicate_dart(&zero_base_elf(), trace, Some("x"), None)
+            .await;
+        assert_eq!(out.len(), 3, "no frame may be dropped or duplicated");
+
+        // Stored order: #02, #01, #00.
+        assert_eq!(out[0].function.as_deref(), Some("main"));
+        assert_eq!(out[0].lineno, Some(7));
+        assert!(out[0].symbolicated);
+
+        assert!(!out[1].symbolicated, "#01 must not have taken a symbol");
+        assert_eq!(out[1].function, None);
+        assert_eq!(out[1].filename.as_deref(), Some("<dart> +0x1000"));
+
+        assert_eq!(out[2].function.as_deref(), Some("helper_add"));
+        assert_eq!(out[2].lineno, Some(4));
+        assert!(out[2].symbolicated);
+
+        assert_eq!(
+            status,
+            Status::Partial,
+            "some frames resolved and one did not"
+        );
+    }
+
     #[tokio::test]
     async fn dart_no_symbols_is_no_artifacts() {
-        let trace = "build_id: 'x'\nisolate_dso_base: 0\n    #00 abs 100 virt 100 sym\n";
+        let trace =
+            "build_id: 'x'\nisolate_dso_base: 0, vm_dso_base: 0\n    #00 abs 100 virt 100 sym\n";
         let fetch = Mem {
             name: "n".into(),
             raw: vec![],

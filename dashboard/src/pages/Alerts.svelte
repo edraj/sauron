@@ -1,5 +1,5 @@
 <script lang="ts">
-  import AppShell from '../lib/components/layout/AppShell.svelte';
+  import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { lockedBy } from '../lib/models/page-access';
   import {
@@ -351,7 +351,7 @@
   });
 </script>
 
-<AppShell>
+<AdminShell requireProject>
   <div class="alerts">
     <header class="head">
       <div>
@@ -534,6 +534,7 @@
               variant="primary"
               loading={savingChannel}
               disabled={!chName}
+              lockedReason={writeLock}
               onclick={submitChannel}
             >
               Create channel
@@ -777,6 +778,7 @@
               variant="primary"
               loading={savingRule}
               disabled={!rName || rChannels.length === 0}
+              lockedReason={writeLock}
               onclick={submitRule}
             >
               Create rule
@@ -896,7 +898,7 @@
       oncancel={() => (confirmDelete = null)}
     />
   {/if}
-</AppShell>
+</AdminShell>
 
 <style>
   .alerts {

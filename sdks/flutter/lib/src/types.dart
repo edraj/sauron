@@ -123,7 +123,15 @@ class DebugMeta {
       if (l.startsWith('build_id:')) {
         buildId = l.substring('build_id:'.length).trim().replaceAll(RegExp('["\']'), '');
       } else if (l.startsWith('isolate_dso_base:')) {
-        dsoBase = l.substring('isolate_dso_base:'.length).trim();
+        // Real Dart AOT puts BOTH dso-base keys on one line:
+        //   isolate_dso_base: 7b9c2b7000, vm_dso_base: 7b9c2b7000
+        // so the remainder of the line is not a bare address. Taking all of it
+        // stored "7b9c2b7000, vm_dso_base: 7b9c2b7000" — confirmed for all 14
+        // events captured from a real device on 2026-08-08 — which the backend's
+        // hex parse then rejected. Keep only the leading token.
+        final String rest = l.substring('isolate_dso_base:'.length).trim();
+        final String token = rest.split(RegExp(r'[,\s]')).first;
+        dsoBase = token.isEmpty ? null : token;
       }
     }
     return DebugMeta(buildId: buildId, isolateDsoBase: dsoBase, os: os);

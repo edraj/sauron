@@ -13,8 +13,10 @@
   import JsonTree from '../lib/components/JsonTree.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { getSession } from '../lib/api/sessions';
-  import { errorMessage, isNormalizedError } from '../lib/api/client';
+  import { isNormalizedError } from '../lib/api/client';
   import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
   import type { SessionDetail } from '../lib/models';
 
@@ -25,27 +27,56 @@
 
   const sessionId = $derived(decodeURIComponent(params?.id ?? ''));
 
-  let detail = $state<SessionDetail | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
-  let notFound = $state(false);
-
-  async function load(appId: string, id: string) {
-    loading = true;
-    error = null;
-    notFound = false;
+  /**
+   * A 404 here is a fact about this session, not a transport failure: the page
+   * has its own empty state for it, and it must not travel the error path (which
+   * would read "Couldn't load session" and offer a Retry that can only 404
+   * again). So it resolves to `null` — a legitimate payload the cache may hold,
+   * which also keeps the not-found state paintable without a second round trip.
+   * Every other failure still throws and lands in `view.error`.
+   *
+   * Resolving rather than throwing is also what keeps the 404 subject to
+   * CachedView's generation guard: a late 404 for a session the user has already
+   * navigated away from is discarded like any other stale response, instead of
+   * flipping a page-level flag over the session now on screen.
+   */
+  async function fetchSession(appId: string, id: string): Promise<SessionDetail | null> {
     try {
-      detail = await getSession(appId, id);
+      return await getSession(appId, id);
     } catch (err) {
-      if (isNormalizedError(err) && err.status === 404) {
-        notFound = true;
-      } else {
-        error = errorMessage(err);
-      }
-      detail = null;
-    } finally {
-      loading = false;
+      if (isNormalizedError(err) && err.status === 404) return null;
+      throw err;
     }
+  }
+
+  // Cached view (lib/stores/cached-view.svelte.ts): a session visited a moment ago
+  // paints instantly on return and refreshes behind the rendered page instead of
+  // blanking to a spinner. Re-exposed under the names the template already used,
+  // so the markup is unchanged apart from Retry now forcing a network hit.
+  //
+  // `revalidating` is deliberately not surfaced: this page has no RefreshButton
+  // to spin, and the payload is replaced in place when the refresh lands.
+  const view = new CachedView<SessionDetail | null>();
+
+  const detail = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
+  // "Loaded, and what loaded was nothing." `hasData` is what separates that from
+  // "nothing loaded yet", since both leave `detail` null.
+  const notFound = $derived(view.hasData && view.data === null);
+
+  // `scopeKey` belongs in the key: it carries the selected environment, which the
+  // axios interceptor adds to the request but which appears in none of these
+  // arguments. Omit it and one environment's session would be served as another's.
+  //
+  // `force` bypasses the fresh-window short-circuit: the Retry button means "go to
+  // the network now", and honouring the cache there makes the control look broken.
+  async function load(appId: string, id: string, force = false) {
+    await view.load(
+      viewKey('sessions.detail', appId, sessionStore.scopeKey, id),
+      () => fetchSession(appId, id),
+      force,
+    );
   }
 
   $effect(() => {
@@ -84,7 +115,7 @@
       {#snippet action()}
         <Button
           variant="secondary"
-          onclick={() => sessionStore.currentAppId && load(sessionStore.currentAppId, sessionId)}
+          onclick={() => sessionStore.currentAppId && load(sessionStore.currentAppId, sessionId, true)}
         >
           Retry
         </Button>

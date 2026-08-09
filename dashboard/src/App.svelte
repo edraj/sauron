@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Router, { location, push } from 'svelte-spa-router';
-  import { routes } from './routes';
+  import { routes, prefetchLandingRoute } from './routes';
   import { authStore } from './lib/stores/auth.svelte';
   import Toast from './lib/components/ui/Toast.svelte';
   import Spinner from './lib/components/ui/Spinner.svelte';
@@ -23,6 +23,22 @@
   onMount(async () => {
     await authStore.boot();
     booted = true;
+  });
+
+  // Routes are lazily imported, so the landing route would otherwise cost a
+  // chunk round trip that the old all-static bundle had already prepaid. That
+  // route is '/overview' — where Redirect sends an authenticated visitor from
+  // '/' or any unmatched path, and where Login pushes after sign-in — NOT the
+  // '/issues' of the effect below, which only fires for an authenticated user
+  // who happens to be sitting on a PUBLIC_ROUTE. `prefetchLandingRoute` names
+  // the chunk; see its comment in routes.ts.
+  //
+  // Keyed on `isAuthenticated` rather than fired unconditionally so an
+  // anonymous visitor still downloads only the login page, which is the entire
+  // point of splitting the routes; that also covers the sign-in transition,
+  // where the flag flips after boot.
+  $effect(() => {
+    if (booted && authStore.isAuthenticated) prefetchLandingRoute();
   });
 
   // Once booted, keep authenticated users out of the login/register pages.

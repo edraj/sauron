@@ -1,6 +1,6 @@
 {
   "name": "@edraj/sauron-node",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Sauron server-side Node/TypeScript SDK: product-analytics events + exception capture for Node backends.",
   "homepage": "https://github.com/edraj/sauron/tree/main/sdks/node#readme",
   "repository": {

@@ -99,7 +99,11 @@ pub async fn detail(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<DeviceDetail>, ApiError> {
     let mut conn = db(&state).await?;
-    let scope = super::scope::authorized_read_scope(
+    // `_with_perms`: `errors` below is whole `ErrorEvent` rows, which carry two
+    // further permission questions — `perm::ISSUE_READ` for the body at all and
+    // `perm::SOURCE_READ` for the de-obfuscated lines inside it. See
+    // `sessions::detail` for the same note.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
         auth.user_id,
         app_id,
@@ -124,7 +128,9 @@ pub async fn detail(
         Some(&device_key),
     )
     .await?;
-    let errors = repo::errors_for_device(&mut conn, scope.clone(), &device_key, 50).await?;
+    let mut errors = repo::errors_for_device(&mut conn, scope.clone(), &device_key, 50).await?;
+    crate::symbolicate::gate_source_context(&perms, &mut errors);
+    crate::symbolicate::gate_event_body(&perms, &mut errors);
     let perf = repo::performance_summary(&mut conn, scope, since, None, Some(&device_key)).await?;
 
     Ok(Json(DeviceDetail {

@@ -58,8 +58,36 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
       REDIS_URL: redis://redis:6379
       INGEST_PORT: "8081"
-      WORKER_CONCURRENCY: "4"
-      INGEST_RATE_LIMIT_PER_MIN: "6000"
+      # These are deliberately blank rather than `:-8` / `:-6000`. This service
+      # has no `env_file:`, so an explicit entry is the only way a variable in
+      # .env reaches the container — deleting the line would remove operator
+      # override entirely. Passing a literal instead keeps compose winning after
+      # any retune of the binary's default, which is exactly how the pinned
+      # WORKER_CONCURRENCY=4 outlived the 1.3.0 changelog entry announcing 8.
+      # Blank arrives as an empty string, which Config's `var()` filters, so the
+      # number lives in sauron-core/src/config.rs alone. Same reasoning as
+      # INSPECTOR_WINDOW_DAYS below.
+      #
+      # Raising WORKER_CONCURRENCY above 8 also needs INGEST_DB_POOL raised to
+      # match, or the extra workers queue on connection checkout. See README's
+      # Ingest gateway table for the measured worker/batch-size interaction.
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-}
+      INGEST_RATE_LIMIT_PER_MIN: ${INGEST_RATE_LIMIT_PER_MIN:-}
+      # Documented in .env.example but previously absent here, so editing them
+      # in .env did nothing at all in the compose path.
+      INGEST_MAX_BODY_BYTES: ${INGEST_MAX_BODY_BYTES:-}
+      INGEST_BACKLOG: ${INGEST_BACKLOG:-}
+      INGEST_DB_POOL: ${INGEST_DB_POOL:-}
+      # Ingest accounting counters. Same blank-passthrough rule as above, so the
+      # default (127.0.0.1:<INGEST_PORT + 10000>) lives in the binary.
+      #
+      # That default is LOOPBACK, and loopback inside a container is the
+      # container — so `docker compose exec ingest curl -s localhost:18081/metrics`
+      # reads it, while nothing on the host can. To scrape it from outside, set
+      # INGEST_METRICS_ADDR=0.0.0.0:18081 in .env and publish 18081 below;
+      # understand first that the counters are per-deployment event volumes.
+      INGEST_METRICS_ADDR: ${INGEST_METRICS_ADDR:-}
+      INGEST_METRICS_SAMPLE_SECS: ${INGEST_METRICS_SAMPLE_SECS:-}
       # Off by default: the published port is reached directly, so the header
       # would be caller-controlled. While off, client IPs are stored as NULL.
       # Set to true only behind a proxy you control.
@@ -85,11 +113,11 @@ services:
       MONITOR_MAX_CONCURRENCY: ${MONITOR_MAX_CONCURRENCY:-50}
       MONITOR_CHECK_RETENTION_DAYS: ${MONITOR_CHECK_RETENTION_DAYS:-30}
       MONITOR_SSRF_ALLOW_PRIVATE: ${MONITOR_SSRF_ALLOW_PRIVATE:-false}
-      # Monitor fires up/down alerts inline, so it needs the channel-secret key.
-      # When NOTIFY_SECRET_KEY is unset it is derived from JWT_SECRET, which must
-      # therefore match the API's — otherwise stored channel secrets won't decrypt.
+      # Monitor fires up/down alerts inline, so it needs the channel key. It is
+      # required and has no fallback: every service that touches channels must
+      # see the SAME value or it cannot decrypt what the others wrote.
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
-      NOTIFY_SECRET_KEY: ${NOTIFY_SECRET_KEY:-}
+      NOTIFY_SECRET_KEY: ${NOTIFY_SECRET_KEY:?set NOTIFY_SECRET_KEY in .env — see README, losing it is unrecoverable}
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     depends_on:
       migrate:
@@ -110,7 +138,7 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
-      NOTIFY_SECRET_KEY: ${NOTIFY_SECRET_KEY:-}
+      NOTIFY_SECRET_KEY: ${NOTIFY_SECRET_KEY:?set NOTIFY_SECRET_KEY in .env — see README, losing it is unrecoverable}
       ALERTS_TICK_SECS: ${ALERTS_TICK_SECS:-30}
       NOTIFY_SUBS_TICK_SECS: ${NOTIFY_SUBS_TICK_SECS:-120}
       NOTIFY_SUBS_BATCH: ${NOTIFY_SUBS_BATCH:-200}
@@ -136,6 +164,10 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      # The API creates and edits notification channels, so it needs the same
+      # channel key `monitor` and `alerts` deliver with. It also runs the
+      # one-shot conversion of any pre-encryption `config` rows at boot.
+      NOTIFY_SECRET_KEY: ${NOTIFY_SECRET_KEY:?set NOTIFY_SECRET_KEY in .env — see README, losing it is unrecoverable}
       JWT_ACCESS_TTL_SECS: "900"
       JWT_REFRESH_TTL_SECS: "2592000"
       AUTH_REVOCATION_POLL_SECS: "5"

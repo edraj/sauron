@@ -1057,6 +1057,43 @@ pub async fn update_role(
     .await
 }
 
+/// Delete a custom role. Scoped by `org_id` as well as `role_id` so a mistaken
+/// call cannot reach across orgs, and filtered on `is_system` so a preset can
+/// never be deleted even if a caller-side check is missed — the same defence in
+/// depth `update_role` uses.
+///
+/// `role_grants.role_id` is ON DELETE CASCADE, so every grant holding this role
+/// disappears with it. Callers must have already counted and confirmed that.
+pub async fn delete_role(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    role_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::delete(
+        roles::table
+            .filter(roles::id.eq(role_id))
+            .filter(roles::org_id.eq(org_id))
+            .filter(roles::is_system.eq(false)),
+    )
+    .execute(conn)
+    .await
+}
+
+/// How many grants currently hold `role_id`. Used to report what a delete
+/// cascaded, since `role_grants.role_id` is ON DELETE CASCADE and the rows are
+/// gone by the time the delete returns.
+pub async fn count_grants_for_role(
+    conn: &mut AsyncPgConnection,
+    role_id: Uuid,
+) -> QueryResult<i64> {
+    let row: GrantCountRow =
+        diesel::sql_query("SELECT count(*)::bigint AS n FROM role_grants WHERE role_id = $1")
+            .bind::<SqlUuid, _>(role_id)
+            .get_result(conn)
+            .await?;
+    Ok(row.n)
+}
+
 /// Idempotently upsert a system preset role (keeps DB in sync with code).
 pub async fn upsert_preset_role(
     conn: &mut AsyncPgConnection,
@@ -2258,6 +2295,82 @@ impl From<IssueRow> for Issue {
     }
 }
 
+/// Which columns a free-text `q` is allowed to be matched against.
+///
+/// **This exists because a search predicate is a read.** `?q=` runs an ILIKE
+/// over `error_events.contexts::text`, `extra::text` and `tags::text` — the
+/// exact columns `sauron-api`'s `symbolicate::strip_event_body` nulls for a
+/// caller holding `issue:read` without `event:read`. A predicate over a
+/// withheld column is a match/no-match oracle over its contents: probe
+/// `?q=sk_live_a`, `?q=sk_live_ab`, … and the row counts spell out a value the
+/// response is not allowed to contain. Byte-for-byte extraction needs only
+/// patience, and every request looks like an ordinary search in the logs.
+///
+/// So the searchable set is made to equal the *readable* set:
+///
+/// | reach | matched against |
+/// |---|---|
+/// | [`ShellOnly`](Self::ShellOnly) | the columns `strip_event_body` KEEPS — `message`, `exception_type`, `exception_value`, and (on issues) `title`/`type`/`culprit`, which are derived from those two |
+/// | [`IncludingBody`](Self::IncludingBody) | the above **plus** the `contexts`/`extra`/`tags` payload scan |
+///
+/// A two-variant enum rather than a `bool` for the reason
+/// `symbolicate::gate_event_body` takes a permission set rather than a `bool`:
+/// `true` and `false` are interchangeable at a call site and the mistake is
+/// silent in the leaking direction. `sauron-db` cannot depend on `sauron-auth`,
+/// so the mapping from permissions to reach lives in ONE place on the other
+/// side of that boundary — `symbolicate::text_search_reach` — and every handler
+/// goes through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSearchReach {
+    /// Only the columns a bare `issue:read` caller may actually read back.
+    ShellOnly,
+    /// Everything, including the jsonb payload scan. Requires `issue:read` AND
+    /// `event:read` at the resolved scope.
+    IncludingBody,
+}
+
+impl TextSearchReach {
+    /// Whether the `contexts`/`extra`/`tags` payload scan belongs in the
+    /// predicate. Named rather than matched inline so the four query sites read
+    /// the same and none of them can invert it.
+    pub fn includes_body(self) -> bool {
+        matches!(self, TextSearchReach::IncludingBody)
+    }
+}
+
+/// [`list_issues_with_reach`] with the payload scan ON.
+///
+/// **Handlers must not call this.** It is the pre-D4 signature, kept so
+/// `crates/sauron-db/tests/env_scoping.rs`' ~30 call sites (which assert
+/// environment scoping, including of the payload scan itself) keep compiling
+/// and keep testing the payload-inclusive predicate. A handler that reaches for
+/// it hands a bare `issue:read` caller the oracle
+/// [`TextSearchReach`] exists to close —
+/// `bins/sauron-api/tests/http_source_context.rs`'
+/// `no_handler_may_call_the_payload_inclusive_repo_entry_points` fails the
+/// build if one does.
+pub async fn list_issues(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    filters: &[ParsedFilter],
+    q: Option<&str>,
+    since: chrono::DateTime<chrono::Utc>,
+    limit: i64,
+    offset: i64,
+) -> QueryResult<Vec<Issue>> {
+    list_issues_with_reach(
+        conn,
+        scope,
+        filters,
+        q,
+        TextSearchReach::IncludingBody,
+        since,
+        limit,
+        offset,
+    )
+    .await
+}
+
 /// Lists issues for an app, optionally scoped to one environment.
 ///
 /// `issues` has no `environment_id` and — per Task 1's write-path measurement
@@ -2407,11 +2520,30 @@ impl From<IssueRow> for Issue {
 /// 100` with no `offset` (see `dashboard/src/pages/Issues.svelte`'s `load()`)
 /// — chosen deliberately, not left as an unnoticed regression; revisit if a
 /// second caller ever pages past offset 0 with one of these filters set.
-pub async fn list_issues(
+///
+/// **`reach` decides whether the free-text `q` may touch the event payload.**
+/// See [`TextSearchReach`] for why that is a permission question and not a
+/// tuning knob. It affects ONLY the `q` predicate: the `EXISTS` over
+/// `contexts`/`extra`/`tags` is emitted under
+/// [`IncludingBody`](TextSearchReach::IncludingBody) and omitted under
+/// [`ShellOnly`](TextSearchReach::ShellOnly), leaving `title`/`type`/`culprit`
+/// matched either way. Filters are untouched by it — the `tag` filter is a
+/// predicate over the same withheld column and is refused one layer up, at the
+/// handler, because dropping a narrowing the user explicitly asked for would
+/// return MORE rows than they filtered for and make the page lie about what it
+/// is showing; see `routes/issues.rs`' `reject_body_filters`.
+// Eight parameters, one over clippy's seven. Deliberately not bundled into a
+// params struct: the other seven ARE the pre-existing signature, and reshaping
+// them would rewrite the ~30 call sites in `tests/env_scoping.rs` that the
+// `list_issues` shim exists to leave alone. Same call as the ~15 other `allow`s
+// in this file.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_issues_with_reach(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     filters: &[ParsedFilter],
     q: Option<&str>,
+    reach: TextSearchReach,
     since: chrono::DateTime<chrono::Utc>,
     limit: i64,
     offset: i64,
@@ -2524,35 +2656,47 @@ pub async fn list_issues(
         }
         if let Some(term) = q {
             let p = like_contains(term);
-            query = query.filter(
-                issues::title
-                    .ilike(p.clone())
-                    .or(issues::type_.ilike(p.clone()))
-                    .or(issues::culprit.ilike(p.clone()))
-                    // Payload search casts jsonb to text, which no index can serve.
-                    // Bounding the correlated scan by time is what keeps it viable:
-                    // without it, an issue with no match forces a full scan of that
-                    // issue's entire event history — for EVERY issue in the app.
-                    // `since` is always supplied by the caller (see `list()` in
-                    // `routes/issues.rs`) — there used to be a `MAX_PAYLOAD_SEARCH_
-                    // DAYS` fallback for when it wasn't, but every route already
-                    // passed `Some(since)`, so that fallback never fired. Deleted
-                    // rather than kept as a guard that reads as protection but
-                    // isn't one.
-                    .or(sql::<Bool>(
-                        "EXISTS (SELECT 1 FROM error_events e \
+            // The shell half: `issues`' own text columns. `title`/`culprit` are
+            // derived from `exception_type`/`exception_value`, which
+            // `strip_event_body` KEEPS, and `type` is the issue's own — so all
+            // three are readable by the same `issue:read` that authorized this
+            // call, and searching them is never an oracle. Split out so the
+            // payload half can be appended conditionally: `.or()` changes the
+            // expression type, so the two reaches cannot be one chain.
+            let shell = issues::title
+                .ilike(p.clone())
+                .or(issues::type_.ilike(p.clone()))
+                .or(issues::culprit.ilike(p.clone()));
+            query = if !reach.includes_body() {
+                query.filter(shell)
+            } else {
+                query.filter(
+                    shell
+                        // Payload search casts jsonb to text, which no index can serve.
+                        // Bounding the correlated scan by time is what keeps it viable:
+                        // without it, an issue with no match forces a full scan of that
+                        // issue's entire event history — for EVERY issue in the app.
+                        // `since` is always supplied by the caller (see `list()` in
+                        // `routes/issues.rs`) — there used to be a `MAX_PAYLOAD_SEARCH_
+                        // DAYS` fallback for when it wasn't, but every route already
+                        // passed `Some(since)`, so that fallback never fired. Deleted
+                        // rather than kept as a guard that reads as protection but
+                        // isn't one.
+                        .or(sql::<Bool>(
+                            "EXISTS (SELECT 1 FROM error_events e \
                          WHERE e.issue_id = issues.id AND e.app_id = issues.app_id \
                          AND e.occurred_at >= ",
-                    )
-                    .bind::<Timestamptz, _>(since)
-                    .sql(" AND (e.contexts::text ILIKE ")
-                    .bind::<Text, _>(p.clone())
-                    .sql(" OR e.extra::text ILIKE ")
-                    .bind::<Text, _>(p.clone())
-                    .sql(" OR e.tags::text ILIKE ")
-                    .bind::<Text, _>(p)
-                    .sql("))")),
-            );
+                        )
+                        .bind::<Timestamptz, _>(since)
+                        .sql(" AND (e.contexts::text ILIKE ")
+                        .bind::<Text, _>(p.clone())
+                        .sql(" OR e.extra::text ILIKE ")
+                        .bind::<Text, _>(p.clone())
+                        .sql(" OR e.tags::text ILIKE ")
+                        .bind::<Text, _>(p)
+                        .sql("))")),
+                )
+            };
         }
         return query
             .select(Issue::as_select())
@@ -2738,13 +2882,25 @@ pub async fn list_issues(
         b
     });
     if let Some(b) = q_bind {
-        let qe_env = scope.env.sql_fragment_for("qe", env_bind_idx);
-        filter_sql += &format!(
-            " AND (title ILIKE ${b} OR type ILIKE ${b} OR culprit ILIKE ${b} \
-              OR EXISTS (SELECT 1 FROM error_events qe WHERE qe.issue_id = issues.id \
-              AND qe.app_id = issues.app_id AND qe.occurred_at >= $2 \
-              AND (qe.contexts::text ILIKE ${b} OR qe.extra::text ILIKE ${b} OR qe.tags::text ILIKE ${b}){qe_env}))"
-        );
+        // Same shell/payload split as the `EnvFilter::All` branch above, and it
+        // must stay in lockstep with it: two code paths answering the same
+        // request differently by environment selection would mean `?q=` leaks
+        // the payload under `?environment_id=X` but not without it. The bind
+        // COUNT is identical either way — `$b` is one bind referenced several
+        // times — so the reach cannot shift `limit_bind`/`offset_bind`.
+        let payload = if reach.includes_body() {
+            let qe_env = scope.env.sql_fragment_for("qe", env_bind_idx);
+            format!(
+                " OR EXISTS (SELECT 1 FROM error_events qe WHERE qe.issue_id = issues.id \
+                  AND qe.app_id = issues.app_id AND qe.occurred_at >= $2 \
+                  AND (qe.contexts::text ILIKE ${b} OR qe.extra::text ILIKE ${b} \
+                  OR qe.tags::text ILIKE ${b}){qe_env})"
+            )
+        } else {
+            String::new()
+        };
+        filter_sql +=
+            &format!(" AND (title ILIKE ${b} OR type ILIKE ${b} OR culprit ILIKE ${b}{payload})");
     }
     let limit_bind = next_bind;
     next_bind += 1;
@@ -2937,6 +3093,30 @@ pub async fn set_issue_users_seen(
 /// `issue_id` through `get_issue(scope, ...)` first, so this is redundant in
 /// practice, but matches the rest of this slice's idiom of never trusting an
 /// id alone to imply tenant scope.
+// Eight parameters; see `list_issues_with_reach` for why the other seven keep
+// their shape.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_error_events_for_issue_with_reach(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    issue_id: Uuid,
+    filters: &[ParsedFilter],
+    q: Option<&str>,
+    reach: TextSearchReach,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    limit: i64,
+) -> QueryResult<Vec<ErrorEvent>> {
+    error_events_for_issue_query(&scope, issue_id, filters, q, reach, since)
+        .select(ErrorEvent::as_select())
+        .order(error_events::occurred_at.desc())
+        .limit(limit)
+        .load(conn)
+        .await
+}
+
+/// [`list_error_events_for_issue_with_reach`] with the payload scan ON.
+/// **Handlers must not call this** — see [`list_issues`] for the whole reason
+/// this shim shape exists.
 pub async fn list_error_events_for_issue(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
@@ -2946,12 +3126,17 @@ pub async fn list_error_events_for_issue(
     since: Option<chrono::DateTime<chrono::Utc>>,
     limit: i64,
 ) -> QueryResult<Vec<ErrorEvent>> {
-    error_events_for_issue_query(&scope, issue_id, filters, q, since)
-        .select(ErrorEvent::as_select())
-        .order(error_events::occurred_at.desc())
-        .limit(limit)
-        .load(conn)
-        .await
+    list_error_events_for_issue_with_reach(
+        conn,
+        scope,
+        issue_id,
+        filters,
+        q,
+        TextSearchReach::IncludingBody,
+        since,
+        limit,
+    )
+    .await
 }
 
 /// The shared `WHERE` clause behind both the occurrences list and its
@@ -2964,11 +3149,18 @@ pub async fn list_error_events_for_issue(
 /// a user count that silently disagrees with the visible rows — and the
 /// `workflow`/`Neq` arm below is exactly the kind of subtlety a second copy
 /// would get wrong.
+///
+/// `reach` is in that same "cannot drift" contract: the stat strip and the rows
+/// must agree about which columns the free-text term was matched against, or a
+/// narrowed search would show a count computed over a wider predicate than the
+/// list it sits above. Threading it through the one shared builder is what makes
+/// that impossible.
 fn error_events_for_issue_query<'a>(
     scope: &'a ReadScope,
     issue_id: Uuid,
     filters: &[ParsedFilter],
     q: Option<&str>,
+    reach: TextSearchReach,
     since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> error_events::BoxedQuery<'a, diesel::pg::Pg> {
     let mut query = error_events::table
@@ -3029,15 +3221,28 @@ fn error_events_for_issue_query<'a>(
     }
     if let Some(term) = q {
         let p = like_contains(term);
-        query = query.filter(
-            error_events::message
-                .ilike(p.clone())
-                .or(error_events::exception_value.ilike(p.clone()))
-                .or(error_events::exception_type.ilike(p.clone()))
-                .or(sql::<Bool>("error_events.contexts::text ILIKE ").bind::<Text, _>(p.clone()))
-                .or(sql::<Bool>("error_events.extra::text ILIKE ").bind::<Text, _>(p.clone()))
-                .or(sql::<Bool>("error_events.tags::text ILIKE ").bind::<Text, _>(p)),
-        );
+        // `message`/`exception_value`/`exception_type` are exactly the text
+        // columns `symbolicate::strip_event_body` KEEPS, so a bare `issue:read`
+        // caller can read back every row this half of the predicate matched.
+        // `contexts`/`extra`/`tags` are the three it NULLS, so matching them for
+        // that caller would answer a question the response is forbidden to —
+        // see [`TextSearchReach`]. Two branches rather than one chain because
+        // `.or()` changes the expression's type.
+        let shell = error_events::message
+            .ilike(p.clone())
+            .or(error_events::exception_value.ilike(p.clone()))
+            .or(error_events::exception_type.ilike(p.clone()));
+        query = if reach.includes_body() {
+            query.filter(
+                shell
+                    .or(sql::<Bool>("error_events.contexts::text ILIKE ")
+                        .bind::<Text, _>(p.clone()))
+                    .or(sql::<Bool>("error_events.extra::text ILIKE ").bind::<Text, _>(p.clone()))
+                    .or(sql::<Bool>("error_events.tags::text ILIKE ").bind::<Text, _>(p)),
+            )
+        } else {
+            query.filter(shell)
+        };
     }
     crate::scope_env!(query, error_events, &scope.env)
 }
@@ -3049,19 +3254,20 @@ fn error_events_for_issue_query<'a>(
 /// per-day counts — the same reason transaction percentiles stay on Postgres.
 /// Once partitions age out to Parquet, a wide range under-reports here exactly
 /// as it already does for the per-environment `users_seen` in `list_issues`.
-pub async fn error_event_stats_for_issue(
+pub async fn error_event_stats_for_issue_with_reach(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     issue_id: Uuid,
     filters: &[ParsedFilter],
     q: Option<&str>,
+    reach: TextSearchReach,
     since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> QueryResult<IssueEventStatsRow> {
     // `distinct_id`/`session_id` are both nullable: an anonymous occurrence and
     // a session-less one contribute a NULL, which `count(DISTINCT …)` skips.
     // That is the intent — "3 users" should not count "no user" as a user.
     let (events, users, sessions) =
-        error_events_for_issue_query(&scope, issue_id, filters, q, since)
+        error_events_for_issue_query(&scope, issue_id, filters, q, reach, since)
             .select((
                 diesel::dsl::count_star(),
                 sql::<BigInt>("count(DISTINCT error_events.distinct_id)"),
@@ -3075,6 +3281,12 @@ pub async fn error_event_stats_for_issue(
         sessions,
     })
 }
+
+// No payload-inclusive shim for the stats query, unlike its two siblings: it
+// had no caller outside `routes/issues.rs`, so there was no pre-D4 signature to
+// preserve. A shim added "for symmetry" would be a fail-OPEN entry point with
+// nothing calling it — surface whose only possible future use is the mistake
+// `TextSearchReach` exists to prevent.
 
 /// Counts behind the occurrences stat strip. Raw-shape row, so it lives here
 /// beside `IssueStatsRow` rather than in `models.rs`.
@@ -7143,6 +7355,571 @@ pub async fn set_dropped_thru(
 }
 
 // ===========================================================================
+// Runtime settings (operator-tunable, no restart)
+// ===========================================================================
+
+/// Raw value for `key`, or `None` when no row exists.
+///
+/// `None` is the normal, default state and means "use the process's configured
+/// value" — it is not an error and must not be treated as one. Nothing seeds this
+/// table, so every key reads as `None` until an operator sets it.
+pub async fn get_runtime_setting(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+) -> QueryResult<Option<String>> {
+    runtime_settings::table
+        .find(key)
+        .select(runtime_settings::value)
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Value plus when it was last changed, for a UI that shows provenance.
+pub async fn get_runtime_setting_row(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+) -> QueryResult<Option<(String, DateTime<Utc>)>> {
+    runtime_settings::table
+        .find(key)
+        .select((runtime_settings::value, runtime_settings::updated_at))
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Upsert `key`. `updated_by` is the acting user, or `None` for a script.
+pub async fn set_runtime_setting(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+    value: &str,
+    updated_by: Option<Uuid>,
+) -> QueryResult<()> {
+    diesel::insert_into(runtime_settings::table)
+        .values((
+            runtime_settings::key.eq(key),
+            runtime_settings::value.eq(value),
+            runtime_settings::updated_at.eq(Utc::now()),
+            runtime_settings::updated_by.eq(updated_by),
+        ))
+        .on_conflict(runtime_settings::key)
+        .do_update()
+        .set((
+            runtime_settings::value.eq(value),
+            runtime_settings::updated_at.eq(Utc::now()),
+            runtime_settings::updated_by.eq(updated_by),
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Remove `key`, reverting it to the process's configured value.
+pub async fn delete_runtime_setting(conn: &mut AsyncPgConnection, key: &str) -> QueryResult<usize> {
+    diesel::delete(runtime_settings::table.find(key))
+        .execute(conn)
+        .await
+}
+
+/// Total number of orgs in the deployment.
+///
+/// Paired with `orgs_with_permission` to express "administers the whole
+/// deployment" using only the existing grant primitives: a caller who holds
+/// org-scoped `org:manage` in every org that exists is, for practical purposes,
+/// the operator. This deployment has no separate super-admin flag (one was added
+/// and removed), and a deployment-wide setting must not be changeable by an admin
+/// of a single tenant — that would let one tenant force another's data out of
+/// Postgres.
+pub async fn count_all_orgs(conn: &mut AsyncPgConnection) -> QueryResult<i64> {
+    organizations::table.count().get_result(conn).await
+}
+
+/// `runtime_settings` key for the cold-rotation age, in days.
+pub const TIER_HOT_DAYS_KEY: &str = "tier.hot_days";
+
+/// Smallest rotation age an operator may set.
+///
+/// Not zero, and not negative. Zero would make every partition instantly
+/// eligible, so the worker would tier the current day's data out from under live
+/// writes; negative would put the cutoff in the future and tier everything. One
+/// day is the smallest value that still leaves a whole bucket hot, matching the
+/// worker's day granularity.
+pub const TIER_HOT_DAYS_MIN: i64 = 1;
+
+/// The rotation age actually in force: the operator's override when one is set
+/// and valid, otherwise the process's configured value.
+///
+/// Invalid stored values (unparseable, or below `TIER_HOT_DAYS_MIN`) fall back to
+/// `configured` rather than erroring. A malformed row must not be able to stop
+/// tiering deployment-wide or, worse, drive the cutoff to zero — the write path
+/// validates, and this is the second line of defence for a value edited by hand
+/// in psql. The caller is expected to log the fallback; this returns no signal
+/// beyond the value so it stays usable on a hot path.
+pub async fn effective_tier_hot_days(
+    conn: &mut AsyncPgConnection,
+    configured: i64,
+) -> QueryResult<i64> {
+    let raw = get_runtime_setting(conn, TIER_HOT_DAYS_KEY).await?;
+    Ok(match raw.as_deref().map(str::trim).map(str::parse::<i64>) {
+        Some(Ok(v)) if v >= TIER_HOT_DAYS_MIN => v,
+        _ => configured,
+    })
+}
+
+// ===========================================================================
+// Tier pins (protect restored ranges from being re-dropped)
+// ===========================================================================
+
+/// True iff any UNEXPIRED pin overlaps `[start, end)` for `table`.
+///
+/// Overlap, not containment: a pin covering part of a partition still has to
+/// block the drop, because dropping the partition would take the pinned rows
+/// with it. The comparison is the standard half-open overlap test
+/// (`pin.start < end AND pin.end > start`), so a pin that merely abuts the
+/// partition does not block it.
+pub async fn is_range_pinned(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> QueryResult<bool> {
+    let n: i64 = tier_pins::table
+        .filter(tier_pins::table_name.eq(table))
+        .filter(tier_pins::expires_at.gt(Utc::now()))
+        .filter(tier_pins::range_start.lt(end))
+        .filter(tier_pins::range_end.gt(start))
+        .count()
+        .get_result(conn)
+        .await?;
+    Ok(n > 0)
+}
+
+/// Create a pin. Overlapping pins are allowed and are not merged — each records
+/// a separate restore with its own expiry, and the drop check only asks whether
+/// ANY is live, so the longest-lived one wins naturally.
+pub async fn create_tier_pin(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    created_by: Option<Uuid>,
+    reason: Option<&str>,
+) -> QueryResult<TierPin> {
+    diesel::insert_into(tier_pins::table)
+        .values((
+            tier_pins::table_name.eq(table),
+            tier_pins::range_start.eq(start),
+            tier_pins::range_end.eq(end),
+            tier_pins::expires_at.eq(expires_at),
+            tier_pins::created_by.eq(created_by),
+            tier_pins::reason.eq(reason),
+        ))
+        .returning(TierPin::as_returning())
+        .get_result(conn)
+        .await
+}
+
+/// Every pin, newest first, expired ones included — the UI shows expiry so an
+/// operator can tell a lapsed restore from a live one.
+pub async fn list_tier_pins(conn: &mut AsyncPgConnection) -> QueryResult<Vec<TierPin>> {
+    tier_pins::table
+        .select(TierPin::as_select())
+        .order(tier_pins::created_at.desc())
+        .load(conn)
+        .await
+}
+
+// `delete_tier_pin` (a bare DELETE of the pin row) was REMOVED, not deprecated.
+// Once a pin owns restored rows, deleting the row alone strands them: they sit
+// in `<table>_default` with a marker nothing will ever match again, invisible to
+// the drop step and added to every chart on top of the Parquet copy of the same
+// events. `release_tier_pin` is the only correct way to remove a pin, and
+// deleting the old function is what stops a future call site from picking the
+// wrong one.
+
+/// Tables a restore may write into and an expiry may delete from.
+///
+/// Every code path that interpolates a table name into restore SQL checks this
+/// first. The `restore_jobs.table_name` CHECK constraint says the same thing in
+/// the database; neither is redundant, because the constant also guards the
+/// expiry path, which reads its table name from a `tier_pins` row rather than
+/// from a job.
+pub const RESTORABLE_TABLES: [&str; 3] = ["error_events", "analytics_events", "transactions"];
+
+pub fn is_restorable_table(table: &str) -> bool {
+    RESTORABLE_TABLES.contains(&table)
+}
+
+/// Delete the rows one restore put back, and nothing else.
+///
+/// Scoped by `restored_pin_id` AND the pin's time range. The pin id alone would
+/// be correct but would have to seq-scan every partition of a very large table;
+/// the range predicate prunes to the partitions the restore actually touched.
+/// See the 000045 migration for why there is deliberately no index here.
+///
+/// `table` MUST come from [`RESTORABLE_TABLES`] — it is interpolated, because a
+/// table name cannot be a bind parameter.
+pub async fn delete_restored_rows(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    pin_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> QueryResult<i64> {
+    if !is_restorable_table(table) {
+        return Err(diesel::result::Error::QueryBuilderError(
+            format!("refusing to delete restored rows from non-restorable table {table}").into(),
+        ));
+    }
+    let n = diesel::sql_query(format!(
+        "DELETE FROM {table} \
+          WHERE restored_pin_id = $1 AND occurred_at >= $2 AND occurred_at < $3"
+    ))
+    .bind::<SqlUuid, _>(pin_id)
+    .bind::<Timestamptz, _>(start)
+    .bind::<Timestamptz, _>(end)
+    .execute(conn)
+    .await?;
+    Ok(n as i64)
+}
+
+/// One pin whose expiry has passed, together with what removing it reclaimed.
+#[derive(Debug, Clone)]
+pub struct ExpiredPin {
+    pub id: Uuid,
+    pub table_name: String,
+    pub rows_deleted: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ExpiredRows {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+/// Expire every lapsed pin: delete the rows that pin restored, then the pin
+/// itself, as ONE statement per pin.
+///
+/// This replaced a purge that deleted only the pin row. That was wrong once
+/// restores actually write data. Restored rows land in `<table>_default` (no
+/// explicit partition is created), and the tier worker's drop step only ever
+/// drops explicit partitions — so a pin deleted without its rows leaves those
+/// rows in Postgres permanently, AND double-counted, because the cross-tier
+/// reader adds `_default` to the cold half while Parquet still holds the same
+/// rows. "Housekeeping" would have quietly become a storage leak and a wrong
+/// number on every chart.
+///
+/// One data-modifying CTE rather than two statements: `conn.transaction(...)`
+/// is blocked by the MSRV (see `delete_app` for the same constraint), and the
+/// two halves must not be separable. The row delete is the CTE and the pin
+/// delete is the main statement, so they share one snapshot and either both
+/// happen or neither does. That matters because the READ path keys on the pin
+/// ROW EXISTING, not on its expiry: for as long as the pin row is there the
+/// range is served from Postgres, and the instant it is gone the rows are gone
+/// too and the range is served from Parquet again. There is no window in which
+/// a chart sees the range twice or not at all.
+pub async fn expire_tier_pins(conn: &mut AsyncPgConnection) -> QueryResult<Vec<ExpiredPin>> {
+    let due: Vec<TierPin> = tier_pins::table
+        .filter(tier_pins::expires_at.le(Utc::now()))
+        .select(TierPin::as_select())
+        .load(conn)
+        .await?;
+
+    let mut out = Vec::with_capacity(due.len());
+    for pin in due {
+        out.push(expire_one_pin(conn, &pin).await?);
+    }
+    Ok(out)
+}
+
+/// Remove one pin and the rows it restored. The single implementation shared by
+/// the worker's expiry sweep and the operator's "release now" action, so both
+/// can only ever do the same thing.
+async fn expire_one_pin(conn: &mut AsyncPgConnection, pin: &TierPin) -> QueryResult<ExpiredPin> {
+    if !is_restorable_table(&pin.table_name) {
+        // A pin naming a table we must not touch: drop the pin, leave the data.
+        // Reaching here means someone inserted a pin by hand.
+        diesel::delete(tier_pins::table.find(pin.id))
+            .execute(conn)
+            .await?;
+        return Ok(ExpiredPin {
+            id: pin.id,
+            table_name: pin.table_name.clone(),
+            rows_deleted: 0,
+        });
+    }
+    let row: ExpiredRows = diesel::sql_query(format!(
+        "WITH del AS ( \
+             DELETE FROM {table} \
+              WHERE restored_pin_id = $1 AND occurred_at >= $2 AND occurred_at < $3 \
+              RETURNING 1 \
+         ), unpin AS ( \
+             DELETE FROM tier_pins WHERE id = $1 RETURNING 1 \
+         ) \
+         SELECT (SELECT count(*) FROM del)::bigint AS n",
+        table = pin.table_name
+    ))
+    .bind::<SqlUuid, _>(pin.id)
+    .bind::<Timestamptz, _>(pin.range_start)
+    .bind::<Timestamptz, _>(pin.range_end)
+    .get_result(conn)
+    .await?;
+    Ok(ExpiredPin {
+        id: pin.id,
+        table_name: pin.table_name.clone(),
+        rows_deleted: row.n,
+    })
+}
+
+/// Release one pin immediately, deleting its restored rows now rather than
+/// waiting for the worker's next sweep.
+///
+/// This is what `DELETE /v1/admin/tier-pins/{id}` must call. Deleting the pin
+/// ROW on its own — which is what a naive `delete_tier_pin` does — would strand
+/// the restored rows in `<table>_default` where nothing can identify them, and
+/// they would then be added to every chart on top of the Parquet copy that
+/// still holds the same events.
+pub async fn release_tier_pin(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<ExpiredPin>> {
+    let pin: Option<TierPin> = tier_pins::table
+        .find(id)
+        .select(TierPin::as_select())
+        .first(conn)
+        .await
+        .optional()?;
+    match pin {
+        Some(p) => Ok(Some(expire_one_pin(conn, &p).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Push a pin's expiry out. The answer to a warn-before-expiry notice when the
+/// investigation is not finished.
+pub async fn extend_tier_pin(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    new_expiry: DateTime<Utc>,
+) -> QueryResult<Option<TierPin>> {
+    diesel::update(tier_pins::table.find(id))
+        .set(tier_pins::expires_at.eq(new_expiry))
+        .returning(TierPin::as_returning())
+        .get_result(conn)
+        .await
+        .optional()
+}
+
+/// Pins that will lapse before `cutoff` and have not lapsed yet — the
+/// warn-before-expiry set. Returned oldest-expiry first so the most urgent
+/// warning is the first one an operator sees.
+pub async fn pins_expiring_before(
+    conn: &mut AsyncPgConnection,
+    cutoff: DateTime<Utc>,
+) -> QueryResult<Vec<TierPin>> {
+    tier_pins::table
+        .filter(tier_pins::expires_at.gt(Utc::now()))
+        .filter(tier_pins::expires_at.le(cutoff))
+        .select(TierPin::as_select())
+        .order(tier_pins::expires_at.asc())
+        .load(conn)
+        .await
+}
+
+/// Ranges of `table` currently held in Postgres by a restore.
+///
+/// Keyed on the pin row EXISTING, deliberately not on `expires_at`: while a
+/// lapsed pin is still present its rows are still in Postgres, and the reader
+/// must keep serving that range hot or it will double-count against Parquet.
+/// `expire_tier_pins` removes rows and pin together, which is the only moment
+/// the answer changes. Contrast `is_range_pinned`, which the tier worker uses to
+/// decide whether to DROP a partition and which correctly does respect expiry.
+pub async fn restored_ranges(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+) -> QueryResult<Vec<(DateTime<Utc>, DateTime<Utc>)>> {
+    tier_pins::table
+        .filter(tier_pins::table_name.eq(table))
+        .select((tier_pins::range_start, tier_pins::range_end))
+        .order(tier_pins::range_start.asc())
+        .load(conn)
+        .await
+}
+
+// ===========================================================================
+// Restore jobs (Parquet -> Postgres)
+// ===========================================================================
+
+/// A queued or running restore whose range overlaps `[start, end)`.
+///
+/// Two concurrent restores of overlapping ranges would each insert the same
+/// Parquet rows under a different pin id, duplicating them — and because each
+/// pin only deletes its OWN rows at expiry, the duplicates would survive until
+/// both expired. The create handler turns this into a 409 rather than letting
+/// the second job start.
+pub async fn overlapping_active_restore(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> QueryResult<Option<RestoreJob>> {
+    restore_jobs::table
+        .filter(restore_jobs::table_name.eq(table))
+        .filter(restore_jobs::status.eq_any(vec!["queued", "running"]))
+        .filter(restore_jobs::range_start.lt(end))
+        .filter(restore_jobs::range_end.gt(start))
+        .select(RestoreJob::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_restore_job(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    app_id: Option<Uuid>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    pin_expires_at: DateTime<Utc>,
+    requested_by: Option<Uuid>,
+) -> QueryResult<RestoreJob> {
+    diesel::insert_into(restore_jobs::table)
+        .values((
+            restore_jobs::table_name.eq(table),
+            restore_jobs::app_id.eq(app_id),
+            restore_jobs::range_start.eq(start),
+            restore_jobs::range_end.eq(end),
+            restore_jobs::pin_expires_at.eq(pin_expires_at),
+            restore_jobs::requested_by.eq(requested_by),
+        ))
+        .returning(RestoreJob::as_returning())
+        .get_result(conn)
+        .await
+}
+
+/// Claim one restore job, copying `claim_one_scan` in shape.
+///
+/// The three arms are the same three that make the inspector's executor work: a
+/// fresh `queued` job, this worker's own `running` job (so a worker that yields
+/// mid-restore can re-enter), and any `running` job whose lease has lapsed
+/// (crash resume). `attempts` bounds the poison case.
+pub async fn claim_one_restore_job(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    lease_secs: i64,
+) -> QueryResult<Option<RestoreJob>> {
+    diesel::sql_query(
+        "UPDATE restore_jobs SET status='running', worker_id=$1, heartbeat_at=now(), \
+                attempts=attempts+1, started_at=COALESCE(started_at, now()) \
+         WHERE id IN (SELECT id FROM restore_jobs \
+                      WHERE status='queued' \
+                         OR (status='running' AND worker_id = $1) \
+                         OR (status='running' AND heartbeat_at < now() - make_interval(secs => $2)) \
+                      ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) \
+         RETURNING *",
+    )
+    .bind::<Text, _>(worker_id)
+    .bind::<BigInt, _>(lease_secs)
+    .get_result(conn)
+    .await
+    .optional()
+}
+
+/// Record the pin this job created, so expiry and the reader can find its rows.
+/// Written BEFORE the insert starts: a crash between pin creation and the first
+/// row leaves an empty pin, which expires harmlessly. The reverse order would
+/// leave rows nothing can identify or reclaim.
+pub async fn set_restore_job_pin(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    pin_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::update(restore_jobs::table.find(id))
+        .set(restore_jobs::pin_id.eq(Some(pin_id)))
+        .execute(conn)
+        .await
+}
+
+pub async fn set_restore_job_estimate(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    rows_estimated: i64,
+) -> QueryResult<usize> {
+    diesel::update(restore_jobs::table.find(id))
+        .set(restore_jobs::rows_estimated.eq(rows_estimated))
+        .execute(conn)
+        .await
+}
+
+/// Heartbeat + progress in one write. Guarded on `worker_id` so a worker whose
+/// lease was stolen mid-restore cannot keep reporting progress on a job another
+/// worker now owns.
+pub async fn beat_restore_job(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    worker_id: &str,
+    rows_restored: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE restore_jobs SET heartbeat_at=now(), rows_restored=$3 \
+         WHERE id=$1 AND worker_id=$2",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(worker_id)
+    .bind::<BigInt, _>(rows_restored)
+    .execute(conn)
+    .await
+}
+
+pub async fn finish_restore_job(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    worker_id: &str,
+    status: &str,
+    rows_restored: i64,
+    error: &str,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "UPDATE restore_jobs SET status=$3, rows_restored=$4, error=$5, \
+                finished_at=now(), heartbeat_at=now() \
+         WHERE id=$1 AND worker_id=$2",
+    )
+    .bind::<SqlUuid, _>(id)
+    .bind::<Text, _>(worker_id)
+    .bind::<Text, _>(status)
+    .bind::<BigInt, _>(rows_restored)
+    .bind::<Text, _>(error)
+    .execute(conn)
+    .await
+}
+
+pub async fn list_restore_jobs(
+    conn: &mut AsyncPgConnection,
+    limit: i64,
+) -> QueryResult<Vec<RestoreJob>> {
+    restore_jobs::table
+        .select(RestoreJob::as_select())
+        .order(restore_jobs::created_at.desc())
+        .limit(limit)
+        .load(conn)
+        .await
+}
+
+pub async fn get_restore_job(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<RestoreJob>> {
+    restore_jobs::table
+        .find(id)
+        .select(RestoreJob::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+// ===========================================================================
 // Partition maintenance
 // ===========================================================================
 
@@ -7747,13 +8524,17 @@ pub async fn get_channel(
         .optional()
 }
 
-/// Update a channel's mutable fields. `secret_enc`: `None` = leave unchanged,
-/// `Some(None)` = clear, `Some(Some(blob))` = replace.
+/// Update a channel's mutable fields.
+///
+/// `config_enc`: `None` = leave unchanged, `Some(blob)` = replace. There is no
+/// "clear" state — a channel always has a config, even if it is `{}`.
+/// `secret_enc`: `None` = leave unchanged, `Some(None)` = clear,
+/// `Some(Some(blob))` = replace.
 pub async fn update_channel(
     conn: &mut AsyncPgConnection,
     id: Uuid,
     name: Option<&str>,
-    config: Option<&Value>,
+    config_enc: Option<Vec<u8>>,
     secret_enc: Option<Option<Vec<u8>>>,
     enabled: Option<bool>,
 ) -> QueryResult<Option<NotificationChannel>> {
@@ -7765,9 +8546,17 @@ pub async fn update_channel(
             .await?;
         any = true;
     }
-    if let Some(c) = config {
+    if let Some(blob) = config_enc {
+        // The legacy plaintext is blanked in the SAME statement. Writing the
+        // ciphertext while leaving `config` populated would keep a readable copy
+        // of the webhook URL and its Authorization header alive on a row the
+        // operator believes is now encrypted — the exact half-migration this
+        // column exists to end.
         diesel::update(notification_channels::table.filter(notification_channels::id.eq(id)))
-            .set(notification_channels::config.eq(c))
+            .set((
+                notification_channels::config_enc.eq(Some(blob)),
+                notification_channels::config.eq(serde_json::json!({})),
+            ))
             .execute(conn)
             .await?;
         any = true;
@@ -7799,6 +8588,77 @@ pub async fn delete_channel(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResu
     diesel::delete(notification_channels::table.filter(notification_channels::id.eq(id)))
         .execute(conn)
         .await
+}
+
+/// Channels still holding a legacy plaintext `config` (migration 000046).
+///
+/// Deliberately org-agnostic and unbounded by any tenant filter: this feeds the
+/// one-shot conversion pass at `sauron-api` boot, which has to see every
+/// unconverted row in the deployment or it leaves plaintext behind in whichever
+/// org it skipped. `LIMIT` is a safety valve, not paging — the caller re-runs
+/// until it comes back empty.
+/// Does `notification_channels.config_enc` exist yet?
+///
+/// Probed rather than assumed, exactly as `probe_event_users_identified` is and
+/// for the same reason: **RPM upgrades never re-run `sauron-migrate`**, so a new
+/// binary routinely meets an old schema. Refusing to boot over one table would
+/// turn a missed migration into a deployment-wide outage.
+pub async fn probe_channel_config_enc(conn: &mut AsyncPgConnection) -> QueryResult<()> {
+    diesel::sql_query("SELECT config_enc FROM notification_channels LIMIT 0")
+        .execute(conn)
+        .await
+        .map(|_| ())
+}
+
+/// Any one stored `secret_enc` blob, for proving the configured key can actually
+/// decrypt what this deployment already has.
+pub async fn any_channel_secret_enc(conn: &mut AsyncPgConnection) -> QueryResult<Option<Vec<u8>>> {
+    notification_channels::table
+        .filter(notification_channels::secret_enc.is_not_null())
+        .order(notification_channels::created_at.asc())
+        .select(notification_channels::secret_enc)
+        .first::<Option<Vec<u8>>>(conn)
+        .await
+        .optional()
+        .map(|o| o.flatten())
+}
+
+pub async fn channels_with_legacy_plaintext_config(
+    conn: &mut AsyncPgConnection,
+    limit: i64,
+) -> QueryResult<Vec<(Uuid, Value)>> {
+    notification_channels::table
+        .filter(notification_channels::config_enc.is_null())
+        .order(notification_channels::created_at.asc())
+        .limit(limit)
+        .select((notification_channels::id, notification_channels::config))
+        .load(conn)
+        .await
+}
+
+/// Store a channel's encrypted config and drop its legacy plaintext.
+///
+/// `AND config_enc IS NULL` makes the conversion pass safe to run concurrently
+/// on several API instances: whoever gets there second updates zero rows instead
+/// of re-encrypting a `{}` over a peer's ciphertext. `updated_at` is left alone
+/// on purpose — this is a storage-format conversion, not an edit, and bumping it
+/// would make every channel in the deployment look freshly modified.
+pub async fn seal_channel_config(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    config_enc: Vec<u8>,
+) -> QueryResult<usize> {
+    diesel::update(
+        notification_channels::table
+            .filter(notification_channels::id.eq(id))
+            .filter(notification_channels::config_enc.is_null()),
+    )
+    .set((
+        notification_channels::config_enc.eq(Some(config_enc)),
+        notification_channels::config.eq(serde_json::json!({})),
+    ))
+    .execute(conn)
+    .await
 }
 
 pub async fn create_alert_rule(
@@ -7967,6 +8827,27 @@ pub async fn channels_for_rule(
         .await
 }
 
+/// The inverse of [`channels_for_rule`]: every rule that currently delivers to
+/// `channel_id`.
+///
+/// Exists for authorization, not for display. A channel's config IS its
+/// destination — the webhook URL for the generic kind, `webhook_url` for
+/// Slack/Discord, the recipient list for email — so editing it redirects the
+/// telemetry of every rule attached to it. The route layer therefore has to know
+/// *whose* telemetry that is before allowing the edit, and the answer is this
+/// list. See `notifications::update_channel`.
+pub async fn rules_using_channel(
+    conn: &mut AsyncPgConnection,
+    channel_id: Uuid,
+) -> QueryResult<Vec<AlertRule>> {
+    alert_rule_channels::table
+        .inner_join(alert_rules::table)
+        .filter(alert_rule_channels::channel_id.eq(channel_id))
+        .select(AlertRule::as_select())
+        .load(conn)
+        .await
+}
+
 pub async fn insert_alert_event(
     conn: &mut AsyncPgConnection,
     ev: NewAlertEvent<'_>,
@@ -7995,15 +8876,45 @@ pub async fn alert_recently_sent(
     Ok(n > 0)
 }
 
-/// Paginated alert history for an org (bounded).
-pub async fn list_alert_events(
+/// Paginated alert history for an org, restricted to what the caller may read.
+///
+/// **There is deliberately no unfiltered variant.** `alert_events.title`/`body`
+/// carry the verbatim issue title (or the probed monitor target) that
+/// `authorize_rule_target` exists to protect, and `AlertEngine::log_event`
+/// persists them, so history is a durable copy of exactly the telemetry the
+/// rule-creation gate guards. An `org_id`-only query hands that copy to every
+/// org-scoped `alert:read` holder and undoes the gate from the read side. This
+/// mirrors `delete_tier_pin`, which was removed rather than deprecated for the
+/// same reason: leaving the unsafe overload in place just waits for a call site.
+///
+/// `visible_rule_ids` is the set of rules whose target the caller is authorized
+/// to read; `orphan_trigger_types` covers rows whose rule has since been
+/// deleted. `rule_id` is `ON DELETE SET NULL`, so **deleting the rule is the
+/// laundering step** — without the second arm the fix would be bypassed by
+/// firing a rule and then removing it. The route decides which trigger types
+/// qualify (it needs grants to do so); an empty slice matches nothing, because
+/// `= ANY('{}')` is false rather than true, so both arms fail closed.
+pub async fn list_alert_events_visible(
     conn: &mut AsyncPgConnection,
     org_id: Uuid,
+    visible_rule_ids: &[Uuid],
+    orphan_trigger_types: &[String],
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<AlertEventRow>> {
+    // Filtering in SQL rather than after the fact keeps `limit`/`offset` exact.
+    // Fetching a page and then dropping unauthorized rows from it would return
+    // short pages whose length leaks how many hidden events the page spanned —
+    // a coarser version of the same oracle.
     alert_events::table
         .filter(alert_events::org_id.eq(org_id))
+        .filter(
+            alert_events::rule_id
+                .eq_any(visible_rule_ids)
+                .or(alert_events::rule_id
+                    .is_null()
+                    .and(alert_events::trigger_type.eq_any(orphan_trigger_types))),
+        )
         .order(alert_events::created_at.desc())
         .limit(limit.clamp(1, 200))
         .offset(offset.clamp(0, 100_000))
@@ -12379,4 +13290,69 @@ pub async fn add_cold_skip(
     .bind::<BigInt, _>(rows)
     .execute(conn)
     .await
+}
+
+// ===========================================================================
+// Active Users (distinct people per UTC day)
+// ===========================================================================
+
+/// Distinct people per UTC day from the HOT tier.
+///
+/// ## What counts as a person
+///
+/// `analytics_events.distinct_id`, and nothing else. There is deliberately no
+/// fallback column: **`analytics_events` has no `anonymous_id`** — the anonymous
+/// id IS the `distinct_id` an unidentified client sends (see the browser and
+/// Flutter SDKs, which store `anon_<uuid>` and put it there until `identify()`).
+/// So "distinct id, falling back to the anonymous id" is one column, not two.
+///
+/// Rows with an EMPTY `distinct_id` are excluded rather than counted. The column
+/// is `NOT NULL DEFAULT ''`, so empty means "this client sent no identity at
+/// all" — server SDKs by design, and mobile clients on versions predating the
+/// anonymous id. The only other candidate to fall back to is `device_key`, and
+/// counting devices inside a metric named Active *Users* would silently answer a
+/// different question: one person on a phone and a tablet would become two, and
+/// the number would move whenever someone reinstalled. Measured on the largest
+/// app here, 0 of 212,415 rows have an empty `distinct_id`, so today this
+/// excludes nothing — it is a rule for the traffic that will arrive later.
+///
+/// ## Bucketing
+///
+/// `(occurred_at AT TIME ZONE 'UTC')::date`, matching `error_counts_by_day_hot`
+/// and — critically — matching the cold side, where `DuckEngine::open` pins
+/// `TimeZone='UTC'` so `CAST(occurred_at AS DATE)` agrees. Two tiers bucketing on
+/// different days would produce a series with a seam nobody could explain.
+///
+/// ## Why this is not summable across tiers
+///
+/// `COUNT(DISTINCT …)` is HOLISTIC. Every other cross-tier metric in this
+/// codebase is a row count, which is why `tier_read.rs` may add the halves
+/// together. A person active either side of the watermark would be counted twice
+/// by that arithmetic, and no amount of post-processing on two independent totals
+/// can detect it. Per-DAY distinct counts are safe to concatenate only because a
+/// day-granular watermark falls on a day boundary; the caller is responsible for
+/// reporting any day the watermark cuts through. See the route.
+pub async fn active_users_by_day_hot(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> QueryResult<Vec<DayCountRow>> {
+    // $1 app_id, $2 from, $3 to — env takes $4 when it needs a bind.
+    let env_sql = scope.env.sql_fragment(4);
+    let q = format!(
+        "SELECT (occurred_at AT TIME ZONE 'UTC')::date AS day, \
+                count(DISTINCT distinct_id)::bigint AS count \
+         FROM analytics_events \
+         WHERE app_id = $1 AND occurred_at >= $2 AND occurred_at < $3 \
+           AND distinct_id <> ''{env_sql} \
+         GROUP BY 1 ORDER BY 1"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(from)
+        .bind::<Timestamptz, _>(to);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    stmt.get_results(conn).await
 }

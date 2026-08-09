@@ -1,13 +1,14 @@
 <script lang="ts">
   import { push } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
+  import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
-  import EnvironmentsCard from '../lib/components/settings/EnvironmentsCard.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
   import { getApp, updateApp, deleteApp } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
@@ -15,9 +16,18 @@
   import { appTypeIcon, appTypeLabel } from '../lib/utils/format';
   import type { App } from '../lib/models';
 
-  let app = $state<App | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): the app record paints from
+  // cache on return rather than blanking to a spinner, then refreshes behind it.
+  // Re-exposed under the names the template already uses, so the markup is
+  // unchanged.
+  //
+  // `app` is a SHARED reference into the cache — replace it (by reloading),
+  // never edit fields through it.
+  const view = new CachedView<App>();
+
+  const app = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
   let togglingIngest = $state(false);
   let confirmDelete = $state(false);
   let deleting = $state(false);
@@ -33,32 +43,58 @@
     app ? lockedBy('app:delete', { app: app.id, level: 'app' }) : 'app:delete',
   );
 
-  async function load(appId: string) {
-    loading = true;
-    error = null;
-    try {
-      app = await getApp(appId);
-    } catch (err) {
-      error = errorMessage(err);
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit — after a successful PATCH
+   * the cached record is known-stale and must be re-read from the network.
+   *
+   * `scopeKey` is in the key because it carries the selected environment, which
+   * the axios interceptor puts on the request but which appears in no argument
+   * here. Omit it and one environment's response can be served as another's.
+   */
+  async function load(appId: string, force = false) {
+    await view.load(
+      viewKey('settings.app', appId, sessionStore.scopeKey),
+      () => getApp(appId),
+      force,
+    );
   }
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
+    // Touch scopeKey so the effect re-runs when the environment changes — it is
+    // part of the cache key, so without this the page would keep showing the
+    // record fetched under the previous scope.
+    sessionStore.scopeKey;
+    // `idle()` on the else branch, not nothing: `CachedView.loading` starts
+    // true and only a completed load clears it, so without this the page
+    // spins forever on a request never issued and the "No app selected"
+    // empty state below is unreachable.
     if (aid) void load(aid);
+    else view.idle();
   });
 
   async function toggleIngest() {
     if (!app || togglingIngest) return;
     togglingIngest = true;
+    const appId = app.id;
     const next = !app.ingest_enabled;
     try {
-      const updated = await updateApp(app.id, { ingest_enabled: next });
-      app = updated;
+      const updated = await updateApp(appId, { ingest_enabled: next });
       sessionStore.upsertApp(updated, false);
       toastStore.success(next ? 'Ingest enabled.' : 'Ingest disabled.');
+      // `app` reads out of the cache now, so it can't be assigned — and hand-
+      // writing the PATCH's response body into the read cache would be caching a
+      // mutation. Force a re-read instead. The cached record stays on screen
+      // while it runs (a cache hit means `loading` never flips), so the cards
+      // don't blank, and `load` never throws — a failed refresh leaves the old
+      // record up rather than turning a successful toggle into an error.
+      // Prefix-wide, not just this key. The key carries `scopeKey`
+      // (`appId:envId`), so this app has one cache entry PER ENVIRONMENT even
+      // though the endpoint takes no environment argument. A forced reload
+      // refreshes only the entry for the environment currently selected;
+      // switching environments afterwards would paint the pre-mutation copy.
+      viewCache.invalidate('settings.app');
+      await load(appId, true);
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -74,7 +110,7 @@
       await deleteApp(id);
       sessionStore.removeApp(id);
       toastStore.success('App deleted.');
-      push('/projects');
+      push('/admin/projects');
     } catch (err) {
       toastStore.error(errorMessage(err));
       deleting = false;
@@ -82,7 +118,7 @@
   }
 </script>
 
-<AppShell requireProject={false}>
+<AdminShell requireProject={false}>
   <div class="head">
     <h1 class="page-title">App settings</h1>
     {#if app}
@@ -104,7 +140,7 @@
       icon="package"
     >
       {#snippet action()}
-        <Button variant="primary" onclick={() => push('/projects')}>Go to Projects</Button>
+        <Button variant="primary" onclick={() => push('/admin/projects')}>Go to Projects</Button>
       {/snippet}
     </EmptyState>
   {:else}
@@ -125,11 +161,6 @@
         </Button>
       </Card>
 
-      <!-- Environments are owned by the project now, so the card needs the app's
-           project id as well: creating one is a catalogue write under
-           `/v1/projects/{project_id}/environments`, not an app write. -->
-      <EnvironmentsCard appId={app.id} projectId={app.project_id} />
-
       <Card title="Delete app">
           <p class="card-desc muted">
             Permanently delete this app and all of its issues and events. This can't be undone.
@@ -138,7 +169,7 @@
             <div class="confirm">
               <span class="confirm-text">Delete <strong>{app.name}</strong> and all its data?</span>
               <div class="confirm-actions">
-                <Button variant="danger" loading={deleting} onclick={doDelete}>Yes, delete</Button>
+                <Button variant="danger" loading={deleting} lockedReason={deleteLock} onclick={doDelete}>Yes, delete</Button>
                 <Button variant="ghost" onclick={() => (confirmDelete = false)}>Cancel</Button>
               </div>
             </div>
@@ -154,7 +185,7 @@
       </Card>
     </div>
   {/if}
-</AppShell>
+</AdminShell>
 
 <style>
   .head {

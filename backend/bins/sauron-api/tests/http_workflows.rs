@@ -137,6 +137,12 @@ impl TestServer {
             .env("DATABASE_URL", &db_url)
             .env("REDIS_URL", &redis_url)
             .env("JWT_SECRET", JWT_SECRET)
+            // Required and fail-closed since migration 000046: the API refuses to
+            // boot without it (it is the only key that decrypts stored channels).
+            .env(
+                "NOTIFY_SECRET_KEY",
+                "sauron-test-notify-secret-key-0000000000",
+            )
             .env("API_PORT", port.to_string())
             .env("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
             .env("RUST_LOG", "error")

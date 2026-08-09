@@ -207,9 +207,21 @@ const NON_TELEMETRY_PAGES = new Set([
   // tracks `currentProjectId` instead, which is the only Topbar dimension that
   // does change what the page may read.
   'ActiveUsers',
+  // Resolves /admin to the first admin child the user can reach and
+  // immediately navigates away (or shows a denial) — it fetches no
+  // telemetry itself and has no app/environment dimension of its own. Each
+  // admin page it forwards to is its own entry in this list with its own
+  // scopeKey wiring where that page's data warrants it.
+  'AdminIndex',
   'Alerts', // org-scoped alert rules/channels, not app-scoped telemetry
   'ChangePassword', // account settings, no app/environment dimension
   'Docs', // static documentation
+  // Project-scoped environment catalogue config (create/rename/retire the
+  // catalogue, plus each app's own key/mute/default), not itself
+  // environment-filtered telemetry — same argument as 'SettingsApp' below.
+  // Built out (Task 11 of the admin-view plan); this classification is
+  // final, not provisional.
+  'Environments',
   'ForgotPassword', // pre-auth
   // The three app-scoped inspector GETs it reads are all in
   // `BACKEND_REJECTS_ENVIRONMENT_ID` above — a policy, its mask audit trail
@@ -234,7 +246,14 @@ const NON_TELEMETRY_PAGES = new Set([
   // Reached from an emailed link, so it must render for a signed-out visitor
   // AND for a signed-in one; either way it reads no telemetry.
   'ResetPassword',
-  'SettingsApp', // app configuration (name, environments, keys), not telemetry
+  // Org-scoped role catalogue, no environment dimension — same shape as
+  // 'Members' above. Built out (Task 7 of the admin-view plan); this
+  // classification is final, not provisional.
+  'Roles',
+  // App configuration (name, ingest toggle, delete), not telemetry. Used to
+  // also host environment/key management via EnvironmentsCard; that moved to
+  // 'Environments' above (Task 11 of the admin-view plan).
+  'SettingsApp',
   'SourceMaps', // symbol artifacts — app-wide config; backend rejects environment_id
   'Storage', // admin storage report, org-scoped
   // Same shape as ResetPassword: reached from an emailed link, must render for

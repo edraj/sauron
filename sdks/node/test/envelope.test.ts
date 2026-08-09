@@ -220,7 +220,7 @@ describe('client emits the reconciled golden shape', () => {
     client.captureMessage('hello');
     await client.flush();
 
-    expect(fake.envelopes[0].header.sdk).toEqual({ name: 'sauron-node', version: '1.3.0' });
+    expect(fake.envelopes[0].header.sdk).toEqual({ name: 'sauron-node', version: '1.4.0' });
   });
 
   it('never carries an environment key on the header (removed: environment is now proven by the ingest key)', async () => {

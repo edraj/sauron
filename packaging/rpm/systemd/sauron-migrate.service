@@ -1,8 +1,11 @@
 [Unit]
 Description=Sauron database migrations (one-shot)
 Documentation=file:///usr/share/doc/sauron-server/SETUP.md
-After=network-online.target
+After=network-online.target postgresql.service
 Wants=network-online.target
+# NOTE: postgresql.service is ordering ONLY — deliberately no Wants= on it, so a
+# host with a remote or containerised Postgres (where that unit does not exist)
+# is unaffected. After=/Wants= naming a nonexistent unit is not an error.
 
 [Service]
 Type=oneshot
@@ -10,10 +13,34 @@ User=sauron
 Group=sauron
 EnvironmentFile=/etc/sauron/sauron.env
 ExecStart=/usr/bin/sauron-migrate
+# Deliberately NO RemainAfterExit=. The unit must RE-RUN on every daemon start,
+# because that is the whole mechanism by which an upgrade cannot leave new
+# binaries on an old schema. RemainAfterExit=yes would leave it active(exited)
+# and therefore "already satisfied", so it would run about once per boot and the
+# stale-schema hole this unit exists to close would reopen. A no-op run costs
+# ~30 ms (measured, 46 migrations already applied), so there is nothing to save.
+#
+# OPERATOR WARNING, and a correction to an earlier round of notes: all six
+# daemons carry Requires=sauron-migrate.service, and Requires= propagates STOP.
+# `systemctl stop sauron-migrate` therefore takes down all six daemons — and it
+# does so with RemainAfterExit unset, i.e. as shipped. Measured on Fedora 44 /
+# systemd 259: with After= only the daemon survives; with Requires= the daemon
+# stops, whether RemainAfterExit is yes or no. An earlier round on systemd
+# 252/256 recorded the RemainAfterExit=no case as a harmless no-op — do not rely
+# on that. To stop Sauron, stop the daemons by name, never this unit.
+#
+# Type=oneshot defaults to TimeoutStartSec=infinity. Without an explicit bound,
+# an unreachable remote Postgres (SYN blackholed, no connect timeout in the
+# migrator) blocks every dependent daemon's start job forever and multi-user
+# .target never completes. Keep this comfortably above MIGRATE_WAIT_SECS
+# (/etc/sauron/sauron.env, default 120).
+TimeoutStartSec=300
 
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 
-# No [Install] section — run on demand: systemctl start sauron-migrate
+# No [Install] section — this unit is static and is pulled in by the daemons'
+# Requires=. It is intentionally absent from the shipped systemd preset for the
+# same reason: `preset` cannot enable a unit that has no [Install].

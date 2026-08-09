@@ -61,30 +61,47 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // monitors.rs:67 authorizes at the project.
   '/monitors': { perm: 'monitor:read', level: 'project', title: 'Monitors' },
 
-  // --- Alerting ------------------------------------------------------------
+  // --- Admin ---------------------------------------------------------------
+  // '/admin' itself is ungated: no single permission expresses "can reach at
+  // least one admin child", and inventing one would drift from the nine child
+  // gates below. AdminIndex redirects to the first reachable child, or renders
+  // PermissionDenied when there is none.
+  '/admin': null,
+  // orgs.rs:160 uses authorize_org — a project- or app-scoped member:read
+  // grant genuinely cannot list members.
+  '/admin/members': { perm: 'member:read', level: 'org', title: 'Members' },
+  // orgs.rs:1380 gates list_roles on member:read, not role:manage — reading
+  // the catalogue is not the same as editing it.
+  '/admin/roles': { perm: 'member:read', level: 'org', title: 'Roles' },
+  // projects.rs:49 is reach-based: an app-scoped member receives a filtered
+  // list rather than a 403, so this is the widest level rather than 'project'.
+  '/admin/projects': { perm: 'project:read', level: 'app', title: 'Projects' },
+  // Widest level rather than 'project' — same reasoning as '/admin/projects'
+  // above. list_project_environments (environments.rs:196) authorizes the
+  // CATALOGUE at the project via authorize_project (not reach-based), but
+  // list_app_environments (:400-425) and the per-app mutation endpoints
+  // (update_app_environment :444, rotate_app_environment_key :525) are
+  // reach-based and authorize at the APP. Gating the page at 'project' would
+  // fail an app-scoped env:read grant outright — before this plan that member
+  // reached the same per-app controls via /settings. 'app' is the widest
+  // `can()` level (keeps org, project AND app scope ids), so it admits that
+  // member; Environments.svelte then degrades the catalogue-only parts of the
+  // page when the project-wide read 403s.
+  '/admin/environments': { perm: 'env:read', level: 'app', title: 'Environments' },
+  '/admin/settings': { perm: 'app:read', level: 'app', title: 'App settings' },
+  // Listing artifacts only needs issue:read (artifacts.rs:189), but this page
+  // exists to upload, so a member who can only list has nothing to do here.
+  '/admin/source-maps': { perm: 'artifact:write', level: 'app', title: 'Source Maps' },
   // notifications.rs:66,313 use authorize_org.
-  '/alerts': { perm: 'alert:read', level: 'org', title: 'Alerts' },
+  '/admin/alerts': { perm: 'alert:read', level: 'org', title: 'Alerts' },
+  // admin.rs:30 uses authorize_org.
+  '/admin/storage': { perm: 'org:manage', level: 'org', title: 'Storage' },
+  '/admin/privacy': { perm: 'pii:read', level: 'app', title: 'Privacy' },
 
-  // --- Manage --------------------------------------------------------------
+  // --- Self-service --------------------------------------------------------
   // Self-scoped (/v1/me/*). Always reachable — see the fallback note on
   // `PermissionDenied`, which relies on at least one ungated page existing.
   '/account': null,
-  // projects.rs:49 is reach-based: an app-scoped member receives a filtered
-  // list rather than a 403, so this is the widest level rather than 'project'.
-  '/projects': { perm: 'project:read', level: 'app', title: 'Projects' },
-  // NB: no '/apps' key. Sidebar's Projects item lists '/apps' as an alternate
-  // `match` prefix, but no such route exists in routes.ts and lookups here go
-  // through `item.href` ('#/projects'), never through `match`.
-  // orgs.rs:160 uses authorize_org — a project- or app-scoped member:read
-  // grant genuinely cannot list members.
-  '/members': { perm: 'member:read', level: 'org', title: 'Members' },
-  '/settings': { perm: 'app:read', level: 'app', title: 'App settings' },
-  // Listing artifacts only needs issue:read (artifacts.rs:189), but this page
-  // exists to upload, so a member who can only list has nothing to do here.
-  '/source-maps': { perm: 'artifact:write', level: 'app', title: 'Source Maps' },
-  // admin.rs:30 uses authorize_org.
-  '/storage': { perm: 'org:manage', level: 'org', title: 'Storage' },
-  '/inspector': { perm: 'pii:read', level: 'app', title: 'Privacy' },
 
   // --- Other ---------------------------------------------------------------
   // projects.rs:102 authorizes project creation at the org.

@@ -190,7 +190,20 @@ export interface TransactionInput {
   name: string;
   /** Operation class: `navigation | http | resource | screen_load | custom`. Default `custom`. */
   op?: string;
-  duration_ms: number;
+  duration_ms?: number;
+  /**
+   * Accepted alias for {@link duration_ms}.
+   *
+   * The browser SDK's equivalent input takes `durationMs` (`sdks/js`), so a
+   * snippet moved between the two — or any plain-JavaScript caller, where the
+   * type checker is not there to object — used to produce a transaction with no
+   * duration at all. The item still validated and still shipped, just without
+   * the one field it exists to carry, which is the worst possible outcome: no
+   * error anywhere and a silently useless performance record.
+   *
+   * Supply exactly one. `duration_ms` wins if both are present.
+   */
+  durationMs?: number;
   status?: string;
   http_method?: string;
   http_status?: number;

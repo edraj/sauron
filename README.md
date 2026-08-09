@@ -114,6 +114,22 @@ Full instructions: **[packaging/rpm/INSTALL.md](packaging/rpm/INSTALL.md)** (bui
 and **[packaging/rpm/SETUP.md](packaging/rpm/SETUP.md)** (configure DB/Redis, migrate,
 enable services, dashboard).
 
+Migrations run automatically on an RPM host: every `sauron-*` daemon unit carries
+`Requires=sauron-migrate.service`, so starting or restarting one applies pending
+migrations first and the daemon refuses to start if that fails. The trade is that a
+Postgres outage longer than `MIGRATE_WAIT_SECS` (default 120) leaves the daemons
+down until someone starts them by hand — systemd never retries a failed *start job*.
+The Compose stack is unaffected; run `make migrate` there.
+
+> **Upgrading to this release is one-way for notification channels.** The first
+> `sauron-api` boot encrypts every channel's config into `config_enc` and blanks the
+> legacy plaintext `config` to `'{}'` (migration `2026-08-09-000046`, a security fix —
+> webhook URLs and `Authorization` headers were previously stored in cleartext). A
+> downgraded binary reads the empty column and every notification delivery silently
+> goes nowhere. `dnf downgrade` does not run `down.sql`, so recovery is to roll
+> forward; a manual `diesel migration revert` of that migration is **unrecoverable**.
+> See [SETUP.md](packaging/rpm/SETUP.md) section 11.
+
 ## Local development (without full compose)
 
 ```bash
@@ -150,6 +166,16 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 > RPM `/etc/sauron/*.env` files pin the direct-bind ports. Where a table default and your
 > deployment disagree, the deployment's env file wins.
 
+> **Upgrading a Compose deployment: four ingest variables now take effect that
+> previously did not.** `INGEST_MAX_BODY_BYTES`, `INGEST_BACKLOG` and
+> `INGEST_DB_POOL` had no entry in the `ingest` service, so setting them in `.env`
+> did nothing; they are now passed through. `INGEST_RATE_LIMIT_PER_MIN` changed
+> from a hard-coded `6000` to a pass-through, so a value in your `.env` now wins
+> where it was previously ignored. The shipped `.env.example` values equal the
+> binary's defaults, so a stock deployment behaves identically — but if you ever
+> set one of these in `.env` believing it worked, it becomes live at your next
+> `docker compose up`. Check those four lines before upgrading.
+
 ### Core
 
 | Variable | What it does | Default | Used by |
@@ -157,12 +183,13 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | `DATABASE_URL` | Postgres connection string, e.g. `postgres://sauron:sauron@localhost:5432/sauron`. The one universally required variable — every binary refuses to start without it. | **required** | all |
 | `REDIS_URL` | Redis backing the ingest stream, DSN cache, rate limiter and HLL counters. | `redis://127.0.0.1:6379` | api, ingest, alerts |
 | `RUST_LOG` | `tracing` filter directive, e.g. `info,sauron=debug`. | `info,sauron=debug` | all |
+| `MIGRATE_WAIT_SECS` | How long `sauron-migrate` waits for Postgres to accept connections before giving up. Only the **connect** is retried — a migration that fails on its own SQL fails immediately and loudly. On an RPM host every `sauron-*` unit has `Requires=sauron-migrate.service`, so exceeding this leaves the daemons **down** (see below). Must stay under the unit's `TimeoutStartSec=300`. | `120` | migrate |
 
 ### Authentication
 
 | Variable | What it does | Default | Used by |
 | --- | --- | --- | --- |
-| `JWT_SECRET` | HS256 signing key for access/refresh tokens, and the fallback source for `NOTIFY_SECRET_KEY`. Must be **≥ 32 characters** — generate with `openssl rand -hex 32`. Fail-closed: the services that mint or verify tokens refuse to start without it. `ingest`, `tier` and `migrate` never read it, so they boot fine without one. | **required** (api, monitor, alerts) | api, monitor, alerts |
+| `JWT_SECRET` | HS256 signing key for access/refresh tokens. Must be **≥ 32 characters** — generate with `openssl rand -hex 32`. Fail-closed: the services that mint or verify tokens refuse to start without it. `ingest`, `tier` and `migrate` never read it, so they boot fine without one. Rotating it logs everyone out and nothing else; it is no longer the fallback source for `NOTIFY_SECRET_KEY`, so it no longer takes stored channel credentials with it. | **required** (api, monitor, alerts) | api, monitor, alerts |
 | `SAURON_DEV` | `1`/`true` relaxes the rule above: a short `JWT_SECRET` is accepted, and a missing one falls back to a compiled-in insecure key. **Local development only** — it makes tokens forgeable. | `false` | api, monitor, alerts |
 | `JWT_ACCESS_TTL_SECS` | Access-token lifetime. | `900` (15 min) | api |
 | `JWT_REFRESH_TTL_SECS` | Refresh-token lifetime. | `2592000` (30 days) | api |
@@ -184,10 +211,71 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | `INGEST_PORT` | TCP port `sauron-ingest` binds. | `8081` | ingest |
 | `INGEST_UDS_PATH` | Listen on this Unix-domain socket instead of TCP. | unset (TCP) | ingest |
 | `INGEST_BACKLOG` | TCP `listen()` backlog. Ignored when `INGEST_UDS_PATH` is set. | `4096` | ingest |
-| `WORKER_CONCURRENCY` | Co-located pipeline workers draining the Redis stream (enrich → fingerprint → group). | `4` | ingest |
+| `WORKER_CONCURRENCY` | Co-located pipeline workers draining the Redis stream (enrich → fingerprint → group). **Do not raise this on its own** — it only pays off at a matching `INGEST_BATCH_SIZE`, and at the old batch of 50 raising it made throughput *worse* (see the tuning note below). `INGEST_DB_POOL` must stay ≥ this value. | `8` | ingest |
+| `INGEST_DB_POOL` | Postgres pool size for the worker pool. **Must stay ≥ `WORKER_CONCURRENCY`**, or the surplus workers block on connection checkout instead of on Postgres and the extra concurrency buys nothing. | `8` | ingest |
+| `INGEST_BATCH_SIZE` | Stream entries a worker asks `XREADGROUP` for. Since an envelope became one entry this is only the **ceiling** on a read, not the batch size — `INGEST_BATCH_ITEMS` derives what is actually requested. Clamped to `1`-`2000`. ⚠️ **Not wired into Compose** (see the note under this table). | `200` | ingest |
+| `INGEST_BATCH_ITEMS` | Items a worker aims to hold in one batch. **This is the knob that governs memory**, not `INGEST_BATCH_SIZE`: items are what occupy the resident set and bind query parameters, and one entry can now carry a whole envelope. Clamped to `1`-`20000`. ⚠️ **Not wired into Compose** (see the note under this table). | `1000` | ingest |
 | `INGEST_RATE_LIMIT_PER_MIN` | Envelopes accepted per app per minute. | `6000` | ingest |
 | `INGEST_MAX_BODY_BYTES` | Largest accepted envelope body. | `1048576` (1 MiB) | ingest |
+| `INGEST_STREAM_MAXLEN` | `XADD MAXLEN ~` bound on the Redis ingest stream. **A data-loss control, not a tuning knob**: trimming is applied regardless of pending deliveries, so a stream deep enough to trim discards envelopes the edge already answered `202` to. Raise it to buy headroom; do not lower it to save memory. ⚠️ **Not wired into Compose** — setting it in `.env` has no effect there (see the note under this table), so on Compose the bound is whatever the binary defaults to. | `1000000` | ingest |
 | `INGEST_TRUST_FORWARDED_HEADERS` | Same trust caveat as `API_TRUST_FORWARDED_HEADERS`. While off, client IPs are recorded as `NULL` rather than spoofable values. | `false` | ingest |
+
+> **Four of these are not settable through Compose.** The general rule above —
+> "Compose reads these from a `.env` file at the repo root" — does not hold for
+> every row, because `docker-compose.yml`'s `ingest` service has no `env_file:`
+> key. A variable reaches that container only if the service lists it explicitly.
+> Measured against the shipped file, the service lists `INGEST_PORT`,
+> `INGEST_BACKLOG`, `WORKER_CONCURRENCY`, `INGEST_DB_POOL`,
+> `INGEST_RATE_LIMIT_PER_MIN`, `INGEST_MAX_BODY_BYTES`,
+> `INGEST_TRUST_FORWARDED_HEADERS`, `INGEST_METRICS_ADDR` and
+> `INGEST_METRICS_SAMPLE_SECS`. It does **not** list `INGEST_BATCH_SIZE`,
+> `INGEST_BATCH_ITEMS`, `INGEST_STREAM_MAXLEN` or `INGEST_UDS_PATH` — putting any
+> of those in `.env` is silently inert under Compose. They work on RPM and bare
+> metal, where the process reads its own environment. To use one under Compose,
+> add it to the `ingest` service's `environment:` block first.
+
+#### Tuning the worker pool: the knobs interact
+
+`WORKER_CONCURRENCY` and `INGEST_BATCH_SIZE` cannot be swept one at a time. From
+the 3×3 grid in
+[`docs/benchmarks/2026-08-04-tier3-envelope-fold.html`](docs/benchmarks/2026-08-04-tier3-envelope-fold.html),
+measured 2026-08-04. Each cell is **items written/s · peak ingest RSS**, from one
+60 s run; the bold cell is the shipped pair:
+
+| | batch 50 | batch 200 | batch 500 |
+| --- | --- | --- | --- |
+| **4 workers** | 7,845 · 69 MB | 12,910 · 158 MB | 14,775 · 288 MB |
+| **8 workers** | 10,050 · 83 MB | **18,987 · 184 MB** | 18,733 · 366 MB |
+| **16 workers** | 6,141 · 102 MB | 18,836 · 237 MB | 19,029 · 405 MB |
+
+Read the batch-50 column downward: **going from 4 workers to 16 measured 22%
+slower** (7,845 → 6,141). At 50-entry batches the workers contend on commits
+rather than amortizing them, so a one-dimensional sweep of `WORKER_CONCURRENCY`
+would have concluded the concurrency knob was already optimal.
+
+`INGEST_BATCH_SIZE` has never been pinned in any shipped config, so its default of
+200 was already in force. The worker count *was* pinned to 4, so the effect of
+unpinning it is the batch-200 row: **12,910 → 18,987 items/s, +47%** — a pinned
+deployment was running at 68% of the tuned rate. Do not quote the report's +142%
+for this change alone; that figure bundles the batch 50 → 200 move, which had
+already shipped via the code default.
+
+Three caveats travel with these numbers:
+
+- **The shipped cell is not the largest number in the table.** The top four
+  points fall within 1.6% of each other *and* are all demand-limited — 19,029
+  items/s essentially *is* the offered rate of 19,199 items/s. The honest reading
+  is "these four are indistinguishable", so the gap over the old default is a
+  floor, not a measured ceiling.
+- **8 workers at batch 200 was chosen on memory, not throughput** — 184 MB where
+  16/500 needs 405 MB at the same rate.
+- **One 60 s run per cell**, which the report itself says justifies changing a
+  default and not much more. The grid was also swept on the pre-envelope-fold
+  build; the report's section 08 flags it as deserving a re-sweep.
+
+Raising `WORKER_CONCURRENCY` above 8 requires raising `INGEST_DB_POOL` with it.
+Note also that **nothing logs the effective worker count or pool size**, so
+neither value can be confirmed from a running host's journal.
 
 ### Uptime monitoring
 
@@ -203,7 +291,7 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 
 | Variable | What it does | Default | Used by |
 | --- | --- | --- | --- |
-| `NOTIFY_SECRET_KEY` | AES-GCM key encrypting stored channel secrets (Slack webhook URLs, SMTP passwords). When unset it is **derived from `JWT_SECRET`** — so rotating `JWT_SECRET` then makes every stored channel secret undecryptable. Set it explicitly to decouple the two, and keep it identical across `api`, `monitor` and `alerts` or they can't read each other's secrets. | unset ⇒ derived from `JWT_SECRET` | api, monitor, alerts |
+| `NOTIFY_SECRET_KEY` | AES-256-GCM key encrypting a notification channel's **whole stored payload** — both its secret bundle (SMTP passwords, bot tokens) and its config (webhook URL, request headers, relay host). Must be **≥ 32 characters** — generate with `openssl rand -hex 32`. Fail-closed and with **no fallback**: `api`, `monitor` and `alerts` refuse to start without it, and it must be **byte-identical across all three** or they cannot read each other's channels. See the warning below. | **required** (api, monitor, alerts) | api, monitor, alerts |
 | `ALERTS_TICK_SECS` | How often metric rules (error spike/threshold, event threshold, latency) are evaluated. Clamped to `5`–`3600`. | `30` | alerts |
 | `ALERTS_DELIVER_TIMEOUT_MS` | Per-delivery HTTP/SMTP timeout. | `10000` | alerts |
 | `ALERTS_ALLOW_PRIVATE` | Allow delivering to private/loopback targets — an internal webhook or LAN SMTP relay. SSRF guard, same shape as the monitor flag. | `false` | alerts |
@@ -217,6 +305,25 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 
 > Monitor up/down alerts fire inline from `sauron-monitor`; only the metric rules need
 > the `sauron-alerts` service. Without it those rules are creatable in the UI but never evaluate.
+
+> **Back up `NOTIFY_SECRET_KEY`. Losing it is unrecoverable.**
+>
+> It is the *only* thing that can decrypt `notification_channels.config_enc` and
+> `secret_enc`. There is no escrow, no recovery, and no derivation from any other
+> value — deliberately, because the old behaviour (derive it from `JWT_SECRET`
+> whenever it was unset) meant a routine JWT rotation silently destroyed every
+> stored channel credential, and nothing surfaced it until an alert failed to
+> deliver. If the key is lost or changed, the only remedy is to **delete and
+> re-create every notification channel**; the API will report `config_error: true`
+> on the ones it can no longer read, and deliveries will fail with
+> `secret decrypt failed`.
+>
+> **Upgrading from a build that had the `JWT_SECRET` fallback?** Set
+> `NOTIFY_SECRET_KEY` to that deployment's *existing* `JWT_SECRET` value before
+> restarting. That is the key the stored rows were actually encrypted under. It
+> also preserves outstanding unsubscribe links, which are signed with a key
+> derived from the same value. The RPM's `%post` does this for you; Docker and
+> hand-rolled deployments must do it explicitly.
 
 ### Transactional email
 

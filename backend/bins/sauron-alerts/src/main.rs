@@ -42,18 +42,11 @@ async fn main() -> anyhow::Result<()> {
     let pool = sauron_db::build_pool(&cfg.database_url, 8)?;
     let redis = RedisStore::connect(&cfg.redis_url).await?;
 
-    let notify_key = match &cfg.notify_secret_key {
-        Some(k) => k.clone(),
-        None => {
-            warn!(
-                "NOTIFY_SECRET_KEY not set; deriving channel-secret key from JWT_SECRET \
-                 (must match sauron-api's derivation or stored secrets will not decrypt)"
-            );
-            cfg.require_jwt_secret()?.to_string()
-        }
-    };
+    // Fail-closed, no JWT_SECRET fallback. Booting with a key derived from
+    // something else would not fail here — it would fail at delivery time, as a
+    // per-channel "secret decrypt failed" buried in `alert_events`.
     let engine = Arc::new(AlertEngine::new(
-        SecretCipher::new(&notify_key),
+        SecretCipher::new(cfg.require_notify_secret_key()?),
         cfg.alerts_allow_private,
         cfg.alerts_deliver_timeout_ms,
     ));

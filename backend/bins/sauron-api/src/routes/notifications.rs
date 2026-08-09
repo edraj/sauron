@@ -11,7 +11,7 @@ use uuid::Uuid;
 use sauron_alerts::channel::{self, ChannelKind};
 use sauron_alerts::rule::{self, TriggerType};
 use sauron_alerts::{AlertContext, Severity};
-use sauron_auth::{authorize_org, perm, AuthUser};
+use sauron_auth::{authorize_app, authorize_org, authorize_project, perm, AuthUser};
 use sauron_db::models::{NewAlertRule, NewNotificationChannel, NotificationChannel};
 use sauron_db::repo;
 
@@ -24,12 +24,98 @@ const SEVERITIES: [&str; 3] = ["info", "warning", "critical"];
 const MIN_THROTTLE_SECS: i32 = 0;
 const MAX_THROTTLE_SECS: i32 = 7 * 24 * 3600;
 
-/// Serialize a channel for API consumption: adds a `has_secret` flag; the
-/// model's `secret_enc` is `skip_serializing` so ciphertext never leaves.
-fn channel_view(ch: &NotificationChannel) -> Value {
+/// The part of a channel's config it is safe to hand back to an `alert:read`
+/// caller.
+///
+/// Encrypting `config` at rest closes the *storage* half of the leak and not one
+/// byte of the API half: the row is decrypted server-side anyway, and
+/// `alert:read` is held by the Developer preset. So the projection has to happen
+/// here too.
+///
+/// It is an ALLOWLIST per kind, deliberately. A denylist ("strip `headers` and
+/// `url`") leaks every field added later by default, which is precisely the
+/// mistake migration 000019 made when it declared `config` "non-secret". An
+/// unknown key here is simply not returned — a visible gap in the UI, which
+/// someone fixes, rather than a silent disclosure that nobody sees.
+///
+/// The generic webhook keeps its ORIGIN but loses its path: `hooks.slack.com`
+/// identifies the vendor, the path segment is the entire credential. Header
+/// names survive, header values never do — an `Authorization: Bearer …` is
+/// exactly what lives in that map.
+fn redacted_config(kind: ChannelKind, config: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let keep = |out: &mut serde_json::Map<String, Value>, key: &str| {
+        if let Some(v) = config.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    };
+    match kind {
+        // The relay, the envelope and the login name: the operator's own mail
+        // settings. The password is the credential and lives in the secret.
+        ChannelKind::Email => {
+            for k in ["host", "port", "from", "to", "username", "implicit_tls"] {
+                keep(&mut out, k);
+            }
+        }
+        // The access token is the credential; the homeserver and room are the
+        // address, and hiding them would make the channel unidentifiable.
+        ChannelKind::Matrix => {
+            for k in ["homeserver", "room_id"] {
+                keep(&mut out, k);
+            }
+        }
+        ChannelKind::Telegram => keep(&mut out, "chat_id"),
+        // The incoming-webhook URL *is* the credential for these two.
+        ChannelKind::Slack | ChannelKind::Discord => {
+            out.insert(
+                "has_webhook_url".into(),
+                json!(config.get("webhook_url").is_some()),
+            );
+        }
+        ChannelKind::Webhook => {
+            out.insert(
+                "url_origin".into(),
+                json!(channel::credential_binding(kind, config)),
+            );
+            out.insert("has_url".into(), json!(config.get("url").is_some()));
+            let names: Vec<&String> = match config.get("headers") {
+                Some(Value::Object(h)) => h.keys().collect(),
+                _ => Vec::new(),
+            };
+            out.insert("header_names".into(), json!(names));
+        }
+    }
+    Value::Object(out)
+}
+
+/// Serialize a channel for API consumption.
+///
+/// Both stored payload columns are `skip_serializing` on the model, so nothing
+/// leaves except what this function puts back: a `has_secret` flag and a
+/// [`redacted_config`] projection.
+///
+/// A config that will not decrypt degrades this ONE row to
+/// `config: null, config_error: true` instead of failing the request. A single
+/// unreadable channel must not make the whole Alerts page unloadable — that is
+/// how an operator loses the ability to delete the broken row and start over.
+/// Writes take the opposite line and refuse; see `update_channel`.
+fn channel_view(cipher: &sauron_alerts::SecretCipher, ch: &NotificationChannel) -> Value {
     let mut v = serde_json::to_value(ch).unwrap_or_else(|_| json!({}));
     if let Some(o) = v.as_object_mut() {
         o.insert("has_secret".into(), json!(ch.secret_enc.is_some()));
+        match (
+            ChannelKind::parse(&ch.kind),
+            sauron_alerts::crypto::open_channel_config(cipher, ch),
+        ) {
+            (Some(kind), Ok(cfg)) => {
+                o.insert("config".into(), redacted_config(kind, &cfg));
+                o.insert("config_error".into(), json!(false));
+            }
+            _ => {
+                o.insert("config".into(), Value::Null);
+                o.insert("config_error".into(), json!(true));
+            }
+        }
     }
     v
 }
@@ -67,7 +153,7 @@ pub async fn list_channels(
     let rows = repo::list_channels_for_org(&mut conn, org_id).await?;
     Ok(Json(json!(rows
         .iter()
-        .map(channel_view)
+        .map(|ch| channel_view(&state.alerts.cipher, ch))
         .collect::<Vec<_>>())))
 }
 
@@ -122,19 +208,29 @@ pub async fn create_channel(
         ),
         None => None,
     };
+    // The config is a credential too: for the generic webhook kind it holds the
+    // target URL and an arbitrary header map (where an `Authorization: Bearer …`
+    // ends up), and for Slack/Discord a `webhook_url` here IS the credential.
+    // New rows therefore only ever carry ciphertext — `NewNotificationChannel`
+    // has no plaintext `config` field to fill in.
+    let config_enc = state
+        .alerts
+        .cipher
+        .encrypt_json(&config)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let ch = repo::create_channel(
         &mut conn,
         NewNotificationChannel {
             org_id,
             name: req.name.trim(),
             kind: kind.as_str(),
-            config: &config,
+            config_enc: Some(config_enc),
             secret_enc,
             created_by: Some(auth.user_id),
         },
     )
     .await?;
-    Ok(Json(channel_view(&ch)))
+    Ok(Json(channel_view(&state.alerts.cipher, &ch)))
 }
 
 /// Load a channel and authorize `perm` against its org.
@@ -161,7 +257,7 @@ pub async fn get_channel(
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (_conn, ch) =
         load_channel_authorized(&state, auth.user_id, channel_id, perm::ALERT_READ).await?;
-    Ok(Json(channel_view(&ch)))
+    Ok(Json(channel_view(&state.alerts.cipher, &ch)))
 }
 
 #[derive(Deserialize)]
@@ -201,6 +297,26 @@ pub async fn update_channel(
         None => None,
     };
 
+    // A channel's config IS its destination, so changing it re-aims every rule
+    // attached to it. That is `update_rule`'s `channel_ids` exfiltration from the
+    // other end: instead of pointing your rule at a channel you may not reach,
+    // you point a channel someone else's rule already uses at a webhook you own.
+    // `alert:write` at the org authorizes configuring alerting; it does not
+    // authorize redirecting telemetry drawn from projects you cannot read.
+    //
+    // Scoped to config/secret changes on purpose. `name` and `enabled` move no
+    // data anywhere — enabling a channel resumes delivery to a destination an
+    // authorized caller chose — and gating them too would 403 an unrelated
+    // rename, the same over-reach `authorize_rule_target` declines to make when
+    // it widens an app-narrowed monitor rule instead of rejecting it.
+    //
+    // `secret` counts because for Slack and Discord the secret bundle IS the
+    // destination (`webhook_url`), so gating `config` alone would leave the two
+    // most common kinds redirectable.
+    if new_config.is_some() || !req.secret.is_null() {
+        authorize_channel_retarget(&mut conn, auth.user_id, ch.org_id, channel_id).await?;
+    }
+
     // Validate the channel as it will exist after the update. For the secret we
     // can only re-validate when the caller supplies one (we can't merge into the
     // stored ciphertext without decrypting — do that only when config changes).
@@ -222,31 +338,97 @@ pub async fn update_channel(
     };
 
     // Effective post-update config/secret for validation.
-    let effective_config = new_config.clone().unwrap_or_else(|| ch.config.clone());
+    //
+    // Both reads are hard failures, never silent degradation. The previous
+    // `.ok().and_then(…).unwrap_or(Value::Null)` on the secret turned an
+    // undecryptable channel into "this channel has no secret", which surfaced as
+    // a baffling `matrix: access_token is required` — and, once `config` moved
+    // behind the same cipher, the equivalent swallow would let an admin's edit
+    // overwrite an unreadable channel with a blank config. A key mismatch must
+    // say so.
+    let stored_config = sauron_alerts::crypto::open_channel_config(&state.alerts.cipher, &ch)
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "this channel's stored config cannot be decrypted ({e}); \
+                 NOTIFY_SECRET_KEY does not match the key it was written with"
+            ))
+        })?;
+    let effective_config = new_config.clone().unwrap_or_else(|| stored_config.clone());
     let effective_secret: Value = match (&req.secret, &ch.secret_enc) {
-        (Value::Null, Some(blob)) => state
-            .alerts
-            .cipher
-            .decrypt_str(blob)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(Value::Null),
+        (Value::Null, Some(blob)) => state.alerts.cipher.decrypt_json(blob).map_err(|e| {
+            ApiError::Internal(format!(
+                "this channel's stored secret cannot be decrypted ({e}); \
+                     NOTIFY_SECRET_KEY does not match the key it was written with"
+            ))
+        })?,
         (Value::Null, None) => Value::Null,
         (v, _) => v.clone(),
     };
+    // A stored secret was issued for ONE destination. `config` holds the
+    // destination (`email.host`, `matrix.homeserver`, `webhook.url`) while the
+    // credential sits in the encrypted bundle, and this handler lets the two be
+    // changed independently — so without this guard a caller holding only
+    // `alert:write` (which never confers *reading* the secret: see
+    // `perm::ALERT_READ`'s "secrets always redacted") can repoint the channel at
+    // a host they control, hit `POST .../test`, and have the server hand over
+    // the SMTP password or the Matrix access token. The SSRF guard does not
+    // help: the attacker's host is public, which it permits by design.
+    //
+    // Only an OMITTED `secret` is dangerous. `{}` clears the credential and a
+    // replacement bundle means the caller supplied it for the new host
+    // knowingly; both fall through.
+    if req.secret.is_null() && ch.secret_enc.is_some() {
+        if channel::credential_binding(kind, &stored_config)
+            != channel::credential_binding(kind, &effective_config)
+        {
+            return Err(ApiError::BadRequest(
+                "changing a channel's destination requires re-supplying its secret".into(),
+            ));
+        }
+        // Adjacent silent no-op, same invariant: for Slack/Discord `resolve`
+        // prefers the stored secret, so a `config.webhook_url` edit returns 200,
+        // shows the new URL in every GET, and keeps delivering to the old
+        // endpoint forever. Refuse rather than lie.
+        if channel::config_claims_shadowed_webhook_url(kind, &effective_config)
+            && effective_config.get("webhook_url") != stored_config.get("webhook_url")
+        {
+            return Err(ApiError::BadRequest(
+                "this channel's webhook URL is stored as its secret; send it in `secret`, \
+                 not `config`"
+                    .into(),
+            ));
+        }
+    }
+
     channel::validate(kind, &effective_config, &effective_secret).map_err(ApiError::BadRequest)?;
+
+    // Re-seal when the caller edited the config — and also when the row is a
+    // pre-000046 one that the boot conversion has not reached (a stale replica,
+    // a row created by an older binary mid-rollout). Any write leaves the row
+    // encrypted; there is no path that keeps plaintext alive past an edit.
+    let config_enc = if new_config.is_some() || ch.config_enc.is_none() {
+        Some(
+            state
+                .alerts
+                .cipher
+                .encrypt_json(&effective_config)
+                .map_err(|e| ApiError::Internal(e.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     let updated = repo::update_channel(
         &mut conn,
         channel_id,
         req.name.as_deref().map(str::trim),
-        new_config.as_ref(),
+        config_enc,
         secret_update,
         req.enabled,
     )
     .await?
     .ok_or(ApiError::NotFound)?;
-    Ok(Json(channel_view(&updated)))
+    Ok(Json(channel_view(&state.alerts.cipher, &updated)))
 }
 
 pub async fn delete_channel(
@@ -383,6 +565,165 @@ async fn check_rule_scope(
     }
 }
 
+/// The read permission a rule's notifications actually disclose.
+///
+/// Alert bodies are not bare counts. Issue triggers embed the verbatim issue
+/// title (`sauron-alerts`' evaluator builds `"{verb}: {issue.title}"`), monitor
+/// triggers embed the probed `target` — frequently an internal hostname. So the
+/// permission a rule must be authorized against is the one that governs reading
+/// *that* signal, not `alert:write`.
+fn rule_read_permission(trigger: TriggerType) -> &'static str {
+    match trigger {
+        // Discloses monitor names and probed URLs, so it is monitor reach —
+        // folding this under `issue:read` would let an issue reader enumerate
+        // the org's monitored endpoints.
+        TriggerType::MonitorDown | TriggerType::MonitorUp => perm::MONITOR_READ,
+        // Analytics-event and latency signal, both governed by `event:read`
+        // (`perf_degradation` reads spans, not issues).
+        TriggerType::EventThreshold | TriggerType::PerfDegradation => perm::EVENT_READ,
+        TriggerType::IssueNew
+        | TriggerType::IssueRegression
+        | TriggerType::ErrorThreshold
+        | TriggerType::ErrorSpike => perm::ISSUE_READ,
+    }
+}
+
+/// Authorize the *telemetry* a rule will emit, at the scope it will cover.
+///
+/// `alert:write` authorizes CONFIGURING alerting; it does not authorize the data
+/// a rule ships out. The exfiltration path is self-service — the same permission
+/// creates a webhook channel pointing anywhere — and the disclosure is durable:
+/// `AlertEngine::log_event` persists title/body into `alert_events`, which
+/// `list_history` serves to any org-scoped `alert:read` holder, so deleting the
+/// rule afterwards does not undo it.
+///
+/// `(None, None)` is the **widest** scope, not the narrowest: `apps_in_alert_scope`
+/// expands an un-narrowed rule to every app in the org, so that arm demands
+/// org-scoped read rather than "no target, no check". A fix that only guarded
+/// `req.app_id` would leave the cheaper exploit — target nothing — wide open.
+///
+/// Matches `notification_prefs::authorize_subscription_scope`, which has
+/// enforced exactly this on personal subscriptions since that slice shipped;
+/// org alert rules carry the same telemetry to a broader audience.
+///
+/// Uses `authorize_app`, never `authorize_app_reachable`: the latter is
+/// read-only by explicit contract (an environment grant must not authorize an
+/// app-wide rule), the same rule `inspector::authorize_policy` spells out.
+///
+/// Called from BOTH `create_rule` (with `check_rule_scope`'s output) and
+/// `update_rule` (with the stored columns). One helper on purpose: the two must
+/// not be able to drift, because a create-time-only gate is bypassed by
+/// creating a rule you may target and then editing it.
+async fn authorize_rule_target(
+    conn: &mut sauron_db::AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+    project_id: Option<Uuid>,
+    app_id: Option<Uuid>,
+    trigger: TriggerType,
+) -> Result<(), ApiError> {
+    let read_perm = rule_read_permission(trigger);
+    // Monitor triggers have no app dimension at FIRING time, so authorizing one
+    // at app scope would be narrower than what the rule actually delivers.
+    // `monitors` carries only `project_id` (no `app_id`, no `environment_id`),
+    // and `repo::alert_rules_for_monitor` accordingly matches on org + project
+    // and never looks at `alert_rules.app_id` — so an app-narrowed
+    // `monitor_down` rule still fires for *every* monitor in its project. The
+    // app narrowing is dropped here to check at the radius that applies.
+    //
+    // Same fact `SubKind::allows_app_scope` encodes for personal uptime
+    // subscriptions, but the remedy differs: subscriptions refuse app scope
+    // outright, while rules accept-and-widen. Refusing would 400 every
+    // app-narrowed monitor rule already stored — including on an unrelated
+    // rename — and the widened check is already the strict reading.
+    //
+    // A hand-inserted row with `app_id` but a NULL `project_id` (nothing the
+    // API can produce: `check_rule_scope` derives the project from the app)
+    // falls through to the org arm, which is stricter still. Fail-safe.
+    let app_id = match trigger {
+        TriggerType::MonitorDown | TriggerType::MonitorUp => None,
+        _ => app_id,
+    };
+    // App narrowing is checked first: `check_rule_scope` returns
+    // `(Some(project), Some(app))` for an app-narrowed rule, so matching on
+    // `project_id` first would settle for the looser project-level check.
+    match (app_id, project_id) {
+        (Some(a), _) => {
+            authorize_app(conn, user_id, a, read_perm).await?;
+        }
+        (None, Some(p)) => {
+            authorize_project(conn, user_id, p, read_perm).await?;
+        }
+        (None, None) => {
+            authorize_org(conn, user_id, org_id, read_perm).await?;
+        }
+    }
+    Ok(())
+}
+
+/// [`authorize_rule_target`] as a question instead of an assertion.
+///
+/// A denial is a legitimate answer here, not an error: both callers below have to
+/// evaluate *many* rules and act on the pattern of answers, so they cannot use a
+/// helper that returns early on the first `Forbidden`.
+///
+/// Only `Forbidden`/`NotFound`/`Auth` become `false`. Anything else — a dropped
+/// connection, a failed query — propagates, because a DB error silently read as
+/// "not authorized" turns an outage into a history page that quietly renders
+/// empty, and an operator would have no way to tell that from "no alerts fired".
+async fn may_read_rule_target(
+    conn: &mut sauron_db::AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+    project_id: Option<Uuid>,
+    app_id: Option<Uuid>,
+    trigger: TriggerType,
+) -> Result<bool, ApiError> {
+    match authorize_rule_target(conn, user_id, org_id, project_id, app_id, trigger).await {
+        Ok(()) => Ok(true),
+        Err(ApiError::Forbidden(_)) | Err(ApiError::NotFound) | Err(ApiError::Auth(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Authorize re-aiming a channel: the caller must be able to read the telemetry
+/// of **every** rule currently delivering to it.
+///
+/// Every, not any. A channel shared by ten rules carries the union of their
+/// disclosures, so being authorized for one of them does not license redirecting
+/// the other nine. The refusal names the offending rule, because an admin who
+/// legitimately cannot edit a shared channel needs to know which attachment is
+/// the obstacle — otherwise the only recovery is guesswork.
+///
+/// A channel with no rules attached is freely editable: it delivers nothing, so
+/// there is no telemetry to redirect. That is also the ordinary create-then-
+/// configure path, which must not require read on data the channel will never
+/// carry.
+async fn authorize_channel_retarget(
+    conn: &mut sauron_db::AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+    channel_id: Uuid,
+) -> Result<(), ApiError> {
+    let rules = repo::rules_using_channel(conn, channel_id).await?;
+    for r in &rules {
+        // An unparseable stored trigger is treated as the strictest reading
+        // rather than skipped: a row the code cannot classify is exactly the row
+        // whose disclosure it cannot bound.
+        let trigger = TriggerType::parse(&r.trigger_type).ok_or_else(|| {
+            ApiError::Internal(format!("stored trigger type invalid: {}", r.trigger_type))
+        })?;
+        if !may_read_rule_target(conn, user_id, org_id, r.project_id, r.app_id, trigger).await? {
+            return Err(ApiError::Forbidden(format!(
+                "changing this channel's destination would redirect alerts from rule \"{}\", \
+                 whose data you do not have read access to",
+                r.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate that every channel id exists and belongs to `org_id`.
 async fn check_channels_in_org(
     conn: &mut sauron_db::AsyncPgConnection,
@@ -443,6 +784,7 @@ pub async fn create_rule(
     authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_WRITE).await?;
     let (project_id, app_id) =
         check_rule_scope(&mut conn, org_id, req.project_id, req.app_id).await?;
+    authorize_rule_target(&mut conn, auth.user_id, org_id, project_id, app_id, trigger).await?;
     check_channels_in_org(&mut conn, org_id, &req.channel_ids).await?;
 
     let rule = repo::create_alert_rule(
@@ -522,6 +864,31 @@ pub async fn update_rule(
         load_rule_authorized(&state, auth.user_id, rule_id, perm::ALERT_WRITE).await?;
     let trigger = TriggerType::parse(&rule.trigger_type)
         .ok_or_else(|| ApiError::Internal("stored trigger_type invalid".into()))?;
+    // The same telemetry gate `create_rule` applies, against the STORED target —
+    // `UpdateRuleReq` deliberately has no `project_id`/`app_id`, so a rule
+    // cannot be re-aimed (pinned by `the_scope_of_an_existing_rule_stays_immutable`
+    // in `tests/http_alerting.rs`). Re-aiming is not the bypass; *re-routing* is.
+    // `load_rule_authorized` checks org-scoped `alert:write` only, and every
+    // remaining field of this request changes what that fixed target discloses
+    // and to whom: `channel_ids` points the rule's alerts at channels the caller
+    // controls, `enabled` revives a switched-off rule, `conditions` lowers the
+    // threshold or drops a filter so it fires, `message_template` rewrites the
+    // body. A caller who could not have CREATED this rule must not be able to
+    // arrive at it by editing one, so the check belongs on both routes.
+    //
+    // Placed before body validation on purpose: a caller with no read on the
+    // target gets one answer, not a validation oracle over channel ids
+    // (`check_channels_in_org` reveals org membership of an id) or over what
+    // `validate_conditions` accepts.
+    authorize_rule_target(
+        &mut conn,
+        auth.user_id,
+        rule.org_id,
+        rule.project_id,
+        rule.app_id,
+        trigger,
+    )
+    .await?;
 
     if let Some(n) = &req.name {
         if n.trim().is_empty() {
@@ -569,6 +936,11 @@ pub async fn update_rule(
     Ok(Json(rule_view(&mut conn, &updated).await?))
 }
 
+/// No `authorize_rule_target` here, unlike `create_rule`/`update_rule`, and
+/// that asymmetry is deliberate: that helper gates *disclosure*, and deleting a
+/// rule discloses nothing — it only stops future notifications. Requiring read
+/// on the target to delete would leave an alerting operator unable to clean up
+/// rules for projects they do not read, which is what `alert:write` is for.
 pub async fn delete_rule(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -601,15 +973,113 @@ pub async fn list_history(
 ) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(q.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
+    // `alert:read` gates *reaching* the history. It does not decide what is in
+    // it: a row's `title`/`body` hold the same issue title or probed monitor
+    // target that `authorize_rule_target` refuses to let an unauthorized caller
+    // route anywhere, and this table is where those strings come to rest.
     authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_READ).await?;
-    let rows = repo::list_alert_events(
+    let (visible_rule_ids, orphan_triggers) =
+        visible_history_keys(&mut conn, auth.user_id, org_id).await?;
+    let rows = repo::list_alert_events_visible(
         &mut conn,
         org_id,
+        &visible_rule_ids,
+        &orphan_triggers,
         q.limit.unwrap_or(50),
         q.offset.unwrap_or(0),
     )
     .await?;
     Ok(Json(json!(rows)))
+}
+
+/// Resolve what of an org's alert history this caller may see.
+///
+/// Returns `(visible rule ids, trigger types whose orphaned rows are visible)`.
+///
+/// Two arms because `alert_events.rule_id` is `ON DELETE SET NULL`: a row whose
+/// rule was deleted has no target left to check, and dropping those rows
+/// outright would hide history an org owner is plainly entitled to. Instead an
+/// orphan is treated as the **widest** possible target — org-scoped read of the
+/// permission its own `trigger_type` implies — which is the same reasoning
+/// `authorize_rule_target` applies to a rule narrowed to nothing. `trigger_type`
+/// is a column on the event itself, so it survives the rule's deletion.
+///
+/// Cost is one authorization per *distinct* `(project, app, permission)` triple
+/// rather than per rule, so a 200-rule org that targets four projects asks four
+/// questions. `list_rules` already loads every rule in the org for its own
+/// response, so the rule scan itself is no new burden.
+async fn visible_history_keys(
+    conn: &mut sauron_db::AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+) -> Result<(Vec<Uuid>, Vec<String>), ApiError> {
+    use std::collections::HashMap;
+
+    let rules = repo::list_alert_rules_for_org(conn, org_id).await?;
+    let mut memo: HashMap<(Option<Uuid>, Option<Uuid>, &'static str), bool> = HashMap::new();
+    let mut visible = Vec::new();
+    for r in &rules {
+        // An unparseable stored trigger yields no visibility rather than an
+        // error: one bad row must not blank the whole page, but it must not be
+        // shown either, since its disclosure cannot be classified.
+        let Some(trigger) = TriggerType::parse(&r.trigger_type) else {
+            continue;
+        };
+        // Keyed on the read permission, not the trigger: `rule_read_permission`
+        // maps several triggers onto one permission, and asking the same
+        // question again per trigger would multiply the queries for no answer.
+        //
+        // Safe despite `authorize_rule_target` DROPPING `app_id` for monitor
+        // triggers — which would otherwise make two rules with identical key
+        // fields ask different questions. It cannot happen here: the only triggers
+        // that drop the app are `MonitorDown`/`MonitorUp`, and they are also the
+        // only two that map to `monitor:read`. So every trigger sharing a
+        // permission also shares the app-narrowing behaviour. Adding a
+        // non-monitor trigger to `monitor:read`, or app-dropping under any other
+        // permission, would break that and the key must then include the trigger.
+        let key = (r.project_id, r.app_id, rule_read_permission(trigger));
+        let allowed = match memo.get(&key) {
+            Some(v) => *v,
+            None => {
+                let v =
+                    may_read_rule_target(conn, user_id, org_id, r.project_id, r.app_id, trigger)
+                        .await?;
+                memo.insert(key, v);
+                v
+            }
+        };
+        if allowed {
+            visible.push(r.id);
+        }
+    }
+
+    // Orphans, by trigger type, at org scope — the widest reading.
+    //
+    // Goes through `may_read_rule_target` with `(None, None)` rather than calling
+    // `authorize_org(...).is_ok()` directly: `is_ok()` would fold a dropped
+    // connection into "not authorized" and render an empty page during an
+    // outage, which is the failure `may_read_rule_target` documents refusing.
+    //
+    // Asked once per distinct PERMISSION, not once per trigger: the eight triggers
+    // map onto three permissions, so this is three queries rather than eight for
+    // an answer that cannot differ within a permission.
+    let mut orphan_triggers = Vec::new();
+    let mut org_perm: HashMap<&'static str, bool> = HashMap::new();
+    for t in TriggerType::ALL {
+        let perm_needed = rule_read_permission(t);
+        let allowed = match org_perm.get(perm_needed) {
+            Some(v) => *v,
+            None => {
+                let v = may_read_rule_target(conn, user_id, org_id, None, None, t).await?;
+                org_perm.insert(perm_needed, v);
+                v
+            }
+        };
+        if allowed {
+            orphan_triggers.push(t.as_str().to_string());
+        }
+    }
+    Ok((visible, orphan_triggers))
 }
 
 /// Per-kind metadata for personal notification subscriptions.

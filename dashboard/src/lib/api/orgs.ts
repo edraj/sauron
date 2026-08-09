@@ -116,3 +116,13 @@ export async function updateRole(
   const { data } = await api.patch<Role>(`/v1/orgs/${orgId}/roles/${roleId}`, body);
   return data;
 }
+
+export async function deleteRole(
+  orgId: string,
+  roleId: string,
+): Promise<{ revoked_grants: number }> {
+  const { data } = await api.delete<{ revoked_grants: number }>(
+    `/v1/orgs/${orgId}/roles/${roleId}`,
+  );
+  return data;
+}

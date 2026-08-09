@@ -36,6 +36,12 @@ export interface UpdateMonitorBody {
   name?: string;
   enabled?: boolean;
   interval_seconds?: number;
+  /**
+   * Three-state, and all three are reachable: omit the key to leave the stored
+   * URL alone, send `null` to clear it, send a string to replace it. There is
+   * no read-back — the response redacts the URL (see `Monitor.has_webhook`), so
+   * an editor must treat this as write-only and drive it from the boolean.
+   */
   webhook_url?: string | null;
 }
 

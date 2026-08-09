@@ -9,12 +9,15 @@
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { getPerson } from '../lib/api/persons';
-  import { errorMessage } from '../lib/api/client';
-  import { relativeTime, formatDateTime, initials } from '../lib/utils/format';
+  import { relativeTime, formatTimestamp, initials } from '../lib/utils/format';
+  import { timeFormatStore } from '../lib/stores/time-format.svelte';
   import type { AnalyticsEvent, ErrorEvent, PersonProfile } from '../lib/models';
 
   interface Props {
@@ -22,11 +25,20 @@
   }
   let { params }: Props = $props();
 
+  // How many events/errors the profile pulls. In the cache key as well as the
+  // request: two pages asking for different depths are different payloads.
+  const LIMIT = 100;
+
   const distinctId = $derived(decodeURIComponent(params?.distinctId ?? ''));
 
-  let profile = $state<PersonProfile | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): a profile you just looked at
+  // paints instantly on return and refreshes behind the render. Re-exposed under
+  // the names the template already used, so the markup is unchanged.
+  const view = new CachedView<PersonProfile>();
+
+  const profile = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
 
   type TimelineItem =
     | { kind: 'event'; at: number; data: AnalyticsEvent }
@@ -44,17 +56,20 @@
     return items.sort((a, b) => b.at - a.at);
   });
 
-  async function load(appId: string, id: string) {
-    loading = true;
-    error = null;
-    try {
-      profile = await getPerson(appId, id, 100);
-    } catch (err) {
-      error = errorMessage(err);
-      profile = null;
-    } finally {
-      loading = false;
-    }
+  /**
+   * `scopeKey` is in the key because it carries the selected environment, which
+   * the axios interceptor adds to the request but which appears in none of these
+   * arguments — omit it and one environment's profile would be served as another's.
+   *
+   * `force` bypasses the fresh-window short-circuit, for a caller that means
+   * "go to the network now".
+   */
+  async function load(appId: string, id: string, force = false) {
+    await view.load(
+      viewKey('persons.profile', appId, sessionStore.scopeKey, id, LIMIT),
+      () => getPerson(appId, id, LIMIT),
+      force,
+    );
   }
 
   $effect(() => {
@@ -117,8 +132,8 @@
         <div class="id-sub">
           {#if profile.user}
             <span class="muted">
-              First seen {relativeTime(profile.user.first_seen)} · Last seen
-              {relativeTime(profile.user.last_seen)}
+              First seen <TimeValue value={profile.user.first_seen} /> · Last seen
+              <TimeValue value={profile.user.last_seen} />
             </span>
           {:else}
             <span class="muted">Anonymous — no persisted profile record.</span>
@@ -138,13 +153,29 @@
         <StatTile label="Sessions" value={sessionCount > 0 ? sessionCount.toLocaleString() : '—'} />
         <StatTile
           label="First seen"
-          value={profile.user ? relativeTime(profile.user.first_seen) : '—'}
-          sub={profile.user ? formatDateTime(profile.user.first_seen) : undefined}
+          value={profile.user
+            ? timeFormatStore.mode === 'relative'
+              ? relativeTime(profile.user.first_seen)
+              : formatTimestamp(profile.user.first_seen)
+            : '—'}
+          sub={profile.user
+            ? timeFormatStore.mode === 'relative'
+              ? formatTimestamp(profile.user.first_seen)
+              : relativeTime(profile.user.first_seen)
+            : undefined}
         />
         <StatTile
           label="Last seen"
-          value={profile.user ? relativeTime(profile.user.last_seen) : '—'}
-          sub={profile.user ? formatDateTime(profile.user.last_seen) : undefined}
+          value={profile.user
+            ? timeFormatStore.mode === 'relative'
+              ? relativeTime(profile.user.last_seen)
+              : formatTimestamp(profile.user.last_seen)
+            : '—'}
+          sub={profile.user
+            ? timeFormatStore.mode === 'relative'
+              ? formatTimestamp(profile.user.last_seen)
+              : relativeTime(profile.user.last_seen)
+            : undefined}
         />
       </StatTiles>
     </div>
@@ -182,9 +213,7 @@
                           session <Icon name="arrow-up-right" size={14} />
                         </a>
                       {/if}
-                      <span class="tl-time" title={formatDateTime(item.data.occurred_at)}>
-                        {relativeTime(item.data.occurred_at)}
-                      </span>
+                      <span class="tl-time"><TimeValue value={item.data.occurred_at} /></span>
                     </div>
                     {#if item.kind === 'event' && item.data.properties && Object.keys(item.data.properties).length > 0}
                       <div class="tl-props">

@@ -13,10 +13,13 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { getDevice } from '../lib/api/devices';
-  import { errorMessage } from '../lib/api/client';
-  import { relativeTime, formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
+  import { relativeTime, formatTimestamp, formatDuration, durationBetween } from '../lib/utils/format';
+  import { timeFormatStore } from '../lib/stores/time-format.svelte';
   import type { DeviceDetail, ErrorEvent, Session } from '../lib/models';
 
   interface Props {
@@ -26,21 +29,31 @@
 
   const deviceKey = $derived(decodeURIComponent(params?.key ?? ''));
 
-  let detail = $state<DeviceDetail | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): a device visited a moment ago
+  // paints instantly on return and refreshes behind the rendered page instead of
+  // blanking to a spinner. Re-exposed under the names the template already used,
+  // so the markup is unchanged.
+  //
+  // `revalidating` is deliberately not surfaced: this page has no RefreshButton
+  // to spin, and the payload is replaced in place when the refresh lands.
+  const view = new CachedView<DeviceDetail>();
 
-  async function load(appId: string, key: string) {
-    loading = true;
-    error = null;
-    try {
-      detail = await getDevice(appId, key);
-    } catch (err) {
-      error = errorMessage(err);
-      detail = null;
-    } finally {
-      loading = false;
-    }
+  const detail = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
+
+  // `scopeKey` belongs in the key: it carries the selected environment, which the
+  // axios interceptor adds to the request but which appears in none of these
+  // arguments. Omit it and one environment's device would be served as another's.
+  //
+  // `force` bypasses the fresh-window short-circuit, for a call site that means
+  // "go to the network now".
+  async function load(appId: string, key: string, force = false) {
+    await view.load(
+      viewKey('devices.detail', appId, sessionStore.scopeKey, key),
+      () => getDevice(appId, key),
+      force,
+    );
   }
 
   $effect(() => {
@@ -103,8 +116,16 @@
         value={device.errors_count.toLocaleString()}
         tone={device.errors_count > 0 ? 'error' : 'neutral'}
       />
-      <StatTile label="First seen" value={formatDateTime(device.first_seen)} />
-      <StatTile label="Last seen" value={relativeTime(device.last_seen)} sub={formatDateTime(device.last_seen)} />
+      <StatTile
+        label="First seen"
+        value={timeFormatStore.mode === 'relative' ? relativeTime(device.first_seen) : formatTimestamp(device.first_seen)}
+        sub={timeFormatStore.mode === 'relative' ? formatTimestamp(device.first_seen) : relativeTime(device.first_seen)}
+      />
+      <StatTile
+        label="Last seen"
+        value={timeFormatStore.mode === 'relative' ? relativeTime(device.last_seen) : formatTimestamp(device.last_seen)}
+        sub={timeFormatStore.mode === 'relative' ? formatTimestamp(device.last_seen) : relativeTime(device.last_seen)}
+      />
     </StatTiles>
 
     <div class="grid">
@@ -137,9 +158,7 @@
                       {s.session_id}
                     </a>
                   </td>
-                  <td class="cell-muted" title={formatDateTime(s.started_at)}>
-                    {relativeTime(s.started_at)}
-                  </td>
+                  <td><TimeValue value={s.started_at} /></td>
                   <td class="cell-muted">{formatDuration(sessionDuration(s))}</td>
                   <td class="num">{s.events_count.toLocaleString()}</td>
                   <td class="num">
@@ -214,9 +233,7 @@
                   <a class="crash" href={`#/issues/${e.issue_id}`}>
                     <div class="crash-top">
                       <LevelBadge level={e.level} size="sm" />
-                      <span class="crash-time" title={formatDateTime(e.occurred_at)}>
-                        {relativeTime(e.occurred_at)}
-                      </span>
+                      <span class="crash-time"><TimeValue value={e.occurred_at} asText /></span>
                     </div>
                     <span class="crash-title mono">{errorTitle(e)}</span>
                   </a>

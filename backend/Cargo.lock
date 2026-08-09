@@ -3458,6 +3458,7 @@ dependencies = [
  "sauron-inspector",
  "sauron-redis",
  "sauron-symbols",
+ "sauron-telemetry",
  "serde",
  "serde_json",
  "tokio",
@@ -3485,6 +3486,7 @@ dependencies = [
  "hex",
  "redis",
  "sauron-core",
+ "sauron-telemetry",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3552,6 +3554,7 @@ dependencies = [
  "sauron-tier",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

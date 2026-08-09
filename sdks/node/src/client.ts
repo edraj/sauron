@@ -214,12 +214,27 @@ export class SauronClient {
   /** Emit a performance transaction item. */
   trackTransaction(input: TransactionInput): void {
     if (typeof input?.name !== 'string' || input.name.length === 0) return;
+    // `durationMs` accepted as an alias — see TransactionInput. Without it, a
+    // caller using the browser SDK's spelling shipped a transaction with the
+    // duration field absent and no complaint from anywhere.
+    const duration = input.duration_ms ?? input.durationMs;
+    if (typeof duration !== 'number' || !Number.isFinite(duration)) {
+      // Refused loudly rather than sent. A transaction whose whole purpose is
+      // to record a duration is not worth persisting without one, and silence
+      // here is what let the mis-spelling survive: the item looked delivered.
+      this.debugLog(
+        `dropped transaction "${input.name}": duration_ms must be a finite number ` +
+          `(got ${typeof duration === 'number' ? duration : typeof duration}). ` +
+          `Use duration_ms, or durationMs if you are porting from the browser SDK.`,
+      );
+      return;
+    }
     const distinctId = input.distinct_id ?? getCurrentScope().data.user?.id ?? undefined;
     const item: TransactionItem = {
       type: 'transaction',
       name: input.name,
       op: input.op ?? 'custom',
-      duration_ms: input.duration_ms,
+      duration_ms: duration,
       timestamp: isoNow(),
     };
     if (input.status !== undefined) item.status = input.status;

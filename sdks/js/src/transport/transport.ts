@@ -242,11 +242,21 @@ export class Transport {
     }
   }
 
-  /** Re-attempt any envelopes that were parked while offline. */
+  /**
+   * Re-attempt any envelopes that were parked while offline.
+   *
+   * `drain()` empties `localStorage` in one shot, so from here on the ONLY copy
+   * of the backlog is the local `payloads` array. Every early return therefore
+   * has to re-park the whole untried remainder, not just the payload that
+   * failed: this used to re-park the failing one and return, which silently
+   * deleted every payload behind it — the exact reconnect-then-one-500 case the
+   * queue exists for.
+   */
   async drainOfflineQueue(): Promise<void> {
     if (this.disabled || !this.offline.available) return;
     const payloads = this.offline.drain();
-    for (const json of payloads) {
+    for (let i = 0; i < payloads.length; i++) {
+      const json = payloads[i];
       let outcome: SendOutcome;
       try {
         outcome = await this.post(json);
@@ -254,14 +264,18 @@ export class Transport {
         outcome = { action: 'retry_backoff' };
       }
       if (outcome.action === 'disable') {
+        this.logger.warn('server rejected credentials while draining; disabling client');
         this.disable();
         this.onDisable();
-        this.offline.enqueue(json);
+        // The credentials may be fixed and the client re-inited; keep the
+        // backlog rather than throwing it away on the way out.
+        this.offline.requeueFront(payloads.slice(i));
         return;
       }
       if (outcome.action === 'retry_after' || outcome.action === 'retry_backoff') {
-        // Still failing — re-park and stop draining to avoid a tight loop.
-        this.offline.enqueue(json);
+        // Still failing — re-park this payload AND everything after it, then
+        // stop draining to avoid a tight loop.
+        this.offline.requeueFront(payloads.slice(i));
         return;
       }
       // drop / split: treat as handled.

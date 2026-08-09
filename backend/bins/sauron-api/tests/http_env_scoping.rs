@@ -215,6 +215,12 @@ impl TestServer {
             .env("DATABASE_URL", &db_url)
             .env("REDIS_URL", &redis_url)
             .env("JWT_SECRET", JWT_SECRET)
+            // Required and fail-closed since migration 000046: the API refuses to
+            // boot without it (it is the only key that decrypts stored channels).
+            .env(
+                "NOTIFY_SECRET_KEY",
+                "sauron-test-notify-secret-key-0000000000",
+            )
             .env("API_PORT", port.to_string())
             .env("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
             .env("RUST_LOG", "error")
@@ -959,6 +965,150 @@ async fn seed_analytics_event(
 // ---------------------------------------------------------------------------
 // S2 Task 10: the ?environment_id= empty-value regression.
 // ---------------------------------------------------------------------------
+
+/// The overview was split into four independently-addressable sections so the
+/// dashboard can paint each card as its own answer lands, instead of waiting on
+/// the SUM of five sequential aggregates. Measured at the SQL layer on a
+/// 210k-event app: ~165 ms (events count) + ~160 ms (errors count) + ~180 ms
+/// (top issues) + the series, all on one connection.
+///
+/// The risk that split introduces is DRIFT: four handlers computing what one
+/// handler used to, diverging silently. So this asserts the sections agree with
+/// `/overview` field for field, rather than merely that each returns 200.
+#[tokio::test]
+async fn overview_sections_agree_with_the_composite_route() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+
+    let whole = srv
+        .get_json(
+            &format!("/v1/apps/{app}/overview?since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+    let totals = srv
+        .get_json(
+            &format!("/v1/apps/{app}/overview/totals?since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+    let series = srv
+        .get_json(
+            &format!("/v1/apps/{app}/overview/series?since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+    let top_issues = srv
+        .get_json(
+            &format!("/v1/apps/{app}/overview/top-issues?since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+    let top_events = srv
+        .get_json(
+            &format!("/v1/apps/{app}/overview/top-events?since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+
+    assert_eq!(whole["totals"], totals["totals"], "totals must not drift");
+    assert_eq!(whole["error_rate"], totals["error_rate"]);
+    assert_eq!(whole["crash_free_sessions"], totals["crash_free_sessions"]);
+    assert_eq!(whole["events_series"], series["events_series"]);
+    assert_eq!(whole["errors_series"], series["errors_series"]);
+    assert_eq!(whole["top_issues"], top_issues);
+    assert_eq!(whole["top_events"], top_events);
+
+    // Non-vacuous: the fixture seeds errors, so a handler returning an empty
+    // body everywhere would satisfy every equality above. Pin that there is
+    // actually something to compare.
+    assert!(
+        totals["totals"]["errors"].as_i64().unwrap_or(0) > 0,
+        "fixture must seed at least one error, else the equalities prove nothing"
+    );
+    assert!(
+        top_issues
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "fixture must seed at least one issue"
+    );
+
+    srv.shutdown().await;
+}
+
+/// Each section is its own HTTP request, so each must resolve the read scope on
+/// its own. Sharing one authorization decision across them would mean trusting
+/// the client to say it had already been authorized — and an env-scoped member
+/// must not see another environment's numbers through a section route just
+/// because the composite route confines them.
+#[tokio::test]
+async fn every_overview_section_is_env_scoped_independently() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+    let granted = f.granted_env;
+    let other = f.other_env;
+
+    // The member may read `granted_env` only.
+    for section in ["totals", "series", "top-issues", "top-events"] {
+        let ok = srv
+            .get_status(
+                &format!(
+                    "/v1/apps/{app}/overview/{section}?environment_id={granted}&since_days=3650"
+                ),
+                &f.member_token,
+            )
+            .await;
+        assert_eq!(
+            ok, 200,
+            "{section} must be readable in the granted environment"
+        );
+
+        let denied = srv
+            .get_status(
+                &format!(
+                    "/v1/apps/{app}/overview/{section}?environment_id={other}&since_days=3650"
+                ),
+                &f.member_token,
+            )
+            .await;
+        assert_eq!(
+            denied, 403,
+            "{section} must refuse an environment the member has no grant in"
+        );
+    }
+
+    // And the confinement is not merely a status code: the granted environment's
+    // error count must exclude the other environment's event. Asserted on
+    // `totals` because it is the section carrying the aggregate a leak would
+    // show up in.
+    let scoped = srv
+        .get_json(
+            &format!("/v1/apps/{app}/overview/totals?environment_id={granted}&since_days=3650"),
+            &f.member_token,
+        )
+        .await;
+    let unscoped = srv
+        .get_json(
+            &format!("/v1/apps/{app}/overview/totals?since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+    assert!(
+        scoped["totals"]["errors"].as_i64().unwrap_or(-1)
+            < unscoped["totals"]["errors"].as_i64().unwrap_or(-1),
+        "the env-scoped total must be strictly smaller than the app-wide one, \
+         or the scope is not being applied: scoped={scoped:?} unscoped={unscoped:?}"
+    );
+
+    srv.shutdown().await;
+}
 
 #[tokio::test]
 async fn empty_environment_id_returns_400_over_http_not_all_environments() {
