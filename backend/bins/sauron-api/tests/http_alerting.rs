@@ -283,6 +283,20 @@ impl TestServer {
         (text, v)
     }
 
+    async fn delete_raw(&self, path: &str, token: &str) -> (u16, String, Value) {
+        let resp = self
+            .client
+            .delete(format!("{}{path}", self.base))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("DELETE {path} failed: {e}"));
+        let status = resp.status().as_u16();
+        let text = resp.text().await.expect("read DELETE body");
+        let v = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+        (status, text, v)
+    }
+
     async fn patch_raw(&self, path: &str, token: &str, body: Value) -> (u16, String, Value) {
         let resp = self
             .client
@@ -1287,9 +1301,14 @@ async fn an_app_narrowed_monitor_rule_is_authorized_at_project_scope() {
     )
     .await;
     let mut conn = server.conn().await;
-    let firing = repo::alert_rules_for_monitor(&mut conn, fx.project_a, "monitor_down")
-        .await
-        .expect("alert_rules_for_monitor");
+    let firing = repo::alert_rules_for_monitor(
+        &mut conn,
+        fx.project_a,
+        uuid::Uuid::from_u128(7),
+        "monitor_down",
+    )
+    .await
+    .expect("alert_rules_for_monitor");
     assert!(
         firing.iter().any(|r| r.id.to_string() == narrowed),
         "an app-narrowed monitor rule is expected to fire project-wide; if this \
@@ -1800,6 +1819,251 @@ async fn history_visibility_follows_the_trigger_s_own_permission() {
         !titles.contains(&"orphan monitor: db-01.internal".to_string()),
         "a monitor row leaks an internal hostname and needs monitor:read, which \
          issue:read must not stand in for: {titles:?}"
+    );
+
+    server.shutdown().await;
+}
+
+/// The `Fixture` seeds projects and apps but no monitors, and a pinned rule
+/// needs a real one because the column is a foreign key.
+async fn create_monitor(server: &TestServer, token: &str, project_id: Uuid, name: &str) -> Uuid {
+    let (_text, body) = server
+        .post_ok(
+            &format!("/v1/projects/{project_id}/monitors"),
+            token,
+            json!({
+                "name": name,
+                "kind": "http",
+                "target": "https://example.test/health",
+            }),
+        )
+        .await;
+    body["id"].as_str().unwrap().parse().unwrap()
+}
+
+/// A monitor from another org must never become a rule's target: the rule's
+/// `project_id` is DERIVED from the monitor, so accepting a foreign one would
+/// hand the caller a rule scoped outside the org they authorized against.
+#[tokio::test]
+async fn a_rule_cannot_be_pinned_to_a_monitor_outside_the_org() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let fx = seed(&server, "pinorg").await;
+    let other = seed(&server, "pinorg-other").await;
+
+    let foreign = create_monitor(&server, &other.owner_token, other.project_a, "foreign").await;
+
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            Some(&fx.owner_token),
+            json!({
+                "name": "cross-org",
+                "trigger_type": "monitor_down",
+                "monitor_id": foreign,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "monitor from another org must be rejected: {text}"
+    );
+
+    server.shutdown().await;
+}
+
+/// `monitor_id` is meaningless on a trigger that never reads it. Rejecting at
+/// the API keeps the CHECK constraint as a backstop rather than the only guard
+/// — a 500 from a constraint violation is not an answer a caller can act on.
+#[tokio::test]
+async fn a_monitor_id_on_a_non_monitor_trigger_is_rejected() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let fx = seed(&server, "pintrigger").await;
+    let mon = create_monitor(&server, &fx.owner_token, fx.project_a, "api").await;
+
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            Some(&fx.owner_token),
+            json!({
+                "name": "wrong trigger",
+                "trigger_type": "issue_new",
+                "monitor_id": mon,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "monitor_id on issue_new must be rejected: {text}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Pinning must narrow, never widen: the derived `project_id` is what the
+/// existing `authorize_rule_target` gate then checks `monitor:read` against.
+#[tokio::test]
+async fn pinning_a_monitor_derives_the_project_and_is_authorized_there() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let fx = seed(&server, "pinderive").await;
+    let mon_a = create_monitor(&server, &fx.owner_token, fx.project_a, "a-health").await;
+    let mon_b = create_monitor(&server, &fx.owner_token, fx.project_b, "b-health").await;
+
+    // Mallory holds no monitor:read anywhere, so she is the wrong witness here:
+    // every arm of `authorize_rule_target` denies her regardless of which
+    // project the monitor derives to, which would make a 403 mean nothing.
+    // `monitor_reader` holds monitor:read at project A ONLY, so her 403/200
+    // split can only be explained by the derived project, not by a missing
+    // permission.
+    let monitor_reader = user_with_read_at(
+        &server,
+        fx.org_id,
+        "pinderive-reader",
+        &[perm::MONITOR_READ],
+        "project",
+        fx.project_a,
+    )
+    .await;
+
+    // A monitor-B-pinned rule must be refused even though she never named
+    // project B in the request: the project is derived from the monitor, and
+    // she cannot read at project B.
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            Some(&monitor_reader),
+            json!({
+                "name": "sneaky",
+                "trigger_type": "monitor_down",
+                "monitor_id": mon_b,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "pinning must be authorized at the monitor's project: {text}"
+    );
+
+    // The control: the SAME caller, a monitor-A-pinned rule, is allowed — proof
+    // that the 403 above is about the derived project, not about a missing
+    // monitor:read grant altogether.
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            Some(&monitor_reader),
+            json!({
+                "name": "a down",
+                "trigger_type": "monitor_down",
+                "monitor_id": mon_a,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "monitor:read at the derived project must be enough: {text}"
+    );
+
+    // And the owner's pinned rule stores both the monitor and the derived project.
+    let (_text, body) = server
+        .post_ok(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            &fx.owner_token,
+            json!({
+                "name": "b down",
+                "trigger_type": "monitor_down",
+                "monitor_id": mon_b,
+            }),
+        )
+        .await;
+    assert_eq!(
+        body["monitor_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
+        mon_b
+    );
+    assert_eq!(
+        body["project_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
+        fx.project_b,
+        "the project must be derived from the monitor, not left NULL"
+    );
+
+    server.shutdown().await;
+}
+
+/// `alert_rules.monitor_id` is `ON DELETE CASCADE` — deleting the monitor a
+/// rule is pinned to silently deletes the rule too. That cascade is correct
+/// (a `SET NULL` would widen the rule instead), but it must be DISCLOSED: the
+/// delete response should tell the caller how many alert rules went with it,
+/// and the rule really must be gone afterward.
+///
+/// If the disclosure were removed (the response reverted to plain
+/// `{"ok": true}`), the `cascaded_alert_rules` assertion below would fail —
+/// that's the point of asserting on the field, not just on the row count.
+#[tokio::test]
+async fn deleting_a_monitor_discloses_and_cascades_its_pinned_alert_rule() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let fx = seed(&server, "pincascade").await;
+    let mon = create_monitor(&server, &fx.owner_token, fx.project_a, "cascade-target").await;
+
+    let (_text, rule) = server
+        .post_ok(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            &fx.owner_token,
+            json!({
+                "name": "cascade rule",
+                "trigger_type": "monitor_down",
+                "monitor_id": mon,
+            }),
+        )
+        .await;
+    let rule_id = rule["id"].as_str().unwrap().to_string();
+
+    // A second rule, un-pinned (org-wide), must survive the delete untouched —
+    // proof that the cascade (and its count) is scoped to the pinned rule,
+    // not to every rule in the org.
+    server
+        .post_ok(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            &fx.owner_token,
+            json!({ "name": "unrelated rule", "trigger_type": "monitor_down" }),
+        )
+        .await;
+
+    let (status, text, body) = server
+        .delete_raw(&format!("/v1/monitors/{mon}"), &fx.owner_token)
+        .await;
+    assert_eq!(status, 200, "monitor delete failed: {text}");
+    assert_eq!(
+        body["cascaded_alert_rules"].as_i64(),
+        Some(1),
+        "delete response must disclose exactly the 1 pinned rule that cascaded: {text}"
+    );
+
+    let (status, text, _) = server
+        .get_raw(&format!("/v1/alert-rules/{rule_id}"), &fx.owner_token)
+        .await;
+    assert_eq!(
+        status, 404,
+        "the pinned rule must actually be gone after the cascade: {text}"
+    );
+
+    assert_eq!(
+        rule_count(&server, fx.org_id).await,
+        1,
+        "only the unrelated, un-pinned rule should remain"
     );
 
     server.shutdown().await;

@@ -986,7 +986,15 @@ async fn workflow_filter_narrows_at_every_level_it_is_offered() {
             &f.owner_token,
         )
         .await;
-    let issues = body.as_array().expect("issues response is a JSON array");
+    // S2c Task 4: the issues list answers a `SearchEnvelope`, not a bare
+    // array — the rows moved under `data`. The `workflow` filter itself is
+    // unchanged: it now travels through `from_legacy` into the catalog's
+    // `workflow` dimension (added by that task precisely so a bridged
+    // `filter=workflow:…` bookmark is not silently reinterpreted as a tag key)
+    // and lowers to the same correlated EXISTS this test always asserted.
+    let issues = body["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("issues response has no `data` array: {body}"));
     assert_eq!(
         issues.len(),
         1,
@@ -1007,9 +1015,9 @@ async fn workflow_filter_narrows_at_every_level_it_is_offered() {
             &f.owner_token,
         )
         .await;
-    let neq_issues = neq_issues
+    let neq_issues = neq_issues["data"]
         .as_array()
-        .expect("issues response is a JSON array");
+        .unwrap_or_else(|| panic!("issues response has no `data` array: {neq_issues}"));
     assert_eq!(
         neq_issues
             .iter()
@@ -1028,16 +1036,24 @@ async fn workflow_filter_narrows_at_every_level_it_is_offered() {
         )
         .await;
     assert!(
-        empty
+        empty["data"]
             .as_array()
-            .expect("issues response is a JSON array")
+            .unwrap_or_else(|| panic!("issues response has no `data` array: {empty}"))
             .is_empty(),
         "{empty:?}"
     );
+    assert_eq!(empty["total"], 0, "{empty:?}");
 
-    // --- level 2: Events page (EVENT_FILTERS -> list_analytics_events) ----
-    // Registered on its own `FieldSpec` list; a missing entry here is not a
-    // silent no-op but an outright `UnknownField` 400.
+    // --- level 2: Events page (the analytics event stream) ----------------
+    // S2c Task 6: this route answers a `SearchEnvelope` too, so the rows moved
+    // under `data`. Its `filter=workflow:…` now travels through `from_legacy`
+    // into the catalog's `workflow` dimension — widened to `Resource::Events`
+    // by that task for the third time and the same reason Task 4 added the
+    // entry at all. Here it lowers to the real `analytics_events.workflow_name`
+    // column, with the `workflow_id IS NOT NULL` partial-index term on the
+    // positive arm only; the `neq` leg below is what pins that omission, since
+    // the unstamped rows it must return are exactly the ones that index
+    // excludes.
     let ev_eq = h
         .get_json(
             &format!(
@@ -1047,15 +1063,18 @@ async fn workflow_filter_narrows_at_every_level_it_is_offered() {
             &f.owner_token,
         )
         .await;
-    let ev_eq = ev_eq.as_array().expect("events response is a JSON array");
+    let ev_eq_rows = ev_eq["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("events response has no `data` array: {ev_eq}"));
     assert_eq!(
-        ev_eq
+        ev_eq_rows
             .iter()
             .filter_map(|e| e["name"].as_str())
             .collect::<Vec<_>>(),
         vec!["checkout.step"],
-        "events workflow:eq must return only the stamped event: {ev_eq:?}"
+        "events workflow:eq must return only the stamped event: {ev_eq_rows:?}"
     );
+    assert_eq!(ev_eq["total"], 1, "{ev_eq}");
 
     let ev_neq = h
         .get_json(
@@ -1066,7 +1085,9 @@ async fn workflow_filter_narrows_at_every_level_it_is_offered() {
             &f.owner_token,
         )
         .await;
-    let ev_neq = ev_neq.as_array().expect("events response is a JSON array");
+    let ev_neq = ev_neq["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("events response has no `data` array: {ev_neq}"));
     assert!(
         ev_neq.iter().any(|e| e["name"] == "unrelated.event"),
         "events workflow:neq must include the UNSTAMPED event — a bare SQL `<>` \
@@ -1079,6 +1100,13 @@ async fn workflow_filter_narrows_at_every_level_it_is_offered() {
     );
 
     // --- level 3: an issue's occurrences (ERROR_EVENT_FILTERS) ------------
+    // S2c Task 5: this route answers a `SearchEnvelope` too, and its
+    // `filter=workflow:…` now travels through `from_legacy` into the catalog's
+    // `workflow` dimension — widened to `Resource::Occurrences` by that task
+    // for the same reason Task 4 added it at all. Here it lowers to the real
+    // `error_events.workflow_name` column rather than Issues' correlated
+    // EXISTS, and the `neq` leg below is what pins the two lowerings to the
+    // SAME semantic.
     let issue_id = issues[0]["id"].as_str().expect("issue id is a string");
     let occ_eq = h
         .get_json(
@@ -1089,9 +1117,9 @@ async fn workflow_filter_narrows_at_every_level_it_is_offered() {
             &f.owner_token,
         )
         .await;
-    let occ_eq = occ_eq
+    let occ_eq = occ_eq["data"]
         .as_array()
-        .expect("occurrences response is a JSON array");
+        .unwrap_or_else(|| panic!("occurrences response has no `data` array: {occ_eq}"));
     assert_eq!(
         occ_eq.len(),
         1,
@@ -1115,9 +1143,9 @@ async fn workflow_filter_narrows_at_every_level_it_is_offered() {
             &f.owner_token,
         )
         .await;
-    let occ_neq = occ_neq
+    let occ_neq = occ_neq["data"]
         .as_array()
-        .expect("occurrences response is a JSON array");
+        .unwrap_or_else(|| panic!("occurrences response has no `data` array: {occ_neq}"));
     assert_eq!(
         occ_neq.len(),
         1,

@@ -86,6 +86,8 @@ export interface CreateRuleBody {
   trigger_type: TriggerType;
   project_id?: string | null;
   app_id?: string | null;
+  /** Pins a monitor_down/monitor_up rule to one monitor; the API derives project_id from it, so send this XOR project_id. */
+  monitor_id?: string | null;
   conditions?: Record<string, unknown>;
   severity?: AlertSeverity;
   throttle_seconds?: number;

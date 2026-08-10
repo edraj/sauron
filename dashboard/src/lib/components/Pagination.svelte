@@ -4,22 +4,30 @@
   interface Props {
     offset: number;
     limit: number;
-    // Number of rows on the current page — used to detect the last page.
+    /** Number of rows on the current page. */
     count: number;
+    /**
+     * Whether a page exists after this one.
+     *
+     * Supplied by the caller rather than inferred from `count >= limit`, which
+     * was wrong: a final page holding exactly `limit` rows offered an enabled
+     * Next that led to an empty page. The caller knows the answer — from a
+     * total, or by requesting `limit + 1` rows and rendering `limit`.
+     */
+    hasNext: boolean;
     onchange: (offset: number) => void;
   }
 
-  let { offset, limit, count, onchange }: Props = $props();
+  let { offset, limit, count, hasNext, onchange }: Props = $props();
 
   const from = $derived(count === 0 ? 0 : offset + 1);
   const to = $derived(offset + count);
   const hasPrev = $derived(offset > 0);
-  const hasNext = $derived(count >= limit);
 </script>
 
 <div class="pager">
   <span class="range muted">
-    {#if count === 0}No results{:else}{from.toLocaleString()}–{to.toLocaleString()}{/if}
+    {#if count === 0 && offset === 0}No results{:else if count === 0}End of results{:else}{from.toLocaleString()}–{to.toLocaleString()}{/if}
   </span>
   <div class="btns">
     <button

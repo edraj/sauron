@@ -21,7 +21,9 @@ pub mod performance;
 pub mod projects;
 pub mod scope;
 pub mod screens;
+pub mod search;
 pub mod sessions;
+pub mod stores;
 pub mod workflows;
 
 use chrono::{Duration, Utc};

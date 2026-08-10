@@ -10,12 +10,24 @@
 
   let { data, height = 180, emptyLabel = 'No user activity in this range' }: Props = $props();
 
-  const maxActive = $derived(data.length ? Math.max(...data.map((d) => d.active), 1) : 1);
-  const maxNew = $derived(data.length ? Math.max(...data.map((d) => d.new_users), 1) : 1);
+  /**
+   * ONE scale across both series.
+   *
+   * New users used to be a polyline normalised to its own maximum, which is
+   * defensible for an overlay but not for a bar: two bar series on independent
+   * scales put a day with 3 new users level with a day of 300 active ones. New
+   * is a subset of active, so a shared maximum is both honest and the one that
+   * makes the pair comparable at a glance.
+   */
+  const scaleMax = $derived(
+    data.length ? Math.max(...data.map((d) => Math.max(d.active, d.new_users)), 1) : 1,
+  );
 
   function barHeight(v: number): number {
-    if (maxActive <= 0) return 0;
-    return v === 0 ? 2 : Math.max(4, (v / maxActive) * 100);
+    if (scaleMax <= 0) return 0;
+    // A zero day keeps a 2% stub so the column still reads as a day that
+    // existed and had none, rather than as missing data.
+    return v === 0 ? 2 : Math.max(4, (v / scaleMax) * 100);
   }
 
   function label(bucket: string): string {
@@ -23,17 +35,6 @@
     if (Number.isNaN(d.getTime())) return bucket;
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   }
-
-  // New-users overlay as a polyline in a 0..100 viewBox (y inverted).
-  const linePoints = $derived(
-    data
-      .map((d, i) => {
-        const x = data.length === 1 ? 50 : (i / (data.length - 1)) * 100;
-        const y = 100 - (maxNew <= 0 ? 0 : (d.new_users / maxNew) * 100);
-        return `${x.toFixed(2)},${y.toFixed(2)}`;
-      })
-      .join(' '),
-  );
 </script>
 
 {#if data.length === 0}
@@ -47,17 +48,17 @@
             class="col"
             title={`${formatDateTime(point.bucket)} · ${point.active} active · ${point.new_users} new`}
           >
-            <div class="bar" style="height:{barHeight(point.active)}%">
-              <span class="tip">{point.active} active · {point.new_users} new<br />{label(point.bucket)}</span>
+            <div class="pair">
+              <div class="bar active" style="height:{barHeight(point.active)}%">
+                <!-- Anchored to the active bar, which is the taller of the two
+                     (new is a subset), so the tip clears both. -->
+                <span class="tip">{point.active} active · {point.new_users} new<br />{label(point.bucket)}</span>
+              </div>
+              <div class="bar new" style="height:{barHeight(point.new_users)}%"></div>
             </div>
           </div>
         {/each}
       </div>
-      {#if maxNew > 0}
-        <svg class="overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-          <polyline points={linePoints} fill="none" stroke="var(--info)" stroke-width="1.5" vector-effect="non-scaling-stroke" />
-        </svg>
-      {/if}
     </div>
     <div class="axis">
       <span>{label(data[0].bucket)}</span>
@@ -79,17 +80,41 @@
     padding: 4px 2px 0;
     border-bottom: 1px solid var(--border);
   }
-  .col { flex: 1; min-width: 3px; height: 100%; display: flex; align-items: flex-end; justify-content: center; }
-  .bar {
+  .col {
     position: relative;
+    flex: 1;
+    min-width: 3px;
+    height: 100%;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  /* The two bars for one day. `gap` is 1px rather than the 3px between days so
+     a pair still reads as a pair at 90-day ranges, where each column is only a
+     few pixels wide. */
+  .pair {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 1px;
     width: 100%;
     max-width: 42px;
+    height: 100%;
+  }
+  .bar {
+    flex: 1;
+    min-width: 0;
     border-radius: 3px 3px 0 0;
-    background: linear-gradient(to top, color-mix(in srgb, var(--primary) 55%, transparent), var(--primary));
     transition: filter 0.12s ease;
   }
+  .bar.active {
+    position: relative; /* positioning context for .tip */
+    background: linear-gradient(to top, color-mix(in srgb, var(--primary) 55%, transparent), var(--primary));
+  }
+  .bar.new {
+    background: linear-gradient(to top, color-mix(in srgb, var(--info) 55%, transparent), var(--info));
+  }
   .col:hover .bar { filter: brightness(1.18); }
-  .overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
   .tip {
     position: absolute;
     bottom: calc(100% + 6px);

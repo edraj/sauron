@@ -287,6 +287,27 @@ neither value can be confirmed from a running host's journal.
 | `MONITOR_CHECK_RETENTION_DAYS` | How long individual check rows are kept before the reaper deletes them. | `30` | monitor |
 | `MONITOR_SSRF_ALLOW_PRIVATE` | Allow probing private/loopback addresses. Enable only for internal self-monitoring — it is an SSRF guard. | `false` | monitor |
 
+### App store install metrics
+
+Daily install and uninstall counts pulled from Google Play and the Apple App
+Store by `sauron-storesync`, shown on Overview when the app's designated store
+environment is selected.
+
+Neither store offers a plain API for this. Google Play's numbers come from the
+Play Console's Cloud Storage reports bucket (monthly CSV per package, read with
+a service account); Apple's come from the App Store Connect **Analytics Reports**
+API, which must be *requested* once and then takes roughly 24–48 hours before it
+publishes anything — that wait shows in the dashboard as `pending`, not as an
+error. Both lag one to three days and are keyed to a package or bundle id, so
+the numbers are app-wide and have no environment dimension.
+
+| Variable | What it does | Default | Used by |
+| --- | --- | --- | --- |
+| `STORE_SYNC_INTERVAL_SECS` | How long after a sync a connection becomes due again. Reports are daily, so faster polling re-fetches identical numbers. | `21600` (6h) | storesync |
+| `STORE_SYNC_MAX_CONCURRENCY` | Store fetches in flight at once. Also sizes the daemon's connection pool (this + 4). | `8` | storesync |
+| `STORE_BACKFILL_DAYS` | How far back a connection's **first** sync reaches. Later syncs use a 7-day window, because both stores only restate recent days. | `90` | storesync |
+| `NOTIFY_SECRET_KEY` | Also encrypts store credentials at rest. One at-rest key for the deployment — `storesync` must hold the same value as `api`, and proves it with a decrypt self-test at boot rather than reporting every connection as broken hours later. | **required** | storesync |
+
 ### Alerting & notifications
 
 | Variable | What it does | Default | Used by |

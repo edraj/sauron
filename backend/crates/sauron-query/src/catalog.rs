@@ -146,6 +146,11 @@ const OPS_ORD: &[MatchOp] = &[
     MatchOp::Lte,
     MatchOp::Has,
 ];
+/// Exactly the three operators the pre-language `filter=workflow:<op>:<value>`
+/// wire format accepted (`eq`, `neq`, `contains`). `Ne` is listed for
+/// completeness even though the parser never emits it — `!workflow:x` arrives
+/// as `Eq` with `negate = true`.
+const OPS_WORKFLOW: &[MatchOp] = &[MatchOp::Eq, MatchOp::Ne, MatchOp::Contains];
 const NO_ALIAS: &[&str] = &[];
 
 const R_ISSUES: &[Resource] = &[Resource::Issues];
@@ -153,6 +158,11 @@ const R_OCC: &[Resource] = &[Resource::Occurrences];
 const R_ISSUE_OCC: &[Resource] = &[Resource::Issues, Resource::Occurrences];
 const R_EVENTS: &[Resource] = &[Resource::Events];
 const R_OCC_EVENTS: &[Resource] = &[Resource::Occurrences, Resource::Events];
+/// All three list resources S2c bridges onto the language. Only `workflow`
+/// uses it — the one field every one of the three pre-language registries
+/// (`ISSUE_FILTERS`/`ERROR_EVENT_FILTERS`/`EVENT_FILTERS`) accepts.
+const R_ISSUE_OCC_EVENTS: &[Resource] =
+    &[Resource::Issues, Resource::Occurrences, Resource::Events];
 const R_TX: &[Resource] = &[Resource::Transactions];
 const R_DEVICES: &[Resource] = &[Resource::Devices];
 const R_PERSONS: &[Resource] = &[Resource::Persons];
@@ -251,6 +261,83 @@ pub const CATALOG: &[Dimension] = &[
         ops: OPS_ORD,
         resources: R_ISSUES,
         index: IndexClass::Indexed,
+    },
+    // **Reading the three passages below: `resolve_field`'s "step 4" no longer
+    // exists.** Each widening of this dimension was argued for at the time as
+    // the alternative to a bare `workflow` being read as a TAG KEY, which is
+    // what an unrecognised field used to become. That fallback has since been
+    // removed, so the failure mode a missing entry would produce today is a
+    // loud 400 rather than a silent wrong answer. The entries stay exactly as
+    // they are: a 400 on every existing `filter=workflow:…` bookmark is still
+    // a regression, just an honest one. The history is kept because it records
+    // WHY each resource was added, which is not recoverable from the list.
+    //
+    // S2c Task 4: NOT a new capability — the pre-language wire format already
+    // had `filter=workflow:eq:X` on the issues list (`sauron_db::filter::
+    // ISSUE_FILTERS`), and `routes/issues.rs` is now bridged through
+    // `from_legacy`. Without an entry here, `resolve_field`'s step 4 would
+    // reinterpret the bare field `workflow` as a TAG KEY, and every existing
+    // `filter=workflow:…` bookmark would silently return the wrong rows —
+    // no error, just a different answer. That is precisely the failure the
+    // legacy bridge exists to prevent.
+    //
+    // `issues` carries no workflow column, so this lowers to a correlated
+    // EXISTS into `error_events` (see `IssuesLower`), same shape as `tag`.
+    // `Contains` is here because legacy `filter=workflow:contains:` existed;
+    // `In`/`Like`/`Has` never did, so they are deliberately absent rather than
+    // reusing `OPS_TEXT` — an op the old wire format never accepted has no
+    // bookmark to keep working, and `has:workflow` is better as a loud
+    // "unsupported op" than as a silent tag probe.
+    //
+    // **S2c Task 5 widened this to `R_ISSUE_OCC`**, for the same
+    // silent-wrong-answer reason it was added at all: the per-issue
+    // occurrences route (`/v1/apps/{id}/issues/{id}/events`) accepts
+    // `filter=workflow:<op>:<value>` through `sauron_db::filter::
+    // ERROR_EVENT_FILTERS`, and Task 5 bridges that route through
+    // `from_legacy` too. Left `R_ISSUES`-only, every such bookmark would hit
+    // `resolve_field`'s step-4 tag fallback and probe a TAG key named
+    // `workflow` instead — the same failure this entry exists to prevent, one
+    // level down the drill-down.
+    //
+    // One entry, two lowerings, and that is fine: `Store` names where the
+    // value lives *for the resource being lowered*, and each `ResourceLower`
+    // switches on it independently. `IssuesLower` maps
+    // `Store::Column("workflow")` to a correlated EXISTS (there is no such
+    // column on `issues`); `OccurrencesLower` maps it to the real
+    // `error_events.workflow_name` column. Splitting it into two dimensions
+    // with the same `name` would instead make `resolve_field`'s lookup
+    // order-dependent.
+    //
+    // **S2c Task 6 widened it again, to `R_ISSUE_OCC_EVENTS`**, for the third
+    // and last time and for the identical reason: the analytics Event Explorer
+    // (`/v1/apps/{id}/events/list`) accepts `filter=workflow:<op>:<value>`
+    // through `sauron_db::filter::EVENT_FILTERS`, and Task 6 bridges that route
+    // through `from_legacy` too. Left off, every such bookmark would hit
+    // `resolve_field`'s step-4 tag fallback and probe a TAG key named
+    // `workflow` on `analytics_events.tags` — a 200 with the wrong rows, which
+    // is worse than an error. `OPS_WORKFLOW` already matches what
+    // `EVENT_FILTERS` grants the field (`OPS_STR` = eq/neq/contains), so no op
+    // widening was needed with it.
+    //
+    // One entry, THREE lowerings now, and that is still fine: `Store` names
+    // where the value lives *for the resource being lowered*, and each
+    // `ResourceLower` switches on it independently. `IssuesLower` maps
+    // `Store::Column("workflow")` to a correlated EXISTS (there is no such
+    // column on `issues`); `OccurrencesLower` to `error_events.workflow_name`;
+    // `EventsLower` to `analytics_events.workflow_name` — the last of the three
+    // additionally carrying the `workflow_id IS NOT NULL` partial-index term on
+    // its positive arms, because that is what the code it replaces measured as
+    // worth 3,700x on the largest table in the system. Splitting this into
+    // three dimensions with the same `name` would instead make `resolve_field`'s
+    // lookup order-dependent.
+    Dimension {
+        name: "workflow",
+        aliases: NO_ALIAS,
+        ty: ValueType::Str,
+        store: Store::Column("workflow"),
+        ops: OPS_WORKFLOW,
+        resources: R_ISSUE_OCC_EVENTS,
+        index: IndexClass::Bounded,
     },
     // ---- issue-level rollups (S3: issue_dimensions) ----
     Dimension {
@@ -635,9 +722,15 @@ pub const CATALOG: &[Dimension] = &[
 /// Resources that carry a developer-supplied `tags` JSONB column.
 const TAGGABLE: &[Resource] = &[Resource::Issues, Resource::Occurrences, Resource::Events];
 
-/// The synthetic dimension every unrecognised field resolves to (spec §5, rule 3).
-/// Deliberately NOT a member of `CATALOG` — it must never appear in autocomplete
-/// or the generated docs table as a field literally named "tag".
+/// The synthetic dimension behind the `tag.<key>` prefix and the
+/// `tag:<key>=<value>` escape hatch.
+///
+/// Deliberately NOT a member of `CATALOG` — it must never appear in
+/// autocomplete or the generated docs table as a field literally named "tag".
+///
+/// It is reached only by those two EXPLICIT spellings. It used to also be where
+/// any unrecognised field landed (spec §5 rule 3), which made every typo a
+/// silent zero-row answer; `resolve_field` now rejects an unknown name instead.
 pub const TAG_DIM: Dimension = Dimension {
     name: "tag",
     aliases: NO_ALIAS,
@@ -648,9 +741,10 @@ pub const TAG_DIM: Dimension = Dimension {
     index: IndexClass::Indexed,
 };
 
-/// `Some` when this resource supports the unknown-field-means-tag fallback.
-/// Devices, Persons, Sessions and Transactions have no `tags` column, so an
-/// unrecognised field there is a genuine error rather than a tag lookup.
+/// `Some` when this resource carries a developer-supplied `tags` column, and so
+/// can answer a `tag.<key>` / `tag:<key>=<value>` predicate at all. Devices,
+/// Persons, Sessions and Transactions cannot, and are told so rather than being
+/// offered a tag spelling that would match nothing.
 pub fn tag_dimension(r: Resource) -> Option<&'static Dimension> {
     if TAG_DIM.resources.contains(&r) {
         Some(&TAG_DIM)
@@ -664,7 +758,8 @@ pub fn dimensions_for(r: Resource) -> impl Iterator<Item = &'static Dimension> {
 }
 
 /// Resolve a field name (canonical or alias) within a resource. Returns `None`
-/// for unknown names — the resolver then falls back to a tag lookup.
+/// for unknown names — the resolver then tries the explicit `tag.<key>` prefix
+/// and the JSON-path form, and rejects the name if neither applies.
 pub fn lookup(field: &str, r: Resource) -> Option<&'static Dimension> {
     dimensions_for(r).find(|d| d.name == field || d.aliases.contains(&field))
 }

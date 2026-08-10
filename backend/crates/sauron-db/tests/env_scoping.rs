@@ -2673,6 +2673,7 @@ async fn list_devices_covers_only_the_selected_environment() {
         50,
         0,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -2704,6 +2705,7 @@ async fn list_devices_covers_only_the_selected_environment() {
         far_past(),
         50,
         0,
+        None,
         None,
     )
     .await
@@ -2745,6 +2747,7 @@ async fn list_devices_covers_only_the_selected_environment() {
         50,
         0,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -2756,6 +2759,7 @@ async fn list_devices_covers_only_the_selected_environment() {
         far_past(),
         50,
         0,
+        None,
         None,
     )
     .await
@@ -3142,6 +3146,7 @@ async fn person_and_device_seen_and_identity_are_derived_per_environment() {
         far_past(),
         50,
         0,
+        None,
         None,
     )
     .await
@@ -5377,9 +5382,36 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     sauron_db::repo::list_persons(&mut conn, scope.clone(), None, 50, 0)
         .await
         .expect("list_persons under Subset");
-    sauron_db::repo::list_devices(&mut conn, scope.clone(), since, 50, 0, None)
+    sauron_db::repo::list_devices(&mut conn, scope.clone(), since, 50, 0, None, None)
         .await
         .expect("list_devices under Subset");
+    // The bind-index hazard, exercised for real: under `Subset`,
+    // `scope.env.consumes_bind()` is `true`, so `env_sql` binds `$6` and the
+    // four group predicates must start at `$7`. `device_groups.rs`'s
+    // `Some(key)` tests only ever run under `ReadScope::all` (`consumes_bind()
+    // == false`, group binds start at `$6`) — this is the only place the
+    // `$7` branch of `group_base` gets a real Postgres round trip. A wrong
+    // base here raises "bind message supplies N parameters, but prepared
+    // statement requires M" at runtime, not a compile error.
+    sauron_db::repo::list_devices(
+        &mut conn,
+        scope.clone(),
+        since,
+        50,
+        0,
+        None,
+        Some(sauron_db::repo::DeviceGroupKey {
+            family: Some("iPhone"),
+            model: None,
+            os_name: Some("iOS"),
+            os_version: None,
+        }),
+    )
+    .await
+    .expect("list_devices with a group filter under Subset");
+    sauron_db::repo::list_device_groups(&mut conn, scope.clone(), since, 50, 0, None)
+        .await
+        .expect("list_device_groups under Subset");
     sauron_db::repo::list_sessions(&mut conn, scope.clone(), since, 50, 0, None, None)
         .await
         .expect("list_sessions under Subset");
@@ -5401,6 +5433,98 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     sauron_db::repo::journey_graph(&mut conn, scope.clone(), since, 20)
         .await
         .expect("journey_graph under Subset");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// The two `list_devices` group-filter × bind-consuming-variant cells the
+/// Subset test above does not reach: `One` and `Unattributed`.
+///
+/// `group_base`'s two arms are `if scope.env.consumes_bind() { 7 } else { 6
+/// }`. `consumes_bind()` groups `One`/`Subset` together and `All`/
+/// `Unattributed` together, so it is tempting to conclude that testing one
+/// representative of each pair (as the Subset test above does for the `true`
+/// arm, and `device_groups.rs`'s `Some(key)` tests do for the `false` arm
+/// under `All`) proves both members of each pair. That holds for
+/// `group_base` itself, but NOT for the SQL text the group predicate is
+/// spliced into:
+///
+/// - `device_membership_sql` (repo.rs) returns `""` — skips the membership
+///   `EXISTS` entirely — **only** for `All`. `Unattributed` builds the full
+///   three-leg `EXISTS` block, at `bind_index = 6`, same as the group binds.
+/// - The `scoped_select`/`scoped_join` split (repo.rs) keys on
+///   `matches!(scope.env, EnvFilter::All)`. `Unattributed` takes the *other*
+///   branch — the one with both count LATERALs and
+///   `device_last_distinct_id_join`, all built at `bind_index = 6`.
+///
+/// So `All × Some(key)` (the only `false`-arm case under test elsewhere)
+/// never executes any of that SQL — under `All` none of it is emitted. The
+/// composition of the group binds (`$6..$9`) alongside `Unattributed`'s full
+/// membership/LATERAL text is safe today only because every `Unattributed`
+/// fragment (`EnvFilter::sql_fragment_for`) is a literal ` AND alias.
+/// environment_id IS NULL` that consumes no bind of its own — but nothing
+/// enforces that invariant at compile time, and no test before this one
+/// exercised it against real Postgres with a group filter active.
+///
+/// `One` gets its own coverage for a different reason: it shares
+/// `consumes_bind() == true` with `Subset`, but binds a scalar `Uuid` (`$1
+/// AND environment_id = $6`) where `Subset` binds an array (`= ANY($6)`) —
+/// a different bind type at the same position. `bins/sauron-api/src/routes/
+/// scope.rs:88` maps a request's `environment_id=<uuid>` query param to
+/// `One` and `environment_id=none`/absent-with-no-app-wide-grant to
+/// `Unattributed`, so once Task 3 exposes the drill-down over HTTP both
+/// become live, caller-reachable paths carrying `Some(key)`.
+#[tokio::test]
+async fn list_devices_group_filter_binds_correctly_under_one_and_unattributed() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    let since = ids.pinned_now - Duration::days(30);
+
+    // `One`: consumes_bind() == true, so group_base must be 7 — same value
+    // Subset needed, reached via a different bind type (scalar Uuid, not an
+    // array). A `None` field (`model`) exercises `IS NOT DISTINCT FROM`
+    // under a variant that also reserves a bind of its own.
+    sauron_db::repo::list_devices(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        since,
+        50,
+        0,
+        None,
+        Some(sauron_db::repo::DeviceGroupKey {
+            family: Some("iPhone"),
+            model: None,
+            os_name: Some("iOS"),
+            os_version: None,
+        }),
+    )
+    .await
+    .expect("list_devices with a group filter under One");
+
+    // `Unattributed`: consumes_bind() == false, so group_base is 6, same as
+    // `All` — but unlike `All`, `Unattributed` still emits the full
+    // membership EXISTS block and both count/last-distinct-id LATERALs, all
+    // built at bind_index = 6. `DeviceGroupKey::default()` (every field
+    // `None`) both exercises `IS NOT DISTINCT FROM` on all four columns and
+    // matches this crate's other all-NULL-group coverage
+    // (`device_groups.rs::group_filter_matches_the_all_null_group`, under
+    // `All` rather than `Unattributed`).
+    sauron_db::repo::list_devices(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::Unattributed),
+        since,
+        50,
+        0,
+        None,
+        Some(sauron_db::repo::DeviceGroupKey::default()),
+    )
+    .await
+    .expect("list_devices with a group filter under Unattributed");
 
     drop(conn);
     db.cleanup().await;

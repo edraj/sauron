@@ -42,7 +42,18 @@
 //! reference `self.app_id`/`self.issue_id` directly (no user predicate
 //! targets them), matching `IssuesLower`'s shape: the fields exist so callers
 //! construct one `OccurrencesLower` per request and so the base-scope filter
-//! — applied once by the caller, alongside `since` — has a `Uuid` to bind.
+//! — applied once by the caller, alongside `since` and the environment — has
+//! a `Uuid` to bind.
+//!
+//! `text_reach` is NOT decoration (S2c Task 5, this lowerer's first caller).
+//! Every leaf here applies to the already-scoped row, so unlike `IssuesLower`
+//! nothing needs an environment bind — but the free-text payload scan over
+//! `contexts`/`extra`/`tags` is exactly the oracle `TextSearchReach` closes,
+//! and the route this lowerer now backs (`/v1/apps/{id}/issues/{id}/events`)
+//! authorizes on `issue:read` ALONE. Emitting the payload half unconditionally
+//! would have answered "does this occurrence's `extra` contain …" for a caller
+//! whose response arrives with `extra` nulled — a regression of D4, reintroduced
+//! by the act of moving the route onto the planner. See `repo::TextSearchReach`.
 
 use diesel::dsl::sql;
 use diesel::prelude::*;
@@ -54,7 +65,7 @@ use sauron_query::{MatchOp, ResolvedPredicate, Store, TypedValue};
 use crate::query_plan::{
     json_path_segments, nest_json_object, Frag, PlanError, PrepCtx, ResourceLower,
 };
-use crate::repo::like_contains;
+use crate::repo::{like_contains, TextSearchReach};
 use crate::schema::error_events;
 
 // ===========================================================================
@@ -682,6 +693,10 @@ fn tag_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<error_events::ta
 pub struct OccurrencesLower {
     pub app_id: Uuid,
     pub issue_id: Uuid,
+    /// Whether a free-text term may reach `contexts`/`extra`/`tags` — the
+    /// three columns `symbolicate::strip_event_body` nulls for a caller
+    /// holding `issue:read` without `event:read`. See the module docs.
+    pub text_reach: TextSearchReach,
 }
 
 impl ResourceLower for OccurrencesLower {
@@ -751,6 +766,18 @@ impl ResourceLower for OccurrencesLower {
                 str_leaf!(error_events::symbolication_status, p, negate)
             }
             Store::Column("message") => str_leaf!(error_events::message, p, negate),
+            // `Store::Column("workflow")` names where the value lives *for the
+            // resource being lowered*: on Issues it is a correlated EXISTS
+            // (there is no such column on `issues`), here it is the real
+            // `workflow_name` column, so an ordinary `str_leaf!` serves it.
+            //
+            // `str_leaf!`'s negated `Eq` emits `<> $1 OR IS NULL`, which is
+            // exactly the semantics `error_events_for_issue_query`'s
+            // `("workflow", Op::Neq)` arm went out of its way to hand-write —
+            // a bare `<>` would drop every unstamped row and make one chip mean
+            // two opposite things at two levels of the same drill-down. Read
+            // that arm's comment before "simplifying" either side.
+            Store::Column("workflow") => str_leaf!(error_events::workflow_name, p, negate),
             Store::Column(other) => Err(PlanError::UnsupportedOnResource {
                 field: other.to_string(),
             }),
@@ -759,12 +786,13 @@ impl ResourceLower for OccurrencesLower {
 
     fn text(&self, term: &str) -> Frag<error_events::table> {
         // Reproduces the pre-planner behaviour exactly
-        // (`repo::list_error_events_for_issue`'s `q` handling): message and
-        // the two exception fields by ILIKE, plus a payload scan over
-        // contexts/extra/tags. Neither `message` nor `exception_type`/
-        // `exception_value` require `app_id`/`issue_id` re-assertion here —
-        // unlike `IssuesLower`'s correlated subquery, this predicate applies
-        // directly to the row already scoped by the caller's base filter.
+        // (`repo::error_events_for_issue_query`'s `q` handling): message and
+        // the two exception fields by ILIKE, plus — for a caller whose reach
+        // includes the body — a payload scan over contexts/extra/tags. Neither
+        // `message` nor `exception_type`/`exception_value` require
+        // `app_id`/`issue_id` re-assertion here — unlike `IssuesLower`'s
+        // correlated subquery, this predicate applies directly to the row
+        // already scoped by the caller's base filter.
         let pattern = like_contains(term);
         let message: Frag<error_events::table> =
             Box::new(error_events::message.ilike(pattern.clone()).nullable());
@@ -778,6 +806,17 @@ impl ResourceLower for OccurrencesLower {
                 .ilike(pattern.clone())
                 .nullable(),
         );
+        let shell: Frag<error_events::table> =
+            Box::new(message.or(exception_type).or(exception_value));
+        // The withheld half. `message`/`exception_type`/`exception_value` above
+        // are exactly the text columns `strip_event_body` KEEPS, so every row
+        // the shell matched can be read back; `contexts`/`extra`/`tags` are
+        // three it NULLS, and matching them for a caller who will receive them
+        // as `null` answers a question the response is forbidden to. Same
+        // branch, same reasoning, as `IssuesLower::text`.
+        if !self.text_reach.includes_body() {
+            return shell;
+        }
         let payload: Frag<error_events::table> = Box::new(
             sql::<Nullable<Bool>>(r#""error_events"."contexts"::text ILIKE "#)
                 .bind::<Text, _>(pattern.clone())
@@ -786,7 +825,7 @@ impl ResourceLower for OccurrencesLower {
                 .sql(r#" OR "error_events"."tags"::text ILIKE "#)
                 .bind::<Text, _>(pattern),
         );
-        Box::new(message.or(exception_type).or(exception_value).or(payload))
+        Box::new(shell.or(payload))
     }
 }
 
@@ -811,12 +850,30 @@ mod tests {
         q: &str,
         ctx: &PrepCtx,
     ) -> Result<Frag<error_events::table>, PlanError> {
+        lower_occ_result_reach(q, ctx, TextSearchReach::IncludingBody)
+    }
+
+    /// `IncludingBody` is the default everywhere above because it is the
+    /// wider predicate — a test that asserted a column IS matched would pass
+    /// vacuously under `ShellOnly`. The narrowing itself gets its own tests.
+    fn lower_occ_result_reach(
+        q: &str,
+        ctx: &PrepCtx,
+        text_reach: TextSearchReach,
+    ) -> Result<Frag<error_events::table>, PlanError> {
         let node = resolve(&parse(q).unwrap(), Resource::Occurrences).unwrap();
         let l = OccurrencesLower {
             app_id: Uuid::nil(),
             issue_id: Uuid::nil(),
+            text_reach,
         };
         lower(&node, &l, ctx)
+    }
+
+    fn lower_occ_sql_reach(q: &str, text_reach: TextSearchReach) -> String {
+        let frag = lower_occ_result_reach(q, &ctx(), text_reach).unwrap();
+        let query = error_events::table.into_boxed().filter(frag);
+        debug_query::<Pg, _>(&query).to_string()
     }
 
     fn lower_occ_result(q: &str) -> Result<Frag<error_events::table>, PlanError> {
@@ -969,14 +1026,14 @@ mod tests {
 
     #[test]
     fn tag_predicate_is_a_direct_column_containment_not_an_exists() {
-        let sql = lower_occ_sql("checkout_step:payment");
+        let sql = lower_occ_sql("tag.checkout_step:payment");
         assert!(sql.contains(r#""error_events"."tags" @>"#), "{sql}");
         assert!(!sql.contains("EXISTS"), "{sql}");
     }
 
     #[test]
     fn tag_never_leaks_the_key_or_value_into_sql_text() {
-        let sql = lower_occ_sql("checkout_step:payment");
+        let sql = lower_occ_sql("tag.checkout_step:payment");
         let query_text = sql.split("-- binds:").next().unwrap();
         assert!(!query_text.contains("checkout_step"), "{query_text}");
         assert!(!query_text.contains("payment"), "{query_text}");
@@ -984,13 +1041,13 @@ mod tests {
 
     #[test]
     fn tag_has_uses_the_question_operator() {
-        let sql = lower_occ_sql("has:checkout_step");
+        let sql = lower_occ_sql("has:tag.checkout_step");
         assert!(sql.contains(r#""error_events"."tags" ?"#), "{sql}");
     }
 
     #[test]
     fn tag_like_uses_the_arrow_operator_and_ilike() {
-        let sql = lower_occ_sql("checkout_step:~payment");
+        let sql = lower_occ_sql("tag.checkout_step:~payment");
         assert!(sql.contains(r#""error_events"."tags" ->>"#), "{sql}");
         assert!(sql.contains("ILIKE"), "{sql}");
     }
@@ -1097,6 +1154,94 @@ mod tests {
             sql.contains(r#""error_events"."tags"::text ILIKE"#),
             "{sql}"
         );
+    }
+
+    /// The D4 invariant, restated for this lowerer: what you may SEARCH is
+    /// exactly what you may READ BACK. Under `ShellOnly` the three columns
+    /// `strip_event_body` nulls must be absent from the predicate entirely —
+    /// not merely unlikely to match.
+    #[test]
+    fn free_text_omits_the_payload_scan_without_event_read() {
+        let sql = lower_occ_sql_reach("boom", TextSearchReach::ShellOnly);
+        // The readable half survives — the search is narrowed, never refused.
+        assert!(
+            sql.contains(r#""error_events"."message" ILIKE $1"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#""error_events"."exception_type" ILIKE $2"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#""error_events"."exception_value" ILIKE $3"#),
+            "{sql}"
+        );
+        for withheld in ["contexts", "extra", "tags"] {
+            assert!(
+                !sql.contains(&format!(r#""error_events"."{withheld}"::text"#)),
+                "`{withheld}` is nulled by strip_event_body for this caller and must not be \
+                 searchable: {sql}"
+            );
+        }
+    }
+
+    // -- workflow: a real column here, an EXISTS on Issues -------------------
+
+    #[test]
+    fn workflow_is_the_real_column_not_an_exists() {
+        let sql = lower_occ_sql("workflow:checkout");
+        assert!(
+            sql.contains(r#""error_events"."workflow_name" = $1"#),
+            "{sql}"
+        );
+        assert!(!sql.contains("EXISTS"), "{sql}");
+    }
+
+    /// The semantics `error_events_for_issue_query`'s hand-written
+    /// `("workflow", Op::Neq)` arm exists for: a bare `<>` drops every
+    /// unstamped row, so the same chip would mean two opposite things on the
+    /// issues list and on that issue's occurrences.
+    #[test]
+    fn negated_workflow_keeps_unstamped_occurrences() {
+        let sql = lower_occ_sql("!workflow:checkout");
+        assert!(
+            sql.contains(r#""error_events"."workflow_name" IS NULL"#),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn workflow_contains_uses_ilike() {
+        let sql = lower_occ_sql("workflow:~check");
+        assert!(
+            sql.contains(r#""error_events"."workflow_name" ILIKE $1"#),
+            "{sql}"
+        );
+    }
+
+    /// The whole reason the catalog entry was widened to Occurrences: without
+    /// it, `resolve_field`'s step-4 fallback reads the bare field `workflow`
+    /// as a TAG KEY, and every `filter=workflow:…` bookmark on this route
+    /// silently probes `error_events.tags` instead. No error — a different
+    /// answer, which is worse.
+    #[test]
+    fn workflow_is_not_reinterpreted_as_a_tag_key() {
+        let sql = lower_occ_sql("workflow:checkout");
+        // The three TAG OPERATORS, not the bare column name: `tags` is in the
+        // SELECT list of every query over this table, so `contains("tags")`
+        // alone is true no matter what the predicate does — an assertion that
+        // could never fail. (It didn't: this test failed on its first run and
+        // that is how the flaw was found.)
+        for tag_op in [
+            r#""error_events"."tags" @>"#,
+            r#""error_events"."tags" ?"#,
+            r#""error_events"."tags" ->>"#,
+        ] {
+            assert!(
+                !sql.contains(tag_op),
+                "workflow must not fall through to the tag store ({tag_op}): {sql}"
+            );
+        }
     }
 
     // -- Composition sanity ---------------------------------------------------

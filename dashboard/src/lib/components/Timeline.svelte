@@ -1,11 +1,13 @@
 <script lang="ts">
-  import type { TimelineItem } from '../models';
+  import type { ErrorEvent, TimelineItem } from '../models';
   import { formatTime, formatMs, latencyTone } from '../utils/format';
   import LatencyBadge from './LatencyBadge.svelte';
   import LevelBadge from './LevelBadge.svelte';
   import Badge from './ui/Badge.svelte';
   import Icon, { type IconName } from './ui/Icon.svelte';
   import JsonTree from './JsonTree.svelte';
+  import StacktraceView from './StacktraceView.svelte';
+  import SymbolicationBadge from './SymbolicationBadge.svelte';
 
   interface Props {
     items: TimelineItem[];
@@ -60,6 +62,15 @@
     }
   }
 
+  /**
+   * The JSON half of an expanded row.
+   *
+   * An error's `stacktrace` is deliberately absent: frames render through
+   * `StacktraceView` above this tree — symbolicated, collapsible, with source
+   * context — and repeating them here as raw JSON would show every frame
+   * twice, the second time in the minified form the symbolication exists to
+   * replace.
+   */
   function payload(item: TimelineItem): unknown {
     switch (item.kind) {
       case 'event':
@@ -67,13 +78,26 @@
       case 'error':
         return {
           exception: { type: item.error.exception_type, value: item.error.exception_value },
-          stacktrace: item.error.stacktrace,
           context: item.error.context,
           tags: item.error.tags,
         };
       case 'transaction':
         return item.transaction;
     }
+  }
+
+  /**
+   * Whether an error carries anything a `StacktraceView` could render. A
+   * message-only error (a `captureMessage`, or a crash whose SDK sent no
+   * frames) has none of the three, and gets no Stacktrace heading rather than
+   * a heading over the words "No stacktrace on this event."
+   */
+  function hasStack(e: ErrorEvent): boolean {
+    return (
+      (e.stacktrace?.length ?? 0) > 0 ||
+      (e.stacktrace_symbolicated?.length ?? 0) > 0 ||
+      e.debug_meta?.raw_stacktrace != null
+    );
   }
 
   function screenOf(item: TimelineItem): string | null {
@@ -124,6 +148,22 @@
                 </a>
               {/if}
             </div>
+            {#if item.kind === 'error' && hasStack(item.error)}
+              <div class="tl-stack">
+                <div class="tl-stack-head">
+                  <span class="section-label">Stacktrace</span>
+                  <SymbolicationBadge
+                    status={item.error.symbolication_status}
+                    isDart={item.error.debug_meta?.raw_stacktrace != null}
+                  />
+                </div>
+                <StacktraceView
+                  frames={item.error.stacktrace ?? []}
+                  symbolicated={item.error.stacktrace_symbolicated}
+                  rawTrace={item.error.debug_meta?.raw_stacktrace}
+                />
+              </div>
+            {/if}
             <JsonTree value={payload(item)} expandTo={2} />
           </div>
         {/if}
@@ -273,6 +313,16 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     overflow-x: auto;
+  }
+  /* `tl-`prefixed because `.stack` is a global utility in app.css. */
+  .tl-stack {
+    margin-bottom: 12px;
+  }
+  .tl-stack-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
   }
   .detail-links {
     display: flex;

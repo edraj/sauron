@@ -22,10 +22,31 @@ pub struct ListQuery {
     #[serde(default)]
     pub filter: Vec<String>,
     pub q: Option<String>,
+    /// The query language. Wins over `filter`/`q` when non-empty.
+    pub query: Option<String>,
+    /// `column` or `-column`. Restricted to keyset-backed orderings — see
+    /// `search::parse_sort`.
+    pub sort: Option<String>,
+    /// Opaque token from the previous page's `next_cursor`.
+    pub cursor: Option<String>,
     #[serde(default = "default_since_days")]
     pub since_days: i64,
     #[serde(default = "default_limit")]
     pub limit: i64,
+    /// Accepted and IGNORED since S2c. Keyset paging replaced it: `offset`
+    /// cannot page a list stably (a row inserted mid-walk shifts every later
+    /// page onto rows an earlier one already returned), which is the defect
+    /// this slice exists to remove. Kept as a field rather than dropped so an
+    /// existing bookmark carrying `?offset=50` still returns the first page
+    /// instead of a `400` from an unknown parameter — the rows it gets are
+    /// *different* from before, but they are correct rows, and the alternative
+    /// is breaking every saved URL. Follow `next_cursor` instead.
+    ///
+    /// The `allow` is what "accepted and ignored" looks like to rustc: the
+    /// field exists to be *deserialized into* — its whole job is absorbing a
+    /// parameter that must not become a 400 — and nothing reads it back.
+    /// Scoped to this one field, never to the struct or the module.
+    #[allow(dead_code)]
     #[serde(default)]
     pub offset: i64,
     // `environment_id` is deliberately NOT a field here — it is read from the
@@ -40,79 +61,54 @@ pub struct ListQuery {
 fn default_limit() -> i64 {
     50
 }
+
+/// The furthest back either list on this resource will look.
+///
+/// The default `since_days` below is deliberately this same number, and must
+/// stay so: a default that exceeds the ceiling is silently narrowed on every
+/// unparameterised request, which is precisely the defect that made
+/// `analytics::events_list` serve 365 days while its default claimed 3650.
+pub(super) const ISSUES_MAX_SINCE_DAYS: i64 = 3650;
+
 fn default_since_days() -> i64 {
-    3650
+    ISSUES_MAX_SINCE_DAYS
 } // effectively "all" unless narrowed
 
-/// Refuse the filters that are predicates over a WITHHELD column.
-///
-/// `tag` and `workflow`. `tag` is the free-text `?q=` bypass wearing a
-/// different hat. `symbolicate::strip_event_body` nulls `tags` for a caller
-/// holding `issue:read` without `event:read`; `filter=tag:eq:k=v` then asks the
-/// database whether an occurrence carries that exact tag, and
-/// `filter=tag:contains:k=v` gives a per-key ILIKE — a *sharper* oracle than
-/// `?q=`, which can only probe the whole `contexts||extra||tags` blob. Both are
-/// reachable on `issues::list`, `issues::events` and `issues::event_stats`, all
-/// three of which authorize on `issue:read` alone.
-///
-/// **Refused, not silently dropped.** Dropping the predicate is what
-/// [`sauron_db::repo::TextSearchReach`] does to the `q` payload scan, and that
-/// is right there: a free-text term is a request to find rows, so matching
-/// fewer columns still answers it honestly. A `tag` filter is the opposite — an
-/// explicit narrowing — and ignoring it returns MORE rows than were asked for,
-/// every one of them presented under a chip claiming they match it. A page that
-/// shows non-matching rows beside an active filter is not a smaller answer, it
-/// is a wrong one. 403 with the reason is the only non-lying option.
-///
-/// `workflow` is the second entry, and the reasoning that first left it out was
-/// wrong in an instructive way. It argued from `strip_event_body`: `workflow_name`
-/// is not in the withheld set, indeed not part of `ErrorEvent`'s wire shape at
-/// all, therefore not a leak. But "absent from the event body" is not the same as
-/// "public". The endpoints that exist to serve workflow names —
-/// `/v1/apps/{id}/workflows` and its `detail`/`runs` siblings — all authorize on
-/// `event:read`. So a caller holding `issue:read` alone is not entitled to learn
-/// workflow names through *any* route, and `filter=workflow:contains:` handed
-/// them an ILIKE to enumerate them one prefix at a time. The correct test is
-/// "which permission governs this column", not "does this column appear in the
-/// body I already strip".
-///
-/// Every remaining whitelisted field is genuinely shell:
-/// `level`/`status`/`type`/`culprit`/`times_seen`/`users_seen` are issue-level,
-/// which is precisely what `issue:read` is the gate for. Keep this in lockstep
-/// with `symbolicate::strip_event_body` *and* with the permission on whatever
-/// endpoint owns each filterable column.
-fn reject_body_filters(
-    filters: &[sauron_db::filter::ParsedFilter],
-    reach: sauron_db::repo::TextSearchReach,
-) -> Result<(), ApiError> {
-    if reach.includes_body() {
-        return Ok(());
-    }
-    if filters.iter().any(|f| f.field == "tag") {
-        return Err(ApiError::Forbidden(
-            "filtering by tag requires event:read: an event's tags are withheld from a caller \
-             holding only issue:read, and a filter over them would disclose their contents"
-                .into(),
-        ));
-    }
-    if filters.iter().any(|f| f.field == "workflow") {
-        return Err(ApiError::Forbidden(
-            "filtering by workflow requires event:read: workflow names are served only by the \
-             workflows endpoints, which require that permission, so a filter over them would \
-             disclose names this caller cannot otherwise read"
-                .into(),
-        ));
-    }
-    Ok(())
-}
+// `reject_body_filters` lived here until S2c Task 6 and is now gone, not
+// moved: it asked "does this raw `filter=` string name a withheld column",
+// and all three routes that used to call it ([`list`], [`events`],
+// [`event_stats`]) are bridged onto the query language, where the same
+// question is asked of the RESOLVED AST by
+// [`super::search::reject_withheld_dimensions`]. The AST form is strictly
+// stronger — it sees `filter=tag:eq:k=v` and its `query=k:v` spelling as the
+// one predicate they lower to, so it cannot be bypassed by rewriting the URL,
+// and it reaches the `Store::JsonRoot` dimensions no `filter=` string could
+// name. Its reasoning (why `tag` and `workflow` are withheld from a bare
+// `issue:read` caller, and why a withheld predicate is REFUSED rather than
+// silently dropped) is preserved in full on that function. Do not reintroduce
+// a string-level check beside it.
 
+/// The searched issues list.
+///
+/// **Answers a [`SearchEnvelope`](super::search::SearchEnvelope), not a bare
+/// array, since S2c.** The array had nowhere to put `total`, `next_cursor` or
+/// the planner's `clamped` notice, and a header is invisible to a
+/// cross-origin dashboard unless it is in `main.rs`' `expose_headers` — which
+/// is the definition of silent. `dashboard/src/lib/api/issues.ts` moves with
+/// it in Task 7.
+///
+/// Three input spellings, one execution path: `query=` (the language),
+/// `filter=`+`q=` (the pre-language wire format, bridged through
+/// `from_legacy`), or nothing. That is what makes an old bookmark and its
+/// `query=` rewrite provably select the same rows — there is no second
+/// planner for them to disagree in.
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<ListQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<Vec<Issue>>, ApiError> {
+) -> Result<Json<super::search::SearchEnvelope<Issue>>, ApiError> {
     let mut conn = db(&state).await?;
     // `_with_perms` rather than the plain `authorized_read_scope`: `issue:read`
     // authorizes the list, and the caller's `event:read` at that same resolved
@@ -126,52 +122,196 @@ pub async fn list(
         raw_query.as_deref(),
     )
     .await?;
-    let filters = sauron_db::filter::parse_filters(&q.filter, sauron_db::filter::ISSUE_FILTERS)?;
-    let search = q.q.as_deref().filter(|s| !s.is_empty());
     // A search predicate is a read: without `event:read` the free-text term is
     // matched against `title`/`type`/`culprit` only, never the
     // `contexts`/`extra`/`tags` payload scan whose contents this caller's event
-    // bodies would arrive with nulled. See `symbolicate::text_search_reach`.
+    // bodies would arrive with nulled. The reach now travels INTO the lowerer
+    // (`IssuesLower.text_reach`) rather than being a separate repo argument —
+    // see `symbolicate::text_search_reach` and `TextSearchReach`.
     //
-    // **This response carries no "your search was narrowed" field, and that is a
-    // decision, not an omission.** It cannot: the route answers a bare JSON
-    // array (`Vec<Issue>`), so there is no envelope to put one in, and adding
-    // one would break every existing client (`dashboard/src/lib/api/issues.ts`'
-    // `listIssues` parses `Issue[]` directly). A response header is no better —
-    // in both shipped topologies the dashboard is cross-origin, so a header not
-    // in `main.rs`' `expose_headers` is invisible to the browser, which is the
-    // definition of silent.
+    // **This response still carries no "your search was narrowed" field, even
+    // though it is now an envelope with room for one, and that is a decision.**
+    // The narrowing carries NO information the caller does not already hold: it
+    // is a pure function of their own permission set at the resolved scope — no
+    // data dependence, no per-request component — so "was my search narrowed?"
+    // is answerable as `!can('event:read', …)` from grants the dashboard has
+    // already fetched (`sessionStore.access`, see
+    // `dashboard/src/lib/stores/session.svelte.ts`), and answerable BEFORE the
+    // search runs rather than after a fruitless one. A flag would restate it.
+    // Contrast `clamped` below, which depends on the *query* and genuinely
+    // cannot be derived client-side — that one gets a field.
     //
-    // What makes that acceptable is that the narrowing carries NO information
-    // the caller does not already hold. It is a pure function of the caller's
-    // own permission set at the resolved scope — no data dependence, no
-    // per-request component — so "was my search narrowed?" is answerable as
-    // `!can('event:read', …)` from grants the dashboard has already fetched
-    // (`sessionStore.access`, see `dashboard/src/lib/stores/session.svelte.ts`),
-    // and answerable BEFORE the search runs rather than after a fruitless one.
-    // A flag would restate it. Contrast a truncation or tier-miss flag, which
-    // depends on the data and genuinely cannot be derived — those get fields.
-    //
-    // The sibling `event_stats` route DOES carry `payload_searched`, because its
-    // response is an object with room for it. Do not read this route's silence
-    // as "not narrowed"; derive it from permissions.
+    // The sibling `event_stats` route DOES carry `payload_searched`. Do not
+    // read this route's silence as "not narrowed"; derive it from permissions.
     let reach = crate::symbolicate::text_search_reach(&perms);
-    reject_body_filters(&filters, reach)?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 3650));
+
+    let node = super::search::resolve_query(
+        q.query.as_deref(),
+        &q.filter,
+        q.q.as_deref().filter(|s| !s.is_empty()),
+        sauron_query::Resource::Issues,
+    )?;
+    // Must run on the resolved AST, not on the raw `filter=` strings: the
+    // `query=` spelling of a tag or workflow probe produces the identical
+    // predicate, so a string-level check would be bypassed by rewriting the
+    // URL. See `search::reject_withheld_dimensions`.
+    //
+    // The `env:read` axis is a no-op on THIS route — `R_ISSUES`' `environment`
+    // is `Store::Rollup`, which `prepare` rejects as `NotYetSupported` before
+    // it could resolve a name — and is passed anyway so the two handlers stay
+    // one shape, and so the day Issues gains a real environment column it is
+    // already gated.
+    super::search::reject_withheld_dimensions(
+        &node,
+        reach,
+        super::search::EnvNameReach::for_perms(&perms),
+    )?;
+
+    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
+        .await
+        .map_err(super::search::map_plan_error)?;
+    let (sort_col, descending) =
+        super::search::parse_sort(q.sort.as_deref(), &["last_seen", "first_seen"], "last_seen")?;
+    // `parse_sort` already refused anything outside the whitelist, so this
+    // cannot be `None` — but the two lists are in different modules and an
+    // `expect` here would be a panic when they drift. A 400 naming the column
+    // is the same answer `parse_sort` would have given.
+    let sort = repo::IssueSort::from_column(&sort_col).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "cannot sort by `{sort_col}`; no keyset index backs it"
+        ))
+    })?;
+    let after = match q.cursor.as_deref() {
+        Some(c) => Some(
+            // Literal `true`, not a call through `IssueSort` — there is no
+            // `IssueSort::is_temporal` to call. Unlike `EventSort`/
+            // `OccurrenceSort` (see Task 2's doc comment on those), Issues
+            // sorting has not been widened past `last_seen`/`first_seen`,
+            // both of which `cursor_ts` below always wraps in
+            // `CursorValue::Ts`, so every cursor this route mints or reads is
+            // temporal, unconditionally.
+            sauron_db::query_plan::cursor::decode(c, &sort_col, true)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    // `Clamp.field` is the GENERIC name "since" — `prepare` does not know
+    // which resource it ran for, so mapping the window onto this resource's
+    // real column is the caller's job. On Issues that column is `last_seen`.
+    // `resolve_window` owns the tightening rule and, crucially, the matching
+    // disclosure: the window reported in `clamped` is the window served.
+    let window = super::search::resolve_window(
+        "last_seen",
+        Utc::now(),
+        q.since_days,
+        ISSUES_MAX_SINCE_DAYS,
+        prepared.clamp,
+    );
+    let since = window.since;
     let limit = q.limit.clamp(1, 200);
-    Ok(Json(
-        repo::list_issues_with_reach(
-            &mut conn,
-            scope,
-            &filters,
-            search,
-            reach,
-            since,
-            limit,
-            super::clamp_offset(q.offset),
-        )
-        .await?,
-    ))
+
+    let search = repo::IssueSearch {
+        node: &node,
+        ctx: &prepared.ctx,
+        since,
+        sort,
+        descending,
+        after,
+        limit,
+        text_reach: reach,
+    };
+    let mut rows = repo::search_issues(&mut conn, &scope, &search)
+        .await
+        .map_err(super::search::map_plan_error)?;
+    let (total, total_is_capped) =
+        repo::count_issues(&mut conn, &scope, &search, super::search::COUNT_CAP)
+            .await
+            .map_err(super::search::map_plan_error)?;
+
+    // `limit + 1` rows were fetched; the surplus one is the has-more probe and
+    // must not be served.
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    // The cursor's timestamp is read through `sort`, not off `last_seen`
+    // directly: a cursor carrying `last_seen` while the walk orders by
+    // `first_seen` would skip and repeat whole pages.
+    //
+    // `IssueSort` carries no `cursor_value` (unlike `EventSort`/
+    // `OccurrenceSort` — see Task 2's doc comment on those): Issues sorting is
+    // deliberately not widened past `last_seen`/`first_seen` here, so there is
+    // no nullable-column coalescing rule to centralise yet. `cursor_ts` is
+    // wrapped in `CursorValue::Ts` directly; the `key` is new (it is what lets
+    // `decode` refuse a cursor minted under the other of the two columns).
+    //
+    // **This mint must stay ABOVE the Phase 2 `apply_issue_env_stats` call
+    // below** — see "Position is load bearing, twice over" on that call for
+    // the full reasoning; in short, Phase 2 overwrites `last_seen`/
+    // `first_seen` on `rows` with per-environment values, and the keyset walk
+    // above ordered on the STORED ones, so a cursor built from an
+    // already-overwritten row would aim the next page at an unrelated point
+    // in the ordering — skipping rows on some pages and repeating them on
+    // others, the exact defect this slice removed. The sibling occurrences
+    // route (`events` below) states the same "build the cursor before
+    // anything else can rewrite the row" rule at its own mint site, even
+    // though nothing there is load-bearing YET. Whoever widens `IssueSort`
+    // past `last_seen`/`first_seen` and is tempted to move this block: don't,
+    // without moving Phase 2 with it.
+    let next_cursor = has_more.then(|| {
+        let last = rows.last().expect("has_more implies a row");
+        sauron_db::query_plan::cursor::encode(&sauron_db::query_plan::cursor::Cursor {
+            key: sort_col.clone(),
+            value: sauron_db::query_plan::cursor::CursorValue::Ts(sort.cursor_ts(last)),
+            id: last.id,
+        })
+    });
+
+    // Phase 2 — re-derive the statistics for the environment actually
+    // selected. `issues` has no `environment_id`, so its stored `times_seen`/
+    // `users_seen`/`first_seen`/`last_seen`/`level`/`culprit`/`title` are
+    // APP-WIDE: under an environment selection they describe events this
+    // caller is not being shown, and the dashboard auto-selects an
+    // environment, so that is most real requests. See
+    // `repo::issue_env_stats`.
+    //
+    // **Position is load bearing, twice over.**
+    //
+    // 1. AFTER `next_cursor`. The keyset walk filters and orders on `issues`'
+    //    STORED `last_seen`/`first_seen`, so the cursor must carry the stored
+    //    value. Building it from a row whose timestamp had already been
+    //    overwritten with the per-environment one would aim the next page at
+    //    an unrelated point in the ordering — skipping rows on some pages and
+    //    repeating them on others, the exact defect this slice removed.
+    //    `tests/http_search.rs`' `env_scoped_paging_still_reaches_every_row`
+    //    is the regression test, and its fixture inverts the two orderings so
+    //    a reversed sequence here cannot pass.
+    // 2. AFTER `rows.truncate(limit)`. The surplus `limit + 1`th row is only
+    //    the has-more probe and is never served, so deriving statistics for it
+    //    is wasted work on every full page.
+    //
+    // Skipped entirely on `EnvFilter::All`: the stored columns already are the
+    // app-wide truth there (and are maintained at ingest, so they can see
+    // data `sauron-tier` has since exported out of `error_events`), which
+    // makes a second query on the commonest path pure cost.
+    if !matches!(scope.env, sauron_db::scope::EnvFilter::All) {
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+        let stats = repo::issue_env_stats(&mut conn, &scope, &ids, since)
+            .await
+            .map_err(super::search::map_plan_error)?;
+        // Values only — never which rows are returned, so `total` (counted
+        // over the same predicate `search_issues` paged) still describes the
+        // same set. `apply_issue_env_stats` documents what happens to an id
+        // the derivation found no row for.
+        repo::apply_issue_env_stats(&mut rows, &stats);
+    }
+
+    Ok(Json(super::search::SearchEnvelope {
+        data: rows,
+        total,
+        total_is_capped,
+        next_cursor,
+        clamped: window.clamped,
+    }))
 }
 
 #[derive(Serialize)]
@@ -271,28 +411,62 @@ pub struct EventsQuery {
     #[serde(default)]
     pub filter: Vec<String>,
     pub q: Option<String>,
+    /// The query language. Wins over `filter`/`q` when non-empty.
+    ///
+    /// **Honoured by [`events`] AND by [`event_stats`], over one shared
+    /// `resolve_query` call.** It used to be refused by `event_stats`, and this
+    /// comment said so until S2c Task 6 bridged that handler onto the language
+    /// too. The refusal existed because honouring `query=` on one side only
+    /// would have put a total computed over a wider predicate above a narrowed
+    /// list — the dashboard builds ONE `occurrenceParams` object and sends it
+    /// to both. Now that both resolve against `Resource::Occurrences` through
+    /// the same function, that divergence is not expressible and the refusal
+    /// has nothing left to protect. See [`event_stats`] for the full history,
+    /// including the vocabulary split it closed at the same time.
+    pub query: Option<String>,
+    /// `column` or `-column`. Restricted to keyset-backed orderings — see
+    /// `search::parse_sort`. Ignored by [`event_stats`], which returns totals:
+    /// no ordering changes a count.
+    pub sort: Option<String>,
+    /// Opaque token from the previous page's `next_cursor`. Ignored by
+    /// [`event_stats`] for the same reason as `sort`.
+    pub cursor: Option<String>,
     #[serde(default = "default_events_since_days")]
     pub since_days: i64,
     #[serde(default = "default_events_limit")]
     pub limit: i64,
     // `environment_id` comes from `RawQuery`, not this struct — see `list`'s
     // comment above.
+    //
+    // No `offset` field, unlike `ListQuery`: this route never had one, so there
+    // is no bookmark carrying it to keep from 400ing.
 }
 
 fn default_events_limit() -> i64 {
     30
 }
 fn default_events_since_days() -> i64 {
-    3650
+    ISSUES_MAX_SINCE_DAYS
 }
 
+/// One issue's occurrences, searched and keyset-paged.
+///
+/// **Answers a [`SearchEnvelope`](super::search::SearchEnvelope), not a bare
+/// array, since S2c** — same change, and the same reasons, as [`list`]. The
+/// array had nowhere to put `total`, `next_cursor` or the planner's `clamped`
+/// notice. `dashboard/src/lib/api/issues.ts`' `listIssueEvents` moves with it
+/// in Task 7.
+///
+/// Three input spellings, one execution path: `query=` (the language),
+/// `filter=`+`q=` (the pre-language wire format, bridged through
+/// `from_legacy`), or nothing.
 pub async fn events(
     auth: AuthUser,
     State(state): State<AppState>,
     Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
     Query(q): Query<EventsQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<Vec<ErrorEvent>>, ApiError> {
+) -> Result<Json<super::search::SearchEnvelope<ErrorEvent>>, ApiError> {
     let mut conn = db(&state).await?;
     // One ancestry+grant resolution authorizes the read, resolves its scope,
     // and answers the second permission question at that same scope.
@@ -313,41 +487,141 @@ pub async fn events(
     // `issue:read` is exactly what entitles them to it.
     let include_body = crate::symbolicate::may_read_event_body(&perms);
     // Confirm the issue belongs to this app before returning its events (prevents
-    // reading another app's events by passing a foreign issue_id).
+    // reading another app's events by passing a foreign issue_id). The WHERE
+    // clauses below carry `app_id` too — this is the first of two layers, not
+    // a substitute for the second.
     repo::get_issue(&mut conn, scope.clone(), issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let filters =
-        sauron_db::filter::parse_filters(&q.filter, sauron_db::filter::ERROR_EVENT_FILTERS)?;
-    let search = q.q.as_deref().filter(|s| !s.is_empty());
     // Same reach as the body gate above, from the same predicate: this route's
     // `?q=` used to ILIKE `contexts`/`extra`/`tags` on rows whose those very
     // columns `gate_event_body` then nulled on the way out — the response
     // withheld the value while the query confirmed it. See
-    // `symbolicate::text_search_reach`.
+    // `symbolicate::text_search_reach`, and `OccurrencesLower::text`, which is
+    // where the narrowing now happens.
     //
-    // Also unenvelopable, so also no explicit flag — see `list`'s comment for
-    // the full reasoning. This route has one extra tell on top of it: every row
-    // a narrowed caller receives arrives with `contexts`, `extra` and `tags`
-    // literally `null`, from the same permission bit that narrowed the search.
-    // "The payload was not searched" is visible in the rows as "the payload is
-    // not here".
+    // No explicit "your search was narrowed" field even though this is now an
+    // envelope with room for one — see `list`'s comment for the full reasoning.
+    // This route has one extra tell on top of it: every row a narrowed caller
+    // receives arrives with `contexts`, `extra` and `tags` literally `null`,
+    // from the same permission bit that narrowed the search.
     let reach = crate::symbolicate::text_search_reach(&perms);
-    reject_body_filters(&filters, reach)?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 3650));
-    let limit = q.limit.clamp(1, 100);
-    let mut events = repo::list_error_events_for_issue_with_reach(
-        &mut conn,
-        scope,
-        issue_id,
-        &filters,
-        search,
+
+    let node = super::search::resolve_query(
+        q.query.as_deref(),
+        &q.filter,
+        q.q.as_deref().filter(|s| !s.is_empty()),
+        sauron_query::Resource::Occurrences,
+    )?;
+    // **The refusal that matters most on this route.** `reject_body_filters`
+    // below only ever saw the raw `filter=` strings, and `filter=` could name
+    // just `tag`/`workflow`. Now that `query=` reaches the same planner,
+    // `contexts`, `extra`, `user`, `stack`, `os`/`browser`/`device`/`app` and
+    // `sdk` are all addressable as `Store::JsonRoot` dimensions over exactly
+    // the columns `symbolicate::strip_event_body` nulls for a caller holding
+    // `issue:read` alone — and this route authorizes on `issue:read` alone.
+    // `extra.token:~sk_live_` is a sharper oracle than anything `filter=` could
+    // spell. `reject_withheld_dimensions` runs on the RESOLVED AST, so it sees
+    // the `filter=` and `query=` spellings of the same probe identically.
+    //
+    // The SECOND axis is live here and, so far, only here: `environment` is a
+    // real `Store::Column("environment_id")` on Occurrences, so
+    // `query=environment:staging` resolves a NAME against the whole app — and
+    // environment names are `env:read` territory, which neither `issue:read`
+    // (what authorized this call) nor `event:read` (what `reach` answers for)
+    // covers. See `search::reject_withheld_environment`.
+    super::search::reject_withheld_dimensions(
+        &node,
         reach,
-        Some(since),
+        super::search::EnvNameReach::for_perms(&perms),
+    )?;
+
+    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
+        .await
+        .map_err(super::search::map_plan_error)?;
+    let (sort_col, descending) = super::search::parse_sort(
+        q.sort.as_deref(),
+        &["occurred_at", "distinct_id", "session_id", "device_key"],
+        "occurred_at",
+    )?;
+    // `parse_sort` already refused anything outside the list, so this cannot be
+    // None; the expect states that rather than inventing a fallback ordering
+    // that would page unstably if the two lists ever drifted apart.
+    let sort = sauron_db::repo::OccurrenceSort::from_column(&sort_col)
+        .expect("parse_sort whitelist and OccurrenceSort::from_column must agree");
+    let after = match q.cursor.as_deref() {
+        Some(c) => Some(
+            // See `analytics.rs`'s identical comment on its own `decode`
+            // call: `sort.is_temporal()` is what stops a cursor whose key
+            // names a text column (`distinct_id`/`session_id`/`device_key`)
+            // from sneaking a `t:` value tag past the key check alone.
+            sauron_db::query_plan::cursor::decode(c, &sort_col, sort.is_temporal())
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    // `Clamp.field` is the GENERIC name "since" — `prepare` does not know which
+    // resource it ran for. On THIS resource the window column is
+    // `occurred_at`, not Issues' `last_seen`.
+    let window = super::search::resolve_window(
+        "occurred_at",
+        Utc::now(),
+        q.since_days,
+        ISSUES_MAX_SINCE_DAYS,
+        prepared.clamp,
+    );
+    let since = window.since;
+    let limit = q.limit.clamp(1, 100);
+
+    let search = repo::OccurrenceSearch {
+        node: &node,
+        ctx: &prepared.ctx,
+        since,
+        sort,
+        descending,
+        after,
         limit,
+        text_reach: reach,
+    };
+    let mut events = repo::search_occurrences(&mut conn, &scope, issue_id, &search)
+        .await
+        .map_err(super::search::map_plan_error)?;
+    let (total, total_is_capped) = repo::count_occurrences(
+        &mut conn,
+        &scope,
+        issue_id,
+        &search,
+        super::search::COUNT_CAP,
     )
-    .await?;
+    .await
+    .map_err(super::search::map_plan_error)?;
     drop(conn); // release before per-event symbolication (checks out its own)
+
+    // `limit + 1` rows were fetched; the surplus one is the has-more probe and
+    // must not be served — nor symbolicated.
+    let has_more = events.len() as i64 > limit;
+    events.truncate(limit as usize);
+    // Built BEFORE symbolication and gating. Neither touches `occurred_at` or
+    // `id` today, so this is not load bearing the way Task 4b's phase-2
+    // ordering is — but building the cursor from the row as the keyset walk
+    // ordered it, before anything else rewrites that row, is the rule that made
+    // Task 4b's bug possible to have. Keep the two adjacent.
+    //
+    // The cursor's value is read through `sort.cursor_value`, not off
+    // `occurred_at` directly, for the same reason as the Events list: a page
+    // sorted by `distinct_id`/`session_id`/`device_key` must mint a cursor
+    // carrying that column's value, coalesced exactly as the keyset predicate
+    // coalesces it — `cursor_value` is the one place that rule is spelled.
+    let next_cursor = has_more.then(|| {
+        let last = events.last().expect("has_more implies a row");
+        sauron_db::query_plan::cursor::encode(&sauron_db::query_plan::cursor::Cursor {
+            key: sort_col.clone(),
+            value: sort.cursor_value(last),
+            id: last.id,
+        })
+    });
+
     if include_body {
         // One shared blob-fetcher for the whole page: the artifact lookup is
         // memoized across events instead of repeated per event.
@@ -359,7 +633,14 @@ pub async fn events(
         }
     }
     crate::symbolicate::gate_event_body(&perms, &mut events);
-    Ok(Json(events))
+
+    Ok(Json(super::search::SearchEnvelope {
+        data: events,
+        total,
+        total_is_capped,
+        next_cursor,
+        clamped: window.clamped,
+    }))
 }
 
 /// Totals for the occurrences the sibling `events` route would list.
@@ -394,9 +675,11 @@ pub struct IssueEventStats {
     /// `environmentsError`/`accessError` flags exist for.
     ///
     /// This is the explicit answer to "a caller whose search was narrowed should
-    /// be able to tell". It lives here and not on `list`/`events` because those
-    /// answer bare JSON arrays with nowhere to put it; see `list`'s comment for
-    /// why that is acceptable there and how a client derives the same fact.
+    /// be able to tell". It lives here and not on `list`/`events` — which since
+    /// S2c answer a `SearchEnvelope` that would have room for it — because the
+    /// narrowing there is a pure function of the caller's own permissions and
+    /// carries no information they do not already hold; see `list`'s comment for
+    /// the full reasoning and how a client derives the same fact.
     pub payload_searched: Option<bool>,
 }
 
@@ -424,9 +707,6 @@ pub async fn event_stats(
     repo::get_issue(&mut conn, scope.clone(), issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let filters =
-        sauron_db::filter::parse_filters(&q.filter, sauron_db::filter::ERROR_EVENT_FILTERS)?;
-    let search = q.q.as_deref().filter(|s| !s.is_empty());
     // The sharpest form of the bypass, and the reason this route needed the fix
     // as much as the list did: a COUNT over a withheld column is a cleaner
     // oracle than a page of rows. The list at least caps at 100 rows and could
@@ -434,24 +714,80 @@ pub async fn event_stats(
     // single request answers "does any occurrence's `extra` contain this
     // substring" with no ambiguity at all.
     let reach = crate::symbolicate::text_search_reach(&perms);
-    reject_body_filters(&filters, reach)?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 3650));
-    let counts = repo::error_event_stats_for_issue_with_reach(
-        &mut conn,
-        scope,
-        issue_id,
-        &filters,
-        search,
+
+    // **Bridged onto the query language in S2c Task 6**, which is what makes
+    // the contract in this route's doc comment true rather than aspirational.
+    //
+    // Until then this handler ran `parse_filters(…, ERROR_EVENT_FILTERS)` while
+    // the list beside it resolved against `Resource::Occurrences`, so the two
+    // accepted DIFFERENT vocabularies from the one `occurrenceParams` object
+    // `dashboard/src/lib/api/issues.ts` builds for both:
+    // `filter=level:eq:error` was a 200 on the list and a 400 here. It also had
+    // to refuse `query=` outright, because honouring it on one side only would
+    // have put a total computed over a wider predicate above a narrowed list.
+    // One `resolve_query` for both routes removes the possibility of either.
+    let node = super::search::resolve_query(
+        q.query.as_deref(),
+        &q.filter,
+        q.q.as_deref().filter(|s| !s.is_empty()),
+        sauron_query::Resource::Occurrences,
+    )?;
+    super::search::reject_withheld_dimensions(
+        &node,
         reach,
-        Some(since),
+        super::search::EnvNameReach::for_perms(&perms),
+    )?;
+    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
+        .await
+        .map_err(super::search::map_plan_error)?;
+
+    // Identical window arithmetic to `events`, including the clamp, because a
+    // total over a different window is the same lie as a total over a different
+    // predicate. Sharing `resolve_window` is what makes "identical" structural
+    // rather than a promise this comment has to keep on its own. The disclosure
+    // is dropped, not omitted by oversight: this route answers a bare stats
+    // object with nowhere to put a `clamped`, and the list it captions carries
+    // the same notice for the same window.
+    let since = super::search::resolve_window(
+        "occurred_at",
+        Utc::now(),
+        q.since_days,
+        ISSUES_MAX_SINCE_DAYS,
+        prepared.clamp,
     )
-    .await?;
+    .since;
+
+    // `sort`/`descending`/`after`/`limit` are the four fields a count ignores —
+    // no ordering and no page boundary changes a total, and `occurrence_stats`/
+    // `count_occurrences` both build off `occurrence_search_base` alone, which
+    // never reads `search.sort` — but the STRUCT is what is passed, so the
+    // fields that do matter cannot be forgotten. `limit` is set to this
+    // route's own default, and `sort` to the same default the sibling list
+    // uses, rather than either being something meaningless: a value that
+    // looked deliberate is easier to read than a magic `0`.
+    let search = repo::OccurrenceSearch {
+        node: &node,
+        ctx: &prepared.ctx,
+        since,
+        sort: repo::OccurrenceSort::OccurredAt,
+        descending: true,
+        after: None,
+        limit: default_events_limit(),
+        text_reach: reach,
+    };
+    let counts = repo::occurrence_stats(&mut conn, &scope, issue_id, &search)
+        .await
+        .map_err(super::search::map_plan_error)?;
     Ok(Json(IssueEventStats {
         counts,
-        // `search`, not `q.q`: an empty `?q=` was already normalized to `None`
-        // above and did not narrow anything, so it must not be reported as a
-        // search that ran.
-        payload_searched: search.map(|_| reach.includes_body()),
+        // Derived from the resolved TREE, not from `q.q`: since the bridge,
+        // free text reaches the planner from both spellings, and a bare `boom`
+        // term inside `query=` narrows exactly as `?q=boom` does. Reporting
+        // `null` ("no search ran") for it would restate the absent/empty/false
+        // conflation this field's three states exist to avoid. An empty `?q=`
+        // was normalized to `None` above and contributes no `Text` node, so it
+        // still reports as no search.
+        payload_searched: super::search::has_free_text(&node).then(|| reach.includes_body()),
     }))
 }
 

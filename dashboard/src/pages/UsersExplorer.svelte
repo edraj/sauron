@@ -162,28 +162,33 @@
     <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
   </div>
 
-  {#if analytics}
-    <StatTiles min={150}>
-      <StatTile label="Total users" value={compactNumber(analytics.stats.total_users)} tone="primary" sub="all time" />
-      <StatTile label="Active" value={compactNumber(analytics.stats.active_in_range)} sub={`last ${sinceDays}d`} />
-      <StatTile label="New" value={compactNumber(analytics.stats.new_in_range)} sub={`last ${sinceDays}d`} />
-      <!-- `stats.dau` has always been in the payload and in the `UserStats`
-           model; the tile was simply never rendered, which is why this page
-           shows a stickiness ratio whose numerator is invisible. -->
-      <StatTile label="DAU" value={compactNumber(analytics.stats.dau)} sub="24h" />
-      <StatTile label="WAU" value={compactNumber(analytics.stats.wau)} sub="7-day" />
-      <StatTile label="MAU" value={compactNumber(analytics.stats.mau)} sub="30-day" />
-      <StatTile label="Stickiness" value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
-      <StatTile label="Avg session" value={formatDuration(analytics.stats.avg_session_ms)} />
-      <StatTile label="Median session" value={formatDuration(analytics.stats.median_session_ms)} />
-    </StatTiles>
+  <!-- The spacing lives on this wrapper rather than on `StatTiles` / `Card`:
+       both are shared house components, and a margin given to them from a page
+       would follow them onto every other page that uses them. -->
+  <div class="audience">
+    {#if analytics}
+      <StatTiles min={150}>
+        <StatTile label="Total users" value={compactNumber(analytics.stats.total_users)} tone="primary" sub="all time" />
+        <StatTile label="Active" value={compactNumber(analytics.stats.active_in_range)} sub={`last ${sinceDays}d`} />
+        <StatTile label="New" value={compactNumber(analytics.stats.new_in_range)} sub={`last ${sinceDays}d`} />
+        <!-- `stats.dau` has always been in the payload and in the `UserStats`
+             model; the tile was simply never rendered, which is why this page
+             shows a stickiness ratio whose numerator is invisible. -->
+        <StatTile label="DAU" value={compactNumber(analytics.stats.dau)} sub="24h" />
+        <StatTile label="WAU" value={compactNumber(analytics.stats.wau)} sub="7-day" />
+        <StatTile label="MAU" value={compactNumber(analytics.stats.mau)} sub="30-day" />
+        <StatTile label="Stickiness" value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
+        <StatTile label="Avg session" value={formatDuration(analytics.stats.avg_session_ms)} />
+        <StatTile label="Median session" value={formatDuration(analytics.stats.median_session_ms)} />
+      </StatTiles>
 
-    <Card title="Active users per day">
-      <UserActivityChart data={analytics.series} />
-    </Card>
-  {:else if analyticsError}
-    <Card><p class="muted">{analyticsError}</p></Card>
-  {/if}
+      <Card title="Active users per day">
+        <UserActivityChart data={analytics.series} />
+      </Card>
+    {:else if analyticsError}
+      <Card><p class="muted">{analyticsError}</p></Card>
+    {/if}
+  </div>
 
   {#if loading && rows.length === 0}
     <div class="center"><Spinner size={24} /></div>
@@ -268,7 +273,16 @@
       </DataTable>
     </div>
 
-    <Pagination {offset} limit={LIMIT} count={rows.length} onchange={(o) => (offset = o)} />
+    <!-- Slice 3 replaces this with a `limit + 1` over-fetch probe. Until then
+         this reproduces the old (wrong) inference rather than hiding it: a final
+         page of exactly `limit` rows still offers a Next to an empty page. -->
+    <Pagination
+      {offset}
+      limit={LIMIT}
+      count={rows.length}
+      hasNext={rows.length >= LIMIT}
+      onchange={(o) => (offset = o)}
+    />
   {/if}
 </AppShell>
 
@@ -291,12 +305,33 @@
     gap: 10px;
     flex-wrap: wrap;
   }
+  /* Section rhythm. The page previously ran header -> tiles -> chart -> table
+     -> pagination with no vertical gap at all, so three unrelated blocks read
+     as one. 18px is the spacing the other pages use between major blocks
+     (Overview's `.grid`, SessionDetail's `.grid`); there is no spacing token to
+     reference. */
   .analytics-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    margin: 8px 0 12px;
+    /* Larger above than below so "Audience" reads as opening a new section
+       rather than trailing the search row. */
+    margin: 24px 0 12px;
+  }
+  .audience {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    /* Separates the chart from the users table below, which is not this
+       element's child. */
+    margin-bottom: 18px;
+  }
+  /* Analytics is loaded independently of the rows, so this wrapper is empty
+     until it lands — without this, the gap it reserves would sit under the
+     Audience header with nothing in it. */
+  .audience:empty {
+    margin-bottom: 0;
   }
   .section-title {
     font-size: 15px;

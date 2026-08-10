@@ -114,14 +114,15 @@ duration:>2s http.status:>=500 "connection refused"
 First match wins.
 
 1. **Curated fields** — typed, backed by a real column or rollup.
-2. **Structured JSONB paths** under a known root: `user.*`, `os.*`, `browser.*`, `device.*`, `runtime.*`, `app.*` (→ enriched `context`), `contexts.*`, `extra.*`, `properties.*`, `stack.*`, `traits.*`.
-3. **Anything unrecognised → a tag lookup.** `checkout_step:payment` works with no prefix. `tag.checkout_step:payment` remains available to disambiguate a tag key that collides with a curated name.
+2. **Explicit tag keys** — the `tag.<key>` prefix, and the `tag:<key>=<value>` escape hatch below for a key the field syntax cannot spell.
+3. **Structured JSONB paths** under a known root: `user.*`, `os.*`, `browser.*`, `device.*`, `runtime.*`, `app.*` (→ enriched `context`), `contexts.*`, `extra.*`, `properties.*`, `stack.*`, `traits.*`.
+4. ~~**Anything unrecognised → a tag lookup.**~~ **REMOVED IN S2c. There is no fourth step.** An unrecognised name is now a 400 that names the field, offers the `tag.<key>` spelling (or `tag:<key>=<value>` where the key is not an identifier, and neither where the resource has no `tags` column), and lists that resource's available fields. The rule was written to make dev-defined tags first-class without ceremony; the price was that every typo — `enviroment:prod`, `checkout_stpe:payment` — resolved to a tag nobody had ever written and answered **200 with zero rows**, indistinguishable from an honest "no matches". `resolve_field` is shared by `query=` and `filter=`, so neither spelling can drift into a laxer vocabulary than the other. No capability is lost: step 2 names any tag key explicitly. See `crates/sauron-query/src/resolve.rs` and `error.rs`.
 
 ### Tag keys are unconstrained, so the grammar needs an escape hatch
 
 Tag keys have **no validation anywhere on the write path** — `envelope.rs` types `tags` as a raw `serde_json::Value`, the ingest edge inspects nothing, `process.rs`'s `object_or_empty` only maps `null`→`{}`, the JSONB column carries no `CHECK`, and no SDK sanitizes keys (`sdks/csharp/Sauron/Envelope.cs:18` says so deliberately: *"Dictionary keys … are left untouched on purpose"*). A developer can therefore store `cart@checkout`, `100%off`, `a+b` or `café`.
 
-Rule 3 resolves an unrecognised field through the identifier rule `[A-Za-z_][A-Za-z0-9_.-]*`, so those keys would be unsearchable. The escape hatch is the legacy spelling, which needs no new syntax because the identifier rule constrains only the *field* side of a term:
+The `tag.<key>` prefix resolves a key through the identifier rule `[A-Za-z_][A-Za-z0-9_.-]*`, so those keys would be unsearchable. The escape hatch is the legacy spelling, which needs no new syntax because the identifier rule constrains only the *field* side of a term:
 
 | Form | Use |
 |---|---|
@@ -135,7 +136,7 @@ The remainder after the first `=` is an ordinary value, so every operator compos
 
 A bare `tag:foo` with no `=` is an error rather than "a tag whose key is literally `tag`".
 
-Rule 3 means the grammar never rejects a query as "unknown field", which removes the single largest source of user frustration and makes dev-defined tags first-class without ceremony.
+~~Rule 3 means the grammar never rejects a query as "unknown field", which removes the single largest source of user frustration and makes dev-defined tags first-class without ceremony.~~ **False since S2c** — see the removed step 4 above. The grammar rejects an unknown field, and the frustration it was meant to remove is smaller than the frustration of a typo that returns 200 with nothing in it and no way to tell why. What survives is the ergonomics: `tag.checkout_step:payment` is one prefix longer than `checkout_step:payment`, and the error message hands you that exact string.
 
 ### Value literals
 
@@ -220,7 +221,9 @@ Five artefacts derive from it rather than being maintained in parallel: the pars
 
 Pure crate, zero DB dependencies: tokenizer → AST → validator against the catalog → cost classifier.
 
-The isolation is load-bearing. This repo has **no test DB and no test-DB helper**, and CI (`.github/workflows/ci.yml:19-59`) runs `cargo test --workspace` with no Postgres or Redis service. `crates/sauron-auth/src/guard.rs:1-6` states the consequence: *"any guard reachable only through a handler is a guard that never gets tested."* A pure crate means the entire grammar — every operator, every precedence rule, every error message — is unit-tested in CI, and handlers stay thin fetch → authorize → plan → run shells.
+The isolation is load-bearing for the grammar: a pure crate means every operator, every precedence rule and every error message is unit-tested with no infrastructure at all, and handlers stay thin fetch → authorize → plan → run shells.
+
+**CORRECTION (S2c): "CI has no database" is no longer true, and the constraint it justified applied only to S1.** `.github/workflows/ci.yml:32-51` now runs `postgres:16` and `redis:7` service containers with `TEST_DATABASE_URL`/`TEST_REDIS_URL`, so route behaviour IS testable in CI through the real router via the `bins/sauron-api/tests/http_*.rs` harness — which is how S2c verified its own routes. The hazard the original wording pointed at is real but different: with no reachable database `TestDb::setup()` returns `None` and every DB-backed test *silently reports passed in 0.00s*, so a green count is not by itself proof they ran.
 
 ### `crates/sauron-db/src/query_plan.rs` (new)
 
@@ -234,14 +237,17 @@ Takes `(AST, resource)` → boxed diesel query.
 
 Next prefix is `2026-07-27-000024` (previous: `2026-07-26-000023_member_lifecycle`). The 6-digit counter, not the date, is the ordering authority. `up.sql` opens with a *why* comment; `down.sql` is bare DDL reversing statement order.
 
+**Numbering is assigned when a slice STARTS, not here.** The counter is shared with every other line of work in the repo, so a number written into this spec is a guess that goes stale the moment anything else lands a migration — which is exactly what happened to the two rows below (they said 26 and 27; by the time S2c finished, the tree was already past 46). Treat the numbers in this table as *identifiers for migrations that have shipped* and, for anything still ahead, read the next free number off `backend/migrations/` at the moment you write it.
+
 `crates/sauron-db/src/schema.rs` is **hand-maintained** despite its `@generated` header — columns must be appended in physical order or `Queryable` binds the wrong fields, and new tables must be added to `allow_tables_to_appear_in_same_query!` (`schema.rs:452-480`) plus any `joinable!`.
 
 | Migration | Contents |
 |---|---|
-| `…24_event_handled_sdk` | `error_events.handled BOOLEAN NULL`; populate `sdk` (pipeline change at `process.rs:230`) |
-| `…25_search_indexes` | Curated btrees; **replace** the duplicate issues indexes with one wider index (see below). **JSONB GINs deferred — measured and rejected, see §13** |
-| `…26_issue_dimensions` | The rollup table |
-| `…27_saved_views` | `saved_views` + `view:write` permission backfill |
+| `…24_event_handled_sdk` | **Shipped (S2a).** `error_events.handled BOOLEAN NULL`; populate `sdk` (pipeline change at `process.rs:230`) |
+| `…25_search_indexes` | **Shipped (S2a).** Curated btrees; **replace** the duplicate issues indexes with one wider index (see below). **JSONB GINs deferred — measured and rejected, see §13** |
+| `2026-08-09-000047_analytics_keyset_index` | **Shipped (S2c).** The `(app_id, occurred_at DESC, id DESC)` tiebreaker on `analytics_events`. Migration 25 gave `issues` and `error_events` their keyset indexes but the closest analytics index was `analytics_project_idx (app_id, occurred_at DESC)` — no `id` — so deep paging on Events was exactly the duplicate-rows bug S2c exists to fix. Runs **synchronously** across live child partitions in one transaction; `CONCURRENTLY` is not available, so it needs a maintenance window |
+| `…49_issue_dimensions` (S3) | The rollup table. **Was written here as 26.** 47 and 48 are taken (48 is `alert_rule_monitor`, unrelated work), so 49 is the next free number as of 2026-08-10 — re-check before creating it |
+| `…50_saved_views` (S5) | `saved_views` + `view:write` permission backfill. **Was written here as 27.** Same caveat: read the real next free number when S5 starts |
 
 ### `issue_dimensions`
 
@@ -288,9 +294,13 @@ Indexes on `(app_id, resource, visibility)` and `(owner_id, resource)`.
   "total": 1204,           // always a number
   "total_is_capped": false, // true => "1204+", counting stopped at the cap
   "next_cursor": "…",       // null on the last page
-  "clamped": null           // or { "field": "since", "to": "30d", "reason": "…" }
+  "clamped": null           // or { "field": "last_seen", "to": "30d", "reason": "…" }
 }
 ```
+
+**Shipped as drawn, with one correction (S2c):** `clamped.field` carries the **resource's own window column** — `last_seen` on Issues, `occurred_at` on Occurrences and Events — not the generic `"since"` this example originally showed. `prepare()` takes no `Resource`, so it reports the window generically and each resource-aware handler maps it onto the real column before serializing.
+
+**`offset=` is accepted and IGNORED** on the three migrated endpoints, rather than dropped. Dropping the field would turn every bookmarked `?offset=50` into a 400 from an unknown parameter; accepting it returns page one, which is different from what that link used to return but is at least correct rows. Callers follow `next_cursor`. Every endpoint still on `clamp_offset` (screens, sessions, devices, workflows, top events) is unaffected.
 
 `total` stays a number and `total_is_capped` carries the nuance — counting is exact when the plan is index-backed and stops at a cap when it degrades to a scan, so counting never becomes the expensive part of the request. Returning a string like `"1000+"` was rejected: it forces every client to parse a number out of a display string.
 
@@ -343,22 +353,23 @@ slice that changes the behaviour it describes:
 | `wiki/Dashboard.md` — Search & saved views walkthrough | **S4** | First slice with a UI to walk through |
 | `dashboard/src/pages/Docs.svelte` — in-app cheatsheet | **S4** | Reachable from the bar it documents; hangs off the existing `queries` section (`Docs.svelte:403`, `:1035`) |
 | Saved-views semantics (private vs shared, defaults) | **S5** | The feature they describe |
-| Anti-rot test — generate the field table from the catalog and fail on drift | **S2c** | Ships with the table it guards, so it can never be "added later" |
+| Anti-rot test — generate the field table from the catalog and fail on drift | ~~S2c~~ → **S6** | **DID NOT SHIP IN S2c.** The page was rewritten and its field table verified against `CATALOG` by a manual `comm` check (plan Task 9 Step 2), which is a point-in-time check and not a guard. §12 already scheduled the test in S6 and that is where it now lives — noted here rather than quietly left, because "ships with the table it guards, so it can never be added later" was the whole argument for S2c and the argument lost |
 
 The grammar itself is **frozen** as of S1 — `sauron-query` is complete and its 159 tests
 pin every operator — so the syntax reference can be written without waiting on anything.
 
-- **`wiki/Search.md`** — full rewrite. Grammar reference, generated field table, saved-views semantics, and an honest "what is fast vs what is a scan" section. The page's current central promise is *"no query language, no operators"* (`wiki/Search.md:10-12`), so this is a replacement rather than an edit. Three further statements on the page are already stale: it claims Events ranges go to all-time (they cap at 90d in `DateRange.svelte:12-17`, 365 at the API), and that `%`/`_` are unescaped on Users and Devices (both now route through `like_contains`).
+- **`wiki/Search.md`** — full rewrite. **DONE in S2c.** Grammar reference, per-resource field tables, the response envelope and cursor paging, and an honest "what is fast vs what is a scan" section. The page's central promise was *"no query language, no operators"*, so this was a replacement rather than an edit. Saved-views semantics are not in it — they move to S5 with the feature. The three pre-existing stale statements were fixed in the same pass: the Events range does **not** go to all-time (the picker stops at 90d, the API caps at 365d, while the Exceptions picker really does offer "All"); `%`/`_` **are** escaped on Users and Devices, which now route through `like_contains` like everything else; and the "~200 rows per page via `limit`/`offset`" line is replaced by the cursor contract.
 - **`wiki/Dashboard.md`** — a Search & saved views section in the UI walkthrough, cross-linked to `Search.md`.
 - **`dashboard/src/pages/Docs.svelte`** — in-app syntax cheatsheet, hung off the existing `queries` entry under "Under the hood".
 
-**Anti-rot test.** The field-reference table in `wiki/Search.md` is generated from the catalog, and a test regenerates it and fails on drift. Precedent: the existing vitest that parses `rbac.rs` off disk and fails if `permissions.ts` drifts.
+**Anti-rot test — still owed, now scheduled for S6.** The field-reference tables in `wiki/Search.md` are hand-written against `CATALOG` and verified once, by hand; nothing yet regenerates them and fails on drift. Precedent for the test when it is written: the existing vitest that parses `rbac.rs` off disk and fails if `permissions.ts` drifts. Until it exists, **anyone adding, renaming or re-scoping a dimension in `crates/sauron-query/src/catalog.rs` must edit `wiki/Search.md`'s "Fields by page" section in the same change**, and re-run the check in the S2c plan's Task 9 Step 2.
 
 ## 11. Testing & verification
 
 - **Unit** — the whole of `sauron-query` (tokenizer, precedence, negation, wildcards, ranges, field resolution including the tag fallback, error messages) and the planner's AST→fragment mapping and cost classification, as pure functions. Tests are inline `#[cfg(test)] mod` in the same file, per repo convention.
 - **Frontend** — vitest over AST round-tripping (text → chips → text must be stable) and the permissions parity test.
-- **E2E** — manual, against the docker stack, since CI has no database. Each slice ends with a live walkthrough. Verifying the dev server against the live API hits CORS: `CORS_ALLOWED_ORIGINS` allows only `http://localhost:10002` while `dashboard-dev` serves on `:5199`.
+- **Route behaviour** — through the real router with the `bins/sauron-api/tests/http_*.rs` harness. **CORRECTED in S2c: CI does have Postgres and Redis** (`.github/workflows/ci.yml:32-51`), so these run in CI, not only locally. But they `return` early when `TEST_DATABASE_URL` is unset, which means a green count proves nothing on its own — quote per-target counts and check the DB was actually reachable.
+- **E2E** — manual, against the docker stack. Each slice ends with a live walkthrough. Verifying the dev server against the live API hits CORS: `CORS_ALLOWED_ORIGINS` allows only `http://localhost:10002` while `dashboard-dev` serves on `:5199`.
 
 **Gates:** `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` are hard; plus `cargo test --workspace`, `npm run build`, `npm test`. Never `--all-features` (rebuilds DuckDB from source). Builds need `DUCKDB_LIB_DIR` / `LD_LIBRARY_PATH` from `packaging/rpm/fetch-libduckdb.sh`.
 
@@ -366,12 +377,16 @@ pin every operator — so the syntax reference can be written without waiting on
 
 This spec covers a multi-slice programme, not a single implementation plan. **Each slice gets its own plan** written when it starts, so the plan for S4 can be informed by what S1–S3 actually produced rather than guessed at now. S1 is the only slice with no dependency on a decision made during another.
 
+**S2c shipped `sort=` RESTRICTED to keyset-backed columns** — `last_seen`/`first_seen` on Issues, `occurred_at` on Occurrences and Events, each optionally prefixed with `-` to reverse. Anything else is a 400 listing what is allowed. An ordering with no supporting `(…, id)` index cannot page stably, and silently returning duplicate rows is the defect this slice exists to remove; §9's "`DataTable` gains sortable column headers" therefore cannot offer an arbitrary column until that column has an index. More orderings arrive **with** their indexes, never ahead of them.
+
+**Two other behaviours differ from what this spec describes, and the spec text above is now wrong on both.** §5's field-resolution rule 3 (*"anything unrecognised → a tag lookup"*) was **removed** in S2c: an unknown field is now a 400 naming the field, offering the `tag.<key>` spelling, and listing the resource's available fields — see `crates/sauron-query/src/resolve.rs`' `resolve_field`, which documents why (a typo resolved to a tag nobody had ever written and answered 200 with zero rows). Rule 3's closing claim, *"the grammar never rejects a query as unknown field"*, is consequently false. And §8's envelope shipped exactly as drawn, but `clamped.field` carries the **resource's own window column** (`last_seen` / `occurred_at`), not the generic `"since"` in the example.
+
 | Slice | Contents | Done when |
 |---|---|---|
 | S1 | `sauron-query` crate: grammar, AST, catalog, cost classifier | Pure unit tests green; zero behaviour change |
 | S2a | Migrations 24–25, `schema.rs`/`models.rs`, `handled`+`sdk` ingest | An ingested event lands with non-NULL `handled` and populated `sdk`; EXPLAIN confirms each new index is chosen. No user-visible change; fully revertible via `down.sql` |
 | S2b | `query_plan.rs` — `ResourceLower` trait, 3 leaf mappers, generic tree-walker, async `prepare` pass, cost/clamp policy | Exact SQL + binds asserted via `diesel::debug_query` for every `(Store, MatchOp)` pair across all 3 resources — **with no database**, so it runs in CI |
-| S2c | `query=`/`cursor=` params, response envelope, keyset paging, api clients, `CursorPagination.svelte`, **+ the `wiki/Search.md` syntax reference** | `query=` and `filter=` return identical rows for equivalent queries; deep paging no longer duplicates rows; **a developer can read the grammar and use `query=` without reading the source** |
+| S2c | **DONE (2026-08-10).** `query=`/`sort=`/`cursor=` params, response envelope, keyset paging, api clients, `CursorPagination.svelte`, **+ the `wiki/Search.md` syntax reference** | ✅ `query=` and `filter=` return identical rows for equivalent queries; deep paging no longer duplicates rows; a developer can read the grammar and use `query=` without reading the source |
 | S3 | `issue_dimensions` rollup, backfill, autocomplete endpoints (migration 26) | Value autocomplete returns real data |
 | S4 | `Popover`/`Combobox` primitives, `SearchBar` | Replaces `FilterBar` on the three core pages |
 | S5 | Saved views end-to-end (migration 27, `view:write`, UI) | Create / share / set-default all work live |
@@ -390,7 +405,8 @@ This spec covers a multi-slice programme, not a single implementation plan. **Ea
 
 ## 14. Deployment notes
 
-- This ships **four migrations**. RPM upgrades never re-run `sauron-migrate`, so an upgrade without a manual migrator run leaves new binaries against an old schema and scatters 500s. The release notes must say so.
+- This ships **five migrations** across the programme, not four: `…24_event_handled_sdk` and `…25_search_indexes` (S2a), `2026-08-09-000047_analytics_keyset_index` (S2c), plus the `issue_dimensions` rollup (S3) and `saved_views` (S5) still to come. RPM upgrades never re-run `sauron-migrate`, so an upgrade without a manual migrator run leaves new binaries against an old schema and scatters 500s. The release notes must say so.
+- **Migration 47 takes a lock on `analytics_events` and every live child partition, in one transaction.** `CREATE INDEX CONCURRENTLY` is not available inside a migration transaction, so this needs a maintenance window sized to the largest table in the system. Its real-world lock duration is **unmeasured** — the scratch database it was verified against held one child partition and ~6k rows.
 - Any new env var goes in `crates/sauron-core/src/config.rs`, the README table, **and** `.env.example`.
 - Any new binary goes in `packaging/rpm/binaries.txt`.
 - Per the standing rule: never create a branch, never commit. Changes are staged; the user commits.

@@ -2,7 +2,15 @@
   import Icon from '../ui/Icon.svelte';
   import SearchInput from '../SearchInput.svelte';
   import DateRange from '../DateRange.svelte';
-  import { OP_LABEL, composeTag, type FieldDef, type Filter, type Op } from './filters';
+  import {
+    OP_LABEL,
+    composeTag,
+    isFilterValueValid,
+    normalizeFilterValue,
+    type FieldDef,
+    type Filter,
+    type Op,
+  } from './filters';
 
   interface Props {
     fields: FieldDef[];
@@ -51,8 +59,9 @@
       adding = false;
       return;
     }
-    if (!draftField || draftValue === '') return;
-    filters = [...filters, { field: draftField, op: draftOp, value: draftValue }];
+    const value = normalizeFilterValue(fieldDef, draftValue);
+    if (!isFilterValueValid(fieldDef, value)) return;
+    filters = [...filters, { field: draftField, op: draftOp, value }];
     adding = false;
   }
   function remove(i: number) {
@@ -93,7 +102,11 @@
             {#each fieldDef?.options ?? [] as opt (opt)}<option value={opt}>{opt}</option>{/each}
           </select>
         {:else if fieldDef?.type === 'number'}
-          <input type="number" bind:value={draftValue} placeholder="value" aria-label="Value" />
+          <!-- Text, not type="number". `bind:value` on a numberlike input
+               writes back a number (or null once cleared) rather than the
+               string `Filter.value` is declared as, which is what let a
+               cleared field commit `times_seen:eq:null`. -->
+          <input type="text" inputmode="numeric" bind:value={draftValue} placeholder="value" aria-label="Value" />
         {:else}
           <input type="text" bind:value={draftValue} placeholder="value" aria-label="Value" />
         {/if}

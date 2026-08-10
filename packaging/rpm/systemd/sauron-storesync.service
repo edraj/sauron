@@ -1,0 +1,53 @@
+[Unit]
+Description=Sauron app store install metrics sync
+Documentation=file:///usr/share/doc/sauron-server/SETUP.md
+# Requires= is what actually pulls the migrator into the transaction. `After=`
+# alone is PURE ORDERING — it only says "if both units are already being
+# started, run sauron-migrate first"; it never causes it to be started. For a
+# long time these units carried only the After= line below, so migrations
+# simply never ran on `dnf upgrade` and new binaries came up against an old
+# schema, scattering 500s. Do NOT "simplify" this back to After= on its own.
+#
+# Do not weaken it to Wants= either: with Wants=, a FAILED migration still lets
+# this daemon start against the stale schema, which is precisely the bug being
+# fixed. This unit in particular needs migration 000049 (app_store_connections,
+# store_daily_metrics) and cannot do anything useful without it.
+#
+# sauron-migrate has no RemainAfterExit, so it re-runs on every start/restart of
+# this unit; a no-op run was measured at ~30 ms.
+Requires=sauron-migrate.service
+After=network-online.target sauron-migrate.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=sauron
+Group=sauron
+EnvironmentFile=/etc/sauron/sauron.env
+EnvironmentFile=-/etc/sauron/storesync.env
+# Store credentials (the Play service-account JSON and the App Store Connect
+# .p8) are encrypted at rest with NOTIFY_SECRET_KEY, the same key the API used
+# to write them. It is REQUIRED — this unit refuses to start without it, and
+# performs a decrypt self-test at boot rather than reporting every connection
+# as broken hours later. It must be byte-identical to the API's.
+EnvironmentFile=/etc/sauron/secret.env
+ExecStart=/usr/bin/sauron-storesync
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+# No AF_UNIX-only mode: this daemon reaches storage.googleapis.com and
+# api.appstoreconnect.apple.com over TCP.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StateDirectory=sauron
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

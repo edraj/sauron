@@ -219,7 +219,16 @@
         {/snippet}
       </DataTable>
 
-      <Pagination {offset} limit={LIMIT} count={rows.length} onchange={(o) => (offset = o)} />
+      <!-- Slice 3 replaces this with a `limit + 1` over-fetch probe. Until then
+           this reproduces the old (wrong) inference rather than hiding it: a final
+           page of exactly `limit` rows still offers a Next to an empty page. -->
+      <Pagination
+        {offset}
+        limit={LIMIT}
+        count={rows.length}
+        hasNext={rows.length >= LIMIT}
+        onchange={(o) => (offset = o)}
+      />
     </Card>
   {/if}
 </AppShell>

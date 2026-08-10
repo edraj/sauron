@@ -314,7 +314,7 @@ async fn notify_transition(
     // subscription is the point, and the `rules.is_empty()` early return below
     // used to make that case enqueue nothing, forever, with no log line.
     enqueue_personal_uptime(notifier, m, status, cause, incident_id, trigger).await;
-    let rules = match repo::alert_rules_for_monitor(&mut conn, m.project_id, trigger).await {
+    let rules = match repo::alert_rules_for_monitor(&mut conn, m.project_id, m.id, trigger).await {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "alert dispatch: loading rules failed");

@@ -141,12 +141,30 @@ pub async fn detail(
 
     let events = repo::events_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
     let mut errors = repo::errors_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
+    let txns = repo::transactions_for_session(&mut conn, scope, &session_id, 500).await?;
+    drop(conn); // release the pooled conn; symbolication checks out its own
+
+    // On-read symbolication, as `issues::detail` and `issues::events` do it. An
+    // error symbolicated at ingest arrives already resolved and takes the fast
+    // path inside; one that predates its source map (or whose upload landed
+    // after the crash) is resolved here and persisted for hot partitions.
+    // Without this the timeline is the one place a symbolicated app still
+    // reads as minified frames.
+    //
+    // Guarded on the body pair for the reason `issues::detail` guards on it:
+    // symbolication decompresses a blob and parses a source map (or walks
+    // DWARF), and `gate_event_body` two lines down would throw the frames away
+    // for a caller who lacks it.
+    if crate::symbolicate::may_read_event_body(&perms) {
+        crate::symbolicate::symbolicate_events(&state, app_id, &mut errors).await;
+    }
     // Both gates before the boxed moves into `TimelineItem::Error` below — they
     // work on `[ErrorEvent]`, and once these are inside the enum they are no
-    // longer a slice.
+    // longer a slice. `gate_source_context` must also stay AFTER the call
+    // above: symbolication is what puts the context lines on the response in
+    // the first place, so stripping first would strip nothing.
     crate::symbolicate::gate_source_context(&perms, &mut errors);
     crate::symbolicate::gate_event_body(&perms, &mut errors);
-    let txns = repo::transactions_for_session(&mut conn, scope, &session_id, 500).await?;
 
     let mut timeline: Vec<TimelineItem> =
         Vec::with_capacity(events.len() + errors.len() + txns.len());

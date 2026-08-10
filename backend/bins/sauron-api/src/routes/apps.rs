@@ -50,10 +50,25 @@ pub struct UpdateAppReq {
     pub name: String,
     #[serde(default = "default_true")]
     pub ingest_enabled: bool,
+    /// Which environment represents the build that ships to the app stores.
+    ///
+    /// Absent leaves the designation alone; an explicit `null` clears it and
+    /// hides the Overview store section. The double `Option` matters because
+    /// every other field on this request is mandatory — without it, any PATCH
+    /// that renamed an app would also silently clear the designation.
+    #[serde(default, deserialize_with = "double_option_uuid")]
+    pub store_environment_id: Option<Option<Uuid>>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn double_option_uuid<'de, D>(d: D) -> Result<Option<Option<Uuid>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(d)?))
 }
 
 pub async fn update_app(
@@ -73,6 +88,21 @@ pub async fn update_app(
         return Err(ApiError::BadRequest("app name is required".into()));
     }
     let ingest_changed = existing.ingest_enabled != req.ingest_enabled;
+
+    if let Some(env) = req.store_environment_id {
+        if let Some(env_id) = env {
+            // Must be an enrollment OF THIS APP. Accepting any UUID would store
+            // a designation that can never equal the environment switcher's
+            // value, hiding the Overview section forever with no error to
+            // explain why.
+            if !repo::app_environment_belongs_to_app(&mut conn, env_id, app_id).await? {
+                return Err(ApiError::BadRequest(
+                    "store_environment_id is not an environment of this app".into(),
+                ));
+            }
+        }
+        repo::set_app_store_environment(&mut conn, app_id, env).await?;
+    }
 
     let app = repo::update_app(&mut conn, app_id, &req.name, req.ingest_enabled)
         .await?

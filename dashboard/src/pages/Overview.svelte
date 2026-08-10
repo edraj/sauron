@@ -9,6 +9,8 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import BarList from '../lib/components/BarList.svelte';
+  import StoreSection from '../lib/components/StoreSection.svelte';
+  import { shouldShowStoreSection } from '../lib/components/stores';
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -36,6 +38,15 @@
   ];
 
   let sinceDays = $state(30);
+
+  /**
+   * The current app, for the store-section gate.
+   *
+   * Read from `sessionStore` rather than fetched: the designation travels on
+   * the app record the switcher already holds, so this costs no request and
+   * updates the moment App settings changes it.
+   */
+  const storeApp = $derived(sessionStore.currentApp);
 
   // FOUR independent views, not one.
   //
@@ -376,6 +387,18 @@
         {/if}
       </Card>
     </div>
+
+    <!--
+      Store installs, shown only in the environment designated as the store
+      build. `StoreSection` owns its own CachedView rather than joining the
+      `Promise.allSettled` batch above, so a store-API failure cannot abort the
+      other five sections.
+    -->
+    {#if storeApp && shouldShowStoreSection(storeApp, sessionStore.currentEnvId)}
+      <div class="store-row">
+        <StoreSection appId={storeApp.id} {sinceDays} />
+      </div>
+    {/if}
   </div>
 </AppShell>
 

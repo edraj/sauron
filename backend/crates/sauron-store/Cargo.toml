@@ -1,0 +1,22 @@
+[package]
+name = "sauron-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+csv = { workspace = true }
+flate2 = { workspace = true }
+# `use_pem` on top of the workspace's `rust_crypto`: both store credentials
+# arrive as PEM text — Google's service-account `private_key` (RSA, for RS256)
+# and Apple's `.p8` (EC, for ES256) — and the workspace pins
+# `default-features = false`, which drops PEM parsing. The API's own JWTs use
+# HMAC secrets and are unaffected.
+jsonwebtoken = { workspace = true, features = ["use_pem"] }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

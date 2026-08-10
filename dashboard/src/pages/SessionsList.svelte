@@ -249,7 +249,16 @@
           {/each}
         {/snippet}
       </DataTable>
-      <Pagination {offset} limit={LIMIT} count={sessions.length} onchange={(o) => (offset = o)} />
+      <!-- Slice 3 replaces this with a `limit + 1` over-fetch probe. Until then
+           this reproduces the old (wrong) inference rather than hiding it: a final
+           page of exactly `limit` rows still offers a Next to an empty page. -->
+      <Pagination
+        {offset}
+        limit={LIMIT}
+        count={sessions.length}
+        hasNext={sessions.length >= LIMIT}
+        onchange={(o) => (offset = o)}
+      />
     {/if}
   </Card>
 </AppShell>
@@ -277,7 +286,10 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 18px;
-    align-items: start;
+    /* Deliberately NOT `align-items: start`: the duration chart and the
+       histogram have different natural heights, and letting each size to its
+       own content leaves two cards of visibly different height sitting side by
+       side. Stretching makes the pair read as one row. */
     margin: 16px 0;
   }
   @media (max-width: 900px) {

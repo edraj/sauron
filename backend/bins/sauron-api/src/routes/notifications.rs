@@ -520,6 +520,9 @@ pub struct CreateRuleReq {
     pub project_id: Option<Uuid>,
     #[serde(default)]
     pub app_id: Option<Uuid>,
+    /// Narrow a monitor trigger to ONE monitor. `None` = every monitor in scope.
+    #[serde(default)]
+    pub monitor_id: Option<Uuid>,
     #[serde(default)]
     pub conditions: Value,
     #[serde(default)]
@@ -532,22 +535,51 @@ pub struct CreateRuleReq {
     pub channel_ids: Vec<Uuid>,
 }
 
-/// Validate that a rule's narrowing scope belongs to `org_id`; returns the
-/// project id implied by an app narrowing so `(project_id, app_id)` stay
-/// consistent.
+/// Validate that a rule's narrowing scope belongs to `org_id`; returns
+/// `(project_id, app_id, monitor_id)` with the project id implied by an app or
+/// monitor narrowing, so all three stay consistent with each other.
 async fn check_rule_scope(
     conn: &mut sauron_db::AsyncPgConnection,
     org_id: Uuid,
     project_id: Option<Uuid>,
     app_id: Option<Uuid>,
-) -> Result<(Option<Uuid>, Option<Uuid>), ApiError> {
+    monitor_id: Option<Uuid>,
+) -> Result<(Option<Uuid>, Option<Uuid>, Option<Uuid>), ApiError> {
+    // A monitor pins the rule to exactly one target, and `monitors` carries only
+    // `project_id` — so the monitor DERIVES the project, exactly as an app does
+    // below. Deriving rather than trusting the caller's `project_id` is what
+    // makes `authorize_rule_target` check `monitor:read` at the radius the rule
+    // will actually fire over.
+    if let Some(m) = monitor_id {
+        // A single message for "no such monitor" and "monitor in another org":
+        // splitting them would let any org alert:write holder probe UUIDs to
+        // learn which ones exist in a foreign org, the same oracle the project
+        // arm below avoids with "project is not in this org".
+        let not_in_org = || ApiError::BadRequest("monitor is not in this org".into());
+        let proj = repo::monitor_project(conn, m)
+            .await?
+            .ok_or_else(not_in_org)?;
+        if repo::project_org(conn, proj).await? != Some(org_id) {
+            return Err(not_in_org());
+        }
+        if let Some(p) = project_id {
+            if p != proj {
+                return Err(ApiError::BadRequest(
+                    "monitor does not belong to the given project".into(),
+                ));
+            }
+        }
+        // A monitor trigger has no app dimension; carrying one would be a
+        // narrowing that never applies.
+        return Ok((Some(proj), None, Some(m)));
+    }
     match (project_id, app_id) {
-        (None, None) => Ok((None, None)),
+        (None, None) => Ok((None, None, None)),
         (Some(p), None) => {
             if repo::project_org(conn, p).await? != Some(org_id) {
                 return Err(ApiError::BadRequest("project is not in this org".into()));
             }
-            Ok((Some(p), None))
+            Ok((Some(p), None, None))
         }
         (maybe_p, Some(a)) => match repo::app_ancestry(conn, a).await? {
             Some((proj, o)) if o == org_id => {
@@ -558,7 +590,7 @@ async fn check_rule_scope(
                         ));
                     }
                 }
-                Ok((Some(proj), Some(a)))
+                Ok((Some(proj), Some(a), None))
             }
             _ => Err(ApiError::BadRequest("app is not in this org".into())),
         },
@@ -623,13 +655,17 @@ async fn authorize_rule_target(
     trigger: TriggerType,
 ) -> Result<(), ApiError> {
     let read_perm = rule_read_permission(trigger);
-    // Monitor triggers have no app dimension at FIRING time, so authorizing one
+    // Monitor triggers have no APP dimension at firing time, so authorizing one
     // at app scope would be narrower than what the rule actually delivers.
     // `monitors` carries only `project_id` (no `app_id`, no `environment_id`),
-    // and `repo::alert_rules_for_monitor` accordingly matches on org + project
-    // and never looks at `alert_rules.app_id` — so an app-narrowed
-    // `monitor_down` rule still fires for *every* monitor in its project. The
-    // app narrowing is dropped here to check at the radius that applies.
+    // so the app narrowing is dropped here to check at the radius that applies.
+    //
+    // Monitor narrowing is different and IS honoured: `alert_rules.monitor_id`
+    // is filtered by `repo::alert_rules_for_monitor`, and `check_rule_scope`
+    // derives `project_id` from the pinned monitor — so a pinned rule arrives
+    // here on the `(None, Some(project))` arm. That is strictly narrower than
+    // the org arm it would otherwise take, never looser, which is why pinning
+    // needs no additional gate of its own.
     //
     // Same fact `SubKind::allows_app_scope` encodes for personal uptime
     // subscriptions, but the remedy differs: subscriptions refuse app scope
@@ -769,6 +805,13 @@ pub async fn create_rule(
         return Err(ApiError::BadRequest("conditions must be an object".into()));
     }
     rule::validate_conditions(trigger, &conditions).map_err(ApiError::BadRequest)?;
+    if req.monitor_id.is_some()
+        && !matches!(trigger, TriggerType::MonitorDown | TriggerType::MonitorUp)
+    {
+        return Err(ApiError::BadRequest(
+            "monitor_id applies only to monitor_down / monitor_up triggers".into(),
+        ));
+    }
     let severity = req.severity.as_deref().unwrap_or("warning");
     if !SEVERITIES.contains(&severity) {
         return Err(ApiError::BadRequest(
@@ -782,8 +825,14 @@ pub async fn create_rule(
 
     let mut conn = db(&state).await?;
     authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_WRITE).await?;
-    let (project_id, app_id) =
-        check_rule_scope(&mut conn, org_id, req.project_id, req.app_id).await?;
+    let (project_id, app_id, monitor_id) = check_rule_scope(
+        &mut conn,
+        org_id,
+        req.project_id,
+        req.app_id,
+        req.monitor_id,
+    )
+    .await?;
     authorize_rule_target(&mut conn, auth.user_id, org_id, project_id, app_id, trigger).await?;
     check_channels_in_org(&mut conn, org_id, &req.channel_ids).await?;
 
@@ -793,6 +842,7 @@ pub async fn create_rule(
             org_id,
             project_id,
             app_id,
+            monitor_id,
             name: req.name.trim(),
             trigger_type: trigger.as_str(),
             conditions: &conditions,

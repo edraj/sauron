@@ -51,6 +51,13 @@
 //!     prove what the engine hands its `BlobFetch`, not that the value survives
 //!     the round trip through Postgres.
 //!
+//! And one for the second route that renders a stack trace:
+//!
+//! 12. the session timeline symbolicates on read, like the issue routes. Same
+//!     failure mode as every other test here — an unsymbolicated event renders
+//!     as minified frames, which is indistinguishable from "no symbols were
+//!     ever uploaded" — and the only place it is visible is the HTTP body.
+//!
 //! Every test spawns the actual compiled `sauron-api` binary (via Cargo's
 //! `CARGO_BIN_EXE_sauron-api`) against a fresh, migrated, ephemeral database
 //! and drives it with `reqwest`. See `tests/http_env_scoping.rs`'s `TestServer`
@@ -1279,6 +1286,182 @@ async fn an_uppercase_reported_build_id_symbolicates_against_the_stored_artifact
             .iter()
             .any(|fr| fr["function"] == "compute_total" && fr["symbolicated"] == json!(true)),
         "the frame must be resolved through the uploaded ELF's DWARF: {detail}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 12. **The session timeline symbolicates on read.** `issues::detail` and
+///     `issues::events` did; `sessions::detail` returned whatever the ingest
+///     path happened to persist, so an app whose symbols were uploaded after
+///     the crash — or whose ingest-time symbolication timed out — rendered
+///     minified frames in the one view that shows a crash in the context of
+///     what the user was doing before it.
+///
+///     Set up so the ONLY thing that can produce a resolved frame is the
+///     handler's own on-read call: the stored row goes in with
+///     `symbolication_status = "pending"` and a null `stacktrace_symbolicated`,
+///     and the symbols are uploaded before the read but after the row exists.
+///
+///     The fixture role holds the body pair (`issue:read` + `event:read`) and
+///     NOT `source:read`, so this also pins the gate ordering: symbolicate,
+///     then strip source lines. Get it backwards — strip before the frames
+///     exist — and `function`/`file`/`lineno` below still arrive, which is why
+///     the assertion names the resolved symbol rather than merely counting
+///     frames.
+#[tokio::test]
+async fn the_session_timeline_symbolicates_on_read() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_artifacts");
+        return;
+    };
+    let f = h.seed_artifacts_fixture().await;
+
+    let now = Utc::now();
+    let session_id = format!("sess-{}", Uuid::new_v4().simple());
+    let fingerprint = format!("dart-session-{}", Uuid::new_v4().simple());
+
+    // 1. A session, and inside it an unsymbolicated crash. `sessions::detail`
+    //    404s without the `sessions` row; the timeline's error leg joins to it
+    //    by `session_id`.
+    {
+        let mut conn = h.conn().await;
+        let issue_id = repo::upsert_issue(
+            &mut conn,
+            NewIssue {
+                app_id: f.app_id,
+                fingerprint: &fingerprint,
+                type_: "error",
+                title: "StateError",
+                culprit: "main.dart",
+                level: "error",
+                first_seen: now,
+                last_seen: now,
+                times_seen: 1,
+            },
+        )
+        .await
+        .expect("issue");
+        repo::insert_error_event(
+            &mut conn,
+            NewErrorEvent {
+                id: Uuid::new_v4(),
+                app_id: f.app_id,
+                environment_id: None,
+                issue_id,
+                fingerprint: fingerprint.clone(),
+                level: "error".into(),
+                message: "Bad state".into(),
+                exception_type: "StateError".into(),
+                exception_value: "Bad state".into(),
+                stacktrace: json!([]),
+                breadcrumbs: json!([]),
+                context: json!({}),
+                tags: json!({}),
+                release: None,
+                distinct_id: None,
+                event_user: None,
+                sdk: None,
+                ip_address: None,
+                occurred_at: now,
+                session_id: Some(session_id.clone()),
+                device_key: None,
+                screen: None,
+                workflow_id: None,
+                workflow_name: None,
+                // The two fields that make this a real on-read test.
+                stacktrace_symbolicated: None,
+                symbolication_status: "pending".into(),
+                debug_meta: Some(json!({
+                    "build_id": SAMPLE_ELF_BUILD_ID,
+                    "isolate_dso_base": "0",
+                    "arch": "arm64",
+                    "os": "android",
+                    "raw_stacktrace": dart_trace_with(SAMPLE_ELF_BUILD_ID),
+                })),
+                contexts: json!({}),
+                extra: json!({}),
+                handled: Some(false),
+                title: Some("StateError".into()),
+                culprit: Some("main.dart".into()),
+            },
+        )
+        .await
+        .expect("error event");
+        repo::bump_session(
+            &mut conn,
+            f.app_id,
+            &session_id,
+            None,
+            None,
+            now,
+            &json!({}),
+            None,
+            None,
+            None,
+            0,
+            1,
+        )
+        .await
+        .expect("bump session");
+    }
+
+    // 2. Symbols land AFTER the crash — the ordering ingest-time symbolication
+    //    cannot help with, and the whole reason an on-read pass exists.
+    let (status, body) = h
+        .upload(
+            f.app_id,
+            &f.token,
+            "kind=dart_symbols&platform=android&arch=arm64",
+            SAMPLE_ELF,
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+
+    // 3. Read the timeline.
+    let detail: Value = h
+        .client
+        .get(format!(
+            "{}/v1/apps/{}/sessions/{}",
+            h.base, f.app_id, session_id
+        ))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .expect("session detail")
+        .json()
+        .await
+        .expect("session detail body");
+
+    let error_item = detail["timeline"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a timeline array: {detail}"))
+        .iter()
+        .find(|i| i["kind"] == "error")
+        .unwrap_or_else(|| panic!("expected an error on the timeline: {detail}"));
+    let event = &error_item["error"];
+
+    assert_eq!(
+        event["symbolication_status"], "symbolicated",
+        "the session timeline must symbolicate on read as the issue routes do — a status still \
+         reading `pending` here is the stored row served verbatim, which is what this route did \
+         before `symbolicate_events` was wired into it: {detail}"
+    );
+    let frames = event["stacktrace_symbolicated"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected symbolicated frames: {detail}"));
+    assert!(
+        frames
+            .iter()
+            .any(|fr| fr["function"] == "compute_total" && fr["symbolicated"] == json!(true)),
+        "the frame must be resolved through the uploaded ELF's DWARF: {detail}"
+    );
+    // The body pair is held and `source:read` is not, so the symbol resolves
+    // and the source line does not travel with it.
+    assert!(
+        frames.iter().all(|fr| fr.get("context_line").is_none()),
+        "`gate_source_context` must still run AFTER symbolication — source lines reached a caller \
+         without `source:read`: {detail}"
     );
 
     h.shutdown().await;

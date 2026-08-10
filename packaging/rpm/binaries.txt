@@ -19,6 +19,7 @@ sauron-monitor
 sauron-alerts
 sauron-tier
 sauron-inspector
+sauron-storesync
 sauron-migrate
 
 # --- sauron-cli ---

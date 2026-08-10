@@ -182,6 +182,12 @@ const BACKEND_REJECTS_ENVIRONMENT_ID: RegExp[] = [
   /^\/v1\/apps\/[^/]+\/inspector\/policy(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/inspector\/mask-actions(?:[/?].*)?$/,
   /^\/v1\/apps\/[^/]+\/inspector\/masked-keys(?:[/?].*)?$/,
+  // Store data has no environment dimension to narrow on: Google and Apple
+  // report per package/bundle id and have never heard of an environment. The
+  // `store_environment_id` designation decides where the Overview section is
+  // SHOWN; it does not partition the numbers.
+  /^\/v1\/apps\/[^/]+\/store-connections(?:[/?].*)?$/,
+  /^\/v1\/apps\/[^/]+\/store-metrics(?:[/?].*)?$/,
 ];
 
 // `/v1/apps/{id}/first-event` (`apps::first_event`) is different in kind from

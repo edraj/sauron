@@ -58,6 +58,13 @@ pub struct Config {
     pub monitor_max_concurrency: usize,
     pub monitor_check_retention_days: i64,
     pub monitor_ssrf_allow_private: bool,
+    /// How often each app-store connection is re-synced. Store reports are
+    /// daily and lag 1-3 days behind, so polling faster buys nothing.
+    pub store_sync_interval_secs: i64,
+    pub store_sync_max_concurrency: usize,
+    /// How far back the *first* sync of a new connection reaches. Later syncs
+    /// use a short window; re-reading a year of reports every tick is waste.
+    pub store_backfill_days: i64,
     pub tier_hot_days: i64,
     pub tier_granularity: String,
     pub tier_cold_path: String,
@@ -265,6 +272,12 @@ impl std::fmt::Debug for Config {
             .field("monitor_tick_ms", &self.monitor_tick_ms)
             .field("monitor_batch", &self.monitor_batch)
             .field("monitor_max_concurrency", &self.monitor_max_concurrency)
+            .field("store_sync_interval_secs", &self.store_sync_interval_secs)
+            .field(
+                "store_sync_max_concurrency",
+                &self.store_sync_max_concurrency,
+            )
+            .field("store_backfill_days", &self.store_backfill_days)
             .field(
                 "monitor_check_retention_days",
                 &self.monitor_check_retention_days,
@@ -777,6 +790,9 @@ impl Config {
             monitor_ssrf_allow_private: var("MONITOR_SSRF_ALLOW_PRIVATE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            store_sync_interval_secs: parse("STORE_SYNC_INTERVAL_SECS", 21_600),
+            store_sync_max_concurrency: parse("STORE_SYNC_MAX_CONCURRENCY", 8),
+            store_backfill_days: parse("STORE_BACKFILL_DAYS", 90),
             tier_hot_days,
             tier_granularity: var("TIER_GRANULARITY").unwrap_or_else(|| "day".to_string()),
             tier_cold_path: var("TIER_COLD_PATH")
@@ -1319,6 +1335,9 @@ mod tests {
             monitor_max_concurrency: 50,
             monitor_check_retention_days: 30,
             monitor_ssrf_allow_private: false,
+            store_sync_interval_secs: 21_600,
+            store_sync_max_concurrency: 8,
+            store_backfill_days: 90,
             tier_hot_days: 30,
             tier_granularity: "day".to_string(),
             tier_cold_path: "/var/lib/sauron/cold".to_string(),
