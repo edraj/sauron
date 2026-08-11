@@ -27,6 +27,7 @@ export 'src/integrations/widgets_binding_observer.dart'
 export 'src/sauron.dart' show Sauron;
 export 'src/sauron_options.dart' show SauronOptions, BeforeSendCallback;
 export 'src/stacktrace/dart_stacktrace_parser.dart' show DartStackTraceParser;
+export 'src/transaction.dart' show ActiveTransaction;
 export 'src/types.dart'
     show
         AppDescriptor,

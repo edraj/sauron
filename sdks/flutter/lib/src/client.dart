@@ -16,6 +16,7 @@ import 'integrations/widgets_binding_observer.dart';
 import 'sauron_options.dart';
 import 'scope.dart';
 import 'stacktrace/dart_stacktrace_parser.dart';
+import 'transaction.dart';
 import 'transport/queue.dart';
 import 'transport/transport.dart';
 import 'types.dart';
@@ -487,6 +488,29 @@ class SauronClient {
       properties['reason'] = normalizeWorkflowReason(reason);
     }
     track(eventName, properties: properties);
+  }
+
+  /// Starts a stateful transaction that computes its own duration.
+  /// 
+  /// The returned [ActiveTransaction] must be `.end()`ed or `.cancel()`ed 
+  /// to record the span. Until then, it is not sent to the server.
+  ActiveTransaction startTransaction({
+    required String name,
+    String op = 'custom',
+    String? status,
+    String? httpMethod,
+    int? httpStatus,
+    String? url,
+  }) {
+    return ActiveTransaction(
+      this,
+      name: name,
+      op: op,
+      status: status,
+      httpMethod: httpMethod,
+      httpStatus: httpStatus,
+      url: url,
+    );
   }
 
   /// Records a performance [TransactionItem]: one timed operation

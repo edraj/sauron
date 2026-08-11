@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:flutter/widgets.dart';
 
 import '../client.dart';
@@ -38,8 +40,29 @@ class SauronWidgetsBindingObserver with WidgetsBindingObserver {
     }
   }
 
+  bool _ignoredInactiveForKeyboard = false;
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Ignore lifecycle transitions that are likely caused by the keyboard
+    // opening or closing on iOS.
+    if (state == AppLifecycleState.inactive) {
+      final double bottomInset = WidgetsBinding
+              .instance.platformDispatcher.implicitView?.viewInsets.bottom ??
+          0.0;
+      if (bottomInset > 0.0) {
+        _ignoredInactiveForKeyboard = true;
+        return;
+      }
+    } else if (state == AppLifecycleState.resumed) {
+      if (_ignoredInactiveForKeyboard) {
+        _ignoredInactiveForKeyboard = false;
+        return;
+      }
+    } else {
+      _ignoredInactiveForKeyboard = false;
+    }
+
     _client.addBreadcrumb(
       Breadcrumb(
         type: 'navigation',

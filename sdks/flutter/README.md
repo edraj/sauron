@@ -397,6 +397,41 @@ Sauron.trackTransaction(
 );
 ```
 
+### `Sauron.startTransaction` / `ActiveTransaction`
+
+For operations that span time asynchronously, use `startTransaction` to get an `ActiveTransaction` object. You can then call `.end()` or `.cancel()` on it. This ensures the SDK captures exactly when the transaction started and when it ended, automatically computing the correct `duration` for you without requiring manual stopwatches.
+
+```dart
+static ActiveTransaction startTransaction({
+  required String name,
+  String op = 'custom',
+  String? status,
+  String? httpMethod,
+  int? httpStatus,
+  String? url,
+})
+```
+
+Calling `.end()` records the transaction with the computed duration. You can override properties like `status` or `httpStatus` at the end:
+
+```dart
+final tx = Sauron.startTransaction(
+  name: 'Fetch Data',
+  op: 'http',
+  httpMethod: 'GET',
+);
+
+try {
+  final response = await http.get(Uri.parse('https://api.example.com/data'));
+  tx.end(status: 'ok', httpStatus: response.statusCode);
+} catch (e) {
+  // Cancelling automatically ends it and sets status to 'cancelled: network_error'
+  tx.cancel('network_error');
+}
+```
+
+If you call `.end()` or `.cancel()` multiple times on the same `ActiveTransaction`, it safely ignores subsequent calls and only records the span once.
+
 ### `Sauron.setScreen` / `Sauron.screen`
 
 ```dart
@@ -790,6 +825,7 @@ Everything below is exported from `package:sauron_flutter/sauron_flutter.dart`.
 | `WorkflowStatus` | enum `ok, alreadyActive, notActive, nameMismatch, invalidName, disabled` | Wire values (in lifecycle-adjacent server logs) are snake_case: `already_active`, `not_active`, `name_mismatch`, `invalid_name`. See [Workflows](#sauronstartworkflow--sauronendworkflow--sauroncancelworkflow--sauronworkflow). |
 | `WorkflowResult` | `WorkflowResult(WorkflowStatus status, [String? workflowId])` | `workflowId` is set when `status == ok`. |
 | `ActiveWorkflow` | `ActiveWorkflow({required String workflowId, required String name, required DateTime startedAt})` | What `Sauron.workflow`/`client.workflow` returns; `null` when none is active. |
+| `ActiveTransaction` | returned by `startTransaction` | Has `.end({status, httpStatus, url})` and `.cancel([reason])`. |
 | `SauronNavigatorObserver` | see [Flutter integration](#flutter-integration) | |
 | `SauronWidgetsBindingObserver` | see [Flutter integration](#flutter-integration) | |
 
