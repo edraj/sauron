@@ -133,8 +133,10 @@
         <button class="row" onclick={() => toggle(i)} type="button">
           <span class="time mono" title={formatTime(item.at)}>{formatTime(item.at)}</span>
           <span class="kind kind-{rowKind(item)}">{rowKind(item)}</span>
-          {#if item.kind === 'transaction' && !isHttp(item) && item.transaction.op}
-            <Badge tone="neutral" size="sm">{item.transaction.op}</Badge>
+          {#if item.kind === 'transaction'}
+            {#if !isHttp(item) && item.transaction.op}
+              <Badge tone="neutral" size="sm">{item.transaction.op}</Badge>
+            {/if}
           {/if}
           <span class="title truncate">{rowTitle(item)}</span>
           <span class="trail">
