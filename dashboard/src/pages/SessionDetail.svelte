@@ -11,6 +11,7 @@
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
+  import Modal from '../lib/components/ui/Modal.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -18,7 +19,7 @@
   import { getSession } from '../lib/api/sessions';
   import { isNormalizedError } from '../lib/api/client';
   import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
-  import type { SessionDetail } from '../lib/models';
+  import type { SessionDetail, Transaction } from '../lib/models';
   import type { TimeMode } from '../lib/models/timeline-row';
 
   interface Props {
@@ -100,6 +101,32 @@
   const hasContext = $derived(
     !!s && !!s.context && typeof s.context === 'object' && Object.keys(s.context).length > 0,
   );
+
+  let sliceStack = $state<Transaction[]>([]);
+  let sliceStartTime = $state<'occurred_at' | 'received_at'>('occurred_at');
+
+  const slicedTimeline = $derived.by(() => {
+    if (!detail || sliceStack.length === 0) return [];
+    const currentSlice = sliceStack[sliceStack.length - 1];
+    
+    const startMs = new Date(sliceStartTime === 'occurred_at' ? currentSlice.occurred_at : currentSlice.received_at).getTime();
+    const endMs = currentSlice.finished_at 
+      ? new Date(currentSlice.finished_at).getTime()
+      : new Date(currentSlice.occurred_at).getTime() + currentSlice.duration_ms;
+
+    return detail.timeline.filter(item => {
+      const itemMs = new Date(item.at).getTime();
+      return itemMs >= startMs && itemMs <= endMs;
+    });
+  });
+
+  function closeSliceModal() {
+    sliceStack = [];
+  }
+
+  function pushSlice(tx: Transaction) {
+    sliceStack = [...sliceStack, tx];
+  }
 </script>
 
 <AppShell requireApp>
@@ -181,7 +208,7 @@
               {timeMode === 'delta' ? 'Since previous' : 'Since start'}
             </Button>
           {/snippet}
-          <Timeline items={detail.timeline} startedAt={s.started_at} {timeMode} />
+          <Timeline items={detail.timeline} startedAt={s.started_at} {timeMode} onslice={pushSlice} />
         </Card>
       </div>
       <aside class="col-side">
@@ -195,6 +222,42 @@
       </aside>
     </div>
   {/if}
+
+  <Modal open={sliceStack.length > 0} onclose={closeSliceModal} size="xl" title="In between transaction">
+    {#if sliceStack.length > 0}
+      <div class="slice-header">
+        <div class="slice-breadcrumbs">
+          {#each sliceStack as tx, i}
+            <button class="breadcrumb-btn" onclick={() => (sliceStack = sliceStack.slice(0, i + 1))}>
+              {tx.name || tx.op || 'transaction'}
+            </button>
+            {#if i < sliceStack.length - 1}
+              <Icon name="chevron-right" size={12} />
+            {/if}
+          {/each}
+        </div>
+        <div class="slice-toggles">
+          <Button
+            size="sm"
+            variant={sliceStartTime === 'occurred_at' ? 'primary' : 'secondary'}
+            onclick={() => (sliceStartTime = 'occurred_at')}
+          >
+            occurred_at
+          </Button>
+          <Button
+            size="sm"
+            variant={sliceStartTime === 'received_at' ? 'primary' : 'secondary'}
+            onclick={() => (sliceStartTime = 'received_at')}
+          >
+            received_at
+          </Button>
+        </div>
+      </div>
+      <div class="slice-timeline">
+        <Timeline items={slicedTimeline} startedAt={sliceStack[sliceStack.length - 1][sliceStartTime]} timeMode="delta" onslice={pushSlice} />
+      </div>
+    {/if}
+  </Modal>
 </AppShell>
 
 <style>
@@ -282,6 +345,37 @@
   }
   .empty-ctx {
     font-size: 13px;
+  }
+  .slice-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .slice-breadcrumbs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 13px;
+  }
+  .breadcrumb-btn {
+    background: none;
+    border: none;
+    color: var(--primary);
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: var(--radius-sm);
+  }
+  .breadcrumb-btn:hover {
+    background: var(--surface-3);
+  }
+  .slice-toggles {
+    display: flex;
+    gap: 8px;
   }
 
   @media (max-width: 960px) {

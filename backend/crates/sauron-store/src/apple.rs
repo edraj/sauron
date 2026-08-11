@@ -296,6 +296,34 @@ async fn create_report_request(
         .await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
+    // 403 here is a ROLE problem, never a credential one, and it is worth
+    // naming because this string is what lands in `last_error` and is the only
+    // thing the admin sees.
+    //
+    // Reaching this line proves the key authenticated: `find_report_request`
+    // above LISTED the app's report requests with the same token one call
+    // earlier, and a bad .p8 / key_id / issuer_id is a 401 NOT_AUTHORIZED, not
+    // a 403. A wrong apple_app_id would have 404'd that same GET. So the key is
+    // valid and can READ analytics report requests but not CREATE one — which
+    // is exactly Apple's split: only an **Admin** key may request a report type
+    // for the first time, while Sales (Access to Reports) and Finance keys can
+    // list requests and download reports once the request exists.
+    //
+    // That second remedy is real and cheaper than re-issuing a key, because
+    // `find_report_request` looks before it creates: an Admin making the
+    // ONGOING request by hand in App Store Connect leaves this key nothing to
+    // create, and the next tick adopts it.
+    if status.as_u16() == 403 {
+        anyhow::bail!(
+            "Apple refused to create the ongoing analytics report request (403). The API key \
+             authenticated and can read this app's report requests, so the credential is fine — \
+             it lacks the role to create one. Only an Admin key may request a report type for the \
+             first time. Either supply an Admin key, or have an Admin create the ONGOING \
+             \"{REPORT_NAME}\" request once in App Store Connect and this key will adopt it on \
+             the next sync. Apple said: {}",
+            text.chars().take(300).collect::<String>()
+        );
+    }
     anyhow::ensure!(
         status.is_success(),
         "creating the Apple report request failed ({status}): {}",

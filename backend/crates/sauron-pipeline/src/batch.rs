@@ -1188,6 +1188,7 @@ mod equivalence_tests {
             timestamp: at,
             workflow_id: None,
             workflow_name: None,
+            finished_at: None,
         })
     }
 

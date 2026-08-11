@@ -188,13 +188,17 @@
     place-items: center;
   }
 
+  .label {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+
   .label.hidden {
     visibility: hidden;
   }
 
   .lock {
     display: inline-flex;
-    vertical-align: -2px;
-    margin-right: 5px;
   }
 </style>

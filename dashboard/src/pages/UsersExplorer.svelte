@@ -2,7 +2,7 @@
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
@@ -223,6 +223,11 @@
       </Card>
     {:else if analyticsError}
       <Card><p class="muted">{analyticsError}</p></Card>
+    {:else}
+      <Skeleton rows={2} height="70px" label="Loading audience stats" />
+      <Card>
+        <Skeleton rows={1} height="200px" label="Loading activity chart" />
+      </Card>
     {/if}
   </div>
 
@@ -242,7 +247,7 @@
   </div>
 
   {#if loading && rows.length === 0}
-    <div class="center"><Spinner size={24} /></div>
+    <Skeleton rows={8} height="48px" label="Loading users" />
   {:else if error}
     <Card>
       <EmptyState title="Couldn't load users" description={error} icon="triangle-alert">
@@ -409,11 +414,6 @@
     font-size: 15px;
     font-weight: 640;
     margin: 0;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   .table {
     transition: opacity 0.12s ease;

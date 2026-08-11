@@ -417,6 +417,7 @@ diesel::table! {
         workflow_id -> Nullable<Text>,
         workflow_name -> Nullable<Text>,
         restored_pin_id -> Nullable<Uuid>,
+        finished_at -> Nullable<Timestamptz>,
     }
 }
 

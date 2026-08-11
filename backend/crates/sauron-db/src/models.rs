@@ -713,6 +713,10 @@ pub struct Transaction {
     pub ip_address: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
+    pub workflow_id: Option<String>,
+    pub workflow_name: Option<String>,
+    pub restored_pin_id: Option<Uuid>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 /// **`Insertable`-only, on purpose** — see [`NewErrorEvent`]'s doc comment for
@@ -743,6 +747,7 @@ pub struct NewTransaction {
     pub release: Option<String>,
     pub ip_address: Option<String>,
     pub occurred_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------
