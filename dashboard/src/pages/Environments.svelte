@@ -12,6 +12,7 @@
   import Modal from '../lib/components/ui/Modal.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { errorMessage, isNormalizedError } from '../lib/api/client';
@@ -206,47 +207,120 @@
     return enrollments.some((r) => r.environment_id === environmentId && r.is_default);
   }
 
-  async function load(pid: string) {
-    loading = true;
-    error = null;
+  /**
+   * Everything this page renders, as one payload.
+   *
+   * The two completeness flags travel WITH the data rather than beside it
+   * because they describe that exact fetch — "the catalogue leg 403'd" and
+   * "some app's enrollments are missing" are properties of the rows on screen,
+   * and a cache that restored the rows without them would present a partial
+   * view as a complete one, which is precisely what `canRetire` must not trust.
+   */
+  interface EnvironmentsPayload {
+    apps: App[];
+    catalogue: ProjectEnvironment[];
+    catalogueReadable: boolean;
+    enrollments: AppEnvironment[];
+    enrollmentsComplete: boolean;
+  }
+
+  async function fetchAll(pid: string): Promise<EnvironmentsPayload> {
+    const projectApps = await listApps(pid);
+    // `allSettled`, NOT `all` — the pattern already used at
+    // IssueDetail.svelte:98. This page is reachable with an APP-scoped
+    // `env:read`, so a member with partial reach gets 403 on the apps they
+    // don't hold. Under `all` one such leg rejected the whole fan-out and
+    // blanked the entire page (and, because the promise was awaited after the
+    // catalogue block, an early throw there left it rejecting unhandled).
+    // Degrade to the apps that did answer; `enrollmentsComplete` records that
+    // the view is partial so `canRetire` stops trusting it.
+    const enrollmentsPromise = Promise.allSettled(
+      projectApps.map((a) => listEnvironments(a.id, true)),
+    );
+
+    // Isolated from the fan-out above: this is the ONE call here that a purely
+    // app-scoped `env:read` grant cannot make (see the comment on
+    // `catalogueReadable`). Catching its 403 HERE, rather than letting it
+    // reject the way every other call does, is what keeps that member's own
+    // enrollment rows on screen instead of a blank error card — degrade this
+    // one piece, not the whole page.
+    let cat: ProjectEnvironment[] = [];
+    let readable = true;
     try {
-      const projectApps = await listApps(pid);
-      apps = projectApps;
-      // `allSettled`, NOT `all` — the pattern already used at
-      // IssueDetail.svelte:98. This page is reachable with an APP-scoped
-      // `env:read`, so a member with partial reach gets 403 on the apps they
-      // don't hold. Under `all` one such leg rejected the whole fan-out and
-      // blanked the entire page (and, because the promise was awaited after the
-      // catalogue block, an early throw there left it rejecting unhandled).
-      // Degrade to the apps that did answer; `enrollmentsComplete` records that
-      // the view is partial so `canRetire` stops trusting it.
-      const enrollmentsPromise = Promise.allSettled(
-        projectApps.map((a) => listEnvironments(a.id, true)),
-      );
-
-      // Isolated from the `try` above it: this is the ONE call in `load()` a
-      // purely app-scoped `env:read` grant cannot make (see the comment on
-      // `catalogueReadable`). Catching its 403 HERE, rather than letting it
-      // reject the same way every other call in this function does, is what
-      // keeps that member's own enrollment rows on screen instead of a blank
-      // error card — degrade this one piece, not the whole page.
-      try {
-        catalogue = await listProjectEnvironments(pid, true);
-        catalogueReadable = true;
-      } catch (err) {
-        if (isNormalizedError(err) && err.status === 403) {
-          catalogue = [];
-          catalogueReadable = false;
-        } else {
-          throw err;
-        }
-      }
-
-      const settled = await enrollmentsPromise;
-      enrollments = settled.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
-      enrollmentsComplete = settled.every((r) => r.status === 'fulfilled');
+      cat = await listProjectEnvironments(pid, true);
     } catch (err) {
-      error = errorMessage(err);
+      if (isNormalizedError(err) && err.status === 403) {
+        cat = [];
+        readable = false;
+      } else {
+        // The fan-out is already in flight; leaving it unobserved would reject
+        // unhandled once this throw unwinds.
+        void enrollmentsPromise.catch(() => {});
+        throw err;
+      }
+    }
+
+    const settled = await enrollmentsPromise;
+    return {
+      apps: projectApps,
+      catalogue: cat,
+      catalogueReadable: readable,
+      enrollments: settled.flatMap((r) => (r.status === 'fulfilled' ? r.value : [])),
+      enrollmentsComplete: settled.every((r) => r.status === 'fulfilled'),
+    };
+  }
+
+  /**
+   * Copy the payload into the page's own state.
+   *
+   * Every array is COPIED. `viewCache` hands back the very arrays it holds, and
+   * these land in `$state` variables that the row-level mutations below rebuild
+   * with `.map()` — assigning the cached arrays directly would deep-proxy them,
+   * so a later write would reach the cached payload and the edit would survive
+   * navigation even if the server had rejected it.
+   */
+  function apply(payload: EnvironmentsPayload): void {
+    apps = [...payload.apps];
+    catalogue = [...payload.catalogue];
+    catalogueReadable = payload.catalogueReadable;
+    enrollments = [...payload.enrollments];
+    enrollmentsComplete = payload.enrollmentsComplete;
+  }
+
+  const pageKey = (pid: string) => viewKey('environments.page', pid);
+
+  /**
+   * Drop the cached payload. Called after every successful mutation: each one
+   * rebuilds a row locally so the list does not jump, which leaves the page's
+   * state correct and the cache one revision behind. Without this, navigating
+   * away and back would restore the pre-mutation rows for the fresh window.
+   */
+  function invalidatePage(): void {
+    viewCache.invalidate('environments.page');
+  }
+
+  async function load(pid: string, force = false) {
+    const key = pageKey(pid);
+    const cached = viewCache.get<EnvironmentsPayload>(key);
+    if (cached !== undefined) {
+      apply(cached);
+      error = null;
+      loading = false;
+    } else {
+      loading = true;
+      error = null;
+    }
+    if (!force && viewCache.isFresh(key)) return;
+    try {
+      const fresh = await viewCache.dedupe(key, () => fetchAll(pid), force);
+      viewCache.set(key, fresh);
+      apply(fresh);
+      error = null;
+    } catch (err) {
+      // A failed refresh over rows that are already on screen leaves them up —
+      // they are still a true answer, merely older. Only a failure with nothing
+      // to show becomes the page's error state.
+      if (cached === undefined) error = errorMessage(err);
     } finally {
       loading = false;
     }
@@ -278,6 +352,7 @@
       catalogue = cat;
       enrollments = perApp.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
       enrollmentsComplete = perApp.every((r) => r.status === 'fulfilled');
+      invalidatePage();
       return true;
     } catch {
       return false;
@@ -292,6 +367,7 @@
    */
   function mergeEnrollment(updated: AppEnvironmentRow) {
     enrollments = enrollments.map((e) => (e.id === updated.id ? { ...updated, name: e.name } : e));
+    invalidatePage();
   }
 
   async function submitCreate() {
@@ -325,6 +401,7 @@
     try {
       const renamed = await renameProjectEnvironment(target.id, { name: renameValue.trim() });
       catalogue = catalogue.map((e) => (e.id === renamed.id ? renamed : e));
+      invalidatePage();
       enrollments = enrollments.map((r) =>
         r.environment_id === renamed.id ? { ...r, name: renamed.name } : r,
       );
@@ -370,6 +447,7 @@
             ? { ...e, is_default: false }
             : e,
       );
+      invalidatePage();
       toastStore.success(`"${row.name}" is now ${appNameFor(row.app_id)}'s default environment.`);
     } catch (err) {
       toastStore.error(errorMessage(err));
@@ -402,6 +480,7 @@
     try {
       const retiredEnv = await retireProjectEnvironment(target.id);
       catalogue = catalogue.map((e) => (e.id === retiredEnv.id ? retiredEnv : e));
+      invalidatePage();
       enrollments = enrollments.map((r) =>
         r.environment_id === retiredEnv.id
           ? {

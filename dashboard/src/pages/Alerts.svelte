@@ -38,6 +38,8 @@
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
   import {
@@ -59,13 +61,29 @@
   type Tab = 'channels' | 'rules' | 'history';
 
   let tab = $state<Tab>('channels');
-  let channels = $state<NotificationChannel[]>([]);
-  let rules = $state<AlertRule[]>([]);
-  let history = $state<AlertEvent[]>([]);
-  let meta = $state<AlertMeta | null>(null);
-  let loading = $state(true);
+  // Cached view (lib/stores/cached-view.svelte.ts): the three lists paint
+  // instantly when you come back from a rule editor, then refresh behind them.
+  //
+  // ONE view for all three because the tabs share a single load and are only
+  // meaningful together — a rule row names the channel it delivers to, so
+  // fresh rules beside stale channels would render a rule pointing at a
+  // channel that no longer exists.
+  const view = new CachedView<{
+    channels: NotificationChannel[];
+    rules: AlertRule[];
+    history: AlertEvent[];
+    meta: AlertMeta;
+  }>();
+  const channels = $derived(view.data?.channels ?? []);
+  const rules = $derived(view.data?.rules ?? []);
+  const history = $derived(view.data?.history ?? []);
+  const meta = $derived(view.data?.meta ?? null);
+  const loading = $derived(view.loading);
   let refreshing = $state(false);
-  let error = $state<string | null>(null);
+  // Mutations report through the same banner as the load, and a `$derived`
+  // cannot be assigned to — so they keep their own state and this is the fold.
+  let actionError = $state<string | null>(null);
+  const error = $derived(actionError ?? view.error);
   let notice = $state<string | null>(null);
 
   const orgId = $derived(sessionStore.currentOrgId);
@@ -331,35 +349,56 @@
   const kindLabel = (k: ChannelKind): string => KIND_LABELS[k] ?? k;
   const triggerLabel = (t: TriggerType): string => TRIGGER_LABELS[t] ?? t;
 
-  async function load() {
-    if (!orgId) {
-      loading = false;
+  /**
+   * Channel/rule TYPE metadata — the static catalogue of what fields each
+   * channel kind takes. Cached under its own key and never revalidated with the
+   * lists: it is deployment-wide configuration, identical for every org, and
+   * the old code already fetched it once and reused it for the tab's lifetime.
+   * Keying it separately keeps that property while extending it across
+   * navigations instead of losing it on every unmount.
+   */
+  async function loadMeta(): Promise<AlertMeta> {
+    const key = viewKey('alerts.meta');
+    const cached = viewCache.get<AlertMeta>(key);
+    if (cached !== undefined) return cached;
+    return viewCache.set(key, await viewCache.dedupe(key, () => getAlertMeta()));
+  }
+
+  /**
+   * `force` bypasses the fresh-window short-circuit. Every mutation re-lists
+   * through it: a re-list that joined a flight issued before the write returns
+   * the pre-write lists, and `set` would then cache it — so the channel just
+   * deleted reappears and stays for the whole fresh window.
+   */
+  async function load(force = false) {
+    const org = orgId;
+    if (!org) {
+      // No org means no request is issued, and `loading` starts true — without
+      // this the page spins forever on a fetch that never happened.
+      view.idle();
       return;
     }
-    loading = true;
-    error = null;
-    try {
-      const [c, r, h, m] = await Promise.all([
-        listChannels(orgId),
-        listRules(orgId),
-        listAlertEvents(orgId, 50),
-        meta ? Promise.resolve(meta) : getAlertMeta(),
-      ]);
-      channels = c;
-      rules = r;
-      history = h;
-      meta = m;
-    } catch (e) {
-      error = errorMessage(e);
-    } finally {
-      loading = false;
-    }
+    actionError = null;
+    await view.load(
+      viewKey('alerts.page', org),
+      async () => {
+        const [channels, rules, history, meta] = await Promise.all([
+          listChannels(org),
+          listRules(org),
+          listAlertEvents(org, 50),
+          loadMeta(),
+        ]);
+        return { channels, rules, history, meta };
+      },
+      force,
+    );
   }
 
   async function refresh() {
     refreshing = true;
     try {
-      await load();
+      viewCache.invalidate('alerts.page');
+      await load(true);
     } finally {
       refreshing = false;
     }
@@ -410,7 +449,7 @@
   async function submitChannel() {
     if (!orgId || !chName) return;
     savingChannel = true;
-    error = null;
+    actionError = null;
     try {
       const { config, secret } = buildChannelPayload();
       if (editingChannelId) {
@@ -430,9 +469,9 @@
         });
       }
       closeChannelForm();
-      await load();
+      await load(true);
     } catch (e) {
-      error = errorMessage(e);
+      actionError = errorMessage(e);
     } finally {
       savingChannel = false;
     }
@@ -441,22 +480,22 @@
   async function toggleChannel(c: NotificationChannel) {
     try {
       await updateChannel(c.id, { enabled: !c.enabled });
-      await load();
+      await load(true);
     } catch (e) {
-      error = errorMessage(e);
+      actionError = errorMessage(e);
     }
   }
 
   async function runTest(c: NotificationChannel) {
     testingId = c.id;
-    error = null;
+    actionError = null;
     notice = null;
     try {
       const res = await testChannel(c.id);
       if (res.ok) notice = `Test notification delivered to “${c.name}”.`;
-      else error = `Test to “${c.name}” failed: ${res.error ?? 'unknown error'}`;
+      else actionError = `Test to “${c.name}” failed: ${res.error ?? 'unknown error'}`;
     } catch (e) {
-      error = errorMessage(e);
+      actionError = errorMessage(e);
     } finally {
       testingId = null;
     }
@@ -488,7 +527,7 @@
   async function submitRule() {
     if (!orgId || !rName) return;
     savingRule = true;
-    error = null;
+    actionError = null;
     try {
       if (editingRuleId) {
         // No `trigger_type`: it is fixed at creation, along with the
@@ -519,9 +558,9 @@
         });
       }
       closeRuleForm();
-      await load();
+      await load(true);
     } catch (e) {
-      error = errorMessage(e);
+      actionError = errorMessage(e);
     } finally {
       savingRule = false;
     }
@@ -530,9 +569,9 @@
   async function toggleRule(r: AlertRule) {
     try {
       await updateRule(r.id, { enabled: !r.enabled });
-      await load();
+      await load(true);
     } catch (e) {
-      error = errorMessage(e);
+      actionError = errorMessage(e);
     }
   }
 
@@ -543,9 +582,9 @@
     try {
       if (target.kind === 'channel') await deleteChannel(target.id);
       else await deleteRule(target.id);
-      await load();
+      await load(true);
     } catch (e) {
-      error = errorMessage(e);
+      actionError = errorMessage(e);
     }
   }
 
@@ -625,7 +664,11 @@
   }
 
   $effect(() => {
-    if (orgId) void load();
+    // Unguarded: `load()` reads `orgId` itself (so this still re-runs on an org
+    // switch) AND owns the no-org case. Guarding here instead would skip the
+    // call entirely, leaving `view.loading` true from construction — the page
+    // would spin forever on a request that was never issued.
+    void load();
   });
 
   // Loaded at page-mount (and whenever the session's project changes), not
