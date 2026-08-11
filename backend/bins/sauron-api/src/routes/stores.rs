@@ -163,8 +163,9 @@ fn validate_identifiers(
 ) -> Result<serde_json::Value, ApiError> {
     match kind {
         StoreKind::GooglePlay => {
-            let ids: GoogleIdentifiers = serde_json::from_value(v.clone())
-                .map_err(|e| ApiError::BadRequest(format!("invalid Google Play identifiers: {e}")))?;
+            let ids: GoogleIdentifiers = serde_json::from_value(v.clone()).map_err(|e| {
+                ApiError::BadRequest(format!("invalid Google Play identifiers: {e}"))
+            })?;
             if ids.package_name.trim().is_empty() || ids.gcs_bucket.trim().is_empty() {
                 return Err(ApiError::BadRequest(
                     "package_name and gcs_bucket are required".into(),

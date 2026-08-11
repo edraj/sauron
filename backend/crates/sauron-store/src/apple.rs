@@ -132,7 +132,11 @@ pub fn parse_report_csv(gzipped: &[u8]) -> anyhow::Result<Vec<DailyMetric>> {
         let day = NaiveDate::parse_from_str(raw_day, "%Y-%m-%d")
             .with_context(|| format!("unparseable Date {raw_day:?} in Apple report"))?;
 
-        let event = rec.get(i_event).unwrap_or_default().trim().to_ascii_lowercase();
+        let event = rec
+            .get(i_event)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
         let n = parse_count(rec.get(i_count));
         let entry = by_day.entry(day).or_insert((0, 0));
 
@@ -310,7 +314,11 @@ pub async fn fetch(
         // `processingDate` is the day this instance covers. Skipping instances
         // outside the window avoids downloading every segment ever produced on
         // each tick.
-        if let Some(d) = inst.attributes.get("processingDate").and_then(|v| v.as_str()) {
+        if let Some(d) = inst
+            .attributes
+            .get("processingDate")
+            .and_then(|v| v.as_str())
+        {
             if let Ok(day) = NaiveDate::parse_from_str(d, "%Y-%m-%d") {
                 if day < since || day > today {
                     continue;
@@ -336,7 +344,10 @@ pub async fn fetch(
         return Ok((request_id, AppleProgress::Pending));
     }
 
-    Ok((request_id, AppleProgress::Ready(fold_days(collected, since, today))))
+    Ok((
+        request_id,
+        AppleProgress::Ready(fold_days(collected, since, today)),
+    ))
 }
 
 /// Segments from different instances can repeat a day, so fold once more at the
@@ -382,7 +393,10 @@ mod tests {
         // 2026-08-01: Install 600 (iPhone) + 180 (iPad) + Reinstall 100 = 880.
         // The Update row (4100) is excluded; Delete 195 is the uninstall side.
         assert_eq!(rows[0].day, NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
-        assert_eq!(rows[0].installs, 880, "install rows must be summed across dimensions");
+        assert_eq!(
+            rows[0].installs, 880,
+            "install rows must be summed across dimensions"
+        );
         assert_eq!(rows[0].uninstalls, 195);
 
         assert_eq!(rows[1].day, NaiveDate::from_ymd_opt(2026, 8, 2).unwrap());
@@ -396,7 +410,8 @@ mod tests {
         // in a separate column this connector ignores, so counting Apple's
         // Update rows would make the App Store line several times too tall and
         // still look entirely plausible.
-        let bytes = gz(b"Date,Event,Unique Devices\n2026-08-01,Update,5000\n2026-08-01,Install,10\n");
+        let bytes =
+            gz(b"Date,Event,Unique Devices\n2026-08-01,Update,5000\n2026-08-01,Install,10\n");
         let rows = parse_report_csv(&bytes).expect("parses");
         assert_eq!(rows[0].installs, 10);
         assert_eq!(rows[0].uninstalls, 0);
@@ -412,7 +427,8 @@ mod tests {
 
     #[test]
     fn event_matching_is_case_and_whitespace_insensitive() {
-        let bytes = gz(b"Date,Event,Unique Devices\n2026-08-01,  INSTALL ,5\n2026-08-01,delete,2\n");
+        let bytes =
+            gz(b"Date,Event,Unique Devices\n2026-08-01,  INSTALL ,5\n2026-08-01,delete,2\n");
         let rows = parse_report_csv(&bytes).expect("parses");
         assert_eq!(rows[0].installs, 5);
         assert_eq!(rows[0].uninstalls, 2);
@@ -429,7 +445,10 @@ mod tests {
     fn unique_devices_wins_when_both_columns_are_present() {
         let bytes = gz(b"Date,Event,Counts,Unique Devices\n2026-08-01,Install,610,600\n");
         let rows = parse_report_csv(&bytes).expect("parses");
-        assert_eq!(rows[0].installs, 600, "device-based column matches Play's semantics");
+        assert_eq!(
+            rows[0].installs, 600,
+            "device-based column matches Play's semantics"
+        );
     }
 
     #[test]
@@ -446,14 +465,18 @@ mod tests {
         // discriminator must be loud, not silently zero.
         let bytes = gz(b"Date,Unique Devices\n2026-08-01,880\n");
         let err = parse_report_csv(&bytes).unwrap_err().to_string();
-        assert!(err.contains("Event"), "must name the missing column, got: {err}");
+        assert!(
+            err.contains("Event"),
+            "must name the missing column, got: {err}"
+        );
     }
 
     #[test]
     fn an_unmapped_event_value_is_not_counted_as_either() {
         // Warned about rather than guessed at. Silently folding an unknown
         // value into installs would be worse than under-reporting it.
-        let bytes = gz(b"Date,Event,Unique Devices\n2026-08-01,Install,10\n2026-08-01,Teleport,999\n");
+        let bytes =
+            gz(b"Date,Event,Unique Devices\n2026-08-01,Install,10\n2026-08-01,Teleport,999\n");
         let rows = parse_report_csv(&bytes).expect("parses");
         assert_eq!(rows[0].installs, 10);
         assert_eq!(rows[0].uninstalls, 0);
@@ -476,10 +499,22 @@ mod tests {
     fn fold_days_merges_across_segments_and_clips_to_the_window() {
         let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
         let rows = vec![
-            DailyMetric { day: d(8, 1), installs: 5, uninstalls: 1 },
-            DailyMetric { day: d(8, 1), installs: 7, uninstalls: 2 },
+            DailyMetric {
+                day: d(8, 1),
+                installs: 5,
+                uninstalls: 1,
+            },
+            DailyMetric {
+                day: d(8, 1),
+                installs: 7,
+                uninstalls: 2,
+            },
             // Outside the window - Apple returned it, we must not chart it.
-            DailyMetric { day: d(7, 1), installs: 99, uninstalls: 99 },
+            DailyMetric {
+                day: d(7, 1),
+                installs: 99,
+                uninstalls: 99,
+            },
         ];
         let folded = fold_days(rows, d(8, 1), d(8, 5));
         assert_eq!(folded.len(), 1);

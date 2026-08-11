@@ -117,8 +117,8 @@ async fn claim_and_sync(
                 // Best-effort: if the database is also down there is nothing
                 // useful left to record, and the next tick will retry.
                 if let Ok(mut conn) = sauron_db::conn(&pool).await {
-                    let _ = repo::record_store_sync_result(&mut conn, id, Some(&e.to_string()))
-                        .await;
+                    let _ =
+                        repo::record_store_sync_result(&mut conn, id, Some(&e.to_string())).await;
                 }
             }
         }));
@@ -136,8 +136,8 @@ async fn sync_one(
     cfg: &Config,
     c: AppStoreConnection,
 ) -> anyhow::Result<()> {
-    let kind = StoreKind::parse(&c.store)
-        .ok_or_else(|| anyhow::anyhow!("unknown store {:?}", c.store))?;
+    let kind =
+        StoreKind::parse(&c.store).ok_or_else(|| anyhow::anyhow!("unknown store {:?}", c.store))?;
     let blob = c
         .secret_enc
         .as_ref()

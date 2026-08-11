@@ -88,7 +88,10 @@ mod tests {
         let headers = csv::StringRecord::from(vec!["Date", "Event"]);
         let err = column_index(&headers, "Deletions").unwrap_err().to_string();
         assert!(err.contains("Deletions"), "got: {err}");
-        assert!(err.contains("Event"), "error should list what WAS found: {err}");
+        assert!(
+            err.contains("Event"),
+            "error should list what WAS found: {err}"
+        );
     }
 
     #[test]

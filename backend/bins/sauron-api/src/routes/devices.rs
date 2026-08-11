@@ -73,14 +73,16 @@ pub async fn list(
     let limit = q.limit.clamp(1, 200);
     let search = q.search.as_deref().filter(|s| !s.is_empty());
     // Any non-empty `group` value turns the filter on; the dashboard sends "1".
-    let group = q.group.as_deref().filter(|s| !s.is_empty()).map(|_| {
-        repo::DeviceGroupKey {
+    let group = q
+        .group
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|_| repo::DeviceGroupKey {
             family: q.family.as_deref(),
             model: q.model.as_deref(),
             os_name: q.os_name.as_deref(),
             os_version: q.os_version.as_deref(),
-        }
-    });
+        });
     Ok(Json(
         repo::list_devices(
             &mut conn,

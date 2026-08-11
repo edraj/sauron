@@ -370,8 +370,22 @@ async fn seed(server: &TestServer, label: &str) -> Fixture {
     // switcher carries and the one `store_environment_id` must equal, not the
     // catalogue id. Returning the wrong one of the two would make the
     // designation test pass for the wrong reason.
-    let env_a = seed_env(&mut conn, project_a.id, app_a.id, "production", &format!("pk-a-{suffix}")).await;
-    let env_b = seed_env(&mut conn, project_b.id, app_b.id, "production", &format!("pk-b-{suffix}")).await;
+    let env_a = seed_env(
+        &mut conn,
+        project_a.id,
+        app_a.id,
+        "production",
+        &format!("pk-a-{suffix}"),
+    )
+    .await;
+    let env_b = seed_env(
+        &mut conn,
+        project_b.id,
+        app_b.id,
+        "production",
+        &format!("pk-b-{suffix}"),
+    )
+    .await;
 
     // `app:read` and nothing else — the narrowest principal that can reach the
     // list endpoint at all.
@@ -522,7 +536,11 @@ async fn a_stored_credential_never_appears_in_any_response() {
     );
     assert_eq!(list.as_array().expect("array").len(), 2);
     for c in list.as_array().unwrap() {
-        assert_eq!(c["has_secret"], json!(true), "has_secret must report storage");
+        assert_eq!(
+            c["has_secret"],
+            json!(true),
+            "has_secret must report storage"
+        );
     }
 
     // …and the chart feed embeds the same connection summaries.
@@ -558,7 +576,8 @@ async fn put_without_a_secret_field_preserves_the_stored_credential() {
 
     // Rename the package. No `secret` key at all — the shape the settings form
     // sends when the operator did not retype the credential.
-    let renamed = json!({"package_name": "com.example.renamed", "gcs_bucket": "pubsite_prod_rev_01234"});
+    let renamed =
+        json!({"package_name": "com.example.renamed", "gcs_bucket": "pubsite_prod_rev_01234"});
     let (status, text, body) = server
         .put_raw(&path, &fx.owner_token, json!({ "identifiers": renamed }))
         .await;
@@ -684,7 +703,10 @@ async fn identifiers_are_validated_against_the_store_slot() {
             json!({ "identifiers": {"bundle_id": "com.example.app"} }),
         )
         .await;
-    assert_eq!(status, 400, "incomplete Apple identifiers should 400: {text}");
+    assert_eq!(
+        status, 400,
+        "incomplete Apple identifiers should 400: {text}"
+    );
 
     let (status, text, _) = server
         .put_raw(
@@ -947,11 +969,18 @@ async fn cors_advertises_put_so_the_dashboard_can_actually_save() {
         .client
         .request(
             reqwest::Method::OPTIONS,
-            format!("{}/v1/apps/{}/store-connections/google_play", server.base, Uuid::new_v4()),
+            format!(
+                "{}/v1/apps/{}/store-connections/google_play",
+                server.base,
+                Uuid::new_v4()
+            ),
         )
         .header("Origin", "http://localhost:5173")
         .header("Access-Control-Request-Method", "PUT")
-        .header("Access-Control-Request-Headers", "authorization,content-type")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization,content-type",
+        )
         .send()
         .await
         .expect("preflight request");

@@ -87,7 +87,10 @@ pub fn decode_utf16le(bytes: &[u8]) -> anyhow::Result<String> {
 pub fn parse_installs_csv(bytes: &[u8]) -> anyhow::Result<Vec<DailyMetric>> {
     let text = decode_utf16le(bytes)?;
     let mut rdr = csv::Reader::from_reader(text.as_bytes());
-    let headers = rdr.headers().context("Play report has no header row")?.clone();
+    let headers = rdr
+        .headers()
+        .context("Play report has no header row")?
+        .clone();
 
     let i_date = column_index(&headers, COL_DATE)?;
     let i_installs = column_index(&headers, COL_INSTALLS)?;
@@ -273,7 +276,8 @@ mod tests {
         // Column order in these reports is not contractual. An index-based
         // parser that shifts by one produces NUMBERS, not errors — so a
         // missing header must be loud and must say which one.
-        let bytes = utf16le("Date,Package Name,Daily Device Uninstalls\n2026-08-01,com.example.app,310\n");
+        let bytes =
+            utf16le("Date,Package Name,Daily Device Uninstalls\n2026-08-01,com.example.app,310\n");
         let err = parse_installs_csv(&bytes).unwrap_err().to_string();
         assert!(
             err.contains("Daily Device Installs"),
@@ -291,7 +295,10 @@ mod tests {
 
     #[test]
     fn decodes_utf16le_with_and_without_bom() {
-        assert_eq!(decode_utf16le(&[0xff, 0xfe, 0x41, 0x00, 0x42, 0x00]).unwrap(), "AB");
+        assert_eq!(
+            decode_utf16le(&[0xff, 0xfe, 0x41, 0x00, 0x42, 0x00]).unwrap(),
+            "AB"
+        );
         assert_eq!(decode_utf16le(&[0x41, 0x00, 0x42, 0x00]).unwrap(), "AB");
     }
 
@@ -306,7 +313,10 @@ mod tests {
         // not 90 — getting this wrong is 90 HTTP 404s per tick per app.
         let since = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
-        assert_eq!(months_spanned(since, today), vec![202605, 202606, 202607, 202608]);
+        assert_eq!(
+            months_spanned(since, today),
+            vec![202605, 202606, 202607, 202608]
+        );
     }
 
     #[test]

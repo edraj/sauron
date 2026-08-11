@@ -101,9 +101,19 @@ async fn stores_are_kept_separate_for_the_same_day() {
     let rows = repo::store_metrics_range(&mut conn, ids.app_id, d)
         .await
         .expect("read back");
-    assert_eq!(rows.len(), 2, "the PK includes `store`; one must not overwrite the other");
-    let play = rows.iter().find(|r| r.store == "google_play").expect("play row");
-    let apple = rows.iter().find(|r| r.store == "app_store").expect("apple row");
+    assert_eq!(
+        rows.len(),
+        2,
+        "the PK includes `store`; one must not overwrite the other"
+    );
+    let play = rows
+        .iter()
+        .find(|r| r.store == "google_play")
+        .expect("play row");
+    let apple = rows
+        .iter()
+        .find(|r| r.store == "app_store")
+        .expect("apple row");
     assert_eq!(play.installs, 100);
     assert_eq!(apple.installs, 80);
 
@@ -156,7 +166,8 @@ async fn secret_omitted_is_preserved_and_explicit_null_clears_it() {
     .expect("create with secret");
 
     // `None` = the caller did not send the field: leave the credential alone.
-    let renamed = json!({"package_name": "com.example.renamed", "gcs_bucket": "pubsite_prod_rev_1"});
+    let renamed =
+        json!({"package_name": "com.example.renamed", "gcs_bucket": "pubsite_prod_rev_1"});
     let row = repo::upsert_store_connection(&mut conn, ids.app_id, "google_play", &renamed, None)
         .await
         .expect("update without secret");
@@ -168,15 +179,10 @@ async fn secret_omitted_is_preserved_and_explicit_null_clears_it() {
     assert_eq!(row.identifiers["package_name"], "com.example.renamed");
 
     // `Some(None)` = the caller explicitly sent null: clear it.
-    let row = repo::upsert_store_connection(
-        &mut conn,
-        ids.app_id,
-        "google_play",
-        &renamed,
-        Some(None),
-    )
-    .await
-    .expect("clear secret");
+    let row =
+        repo::upsert_store_connection(&mut conn, ids.app_id, "google_play", &renamed, Some(None))
+            .await
+            .expect("clear secret");
     assert!(row.secret_enc.is_none(), "explicit null clears the secret");
 
     db.cleanup().await;

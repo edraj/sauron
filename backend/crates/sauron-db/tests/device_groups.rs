@@ -136,14 +136,41 @@ async fn seed_device_fleet(db: &TestDb) -> FleetIds {
     let org = repo::create_org(&mut conn, "fleet org", &format!("fleet-org-{suffix}"))
         .await
         .expect("create org");
-    let project = repo::create_project(&mut conn, org.id, "fleet project", &format!("fleet-proj-{suffix}"))
-        .await
-        .expect("create project");
-    let app = repo::create_app(&mut conn, project.id, "fleet app", &format!("fleet-app-{suffix}"), "web")
-        .await
-        .expect("create app");
-    let env_a = seed_env(&mut conn, project.id, app.id, "env_a", &format!("pk_fleet_a_{suffix}"), true).await;
-    let env_b = seed_env(&mut conn, project.id, app.id, "env_b", &format!("pk_fleet_b_{suffix}"), false).await;
+    let project = repo::create_project(
+        &mut conn,
+        org.id,
+        "fleet project",
+        &format!("fleet-proj-{suffix}"),
+    )
+    .await
+    .expect("create project");
+    let app = repo::create_app(
+        &mut conn,
+        project.id,
+        "fleet app",
+        &format!("fleet-app-{suffix}"),
+        "web",
+    )
+    .await
+    .expect("create app");
+    let env_a = seed_env(
+        &mut conn,
+        project.id,
+        app.id,
+        "env_a",
+        &format!("pk_fleet_a_{suffix}"),
+        true,
+    )
+    .await;
+    let env_b = seed_env(
+        &mut conn,
+        project.id,
+        app.id,
+        "env_b",
+        &format!("pk_fleet_b_{suffix}"),
+        false,
+    )
+    .await;
 
     let iphone_a = format!("fleet-{suffix}-iphone-a");
     let iphone_b = format!("fleet-{suffix}-iphone-b");
@@ -153,18 +180,69 @@ async fn seed_device_fleet(db: &TestDb) -> FleetIds {
 
     // (device_key, family, model, os_name, os_version, events, errors)
     #[allow(clippy::type_complexity)]
-    let fleet: [(&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>, i64, i64); 5] = [
-        (&iphone_a,     Some("iPhone"), Some("iPhone15,2"), Some("iOS"), Some("17.4.1"), 3, 1),
-        (&iphone_b,     Some("iPhone"), Some("iPhone15,2"), Some("iOS"), Some("17.4.1"), 5, 2),
-        (&iphone_older, Some("iPhone"), Some("iPhone15,2"), Some("iOS"), Some("17.4.0"), 7, 4),
-        (&unknown,      None,           None,               None,        None,           2, 1),
-        (&pixel_b_only, Some("Pixel"),  Some("Pixel 8"),    Some("Android"), Some("14"), 9, 3),
+    let fleet: [(
+        &str,
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+        i64,
+        i64,
+    ); 5] = [
+        (
+            &iphone_a,
+            Some("iPhone"),
+            Some("iPhone15,2"),
+            Some("iOS"),
+            Some("17.4.1"),
+            3,
+            1,
+        ),
+        (
+            &iphone_b,
+            Some("iPhone"),
+            Some("iPhone15,2"),
+            Some("iOS"),
+            Some("17.4.1"),
+            5,
+            2,
+        ),
+        (
+            &iphone_older,
+            Some("iPhone"),
+            Some("iPhone15,2"),
+            Some("iOS"),
+            Some("17.4.0"),
+            7,
+            4,
+        ),
+        (&unknown, None, None, None, None, 2, 1),
+        (
+            &pixel_b_only,
+            Some("Pixel"),
+            Some("Pixel 8"),
+            Some("Android"),
+            Some("14"),
+            9,
+            3,
+        ),
     ];
 
     for (key, family, model, os_name, os_version, events, errors) in fleet {
         repo::bump_device(
-            &mut conn, app.id, key, family, model, os_name, os_version,
-            None, None, None, now - Duration::seconds(30), events, errors,
+            &mut conn,
+            app.id,
+            key,
+            family,
+            model,
+            os_name,
+            os_version,
+            None,
+            None,
+            None,
+            now - Duration::seconds(30),
+            events,
+            errors,
         )
         .await
         .expect("bump_device");
@@ -208,7 +286,10 @@ async fn devices_sharing_model_and_os_collapse_into_one_group() {
         .iter()
         .find(|r| r.os_version.as_deref() == Some("17.4.1"))
         .expect("the iOS 17.4.1 group");
-    assert_eq!(collapsed.device_count, 2, "iphone_a and iphone_b are one group");
+    assert_eq!(
+        collapsed.device_count, 2,
+        "iphone_a and iphone_b are one group"
+    );
     assert_eq!(collapsed.model.as_deref(), Some("iPhone15,2"));
     assert_eq!(collapsed.events_count, 8, "3 + 5 summed across the group");
     assert_eq!(collapsed.errors_count, 3, "1 + 2 summed across the group");
@@ -233,9 +314,16 @@ async fn devices_with_null_descriptors_form_one_unknown_group() {
     let ids = seed_device_fleet(&db).await;
     let mut conn = db.conn().await;
 
-    let rows = repo::list_device_groups(&mut conn, ReadScope::all(ids.app_id), far_past(), 50, 0, None)
-        .await
-        .expect("list_device_groups");
+    let rows = repo::list_device_groups(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+        50,
+        0,
+        None,
+    )
+    .await
+    .expect("list_device_groups");
 
     let unknown = rows
         .iter()
@@ -247,7 +335,11 @@ async fn devices_with_null_descriptors_form_one_unknown_group() {
     assert!(unknown.os_version.is_none());
 
     // Five seeded devices, four distinct descriptor tuples.
-    assert_eq!(rows.len(), 4, "17.4.1, 17.4.0, Android 14, and the NULL group");
+    assert_eq!(
+        rows.len(),
+        4,
+        "17.4.1, 17.4.0, Android 14, and the NULL group"
+    );
 
     drop(conn);
     db.cleanup().await;
@@ -267,8 +359,22 @@ async fn groups_exclude_devices_from_other_environments() {
     // Give iphone_a signals in env_a and pixel_b_only signals in env_b, so
     // membership differs by environment. See `seed_device_signal`'s doc
     // comment for why this is not `common::seed_signal_event`.
-    seed_device_signal(&mut conn, ids.app_id, Some(ids.env_a), &ids.iphone_a, ids.pinned_now - Duration::seconds(20)).await;
-    seed_device_signal(&mut conn, ids.app_id, Some(ids.env_b), &ids.pixel_b_only, ids.pinned_now - Duration::seconds(20)).await;
+    seed_device_signal(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        &ids.iphone_a,
+        ids.pinned_now - Duration::seconds(20),
+    )
+    .await;
+    seed_device_signal(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_b),
+        &ids.pixel_b_only,
+        ids.pinned_now - Duration::seconds(20),
+    )
+    .await;
 
     let rows_a = repo::list_device_groups(
         &mut conn,
@@ -282,7 +388,9 @@ async fn groups_exclude_devices_from_other_environments() {
     .expect("list_device_groups env_a");
 
     assert!(
-        rows_a.iter().all(|r| r.os_name.as_deref() != Some("Android")),
+        rows_a
+            .iter()
+            .all(|r| r.os_name.as_deref() != Some("Android")),
         "pixel_b_only is env_b-only and must not surface under One(env_a)"
     );
     let iphone = rows_a
@@ -343,20 +451,53 @@ async fn group_sessions_and_first_last_seen_use_pinned_timestamps() {
 
     // iphone_a: one session BEFORE `since` (excluded from the FILTER'd
     // count, but not from the unbounded `min(started_at)`), one after.
-    seed_group_session(&mut conn, ids.app_id, Some(ids.env_a), "grp-a-before", &ids.iphone_a, t0 - Duration::seconds(50)).await;
-    seed_group_session(&mut conn, ids.app_id, Some(ids.env_a), "grp-a-after", &ids.iphone_a, t0 - Duration::seconds(20)).await;
+    seed_group_session(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        "grp-a-before",
+        &ids.iphone_a,
+        t0 - Duration::seconds(50),
+    )
+    .await;
+    seed_group_session(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        "grp-a-after",
+        &ids.iphone_a,
+        t0 - Duration::seconds(20),
+    )
+    .await;
     // iphone_b: two sessions, both after `since`.
-    seed_group_session(&mut conn, ids.app_id, Some(ids.env_a), "grp-b-1", &ids.iphone_b, t0 - Duration::seconds(25)).await;
-    seed_group_session(&mut conn, ids.app_id, Some(ids.env_a), "grp-b-2", &ids.iphone_b, t0 - Duration::seconds(15)).await;
+    seed_group_session(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        "grp-b-1",
+        &ids.iphone_b,
+        t0 - Duration::seconds(25),
+    )
+    .await;
+    seed_group_session(
+        &mut conn,
+        ids.app_id,
+        Some(ids.env_a),
+        "grp-b-2",
+        &ids.iphone_b,
+        t0 - Duration::seconds(15),
+    )
+    .await;
 
     // Under `All`: sessions_count is unaffected by environment (no `env_sql`
     // filter on the session LATERAL), but first_seen/last_seen read the
     // durable `devices` columns — both iphone_a and iphone_b were bumped
     // exactly once, at `t0 - 30s` (`seed_device_fleet`) — and so are
     // untouched by any of the four session timestamps above.
-    let rows_all = repo::list_device_groups(&mut conn, ReadScope::all(ids.app_id), since, 50, 0, None)
-        .await
-        .expect("list_device_groups All");
+    let rows_all =
+        repo::list_device_groups(&mut conn, ReadScope::all(ids.app_id), since, 50, 0, None)
+            .await
+            .expect("list_device_groups All");
     let group_all = rows_all
         .iter()
         .find(|r| r.os_version.as_deref() == Some("17.4.1"))
@@ -394,7 +535,10 @@ async fn group_sessions_and_first_last_seen_use_pinned_timestamps() {
         .iter()
         .find(|r| r.os_version.as_deref() == Some("17.4.1"))
         .expect("the iOS 17.4.1 group under One(env_a)");
-    assert_eq!(group_scoped.device_count, 2, "iphone_a and iphone_b, both env_a-tagged");
+    assert_eq!(
+        group_scoped.device_count, 2,
+        "iphone_a and iphone_b, both env_a-tagged"
+    );
     assert_eq!(
         group_scoped.sessions_count, 3,
         "grp-a-before is excluded by the FILTER; the other 3 sessions are counted"
@@ -496,19 +640,41 @@ async fn seed_tied_groups(db: &TestDb, n: usize, at: DateTime<Utc>) -> Uuid {
     let org = repo::create_org(&mut conn, "tie org", &format!("tie-org-{suffix}"))
         .await
         .expect("create org");
-    let project = repo::create_project(&mut conn, org.id, "tie project", &format!("tie-proj-{suffix}"))
-        .await
-        .expect("create project");
-    let app = repo::create_app(&mut conn, project.id, "tie app", &format!("tie-app-{suffix}"), "web")
-        .await
-        .expect("create app");
+    let project = repo::create_project(
+        &mut conn,
+        org.id,
+        "tie project",
+        &format!("tie-proj-{suffix}"),
+    )
+    .await
+    .expect("create project");
+    let app = repo::create_app(
+        &mut conn,
+        project.id,
+        "tie app",
+        &format!("tie-app-{suffix}"),
+        "web",
+    )
+    .await
+    .expect("create app");
 
     for i in 0..n {
         let key = format!("tie-{suffix}-{i}");
         let family = format!("Fam-{i}");
         repo::bump_device(
-            &mut conn, app.id, &key, Some(&family), Some("M1"), Some("OS"), Some("1"),
-            None, None, None, at, 1, 0,
+            &mut conn,
+            app.id,
+            &key,
+            Some(&family),
+            Some("M1"),
+            Some("OS"),
+            Some("1"),
+            None,
+            None,
+            None,
+            at,
+            1,
+            0,
         )
         .await
         .expect("bump_device");
@@ -571,7 +737,10 @@ async fn group_pagination_is_stable_across_last_seen_ties() {
             seen.push(r.family.clone().expect("every seeded group has a family"));
         }
         offset += page_size;
-        assert!(offset <= (n as i64) * 3, "pagination did not terminate — runaway loop: {seen:?}");
+        assert!(
+            offset <= (n as i64) * 3,
+            "pagination did not terminate — runaway loop: {seen:?}"
+        );
     }
 
     assert_eq!(
@@ -601,9 +770,17 @@ async fn no_group_filter_returns_every_device() {
     let ids = seed_device_fleet(&db).await;
     let mut conn = db.conn().await;
 
-    let rows = repo::list_devices(&mut conn, ReadScope::all(ids.app_id), far_past(), 50, 0, None, None)
-        .await
-        .expect("list_devices unfiltered");
+    let rows = repo::list_devices(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        far_past(),
+        50,
+        0,
+        None,
+        None,
+    )
+    .await
+    .expect("list_devices unfiltered");
     assert_eq!(rows.len(), 5, "all five seeded devices");
 
     drop(conn);
