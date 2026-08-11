@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ErrorEvent, TimelineItem } from '../models';
+  import type { ErrorEvent, TimelineItem, Transaction } from '../models';
   import {
     httpStatusTone,
     isHttp,
@@ -25,9 +25,10 @@
     // What that offset reads against: the session start, or the row above.
     // The control that flips it lives with the caller (the Card header).
     timeMode?: TimeMode;
+    onslice?: (item: Transaction) => void;
   }
 
-  let { items, startedAt = null, timeMode = 'session' }: Props = $props();
+  let { items, startedAt = null, timeMode = 'session', onslice }: Props = $props();
 
   let expanded = $state<Set<number>>(new Set());
 
@@ -152,6 +153,18 @@
                 {/if}
               {/if}
               <LatencyBadge ms={item.transaction.duration_ms} size="sm" />
+              {#if onslice}
+                <button
+                  class="in-between-btn"
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    onslice(item.transaction);
+                  }}
+                  title="Slice timeline to this transaction"
+                >
+                  In between
+                </button>
+              {/if}
             {:else if item.kind === 'error'}
               <LevelBadge level={item.error.level} size="sm" />
             {/if}
@@ -393,5 +406,24 @@
     padding: 24px;
     text-align: center;
     font-size: 13px;
+  }
+  .in-between-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 560;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+  .in-between-btn:hover {
+    background: var(--surface-3);
+    color: var(--text);
   }
 </style>

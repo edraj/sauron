@@ -338,6 +338,7 @@ async fn seed_cross_env_session_child_rows(
             release: None,
             ip_address: None,
             occurred_at: at,
+            finished_at: None,
         },
     )
     .await

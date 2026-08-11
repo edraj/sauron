@@ -384,6 +384,7 @@ fn event_items(user: &VirtualUser, seq: u64, workflow_ratio: f64) -> (EnvelopeIt
         workflow_id: workflow.as_ref().map(|(id, _)| id.clone()),
         workflow_name: workflow.as_ref().map(|(_, name)| name.clone()),
         timestamp: Utc::now(),
+        finished_at: None,
     });
     (event, txn)
 }

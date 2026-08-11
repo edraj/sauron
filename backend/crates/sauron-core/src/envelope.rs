@@ -288,6 +288,8 @@ pub struct TransactionItem {
     pub workflow_name: Option<String>,
     #[serde(default = "Utc::now")]
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 /// An `identify()` call: attach traits to a person, optionally aliasing an

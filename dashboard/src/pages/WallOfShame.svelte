@@ -382,7 +382,7 @@
       {#snippet children()}
         {#each entries as entry (entry.id)}
           {@const described = describeAction(entry.action)}
-          <tr class="row" onclick={() => (selected = entry)}>
+          <tr class="clickable" onclick={() => (selected = entry)}>
             <td><TimeValue value={entry.created_at} muted /></td>
             <td class="who">{entry.actor_email || '—'}</td>
             <td>
@@ -515,7 +515,7 @@
     gap: 0.5rem;
   }
 
-  .toggle {
+  .filters label.toggle {
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -540,12 +540,7 @@
     padding: 1.5rem 0;
   }
 
-  .row {
-    cursor: pointer;
-  }
-  .row:hover {
-    background: var(--surface-hover);
-  }
+  /* .clickable handles hover in DataTable now, so .row is gone */
 
   .who,
   .target {

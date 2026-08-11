@@ -615,6 +615,10 @@ export interface Transaction {
   ip_address: string | null;
   occurred_at: string;
   received_at: string;
+  workflow_id: string | null;
+  workflow_name: string | null;
+  restored_pin_id: string | null;
+  finished_at: string | null;
 }
 
 // One entry on the session timeline — a discriminated union keyed by `kind`.

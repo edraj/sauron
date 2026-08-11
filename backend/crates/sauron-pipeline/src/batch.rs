@@ -978,6 +978,7 @@ fn prepare_transaction(
         device_key: info.device_key.clone(),
         workflow_id: workflow_id.clone(),
         workflow_name: workflow_name.clone(),
+        finished_at: t.finished_at,
         release: job.release.clone(),
         ip_address: job.ip.clone(),
         occurred_at: t.timestamp,
@@ -1188,6 +1189,7 @@ mod equivalence_tests {
             timestamp: at,
             workflow_id: None,
             workflow_name: None,
+            finished_at: None,
         })
     }
 

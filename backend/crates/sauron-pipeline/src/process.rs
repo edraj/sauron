@@ -630,6 +630,7 @@ async fn process_transaction(
             release: job.release.clone(),
             ip_address: job.ip.clone(),
             occurred_at: t.timestamp,
+            finished_at: t.finished_at,
         },
     )
     .await?;

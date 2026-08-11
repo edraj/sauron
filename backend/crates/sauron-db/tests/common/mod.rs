@@ -1626,6 +1626,7 @@ async fn seed_transaction(
             device_key: None,
             workflow_id: None,
             workflow_name: None,
+            finished_at: None,
             release: None,
             ip_address: None,
             occurred_at,
