@@ -12,6 +12,8 @@
   import MembersTable from '../lib/components/members/MembersTable.svelte';
   import ScopeTree from '../lib/components/members/ScopeTree.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
   import { authStore } from '../lib/stores/auth.svelte';
   import {
@@ -42,8 +44,16 @@
     type ScopeSelection,
   } from '../lib/models/scope-tree';
 
-  let members = $state<MemberGrant[]>([]);
-  let roles = $state<Role[]>([]);
+  // Cached view (lib/stores/cached-view.svelte.ts): the roster paints instantly
+  // on a revisit, then refreshes behind the rows.
+  //
+  // ONE view holding both responses rather than two: the grant form's role
+  // picker is built from `roles` while the table renders `members`, and a cache
+  // that could serve one fresh beside the other stale would offer a role that
+  // no longer exists to a roster that already reflects its deletion.
+  const view = new CachedView<{ members: MemberGrant[]; roles: Role[] }>();
+  const members = $derived(view.data?.members ?? []);
+  const roles = $derived(view.data?.roles ?? []);
   // Keyed by project because the scope tree renders by project; `appsById` is
   // the flattened view the table and the scope labels want.
   let appsByProject = $state<Record<string, App[]>>({});
@@ -51,8 +61,11 @@
   // settles, EditMemberDialog cannot tell an app-scoped grant from one whose
   // target it can't see, so it waits rather than seeding a wrong tree.
   let appsLoaded = $state(false);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  const loading = $derived(view.loading);
+  // Mutations report through the same banner as the load, and a `$derived`
+  // cannot be assigned to — so they keep their own state and this is the fold.
+  let actionError = $state<string | null>(null);
+  const error = $derived(actionError ?? view.error);
 
   // Environments per app, keyed by app id — the fourth scope level. Unlike
   // projects and apps this is NOT loaded eagerly: an org can have hundreds of
@@ -171,20 +184,38 @@
       !isEmptySelection(grantSelection),
   );
 
-  async function load(orgId: string) {
-    loading = true;
-    error = null;
-    try {
-      const [mem, rls] = await Promise.all([listMembers(orgId), listRoles(orgId)]);
-      members = mem;
-      roles = rls;
-      if (rls.length && !grantRoleId) grantRoleId = rls[0].id;
-    } catch (err) {
-      error = errorMessage(err);
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit. Every mutation on this page
+   * re-lists through it: a re-list that joined a flight issued before the write
+   * returns the pre-write roster, and `set` would then cache it — so the grant
+   * just revoked reappears and stays for the whole fresh window.
+   */
+  async function load(orgId: string, force = false) {
+    actionError = null;
+    await view.load(
+      viewKey('members.roster', orgId),
+      async () => {
+        const [members, roles] = await Promise.all([listMembers(orgId), listRoles(orgId)]);
+        return { members, roles };
+      },
+      force,
+    );
   }
+
+  async function reload() {
+    const org = sessionStore.currentOrgId;
+    if (!org) return;
+    viewCache.invalidate('members.roster');
+    await load(org, true);
+  }
+
+  // Default the grant form's role picker once the catalogue is known. An effect
+  // rather than a line inside load(), because `roles` is now derived from the
+  // view and a cache HIT populates it without load() ever reaching its body.
+  $effect(() => {
+    const first = roles[0];
+    if (first && !grantRoleId) grantRoleId = first.id;
+  });
 
   // Resolve app names across every project so app-scoped grants read nicely and
   // the scope tree can list apps under their project.
@@ -223,7 +254,10 @@
   $effect(() => {
     const org = sessionStore.currentOrgId;
     if (org && canReadMembers) void load(org);
-    else if (org) loading = false;
+    // No read permission means no request is issued at all, and `loading` starts
+    // true — so without this the page spins forever on a fetch that never
+    // happened. `idle()` is exactly that state: nothing to load, not an error.
+    else if (org) view.idle();
   });
 
   // The grant form holds bare project/app ids belonging to the org that was
@@ -260,7 +294,7 @@
       });
       grantEmail = '';
       grantSelection = { ...EMPTY_SELECTION, projects: [], apps: [], envs: [] };
-      await load(org);
+      await load(org, true);
       toastStore.success('Access granted.');
     } catch (err) {
       toastStore.error(errorMessage(err));
@@ -274,7 +308,11 @@
     removingId = id;
     try {
       await deleteGrant(id);
-      members = members.filter((m) => m.id !== id);
+      // Re-list rather than filtering locally: `members` is derived from the
+      // cache's own payload, so a local edit would either be discarded by the
+      // next read or — if written through the proxy — corrupt the cached roster
+      // for every later visit.
+      await reload();
       toastStore.success('Access removed.');
     } catch (err) {
       toastStore.error(errorMessage(err));
@@ -294,7 +332,7 @@
           ? `${member.email} can no longer sign in.`
           : `${member.email} can sign in again.`,
       );
-      await load(org.id);
+      await load(org.id, true);
     } catch (err) {
       // The backend's 409s carry the actionable text (last owner, cross-org,
       // self) — surface it verbatim rather than a generic failure.
@@ -333,7 +371,7 @@
           : `${target.member.email} can sign in with their existing password again.`,
       );
       resetTarget = null;
-      await load(org.id);
+      await load(org.id, true);
     } catch (err) {
       // The backend's 409s carry the actionable text (self, inactive,
       // cross-org) and its 503 names the missing setting — surface both

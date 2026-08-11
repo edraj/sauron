@@ -17,8 +17,11 @@
     retryIngestFailure,
     dropIngestFailure,
     type IngestFailure,
+    type IngestFailurePage,
     type IngestFailurePayload,
   } from '../lib/api/ingest-failures';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import {
     describeKind,
     describeRecovery,
@@ -29,12 +32,35 @@
     wasAutoRetried,
   } from '../lib/models/ingest-failures';
 
-  let failures = $state<IngestFailure[]>([]);
-  let nextCursor = $state<string | null>(null);
-  let loading = $state(true);
-  let loadingMore = $state(false);
-  let error = $state<string | null>(null);
   let statusFilter = $state<string>('failed');
+
+  // Cached view (lib/stores/cached-view.svelte.ts): only the FIRST page is
+  // cached, keyed on the status filter. Pages walked into via "Load more" are
+  // held separately in `appended` and deliberately not cached — their cursors
+  // are only meaningful behind the exact first page that produced them, so
+  // caching them under this key would let a revisit reassemble a list out of
+  // two different snapshots.
+  const view = new CachedView<IngestFailurePage>();
+  let appended = $state<IngestFailure[]>([]);
+  // Cursor for the NEXT "Load more". Null until a page has been appended, at
+  // which point it supersedes the first page's own cursor.
+  let appendedCursor = $state<string | null>(null);
+  let loadingMore = $state(false);
+
+  // `view.data.failures` is the cache's own array; spreading builds a new one so
+  // no render path can write back through it.
+  const failures = $derived([...(view.data?.failures ?? []), ...appended]);
+  const nextCursor = $derived(
+    appended.length > 0 ? appendedCursor : (view.data?.next_cursor ?? null),
+  );
+  const loading = $derived(view.loading);
+  const revalidating = $derived(view.revalidating);
+
+  // Actions report failures through the same banner as the list's own load
+  // error, and a `$derived` cannot be assigned to — so actions keep their own
+  // state and the template's `error` is the two folded together.
+  let actionError = $state<string | null>(null);
+  const error = $derived(actionError ?? view.error);
 
   // Drill-down state.
   let selected = $state<IngestFailure | null>(null);
@@ -48,36 +74,45 @@
 
   const dropLock = $derived(lockedBy('org:manage'));
 
-  async function load() {
-    loading = true;
-    error = null;
-    try {
-      const page = await listIngestFailures({
-        status: statusFilter || undefined,
-        limit: 50,
-      });
-      failures = page.failures;
-      nextCursor = page.next_cursor;
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit — an explicit Refresh, and
+   * the re-list after a retry or a drop, both mean "go to the network now".
+   *
+   * Any load resets the appended pages: they were walked out of a first page
+   * that is being replaced, so keeping them would splice rows from the old
+   * snapshot onto the new one.
+   */
+  async function load(force = false) {
+    actionError = null;
+    appended = [];
+    appendedCursor = null;
+    await view.load(
+      viewKey('ingest-failures.list', statusFilter),
+      () => listIngestFailures({ status: statusFilter || undefined, limit: 50 }),
+      force,
+    );
+  }
+
+  /** Refresh must reach the network, so it always forces. */
+  async function refresh() {
+    viewCache.invalidate('ingest-failures.list');
+    await load(true);
   }
 
   async function loadMore() {
-    if (!nextCursor) return;
+    const cursor = nextCursor;
+    if (!cursor) return;
     loadingMore = true;
     try {
       const page = await listIngestFailures({
         status: statusFilter || undefined,
         limit: 50,
-        cursor: nextCursor,
+        cursor,
       });
-      failures = [...failures, ...page.failures];
-      nextCursor = page.next_cursor;
+      appended = [...appended, ...page.failures];
+      appendedCursor = page.next_cursor;
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      actionError = e instanceof Error ? e.message : String(e);
     } finally {
       loadingMore = false;
     }
@@ -90,7 +125,7 @@
     try {
       payloads = await getIngestFailurePayloads(f.id);
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      actionError = e instanceof Error ? e.message : String(e);
     } finally {
       payloadsLoading = false;
     }
@@ -109,9 +144,9 @@
       if (r.unrecoverable > 0)
         parts.push(`${fmt(r.unrecoverable)} were never retained and cannot be recovered.`);
       notice = parts.join(' ');
-      await load();
+      await refresh();
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      actionError = e instanceof Error ? e.message : String(e);
     } finally {
       acting = false;
     }
@@ -125,9 +160,9 @@
       notice = `Dropped ${describeKind(confirmDrop.error_kind)} permanently.`;
       confirmDrop = null;
       selected = null;
-      await load();
+      await refresh();
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      actionError = e instanceof Error ? e.message : String(e);
     } finally {
       acting = false;
     }
@@ -150,7 +185,7 @@
         retried automatically before they appear here.
       </p>
     </div>
-    <RefreshButton onclick={load} {loading} />
+    <RefreshButton onclick={refresh} loading={loading || revalidating} />
   </div>
 
   <Card>

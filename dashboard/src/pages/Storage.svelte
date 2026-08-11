@@ -44,10 +44,22 @@
   import { sortRows } from '../lib/models/sort-rows';
   import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
 
-  let report = $state<StorageReport | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): the report paints instantly
+  // on a revisit and refreshes behind the tables. `/v1/admin/storage` walks
+  // `pg_partition_tree` across every partition, so it is one of the slower
+  // reads in the dashboard and the one most worth not repeating on every visit.
+  //
+  // Not keyed on a scope: the endpoint is org-scoped server-side and returns
+  // exactly the orgs you manage, so the caller has no id to vary it by. The
+  // whole cache is dropped on logout, which is what keeps a second user on the
+  // same tab from being served the first one's report.
+  const view = new CachedView<StorageReport>();
+  const report = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
 
   // Both tables arrive whole in the one `/v1/admin/storage` response — one row
   // per tiered table, one per visible app — so each sort runs over the ENTIRE
@@ -110,16 +122,14 @@
     openApp = { ...openApp, [appId]: !openApp[appId] };
   }
 
-  async function load() {
-    loading = true;
-    error = null;
-    try {
-      report = await getAdminStorage();
-    } catch (e) {
-      error = (e as Error).message;
-    } finally {
-      loading = false;
-    }
+  /** `force` bypasses the fresh window — an explicit Refresh means "go now". */
+  async function load(force = false) {
+    await view.load(viewKey('admin.storage'), () => getAdminStorage(), force);
+  }
+
+  async function refresh() {
+    viewCache.invalidate('admin.storage');
+    await load(true);
   }
 
   async function loadPolicy() {
@@ -304,6 +314,20 @@
       pinBusy = null;
     }
   }
+
+  // A restore copies rows back into hot storage, so the byte counts in the
+  // report are stale the moment one finishes. Refresh when the last active job
+  // settles — the poll below is what drives `jobsActive` false.
+  //
+  // A PLAIN let, not `$state`: an effect that both reads and writes the same
+  // reactive value re-triggers on its own write. Nothing renders this, so it
+  // has no reason to be reactive.
+  let wasJobsActive = false;
+  $effect(() => {
+    const active = jobsActive;
+    if (wasJobsActive && !active) void refresh();
+    wasJobsActive = active;
+  });
 
   // Poll only while something is in flight. A restore is a background copy that
   // can take minutes, so the create call returns a queued job and this is what

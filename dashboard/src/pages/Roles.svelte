@@ -12,21 +12,33 @@
   import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
   import DeleteRoleDialog from '../lib/components/members/DeleteRoleDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy, lockTitle } from '../lib/models/page-access';
   import { listRoles, listMembers } from '../lib/api/orgs';
-  import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { ROLE_DEFAULT_SORT, roleAccessor } from '../lib/models/role-sort';
   import { sortRows } from '../lib/models/sort-rows';
   import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import { groupMembers, type MemberGrant, type Permission, type Role } from '../lib/models';
 
-  let roles = $state<Role[]>([]);
-  // Loaded alongside roles purely to feed roleMemberCounts below — this page
-  // has no member-management UI of its own.
-  let members = $state<MemberGrant[]>([]);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): the catalogue paints
+  // instantly on a revisit, then refreshes behind the existing rows.
+  //
+  // ONE view holding both responses rather than two, because the two are only
+  // ever useful together — `roleMemberCounts` derives from `members` and is
+  // read by the roles table's own sort, so a cache that could serve fresh roles
+  // beside stale members would order the column by a different number than the
+  // cell displays.
+  //
+  // `members` is loaded purely to feed `roleMemberCounts`; this page has no
+  // member-management UI of its own.
+  const view = new CachedView<{ roles: Role[]; members: MemberGrant[] }>();
+
+  const roles = $derived(view.data?.roles ?? []);
+  const members = $derived(view.data?.members ?? []);
+  const loading = $derived(view.loading);
+  const error = $derived(view.error);
 
   // Role editor dialog (create + edit + read-only view of system presets).
   // Exactly one of `editingRole` / `copyFromRole` is set at a time — `open*`
@@ -127,18 +139,39 @@
     return null;
   }
 
-  async function load(orgId: string) {
-    loading = true;
-    error = null;
-    try {
-      const [rls, mem] = await Promise.all([listRoles(orgId), listMembers(orgId)]);
-      roles = rls;
-      members = mem;
-    } catch (err) {
-      error = errorMessage(err);
-    } finally {
-      loading = false;
-    }
+  /**
+   * `force` bypasses the fresh-window short-circuit. Every mutation on this page
+   * goes through it, because a re-list that joined a flight issued before the
+   * write would return the pre-write catalogue and `set` would then cache it —
+   * the deleted role reappears and stays for the whole fresh window.
+   */
+  async function load(orgId: string, force = false) {
+    await view.load(
+      viewKey('roles.list', orgId),
+      async () => {
+        const [roles, members] = await Promise.all([listRoles(orgId), listMembers(orgId)]);
+        return { roles, members };
+      },
+      force,
+    );
+  }
+
+  /**
+   * Re-list after a create/edit/delete instead of splicing the row into `roles`
+   * locally.
+   *
+   * The local edit is what the old code did, and it cannot survive caching:
+   * `view.data` is the VERY object the cache holds, handed back by reference,
+   * so `roles[i] = saved` would write through into the cached payload and the
+   * edit would persist across navigations even if the server had rejected it.
+   * A forced re-list is one request and cannot drift from what the server
+   * actually stored.
+   */
+  async function reload() {
+    const org = sessionStore.currentOrgId;
+    if (!org) return;
+    viewCache.invalidate('roles.list');
+    await load(org, true);
   }
 
   function openNewRole() {
@@ -159,11 +192,9 @@
     roleDialogOpen = true;
   }
 
-  function onRoleSaved(saved: Role) {
-    const i = roles.findIndex((r) => r.id === saved.id);
-    if (i >= 0) roles[i] = saved;
-    else roles = [...roles, saved];
+  async function onRoleSaved(saved: Role) {
     toastStore.success(`Role "${saved.name}" saved.`);
+    await reload();
   }
 
   function openDeleteRole(role: Role) {
@@ -171,8 +202,8 @@
     deleteDialogOpen = true;
   }
 
-  function onRoleDeleted(role: Role, revokedGrants: number) {
-    roles = roles.filter((r) => r.id !== role.id);
+  async function onRoleDeleted(role: Role, revokedGrants: number) {
+    await reload();
     toastStore.success(
       revokedGrants > 0
         ? `Deleted "${role.name}" and revoked ${revokedGrants} grant${revokedGrants === 1 ? '' : 's'}.`

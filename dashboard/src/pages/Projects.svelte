@@ -13,6 +13,7 @@
   import { createProject, updateProject, deleteProject } from '../lib/api/projects';
   import { listApps, createApp } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { appTypeIcon, appTypeLabel, APP_TYPES } from '../lib/utils/format';
   import type { App, AppType } from '../lib/models';
@@ -53,13 +54,35 @@
     }
   }
 
-  async function loadApps(projectId: string) {
-    loadingApps[projectId] = true;
+  /**
+   * Expanding a project paints its apps from cache immediately, then refreshes
+   * behind them — re-expanding a row you collapsed a moment ago no longer spins.
+   *
+   * `viewCache` directly rather than a `CachedView`: this page holds N lists at
+   * once, one per expanded project, and `CachedView` models a single payload.
+   * The record already carries the per-project state a view would have supplied.
+   *
+   * Both assignments COPY. `viewCache.get`/`set` hand back the very array the
+   * cache holds, and assigning it into `appsByProject` — a `$state` record —
+   * would wrap it in Svelte's deep proxy, so a later write through the proxy
+   * would reach the cached array and survive navigation. Copying severs that.
+   */
+  async function loadApps(projectId: string, force = false) {
+    const key = viewKey('projects.apps', projectId);
+    const cached = viewCache.get<App[]>(key);
+    if (cached !== undefined) appsByProject[projectId] = [...cached];
+    if (!force && viewCache.isFresh(key)) return;
+    // Only a cache MISS shows the spinner; a revalidate leaves the rows up.
+    loadingApps[projectId] = cached === undefined;
     try {
-      appsByProject[projectId] = await listApps(projectId);
+      const apps = await viewCache.dedupe(key, () => listApps(projectId), force);
+      viewCache.set(key, apps);
+      appsByProject[projectId] = [...apps];
     } catch (err) {
       toastStore.error(errorMessage(err));
-      appsByProject[projectId] = [];
+      // Only blank the row when there was nothing to keep. A failed refresh over
+      // good rows leaves them up — they are still a true answer, merely older.
+      if (cached === undefined) appsByProject[projectId] = [];
     } finally {
       loadingApps[projectId] = false;
     }
@@ -112,6 +135,9 @@
       await deleteProject(projectId);
       sessionStore.removeProject(projectId);
       delete appsByProject[projectId];
+      // The project is gone; its cached app list must not outlive it and be
+      // served to an id the server would now 404.
+      viewCache.invalidate(viewKey('projects.apps', projectId));
       confirmDeleteId = null;
       toastStore.success('Project deleted.');
     } catch (err) {
@@ -134,6 +160,9 @@
     try {
       const a = await createApp(projectId, { name: newAppName.trim(), app_type: newAppType });
       appsByProject[projectId] = [...(appsByProject[projectId] ?? []), a];
+      // The row is on screen already; drop the cache entry so the next expand
+      // refetches instead of serving a pre-create list for the fresh window.
+      viewCache.invalidate(viewKey('projects.apps', projectId));
       if (projectId === sessionStore.currentProjectId) sessionStore.upsertApp(a, false);
       newAppFor = null;
       toastStore.success('App created.');

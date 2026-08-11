@@ -12,10 +12,13 @@
   import TimeValue from '../lib/components/TimeValue.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
   import {
     downloadAuditCsv,
     getAuditLog,
     type AuditEntry,
+    type AuditPage,
     type AuditFacets,
   } from '../lib/api/audit';
   import {
@@ -53,12 +56,42 @@
   // never inside an effect, so it cannot fight the sync effect below — the
   // same shape DevicesInventory.svelte:27 documents.
   let filters = $state<FilterState>(filtersFromQuery($querystring ?? ''));
-  let entries = $state<AuditEntry[]>([]);
+  // Cached view (lib/stores/cached-view.svelte.ts): page one paints from cache
+  // on a revisit and refreshes behind the rows. Only page one is cached —
+  // cursors from "Load more" are only meaningful behind the exact page that
+  // produced them, so `appended` is held outside the cache.
+  const view = new CachedView<AuditPage>();
+  let appended = $state<AuditEntry[]>([]);
+  let appendedCursor = $state<string | null>(null);
+
+  // Spread rather than handing the cache's own array to the template.
+  const entries = $derived([...(view.data?.entries ?? []), ...appended]);
+  const nextCursor = $derived(
+    appended.length > 0 ? appendedCursor : (view.data?.next_cursor ?? null),
+  );
+  const loading = $derived(view.loading);
+  const revalidating = $derived(view.revalidating);
+
+  // Facets are mirrored into their own state rather than read off `view.data`,
+  // to preserve a deliberate behaviour of the old code: a failed fetch clears
+  // the rows but NOT the dropdowns, because keeping them populated is what lets
+  // the user narrow the query that just failed instead of reloading the page to
+  // get their filters back. `view.data` goes undefined on a cache-miss failure,
+  // so reading facets straight off it would blank them.
   let facets = $state<AuditFacets>(EMPTY_FACETS);
-  let nextCursor = $state<string | null>(null);
-  let loading = $state(true);
+  $effect(() => {
+    const fresh = view.data?.facets;
+    // Shallow copy: `view.data` is the cache's own object, and assigning it into
+    // `$state` would deep-proxy it so any later write reached the cached payload.
+    if (fresh) facets = { ...fresh };
+  });
+
   let loadingMore = $state(false);
-  let error = $state<string | null>(null);
+  // A "Load more" failure surfaces in the SAME banner as a page-one failure, as
+  // it did before — it is a failure to read the log, not an export problem, and
+  // a `$derived` cannot be assigned to.
+  let moreError = $state<string | null>(null);
+  const error = $derived(moreError ?? view.error);
   let selected = $state<AuditEntry | null>(null);
   let exporting = $state(false);
   let exportError = $state<string | null>(null);
@@ -70,35 +103,48 @@
    * which is why it resets the cursor rather than appending — a stale cursor
    * from the previous filter set would page through the wrong stream.
    */
-  async function load() {
+  async function load(force = false) {
     if (!orgId) return;
-    loading = true;
-    error = null;
-    try {
-      const page = await getAuditLog(orgId, toApiFilters(filters));
-      entries = page.entries;
-      facets = page.facets;
-      nextCursor = page.next_cursor;
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-      entries = [];
-      // Deliberately NOT cleared: keeping the dropdowns populated after a
-      // failed fetch is what lets the user narrow the query that just failed
-      // instead of having to reload the page to get their filters back.
-    } finally {
-      loading = false;
-    }
+    appended = [];
+    appendedCursor = null;
+    moreError = null;
+    const api = toApiFilters(filters);
+    await view.load(
+      // Keyed on `filtersToQuery(filters)` — the USER's filter set — and NOT on
+      // `api`. `toApiFilters` resolves a range like `7d` into an absolute `from`
+      // computed from the current clock, so it returns a different value on
+      // every call: keying on it mints a new entry per load and the cache can
+      // never hit. Measured before this fix — three consecutive loads of the
+      // unchanged default filters produced `from=…17:33:39`, `…17:34:36` and
+      // `…17:34:49`, i.e. three keys and three requests.
+      //
+      // The query string is already this page's canonical identity for a filter
+      // set (both URL-sync effects above compare through it), so it is stable
+      // across calls and carries every field the request varies on. The cost is
+      // that "last 7 days" does not slide within the 60s fresh window, which is
+      // exactly the staleness contract the rest of the cache runs on.
+      viewKey('audit.log', orgId, filtersToQuery(filters)),
+      () => getAuditLog(orgId, api),
+      force,
+    );
+  }
+
+  /** Refresh must reach the network, so it always forces. */
+  async function refresh() {
+    viewCache.invalidate('audit.log');
+    await load(true);
   }
 
   async function loadMore() {
-    if (!orgId || !nextCursor || loadingMore) return;
+    const cursor = nextCursor;
+    if (!orgId || !cursor || loadingMore) return;
     loadingMore = true;
     try {
-      const page = await getAuditLog(orgId, toApiFilters(filters), nextCursor);
-      entries = [...entries, ...page.entries];
-      nextCursor = page.next_cursor;
+      const page = await getAuditLog(orgId, toApiFilters(filters), cursor);
+      appended = [...appended, ...page.entries];
+      appendedCursor = page.next_cursor;
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      moreError = e instanceof Error ? e.message : String(e);
     } finally {
       loadingMore = false;
     }
@@ -204,7 +250,7 @@
       >
         {exporting ? 'Preparing…' : 'Export CSV'}
       </Button>
-      <RefreshButton onclick={load} loading={loading} />
+      <RefreshButton onclick={refresh} loading={loading || revalidating} />
     </div>
   </div>
 
