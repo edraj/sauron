@@ -6,6 +6,7 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
@@ -17,6 +18,13 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { listWorkflows } from '../lib/api/workflows';
+  import {
+    setOffsetPage,
+    setOffsetSort,
+    type ListPage,
+    type OffsetListState,
+  } from '../lib/models/list-state';
+  import { sortParam, type SortDir } from '../lib/models/sort';
   import { completionRate, formatDuration } from '../lib/workflows';
   import { compactNumber, formatPercent } from '../lib/utils/format';
   import type { WorkflowRow } from '../lib/models';
@@ -28,16 +36,27 @@
   // that drives loads (same split as Issues.svelte).
   let search = $state('');
   let appliedSearch = $state('');
-  let offset = $state(0);
+
+  // `started` descending is the endpoint's own default, so this describes the
+  // first request rather than changing it.
+  let list = $state<OffsetListState>({ sort: { key: 'started', dir: 'desc' }, offset: 0 });
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
 
   // Cached view (lib/stores/cached-view.svelte.ts): cached rows paint instantly on
   // return and refresh behind a spinner. Re-exposed under the names the template
   // already used, so the markup is unchanged apart from the refresh control —
   // `loading` still means "nothing to show", and `revalidating` is the new
   // "rows are up, fetching fresh behind them".
-  const view = new CachedView<WorkflowRow[]>();
+  const view = new CachedView<ListPage<WorkflowRow>>();
 
-  const rows = $derived(view.data ?? []);
+  const rows = $derived(view.data?.rows ?? []);
+  // Read off the cached payload, not a separate `$state` set on the network
+  // path: a cache HIT repaints rows without fetching, and a `hasNext` only the
+  // fetch updates would be the previous key's answer.
+  const hasNext = $derived(view.data?.hasNext ?? false);
   const loading = $derived(view.loading);
   const revalidating = $derived(view.revalidating);
   const error = $derived(view.error);
@@ -60,11 +79,11 @@
 
   function onRange(days: number) {
     sinceDays = days;
-    offset = 0;
+    list = setOffsetPage(list, 0);
   }
 
   function onSearch() {
-    offset = 0;
+    list = setOffsetPage(list, 0);
   }
 
   /**
@@ -75,14 +94,26 @@
    * the axios interceptor adds to the request but which appears in none of these
    * arguments — omit it and one environment's workflows would be served as
    * another's.
+   *
+   * `sort` is in it for a related reason: without it a header click finds the
+   * previous ordering already cached under the same key and repaints it with
+   * NO request on the wire, so the sort looks like it silently did nothing.
    */
-  async function load(appId: string, days: number, s: string, off: number, force = false) {
+  async function load(
+    appId: string,
+    days: number,
+    s: string,
+    sort: string,
+    off: number,
+    force = false,
+  ) {
     await view.load(
-      viewKey('workflows.list', appId, sessionStore.scopeKey, days, s, off, LIMIT),
+      viewKey('workflows.list', appId, sessionStore.scopeKey, days, s, sort, off, LIMIT),
       () =>
         listWorkflows(appId, {
           since_days: days,
           search: s || undefined,
+          sort,
           limit: LIMIT,
           offset: off,
         }),
@@ -96,7 +127,7 @@
     refreshing = true;
     try {
       // force: an explicit click must reach the network regardless of freshness.
-      await load(aid, sinceDays, appliedSearch, offset, true);
+      await load(aid, sinceDays, appliedSearch, sortParam(list.sort), list.offset, true);
     } finally {
       refreshing = false;
     }
@@ -110,7 +141,7 @@
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       appliedSearch = s;
-      offset = 0;
+      list = setOffsetPage(list, 0);
     }, 300);
     return () => clearTimeout(searchTimer);
   });
@@ -122,8 +153,9 @@
     sessionStore.scopeKey;
     const days = sinceDays;
     const s = appliedSearch;
-    const off = offset;
-    if (aid) void load(aid, days, s, off);
+    const sort = sortParam(list.sort);
+    const off = list.offset;
+    if (aid) void load(aid, days, s, sort, off);
   });
 </script>
 
@@ -153,7 +185,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, sinceDays, appliedSearch, offset, true);
+              if (aid) load(aid, sinceDays, appliedSearch, sortParam(list.sort), list.offset, true);
             }}
           >
             Retry
@@ -189,16 +221,37 @@
       <DataTable>
         {#snippet head()}
           <tr>
-            <th>Workflow</th>
-            <th class="num">Started</th>
-            <th class="num">Completed</th>
-            <th class="num">Cancelled</th>
-            <th class="num">Abandoned</th>
-            <th class="num">Completion rate</th>
-            <th class="num">Median</th>
-            <th class="num">p95</th>
-            <th class="num">Users</th>
-            <th class="num">Last seen</th>
+            <SortableTh key="name" columnDefault="asc" sort={list.sort} {onsort}>
+              Workflow
+            </SortableTh>
+            <SortableTh key="started" class="num" sort={list.sort} {onsort}>Started</SortableTh>
+            <SortableTh key="completed" class="num" sort={list.sort} {onsort}>
+              Completed
+            </SortableTh>
+            <SortableTh key="cancelled" class="num" sort={list.sort} {onsort}>
+              Cancelled
+            </SortableTh>
+            <SortableTh key="abandoned" class="num" sort={list.sort} {onsort}>
+              Abandoned
+            </SortableTh>
+            <!-- `completion_rate` has no column: the server orders by the same
+                 `completed / started` ratio this cell computes client-side. -->
+            <SortableTh key="completion_rate" class="num" sort={list.sort} {onsort}>
+              Completion rate
+            </SortableTh>
+            <SortableTh key="median_duration_ms" class="num" sort={list.sort} {onsort}>
+              Median
+            </SortableTh>
+            <SortableTh key="p95_duration_ms" class="num" sort={list.sort} {onsort}>
+              p95
+            </SortableTh>
+            <!-- `users` ON THE WIRE, even though the row field and the SQL
+                 alias are both `unique_users`. Sending `unique_users` is a
+                 400, not a silently ignored parameter. -->
+            <SortableTh key="users" class="num" sort={list.sort} {onsort}>Users</SortableTh>
+            <SortableTh key="last_seen" class="num" sort={list.sort} {onsort}>
+              Last seen
+            </SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
@@ -219,15 +272,15 @@
         {/snippet}
       </DataTable>
 
-      <!-- Slice 3 replaces this with a `limit + 1` over-fetch probe. Until then
-           this reproduces the old (wrong) inference rather than hiding it: a final
-           page of exactly `limit` rows still offers a Next to an empty page. -->
+      <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
+           inference from the row count: a final page of exactly `LIMIT` rows
+           used to offer a Next that led to an empty page. -->
       <Pagination
-        {offset}
+        offset={list.offset}
         limit={LIMIT}
         count={rows.length}
-        hasNext={rows.length >= LIMIT}
-        onchange={(o) => (offset = o)}
+        {hasNext}
+        onchange={(o) => (list = setOffsetPage(list, o))}
       />
     </Card>
   {/if}

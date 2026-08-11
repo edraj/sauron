@@ -19,6 +19,7 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -34,11 +35,52 @@
     RESTORE_MIN_DAYS,
     RESTORE_MAX_DAYS,
   } from '../lib/models/tier-policy';
+  import {
+    STORAGE_APP_DEFAULT_SORT,
+    STORAGE_TABLE_DEFAULT_SORT,
+    storageAppAccessor,
+    storageTableAccessor,
+  } from '../lib/models/storage-sort';
+  import { sortRows } from '../lib/models/sort-rows';
+  import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
 
   let report = $state<StorageReport | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  // Both tables arrive whole in the one `/v1/admin/storage` response — one row
+  // per tiered table, one per visible app — so each sort runs over the ENTIRE
+  // array its table renders. Neither gets a pager: the table list is a fixed
+  // handful and the app list is bounded by the orgs you manage, and a pager on
+  // either would imply a page two that does not exist.
+  //
+  // A bare `SortState` per table, not the `OffsetListState` the paginated
+  // tables use: that type exists to make "apply a sort" and "reset to page 1"
+  // one indivisible step, and with no offset there is nothing to reset. Its
+  // `key`/`dir` are `readonly` (see `sort.ts`), so `tableSort.dir = 'asc'` is
+  // a type error and every transition goes through `toggleSort`.
+  let tableSort = $state<SortState>(STORAGE_TABLE_DEFAULT_SORT);
+  let appSort = $state<SortState>(STORAGE_APP_DEFAULT_SORT);
+
+  // `sortRows` copies before sorting, so the arrays inside `report` — the very
+  // object the poll below replaces wholesale — are never reordered in place.
+  // Every byte column orders by its RAW byte count, never by `fmtBytes`'s
+  // label: "900 KB" above "1.2 GB" is what text ordering gives, on the one
+  // page whose job is saying what is big.
+  const sortedTables = $derived(
+    sortRows(report?.database.tables ?? [], storageTableAccessor(tableSort.key), tableSort.dir),
+  );
+  const sortedApps = $derived(
+    sortRows(report?.apps ?? [], storageAppAccessor(appSort.key), appSort.dir),
+  );
+
+  function onTableSort(key: string, columnDefault: SortDir) {
+    tableSort = toggleSort(tableSort, key, columnDefault);
+  }
+  function onAppSort(key: string, columnDefault: SortDir) {
+    appSort = toggleSort(appSort, key, columnDefault);
+  }
 
   // Rotation policy. Loaded separately from the storage report and allowed to
   // fail on its own: the endpoint requires org:manage in EVERY org, so an admin
@@ -585,19 +627,25 @@
 
       <div class="section">
         <Card title="Database tables" padding="none">
-          {#if rep.database.tables.length === 0}
+          {#if sortedTables.length === 0}
             <EmptyState title="No tables" description="No tiered tables were reported." icon="server" />
           {:else}
             <DataTable>
               {#snippet head()}
                 <tr>
-                  <th>Table</th>
-                  <th class="num">Size</th>
-                  <th class="num">Hot rows</th>
+                  <SortableTh key="table" columnDefault="asc" sort={tableSort} onsort={onTableSort}>
+                    Table
+                  </SortableTh>
+                  <SortableTh key="size" class="num" sort={tableSort} onsort={onTableSort}>
+                    Size
+                  </SortableTh>
+                  <SortableTh key="hot_rows" class="num" sort={tableSort} onsort={onTableSort}>
+                    Hot rows
+                  </SortableTh>
                 </tr>
               {/snippet}
               {#snippet children()}
-                {#each rep.database.tables as t (t.name)}
+                {#each sortedTables as t (t.name)}
                   <tr>
                     <td><span class="cell-mono">{t.name}</span></td>
                     <td class="num">{fmtBytes(t.total_bytes)}</td>
@@ -612,23 +660,37 @@
 
       <div class="section">
         <Card title="Storage by app" padding="none">
-          {#if rep.apps.length === 0}
+          {#if sortedApps.length === 0}
             <EmptyState title="No apps" description="No apps have been created yet." icon="package" />
           {:else}
             <DataTable>
               {#snippet head()}
                 <tr>
-                  <th>Org</th>
-                  <th>Project</th>
-                  <th>App</th>
-                  <th class="num">Hot rows</th>
-                  <th class="num">Cold rows</th>
-                  <th class="num">Cold bytes</th>
-                  <th class="num">Est. hot bytes</th>
+                  <SortableTh key="org" columnDefault="asc" sort={appSort} onsort={onAppSort}>
+                    Org
+                  </SortableTh>
+                  <SortableTh key="project" columnDefault="asc" sort={appSort} onsort={onAppSort}>
+                    Project
+                  </SortableTh>
+                  <SortableTh key="app" columnDefault="asc" sort={appSort} onsort={onAppSort}>
+                    App
+                  </SortableTh>
+                  <SortableTh key="hot_rows" class="num" sort={appSort} onsort={onAppSort}>
+                    Hot rows
+                  </SortableTh>
+                  <SortableTh key="cold_rows" class="num" sort={appSort} onsort={onAppSort}>
+                    Cold rows
+                  </SortableTh>
+                  <SortableTh key="cold_bytes" class="num" sort={appSort} onsort={onAppSort}>
+                    Cold bytes
+                  </SortableTh>
+                  <SortableTh key="hot_bytes" class="num" sort={appSort} onsort={onAppSort}>
+                    Est. hot bytes
+                  </SortableTh>
                 </tr>
               {/snippet}
               {#snippet children()}
-                {#each rep.apps as a (a.app_id)}
+                {#each sortedApps as a (a.app_id)}
                   <tr class="clickable" onclick={() => toggleApp(a.app_id)}>
                     <td>
                       <!-- The disclosure chevron leads the row, so it stays in

@@ -292,6 +292,20 @@ impl TestServer {
         self.get(path, token).await.status().as_u16()
     }
 
+    /// [`get_status`](TestServer::get_status) plus the raw body, for
+    /// assertions whose failure message is only useful with the server's own
+    /// error text in it — a 500 from a malformed ORDER BY says which column
+    /// Postgres rejected, and the status alone does not.
+    async fn get_status_and_body(&self, path: &str, token: &str) -> (u16, String) {
+        let resp = self.get(path, token).await;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| panic!("GET {path}: failed to read body (status {status}): {e}"));
+        (status, text)
+    }
+
     /// [`get`](TestServer::get), parsed as JSON — for tests that need to
     /// count rows, not just check the status. Parses via `.text()` +
     /// `serde_json::from_str` rather than `reqwest::Response::json` — this
@@ -3514,6 +3528,773 @@ async fn devices_group_filter_applies_only_behind_the_sentinel() {
     assert_ne!(
         exact, empty_os_version,
         "omitting os_version and sending it empty must not be equivalent"
+    );
+
+    srv.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Devices sorting (S2c slice 3, Task 2): the `sort` query parameter.
+//
+// Lives here rather than in a file of its own so it reuses this suite's
+// spawned-binary harness and its seeded app; the sort whitelist is enforced on
+// the same two routes the section above already drives.
+// ---------------------------------------------------------------------------
+
+/// Both device lists build their ORDER BY by `format!`, so an unlisted `sort`
+/// value that reached the SQL would be injection. `parse_sort` refuses it with
+/// a 400 before any SQL is assembled — and the 400 is itself the proof the
+/// parameter is wired at all: an ignored `sort` would return 200 here and the
+/// caller would never learn their ordering was silently dropped.
+#[tokio::test]
+async fn a_sort_column_from_the_caller_never_reaches_the_sql() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+
+    // `last_seen; DROP TABLE devices`, percent-encoded.
+    let injected = "last_seen%3B%20DROP%20TABLE%20devices";
+    for route in ["devices", "device-groups"] {
+        let status = srv
+            .get_status(
+                &format!("/v1/apps/{app}/{route}?sort={injected}"),
+                &f.owner_token,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "/{route}: an unlisted sort column must be refused, not interpolated"
+        );
+    }
+
+    // And the table is still there.
+    for route in ["devices", "device-groups"] {
+        assert_eq!(
+            srv.get_status(&format!("/v1/apps/{app}/{route}"), &f.owner_token)
+                .await,
+            200,
+            "/{route} must still be readable after the refused sort"
+        );
+    }
+
+    // A column that belongs to the OTHER list is refused too — the two
+    // whitelists are separate on purpose (`distinct_id` has no meaning for a
+    // group, `device_count` none for a device), and sharing one would emit SQL
+    // naming a column the query does not select.
+    assert_eq!(
+        srv.get_status(
+            &format!("/v1/apps/{app}/device-groups?sort=distinct_id"),
+            &f.owner_token
+        )
+        .await,
+        400,
+        "`distinct_id` is a flat-list column and must not be accepted for groups"
+    );
+    assert_eq!(
+        srv.get_status(
+            &format!("/v1/apps/{app}/devices?sort=device_count"),
+            &f.owner_token
+        )
+        .await,
+        400,
+        "`device_count` is a grouped-list column and must not be accepted for devices"
+    );
+
+    srv.shutdown().await;
+}
+
+/// Every whitelisted column, both directions, must produce SQL Postgres
+/// accepts. A `match` arm naming a column the outer select does not expose
+/// (`d.foo`, or an aggregate alias spelled wrong) is not a compile error and
+/// no unit test on `SortSpec` can see it — it surfaces only as a 500 from a
+/// real query, which is exactly what this asserts is absent.
+#[tokio::test]
+async fn every_whitelisted_device_sort_produces_valid_sql() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+
+    for (route, columns) in [
+        (
+            "devices",
+            &[
+                "last_seen",
+                "family",
+                "os_name",
+                "browser",
+                "distinct_id",
+                "sessions_count",
+                "events_count",
+                "errors_count",
+            ][..],
+        ),
+        (
+            "device-groups",
+            &[
+                "last_seen",
+                "family",
+                "os_name",
+                "device_count",
+                "sessions_count",
+                "events_count",
+                "errors_count",
+            ][..],
+        ),
+    ] {
+        for column in columns {
+            for spec in [column.to_string(), format!("-{column}")] {
+                let path = format!("/v1/apps/{app}/{route}?since_days=3650&sort={spec}");
+                let (status, body) = srv.get_status_and_body(&path, &f.owner_token).await;
+                assert_eq!(status, 200, "GET {path} returned {status}: {body}");
+            }
+        }
+    }
+
+    // The environment-scoped read selects `last_seen`/`events_count`/
+    // `errors_count`/`last_distinct_id` from the LATERALs instead of from the
+    // `devices` columns, so it is a different select list and a different set
+    // of orderable names. Covered separately or not at all.
+    let granted = f.granted_env;
+    for column in ["last_seen", "distinct_id", "events_count", "sessions_count"] {
+        let path = format!(
+            "/v1/apps/{app}/devices?since_days=3650&environment_id={granted}&sort={column}"
+        );
+        let (status, body) = srv.get_status_and_body(&path, &f.owner_token).await;
+        assert_eq!(status, 200, "GET {path} returned {status}: {body}");
+    }
+
+    srv.shutdown().await;
+}
+
+/// Three devices whose `browser`, `os_name` and `events_count` orderings are
+/// each DIFFERENT from the other two, so no single expected sequence can be
+/// produced by sorting on the wrong one of the three.
+///
+/// | key | browser | os_name | events |
+/// |---|---|---|---|
+/// | `sortprobe-a` | `Chrome` | `Alpha`   | 1 |
+/// | `sortprobe-b` | `Brave`  | `Charlie` | 2 |
+/// | `sortprobe-c` | `Amber`  | `Bravo`   | 3 |
+///
+/// descending by browser → a, b, c · by os_name → b, c, a · by events → c, b, a.
+async fn seed_sort_probe_devices(srv: &TestServer, app_id: Uuid) -> Vec<String> {
+    let mut conn = srv.conn().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    // `chrono::Duration`, spelled out: this file's bare `Duration` is
+    // `std::time::Duration`, which cannot be subtracted from a `DateTime`.
+    let at = Utc::now() - chrono::Duration::seconds(30);
+    let mut keys = Vec::new();
+    for (n, browser, os_name, events) in [
+        ("a", "Chrome", "Alpha", 1i64),
+        ("b", "Brave", "Charlie", 2),
+        ("c", "Amber", "Bravo", 3),
+    ] {
+        let key = format!("sortprobe-{suffix}-{n}");
+        repo::bump_device(
+            &mut conn,
+            app_id,
+            &key,
+            Some("SortProbe"),
+            Some("SortProbeModel"),
+            Some(os_name),
+            Some("1"),
+            None,
+            Some(browser),
+            None,
+            at,
+            events,
+            0,
+        )
+        .await
+        .expect("bump_device");
+        keys.push(key);
+    }
+    drop(conn);
+    keys
+}
+
+/// End-to-end: a non-default column must come back in the requested order
+/// through the real route, in both directions.
+///
+/// The unit tests in `routes::devices` pin the name→column mapping; this pins
+/// the WIRING — that `?sort=` actually reaches `list_devices`' ORDER BY and
+/// that the ORDER BY is the one asked for. Neither a 200-only assertion nor a
+/// repo-level test using the test file's own copy of the mapping can see a
+/// route that resolves `browser` to `d.os_name`: this fixture makes those two
+/// orderings different on purpose, so a mis-map produces the wrong sequence
+/// rather than a wrong-but-identical one.
+#[tokio::test]
+async fn a_non_default_sort_column_orders_the_response_through_the_route() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+    let keys = seed_sort_probe_devices(&srv, app).await;
+    let (a, b, c) = (keys[0].clone(), keys[1].clone(), keys[2].clone());
+
+    // Only the three probe devices, in response order — the fixture's own
+    // device is filtered out rather than positioned, so this asserts relative
+    // order and stays independent of where NULLs land.
+    async fn probe_order(
+        srv: &TestServer,
+        token: &str,
+        path: &str,
+        keys: &[String],
+    ) -> Vec<String> {
+        let body = srv.get_json(path, token).await;
+        body.as_array()
+            .unwrap_or_else(|| panic!("GET {path}: expected an array, got {body}"))
+            .iter()
+            .filter_map(|r| r["device_key"].as_str().map(str::to_owned))
+            .filter(|k| keys.contains(k))
+            .collect()
+    }
+
+    for (sort, expected) in [
+        ("browser", vec![&a, &b, &c]),
+        ("-browser", vec![&c, &b, &a]),
+        ("os_name", vec![&b, &c, &a]),
+        ("-os_name", vec![&a, &c, &b]),
+        ("events_count", vec![&c, &b, &a]),
+        ("-events_count", vec![&a, &b, &c]),
+    ] {
+        let path = format!("/v1/apps/{app}/devices?since_days=3650&sort={sort}");
+        let got = probe_order(&srv, &f.owner_token, &path, &keys).await;
+        let want: Vec<String> = expected.into_iter().cloned().collect();
+        assert_eq!(
+            got, want,
+            "?sort={sort} returned the wrong order — the route's `match` arm \
+             may name a different column than the one requested"
+        );
+    }
+
+    srv.shutdown().await;
+}
+
+// ===========================================================================
+// Ingest failure recovery — the deployment-admin boundary and the four routes
+// ===========================================================================
+
+/// The whole surface, over real HTTP, through the real router.
+///
+/// The unit tests below `sauron-db` prove the SQL is right and the classifier
+/// tests prove the policy is right, but neither can see whether a handler
+/// actually *calls* `require_deployment_admin`, whether the route table wires
+/// the right method to the right handler, or whether the keyset cursor survives
+/// a round trip through `Query`. Those are exactly the defects that ship green.
+///
+/// `require_deployment_admin` means org:manage in EVERY org. This database has
+/// exactly one org, so one grant satisfies it — and the second user, holding a
+/// role WITHOUT org:manage, is the negative case.
+#[tokio::test]
+async fn ingest_failures_require_deployment_admin_and_round_trip() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let suffix = Uuid::new_v4().simple().to_string();
+
+    let (admin_id, outsider_id, failure_id) = {
+        let mut conn = srv.conn().await;
+        let org = repo::create_org(
+            &mut conn,
+            "ingest-failure org",
+            &format!("ingest-failure-org-{suffix}"),
+        )
+        .await
+        .expect("create org");
+
+        let admin = repo::create_user(
+            &mut conn,
+            &format!("if-admin-{suffix}@example.test"),
+            "unused-password-hash",
+            "Deployment Admin",
+        )
+        .await
+        .expect("create admin");
+        let admin_role = repo::create_role(
+            &mut conn,
+            org.id,
+            "deployment admin",
+            "org:manage everywhere",
+            json!([perm::ORG_MANAGE]),
+        )
+        .await
+        .expect("create admin role");
+        repo::create_grant(
+            &mut conn,
+            NewRoleGrant {
+                org_id: org.id,
+                user_id: admin.id,
+                role_id: admin_role.id,
+                scope_type: "org".to_string(),
+                scope_id: org.id,
+            },
+        )
+        .await
+        .expect("grant org:manage");
+
+        // Authenticated, but without org:manage — the shape that must 403.
+        let outsider = repo::create_user(
+            &mut conn,
+            &format!("if-outsider-{suffix}@example.test"),
+            "unused-password-hash",
+            "Ordinary Member",
+        )
+        .await
+        .expect("create outsider");
+        let reader_role = repo::create_role(
+            &mut conn,
+            org.id,
+            "reader",
+            "no org:manage",
+            json!([perm::EVENT_READ]),
+        )
+        .await
+        .expect("create reader role");
+        repo::create_grant(
+            &mut conn,
+            NewRoleGrant {
+                org_id: org.id,
+                user_id: outsider.id,
+                role_id: reader_role.id,
+                scope_type: "org".to_string(),
+                scope_id: org.id,
+            },
+        )
+        .await
+        .expect("grant reader");
+
+        // Two occurrences of one failure, so the response must show a group of
+        // two rather than two groups of one.
+        let mut id = Uuid::nil();
+        for i in 0..2 {
+            id = repo::record_ingest_failure(
+                &mut conn,
+                &sauron_db::models::NewIngestFailure {
+                    fingerprint: &format!("http-fp-{suffix}"),
+                    error_kind: "decode",
+                    error_message: "expected value at line 1 column 1",
+                    org_id: Some(org.id),
+                    project_id: None,
+                    app_id: None,
+                },
+                Some(&json!({ "seq": i })),
+                0,
+                100,
+            )
+            .await
+            .expect("record failure")
+            .id;
+        }
+        (admin.id, outsider.id, id)
+    };
+
+    let keys = JwtKeys::new(JWT_SECRET, 900);
+    let (admin_token, _) = keys
+        .issue_access(admin_id, false, None)
+        .expect("issue admin token");
+    let (outsider_token, _) = keys
+        .issue_access(outsider_id, false, None)
+        .expect("issue outsider token");
+
+    // --- the RBAC boundary, on every one of the four routes ----------------
+    //
+    // Checked per route, not once: a guard is easy to add to three handlers
+    // and forget on the fourth, and the forgotten one is always the mutating
+    // one.
+    for (method, path) in [
+        ("GET", "/v1/admin/ingest-failures".to_string()),
+        (
+            "GET",
+            format!("/v1/admin/ingest-failures/{failure_id}/payloads"),
+        ),
+        (
+            "POST",
+            format!("/v1/admin/ingest-failures/{failure_id}/retry"),
+        ),
+        ("DELETE", format!("/v1/admin/ingest-failures/{failure_id}")),
+    ] {
+        let status = match method {
+            "GET" => srv.get_status(&path, &outsider_token).await,
+            "POST" => srv.post_status(&path, &outsider_token, json!({})).await,
+            _ => srv.delete_status(&path, &outsider_token).await,
+        };
+        assert_eq!(
+            status, 403,
+            "{method} {path} must refuse a caller without org:manage"
+        );
+    }
+
+    // --- the list, as the admin ---------------------------------------------
+    let body = srv
+        .get_json("/v1/admin/ingest-failures", &admin_token)
+        .await;
+    let rows = body["failures"].as_array().expect("failures array");
+    assert_eq!(rows.len(), 1, "two occurrences must fold into ONE group");
+    assert_eq!(rows[0]["occurrences"], 2);
+    assert_eq!(rows[0]["retained"], 2);
+    assert_eq!(rows[0]["dropped"], 0);
+    assert_eq!(rows[0]["error_kind"], "decode");
+    assert_eq!(rows[0]["status"], "failed");
+
+    // A filter that matches nothing must return nothing, not everything — the
+    // classic `($1 IS NULL OR col = $1)` inversion.
+    let none = srv
+        .get_json(
+            "/v1/admin/ingest-failures?error_kind=db_deadlock",
+            &admin_token,
+        )
+        .await;
+    assert_eq!(none["failures"].as_array().unwrap().len(), 0);
+
+    // --- payloads ------------------------------------------------------------
+    let payloads = srv
+        .get_json(
+            &format!("/v1/admin/ingest-failures/{failure_id}/payloads"),
+            &admin_token,
+        )
+        .await;
+    assert_eq!(payloads.as_array().expect("payload array").len(), 2);
+
+    // --- retry --------------------------------------------------------------
+    let retried = srv
+        .post(
+            &format!("/v1/admin/ingest-failures/{failure_id}/retry"),
+            &admin_token,
+            json!({}),
+        )
+        .await;
+    assert_eq!(retried.status().as_u16(), 200);
+    let retried: serde_json::Value = retried.json().await.expect("retry body");
+    assert_eq!(
+        retried["requeued"], 2,
+        "both retained payloads must re-queue"
+    );
+    assert_eq!(retried["failed"], 0);
+    assert_eq!(retried["unrecoverable"], 0);
+
+    // --- drop, and the audit entry that must precede it ---------------------
+    assert_eq!(
+        srv.delete_status(
+            &format!("/v1/admin/ingest-failures/{failure_id}"),
+            &admin_token
+        )
+        .await,
+        200,
+    );
+    assert_eq!(
+        srv.get_status(
+            &format!("/v1/admin/ingest-failures/{failure_id}/payloads"),
+            &admin_token
+        )
+        .await,
+        200,
+        "a dropped group's payload listing is empty, not an error",
+    );
+
+    let gone = srv
+        .get_json("/v1/admin/ingest-failures", &admin_token)
+        .await;
+    assert_eq!(gone["failures"].as_array().unwrap().len(), 0);
+
+    // The drop is a hard DELETE, so this row is the ONLY surviving record that
+    // those events existed. If it is missing, the deletion is untraceable.
+    {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = srv.conn().await;
+        let rows: Vec<(String, serde_json::Value)> = sauron_db::schema::audit_log::table
+            .filter(sauron_db::schema::audit_log::action.eq("ingest_failure.drop"))
+            .select((
+                sauron_db::schema::audit_log::action,
+                sauron_db::schema::audit_log::changes,
+            ))
+            .load(&mut conn)
+            .await
+            .expect("read audit log");
+        assert_eq!(rows.len(), 1, "the drop must leave exactly one audit entry");
+        let changes = &rows[0].1;
+        assert_eq!(changes["occurrences"]["to"], 2);
+        assert_eq!(changes["error_kind"]["to"], "decode");
+        // The allowlist guarantee, asserted rather than assumed: these rows are
+        // masked copies of real user events, and the audit table is read by org
+        // admins and kept forever.
+        assert!(
+            changes.get("payload").is_none(),
+            "an audit entry must NEVER carry the payload it describes"
+        );
+    }
+
+    srv.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Offset-list sorting (S2c slice 3, Task 3): the `sort` query parameter on
+// /persons, /screens, /sessions and /workflows.
+//
+// Here rather than in a file of its own for the reason the devices section
+// above gives — this suite already has the spawned-binary harness and a seeded
+// app+token, and `sauron-db` must not depend on the API binary, so the
+// injection check cannot live in `crates/sauron-db/tests/offset_sort.rs`.
+// ---------------------------------------------------------------------------
+
+/// Every whitelisted `?sort=` value for the four Task 3 lists, by route.
+const OFFSET_LIST_SORTS: &[(&str, &[&str])] = &[
+    (
+        "persons",
+        &[
+            "last_seen",
+            "distinct_id",
+            "first_seen",
+            "sessions_count",
+            "events_count",
+            "errors_count",
+        ],
+    ),
+    (
+        "screens",
+        &[
+            "views",
+            "screen",
+            "events",
+            "exceptions",
+            "users",
+            "avg_dwell_ms",
+        ],
+    ),
+    (
+        "sessions",
+        &[
+            "started_at",
+            "distinct_id",
+            "device_key",
+            "duration_ms",
+            "events_count",
+            "errors_count",
+        ],
+    ),
+    (
+        "workflows",
+        &[
+            "started",
+            "name",
+            "completed",
+            "cancelled",
+            "abandoned",
+            "completion_rate",
+            "median_duration_ms",
+            "p95_duration_ms",
+            "users",
+            "last_seen",
+        ],
+    ),
+];
+
+/// All four lists build their ORDER BY by `format!` (or, for `/sessions`, by
+/// `diesel::dsl::sql`), so an unlisted `sort` value that reached the SQL would
+/// be injection. `parse_sort` refuses it with a 400 before any SQL is
+/// assembled.
+///
+/// The 400 is also the only end-to-end proof the parameter is WIRED: a handler
+/// that resolved the spec and then forgot to pass it — or never read
+/// `q.sort` — returns a perfectly normal 200 here and the caller never learns
+/// their ordering was dropped.
+#[tokio::test]
+async fn a_sort_column_from_the_caller_never_reaches_the_offset_list_sql() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+
+    // `<default>; DROP TABLE sessions`, percent-encoded, with each list's own
+    // default as the prefix so the value looks legitimate up to the semicolon.
+    for (route, columns) in OFFSET_LIST_SORTS {
+        let injected = format!("{}%3B%20DROP%20TABLE%20sessions", columns[0]);
+        let status = srv
+            .get_status(
+                &format!("/v1/apps/{app}/{route}?sort={injected}"),
+                &f.owner_token,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "/{route}: an unlisted sort column must be refused, not interpolated"
+        );
+    }
+
+    // And every table is still there.
+    for (route, _) in OFFSET_LIST_SORTS {
+        assert_eq!(
+            srv.get_status(&format!("/v1/apps/{app}/{route}"), &f.owner_token)
+                .await,
+            200,
+            "/{route} must still be readable after the refused sort"
+        );
+    }
+
+    // Each list refuses the OTHER lists' exclusive columns. The whitelists are
+    // separate on purpose — `views` means nothing to a session, `duration_ms`
+    // nothing to a screen — and sharing one would emit SQL naming a column the
+    // query does not select, i.e. a 500.
+    for (route, foreign) in [
+        ("persons", "views"),
+        ("screens", "duration_ms"),
+        ("sessions", "views"),
+        ("workflows", "duration_ms"),
+        // `last_event_at` is a real `sessions` column AND that list's former
+        // hard-coded ordering, so accepting it would look entirely reasonable.
+        ("sessions", "last_event_at"),
+        // `active` is a real alias of `workflow_list`'s select and would
+        // produce valid SQL — only the whitelist stops it.
+        ("workflows", "active"),
+    ] {
+        assert_eq!(
+            srv.get_status(
+                &format!("/v1/apps/{app}/{route}?sort={foreign}"),
+                &f.owner_token
+            )
+            .await,
+            400,
+            "/{route} must refuse `{foreign}`"
+        );
+    }
+
+    srv.shutdown().await;
+}
+
+/// Every whitelisted column, both directions, must produce SQL Postgres
+/// accepts.
+///
+/// This is the only thing that can catch a `match` arm naming a column the
+/// query does not expose — `total_dwell_ms` on the screens list, `users`
+/// instead of `unique_users` on workflows, a typo'd alias anywhere. It is not
+/// a compile error and no `SortSpec` unit test can see it; it surfaces only as
+/// a 500 from a real query, which is exactly what this asserts is absent.
+#[tokio::test]
+async fn every_whitelisted_offset_list_sort_produces_valid_sql() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+
+    for (route, columns) in OFFSET_LIST_SORTS {
+        for column in *columns {
+            for spec in [column.to_string(), format!("-{column}")] {
+                let path = format!("/v1/apps/{app}/{route}?since_days=365&sort={spec}");
+                let (status, body) = srv.get_status_and_body(&path, &f.owner_token).await;
+                assert_eq!(status, 200, "GET {path} returned {status}: {body}");
+            }
+        }
+    }
+
+    // The environment-scoped read of /persons selects `first_seen`/`last_seen`
+    // from the three LATERALs (`LEAST`/`GREATEST`) instead of from
+    // `event_users`, so it is a different select list and a different set of
+    // orderable names. Covered separately or not at all. The other three
+    // lists' select lists do not vary with scope.
+    let granted = f.granted_env;
+    for column in ["last_seen", "first_seen", "distinct_id", "sessions_count"] {
+        let path = format!("/v1/apps/{app}/persons?environment_id={granted}&sort={column}");
+        let (status, body) = srv.get_status_and_body(&path, &f.owner_token).await;
+        assert_eq!(status, 200, "GET {path} returned {status}: {body}");
+    }
+
+    srv.shutdown().await;
+}
+
+/// `devices::detail`'s "recent sessions" panel must stay ordered by
+/// `last_event_at DESC` — its behaviour before Slice 3 — and must NOT follow
+/// the sessions LIST's new `started_at DESC` default.
+///
+/// Both consumers call the same `repo::list_sessions`, so the two orderings can
+/// only be kept apart by the call site pinning one. `routes::devices`'
+/// `the_device_detail_session_panel_pins_last_event_at` asserts the constant;
+/// this asserts the handler actually uses it, which the unit test cannot see.
+///
+/// The fixture is built so the two orderings disagree — a panel served with
+/// either one returns the same two sessions, and only their ORDER tells them
+/// apart:
+///
+/// | session | `started_at` | `last_event_at` |
+/// |---|---|---|
+/// | `early-start` | T-10m | T-1m |
+/// | `late-start`  | T-5m  | T-4m |
+///
+/// `last_event_at DESC` -> early-start, late-start ·
+/// `started_at DESC` -> late-start, early-start.
+#[tokio::test]
+async fn the_device_detail_sessions_panel_stays_ordered_by_last_event_at() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let early = format!("panelprobe-{suffix}-early-start");
+    let late = format!("panelprobe-{suffix}-late-start");
+
+    {
+        let mut conn = srv.conn().await;
+        // `chrono::Duration` spelled out: this file's bare `Duration` is
+        // `std::time::Duration`, which cannot be subtracted from a `DateTime`.
+        let now = Utc::now();
+        // `bump_session` writes `started_at` and `last_event_at` from one bind,
+        // so a session whose two timestamps differ needs a second call at the
+        // later instant — `LEAST`/`GREATEST` on conflict spread them apart.
+        for (session_id, started_min, last_min) in [(&early, 10i64, 1i64), (&late, 5, 4)] {
+            for at in [
+                now - chrono::Duration::minutes(started_min),
+                now - chrono::Duration::minutes(last_min),
+            ] {
+                repo::bump_session(
+                    &mut conn,
+                    app,
+                    session_id,
+                    None,
+                    Some(&f.device_key),
+                    at,
+                    &serde_json::json!({}),
+                    None,
+                    Some(f.granted_env),
+                    None,
+                    0,
+                    0,
+                )
+                .await
+                .expect("bump_session");
+            }
+        }
+    }
+
+    let body = srv
+        .get_json(
+            &format!("/v1/apps/{app}/device?key={}", f.device_key),
+            &f.owner_token,
+        )
+        .await;
+    // Filtered to the two probes rather than asserting the whole array, so an
+    // unrelated session seeded later cannot turn this into a flake. The
+    // relative order is the whole assertion and survives the filter.
+    let served: Vec<String> = body["sessions"]
+        .as_array()
+        .expect("the device detail carries a `sessions` array")
+        .iter()
+        .filter_map(|s| s["session_id"].as_str().map(str::to_string))
+        .filter(|s| s == &early || s == &late)
+        .collect();
+    assert_eq!(
+        served,
+        vec![early.clone(), late.clone()],
+        "the device panel must order by last_event_at DESC; the sessions \
+         list's `started_at DESC` default would return {:?}",
+        vec![late, early]
     );
 
     srv.shutdown().await;

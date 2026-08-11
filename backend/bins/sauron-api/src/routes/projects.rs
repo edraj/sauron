@@ -117,6 +117,26 @@ pub async fn create_project(
             Ok(project)
         })
         .await?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::PROJECT_CREATE,
+            crate::audit::entity::PROJECT,
+        )
+        .target(project.id, &project.name)
+        .project(project.id, &project.name)
+        .changes(crate::audit::created(
+            crate::audit::entity::PROJECT,
+            &[
+                ("name", serde_json::json!(project.name)),
+                ("slug", serde_json::json!(project.slug)),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(project))
 }
 
@@ -143,13 +163,42 @@ pub async fn update_project(
     Json(req): Json<UpdateProjectReq>,
 ) -> Result<Json<Project>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_project(&mut conn, auth.user_id, project_id, perm::PROJECT_UPDATE).await?;
+    let before =
+        authorize_project(&mut conn, auth.user_id, project_id, perm::PROJECT_UPDATE).await?;
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("project name is required".into()));
     }
     let project = repo::rename_project(&mut conn, project_id, &req.name)
         .await?
         .ok_or(ApiError::NotFound)?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            project.org_id,
+            crate::audit::action::PROJECT_UPDATE,
+            crate::audit::entity::PROJECT,
+        )
+        .target(project.id, &project.name)
+        .project(project.id, &project.name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::PROJECT,
+            &[
+                (
+                    "name",
+                    serde_json::json!(before.name),
+                    serde_json::json!(project.name),
+                ),
+                (
+                    "slug",
+                    serde_json::json!(before.slug),
+                    serde_json::json!(project.slug),
+                ),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(project))
 }
 
@@ -159,8 +208,26 @@ pub async fn delete_project(
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_project(&mut conn, auth.user_id, project_id, perm::PROJECT_DELETE).await?;
+    let project =
+        authorize_project(&mut conn, auth.user_id, project_id, perm::PROJECT_DELETE).await?;
     repo::delete_project(&mut conn, project_id).await?;
+
+    // Recorded AFTER the delete, naming a project row that no longer exists.
+    // Only possible because this table carries no FK on `project_id` — with
+    // one, this insert would fail and the deletion would be the single action
+    // guaranteed to go unrecorded. See migration 50.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            project.org_id,
+            crate::audit::action::PROJECT_DELETE,
+            crate::audit::entity::PROJECT,
+        )
+        .target(project.id, &project.name)
+        .project(project.id, &project.name),
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -236,7 +303,7 @@ pub async fn create_app(
         )));
     }
     let mut conn = db(&state).await?;
-    authorize_project(&mut conn, auth.user_id, project_id, perm::APP_CREATE).await?;
+    let project = authorize_project(&mut conn, auth.user_id, project_id, perm::APP_CREATE).await?;
 
     // Both inserts run in one transaction: an app is unreachable by any SDK
     // without at least one enrollment holding an ingest key, so if the
@@ -260,5 +327,29 @@ pub async fn create_app(
             Ok(app)
         })
         .await?;
+
+    // The enrollment keys minted by `enroll_new_app` are deliberately absent:
+    // `app` is not the allowlisted-field source, `audit::created` is, and
+    // `public_key` is not on that list.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            project.org_id,
+            crate::audit::action::APP_CREATE,
+            crate::audit::entity::APP,
+        )
+        .target(app.id, &app.name)
+        .project(project.id, &project.name)
+        .app(app.id, &app.name)
+        .changes(crate::audit::created(
+            crate::audit::entity::APP,
+            &[
+                ("name", serde_json::json!(app.name)),
+                ("platform", serde_json::json!(app.app_type)),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(app))
 }

@@ -159,12 +159,33 @@ constantly.
 
 | Table | Sortable | Not sortable |
 |---|---|---|
-| Devices (flat) | Device, OS, Browser/Arch, Last user, Sessions, Events, Errors, Last seen | — |
+| Devices (flat) | Browser/Arch, Last user, Sessions, Events, Errors, Last seen | Device, OS |
 | Devices (grouped) | Device, OS, Devices, Sessions, Events, Errors, Last seen | — |
 | Users | User, Sessions, Events, Errors, First seen, Last seen | Traits (JSON) |
 | Screens | Screen, Views, Events, Exceptions, Users, Avg dwell | — |
-| Sessions | Session, User, Device, Started, Duration, Events, Errors | — |
+| Sessions | User, Device, Started, Duration, Events, Errors | Session |
 | Workflows | Workflow, Started, Completed, Cancelled, Abandoned, Completion rate, Median, p95, Users, Last seen | — |
+
+Two rows above are narrower than the endpoint's whitelist, and the difference
+is deliberate in both cases — do not "close the gap" by wiring a header.
+
+**Sessions' `Session` column.** It renders an opaque `session_key` that nobody
+orders by, so it is not in `SESSION_SORTS` and `session_id` is pinned as
+*refused* by a route test. An earlier draft of this table listed it as
+sortable; a header for it would 400 the page.
+
+**The flat Devices table's `Device` and `OS` columns.** The endpoint's
+whitelist does accept `family` and `os_name` — `/devices` without `group=1` is
+a legal call and they are meaningful there — but the dashboard never makes that
+call: `DevicesInventory` renders the flat table only inside a group drill-down,
+and a drill-down pins all four descriptor columns with `IS NOT DISTINCT FROM`.
+Every row the flat table can render therefore shares one family, model, os_name
+and os_version, so those two headers would flip a caret and move no row. They
+are plain `<th>` in `DeviceFlatTable.svelte` for the reason stated for Issues
+above: an unsorted column is honest, a wrongly-sorted one is not — and a header
+that never reorders is closer to the second. They stay sortable on the
+**grouped** table, where the descriptors vary. No backend change: the whitelist
+is correct for the endpoint, and this is a client affordance.
 
 No new indexes are added. Correctness does not depend on them, and choosing
 indexes belongs to a measured performance pass, not to a UI feature. Comments

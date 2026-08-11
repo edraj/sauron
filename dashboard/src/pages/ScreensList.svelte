@@ -6,6 +6,7 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
@@ -14,6 +15,13 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { listScreens } from '../lib/api/screens';
+  import {
+    setOffsetPage,
+    setOffsetSort,
+    type ListPage,
+    type OffsetListState,
+  } from '../lib/models/list-state';
+  import { sortParam, type SortDir } from '../lib/models/sort';
   import { compactNumber, formatDuration } from '../lib/utils/format';
   import type { ScreenRow } from '../lib/models';
 
@@ -23,14 +31,25 @@
   // `query` is bound to the input; `search` is the debounced value that drives loads.
   let query = $state('');
   let search = $state('');
-  let offset = $state(0);
+
+  // `views` descending is the endpoint's own default, so this describes the
+  // first request rather than changing it.
+  let list = $state<OffsetListState>({ sort: { key: 'views', dir: 'desc' }, offset: 0 });
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
 
   // Cached view (lib/stores/cached-view.svelte.ts): rows already fetched paint
   // instantly on return, then refresh behind a spinner instead of a skeleton.
   // Re-exposed under the names the template already used, so the markup is
   // unchanged apart from the refresh indicator.
-  const view = new CachedView<ScreenRow[]>();
-  const rows = $derived(view.data ?? []);
+  const view = new CachedView<ListPage<ScreenRow>>();
+  const rows = $derived(view.data?.rows ?? []);
+  // Read off the cached payload, not a separate `$state` set on the network
+  // path: a cache HIT repaints rows without fetching, and a `hasNext` only the
+  // fetch updates would be the previous key's answer.
+  const hasNext = $derived(view.data?.hasNext ?? false);
   const revalidating = $derived(view.revalidating);
   const loading = $derived(view.loading);
   let refreshing = $state(false);
@@ -42,27 +61,40 @@
     clearTimeout(debounce);
     debounce = setTimeout(() => {
       search = v.trim();
-      offset = 0;
+      list = setOffsetPage(list, 0);
     }, 220);
   }
 
   function onRange(days: number) {
     sinceDays = days;
-    offset = 0;
+    list = setOffsetPage(list, 0);
   }
 
   // `scopeKey` must be in the key: it carries the selected environment, which the
   // axios interceptor adds to the request but which appears in none of these
   // arguments. Omit it and one environment's rows are served as another's.
   //
+  // `sort` must be in it for a related reason: without it a header click finds
+  // the previous ordering already cached under the same key and repaints it
+  // with NO request on the wire, so the sort looks like it silently did
+  // nothing.
+  //
   // `force` bypasses the fresh-window short-circuit — an explicit Refresh or
   // Retry means "go to the network now".
-  async function load(appId: string, days: number, s: string, off: number, force = false) {
+  async function load(
+    appId: string,
+    days: number,
+    s: string,
+    sort: string,
+    off: number,
+    force = false,
+  ) {
     await view.load(
-      viewKey('screens.list', appId, sessionStore.scopeKey, days, s, off, LIMIT),
+      viewKey('screens.list', appId, sessionStore.scopeKey, days, s, sort, off, LIMIT),
       () => listScreens(appId, {
         q: s || undefined,
         sinceDays: days,
+        sort,
         limit: LIMIT,
         offset: off,
       }),
@@ -75,7 +107,9 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, sinceDays, search, offset, true)]);
+      await Promise.all([
+        load(aid, sinceDays, search, sortParam(list.sort), list.offset, true),
+      ]);
     } finally {
       refreshing = false;
     }
@@ -88,8 +122,9 @@
     sessionStore.scopeKey;
     const days = sinceDays;
     const s = search;
-    const off = offset;
-    if (aid) void load(aid, days, s, off);
+    const sort = sortParam(list.sort);
+    const off = list.offset;
+    if (aid) void load(aid, days, s, sort, off);
   });
 </script>
 
@@ -114,7 +149,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, sinceDays, search, offset);
+              if (aid) load(aid, sinceDays, search, sortParam(list.sort), list.offset);
             }}
           >
             Retry
@@ -138,12 +173,16 @@
     <DataTable>
       {#snippet head()}
         <tr>
-          <th>Screen</th>
-          <th class="num">Views</th>
-          <th class="num">Events</th>
-          <th class="num">Exceptions</th>
-          <th class="num">Users</th>
-          <th class="num">Avg dwell</th>
+          <SortableTh key="screen" columnDefault="asc" sort={list.sort} {onsort}>Screen</SortableTh>
+          <SortableTh key="views" class="num" sort={list.sort} {onsort}>Views</SortableTh>
+          <SortableTh key="events" class="num" sort={list.sort} {onsort}>Events</SortableTh>
+          <SortableTh key="exceptions" class="num" sort={list.sort} {onsort}>
+            Exceptions
+          </SortableTh>
+          <SortableTh key="users" class="num" sort={list.sort} {onsort}>Users</SortableTh>
+          <SortableTh key="avg_dwell_ms" class="num" sort={list.sort} {onsort}>
+            Avg dwell
+          </SortableTh>
         </tr>
       {/snippet}
       {#snippet children()}
@@ -160,15 +199,15 @@
       {/snippet}
     </DataTable>
 
-    <!-- Slice 3 replaces this with a `limit + 1` over-fetch probe. Until then
-         this reproduces the old (wrong) inference rather than hiding it: a final
-         page of exactly `limit` rows still offers a Next to an empty page. -->
+    <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
+         inference from the row count: a final page of exactly `LIMIT` rows
+         used to offer a Next that led to an empty page. -->
     <Pagination
-      {offset}
+      offset={list.offset}
       limit={LIMIT}
       count={rows.length}
-      hasNext={rows.length >= LIMIT}
-      onchange={(o) => (offset = o)}
+      {hasNext}
+      onchange={(o) => (list = setOffsetPage(list, o))}
     />
   {/if}
 </AppShell>

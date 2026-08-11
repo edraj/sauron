@@ -84,6 +84,9 @@ pub async fn update_app(
     // on its own. `authorize_app` already fetches the row, so bind it instead
     // of re-querying it via `repo::get_app`.
     let existing = authorize_app(&mut conn, auth.user_id, app_id, perm::APP_UPDATE).await?;
+    let (_, org_id) = repo::app_ancestry(&mut conn, app_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("app name is required".into()));
     }
@@ -124,6 +127,38 @@ pub async fn update_app(
             }
         }
     }
+
+    // `store_environment_id` is deliberately not recorded: it names an
+    // enrollment id, which is not a value a reader of the trail could
+    // interpret without a lookup this table is designed to avoid.
+    let entry = crate::audit::with_app_scope(
+        &mut conn,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::APP_UPDATE,
+            crate::audit::entity::APP,
+        )
+        .target(app.id, &app.name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::APP,
+            &[
+                (
+                    "name",
+                    serde_json::json!(existing.name),
+                    serde_json::json!(app.name),
+                ),
+                (
+                    "ingest_enabled",
+                    serde_json::json!(existing.ingest_enabled),
+                    serde_json::json!(app.ingest_enabled),
+                ),
+            ],
+        )),
+        app_id,
+    )
+    .await;
+    crate::audit::record(&mut conn, auth.user_id, entry).await;
+
     Ok(Json(app))
 }
 
@@ -133,7 +168,24 @@ pub async fn delete_app(
     Path(app_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_app(&mut conn, auth.user_id, app_id, perm::APP_DELETE).await?;
+    let app = authorize_app(&mut conn, auth.user_id, app_id, perm::APP_DELETE).await?;
+    let (_, org_id) = repo::app_ancestry(&mut conn, app_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Resolved BEFORE the delete: `audit_app_scope` joins `apps` to `projects`,
+    // and after the row is gone it would return None and the entry would name
+    // no project at all.
+    let scope = crate::audit::with_app_scope(
+        &mut conn,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::APP_DELETE,
+            crate::audit::entity::APP,
+        )
+        .target(app.id, &app.name),
+        app_id,
+    )
+    .await;
     // The environments cascade away with the app, but their keys can still be
     // sitting in the ingest cache for the full positive TTL — during which a
     // deleted app keeps returning 202 for events that are then dropped on an FK
@@ -148,6 +200,7 @@ pub async fn delete_app(
             tracing::warn!(error = %e, env_id = %env_id, "failed to invalidate ingest key cache");
         }
     }
+    crate::audit::record(&mut conn, auth.user_id, scope).await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

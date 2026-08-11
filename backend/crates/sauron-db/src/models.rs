@@ -1619,6 +1619,196 @@ pub struct StoreDailyMetric {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One recorded administrative action — the Wall of Shame's row type.
+///
+/// `actor_email`, `entity_name`, `project_name`, `app_name` and
+/// `environment_name` are snapshots, not joins. Every id on this row is
+/// `ON DELETE SET NULL` (or, for `environment_id`, unconstrained), so the
+/// names are the only thing that keeps an entry readable once the thing it
+/// describes has been deleted — which is exactly when the trail is consulted.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = audit_log)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AuditLogEntry {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub actor_id: Option<Uuid>,
+    pub actor_email: String,
+    pub action: String,
+    pub entity_type: String,
+    pub entity_id: Option<Uuid>,
+    pub entity_name: String,
+    pub project_id: Option<Uuid>,
+    pub project_name: String,
+    pub app_id: Option<Uuid>,
+    pub app_name: String,
+    pub environment_id: Option<Uuid>,
+    pub environment_name: String,
+    /// `{field: {from, to}}`, changed fields only. Populated from a per-entity
+    /// allowlist in `sauron-api::audit`; never from serializing an entity
+    /// wholesale, so secrets cannot reach a table org admins can read.
+    pub changes: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = audit_log)]
+pub struct NewAuditLogEntry<'a> {
+    pub org_id: Uuid,
+    pub actor_id: Option<Uuid>,
+    pub actor_email: &'a str,
+    pub action: &'a str,
+    pub entity_type: &'a str,
+    pub entity_id: Option<Uuid>,
+    pub entity_name: &'a str,
+    pub project_id: Option<Uuid>,
+    pub project_name: &'a str,
+    pub app_id: Option<Uuid>,
+    pub app_name: &'a str,
+    pub environment_id: Option<Uuid>,
+    pub environment_name: &'a str,
+    pub changes: Value,
+}
+
+// ===========================================================================
+// Ingest failure recovery
+// ===========================================================================
+
+/// One *kind* of ingest failure, not one occurrence.
+///
+/// 242,700 identical malformed payloads are one row here with
+/// `occurrences = 242_700`. The individual payloads live in
+/// [`IngestFailurePayload`], capped per group — grouping alone would reduce
+/// "retry" to replaying a single sample, which verifies a fix but recovers
+/// nothing.
+///
+/// `org_id`, `project_id` and `app_id` carry no foreign key and are nullable,
+/// for the same reasons as [`AuditLogEntry`]: the row is an inert snapshot that
+/// must outlive the app it describes, and the dominant failure mode is a
+/// payload that never decoded, so there is no app to point at.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = ingest_failures)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct IngestFailure {
+    pub id: Uuid,
+    pub fingerprint: String,
+    /// Low-cardinality slug (`decode`, `db_deadlock`, …). Also a metrics label,
+    /// which is why the raw message is a separate column.
+    pub error_kind: String,
+    pub error_message: String,
+    pub org_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub app_id: Option<Uuid>,
+    /// Everything ever seen for this fingerprint, including occurrences the
+    /// payload cap refused to store.
+    ///
+    /// The only counter on the row. Retained and dropped counts are derived
+    /// (see [`IngestFailureRow`]) rather than denormalized, because bumping
+    /// them would require updating this row twice in one statement — which
+    /// Postgres silently declines to do.
+    pub occurrences: i64,
+    /// `failed` | `requeued` | `resolved`.
+    pub status: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+/// An [`IngestFailure`] as the admin page reads it, with the two counts the
+/// table deliberately does not store.
+///
+/// `retained` is `COUNT(children)` and `dropped` is `occurrences - retained`.
+/// Deriving beats denormalizing here: the alternative is bumping counter
+/// columns in the same statement as the fingerprint upsert, and Postgres will
+/// not update one row twice in a single statement — the bump would silently
+/// not apply and the counters would drift while every test still passed.
+///
+/// `dropped` is rendered wherever it is non-zero. Silent truncation that reads
+/// as full coverage is the specific bug class this page exists to expose, so
+/// the number is never hidden behind a tooltip or an expander.
+#[derive(Debug, Clone, QueryableByName, Serialize)]
+pub struct IngestFailureRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    pub id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub fingerprint: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub error_kind: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub error_message: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    pub org_id: Option<Uuid>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    pub project_id: Option<Uuid>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    pub app_id: Option<Uuid>,
+    /// Denormalized like `audit_log`'s name columns: the row must stay readable
+    /// after its app is deleted, which is often when it is finally read.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub app_name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub occurrences: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub retained: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub dropped: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub status: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    pub first_seen_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    pub last_seen_at: DateTime<Utc>,
+}
+
+/// Status values for [`IngestFailure::status`], as the one place they are spelt.
+pub mod ingest_failure_status {
+    /// Terminal until a human acts on it.
+    pub const FAILED: &str = "failed";
+    /// Re-injected onto the ingest stream; awaiting the worker's verdict.
+    pub const REQUEUED: &str = "requeued";
+    /// Every retained payload was replayed successfully.
+    pub const RESOLVED: &str = "resolved";
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = ingest_failures)]
+pub struct NewIngestFailure<'a> {
+    pub fingerprint: &'a str,
+    pub error_kind: &'a str,
+    pub error_message: &'a str,
+    pub org_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub app_id: Option<Uuid>,
+}
+
+/// One retained, **already PII-masked** payload behind an [`IngestFailure`].
+///
+/// `mask::apply_wire` runs in the worker before anything is persisted or
+/// re-queued, so this is never the raw wire payload. It is still a copy of a
+/// real user event, which is why the retention reaper exists.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = ingest_failure_payloads)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct IngestFailurePayload {
+    pub id: Uuid,
+    pub failure_id: Uuid,
+    pub payload: Value,
+    /// Retries burned before this landed here. Always 0 for a permanent
+    /// failure, which is never retried by design.
+    pub attempts: i32,
+    pub created_at: DateTime<Utc>,
+    /// Set when re-injected, cleared if that attempt fails. This is what closes
+    /// the manual-retry loop.
+    pub requeued_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = ingest_failure_payloads)]
+pub struct NewIngestFailurePayload {
+    pub failure_id: Uuid,
+    pub payload: Value,
+    pub attempts: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::mask_ip;

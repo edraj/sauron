@@ -21,6 +21,37 @@ use crate::query_plan::{Frag, PlanError};
 use crate::schema::*;
 use crate::scope::{EnvFilter, ReadScope};
 
+/// A validated ORDER BY.
+///
+/// `column` and `tiebreak` are `&'static str` rather than `String` on purpose:
+/// these queries are assembled with `format!` into `sql_query`, so anything
+/// derived from caller input reaching them is SQL injection. A route obtains
+/// the validated name from `parse_sort` and then maps it through a `match` to
+/// one of these literals, which means the compiler — not a reviewer — is what
+/// guarantees no caller string is ever interpolated.
+///
+/// `tiebreak` must be UNIQUE within the result set. OFFSET paging re-runs the
+/// query per page, so two rows tied on `column` with no further ordering may
+/// come back in either order on either page: one row appears twice and another
+/// never appears. `last_seen` ties constantly.
+pub struct SortSpec {
+    pub column: &'static str,
+    pub descending: bool,
+    /// A column, or expression, that is unique across the result set.
+    pub tiebreak: &'static str,
+    /// True when `column` is nullable, so NULLS LAST is pinned rather than
+    /// left to Postgres' direction-dependent default.
+    pub nulls_last: bool,
+}
+
+impl SortSpec {
+    pub fn order_by(&self) -> String {
+        let dir = if self.descending { "DESC" } else { "ASC" };
+        let nulls = if self.nulls_last { " NULLS LAST" } else { "" };
+        format!("{} {dir}{nulls}, {} ASC", self.column, self.tiebreak)
+    }
+}
+
 // ===========================================================================
 // Users & refresh tokens
 // ===========================================================================
@@ -5875,6 +5906,7 @@ const WORKFLOW_OUTCOME_SELECT: &str = "\
 /// matching every other free-text search in this file. The `%…%` wrapping
 /// happens in Rust, not via SQL-side `||` concatenation, which is what lets
 /// the escaping apply at all.
+#[allow(clippy::too_many_arguments)]
 pub async fn workflow_list(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
@@ -5882,6 +5914,7 @@ pub async fn workflow_list(
     search: Option<&str>,
     limit: i64,
     offset: i64,
+    sort: SortSpec,
 ) -> QueryResult<Vec<WorkflowRow>> {
     let env_sql = scope.env.sql_fragment_for("w", 3);
     let search_idx = if scope.env.consumes_bind() { 4 } else { 3 };
@@ -5889,12 +5922,35 @@ pub async fn workflow_list(
     let offset_idx = limit_idx + 1;
     let search_pattern = search.map(like_contains);
 
+    // `sort` replaces a hard-coded `ORDER BY started DESC, w.name ASC`, which
+    // was already total — the query is `GROUP BY w.name`, so one row per name
+    // — and [`SortSpec`] expresses that same pairing rather than a new one.
+    //
+    // No restructuring: the ORDER BY was already on the outer, post-`GROUP BY`
+    // query, where every aggregate alias is addressable, so — like
+    // [`screen_list`] and unlike [`list_persons`] — this function gains NO new
+    // paging cost. `LIMIT` sat above the aggregation before and still does.
+    //
+    // Two of the ten sortable names are NOT aliases of `WORKFLOW_OUTCOME_
+    // SELECT`: `users` resolves to `unique_users` (the wire name the dashboard
+    // column uses differs from the SQL alias), and `completion_rate` has no
+    // alias at all — it is the aggregate ratio the dashboard computes
+    // client-side in `lib/workflows.ts`, restated here as an ORDER BY
+    // expression rather than added to the select list, because that list is
+    // shared verbatim with `workflow_detail` and `WorkflowRow` and adding a
+    // column would change both. See `routes::workflows::workflow_sort_spec`.
+    //
+    // No index supports any of them: `workflows_app_name_started_idx` leads
+    // with `name`, and every other sortable value is an aggregate over the
+    // group. That was already true of the old `started DESC` default. None
+    // added.
+    let order_by = sort.order_by();
     let q = format!(
         "SELECT {WORKFLOW_OUTCOME_SELECT} \
          FROM ({}) w \
          WHERE (${search_idx}::text IS NULL OR w.name ILIKE ${search_idx}) \
          GROUP BY w.name \
-         ORDER BY started DESC, w.name ASC \
+         ORDER BY {order_by} \
          LIMIT ${limit_idx} OFFSET ${offset_idx}",
         workflow_outcome_subquery(&env_sql, "")
     );
@@ -6307,6 +6363,53 @@ pub async fn error_series(
 // Sessions (list + per-session signal streams for the timeline)
 // ===========================================================================
 
+/// One page of sessions in the window, ordered by `sort`.
+///
+/// The only one of this slice's five lists that is a boxed-diesel read rather
+/// than a `sql_query`, so the ORDER BY arrives through `sql::<Text>` — the
+/// idiom `occurrence_query` above already uses, including the reason the type
+/// parameter is `Text` and not `()`. `SortSpec`'s fields are `&'static str`
+/// and `order_by()` concatenates only those, so nothing caller-derived reaches
+/// the fragment; see [`SortSpec`]'s doc comment.
+///
+/// `sort` replaces a hard-coded `ORDER BY last_event_at DESC` that had NO
+/// tiebreaker, so tied rows could be served twice or never across pages.
+///
+/// TWO deliberate behaviour changes come with it:
+/// - The default is now `started_at DESC` rather than `last_event_at DESC`.
+///   `last_event_at` is not a column the Sessions table displays (it shows
+///   `Started` and a derived `Duration`), so leaving it the default would make
+///   the initial ordering one the user cannot return to by clicking a header.
+/// - `last_event_at DESC` was index-backed by `sessions_app_last_event_idx`;
+///   `started_at` is not — the only `started_at` index,
+///   `sessions_app_device_started_idx`, is partial and leads with
+///   `device_key`, so it serves the drill-down in `devices::detail` and not
+///   this list. Measured with `EXPLAIN` over 2,000 sessions in the window:
+///
+///   ```text
+///   before  ORDER BY last_event_at DESC
+///           Limit <- Index Scan sessions_app_last_event_idx      cost   3.9
+///   after   ORDER BY started_at DESC, id ASC
+///           Limit <- Sort <- Seq Scan                            cost 143.6
+///   after   ORDER BY (last_event_at - started_at) DESC, id ASC
+///           Limit <- Sort <- Seq Scan                            cost 148.6
+///   ```
+///
+///   PROVENANCE, because the neighbouring [`list_persons`] comment makes a
+///   point of saying its figures were "captured from a running build, not
+///   transcribed" and this one is not the same thing: these three plans were
+///   `EXPLAIN`ed over a HAND-WRITTEN query shape reproducing what this
+///   function emits, not over a statement captured from diesel. The shape is
+///   a single-table read with no joins and the ORDER BY arrives through
+///   `sql::<Text>`, so the transcription is a short one — but it is a
+///   transcription, and the numbers are only as good as it is. Two adjacent
+///   comments, one asserting provenance and one silently lacking it, would be
+///   worse than neither doing so.
+///
+///   The `Limit` no longer stops early. That is real, but it is bounded work
+///   over ONE table inside one app's `since` window with no LATERALs above it
+///   — a different order of problem from [`list_persons`], where the same
+///   structural change multiplies three correlated subqueries. No index added.
 #[allow(clippy::too_many_arguments)]
 pub async fn list_sessions(
     conn: &mut AsyncPgConnection,
@@ -6314,6 +6417,7 @@ pub async fn list_sessions(
     since: DateTime<Utc>,
     limit: i64,
     offset: i64,
+    sort: SortSpec,
     distinct_id: Option<&str>,
     device_key: Option<&str>,
 ) -> QueryResult<Vec<Session>> {
@@ -6329,7 +6433,7 @@ pub async fn list_sessions(
         q = q.filter(sessions::device_key.eq(dk.to_string()));
     }
     q.select(Session::as_select())
-        .order(sessions::last_event_at.desc())
+        .order(sql::<Text>(&sort.order_by()))
         .limit(limit)
         .offset(offset)
         .load(conn)
@@ -6591,12 +6695,28 @@ pub struct DeviceGroupKey<'a> {
     pub os_version: Option<&'a str>,
 }
 
+/// One page of devices, ordered by `sort`.
+///
+/// `sort` is a [`SortSpec`], not a caller string: see that type's doc comment
+/// for why the compiler is what keeps caller input out of this `format!`.
+///
+/// Exactly ONE ordering has index support: `last_seen` under
+/// `EnvFilter::All`, from `devices_app_last_seen_idx` on
+/// `(app_id, last_seen DESC)`. `family`, `os_name`, `browser` and the four
+/// computed columns have none under any scope — and under
+/// `One`/`Unattributed` neither does `last_seen`, because the scoped alias is
+/// an aggregate over three other tables rather than the indexed column. No new
+/// index is added and none would help the scoped case; see the block comment
+/// over this function's ORDER BY for the measured plans and why the cost is
+/// accepted.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_devices(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     since: DateTime<Utc>,
     limit: i64,
     offset: i64,
+    sort: SortSpec,
     search: Option<&str>,
     group: Option<DeviceGroupKey<'_>>,
 ) -> QueryResult<Vec<DeviceRow>> {
@@ -6622,8 +6742,9 @@ pub async fn list_devices(
 
     // `IS NOT DISTINCT FROM`, not `=`: the all-NULL group is a real group, and
     // `model = NULL` is NULL (never true), which would silently return zero
-    // rows for it. Applied inside the paging subquery, alongside the search
-    // predicate, so LIMIT still applies to the filtered set.
+    // rows for it. Applied inside the qualifying-devices subquery, alongside
+    // the search predicate, so the outer LIMIT still applies to the filtered
+    // set.
     let group_sql = if group.is_some() {
         format!(
             " AND family IS NOT DISTINCT FROM ${} \
@@ -6640,8 +6761,9 @@ pub async fn list_devices(
     };
 
     // See `list_persons`' doc comment: this is a WHERE-clause predicate on the
-    // paging subquery, not a join, so it does not disturb where LIMIT is
-    // applied. Omitted entirely under `All` — same reasoning as `list_persons`.
+    // qualifying-devices subquery, not a join, so it narrows the set the outer
+    // LIMIT pages over rather than the page itself. Omitted entirely under
+    // `All` — same reasoning as `list_persons`.
     // See [`device_membership_sql`] for the alias-qualification and
     // `started_at >= $2` reasoning; shared verbatim with [`list_device_groups`].
     let membership_sql = device_membership_sql(&scope.env, 6);
@@ -6719,19 +6841,85 @@ pub async fn list_devices(
         )
     };
 
-    // Page FIRST, then count per returned device via LATERAL subqueries — same
-    // reasoning as `list_persons` (Postgres cannot push the outer LIMIT into a
-    // grouped subquery).
+    // ORDER BY and LIMIT/OFFSET both live on the OUTER query. They used to sit
+    // inside the subquery ("page first, then count per returned device"),
+    // which worked only while the sole ordering was `last_seen`, a column of
+    // `devices`. `sessions_count`, `events_count`, `errors_count` and
+    // `last_distinct_id` are produced by the LATERALs below and are not
+    // addressable in there at all, so a subquery-level ORDER BY cannot serve
+    // them. One code path for every column beats two that drift.
+    //
+    // THE COST. Measured with `EXPLAIN` over this exact SQL, not estimated,
+    // and it is not uniform: it turns on whether an index can presort the
+    // ORDER BY column, which depends on `scope.env` as well as on the column.
+    //
+    // - `All` + the default `last_seen`: NO regression. `Index Scan using
+    //   devices_app_last_seen_idx` already delivers `last_seen` order, so the
+    //   tiebreak only adds an `Incremental Sort` with `Presorted Key:
+    //   devices.last_seen`, and the `Limit` still stops early — the same
+    //   bounded work the old inner `LIMIT` did.
+    //
+    // - `One`/`Unattributed`, ANY column INCLUDING the default: the whole
+    //   window. This is the common path, not the exception — the dashboard
+    //   auto-selects an environment — so it is the regression that matters.
+    //   Scoped, the `last_seen` alias is `GREATEST(max(ae.occurred_at),
+    //   max(ee.occurred_at), max(se.last_event_at))`, which nothing can
+    //   presort, and the plan becomes a blocking `Sort` (observed
+    //   `Sort Key: (GREATEST(...)) DESC, devices.device_key`) sitting above
+    //   FOUR nested-loop LATERALs — `ae`, `ee`, `ld`, `se`, and `ld` is itself
+    //   a three-way `UNION ALL` with its own `Sort ... LIMIT 1`. A blocking
+    //   sort must consume every row, so all four run once per qualifying
+    //   device in the `since` window. The old inner `LIMIT` capped them at
+    //   `limit + offset` — i.e. at most 200 + offset, and 50 on the first
+    //   page. This is a real and potentially large regression on an app with
+    //   many devices in the window, stated plainly rather than softened.
+    //
+    //   THE NUMBERS, and why there is no ratio here the way there is over
+    //   `list_persons`. The measurement fixture was 40 devices with one
+    //   env-tagged `analytics_events` row each, and on it the planner
+    //   estimated **81.79 either way** — `rows=1` for both shapes, because a
+    //   40-row table with no statistics gives it nothing to work with. That
+    //   figure is recorded so nobody re-derives it and mistakes it for
+    //   evidence of no regression: it is not a cost comparison, it is the
+    //   absence of one. The falsifiable signal on this fixture is
+    //   STRUCTURAL — whether `Limit` sits above or below the four joins —
+    //   and that difference is unambiguous in the plans quoted above.
+    //   A future optimiser wanting a ratio to beat has to re-measure on a
+    //   fixture with enough devices to make the planner's estimate mean
+    //   something; `list_persons` used 2,000 rows and got 40.0x/35.0x out of
+    //   the same structural change.
+    //
+    // - `All` + any non-indexable column (`family`, `os_name`, `browser`, the
+    //   four computed ones): the same blocking `Sort`, same full-window cost.
+    //   Unavoidable, and the price of being able to sort by them at all — the
+    //   trade [`list_device_groups`] already documents and accepts.
+    //
+    // Accepted rather than overlooked, because the cheap plan was also WRONG
+    // under a scoped read: the old inner `ORDER BY last_seen ... LIMIT` paged
+    // on `devices.last_seen`, the app-wide column, while the page displayed
+    // the env-scoped `GREATEST(...)`. It chose which rows to show by a value
+    // the caller never sees, and `d.last_seen` can be newer than the scoped
+    // one because of activity this scope cannot see. Restoring the bounded
+    // plan for scoped reads means restoring that bug. Ordering on the OUTPUT
+    // alias — Postgres resolves a bare name in ORDER BY against the select
+    // list first — is what fixes it; see the same reasoning spelled out over
+    // `list_device_groups`' ORDER BY.
+    //
+    // No index can buy the scoped case back: the sort key is an aggregate over
+    // three other tables. If this becomes a measured problem in production the
+    // answer is a materialized per-(device, environment) rollup, not an index
+    // and not a second code path here.
     //
     // The `se` LATERAL's `since` bound moved from a `WHERE` clause to a
     // `count(*) FILTER (...)` — F4 needs `min(started_at)`/`max(last_event_at)`
     // over *all* of this device's env-scoped sessions, not just the ones
     // after `since` (a device's true per-environment `first_seen` can predate
     // the page's window; `since` only decides which devices are listed, via
-    // the outer `WHERE ... last_seen >= $2`, unchanged). Filtering only the
-    // count aggregate is equivalent to the old `WHERE started_at >= $2` for
-    // `cnt` specifically (same rows excluded, same count), while leaving the
-    // two new aggregates unbounded.
+    // the `WHERE ... last_seen >= $2` in the subquery, unchanged). Filtering
+    // only the count aggregate is equivalent to the old `WHERE started_at >=
+    // $2` for `cnt` specifically (same rows excluded, same count), while
+    // leaving the two new aggregates unbounded.
+    let order_by = sort.order_by();
     let q = format!(
         "SELECT d.id, d.device_key, d.family, d.model, d.os_name, d.os_version, d.arch, \
                 d.browser, \
@@ -6742,7 +6930,6 @@ pub async fn list_devices(
              WHERE app_id = $1 AND last_seen >= $2 \
                AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
                     COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3{membership_sql}{group_sql} \
-             ORDER BY last_seen DESC LIMIT $4 OFFSET $5 \
          ) d{scoped_join} \
          LEFT JOIN LATERAL ( \
              SELECT count(*) FILTER (WHERE started_at >= $2) AS cnt, \
@@ -6750,7 +6937,8 @@ pub async fn list_devices(
              FROM sessions \
              WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
          ) se ON TRUE \
-         ORDER BY d.last_seen DESC"
+         ORDER BY {order_by} \
+         LIMIT $4 OFFSET $5"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -6812,16 +7000,17 @@ pub struct DeviceGroupRow {
 ///
 /// The qualifying-devices subquery is `list_devices`' verbatim — same
 /// `last_seen >= $2` window, same escaped `ILIKE`, same membership `EXISTS`
-/// legs — minus its `ORDER BY ... LIMIT/OFFSET`, because every qualifying
-/// device must be visible to the aggregate. Paging moves to the outer query,
-/// after `GROUP BY`.
+/// legs. Paging is on the outer query, after `GROUP BY`, because every
+/// qualifying device must be visible to the aggregate.
 ///
 /// Cost, stated rather than discovered: the count LATERALs run for every
 /// qualifying device in the window, not just the 50 on screen. Each is an index
 /// probe — `sessions_app_device_started_idx`, `analytics_events_app_device_idx`,
-/// `error_events_app_device_idx` — but this is strictly more work per request
-/// than `list_devices`' page-then-count, and is the accepted price of paging
-/// over groups.
+/// `error_events_app_device_idx` — and this is the accepted price of paging
+/// over groups. No sortable column here has an index behind it: the aggregates
+/// cannot, and `last_seen`'s `devices_app_last_seen_idx` cannot survive the
+/// `GROUP BY` either. Deliberate — the sort runs over one app's descriptor
+/// groups, of which there are far fewer than devices.
 ///
 /// The `All`-vs-scoped source split is `list_devices`' unchanged: durable
 /// `devices` columns under `All`, environment-scoped LATERALs otherwise,
@@ -6836,6 +7025,7 @@ pub async fn list_device_groups(
     since: DateTime<Utc>,
     limit: i64,
     offset: i64,
+    sort: SortSpec,
     search: Option<&str>,
 ) -> QueryResult<Vec<DeviceGroupRow>> {
     let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
@@ -6882,25 +7072,31 @@ pub async fn list_device_groups(
         )
     };
 
-    // `ORDER BY last_seen`, the OUTPUT column, not `max(d.last_seen)`. The two
-    // coincide only under `All`; under a scoped filter the selected `last_seen`
-    // is derived from the LATERALs while `d.last_seen` is the app-wide column,
-    // which can be newer because of activity this scope cannot see. Postgres
-    // resolves a bare ORDER BY name against the select list's output aliases
-    // first. If it ever resolved the other way the query would raise "column
-    // d.last_seen must appear in the GROUP BY clause" — a hard error, not a
-    // silently mis-sorted page.
+    // The default `sort.column` is `last_seen`, the OUTPUT column, not
+    // `max(d.last_seen)`. The two coincide only under `All`; under a scoped
+    // filter the selected `last_seen` is derived from the LATERALs while
+    // `d.last_seen` is the app-wide column, which can be newer because of
+    // activity this scope cannot see. Postgres resolves a bare ORDER BY name
+    // against the select list's output aliases first. If it ever resolved the
+    // other way the query would raise "column d.last_seen must appear in the
+    // GROUP BY clause" — a hard error, not a silently mis-sorted page. The
+    // aggregate columns (`device_count` and the three counts) are output
+    // aliases for the same reason; only `d.family`/`d.os_name` are qualified,
+    // and those are in the `GROUP BY` so they resolve either way.
     //
-    // The four `GROUP BY` columns are appended as a tiebreaker after
-    // `last_seen DESC` — ties on `last_seen` are not exotic (bulk/backfilled
-    // ingest, second-resolution SDK timestamps) and are otherwise unordered
-    // by Postgres, whose plan can differ between `OFFSET 0` (top-N heapsort)
-    // and a large `OFFSET` (full sort). Without a full tiebreaker, paging
-    // over more than one page of tied groups can show the same group twice
-    // while never showing another at all. `d.family, d.model, d.os_name,
-    // d.os_version` are exactly the `GROUP BY` list, so each group's tuple is
-    // unique and the combined ORDER BY fully determines page order without
-    // changing the primary (most-recent-first) ordering groups already show.
+    // `sort.tiebreak` is the four `GROUP BY` columns — see the caller's
+    // `match` in `routes::devices::groups`. Ties on the sort column are not
+    // exotic (bulk/backfilled ingest, second-resolution SDK timestamps) and
+    // are otherwise unordered by Postgres, whose plan can differ between
+    // `OFFSET 0` (top-N heapsort) and a large `OFFSET` (full sort). Without a
+    // full tiebreaker, paging over more than one page of tied groups can show
+    // the same group twice while never showing another at all. The `GROUP BY`
+    // list is exactly what makes each group's tuple unique, so appending it
+    // fully determines page order without changing the primary ordering.
+    // Sorting BY `family` or `os_name` repeats that column in the tiebreak;
+    // a repeated ORDER BY key is a no-op in Postgres, and one code path for
+    // every column beats special-casing two of them.
+    let order_by = sort.order_by();
     let q = format!(
         "SELECT d.family, d.model, d.os_name, d.os_version, \
                 count(*)::bigint AS device_count, \
@@ -6919,7 +7115,7 @@ pub async fn list_device_groups(
              WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
          ) se ON TRUE \
          GROUP BY d.family, d.model, d.os_name, d.os_version \
-         ORDER BY last_seen DESC, d.family, d.model, d.os_name, d.os_version \
+         ORDER BY {order_by} \
          LIMIT $4 OFFSET $5"
     );
     let mut stmt = diesel::sql_query(q)
@@ -7117,6 +7313,7 @@ pub async fn list_persons(
     search: Option<&str>,
     limit: i64,
     offset: i64,
+    sort: SortSpec,
 ) -> QueryResult<Vec<PersonRow>> {
     // Escape LIKE metacharacters: an unescaped `%`/`_` makes a literal search
     // term match the wrong rows, and a pattern of many wildcards makes ILIKE
@@ -7167,17 +7364,17 @@ pub async fn list_persons(
         )
     };
 
-    // Page FIRST, then count per returned person via LATERAL subqueries.
+    // Count per person via LATERAL subqueries.
     //
-    // The previous form used three grouped subqueries over analytics_events,
-    // error_events and sessions filtered only by app_id. Postgres cannot push
-    // the outer LIMIT into a GROUP BY subquery, so every page load aggregated
-    // the app's entire history across the two largest tables and then discarded
-    // all but ~50 rows. Counting per-page turns that into a handful of
-    // index lookups on (app_id, distinct_id). Adding `membership_sql` above
-    // preserves this shape — it narrows the *same* inner subquery's WHERE
-    // clause, before LIMIT/OFFSET are applied, rather than adding a join stage
-    // — confirmed with `EXPLAIN`, see the task report.
+    // The form before those LATERALs used three grouped subqueries over
+    // analytics_events, error_events and sessions filtered only by app_id.
+    // Postgres cannot push a LIMIT into a GROUP BY subquery, so every page
+    // load aggregated the app's entire history across the two largest tables
+    // and then discarded all but ~50 rows. Counting per-person turns that into
+    // a handful of index lookups on (app_id, distinct_id). `membership_sql`
+    // above preserves that shape — it narrows the inner subquery's WHERE
+    // clause rather than adding a join stage — confirmed with `EXPLAIN`, see
+    // the task report.
     //
     // F4: `ae`/`ee`/`se` also compute `min`/`max(occurred_at)` now (sessions'
     // own analogue is `started_at`/`last_event_at` — it has no single
@@ -7199,6 +7396,86 @@ pub async fn list_persons(
          GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event) AS last_seen"
             .to_string()
     };
+    // ORDER BY and LIMIT/OFFSET both live on the OUTER query, matching
+    // [`list_devices`] — read that function's ORDER BY comment first, this is
+    // the same trade with a different (worse) window. They used to sit inside
+    // the `eu` subquery, which worked only while the sole ordering was
+    // `last_seen`, a column of `event_users`. `events_count`, `errors_count`
+    // and `sessions_count` are produced by the LATERALs below and are not
+    // addressable in there at all, and under a scoped read neither are
+    // `first_seen`/`last_seen` — so a subquery-level ORDER BY cannot serve
+    // four of the six sortable columns. One code path for every column beats
+    // two that drift.
+    //
+    // THE COST, measured with `EXPLAIN` over the exact string this `format!`
+    // emits (captured from a running build, not transcribed by hand) against
+    // 2,000 `event_users` and 2,000 `analytics_events`. Not estimated. The
+    // three LATERALs now run once per person the WHERE clause admits, not
+    // once per person on the page:
+    //
+    //   EnvFilter::All
+    //     before: Nested Loop Left Join x3 <- Limit(50)
+    //               <- Index Scan event_users_app_last_seen_idx    cost   423
+    //     after:  Limit <- Sort (last_seen DESC, distinct_id)
+    //               <- Nested Loop Left Join x3 <- Seq Scan        cost 16930
+    //
+    //   EnvFilter::One
+    //     before: Nested Loop Left Join x3 <- Limit(50)
+    //               <- Index Scan event_users_app_last_seen_idx    cost   900
+    //     after:  Limit <- Sort (GREATEST(...) DESC, distinct_id)
+    //               <- Nested Loop Left Join x3 <- Seq Scan        cost 31463
+    //
+    // 40.0x under `All` and 35.0x under `One` on that fixture (not "~40x
+    // either way" — the two differ, and rounding the smaller one up is the
+    // wrong direction for a figure someone will later measure against). It
+    // scales with the person count, not the page size. A blocking `Sort` must
+    // consume every input row, so the `Limit` can no longer cap the joins —
+    // identical plan at `OFFSET 0` and `OFFSET 1500`, so this is not an
+    // artifact of deep paging, and identical again for `events_count`, so it
+    // is not specific to the default column either.
+    //
+    // This is a LARGER regression than `list_devices`' because this list has
+    // NO time window at all: `list_devices` at least bounds its subquery with
+    // `last_seen >= $2`, while the only narrowing here is `app_id` plus an
+    // `ILIKE` that is `'%'` on an unsearched page. On an app with a large
+    // `event_users` table an unsearched page now probes `analytics_events`,
+    // `error_events` and `sessions` once per person in the app. Stated plainly
+    // rather than softened; it is the sharpest cost in this task and the
+    // reason its own concern is filed in the task report.
+    //
+    // Accepted rather than overlooked, for `list_devices`' second reason as
+    // well as the first: the cheap plan was also WRONG under a scoped read.
+    // The old inner `ORDER BY last_seen … LIMIT` chose the page by
+    // `event_users.last_seen`, the app-wide column, while the page displayed
+    // the env-scoped `GREATEST(…)` from `seen_select`. It picked which rows to
+    // show by a value the caller never sees. Ordering on the OUTPUT alias —
+    // Postgres resolves a bare name in ORDER BY against the select list first
+    // — is what fixes that.
+    //
+    // BUT read that carefully, because it does not cover the whole
+    // regression. It is the argument for the SCOPED read only. Under
+    // `EnvFilter::All` the old plan was CORRECT as well as cheap — `last_seen`
+    // there IS `eu.last_seen`, exactly what the page displays — and the 423 →
+    // 16930 above is paid anyway. So the `All` half was NOT regressed on
+    // correctness grounds.
+    //
+    // CONSIDERED AND REJECTED, deliberately and on maintainability grounds:
+    // keeping the bounded plan for `EnvFilter::All` + the default column,
+    // where the old plan was right. The dashboard auto-selects an
+    // environment, so that path is uncommon, and it would buy a rarely-taken
+    // optimisation at the price of a SECOND query shape to maintain and test.
+    // Recorded here rather than only in the slice ledger, because a reader of
+    // this comment alone would otherwise conclude the cheap plan was wrong
+    // everywhere and never discover that one scope traded a correct fast plan
+    // for a uniform slow one. If that trade is ever revisited, this paragraph
+    // is what to revisit — not the correctness argument above it, which still
+    // stands for `One`/`Unattributed`.
+    //
+    // No index can buy the scoped case back (the sort key is an aggregate over
+    // three other tables), and no index is added here. If this becomes a
+    // measured problem the answer is a materialized per-(person, environment)
+    // rollup, not an index and not a second code path.
+    let order_by = sort.order_by();
     let q = format!(
         "SELECT eu.distinct_id, eu.properties, {seen_select}, \
                 COALESCE(ae.cnt,0)::bigint AS events_count, \
@@ -7207,7 +7484,6 @@ pub async fn list_persons(
          FROM ( \
              SELECT distinct_id, properties, first_seen, last_seen FROM event_users \
              WHERE app_id=$1 AND (distinct_id ILIKE $2 OR properties::text ILIKE $2){membership_sql} \
-             ORDER BY last_seen DESC LIMIT $3 OFFSET $4 \
          ) eu \
          LEFT JOIN LATERAL (SELECT count(*) cnt, min(occurred_at) min_occurred, \
                     max(occurred_at) max_occurred FROM analytics_events \
@@ -7218,7 +7494,8 @@ pub async fn list_persons(
          LEFT JOIN LATERAL (SELECT count(*) cnt, min(started_at) min_started, \
                     max(last_event_at) max_last_event FROM sessions \
                     WHERE app_id=$1 AND distinct_id = eu.distinct_id{env_sql}) se ON TRUE \
-         ORDER BY eu.last_seen DESC"
+         ORDER BY {order_by} \
+         LIMIT $3 OFFSET $4"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -7273,6 +7550,44 @@ pub struct OverviewTotals {
 /// exist on the outer table resolves there silently instead of erroring, turning the
 /// predicate into an always-true tautology with no query error to catch it. Demonstrated
 /// live during Task 8's review; see `list_persons`' doc comment.
+///
+/// # Why `IN (… UNION …)` and not three correlated `EXISTS`
+///
+/// This used to emit `EXISTS(…) OR EXISTS(…) OR EXISTS(…)`, correlated on
+/// `event_users.distinct_id`. That reads as the cheaper form — each leg can short-circuit on
+/// the first hit — but it is evaluated ONCE PER `event_users` ROW, and none of the three legs
+/// carries an `occurred_at` predicate (membership is all-time by definition, see above). With
+/// no time qualifier there is nothing to prune on, so every probe visits EVERY partition of
+/// `analytics_events`/`error_events`. Cost therefore scales with total retained data and with
+/// the partition count, NOT with the caller's `since` window — the report asks for 30 days and
+/// pays for all of history, every row, three times.
+///
+/// Measured on a 1M-event / 500k-`event_users` / 29-partition fixture, `overview_totals`
+/// under `One`: 32.6s as three correlated `EXISTS`, 3.4s in this form — 9.6x, and the
+/// difference between shedding as a 503 and answering, since `sauron-api`'s `TimeoutLayer`
+/// maps a 30s request timeout onto `SERVICE_UNAVAILABLE`.
+///
+/// Uncorrelated, the membership set is built once per leg and probed as a hash, so the
+/// per-row partition sweep disappears. `UNION` (not `UNION ALL`) because this feeds an `IN`
+/// and the de-duplication is what keeps the hash small.
+///
+/// Semantics are UNCHANGED and that is the point: still "has at least one analytics event,
+/// error event or session in this environment, all-time", i.e. reading (a) as documented on
+/// `overview_totals`. Adding an `occurred_at` bound here would prune far harder but would
+/// silently redefine every `users`/`new_users` metric to reading (b) — deliberately not done.
+/// Equivalence was verified against the old fragment across both environments of the fixture
+/// at 1/7/30-day windows (64,000 and 4,000 users respectively, identical on both sides).
+///
+/// Needs no new index: the `UNION` legs are served by the existing
+/// `{analytics,error}_events_app_env_time_users_idx` — `(app_id, environment_id, occurred_at
+/// DESC) INCLUDE (distinct_id)` — as index-only scans. The 3.4s above was measured with no
+/// index added, and a purpose-built `(app_id, distinct_id, environment_id)` index was
+/// measured and DECLINED: it only pays off for the correlated form this replaces.
+///
+/// Do NOT copy this rewrite onto [`device_membership_sql`]. That one filters `devices`
+/// (thousands of rows, not hundreds of thousands), where the correlated `EXISTS` short-
+/// circuits per row and beats the uncorrelated form — measured 2.5s vs 3.6s on the same
+/// fixture. The right shape follows from the outer table's cardinality, not from a rule.
 fn event_user_membership_exists(env: EnvFilter, bind_index: usize) -> String {
     if matches!(env, EnvFilter::All) {
         return String::new();
@@ -7281,10 +7596,10 @@ fn event_user_membership_exists(env: EnvFilter, bind_index: usize) -> String {
     let ee_env = env.sql_fragment_for("ee", bind_index);
     let se_env = env.sql_fragment_for("se", bind_index);
     format!(
-        " AND ( \
-            EXISTS (SELECT 1 FROM analytics_events ae WHERE ae.app_id=$1 AND ae.distinct_id = event_users.distinct_id{ae_env}) \
-            OR EXISTS (SELECT 1 FROM error_events ee WHERE ee.app_id=$1 AND ee.distinct_id = event_users.distinct_id{ee_env}) \
-            OR EXISTS (SELECT 1 FROM sessions se WHERE se.app_id=$1 AND se.distinct_id = event_users.distinct_id{se_env}) \
+        " AND event_users.distinct_id IN ( \
+            SELECT ae.distinct_id FROM analytics_events ae WHERE ae.app_id=$1{ae_env} \
+            UNION SELECT ee.distinct_id FROM error_events ee WHERE ee.app_id=$1{ee_env} \
+            UNION SELECT se.distinct_id FROM sessions se WHERE se.app_id=$1{se_env} \
           )"
     )
 }
@@ -8667,6 +8982,21 @@ const SCREEN_PRED_EXACT: &str = "screen = $3";
 /// Predicate for the paginated list (`$3` is an escaped ILIKE pattern).
 const SCREEN_PRED_LIKE: &str = "screen ILIKE $3";
 
+/// One row per screen in the window, paginated.
+///
+/// `sort` replaces what was a hard-coded `ORDER BY views DESC, k.screen ASC`.
+/// That pairing was already total — `keys` is a `UNION`, so `k.screen` is one
+/// row per distinct screen — and [`SortSpec`] expresses it unchanged rather
+/// than inventing a different tiebreak.
+///
+/// No restructuring was needed: the ORDER BY was already on the outer query,
+/// above the four CTEs, so every sortable column (all of them aggregates or
+/// the grouping key) was already addressable there. Unlike [`list_devices`]
+/// and [`list_persons`], this function therefore carries NO new paging cost —
+/// `LIMIT` sat above the aggregation before this change and still does. No
+/// sortable column here has index support and none did before: `ev`/`ex`/`us`/
+/// `dw` aggregate over `analytics_events`/`error_events` and nothing can
+/// presort a `count(*)`.
 pub async fn screen_list(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
@@ -8674,6 +9004,7 @@ pub async fn screen_list(
     q_pattern: &str, // '%' for no filter, else like_contains(term)
     limit: i64,
     offset: i64,
+    sort: SortSpec,
 ) -> QueryResult<Vec<ScreenRow>> {
     // $1 app_id, $2 since, $3 q_pattern (SCREEN_PRED_LIKE's own bind) — env
     // takes $4 when it needs a bind, which pushes limit/offset from $4/$5 to
@@ -8682,6 +9013,12 @@ pub async fn screen_list(
     let env_sql = scope.env.sql_fragment(4);
     let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
     let offset_idx = limit_idx + 1;
+    // Every sortable name here is an OUTPUT ALIAS of this select list (or
+    // `k.screen`, the tiebreak), which is what lets a bare `views`/`users`
+    // resolve at all: `ev.views` and the aliased `views` are the same value,
+    // but `avg_dwell_ms` exists ONLY as the alias — it is a division computed
+    // here and in no CTE.
+    let order_by = sort.order_by();
     let q = format!(
         "{} \
          SELECT k.screen, \
@@ -8693,7 +9030,7 @@ pub async fn screen_list(
          FROM keys k \
          LEFT JOIN ev ON ev.screen=k.screen LEFT JOIN ex ON ex.screen=k.screen \
          LEFT JOIN us ON us.screen=k.screen LEFT JOIN dw ON dw.screen=k.screen \
-         ORDER BY views DESC, k.screen ASC LIMIT ${limit_idx} OFFSET ${offset_idx}",
+         ORDER BY {order_by} LIMIT ${limit_idx} OFFSET ${offset_idx}",
         screen_ctes(SCREEN_PRED_LIKE, &env_sql)
     );
     let mut stmt = diesel::sql_query(q)
@@ -15531,4 +15868,719 @@ pub async fn set_app_store_environment(
         ))
         .execute(conn)
         .await
+}
+
+// ===========================================================================
+// Audit log — the Wall of Shame
+// ===========================================================================
+
+/// Append one administrative action to the trail.
+///
+/// Callers in the API layer treat a failure here as non-fatal: see
+/// `sauron_api::audit::record`, which logs and swallows. That policy lives
+/// there rather than here so this function stays honest about whether the
+/// write succeeded, and so tests can assert on the error.
+pub async fn insert_audit_log(
+    conn: &mut AsyncPgConnection,
+    new: NewAuditLogEntry<'_>,
+) -> QueryResult<AuditLogEntry> {
+    diesel::insert_into(audit_log::table)
+        .values(&new)
+        .returning(AuditLogEntry::as_returning())
+        .get_result(conn)
+        .await
+}
+
+/// One row of the unified trail: `audit_log` plus the two pre-existing
+/// inspector audit tables projected into the same shape.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct AuditFeedRow {
+    #[diesel(sql_type = SqlUuid)]
+    pub id: Uuid,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    pub actor_id: Option<Uuid>,
+    #[diesel(sql_type = Text)]
+    pub actor_email: String,
+    #[diesel(sql_type = Text)]
+    pub action: String,
+    #[diesel(sql_type = Text)]
+    pub entity_type: String,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    pub entity_id: Option<Uuid>,
+    #[diesel(sql_type = Text)]
+    pub entity_name: String,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    pub project_id: Option<Uuid>,
+    #[diesel(sql_type = Text)]
+    pub project_name: String,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    pub app_id: Option<Uuid>,
+    #[diesel(sql_type = Text)]
+    pub app_name: String,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    pub environment_id: Option<Uuid>,
+    #[diesel(sql_type = Text)]
+    pub environment_name: String,
+    #[diesel(sql_type = Jsonb)]
+    pub changes: Value,
+    #[diesel(sql_type = Timestamptz)]
+    pub created_at: DateTime<Utc>,
+    /// `'audit'` or `'inspector'`. The dashboard uses this to explain why an
+    /// inspector-sourced row carries no before/after diff.
+    #[diesel(sql_type = Text)]
+    pub source: String,
+}
+
+/// Every filter the Wall of Shame offers. `None` means "no filter on this
+/// axis" — never "match NULL".
+#[derive(Debug, Default, Clone)]
+pub struct AuditFilter {
+    pub project_id: Option<Uuid>,
+    pub app_id: Option<Uuid>,
+    pub environment_id: Option<Uuid>,
+    pub actor_id: Option<Uuid>,
+    pub action: Option<String>,
+    pub entity_type: Option<String>,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    /// Keyset cursor: return only rows strictly older than this
+    /// `(created_at, id)`. Both halves or neither.
+    pub cursor: Option<(DateTime<Utc>, Uuid)>,
+    /// Include the `auth` stream (sign-ins). **Defaults to false**, which is
+    /// the whole point: logins outnumber administrative actions by orders of
+    /// magnitude, and mixing them in would bury the events this feed exists to
+    /// surface. See migration 52 for the index that keeps the exclusion cheap.
+    pub include_auth: bool,
+}
+
+/// The unified feed, newest first.
+///
+/// The SQL is STATIC. Every filter is expressed as `($n IS NULL OR col = $n)`
+/// with a bound parameter rather than by concatenating predicates, so there is
+/// no injection surface and no parameter-numbering drift as filters are added.
+/// The cost is that Postgres cannot use the per-axis partial indexes for a
+/// filtered query and falls back to `audit_log_org_time_idx` plus a filter —
+/// acceptable because this table holds administrative actions (thousands per
+/// year), not event data.
+///
+/// The keyset predicate is on the TUPLE `(created_at, id)`, not on
+/// `created_at` alone. Entries written by one request share a `created_at` to
+/// microsecond precision, so a cursor on the timestamp alone would skip or
+/// repeat rows at a page boundary — silently, and only under load.
+///
+/// `limit` is applied to the unified stream after ordering, so a page is the
+/// true newest N across all three sources rather than N from each.
+pub async fn list_audit_feed(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    f: &AuditFilter,
+    limit: i64,
+) -> QueryResult<Vec<AuditFeedRow>> {
+    const SQL: &str = r#"
+WITH unified AS (
+    SELECT a.id, a.actor_id, a.actor_email, a.action, a.entity_type,
+           a.entity_id, a.entity_name,
+           a.project_id, a.project_name, a.app_id, a.app_name,
+           a.environment_id, a.environment_name,
+           a.changes, a.created_at, 'audit' AS source
+    FROM audit_log a
+    WHERE a.org_id = $1
+
+    UNION ALL
+
+    -- Projected, not copied: these rows keep living in their own table and
+    -- the Privacy page keeps its detailed views of them.
+    SELECT r.id, r.user_id, r.user_email, 'pii.reveal', 'pii',
+           r.finding_id,
+           r.source_table || '.' || r.source_column ||
+               CASE WHEN r.key_path = '' THEN '' ELSE '.' || r.key_path END,
+           p.id, COALESCE(p.name, ''), r.app_id, COALESCE(ap.name, ''),
+           NULL::uuid, '',
+           jsonb_build_object(
+               'source_table', r.source_table,
+               'source_column', r.source_column,
+               'key_path', r.key_path,
+               'request_source', r.request_source),
+           r.created_at, 'inspector'
+    FROM inspector_reveal_audit r
+    LEFT JOIN apps ap ON ap.id = r.app_id
+    LEFT JOIN projects p ON p.id = ap.project_id
+    WHERE r.org_id = $1
+
+    UNION ALL
+
+    SELECT m.id, m.requested_by, m.requested_by_email,
+           CASE WHEN m.kind = 'preview' THEN 'pii.mask_preview' ELSE 'pii.mask' END,
+           'pii', m.id,
+           COALESCE(ap2.name, '') || ' (' || m.status || ')',
+           p2.id, COALESCE(p2.name, ''), m.app_id, COALESCE(ap2.name, ''),
+           NULL::uuid, '',
+           jsonb_build_object(
+               'status', m.status,
+               'targets', m.targets,
+               'rows_masked', m.rows_masked,
+               'rows_scanned', m.rows_scanned),
+           m.requested_at, 'inspector'
+    FROM inspector_mask_actions m
+    LEFT JOIN apps ap2 ON ap2.id = m.app_id
+    LEFT JOIN projects p2 ON p2.id = ap2.project_id
+    WHERE m.org_id = $1
+)
+SELECT * FROM unified
+WHERE ($2::uuid        IS NULL OR project_id     = $2::uuid)
+  AND ($3::uuid        IS NULL OR app_id         = $3::uuid)
+  AND ($4::uuid        IS NULL OR environment_id = $4::uuid)
+  AND ($5::uuid        IS NULL OR actor_id       = $5::uuid)
+  AND ($6::text        IS NULL OR action         = $6::text)
+  AND ($7::text        IS NULL OR entity_type    = $7::text)
+  AND ($8::timestamptz IS NULL OR created_at    >= $8::timestamptz)
+  AND ($9::timestamptz IS NULL OR created_at    <= $9::timestamptz)
+  AND ($10::timestamptz IS NULL OR $11::uuid IS NULL
+       OR (created_at, id) < ($10::timestamptz, $11::uuid))
+  -- Spelled exactly as migration 52's partial-index predicate. Postgres only
+  -- uses a partial index when it can prove the query predicate implies the
+  -- index predicate, and a cosmetic difference costs a full scan silently.
+  AND ($13::bool OR entity_type <> 'auth')
+ORDER BY created_at DESC, id DESC
+LIMIT $12
+"#;
+    diesel::sql_query(SQL)
+        .bind::<SqlUuid, _>(org_id)
+        .bind::<Nullable<SqlUuid>, _>(f.project_id)
+        .bind::<Nullable<SqlUuid>, _>(f.app_id)
+        .bind::<Nullable<SqlUuid>, _>(f.environment_id)
+        .bind::<Nullable<SqlUuid>, _>(f.actor_id)
+        .bind::<Nullable<Text>, _>(f.action.clone())
+        .bind::<Nullable<Text>, _>(f.entity_type.clone())
+        .bind::<Nullable<Timestamptz>, _>(f.from)
+        .bind::<Nullable<Timestamptz>, _>(f.to)
+        .bind::<Nullable<Timestamptz>, _>(f.cursor.map(|c| c.0))
+        .bind::<Nullable<SqlUuid>, _>(f.cursor.map(|c| c.1))
+        .bind::<BigInt, _>(limit)
+        .bind::<Bool, _>(f.include_auth)
+        .load(conn)
+        .await
+}
+
+/// A distinct value offered by a filter dropdown.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct AuditFacet {
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    pub id: Option<Uuid>,
+    #[diesel(sql_type = Text)]
+    pub label: String,
+}
+
+/// Distinct actors that appear in this org's trail.
+///
+/// Sourced from the trail itself rather than from the org's member list, so a
+/// dropdown can only ever offer a value that returns results — including
+/// actors who have since been removed from the org, whose entries are exactly
+/// the ones an administrator is most likely to be looking for.
+pub async fn audit_actor_facets(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    include_auth: bool,
+) -> QueryResult<Vec<AuditFacet>> {
+    const SQL: &str = r#"
+SELECT actor_id AS id, MAX(actor_email) AS label FROM (
+    SELECT actor_id, actor_email FROM audit_log
+    WHERE org_id = $1 AND ($2::bool OR entity_type <> 'auth')
+    UNION ALL
+    SELECT user_id, user_email FROM inspector_reveal_audit WHERE org_id = $1
+    UNION ALL
+    SELECT requested_by, requested_by_email FROM inspector_mask_actions WHERE org_id = $1
+) s
+WHERE actor_id IS NOT NULL
+GROUP BY actor_id
+ORDER BY label
+"#;
+    diesel::sql_query(SQL)
+        .bind::<SqlUuid, _>(org_id)
+        .bind::<Bool, _>(include_auth)
+        .load(conn)
+        .await
+}
+
+/// Distinct action strings present in this org's trail, alphabetically.
+pub async fn audit_action_facets(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    include_auth: bool,
+) -> QueryResult<Vec<AuditFacet>> {
+    const SQL: &str = r#"
+SELECT NULL::uuid AS id, action AS label FROM (
+    -- A dropdown must only offer values that return results. With auth
+    -- excluded from the feed, offering "Signed in" would produce an empty
+    -- table and read as a bug rather than as a filter working correctly.
+    SELECT DISTINCT action FROM audit_log
+    WHERE org_id = $1 AND ($2::bool OR entity_type <> 'auth')
+    UNION
+    SELECT 'pii.reveal' WHERE EXISTS (
+        SELECT 1 FROM inspector_reveal_audit WHERE org_id = $1)
+    UNION
+    SELECT CASE WHEN kind = 'preview' THEN 'pii.mask_preview' ELSE 'pii.mask' END
+    FROM inspector_mask_actions WHERE org_id = $1
+) s
+ORDER BY label
+"#;
+    diesel::sql_query(SQL)
+        .bind::<SqlUuid, _>(org_id)
+        .bind::<Bool, _>(include_auth)
+        .load(conn)
+        .await
+}
+
+/// `(project_id, project_name, app_name)` for one app — the name snapshots an
+/// audit entry needs when the handler only has an `app_id` in hand.
+///
+/// One join rather than two round trips, because it runs on the success path
+/// of every app-scoped administrative action.
+pub async fn audit_app_scope(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Option<(Uuid, String, String)>> {
+    apps::table
+        .inner_join(projects::table.on(projects::id.eq(apps::project_id)))
+        .filter(apps::id.eq(app_id))
+        .select((apps::project_id, projects::name, apps::name))
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// `(org_id, project_name)` for one project — the org partition and the name
+/// snapshot an audit entry needs when the handler holds only a `project_id`.
+pub async fn audit_project_scope(
+    conn: &mut AsyncPgConnection,
+    project_id: Uuid,
+) -> QueryResult<Option<(Uuid, String)>> {
+    projects::table
+        .filter(projects::id.eq(project_id))
+        .select((projects::org_id, projects::name))
+        .first(conn)
+        .await
+        .optional()
+}
+
+#[cfg(test)]
+mod sort_spec_tests {
+    use super::SortSpec;
+
+    #[test]
+    fn writes_the_direction_and_always_appends_the_tiebreak() {
+        let s = SortSpec {
+            column: "last_seen",
+            descending: true,
+            tiebreak: "d.device_key",
+            nulls_last: false,
+        };
+        assert_eq!(s.order_by(), "last_seen DESC, d.device_key ASC");
+    }
+
+    #[test]
+    fn the_tiebreak_never_reverses() {
+        // The tiebreak exists to make the ordering TOTAL, and a total order is
+        // total in either direction. Keeping it ASC in both means the two
+        // directions are exact reverses of each other row-for-row; flipping it
+        // with the sort would leave two tied rows in the same relative order in
+        // both directions, so reversing the sort would not reverse the list.
+        let s = SortSpec {
+            column: "last_seen",
+            descending: false,
+            tiebreak: "d.device_key",
+            nulls_last: false,
+        };
+        assert_eq!(s.order_by(), "last_seen ASC, d.device_key ASC");
+    }
+
+    #[test]
+    fn nulls_sort_last_on_a_nullable_column() {
+        // Postgres defaults NULLS LAST for ASC and NULLS FIRST for DESC, so a
+        // descending sort on a nullable column leads with rows that have no
+        // value at all — which reads as "the biggest" and is not. Pinned.
+        let s = SortSpec {
+            column: "screen",
+            descending: true,
+            tiebreak: "id",
+            nulls_last: true,
+        };
+        assert_eq!(s.order_by(), "screen DESC NULLS LAST, id ASC");
+    }
+}
+
+/// Every org id in the deployment.
+///
+/// Used by the audit log for DEPLOYMENT-WIDE actions (the cold-tier rotation
+/// age, restores, pins). Those change one setting that governs every tenant's
+/// data, so filing them under a single org would hide them from every other
+/// tenant they affect.
+pub async fn all_org_ids(conn: &mut AsyncPgConnection) -> QueryResult<Vec<Uuid>> {
+    organizations::table
+        .select(organizations::id)
+        .load(conn)
+        .await
+}
+
+/// The project / app / environment options a filter dropdown should offer.
+pub struct AuditScopeFacets {
+    pub projects: Vec<AuditFacet>,
+    pub apps: Vec<AuditFacet>,
+    pub environments: Vec<AuditFacet>,
+}
+
+/// Distinct scopes present in this org's trail.
+///
+/// Sourced from the trail, not from live `projects`/`apps` rows, so a filter
+/// can still name something that has since been deleted — which is exactly
+/// what an administrator investigating a deletion needs to select.
+pub async fn audit_scope_facets(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+) -> QueryResult<AuditScopeFacets> {
+    // One statement per axis rather than one grouped query: each axis is a
+    // different NOT NULL subset, and merging them would need a three-way
+    // FULL OUTER JOIN to say nothing more.
+    // `DISTINCT ON … ORDER BY created_at DESC` picks the MOST RECENT name each
+    // id was recorded under, not `MAX(name)`.
+    //
+    // The difference is not cosmetic. A renamed project appears in the trail
+    // under both names, and `MAX` picks whichever sorts higher — so renaming
+    // "Checkout Service" to "Checkout Platform" leaves the filter dropdown
+    // offering the old name, because 'S' > 'P'. The dropdown must agree with
+    // what the rest of the dashboard calls that project, or the user cannot
+    // find it.
+    const SQL: &str = r#"
+SELECT id, label FROM (
+    SELECT DISTINCT ON ({id_col})
+           {id_col} AS id, {name_col} AS label
+    FROM audit_log
+    WHERE org_id = $1 AND {id_col} IS NOT NULL AND {name_col} <> ''
+    ORDER BY {id_col}, created_at DESC
+) s
+ORDER BY label
+"#;
+    let mut out = AuditScopeFacets {
+        projects: Vec::new(),
+        apps: Vec::new(),
+        environments: Vec::new(),
+    };
+    for (id_col, name_col, sink) in [
+        ("project_id", "project_name", 0u8),
+        ("app_id", "app_name", 1),
+        ("environment_id", "environment_name", 2),
+    ] {
+        // Column names are substituted from this fixed local array, never from
+        // caller input; the org filter stays a bound parameter.
+        let sql = SQL
+            .replace("{id_col}", id_col)
+            .replace("{name_col}", name_col);
+        let rows: Vec<AuditFacet> = diesel::sql_query(sql)
+            .bind::<SqlUuid, _>(org_id)
+            .load(conn)
+            .await?;
+        match sink {
+            0 => out.projects = rows,
+            1 => out.apps = rows,
+            _ => out.environments = rows,
+        }
+    }
+    Ok(out)
+}
+
+// ===========================================================================
+// Ingest failure recovery
+// ===========================================================================
+
+/// The outcome of [`record_ingest_failure`]: which group the occurrence joined,
+/// and whether its payload was actually retained or refused by the cap.
+#[derive(Debug, Clone, QueryableByName)]
+pub struct RecordedFailure {
+    #[diesel(sql_type = SqlUuid)]
+    pub id: Uuid,
+    #[diesel(sql_type = Bool)]
+    pub retained: bool,
+}
+
+/// A payload handed back for re-injection onto the ingest stream.
+#[derive(Debug, Clone, QueryableByName)]
+pub struct RequeuedPayload {
+    #[diesel(sql_type = SqlUuid)]
+    pub id: Uuid,
+    #[diesel(sql_type = Jsonb)]
+    pub payload: Value,
+    #[diesel(sql_type = Integer)]
+    pub attempts: i32,
+}
+
+/// The SELECT list behind [`IngestFailureRow`]. One place, so the list endpoint
+/// and the single-row fetch cannot drift in what they compute.
+///
+/// `retained` is counted from the child table and `dropped` derived from it,
+/// rather than read from denormalized counters — see [`IngestFailureRow`] for
+/// why storing them would silently drift.
+const FAILURE_ROW_SELECT: &str = "
+    SELECT f.id, f.fingerprint, f.error_kind, f.error_message,
+           f.org_id, f.project_id, f.app_id,
+           COALESCE(a.name, '') AS app_name,
+           f.occurrences,
+           COALESCE(c.n, 0) AS retained,
+           GREATEST(f.occurrences - COALESCE(c.n, 0), 0) AS dropped,
+           f.status, f.first_seen_at, f.last_seen_at
+    FROM ingest_failures f
+    LEFT JOIN apps a ON a.id = f.app_id
+    LEFT JOIN LATERAL (
+        SELECT count(*) AS n FROM ingest_failure_payloads p WHERE p.failure_id = f.id
+    ) c ON TRUE
+";
+
+/// Record one ingest failure, folding it into its fingerprint group and
+/// retaining the payload if the group is still under `payload_cap`.
+///
+/// **One statement, not a transaction.** `conn.transaction` is avoided
+/// workspace-wide (diesel-async 0.9 wants async closures, which would push the
+/// MSRV past the 1.82 the RPM spec builds against), so the upsert and the
+/// conditional child insert are a single data-modifying CTE.
+///
+/// The cap is tested with `count(*)` over the children rather than a stored
+/// counter. That is not merely simpler: sub-statements of one statement share a
+/// snapshot and cannot see each other's effects, so a counter-bumping CTE would
+/// be a *second* update of the row the upsert just wrote, which Postgres
+/// silently declines to apply. Counters would then drift from reality while
+/// every test still passed.
+///
+/// Two concurrent workers recording the same fingerprint can each see
+/// `count < cap` and both insert, overshooting the cap by the number of racing
+/// writers. That is deliberate and harmless: the cap is a guard against one
+/// runaway failure eating the disk, not an invariant anything reads.
+///
+/// A new occurrence reopens a `resolved` group. A `requeued` group is left
+/// alone — the worker closing that retry loop is the only thing that should
+/// move it, and stamping it back to `failed` here would race that verdict.
+pub async fn record_ingest_failure(
+    conn: &mut AsyncPgConnection,
+    f: &NewIngestFailure<'_>,
+    payload: Option<&Value>,
+    attempts: i32,
+    payload_cap: i64,
+) -> QueryResult<RecordedFailure> {
+    const SQL: &str = "
+        WITH parent AS (
+            INSERT INTO ingest_failures
+                (fingerprint, error_kind, error_message, org_id, project_id, app_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (fingerprint) DO UPDATE SET
+                occurrences   = ingest_failures.occurrences + 1,
+                last_seen_at  = now(),
+                error_message = EXCLUDED.error_message,
+                status = CASE WHEN ingest_failures.status = 'resolved'
+                              THEN 'failed' ELSE ingest_failures.status END
+            RETURNING id
+        ),
+        ins AS (
+            INSERT INTO ingest_failure_payloads (failure_id, payload, attempts)
+            SELECT p.id, $7::jsonb, $8
+            FROM parent p
+            WHERE $9
+              AND (SELECT count(*) FROM ingest_failure_payloads c
+                   WHERE c.failure_id = p.id) < $10
+            RETURNING id
+        )
+        SELECT p.id AS id, EXISTS (SELECT 1 FROM ins) AS retained FROM parent p
+    ";
+    diesel::sql_query(SQL)
+        .bind::<Text, _>(f.fingerprint)
+        .bind::<Text, _>(f.error_kind)
+        .bind::<Text, _>(f.error_message)
+        .bind::<Nullable<SqlUuid>, _>(f.org_id)
+        .bind::<Nullable<SqlUuid>, _>(f.project_id)
+        .bind::<Nullable<SqlUuid>, _>(f.app_id)
+        .bind::<Jsonb, _>(payload.cloned().unwrap_or(Value::Null))
+        .bind::<Integer, _>(attempts)
+        .bind::<Bool, _>(payload.is_some())
+        .bind::<BigInt, _>(payload_cap)
+        .get_result(conn)
+        .await
+}
+
+/// One page of failure groups, newest activity first.
+///
+/// Keyset, not OFFSET, and the cursor carries `id` as well as `last_seen_at`:
+/// a burst of failures recorded in one statement shares `last_seen_at` to
+/// microsecond precision, and an untiebroken cursor silently skips or repeats
+/// one of them at the page boundary.
+pub async fn list_ingest_failures(
+    conn: &mut AsyncPgConnection,
+    status: Option<&str>,
+    error_kind: Option<&str>,
+    cursor: Option<(DateTime<Utc>, Uuid)>,
+    limit: i64,
+) -> QueryResult<Vec<IngestFailureRow>> {
+    let sql = format!(
+        "{FAILURE_ROW_SELECT}
+         WHERE ($1::text IS NULL OR f.status = $1)
+           AND ($2::text IS NULL OR f.error_kind = $2)
+           AND ($3::timestamptz IS NULL OR (f.last_seen_at, f.id) < ($3, $4))
+         ORDER BY f.last_seen_at DESC, f.id DESC
+         LIMIT $5"
+    );
+    diesel::sql_query(sql)
+        .bind::<Nullable<Text>, _>(status)
+        .bind::<Nullable<Text>, _>(error_kind)
+        .bind::<Nullable<Timestamptz>, _>(cursor.map(|c| c.0))
+        .bind::<Nullable<SqlUuid>, _>(cursor.map(|c| c.1))
+        .bind::<BigInt, _>(limit)
+        .load(conn)
+        .await
+}
+
+/// One failure group by id, with the same derived counts as the list.
+pub async fn get_ingest_failure(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Option<IngestFailureRow>> {
+    let sql = format!("{FAILURE_ROW_SELECT} WHERE f.id = $1");
+    diesel::sql_query(sql)
+        .bind::<SqlUuid, _>(id)
+        .get_results::<IngestFailureRow>(conn)
+        .await
+        .map(|mut v| v.pop())
+}
+
+/// The retained payloads behind one group, oldest first.
+pub async fn list_ingest_failure_payloads(
+    conn: &mut AsyncPgConnection,
+    failure_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> QueryResult<Vec<IngestFailurePayload>> {
+    ingest_failure_payloads::table
+        .filter(ingest_failure_payloads::failure_id.eq(failure_id))
+        .order((
+            ingest_failure_payloads::created_at.asc(),
+            ingest_failure_payloads::id.asc(),
+        ))
+        .limit(limit)
+        .offset(offset)
+        .select(IngestFailurePayload::as_select())
+        .load(conn)
+        .await
+}
+
+/// Mark a group as requeued and hand back every retained payload to re-inject.
+///
+/// Stamping `requeued_at` and returning the rows in one statement is what makes
+/// the button honest: the caller cannot mark the group in flight and then fail
+/// to learn which payloads it owes a verdict on.
+pub async fn start_ingest_failure_retry(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> QueryResult<Vec<RequeuedPayload>> {
+    const SQL: &str = "
+        WITH g AS (
+            UPDATE ingest_failures SET status = 'requeued' WHERE id = $1 RETURNING id
+        ),
+        upd AS (
+            UPDATE ingest_failure_payloads p SET requeued_at = now()
+            FROM g WHERE p.failure_id = g.id
+            RETURNING p.id, p.payload, p.attempts
+        )
+        SELECT id, payload, attempts FROM upd
+    ";
+    diesel::sql_query(SQL)
+        .bind::<SqlUuid, _>(id)
+        .load(conn)
+        .await
+}
+
+/// A replayed payload succeeded: drop it, and resolve the group if it was the
+/// last one outstanding.
+///
+/// The `NOT EXISTS` deliberately excludes `$1` by id. Sub-statements of one
+/// statement share a snapshot, so the subquery still sees the row the CTE is
+/// deleting; without that exclusion a group would never reach `resolved` and
+/// the page would show permanently-requeued rows that are in fact done.
+pub async fn resolve_ingest_failure_payload(
+    conn: &mut AsyncPgConnection,
+    payload_id: Uuid,
+) -> QueryResult<usize> {
+    const SQL: &str = "
+        WITH del AS (
+            DELETE FROM ingest_failure_payloads WHERE id = $1 RETURNING failure_id
+        )
+        UPDATE ingest_failures f SET status = 'resolved'
+        FROM del
+        WHERE f.id = del.failure_id
+          AND NOT EXISTS (
+              SELECT 1 FROM ingest_failure_payloads p
+              WHERE p.failure_id = f.id AND p.id <> $1
+          )
+    ";
+    diesel::sql_query(SQL)
+        .bind::<SqlUuid, _>(payload_id)
+        .execute(conn)
+        .await
+}
+
+/// A replayed payload failed again: return it to the pool and reopen the group
+/// with the new error, so the admin sees why the retry did not take.
+pub async fn fail_ingest_failure_payload(
+    conn: &mut AsyncPgConnection,
+    payload_id: Uuid,
+    error_message: &str,
+) -> QueryResult<usize> {
+    const SQL: &str = "
+        WITH upd AS (
+            UPDATE ingest_failure_payloads SET requeued_at = NULL
+            WHERE id = $1 RETURNING failure_id
+        )
+        UPDATE ingest_failures f
+        SET status = 'failed', error_message = $2, last_seen_at = now()
+        FROM upd WHERE f.id = upd.failure_id
+    ";
+    diesel::sql_query(SQL)
+        .bind::<SqlUuid, _>(payload_id)
+        .bind::<Text, _>(error_message)
+        .execute(conn)
+        .await
+}
+
+/// Drop a failure group and every payload under it, permanently.
+///
+/// Hard DELETE, by design: these are masked copies of real user events, and the
+/// audit entry written before this call is the only intended survivor. Children
+/// go via `ON DELETE CASCADE`.
+pub async fn delete_ingest_failure(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
+    diesel::delete(ingest_failures::table.filter(ingest_failures::id.eq(id)))
+        .execute(conn)
+        .await
+}
+
+/// Age out failure groups whose last occurrence predates `cutoff`.
+///
+/// The privacy bound, and the reason this feature does not simply move the
+/// Redis DLQ's unbounded-growth problem into Postgres. Children cascade.
+pub async fn reap_ingest_failures(
+    conn: &mut AsyncPgConnection,
+    cutoff: DateTime<Utc>,
+) -> QueryResult<usize> {
+    diesel::delete(ingest_failures::table.filter(ingest_failures::last_seen_at.lt(cutoff)))
+        .execute(conn)
+        .await
+}
+
+/// The user a session belongs to.
+///
+/// `logout` is authenticated by a refresh token rather than a bearer, so the
+/// handler has no `AuthUser` and cannot name the actor without this.
+pub async fn session_user(
+    conn: &mut AsyncPgConnection,
+    session_id: Uuid,
+) -> QueryResult<Option<Uuid>> {
+    auth_sessions::table
+        .filter(auth_sessions::id.eq(session_id))
+        .select(auth_sessions::user_id)
+        .first(conn)
+        .await
+        .optional()
 }

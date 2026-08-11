@@ -7,12 +7,19 @@
   import DateRange from '../lib/components/DateRange.svelte';
   import BarList from '../lib/components/BarList.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import SankeyChart from '../lib/components/SankeyChart.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { getJourney } from '../lib/api/journeys';
+  import {
+    JOURNEY_TRANSITION_DEFAULT_SORT,
+    journeyTransitionAccessor,
+  } from '../lib/models/journey-sort';
+  import { sortRows } from '../lib/models/sort-rows';
+  import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import type { Journey } from '../lib/models';
 
   const DEPTHS = [2, 3, 4, 5, 6, 7, 8];
@@ -69,9 +76,41 @@
       : [],
   );
 
+  // WHICH ten rows the table shows — the ten highest-count links. Kept as its
+  // own step because it is the table's definition, not its order: the card is
+  // titled "Top transitions", and sorting the full link list by From and then
+  // taking ten would fill that card with the ten alphabetically-first
+  // transitions, most of which are top nothing. `[...journey.links]` copies
+  // before sorting, so the cached graph the Sankey renders from is never
+  // reordered underneath it.
   const topTransitions = $derived(
     journey ? [...journey.links].sort((a, b) => b.count - a.count).slice(0, 10) : [],
   );
+
+  // The display order of those ten, seeded to reproduce the count-descending
+  // order they are selected in — so the table opens looking exactly as it did
+  // and the caret names the column that produced it. The sort runs over the
+  // whole ten-row array, which IS the whole table; there is no pager, because
+  // ten rows have no page two.
+  //
+  // A bare `SortState`, not the `OffsetListState` the paginated tables use:
+  // that type exists to make "apply a sort" and "reset to page 1" one
+  // indivisible step, and with no offset there is nothing to reset. Its
+  // `key`/`dir` are `readonly` (see `sort.ts`), so `sort.dir = 'asc'` is a
+  // type error and every transition goes through `toggleSort`.
+  let transitionSort = $state<SortState>(JOURNEY_TRANSITION_DEFAULT_SORT);
+
+  const sortedTransitions = $derived(
+    sortRows(
+      topTransitions,
+      journeyTransitionAccessor(transitionSort.key),
+      transitionSort.dir,
+    ),
+  );
+
+  function onTransitionSort(key: string, columnDefault: SortDir) {
+    transitionSort = toggleSort(transitionSort, key, columnDefault);
+  }
 
   function retry() {
     const aid = sessionStore.currentAppId;
@@ -181,20 +220,32 @@
       </Card>
 
       <Card title="Top transitions" padding="none">
-        {#if topTransitions.length === 0}
+        {#if sortedTransitions.length === 0}
           <p class="faint empty-inline pad">No transitions between events yet.</p>
         {:else}
           <DataTable>
             {#snippet head()}
               <tr>
-                <th>From</th>
+                <SortableTh key="from" columnDefault="asc" sort={transitionSort} onsort={onTransitionSort}>
+                  From
+                </SortableTh>
+                <!-- The arrow glyph. Nothing to order by. -->
                 <th></th>
-                <th>To</th>
-                <th class="num">Users</th>
+                <SortableTh key="to" columnDefault="asc" sort={transitionSort} onsort={onTransitionSort}>
+                  To
+                </SortableTh>
+                <SortableTh key="users" class="num" sort={transitionSort} onsort={onTransitionSort}>
+                  Users
+                </SortableTh>
               </tr>
             {/snippet}
             {#snippet children()}
-              {#each topTransitions as t, i (i)}
+              <!-- Keyed by the transition itself, not by its index: the rows
+                   reorder now, and an index key makes Svelte rewrite every
+                   cell in place instead of moving the row that moved. The
+                   triple is unique — the backend groups links by exactly
+                   (from_step, from_event, to_event). -->
+              {#each sortedTransitions as t (t.from_step + ':' + t.from_event + '>' + t.to_event)}
                 <tr>
                   <td>
                     <span class="mono">{t.from_event}</span>

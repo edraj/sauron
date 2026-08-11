@@ -114,3 +114,36 @@ export function setOffsetSort(
 export function setOffsetPage(s: OffsetListState, offset: number): OffsetListState {
   return { sort: s.sort, offset };
 }
+
+/**
+ * One page of rows, plus whether another page follows it.
+ *
+ * The offset-paged endpoints return a bare array with no total, so "is there a
+ * page after this one" cannot be read off the response. `Pagination` used to
+ * infer it as `rows.length >= limit`, which is wrong for the one case that
+ * matters: a final page holding exactly `limit` rows offered an enabled Next
+ * leading to an empty page.
+ */
+export interface ListPage<T> {
+  rows: T[];
+  hasNext: boolean;
+}
+
+/**
+ * Split an over-fetched response into the page to render and the has-more
+ * answer.
+ *
+ * Callers request `limit + 1` rows; the surplus row is the probe and is
+ * discarded. Every Group B endpoint clamps `limit` at 200 or above, so asking
+ * for one more than any page size the UI offers stays inside the clamp — a
+ * clamped request would silently return `limit` rows and report `hasNext:
+ * false` on a full page.
+ *
+ * Lives here, tested, rather than inline at five clients because the whole
+ * fix is one comparison: `data.length > limit` is right and `>= limit` is the
+ * bug being removed, and the two differ by one character at a call site where
+ * nothing would fail loudly.
+ */
+export function overFetched<T>(data: T[], limit: number): ListPage<T> {
+  return { rows: data.slice(0, limit), hasNext: data.length > limit };
+}

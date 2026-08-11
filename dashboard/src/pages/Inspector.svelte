@@ -15,6 +15,8 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
+  import ClientPager from '../lib/components/ClientPager.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
   import MaskDialog from '../lib/components/inspector/MaskDialog.svelte';
@@ -39,6 +41,18 @@
     defaultEnvEnrollmentId,
   } from '../lib/models/inspector';
   import { DETECTORS, SUGGESTED_KEYS } from '../lib/constants/inspectorDetectors';
+  import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
+  import {
+    FINDING_DEFAULT_SORT,
+    MASK_DEFAULT_SORT,
+    SCAN_DEFAULT_SORT,
+    findingAccessor,
+    maskActionAccessor,
+    scanAccessor,
+  } from '../lib/models/pii-inspector-sort';
+  import { pageSlice } from '../lib/models/paginate';
+  import { sortRows } from '../lib/models/sort-rows';
+  import type { SortDir } from '../lib/models/sort';
   import type {
     EffectivePolicy,
     InspectorFinding,
@@ -75,6 +89,57 @@
   );
   const policy = $derived(effective?.policy ?? null);
   const groups = $derived(groupFindings(findings));
+
+  // --- sorting and paging ---------------------------------------------------
+  // Every list on this page arrives whole, so both the sort and the pager run
+  // here, over the SAME array each time: order the whole list first, then take
+  // a window out of it. Sorting the window instead would reorder only what is
+  // on screen while presenting itself as having ordered everything.
+  //
+  // `sortRows` copies, which matters even though these arrays are `$state.raw`
+  // — raw means the array is handed around by identity, so an in-place sort
+  // would reorder the very array `loadAll` stored and the polling effect reads.
+  /** Rows per page, for all three tables. */
+  const PAGE = 25;
+
+  // The Findings tab renders ONE table per `source_table.source_column` group,
+  // so its list state is per group KEY, not one object: each group is its own
+  // table with its own header row, and sorting one must not reorder — or
+  // re-page — its neighbours.
+  const FINDING_INITIAL: OffsetListState = { sort: FINDING_DEFAULT_SORT, offset: 0 };
+  let findingLists = $state<Record<string, OffsetListState>>({});
+  const findingList = (groupKey: string): OffsetListState =>
+    findingLists[groupKey] ?? FINDING_INITIAL;
+  // Replaced, never mutated in place — the house rule for a Record inside
+  // `$state` on this page (see `expanded` below).
+  function onFindingSort(groupKey: string, key: string, columnDefault: SortDir) {
+    findingLists = {
+      ...findingLists,
+      [groupKey]: setOffsetSort(findingList(groupKey), key, columnDefault),
+    };
+  }
+  function setFindingPage(groupKey: string, offset: number) {
+    findingLists = {
+      ...findingLists,
+      [groupKey]: setOffsetPage(findingList(groupKey), offset),
+    };
+  }
+
+  let scanList = $state<OffsetListState>({ sort: SCAN_DEFAULT_SORT, offset: 0 });
+  const scansSorted = $derived(sortRows(scans, scanAccessor(scanList.sort.key), scanList.sort.dir));
+  const scanPage = $derived(pageSlice(scansSorted, scanList.offset, PAGE));
+  function onScanSort(key: string, columnDefault: SortDir) {
+    scanList = setOffsetSort(scanList, key, columnDefault);
+  }
+
+  let maskList = $state<OffsetListState>({ sort: MASK_DEFAULT_SORT, offset: 0 });
+  const masksSorted = $derived(
+    sortRows(actions, maskActionAccessor(maskList.sort.key), maskList.sort.dir),
+  );
+  const maskPage = $derived(pageSlice(masksSorted, maskList.offset, PAGE));
+  function onMaskSort(key: string, columnDefault: SortDir) {
+    maskList = setOffsetSort(maskList, key, columnDefault);
+  }
 
   // --- create-policy form -------------------------------------------------
   // Only reachable when no policy covers this app; `create_policy` is
@@ -232,20 +297,54 @@
       <EmptyState title="No findings" description="Run a scan from the Scans tab." />
     {:else}
       {#each groups as g (g.key)}
+        <!-- Sort the whole group, THEN slice it — reversing these two lines
+             would order only the rows already on screen. `gl` is this group's
+             own sort/offset; `gSorted` is what the pager below measures. -->
+        {@const gl = findingList(g.key)}
+        {@const gSorted = sortRows(g.findings, findingAccessor(gl.sort.key), gl.sort.dir)}
+        {@const gPage = pageSlice(gSorted, gl.offset, PAGE)}
         <Card>
           <h3>{g.table}.{g.column} <Badge>{formatMatchCount(g.total, true)} matches</Badge></h3>
           <DataTable>
             {#snippet head()}
               <tr>
-                <th>Path</th>
-                <th>Type</th>
-                <th class="num">Matches</th>
-                <th>Last seen</th>
+                <SortableTh
+                  key="path"
+                  columnDefault="asc"
+                  sort={gl.sort}
+                  onsort={(k, d) => onFindingSort(g.key, k, d)}
+                >
+                  Path
+                </SortableTh>
+                <SortableTh
+                  key="type"
+                  columnDefault="asc"
+                  sort={gl.sort}
+                  onsort={(k, d) => onFindingSort(g.key, k, d)}
+                >
+                  Type
+                </SortableTh>
+                <SortableTh
+                  key="matches"
+                  class="num"
+                  sort={gl.sort}
+                  onsort={(k, d) => onFindingSort(g.key, k, d)}
+                >
+                  Matches
+                </SortableTh>
+                <SortableTh
+                  key="last_seen"
+                  sort={gl.sort}
+                  onsort={(k, d) => onFindingSort(g.key, k, d)}
+                >
+                  Last seen
+                </SortableTh>
+                <!-- Badges and the Mask button: no value to order by. -->
                 <th></th>
               </tr>
             {/snippet}
             {#snippet children()}
-              {#each g.findings as f (f.id)}
+              {#each gPage.rows as f (f.id)}
                 <tr
                   class="clickable"
                   onclick={() => (expanded = { ...expanded, [f.id]: !expanded[f.id] })}
@@ -324,6 +423,21 @@
               {/each}
             {/snippet}
           </DataTable>
+
+          <!-- `total` is the length of the EXACT array handed to `pageSlice`
+               above — `gSorted`, the same expression, not `findings.length`
+               and not `g.total` (which is a sum of match counts, not a row
+               count). A pager measuring a longer list than the one being
+               sliced re-creates the enabled-Next-onto-an-empty-page bug that
+               `Pagination.hasNext` was made a required prop to kill. The
+               grouping IS the filter here, and it is already applied to the
+               array both the slice and this total read. -->
+          <ClientPager
+            offset={gl.offset}
+            limit={PAGE}
+            total={gSorted.length}
+            onchange={(o) => setFindingPage(g.key, o)}
+          />
         </Card>
       {/each}
     {/if}
@@ -635,17 +749,32 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              <th>Started</th>
-              <th>Finished</th>
-              <th>Status</th>
-              <th class="num">Rows scanned</th>
-              <th class="num">Findings</th>
-              <th>Coverage</th>
+              <SortableTh key="started" sort={scanList.sort} onsort={onScanSort}>Started</SortableTh>
+              <SortableTh key="finished" sort={scanList.sort} onsort={onScanSort}>
+                Finished
+              </SortableTh>
+              <!-- `desc` (the default), not `asc`: a RANK — see
+                   `SCAN_STATUS_ORDER` — so the first click leads with the
+                   scans that failed. Coverage, below, is deliberately still
+                   text; its alphabetical order already is its meaning. -->
+              <SortableTh key="status" sort={scanList.sort} onsort={onScanSort}>
+                Status
+              </SortableTh>
+              <SortableTh key="rows_scanned" class="num" sort={scanList.sort} onsort={onScanSort}>
+                Rows scanned
+              </SortableTh>
+              <SortableTh key="findings" class="num" sort={scanList.sort} onsort={onScanSort}>
+                Findings
+              </SortableTh>
+              <SortableTh key="coverage" sort={scanList.sort} onsort={onScanSort}>
+                Coverage
+              </SortableTh>
+              <!-- Stop / CSV buttons: no value to order by. -->
               <th></th>
             </tr>
           {/snippet}
           {#snippet children()}
-            {#each scans as s (s.id)}
+            {#each scanPage.rows as s (s.id)}
               <tr>
                 <td><TimeValue value={s.started_at} /></td>
                 <td><TimeValue value={s.finished_at} /></td>
@@ -696,6 +825,17 @@
             {/each}
           {/snippet}
         </DataTable>
+
+        <!-- `total` is the length of the EXACT array handed to `pageSlice` —
+             `scansSorted`, the same expression. Nothing filters this table; if
+             anything ever does, the filtered array must feed both, and the
+             filter change must reset the offset with `setOffsetPage`. -->
+        <ClientPager
+          offset={scanList.offset}
+          limit={PAGE}
+          total={scansSorted.length}
+          onchange={(o) => (scanList = setOffsetPage(scanList, o))}
+        />
       {/if}
     </Card>
   {:else}
@@ -711,17 +851,32 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              <th>When</th>
-              <th>Who</th>
-              <th class="num">Targets</th>
-              <th>Status</th>
-              <th class="num">Rows masked</th>
-              <th class="num">Cold skipped</th>
-              <th>Cancelled by</th>
+              <SortableTh key="when" sort={maskList.sort} onsort={onMaskSort}>When</SortableTh>
+              <SortableTh key="who" columnDefault="asc" sort={maskList.sort} onsort={onMaskSort}>
+                Who
+              </SortableTh>
+              <SortableTh key="targets" class="num" columnDefault="asc" sort={maskList.sort} onsort={onMaskSort}>
+                Targets
+              </SortableTh>
+              <!-- `desc` (the default), not `asc`: a RANK — see
+                   `MASK_STATUS_ORDER` — so the first click leads with the mask
+                   actions that failed part-way. -->
+              <SortableTh key="status" sort={maskList.sort} onsort={onMaskSort}>
+                Status
+              </SortableTh>
+              <SortableTh key="rows_masked" class="num" sort={maskList.sort} onsort={onMaskSort}>
+                Rows masked
+              </SortableTh>
+              <SortableTh key="cold_skipped" class="num" sort={maskList.sort} onsort={onMaskSort}>
+                Cold skipped
+              </SortableTh>
+              <SortableTh key="cancelled_by" columnDefault="asc" sort={maskList.sort} onsort={onMaskSort}>
+                Cancelled by
+              </SortableTh>
             </tr>
           {/snippet}
           {#snippet children()}
-            {#each actions as a (a.id)}
+            {#each maskPage.rows as a (a.id)}
               <tr
                 class="clickable"
                 onclick={() => (expanded = { ...expanded, [a.id]: !expanded[a.id] })}
@@ -781,6 +936,18 @@
             {/each}
           {/snippet}
         </DataTable>
+
+        <!-- `total` is the length of the EXACT array handed to `pageSlice` —
+             `masksSorted`, the same expression. -->
+        <ClientPager
+          offset={maskList.offset}
+          limit={PAGE}
+          total={masksSorted.length}
+          onchange={(o) => (maskList = setOffsetPage(maskList, o))}
+        />
+
+        <!-- Exports the WHOLE trail, not the page on screen — the server builds
+             the CSV from the app's actions and knows nothing about this pager. -->
         <Button
           size="sm"
           onclick={() => {

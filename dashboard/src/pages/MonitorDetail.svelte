@@ -10,6 +10,7 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -19,6 +20,14 @@
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
+  import {
+    MONITOR_CHECK_DEFAULT_SORT,
+    MONITOR_INCIDENT_DEFAULT_SORT,
+    monitorCheckAccessor,
+    monitorIncidentAccessor,
+  } from '../lib/models/monitor-detail-sort';
+  import { sortRows } from '../lib/models/sort-rows';
+  import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
 
   let { params }: { params: { id: string } } = $props();
 
@@ -62,8 +71,50 @@
   const checksAsc = $derived(
     checks.slice().sort((a, b) => new Date(a.checked_at).getTime() - new Date(b.checked_at).getTime()),
   );
+  // WHICH hundred rows the log shows — the most recent ones. Kept as its own
+  // step, and kept chronological, because it is the table's definition rather
+  // than its order: `barChecks` below reads the same ascending array
+  // left-to-right, and the log is "the last 100 checks" however the user then
+  // chooses to order them. Replacing this with the sort would let a click on
+  // Latency change which checks are on the page, not just their order.
   const recentChecks = $derived(checksAsc.slice().reverse().slice(0, 100));
   const barChecks = $derived(checksAsc.slice(-60));
+
+  // Both tables arrive whole — 24h of checks, capped at the 100 most recent
+  // for the log, and every incident this monitor has — so each sort runs over
+  // the ENTIRE array its table renders. Neither gets a pager: what is on
+  // screen is already all of it, and a pager would imply a page two that does
+  // not exist.
+  //
+  // A bare `SortState` per table, not the `OffsetListState` the paginated
+  // tables use: that type exists to make "apply a sort" and "reset to page 1"
+  // one indivisible step, and with no offset there is nothing to reset. Its
+  // `key`/`dir` are `readonly` (see `sort.ts`), so `checkSort.dir = 'asc'` is
+  // a type error and every transition goes through `toggleSort`.
+  //
+  // The check seed reproduces the reverse-chronological order the log has
+  // today, so the page opens looking exactly as it did.
+  let checkSort = $state<SortState>(MONITOR_CHECK_DEFAULT_SORT);
+  let incidentSort = $state<SortState>(MONITOR_INCIDENT_DEFAULT_SORT);
+
+  // `sortRows` copies before sorting, so neither `checks` nor the payload's
+  // `incidents` array is reordered in place. `recentChecks` is already a copy,
+  // but `detail.incidents` is the response object's own array and this page
+  // hands that same object to nothing else only by accident — copying is what
+  // makes that safe rather than lucky.
+  const sortedChecks = $derived(
+    sortRows(recentChecks, monitorCheckAccessor(checkSort.key), checkSort.dir),
+  );
+  const sortedIncidents = $derived(
+    sortRows(detail?.incidents ?? [], monitorIncidentAccessor(incidentSort.key), incidentSort.dir),
+  );
+
+  function onCheckSort(key: string, columnDefault: SortDir) {
+    checkSort = toggleSort(checkSort, key, columnDefault);
+  }
+  function onIncidentSort(key: string, columnDefault: SortDir) {
+    incidentSort = toggleSort(incidentSort, key, columnDefault);
+  }
 
   async function load() {
     loading = true; error = null;
@@ -155,7 +206,6 @@
       {/snippet}
     </EmptyState>
   {:else if detail}
-    {@const incidents = detail.incidents}
     <header class="detail-head">
       <div class="head-main">
         <h1 class="mon-title">{detail.monitor.name} <StatusPill status={detail.monitor.status} /></h1>
@@ -256,15 +306,24 @@
           <DataTable>
             {#snippet head()}
               <tr>
-                <th>Time</th>
-                <th>Result</th>
-                <th class="num">Code</th>
-                <th class="num">Latency</th>
+                <SortableTh key="time" sort={checkSort} onsort={onCheckSort}>Time</SortableTh>
+                <SortableTh key="result" columnDefault="asc" sort={checkSort} onsort={onCheckSort}>
+                  Result
+                </SortableTh>
+                <SortableTh key="code" class="num" sort={checkSort} onsort={onCheckSort}>
+                  Code
+                </SortableTh>
+                <SortableTh key="latency" class="num" sort={checkSort} onsort={onCheckSort}>
+                  Latency
+                </SortableTh>
+                <!-- Free text, often a whole stack of it, and blank on every
+                     healthy check. Ordering it would sort the log by whichever
+                     failure message happens to start with the earliest letter. -->
                 <th>Error</th>
               </tr>
             {/snippet}
             {#snippet children()}
-              {#each recentChecks as c (c.checked_at)}
+              {#each sortedChecks as c (c.checked_at)}
                 <tr>
                   <td>{formatDateTime(c.checked_at)}</td>
                   <td>
@@ -291,7 +350,7 @@
 
     <div class="section">
       <Card title="Incidents" padding="none">
-        {#if incidents.length === 0}
+        {#if sortedIncidents.length === 0}
           <EmptyState
             title="No incidents"
             description="No downtime has been recorded for this monitor."
@@ -301,14 +360,22 @@
           <DataTable>
             {#snippet head()}
               <tr>
-                <th>Started</th>
-                <th>Resolved</th>
-                <th class="num">Duration</th>
-                <th>Cause</th>
+                <SortableTh key="started" sort={incidentSort} onsort={onIncidentSort}>
+                  Started
+                </SortableTh>
+                <SortableTh key="resolved" sort={incidentSort} onsort={onIncidentSort}>
+                  Resolved
+                </SortableTh>
+                <SortableTh key="duration" class="num" sort={incidentSort} onsort={onIncidentSort}>
+                  Duration
+                </SortableTh>
+                <SortableTh key="cause" columnDefault="asc" sort={incidentSort} onsort={onIncidentSort}>
+                  Cause
+                </SortableTh>
               </tr>
             {/snippet}
             {#snippet children()}
-              {#each incidents as i (i.id)}
+              {#each sortedIncidents as i (i.id)}
                 <tr>
                   <td>{formatDateTime(i.started_at)}</td>
                   <td>

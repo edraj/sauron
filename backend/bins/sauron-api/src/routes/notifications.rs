@@ -230,6 +230,26 @@ pub async fn create_channel(
         },
     )
     .await?;
+
+    // Only name/kind/enabled. `config_enc` and `secret_enc` are the encrypted
+    // delivery credentials D6 exists to protect — the channel allowlist has no
+    // key that could carry either, and `channel_view` redacts them below
+    // `manage` for the same reason.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::ALERT_CHANNEL_CREATE,
+            crate::audit::entity::ALERT_CHANNEL,
+        )
+        .target(ch.id, &ch.name)
+        .changes(crate::audit::created(
+            crate::audit::entity::ALERT_CHANNEL,
+            &[("name", json!(ch.name)), ("kind", json!(ch.kind))],
+        )),
+    )
+    .await;
     Ok(Json(channel_view(&state.alerts.cipher, &ch)))
 }
 
@@ -428,6 +448,29 @@ pub async fn update_channel(
     )
     .await?
     .ok_or(ApiError::NotFound)?;
+
+    // A config change is recorded as "config changed" via `enabled`/`name`
+    // only. The retarget path (D9) is authorized separately above; what the
+    // trail must show is that SOMEONE altered a delivery channel and when, not
+    // where it now points — that destination is the secret.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            ch.org_id,
+            crate::audit::action::ALERT_CHANNEL_UPDATE,
+            crate::audit::entity::ALERT_CHANNEL,
+        )
+        .target(updated.id, &updated.name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::ALERT_CHANNEL,
+            &[
+                ("name", json!(ch.name), json!(updated.name)),
+                ("enabled", json!(ch.enabled), json!(updated.enabled)),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(channel_view(&state.alerts.cipher, &updated)))
 }
 
@@ -438,9 +481,25 @@ pub async fn delete_channel(
     Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
-    let (mut conn, _ch) =
+    let (mut conn, ch) =
         load_channel_authorized(&state, auth.user_id, channel_id, perm::ALERT_WRITE).await?;
     repo::delete_channel(&mut conn, channel_id).await?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            ch.org_id,
+            crate::audit::action::ALERT_CHANNEL_DELETE,
+            crate::audit::entity::ALERT_CHANNEL,
+        )
+        .target(ch.id, &ch.name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::ALERT_CHANNEL,
+            &[("kind", json!(ch.kind), Value::Null)],
+        )),
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -450,8 +509,25 @@ pub async fn test_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    let (_conn, ch) =
+    let (mut conn, ch) =
         load_channel_authorized(&state, auth.user_id, channel_id, perm::ALERT_WRITE).await?;
+
+    // Recorded before delivery, not after: a test send is how you confirm a
+    // channel's destination, so an operator probing a channel they just
+    // repointed is exactly the sequence worth seeing — whether or not the
+    // send succeeds.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            ch.org_id,
+            crate::audit::action::ALERT_CHANNEL_TEST,
+            crate::audit::entity::ALERT_CHANNEL,
+        )
+        .target(ch.id, &ch.name),
+    )
+    .await;
+    drop(conn);
 
     let mut ctx = AlertContext::new(Severity::Info, "test")
         .var("channel", ch.name.clone())
@@ -859,6 +935,27 @@ pub async fn create_rule(
     )
     .await?;
     repo::set_rule_channels(&mut conn, rule.id, &req.channel_ids).await?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::ALERT_RULE_CREATE,
+            crate::audit::entity::ALERT_RULE,
+        )
+        .target(rule.id, &rule.name)
+        .changes(crate::audit::created(
+            crate::audit::entity::ALERT_RULE,
+            &[
+                ("name", json!(rule.name)),
+                ("enabled", json!(rule.enabled)),
+                ("severity", json!(rule.severity)),
+                ("monitor_id", json!(rule.monitor_id)),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(rule_view(&mut conn, &rule).await?))
 }
 
@@ -983,6 +1080,31 @@ pub async fn update_rule(
     if let Some(ids) = &req.channel_ids {
         repo::set_rule_channels(&mut conn, rule_id, ids).await?;
     }
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            updated.org_id,
+            crate::audit::action::ALERT_RULE_UPDATE,
+            crate::audit::entity::ALERT_RULE,
+        )
+        .target(updated.id, &updated.name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::ALERT_RULE,
+            &[
+                ("name", json!(rule.name), json!(updated.name)),
+                ("enabled", json!(rule.enabled), json!(updated.enabled)),
+                ("severity", json!(rule.severity), json!(updated.severity)),
+                (
+                    "monitor_id",
+                    json!(rule.monitor_id),
+                    json!(updated.monitor_id),
+                ),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(rule_view(&mut conn, &updated).await?))
 }
 
@@ -998,9 +1120,25 @@ pub async fn delete_rule(
     Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
-    let (mut conn, _rule) =
+    let (mut conn, rule) =
         load_rule_authorized(&state, auth.user_id, rule_id, perm::ALERT_WRITE).await?;
     repo::delete_alert_rule(&mut conn, rule_id).await?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            rule.org_id,
+            crate::audit::action::ALERT_RULE_DELETE,
+            crate::audit::entity::ALERT_RULE,
+        )
+        .target(rule.id, &rule.name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::ALERT_RULE,
+            &[("enabled", json!(rule.enabled), Value::Null)],
+        )),
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 

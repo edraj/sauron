@@ -71,15 +71,21 @@
    * context — and repeating them here as raw JSON would show every frame
    * twice, the second time in the minified form the symbolication exists to
    * replace.
+   *
+   * `context` is absent for the same reason. The ingest pipeline enriches one
+   * context per envelope and writes that same value to both the event row and
+   * the session row, so on this page it is already on screen once, in the
+   * "Session context" card beside the timeline — and it would otherwise repeat
+   * there under every expanded row. What stays is the part that varies per
+   * row: an event's `properties`, an error's exception and `tags`.
    */
   function payload(item: TimelineItem): unknown {
     switch (item.kind) {
       case 'event':
-        return { properties: item.event.properties, context: item.event.context };
+        return { properties: item.event.properties };
       case 'error':
         return {
           exception: { type: item.error.exception_type, value: item.error.exception_value },
-          context: item.error.context,
           tags: item.error.tags,
         };
       case 'transaction':

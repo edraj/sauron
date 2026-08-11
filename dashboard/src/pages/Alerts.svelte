@@ -32,11 +32,29 @@
   import Card from '../lib/components/ui/Card.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
+  import ClientPager from '../lib/components/ClientPager.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
+  import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
+  import {
+    alertEventAccessor,
+    channelAccessor,
+    ruleAccessor,
+    CHANNEL_DEFAULT_SORT,
+    EVENT_DEFAULT_SORT,
+    RULE_DEFAULT_SORT,
+  } from '../lib/models/alert-sort';
+  import { pageSlice } from '../lib/models/paginate';
+  import { sortRows } from '../lib/models/sort-rows';
+  import type { SortDir } from '../lib/models/sort';
+
+  /** Rows per page, for all three tables. Each list arrives whole, so this is a
+      rendering budget only — no request is issued by a sort or a page click. */
+  const PAGE = 25;
 
   type Tab = 'channels' | 'rules' | 'history';
 
@@ -305,6 +323,14 @@
     webhook: 'Webhook',
   };
 
+  // The two label lookups the cells render, named once so the Type and Trigger
+  // columns can be SORTED by exactly the text they show. Both maps are keyed by
+  // an enum the API could extend, so the `?? key` arm is a real fallback rather
+  // than defensive noise — and passing the accessor a lookup that disagreed
+  // with the cell is precisely the "orders by one value, displays another" bug.
+  const kindLabel = (k: ChannelKind): string => KIND_LABELS[k] ?? k;
+  const triggerLabel = (t: TriggerType): string => TRIGGER_LABELS[t] ?? t;
+
   async function load() {
     if (!orgId) {
       loading = false;
@@ -536,8 +562,67 @@
 
   const fmtTime = (iso: string) => new Date(iso).toLocaleString();
 
-  const channelName = (id: string | null) =>
-    channels.find((c) => c.id === id)?.name ?? '—';
+  /**
+   * The channel a delivery went to, or `null` when there is no name to show.
+   *
+   * `null` rather than the em dash, so the History table's Channel column can
+   * sort by it: `sortRows` keeps a null last in both directions, whereas the
+   * literal `'—'` collates before every real name and would lead one direction
+   * while trailing the other. The dash is applied at the cell instead, which is
+   * where a rendering decision belongs.
+   */
+  const channelName = (id: string | null): string | null =>
+    channels.find((c) => c.id === id)?.name ?? null;
+
+  // --- sorting and paging ---------------------------------------------------
+  // All three lists arrive whole (`listChannels` / `listRules` /
+  // `listAlertEvents(orgId, 50)`), so both the sort and the pager run here,
+  // over the SAME array each time: order the whole list first, then take a
+  // window out of it. Sorting the window instead would reorder only what is on
+  // screen while presenting itself as having ordered everything.
+  //
+  // THREE states, one per table, never a shared pair: sorting the channels list
+  // must not send the rules list back to page 1 under a header nobody clicked.
+  // Each is one `OffsetListState` rather than two variables because
+  // `setOffsetSort` resets the offset as part of applying a sort — a re-ordered
+  // list makes the current window meaningless, so page 1 is the only honest
+  // place to land.
+  let channelList = $state<OffsetListState>({ sort: CHANNEL_DEFAULT_SORT, offset: 0 });
+  let ruleList = $state<OffsetListState>({ sort: RULE_DEFAULT_SORT, offset: 0 });
+  let historyList = $state<OffsetListState>({ sort: EVENT_DEFAULT_SORT, offset: 0 });
+
+  // `sortRows` copies before sorting, and that is load-bearing rather than
+  // tidy: `channels` / `rules` / `history` are the arrays the page holds and
+  // hands to the forms as well (the rule form's channel chips read `channels`
+  // directly), so an in-place sort would reorder them underneath every other
+  // reader.
+  const channelsSorted = $derived(
+    sortRows(channels, channelAccessor(channelList.sort.key, kindLabel), channelList.sort.dir),
+  );
+  const channelPage = $derived(pageSlice(channelsSorted, channelList.offset, PAGE));
+
+  const rulesSorted = $derived(
+    sortRows(rules, ruleAccessor(ruleList.sort.key, triggerLabel), ruleList.sort.dir),
+  );
+  const rulePage = $derived(pageSlice(rulesSorted, ruleList.offset, PAGE));
+
+  // The Channel accessor closes over `channelName`, which reads `channels` — so
+  // renaming a channel re-derives this ordering, as it must, since the column
+  // is ordered by the name it renders.
+  const historySorted = $derived(
+    sortRows(history, alertEventAccessor(historyList.sort.key, channelName), historyList.sort.dir),
+  );
+  const historyPage = $derived(pageSlice(historySorted, historyList.offset, PAGE));
+
+  function onChannelSort(key: string, columnDefault: SortDir) {
+    channelList = setOffsetSort(channelList, key, columnDefault);
+  }
+  function onRuleSort(key: string, columnDefault: SortDir) {
+    ruleList = setOffsetSort(ruleList, key, columnDefault);
+  }
+  function onHistorySort(key: string, columnDefault: SortDir) {
+    historyList = setOffsetSort(historyList, key, columnDefault);
+  }
 
   $effect(() => {
     if (orgId) void load();
@@ -777,18 +862,27 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              <th>Name</th>
-              <th>Type</th>
+              <SortableTh key="name" columnDefault="asc" sort={channelList.sort} onsort={onChannelSort}>
+                Name
+              </SortableTh>
+              <SortableTh key="type" columnDefault="asc" sort={channelList.sort} onsort={onChannelSort}>
+                Type
+              </SortableTh>
+              <!-- Secret is a presence flag rendered as a badge and Actions is
+                   a row of buttons; neither is a value to order by, so both
+                   stay plain. -->
               <th>Secret</th>
-              <th>Status</th>
+              <SortableTh key="status" columnDefault="asc" sort={channelList.sort} onsort={onChannelSort}>
+                Status
+              </SortableTh>
               <th class="num">Actions</th>
             </tr>
           {/snippet}
           {#snippet children()}
-            {#each channels as c (c.id)}
+            {#each channelPage.rows as c (c.id)}
               <tr>
                 <td>{c.name}</td>
-                <td>{KIND_LABELS[c.kind] ?? c.kind}</td>
+                <td>{kindLabel(c.kind)}</td>
                 <td>
                   {#if c.has_secret}
                     <Badge tone="success" size="sm">stored</Badge>
@@ -838,6 +932,23 @@
             {/each}
           {/snippet}
         </DataTable>
+
+        <!-- `total` is the length of the EXACT array handed to `pageSlice`
+             above — `channelsSorted`, the same expression, not "all the
+             channels". A pager measuring a longer list than the one being
+             sliced re-creates the enabled-Next-onto-an-empty-page bug that
+             `Pagination.hasNext` was made a required prop to kill; it is only
+             because they agree that a final page of exactly PAGE rows
+             correctly disables Next. Nothing filters this table — if anything
+             ever does, the filtered array must feed BOTH `pageSlice` and this
+             total, and the filter change must reset the offset with
+             `setOffsetPage(list, 0)`. -->
+        <ClientPager
+          offset={channelList.offset}
+          limit={PAGE}
+          total={channelsSorted.length}
+          onchange={(o) => (channelList = setOffsetPage(channelList, o))}
+        />
       {/if}
     {:else if tab === 'rules'}
       <!-- ---------------- Rules ---------------- -->
@@ -1020,7 +1131,7 @@
                     onclick={() => toggleRuleChannel(c.id)}
                   >
                     {c.name}
-                    <span class="chip-kind">{KIND_LABELS[c.kind] ?? c.kind}</span>
+                    <span class="chip-kind">{kindLabel(c.kind)}</span>
                   </button>
                 {/each}
               </div>
@@ -1060,21 +1171,42 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              <th>Name</th>
-              <th>Trigger</th>
-              <th>Severity</th>
-              <th class="num">Channels</th>
-              <th class="num">Throttle</th>
-              <th>Status</th>
+              <SortableTh key="name" columnDefault="asc" sort={ruleList.sort} onsort={onRuleSort}>
+                Name
+              </SortableTh>
+              <SortableTh key="trigger" columnDefault="asc" sort={ruleList.sort} onsort={onRuleSort}>
+                Trigger
+              </SortableTh>
+              <!-- A RANK, not the word — see `SEVERITY_ORDER` in
+                   `alert-sort.ts`. `columnDefault` is left at `desc` so the
+                   first click leads with `critical`, the same way the count
+                   columns lead with their largest value. -->
+              <SortableTh key="severity" sort={ruleList.sort} onsort={onRuleSort}>
+                Severity
+              </SortableTh>
+              <!-- The brief ruled this column out as a chip list; the chips are
+                   in the rule FORM, and the cell is `r.channel_ids.length` — the
+                   same shape as the mask audit trail's Targets column, which
+                   this slice made sortable. Actions, below, is the genuinely
+                   unsortable one: a row of buttons. -->
+              <SortableTh key="channels" class="num" sort={ruleList.sort} onsort={onRuleSort}>
+                Channels
+              </SortableTh>
+              <SortableTh key="throttle" class="num" sort={ruleList.sort} onsort={onRuleSort}>
+                Throttle
+              </SortableTh>
+              <SortableTh key="status" columnDefault="asc" sort={ruleList.sort} onsort={onRuleSort}>
+                Status
+              </SortableTh>
               <th class="num">Actions</th>
             </tr>
           {/snippet}
           {#snippet children()}
-            {#each rules as r (r.id)}
+            {#each rulePage.rows as r (r.id)}
               <tr>
                 <td>{r.name}</td>
                 <td>
-                  {TRIGGER_LABELS[r.trigger_type] ?? r.trigger_type}
+                  {triggerLabel(r.trigger_type)}
                   {#if r.monitor_id}
                     <span class="muted small">
                       · {monitorOptions.find((m) => m.id === r.monitor_id)?.name ?? 'pinned monitor'}
@@ -1111,6 +1243,15 @@
             {/each}
           {/snippet}
         </DataTable>
+
+        <!-- Same rule as the channels pager: `total` is the length of the very
+             array `pageSlice` was given. -->
+        <ClientPager
+          offset={ruleList.offset}
+          limit={PAGE}
+          total={rulesSorted.length}
+          onchange={(o) => (ruleList = setOffsetPage(ruleList, o))}
+        />
       {/if}
     {:else}
       <!-- ---------------- History ---------------- -->
@@ -1124,15 +1265,26 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              <th>When</th>
-              <th>Title</th>
-              <th>Channel</th>
-              <th>Status</th>
-              <th class="num">Attempts</th>
+              <SortableTh key="when" sort={historyList.sort} onsort={onHistorySort}>When</SortableTh>
+              <SortableTh key="title" columnDefault="asc" sort={historyList.sort} onsort={onHistorySort}>
+                Title
+              </SortableTh>
+              <SortableTh key="channel" columnDefault="asc" sort={historyList.sort} onsort={onHistorySort}>
+                Channel
+              </SortableTh>
+              <!-- `desc` (the default), not `asc`: a RANK — see
+                   `DELIVERY_ORDER` — so the first click leads with the
+                   deliveries that failed rather than the ones that arrived. -->
+              <SortableTh key="status" sort={historyList.sort} onsort={onHistorySort}>
+                Status
+              </SortableTh>
+              <SortableTh key="attempts" class="num" sort={historyList.sort} onsort={onHistorySort}>
+                Attempts
+              </SortableTh>
             </tr>
           {/snippet}
           {#snippet children()}
-            {#each history as h (h.id)}
+            {#each historyPage.rows as h (h.id)}
               <tr>
                 <td class="nowrap">{fmtTime(h.created_at)}</td>
                 <td>
@@ -1141,13 +1293,24 @@
                     <div class="err-detail">{h.error}</div>
                   {/if}
                 </td>
-                <td>{channelName(h.channel_id)}</td>
+                <td>{channelName(h.channel_id) ?? '—'}</td>
                 <td><Badge tone={statusTone(h.status)} size="sm">{h.status}</Badge></td>
                 <td class="num">{h.attempts}</td>
               </tr>
             {/each}
           {/snippet}
         </DataTable>
+
+        <!-- Same rule again. `listAlertEvents(orgId, 50)` caps the fetch at 50
+             rows, so this pager walks what the server sent, not the whole
+             history — the cap is the server's, and the pager measures the
+             array it slices either way. -->
+        <ClientPager
+          offset={historyList.offset}
+          limit={PAGE}
+          total={historySorted.length}
+          onchange={(o) => (historyList = setOffsetPage(historyList, o))}
+        />
       {/if}
     {/if}
   </div>

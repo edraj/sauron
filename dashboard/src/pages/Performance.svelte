@@ -8,6 +8,7 @@
   import DateRange from '../lib/components/DateRange.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
@@ -17,6 +18,9 @@
   import { viewKey } from '../lib/stores/view-cache';
   import { perfSummary, perfSeries } from '../lib/api/performance';
   import { compactNumber, formatMs, formatPercent, latencyTone } from '../lib/utils/format';
+  import { OPERATION_DEFAULT_SORT, operationAccessor } from '../lib/models/performance-sort';
+  import { sortRows } from '../lib/models/sort-rows';
+  import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import type { PerfSummaryRow, PerfSeriesPoint } from '../lib/models';
 
   type BadgeTone = 'neutral' | 'primary' | 'error' | 'warning' | 'success' | 'info' | 'fatal';
@@ -86,6 +90,33 @@
     const opv = op;
     if (aid) void load(aid, days, opv);
   });
+
+  // The table arrives whole — `performance_summary` returns its top 100
+  // operations in one response — so the sort runs over the ENTIRE array the
+  // table renders. No pager: what is on screen is already all of it, and the
+  // tiles above are computed from the same rows.
+  //
+  // A bare `SortState`, not the `OffsetListState` the paginated tables use:
+  // that type exists to make "apply a sort" and "reset to page 1" one
+  // indivisible step, and with no offset there is nothing to reset. Its
+  // `key`/`dir` are `readonly` (see `sort.ts`), so `sort.dir = 'asc'` is a
+  // type error and every transition goes through `toggleSort`.
+  //
+  // The seed reproduces the endpoint's own `ORDER BY count DESC`, so the page
+  // opens exactly as it did and the caret names the column that produced it.
+  let sort = $state<SortState>(OPERATION_DEFAULT_SORT);
+
+  // `sortRows` copies before sorting. That is load-bearing, not tidy: `rows`
+  // is the VERY ARRAY inside the view cache's payload, handed back by
+  // reference (`cached-view.svelte.ts` says so, and `$state.raw` keeps that
+  // identity exact), so an in-place sort would reorder the cached payload for
+  // every later reader and the ordering would survive into the next visit to
+  // this page. No runes machinery prevents that — only copying does.
+  const sortedRows = $derived(sortRows(rows, operationAccessor(sort.key), sort.dir));
+
+  function onsort(key: string, columnDefault: SortDir) {
+    sort = toggleSort(sort, key, columnDefault);
+  }
 
   // --- summary aggregates (client-side across the returned rows) -------------
   const throughput = $derived(rows.reduce((sum, r) => sum + r.count, 0));
@@ -246,18 +277,18 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              <th>Name</th>
-              <th>Op</th>
-              <th class="num">Throughput</th>
-              <th class="num">p50</th>
-              <th class="num">p95</th>
-              <th class="num">p99</th>
-              <th class="num">Avg</th>
-              <th class="num">Error rate</th>
+              <SortableTh key="name" columnDefault="asc" {sort} {onsort}>Name</SortableTh>
+              <SortableTh key="op" columnDefault="asc" {sort} {onsort}>Op</SortableTh>
+              <SortableTh key="throughput" class="num" {sort} {onsort}>Throughput</SortableTh>
+              <SortableTh key="p50" class="num" {sort} {onsort}>p50</SortableTh>
+              <SortableTh key="p95" class="num" {sort} {onsort}>p95</SortableTh>
+              <SortableTh key="p99" class="num" {sort} {onsort}>p99</SortableTh>
+              <SortableTh key="avg" class="num" {sort} {onsort}>Avg</SortableTh>
+              <SortableTh key="error_rate" class="num" {sort} {onsort}>Error rate</SortableTh>
             </tr>
           {/snippet}
           {#snippet children()}
-            {#each rows as r (r.op + '::' + r.name)}
+            {#each sortedRows as r (r.op + '::' + r.name)}
               <tr>
                 <td>
                   <span class="name mono truncate" title={r.name}>{r.name}</span>

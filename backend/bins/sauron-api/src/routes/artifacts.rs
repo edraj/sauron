@@ -342,6 +342,29 @@ pub async fn upload(
         Err(e) => return Err(e.into()),
     };
 
+    // Only the non-deduped path records an upload: the dedupe arm above returns
+    // early having created nothing, and an entry there would claim an artifact
+    // was added when the existing one was reused.
+    let (_, org_id) = repo::app_ancestry(&mut conn, app_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let entry = crate::audit::with_app_scope(
+        &mut conn,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::ARTIFACT_UPLOAD,
+            crate::audit::entity::ARTIFACT,
+        )
+        .target(art.id, art.name.clone().unwrap_or_default())
+        .changes(crate::audit::created(
+            crate::audit::entity::ARTIFACT,
+            &[("name", json!(art.name)), ("kind", json!(art.kind))],
+        )),
+        app_id,
+    )
+    .await;
+    crate::audit::record(&mut conn, auth.user_id, entry).await;
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -400,6 +423,23 @@ pub async fn delete(
     let mut conn = db(&state).await?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ARTIFACT_WRITE).await?;
     if repo::delete_symbol_artifact(&mut conn, app_id, artifact_id).await? {
+        let (_, org_id) = repo::app_ancestry(&mut conn, app_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        // Inside the `true` arm: the `false` arm deleted nothing and returns
+        // 404, so recording there would log a deletion that never happened.
+        let entry = crate::audit::with_app_scope(
+            &mut conn,
+            crate::audit::Entry::new(
+                org_id,
+                crate::audit::action::ARTIFACT_DELETE,
+                crate::audit::entity::ARTIFACT,
+            )
+            .target(artifact_id, ""),
+            app_id,
+        )
+        .await;
+        crate::audit::record(&mut conn, auth.user_id, entry).await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound)

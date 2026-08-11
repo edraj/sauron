@@ -30,18 +30,12 @@ export function describeSession(s: AccountSession): string {
   return 'Unknown device';
 }
 
-/**
- * Current session first, then most recently used.
- *
- * Returns a new array: the caller holds this list in `$state`, and sorting in
- * place would mutate a proxied array during a derivation.
- */
-export function sortSessions(list: AccountSession[]): AccountSession[] {
-  return [...list].sort((a, b) => {
-    if (a.current !== b.current) return a.current ? -1 : 1;
-    return Date.parse(b.last_used_at) - Date.parse(a.last_used_at);
-  });
-}
+// `sortSessions` used to live here — current session first, then most recently
+// used. It is gone rather than deprecated: `Account.svelte` now orders the table
+// through `sortRows` + `account-session-sort.ts`, seeded at `last_used desc`,
+// and a second ordering sitting one import away is a bug waiting for someone to
+// change one of the two. The "current first" rule went with it; the current
+// device is still marked, by its "This device" badge.
 
 /** Live sessions that are not the caller's own — what "Sign out other devices" reaches. */
 export function otherSessionCount(list: AccountSession[]): number {

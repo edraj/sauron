@@ -7,26 +7,45 @@
 // `getWorkflow` (detail view) lands in Task 12 alongside `WorkflowDetail`.
 
 import { api } from './client';
+import { overFetched, type ListPage } from '../models/list-state';
 import type { WorkflowRow, WorkflowRun, WorkflowSpan, WorkflowStatus } from '../models';
 
 export interface ListWorkflowsParams {
+  /** Rows to RENDER; the request asks for one more. See `listWorkflows`. */
+  limit: number;
+  offset: number;
   since_days?: number;
   search?: string;
-  limit?: number;
-  offset?: number;
+  /**
+   * `sort=` as `sortParam()` encodes it — a BARE column descends, a `-` prefix
+   * ascends. Accepts `started`, `name`, `completed`, `cancelled`, `abandoned`,
+   * `completion_rate`, `median_duration_ms`, `p95_duration_ms`, `users`,
+   * `last_seen`; anything else is a 400.
+   *
+   * The unique-user count is `users` ON THE WIRE even though the row field and
+   * the SQL alias are both `unique_users` — sending `unique_users` is a 400.
+   */
+  sort?: string;
 }
 
+/**
+ * One page of workflows, plus whether another page follows.
+ *
+ * Requests `limit + 1` and returns `limit`; the surplus row is the has-more
+ * probe. See `overFetched`.
+ */
 export async function listWorkflows(
   appId: string,
-  opts: ListWorkflowsParams = {},
-): Promise<WorkflowRow[]> {
+  opts: ListWorkflowsParams,
+): Promise<ListPage<WorkflowRow>> {
   const p = new URLSearchParams();
   if (opts.since_days !== undefined) p.set('since_days', String(opts.since_days));
   if (opts.search) p.set('search', opts.search);
-  if (opts.limit !== undefined) p.set('limit', String(opts.limit));
-  if (opts.offset !== undefined) p.set('offset', String(opts.offset));
+  if (opts.sort) p.set('sort', opts.sort);
+  p.set('limit', String(opts.limit + 1));
+  p.set('offset', String(opts.offset));
   const { data } = await api.get<WorkflowRow[]>(`/v1/apps/${appId}/workflows?${p.toString()}`);
-  return data;
+  return overFetched(data, opts.limit);
 }
 
 export interface ListWorkflowRunsParams {

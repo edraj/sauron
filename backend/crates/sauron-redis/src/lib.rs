@@ -12,11 +12,30 @@ use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, AsyncConnectionConfig};
 
 /// Redis key names / conventions in one place.
+/// Default `XADD MAXLEN ~` bound on the ingest stream.
+///
+/// Lives here rather than in `sauron-ingest` because three separate processes
+/// now append to that stream — the edge, the worker's retry drain, and the
+/// API's manual replay — and they are separate binaries that cannot see each
+/// other's parse of `INGEST_STREAM_MAXLEN`. A re-enqueue using a SMALLER bound
+/// than the edge would trim live entries the edge had already answered `202`
+/// to, turning the recovery path into a data-loss path. One constant is what
+/// makes that impossible rather than merely unlikely.
+pub const INGEST_STREAM_MAXLEN_DEFAULT: usize = 1_000_000;
+
 pub mod keys {
     use sha2::{Digest, Sha256};
 
     pub const INGEST_STREAM: &str = "sauron:ingest:stream";
     pub const INGEST_DLQ: &str = "sauron:ingest:dlq";
+    /// Jobs waiting out a retry backoff, scored by the unix-millis instant they
+    /// become due.
+    ///
+    /// A sorted set rather than a stream because the access pattern is "give me
+    /// everything due by now", which is exactly `ZRANGEBYSCORE`. It holds only
+    /// jobs mid-backoff, so it is bounded by the failure *rate*, not by failure
+    /// *history* the way the dead-letter stream is.
+    pub const INGEST_RETRY: &str = "sauron:ingest:retry";
     pub const CONSUMER_GROUP: &str = "workers";
 
     /// Truncated SHA-256 of a DSN public key, so the credential itself never
@@ -272,8 +291,23 @@ impl RedisStore {
 
     /// Enqueue a JSON job onto the ingest stream (trimmed to ~`maxlen`).
     pub async fn xadd_job(&self, payload: &str, maxlen: usize) -> anyhow::Result<String> {
+        self.xadd_job_to(keys::INGEST_STREAM, payload, maxlen).await
+    }
+
+    /// [`xadd_job`](Self::xadd_job) against an arbitrary stream key.
+    ///
+    /// Exists for the same reason `stream_stats` takes its keys as parameters:
+    /// the retry drain's tests must be able to exercise the real re-enqueue
+    /// path without appending synthetic payloads to the live ingest stream, and
+    /// without two concurrent tests sharing one key and clobbering each other.
+    pub async fn xadd_job_to(
+        &self,
+        stream_key: &str,
+        payload: &str,
+        maxlen: usize,
+    ) -> anyhow::Result<String> {
         let mut ids = self
-            .xadd_jobs(std::slice::from_ref(&payload), maxlen)
+            .xadd_jobs_to(stream_key, std::slice::from_ref(&payload), maxlen)
             .await?;
         // Exactly one command went out, so exactly one reply came back; the
         // per-entry error is flattened into the outer one for this shape.
@@ -311,6 +345,17 @@ impl RedisStore {
         payloads: &[&str],
         maxlen: usize,
     ) -> anyhow::Result<Vec<redis::RedisResult<String>>> {
+        self.xadd_jobs_to(keys::INGEST_STREAM, payloads, maxlen)
+            .await
+    }
+
+    /// [`xadd_jobs`](Self::xadd_jobs) against an arbitrary stream key.
+    pub async fn xadd_jobs_to(
+        &self,
+        stream_key: &str,
+        payloads: &[&str],
+        maxlen: usize,
+    ) -> anyhow::Result<Vec<redis::RedisResult<String>>> {
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
@@ -318,7 +363,7 @@ impl RedisStore {
         pipe.ignore_errors();
         for payload in payloads {
             pipe.cmd("XADD")
-                .arg(keys::INGEST_STREAM)
+                .arg(stream_key)
                 .arg("MAXLEN")
                 .arg("~")
                 .arg(maxlen)
@@ -543,6 +588,138 @@ impl RedisStore {
         Ok(removed.max(0) as u64)
     }
 
+    // --- retry backoff -----------------------------------------------------
+
+    /// Park a job until `due_at_ms`, so a transient failure gets another go.
+    ///
+    /// The caller MUST have acked the job's stream entry before calling this.
+    /// Leaving it in the pending list would let `claim_stale` reclaim it after
+    /// `RECLAIM_IDLE_MS` — 60s, i.e. almost exactly when the drain re-injects
+    /// it — and every transient failure would double-write.
+    pub async fn retry_schedule(&self, member: &str, due_at_ms: i64) -> anyhow::Result<()> {
+        self.retry_schedule_to(keys::INGEST_RETRY, member, due_at_ms)
+            .await
+    }
+
+    /// [`retry_schedule`] against an arbitrary key — see [`dlq_push_to`] for why
+    /// these variants exist: a test must be able to drive the backoff set
+    /// without touching the live one.
+    ///
+    /// [`retry_schedule`]: Self::retry_schedule
+    /// [`dlq_push_to`]: Self::dlq_push_to
+    pub async fn retry_schedule_to(
+        &self,
+        key: &str,
+        member: &str,
+        due_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let mut c = self.conn.clone();
+        redis::cmd("ZADD")
+            .arg(key)
+            .arg(due_at_ms)
+            .arg(member)
+            .query_async::<()>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    /// Take up to `limit` jobs that are due, removing them from the set.
+    ///
+    /// Read-then-remove rather than a single atomic pop, because there is no
+    /// Redis primitive that pops from a ZSET *and* appends to a stream. The
+    /// caller re-enqueues each member and only then calls [`retry_forget`], so
+    /// a crash mid-drain costs a duplicate rather than a lost job — the correct
+    /// side to fail toward for an ingest pipeline.
+    ///
+    /// `limit` is what keeps one mass failure from turning a single tick into
+    /// an unbounded re-injection storm.
+    pub async fn retry_due(&self, now_ms: i64, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.retry_due_from(keys::INGEST_RETRY, now_ms, limit).await
+    }
+
+    /// [`retry_due`](Self::retry_due) against an arbitrary key.
+    pub async fn retry_due_from(
+        &self,
+        key: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut c = self.conn.clone();
+        let due: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(key)
+            .arg(0)
+            .arg(now_ms)
+            .arg("LIMIT")
+            .arg(0)
+            .arg(limit)
+            .query_async(&mut c)
+            .await?;
+        Ok(due)
+    }
+
+    /// Drop a member once it has been successfully re-enqueued.
+    pub async fn retry_forget(&self, member: &str) -> anyhow::Result<()> {
+        self.retry_forget_from(keys::INGEST_RETRY, member).await
+    }
+
+    /// [`retry_forget`](Self::retry_forget) against an arbitrary key.
+    pub async fn retry_forget_from(&self, key: &str, member: &str) -> anyhow::Result<()> {
+        let mut c = self.conn.clone();
+        redis::cmd("ZREM")
+            .arg(key)
+            .arg(member)
+            .query_async::<()>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    /// Count one failed attempt for a job, returning the running total.
+    ///
+    /// The attempt count cannot travel with the job. A drained retry is
+    /// re-injected onto the ingest stream as an ordinary payload, and teaching
+    /// the stream format to carry a counter would change the decode path every
+    /// healthy event takes, for the benefit of the rare failing one. So the
+    /// count lives beside the job, keyed by a hash of its bytes.
+    ///
+    /// Without this the retry loop is INFINITE: every re-injected job would
+    /// fail at attempt 1 forever, and a permanently-broken payload would cycle
+    /// through the backoff set for as long as the deployment lives.
+    ///
+    /// `INCR` then `EXPIRE`, pipelined. The TTL is what makes the key
+    /// self-cleaning — a job that succeeds on retry never comes back to clear
+    /// its counter, so the counter has to forget on its own.
+    pub async fn bump_attempt(&self, job_hash: &str, ttl_secs: u64) -> anyhow::Result<i32> {
+        let key = format!("sauron:ingest:att:{job_hash}");
+        let mut c = self.conn.clone();
+        let mut pipe = redis::pipe();
+        pipe.cmd("INCR").arg(&key);
+        pipe.cmd("EXPIRE").arg(&key).arg(ttl_secs).ignore();
+        let (n,): (i32,) = pipe.query_async(&mut c).await?;
+        Ok(n)
+    }
+
+    /// Forget a job's attempt count, once it has succeeded or gone terminal.
+    pub async fn clear_attempt(&self, job_hash: &str) -> anyhow::Result<()> {
+        let mut c = self.conn.clone();
+        redis::cmd("DEL")
+            .arg(format!("sauron:ingest:att:{job_hash}"))
+            .query_async::<()>(&mut c)
+            .await?;
+        Ok(())
+    }
+
+    /// How many jobs are currently waiting out a backoff. For the gauge.
+    pub async fn retry_depth(&self) -> anyhow::Result<u64> {
+        self.retry_depth_of(keys::INGEST_RETRY).await
+    }
+
+    /// [`retry_depth`](Self::retry_depth) against an arbitrary key.
+    pub async fn retry_depth_of(&self, key: &str) -> anyhow::Result<u64> {
+        let mut c = self.conn.clone();
+        let n: u64 = redis::cmd("ZCARD").arg(key).query_async(&mut c).await?;
+        Ok(n)
+    }
+
     // --- stream observability ---------------------------------------------
 
     /// A strictly read-only reading of a stream, its consumer group and a
@@ -577,11 +754,28 @@ impl RedisStore {
         group: &str,
         dlq_key: &str,
     ) -> anyhow::Result<StreamSnapshot> {
+        self.stream_stats_with_retry(stream_key, group, dlq_key, keys::INGEST_RETRY)
+            .await
+    }
+
+    /// [`stream_stats`](Self::stream_stats) with the backoff set named
+    /// explicitly, so a test can probe its own keys.
+    pub async fn stream_stats_with_retry(
+        &self,
+        stream_key: &str,
+        group: &str,
+        dlq_key: &str,
+        retry_key: &str,
+    ) -> anyhow::Result<StreamSnapshot> {
         let mut pipe = redis::pipe();
         pipe.ignore_errors();
         pipe.cmd("XINFO").arg("STREAM").arg(stream_key);
         pipe.cmd("XINFO").arg("GROUPS").arg(stream_key);
         pipe.cmd("XLEN").arg(dlq_key);
+        // Folded into the SAME pipeline rather than a separate round trip: this
+        // probe runs on the metrics path, and an extra RTT there is paid on
+        // every scrape forever.
+        pipe.cmd("ZCARD").arg(retry_key);
 
         let mut c = self.conn.clone();
         let replies: Vec<redis::RedisResult<redis::Value>> = pipe.query_async(&mut c).await?;
@@ -626,6 +820,10 @@ impl RedisStore {
                     }
                 }
             }
+        }
+
+        if let Some(v) = reply(3) {
+            stats.retry_length = as_u64(v).unwrap_or(0);
         }
 
         if let Some(v) = reply(2) {
@@ -909,6 +1107,172 @@ mod hll_tests {
             .unwrap();
     }
 
+    // --- retry backoff, against a real Redis -----------------------------
+
+    /// Only jobs whose due time has passed come back, and taking them does not
+    /// remove them — the drain removes each one only after re-enqueueing it.
+    #[tokio::test]
+    async fn retry_due_returns_only_what_is_due_and_removes_nothing() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:retry:{}", uuid::Uuid::new_v4());
+        let now = 1_700_000_000_000i64;
+
+        redis
+            .retry_schedule_to(&key, "due-a", now - 1000)
+            .await
+            .unwrap();
+        redis.retry_schedule_to(&key, "due-b", now).await.unwrap();
+        redis
+            .retry_schedule_to(&key, "later", now + 60_000)
+            .await
+            .unwrap();
+
+        let due = redis.retry_due_from(&key, now, 10).await.unwrap();
+        assert_eq!(
+            due.len(),
+            2,
+            "the future job must not be handed back: {due:?}"
+        );
+        assert!(due.contains(&"due-a".to_string()));
+        assert!(due.contains(&"due-b".to_string()));
+
+        // Read must not consume. If it did, a crash between the read and the
+        // re-enqueue would lose the job outright rather than duplicate it.
+        assert_eq!(redis.retry_depth_of(&key).await.unwrap(), 3);
+
+        redis.retry_forget_from(&key, "due-a").await.unwrap();
+        assert_eq!(redis.retry_depth_of(&key).await.unwrap(), 2);
+
+        let mut c = redis.conn.clone();
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// The per-tick ceiling actually binds. Without it, one mass transient
+    /// failure turns the first tick afterwards into a re-injection storm that
+    /// recreates the outage it is recovering from.
+    #[tokio::test]
+    async fn retry_due_respects_its_limit() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:retry:{}", uuid::Uuid::new_v4());
+        let now = 1_700_000_000_000i64;
+        for i in 0..25 {
+            redis
+                .retry_schedule_to(&key, &format!("m{i}"), now - 1)
+                .await
+                .unwrap();
+        }
+        assert_eq!(redis.retry_due_from(&key, now, 10).await.unwrap().len(), 10);
+        assert_eq!(
+            redis.retry_due_from(&key, now, 100).await.unwrap().len(),
+            25
+        );
+
+        let mut c = redis.conn.clone();
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A sorted set keys on the MEMBER, so two byte-identical payloads would
+    /// collapse into one and the second event would be silently dropped. This
+    /// is why the parked envelope carries a nonce — asserted here against a
+    /// real Redis rather than inferred from the serializer.
+    #[tokio::test]
+    async fn identical_members_collapse_which_is_why_the_nonce_exists() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = format!("sauron:test:retry:{}", uuid::Uuid::new_v4());
+        let now = 1_700_000_000_000i64;
+
+        redis
+            .retry_schedule_to(&key, "same-bytes", now)
+            .await
+            .unwrap();
+        redis
+            .retry_schedule_to(&key, "same-bytes", now)
+            .await
+            .unwrap();
+        assert_eq!(
+            redis.retry_depth_of(&key).await.unwrap(),
+            1,
+            "identical members DO collapse — the nonce in `retry::Parked` is \
+             what keeps two identical payloads from becoming one"
+        );
+
+        redis
+            .retry_schedule_to(&key, "{\"n\":\"1\",\"d\":\"x\"}", now)
+            .await
+            .unwrap();
+        redis
+            .retry_schedule_to(&key, "{\"n\":\"2\",\"d\":\"x\"}", now)
+            .await
+            .unwrap();
+        assert_eq!(redis.retry_depth_of(&key).await.unwrap(), 3);
+
+        let mut c = redis.conn.clone();
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// The guard against an infinite retry loop: the counter must actually
+    /// increment across calls, and must carry a TTL so a job that succeeds on
+    /// retry (and so never comes back to clear it) cannot leak a key forever.
+    #[tokio::test]
+    async fn attempt_counter_increments_and_expires() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let hash = format!("test{}", uuid::Uuid::new_v4().simple());
+
+        assert_eq!(redis.bump_attempt(&hash, 900).await.unwrap(), 1);
+        assert_eq!(redis.bump_attempt(&hash, 900).await.unwrap(), 2);
+        assert_eq!(redis.bump_attempt(&hash, 900).await.unwrap(), 3);
+
+        let mut c = redis.conn.clone();
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(format!("sauron:ingest:att:{hash}"))
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(
+            ttl > 0 && ttl <= 900,
+            "the counter must expire on its own (ttl was {ttl}); a -1 here means \
+             every job that ever failed leaks a key for the life of the server"
+        );
+
+        // A distinct job must not inherit another's attempts.
+        let other = format!("test{}", uuid::Uuid::new_v4().simple());
+        assert_eq!(redis.bump_attempt(&other, 900).await.unwrap(), 1);
+
+        redis.clear_attempt(&hash).await.unwrap();
+        assert_eq!(
+            redis.bump_attempt(&hash, 900).await.unwrap(),
+            1,
+            "clearing must reset, or a later identical payload starts terminal"
+        );
+
+        redis.clear_attempt(&hash).await.unwrap();
+        redis.clear_attempt(&other).await.unwrap();
+    }
+
     async fn store() -> Option<RedisStore> {
         let url = std::env::var("TEST_REDIS_URL").ok()?;
         RedisStore::connect(&url).await.ok()
@@ -1159,6 +1523,60 @@ mod hll_tests {
 #[cfg(test)]
 mod stream_stats_tests {
     use super::*;
+
+    /// The backoff-set depth must come from the RIGHT pipeline reply.
+    ///
+    /// `ZCARD` was appended as the fourth command, so it is read at index 3. An
+    /// off-by-one here does not error — it silently reports the DLQ's length as
+    /// the retry depth (or zero), which is a plausible number that would send an
+    /// operator hunting the wrong tier during an incident.
+    #[tokio::test]
+    async fn retry_length_reads_the_backoff_set_not_the_dlq() {
+        let Some(redis) = store().await else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let key = unique("stream");
+        let dlq = unique("dlq");
+        let retry = unique("retry");
+        let group = "test-workers";
+
+        // Deliberately DIFFERENT counts in every key, so a mixed-up index
+        // cannot coincidentally produce the right answer.
+        let mut c0 = redis.conn.clone();
+        let _: String = redis::cmd("XADD")
+            .arg(&key)
+            .arg("*")
+            .arg("d")
+            .arg("{}")
+            .query_async(&mut c0)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            redis
+                .dlq_push_to(&dlq, &format!("{{\"i\":{i}}}"), 100)
+                .await
+                .unwrap();
+        }
+        for i in 0..7 {
+            redis
+                .retry_schedule_to(&retry, &format!("m{i}"), 1_700_000_000_000)
+                .await
+                .unwrap();
+        }
+
+        let s = redis
+            .stream_stats_with_retry(&key, group, &dlq, &retry)
+            .await
+            .unwrap();
+        assert_eq!(s.dlq_length, 3, "dlq_length must still be the DLQ");
+        assert_eq!(s.retry_length, 7, "retry_length must be the backoff set");
+
+        let mut c = redis.conn.clone();
+        for k in [&key, &dlq, &retry] {
+            let _: () = redis::cmd("DEL").arg(k).query_async(&mut c).await.unwrap();
+        }
+    }
 
     /// Every key this module touches carries a per-test UUID, so it can run
     /// against a shared Redis without going anywhere near

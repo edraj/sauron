@@ -70,7 +70,10 @@ pub async fn storage(
 /// In a multi-tenant one it correctly refuses a single-tenant admin. A deployment
 /// with zero orgs is refused rather than trivially satisfied — `0 >= 0` would
 /// otherwise let any authenticated user through on a fresh install.
-async fn require_deployment_admin(state: &AppState, auth: &AuthUser) -> Result<(), ApiError> {
+pub(crate) async fn require_deployment_admin(
+    state: &AppState,
+    auth: &AuthUser,
+) -> Result<(), ApiError> {
     let mut conn = crate::routes::db(state).await?;
     let held = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ORG_MANAGE).await?;
     let total = repo::count_all_orgs(&mut conn).await?;
@@ -227,6 +230,25 @@ pub async fn set_tier_policy(
             repo::delete_runtime_setting(&mut conn, repo::TIER_HOT_DAYS_KEY).await?;
         }
     }
+
+    // Deployment-wide: this one value decides when EVERY tenant's data leaves
+    // Postgres, so it is recorded into every org's trail rather than one.
+    crate::audit::record_all_orgs(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            uuid::Uuid::nil(),
+            crate::audit::action::TIER_POLICY_UPDATE,
+            crate::audit::entity::TIER,
+        )
+        .target_named("cold-tier rotation age")
+        .changes(crate::audit::created(
+            crate::audit::entity::TIER,
+            &[("hot_days", serde_json::json!(body.hot_days))],
+        )),
+    )
+    .await;
+
     drop(conn);
     get_tier_policy(auth, State(state)).await
 }
@@ -360,6 +382,25 @@ pub async fn create_restore(
         Some(auth.user_id),
     )
     .await?;
+
+    crate::audit::record_all_orgs(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            uuid::Uuid::nil(),
+            crate::audit::action::TIER_RESTORE_CREATE,
+            crate::audit::entity::TIER,
+        )
+        .target(job.id, &body.table_name)
+        .changes(crate::audit::created(
+            crate::audit::entity::TIER,
+            &[
+                ("table_name", serde_json::json!(body.table_name)),
+                ("expires_at", serde_json::json!(job.pin_expires_at)),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(job.into()))
 }
 
@@ -406,11 +447,34 @@ pub async fn release_pin(
     require_deployment_admin(&state, &auth).await?;
     let mut conn = crate::routes::db(&state).await?;
     match repo::release_tier_pin(&mut conn, id).await? {
-        Some(e) => Ok(Json(ReleasedPin {
-            id: e.id,
-            table_name: e.table_name,
-            rows_deleted: e.rows_deleted,
-        })),
+        Some(e) => {
+            // Releasing a pin DELETES the restored rows. That is the most
+            // destructive operation this endpoint set offers, so the row count
+            // is part of the record.
+            crate::audit::record_all_orgs(
+                &mut conn,
+                auth.user_id,
+                crate::audit::Entry::new(
+                    uuid::Uuid::nil(),
+                    crate::audit::action::TIER_PIN_RELEASE,
+                    crate::audit::entity::TIER,
+                )
+                .target(e.id, &e.table_name)
+                .changes(crate::audit::created(
+                    crate::audit::entity::TIER,
+                    &[
+                        ("table_name", serde_json::json!(e.table_name)),
+                        ("rows_deleted", serde_json::json!(e.rows_deleted)),
+                    ],
+                )),
+            )
+            .await;
+            Ok(Json(ReleasedPin {
+                id: e.id,
+                table_name: e.table_name,
+                rows_deleted: e.rows_deleted,
+            }))
+        }
         None => Err(ApiError::NotFound),
     }
 }
@@ -439,7 +503,27 @@ pub async fn extend_pin(
     let mut conn = crate::routes::db(&state).await?;
     let new_expiry = chrono::Utc::now() + chrono::Duration::days(body.days);
     match repo::extend_tier_pin(&mut conn, id, new_expiry).await? {
-        Some(p) => Ok(Json(TierPinView::from_pin(p, chrono::Utc::now()))),
+        Some(p) => {
+            crate::audit::record_all_orgs(
+                &mut conn,
+                auth.user_id,
+                crate::audit::Entry::new(
+                    uuid::Uuid::nil(),
+                    crate::audit::action::TIER_PIN_EXTEND,
+                    crate::audit::entity::TIER,
+                )
+                .target(p.id, &p.table_name)
+                .changes(crate::audit::created(
+                    crate::audit::entity::TIER,
+                    &[
+                        ("table_name", serde_json::json!(p.table_name)),
+                        ("expires_at", serde_json::json!(new_expiry)),
+                    ],
+                )),
+            )
+            .await;
+            Ok(Json(TierPinView::from_pin(p, chrono::Utc::now())))
+        }
         None => Err(ApiError::NotFound),
     }
 }

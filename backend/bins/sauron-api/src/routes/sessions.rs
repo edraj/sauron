@@ -11,10 +11,76 @@ use uuid::Uuid;
 use sauron_auth::{perm, AuthUser};
 use sauron_db::models::{AnalyticsEvent, ErrorEvent, Session, Transaction};
 use sauron_db::repo;
+use sauron_db::repo::SortSpec;
 
 use super::db;
 use crate::error::ApiError;
 use crate::AppState;
+
+/// `sessions.id` is the table's primary key, so it is unique across any result
+/// set this list can produce. Every ordering in [`list`] appends it, which is
+/// what makes OFFSET paging total — before this the list had no tiebreaker at
+/// all.
+const SESSION_TIEBREAK: &str = "id";
+
+/// What `?sort=` accepts on [`list`] — six of the seven columns the Sessions
+/// table displays.
+///
+/// The seventh is **Session** itself, the `session_key` cell, and it is left
+/// out on purpose: it renders an opaque key that no user orders by, and the
+/// `an_unlisted_column_is_refused` test below pins `session_id` as refused.
+/// The design spec listed it as sortable, which was wrong and is corrected —
+/// wiring a header for it would 400 the page.
+///
+/// `last_event_at`, the *old* hard-coded ordering, is deliberately absent for
+/// a different reason: it is not a displayed column at all, so a user who
+/// sorted away from it could never click their way back.
+const SESSION_SORTS: &[&str] = &[
+    "started_at",
+    "distinct_id",
+    "device_key",
+    "duration_ms",
+    "events_count",
+    "errors_count",
+];
+
+/// The wire `?sort=` value for the sessions list, resolved to a validated
+/// [`SortSpec`].
+///
+/// A free function, not inlined into [`list`], for the reason
+/// `devices::device_sort_spec`'s doc comment gives: an arm naming a
+/// valid-but-WRONG column compiles, returns 200, and sorts by the wrong data.
+/// Lifting it here is what lets `mod tests` below pin every arm without a
+/// database.
+///
+/// The `&'static str` on the right of each arm is what reaches the SQL; the
+/// `String` `parse_sort` returns never does — see [`SortSpec`]'s doc comment.
+///
+/// Bare column names, unqualified: the query is a single-table read of
+/// `sessions` with no joins, so there is nothing to qualify against.
+pub(crate) fn session_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> {
+    let (column, descending) = super::search::parse_sort(raw, SESSION_SORTS, "started_at")?;
+    let (column, nulls_last) = match column.as_str() {
+        "distinct_id" => ("distinct_id", true),
+        "device_key" => ("device_key", true),
+        // There is no stored duration. The table renders
+        // `last_event_at - started_at`; ordering by the interval itself sorts
+        // identically to the milliseconds the dashboard formats, without a
+        // float conversion. Both operands are NOT NULL, so the difference is
+        // too.
+        "duration_ms" => ("(last_event_at - started_at)", false),
+        "events_count" => ("events_count", false),
+        "errors_count" => ("errors_count", false),
+        // `parse_sort` refused everything else, so this is the default.
+        _ => ("started_at", false),
+    };
+    Ok(SortSpec {
+        column,
+        descending,
+        tiebreak: SESSION_TIEBREAK,
+        nulls_last,
+    })
+}
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -26,6 +92,9 @@ pub struct ListQuery {
     pub offset: i64,
     pub distinct_id: Option<String>,
     pub device_key: Option<String>,
+    /// A column name from [`SESSION_SORTS`], optionally `-`-prefixed to
+    /// ascend. Absent means `started_at` descending.
+    pub sort: Option<String>,
     // `environment_id` is deliberately NOT a field here — it is read from the
     // raw query string via `RawQuery` + `scope::authorized_read_scope`
     // instead of this `Query<T>` extractor. See `routes::scope`'s module docs
@@ -57,6 +126,7 @@ pub async fn list(
     .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
     let limit = q.limit.clamp(1, 200);
+    let sort = session_sort_spec(q.sort.as_deref())?;
     Ok(Json(
         repo::list_sessions(
             &mut conn,
@@ -64,6 +134,7 @@ pub async fn list(
             since,
             limit,
             super::clamp_offset(q.offset),
+            sort,
             q.distinct_id.as_deref(),
             q.device_key.as_deref(),
         )
@@ -189,4 +260,125 @@ pub async fn detail(
     timeline.sort_by_key(|i| i.at());
 
     Ok(Json(SessionDetail { session, timeline }))
+}
+
+#[cfg(test)]
+mod session_sort_tests {
+    use super::*;
+
+    /// `(wire name, expected column, expected nulls_last)` for [`list`].
+    ///
+    /// Written out rather than derived from the name. Only one entry is not
+    /// its own wire name: `duration_ms` has no stored column and resolves to
+    /// the interval expression.
+    const SESSION_EXPECTED: &[(&str, &str, bool)] = &[
+        ("started_at", "started_at", false),
+        ("distinct_id", "distinct_id", true),
+        ("device_key", "device_key", true),
+        ("duration_ms", "(last_event_at - started_at)", false),
+        ("events_count", "events_count", false),
+        ("errors_count", "errors_count", false),
+    ];
+
+    /// The finding this exists for: an arm mapping a whitelisted name to a
+    /// valid-but-wrong column (`"started_at" => "last_event_at"` — both real
+    /// `sessions` columns, and near-identical on most rows) compiles, returns
+    /// 200, and silently sorts by the wrong data.
+    #[test]
+    fn every_whitelisted_name_maps_to_its_own_column() {
+        for (name, column, nulls_last) in SESSION_EXPECTED {
+            let spec = session_sort_spec(Some(name)).expect("whitelisted");
+            assert_eq!(spec.column, *column, "session sort `{name}` mapped wrong");
+            assert_eq!(
+                spec.nulls_last, *nulls_last,
+                "session sort `{name}`: wrong nulls_last"
+            );
+            assert_eq!(spec.tiebreak, SESSION_TIEBREAK, "session sort `{name}`");
+        }
+    }
+
+    /// A column added to `SESSION_SORTS` without a matching arm falls through
+    /// to `_ =>` and sorts by `started_at` — a 200 and a wrong table.
+    #[test]
+    fn the_expected_table_covers_exactly_the_whitelist() {
+        let names: Vec<&str> = SESSION_EXPECTED.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(names, SESSION_SORTS.to_vec());
+    }
+
+    #[test]
+    fn no_two_sort_names_share_a_column() {
+        let mut columns: Vec<&str> = SESSION_SORTS
+            .iter()
+            .map(|n| session_sort_spec(Some(n)).expect("whitelisted").column)
+            .collect();
+        let total = columns.len();
+        columns.sort_unstable();
+        columns.dedup();
+        assert_eq!(
+            columns.len(),
+            total,
+            "two sort names resolved to the same column: {columns:?}"
+        );
+    }
+
+    /// The two nullable columns must pin NULLS LAST, and the rest must not:
+    /// `sessions.distinct_id`/`device_key` are both nullable, and without the
+    /// pin an ascending sort would float every anonymous session to the top.
+    #[test]
+    fn only_the_nullable_columns_pin_nulls_last() {
+        for name in ["distinct_id", "device_key"] {
+            let spec = session_sort_spec(Some(name)).expect("whitelisted");
+            assert!(
+                spec.nulls_last,
+                "`{name}` is nullable and must pin NULLS LAST"
+            );
+            assert!(spec.order_by().contains(" NULLS LAST,"));
+        }
+        for name in ["started_at", "duration_ms", "events_count", "errors_count"] {
+            let spec = session_sort_spec(Some(name)).expect("whitelisted");
+            assert!(!spec.nulls_last, "`{name}` is NOT NULL — no NULLS LAST");
+        }
+    }
+
+    #[test]
+    fn a_dash_prefix_ascends_and_the_tiebreak_does_not_follow() {
+        let desc = session_sort_spec(Some("events_count")).expect("bare");
+        assert!(desc.descending);
+        let asc = session_sort_spec(Some("-events_count")).expect("dash");
+        assert!(!asc.descending);
+        assert_eq!(desc.column, asc.column);
+        assert!(desc.order_by().ends_with(", id ASC"));
+        assert!(asc.order_by().ends_with(", id ASC"));
+    }
+
+    /// The default is `started_at`, NOT the `last_event_at` this list used to
+    /// order by. Pinned so the change cannot be undone silently — see
+    /// `repo::list_sessions`' doc comment for why it moved.
+    #[test]
+    fn absent_means_started_at_not_the_old_last_event_at() {
+        for raw in [None, Some(""), Some("  ")] {
+            let spec = session_sort_spec(raw).expect("default");
+            assert_eq!(spec.column, "started_at");
+            assert!(spec.descending);
+            assert_eq!(spec.tiebreak, SESSION_TIEBREAK);
+        }
+    }
+
+    /// `last_event_at` is the trap worth pinning: it is a real `sessions`
+    /// column and the list's own former ordering, so accepting it would look
+    /// entirely reasonable — but it is not a column the table displays.
+    #[test]
+    fn an_unlisted_column_is_refused() {
+        for bad in [
+            "started_at; DROP TABLE sessions",
+            "last_event_at",
+            "session_id",
+            "ip_address",
+        ] {
+            assert!(
+                session_sort_spec(Some(bad)).is_err(),
+                "the sessions list must refuse `{bad}`"
+            );
+        }
+    }
 }

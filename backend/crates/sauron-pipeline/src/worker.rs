@@ -49,6 +49,24 @@ fn dlq_retention() -> Duration {
     })
 }
 
+/// The ingest stream's `MAXLEN`, as the retry drain needs it to re-enqueue.
+///
+/// Read here as well as in `sauron-ingest` because the two binaries are
+/// separate processes and neither can see the other's parse. The default MUST
+/// match `sauron-ingest`'s: a drain that re-enqueued with a smaller bound would
+/// trim live entries the edge had already answered `202` to, turning a recovery
+/// mechanism into a data-loss one.
+fn stream_maxlen() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("INGEST_STREAM_MAXLEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(sauron_redis::INGEST_STREAM_MAXLEN_DEFAULT)
+    })
+}
+
 /// Trim aged dead-letter entries. Runs on one worker, periodically.
 pub async fn reap_dlq_once(redis: &RedisStore) {
     match redis.dlq_reap(dlq_retention()).await {
@@ -249,6 +267,16 @@ async fn worker_loop(
             // whose oldest entry is newer than the cutoff is O(1).
             if consumer == "worker-0" {
                 reap_dlq_once(&redis).await;
+                // Put transient failures back. Same tick, same single-worker
+                // rule, and for the same reason: N workers draining would be
+                // correct but would race for the same members and log the same
+                // logical event N times.
+                //
+                // This is the only thing that moves a parked job, so a stopped
+                // worker means retries never resume — the same "bounds only
+                // hold while code runs" property the dead-letter reaper has.
+                crate::retry::drain_due(&redis, now_ms(), stream_maxlen()).await;
+                crate::failures::reap_once(&pool).await;
             }
         }
 
@@ -348,13 +376,40 @@ async fn process_entries(
         let batch = match decode_entry(&payload) {
             Ok(b) => b,
             Err(e) => {
-                warn!(consumer, id, error = %e, "malformed job; dead-lettering");
-                // Not discarded: `dead_letter` acks only if the DLQ write
-                // succeeded, so an error here means the entry is still pending
-                // and will be redelivered rather than silently dropped.
-                if let Err(de) = redis.dead_letter(&id, &payload, dlq_maxlen()).await {
-                    error!(consumer, id, error = %de, "DLQ write FAILED for a malformed entry; it stays pending");
-                    sauron_telemetry::metrics::dlq_write_failures(1);
+                warn!(consumer, id, error = %e, "malformed job; recording as a permanent failure");
+                // Never retried, and that is the point of classifying at all:
+                // malformed JSON cannot become valid JSON, so three attempts a
+                // minute apart would spend three minutes reaching a
+                // guaranteed-identical result.
+                //
+                // No app_id — the payload never decoded, so there is nothing to
+                // attribute it to. Those groups are visible only to a
+                // deployment admin, which is why the page is gated that way.
+                let recorded = crate::failures::record(
+                    pool,
+                    redis,
+                    dlq_maxlen(),
+                    crate::failures::Terminal {
+                        class: crate::classify::DECODE_FAILURE,
+                        message: &e.to_string(),
+                        payload: &payload,
+                        attempts: 0,
+                        org_id: None,
+                        project_id: None,
+                        app_id: None,
+                    },
+                )
+                .await;
+                if recorded {
+                    // Acked only now. An unrecorded entry stays pending and is
+                    // redelivered, which is the last thing standing between a
+                    // malformed payload and silent loss.
+                    let _ = redis.ack(&id).await;
+                } else {
+                    error!(
+                        consumer,
+                        id, "malformed entry recorded NOWHERE; it stays pending"
+                    );
                 }
                 // Counted in ENTRIES, not items: the payload did not decode, so
                 // how many items it carried is not knowable here. That is why
@@ -465,36 +520,92 @@ async fn process_one_by_one(
         // for `INGEST_DLQ_RETENTION_HOURS`, so it is a second copy of the event
         // living outside every retention window the product otherwise honours.
         let masked_payload = serde_json::to_string(&d.job).unwrap_or_default();
-        // Set when an item's DLQ write failed. The entry must NOT be acked in
-        // that case: acking would retire the only remaining copy of an event
-        // that is neither in Postgres nor in the DLQ. See below.
-        let mut dlq_write_failed = false;
+        // Captured before `process_job` consumes the job: a failure row is
+        // filed against the app it came from, and by then the ids are gone.
+        let (org_id, project_id, app_id) = (d.job.org_id, d.job.project_id, d.job.app_id);
+        // Set when an item could not be durably recorded ANYWHERE. The entry
+        // must NOT be acked in that case: acking would retire the only
+        // remaining copy of an event that is in neither Postgres nor Redis.
+        let mut record_failed = false;
         // Counted per ITEM here, which is the granularity this path works at.
         match process_job(pool, redis, sym, &d.masks, d.job).await {
             Ok(()) => sauron_telemetry::metrics::items_persisted(1),
             Err(e) => {
-                warn!(consumer, id = d.id, error = %e, "job processing failed; dead-lettering");
-                // Deliberately NOT `dead_letter`, which acks: one failing item
-                // must not retire the entry while its siblings are still
-                // unwritten. A crash before the tail then replays the whole
-                // envelope — duplicate writes rather than a silent partial loss.
-                match redis.dlq_push(&masked_payload, dlq_maxlen()).await {
-                    Ok(()) => sauron_telemetry::metrics::items_deadlettered(1),
-                    Err(de) => {
-                        // The result used to be discarded with `let _ =`. That
-                        // made the DLQ advisory: Redis rejects the write (OOM,
-                        // a failover mid-command, the stream at a hard limit),
-                        // the entry is acked a few lines below anyway, and the
-                        // event is gone from Postgres, the stream AND the DLQ
-                        // with nothing recording that it existed. Dead-lettering
-                        // is only a safety net if failing to write to it is
-                        // treated as a failure.
+                let class = crate::classify::classify(&e);
+                let hash = crate::retry::job_hash(&masked_payload);
+                // One round trip, and only on the failing path. The count
+                // cannot ride along with the job: a re-injected retry re-enters
+                // as an ordinary stream payload, so without a counter beside it
+                // every attempt would look like the first and the loop would
+                // never terminate.
+                let attempt = match redis
+                    .bump_attempt(&hash, crate::retry::ATTEMPT_TTL_SECS)
+                    .await
+                {
+                    Ok(n) => n,
+                    Err(be) => {
+                        // Fail toward terminal, not toward infinite retry: an
+                        // unknown attempt count that defaulted to "1" would
+                        // re-park this job forever every time Redis was unwell.
+                        warn!(consumer, id = d.id, error = %be, "attempt counter unavailable; treating as terminal");
+                        crate::classify::MAX_ATTEMPTS
+                    }
+                };
+
+                if class.is_transient() && attempt < crate::classify::MAX_ATTEMPTS {
+                    warn!(
+                        consumer, id = d.id, attempt, kind = class.error_kind, error = %e,
+                        "transient job failure; parking for retry"
+                    );
+                    if let Err(pe) = crate::retry::park(redis, &masked_payload, now_ms()).await {
+                        // Could not park: fall through to terminal rather than
+                        // drop it. A failed park is not a reason to lose data.
+                        error!(consumer, id = d.id, error = %pe, "retry park failed; recording as terminal");
+                        record_failed = !record_terminal(
+                            pool,
+                            redis,
+                            &class,
+                            &e,
+                            &masked_payload,
+                            attempt,
+                            org_id,
+                            project_id,
+                            app_id,
+                        )
+                        .await;
+                    } else {
+                        sauron_telemetry::metrics::items_deadlettered(1);
+                    }
+                } else {
+                    warn!(
+                        consumer, id = d.id, attempt, kind = class.error_kind, error = %e,
+                        "job failure is terminal; recording"
+                    );
+                    record_failed = !record_terminal(
+                        pool,
+                        redis,
+                        &class,
+                        &e,
+                        &masked_payload,
+                        attempt,
+                        org_id,
+                        project_id,
+                        app_id,
+                    )
+                    .await;
+                    if !record_failed {
+                        // The job is now Postgres' problem, so its counter has
+                        // nothing left to count. Left behind it would survive
+                        // its TTL and give a later, unrelated identical payload
+                        // a head start into the terminal path.
+                        let _ = redis.clear_attempt(&hash).await;
+                        sauron_telemetry::metrics::items_deadlettered(1);
+                    } else {
                         error!(
-                            consumer, id = d.id, error = %de,
-                            "DLQ write FAILED; not acking so the entry is redelivered"
+                            consumer,
+                            id = d.id,
+                            "failure recorded NOWHERE; not acking so the entry is redelivered"
                         );
-                        sauron_telemetry::metrics::dlq_write_failures(1);
-                        dlq_write_failed = true;
                     }
                 }
             }
@@ -509,10 +620,52 @@ async fn process_one_by_one(
         // path already makes for a crash before the tail, and it is the right
         // way round: a duplicate is visible and fixable, a silently vanished
         // event is neither.
-        if d.entry_tail && !dlq_write_failed {
+        if d.entry_tail && !record_failed {
             let _ = redis.ack(&d.id).await;
         }
     }
+}
+
+/// Unix millis. One place, so the retry scheduler and its drain agree on what
+/// "now" means.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// File a terminal failure, returning whether it landed anywhere durable.
+///
+/// Thin wrapper over [`crate::failures::record`] so the two call sites above
+/// cannot pass a different `dlq_maxlen` or forget the backstop.
+#[allow(clippy::too_many_arguments)]
+async fn record_terminal(
+    pool: &PgPool,
+    redis: &RedisStore,
+    class: &crate::classify::Classified,
+    err: &anyhow::Error,
+    payload: &str,
+    attempts: i32,
+    org_id: uuid::Uuid,
+    project_id: uuid::Uuid,
+    app_id: uuid::Uuid,
+) -> bool {
+    crate::failures::record(
+        pool,
+        redis,
+        dlq_maxlen(),
+        crate::failures::Terminal {
+            class: *class,
+            message: &err.to_string(),
+            payload,
+            attempts,
+            org_id: Some(org_id),
+            project_id: Some(project_id),
+            app_id: Some(app_id),
+        },
+    )
+    .await
 }
 
 /// Decode one stream entry into an envelope.

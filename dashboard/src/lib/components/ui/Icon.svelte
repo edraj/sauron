@@ -46,6 +46,7 @@
   import Moon from '@lucide/svelte/icons/moon';
   import Package from '@lucide/svelte/icons/package';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import ScrollText from '@lucide/svelte/icons/scroll-text';
   import Search from '@lucide/svelte/icons/search';
   import Server from '@lucide/svelte/icons/server';
   import Settings from '@lucide/svelte/icons/settings';
@@ -101,6 +102,7 @@
     moon: Moon,
     package: Package,
     refresh: RefreshCw,
+    'scroll-text': ScrollText,
     search: Search,
     server: Server,
     settings: Settings,

@@ -6,6 +6,7 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
@@ -21,6 +22,13 @@
   import { getUserAnalytics } from '../lib/api/users';
   import { errorMessage } from '../lib/api/client';
   import {
+    setOffsetPage,
+    setOffsetSort,
+    type ListPage,
+    type OffsetListState,
+  } from '../lib/models/list-state';
+  import { sortParam, type SortDir } from '../lib/models/sort';
+  import {
     initials,
     hueFromString,
     compactNumber,
@@ -33,14 +41,25 @@
 
   let searchTerm = $state('');
   let query = $state('');
-  let offset = $state(0);
+
+  // `last_seen` descending is the endpoint's own default, so this describes
+  // the first request rather than changing it.
+  let list = $state<OffsetListState>({ sort: { key: 'last_seen', dir: 'desc' }, offset: 0 });
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
 
   // Cached view (lib/stores/cached-view.svelte.ts): rows already fetched paint
   // instantly on return, then refresh behind a spinner instead of a skeleton.
   // Re-exposed under the names the template already used, so the markup is
   // unchanged apart from the refresh indicator.
-  const view = new CachedView<PersonRow[]>();
-  const rows = $derived(view.data ?? []);
+  const view = new CachedView<ListPage<PersonRow>>();
+  const rows = $derived(view.data?.rows ?? []);
+  // Read off the cached payload, not a separate `$state` set on the network
+  // path: a cache HIT repaints rows without fetching, and a `hasNext` only the
+  // fetch updates would be the previous key's answer.
+  const hasNext = $derived(view.data?.hasNext ?? false);
   const revalidating = $derived(view.revalidating);
   const loading = $derived(view.loading);
   const error = $derived(view.error);
@@ -58,7 +77,10 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, query, offset, true), loadAnalytics(aid, sinceDays)]);
+      await Promise.all([
+        load(aid, query, sortParam(list.sort), list.offset, true),
+        loadAnalytics(aid, sinceDays),
+      ]);
     } finally {
       refreshing = false;
     }
@@ -87,7 +109,7 @@
     clearTimeout(debounce);
     debounce = setTimeout(() => {
       query = v.trim();
-      offset = 0;
+      list = setOffsetPage(list, 0);
     }, 250);
   }
 
@@ -95,13 +117,19 @@
   // axios interceptor adds to the request but which appears in none of these
   // arguments. Omit it and one environment's rows are served as another's.
   //
+  // `sort` is in the cache key for the same reason `q` and `off` are: without
+  // it a header click finds the previous ordering already cached under the
+  // same key and repaints it with NO request on the wire, so the sort looks
+  // like it silently did nothing.
+  //
   // `force` bypasses the fresh-window short-circuit — an explicit Refresh or
   // Retry means "go to the network now".
-  async function load(appId: string, q: string, off: number, force = false) {
+  async function load(appId: string, q: string, sort: string, off: number, force = false) {
     await view.load(
-      viewKey('persons.list', appId, sessionStore.scopeKey, q, off, LIMIT),
+      viewKey('persons.list', appId, sessionStore.scopeKey, q, sort, off, LIMIT),
       () => listPersons(appId, {
         search: q || undefined,
+        sort,
         limit: LIMIT,
         offset: off,
       }),
@@ -115,8 +143,9 @@
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
     const q = query;
-    const off = offset;
-    if (aid) void load(aid, q, off);
+    const sort = sortParam(list.sort);
+    const off = list.offset;
+    if (aid) void load(aid, q, sort, off);
   });
 
   // A compact digest of the most useful person traits, shown in the table.
@@ -205,7 +234,10 @@
   <div class="people-head">
     <div>
       <h2 class="section-title">People</h2>
-      <p class="muted section-hint">One row per distinct ID, most recently seen first.</p>
+      <!-- No longer "most recently seen first": that was true of the fixed
+           ordering this table used to have, and would now contradict the
+           header the user just clicked. -->
+      <p class="muted section-hint">One row per distinct ID.</p>
     </div>
   </div>
 
@@ -219,7 +251,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, query, offset);
+              if (aid) load(aid, query, sortParam(list.sort), list.offset);
             }}
           >
             Retry
@@ -242,13 +274,24 @@
       <DataTable>
         {#snippet head()}
           <tr>
-            <th>User</th>
+            <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>
+              User
+            </SortableTh>
+            <!-- Traits stays a plain `<th>`: the cell is a fold of an
+                 arbitrary JSON object into one chip plus a "…", so there is no
+                 single column to order by and the endpoint offers none. -->
             <th>Traits</th>
-            <th class="num">Sessions</th>
-            <th class="num">Events</th>
-            <th class="num">Errors</th>
-            <th>First seen</th>
-            <th>Last seen</th>
+            <SortableTh key="sessions_count" class="num" sort={list.sort} {onsort}>
+              Sessions
+            </SortableTh>
+            <SortableTh key="events_count" class="num" sort={list.sort} {onsort}>
+              Events
+            </SortableTh>
+            <SortableTh key="errors_count" class="num" sort={list.sort} {onsort}>
+              Errors
+            </SortableTh>
+            <SortableTh key="first_seen" sort={list.sort} {onsort}>First seen</SortableTh>
+            <SortableTh key="last_seen" sort={list.sort} {onsort}>Last seen</SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
@@ -302,15 +345,15 @@
       </DataTable>
     </div>
 
-    <!-- Slice 3 replaces this with a `limit + 1` over-fetch probe. Until then
-         this reproduces the old (wrong) inference rather than hiding it: a final
-         page of exactly `limit` rows still offers a Next to an empty page. -->
+    <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
+         inference from the row count: a final page of exactly `LIMIT` rows
+         used to offer a Next that led to an empty page. -->
     <Pagination
-      {offset}
+      offset={list.offset}
       limit={LIMIT}
       count={rows.length}
-      hasNext={rows.length >= LIMIT}
-      onchange={(o) => (offset = o)}
+      {hasNext}
+      onchange={(o) => (list = setOffsetPage(list, o))}
     />
   {/if}
 </AppShell>

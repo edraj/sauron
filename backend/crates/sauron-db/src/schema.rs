@@ -885,6 +885,56 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    audit_log (id) {
+        id -> Uuid,
+        org_id -> Uuid,
+        actor_id -> Nullable<Uuid>,
+        actor_email -> Text,
+        action -> Text,
+        entity_type -> Text,
+        entity_id -> Nullable<Uuid>,
+        entity_name -> Text,
+        project_id -> Nullable<Uuid>,
+        project_name -> Text,
+        app_id -> Nullable<Uuid>,
+        app_name -> Text,
+        environment_id -> Nullable<Uuid>,
+        environment_name -> Text,
+        changes -> Jsonb,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    ingest_failures (id) {
+        id -> Uuid,
+        fingerprint -> Text,
+        error_kind -> Text,
+        error_message -> Text,
+        org_id -> Nullable<Uuid>,
+        project_id -> Nullable<Uuid>,
+        app_id -> Nullable<Uuid>,
+        occurrences -> BigInt,
+        status -> Text,
+        first_seen_at -> Timestamptz,
+        last_seen_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    ingest_failure_payloads (id) {
+        id -> Uuid,
+        failure_id -> Uuid,
+        payload -> Jsonb,
+        attempts -> Integer,
+        created_at -> Timestamptz,
+        requeued_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::joinable!(ingest_failure_payloads -> ingest_failures (failure_id));
+
 diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
     auth_sessions,
@@ -933,4 +983,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     runtime_settings,
     tier_pins,
     restore_jobs,
+    audit_log,
+    ingest_failures,
+    ingest_failure_payloads,
 );

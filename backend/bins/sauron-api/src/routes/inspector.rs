@@ -223,6 +223,22 @@ pub async fn create_policy(
     // Called after EVERY schedule-field write so `next_run_at` is never stale.
     repo::reschedule_policy(&mut conn, policy.id).await?;
     let fresh = repo::get_inspector_policy(&mut conn, policy.id).await?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::INSPECTOR_POLICY_CREATE,
+            crate::audit::entity::INSPECTOR_POLICY,
+        )
+        .target(policy.id, &req.target_type)
+        .changes(crate::audit::created(
+            crate::audit::entity::INSPECTOR_POLICY,
+            &[("enabled", json!(policy.enabled))],
+        )),
+    )
+    .await;
     Ok(Json(json!(fresh)))
 }
 
@@ -466,6 +482,22 @@ pub async fn patch_policy(
     .ok_or(ApiError::NotFound)?;
     repo::reschedule_policy(&mut conn, patched.id).await?;
     let fresh = repo::get_inspector_policy(&mut conn, id).await?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            patched.org_id,
+            crate::audit::action::INSPECTOR_POLICY_UPDATE,
+            crate::audit::entity::INSPECTOR_POLICY,
+        )
+        .target(patched.id, &patched.target_type)
+        .changes(crate::audit::diff(
+            crate::audit::entity::INSPECTOR_POLICY,
+            &[("enabled", json!(existing.enabled), json!(patched.enabled))],
+        )),
+    )
+    .await;
     Ok(Json(json!(fresh)))
 }
 
@@ -507,6 +539,22 @@ pub async fn delete_policy(
     }
 
     repo::delete_inspector_policy(&mut conn, id).await?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            p.org_id,
+            crate::audit::action::INSPECTOR_POLICY_DELETE,
+            crate::audit::entity::INSPECTOR_POLICY,
+        )
+        .target(p.id, &p.target_type)
+        .changes(crate::audit::diff(
+            crate::audit::entity::INSPECTOR_POLICY,
+            &[("enabled", json!(p.enabled), Value::Null)],
+        )),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

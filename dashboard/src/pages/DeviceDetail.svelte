@@ -11,6 +11,7 @@
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
@@ -20,6 +21,14 @@
   import { getDevice } from '../lib/api/devices';
   import { relativeTime, formatTimestamp, formatDuration, durationBetween } from '../lib/utils/format';
   import { timeFormatStore } from '../lib/stores/time-format.svelte';
+  import {
+    DEVICE_PERF_DEFAULT_SORT,
+    DEVICE_SESSION_DEFAULT_SORT,
+    devicePerfAccessor,
+    deviceSessionAccessor,
+  } from '../lib/models/device-detail-sort';
+  import { sortRows } from '../lib/models/sort-rows';
+  import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import type { DeviceDetail, ErrorEvent, Session } from '../lib/models';
 
   interface Props {
@@ -74,6 +83,40 @@
 
   function sessionDuration(s: Session): number {
     return durationBetween(s.started_at, s.last_event_at);
+  }
+
+  // Both panels arrive whole — the sessions list is the server's 50 most
+  // recent and the perf profile its top 100 operations — so the sort runs over
+  // the ENTIRE array each table renders. Neither gets a pager: what is on
+  // screen is already everything the query returned, and a pager here would
+  // imply a page two that does not exist.
+  //
+  // A bare `SortState` per table, not the `OffsetListState` the paginated
+  // tables use: that type exists to make "apply a sort" and "reset to page 1"
+  // one indivisible step, and with no offset there is nothing to reset. Its
+  // `key`/`dir` are `readonly` (see `sort.ts`), so `sessionSort.dir = 'asc'`
+  // is a type error and every transition goes through `toggleSort`.
+  let sessionSort = $state<SortState>(DEVICE_SESSION_DEFAULT_SORT);
+  let perfSort = $state<SortState>(DEVICE_PERF_DEFAULT_SORT);
+
+  // `sortRows` copies before sorting. That is load-bearing, not tidy:
+  // `view.data` is the VERY OBJECT the view cache holds, handed back by
+  // reference (`cached-view.svelte.ts` says so, and `$state.raw` keeps that
+  // identity exact), so an in-place sort would reorder the cached payload for
+  // every later reader and the ordering would survive into the next visit to
+  // this device. No runes machinery prevents that — only copying does.
+  const sortedSessions = $derived(
+    sortRows(detail?.sessions ?? [], deviceSessionAccessor(sessionSort.key), sessionSort.dir),
+  );
+  const sortedPerf = $derived(
+    sortRows(detail?.perf ?? [], devicePerfAccessor(perfSort.key), perfSort.dir),
+  );
+
+  function onSessionSort(key: string, columnDefault: SortDir) {
+    sessionSort = toggleSort(sessionSort, key, columnDefault);
+  }
+  function onPerfSort(key: string, columnDefault: SortDir) {
+    perfSort = toggleSort(perfSort, key, columnDefault);
   }
 
   function errorTitle(e: ErrorEvent): string {
@@ -131,20 +174,30 @@
     <div class="grid">
       <div class="col-main">
         <Card title="Recent sessions" padding="none">
-          {#if detail.sessions.length === 0}
+          {#if sortedSessions.length === 0}
             <p class="empty-note muted">No sessions recorded for this device.</p>
           {:else}
             <DataTable>
               {#snippet head()}
                 <tr>
-                  <th>Session</th>
-                  <th>Started</th>
-                  <th>Duration</th>
-                  <th class="num">Events</th>
-                  <th class="num">Errors</th>
+                  <SortableTh key="session" columnDefault="asc" sort={sessionSort} onsort={onSessionSort}>
+                    Session
+                  </SortableTh>
+                  <SortableTh key="started" sort={sessionSort} onsort={onSessionSort}>
+                    Started
+                  </SortableTh>
+                  <SortableTh key="duration" sort={sessionSort} onsort={onSessionSort}>
+                    Duration
+                  </SortableTh>
+                  <SortableTh key="events" class="num" sort={sessionSort} onsort={onSessionSort}>
+                    Events
+                  </SortableTh>
+                  <SortableTh key="errors" class="num" sort={sessionSort} onsort={onSessionSort}>
+                    Errors
+                  </SortableTh>
                 </tr>
               {/snippet}
-              {#each detail.sessions as s (s.id)}
+              {#each sortedSessions as s (s.id)}
                 <tr
                   class="clickable"
                   onclick={() => push('/sessions/' + encodeURIComponent(s.session_id))}
@@ -171,19 +224,25 @@
         </Card>
 
         <Card title="Performance profile" padding="none">
-          {#if detail.perf.length === 0}
+          {#if sortedPerf.length === 0}
             <p class="empty-note muted">No performance data yet.</p>
           {:else}
             <DataTable>
               {#snippet head()}
                 <tr>
-                  <th>Name</th>
-                  <th>Op</th>
-                  <th class="num">p95</th>
-                  <th class="num">Count</th>
+                  <SortableTh key="name" columnDefault="asc" sort={perfSort} onsort={onPerfSort}>
+                    Name
+                  </SortableTh>
+                  <SortableTh key="op" columnDefault="asc" sort={perfSort} onsort={onPerfSort}>
+                    Op
+                  </SortableTh>
+                  <SortableTh key="p95" class="num" sort={perfSort} onsort={onPerfSort}>p95</SortableTh>
+                  <SortableTh key="count" class="num" sort={perfSort} onsort={onPerfSort}>
+                    Count
+                  </SortableTh>
                 </tr>
               {/snippet}
-              {#each detail.perf as p (p.op + ':' + p.name)}
+              {#each sortedPerf as p (p.op + ':' + p.name)}
                 <tr>
                   <td><span class="mono truncate perf-name">{p.name}</span></td>
                   <td><Badge tone="neutral" size="sm">{p.op}</Badge></td>

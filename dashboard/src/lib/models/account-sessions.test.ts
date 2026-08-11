@@ -4,7 +4,6 @@ import {
   describeSession,
   hasCurrentSession,
   otherSessionCount,
-  sortSessions,
 } from './account-sessions';
 import type { AccountSession } from './index';
 
@@ -54,20 +53,9 @@ describe('describeSession', () => {
   });
 });
 
-describe('sortSessions', () => {
-  it('puts the current session first, then most recently used', () => {
-    const a = session({ id: 'a', last_used_at: '2026-08-01T09:00:00Z' });
-    const b = session({ id: 'b', last_used_at: '2026-08-01T11:00:00Z' });
-    const c = session({ id: 'c', last_used_at: '2026-08-01T08:00:00Z', current: true });
-    expect(sortSessions([a, b, c]).map((s) => s.id)).toEqual(['c', 'b', 'a']);
-  });
-
-  it('does not mutate its input', () => {
-    const list = [session({ id: 'a' }), session({ id: 'b', current: true })];
-    sortSessions(list);
-    expect(list.map((s) => s.id)).toEqual(['a', 'b']);
-  });
-});
+// The `sortSessions` block that stood here is gone with the function — the
+// table's ordering is covered by `account-session-sort.test.ts` now, and tests
+// for a function nothing calls are coverage of nothing.
 
 describe('otherSessionCount and hasCurrentSession', () => {
   it('are zero and false on an empty list', () => {

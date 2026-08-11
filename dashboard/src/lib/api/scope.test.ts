@@ -234,6 +234,12 @@ const NON_TELEMETRY_PAGES = new Set([
   // rendered per row rather than filtered on, so the page shows the whole app
   // exactly as the scan produced it.)
   'Inspector',
+  // Deployment-wide by construction: the failure groups it lists are keyed by
+  // fingerprint, and the dominant one (a payload that never decoded) has no
+  // app_id or environment_id at all — there is nothing for the Topbar's
+  // selection to filter. Keying its load on `scopeKey` would refire the page
+  // on every app switch to re-fetch a byte-identical deployment-wide list.
+  'IngestFailures',
   'Login', // pre-auth
   'Members', // org membership management
   'MonitorDetail', // uptime monitor detail, project-scoped not environment-scoped
@@ -260,6 +266,17 @@ const NON_TELEMETRY_PAGES = new Set([
   // a signed-out visitor AND a signed-in one, and POSTs a single opaque token.
   // It reads no telemetry and has no app or environment dimension to scope to.
   'Unsubscribe',
+  // The org's administrative audit trail. Org-scoped, like 'Storage' and
+  // 'Members' above, and gated on org:manage in the current org.
+  //
+  // It DOES have project/app/environment filters, which is exactly why it must
+  // not observe `scopeKey`: those are its own filters, populated from the
+  // facets of the trail itself (including projects and apps that have since
+  // been DELETED, which the Topbar pickers cannot offer at all). Keying its
+  // load on `scopeKey` would refire on every Topbar app or environment switch
+  // and silently overwrite the selection the user made in the page's own
+  // filter bar — the same failure 'Inspector' above describes.
+  'WallOfShame',
 ]);
 
 const ALL_PAGES = listAllPageNames();

@@ -6,6 +6,7 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
@@ -20,6 +21,13 @@
   import { viewKey } from '../lib/stores/view-cache';
   import { listSessions, getSessionAnalytics } from '../lib/api/sessions';
   import {
+    setOffsetPage,
+    setOffsetSort,
+    type ListPage,
+    type OffsetListState,
+  } from '../lib/models/list-state';
+  import { sortParam, type SortDir } from '../lib/models/sort';
+  import {
     formatDuration,
     durationBetween,
     compactNumber,
@@ -29,16 +37,30 @@
   const LIMIT = 50;
 
   let sinceDays = $state(30);
-  let offset = $state(0);
   let search = $state('');
+
+  /**
+   * `started_at`, matching the endpoint's default — which slice 3 CHANGED from
+   * `last_event_at`. Naming any other column here would put the caret on a
+   * header the server did not order by.
+   */
+  let list = $state<OffsetListState>({ sort: { key: 'started_at', dir: 'desc' }, offset: 0 });
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
 
   // Cached views (lib/stores/cached-view.svelte.ts): cached rows paint instantly on
   // return, then refresh behind a spinner. Re-exposed under the template's existing
   // names, so the markup is unchanged.
-  const sessionsView = new CachedView<Session[]>();
+  const sessionsView = new CachedView<ListPage<Session>>();
   const analyticsView = new CachedView<SessionsAnalytics>();
 
-  const sessions = $derived(sessionsView.data ?? []);
+  const sessions = $derived(sessionsView.data?.rows ?? []);
+  // Read off the cached payload, not a separate `$state` set on the network
+  // path: a cache HIT repaints rows without fetching, and a `hasNext` only the
+  // fetch updates would be the previous key's answer.
+  const hasNext = $derived(sessionsView.data?.hasNext ?? false);
   const loading = $derived(sessionsView.loading);
   const error = $derived(sessionsView.error);
   const revalidating = $derived(sessionsView.revalidating || analyticsView.revalidating);
@@ -64,10 +86,20 @@
     );
   }
 
-  async function load(appId: string, days: number, off: number, force = false) {
+  // `sort` is in the key for the same reason `days` and `off` are: without it a
+  // header click finds the previous ordering already cached under the same key
+  // and repaints it with NO request on the wire, so the sort looks like it
+  // silently did nothing.
+  async function load(
+    appId: string,
+    days: number,
+    sort: string,
+    off: number,
+    force = false,
+  ) {
     await sessionsView.load(
-      viewKey('sessions.list', appId, sessionStore.scopeKey, days, off, LIMIT),
-      () => listSessions(appId, { since_days: days, limit: LIMIT, offset: off }),
+      viewKey('sessions.list', appId, sessionStore.scopeKey, days, sort, off, LIMIT),
+      () => listSessions(appId, { since_days: days, sort, limit: LIMIT, offset: off }),
       force,
     );
   }
@@ -79,7 +111,7 @@
     try {
       // force: an explicit click must reach the network regardless of freshness.
       await Promise.all([
-        load(aid, sinceDays, offset, true),
+        load(aid, sinceDays, sortParam(list.sort), list.offset, true),
         loadAnalytics(aid, sinceDays, true),
       ]);
     } finally {
@@ -93,8 +125,9 @@
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
     const days = sinceDays;
-    const off = offset;
-    if (aid) void load(aid, days, off);
+    const sort = sortParam(list.sort);
+    const off = list.offset;
+    if (aid) void load(aid, days, sort, off);
   });
 
   $effect(() => {
@@ -108,7 +141,7 @@
 
   function onRange(days: number) {
     if (days === sinceDays) return;
-    offset = 0;
+    list = setOffsetPage(list, 0);
     sinceDays = days;
   }
 
@@ -176,7 +209,14 @@
           <Button
             variant="secondary"
             onclick={() =>
-              sessionStore.currentAppId && load(sessionStore.currentAppId, sinceDays, offset, true)}
+              sessionStore.currentAppId &&
+              load(
+                sessionStore.currentAppId,
+                sinceDays,
+                sortParam(list.sort),
+                list.offset,
+                true,
+              )}
           >
             Retry
           </Button>
@@ -198,13 +238,27 @@
       <DataTable>
         {#snippet head()}
           <tr>
+            <!-- Session stays a plain `<th>`: the endpoint's whitelist has no
+                 session-id column, and an unlisted `sort=` is a 400 rather
+                 than a silently ignored parameter. An unsorted column is
+                 honest; a header that 400s the page is not. -->
             <th>Session</th>
-            <th>User</th>
-            <th>Device</th>
-            <th>Started</th>
-            <th>Duration</th>
-            <th class="num">Events</th>
-            <th class="num">Errors</th>
+            <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>
+              User
+            </SortableTh>
+            <SortableTh key="device_key" columnDefault="asc" sort={list.sort} {onsort}>
+              Device
+            </SortableTh>
+            <SortableTh key="started_at" sort={list.sort} {onsort}>Started</SortableTh>
+            <!-- No stored duration: the server orders by `last_event_at -
+                 started_at`, the same interval this column renders. -->
+            <SortableTh key="duration_ms" sort={list.sort} {onsort}>Duration</SortableTh>
+            <SortableTh key="events_count" class="num" sort={list.sort} {onsort}>
+              Events
+            </SortableTh>
+            <SortableTh key="errors_count" class="num" sort={list.sort} {onsort}>
+              Errors
+            </SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
@@ -249,15 +303,19 @@
           {/each}
         {/snippet}
       </DataTable>
-      <!-- Slice 3 replaces this with a `limit + 1` over-fetch probe. Until then
-           this reproduces the old (wrong) inference rather than hiding it: a final
-           page of exactly `limit` rows still offers a Next to an empty page. -->
+      <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
+           inference from the row count: a final page of exactly `LIMIT` rows
+           used to offer a Next that led to an empty page.
+
+           `count` stays the FETCHED page size, not `filtered.length`: the
+           search box above filters this page in the browser only, so the
+           pager's range describes the page the server sent. -->
       <Pagination
-        {offset}
+        offset={list.offset}
         limit={LIMIT}
         count={sessions.length}
-        hasNext={sessions.length >= LIMIT}
-        onchange={(o) => (offset = o)}
+        {hasNext}
+        onchange={(o) => (list = setOffsetPage(list, o))}
       />
     {/if}
   </Card>

@@ -97,6 +97,18 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // admin.rs:30 uses authorize_org.
   '/admin/storage': { perm: 'org:manage', level: 'org', title: 'Storage' },
   '/admin/privacy': { perm: 'pii:read', level: 'app', title: 'Privacy' },
+  // audit.rs's `list` calls authorize_org with ORG_MANAGE. Org-level, and
+  // deliberately the same gate as '/admin/storage': the people who may read
+  // who did what are the people who administer the org. No new permission
+  // was introduced for this page.
+  '/admin/wall-of-shame': { perm: 'org:manage', level: 'org', title: 'Wall of Shame' },
+  // Same gate as Storage and the tier routes. The backend requires org:manage
+  // in EVERY org (require_deployment_admin), which this table cannot express —
+  // org-level org:manage is the closest it has, so the nav is slightly more
+  // permissive than the API. That direction is the safe one: the page loads
+  // and reports a clean 403 rather than hiding a capability from someone who
+  // holds it. See failures.rs for why the endpoint is deployment-wide.
+  '/admin/ingest-failures': { perm: 'org:manage', level: 'org', title: 'Ingest failures' },
 
   // --- Self-service --------------------------------------------------------
   // Self-scoped (/v1/me/*). Always reachable — see the fallback note on

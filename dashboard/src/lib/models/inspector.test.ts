@@ -26,7 +26,9 @@ describe('UNREACHABLE_COPY', () => {
       'cold parquet',
       'tier_hot_days',
       'redis ingest stream',
-      'dlq',
+      // Was 'dlq'. The row now names the Postgres failure store as the
+      // primary sink, with the Redis DLQ as the fallback it became.
+      'failed ingest',
       'breadcrumbs',
       'alert_events',
       'already-delivered',

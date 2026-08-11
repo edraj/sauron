@@ -246,6 +246,28 @@ pub async fn upsert(
     let row =
         repo::upsert_store_connection(&mut conn, app_id, kind.as_str(), &identifiers, secret_enc)
             .await?;
+
+    // The store credential is encrypted at rest and never recorded: the store
+    // allowlist carries no key that could hold it.
+    let (_, org_id) = repo::app_ancestry(&mut conn, app_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let entry = crate::audit::with_app_scope(
+        &mut conn,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::STORE_UPSERT,
+            crate::audit::entity::STORE,
+        )
+        .target(app_id, kind.as_str())
+        .changes(crate::audit::created(
+            crate::audit::entity::STORE,
+            &[("store", serde_json::json!(kind.as_str()))],
+        )),
+        app_id,
+    )
+    .await;
+    crate::audit::record(&mut conn, auth.user_id, entry).await;
     Ok(Json(to_out(row)))
 }
 
@@ -260,6 +282,22 @@ pub async fn delete(
     // Collected history in `store_daily_metrics` is deliberately kept: it is
     // not a credential, and re-adding the connection resumes against it.
     repo::delete_store_connection(&mut conn, app_id, kind.as_str()).await?;
+
+    let (_, org_id) = repo::app_ancestry(&mut conn, app_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let entry = crate::audit::with_app_scope(
+        &mut conn,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::STORE_DELETE,
+            crate::audit::entity::STORE,
+        )
+        .target(app_id, kind.as_str()),
+        app_id,
+    )
+    .await;
+    crate::audit::record(&mut conn, auth.user_id, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -275,6 +313,22 @@ pub async fn queue_sync(
     // report walk takes minutes and must never run inside an HTTP request.
     // 202, not 200, because nothing has been fetched yet.
     repo::queue_store_sync(&mut conn, app_id, kind.as_str()).await?;
+
+    let (_, org_id) = repo::app_ancestry(&mut conn, app_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let entry = crate::audit::with_app_scope(
+        &mut conn,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::STORE_SYNC,
+            crate::audit::entity::STORE,
+        )
+        .target(app_id, kind.as_str()),
+        app_id,
+    )
+    .await;
+    crate::audit::record(&mut conn, auth.user_id, entry).await;
     Ok(StatusCode::ACCEPTED)
 }
 
