@@ -59,3 +59,50 @@ export function sortRows<T>(
     return sign * compare(a, b);
   });
 }
+
+/**
+ * An accessor that orders a small enum by MEANING instead of by spelling.
+ *
+ * Severity is the case that matters. Sorted as text, `critical < info <
+ * warning` — so `info` lands above `warning`, and the column looks sorted while
+ * saying something nobody means. The same is true of every status column on
+ * these tables: alphabetically a monitor that is `paused` outranks one that is
+ * `unknown` for no reason a reader can defend.
+ *
+ * DIRECTION, stated once here so every caller inherits it: `order` runs from
+ * LEAST to MOST — least severe, least urgent, least worth looking at first — so
+ * a **higher rank is worse**. That makes a ranked column behave exactly like
+ * every other magnitude column in these tables: `desc` (the direction
+ * `SortableTh` gives a count by default) puts the worst row at the top, and
+ * `aria-sort="descending"` announces what the reader is actually looking at.
+ * A ladder written the other way round would invert every caret and every
+ * announcement without changing a line of this file, which is why the rule
+ * lives here and not in each `*-sort.ts`.
+ *
+ * UNKNOWN AND ABSENT VALUES rank `null`, not a number — so `sortRows` puts them
+ * last in BOTH directions, the same treatment it gives every other absent
+ * value. The alternatives are both worse and both look like they work:
+ *
+ * - `0` (or any low rank) makes an unrecognised status the least severe thing
+ *   on the page; `order.length` makes it the most severe in descending order,
+ *   so the row leads the "worst first" list it was never ranked for.
+ * - Even `order.length` used as a plain number is asymmetric — last ascending,
+ *   FIRST descending — which is exactly the asymmetry `emailOrNull` in
+ *   `pii-inspector-sort.ts` exists to prevent.
+ *
+ * This is not a hypothetical: every ladder here is typed against a union the
+ * backend can extend, and a status this dashboard has never heard of arrives as
+ * a plain string that type-checks fine. It is unknown, not extreme.
+ *
+ * Generic in `T` so a ladder annotated `readonly AlertSeverity[]` rejects a
+ * misspelt or non-member value at compile time. It cannot catch an OMITTED
+ * member — an incomplete ladder is still a valid array — so each caller's test
+ * pins the ladder against a `Record<Union, number>`, which does fail to compile
+ * when the union grows.
+ */
+export function rankOf<T extends string>(
+  order: readonly T[],
+): (value: string | null | undefined) => number | null {
+  const ranks = new Map<string, number>(order.map((v, i) => [v, i]));
+  return (value) => (value == null ? null : (ranks.get(value) ?? null));
+}

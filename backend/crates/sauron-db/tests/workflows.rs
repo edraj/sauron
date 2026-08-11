@@ -858,6 +858,7 @@ async fn workflow_list_derives_abandoned_from_staleness() {
         None,
         50,
         0,
+        common::default_workflow_sort(),
     )
     .await
     .expect("workflow_list");
@@ -952,6 +953,7 @@ async fn workflow_list_is_environment_scoped() {
         None,
         50,
         0,
+        common::default_workflow_sort(),
     )
     .await
     .expect("workflow_list env_a");
@@ -965,15 +967,24 @@ async fn workflow_list_is_environment_scoped() {
         None,
         50,
         0,
+        common::default_workflow_sort(),
     )
     .await
     .expect("workflow_list env_b");
     assert_eq!(rows_b.len(), 1);
     assert_eq!(rows_b[0].started, 3, "env_b must see only its own 3 rows");
 
-    let rows_all = repo::workflow_list(&mut conn, ReadScope::all(ids.app_id), 1, None, 50, 0)
-        .await
-        .expect("workflow_list All");
+    let rows_all = repo::workflow_list(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        1,
+        None,
+        50,
+        0,
+        common::default_workflow_sort(),
+    )
+    .await
+    .expect("workflow_list All");
     assert_eq!(rows_all.len(), 1);
     assert_eq!(
         rows_all[0].started, 5,
@@ -1063,24 +1074,41 @@ async fn workflow_list_search_filters_by_name_substring() {
         Some("check"),
         50,
         0,
+        common::default_workflow_sort(),
     )
     .await
     .expect("workflow_list search=check");
     assert_eq!(rows.len(), 1, "only 'checkout' should match 'check'");
     assert_eq!(rows[0].name, "checkout");
 
-    let all_rows = repo::workflow_list(&mut conn, ReadScope::all(ids.app_id), 1, None, 50, 0)
-        .await
-        .expect("workflow_list search=None");
+    let all_rows = repo::workflow_list(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        1,
+        None,
+        50,
+        0,
+        common::default_workflow_sort(),
+    )
+    .await
+    .expect("workflow_list search=None");
     assert_eq!(all_rows.len(), 3, "no search filter must return every name");
 
     // --- LIKE metacharacters are matched literally -------------------------
     // `search` routes through `like_contains`, so a user typing `%` or `_`
     // gets those characters, not wildcards. Without the escaping these two
     // assertions read 3 and 2 respectively.
-    let pct = repo::workflow_list(&mut conn, ReadScope::all(ids.app_id), 1, Some("%"), 50, 0)
-        .await
-        .expect("workflow_list search=%");
+    let pct = repo::workflow_list(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        1,
+        Some("%"),
+        50,
+        0,
+        common::default_workflow_sort(),
+    )
+    .await
+    .expect("workflow_list search=%");
     assert!(
         pct.is_empty(),
         "a literal '%' matches no seeded name — unescaped it would be a \
@@ -1095,6 +1123,7 @@ async fn workflow_list_search_filters_by_name_substring() {
         Some("sign_up"),
         50,
         0,
+        common::default_workflow_sort(),
     )
     .await
     .expect("workflow_list search=sign_up");
@@ -1112,6 +1141,7 @@ async fn workflow_list_search_filters_by_name_substring() {
         Some("sign_u"),
         50,
         0,
+        common::default_workflow_sort(),
     )
     .await
     .expect("workflow_list search=sign_u");

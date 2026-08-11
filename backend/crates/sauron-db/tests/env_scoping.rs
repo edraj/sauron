@@ -7,6 +7,7 @@ use diesel::sql_types::{BigInt, Text, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
 use sauron_auth::{authorize_env_read, perm, AuthError};
 use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewTransaction, Workflow};
+use sauron_db::repo::SortSpec;
 use sauron_db::schema::workflows;
 use sauron_db::scope::{EnvFilter, ReadScope};
 use serde_json::json;
@@ -16,6 +17,29 @@ use uuid::Uuid;
 struct CountRow {
     #[diesel(sql_type = BigInt)]
     n: i64,
+}
+
+/// The default ordering `routes::devices::list` builds. This file asserts on
+/// environment scoping, never on order, so every device call site below takes
+/// the default — spelled as a function because `SortSpec` is passed by value.
+fn device_sort() -> SortSpec {
+    SortSpec {
+        column: "last_seen",
+        descending: true,
+        tiebreak: "d.device_key",
+        nulls_last: false,
+    }
+}
+
+/// The default ordering `routes::devices::groups` builds. Same reasoning as
+/// [`device_sort`].
+fn group_sort() -> SortSpec {
+    SortSpec {
+        column: "last_seen",
+        descending: true,
+        tiebreak: "d.family, d.model, d.os_name, d.os_version",
+        nulls_last: false,
+    }
 }
 
 /// The harness itself works: it can reach a database, seed two environments,
@@ -143,6 +167,7 @@ async fn list_sessions_returns_only_the_selected_environment() {
         far_past(),
         100,
         0,
+        common::default_session_sort(),
         None,
         None,
     )
@@ -157,6 +182,7 @@ async fn list_sessions_returns_only_the_selected_environment() {
         far_past(),
         100,
         0,
+        common::default_session_sort(),
         None,
         None,
     )
@@ -171,6 +197,7 @@ async fn list_sessions_returns_only_the_selected_environment() {
         far_past(),
         100,
         0,
+        common::default_session_sort(),
         None,
         None,
     )
@@ -185,6 +212,7 @@ async fn list_sessions_returns_only_the_selected_environment() {
         far_past(),
         100,
         0,
+        common::default_session_sort(),
         None,
         None,
     )
@@ -2215,6 +2243,7 @@ async fn screen_list_covers_only_the_selected_environment() {
         "%",
         50,
         0,
+        common::default_screen_sort(),
     )
     .await
     .unwrap();
@@ -2253,6 +2282,7 @@ async fn screen_list_covers_only_the_selected_environment() {
         "%",
         50,
         0,
+        common::default_screen_sort(),
     )
     .await
     .unwrap();
@@ -2286,6 +2316,7 @@ async fn screen_list_covers_only_the_selected_environment() {
         "%",
         50,
         0,
+        common::default_screen_sort(),
     )
     .await
     .unwrap();
@@ -2307,6 +2338,7 @@ async fn screen_list_covers_only_the_selected_environment() {
         "%",
         50,
         0,
+        common::default_screen_sort(),
     )
     .await
     .unwrap();
@@ -2339,6 +2371,7 @@ async fn screen_list_covers_only_the_selected_environment() {
         "%",
         1,
         0,
+        common::default_screen_sort(),
     )
     .await
     .unwrap();
@@ -2355,6 +2388,7 @@ async fn screen_list_covers_only_the_selected_environment() {
         "%",
         1,
         1,
+        common::default_screen_sort(),
     )
     .await
     .unwrap();
@@ -2501,6 +2535,7 @@ async fn list_persons_covers_only_the_selected_environment() {
         None,
         50,
         0,
+        common::default_person_sort(),
     )
     .await
     .unwrap();
@@ -2550,6 +2585,7 @@ async fn list_persons_covers_only_the_selected_environment() {
         None,
         50,
         0,
+        common::default_person_sort(),
     )
     .await
     .unwrap();
@@ -2590,6 +2626,7 @@ async fn list_persons_covers_only_the_selected_environment() {
         None,
         50,
         0,
+        common::default_person_sort(),
     )
     .await
     .unwrap();
@@ -2604,10 +2641,16 @@ async fn list_persons_covers_only_the_selected_environment() {
             && r.distinct_id != ids.distinct_id_env_b_only
             && r.distinct_id != ids.session_only_distinct_id));
 
-    let rows_all =
-        sauron_db::repo::list_persons(&mut conn, ReadScope::all(ids.app_id), None, 50, 0)
-            .await
-            .unwrap();
+    let rows_all = sauron_db::repo::list_persons(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        None,
+        50,
+        0,
+        common::default_person_sort(),
+    )
+    .await
+    .unwrap();
     assert_eq!(rows_all.len(), 8, "all 8 event_users identities");
     let shared_all = rows_all
         .iter()
@@ -2672,6 +2715,7 @@ async fn list_devices_covers_only_the_selected_environment() {
         far_past(),
         50,
         0,
+        device_sort(),
         None,
         None,
     )
@@ -2705,6 +2749,7 @@ async fn list_devices_covers_only_the_selected_environment() {
         far_past(),
         50,
         0,
+        device_sort(),
         None,
         None,
     )
@@ -2746,6 +2791,7 @@ async fn list_devices_covers_only_the_selected_environment() {
         far_past(),
         50,
         0,
+        device_sort(),
         None,
         None,
     )
@@ -2759,6 +2805,7 @@ async fn list_devices_covers_only_the_selected_environment() {
         far_past(),
         50,
         0,
+        device_sort(),
         None,
         None,
     )
@@ -3085,6 +3132,7 @@ async fn person_and_device_seen_and_identity_are_derived_per_environment() {
         None,
         50,
         0,
+        common::default_person_sort(),
     )
     .await
     .unwrap();
@@ -3099,6 +3147,7 @@ async fn person_and_device_seen_and_identity_are_derived_per_environment() {
         None,
         50,
         0,
+        common::default_person_sort(),
     )
     .await
     .unwrap();
@@ -3146,6 +3195,7 @@ async fn person_and_device_seen_and_identity_are_derived_per_environment() {
         far_past(),
         50,
         0,
+        device_sort(),
         None,
         None,
     )
@@ -5379,12 +5429,28 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     sauron_db::repo::top_issues(&mut conn, scope.clone(), since, 10)
         .await
         .expect("top_issues under Subset");
-    sauron_db::repo::list_persons(&mut conn, scope.clone(), None, 50, 0)
-        .await
-        .expect("list_persons under Subset");
-    sauron_db::repo::list_devices(&mut conn, scope.clone(), since, 50, 0, None, None)
-        .await
-        .expect("list_devices under Subset");
+    sauron_db::repo::list_persons(
+        &mut conn,
+        scope.clone(),
+        None,
+        50,
+        0,
+        common::default_person_sort(),
+    )
+    .await
+    .expect("list_persons under Subset");
+    sauron_db::repo::list_devices(
+        &mut conn,
+        scope.clone(),
+        since,
+        50,
+        0,
+        device_sort(),
+        None,
+        None,
+    )
+    .await
+    .expect("list_devices under Subset");
     // The bind-index hazard, exercised for real: under `Subset`,
     // `scope.env.consumes_bind()` is `true`, so `env_sql` binds `$6` and the
     // four group predicates must start at `$7`. `device_groups.rs`'s
@@ -5399,6 +5465,7 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
         since,
         50,
         0,
+        device_sort(),
         None,
         Some(sauron_db::repo::DeviceGroupKey {
             family: Some("iPhone"),
@@ -5409,12 +5476,21 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     )
     .await
     .expect("list_devices with a group filter under Subset");
-    sauron_db::repo::list_device_groups(&mut conn, scope.clone(), since, 50, 0, None)
+    sauron_db::repo::list_device_groups(&mut conn, scope.clone(), since, 50, 0, group_sort(), None)
         .await
         .expect("list_device_groups under Subset");
-    sauron_db::repo::list_sessions(&mut conn, scope.clone(), since, 50, 0, None, None)
-        .await
-        .expect("list_sessions under Subset");
+    sauron_db::repo::list_sessions(
+        &mut conn,
+        scope.clone(),
+        since,
+        50,
+        0,
+        common::default_session_sort(),
+        None,
+        None,
+    )
+    .await
+    .expect("list_sessions under Subset");
     sauron_db::repo::session_stats(&mut conn, scope.clone(), since)
         .await
         .expect("session_stats under Subset");
@@ -5495,6 +5571,7 @@ async fn list_devices_group_filter_binds_correctly_under_one_and_unattributed() 
         since,
         50,
         0,
+        device_sort(),
         None,
         Some(sauron_db::repo::DeviceGroupKey {
             family: Some("iPhone"),
@@ -5520,6 +5597,7 @@ async fn list_devices_group_filter_binds_correctly_under_one_and_unattributed() 
         since,
         50,
         0,
+        device_sort(),
         None,
         Some(sauron_db::repo::DeviceGroupKey::default()),
     )

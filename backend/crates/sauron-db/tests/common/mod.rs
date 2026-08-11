@@ -1868,6 +1868,57 @@ pub fn far_past() -> DateTime<Utc> {
     Utc::now() - chrono::Duration::days(3650)
 }
 
+/// The DEFAULT ordering each of Slice 3's OFFSET-paged lists is served with
+/// when `?sort=` is absent — i.e. what the route's `*_sort_spec(None)`
+/// resolves to, and (except for sessions, see below) what the function had
+/// hard-coded before the parameter existed.
+///
+/// Deliberately only the DEFAULT and not a full mirror of each route's
+/// whitelist: `sauron-db` cannot depend on the API binary, so a per-column
+/// mirror here would be a second source of truth with nothing keeping it
+/// honest. `offset_sort.rs` carries the per-column mirrors its own sorting
+/// assertions need, and the API's `mod tests` pin the real mapping.
+///
+/// The sessions default is `started_at`, NOT the `last_event_at` this list
+/// used to order by — see `repo::list_sessions`' doc comment for why the
+/// default moved. Tests here therefore assert set membership rather than
+/// order, which is what they already did.
+pub fn default_person_sort() -> repo::SortSpec {
+    repo::SortSpec {
+        column: "last_seen",
+        descending: true,
+        tiebreak: "eu.distinct_id",
+        nulls_last: false,
+    }
+}
+
+pub fn default_screen_sort() -> repo::SortSpec {
+    repo::SortSpec {
+        column: "views",
+        descending: true,
+        tiebreak: "k.screen",
+        nulls_last: false,
+    }
+}
+
+pub fn default_session_sort() -> repo::SortSpec {
+    repo::SortSpec {
+        column: "started_at",
+        descending: true,
+        tiebreak: "id",
+        nulls_last: false,
+    }
+}
+
+pub fn default_workflow_sort() -> repo::SortSpec {
+    repo::SortSpec {
+        column: "started",
+        descending: true,
+        tiebreak: "w.name",
+        nulls_last: false,
+    }
+}
+
 /// Flag `distinct_id` on `app_id` as identified, exactly as `identify()` does
 /// on the live path. The only way a harness-seeded identity becomes a `'u:'`
 /// key.

@@ -5,8 +5,11 @@
 //! [`IngestJob`]: sauron_core::envelope::IngestJob
 
 pub mod batch;
+pub mod classify;
 pub mod enrich;
+pub mod failures;
 pub mod mask;
+pub mod retry;
 pub mod process;
 pub mod symbolize;
 pub mod worker;

@@ -17,6 +17,13 @@
   import { viewKey } from '../lib/stores/view-cache';
   import { listDevices, listDeviceGroups } from '../lib/api/devices';
   import { decodeGroupKey, encodeGroupKey, groupLabel, sameGroupKey } from '../lib/models/device-groups';
+  import {
+    setOffsetPage,
+    setOffsetSort,
+    type ListPage,
+    type OffsetListState,
+  } from '../lib/models/list-state';
+  import { sortParam, type SortDir } from '../lib/models/sort';
   import type { DeviceRow, DeviceGroupRow } from '../lib/models';
 
   const LIMIT = 50;
@@ -31,17 +38,46 @@
   // `query` is bound to the input; `search` is the debounced value that drives loads.
   let query = $state('');
   let search = $state('');
-  let offset = $state(0);
+
+  /**
+   * `last_seen` descending is what both endpoints default to, so this state
+   * describes the first request rather than changing it.
+   *
+   * A function rather than a shared module constant because it is assigned
+   * from two places (initialisation and the mode-switch reset below), and
+   * `list` is `$state` — handing the same object to both would put one
+   * long-lived target behind every reset instead of a fresh value each time.
+   * Nothing here mutates it, so this is cheap insurance rather than a fix for
+   * an observed bug.
+   */
+  function initialList(): OffsetListState {
+    return { sort: { key: 'last_seen', dir: 'desc' }, offset: 0 };
+  }
+
+  // ONE state for both tables — only one is ever on screen. See the reset in
+  // the group-key sync effect below for why switching between them does not
+  // carry the sort across.
+  let list = $state<OffsetListState>(initialList());
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
 
   // Two cached views, one per mode. Separate instances rather than one shared:
   // the payloads are different types, and keeping them apart means switching
   // modes repaints from cache instead of re-fetching.
-  const groupView = new CachedView<DeviceGroupRow[]>();
-  const flatView = new CachedView<DeviceRow[]>();
+  const groupView = new CachedView<ListPage<DeviceGroupRow>>();
+  const flatView = new CachedView<ListPage<DeviceRow>>();
 
-  const groups = $derived(groupView.data ?? []);
-  const devices = $derived(flatView.data ?? []);
+  const groups = $derived(groupView.data?.rows ?? []);
+  const devices = $derived(flatView.data?.rows ?? []);
   const rowCount = $derived(grouped ? groups.length : devices.length);
+  // Read off the cached payload rather than a separate `$state` set on the
+  // network path: a cache HIT repaints rows without fetching, and a `hasNext`
+  // that only the fetch updates would be the previous key's answer.
+  const hasNext = $derived(
+    (grouped ? groupView.data?.hasNext : flatView.data?.hasNext) ?? false,
+  );
 
   // Cached view (lib/stores/cached-view.svelte.ts): rows already fetched paint
   // instantly on return, then refresh behind a spinner instead of a skeleton.
@@ -59,13 +95,13 @@
     clearTimeout(debounce);
     debounce = setTimeout(() => {
       search = v.trim();
-      offset = 0;
+      list = setOffsetPage(list, 0);
     }, 220);
   }
 
   function onRange(days: number) {
     sinceDays = days;
-    offset = 0;
+    list = setOffsetPage(list, 0);
   }
 
   // `scopeKey` must be in the key: it carries the selected environment, which
@@ -75,13 +111,25 @@
   // The group key is in the cache key too, for the same reason — two drill-downs
   // differ only by it.
   //
+  // `sort` is in the cache key for the same reason every other varying input
+  // is: without it a header click finds the previous ordering already cached
+  // under the same key and repaints it with NO request on the wire — the sort
+  // looks like it silently did nothing.
+  //
   // `force` bypasses the fresh-window short-circuit — an explicit Refresh or
   // Retry means "go to the network now".
-  async function load(appId: string, days: number, s: string, off: number, force = false) {
-    const params = { since_days: days, search: s || undefined, limit: LIMIT, offset: off };
+  async function load(
+    appId: string,
+    days: number,
+    s: string,
+    sort: string,
+    off: number,
+    force = false,
+  ) {
+    const params = { since_days: days, search: s || undefined, sort, limit: LIMIT, offset: off };
     if (groupKey === null) {
       await groupView.load(
-        viewKey('devices.groups', appId, sessionStore.scopeKey, days, s, off, LIMIT),
+        viewKey('devices.groups', appId, sessionStore.scopeKey, days, s, sort, off, LIMIT),
         () => listDeviceGroups(appId, params),
         force,
       );
@@ -89,7 +137,17 @@
     }
     const k = groupKey;
     await flatView.load(
-      viewKey('devices.list', appId, sessionStore.scopeKey, days, s, off, LIMIT, encodeGroupKey(k)),
+      viewKey(
+        'devices.list',
+        appId,
+        sessionStore.scopeKey,
+        days,
+        s,
+        sort,
+        off,
+        LIMIT,
+        encodeGroupKey(k),
+      ),
       () => listDevices(appId, {
         ...params,
         group: '1',
@@ -112,10 +170,11 @@
     sessionStore.scopeKey;
     const days = sinceDays;
     const s = search;
-    const off = offset;
+    const sort = sortParam(list.sort);
+    const off = list.offset;
     // Touch groupKey so entering or leaving a drill-down refetches.
     groupKey;
-    if (aid) void load(aid, days, s, off);
+    if (aid) void load(aid, days, s, sort, off);
   });
 
   // The router owns the URL; the page follows it. `push`ing a drill-down URL
@@ -135,7 +194,13 @@
     // test cases for the exact collision this replaced.
     if (!sameGroupKey(next, groupKey)) {
       groupKey = next;
-      offset = 0;
+      // The SORT resets here too, not only the offset. The two device
+      // endpoints do not share a sort whitelist — `browser` and `distinct_id`
+      // exist only on the flat list, `device_count` only on the grouped one —
+      // and an unlisted column is a 400, not a silently ignored parameter. So
+      // drilling into a group while sorted by Devices, or leaving one while
+      // sorted by Browser, would fail the very request the click was for.
+      list = initialList();
     }
   });
 
@@ -148,7 +213,9 @@
     if (!aid) return;
     refreshing = true;
     try {
-      await Promise.all([load(aid, sinceDays, search, offset, true)]);
+      await Promise.all([
+        load(aid, sinceDays, search, sortParam(list.sort), list.offset, true),
+      ]);
     } finally {
       refreshing = false;
     }
@@ -205,7 +272,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, sinceDays, search, offset);
+              if (aid) load(aid, sinceDays, search, sortParam(list.sort), list.offset);
             }}
           >
             Retry
@@ -229,20 +296,20 @@
     </Card>
   {:else}
     {#if grouped}
-      <DeviceGroupTable rows={groups} />
+      <DeviceGroupTable rows={groups} sort={list.sort} {onsort} />
     {:else}
-      <DeviceFlatTable rows={devices} />
+      <DeviceFlatTable rows={devices} sort={list.sort} {onsort} />
     {/if}
 
-    <!-- Slice 3 replaces this with a `limit + 1` over-fetch probe. Until then
-         this reproduces the old (wrong) inference rather than hiding it: a final
-         page of exactly `limit` rows still offers a Next to an empty page. -->
+    <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
+         inference from the row count: a final page of exactly `LIMIT` rows
+         used to offer a Next that led to an empty page. -->
     <Pagination
-      {offset}
+      offset={list.offset}
       limit={LIMIT}
       count={rowCount}
-      hasNext={rowCount >= LIMIT}
-      onchange={(o) => (offset = o)}
+      {hasNext}
+      onchange={(o) => (list = setOffsetPage(list, o))}
     />
   {/if}
 </AppShell>

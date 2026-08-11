@@ -72,6 +72,24 @@ pub async fn create_org(
         },
     )
     .await?;
+
+    // The org's own creation is the first row of its trail — and, because
+    // `audit_log.org_id` CASCADEs, the last one to survive its deletion.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org.id,
+            crate::audit::action::ORG_CREATE,
+            crate::audit::entity::ORG,
+        )
+        .target(org.id, &org.name)
+        .changes(crate::audit::created(
+            crate::audit::entity::ORG,
+            &[("name", serde_json::json!(org.name))],
+        )),
+    )
+    .await;
     Ok(Json(org))
 }
 
@@ -561,6 +579,46 @@ pub async fn create_grant(
 
     // `id` repeats the first id purely so a dashboard build older than this api
     // keeps working after a partial RPM upgrade — they are separate subpackages.
+    // The target is the PERSON, not the grant row: an administrator asks "what
+    // was this member given", and `resolved` may hold several grants from this
+    // one call. `permissions` records what the role conferred at grant time, so
+    // a later edit to that role cannot silently rewrite history.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::GRANT_CREATE,
+            crate::audit::entity::GRANT,
+        )
+        .target(user.id, &user.email)
+        .changes(crate::audit::created(
+            crate::audit::entity::GRANT,
+            &[
+                ("role_id", serde_json::json!(role.id)),
+                ("role_name", serde_json::json!(role.name)),
+                ("permissions", serde_json::json!(role_perms)),
+                (
+                    "scopes",
+                    serde_json::json!(resolved
+                        .iter()
+                        .map(|s| {
+                            // `Scope::parts` is the same (scope_type, scope_id)
+                            // spelling `role_grants` stores, so a reader can
+                            // match an entry against the grants table directly.
+                            let (scope_type, scope_id) = s.scope.parts();
+                            serde_json::json!({
+                                "scope_type": scope_type,
+                                "scope_id": scope_id,
+                            })
+                        })
+                        .collect::<Vec<_>>()),
+                ),
+            ],
+        )),
+    )
+    .await;
+
     Ok(Json(serde_json::json!({ "ids": ids, "id": ids.first() })))
 }
 
@@ -671,6 +729,30 @@ pub async fn create_member(
         .ok_or_else(|| ApiError::Internal("member insert returned no grants".into()))?;
     let grant_ids: Vec<Uuid> = created.iter().map(|row| row.grant_id).collect();
 
+    // The generated temp password is NOT recorded — it is a live credential,
+    // and `audit::created`'s allowlist has no key that could carry it. What is
+    // worth knowing is that an account was created, for whom, and with how
+    // many scopes; the grants themselves are individually auditable through
+    // `grant.create`.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::MEMBER_CREATE,
+            crate::audit::entity::MEMBER,
+        )
+        .target(user_id, &req.email)
+        .changes(crate::audit::created(
+            crate::audit::entity::MEMBER,
+            &[
+                ("email", serde_json::json!(req.email)),
+                ("name", serde_json::json!(req.name)),
+            ],
+        )),
+    )
+    .await;
+
     // `grant_id` repeats the first id purely so a dashboard build older than
     // this api keeps working after a partial RPM upgrade.
     Ok(Json(serde_json::json!({
@@ -755,6 +837,43 @@ pub async fn delete_grant(
     {
         tracing::warn!(error = ?e, "notification subscription sweep failed after grant delete");
     }
+
+    let target_email = repo::user_email(&mut conn, grant.user_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::GRANT_DELETE,
+            crate::audit::entity::GRANT,
+        )
+        .target(grant.user_id, &target_email)
+        .changes(crate::audit::diff(
+            crate::audit::entity::GRANT,
+            &[
+                (
+                    "scope_type",
+                    serde_json::json!(grant.scope_type),
+                    serde_json::Value::Null,
+                ),
+                (
+                    "scope_id",
+                    serde_json::json!(grant.scope_id),
+                    serde_json::Value::Null,
+                ),
+                (
+                    "permissions",
+                    serde_json::json!(role_perms),
+                    serde_json::Value::Null,
+                ),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -943,6 +1062,39 @@ pub async fn set_member_active(
             "notification subscription sweep failed after member active change"
         );
     }
+
+    // Two distinct actions rather than one `member.update` with a boolean in
+    // the diff: deactivation is a security event that an administrator filters
+    // for by name, and burying it inside a generic update would mean finding it
+    // required reading every entry's diff.
+    let target_email = repo::user_email(&mut conn, user_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            if req.is_active {
+                crate::audit::action::MEMBER_ACTIVATE
+            } else {
+                crate::audit::action::MEMBER_DEACTIVATE
+            },
+            crate::audit::entity::MEMBER,
+        )
+        .target(user_id, &target_email)
+        .changes(crate::audit::diff(
+            crate::audit::entity::MEMBER,
+            &[(
+                "is_active",
+                serde_json::json!(!req.is_active),
+                serde_json::json!(req.is_active),
+            )],
+        )),
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -985,6 +1137,30 @@ pub async fn revoke_member_sessions(
         Some(auth.user_id),
     )
     .await?;
+
+    // Before `drop(conn)` — the connection is released below and re-acquiring
+    // one just to log would be a second pool checkout on a path that already
+    // holds the answer.
+    let target_email = repo::user_email(&mut conn, user_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::MEMBER_REVOKE_SESSIONS,
+            crate::audit::entity::MEMBER,
+        )
+        .target(user_id, &target_email)
+        .changes(crate::audit::created(
+            crate::audit::entity::MEMBER,
+            &[("revoked_sessions", serde_json::json!(ids.len()))],
+        )),
+    )
+    .await;
     drop(conn);
 
     state.revocations.mark_revoked(&ids);
@@ -1169,6 +1345,21 @@ pub async fn reset_member_password(
             repo::RESET_INVALIDATED_SUPERSEDED,
         )
         .await?;
+        crate::audit::record(
+            &mut conn,
+            auth.user_id,
+            crate::audit::Entry::new(
+                org_id,
+                crate::audit::action::MEMBER_RESET_PASSWORD,
+                crate::audit::entity::MEMBER,
+            )
+            .target(user_id, &user.email)
+            .changes(crate::audit::created(
+                crate::audit::entity::MEMBER,
+                &[("reset_action", serde_json::json!("cancel"))],
+            )),
+        )
+        .await;
         return Ok(Json(serde_json::json!({
             "ok": true,
             "action": "cancel",
@@ -1238,6 +1429,33 @@ pub async fn reset_member_password(
         user.name.clone()
     };
     let email = user.email.clone();
+
+    // Recorded while the connection is still held, and before the mail is
+    // enqueued: by this point the credential is already invalidated and every
+    // session revoked, so the account is altered whether or not the mail ever
+    // goes out. Auditing after the enqueue would lose exactly the case worth
+    // investigating — a reset that took effect but never arrived. Neither the
+    // token nor its hash is recorded; only that a reset was issued and when it
+    // lapses.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::MEMBER_RESET_PASSWORD,
+            crate::audit::entity::MEMBER,
+        )
+        .target(user_id, &email)
+        .changes(crate::audit::created(
+            crate::audit::entity::MEMBER,
+            &[
+                ("reset_action", serde_json::json!("reset")),
+                ("expires_at", serde_json::json!(expires_at)),
+                ("revoked_sessions", serde_json::json!(ids.len())),
+            ],
+        )),
+    )
+    .await;
 
     // `MailSender` checks out its own pooled connection; see the identical drop
     // and its full reasoning in `routes::auth::forgot_password`.
@@ -1415,6 +1633,48 @@ pub async fn update_grant_handler(
     {
         tracing::warn!(error = ?e, "notification subscription sweep failed after grant update");
     }
+
+    let target_email = repo::user_email(&mut conn, grant.user_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::GRANT_UPDATE,
+            crate::audit::entity::GRANT,
+        )
+        .target(grant.user_id, &target_email)
+        .changes(crate::audit::diff(
+            crate::audit::entity::GRANT,
+            &[
+                (
+                    "role_id",
+                    serde_json::json!(grant.role_id),
+                    serde_json::json!(new_role_id),
+                ),
+                (
+                    "role_name",
+                    serde_json::Value::Null,
+                    serde_json::json!(new_role.name),
+                ),
+                (
+                    "scope_type",
+                    serde_json::json!(grant.scope_type),
+                    serde_json::json!(new_scope_type),
+                ),
+                (
+                    "scope_id",
+                    serde_json::json!(grant.scope_id),
+                    serde_json::json!(new_scope_id),
+                ),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(serde_json::json!({ "id": updated.id })))
 }
 
@@ -1478,6 +1738,25 @@ pub async fn create_role(
             ) => ApiError::Conflict("a role with that name already exists in this org".into()),
             other => ApiError::from(other),
         })?;
+
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::ROLE_CREATE,
+            crate::audit::entity::ROLE,
+        )
+        .target(role.id, &role.name)
+        .changes(crate::audit::created(
+            crate::audit::entity::ROLE,
+            &[
+                ("name", serde_json::json!(role.name)),
+                ("permissions", serde_json::json!(req.permissions)),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(role))
 }
 
@@ -1565,6 +1844,37 @@ pub async fn update_role_handler(
             ) => ApiError::Conflict("a role with that name already exists in this org".into()),
             other => ApiError::from(other),
         })?;
+
+    // The permission diff is the reason this feature exists: "someone widened
+    // a role" is only actionable if the trail says WHICH permission was added.
+    // `old_perms`/`new_perms` are already sorted-and-normalized by
+    // `role_permissions`, so a reorder alone does not register as a change.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::ROLE_UPDATE,
+            crate::audit::entity::ROLE,
+        )
+        .target(updated.id, &updated.name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::ROLE,
+            &[
+                (
+                    "name",
+                    serde_json::json!(role.name),
+                    serde_json::json!(updated.name),
+                ),
+                (
+                    "permissions",
+                    serde_json::json!(old_perms),
+                    serde_json::json!(new_perms),
+                ),
+            ],
+        )),
+    )
+    .await;
     Ok(Json(updated))
 }
 
@@ -1632,5 +1942,28 @@ pub async fn delete_role_handler(
     if deleted == 0 {
         return Err(ApiError::NotFound);
     }
+
+    // Records what the role could do at the moment it was deleted. Without
+    // that, the trail would say a role vanished but not what access vanished
+    // with it — and the role row is gone, so this is the only chance to say.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::ROLE_DELETE,
+            crate::audit::entity::ROLE,
+        )
+        .target(role.id, &role.name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::ROLE,
+            &[(
+                "permissions",
+                serde_json::json!(old_perms),
+                serde_json::Value::Null,
+            )],
+        )),
+    )
+    .await;
     Ok(Json(json!({ "revoked_grants": revoked })))
 }

@@ -171,6 +171,32 @@ pub async fn create(
         created_by: Some(auth.user_id),
     };
     let m = repo::create_monitor(&mut conn, new).await?;
+
+    // `webhook_url` and `config` are absent from the monitor allowlist: both
+    // can carry a delivery secret in the query string.
+    if let Some(entry) = crate::audit::project_entry(
+        &mut conn,
+        project_id,
+        crate::audit::action::MONITOR_CREATE,
+        crate::audit::entity::MONITOR,
+    )
+    .await
+    {
+        crate::audit::record(
+            &mut conn,
+            auth.user_id,
+            entry.target(m.id, &m.name).changes(crate::audit::created(
+                crate::audit::entity::MONITOR,
+                &[
+                    ("name", json!(m.name)),
+                    ("url", json!(m.target)),
+                    ("method", json!(m.method)),
+                    ("interval_seconds", json!(m.interval_seconds)),
+                ],
+            )),
+        )
+        .await;
+    }
     Ok(Json(monitor_view(&m)))
 }
 
@@ -270,7 +296,7 @@ pub async fn update(
     }
     // Reuse the connection `load_authorized` already checked out rather than
     // taking a second one from the pool for the same request.
-    let (mut conn, _m) =
+    let (mut conn, before) =
         load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
     // Pausing/enabling flips status too.
     let status = req.enabled.map(|e| if e { "unknown" } else { "paused" });
@@ -292,6 +318,33 @@ pub async fn update(
     )
     .await?
     .ok_or(ApiError::NotFound)?;
+
+    if let Some(entry) = crate::audit::project_entry(
+        &mut conn,
+        m.project_id,
+        crate::audit::action::MONITOR_UPDATE,
+        crate::audit::entity::MONITOR,
+    )
+    .await
+    {
+        crate::audit::record(
+            &mut conn,
+            auth.user_id,
+            entry.target(m.id, &m.name).changes(crate::audit::diff(
+                crate::audit::entity::MONITOR,
+                &[
+                    ("name", json!(before.name), json!(m.name)),
+                    ("enabled", json!(before.enabled), json!(m.enabled)),
+                    (
+                        "interval_seconds",
+                        json!(before.interval_seconds),
+                        json!(m.interval_seconds),
+                    ),
+                ],
+            )),
+        )
+        .await;
+    }
     Ok(Json(monitor_view(&m)))
 }
 
@@ -302,7 +355,7 @@ pub async fn delete(
     Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
-    let (mut conn, _m) =
+    let (mut conn, m) =
         load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
     // `alert_rules.monitor_id` is `ON DELETE CASCADE`: deleting the monitor
     // silently deletes every alert rule pinned to it too, including ones the
@@ -311,6 +364,34 @@ pub async fn delete(
     // that is the mitigation, since the cascade itself must stay.
     let cascaded_alert_rules = repo::count_alert_rules_for_monitor(&mut conn, monitor_id).await?;
     repo::delete_monitor(&mut conn, monitor_id).await?;
+
+    // The cascade count is recorded as well as disclosed, so the trail explains
+    // the alert rules that vanish alongside the monitor.
+    if let Some(entry) = crate::audit::project_entry(
+        &mut conn,
+        m.project_id,
+        crate::audit::action::MONITOR_DELETE,
+        crate::audit::entity::MONITOR,
+    )
+    .await
+    {
+        crate::audit::record(
+            &mut conn,
+            auth.user_id,
+            entry.target(m.id, &m.name).changes(crate::audit::diff(
+                crate::audit::entity::MONITOR,
+                &[
+                    ("url", json!(m.target), Value::Null),
+                    (
+                        "cascaded_alert_rules",
+                        json!(cascaded_alert_rules),
+                        Value::Null,
+                    ),
+                ],
+            )),
+        )
+        .await;
+    }
     Ok(Json(
         json!({ "ok": true, "cascaded_alert_rules": cascaded_alert_rules }),
     ))

@@ -8,6 +8,7 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import RowActionsMenu from '../lib/components/ui/RowActionsMenu.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
   import DeleteRoleDialog from '../lib/components/members/DeleteRoleDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -15,6 +16,9 @@
   import { listRoles, listMembers } from '../lib/api/orgs';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
+  import { ROLE_DEFAULT_SORT, roleAccessor } from '../lib/models/role-sort';
+  import { sortRows } from '../lib/models/sort-rows';
+  import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import { groupMembers, type MemberGrant, type Permission, type Role } from '../lib/models';
 
   let roles = $state<Role[]>([]);
@@ -62,6 +66,33 @@
     for (const [roleId, users] of usersByRole) counts[roleId] = users.size;
     return counts;
   });
+
+  // `list_roles` returns the org's whole catalogue in one response — a handful
+  // of rows — so the sort runs over the ENTIRE array and there is no pager: a
+  // pager on a five-row table implies a page two that does not exist.
+  //
+  // A bare `SortState`, not the `OffsetListState` the paginated tables use:
+  // that type exists to make "apply a sort" and "reset to page 1" one
+  // indivisible step, and with no offset there is nothing to reset. Its
+  // `key`/`dir` are `readonly` (see `sort.ts`), so `sort.dir = 'asc'` is a
+  // type error and every transition goes through `toggleSort`.
+  let sort = $state<SortState>(ROLE_DEFAULT_SORT);
+
+  // `sortRows` copies before sorting, so `roles` — the array `onRoleSaved` and
+  // `onRoleDeleted` write back into by identity — is never reordered in place
+  // underneath them.
+  //
+  // `roleMemberCounts` is passed in rather than restated inside the accessor
+  // module: it is derived from the members list, and there must be exactly one
+  // definition of "how many people hold this role" or the column orders by a
+  // different number than the cell displays.
+  const sortedRoles = $derived(
+    sortRows(roles, roleAccessor(sort.key, roleMemberCounts), sort.dir),
+  );
+
+  function onsort(key: string, columnDefault: SortDir) {
+    sort = toggleSort(sort, key, columnDefault);
+  }
 
   // orgs.rs:1399,1454,1538 resolve create/update/delete through authorize_org
   // with ROLE_MANAGE — no project- or app-scoped grant can satisfy it, hence
@@ -188,15 +219,19 @@
     <DataTable>
       {#snippet head()}
         <tr>
-          <th>Name</th>
-          <th>Description</th>
-          <th class="num">Permissions</th>
-          <th class="num">Members</th>
+          <SortableTh key="name" columnDefault="asc" {sort} {onsort}>Name</SortableTh>
+          <SortableTh key="description" columnDefault="asc" {sort} {onsort}>Description</SortableTh>
+          <!-- By COUNT, which is what the cell renders. A header that ordered
+               by "whichever permission comes first alphabetically" would be
+               worse than one that does not sort. -->
+          <SortableTh key="permissions" class="num" {sort} {onsort}>Permissions</SortableTh>
+          <SortableTh key="members" class="num" {sort} {onsort}>Members</SortableTh>
+          <!-- The row actions menu. Nothing to order by. -->
           <th class="col-act"></th>
         </tr>
       {/snippet}
       {#snippet children()}
-        {#each roles as role (role.id)}
+        {#each sortedRoles as role (role.id)}
           {@const rowLock = role.is_system ? null : roleManageLock}
           {@const copyLock = blockedByMissingPermission(role)}
           {@const deleteLock = role.is_system ? null : blockedByMissingPermission(role)}

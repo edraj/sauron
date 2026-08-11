@@ -21,6 +21,16 @@ uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# Failure classification downcasts through the `anyhow` chain to the concrete
+# error types, so it needs the crates that define them. Without this the
+# classifier can only match on error *strings*, which silently stops working the
+# moment diesel or redis rewords a message.
+diesel.workspace = true
+redis.workspace = true
+# Fingerprinting failure groups and hashing job payloads for their attempt
+# counters.
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 # Used only by the workflow-lifecycle pipeline test in `process.rs` (a raw

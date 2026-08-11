@@ -4,6 +4,8 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
+  import ClientPager from '../lib/components/ClientPager.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -33,6 +35,14 @@
     type DartPlatform,
     type UploadForm,
   } from '../lib/models/artifact-upload';
+  import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
+  import { ARTIFACT_DEFAULT_SORT, artifactAccessor } from '../lib/models/artifact-sort';
+  import { pageSlice } from '../lib/models/paginate';
+  import { sortRows } from '../lib/models/sort-rows';
+  import type { SortDir } from '../lib/models/sort';
+
+  /** Rows per page. The list arrives whole, so this is a rendering budget only. */
+  const PAGE = 25;
 
   // Cached view (lib/stores/cached-view.svelte.ts): the artifact list paints from
   // cache on return instead of blanking to a spinner, then refreshes behind it.
@@ -53,6 +63,30 @@
   const writeLock = $derived(
     lockedBy('artifact:write', { app: sessionStore.currentAppId, level: 'app' }),
   );
+
+  // `/v1/apps/{id}/artifacts` returns every artifact in one response, so the
+  // sort and the pager both run here, over the SAME array: order the whole list
+  // first, then take a window out of it. Sorting the window instead would
+  // reorder only what is on screen while presenting itself as having ordered
+  // everything.
+  //
+  // Sort and offset are one `OffsetListState` rather than two variables because
+  // `setOffsetSort` resets the offset as part of applying a sort — a re-ordered
+  // list makes the current window meaningless, so page 1 is the only honest
+  // place to land.
+  let list = $state<OffsetListState>({ sort: ARTIFACT_DEFAULT_SORT, offset: 0 });
+
+  // `sortRows` copies before sorting. That is load-bearing here and not merely
+  // tidy: `view.data` is the VERY ARRAY the view cache holds, handed back by
+  // reference (this file's own header comment says so, and `$state.raw` keeps
+  // that identity exact), so an in-place sort would reorder the cached payload
+  // for every later reader and the ordering would survive into the next visit.
+  const sorted = $derived(sortRows(artifacts, artifactAccessor(list.sort.key), list.sort.dir));
+  const page = $derived(pageSlice(sorted, list.offset, PAGE));
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
 
   // Upload form. Handles both artifact kinds the API accepts: JavaScript source
   // maps and Flutter/Dart symbol ELFs. Which fields are shown, what the file
@@ -275,17 +309,22 @@
       <DataTable>
         {#snippet head()}
           <tr>
-            <th>Release</th>
-            <th>File</th>
-            <th>Platform</th>
-            <th>Kind</th>
-            <th class="num">Size</th>
-            <th>Uploaded</th>
+            <SortableTh key="release" columnDefault="asc" sort={list.sort} {onsort}>
+              Release
+            </SortableTh>
+            <SortableTh key="file" columnDefault="asc" sort={list.sort} {onsort}>File</SortableTh>
+            <SortableTh key="platform" columnDefault="asc" sort={list.sort} {onsort}>
+              Platform
+            </SortableTh>
+            <SortableTh key="kind" columnDefault="asc" sort={list.sort} {onsort}>Kind</SortableTh>
+            <SortableTh key="size" class="num" sort={list.sort} {onsort}>Size</SortableTh>
+            <SortableTh key="uploaded" sort={list.sort} {onsort}>Uploaded</SortableTh>
+            <!-- The Delete button's column has no value to order by. -->
             <th></th>
           </tr>
         {/snippet}
         {#snippet children()}
-          {#each artifacts as a (a.id)}
+          {#each page.rows as a (a.id)}
             <tr>
               <td class="mono">{a.release ?? '—'}</td>
               <td class="mono">{a.name ?? a.debug_id ?? '—'}</td>
@@ -302,6 +341,22 @@
           {/each}
         {/snippet}
       </DataTable>
+
+      <!-- `total` is the length of the EXACT array handed to `pageSlice` above
+           — `sorted`, the same expression, not "all the artifacts". The two
+           must be the same array: a pager measuring a longer list than the one
+           being sliced re-creates the enabled-Next-onto-an-empty-page bug that
+           `Pagination.hasNext` was made a required prop to kill. It is only
+           because they agree that a final page of exactly PAGE rows correctly
+           disables Next. (Nothing filters this table. If anything ever does,
+           the filter must both feed `pageSlice` and be measured here, AND reset
+           the offset with `setOffsetPage(list, 0)`.) -->
+      <ClientPager
+        offset={list.offset}
+        limit={PAGE}
+        total={sorted.length}
+        onchange={(o) => (list = setOffsetPage(list, o))}
+      />
     {/if}
   </div>
 </AdminShell>

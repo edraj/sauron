@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { sortRows } from './sort-rows';
+import { rankOf, sortRows } from './sort-rows';
 
 const names = (rows: { name: string }[]) => rows.map((r) => r.name);
 
@@ -77,5 +77,74 @@ describe('sortRows', () => {
     const rows = [{ name: 'on', enabled: true }, { name: 'off', enabled: false }];
     expect(names(sortRows(rows, (r) => r.enabled, 'asc'))).toEqual(['off', 'on']);
     expect(names(sortRows(rows, (r) => r.enabled, 'desc'))).toEqual(['on', 'off']);
+  });
+});
+
+describe('rankOf', () => {
+  // Least severe first, so a higher rank is worse — the direction `rankOf`
+  // documents and every caller inherits.
+  const severity = rankOf(['debug', 'info', 'warning', 'error', 'fatal']);
+  const levels = (rows: { l: string }[]) => rows.map((r) => r.l);
+
+  it('orders by rank, not alphabetically, in both directions', () => {
+    // Every one of the four possible answers here is DIFFERENT, which is the
+    // point of this fixture — a rank test whose levels happen to be in
+    // alphabetical order cannot tell a ranking from a spelling:
+    //   text asc  → debug, fatal, warning   (fatal above warning: wrong)
+    //   text desc → warning, fatal, debug   (warning the most severe: wrong)
+    //   rank asc  → debug, warning, fatal
+    //   rank desc → fatal, warning, debug
+    // So the old text accessor fails this assertion in BOTH directions rather
+    // than coincidentally agreeing with it in one.
+    const rows = [{ l: 'debug' }, { l: 'fatal' }, { l: 'warning' }];
+    expect(levels(sortRows(rows, (r) => severity(r.l), 'asc'))).toEqual([
+      'debug',
+      'warning',
+      'fatal',
+    ]);
+    expect(levels(sortRows(rows, (r) => severity(r.l), 'desc'))).toEqual([
+      'fatal',
+      'warning',
+      'debug',
+    ]);
+  });
+
+  it('sorts an unranked value LAST in both directions, not first in either', () => {
+    // A level the ladder has never heard of — a status the backend added and
+    // this build does not know — must not lead either list. It is unknown, not
+    // extreme.
+    //
+    // This is where `order.length` (the obvious alternative to null) dies: it
+    // is last ascending and FIRST descending, so `wat` would head the
+    // worst-first list. The text accessor dies here too — as text `wat` sorts
+    // after both real levels ascending and before both descending.
+    const rows = [{ l: 'fatal' }, { l: 'wat' }, { l: 'info' }];
+    expect(levels(sortRows(rows, (r) => severity(r.l), 'asc'))).toEqual([
+      'info',
+      'fatal',
+      'wat',
+    ]);
+    expect(levels(sortRows(rows, (r) => severity(r.l), 'desc'))).toEqual([
+      'fatal',
+      'info',
+      'wat',
+    ]);
+  });
+
+  it('ranks the least severe value 0, and 0 is a rank rather than an absence', () => {
+    // `ranks.get(value) || null` instead of `?? null` turns the bottom of every
+    // ladder into an unknown, so `debug` would sort last with `wat`. The rank
+    // assertions above cannot see that — `debug` is already last-but-one there.
+    expect(severity('debug')).toBe(0);
+    expect(severity('fatal')).toBe(4);
+    const rows = [{ l: 'wat' }, { l: 'debug' }];
+    expect(levels(sortRows(rows, (r) => severity(r.l), 'asc'))).toEqual(['debug', 'wat']);
+    expect(levels(sortRows(rows, (r) => severity(r.l), 'desc'))).toEqual(['debug', 'wat']);
+  });
+
+  it('ranks null and undefined as absent, the same as an unknown value', () => {
+    expect(severity(null)).toBeNull();
+    expect(severity(undefined)).toBeNull();
+    expect(severity('nope')).toBeNull();
   });
 });

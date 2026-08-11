@@ -21,8 +21,9 @@
 //! those must never be subtracted from an item count. Most of them are named for
 //! it — `sauron_ingest_stream_length`, `..._stream_entries_added`,
 //! `..._stream_entries_read`, `..._stream_group_lag`,
-//! `..._stream_unread_trimmed` — but the sixth probe-derived gauge is
-//! `sauron_ingest_dlq_length`, with no `stream_` in its name, so "the
+//! `..._stream_unread_trimmed` — but two probe-derived gauges are not:
+//! `sauron_ingest_dlq_length` and `sauron_ingest_retry_length`, neither with
+//! `stream_` in its name, so "the
 //! `..._stream_...` gauges" is not a way to select the entries-unit ones. What
 //! does hold, and is pinned by
 //! `every_help_states_a_unit_and_only_dlq_length_lacks_the_stream_marker`: every
@@ -206,6 +207,13 @@ pub struct StreamSnapshot {
     pub lag: Option<u64>,
     /// Entries in the dead-letter stream.
     pub dlq_length: u64,
+    /// Jobs currently waiting out a retry backoff.
+    ///
+    /// The recovery feature's own backlog. Without it the tier that exists to
+    /// stop transient failures becoming data loss is itself unobservable: a
+    /// database wobble parks thousands of jobs and the only visible symptom is
+    /// that `items_persisted` quietly lags `items_accepted`.
+    pub retry_length: u64,
 }
 
 impl StreamSnapshot {
@@ -373,11 +381,25 @@ pub fn render_counters(c: &Counters, stream: Option<&StreamSnapshot>) -> String 
             &mut out,
             "sauron_ingest_dlq_length",
             "gauge",
-            "ENTRIES in the dead-letter stream. Unit: entries. Note the name: this is the one \
-             gauge here that carries no stream_ marker, so a query written as \
-             sauron_ingest_stream_* selects the other five and silently omits this one. The DLQ \
-             has no MAXLEN and no reaper, so this only ever grows until an operator drains it.",
+            "ENTRIES in the dead-letter stream. Unit: entries. Note the name: this and \
+             sauron_ingest_retry_length carry no stream_ marker, so a query written as \
+             sauron_ingest_stream_* silently omits both. Since ingest failure recovery landed \
+             this is only the BACKSTOP — it counts failures that could not even be written to \
+             Postgres — so a non-zero value here means the database was unreachable, not merely \
+             that an event was malformed. Bounded by INGEST_DLQ_MAXLEN and reaped after \
+             INGEST_DLQ_RETENTION_HOURS, but both bounds require a running worker.",
             s.dlq_length,
+        );
+        metric(
+            &mut out,
+            "sauron_ingest_retry_length",
+            "gauge",
+            "JOBS currently waiting out a retry backoff. Unit: entries. A live gauge of the \
+             recovery tier's own backlog: transient failures park here for ~60s per attempt and \
+             leave once re-enqueued, so a sustained non-zero value means failures are arriving \
+             faster than they are clearing. Only worker-0 drains it, so this rising while \
+             nothing else changes means no worker is running.",
+            s.retry_length,
         );
     }
 
@@ -467,10 +489,10 @@ mod tests {
     }
 
     /// The two claims the module doc makes about NAMES, checked rather than
-    /// asserted in prose: every metric states its unit, and `dlq_length` is the
-    /// only probe-derived gauge whose name lacks the `stream_` marker — which is
-    /// why `sauron_ingest_stream_*` is not a way to select the entries-unit
-    /// gauges.
+    /// asserted in prose: every metric states its unit, and `dlq_length` and
+    /// `retry_length` are the probe-derived gauges whose names lack the
+    /// `stream_` marker — which is why `sauron_ingest_stream_*` is not a way to
+    /// select the entries-unit gauges.
     #[test]
     fn every_help_states_a_unit_and_only_dlq_length_lacks_the_stream_marker() {
         // A snapshot with every optional field present, so nothing is skipped.
@@ -480,6 +502,7 @@ mod tests {
             entries_read: Some(3),
             lag: Some(2),
             dlq_length: 1,
+            retry_length: 4,
         };
         let text = render_counters(
             &Counters {
@@ -497,8 +520,8 @@ mod tests {
         let helps: Vec<&str> = text.lines().filter(|l| l.starts_with("# HELP ")).collect();
         assert_eq!(
             helps.len(),
-            13,
-            "expected 7 counters + 6 gauges, got:\n{text}"
+            14,
+            "expected 7 counters + 7 gauges, got:\n{text}"
         );
         for h in &helps {
             assert!(h.contains("Unit: "), "help line states no unit: {h}");
@@ -510,7 +533,7 @@ mod tests {
             .filter(|l| l.ends_with(" gauge"))
             .map(|l| l.split(' ').next().unwrap())
             .collect();
-        assert_eq!(gauges.len(), 6, "expected six probe-derived gauges");
+        assert_eq!(gauges.len(), 7, "expected seven probe-derived gauges");
         for g in &gauges {
             let help = helps
                 .iter()
@@ -527,9 +550,10 @@ mod tests {
             .collect();
         assert_eq!(
             unmarked,
-            vec![&"sauron_ingest_dlq_length"],
+            vec![&"sauron_ingest_dlq_length", &"sauron_ingest_retry_length"],
             "the set of gauges without a stream_ marker changed; the module doc and the \
-             dlq_length help both name dlq_length as the only one"
+             dlq_length help must both name every gauge that lacks the marker, or a \
+             dashboard written as sauron_ingest_stream_* silently omits one"
         );
     }
 
@@ -556,6 +580,7 @@ mod tests {
             entries_read: Some(11),
             lag: None,
             dlq_length: 0,
+            retry_length: 0,
         };
         assert_eq!(s.unread_trimmed(), None);
 

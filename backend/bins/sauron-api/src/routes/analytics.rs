@@ -11,7 +11,7 @@ use uuid::Uuid;
 use sauron_auth::{authorize_app, perm, AuthUser};
 use sauron_db::models::{AnalyticsEvent, ErrorEvent, Issue};
 use sauron_db::repo;
-use sauron_db::repo::{EventCount, PersonRow, SeriesPoint};
+use sauron_db::repo::{EventCount, PersonRow, SeriesPoint, SortSpec};
 
 use super::db;
 use crate::error::ApiError;
@@ -149,6 +149,70 @@ pub async fn person(
 // Users Explorer — searchable directory of people with activity counts.
 // ---------------------------------------------------------------------------
 
+/// `UNIQUE (app_id, distinct_id)` on `event_users`, and this list pages one
+/// app, so `distinct_id` is unique across its result set. Every ordering in
+/// [`persons_list`] appends it, which is what makes OFFSET paging total —
+/// before this the list had no tiebreaker at all.
+///
+/// Qualified with the `eu` alias: `distinct_id` is also selected by the three
+/// LATERAL subqueries' correlation, and an unqualified name in the ORDER BY
+/// would be resolving against the output list by luck rather than by
+/// intention.
+const PERSON_TIEBREAK: &str = "eu.distinct_id";
+
+/// What `?sort=` accepts on [`persons_list`].
+const PERSON_SORTS: &[&str] = &[
+    "last_seen",
+    "distinct_id",
+    "first_seen",
+    "sessions_count",
+    "events_count",
+    "errors_count",
+];
+
+/// The wire `?sort=` value for the Users Explorer, resolved to a validated
+/// [`SortSpec`].
+///
+/// A free function, not inlined into [`persons_list`], for the reason
+/// `devices::device_sort_spec`'s doc comment gives: an arm naming a
+/// valid-but-WRONG column compiles, returns 200, and sorts the table by the
+/// wrong data. Lifting it here is what lets `mod tests` below pin every arm
+/// without a database or a server.
+///
+/// The `&'static str` on the right of each arm is what reaches the SQL; the
+/// `String` `parse_sort` returns never does — see [`SortSpec`]'s doc comment.
+///
+/// `first_seen`/`last_seen` are the BARE output aliases, deliberately not
+/// `eu.`-qualified. Under a scoped read those aliases are
+/// `LEAST`/`GREATEST` over the three LATERALs while `eu.first_seen`/
+/// `eu.last_seen` are the app-wide `event_users` columns — ordering on the
+/// latter would page by a value the caller never sees. Postgres resolves a
+/// bare name in ORDER BY against the select list first, which is what picks
+/// the right one. `distinct_id` has no such split, so it is qualified.
+pub(crate) fn person_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> {
+    let (column, descending) = super::search::parse_sort(raw, PERSON_SORTS, "last_seen")?;
+    let (column, nulls_last) = match column.as_str() {
+        "distinct_id" => ("eu.distinct_id", false),
+        "first_seen" => ("first_seen", false),
+        "sessions_count" => ("sessions_count", false),
+        "events_count" => ("events_count", false),
+        "errors_count" => ("errors_count", false),
+        // `parse_sort` refused everything else, so this is the default.
+        _ => ("last_seen", false),
+    };
+    // `nulls_last` is uniformly false and that is a measured claim, not an
+    // oversight: `distinct_id`/`first_seen`/`last_seen` are NOT NULL on
+    // `event_users`, the three counts are `COALESCE(...,0)`, and under a
+    // scoped read `LEAST`/`GREATEST` still return non-NULL because the
+    // membership `EXISTS` guarantees at least one of the three legs matched.
+    Ok(SortSpec {
+        column,
+        descending,
+        tiebreak: PERSON_TIEBREAK,
+        nulls_last,
+    })
+}
+
 #[derive(Deserialize)]
 pub struct PersonsQuery {
     pub search: Option<String>,
@@ -156,6 +220,9 @@ pub struct PersonsQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    /// A column name from [`PERSON_SORTS`], optionally `-`-prefixed to ascend.
+    /// Absent means `last_seen` descending.
+    pub sort: Option<String>,
     // See `RangeQuery`'s comment: `environment_id` comes from `RawQuery`, not
     // this struct.
 }
@@ -181,6 +248,7 @@ pub async fn persons_list(
     )
     .await?;
     let search = q.search.as_deref().filter(|s| !s.is_empty());
+    let sort = person_sort_spec(q.sort.as_deref())?;
     Ok(Json(
         repo::list_persons(
             &mut conn,
@@ -188,6 +256,7 @@ pub async fn persons_list(
             search,
             q.limit.clamp(1, 200),
             super::clamp_offset(q.offset),
+            sort,
         )
         .await?,
     ))
@@ -1006,4 +1075,115 @@ pub async fn active_users_series(
         series: series.into_iter().map(DayCountOut::from).collect(),
         partial_days,
     }))
+}
+
+#[cfg(test)]
+mod person_sort_tests {
+    use super::*;
+
+    /// `(wire name, expected column, expected nulls_last)` for
+    /// [`persons_list`].
+    ///
+    /// Written out rather than derived from the name, because deriving it
+    /// would reproduce whatever rule the implementation used and stop being an
+    /// independent check. One of these is deliberately NOT the bare wire name
+    /// (`distinct_id` is `eu.`-qualified) and two deliberately ARE (the bare
+    /// `first_seen`/`last_seen` are the output aliases, not `eu.`'s columns —
+    /// see [`person_sort_spec`]'s doc comment for why that distinction is
+    /// load-bearing under a scoped read).
+    const PERSON_EXPECTED: &[(&str, &str, bool)] = &[
+        ("last_seen", "last_seen", false),
+        ("distinct_id", "eu.distinct_id", false),
+        ("first_seen", "first_seen", false),
+        ("sessions_count", "sessions_count", false),
+        ("events_count", "events_count", false),
+        ("errors_count", "errors_count", false),
+    ];
+
+    /// The finding this exists for: an arm mapping a whitelisted name to a
+    /// valid-but-wrong column (`"first_seen" => "last_seen"`) compiles,
+    /// returns 200, and silently sorts the table by the wrong data. Only an
+    /// assertion on the resolved `column` can see it.
+    #[test]
+    fn every_whitelisted_name_maps_to_its_own_column() {
+        for (name, column, nulls_last) in PERSON_EXPECTED {
+            let spec = person_sort_spec(Some(name)).expect("whitelisted");
+            assert_eq!(spec.column, *column, "person sort `{name}` mapped wrong");
+            assert_eq!(
+                spec.nulls_last, *nulls_last,
+                "person sort `{name}`: wrong nulls_last"
+            );
+            assert_eq!(spec.tiebreak, PERSON_TIEBREAK, "person sort `{name}`");
+        }
+    }
+
+    /// The table above and the whitelist must not drift apart: a column added
+    /// to `PERSON_SORTS` without a matching `match` arm silently falls through
+    /// to the `_ =>` default and sorts by `last_seen` instead — a 200 and a
+    /// wrong table.
+    #[test]
+    fn the_expected_table_covers_exactly_the_whitelist() {
+        let names: Vec<&str> = PERSON_EXPECTED.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(names, PERSON_SORTS.to_vec());
+    }
+
+    /// No two names may resolve to the same column — the invariant a
+    /// copy-pasted arm violates first, and it holds without restating the
+    /// mapping.
+    #[test]
+    fn no_two_sort_names_share_a_column() {
+        let mut columns: Vec<&str> = PERSON_SORTS
+            .iter()
+            .map(|n| person_sort_spec(Some(n)).expect("whitelisted").column)
+            .collect();
+        let total = columns.len();
+        columns.sort_unstable();
+        columns.dedup();
+        assert_eq!(
+            columns.len(),
+            total,
+            "two sort names resolved to the same column: {columns:?}"
+        );
+    }
+
+    /// Direction is `parse_sort`'s: bare descends, `-` ascends. The tiebreak
+    /// never reverses with it.
+    #[test]
+    fn a_dash_prefix_ascends_and_the_tiebreak_does_not_follow() {
+        let desc = person_sort_spec(Some("events_count")).expect("bare");
+        assert!(desc.descending);
+        let asc = person_sort_spec(Some("-events_count")).expect("dash");
+        assert!(!asc.descending);
+        assert_eq!(desc.column, asc.column);
+        assert!(desc.order_by().ends_with(", eu.distinct_id ASC"));
+        assert!(asc.order_by().ends_with(", eu.distinct_id ASC"));
+    }
+
+    /// Absent and empty both mean the list's default, and the default is a
+    /// real member of the whitelist rather than an unvalidated fallthrough.
+    #[test]
+    fn absent_means_the_default_ordering() {
+        for raw in [None, Some(""), Some("  ")] {
+            let spec = person_sort_spec(raw).expect("default");
+            assert_eq!(spec.column, "last_seen");
+            assert!(spec.descending);
+            assert_eq!(spec.tiebreak, PERSON_TIEBREAK);
+        }
+    }
+
+    /// Junk, injection and another list's exclusive columns are all refused.
+    #[test]
+    fn an_unlisted_column_is_refused() {
+        for bad in [
+            "last_seen; DROP TABLE event_users",
+            "properties",
+            "id",
+            "device_count",
+        ] {
+            assert!(
+                person_sort_spec(Some(bad)).is_err(),
+                "the persons list must refuse `{bad}`"
+            );
+        }
+    }
 }

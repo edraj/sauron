@@ -5,6 +5,7 @@
 //! caller's org/project membership.
 
 mod admin_storage;
+mod audit;
 mod csv;
 mod error;
 mod mail;
@@ -843,6 +844,13 @@ async fn main() -> anyhow::Result<()> {
         )
         // --- storage & records (org:manage required) ---
         .route("/v1/admin/storage", get(routes::admin::storage))
+        // --- Wall of Shame: the administrative trail for one org ---
+        // `org_id` is a required query parameter and is authorized against the
+        // caller's grants inside the handler, so this is org-partitioned even
+        // though the path is not.
+        .route("/v1/admin/audit", get(routes::audit::list))
+        // Same filters, same gate, whole filtered set rather than one page.
+        .route("/v1/admin/audit.csv", get(routes::audit::export_csv))
         // Deployment-wide rotation policy. Gated on holding org:manage in EVERY
         // org (see require_deployment_admin) — a single tenant's admin must not be
         // able to move the hot/cold boundary for everyone.
@@ -862,6 +870,25 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/tier-pins/{id}/extend",
             post(routes::admin::extend_pin),
+        )
+        // Ingest failures. Deployment-wide for the same reason as the tier
+        // routes above, plus one of its own: the dominant failure never
+        // decoded, so it carries no org_id to scope an org-level grant against.
+        .route(
+            "/v1/admin/ingest-failures",
+            get(routes::failures::list),
+        )
+        .route(
+            "/v1/admin/ingest-failures/{id}",
+            axum::routing::delete(routes::failures::drop_group),
+        )
+        .route(
+            "/v1/admin/ingest-failures/{id}/payloads",
+            get(routes::failures::payloads),
+        )
+        .route(
+            "/v1/admin/ingest-failures/{id}/retry",
+            post(routes::failures::retry),
         )
         // A JSON API body never legitimately reaches megabytes; the artifact
         // routes below are merged separately with their own raised limit.

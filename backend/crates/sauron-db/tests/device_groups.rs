@@ -14,10 +14,33 @@ use chrono::{DateTime, Duration, SubsecRound, Utc};
 use common::{far_past, seed_env, TestDb};
 use sauron_db::models::NewAnalyticsEvent;
 use sauron_db::repo;
-use sauron_db::repo::DeviceGroupKey;
+use sauron_db::repo::{DeviceGroupKey, SortSpec};
 use sauron_db::scope::{EnvFilter, ReadScope};
 use serde_json::json;
 use uuid::Uuid;
+
+/// The default ordering `routes::devices::groups` builds — most recent first,
+/// tiebroken on the grouping tuple. Spelled as a function, not a constant,
+/// because `SortSpec` is passed by value and every call site needs its own.
+fn group_sort() -> SortSpec {
+    SortSpec {
+        column: "last_seen",
+        descending: true,
+        tiebreak: "d.family, d.model, d.os_name, d.os_version",
+        nulls_last: false,
+    }
+}
+
+/// The default ordering `routes::devices::list` builds. Same reasoning as
+/// [`group_sort`].
+fn device_sort() -> SortSpec {
+    SortSpec {
+        column: "last_seen",
+        descending: true,
+        tiebreak: "d.device_key",
+        nulls_last: false,
+    }
+}
 
 /// One `analytics_events` row keyed by `device_key`, tagged `env`.
 ///
@@ -277,6 +300,7 @@ async fn devices_sharing_model_and_os_collapse_into_one_group() {
         far_past(),
         50,
         0,
+        group_sort(),
         None,
     )
     .await
@@ -320,6 +344,7 @@ async fn devices_with_null_descriptors_form_one_unknown_group() {
         far_past(),
         50,
         0,
+        group_sort(),
         None,
     )
     .await
@@ -382,6 +407,7 @@ async fn groups_exclude_devices_from_other_environments() {
         far_past(),
         50,
         0,
+        group_sort(),
         None,
     )
     .await
@@ -494,10 +520,17 @@ async fn group_sessions_and_first_last_seen_use_pinned_timestamps() {
     // durable `devices` columns — both iphone_a and iphone_b were bumped
     // exactly once, at `t0 - 30s` (`seed_device_fleet`) — and so are
     // untouched by any of the four session timestamps above.
-    let rows_all =
-        repo::list_device_groups(&mut conn, ReadScope::all(ids.app_id), since, 50, 0, None)
-            .await
-            .expect("list_device_groups All");
+    let rows_all = repo::list_device_groups(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        since,
+        50,
+        0,
+        group_sort(),
+        None,
+    )
+    .await
+    .expect("list_device_groups All");
     let group_all = rows_all
         .iter()
         .find(|r| r.os_version.as_deref() == Some("17.4.1"))
@@ -527,6 +560,7 @@ async fn group_sessions_and_first_last_seen_use_pinned_timestamps() {
         since,
         50,
         0,
+        group_sort(),
         None,
     )
     .await
@@ -574,6 +608,7 @@ async fn group_filter_returns_only_that_groups_devices() {
         far_past(),
         50,
         0,
+        device_sort(),
         None,
         Some(DeviceGroupKey {
             family: Some("iPhone"),
@@ -615,6 +650,7 @@ async fn group_filter_matches_the_all_null_group() {
         far_past(),
         50,
         0,
+        device_sort(),
         None,
         Some(DeviceGroupKey::default()),
     )
@@ -726,6 +762,7 @@ async fn group_pagination_is_stable_across_last_seen_ties() {
             far_past(),
             page_size,
             offset,
+            group_sort(),
             None,
         )
         .await
@@ -776,6 +813,7 @@ async fn no_group_filter_returns_every_device() {
         far_past(),
         50,
         0,
+        device_sort(),
         None,
         None,
     )

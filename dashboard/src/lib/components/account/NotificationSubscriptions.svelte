@@ -6,6 +6,8 @@
   import EmptyState from '../ui/EmptyState.svelte';
   import ConfirmDialog from '../ui/ConfirmDialog.svelte';
   import DataTable from '../DataTable.svelte';
+  import SortableTh from '../SortableTh.svelte';
+  import ClientPager from '../ClientPager.svelte';
   import SubscriptionDialog from './SubscriptionDialog.svelte';
   import {
     deleteSubscription,
@@ -16,7 +18,15 @@
   import { listApps } from '../../api/apps';
   import { listEnvironments, listProjectEnvironments } from '../../api/environments';
   import { describeSubscription, quietHoursLabel } from '../../models/notification-prefs';
-  import type { NotificationSubscription } from '../../models';
+  import { setOffsetPage, setOffsetSort, type OffsetListState } from '../../models/list-state';
+  import {
+    SUBSCRIPTION_DEFAULT_SORT,
+    subscriptionAccessor,
+  } from '../../models/subscription-sort';
+  import { pageSlice } from '../../models/paginate';
+  import { sortRows } from '../../models/sort-rows';
+  import type { SortDir } from '../../models/sort';
+  import type { NotificationSubscription, SubscriptionKind } from '../../models';
   import { sessionStore } from '../../stores/session.svelte';
   import { toastStore } from '../../stores/toast.svelte';
 
@@ -26,6 +36,14 @@
     error_new_issue: 'New issue',
     error_regression: 'Issue regressed',
   };
+
+  // Named once so the "Notify about" column can be SORTED by exactly the text
+  // it renders; handing the accessor a lookup that disagreed with the cell is
+  // the "orders by one value, displays another" bug.
+  const kindLabel = (k: SubscriptionKind): string => KIND_LABELS[k] ?? k;
+
+  /** Rows per page. The list arrives whole, so this is a rendering budget only. */
+  const PAGE = 25;
 
   let subs = $state<NotificationSubscription[]>([]);
   let loading = $state(true);
@@ -44,6 +62,28 @@
   // (`pages/Members.svelte:385`).
   const orgId = $derived(sessionStore.currentOrg?.id ?? '');
   const orgName = $derived(sessionStore.currentOrg?.name ?? 'Organization');
+
+  // `/v1/me/notification-subscriptions` returns every subscription in one
+  // response, so the sort and the pager both run here, over the SAME array:
+  // order the whole list first, then take a window out of it. Sorting the
+  // window instead would reorder only what is on screen while presenting
+  // itself as having ordered everything.
+  //
+  // Sort and offset are one `OffsetListState` rather than two variables because
+  // `setOffsetSort` resets the offset as part of applying a sort.
+  let list = $state<OffsetListState>({ sort: SUBSCRIPTION_DEFAULT_SORT, offset: 0 });
+
+  // `sortRows` copies before sorting. `subs` is replaced wholesale by `load()`
+  // and read by the dialog through `editing`, so an in-place sort would reorder
+  // the array every other reader holds.
+  const sorted = $derived(
+    sortRows(subs, subscriptionAccessor(list.sort.key, kindLabel), list.sort.dir),
+  );
+  const page = $derived(pageSlice(sorted, list.offset, PAGE));
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
 
   async function load() {
     loading = true;
@@ -171,20 +211,29 @@
     <DataTable>
       {#snippet head()}
         <tr>
-          <th>Scope</th>
-          <th>Notify about</th>
-          <th>Environments</th>
-          <th>Delivery</th>
-          <th>Quiet hours</th>
-          <th>State</th>
+          <SortableTh key="scope" columnDefault="asc" sort={list.sort} {onsort}>Scope</SortableTh>
+          <SortableTh key="kind" columnDefault="asc" sort={list.sort} {onsort}>
+            Notify about
+          </SortableTh>
+          <SortableTh key="environments" columnDefault="asc" sort={list.sort} {onsort}>
+            Environments
+          </SortableTh>
+          <SortableTh key="delivery" columnDefault="asc" sort={list.sort} {onsort}>
+            Delivery
+          </SortableTh>
+          <SortableTh key="quiet_hours" columnDefault="asc" sort={list.sort} {onsort}>
+            Quiet hours
+          </SortableTh>
+          <SortableTh key="state" columnDefault="asc" sort={list.sort} {onsort}>State</SortableTh>
+          <!-- Edit / Enable / Delete: no value to order by. -->
           <th></th>
         </tr>
       {/snippet}
       {#snippet children()}
-        {#each subs as s (s.id)}
+        {#each page.rows as s (s.id)}
           <tr>
             <td>{describeSubscription(s)}</td>
-            <td>{KIND_LABELS[s.kind] ?? s.kind}</td>
+            <td>{kindLabel(s.kind)}</td>
             <td>{s.environment_ids.length === 0 ? 'All' : s.environment_ids.length}</td>
             <td>
               {s.effective_delivery}
@@ -223,6 +272,20 @@
         {/each}
       {/snippet}
     </DataTable>
+
+    <!-- `total` is the length of the EXACT array handed to `pageSlice` above —
+         `sorted`, the same expression, not "all the subscriptions". A pager
+         measuring a longer list than the one being sliced re-creates the
+         enabled-Next-onto-an-empty-page bug that `Pagination.hasNext` was made
+         a required prop to kill. (Nothing filters this table. If anything ever
+         does, the filter must both feed `pageSlice` and be measured here, AND
+         reset the offset with `setOffsetPage(list, 0)`.) -->
+    <ClientPager
+      offset={list.offset}
+      limit={PAGE}
+      total={sorted.length}
+      onchange={(o) => (list = setOffsetPage(list, o))}
+    />
   {/if}
 </Card>
 

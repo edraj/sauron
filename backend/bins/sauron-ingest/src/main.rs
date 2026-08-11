@@ -91,6 +91,12 @@ const DSN_CACHE_MAX: usize = 10_000;
 /// Sizing it is a function of RATE, not of events: one entry now holds a whole
 /// envelope, so the same cap covers roughly `items_per_envelope` times more
 /// telemetry than it did when each item was its own entry.
+///
+/// The default is shared with the worker's retry drain and the API's manual
+/// replay via `sauron_redis::INGEST_STREAM_MAXLEN_DEFAULT`. Three processes now
+/// append to this stream and none can see the others' parse of the env var; a
+/// re-enqueue with a smaller bound would trim live entries this binary had
+/// already answered `202` to.
 fn stream_maxlen() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -98,7 +104,7 @@ fn stream_maxlen() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(1_000_000)
+            .unwrap_or(sauron_redis::INGEST_STREAM_MAXLEN_DEFAULT)
     })
 }
 

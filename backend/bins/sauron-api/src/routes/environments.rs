@@ -210,7 +210,7 @@ pub async fn create_project_environment(
     Json(req): Json<CreateEnvReq>,
 ) -> Result<Json<Environment>, ApiError> {
     let mut conn = db(&state).await?;
-    authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_CREATE).await?;
+    let project = authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_CREATE).await?;
     let name = validate_env_name(&req.name).map_err(ApiError::BadRequest)?;
 
     if repo::count_active_project_environments(&mut conn, project_id).await?
@@ -264,6 +264,29 @@ pub async fn create_project_environment(
         })
         .await?;
 
+    // After the transaction, never inside it: a swallowed audit error raised
+    // within `conn.transaction` would still poison it and roll the whole
+    // create back, which is the opposite of `audit::record`'s fail-open
+    // contract. The enrollment keys minted above are deliberately not
+    // recorded — see `audit::FORBIDDEN_FIELDS`.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            project.org_id,
+            crate::audit::action::ENV_CREATE,
+            crate::audit::entity::ENVIRONMENT,
+        )
+        .target(env.id, &env.name)
+        .project(project.id, &project.name)
+        .environment(env.id, &env.name)
+        .changes(crate::audit::created(
+            crate::audit::entity::ENVIRONMENT,
+            &[("name", serde_json::json!(env.name))],
+        )),
+    )
+    .await;
+
     Ok(Json(env))
 }
 
@@ -282,7 +305,8 @@ pub async fn update_project_environment(
     let (project_id, _) = repo::project_env_ancestry(&mut conn, env_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_UPDATE).await?;
+    let project =
+        authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_UPDATE).await?;
 
     let env = repo::get_project_environment(&mut conn, env_id)
         .await?
@@ -299,8 +323,32 @@ pub async fn update_project_environment(
     let name = validate_env_name(raw).map_err(ApiError::BadRequest)?;
     // No cache invalidation: the name is not part of `EnvRef`, and renaming
     // changes no key and no ingest switch. Every enrollment keeps resolving.
+    let previous_name = env.name.clone();
     match repo::rename_project_environment(&mut conn, env_id, name).await {
-        Ok(env) => Ok(Json(env)),
+        Ok(renamed) => {
+            crate::audit::record(
+                &mut conn,
+                auth.user_id,
+                crate::audit::Entry::new(
+                    project.org_id,
+                    crate::audit::action::ENV_UPDATE,
+                    crate::audit::entity::ENVIRONMENT,
+                )
+                .target(renamed.id, &renamed.name)
+                .project(project.id, &project.name)
+                .environment(renamed.id, &renamed.name)
+                .changes(crate::audit::diff(
+                    crate::audit::entity::ENVIRONMENT,
+                    &[(
+                        "name",
+                        serde_json::json!(previous_name),
+                        serde_json::json!(renamed.name),
+                    )],
+                )),
+            )
+            .await;
+            Ok(Json(renamed))
+        }
         Err(diesel::result::Error::DatabaseError(
             diesel::result::DatabaseErrorKind::UniqueViolation,
             _,
@@ -320,7 +368,8 @@ pub async fn retire_project_environment(
     let (project_id, _) = repo::project_env_ancestry(&mut conn, env_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_DELETE).await?;
+    let project =
+        authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_DELETE).await?;
 
     // Both invariants are read and acted on in one transaction that starts with a
     // project-level lock, so two concurrent retires of DIFFERENT environments in
@@ -365,6 +414,30 @@ pub async fn retire_project_environment(
                 tracing::warn!(error = %e, env_id = %env_id, "failed to invalidate ingest key cache");
             }
         }
+        // Gated on the real state transition, for the same reason the cache
+        // invalidation above is: the idempotent re-retire changed nothing, and
+        // recording it would fill the trail with events that never happened.
+        crate::audit::record(
+            &mut conn,
+            auth.user_id,
+            crate::audit::Entry::new(
+                project.org_id,
+                crate::audit::action::ENV_RETIRE,
+                crate::audit::entity::ENVIRONMENT,
+            )
+            .target(retired.id, &retired.name)
+            .project(project.id, &project.name)
+            .environment(retired.id, &retired.name)
+            .changes(crate::audit::diff(
+                crate::audit::entity::ENVIRONMENT,
+                &[(
+                    "retired_at",
+                    serde_json::Value::Null,
+                    serde_json::json!(retired.retired_at),
+                )],
+            )),
+        )
+        .await;
     }
     Ok(Json(retired))
 }
@@ -438,7 +511,7 @@ pub async fn update_app_environment(
     Json(req): Json<UpdateAppEnvReq>,
 ) -> Result<Json<AppEnvironment>, ApiError> {
     let mut conn = db(&state).await?;
-    let (app_id, _, _) = repo::env_ancestry(&mut conn, id)
+    let (app_id, _, org_id) = repo::env_ancestry(&mut conn, id)
         .await?
         .ok_or(ApiError::NotFound)?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ENV_UPDATE).await?;
@@ -463,6 +536,11 @@ pub async fn update_app_environment(
     }
 
     let ingest_changed = req.ingest_enabled.is_some();
+    // Captured before the transaction consumes `env`. These are the diff's
+    // "from" side; `audit::diff` drops any that did not actually move, so a
+    // no-op PATCH records an entry with an empty `changes` rather than a
+    // fictitious one.
+    let (was_ingest_enabled, was_default) = (env.ingest_enabled, env.is_default);
 
     let current = conn
         .transaction::<_, ApiError, _>(async |conn| {
@@ -510,6 +588,49 @@ pub async fn update_app_environment(
         }
     }
 
+    // The enrollment carries no name of its own — it lives on the catalogue row
+    // this enrollment points at.
+    let env_name = repo::get_project_environment(&mut conn, current.environment_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.name)
+        .unwrap_or_default();
+
+    // `entity_id` is the ENROLLMENT (that is what changed); `environment_id` is
+    // the CATALOGUE entry. They are deliberately different ids. The Wall's
+    // environment filter is org-wide, and a user filtering for "staging" means
+    // the catalogue environment across every app — an enrollment id would match
+    // exactly one app and silently hide the rest.
+    let entry = crate::audit::with_app_scope(
+        &mut conn,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::ENV_ENROLLMENT_UPDATE,
+            crate::audit::entity::ENVIRONMENT,
+        )
+        .target(current.id, &env_name)
+        .environment(current.environment_id, &env_name)
+        .changes(crate::audit::diff(
+            crate::audit::entity::ENVIRONMENT,
+            &[
+                (
+                    "ingest_enabled",
+                    serde_json::json!(was_ingest_enabled),
+                    serde_json::json!(current.ingest_enabled),
+                ),
+                (
+                    "is_default",
+                    serde_json::json!(was_default),
+                    serde_json::json!(current.is_default),
+                ),
+            ],
+        )),
+        app_id,
+    )
+    .await;
+    crate::audit::record(&mut conn, auth.user_id, entry).await;
+
     Ok(Json(current))
 }
 
@@ -519,7 +640,7 @@ pub async fn rotate_app_environment_key(
     Path(id): Path<Uuid>,
 ) -> Result<Json<AppEnvironment>, ApiError> {
     let mut conn = db(&state).await?;
-    let (app_id, _, _) = repo::env_ancestry(&mut conn, id)
+    let (app_id, _, org_id) = repo::env_ancestry(&mut conn, id)
         .await?
         .ok_or(ApiError::NotFound)?;
     authorize_app(&mut conn, auth.user_id, app_id, perm::ENV_ROTATE_KEY).await?;
@@ -541,5 +662,30 @@ pub async fn rotate_app_environment_key(
     if let Err(e) = state.redis.del(&keys::dsn_cache(&env.public_key)).await {
         tracing::warn!(error = %e, env_id = %id, "failed to invalidate ingest key cache");
     }
+
+    let env_name = repo::get_project_environment(&mut conn, updated.environment_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.name)
+        .unwrap_or_default();
+    // `changes` is deliberately EMPTY. This is the platform's revocation
+    // button, so that it happened, to which enrollment, and by whom is the
+    // whole record — recording either key would put a live ingest credential
+    // into a table org admins can read and that is never pruned.
+    let entry = crate::audit::with_app_scope(
+        &mut conn,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::ENV_ROTATE_KEY,
+            crate::audit::entity::ENVIRONMENT,
+        )
+        .target(updated.id, &env_name)
+        .environment(updated.environment_id, &env_name),
+        app_id,
+    )
+    .await;
+    crate::audit::record(&mut conn, auth.user_id, entry).await;
+
     Ok(Json(updated))
 }

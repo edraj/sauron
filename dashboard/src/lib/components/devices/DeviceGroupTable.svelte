@@ -1,14 +1,23 @@
 <script lang="ts">
   import { push } from 'svelte-spa-router';
   import DataTable from '../DataTable.svelte';
+  import SortableTh from '../SortableTh.svelte';
   import TimeValue from '../TimeValue.svelte';
   import { encodeGroupKey } from '../../models/device-groups';
+  import type { SortDir, SortState } from '../../models/sort';
   import type { DeviceGroupRow } from '../../models';
 
   interface Props {
     rows: DeviceGroupRow[];
+    /**
+     * Sort state and the click handler both come from `DevicesInventory`,
+     * which owns the one `OffsetListState` these headers drive: the sort has
+     * to reset the offset, and only the page holds that.
+     */
+    sort: SortState;
+    onsort: (key: string, columnDefault: SortDir) => void;
   }
-  let { rows }: Props = $props();
+  let { rows, sort, onsort }: Props = $props();
 
   function deviceName(g: DeviceGroupRow): string {
     return [g.family, g.model].filter(Boolean).join(' ').trim();
@@ -46,14 +55,25 @@
 
 <DataTable>
   {#snippet head()}
+    <!--
+      `Device` and `OS` each render a PAIR and sort by the first half only —
+      `family` of `family model`, `os_name` of `os_name os_version` — because
+      those are the columns the grouped whitelist offers. Ruled acceptable for
+      this slice: within one OS name the order falls to the tiebreak rather
+      than to the version. Do NOT add a second sort key.
+
+      There is no `browser` or `distinct_id` here and no `device_count` on the
+      flat table, which is why `DevicesInventory` resets the sort when the two
+      swap — an unlisted column is a 400, not a silently ignored parameter.
+    -->
     <tr>
-      <th>Device</th>
-      <th>OS</th>
-      <th class="num">Devices</th>
-      <th class="num">Sessions</th>
-      <th class="num">Events</th>
-      <th class="num">Errors</th>
-      <th>Last seen</th>
+      <SortableTh key="family" columnDefault="asc" {sort} {onsort}>Device</SortableTh>
+      <SortableTh key="os_name" columnDefault="asc" {sort} {onsort}>OS</SortableTh>
+      <SortableTh key="device_count" class="num" {sort} {onsort}>Devices</SortableTh>
+      <SortableTh key="sessions_count" class="num" {sort} {onsort}>Sessions</SortableTh>
+      <SortableTh key="events_count" class="num" {sort} {onsort}>Events</SortableTh>
+      <SortableTh key="errors_count" class="num" {sort} {onsort}>Errors</SortableTh>
+      <SortableTh key="last_seen" {sort} {onsort}>Last seen</SortableTh>
     </tr>
   {/snippet}
   {#each rows as g (rowKey(g))}

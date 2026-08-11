@@ -51,9 +51,13 @@ export const UNREACHABLE_COPY: UnreachableRow[] = [
     bounded: 'XADD … MAXLEN ~ 1000000.',
   },
   {
-    what: 'The Redis DLQ',
-    why: 'sauron:ingest:dlq is XADD with no MAXLEN and no TTL, and no reaper exists. A payload that fails to deserialize still dead-letters raw.',
-    bounded: 'Nothing. Permanent.',
+    what: 'Failed ingest',
+    // Every clause of the previous text became false once the bounded DLQ, its
+    // reaper, and the ingest_failures table landed. A privacy page that reports
+    // a closed hazard as open is worse than one that omits it: it spends the
+    // reader's attention on a problem that no longer exists.
+    why: 'Events that fail to persist are retained as masked copies — in ingest_failures, and in sauron:ingest:dlq when even that write fails.',
+    bounded: 'INGEST_FAILURE_RETENTION_DAYS (30d) and INGEST_DLQ_RETENTION_HOURS (7d).',
   },
   {
     what: 'Per-person breadcrumbs in Redis',

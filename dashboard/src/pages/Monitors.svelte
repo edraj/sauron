@@ -13,10 +13,20 @@
   import Input from '../lib/components/ui/Input.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
+  import ClientPager from '../lib/components/ClientPager.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
+  import { MONITOR_DEFAULT_SORT, monitorAccessor } from '../lib/models/monitor-sort';
+  import { pageSlice } from '../lib/models/paginate';
+  import { sortRows } from '../lib/models/sort-rows';
+  import type { SortDir } from '../lib/models/sort';
+
+  /** Rows per page. The list arrives whole, so this is a rendering budget only. */
+  const PAGE = 25;
 
   let showForm = $state(false);
   let refreshing = $state(false);
@@ -43,6 +53,33 @@
   const monitors = $derived(monitorsView.data ?? []);
   const revalidating = $derived(monitorsView.revalidating);
   const loading = $derived(monitorsView.loading);
+
+  // `/v1/projects/{id}/monitors` returns every monitor in one response, so the
+  // sort and the pager both run here, over the SAME array: order the whole list
+  // first, then take a window out of it. Sorting the window instead would
+  // reorder only what is on screen while presenting itself as having ordered
+  // everything.
+  //
+  // Sort and offset are one `OffsetListState` rather than two variables because
+  // `setOffsetSort` resets the offset as part of applying a sort — a re-ordered
+  // list makes the current window meaningless, so page 1 is the only honest
+  // place to land.
+  let list = $state<OffsetListState>({ sort: MONITOR_DEFAULT_SORT, offset: 0 });
+
+  // `sortRows` copies before sorting. That is load-bearing here and not merely
+  // tidy: `monitorsView.data` is the VERY ARRAY the view cache holds, handed
+  // back by reference (`cached-view.svelte.ts` says so, and `$state.raw` keeps
+  // that identity exact), so an in-place sort would reorder the cached payload
+  // for every later reader and the ordering would survive into the next visit
+  // to this page. No runes machinery prevents that — the same file notes
+  // proxying is not a safety mechanism — only copying does.
+  const sorted = $derived(sortRows(monitors, monitorAccessor(list.sort.key), list.sort.dir));
+  // `page.rows` is the window; `sorted` stays the thing the pager measures.
+  const page = $derived(pageSlice(sorted, list.offset, PAGE));
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
 
   // The create form reports failures through the same banner as the list's own
   // load error, and a `$derived` cannot be assigned to — so the form keeps its
@@ -242,16 +279,22 @@
       <DataTable>
         {#snippet head()}
           <tr>
-            <th>Name</th>
-            <th>Target</th>
-            <th>Status</th>
-            <th class="num">Uptime 24h</th>
-            <th class="num">Latency</th>
-            <th class="num">Checked</th>
+            <SortableTh key="name" columnDefault="asc" sort={list.sort} {onsort}>Name</SortableTh>
+            <SortableTh key="target" columnDefault="asc" sort={list.sort} {onsort}>
+              Target
+            </SortableTh>
+            <!-- `desc` (the default), not `asc`: Status is a RANK — see
+                 `MONITOR_STATUS_ORDER` — so it behaves like the count columns
+                 beside it and the first click leads with the outages. `asc`
+                 here would open the column with the healthy monitors on top. -->
+            <SortableTh key="status" sort={list.sort} {onsort}>Status</SortableTh>
+            <SortableTh key="uptime" class="num" sort={list.sort} {onsort}>Uptime 24h</SortableTh>
+            <SortableTh key="latency" class="num" sort={list.sort} {onsort}>Latency</SortableTh>
+            <SortableTh key="checked" class="num" sort={list.sort} {onsort}>Checked</SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
-          {#each monitors as m (m.id)}
+          {#each page.rows as m (m.id)}
             <tr class="clickable" onclick={() => push(`/monitors/${m.id}`)}>
               <td>
                 <div class="name-cell">
@@ -274,6 +317,22 @@
           {/each}
         {/snippet}
       </DataTable>
+
+      <!-- `total` is the length of the EXACT array handed to `pageSlice` above
+           — `sorted`, the same expression, not "all the monitors". The two must
+           be the same array: a pager measuring a longer list than the one being
+           sliced re-creates the enabled-Next-onto-an-empty-page bug that
+           `Pagination.hasNext` was made a required prop to kill. It is only
+           because they agree that a final page of exactly PAGE rows correctly
+           disables Next. (Nothing filters this table. If anything ever does,
+           the filter must both feed `pageSlice` and be measured here, AND reset
+           the offset with `setOffsetPage(list, 0)`.) -->
+      <ClientPager
+        offset={list.offset}
+        limit={PAGE}
+        total={sorted.length}
+        onchange={(o) => (list = setOffsetPage(list, o))}
+      />
     {/if}
   </div>
 </AppShell>

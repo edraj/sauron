@@ -498,6 +498,45 @@ pub struct LoginReq {
     pub password: String,
 }
 
+/// Record an authentication event without delaying the response.
+///
+/// **Spawned rather than awaited, and that is a security requirement, not a
+/// performance one.** `login` below spends one constant-time Argon2 verify on
+/// both the "no such account" and the "wrong password" path precisely so the
+/// two are indistinguishable from the outside. Only the second has a user to
+/// attribute an entry to — so awaiting a write there would make a REAL account
+/// measurably slower to reject than a nonexistent one, reintroducing exactly
+/// the user-enumeration oracle `spend_dummy_verify` exists to close. The same
+/// asymmetry would appear on the deactivated and reset-required branches.
+///
+/// Detaching costs nothing the audit contract did not already permit: writes
+/// are fail-open, so an entry that never lands is a logged gap, never a failed
+/// request.
+fn record_auth(state: &AppState, actor_id: uuid::Uuid, action: &'static str, reason: &str) {
+    let pool = state.pool.clone();
+    let reason = reason.to_string();
+    tokio::spawn(async move {
+        let mut conn = match sauron_db::conn(&pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, action, "audit: no connection for an auth event");
+                return;
+            }
+        };
+        // `org_id` is a placeholder: `record_for_user_orgs` overwrites it with
+        // each org the actor belongs to and files one entry per org.
+        let mut entry =
+            crate::audit::Entry::new(uuid::Uuid::nil(), action, crate::audit::entity::AUTH);
+        if !reason.is_empty() {
+            entry = entry.changes(crate::audit::created(
+                crate::audit::entity::AUTH,
+                &[("reason", serde_json::json!(reason))],
+            ));
+        }
+        crate::audit::record_for_user_orgs(&mut conn, actor_id, entry).await;
+    });
+}
+
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -539,11 +578,24 @@ pub async fn login(
             if verify_password_async(req.password.clone(), u.password_hash.clone()).await {
                 u
             } else {
+                // Recorded: a burst of these against one account is the signal
+                // an administrator is looking for. Detached, so the response
+                // stays indistinguishable from the no-such-account path below.
+                record_auth(
+                    &state,
+                    u.id,
+                    crate::audit::action::AUTH_LOGIN_FAILED,
+                    "wrong password",
+                );
                 return Err(ApiError::Auth(AuthError::InvalidCredentials));
             }
         }
         None => {
             spend_dummy_verify(req.password.clone()).await;
+            // NOT recorded, deliberately. There is no user, so no org to file
+            // an entry under — and an entry anywhere would make the Wall an
+            // account-enumeration oracle, which is exactly the answer the dummy
+            // verify above exists to withhold.
             return Err(ApiError::Auth(AuthError::InvalidCredentials));
         }
     };
@@ -554,6 +606,12 @@ pub async fn login(
     // user-enumeration oracle the dummy-verify above exists to close. Someone
     // who does not know the password learns nothing.
     if !user.is_active {
+        record_auth(
+            &state,
+            user.id,
+            crate::audit::action::AUTH_LOGIN_FAILED,
+            "account deactivated",
+        );
         return Err(ApiError::Auth(AuthError::AccountDeactivated));
     }
 
@@ -569,10 +627,17 @@ pub async fn login(
     // producing a gated session. Completing the reset clears the column, in the
     // same statement that writes the new password.
     if user.credentials_invalidated_at.is_some() {
+        record_auth(
+            &state,
+            user.id,
+            crate::audit::action::AUTH_LOGIN_FAILED,
+            "password reset required",
+        );
         return Err(ApiError::Auth(AuthError::PasswordResetRequired));
     }
 
     let _ = repo::touch_last_login(&mut conn, user.id).await;
+    record_auth(&state, user.id, crate::audit::action::AUTH_LOGIN, "");
     let tokens = issue_tokens(
         &state,
         &mut conn,
@@ -793,7 +858,18 @@ pub async fn logout(
     // whoever holds the raw refresh token could already revoke it.
     let revoked =
         repo::revoke_refresh_token_and_session(&mut conn, &hash, repo::REVOKE_LOGOUT).await?;
+    // Only when a session was ACTUALLY revoked: a replayed or already-revoked
+    // token changes nothing and must not produce an entry. This handler carries
+    // no `AuthUser` — it authenticates by refresh token — so the actor comes
+    // from the session row, resolved before the connection is released.
+    let actor = match revoked {
+        Some(sid) => repo::session_user(&mut conn, sid).await.ok().flatten(),
+        None => None,
+    };
     drop(conn);
+    if let Some(uid) = actor {
+        record_auth(&state, uid, crate::audit::action::AUTH_LOGOUT, "");
+    }
     if let Some(sid) = revoked {
         state.revocations.mark_revoked(&[sid]);
     }
@@ -1253,6 +1329,12 @@ pub async fn change_password(
     .await?;
     state.revocations.mark_revoked(&revoked);
     repo::set_user_password(&mut conn, auth.user_id, &hash).await?;
+    record_auth(
+        &state,
+        auth.user_id,
+        crate::audit::action::AUTH_PASSWORD_CHANGE,
+        "",
+    );
     let tokens = issue_tokens(
         &state,
         &mut conn,

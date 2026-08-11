@@ -218,9 +218,13 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 | `INGEST_RATE_LIMIT_PER_MIN` | Envelopes accepted per app per minute. | `6000` | ingest |
 | `INGEST_MAX_BODY_BYTES` | Largest accepted envelope body. | `1048576` (1 MiB) | ingest |
 | `INGEST_STREAM_MAXLEN` | `XADD MAXLEN ~` bound on the Redis ingest stream. **A data-loss control, not a tuning knob**: trimming is applied regardless of pending deliveries, so a stream deep enough to trim discards envelopes the edge already answered `202` to. Raise it to buy headroom; do not lower it to save memory. ⚠️ **Not wired into Compose** — setting it in `.env` has no effect there (see the note under this table), so on Compose the bound is whatever the binary defaults to. | `1000000` | ingest |
+| `INGEST_DLQ_MAXLEN` | Ceiling on ENTRIES in the Redis dead-letter stream. Since ingest failure recovery landed the DLQ is only the **backstop** — it takes a failure solely when the Postgres write also failed — so a non-zero length means the database was unreachable. Deliberately modest: raising it does not buy headroom, it buys a longer period of un-noticed breakage. ⚠️ **Not wired into Compose** (see the note under this table). | `100000` | ingest |
+| `INGEST_DLQ_RETENTION_HOURS` | Age after which dead-lettered entries are trimmed by `XTRIM MINID`. A bound in TIME as well as count, because the entries are masked copies of real events living outside every retention window the product enforces. ⚠️ Enforced only by a **running worker** — with all workers stopped the stream is bounded by nothing. ⚠️ **Not wired into Compose** (see the note under this table). | `168` (7 days) | ingest |
+| `INGEST_FAILURE_PAYLOAD_CAP` | Payloads retained per failure fingerprint in `ingest_failure_payloads`. Bounds what one runaway failure can claim on disk while keeping enough for "fix the root cause, then retry" to mean something. Occurrences past the cap are still counted and are reported as unrecoverable on the Ingest failures page — never silently dropped. ⚠️ **Not wired into Compose** (see the note under this table). | `1000` | ingest |
+| `INGEST_FAILURE_RETENTION_DAYS` | Age after which a failure group and its payloads are deleted. Same privacy argument as `INGEST_DLQ_RETENTION_HOURS`, and the reason this feature does not relocate the DLQ's unbounded growth into Postgres. ⚠️ Enforced only by a **running worker**. ⚠️ **Not wired into Compose** (see the note under this table). | `30` | ingest |
 | `INGEST_TRUST_FORWARDED_HEADERS` | Same trust caveat as `API_TRUST_FORWARDED_HEADERS`. While off, client IPs are recorded as `NULL` rather than spoofable values. | `false` | ingest |
 
-> **Four of these are not settable through Compose.** The general rule above —
+> **Eight of these are not settable through Compose.** The general rule above —
 > "Compose reads these from a `.env` file at the repo root" — does not hold for
 > every row, because `docker-compose.yml`'s `ingest` service has no `env_file:`
 > key. A variable reaches that container only if the service lists it explicitly.
@@ -229,7 +233,9 @@ Docker Compose reads these from a `.env` file at the repo root — copy
 > `INGEST_RATE_LIMIT_PER_MIN`, `INGEST_MAX_BODY_BYTES`,
 > `INGEST_TRUST_FORWARDED_HEADERS`, `INGEST_METRICS_ADDR` and
 > `INGEST_METRICS_SAMPLE_SECS`. It does **not** list `INGEST_BATCH_SIZE`,
-> `INGEST_BATCH_ITEMS`, `INGEST_STREAM_MAXLEN` or `INGEST_UDS_PATH` — putting any
+> `INGEST_BATCH_ITEMS`, `INGEST_STREAM_MAXLEN`, `INGEST_UDS_PATH`,
+> `INGEST_DLQ_MAXLEN`, `INGEST_DLQ_RETENTION_HOURS`,
+> `INGEST_FAILURE_PAYLOAD_CAP` or `INGEST_FAILURE_RETENTION_DAYS` — putting any
 > of those in `.env` is silently inert under Compose. They work on RPM and bare
 > metal, where the process reads its own environment. To use one under Compose,
 > add it to the `ingest` service's `environment:` block first.

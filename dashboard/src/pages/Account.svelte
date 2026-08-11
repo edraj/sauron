@@ -2,6 +2,8 @@
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
+  import ClientPager from '../lib/components/ClientPager.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
@@ -23,9 +25,16 @@
     describeSession,
     hasCurrentSession,
     otherSessionCount,
-    sortSessions,
   } from '../lib/models/account-sessions';
+  import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
+  import { SESSION_DEFAULT_SORT, sessionAccessor } from '../lib/models/account-session-sort';
+  import { pageSlice } from '../lib/models/paginate';
+  import { sortRows } from '../lib/models/sort-rows';
+  import type { SortDir } from '../lib/models/sort';
   import type { AccountSession } from '../lib/models';
+
+  /** Rows per page. The list arrives whole, so this is a rendering budget only. */
+  const PAGE = 25;
 
   // Cached view (lib/stores/cached-view.svelte.ts): the cached device list paints
   // instantly on return, then refreshes behind the Refresh button's spinner.
@@ -48,9 +57,54 @@
     null,
   );
 
-  const rows = $derived(sortSessions(sessions));
-  const live = $derived(rows.filter((s) => s.revoked_at === null));
-  const revoked = $derived(rows.filter((s) => s.revoked_at !== null));
+  // `/v1/me/sessions` returns every session in one response, so the sort and
+  // the pager both run here, over the SAME array: order the whole list first,
+  // then take a window out of it. Sorting the window instead would reorder only
+  // what is on screen while presenting itself as having ordered everything.
+  //
+  // Sort and offset are one `OffsetListState` rather than two variables because
+  // `setOffsetSort` resets the offset as part of applying a sort.
+  let list = $state<OffsetListState>({ sort: SESSION_DEFAULT_SORT, offset: 0 });
+
+  // `sortRows` copies before sorting, which is load-bearing rather than tidy:
+  // `sessionsView.data` is the VERY ARRAY the view cache holds, handed back by
+  // reference (`cached-view.svelte.ts` says so, and `$state.raw` keeps that
+  // identity exact), so an in-place sort would reorder the cached payload for
+  // every later reader.
+  //
+  // This replaces the page's own `sortSessions(sessions)` call. Two orderings
+  // applied in sequence is a bug waiting for someone to change one of them, and
+  // the seed (`last_used desc`) is what `sortSessions` produced apart from its
+  // current-session-first rule — the current device is still marked by its
+  // "This device" badge.
+  const sorted = $derived(sortRows(sessions, sessionAccessor(list.sort.key), list.sort.dir));
+  const live = $derived(sorted.filter((s) => s.revoked_at === null));
+  const revoked = $derived(sorted.filter((s) => s.revoked_at !== null));
+
+  /**
+   * The rows the table actually renders: live first, then revoked, each group
+   * in the chosen order.
+   *
+   * The grouping is a FIXED primary key and is stated here rather than hidden
+   * in a comparator, because a header click orders within it and not across it.
+   * It stays because the two groups render different content in the same
+   * columns — a live row's last column offers "Sign out" while a revoked one
+   * explains why it ended, and the Last-used cell shows a use time for one and
+   * a sign-out time for the other. Interleaving them would put two meanings in
+   * one column and order it by neither.
+   *
+   * With "Show recent sign-outs" off — the default — the endpoint returns no
+   * revoked rows at all, so `visible` is exactly `live` and every header orders
+   * the entire table.
+   */
+  const visible = $derived([...live, ...revoked]);
+  // `page.rows` is the window; `visible` stays the thing the pager measures.
+  const page = $derived(pageSlice(visible, list.offset, PAGE));
+
+  function onsort(key: string, columnDefault: SortDir) {
+    list = setOffsetSort(list, key, columnDefault);
+  }
+
   const otherCount = $derived(otherSessionCount(sessions));
   const hasCurrent = $derived(hasCurrentSession(sessions));
   const proxied = $derived(allSameIp(sessions));
@@ -85,6 +139,12 @@
   // request — where this previously issued two.
   async function toggleHistory() {
     showRevoked = !showRevoked;
+    // A FILTER CHANGE RESETS THE OFFSET, exactly as a sort change does through
+    // `setOffsetSort`. This toggle changes which rows the endpoint returns, so
+    // without the reset, hiding sign-outs while on page 3 of a list that is
+    // suddenly one page long leaves you looking at an empty table with Prev as
+    // the only way out.
+    list = setOffsetPage(list, 0);
     await load();
   }
 
@@ -226,50 +286,85 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              <th>Device</th>
-              <th>IP</th>
-              <th>Signed in</th>
-              <th>Last used</th>
+              <SortableTh key="device" columnDefault="asc" sort={list.sort} {onsort}>
+                Device
+              </SortableTh>
+              <SortableTh key="ip" columnDefault="asc" sort={list.sort} {onsort}>IP</SortableTh>
+              <SortableTh key="signed_in" sort={list.sort} {onsort}>Signed in</SortableTh>
+              <SortableTh key="last_used" sort={list.sort} {onsort}>Last used</SortableTh>
+              <!-- The revoke button (and, on a revoked row, the reason it
+                   ended) — no value to order by. -->
               <th aria-label="actions"></th>
             </tr>
           {/snippet}
           {#snippet children()}
-            {#each live as s (s.id)}
-              <tr>
-                <td>
-                  <span class="device">
-                    {describeSession(s)}
-                    {#if s.current}<Badge tone="primary" size="sm">This device</Badge>{/if}
-                  </span>
-                </td>
-                <td class="cell-mono cell-muted">{s.ip ?? '—'}</td>
-                <td><TimeValue value={s.created_at} /></td>
-                <td><TimeValue value={s.last_used_at} /></td>
-                <td class="col-act">
-                  {#if !s.current}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled={!hasCurrent}
-                      onclick={() => requestRevokeOne(s)}
-                    >
-                      Sign out
-                    </Button>
-                  {/if}
-                </td>
-              </tr>
-            {/each}
-            {#each revoked as s (s.id)}
-              <tr class="dim">
-                <td>{describeSession(s)}</td>
-                <td class="cell-mono cell-muted">{s.ip ?? '—'}</td>
-                <td><TimeValue value={s.created_at} /></td>
-                <td>Signed out {#if s.revoked_at}<TimeValue value={s.revoked_at} />{/if}</td>
-                <td class="col-act cell-muted">{reasonLabel(s.revoked_reason)}</td>
-              </tr>
+            {#each page.rows as s (s.id)}
+              {#if s.revoked_at === null}
+                <tr>
+                  <td>
+                    <span class="device">
+                      {describeSession(s)}
+                      {#if s.current}<Badge tone="primary" size="sm">This device</Badge>{/if}
+                    </span>
+                  </td>
+                  <td class="cell-mono cell-muted">{s.ip ?? '—'}</td>
+                  <td><TimeValue value={s.created_at} /></td>
+                  <td><TimeValue value={s.last_used_at} /></td>
+                  <td class="col-act">
+                    {#if !s.current}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={!hasCurrent}
+                        onclick={() => requestRevokeOne(s)}
+                      >
+                        Sign out
+                      </Button>
+                    {/if}
+                  </td>
+                </tr>
+              {:else}
+                <tr class="dim">
+                  <td>{describeSession(s)}</td>
+                  <td class="cell-mono cell-muted">{s.ip ?? '—'}</td>
+                  <td><TimeValue value={s.created_at} /></td>
+                  <td>Signed out <TimeValue value={s.revoked_at} /></td>
+                  <td class="col-act cell-muted">{reasonLabel(s.revoked_reason)}</td>
+                </tr>
+              {/if}
             {/each}
           {/snippet}
         </DataTable>
+
+        <!-- `total` is the length of the EXACT array handed to `pageSlice`
+             above — `visible`, the same expression.
+
+             Be accurate about why, because this table is NOT the pager rule's
+             counter-example and was described as one in an earlier draft:
+             `live` and `revoked` PARTITION `sessions`, so `visible.length` and
+             `sessions.length` are always equal and measuring the wrong one
+             could not produce a wrong answer here. Writing `visible.length` is
+             a discipline — the rule is "measure the array you sliced", not
+             "measure whichever array happens to agree today" — and it is what
+             keeps this correct if a real filter is ever added above.
+
+             The case where the two lengths genuinely differ is Inspector's
+             findings tab, where each table is fed `g.findings`, a strict subset
+             of `findings`; measuring the whole set there would offer an enabled
+             Next onto an empty page, the bug that made `hasNext` a required
+             prop on `Pagination` in slice 1.
+
+             What this table DOES exercise is the rule's other half: the
+             "Show recent sign-outs" toggle changes which rows the endpoint
+             returns, and `toggleHistory` resets the offset with
+             `setOffsetPage(list, 0)` so a narrowing change cannot strand you on
+             a page that no longer exists. -->
+        <ClientPager
+          offset={list.offset}
+          limit={PAGE}
+          total={visible.length}
+          onchange={(o) => (list = setOffsetPage(list, o))}
+        />
 
         {#if proxied}
           <p class="hint muted">
