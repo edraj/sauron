@@ -85,15 +85,15 @@ mod tests {
 
     #[test]
     fn column_index_error_names_the_missing_column() {
-        let headers = csv::StringRecord::from(vec!["Date", "Installations"]);
+        let headers = csv::StringRecord::from(vec!["Date", "Event"]);
         let err = column_index(&headers, "Deletions").unwrap_err().to_string();
         assert!(err.contains("Deletions"), "got: {err}");
-        assert!(err.contains("Installations"), "error should list what WAS found: {err}");
+        assert!(err.contains("Event"), "error should list what WAS found: {err}");
     }
 
     #[test]
     fn column_index_ignores_surrounding_whitespace() {
-        let headers = csv::StringRecord::from(vec![" Date ", "Installations"]);
+        let headers = csv::StringRecord::from(vec![" Date ", "Event"]);
         assert_eq!(column_index(&headers, "Date").unwrap(), 0);
     }
 }

@@ -2,6 +2,18 @@
 
 All notable changes to the Sauron Python SDK are documented here.
 
+## 1.4.0
+
+**No functional changes.** The `sauron` package is identical to 1.3.0 apart from
+`SDK_VERSION`, which is reported in the envelope header's `sdk` block. The
+version moved because the JS, Node and .NET SDKs moved; nothing in this
+package's behaviour differs from 1.3.0.
+
+- Added a cross-SDK wire-fixture conformance suite (`tests/test_wire_fixture.py`)
+  that checks this SDK's envelope against the shared fixtures in
+  `sdks/wire-fixtures/`, so a wire-shape drift between the five SDKs fails a test
+  here instead of at the ingest gateway. Test-only — not shipped in the wheel.
+
 ## 1.3.0
 
 - **Workflows** — bound a named span of activity with start / end / cancel, and

@@ -19,6 +19,7 @@
   import { isNormalizedError } from '../lib/api/client';
   import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
   import type { SessionDetail } from '../lib/models';
+  import type { TimeMode } from '../lib/models/timeline-row';
 
   interface Props {
     params?: { id?: string };
@@ -87,6 +88,12 @@
     const id = sessionId;
     if (aid && id) void load(aid, id);
   });
+
+  // What the Timeline's trailing offsets read against. Deliberately not
+  // persisted: "since the session started" is the right first answer for a
+  // session you have just opened, and a remembered delta mode would silently
+  // change what every future session's numbers mean.
+  let timeMode = $state<TimeMode>('session');
 
   const s = $derived(detail?.session ?? null);
   const durationMs = $derived(s ? durationBetween(s.started_at, s.last_event_at) : 0);
@@ -161,7 +168,20 @@
     <div class="grid">
       <div class="col-main">
         <Card title="Timeline">
-          <Timeline items={detail.timeline} startedAt={s.started_at} />
+          {#snippet actions()}
+            <Button
+              variant="ghost"
+              size="sm"
+              title={timeMode === 'delta'
+                ? 'Showing time since the previous entry — click to measure from the session start'
+                : 'Showing time since the session started — click to measure from the previous entry'}
+              onclick={() => (timeMode = timeMode === 'delta' ? 'session' : 'delta')}
+            >
+              <Icon name="clock" size={14} />
+              {timeMode === 'delta' ? 'Since previous' : 'Since start'}
+            </Button>
+          {/snippet}
+          <Timeline items={detail.timeline} startedAt={s.started_at} {timeMode} />
         </Card>
       </div>
       <aside class="col-side">

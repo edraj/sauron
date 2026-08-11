@@ -184,9 +184,44 @@ Both parsers **map columns by header name, not by position**, and fail with an
 error naming the missing header. Store report layouts change; an index-based
 parser that shifts by one column produces numbers rather than errors.
 
-Apple's exact column names for the "App Store Installations and Deletions"
-report are confirmed against a real downloaded report during implementation, and
-the fixture committed with the test is that real file.
+**Apple's report is `Event`-shaped, not column-shaped.** This was the design's
+one open unknown; it resolved against Apple's documentation *after* the first
+implementation, and the first implementation was wrong. The report carries:
+
+```
+Date | Event | Counts | Unique Devices | App Apple Identifier | App Name |
+App Version | Device | Territory | Platform Version | Source Type |
+Source Info | Page Type | Page Title | Download Type | App Download Date
+```
+
+There are **no `Installations` / `Deletions` columns**. Installs and deletions
+are *rows* discriminated by `Event`, and one calendar day is crossed by every
+dimension above — so a day's figure is the SUM over its rows, not a cell.
+
+Three mappings follow, each a named constant in `apple.rs`:
+
+- **`Unique Devices` is the count column**, with `Counts` as a fallback when a
+  report variant omits it. `Unique Devices` is the direct analogue of Play's
+  `Daily Device Installs`; `Counts` totals events, so a redownload on one device
+  counts twice and the two halves of the chart would be measuring different
+  things.
+- **Installs = `Install` + `Reinstall`. `Update` is excluded.** Play reports
+  upgrades in a separate column this connector already ignores, so excluding
+  updates is what makes the stores comparable — not a judgement about which
+  number is more interesting. Counting them would inflate the App Store line
+  several-fold and still look plausible.
+- **Uninstalls = `Delete` / `Deletion`** (both spellings; the column is
+  documented by description rather than by enumerated value).
+
+An `Event` value in none of those sets is counted as neither and named in a
+`WARN`, rather than guessed at — silently folding an unknown value into installs
+is worse than visibly under-reporting it.
+
+The committed fixture is shaped like the real report (multi-row days, both count
+columns, an `Update` row that must not be counted) but is synthetic. Replacing it
+with a genuine downloaded segment remains worthwhile; it would confirm the
+`Event` spellings, which are the one thing documentation describes rather than
+enumerates.
 
 ### Network posture
 

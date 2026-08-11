@@ -1,20 +1,37 @@
 # Changelog
 
-## 1.5.0
+## 1.6.0
 
-*A minor bump, not a patch: 1.4.0 dropped every pre-login analytics event and
-1.5.0 counts them under an anonymous id. Without a version change the two builds
-are indistinguishable in `header.sdk.version`, and the one-time step in Active
-Users described below could not be attributed to an SDK upgrade after the fact.*
+*Follows 1.4.0 on pub.dev directly: 1.5.0 was built but never published, and its
+two fixes are folded in here. A minor bump, not a patch — 1.4.0 could not
+attribute a pre-login analytics event to anyone, and 1.6.0 counts it under an
+anonymous id. Without a version change the builds are indistinguishable in
+`header.sdk.version`, and the one-time step in Active Users described below
+could not be attributed to an SDK upgrade after the fact.*
+
+- **Fixed: `track()` before `identify()` destroyed the whole envelope.** The
+  wire's `AnalyticsItem.distinct_id` is a non-optional `String`, so the `null`
+  that 1.4.0 sent was not "one item with a null field" — the gateway failed to
+  deserialize the ENTIRE envelope (`400 invalid_envelope`), and because every
+  SDK treats a 400 as non-retryable, every unrelated error, transaction and
+  identify batched alongside it was dropped too, without a retry and without a
+  trace. `setScreen()` and the `$workflow_*` lifecycle events are affected the
+  same way, since they emit through `track()`.
+
+  Such an item is now attributed to an anonymous id (below). In the one window
+  where neither kind of identity exists yet — tracking before
+  `await Sauron.init(...)` has finished — it is dropped rather than sent, and
+  the first drop prints regardless of `SauronOptions.debug`, so it cannot stay
+  invisible the way this bug did.
 
 - **Anonymous id — `track()` no longer requires `identify()` first.** When no
   user has been identified, `distinct_id` is now a persisted `anon_<uuidv4>`
   stored in `<app-support>/sauron/sauron_prefs.json` under `sauron.anon_id` —
   the same format and key name the browser SDK uses in `localStorage`. This is
   what lets an unidentified person be counted as a person: Active Users is a
-  distinct count over `distinct_id` per UTC day, and until now every Flutter
-  event before login was dropped, so those people were invisible rather than
-  anonymous.
+  distinct count over `distinct_id` per UTC day, and until now no Flutter event
+  before login reached the server attributable to anyone, so those people were
+  invisible rather than anonymous.
 
   **Every Flutter app's reported active-user count rises on the day this is
   adopted.** That is the previously-dropped population arriving, not a
@@ -51,11 +68,15 @@ Users described below could not be attributed to an SDK upgrade after the fact.*
   anonymous id splits the user one. Writes now merge, and keys written by a
   newer SDK version survive a downgrade.
 
-- **Behaviour change:** an analytics item is now dropped only when it is tracked
-  before `await Sauron.init(...)` has finished, which is the one remaining
-  window with no identity of either kind. The unconditional
-  `dropped analytics item … no distinct_id` warning stays, with wording that
-  points at init rather than at `identify`.
+- **Fixed: obfuscated Dart stack traces could not be symbolicated.** Real Dart
+  AOT writes both DSO base keys on a single line —
+  `isolate_dso_base: 7b9c2b7000, vm_dso_base: 7b9c2b7000` — and the parser took
+  the entire remainder of that line, reporting an `isolate_dso_base` of
+  `"7b9c2b7000, vm_dso_base: 7b9c2b7000"`, which the backend's hex parse
+  rejected outright. Confirmed across all 14 events captured from a real device
+  on 2026-08-08. Only the leading token is kept now. Release-build stack traces
+  stayed unreadable in the dashboard until this fix; events ingested before it
+  carry the malformed value and are not retroactively repaired.
 
 ## 1.4.0 - 2026-07-30
 

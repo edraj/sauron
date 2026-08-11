@@ -301,6 +301,22 @@ publishes anything — that wait shows in the dashboard as `pending`, not as an
 error. Both lag one to three days and are keyed to a package or bundle id, so
 the numbers are app-wide and have no environment dimension.
 
+What each number counts, since the two stores do not agree by default:
+
+| | Google Play | App Store |
+| --- | --- | --- |
+| Installs | `Daily Device Installs` | `Event` rows `Install` + `Reinstall`, summed over `Unique Devices` |
+| Uninstalls | `Daily Device Uninstalls` | `Event` rows `Delete`, summed over `Unique Devices` |
+| Excluded | `Daily Device Upgrades` | `Event` rows `Update` |
+
+Apple's updates are excluded because Play reports upgrades separately and this
+connector ignores that column — dropping both is what makes the two halves of
+the chart comparable. `Unique Devices` is used in preference to Apple's `Counts`
+for the same reason: it is device-based, like Play's figure, whereas `Counts`
+counts a redownload on one device twice. All of this lives in named constants at
+the top of `backend/crates/sauron-store/src/apple.rs` if you want it counted
+differently.
+
 | Variable | What it does | Default | Used by |
 | --- | --- | --- | --- |
 | `STORE_SYNC_INTERVAL_SECS` | How long after a sync a connection becomes due again. Reports are daily, so faster polling re-fetches identical numbers. | `21600` (6h) | storesync |

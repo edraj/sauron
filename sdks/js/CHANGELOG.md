@@ -4,6 +4,31 @@ All notable changes to `@edraj/sauron-browser` are documented here.
 
 ## 1.4.0
 
+### Fixed
+
+- **`captureMessage()` poisoned the entire envelope.** It sent an `exception`
+  block with `type: null`, but the gateway's `ExceptionInfo.ty` is a
+  non-optional string with no default, so the envelope failed to deserialize and
+  was rejected whole (`400 invalid_envelope`) — taking every unrelated error,
+  event and transaction batched alongside it. Every SDK treats a 400 as
+  non-retryable, so the batch was dropped without a retry and without a trace.
+  A message item now carries no `exception` block at all and puts its text in
+  `message`, which is the shape the Python SDK already sent.
+
+  Worth knowing before you upgrade: this also changes server-side grouping.
+  Messages now fingerprint on their normalized text instead of piling into one
+  bucket keyed by a synthetic exception type, so existing message issues will
+  re-split into separate issues.
+- **A failed offline-queue drain silently deleted the rest of the backlog.**
+  `drain()` empties `localStorage` in one shot, so from that point the parked
+  envelopes exist only in a local array — and a send failure re-parked just the
+  payload that had failed before returning, discarding every payload behind it.
+  The whole untried remainder is now re-parked, at the head, preserving the
+  oldest-first order the byte-cap eviction policy depends on. This is the plain
+  reconnect-then-one-500 case the queue exists for. A 401/403 mid-drain now
+  keeps the backlog too — the credentials may be fixed and the client
+  re-inited — and logs a warning instead of disabling in silence.
+
 ### Changed
 
 - The anonymous id is now persisted in `localStorage` under `sauron.anon_id`
@@ -15,6 +40,10 @@ All notable changes to `@edraj/sauron-browser` are documented here.
 - The anonymous id is a durable first-party identifier stored on the user's
   terminal. That is a retention and consent consequence, not just an
   implementation detail.
+- `ExceptionValue.type` is `string`, no longer `string | null`, and `ErrorItem`
+  gained an optional `message`. A TypeScript caller that builds these by hand
+  will now see a type error where it previously compiled — passing `null` there
+  is precisely what produced the envelope rejection above.
 
 ### Added
 

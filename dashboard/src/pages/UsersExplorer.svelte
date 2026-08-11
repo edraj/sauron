@@ -134,6 +134,13 @@
     return out;
   }
 
+  // The traits the "…" chip stands in for, as a hover title. The chip replaces
+  // them in the cell, so without this the values would be unreachable without
+  // opening the person — a compaction that loses data rather than folding it.
+  function traitSummary(rest: { key: string; value: string }[]): string {
+    return rest.map((t) => `${t.key}: ${t.value}`).join('\n');
+  }
+
   function open(distinctId: string) {
     push('/persons/' + encodeURIComponent(distinctId));
   }
@@ -190,6 +197,18 @@
     {/if}
   </div>
 
+  <!-- Gives the table the same section identity as Audience above it. Without a
+       heading the widened gap reads as a stray hole rather than a boundary, and
+       the table's own header row has to double as the section label. Sits
+       outside the branch below so it holds through the loading and empty
+       states instead of appearing only once rows land. -->
+  <div class="people-head">
+    <div>
+      <h2 class="section-title">People</h2>
+      <p class="muted section-hint">One row per distinct ID, most recently seen first.</p>
+    </div>
+  </div>
+
   {#if loading && rows.length === 0}
     <div class="center"><Spinner size={24} /></div>
   {:else if error}
@@ -234,6 +253,7 @@
         {/snippet}
         {#snippet children()}
           {#each rows as row (row.distinct_id)}
+            {@const rowTraits = traits(row.properties)}
             <tr class="clickable" onclick={() => open(row.distinct_id)}>
               <td>
                 <span class="user">
@@ -247,14 +267,23 @@
                 </span>
               </td>
               <td>
-                {#if traits(row.properties).length > 0}
+                {#if rowTraits.length > 0}
+                  <!-- One chip, then a "…" standing in for the rest: three
+                       chips wrapped onto two lines and set the row height off
+                       every other column. The hover title carries the folded
+                       values so nothing is lost. -->
                   <span class="traits">
-                    {#each traits(row.properties) as t (t.key)}
-                      <span class="trait">
-                        <span class="tkey">{t.key}</span>
-                        <span class="tval mono">{t.value}</span>
-                      </span>
-                    {/each}
+                    <span class="trait">
+                      <span class="tkey">{rowTraits[0].key}</span>
+                      <span class="tval mono">{rowTraits[0].value}</span>
+                    </span>
+                    {#if rowTraits.length > 1}
+                      <span
+                        class="trait more"
+                        title={traitSummary(rowTraits.slice(1))}
+                        aria-label={`${rowTraits.length - 1} more trait${rowTraits.length > 2 ? 's' : ''}`}
+                      >…</span>
+                    {/if}
                   </span>
                 {:else}
                   <span class="faint">—</span>
@@ -292,7 +321,7 @@
     align-items: flex-start;
     justify-content: space-between;
     gap: 16px;
-    margin-bottom: 20px;
+    margin-bottom: 28px;
     flex-wrap: wrap;
   }
   .sub {
@@ -305,33 +334,33 @@
     gap: 10px;
     flex-wrap: wrap;
   }
-  /* Section rhythm. The page previously ran header -> tiles -> chart -> table
-     -> pagination with no vertical gap at all, so three unrelated blocks read
-     as one. 18px is the spacing the other pages use between major blocks
-     (Overview's `.grid`, SessionDetail's `.grid`); there is no spacing token to
-     reference. */
-  .analytics-head {
+  /* Section rhythm. The page runs header -> Audience (tiles + chart) -> People
+     (table + pagination). Each section opens with a heading, so the gap ABOVE a
+     heading is what separates two sections and must stay clearly larger than
+     the gap below it (which only ties a heading to its own content). At the
+     previous 24/12 the two were close enough that "Audience" read as floating
+     between the blocks rather than belonging to the one under it. */
+  .analytics-head,
+  .people-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    /* Larger above than below so "Audience" reads as opening a new section
-       rather than trailing the search row. */
-    margin: 24px 0 12px;
+    margin: 40px 0 16px;
   }
+  /* The People heading owns the space above the table, so this wrapper adds no
+     bottom margin of its own. That also retires the `.audience:empty` guard
+     that used to sit here: it existed to cancel a `margin-bottom` during the
+     first paint, before either the tiles or the error Card had landed, and
+     there is no longer a margin to cancel. */
   .audience {
     display: flex;
     flex-direction: column;
-    gap: 18px;
-    /* Separates the chart from the users table below, which is not this
-       element's child. */
-    margin-bottom: 18px;
+    gap: 24px;
   }
-  /* Analytics is loaded independently of the rows, so this wrapper is empty
-     until it lands — without this, the gap it reserves would sit under the
-     Audience header with nothing in it. */
-  .audience:empty {
-    margin-bottom: 0;
+  .section-hint {
+    font-size: 13px;
+    margin-top: 2px;
   }
   .section-title {
     font-size: 15px;
@@ -376,10 +405,17 @@
     display: inline-block;
     vertical-align: middle;
   }
+  /* `nowrap`, not `wrap`: at narrow widths a long value used to push the "…"
+     onto a second line, which is the row-height unevenness this column was
+     folded to remove. The value truncates instead — `min-width: 0` is what lets
+     it, since a flex item's default `min-width: auto` refuses to shrink below
+     its content and the overflow would escape the cell rather than ellipsize. */
   .traits {
     display: inline-flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 6px;
+    max-width: 100%;
+    min-width: 0;
   }
   .trait {
     display: inline-flex;
@@ -390,6 +426,26 @@
     border-radius: var(--radius-pill);
     padding: 2px 9px;
     max-width: 220px;
+    min-width: 0;
+  }
+  /* Reads as "there is more here" rather than as another trait: no key/value
+     pair, tighter, and carrying the hover cue. `help` over `pointer` because
+     the row's own click opens the person — a pointer here would promise a
+     separate action that does not exist. */
+  .more {
+    padding: 2px 8px;
+    /* `--text-muted`, not the `--text-faint` used by `.tkey` beside it: that
+       token measures 2.86:1 on this chip in the light theme. A key sitting next
+       to its own value can afford that; this glyph is the only thing on screen
+       saying more traits exist, so it has to clear AA (5.77:1 light, 6.69:1
+       dark). */
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.1;
+    cursor: help;
+    /* Never the item that gives way when the row is tight — the whole point of
+       the chip is that it stays visible to say more exists. */
+    flex: none;
   }
   .tkey {
     font-size: 10px;
