@@ -133,6 +133,9 @@
         <button class="row" onclick={() => toggle(i)} type="button">
           <span class="time mono" title={formatTime(item.at)}>{formatTime(item.at)}</span>
           <span class="kind kind-{rowKind(item)}">{rowKind(item)}</span>
+          {#if item.kind === 'transaction' && !isHttp(item) && item.transaction.op}
+            <Badge tone="neutral" size="sm">{item.transaction.op}</Badge>
+          {/if}
           <span class="title truncate">{rowTitle(item)}</span>
           <span class="trail">
             {#if item.kind === 'transaction'}
@@ -145,8 +148,6 @@
                     {item.transaction.http_status}
                   </Badge>
                 {/if}
-              {:else}
-                <Badge tone="neutral" size="sm">{item.transaction.op}</Badge>
               {/if}
               <LatencyBadge ms={item.transaction.duration_ms} size="sm" />
             {:else if item.kind === 'error'}

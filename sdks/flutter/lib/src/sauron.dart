@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import 'client.dart';
 import 'integrations/run_zoned_guarded.dart';
 import 'sauron_options.dart';
+import 'transaction.dart';
 import 'types.dart';
 import 'workflow.dart';
 
@@ -153,6 +154,36 @@ class Sauron {
       _client?.trackTransaction(
         name: name,
         duration: duration,
+        op: op,
+        status: status,
+        httpMethod: httpMethod,
+        httpStatus: httpStatus,
+        url: url,
+      );
+
+  /// Starts a stateful transaction that computes its own duration.
+  /// 
+  /// The returned [ActiveTransaction] must be `.end()`ed or `.cancel()`ed 
+  /// to record the span. Until then, it is not sent to the server.
+  static ActiveTransaction startTransaction({
+    required String name,
+    String op = 'custom',
+    String? status,
+    String? httpMethod,
+    int? httpStatus,
+    String? url,
+  }) =>
+      _client?.startTransaction(
+        name: name,
+        op: op,
+        status: status,
+        httpMethod: httpMethod,
+        httpStatus: httpStatus,
+        url: url,
+      ) ??
+      ActiveTransaction(
+        null,
+        name: name,
         op: op,
         status: status,
         httpMethod: httpMethod,

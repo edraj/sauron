@@ -227,16 +227,62 @@ async fn get_json(client: &reqwest::Client, token: &str, url: &str) -> anyhow::R
     serde_json::from_str(&body).context("unexpected App Store Connect response shape")
 }
 
+/// Find an existing ONGOING request for this app, if one is already there.
+///
+/// Apple allows exactly one ONGOING request per app and 409s on a second, so
+/// creating blind is a permanent wedge whenever the id we persisted is not the
+/// whole truth: the request outlives our row, so re-entering credentials,
+/// restoring an older database, or one operator making the request by hand in
+/// App Store Connect all leave a live request we have no id for. Looking first
+/// makes first contact idempotent.
+async fn find_report_request(
+    client: &reqwest::Client,
+    token: &str,
+    base: &str,
+    apple_app_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let list = get_json(
+        client,
+        token,
+        &format!(
+            "{base}/v1/apps/{apple_app_id}/analyticsReportRequests\
+             ?filter[accessType]=ONGOING&limit=200"
+        ),
+    )
+    .await?;
+    // `stoppedDueToInactivity` requests still occupy the app's ONGOING slot but
+    // never produce another instance, so reusing one would leave the connection
+    // Pending forever. Apple's own remedy is to delete and re-request, which is
+    // an operator decision (it restarts the 24-48h window), so surface it
+    // rather than silently adopting a dead request.
+    Ok(list
+        .data
+        .into_iter()
+        .find(|r| {
+            !r.attributes
+                .get("stoppedDueToInactivity")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .map(|r| r.id))
+}
+
 async fn create_report_request(
     client: &reqwest::Client,
     token: &str,
     base: &str,
     apple_app_id: &str,
 ) -> anyhow::Result<String> {
+    if let Some(existing) = find_report_request(client, token, base, apple_app_id).await? {
+        return Ok(existing);
+    }
+    // `accessType` is the ONLY writable attribute on this resource. There is no
+    // `name` — sending one is a 409 ENTITY_ERROR.ATTRIBUTE.UNKNOWN, not a
+    // warning, so the whole request fails and no report is ever created.
     let body = serde_json::json!({
         "data": {
             "type": "analyticsReportRequests",
-            "attributes": { "accessType": "ONGOING", "name": "Sauron install metrics" },
+            "attributes": { "accessType": "ONGOING" },
             "relationships": {
                 "app": { "data": { "type": "apps", "id": apple_app_id } }
             }
