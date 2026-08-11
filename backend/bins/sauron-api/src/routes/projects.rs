@@ -303,8 +303,7 @@ pub async fn create_app(
         )));
     }
     let mut conn = db(&state).await?;
-    let project =
-        authorize_project(&mut conn, auth.user_id, project_id, perm::APP_CREATE).await?;
+    let project = authorize_project(&mut conn, auth.user_id, project_id, perm::APP_CREATE).await?;
 
     // Both inserts run in one transaction: an app is unreachable by any SDK
     // without at least one enrollment holding an ingest key, so if the

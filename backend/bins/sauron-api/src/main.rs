@@ -874,10 +874,7 @@ async fn main() -> anyhow::Result<()> {
         // Ingest failures. Deployment-wide for the same reason as the tier
         // routes above, plus one of its own: the dominant failure never
         // decoded, so it carries no org_id to scope an org-level grant against.
-        .route(
-            "/v1/admin/ingest-failures",
-            get(routes::failures::list),
-        )
+        .route("/v1/admin/ingest-failures", get(routes::failures::list))
         .route(
             "/v1/admin/ingest-failures/{id}",
             axum::routing::delete(routes::failures::drop_group),

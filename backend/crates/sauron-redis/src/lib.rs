@@ -345,7 +345,8 @@ impl RedisStore {
         payloads: &[&str],
         maxlen: usize,
     ) -> anyhow::Result<Vec<redis::RedisResult<String>>> {
-        self.xadd_jobs_to(keys::INGEST_STREAM, payloads, maxlen).await
+        self.xadd_jobs_to(keys::INGEST_STREAM, payloads, maxlen)
+            .await
     }
 
     /// [`xadd_jobs`](Self::xadd_jobs) against an arbitrary stream key.
@@ -1119,12 +1120,22 @@ mod hll_tests {
         let key = format!("sauron:test:retry:{}", uuid::Uuid::new_v4());
         let now = 1_700_000_000_000i64;
 
-        redis.retry_schedule_to(&key, "due-a", now - 1000).await.unwrap();
+        redis
+            .retry_schedule_to(&key, "due-a", now - 1000)
+            .await
+            .unwrap();
         redis.retry_schedule_to(&key, "due-b", now).await.unwrap();
-        redis.retry_schedule_to(&key, "later", now + 60_000).await.unwrap();
+        redis
+            .retry_schedule_to(&key, "later", now + 60_000)
+            .await
+            .unwrap();
 
         let due = redis.retry_due_from(&key, now, 10).await.unwrap();
-        assert_eq!(due.len(), 2, "the future job must not be handed back: {due:?}");
+        assert_eq!(
+            due.len(),
+            2,
+            "the future job must not be handed back: {due:?}"
+        );
         assert!(due.contains(&"due-a".to_string()));
         assert!(due.contains(&"due-b".to_string()));
 
@@ -1136,7 +1147,11 @@ mod hll_tests {
         assert_eq!(redis.retry_depth_of(&key).await.unwrap(), 2);
 
         let mut c = redis.conn.clone();
-        let _: () = redis::cmd("DEL").arg(&key).query_async(&mut c).await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
     }
 
     /// The per-tick ceiling actually binds. Without it, one mass transient
@@ -1157,10 +1172,17 @@ mod hll_tests {
                 .unwrap();
         }
         assert_eq!(redis.retry_due_from(&key, now, 10).await.unwrap().len(), 10);
-        assert_eq!(redis.retry_due_from(&key, now, 100).await.unwrap().len(), 25);
+        assert_eq!(
+            redis.retry_due_from(&key, now, 100).await.unwrap().len(),
+            25
+        );
 
         let mut c = redis.conn.clone();
-        let _: () = redis::cmd("DEL").arg(&key).query_async(&mut c).await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
     }
 
     /// A sorted set keys on the MEMBER, so two byte-identical payloads would
@@ -1176,8 +1198,14 @@ mod hll_tests {
         let key = format!("sauron:test:retry:{}", uuid::Uuid::new_v4());
         let now = 1_700_000_000_000i64;
 
-        redis.retry_schedule_to(&key, "same-bytes", now).await.unwrap();
-        redis.retry_schedule_to(&key, "same-bytes", now).await.unwrap();
+        redis
+            .retry_schedule_to(&key, "same-bytes", now)
+            .await
+            .unwrap();
+        redis
+            .retry_schedule_to(&key, "same-bytes", now)
+            .await
+            .unwrap();
         assert_eq!(
             redis.retry_depth_of(&key).await.unwrap(),
             1,
@@ -1185,12 +1213,22 @@ mod hll_tests {
              what keeps two identical payloads from becoming one"
         );
 
-        redis.retry_schedule_to(&key, "{\"n\":\"1\",\"d\":\"x\"}", now).await.unwrap();
-        redis.retry_schedule_to(&key, "{\"n\":\"2\",\"d\":\"x\"}", now).await.unwrap();
+        redis
+            .retry_schedule_to(&key, "{\"n\":\"1\",\"d\":\"x\"}", now)
+            .await
+            .unwrap();
+        redis
+            .retry_schedule_to(&key, "{\"n\":\"2\",\"d\":\"x\"}", now)
+            .await
+            .unwrap();
         assert_eq!(redis.retry_depth_of(&key).await.unwrap(), 3);
 
         let mut c = redis.conn.clone();
-        let _: () = redis::cmd("DEL").arg(&key).query_async(&mut c).await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
     }
 
     /// The guard against an infinite retry loop: the counter must actually
@@ -1515,7 +1553,10 @@ mod stream_stats_tests {
             .await
             .unwrap();
         for i in 0..3 {
-            redis.dlq_push_to(&dlq, &format!("{{\"i\":{i}}}"), 100).await.unwrap();
+            redis
+                .dlq_push_to(&dlq, &format!("{{\"i\":{i}}}"), 100)
+                .await
+                .unwrap();
         }
         for i in 0..7 {
             redis
@@ -1536,7 +1577,6 @@ mod stream_stats_tests {
             let _: () = redis::cmd("DEL").arg(k).query_async(&mut c).await.unwrap();
         }
     }
-
 
     /// Every key this module touches carries a per-test UUID, so it can run
     /// against a shared Redis without going anywhere near

@@ -3913,7 +3913,10 @@ async fn ingest_failures_require_deployment_admin_and_round_trip() {
             "GET",
             format!("/v1/admin/ingest-failures/{failure_id}/payloads"),
         ),
-        ("POST", format!("/v1/admin/ingest-failures/{failure_id}/retry")),
+        (
+            "POST",
+            format!("/v1/admin/ingest-failures/{failure_id}/retry"),
+        ),
         ("DELETE", format!("/v1/admin/ingest-failures/{failure_id}")),
     ] {
         let status = match method {
@@ -3968,14 +3971,20 @@ async fn ingest_failures_require_deployment_admin_and_round_trip() {
         .await;
     assert_eq!(retried.status().as_u16(), 200);
     let retried: serde_json::Value = retried.json().await.expect("retry body");
-    assert_eq!(retried["requeued"], 2, "both retained payloads must re-queue");
+    assert_eq!(
+        retried["requeued"], 2,
+        "both retained payloads must re-queue"
+    );
     assert_eq!(retried["failed"], 0);
     assert_eq!(retried["unrecoverable"], 0);
 
     // --- drop, and the audit entry that must precede it ---------------------
     assert_eq!(
-        srv.delete_status(&format!("/v1/admin/ingest-failures/{failure_id}"), &admin_token)
-            .await,
+        srv.delete_status(
+            &format!("/v1/admin/ingest-failures/{failure_id}"),
+            &admin_token
+        )
+        .await,
         200,
     );
     assert_eq!(

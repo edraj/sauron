@@ -81,49 +81,96 @@ const AUDITED: &[&str] = &[
 /// reason is the part that matters.
 const EXEMPT: &[(&str, &str)] = &[
     // --- Self-service, not administration -----------------------------------
-    ("routes::account::revoke_session",
-     "the caller ending their own session; the Wall records what admins do TO others"),
-    ("routes::account::revoke_other_sessions",
-     "same: self-service session hygiene, already visible on the Sessions page"),
-
+    (
+        "routes::account::revoke_session",
+        "the caller ending their own session; the Wall records what admins do TO others",
+    ),
+    (
+        "routes::account::revoke_other_sessions",
+        "same: self-service session hygiene, already visible on the Sessions page",
+    ),
     // --- Auth events (locked decision 1) ------------------------------------
-    ("routes::auth::register",
-     "self-signup. The org it creates is recorded by org.create; the account \
-      itself has no org to file under until that grant exists"),
-    ("routes::auth::refresh",
-     "fires on every token rotation — minutes apart per active session. Recording \
+    (
+        "routes::auth::register",
+        "self-signup. The org it creates is recorded by org.create; the account \
+      itself has no org to file under until that grant exists",
+    ),
+    (
+        "routes::auth::refresh",
+        "fires on every token rotation — minutes apart per active session. Recording \
       it would swamp even the opt-in auth stream while adding nothing login and \
-      logout do not already show"),
-    ("routes::auth::forgot_password",
-     "unauthenticated — there is no actor to attribute, and recording the email \
-      would turn the trail into an account-enumeration oracle"),
-    ("routes::auth::reset_password",
-     "unauthenticated (bearer is the reset token); the ADMIN half of a reset is \
-      recorded by orgs::reset_member_password"),
-
+      logout do not already show",
+    ),
+    (
+        "routes::auth::forgot_password",
+        "unauthenticated — there is no actor to attribute, and recording the email \
+      would turn the trail into an account-enumeration oracle",
+    ),
+    (
+        "routes::auth::reset_password",
+        "unauthenticated (bearer is the reset token); the ADMIN half of a reset is \
+      recorded by orgs::reset_member_password",
+    ),
     // --- Product data, not configuration (locked decision 1) ----------------
-    ("routes::issues::update", "issue triage: product data, high volume, decision 1"),
-    ("routes::funnels::compute", "read-only analysis; POST only because the query is a body"),
-    ("routes::funnels::create_saved", "saved analysis view: product data, decision 1"),
-    ("routes::funnels::update_saved", "saved analysis view: product data, decision 1"),
-    ("routes::funnels::delete_saved", "saved analysis view: product data, decision 1"),
-
+    (
+        "routes::issues::update",
+        "issue triage: product data, high volume, decision 1",
+    ),
+    (
+        "routes::funnels::compute",
+        "read-only analysis; POST only because the query is a body",
+    ),
+    (
+        "routes::funnels::create_saved",
+        "saved analysis view: product data, decision 1",
+    ),
+    (
+        "routes::funnels::update_saved",
+        "saved analysis view: product data, decision 1",
+    ),
+    (
+        "routes::funnels::delete_saved",
+        "saved analysis view: product data, decision 1",
+    ),
     // --- Personal preferences ------------------------------------------------
-    ("routes::notification_prefs::create_subscription", "the caller's own notification prefs"),
-    ("routes::notification_prefs::patch_subscription", "the caller's own notification prefs"),
-    ("routes::notification_prefs::delete_subscription_route", "the caller's own notification prefs"),
-    ("routes::notification_prefs::unsubscribe",
-     "unauthenticated one-click unsubscribe from a mailed token; no actor to attribute"),
-
+    (
+        "routes::notification_prefs::create_subscription",
+        "the caller's own notification prefs",
+    ),
+    (
+        "routes::notification_prefs::patch_subscription",
+        "the caller's own notification prefs",
+    ),
+    (
+        "routes::notification_prefs::delete_subscription_route",
+        "the caller's own notification prefs",
+    ),
+    (
+        "routes::notification_prefs::unsubscribe",
+        "unauthenticated one-click unsubscribe from a mailed token; no actor to attribute",
+    ),
     // --- Already audited by their own tables (locked decision 10) -----------
-    ("routes::inspector::reveal_finding",
-     "writes inspector_reveal_audit, which the Wall unions in at read time; \
-      double-writing would let the two copies drift"),
-    ("routes::inspector::mask_preview", "writes inspector_mask_actions; unioned in at read time"),
-    ("routes::inspector::confirm_mask", "writes inspector_mask_actions; unioned in at read time"),
-    ("routes::inspector::cancel_mask", "writes inspector_mask_actions; unioned in at read time"),
-    ("routes::inspector::start_scan",
-     "scan lifecycle is recorded in inspector_scans and shown on the Privacy page"),
+    (
+        "routes::inspector::reveal_finding",
+        "writes inspector_reveal_audit, which the Wall unions in at read time; \
+      double-writing would let the two copies drift",
+    ),
+    (
+        "routes::inspector::mask_preview",
+        "writes inspector_mask_actions; unioned in at read time",
+    ),
+    (
+        "routes::inspector::confirm_mask",
+        "writes inspector_mask_actions; unioned in at read time",
+    ),
+    (
+        "routes::inspector::cancel_mask",
+        "writes inspector_mask_actions; unioned in at read time",
+    ),
+    (
+        "routes::inspector::start_scan",
+        "scan lifecycle is recorded in inspector_scans and shown on the Privacy page",
+    ),
     ("routes::inspector::cancel_scan", "scan lifecycle, as above"),
 ];
 
@@ -228,21 +275,46 @@ fn every_exemption_carries_a_real_reason() {
 const SOURCES: &[(&str, &str)] = &[
     ("routes::admin", include_str!("../src/routes/admin.rs")),
     ("routes::apps", include_str!("../src/routes/apps.rs")),
-    ("routes::artifacts", include_str!("../src/routes/artifacts.rs")),
+    (
+        "routes::artifacts",
+        include_str!("../src/routes/artifacts.rs"),
+    ),
     ("routes::auth", include_str!("../src/routes/auth.rs")),
-    ("routes::environments", include_str!("../src/routes/environments.rs")),
-    ("routes::failures", include_str!("../src/routes/failures.rs")),
-    ("routes::inspector", include_str!("../src/routes/inspector.rs")),
-    ("routes::monitors", include_str!("../src/routes/monitors.rs")),
-    ("routes::notifications", include_str!("../src/routes/notifications.rs")),
+    (
+        "routes::environments",
+        include_str!("../src/routes/environments.rs"),
+    ),
+    (
+        "routes::failures",
+        include_str!("../src/routes/failures.rs"),
+    ),
+    (
+        "routes::inspector",
+        include_str!("../src/routes/inspector.rs"),
+    ),
+    (
+        "routes::monitors",
+        include_str!("../src/routes/monitors.rs"),
+    ),
+    (
+        "routes::notifications",
+        include_str!("../src/routes/notifications.rs"),
+    ),
     ("routes::orgs", include_str!("../src/routes/orgs.rs")),
-    ("routes::projects", include_str!("../src/routes/projects.rs")),
+    (
+        "routes::projects",
+        include_str!("../src/routes/projects.rs"),
+    ),
     ("routes::stores", include_str!("../src/routes/stores.rs")),
 ];
 
 /// The module half of a `routes::module::handler` path.
 fn module_of(handler: &str) -> String {
-    handler.rsplit_once("::").map(|(m, _)| m).unwrap_or(handler).to_string()
+    handler
+        .rsplit_once("::")
+        .map(|(m, _)| m)
+        .unwrap_or(handler)
+        .to_string()
 }
 
 /// Closes the hole that lets `audited_handlers_actually_call_record` skip a

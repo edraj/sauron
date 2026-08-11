@@ -68,13 +68,25 @@ async fn repeated_failures_fold_into_one_group() {
 
     let mut id = Uuid::nil();
     for i in 0..5 {
-        let r = record(&db, "fp-fold", "decode", "bad json", None, Some(json!({"i": i})), 100).await;
+        let r = record(
+            &db,
+            "fp-fold",
+            "decode",
+            "bad json",
+            None,
+            Some(json!({"i": i})),
+            100,
+        )
+        .await;
         id = r.id;
         assert!(r.retained, "under the cap, every payload is retained");
     }
 
     let g = group(&db, id).await;
-    assert_eq!(g.occurrences, 5, "five occurrences must be one group of five");
+    assert_eq!(
+        g.occurrences, 5,
+        "five occurrences must be one group of five"
+    );
     assert_eq!(g.retained, 5);
     assert_eq!(g.dropped, 0);
 
@@ -97,7 +109,16 @@ async fn the_payload_cap_refuses_without_losing_the_count() {
     let mut id = Uuid::nil();
     let mut retained_reports = 0;
     for i in 0..10 {
-        let r = record(&db, "fp-cap", "decode", "bad json", None, Some(json!({"i": i})), cap).await;
+        let r = record(
+            &db,
+            "fp-cap",
+            "decode",
+            "bad json",
+            None,
+            Some(json!({"i": i})),
+            cap,
+        )
+        .await;
         id = r.id;
         if r.retained {
             retained_reports += 1;
@@ -107,7 +128,10 @@ async fn the_payload_cap_refuses_without_losing_the_count() {
     let g = group(&db, id).await;
     assert_eq!(g.occurrences, 10, "every occurrence counts, capped or not");
     assert_eq!(g.retained, cap, "the cap bounds retained payloads");
-    assert_eq!(retained_reports, cap, "record() must report the refusals honestly");
+    assert_eq!(
+        retained_reports, cap,
+        "record() must report the refusals honestly"
+    );
     assert_eq!(
         g.dropped,
         10 - cap,
@@ -138,7 +162,11 @@ async fn distinct_fingerprints_are_distinct_groups() {
     let decodes = repo::list_ingest_failures(&mut conn, None, Some("decode"), None, 50)
         .await
         .unwrap();
-    assert_eq!(decodes.len(), 1, "the error_kind filter must not over-match");
+    assert_eq!(
+        decodes.len(),
+        1,
+        "the error_kind filter must not over-match"
+    );
     assert_eq!(decodes[0].error_kind, "decode");
     drop(conn);
 
@@ -158,20 +186,38 @@ async fn resolving_the_last_payload_resolves_the_group() {
         return;
     };
 
-    let r = record(&db, "fp-resolve", "decode", "x", None, Some(json!({"n": 1})), 10).await;
+    let r = record(
+        &db,
+        "fp-resolve",
+        "decode",
+        "x",
+        None,
+        Some(json!({"n": 1})),
+        10,
+    )
+    .await;
 
     let mut conn = db.conn().await;
-    let items = repo::start_ingest_failure_retry(&mut conn, r.id).await.unwrap();
+    let items = repo::start_ingest_failure_retry(&mut conn, r.id)
+        .await
+        .unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(
-        repo::get_ingest_failure(&mut conn, r.id).await.unwrap().unwrap().status,
+        repo::get_ingest_failure(&mut conn, r.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         "requeued",
     );
 
     repo::resolve_ingest_failure_payload(&mut conn, items[0].id)
         .await
         .unwrap();
-    let g = repo::get_ingest_failure(&mut conn, r.id).await.unwrap().unwrap();
+    let g = repo::get_ingest_failure(&mut conn, r.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         g.status, "resolved",
         "the last payload resolving must resolve the group"
@@ -192,19 +238,32 @@ async fn resolving_one_of_many_leaves_the_group_open() {
 
     let mut id = Uuid::nil();
     for i in 0..3 {
-        id = record(&db, "fp-partial", "decode", "x", None, Some(json!({"i": i})), 10)
-            .await
-            .id;
+        id = record(
+            &db,
+            "fp-partial",
+            "decode",
+            "x",
+            None,
+            Some(json!({"i": i})),
+            10,
+        )
+        .await
+        .id;
     }
 
     let mut conn = db.conn().await;
-    let items = repo::start_ingest_failure_retry(&mut conn, id).await.unwrap();
+    let items = repo::start_ingest_failure_retry(&mut conn, id)
+        .await
+        .unwrap();
     assert_eq!(items.len(), 3);
     repo::resolve_ingest_failure_payload(&mut conn, items[0].id)
         .await
         .unwrap();
 
-    let g = repo::get_ingest_failure(&mut conn, id).await.unwrap().unwrap();
+    let g = repo::get_ingest_failure(&mut conn, id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(g.status, "requeued", "two payloads are still outstanding");
     assert_eq!(g.retained, 2);
     drop(conn);
@@ -220,18 +279,38 @@ async fn a_failed_replay_reopens_the_group() {
         return;
     };
 
-    let r = record(&db, "fp-refail", "db_constraint", "original", None, Some(json!({})), 10).await;
+    let r = record(
+        &db,
+        "fp-refail",
+        "db_constraint",
+        "original",
+        None,
+        Some(json!({})),
+        10,
+    )
+    .await;
 
     let mut conn = db.conn().await;
-    let items = repo::start_ingest_failure_retry(&mut conn, r.id).await.unwrap();
+    let items = repo::start_ingest_failure_retry(&mut conn, r.id)
+        .await
+        .unwrap();
     repo::fail_ingest_failure_payload(&mut conn, items[0].id, "still broken")
         .await
         .unwrap();
 
-    let g = repo::get_ingest_failure(&mut conn, r.id).await.unwrap().unwrap();
+    let g = repo::get_ingest_failure(&mut conn, r.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(g.status, "failed");
-    assert_eq!(g.error_message, "still broken", "the NEW error must be shown");
-    assert_eq!(g.retained, 1, "a failed replay must not consume the payload");
+    assert_eq!(
+        g.error_message, "still broken",
+        "the NEW error must be shown"
+    );
+    assert_eq!(
+        g.retained, 1,
+        "a failed replay must not consume the payload"
+    );
 
     let payloads = repo::list_ingest_failure_payloads(&mut conn, r.id, 10, 0)
         .await
@@ -255,17 +334,32 @@ async fn a_new_occurrence_reopens_a_resolved_group() {
 
     let r = record(&db, "fp-reopen", "decode", "x", None, Some(json!({})), 10).await;
     let mut conn = db.conn().await;
-    let items = repo::start_ingest_failure_retry(&mut conn, r.id).await.unwrap();
+    let items = repo::start_ingest_failure_retry(&mut conn, r.id)
+        .await
+        .unwrap();
     repo::resolve_ingest_failure_payload(&mut conn, items[0].id)
         .await
         .unwrap();
     assert_eq!(
-        repo::get_ingest_failure(&mut conn, r.id).await.unwrap().unwrap().status,
+        repo::get_ingest_failure(&mut conn, r.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         "resolved"
     );
     drop(conn);
 
-    record(&db, "fp-reopen", "decode", "x again", None, Some(json!({})), 10).await;
+    record(
+        &db,
+        "fp-reopen",
+        "decode",
+        "x again",
+        None,
+        Some(json!({})),
+        10,
+    )
+    .await;
     let g = group(&db, r.id).await;
     assert_eq!(g.status, "failed", "a recurrence must reopen the group");
     assert_eq!(g.occurrences, 2);
@@ -284,14 +378,25 @@ async fn dropping_a_group_cascades_to_its_payloads() {
 
     let mut id = Uuid::nil();
     for i in 0..4 {
-        id = record(&db, "fp-drop", "decode", "x", None, Some(json!({"i": i})), 10)
-            .await
-            .id;
+        id = record(
+            &db,
+            "fp-drop",
+            "decode",
+            "x",
+            None,
+            Some(json!({"i": i})),
+            10,
+        )
+        .await
+        .id;
     }
 
     let mut conn = db.conn().await;
     assert_eq!(repo::delete_ingest_failure(&mut conn, id).await.unwrap(), 1);
-    assert!(repo::get_ingest_failure(&mut conn, id).await.unwrap().is_none());
+    assert!(repo::get_ingest_failure(&mut conn, id)
+        .await
+        .unwrap()
+        .is_none());
     assert!(
         repo::list_ingest_failure_payloads(&mut conn, id, 50, 0)
             .await
@@ -326,9 +431,18 @@ async fn the_reaper_deletes_only_aged_groups() {
     .unwrap();
 
     let cutoff = Utc::now() - Duration::days(30);
-    assert_eq!(repo::reap_ingest_failures(&mut conn, cutoff).await.unwrap(), 1);
-    assert!(repo::get_ingest_failure(&mut conn, old.id).await.unwrap().is_none());
-    assert!(repo::get_ingest_failure(&mut conn, fresh.id).await.unwrap().is_some());
+    assert_eq!(
+        repo::reap_ingest_failures(&mut conn, cutoff).await.unwrap(),
+        1
+    );
+    assert!(repo::get_ingest_failure(&mut conn, old.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repo::get_ingest_failure(&mut conn, fresh.id)
+        .await
+        .unwrap()
+        .is_some());
     drop(conn);
 
     db.cleanup().await;
@@ -347,7 +461,16 @@ async fn paging_covers_every_group_exactly_once() {
     };
 
     for i in 0..7 {
-        record(&db, &format!("fp-page-{i}"), "decode", "x", None, Some(json!({})), 10).await;
+        record(
+            &db,
+            &format!("fp-page-{i}"),
+            "decode",
+            "x",
+            None,
+            Some(json!({})),
+            10,
+        )
+        .await;
     }
 
     let mut conn = db.conn().await;

@@ -92,7 +92,10 @@ pub async fn list(
         None
     };
 
-    Ok(Json(ListResponse { failures: rows, next_cursor }))
+    Ok(Json(ListResponse {
+        failures: rows,
+        next_cursor,
+    }))
 }
 
 #[derive(Debug, Deserialize)]

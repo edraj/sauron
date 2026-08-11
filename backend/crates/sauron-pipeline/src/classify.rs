@@ -59,10 +59,16 @@ pub struct Classified {
 
 impl Classified {
     const fn transient(error_kind: &'static str) -> Self {
-        Self { failure: FailureKind::Transient, error_kind }
+        Self {
+            failure: FailureKind::Transient,
+            error_kind,
+        }
     }
     const fn permanent(error_kind: &'static str) -> Self {
-        Self { failure: FailureKind::Permanent, error_kind }
+        Self {
+            failure: FailureKind::Permanent,
+            error_kind,
+        }
     }
 
     pub fn is_transient(&self) -> bool {
@@ -119,9 +125,7 @@ pub fn classify(err: &anyhow::Error) -> Classified {
 fn classify_diesel(err: &diesel::result::Error) -> Classified {
     use diesel::result::{DatabaseErrorKind as K, Error as E};
     match err {
-        E::DatabaseError(K::SerializationFailure, _) => {
-            Classified::transient(kind::DB_CONTENTION)
-        }
+        E::DatabaseError(K::SerializationFailure, _) => Classified::transient(kind::DB_CONTENTION),
         E::DatabaseError(K::ClosedConnection, _) | E::DatabaseError(K::UnableToSendCommand, _) => {
             Classified::transient(kind::DB_UNAVAILABLE)
         }
@@ -208,13 +212,10 @@ pub fn normalize_message(msg: &str) -> String {
 
 fn looks_like_uuid(s: &str) -> bool {
     s.len() == 36
-        && s.as_bytes()
-            .iter()
-            .enumerate()
-            .all(|(i, b)| match i {
-                8 | 13 | 18 | 23 => *b == b'-',
-                _ => b.is_ascii_hexdigit(),
-            })
+        && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 #[cfg(test)]

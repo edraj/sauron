@@ -113,7 +113,10 @@ pub async fn drain_due_between(
     now_ms: i64,
     stream_maxlen: usize,
 ) -> usize {
-    let due = match redis.retry_due_from(retry_key, now_ms, RETRY_DRAIN_LIMIT).await {
+    let due = match redis
+        .retry_due_from(retry_key, now_ms, RETRY_DRAIN_LIMIT)
+        .await
+    {
         Ok(d) if d.is_empty() => return 0,
         Ok(d) => d,
         Err(e) => {

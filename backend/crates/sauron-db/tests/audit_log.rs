@@ -69,7 +69,17 @@ async fn entries_round_trip_and_come_back_newest_first() {
     let ids = db.seed_two_envs().await;
 
     for action in ["project.create", "app.create", "role.update"] {
-        insert(&db, ids.org_id, action, "project", None, "a@example.com", None, None).await;
+        insert(
+            &db,
+            ids.org_id,
+            action,
+            "project",
+            None,
+            "a@example.com",
+            None,
+            None,
+        )
+        .await;
     }
 
     let rows = feed(&db, ids.org_id, &AuditFilter::default(), 50).await;
@@ -100,8 +110,28 @@ async fn one_orgs_trail_is_invisible_to_another() {
             .id
     };
 
-    insert(&db, a.org_id, "project.create", "project", None, "a@example.com", None, None).await;
-    insert(&db, other_org, "project.delete", "project", None, "b@example.com", None, None).await;
+    insert(
+        &db,
+        a.org_id,
+        "project.create",
+        "project",
+        None,
+        "a@example.com",
+        None,
+        None,
+    )
+    .await;
+    insert(
+        &db,
+        other_org,
+        "project.delete",
+        "project",
+        None,
+        "b@example.com",
+        None,
+        None,
+    )
+    .await;
 
     let mine = feed(&db, a.org_id, &AuditFilter::default(), 50).await;
     assert_eq!(mine.len(), 1);
@@ -124,11 +154,39 @@ async fn each_filter_axis_narrows_independently() {
     let actor = Uuid::new_v4();
     let other_project = Uuid::new_v4();
 
-    insert(&db, ids.org_id, "project.create", "project", Some(actor), "a@x.com",
-           Some((ids.project_id, "Alpha")), None).await;
-    insert(&db, ids.org_id, "app.create", "app", None, "b@x.com",
-           Some((other_project, "Beta")), Some((ids.app_id, "MyApp"))).await;
-    insert(&db, ids.org_id, "role.update", "role", Some(actor), "a@x.com", None, None).await;
+    insert(
+        &db,
+        ids.org_id,
+        "project.create",
+        "project",
+        Some(actor),
+        "a@x.com",
+        Some((ids.project_id, "Alpha")),
+        None,
+    )
+    .await;
+    insert(
+        &db,
+        ids.org_id,
+        "app.create",
+        "app",
+        None,
+        "b@x.com",
+        Some((other_project, "Beta")),
+        Some((ids.app_id, "MyApp")),
+    )
+    .await;
+    insert(
+        &db,
+        ids.org_id,
+        "role.update",
+        "role",
+        Some(actor),
+        "a@x.com",
+        None,
+        None,
+    )
+    .await;
 
     // Unfiltered sees everything, so each assertion below is a real narrowing
     // rather than a query that happened to return few rows.
@@ -185,10 +243,28 @@ async fn filters_combine_as_and_not_or() {
     let ids = db.seed_two_envs().await;
     let actor = Uuid::new_v4();
 
-    insert(&db, ids.org_id, "project.create", "project", Some(actor), "a@x.com",
-           Some((ids.project_id, "Alpha")), None).await;
-    insert(&db, ids.org_id, "project.delete", "project", None, "b@x.com",
-           Some((ids.project_id, "Alpha")), None).await;
+    insert(
+        &db,
+        ids.org_id,
+        "project.create",
+        "project",
+        Some(actor),
+        "a@x.com",
+        Some((ids.project_id, "Alpha")),
+        None,
+    )
+    .await;
+    insert(
+        &db,
+        ids.org_id,
+        "project.delete",
+        "project",
+        None,
+        "b@x.com",
+        Some((ids.project_id, "Alpha")),
+        None,
+    )
+    .await;
 
     // Matches the project but not the actor. An OR bug returns 2 here.
     let rows = feed(
@@ -265,7 +341,10 @@ async fn keyset_pagination_does_not_skip_or_repeat_across_identical_timestamps()
         let rows = feed(
             &db,
             ids.org_id,
-            &AuditFilter { cursor, ..Default::default() },
+            &AuditFilter {
+                cursor,
+                ..Default::default()
+            },
             2,
         )
         .await;
@@ -292,7 +371,17 @@ async fn time_bounds_are_inclusive_and_exclude_outside_rows() {
         return;
     };
     let ids = db.seed_two_envs().await;
-    let id = insert(&db, ids.org_id, "project.create", "project", None, "a@x.com", None, None).await;
+    let id = insert(
+        &db,
+        ids.org_id,
+        "project.create",
+        "project",
+        None,
+        "a@x.com",
+        None,
+        None,
+    )
+    .await;
 
     // Backdate it a week.
     {
@@ -336,18 +425,33 @@ async fn facets_are_sourced_from_the_trail_including_deleted_targets() {
     // facets come from the trail rather than from live rows.
     let ghost_project = Uuid::new_v4();
 
-    insert(&db, ids.org_id, "project.delete", "project", Some(actor), "gone@x.com",
-           Some((ghost_project, "Deleted Project")), None).await;
+    insert(
+        &db,
+        ids.org_id,
+        "project.delete",
+        "project",
+        Some(actor),
+        "gone@x.com",
+        Some((ghost_project, "Deleted Project")),
+        None,
+    )
+    .await;
 
     let mut conn = db.conn().await;
-    let actors = repo::audit_actor_facets(&mut conn, ids.org_id, false).await.unwrap();
+    let actors = repo::audit_actor_facets(&mut conn, ids.org_id, false)
+        .await
+        .unwrap();
     assert_eq!(actors.len(), 1);
     assert_eq!(actors[0].label, "gone@x.com");
 
-    let actions = repo::audit_action_facets(&mut conn, ids.org_id, false).await.unwrap();
+    let actions = repo::audit_action_facets(&mut conn, ids.org_id, false)
+        .await
+        .unwrap();
     assert!(actions.iter().any(|a| a.label == "project.delete"));
 
-    let scopes = repo::audit_scope_facets(&mut conn, ids.org_id).await.unwrap();
+    let scopes = repo::audit_scope_facets(&mut conn, ids.org_id)
+        .await
+        .unwrap();
     assert_eq!(scopes.projects.len(), 1);
     assert_eq!(scopes.projects[0].label, "Deleted Project");
     assert_eq!(scopes.projects[0].id, Some(ghost_project));
@@ -356,11 +460,26 @@ async fn facets_are_sourced_from_the_trail_including_deleted_targets() {
     // A rename must leave the dropdown offering the CURRENT name. `MAX(name)`
     // would answer "Aardvark" here purely because it sorts first, and the
     // dropdown would disagree with every other page in the dashboard.
-    insert(&db, ids.org_id, "project.update", "project", Some(actor), "gone@x.com",
-           Some((ghost_project, "Aardvark Renamed Later")), None).await;
+    insert(
+        &db,
+        ids.org_id,
+        "project.update",
+        "project",
+        Some(actor),
+        "gone@x.com",
+        Some((ghost_project, "Aardvark Renamed Later")),
+        None,
+    )
+    .await;
     let mut conn = db.conn().await;
-    let after = repo::audit_scope_facets(&mut conn, ids.org_id).await.unwrap();
-    assert_eq!(after.projects.len(), 1, "a rename must not create a second option");
+    let after = repo::audit_scope_facets(&mut conn, ids.org_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.projects.len(),
+        1,
+        "a rename must not create a second option"
+    );
     assert_eq!(after.projects[0].label, "Aardvark Renamed Later");
     // No app entries were written, so the app dropdown must be empty rather
     // than listing the org's live apps.
@@ -420,11 +539,30 @@ async fn limit_bounds_the_page() {
     };
     let ids = db.seed_two_envs().await;
     for i in 0..5 {
-        insert(&db, ids.org_id, "project.update", "project", None,
-               &format!("a{i}@x.com"), None, None).await;
+        insert(
+            &db,
+            ids.org_id,
+            "project.update",
+            "project",
+            None,
+            &format!("a{i}@x.com"),
+            None,
+            None,
+        )
+        .await;
     }
-    assert_eq!(feed(&db, ids.org_id, &AuditFilter::default(), 2).await.len(), 2);
-    assert_eq!(feed(&db, ids.org_id, &AuditFilter::default(), 50).await.len(), 5);
+    assert_eq!(
+        feed(&db, ids.org_id, &AuditFilter::default(), 2)
+            .await
+            .len(),
+        2
+    );
+    assert_eq!(
+        feed(&db, ids.org_id, &AuditFilter::default(), 50)
+            .await
+            .len(),
+        5
+    );
 
     db.cleanup().await;
 }
@@ -445,9 +583,29 @@ async fn auth_events_are_hidden_from_the_default_feed() {
     let ids = db.seed_two_envs().await;
     let actor = Uuid::new_v4();
 
-    insert(&db, ids.org_id, "role.update", "role", Some(actor), "a@x.com", None, None).await;
+    insert(
+        &db,
+        ids.org_id,
+        "role.update",
+        "role",
+        Some(actor),
+        "a@x.com",
+        None,
+        None,
+    )
+    .await;
     for _ in 0..5 {
-        insert(&db, ids.org_id, "auth.login", "auth", Some(actor), "a@x.com", None, None).await;
+        insert(
+            &db,
+            ids.org_id,
+            "auth.login",
+            "auth",
+            Some(actor),
+            "a@x.com",
+            None,
+            None,
+        )
+        .await;
     }
 
     // Default: the one admin action, and none of the five logins.
@@ -459,7 +617,10 @@ async fn auth_events_are_hidden_from_the_default_feed() {
     let with_auth = feed(
         &db,
         ids.org_id,
-        &AuditFilter { include_auth: true, ..Default::default() },
+        &AuditFilter {
+            include_auth: true,
+            ..Default::default()
+        },
         50,
     )
     .await;
@@ -495,22 +656,50 @@ async fn facets_hide_auth_unless_it_is_included() {
     let admin = Uuid::new_v4();
     let signer = Uuid::new_v4();
 
-    insert(&db, ids.org_id, "role.update", "role", Some(admin), "admin@x.com", None, None).await;
-    insert(&db, ids.org_id, "auth.login", "auth", Some(signer), "signer@x.com", None, None).await;
+    insert(
+        &db,
+        ids.org_id,
+        "role.update",
+        "role",
+        Some(admin),
+        "admin@x.com",
+        None,
+        None,
+    )
+    .await;
+    insert(
+        &db,
+        ids.org_id,
+        "auth.login",
+        "auth",
+        Some(signer),
+        "signer@x.com",
+        None,
+        None,
+    )
+    .await;
 
     let mut conn = db.conn().await;
 
-    let actions = repo::audit_action_facets(&mut conn, ids.org_id, false).await.unwrap();
+    let actions = repo::audit_action_facets(&mut conn, ids.org_id, false)
+        .await
+        .unwrap();
     assert!(actions.iter().all(|a| a.label != "auth.login"));
-    let actions_with = repo::audit_action_facets(&mut conn, ids.org_id, true).await.unwrap();
+    let actions_with = repo::audit_action_facets(&mut conn, ids.org_id, true)
+        .await
+        .unwrap();
     assert!(actions_with.iter().any(|a| a.label == "auth.login"));
 
     // An actor who ONLY ever signed in must not appear in the "Who" dropdown of
     // a feed that hides sign-ins — selecting them would return nothing.
-    let actors = repo::audit_actor_facets(&mut conn, ids.org_id, false).await.unwrap();
+    let actors = repo::audit_actor_facets(&mut conn, ids.org_id, false)
+        .await
+        .unwrap();
     assert_eq!(actors.len(), 1);
     assert_eq!(actors[0].label, "admin@x.com");
-    let actors_with = repo::audit_actor_facets(&mut conn, ids.org_id, true).await.unwrap();
+    let actors_with = repo::audit_actor_facets(&mut conn, ids.org_id, true)
+        .await
+        .unwrap();
     assert_eq!(actors_with.len(), 2);
 
     db.cleanup().await;
@@ -528,9 +717,29 @@ async fn the_default_feed_uses_the_admin_partial_index() {
     };
     let ids = db.seed_two_envs().await;
     for i in 0..20 {
-        insert(&db, ids.org_id, "auth.login", "auth", None, &format!("u{i}@x.com"), None, None).await;
+        insert(
+            &db,
+            ids.org_id,
+            "auth.login",
+            "auth",
+            None,
+            &format!("u{i}@x.com"),
+            None,
+            None,
+        )
+        .await;
     }
-    insert(&db, ids.org_id, "role.update", "role", None, "a@x.com", None, None).await;
+    insert(
+        &db,
+        ids.org_id,
+        "role.update",
+        "role",
+        None,
+        "a@x.com",
+        None,
+        None,
+    )
+    .await;
 
     let mut conn = db.conn().await;
     // ANALYZE first: on a tiny table the planner will pick a seq scan whatever
@@ -557,7 +766,11 @@ async fn the_default_feed_uses_the_admin_partial_index() {
     .load(&mut conn)
     .await
     .unwrap();
-    let text = plan.iter().map(|p| p.line.as_str()).collect::<Vec<_>>().join("\n");
+    let text = plan
+        .iter()
+        .map(|p| p.line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         text.contains("audit_log_org_time_admin_idx"),
         "the default feed is not using migration 52's partial index — the query \

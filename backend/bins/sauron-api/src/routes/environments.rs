@@ -305,8 +305,7 @@ pub async fn update_project_environment(
     let (project_id, _) = repo::project_env_ancestry(&mut conn, env_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let project =
-        authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_UPDATE).await?;
+    let project = authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_UPDATE).await?;
 
     let env = repo::get_project_environment(&mut conn, env_id)
         .await?
@@ -368,8 +367,7 @@ pub async fn retire_project_environment(
     let (project_id, _) = repo::project_env_ancestry(&mut conn, env_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let project =
-        authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_DELETE).await?;
+    let project = authorize_project(&mut conn, auth.user_id, project_id, perm::ENV_DELETE).await?;
 
     // Both invariants are read and acted on in one transaction that starts with a
     // project-level lock, so two concurrent retires of DIFFERENT environments in

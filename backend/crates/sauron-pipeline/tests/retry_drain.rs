@@ -95,25 +95,37 @@ async fn a_parked_job_returns_to_the_stream_when_due() {
     };
     let now = now_ms();
 
-    retry::park_to(&redis, &k.retry, "{\"item\":\"a\"}", now).await.unwrap();
+    retry::park_to(&redis, &k.retry, "{\"item\":\"a\"}", now)
+        .await
+        .unwrap();
     assert_eq!(redis.retry_depth_of(&k.retry).await.unwrap(), 1);
 
     // Not yet due: the backoff must actually hold the job back, or "retry after
     // 60s" is really "retry immediately" and a database that needs a moment to
     // recover gets hammered instead.
-    assert_eq!(retry::drain_due_between(&redis, &k.retry, &k.stream, now, MAXLEN).await, 0);
+    assert_eq!(
+        retry::drain_due_between(&redis, &k.retry, &k.stream, now, MAXLEN).await,
+        0
+    );
     assert_eq!(redis.retry_depth_of(&k.retry).await.unwrap(), 1);
     assert_eq!(stream_len(&redis, &k).await, 0);
 
     // Due.
     let later = now + retry::RETRY_BACKOFF_SECS * 1000 + 1;
-    assert_eq!(retry::drain_due_between(&redis, &k.retry, &k.stream, later, MAXLEN).await, 1);
+    assert_eq!(
+        retry::drain_due_between(&redis, &k.retry, &k.stream, later, MAXLEN).await,
+        1
+    );
     assert_eq!(
         redis.retry_depth_of(&k.retry).await.unwrap(),
         0,
         "a re-enqueued job must leave the set, or every tick re-injects it"
     );
-    assert_eq!(stream_len(&redis, &k).await, 1, "the job must reach the stream");
+    assert_eq!(
+        stream_len(&redis, &k).await,
+        1,
+        "the job must reach the stream"
+    );
 
     cleanup(&redis, &k).await;
 }
@@ -131,8 +143,12 @@ async fn two_identical_payloads_both_come_back() {
     };
     let now = now_ms();
 
-    retry::park_to(&redis, &k.retry, "{\"same\":1}", now).await.unwrap();
-    retry::park_to(&redis, &k.retry, "{\"same\":1}", now).await.unwrap();
+    retry::park_to(&redis, &k.retry, "{\"same\":1}", now)
+        .await
+        .unwrap();
+    retry::park_to(&redis, &k.retry, "{\"same\":1}", now)
+        .await
+        .unwrap();
     assert_eq!(
         redis.retry_depth_of(&k.retry).await.unwrap(),
         2,
@@ -140,8 +156,15 @@ async fn two_identical_payloads_both_come_back() {
     );
 
     let later = now + retry::RETRY_BACKOFF_SECS * 1000 + 1;
-    assert_eq!(retry::drain_due_between(&redis, &k.retry, &k.stream, later, MAXLEN).await, 2);
-    assert_eq!(stream_len(&redis, &k).await, 2, "both events must be replayed");
+    assert_eq!(
+        retry::drain_due_between(&redis, &k.retry, &k.stream, later, MAXLEN).await,
+        2
+    );
+    assert_eq!(
+        stream_len(&redis, &k).await,
+        2,
+        "both events must be replayed"
+    );
 
     cleanup(&redis, &k).await;
 }
@@ -164,7 +187,10 @@ async fn the_drain_limit_bounds_a_tick_without_losing_the_remainder() {
 
     let later = now + retry::RETRY_BACKOFF_SECS * 1000 + 1;
     let moved = retry::drain_due_between(&redis, &k.retry, &k.stream, later, MAXLEN).await;
-    assert_eq!(moved, RETRY_DRAIN_LIMIT, "one tick must not drain everything");
+    assert_eq!(
+        moved, RETRY_DRAIN_LIMIT,
+        "one tick must not drain everything"
+    );
     assert_eq!(
         redis.retry_depth_of(&k.retry).await.unwrap() as usize,
         total - RETRY_DRAIN_LIMIT,
@@ -199,7 +225,9 @@ async fn an_unparseable_member_is_discarded_not_retried_forever() {
         .retry_schedule_to(&k.retry, "this is not the envelope shape", now - 1)
         .await
         .unwrap();
-    retry::park_to(&redis, &k.retry, "{\"good\":1}", now - 61_000).await.unwrap();
+    retry::park_to(&redis, &k.retry, "{\"good\":1}", now - 61_000)
+        .await
+        .unwrap();
 
     let moved = retry::drain_due_between(&redis, &k.retry, &k.stream, now, MAXLEN).await;
     assert_eq!(moved, 1, "only the parseable job is re-enqueued");
@@ -241,10 +269,13 @@ async fn the_attempt_count_survives_the_round_trip_and_terminates() {
         attempt = redis.bump_attempt(&hash, ATTEMPT_TTL_SECS).await.unwrap();
         if attempt < MAX_ATTEMPTS {
             let now = now_ms();
-            retry::park_to(&redis, &k.retry, payload, now).await.unwrap();
+            retry::park_to(&redis, &k.retry, payload, now)
+                .await
+                .unwrap();
             parks += 1;
             // Re-injected: the next failure must see attempt N+1, not 1.
-            let moved = retry::drain_due_between(&redis, &k.retry, &k.stream, now + 61_000, MAXLEN).await;
+            let moved =
+                retry::drain_due_between(&redis, &k.retry, &k.stream, now + 61_000, MAXLEN).await;
             assert_eq!(moved, 1, "round {round}: the parked job must come back");
         } else {
             break;
@@ -265,7 +296,10 @@ async fn the_attempt_count_survives_the_round_trip_and_terminates() {
     // Going terminal clears the counter, so a later identical payload gets its
     // own full allowance rather than starting already-exhausted.
     redis.clear_attempt(&hash).await.unwrap();
-    assert_eq!(redis.bump_attempt(&hash, ATTEMPT_TTL_SECS).await.unwrap(), 1);
+    assert_eq!(
+        redis.bump_attempt(&hash, ATTEMPT_TTL_SECS).await.unwrap(),
+        1
+    );
 
     redis.clear_attempt(&hash).await.unwrap();
     cleanup(&redis, &k).await;

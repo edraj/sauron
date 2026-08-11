@@ -391,7 +391,10 @@ mod tests {
             "2026-08-11T03:04:05Z|not-a-uuid",
             "nonsense|11111111-2222-3333-4444-555555555555",
         ] {
-            assert!(decode_cursor(bad).is_err(), "accepted malformed cursor {bad:?}");
+            assert!(
+                decode_cursor(bad).is_err(),
+                "accepted malformed cursor {bad:?}"
+            );
         }
     }
 }

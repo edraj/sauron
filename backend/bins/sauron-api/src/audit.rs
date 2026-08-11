@@ -300,10 +300,7 @@ pub fn diff(entity_type: &str, pairs: &[(&str, Value, Value)]) -> Value {
         if before == after {
             continue;
         }
-        out.insert(
-            (*field).to_string(),
-            json!({ "from": before, "to": after }),
-        );
+        out.insert((*field).to_string(), json!({ "from": before, "to": after }));
     }
     Value::Object(out)
 }
@@ -412,9 +409,9 @@ impl Entry {
 /// whole path is fail-open by design.
 pub async fn with_app_scope(conn: &mut AsyncPgConnection, entry: Entry, app_id: Uuid) -> Entry {
     match repo::audit_app_scope(conn, app_id).await {
-        Ok(Some((project_id, project_name, app_name))) => {
-            entry.project(project_id, project_name).app(app_id, app_name)
-        }
+        Ok(Some((project_id, project_name, app_name))) => entry
+            .project(project_id, project_name)
+            .app(app_id, app_name),
         Ok(None) => entry.app(app_id, ""),
         Err(e) => {
             tracing::warn!(error = %e, %app_id, "audit: could not resolve app scope names");
@@ -657,7 +654,11 @@ mod tests {
             entity::ALERT_CHANNEL,
             &[
                 ("name", json!("old"), json!("new")),
-                ("config", json!({"url": "https://secret"}), json!({"url": "https://other"})),
+                (
+                    "config",
+                    json!({"url": "https://secret"}),
+                    json!({"url": "https://other"}),
+                ),
             ],
         );
         assert_eq!(d, json!({ "name": { "from": "old", "to": "new" } }));

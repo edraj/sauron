@@ -92,12 +92,7 @@ pub fn fingerprint(error_kind: &str, message: &str, app_id: Option<Uuid>) -> Str
 /// means BOTH sinks refused, and the caller must not ack the stream entry —
 /// leaving it pending is the last thing standing between a failure and silent
 /// loss.
-pub async fn record(
-    pool: &PgPool,
-    redis: &RedisStore,
-    dlq_maxlen: usize,
-    t: Terminal<'_>,
-) -> bool {
+pub async fn record(pool: &PgPool, redis: &RedisStore, dlq_maxlen: usize, t: Terminal<'_>) -> bool {
     let fp = fingerprint(t.class.error_kind, t.message, t.app_id);
     // Truncated for the same reason the fingerprint normalizes: a multi-megabyte
     // serde error is not more informative than its first lines, and it would be
@@ -109,7 +104,9 @@ pub async fn record(
         // A payload that does not parse as JSON is precisely the `decode`
         // failure case. Store it as a JSON string so the column stays typed and
         // the admin can still read the bytes that broke.
-        Err(_) => Some(serde_json::Value::String(t.payload.chars().take(64 * 1024).collect())),
+        Err(_) => Some(serde_json::Value::String(
+            t.payload.chars().take(64 * 1024).collect(),
+        )),
     };
 
     let recorded = match sauron_db::conn(pool).await {
@@ -204,7 +201,10 @@ mod tests {
     fn class(k: &'static str) -> Classified {
         // Constructed directly: the point of these tests is the fingerprint,
         // not the classifier that produced the kind.
-        Classified { failure: FailureKind::Permanent, error_kind: k }
+        Classified {
+            failure: FailureKind::Permanent,
+            error_kind: k,
+        }
     }
 
     /// The property the page depends on: one problem is one row.

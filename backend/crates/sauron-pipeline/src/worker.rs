@@ -406,7 +406,10 @@ async fn process_entries(
                     // malformed payload and silent loss.
                     let _ = redis.ack(&id).await;
                 } else {
-                    error!(consumer, id, "malformed entry recorded NOWHERE; it stays pending");
+                    error!(
+                        consumer,
+                        id, "malformed entry recorded NOWHERE; it stays pending"
+                    );
                 }
                 // Counted in ENTRIES, not items: the payload did not decode, so
                 // how many items it carried is not knowable here. That is why
@@ -559,8 +562,15 @@ async fn process_one_by_one(
                         // drop it. A failed park is not a reason to lose data.
                         error!(consumer, id = d.id, error = %pe, "retry park failed; recording as terminal");
                         record_failed = !record_terminal(
-                            pool, redis, &class, &e, &masked_payload, attempt,
-                            org_id, project_id, app_id,
+                            pool,
+                            redis,
+                            &class,
+                            &e,
+                            &masked_payload,
+                            attempt,
+                            org_id,
+                            project_id,
+                            app_id,
                         )
                         .await;
                     } else {
@@ -572,8 +582,15 @@ async fn process_one_by_one(
                         "job failure is terminal; recording"
                     );
                     record_failed = !record_terminal(
-                        pool, redis, &class, &e, &masked_payload, attempt,
-                        org_id, project_id, app_id,
+                        pool,
+                        redis,
+                        &class,
+                        &e,
+                        &masked_payload,
+                        attempt,
+                        org_id,
+                        project_id,
+                        app_id,
                     )
                     .await;
                     if !record_failed {
@@ -585,7 +602,8 @@ async fn process_one_by_one(
                         sauron_telemetry::metrics::items_deadlettered(1);
                     } else {
                         error!(
-                            consumer, id = d.id,
+                            consumer,
+                            id = d.id,
                             "failure recorded NOWHERE; not acking so the entry is redelivered"
                         );
                     }
