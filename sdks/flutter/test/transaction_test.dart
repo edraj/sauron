@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:mocktail/mocktail.dart';
@@ -10,6 +11,9 @@ class _MockClient extends Mock implements http.Client {}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  const MethodChannel pathProvider =
+      MethodChannel('plugins.flutter.io/path_provider');
 
   late Directory dir;
   late _MockClient httpClient;
@@ -21,6 +25,15 @@ void main() {
 
   setUp(() async {
     dir = await Directory.systemTemp.createTemp('sauron_transaction_test');
+    // These tests drive the `Sauron` facade, and `Sauron.init` without an
+    // explicit queue directory resolves one via path_provider — a platform
+    // plugin with no implementation under `flutter test`. Without this handler
+    // every test here dies on `initSauron()` with MissingPluginException before
+    // asserting anything. Same pattern as init_test.dart / zone_test.dart.
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+            pathProvider, (MethodCall _) async => dir.path);
+
     httpClient = _MockClient();
     items.clear();
     when(() => httpClient.post(
@@ -42,6 +55,8 @@ void main() {
 
   tearDown(() async {
     await Sauron.close();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(pathProvider, null);
     if (await dir.exists()) {
       await dir.delete(recursive: true);
     }
