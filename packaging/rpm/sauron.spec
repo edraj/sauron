@@ -8,8 +8,8 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.3.0
-Release:        2%{?dist}
+Version:        1.4.0
+Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
 License:        AGPL-3.0-only
@@ -24,6 +24,7 @@ Source13:       sauron-tier.service
 Source14:       sauron-migrate.service
 Source15:       sauron-alerts.service
 Source16:       sauron-inspector.service
+Source17:       sauron-storesync.service
 Source20:       sauron.sysusers
 Source21:       sauron.tmpfiles
 Source30:       sauron.env
@@ -34,6 +35,7 @@ Source34:       tier.env
 Source35:       dashboard.env
 Source36:       alerts.env
 Source37:       inspector.env
+Source38:       storesync.env
 Source40:       sauron-dashboard.conf
 Source41:       sauron-dashboard-config
 # Prebuilt libduckdb.so (DuckDB C library) matching the libduckdb-sys crate pin,
@@ -155,6 +157,7 @@ install -Dm0644 %{SOURCE13} %{buildroot}%{_unitdir}/sauron-tier.service
 install -Dm0644 %{SOURCE14} %{buildroot}%{_unitdir}/sauron-migrate.service
 install -Dm0644 %{SOURCE15} %{buildroot}%{_unitdir}/sauron-alerts.service
 install -Dm0644 %{SOURCE16} %{buildroot}%{_unitdir}/sauron-inspector.service
+install -Dm0644 %{SOURCE17} %{buildroot}%{_unitdir}/sauron-storesync.service
 
 # --- systemd preset ---
 # Installed from the unpacked source tree rather than as a SourceN, on purpose:
@@ -178,6 +181,7 @@ install -Dm0640 %{SOURCE33} %{buildroot}%{_sysconfdir}/sauron/monitor.env
 install -Dm0640 %{SOURCE34} %{buildroot}%{_sysconfdir}/sauron/tier.env
 install -Dm0640 %{SOURCE36} %{buildroot}%{_sysconfdir}/sauron/alerts.env
 install -Dm0640 %{SOURCE37} %{buildroot}%{_sysconfdir}/sauron/inspector.env
+install -Dm0640 %{SOURCE38} %{buildroot}%{_sysconfdir}/sauron/storesync.env
 install -Dm0644 %{SOURCE35} %{buildroot}%{_sysconfdir}/sauron/dashboard.env
 
 # --- data dirs (also created at runtime by tmpfiles) ---
@@ -215,7 +219,7 @@ install -Dm0755 %{SOURCE41} %{buildroot}%{_libexecdir}/sauron/sauron-dashboard-c
 # is-enabled keeps reporting "static". Listing it costs nothing and keeps the
 # %%post/%%preun lists identical to %%files. It is deliberately NOT in the preset
 # file — it is pulled in by every daemon's Requires=sauron-migrate.service.
-%systemd_post sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service sauron-migrate.service
+%systemd_post sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service sauron-storesync.service sauron-migrate.service
 # Refresh the dynamic linker cache so sauron-tier finds the vendored
 # %%{_libdir}/sauron/libduckdb.so via the ld.so.conf.d drop-in.
 /sbin/ldconfig
@@ -274,7 +278,7 @@ fi
 # Erase only ($1 -eq 0): `disable --now` each unit. sauron-migrate is listed for
 # symmetry with %%post/%%files; on a static unit disable is a no-op (rc=0), and
 # because it is inactive between runs the --now half is a no-op too.
-%systemd_preun sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service sauron-migrate.service
+%systemd_preun sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service sauron-storesync.service sauron-migrate.service
 
 %postun server
 # sauron-migrate.service is DELIBERATELY ABSENT from this list. Do not "fix" it
@@ -296,7 +300,7 @@ fi
 # RemainAfterExit=yes, and that variant is rejected because it would then run
 # roughly once per boot instead of once per daemon start — see the comment in
 # sauron-migrate.service.
-%systemd_postun_with_restart sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service
+%systemd_postun_with_restart sauron-api.service sauron-ingest.service sauron-monitor.service sauron-alerts.service sauron-tier.service sauron-inspector.service sauron-storesync.service
 # Rebuild the linker cache after the vendored libduckdb is added/removed.
 /sbin/ldconfig
 
@@ -321,6 +325,7 @@ fi
 %{_bindir}/sauron-alerts
 %{_bindir}/sauron-tier
 %{_bindir}/sauron-inspector
+%{_bindir}/sauron-storesync
 %{_bindir}/sauron-migrate
 %{_unitdir}/sauron-api.service
 %{_unitdir}/sauron-ingest.service
@@ -328,6 +333,7 @@ fi
 %{_unitdir}/sauron-alerts.service
 %{_unitdir}/sauron-tier.service
 %{_unitdir}/sauron-inspector.service
+%{_unitdir}/sauron-storesync.service
 %{_unitdir}/sauron-migrate.service
 # Vendor preset: which daemons `systemctl preset` enables on first install.
 # Not %%config — operator overrides belong in /etc/systemd/system-preset/.
@@ -338,6 +344,7 @@ fi
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/tier.env
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/alerts.env
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/inspector.env
+%attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/storesync.env
 %ghost %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/secret.env
 # Vendored DuckDB C library (linked by sauron-tier) + loader path.
 %dir %{_libdir}/sauron
@@ -357,6 +364,35 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Tue Aug 11 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.4.0-1
+- App store install and uninstall metrics. Daily counts are pulled from Google
+  Play (monthly CSV reports from the Play Console's Cloud Storage bucket) and
+  the Apple App Store (the App Store Connect Analytics Reports API, which is the
+  only Apple source that reports deletions), stored per app per store per day,
+  and charted on Overview as diverging bars — installs above the zero line,
+  uninstalls below, both stores stacked in each direction on one shared scale.
+- NEW DAEMON: sauron-storesync, enabled by the vendor preset. It claims due
+  connections FOR UPDATE SKIP LOCKED, fetches concurrently and upserts; a store
+  outage is recorded on that one connection and touches nothing else. Tunables
+  live in /etc/sauron/storesync.env (STORE_SYNC_INTERVAL_SECS, default 6h;
+  STORE_SYNC_MAX_CONCURRENCY; STORE_BACKFILL_DAYS).
+- Store credentials (the Play service-account JSON, the App Store Connect .p8)
+  are encrypted at rest under the EXISTING NOTIFY_SECRET_KEY — one at-rest key
+  for the deployment, not a second one to keep in step. sauron-storesync proves
+  it can decrypt what is stored at boot and refuses to start otherwise, rather
+  than reporting every connection as broken hours later.
+- Migration 2026-08-10-000049_store_metrics adds app_store_connections,
+  store_daily_metrics and a nullable apps.store_environment_id. Purely additive
+  and safe to apply with the daemons running. As always on this platform, an RPM
+  upgrade does not re-run sauron-migrate by itself — the daemon units pull it in
+  via Requires=, so a restart applies it.
+- Apple publishes nothing for roughly 24-48 hours after its ongoing report is
+  first requested. That window is surfaced as a "pending" state in App settings,
+  deliberately not as an error.
+- FIX: the API's CORS layer did not advertise PUT, so the first PUT route (the
+  store-connection upsert) failed in browsers with net::ERR_FAILED while the
+  preflight still answered 200. No route shipped before this release used PUT.
+
 * Sun Aug 09 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.3.0-2
 - SECURITY (migration 2026-08-09-000046_channel_config_enc): a notification
   channel's `config` was stored in CLEARTEXT in Postgres, and therefore in every

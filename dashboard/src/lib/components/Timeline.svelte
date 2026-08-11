@@ -1,19 +1,33 @@
 <script lang="ts">
-  import type { TimelineItem } from '../models';
+  import type { ErrorEvent, TimelineItem } from '../models';
+  import {
+    httpStatusTone,
+    isHttp,
+    isNavigation,
+    offsetMs,
+    rowKind,
+    rowTitle,
+    type TimeMode,
+  } from '../models/timeline-row';
   import { formatTime, formatMs, latencyTone } from '../utils/format';
   import LatencyBadge from './LatencyBadge.svelte';
   import LevelBadge from './LevelBadge.svelte';
   import Badge from './ui/Badge.svelte';
   import Icon, { type IconName } from './ui/Icon.svelte';
   import JsonTree from './JsonTree.svelte';
+  import StacktraceView from './StacktraceView.svelte';
+  import SymbolicationBadge from './SymbolicationBadge.svelte';
 
   interface Props {
     items: TimelineItem[];
     // When set, the session start — renders an elapsed offset per row.
     startedAt?: string | null;
+    // What that offset reads against: the session start, or the row above.
+    // The control that flips it lives with the caller (the Card header).
+    timeMode?: TimeMode;
   }
 
-  let { items, startedAt = null }: Props = $props();
+  let { items, startedAt = null, timeMode = 'session' }: Props = $props();
 
   let expanded = $state<Set<number>>(new Set());
 
@@ -25,6 +39,7 @@
   }
 
   function icon(item: TimelineItem): IconName {
+    if (isNavigation(item)) return 'compass';
     switch (item.kind) {
       case 'event':
         return 'diamond';
@@ -41,25 +56,22 @@
       return l === 'fatal' ? 'fatal' : l === 'warning' ? 'warning' : 'error';
     }
     if (item.kind === 'transaction') return latencyTone(item.transaction.duration_ms);
-    return 'event';
+    // Its own tone rather than the existing `warning` (which happens to carry
+    // the same values): the rail node and the row's badge are one signal, and a
+    // navigation node left on the event indigo would read as an ordinary event
+    // wearing an odd glyph.
+    return isNavigation(item) ? 'navigation' : 'event';
   }
 
-  function title(item: TimelineItem): string {
-    switch (item.kind) {
-      case 'event':
-        return item.event.name;
-      case 'error': {
-        const e = item.error;
-        if (e.exception_type) {
-          return e.exception_value ? `${e.exception_type}: ${e.exception_value}` : e.exception_type;
-        }
-        return e.message ?? 'Error';
-      }
-      case 'transaction':
-        return item.transaction.name;
-    }
-  }
-
+  /**
+   * The JSON half of an expanded row.
+   *
+   * An error's `stacktrace` is deliberately absent: frames render through
+   * `StacktraceView` above this tree — symbolicated, collapsible, with source
+   * context — and repeating them here as raw JSON would show every frame
+   * twice, the second time in the minified form the symbolication exists to
+   * replace.
+   */
   function payload(item: TimelineItem): unknown {
     switch (item.kind) {
       case 'event':
@@ -67,7 +79,6 @@
       case 'error':
         return {
           exception: { type: item.error.exception_type, value: item.error.exception_value },
-          stacktrace: item.error.stacktrace,
           context: item.error.context,
           tags: item.error.tags,
         };
@@ -76,17 +87,33 @@
     }
   }
 
+  /**
+   * Whether an error carries anything a `StacktraceView` could render. A
+   * message-only error (a `captureMessage`, or a crash whose SDK sent no
+   * frames) has none of the three, and gets no Stacktrace heading rather than
+   * a heading over the words "No stacktrace on this event."
+   */
+  function hasStack(e: ErrorEvent): boolean {
+    return (
+      (e.stacktrace?.length ?? 0) > 0 ||
+      (e.stacktrace_symbolicated?.length ?? 0) > 0 ||
+      e.debug_meta?.raw_stacktrace != null
+    );
+  }
+
   function screenOf(item: TimelineItem): string | null {
     if (item.kind === 'event') return item.event.screen ?? null;
     if (item.kind === 'error') return item.error.screen ?? null;
     return null;
   }
 
-  function elapsed(at: string): string {
-    if (!startedAt) return '';
-    const ms = new Date(at).getTime() - new Date(startedAt).getTime();
-    if (ms < 0 || Number.isNaN(ms)) return '';
-    return `+${formatMs(ms)}`;
+  /**
+   * The trailing offset label. An em dash — not a `+` with nothing after it —
+   * when there is no reference point, which in `delta` mode is the first row.
+   */
+  function offsetLabel(i: number): string {
+    const ms = offsetMs(items, i, startedAt, timeMode);
+    return ms === null ? '—' : `+${formatMs(ms)}`;
   }
 </script>
 
@@ -99,16 +126,32 @@
       <div class="content">
         <button class="row" onclick={() => toggle(i)} type="button">
           <span class="time mono" title={formatTime(item.at)}>{formatTime(item.at)}</span>
-          <span class="kind kind-{item.kind}">{item.kind}</span>
-          <span class="title truncate">{title(item)}</span>
+          <span class="kind kind-{rowKind(item)}">{rowKind(item)}</span>
+          <span class="title truncate">{rowTitle(item)}</span>
           <span class="trail">
             {#if item.kind === 'transaction'}
-              <Badge tone="neutral" size="sm">{item.transaction.op}</Badge>
+              {#if isHttp(item)}
+                <!-- The op badge would read "http" beside a badge already
+                     reading HTTP; the response code is the fact that isn't
+                     anywhere else on the collapsed row. -->
+                {#if item.transaction.http_status != null}
+                  <Badge tone={httpStatusTone(item.transaction.http_status)} size="sm">
+                    {item.transaction.http_status}
+                  </Badge>
+                {/if}
+              {:else}
+                <Badge tone="neutral" size="sm">{item.transaction.op}</Badge>
+              {/if}
               <LatencyBadge ms={item.transaction.duration_ms} size="sm" />
             {:else if item.kind === 'error'}
               <LevelBadge level={item.error.level} size="sm" />
             {/if}
-            {#if startedAt}<span class="elapsed faint mono">{elapsed(item.at)}</span>{/if}
+            {#if startedAt || timeMode === 'delta'}
+              <span
+                class="elapsed faint mono"
+                title={timeMode === 'delta' ? 'Since the previous entry' : 'Since the session started'}
+              >{offsetLabel(i)}</span>
+            {/if}
             <span class="caret" class:open={expanded.has(i)}><Icon name="chevron-right" size={13} /></span>
           </span>
         </button>
@@ -124,6 +167,22 @@
                 </a>
               {/if}
             </div>
+            {#if item.kind === 'error' && hasStack(item.error)}
+              <div class="tl-stack">
+                <div class="tl-stack-head">
+                  <span class="section-label">Stacktrace</span>
+                  <SymbolicationBadge
+                    status={item.error.symbolication_status}
+                    isDart={item.error.debug_meta?.raw_stacktrace != null}
+                  />
+                </div>
+                <StacktraceView
+                  frames={item.error.stacktrace ?? []}
+                  symbolicated={item.error.stacktrace_symbolicated}
+                  rawTrace={item.error.debug_meta?.raw_stacktrace}
+                />
+              </div>
+            {/if}
             <JsonTree value={payload(item)} expandTo={2} />
           </div>
         {/if}
@@ -186,6 +245,10 @@
     color: var(--warning);
     background: var(--warning-soft);
   }
+  .node.navigation {
+    color: var(--warning);
+    background: var(--warning-soft);
+  }
   .node.error {
     color: var(--error);
     background: var(--error-soft);
@@ -238,9 +301,22 @@
     color: var(--info);
     background: var(--info-soft);
   }
+  /* Shares the transaction tone on purpose: an HTTP row IS a transaction, just
+     a named one, and the response-code badge beside it already carries the
+     colour that varies per row. */
+  .kind-http {
+    color: var(--info);
+    background: var(--info-soft);
+  }
   .kind-event {
     color: var(--primary);
     background: var(--primary-soft);
+  }
+  /* Its own tone: --primary is taken by events and --info by transactions, and
+     a navigation row that borrows either reads as one of them at a glance. */
+  .kind-navigation {
+    color: var(--warning);
+    background: var(--warning-soft);
   }
   .title {
     flex: 1;
@@ -273,6 +349,16 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     overflow-x: auto;
+  }
+  /* `tl-`prefixed because `.stack` is a global utility in app.css. */
+  .tl-stack {
+    margin-bottom: 12px;
+  }
+  .tl-stack-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
   }
   .detail-links {
     display: flex;

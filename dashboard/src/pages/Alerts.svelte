@@ -21,10 +21,12 @@
     AlertRule,
     AlertSeverity,
     ChannelKind,
+    MonitorListItem,
     NotificationChannel,
     TriggerType,
   } from '../lib/models';
   import { errorMessage } from '../lib/api/client';
+  import { listMonitors } from '../lib/api/monitors';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -52,6 +54,10 @@
   // notifications.rs:113,187,260,272,443,522,580 all use `authorize_org`, so a
   // project- or app-scoped `alert:write` grant cannot satisfy any of them.
   const writeLock = $derived(lockedBy('alert:write', { level: 'org' }));
+  // The Alerts page has no project selector of its own — it reuses the
+  // session's, same as Monitors.svelte. Monitor pinning is unavailable
+  // (field disabled) until one is selected.
+  const projectId = $derived(sessionStore.currentProjectId);
 
   // --- channel form ---------------------------------------------------------
   let showChannelForm = $state(false);
@@ -86,6 +92,11 @@
   let showRuleForm = $state(false);
   let rName = $state('');
   let rTrigger = $state<TriggerType>('monitor_down');
+  // Plain id string, not the monitor object — `$state` deep-proxies stored
+  // objects, so an identity comparison against `monitorOptions` entries would
+  // never match. See buildConditions/needs.monitor for how this is gated.
+  let rMonitor = $state<string>('');
+  let monitorOptions = $state<MonitorListItem[]>([]);
   let rSeverity = $state<AlertSeverity>('warning');
   // Numeric fields are held as strings because `Input.value` is a string; they
   // are parsed once, at submit.
@@ -102,12 +113,170 @@
   let rChannels = $state<string[]>([]);
   let savingRule = $state(false);
 
+  // --- edit mode ------------------------------------------------------------
+  // The create forms double as edit forms rather than being duplicated. Both
+  // PATCH endpoints are narrower than their POST counterparts: a channel's
+  // `kind` and a rule's `trigger_type`/scope cannot change after creation, so
+  // those controls are locked while editing rather than offered and ignored.
+  let editingChannelId = $state<string | null>(null);
+  let editingRuleId = $state<string | null>(null);
+
+  /**
+   * The channel config fields as they were when the form opened.
+   *
+   * `config` is REPLACED wholesale by the API, and what it hands back on read is
+   * a redacted projection — a webhook's `url` and a Slack/Discord `webhook_url`
+   * come back as presence flags, never values. So a form that always sent its
+   * config would erase the destination of any channel whose destination it was
+   * never allowed to see. Comparing against this snapshot means config and
+   * secret are sent only when someone actually typed in them.
+   *
+   * It also keeps a rename cheap: `update_channel` runs an extra retarget
+   * authorization whenever config or secret is present, which a rename neither
+   * needs nor should be refused for.
+   */
+  let chSnapshot = $state('');
+  const chFieldsTouched = $derived(JSON.stringify(chFields) !== chSnapshot);
+
+  function openNewChannel() {
+    editingChannelId = null;
+    chName = '';
+    chKind = 'slack';
+    resetChannelFields();
+    chSnapshot = JSON.stringify(chFields);
+    showChannelForm = true;
+  }
+
+  function openEditChannel(c: NotificationChannel) {
+    editingChannelId = c.id;
+    chName = c.name;
+    chKind = c.kind;
+    resetChannelFields();
+    // Prefill only the genuinely non-secret fields the API returns. Anything
+    // redacted stays blank and is re-typed to change it.
+    const cfg = (c.config ?? {}) as Record<string, unknown>;
+    const put = (k: string, v: unknown) => {
+      if (v === undefined || v === null) return;
+      chFields[k] = Array.isArray(v) ? v.join(', ') : String(v);
+    };
+    put('host', cfg.host);
+    put('port', cfg.port);
+    put('from', cfg.from);
+    put('to', cfg.to);
+    put('username', cfg.username);
+    put('homeserver', cfg.homeserver);
+    put('room_id', cfg.room_id);
+    put('chat_id', cfg.chat_id);
+    chSnapshot = JSON.stringify(chFields);
+    showChannelForm = true;
+  }
+
+  function closeChannelForm() {
+    showChannelForm = false;
+    editingChannelId = null;
+    chName = '';
+    resetChannelFields();
+  }
+
+  /**
+   * `/v1/projects/{id}/monitors` is project-scoped, and the Alerts page has no
+   * project selector of its own — it uses the session's. With no project
+   * selected the field is disabled rather than empty-and-clickable, and the
+   * rule can still be created un-narrowed.
+   */
+  async function loadMonitorOptions() {
+    const pid = projectId;
+    if (!pid) { monitorOptions = []; return; }
+    try {
+      monitorOptions = await listMonitors(pid);
+    } catch {
+      monitorOptions = [];
+    }
+  }
+
+  function openNewRule() {
+    editingRuleId = null;
+    rName = '';
+    rTrigger = 'monitor_down';
+    rSeverity = 'warning';
+    rThrottle = '300';
+    rThreshold = '10';
+    rComparator = 'gte';
+    rWindowMinutes = '5';
+    rSpikeFactor = '3';
+    rMetric = 'p95';
+    rLevel = '';
+    rEnvironment = '';
+    rEventName = '';
+    rTemplate = '';
+    rChannels = [];
+    rMonitor = '';
+    void loadMonitorOptions();
+    showRuleForm = true;
+  }
+
+  async function openEditRule(r: AlertRule) {
+    editingRuleId = r.id;
+    rName = r.name;
+    rTrigger = r.trigger_type;
+    rMonitor = r.monitor_id ?? '';
+    // The rule's own project is derived from its monitor at creation and may
+    // not be the session's currently-selected project, so the fetched list
+    // can legitimately not contain a pinned rule's monitor. A native <select>
+    // silently falls back to its first option ("All monitors...") when its
+    // bound value matches no <option>, which would tell the operator a
+    // pinned rule is un-pinned. Awaiting the load (rather than firing it and
+    // moving on, as `openNewRule` does) lets us detect that and splice in a
+    // synthetic option carrying the real id — never inventing a name we
+    // don't have.
+    await loadMonitorOptions();
+    if (r.monitor_id && !monitorOptions.some((m) => m.id === r.monitor_id)) {
+      monitorOptions = [
+        {
+          id: r.monitor_id,
+          name: 'Pinned monitor (outside the selected project)',
+          kind: 'http',
+          target: '',
+          status: 'unknown',
+          enabled: true,
+          last_response_time_ms: null,
+          last_checked_at: null,
+          uptime_24h: null,
+        },
+        ...monitorOptions,
+      ];
+    }
+    rSeverity = r.severity;
+    rThrottle = String(r.throttle_seconds);
+    rTemplate = r.message_template ?? '';
+    rChannels = [...r.channel_ids];
+    // Unlike a channel's config, conditions come back in full, so the form can
+    // round-trip them. Anything the trigger does not use keeps its default —
+    // `buildConditions` only reads the subset `triggerNeeds` selects.
+    const c = r.conditions ?? {};
+    rThreshold = c.threshold != null ? String(c.threshold) : '10';
+    rComparator = c.comparator ?? 'gte';
+    rWindowMinutes = c.window_seconds != null ? String(Math.round(c.window_seconds / 60)) : '5';
+    rSpikeFactor = c.spike_factor != null ? String(c.spike_factor) : '3';
+    rMetric = c.metric ?? 'p95';
+    rLevel = c.filters?.level ?? '';
+    rEnvironment = c.filters?.environment ?? '';
+    rEventName = c.filters?.event_name ?? '';
+    showRuleForm = true;
+  }
+
+  function closeRuleForm() {
+    showRuleForm = false;
+    editingRuleId = null;
+  }
+
   let confirmDelete = $state<{ kind: 'channel' | 'rule'; id: string; name: string } | null>(null);
 
   /** Which extra condition inputs a trigger actually uses. */
   const triggerNeeds = (t: TriggerType) => ({
     threshold: t === 'error_threshold' || t === 'event_threshold' || t === 'perf_degradation',
     window: t !== 'monitor_down' && t !== 'monitor_up',
+    monitor: t === 'monitor_down' || t === 'monitor_up',
     spike: t === 'error_spike',
     metric: t === 'perf_degradation',
     level: t === 'issue_new' || t === 'issue_regression' || t === 'error_threshold' || t === 'error_spike',
@@ -218,15 +387,23 @@
     error = null;
     try {
       const { config, secret } = buildChannelPayload();
-      await createChannel(orgId, {
-        name: chName,
-        kind: chKind,
-        config,
-        secret: Object.keys(secret).length ? secret : undefined,
-      });
-      showChannelForm = false;
-      chName = '';
-      resetChannelFields();
+      if (editingChannelId) {
+        // `kind` is absent on purpose — the API cannot change it. config and
+        // secret go only when something was typed into them; see `chSnapshot`.
+        await updateChannel(editingChannelId, {
+          name: chName,
+          ...(chFieldsTouched ? { config } : {}),
+          ...(chFieldsTouched && Object.keys(secret).length ? { secret } : {}),
+        });
+      } else {
+        await createChannel(orgId, {
+          name: chName,
+          kind: chKind,
+          config,
+          secret: Object.keys(secret).length ? secret : undefined,
+        });
+      }
+      closeChannelForm();
       await load();
     } catch (e) {
       error = errorMessage(e);
@@ -287,19 +464,35 @@
     savingRule = true;
     error = null;
     try {
-      await createRule(orgId, {
-        name: rName,
-        trigger_type: rTrigger,
-        conditions: buildConditions(),
-        severity: rSeverity,
-        throttle_seconds: num(rThrottle, 300),
-        message_template: rTemplate || null,
-        channel_ids: rChannels,
-      });
-      showRuleForm = false;
-      rName = '';
-      rTemplate = '';
-      rChannels = [];
+      if (editingRuleId) {
+        // No `trigger_type`: it is fixed at creation, along with the
+        // project/app scope, so the form locks the selector while editing.
+        await updateRule(editingRuleId, {
+          name: rName,
+          conditions: buildConditions(),
+          severity: rSeverity,
+          throttle_seconds: num(rThrottle, 300),
+          message_template: rTemplate || null,
+          channel_ids: rChannels,
+        });
+      } else {
+        await createRule(orgId, {
+          name: rName,
+          trigger_type: rTrigger,
+          // Gated on `needs.monitor`, not just `rMonitor` — switching the
+          // trigger away from monitor_down/monitor_up leaves `rMonitor` set
+          // but hidden, and the API 400s on monitor_id with a non-monitor
+          // trigger. project_id is also never sent here: the API derives it
+          // from the monitor, and a disagreeing value is a 400.
+          monitor_id: needs.monitor ? rMonitor || undefined : undefined,
+          conditions: buildConditions(),
+          severity: rSeverity,
+          throttle_seconds: num(rThrottle, 300),
+          message_template: rTemplate || null,
+          channel_ids: rChannels,
+        });
+      }
+      closeRuleForm();
       await load();
     } catch (e) {
       error = errorMessage(e);
@@ -348,6 +541,16 @@
 
   $effect(() => {
     if (orgId) void load();
+  });
+
+  // Loaded at page-mount (and whenever the session's project changes), not
+  // only when the rule form opens, so the rules table's "· <monitor name>"
+  // annotation shows real names in the common case instead of the generic
+  // `?? 'pinned monitor'` fallback. `loadMonitorOptions` already no-ops to
+  // `[]` with no project selected and swallows fetch failures, so this can't
+  // break the page.
+  $effect(() => {
+    if (projectId) void loadMonitorOptions();
   });
 </script>
 
@@ -401,21 +604,34 @@
           returned by the API.
         </p>
         {#if !showChannelForm}
-          <Button variant="primary" lockedReason={writeLock} onclick={() => (showChannelForm = true)}>
+          <Button variant="primary" lockedReason={writeLock} onclick={openNewChannel}>
             New channel
           </Button>
         {/if}
       </div>
 
       {#if showChannelForm}
-        <Card title="New channel">
+        <Card title={editingChannelId ? 'Edit channel' : 'New channel'}>
           <div class="form-grid">
             <Input label="Name" bind:value={chName} placeholder="Ops Slack" required />
+
+            {#if editingChannelId}
+              <!-- Says out loud what the API enforces: kind is fixed, and a
+                   secret that is never returned cannot be round-tripped, so a
+                   blank field has to mean "keep" rather than "clear". -->
+              <p class="span-2 muted small">
+                Type is fixed after creation. Secrets are never returned — leave a credential
+                field blank to keep what is stored, or type a new value to replace it.
+                {#if chKind === 'webhook'}
+                  The destination URL is stored encrypted and is not shown; retype it to change it.
+                {/if}
+              </p>
+            {/if}
 
             <div class="field">
               <label class="lbl" for="ch-kind">Type</label>
               <div class="control select">
-                <select id="ch-kind" bind:value={chKind}>
+                <select id="ch-kind" bind:value={chKind} disabled={editingChannelId !== null}>
                   {#each Object.entries(KIND_LABELS) as [k, label] (k)}
                     <option value={k}>{label}</option>
                   {/each}
@@ -529,7 +745,7 @@
           </div>
 
           <div class="form-foot">
-            <Button variant="ghost" onclick={() => (showChannelForm = false)}>Cancel</Button>
+            <Button variant="ghost" onclick={closeChannelForm}>Cancel</Button>
             <Button
               variant="primary"
               loading={savingChannel}
@@ -551,7 +767,7 @@
         >
           {#snippet action()}
             {#if !showChannelForm}
-              <Button variant="primary" lockedReason={writeLock} onclick={() => (showChannelForm = true)}>
+              <Button variant="primary" lockedReason={writeLock} onclick={openNewChannel}>
                 New channel
               </Button>
             {/if}
@@ -600,6 +816,17 @@
                   </Button>
                   <Button
                     size="sm"
+                    lockedReason={writeLock}
+                    disabled={c.config_error}
+                    title={c.config_error
+                      ? 'This channel’s stored payload cannot be decrypted, so it cannot be edited'
+                      : undefined}
+                    onclick={() => openEditChannel(c)}
+                  >
+                    Edit
+                  </Button>
+                  <Button
+                    size="sm"
                     variant="ghost"
                     lockedReason={writeLock}
                     onclick={() => (confirmDelete = { kind: 'channel', id: c.id, name: c.name })}
@@ -625,7 +852,7 @@
             lockedReason={writeLock}
             disabled={channels.length === 0}
             title={channels.length === 0 ? 'Create a channel first' : undefined}
-            onclick={() => (showRuleForm = true)}
+            onclick={openNewRule}
           >
             New rule
           </Button>
@@ -633,14 +860,20 @@
       </div>
 
       {#if showRuleForm}
-        <Card title="New alert rule">
+        <Card title={editingRuleId ? 'Edit alert rule' : 'New alert rule'}>
           <div class="form-grid">
             <Input label="Name" bind:value={rName} placeholder="API down → oncall" required />
+
+            {#if editingRuleId}
+              <p class="span-2 muted small">
+                Trigger and scope are fixed after creation; everything else can change.
+              </p>
+            {/if}
 
             <div class="field">
               <label class="lbl" for="r-trigger">Trigger</label>
               <div class="control select">
-                <select id="r-trigger" bind:value={rTrigger}>
+                <select id="r-trigger" bind:value={rTrigger} disabled={editingRuleId !== null}>
                   {#each Object.entries(TRIGGER_LABELS) as [k, label] (k)}
                     <option value={k}>{label}</option>
                   {/each}
@@ -648,6 +881,28 @@
                 <span class="affix"><Icon name="chevron-down" size={15} /></span>
               </div>
             </div>
+
+            {#if needs.monitor}
+              <div class="field">
+                <label class="lbl" for="r-monitor">Monitor</label>
+                <div class="control select">
+                  <select
+                    id="r-monitor"
+                    bind:value={rMonitor}
+                    disabled={editingRuleId !== null || !projectId}
+                  >
+                    <option value="">All monitors in this project</option>
+                    {#each monitorOptions as m (m.id)}
+                      <option value={m.id}>{m.name}</option>
+                    {/each}
+                  </select>
+                  <span class="affix"><Icon name="chevron-down" size={15} /></span>
+                </div>
+                {#if !projectId}
+                  <p class="muted small">Select a project to pin this rule to one monitor.</p>
+                {/if}
+              </div>
+            {/if}
 
             {#if needs.threshold}
               <div class="field">
@@ -773,7 +1028,7 @@
           </div>
 
           <div class="form-foot">
-            <Button variant="ghost" onclick={() => (showRuleForm = false)}>Cancel</Button>
+            <Button variant="ghost" onclick={closeRuleForm}>Cancel</Button>
             <Button
               variant="primary"
               loading={savingRule}
@@ -795,7 +1050,7 @@
         >
           {#snippet action()}
             {#if !showRuleForm && channels.length > 0}
-              <Button variant="primary" lockedReason={writeLock} onclick={() => (showRuleForm = true)}>
+              <Button variant="primary" lockedReason={writeLock} onclick={openNewRule}>
                 New rule
               </Button>
             {/if}
@@ -818,7 +1073,14 @@
             {#each rules as r (r.id)}
               <tr>
                 <td>{r.name}</td>
-                <td>{TRIGGER_LABELS[r.trigger_type] ?? r.trigger_type}</td>
+                <td>
+                  {TRIGGER_LABELS[r.trigger_type] ?? r.trigger_type}
+                  {#if r.monitor_id}
+                    <span class="muted small">
+                      · {monitorOptions.find((m) => m.id === r.monitor_id)?.name ?? 'pinned monitor'}
+                    </span>
+                  {/if}
+                </td>
                 <td>
                   <Badge tone={severityTone(r.severity)} size="sm">{r.severity}</Badge>
                 </td>
@@ -832,6 +1094,9 @@
                 <td class="num actions">
                   <Button size="sm" lockedReason={writeLock} onclick={() => toggleRule(r)}>
                     {r.enabled ? 'Disable' : 'Enable'}
+                  </Button>
+                  <Button size="sm" lockedReason={writeLock} onclick={() => openEditRule(r)}>
+                    Edit
                   </Button>
                   <Button
                     size="sm"

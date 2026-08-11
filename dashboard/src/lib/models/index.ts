@@ -87,6 +87,16 @@ export interface App {
   ingest_enabled: boolean;
   // Retained by the API for backwards compat; not surfaced in the UI.
   platform?: string | null;
+  /**
+   * The environment whose build ships to the app stores, or `null`.
+   *
+   * An `AppEnvironment` (enrollment) id — the same id the environment switcher
+   * carries — so the Overview gate is a plain `===` against
+   * `sessionStore.currentEnvironmentId`. It decides where the store section is
+   * SHOWN; it does not partition the numbers, because Google and Apple report
+   * per package/bundle and have no environment dimension at all.
+   */
+  store_environment_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -516,6 +526,21 @@ export interface IssueEventStats {
   events: number;
   users: number;
   sessions: number;
+  /**
+   * Whether the free-text term was matched against the event payload
+   * (`contexts`/`extra`/`tags`) as well as the message and exception fields.
+   *
+   * **Three states, and the third is the point.** `null` means no free-text
+   * search ran at all; `false` that one ran but the payload columns were
+   * excluded because this member lacks `event:read`; `true` that it ran over
+   * everything. Collapsing `null` into `false` would claim a narrowing on every
+   * unfiltered request — the same "absent is not empty is not false" trap
+   * `environmentsError` and `accessError` exist to avoid.
+   *
+   * `false` is the one worth surfacing: the member's search silently matched
+   * less than they think it did, and nothing else on screen says so.
+   */
+  payload_searched: boolean | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +647,24 @@ export interface DeviceRow {
   events_count: number;
   errors_count: number;
   sessions_count: number;
+}
+
+/**
+ * One row per (family, model, os_name, os_version) — the Devices inventory's
+ * default shape. No `last_distinct_id`, `browser` or `arch`: none has a single
+ * value across a group. All four are on `DeviceRow`, in the drill-down.
+ */
+export interface DeviceGroupRow {
+  family: string | null;
+  model: string | null;
+  os_name: string | null;
+  os_version: string | null;
+  device_count: number;
+  events_count: number;
+  errors_count: number;
+  sessions_count: number;
+  first_seen: string;
+  last_seen: string;
 }
 
 export interface DeviceDetail {
@@ -979,6 +1022,10 @@ export interface MonitorDetail {
   monitor: Monitor;
   uptime: { h24: number | null; d7: number | null; d30: number | null };
   incidents: MonitorIncident[];
+  // Alert rules pinned to this monitor via alert_rules.monitor_id, which is
+  // ON DELETE CASCADE — deleting the monitor deletes these too. Surfaced
+  // here so the delete confirmation can disclose it before the delete call.
+  pinned_alert_rules: number;
 }
 
 export interface MonitorCheck {
@@ -1045,6 +1092,8 @@ export interface AlertRule {
   org_id: string;
   project_id: string | null;
   app_id: string | null;
+  /** Set only for `monitor_down`/`monitor_up` rules pinned to one monitor; null means every monitor in scope. */
+  monitor_id: string | null;
   name: string;
   trigger_type: TriggerType;
   enabled: boolean;

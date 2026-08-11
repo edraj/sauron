@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::models::*;
+use crate::query_plan::{Frag, PlanError};
 use crate::schema::*;
 use crate::scope::{EnvFilter, ReadScope};
 
@@ -3054,6 +3055,1643 @@ pub async fn get_issue(
     Ok(row.map(Issue::from))
 }
 
+// ===========================================================================
+// Issues — the query-language read path (S2c Task 4).
+//
+// Runs beside `list_issues_with_reach` rather than replacing it: the two
+// answer different questions. This one takes a `ResolvedNode` from
+// `sauron-query` and pages by keyset; the old one takes the pre-language
+// `ParsedFilter` list and pages by OFFSET, and is still what
+// `crates/sauron-db/tests/env_scoping.rs` exercises.
+// ===========================================================================
+
+/// Extracts the value a temporal cursor carries.
+///
+/// Returns the Unix epoch for a `Text` cursor. That arm is defense in depth,
+/// not evidence that this function itself enforces anything: the actual
+/// guard is `crate::query_plan::cursor::decode`, which takes the sort's
+/// `is_temporal` alongside its key and refuses a mismatch as a
+/// `KindMismatch` before a `Cursor` is ever constructed, so every `Cursor`
+/// that reached here via an HTTP request has already been kind-checked.
+/// This function stays total anyway: panicking on a `Text` cursor would turn
+/// a `Cursor` built some other way — this module's own tests construct one
+/// directly, and so could a future call site that forgets to route through
+/// `decode` — into a 500 instead of a wrong-but-bounded `UNIX_EPOCH`. Mirrors
+/// [`text_of`] below.
+fn ts_of(c: &crate::query_plan::cursor::Cursor) -> DateTime<Utc> {
+    match c.value {
+        crate::query_plan::cursor::CursorValue::Ts(ts) => ts,
+        crate::query_plan::cursor::CursorValue::Text(_) => DateTime::<Utc>::UNIX_EPOCH,
+    }
+}
+
+/// Extracts the value a text cursor carries.
+///
+/// Returns `""` for a `Ts` cursor for the same reason [`ts_of`] returns
+/// `UNIX_EPOCH` for a `Text` one — see its doc comment. `decode` is the
+/// actual guard; this fallback is for a `Cursor` that reached here without
+/// going through it.
+fn text_of(c: &crate::query_plan::cursor::Cursor) -> String {
+    match &c.value {
+        crate::query_plan::cursor::CursorValue::Text(s) => s.clone(),
+        crate::query_plan::cursor::CursorValue::Ts(_) => String::new(),
+    }
+}
+
+/// Which keyset ordering [`search_issues`] walks.
+///
+/// An enum, not a `&str`: the column also decides which value goes into the
+/// cursor, and a string that reached the query builder without matching a
+/// known ordering could only be handled by falling back to a default — i.e.
+/// by silently serving a different sort than was asked for.
+///
+/// Both variants are backed by an index whose trailing column is `id`
+/// (`issues_app_last_seen_id_idx`, migration 25; `first_seen` falls back to a
+/// sort, which is why only `last_seen` is the default). Keeping `id` as the
+/// tiebreaker in BOTH is what makes each a total order — the property deep
+/// paging depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSort {
+    LastSeen,
+    FirstSeen,
+}
+
+impl IssueSort {
+    /// The column name as `routes/search.rs`' sort whitelist spells it.
+    pub fn from_column(col: &str) -> Option<Self> {
+        match col {
+            "last_seen" => Some(IssueSort::LastSeen),
+            "first_seen" => Some(IssueSort::FirstSeen),
+            _ => None,
+        }
+    }
+
+    /// The timestamp a cursor for this ordering must carry. Reading
+    /// `last_seen` while ordering by `first_seen` would produce a cursor that
+    /// skips or repeats whole pages, so the two are derived from one value.
+    pub fn cursor_ts(self, issue: &Issue) -> DateTime<Utc> {
+        match self {
+            IssueSort::LastSeen => issue.last_seen,
+            IssueSort::FirstSeen => issue.first_seen,
+        }
+    }
+}
+
+/// Which keyset ordering [`search_events`] walks.
+///
+/// `OccurredAt` is backed by `analytics_events_app_time_id_idx` (migration
+/// `2026-08-09-000047`, see [`search_events`]'s own doc comment). The other
+/// three have no dedicated composite index yet — deep paging on them costs a
+/// sort, same as an unindexed `ORDER BY` anywhere else. Correctness of the
+/// predicate (this task) is independent of that; indexing it is future work,
+/// not a silent gap this type hides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventSort {
+    OccurredAt,
+    Name,
+    DistinctId,
+    SessionId,
+}
+
+impl EventSort {
+    /// The column name as `routes/search.rs`' sort whitelist spells it.
+    pub fn from_column(col: &str) -> Option<Self> {
+        match col {
+            "occurred_at" => Some(EventSort::OccurredAt),
+            "name" => Some(EventSort::Name),
+            "distinct_id" => Some(EventSort::DistinctId),
+            "session_id" => Some(EventSort::SessionId),
+            _ => None,
+        }
+    }
+
+    pub fn column(self) -> &'static str {
+        match self {
+            EventSort::OccurredAt => "occurred_at",
+            EventSort::Name => "name",
+            EventSort::DistinctId => "distinct_id",
+            EventSort::SessionId => "session_id",
+        }
+    }
+
+    /// Whether the cursor for this column carries a timestamp or text.
+    pub fn is_temporal(self) -> bool {
+        matches!(self, EventSort::OccurredAt)
+    }
+
+    /// The value a cursor minted under this ordering must carry, read off a
+    /// REAL row rather than re-derived at the route.
+    ///
+    /// `SessionId` coalesces `None` to `""` — the same rule
+    /// `event_query_for`'s keyset predicate compares against, spelled here
+    /// instead of a second time at the call site. `IssueSort::cursor_ts` set
+    /// this precedent for the temporal case; nullable text columns are where
+    /// a second, drifting spelling would matter most, since the nullable
+    /// trap this whole slice is about lives in exactly that gap.
+    pub fn cursor_value(self, row: &AnalyticsEvent) -> crate::query_plan::cursor::CursorValue {
+        use crate::query_plan::cursor::CursorValue;
+        match self {
+            EventSort::OccurredAt => CursorValue::Ts(row.occurred_at),
+            EventSort::Name => CursorValue::Text(row.name.clone()),
+            EventSort::DistinctId => CursorValue::Text(row.distinct_id.clone()),
+            EventSort::SessionId => CursorValue::Text(row.session_id.clone().unwrap_or_default()),
+        }
+    }
+}
+
+/// Which keyset ordering [`search_occurrences`] walks.
+///
+/// `OccurredAt` is backed by `error_events_issue_time_id_idx`, see
+/// [`search_occurrences`]'s own doc comment. The other three have no
+/// dedicated composite index yet — see [`EventSort`]'s doc comment for why
+/// that is a separate concern from this type's correctness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccurrenceSort {
+    OccurredAt,
+    DistinctId,
+    SessionId,
+    DeviceKey,
+}
+
+impl OccurrenceSort {
+    /// The column name as `routes/search.rs`' sort whitelist spells it.
+    pub fn from_column(col: &str) -> Option<Self> {
+        match col {
+            "occurred_at" => Some(OccurrenceSort::OccurredAt),
+            "distinct_id" => Some(OccurrenceSort::DistinctId),
+            "session_id" => Some(OccurrenceSort::SessionId),
+            "device_key" => Some(OccurrenceSort::DeviceKey),
+            _ => None,
+        }
+    }
+
+    pub fn column(self) -> &'static str {
+        match self {
+            OccurrenceSort::OccurredAt => "occurred_at",
+            OccurrenceSort::DistinctId => "distinct_id",
+            OccurrenceSort::SessionId => "session_id",
+            OccurrenceSort::DeviceKey => "device_key",
+        }
+    }
+
+    /// Whether the cursor for this column carries a timestamp or text.
+    pub fn is_temporal(self) -> bool {
+        matches!(self, OccurrenceSort::OccurredAt)
+    }
+
+    /// The value a cursor minted under this ordering must carry, read off a
+    /// REAL row rather than re-derived at the route. See
+    /// [`EventSort::cursor_value`]'s doc comment for why this exists as one
+    /// function rather than something Task 3 re-derives per route: ALL THREE
+    /// non-temporal columns here are nullable on `error_events`, so this is
+    /// the one place `unwrap_or_default()`'s coalescing rule is spelled for
+    /// occurrences, matching `occurrence_query_for`'s keyset predicate.
+    pub fn cursor_value(self, row: &ErrorEvent) -> crate::query_plan::cursor::CursorValue {
+        use crate::query_plan::cursor::CursorValue;
+        match self {
+            OccurrenceSort::OccurredAt => CursorValue::Ts(row.occurred_at),
+            OccurrenceSort::DistinctId => {
+                CursorValue::Text(row.distinct_id.clone().unwrap_or_default())
+            }
+            OccurrenceSort::SessionId => {
+                CursorValue::Text(row.session_id.clone().unwrap_or_default())
+            }
+            OccurrenceSort::DeviceKey => {
+                CursorValue::Text(row.device_key.clone().unwrap_or_default())
+            }
+        }
+    }
+}
+
+/// Everything [`search_issues`] needs beyond the connection and the scope.
+///
+/// A struct rather than eight positional parameters: `descending` and the two
+/// timestamps are all easy to transpose at a call site, and Tasks 5 and 6
+/// copy this shape onto two more endpoints.
+pub struct IssueSearch<'a> {
+    pub node: &'a sauron_query::ResolvedNode,
+    pub ctx: &'a crate::query_plan::PrepCtx,
+    /// Lower bound on `issues.last_seen`. Always applied, on both orderings —
+    /// it is the caller's `since_days` window, already tightened by any
+    /// `Clamp` the planner returned.
+    pub since: DateTime<Utc>,
+    pub sort: IssueSort,
+    pub descending: bool,
+    /// The previous page's `next_cursor`, decoded.
+    pub after: Option<crate::query_plan::cursor::Cursor>,
+    pub limit: i64,
+    /// Whether the free-text term may reach the event payload. Travels into
+    /// `IssuesLower`; see [`TextSearchReach`].
+    pub text_reach: TextSearchReach,
+}
+
+/// `issues` has no `environment_id` column, so environment scope is
+/// *membership*: does this issue have an occurrence in the selected
+/// environment, inside the window.
+///
+/// `None` for [`EnvFilter::All`], which must add no predicate at all.
+///
+/// This is the same derivation `list_issues_with_reach`'s env branch performs
+/// (its paging subquery's membership `EXISTS` plus its `agg` LATERAL's
+/// `occurred_at >= $2` + `HAVING count(*) > 0`), collapsed into one
+/// predicate. **What it does NOT reproduce is that branch's per-environment
+/// re-derivation of `times_seen`/`users_seen`/`first_seen`/`last_seen`/
+/// `level`/`culprit`/`title`** — those need a LATERAL join and a different
+/// select list, which a boxed diesel query over `issues` cannot express, and
+/// per-environment `last_seen` is not indexable so it cannot be the keyset
+/// column either. Rows visible are the same; the numbers on them are the
+/// app-wide stored ones. Recorded in this slice's task-4 report as the open
+/// item it is.
+fn issue_env_membership(env: &EnvFilter, since: DateTime<Utc>) -> Option<Frag<issues::table>> {
+    // The tenant key is re-asserted inside the subquery, exactly as the tag
+    // and free-text `EXISTS`es in `query_plan::issues` do — every query
+    // carries it, including nested ones.
+    const HEAD: &str = "EXISTS (SELECT 1 FROM error_events e WHERE e.issue_id = issues.id \
+                        AND e.app_id = issues.app_id AND e.occurred_at >= ";
+    match env {
+        EnvFilter::All => None,
+        EnvFilter::One(id) => Some(Box::new(
+            sql::<Nullable<Bool>>(HEAD)
+                .bind::<Timestamptz, _>(since)
+                .sql(" AND e.environment_id = ")
+                .bind::<SqlUuid, _>(*id)
+                .sql(")"),
+        )),
+        EnvFilter::Subset(ids) => Some(Box::new(
+            sql::<Nullable<Bool>>(HEAD)
+                .bind::<Timestamptz, _>(since)
+                .sql(" AND e.environment_id = ANY(")
+                .bind::<Array<SqlUuid>, _>(ids.clone())
+                .sql("))"),
+        )),
+        EnvFilter::Unattributed => Some(Box::new(
+            sql::<Nullable<Bool>>(HEAD)
+                .bind::<Timestamptz, _>(since)
+                .sql(" AND e.environment_id IS NULL)"),
+        )),
+    }
+}
+
+/// Tenant key + environment membership + the lowered query predicate.
+///
+/// Called once per query rather than built once and cloned: `Frag` is a boxed
+/// trait object, so the fragment is consumed by whichever query it is filtered
+/// into. That is why [`count_issues`] lowers the same node a second time.
+fn issue_search_base(
+    scope: &ReadScope,
+    node: &sauron_query::ResolvedNode,
+    ctx: &crate::query_plan::PrepCtx,
+    since: DateTime<Utc>,
+    text_reach: TextSearchReach,
+) -> Result<issues::BoxedQuery<'static, diesel::pg::Pg>, PlanError> {
+    let predicate = crate::query_plan::lower(
+        node,
+        // `env` and `since` go IN, not on afterwards: both must land inside
+        // the correlated `EXISTS` subqueries the tag/workflow/free-text leaves
+        // build, and nothing outside `lower` can reach in there. See
+        // `IssuesLower`'s field docs.
+        &crate::query_plan::issues::IssuesLower {
+            app_id: scope.app_id,
+            text_reach,
+            env: &scope.env,
+            since,
+        },
+        ctx,
+    )?;
+    // The tenant key in the WHERE clause is the mandatory second layer; the
+    // handler's `authorized_read_scope_with_perms` call is the first. Neither
+    // substitutes for the other.
+    let mut q = issues::table
+        .filter(issues::app_id.eq(scope.app_id))
+        .filter(issues::last_seen.ge(since))
+        .filter(predicate)
+        .into_boxed();
+    if let Some(member) = issue_env_membership(&scope.env, since) {
+        q = q.filter(member);
+    }
+    Ok(q)
+}
+
+/// `limit + 1` rows, ordered by the requested keyset, optionally starting
+/// after a cursor.
+///
+/// The caller truncates back to `limit`; the surplus row is the has-more
+/// probe, so "is there a next page" costs no second query.
+pub async fn search_issues(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &IssueSearch<'_>,
+) -> Result<Vec<Issue>, PlanError> {
+    let mut q = issue_search_base(
+        scope,
+        search.node,
+        search.ctx,
+        search.since,
+        search.text_reach,
+    )?;
+
+    // Keyset, not OFFSET: `(sort_column, id)` is a TOTAL order, so a row
+    // inserted mid-walk cannot shift a later page onto rows an earlier page
+    // already returned, and a tie group larger than one page cannot loop.
+    // `last_seen` alone is not total — thousands of issues legitimately share
+    // one `last_seen` — which is the entire reason `id` is in the tuple and
+    // in the index.
+    if let Some(c) = &search.after {
+        let ts = ts_of(c);
+        q = match (search.sort, search.descending) {
+            (IssueSort::LastSeen, true) => q.filter(
+                issues::last_seen
+                    .lt(ts)
+                    .or(issues::last_seen.eq(ts).and(issues::id.lt(c.id))),
+            ),
+            (IssueSort::LastSeen, false) => q.filter(
+                issues::last_seen
+                    .gt(ts)
+                    .or(issues::last_seen.eq(ts).and(issues::id.gt(c.id))),
+            ),
+            (IssueSort::FirstSeen, true) => q.filter(
+                issues::first_seen
+                    .lt(ts)
+                    .or(issues::first_seen.eq(ts).and(issues::id.lt(c.id))),
+            ),
+            (IssueSort::FirstSeen, false) => q.filter(
+                issues::first_seen
+                    .gt(ts)
+                    .or(issues::first_seen.eq(ts).and(issues::id.gt(c.id))),
+            ),
+        };
+    }
+    // The ORDER BY must be the same tuple, in the same direction, as the
+    // keyset predicate above — they are one mechanism split across two
+    // clauses, and disagreeing is how paging silently skips rows.
+    let q = match (search.sort, search.descending) {
+        (IssueSort::LastSeen, true) => q.order((issues::last_seen.desc(), issues::id.desc())),
+        (IssueSort::LastSeen, false) => q.order((issues::last_seen.asc(), issues::id.asc())),
+        (IssueSort::FirstSeen, true) => q.order((issues::first_seen.desc(), issues::id.desc())),
+        (IssueSort::FirstSeen, false) => q.order((issues::first_seen.asc(), issues::id.asc())),
+    };
+    q.select(Issue::as_select())
+        .limit(search.limit + 1)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))
+}
+
+/// `(total, capped)` over the same predicate [`search_issues`] pages.
+///
+/// Counting is exact up to `cap` and stops there, so counting never becomes
+/// the expensive part of the request. `cap + 1` ids are selected because
+/// `cap + 1` is the sentinel that distinguishes "exactly cap" from "more than
+/// cap" without counting the rest.
+///
+/// Takes the whole [`IssueSearch`] rather than a handful of its fields so the
+/// count cannot drift from the page: `node`, `ctx`, `since`, the scope AND
+/// `text_reach` must all be identical, or the total describes a different row
+/// set than the rows rendered beside it. `sort`/`after`/`limit` are the only
+/// fields it ignores, and none of them changes which rows match.
+pub async fn count_issues(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &IssueSearch<'_>,
+    cap: i64,
+) -> Result<(i64, bool), PlanError> {
+    let ids: Vec<Uuid> = issue_search_base(
+        scope,
+        search.node,
+        search.ctx,
+        search.since,
+        search.text_reach,
+    )?
+    .select(issues::id)
+    .limit(cap + 1)
+    .load(conn)
+    .await
+    .map_err(|e| PlanError::Database(e.to_string()))?;
+    let n = ids.len() as i64;
+    Ok(if n > cap { (cap, true) } else { (n, false) })
+}
+
+// ===========================================================================
+// S2c Task 5: the searched OCCURRENCES list — one issue's `error_events`,
+// keyset-paged on `(occurred_at, id)`.
+//
+// Deliberately the same shape as `search_issues`/`count_issues` above: a
+// parameter struct, one shared base builder both entry points call, `limit +
+// 1` rows with the caller truncating. Three near-identical list endpoints that
+// drift apart is the failure this slice exists to prevent, and the drift would
+// be client-visible.
+//
+// Simpler than the issues pair in exactly one way, and it is worth naming so
+// nobody "restores symmetry": `error_events` HAS an `environment_id` column,
+// so environment scope is an ordinary `scope_env!` filter here rather than the
+// derived membership `EXISTS` + second aggregate query that `issues` needs.
+// ===========================================================================
+
+/// Everything [`search_occurrences`] needs beyond the connection and the scope.
+///
+/// A struct rather than eight positional parameters, for the reason
+/// [`IssueSearch`] is one: `descending` and the timestamp are easy to
+/// transpose at a call site.
+pub struct OccurrenceSearch<'a> {
+    pub node: &'a sauron_query::ResolvedNode,
+    pub ctx: &'a crate::query_plan::PrepCtx,
+    /// Lower bound on `error_events.occurred_at` — the caller's `since_days`
+    /// window, already tightened by any `Clamp` the planner returned.
+    ///
+    /// Never optional, unlike `error_events_for_issue_query`'s `Option`:
+    /// `error_events` is `PARTITION BY RANGE (occurred_at)`, so an unbounded
+    /// lower bound is a MergeAppend across every partition. The route's own
+    /// default (3650 days) already means "effectively all".
+    pub since: DateTime<Utc>,
+    /// The ordering this page walks. The cursor in `after` must have been
+    /// minted under the same column — `cursor::decode` enforces it at the
+    /// route.
+    pub sort: OccurrenceSort,
+    pub descending: bool,
+    /// The previous page's `next_cursor`, decoded.
+    pub after: Option<crate::query_plan::cursor::Cursor>,
+    pub limit: i64,
+    /// Whether the free-text term may reach `contexts`/`extra`/`tags`.
+    /// Travels into `OccurrencesLower`; see [`TextSearchReach`].
+    pub text_reach: TextSearchReach,
+}
+
+/// Tenant key + issue + environment + window + the lowered query predicate.
+///
+/// Called once per query rather than built once and cloned, for the reason
+/// [`issue_search_base`] documents: `Frag` is a boxed trait object, consumed by
+/// whichever query it is filtered into.
+///
+/// **Both `app_id` and `issue_id` are in the WHERE clause.** `issue_id` is by
+/// far the narrower predicate and every caller has already resolved the issue
+/// through `get_issue(scope, …)`, so the tenant key is redundant *in practice*
+/// — and it is mandatory anyway. An id is not a scope, and the day some caller
+/// reaches this without the pre-check, the layer that is still standing is the
+/// one in the WHERE clause.
+fn occurrence_search_base<'a>(
+    scope: &'a ReadScope,
+    issue_id: Uuid,
+    search: &OccurrenceSearch<'_>,
+) -> Result<error_events::BoxedQuery<'a, diesel::pg::Pg>, PlanError> {
+    let predicate = crate::query_plan::lower(
+        search.node,
+        &crate::query_plan::occurrences::OccurrencesLower {
+            app_id: scope.app_id,
+            issue_id,
+            text_reach: search.text_reach,
+        },
+        search.ctx,
+    )?;
+    let query = error_events::table
+        .filter(error_events::app_id.eq(scope.app_id))
+        .filter(error_events::issue_id.eq(issue_id))
+        .filter(error_events::occurred_at.ge(search.since))
+        .filter(predicate)
+        .into_boxed();
+    // `error_events` carries `environment_id` directly, so this is the ordinary
+    // column filter — see `error_events_for_issue_query`, which this replaces
+    // for the list, and `list_issues`' derived membership for the contrast.
+    Ok(crate::scope_env!(query, error_events, &scope.env))
+}
+
+/// The boxed query [`search_occurrences`] loads, built but not yet executed.
+///
+/// Split out from `search_occurrences` so a `debug_query` unit test can
+/// inspect the exact SQL a real call produces — in particular, whether the
+/// raw keyset fragments below are correctly self-parenthesised — without a
+/// database connection. See `keyset_predicate_tests` at the end of this
+/// section.
+///
+/// Backed by `error_events_issue_time_id_idx (issue_id, occurred_at DESC, id
+/// DESC)` for the `OccurredAt` ordering. `occurred_at` alone is not a total
+/// order — a burst of occurrences routinely shares a microsecond — which is
+/// why `id` is in both the tuple and the index.
+fn occurrence_query_for<'a>(
+    scope: &'a ReadScope,
+    issue_id: Uuid,
+    search: &OccurrenceSearch<'_>,
+) -> Result<error_events::BoxedQuery<'a, diesel::pg::Pg>, PlanError> {
+    let mut q = occurrence_search_base(scope, issue_id, search)?;
+
+    // `distinct_id`/`session_id`/`device_key` are all `Nullable<Text>` on
+    // `error_events`. `COALESCE(col,'')` in BOTH the predicate and the ORDER
+    // BY is what keeps a row with no session/device in the walk: a bare
+    // nullable-column comparison is NULL, not true, for such a row, which
+    // silently drops it from every page after the first. See
+    // `paging_by_session_reaches_rows_with_no_session` in
+    // `tests/keyset_plan.rs`.
+    if let Some(c) = &search.after {
+        q = match (search.sort, search.descending) {
+            (OccurrenceSort::OccurredAt, true) => q.filter(
+                error_events::occurred_at
+                    .lt(ts_of(c))
+                    .or(error_events::occurred_at
+                        .eq(ts_of(c))
+                        .and(error_events::id.lt(c.id))),
+            ),
+            (OccurrenceSort::OccurredAt, false) => q.filter(
+                error_events::occurred_at
+                    .gt(ts_of(c))
+                    .or(error_events::occurred_at
+                        .eq(ts_of(c))
+                        .and(error_events::id.gt(c.id))),
+            ),
+            // Every raw fragment below opens with its OWN `(` and closes with
+            // `))` — the inner paren closes the tie-branch, the outer one
+            // wraps the whole disjunction. Without it, diesel's `.filter()`
+            // ANDs this fragment onto the existing WHERE clause without
+            // grouping it (`SqlLiteral` emits its text verbatim; `WhereAnd`
+            // parenthesises `existing AND predicate` as a whole, not
+            // `predicate` alone), and because `AND` binds tighter than `OR`,
+            // the fragment's top-level `OR` splits the WHERE clause in two —
+            // the second half carrying no `app_id`, no `issue_id`, no `since`
+            // window. See `paging_by_session_never_returns_another_apps_rows`
+            // in `tests/keyset_plan.rs`, which reproduces exactly that leak.
+            (OccurrenceSort::DistinctId, true) => q.filter(
+                sql::<Bool>("(COALESCE(distinct_id,'') < ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" OR (COALESCE(distinct_id,'') = ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" AND id < ")
+                    .bind::<SqlUuid, _>(c.id)
+                    .sql("))"),
+            ),
+            (OccurrenceSort::DistinctId, false) => q.filter(
+                sql::<Bool>("(COALESCE(distinct_id,'') > ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" OR (COALESCE(distinct_id,'') = ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" AND id > ")
+                    .bind::<SqlUuid, _>(c.id)
+                    .sql("))"),
+            ),
+            (OccurrenceSort::SessionId, true) => q.filter(
+                sql::<Bool>("(COALESCE(session_id,'') < ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" OR (COALESCE(session_id,'') = ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" AND id < ")
+                    .bind::<SqlUuid, _>(c.id)
+                    .sql("))"),
+            ),
+            (OccurrenceSort::SessionId, false) => q.filter(
+                sql::<Bool>("(COALESCE(session_id,'') > ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" OR (COALESCE(session_id,'') = ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" AND id > ")
+                    .bind::<SqlUuid, _>(c.id)
+                    .sql("))"),
+            ),
+            (OccurrenceSort::DeviceKey, true) => q.filter(
+                sql::<Bool>("(COALESCE(device_key,'') < ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" OR (COALESCE(device_key,'') = ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" AND id < ")
+                    .bind::<SqlUuid, _>(c.id)
+                    .sql("))"),
+            ),
+            (OccurrenceSort::DeviceKey, false) => q.filter(
+                sql::<Bool>("(COALESCE(device_key,'') > ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" OR (COALESCE(device_key,'') = ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" AND id > ")
+                    .bind::<SqlUuid, _>(c.id)
+                    .sql("))"),
+            ),
+        };
+    }
+    // The ORDER BY must be the same tuple, in the same direction, as the keyset
+    // predicate above — one mechanism split across two clauses, and disagreeing
+    // is how paging silently skips rows.
+    //
+    // `sql::<Text>` on the three raw fragments below, not `sql::<()>`: each
+    // fragment is two comma-joined ORDER BY items, not one `Text`-typed
+    // value, but diesel's `.order()` still requires `Expr: Expression`, which
+    // requires a `TypedExpressionType` — and `()` does not implement it in
+    // this diesel version (2.3.11) despite being the natural spelling for
+    // "no meaningful output type". `Text` is never read back (nothing
+    // `.select()`s an ORDER BY clause), so it is a type-checker satisfier
+    // only, not a claim about the fragment's shape.
+    let q = match (search.sort, search.descending) {
+        (OccurrenceSort::OccurredAt, true) => {
+            q.order((error_events::occurred_at.desc(), error_events::id.desc()))
+        }
+        (OccurrenceSort::OccurredAt, false) => {
+            q.order((error_events::occurred_at.asc(), error_events::id.asc()))
+        }
+        (OccurrenceSort::DistinctId, true) => {
+            q.order(sql::<Text>("COALESCE(distinct_id,'') DESC, id DESC"))
+        }
+        (OccurrenceSort::DistinctId, false) => {
+            q.order(sql::<Text>("COALESCE(distinct_id,'') ASC, id ASC"))
+        }
+        (OccurrenceSort::SessionId, true) => {
+            q.order(sql::<Text>("COALESCE(session_id,'') DESC, id DESC"))
+        }
+        (OccurrenceSort::SessionId, false) => {
+            q.order(sql::<Text>("COALESCE(session_id,'') ASC, id ASC"))
+        }
+        (OccurrenceSort::DeviceKey, true) => {
+            q.order(sql::<Text>("COALESCE(device_key,'') DESC, id DESC"))
+        }
+        (OccurrenceSort::DeviceKey, false) => {
+            q.order(sql::<Text>("COALESCE(device_key,'') ASC, id ASC"))
+        }
+    };
+    Ok(q)
+}
+
+/// `limit + 1` occurrences of one issue, ordered by the requested keyset,
+/// optionally starting after a cursor.
+///
+/// The caller truncates back to `limit`; the surplus row is the has-more
+/// probe, so "is there a next page" costs no second query. See
+/// [`occurrence_query_for`] for how the query itself is built.
+pub async fn search_occurrences(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    issue_id: Uuid,
+    search: &OccurrenceSearch<'_>,
+) -> Result<Vec<ErrorEvent>, PlanError> {
+    occurrence_query_for(scope, issue_id, search)?
+        .select(ErrorEvent::as_select())
+        .limit(search.limit + 1)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))
+}
+
+/// `(total, capped)` over the same predicate [`search_occurrences`] pages.
+///
+/// Takes the whole [`OccurrenceSearch`] rather than a handful of its fields for
+/// the reason [`count_issues`] does: `node`, `ctx`, `since`, the scope AND
+/// `text_reach` must all be identical, or the total describes a different row
+/// set than the rows rendered beside it. `descending`/`after`/`limit` are the
+/// only fields it ignores, and none of them changes which rows match.
+///
+/// Selects ids rather than `count(*)` so the `cap` is a real `LIMIT` the
+/// planner can stop at — see [`count_issues`].
+pub async fn count_occurrences(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    issue_id: Uuid,
+    search: &OccurrenceSearch<'_>,
+    cap: i64,
+) -> Result<(i64, bool), PlanError> {
+    let ids: Vec<Uuid> = occurrence_search_base(scope, issue_id, search)?
+        .select(error_events::id)
+        .limit(cap + 1)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    let n = ids.len() as i64;
+    Ok(if n > cap { (cap, true) } else { (n, false) })
+}
+
+/// The occurrences stat strip's three counts, over the same predicate
+/// [`search_occurrences`] pages and [`count_occurrences`] counts.
+///
+/// **Takes the whole [`OccurrenceSearch`], deliberately**, for the reason
+/// [`count_occurrences`] does and then some: this route's entire contract is
+/// that its counts describe the rows the sibling list returns. Passing a
+/// handful of fields would let the two drift; passing the struct makes them
+/// provably one predicate. `descending`/`after`/`limit` are ignored here —
+/// no ordering and no page boundary changes a total.
+///
+/// Replaces `error_event_stats_for_issue_with_reach` for the route (S2c Task
+/// 6). That function took the pre-language `ParsedFilter` list, whose
+/// `ERROR_EVENT_FILTERS` registry accepted only `tag`/`workflow` — so
+/// `filter=level:eq:error` was a 200 on the list beside it and a 400 here,
+/// from one `occurrenceParams` the dashboard built for both.
+///
+/// `distinct_id`/`session_id` are both nullable: an anonymous occurrence and a
+/// session-less one contribute a NULL, which `count(DISTINCT …)` skips. That is
+/// the intent — "3 users" must not count "no user" as a user.
+///
+/// HOT-TIER ONLY. `count(DISTINCT …)` is holistic, not additive, so it cannot be
+/// split at the tier watermark and summed the way `tier_read.rs` merges per-day
+/// counts — the same reason transaction percentiles stay on Postgres. Once
+/// partitions age out to Parquet, a wide range under-reports here exactly as it
+/// already does for the per-environment `users_seen` in `list_issues`.
+pub async fn occurrence_stats(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    issue_id: Uuid,
+    search: &OccurrenceSearch<'_>,
+) -> Result<IssueEventStatsRow, PlanError> {
+    let (events, users, sessions) = occurrence_search_base(scope, issue_id, search)?
+        .select((
+            diesel::dsl::count_star(),
+            sql::<BigInt>("count(DISTINCT error_events.distinct_id)"),
+            sql::<BigInt>("count(DISTINCT error_events.session_id)"),
+        ))
+        .get_result::<(i64, i64, i64)>(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    Ok(IssueEventStatsRow {
+        events,
+        users,
+        sessions,
+    })
+}
+
+// ===========================================================================
+// S2c Task 6: the searched ANALYTICS EVENTS list — one app's
+// `analytics_events`, keyset-paged on `(occurred_at, id)`.
+//
+// The third and last of the trio, and deliberately the same shape as the two
+// above: a parameter struct, one shared base builder both entry points call,
+// `limit + 1` rows with the caller truncating. Three near-identical list
+// endpoints that drift apart is the failure this slice exists to prevent, and
+// the drift would be client-visible.
+//
+// Two things differ from the occurrences pair, and both are worth naming so
+// nobody "restores symmetry":
+//
+// 1. **No `text_reach` field.** `TextSearchReach` exists because a caller
+//    holding `issue:read` without `event:read` receives `ErrorEvent` rows with
+//    `contexts`/`extra`/`tags` nulled by `symbolicate::strip_event_body`, so a
+//    predicate over them answers what the response withholds. Nothing strips an
+//    `AnalyticsEvent` — `strip_event_body` takes an `&mut ErrorEvent` and is
+//    never applied here — so there is no withheld half for a reach to gate, and
+//    `EventsLower::text` (written in Task 3, before this caller existed)
+//    correctly takes no reach either. A field here would be a knob with no
+//    honest setting.
+// 2. **The base scope comes from `EventsLower::base_scope`,** which carries the
+//    tenant key AND the `name <> '$screen'` exclusion. That exclusion is part of
+//    what "an analytics event" means in the Event Explorer, not a filter a
+//    query may opt out of — see the method's own doc comment.
+// ===========================================================================
+
+/// Everything [`search_events`] needs beyond the connection and the scope.
+///
+/// A struct rather than six positional parameters, for the reason
+/// [`IssueSearch`]/[`OccurrenceSearch`] are: `descending` and the timestamp are
+/// easy to transpose at a call site.
+pub struct EventSearch<'a> {
+    pub node: &'a sauron_query::ResolvedNode,
+    pub ctx: &'a crate::query_plan::PrepCtx,
+    /// Lower bound on `analytics_events.occurred_at` — the caller's
+    /// `since_days` window, already tightened by any `Clamp` the planner
+    /// returned.
+    ///
+    /// Never optional, unlike `list_analytics_events`' `Option`:
+    /// `analytics_events` is `PARTITION BY RANGE (occurred_at)`, so an
+    /// unbounded lower bound is a MergeAppend across every partition.
+    pub since: DateTime<Utc>,
+    /// The ordering this page walks. The cursor in `after` must have been
+    /// minted under the same column — `cursor::decode` enforces it at the
+    /// route.
+    pub sort: EventSort,
+    pub descending: bool,
+    /// The previous page's `next_cursor`, decoded.
+    pub after: Option<crate::query_plan::cursor::Cursor>,
+    pub limit: i64,
+}
+
+/// Tenant key + the `$screen` exclusion + environment + window + the lowered
+/// query predicate.
+///
+/// Called once per query rather than built once and cloned, for the reason
+/// [`issue_search_base`] documents: `Frag` is a boxed trait object, consumed by
+/// whichever query it is filtered into.
+///
+/// **One `EventsLower` serves both the predicate and the base scope**, so the
+/// `app_id` in the WHERE clause and the `app_id` the leaves are lowered against
+/// cannot disagree — they are the same field of the same value. That WHERE-
+/// clause tenant key is the mandatory second authorization layer; the handler's
+/// `authorized_read_scope_with_perms` is the first, and neither substitutes for
+/// the other.
+fn event_search_base<'a>(
+    scope: &'a ReadScope,
+    search: &EventSearch<'_>,
+) -> Result<analytics_events::BoxedQuery<'a, diesel::pg::Pg>, PlanError> {
+    let lowerer = crate::query_plan::events::EventsLower {
+        app_id: scope.app_id,
+    };
+    let predicate = crate::query_plan::lower(search.node, &lowerer, search.ctx)?;
+    let query = analytics_events::table
+        .filter(lowerer.base_scope())
+        .filter(analytics_events::occurred_at.ge(search.since))
+        .filter(predicate)
+        .into_boxed();
+    // `analytics_events` carries `environment_id` directly, so this is the
+    // ordinary column filter — see `list_analytics_events`, which this replaces
+    // for the list, and `issue_env_membership` for the contrast.
+    Ok(crate::scope_env!(query, analytics_events, &scope.env))
+}
+
+/// The boxed query [`search_events`] loads, built but not yet executed.
+///
+/// Split out from `search_events` so a `debug_query` unit test can inspect
+/// the exact SQL a real call produces — in particular, whether the raw
+/// keyset fragments below are correctly self-parenthesised — without a
+/// database connection. See `keyset_predicate_tests` at the end of this
+/// section.
+///
+/// Backed by `analytics_events_app_time_id_idx (app_id, occurred_at DESC, id
+/// DESC)` for the `OccurredAt` ordering (migration `2026-08-09-000047`, added
+/// for exactly this walk). Without the `id` column the tuple is not a total
+/// order — analytics events arrive in bursts that routinely share a
+/// microsecond — and a page boundary landing inside such a group repeats or
+/// skips rows.
+fn event_query_for<'a>(
+    scope: &'a ReadScope,
+    search: &EventSearch<'_>,
+) -> Result<analytics_events::BoxedQuery<'a, diesel::pg::Pg>, PlanError> {
+    let mut q = event_search_base(scope, search)?;
+
+    // `session_id` is `Nullable<Text>` on `analytics_events` (`name`/
+    // `distinct_id` are not). `COALESCE(session_id,'')` in BOTH the predicate
+    // and the ORDER BY is what keeps a row with no session in the walk: a
+    // bare nullable-column comparison is NULL, not true, for such a row,
+    // which silently drops it from every page after the first. See
+    // `paging_by_session_reaches_rows_with_no_session` in
+    // `tests/keyset_plan.rs`.
+    if let Some(c) = &search.after {
+        q = match (search.sort, search.descending) {
+            (EventSort::OccurredAt, true) => q.filter(
+                analytics_events::occurred_at
+                    .lt(ts_of(c))
+                    .or(analytics_events::occurred_at
+                        .eq(ts_of(c))
+                        .and(analytics_events::id.lt(c.id))),
+            ),
+            (EventSort::OccurredAt, false) => q.filter(
+                analytics_events::occurred_at
+                    .gt(ts_of(c))
+                    .or(analytics_events::occurred_at
+                        .eq(ts_of(c))
+                        .and(analytics_events::id.gt(c.id))),
+            ),
+            (EventSort::Name, true) => q.filter(
+                analytics_events::name
+                    .lt(text_of(c))
+                    .or(analytics_events::name
+                        .eq(text_of(c))
+                        .and(analytics_events::id.lt(c.id))),
+            ),
+            (EventSort::Name, false) => q.filter(
+                analytics_events::name
+                    .gt(text_of(c))
+                    .or(analytics_events::name
+                        .eq(text_of(c))
+                        .and(analytics_events::id.gt(c.id))),
+            ),
+            (EventSort::DistinctId, true) => q.filter(
+                analytics_events::distinct_id
+                    .lt(text_of(c))
+                    .or(analytics_events::distinct_id
+                        .eq(text_of(c))
+                        .and(analytics_events::id.lt(c.id))),
+            ),
+            (EventSort::DistinctId, false) => q.filter(
+                analytics_events::distinct_id
+                    .gt(text_of(c))
+                    .or(analytics_events::distinct_id
+                        .eq(text_of(c))
+                        .and(analytics_events::id.gt(c.id))),
+            ),
+            // Self-parenthesised, like the `OccurrenceSort` fragments above —
+            // see that match's comment for why an unwrapped raw fragment
+            // leaks across tenants.
+            (EventSort::SessionId, true) => q.filter(
+                sql::<Bool>("(COALESCE(session_id,'') < ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" OR (COALESCE(session_id,'') = ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" AND id < ")
+                    .bind::<SqlUuid, _>(c.id)
+                    .sql("))"),
+            ),
+            (EventSort::SessionId, false) => q.filter(
+                sql::<Bool>("(COALESCE(session_id,'') > ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" OR (COALESCE(session_id,'') = ")
+                    .bind::<Text, _>(text_of(c))
+                    .sql(" AND id > ")
+                    .bind::<SqlUuid, _>(c.id)
+                    .sql("))"),
+            ),
+        };
+    }
+    // The ORDER BY must be the same tuple, in the same direction, as the keyset
+    // predicate above — one mechanism split across two clauses, and disagreeing
+    // is how paging silently skips rows.
+    let q = match (search.sort, search.descending) {
+        (EventSort::OccurredAt, true) => q.order((
+            analytics_events::occurred_at.desc(),
+            analytics_events::id.desc(),
+        )),
+        (EventSort::OccurredAt, false) => q.order((
+            analytics_events::occurred_at.asc(),
+            analytics_events::id.asc(),
+        )),
+        (EventSort::Name, true) => {
+            q.order((analytics_events::name.desc(), analytics_events::id.desc()))
+        }
+        (EventSort::Name, false) => {
+            q.order((analytics_events::name.asc(), analytics_events::id.asc()))
+        }
+        (EventSort::DistinctId, true) => q.order((
+            analytics_events::distinct_id.desc(),
+            analytics_events::id.desc(),
+        )),
+        (EventSort::DistinctId, false) => q.order((
+            analytics_events::distinct_id.asc(),
+            analytics_events::id.asc(),
+        )),
+        (EventSort::SessionId, true) => {
+            q.order(sql::<Text>("COALESCE(session_id,'') DESC, id DESC"))
+        }
+        (EventSort::SessionId, false) => {
+            q.order(sql::<Text>("COALESCE(session_id,'') ASC, id ASC"))
+        }
+    };
+    Ok(q)
+}
+
+/// `limit + 1` analytics events for one app, ordered by the requested
+/// keyset, optionally starting after a cursor.
+///
+/// The caller truncates back to `limit`; the surplus row is the has-more
+/// probe, so "is there a next page" costs no second query. See
+/// [`event_query_for`] for how the query itself is built.
+pub async fn search_events(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &EventSearch<'_>,
+) -> Result<Vec<AnalyticsEvent>, PlanError> {
+    event_query_for(scope, search)?
+        .select(AnalyticsEvent::as_select())
+        .limit(search.limit + 1)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))
+}
+
+/// `(total, capped)` over the same predicate [`search_events`] pages.
+///
+/// Takes the whole [`EventSearch`] rather than a handful of its fields for the
+/// reason [`count_issues`] does: `node`, `ctx`, `since` AND the scope must all
+/// be identical, or the total describes a different row set than the rows
+/// rendered beside it. `descending`/`after`/`limit` are the only fields it
+/// ignores, and none of them changes which rows match.
+///
+/// Selects ids rather than `count(*)` so the `cap` is a real `LIMIT` the
+/// planner can stop at — see [`count_issues`].
+pub async fn count_events(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &EventSearch<'_>,
+    cap: i64,
+) -> Result<(i64, bool), PlanError> {
+    let ids: Vec<Uuid> = event_search_base(scope, search)?
+        .select(analytics_events::id)
+        .limit(cap + 1)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    let n = ids.len() as i64;
+    Ok(if n > cap { (cap, true) } else { (n, false) })
+}
+
+/// Pins the exact SQL shape of the raw keyset fragments in
+/// [`event_query_for`]/[`occurrence_query_for`] — specifically, that each one
+/// opens with its own `(` and closes with `))`.
+///
+/// **Why this matters enough for its own test.** A `sql::<Bool>` fragment
+/// containing a top-level `OR`, added via `.filter()`, is not grouped by
+/// diesel: `SqlLiteral::walk_ast` emits its text verbatim, and `WhereAnd::
+/// and` parenthesises `existing AND predicate` as a whole, never `predicate`
+/// alone (diesel 2.3.11, `query_builder/where_clause.rs`). Because `AND`
+/// binds tighter than `OR`, an unparenthesised fragment splits the WHERE
+/// clause into two disjuncts, and the second carries no tenant key, no
+/// `since` window, no environment filter — a cross-tenant leak reproduced
+/// live in `tests/keyset_plan.rs`'s
+/// `paging_by_session_never_returns_another_apps_rows`.
+///
+/// These run with every other `cargo test -p sauron-db` unit test — no
+/// database connection, `debug_query` only renders SQL text — so a future
+/// edit that drops a paren fails in under a second, not in production.
+#[cfg(test)]
+mod keyset_predicate_tests {
+    use super::*;
+    use crate::query_plan::PrepCtx;
+    use diesel::debug_query;
+    use diesel::pg::Pg;
+
+    fn ctx() -> PrepCtx {
+        PrepCtx {
+            environments: HashMap::new(),
+            now: Utc::now(),
+        }
+    }
+
+    fn resolved(resource: sauron_query::Resource) -> sauron_query::ResolvedNode {
+        let ast = sauron_query::from_legacy(&[], None).expect("empty legacy filter");
+        sauron_query::resolve(&ast, resource).expect("resolve")
+    }
+
+    fn text_cursor(key: &str) -> crate::query_plan::cursor::Cursor {
+        crate::query_plan::cursor::Cursor {
+            key: key.to_string(),
+            value: crate::query_plan::cursor::CursorValue::Text("probe".to_string()),
+            id: Uuid::new_v4(),
+        }
+    }
+
+    /// Asserts `sql` has a properly self-wrapped raw keyset fragment for
+    /// `col`: walking parenthesis depth forward from the fragment's own
+    /// leading `(` (found immediately before `COALESCE({col}`), depth must
+    /// not return to zero until AFTER the tie branch's `id {cmp} $n` has
+    /// appeared.
+    ///
+    /// **Why not the two substring checks this replaced, and why THIS check
+    /// instead of an exact trailing close-paren count.** An earlier version
+    /// of this test tried asserting the fragment's tail was followed by
+    /// exactly `))`, reasoning that the fix adds one paren. Reverting the fix
+    /// locally and re-running proved that check worthless: diesel wraps EVERY
+    /// `.filter()` call's accumulated WHERE clause in its own `Grouped`
+    /// (`query_builder/where_clause.rs`), and that wrapper contributes its
+    /// OWN trailing `)` regardless of what the fragment itself does — so an
+    /// unfixed fragment's render also ends in `))` (one from the tie-branch,
+    /// one supplied by diesel's wrapper), indistinguishable by trailing count
+    /// alone from a fixed one.
+    ///
+    /// The version this replaces moved to the OPENING side instead, on the
+    /// reasoning that only this fragment's own text can put a `(` directly
+    /// before `COALESCE`. That is true, but it asserted the opening paren's
+    /// EXISTENCE, and separately the tie-branch's opening paren's existence,
+    /// each checked independently of the other — and a whole-slice review
+    /// found both satisfied by
+    ///
+    /// ```text
+    /// … AND (COALESCE(c,'') < $1) OR (COALESCE(c,'') = $2 AND id < $3)
+    /// ```
+    ///
+    /// which is NOT one self-wrapped group. It is two independently balanced
+    /// groups joined by a bare `OR` — exactly the shape that lets the `OR`
+    /// escape the WHERE clause via operator precedence and leak rows across
+    /// tenants, the original defect this whole test exists to catch. Both
+    /// substrings appear in it verbatim, so the assertion it replaced passed
+    /// a leaking fragment: a guard a leaking string satisfies is worse than
+    /// none, since it reads as protection. Walking depth from the fragment's
+    /// own opening paren to ITS OWN matching close, and requiring the tie
+    /// branch's `id {cmp} $n` to appear strictly before that close, catches
+    /// it: on the string above depth returns to zero right after `$1)`,
+    /// before any `id {cmp}` has been seen. The test
+    /// `self_wrapped_assertion_rejects_the_reviewers_counterexample` below
+    /// pins exactly that string as a permanent negative control; this
+    /// function's own call sites past the end of this module are the
+    /// positive control, against real `debug_query` output.
+    ///
+    /// **Round 2: the depth walk alone still accepted a leaking shape.**
+    /// `sql.find("(COALESCE({col}")` returns the FIRST match — which, if the
+    /// fragment's own leading `(` is DROPPED rather than moved, is the tie
+    /// branch's opening paren instead:
+    ///
+    /// ```text
+    /// … AND TRUE) AND COALESCE(session_id,'') < $4 OR (COALESCE(session_id,'') = $5 AND id < $6)
+    /// ```
+    ///
+    /// Here the left branch reads `AND COALESCE(session_id,'') < $4` — no `(`
+    /// before `COALESCE` at all — so `find` skips past it to
+    /// `(COALESCE(session_id,'') = $5 AND id < $6)`, the tie branch's OWN
+    /// paren, which is entirely self-contained and closes cleanly right
+    /// after `id < $6` BY CONSTRUCTION. The depth walk, started from there,
+    /// finds `id {cmp} $n` inside its span and passes — for the wrong
+    /// fragment. The fix is the assertion immediately below: a genuinely
+    /// self-wrapped fragment's own `(` is the FIRST mention of
+    /// `COALESCE(col` anywhere in the WHERE clause, so any EARLIER,
+    /// paren-less mention proves `find` landed on the wrong occurrence. The
+    /// test `self_wrapped_assertion_rejects_a_dropped_leading_paren` below
+    /// pins this exact string as a second permanent negative control,
+    /// alongside the first — pinning only one shape is precisely how this
+    /// hole survived the round 1 fix.
+    fn assert_fragment_is_self_wrapped(sql: &str, col: &str, cmp: &str) {
+        let marker = format!("(COALESCE({col}");
+        let start = sql.find(&marker).unwrap_or_else(|| {
+            panic!(
+                "missing {col}'s own opening paren — the exact defect that lets \
+                 this fragment's OR escape the WHERE clause via operator \
+                 precedence and leak rows across tenants: {sql}"
+            )
+        });
+
+        // `find` returns the FIRST match of `(COALESCE(col` — which, if the
+        // fragment's OWN leading `(` is missing (dropped, not just moved),
+        // is the TIE BRANCH's opening paren instead: e.g.
+        // `AND COALESCE(col,'') < $1 OR (COALESCE(col,'') = $2 AND id < $3)`
+        // has no `(` before the first `COALESCE` at all, so `find` skips
+        // straight past it to the tie branch's own, entirely self-contained
+        // `(COALESCE(col,'') = $2 AND id < $3)` — which closes cleanly AFTER
+        // `id {cmp} $n` BY CONSTRUCTION, so the depth walk below would pass
+        // it for the wrong reason: this is a round-2 finding, not a
+        // hypothetical — the depth walk alone accepted exactly this shape
+        // against `session_id`. Ruling out any EARLIER, paren-less mention of
+        // `COALESCE(col` closes that: a genuinely self-wrapped fragment's own
+        // `(` is the FIRST appearance of `COALESCE(col` in the WHERE clause,
+        // full stop — nothing legitimate mentions the column before it.
+        assert!(
+            !sql[..start].contains(&format!("COALESCE({col}")),
+            "found an earlier, un-parenthesised `COALESCE({col}` before the \
+             match at byte {start} — the fragment's own leading `(` is \
+             MISSING (not just misplaced), so `find` landed on the tie \
+             branch's self-contained paren instead of the fragment's own: \
+             {sql}"
+        );
+
+        // Walk paren depth forward from that leading `(`, counted as depth 1,
+        // until it finds ITS OWN matching close — i.e. the first point depth
+        // returns to zero. Starting the count here, rather than at the start
+        // of `sql`, is what makes this immune to diesel's own outer
+        // `Grouped` wrapper: that wrapper's parens sit outside this span
+        // entirely, so they are never counted.
+        let mut depth = 0i32;
+        let mut close_at = None;
+        for (i, &b) in sql.as_bytes()[start..].iter().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_at = Some(start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close_at =
+            close_at.unwrap_or_else(|| panic!("{col}'s own leading paren never closes: {sql}"));
+
+        // The span from the fragment's own `(` to THAT paren's own matching
+        // close. A genuinely self-wrapped fragment cannot close this paren
+        // until after the tie branch's `id {cmp} $n` — that comparison is the
+        // last thing inside it by construction — so if it is missing from
+        // this span, the paren closed too early and the fragment is two
+        // groups, not one.
+        let span = &sql[start..=close_at];
+        assert!(
+            span.contains(&format!("id {cmp} $")),
+            "the paren opened at {col}'s own `(` closes before the tie \
+             branch's `id {cmp} $n` appears — this is NOT one self-wrapped \
+             group, which is exactly the shape that lets its OR escape the \
+             WHERE clause via operator precedence and leak rows across \
+             tenants: fragment = {span:?}, full sql = {sql}"
+        );
+    }
+
+    /// **Negative control 1 for [`assert_fragment_is_self_wrapped`] itself.**
+    /// Pins that the walker rejects the exact leaking shape a whole-slice
+    /// review found the PREVIOUS version of this assertion satisfied by
+    /// mistake — see that function's doc comment for the full story. Both of
+    /// the old assertion's substring checks passed on this string; the depth
+    /// walk must not.
+    #[test]
+    #[should_panic(expected = "NOT one self-wrapped group")]
+    fn self_wrapped_assertion_rejects_the_reviewers_counterexample() {
+        let leaking = "… AND (COALESCE(c,'') < $1) OR (COALESCE(c,'') = $2 AND id < $3)";
+        assert_fragment_is_self_wrapped(leaking, "c", "<");
+    }
+
+    /// **Negative control 2.** Pins the ROUND 2 finding — see this function's
+    /// doc comment's "Round 2" paragraph for the full story. The depth walk
+    /// alone (negative control 1's fix) still accepted this shape: dropping
+    /// the fragment's own leading `(` entirely, rather than moving it,
+    /// leaves `find` to land on the tie branch's own self-contained paren,
+    /// which closes cleanly after `id < $n` by construction and so passes
+    /// the walk for the wrong reason. Pinning only the FIRST leaking shape is
+    /// exactly how this second one survived the first fix — hence a second,
+    /// separate pin here rather than folding it into the one above.
+    #[test]
+    #[should_panic(expected = "is MISSING")]
+    fn self_wrapped_assertion_rejects_a_dropped_leading_paren() {
+        let leaking = "… AND TRUE) AND COALESCE(session_id,'') < $4 OR \
+                        (COALESCE(session_id,'') = $5 AND id < $6)";
+        assert_fragment_is_self_wrapped(leaking, "session_id", "<");
+    }
+
+    /// Cheap, resource-agnostic sanity net: every `(` in the rendered query
+    /// has a matching `)`. Does not by itself prove correct GROUPING (a
+    /// dropped paren on one side and a stray one on the other could still
+    /// balance in total), which is exactly why
+    /// [`assert_fragment_is_self_wrapped`] exists — but an imbalance here
+    /// means the query cannot even reach Postgres to be misinterpreted, so
+    /// it is worth ruling out first.
+    fn assert_parens_balanced(sql: &str) {
+        let opens = sql.matches('(').count();
+        let closes = sql.matches(')').count();
+        assert_eq!(
+            opens, closes,
+            "unbalanced parens ({opens} open, {closes} close): {sql}"
+        );
+    }
+
+    /// The one nullable `EventSort` column, both directions — the 2 of the
+    /// review's 8 flagged fragments that live in `search_events`.
+    #[test]
+    fn event_session_keyset_fragment_is_self_parenthesised() {
+        let node = resolved(sauron_query::Resource::Events);
+        let ctx = ctx();
+        let scope = ReadScope::all(Uuid::new_v4());
+
+        for descending in [true, false] {
+            let search = EventSearch {
+                node: &node,
+                ctx: &ctx,
+                since: Utc::now() - chrono::Duration::days(1),
+                sort: EventSort::SessionId,
+                descending,
+                after: Some(text_cursor("session_id")),
+                limit: 10,
+            };
+            let query = event_query_for(&scope, &search)
+                .expect("build query")
+                .select(analytics_events::id);
+            let sql = debug_query::<Pg, _>(&query).to_string();
+
+            let cmp = if descending { "<" } else { ">" };
+            assert_parens_balanced(&sql);
+            assert_fragment_is_self_wrapped(&sql, "session_id", cmp);
+        }
+    }
+
+    /// All three nullable `OccurrenceSort` columns, both directions — the
+    /// remaining 6 of the review's 8 flagged fragments, in
+    /// `search_occurrences`. These never executed against a real database
+    /// before this round (`OccurrenceSearch` is constructed nowhere else in
+    /// `sauron-db`), so this is also the first coverage — even SQL-shape-only
+    /// — any of the three has ever had.
+    #[test]
+    fn occurrence_nullable_keyset_fragments_are_self_parenthesised() {
+        let node = resolved(sauron_query::Resource::Occurrences);
+        let ctx = ctx();
+        let scope = ReadScope::all(Uuid::new_v4());
+        let issue_id = Uuid::new_v4();
+
+        for (sort, col) in [
+            (OccurrenceSort::DistinctId, "distinct_id"),
+            (OccurrenceSort::SessionId, "session_id"),
+            (OccurrenceSort::DeviceKey, "device_key"),
+        ] {
+            for descending in [true, false] {
+                let search = OccurrenceSearch {
+                    node: &node,
+                    ctx: &ctx,
+                    since: Utc::now() - chrono::Duration::days(1),
+                    sort,
+                    descending,
+                    after: Some(text_cursor(col)),
+                    limit: 10,
+                    text_reach: TextSearchReach::ShellOnly,
+                };
+                let query = occurrence_query_for(&scope, issue_id, &search)
+                    .expect("build query")
+                    .select(error_events::id);
+                let sql = debug_query::<Pg, _>(&query).to_string();
+
+                let cmp = if descending { "<" } else { ">" };
+                assert_parens_balanced(&sql);
+                assert_fragment_is_self_wrapped(&sql, col, cmp);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: per-environment issue statistics (S2c Task 4b).
+// ---------------------------------------------------------------------------
+
+/// One issue's statistics as seen from ONE environment selection.
+///
+/// Every field here has an app-wide counterpart stored on `issues`, and under
+/// an environment selection that stored value describes events the caller is
+/// not being shown. An issue that saw 3 events in `staging` reporting the
+/// app-wide 1,204 is not a rounding difference, it is a wrong answer.
+///
+/// `title`/`culprit`/`level` are `Option` because they reproduce the old
+/// query's `COALESCE(latest.x, i.x)`: `error_events.title`/`culprit` were only
+/// added in migration 30 and were not backfilled, so an older occurrence
+/// carries `NULL` and must fall back to the issue's own column rather than
+/// blanking the row. `level` is `NOT NULL` on `error_events` and so is only
+/// ever `None` in the same "no row at all" case the map itself already
+/// excludes — kept `Option` so all three merge through one rule.
+#[derive(Debug, Clone)]
+pub struct IssueEnvStats {
+    pub times_seen: i64,
+    pub users_seen: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub title: Option<String>,
+    pub culprit: Option<String>,
+    pub level: Option<String>,
+}
+
+#[derive(Debug, QueryableByName)]
+struct IssueEnvStatsRow {
+    #[diesel(sql_type = SqlUuid)]
+    issue_id: Uuid,
+    #[diesel(sql_type = BigInt)]
+    times_seen: i64,
+    #[diesel(sql_type = BigInt)]
+    users_seen: i64,
+    #[diesel(sql_type = Timestamptz)]
+    first_seen: DateTime<Utc>,
+    #[diesel(sql_type = Timestamptz)]
+    last_seen: DateTime<Utc>,
+    #[diesel(sql_type = Nullable<Text>)]
+    title: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    culprit: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    level: Option<String>,
+}
+
+/// Re-derive `times_seen`/`users_seen`/`first_seen`/`last_seen`/`title`/
+/// `culprit`/`level` for one page of issues, from that page's occurrences in
+/// the selected environment only.
+///
+/// **Why this is a second query and not part of [`search_issues`].** `issues`
+/// has no `environment_id` column and — per S2 Task 1's write-path measurement
+/// — no `issue_environments` rollup either, so per-environment values only
+/// exist as an aggregate over `error_events`. Keyset pagination structurally
+/// requires ordering by an *indexed stored* column, and a per-environment
+/// `last_seen` is not one. So phase 1 chooses the page by the stored ordering
+/// and phase 2 — this function — re-values only the ≤`limit` ids it returned.
+/// One query for the whole page, never one per row.
+///
+/// **Known limitation, accepted when this approach was chosen.** Ordering
+/// stays by STORED `last_seen`, so under an environment selection rows can
+/// appear slightly out of order relative to their *displayed* per-environment
+/// `last_seen`. That is inherent to keyset paging — the alternative is
+/// OFFSET paging on a derived column, which is what this slice removed. **Do
+/// not "fix" it by sorting the page in memory:** that reorders within a page
+/// only, so row 51 still outranks row 50 across the boundary, which reads as a
+/// bug rather than as a limitation.
+///
+/// Returns an **empty map for [`EnvFilter::All`]** and for an empty `ids`.
+/// `All` is the commonest path and its stored columns already are the app-wide
+/// truth, so a second query there is pure cost — and, worse, would *overwrite*
+/// lifetime counts with window-scoped ones. The caller skips the call
+/// entirely; the guard here is so a future caller cannot reintroduce that.
+///
+/// An id with no in-environment occurrence is simply **absent from the map** —
+/// that is the old query's `HAVING count(*) > 0` (an aggregate with no `GROUP
+/// BY` returns one all-zero row even when nothing matches, which would turn
+/// the inner join into a no-op). What the caller does with an absent id is
+/// [`apply_issue_env_stats`]' documented decision, not this function's.
+///
+/// # Shape
+///
+/// Deliberately the same shape as the pre-planner raw-SQL branch of
+/// [`list_issues_with_reach`] (`agg` + `latest` LATERALs), because that shape
+/// is what migrations 28 and 31 were measured against:
+/// `error_events_issue_env_time_idx` is `(issue_id, environment_id,
+/// occurred_at DESC) INCLUDE (distinct_id)`, so per issue the aggregate is one
+/// index range scan (index-only, `distinct_id` and `occurred_at` both in the
+/// index) and `latest` is an index-ordered scan that stops at the first row —
+/// no sort node. A `GROUP BY`/`DISTINCT ON` over the whole page instead would
+/// materialize and sort every matching occurrence, which for a hot issue with
+/// tens of thousands of events in one environment is the exact regression
+/// migration 31 exists to have closed.
+///
+/// Two details carried over verbatim from that branch, both deliberate:
+///
+/// - **The tenant key sits on `issues`, not inside the aggregate.** `ids` is a
+///   plain function argument, so unlike the old query's `i.id` it carries no
+///   structural app binding — hence `FROM issues i WHERE i.id = ANY($1) AND
+///   i.app_id = $2`, which both re-asserts the tenant and keeps `e.app_id` out
+///   of the aggregate's `WHERE`, where it would force a heap fetch per row and
+///   cost the index-only scan.
+/// - **`latest` is NOT bounded by `since`, and does not need to be.** `agg`'s
+///   `HAVING count(*) > 0` already requires an in-environment occurrence at or
+///   after `since`, so the newest in-environment occurrence overall is at
+///   least that recent and is therefore in-window too. Adding the bound would
+///   select the same row and only narrow the index scan's usable range.
+///
+/// `since` IS pushed into the aggregate, exactly as before: the returned
+/// counts are within the requested window, not lifetime, so they will not
+/// match `issues.times_seen` even for the same environment. See
+/// [`list_issues_with_reach`]' doc comment for the three other documented
+/// discrepancies between derived and stored values (HyperLogLog approximation,
+/// tiered-out data, windowing).
+pub async fn issue_env_stats(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    ids: &[Uuid],
+    since: DateTime<Utc>,
+) -> Result<HashMap<Uuid, IssueEnvStats>, PlanError> {
+    if ids.is_empty() || matches!(scope.env, EnvFilter::All) {
+        return Ok(HashMap::new());
+    }
+    // Bind layout: $1 ids, $2 app_id, $3 since, $4 env (One/Subset only —
+    // `Unattributed` is a literal `IS NULL` and consumes nothing, `All`
+    // returned above). The env fragment appears TWICE in the text and both
+    // occurrences reference the same $4: one bind, referenced where needed,
+    // the same idiom as `list_issues_with_reach`'s $3.
+    let env_sql = scope.env.sql_fragment_for("e", 4);
+    let sql_text = format!(
+        "SELECT i.id AS issue_id, \
+                agg.times_seen, agg.users_seen, agg.first_seen, agg.last_seen, \
+                latest.title, latest.culprit, latest.level \
+         FROM issues i \
+         JOIN LATERAL ( \
+             SELECT count(*)::bigint AS times_seen, \
+                    count(DISTINCT e.distinct_id)::bigint AS users_seen, \
+                    min(e.occurred_at) AS first_seen, \
+                    max(e.occurred_at) AS last_seen \
+             FROM error_events e \
+             WHERE e.issue_id = i.id AND e.occurred_at >= $3{env_sql} \
+             HAVING count(*) > 0 \
+         ) agg ON TRUE \
+         LEFT JOIN LATERAL ( \
+             SELECT e.title, e.culprit, e.level \
+             FROM error_events e \
+             WHERE e.issue_id = i.id{env_sql} \
+             ORDER BY e.occurred_at DESC \
+             LIMIT 1 \
+         ) latest ON TRUE \
+         WHERE i.id = ANY($1) AND i.app_id = $2"
+    );
+    let mut stmt = diesel::sql_query(sql_text)
+        .into_boxed()
+        .bind::<Array<SqlUuid>, _>(ids.to_vec())
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(since);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    let rows: Vec<IssueEnvStatsRow> = stmt
+        .get_results(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.issue_id,
+                IssueEnvStats {
+                    times_seen: r.times_seen,
+                    users_seen: r.users_seen,
+                    first_seen: r.first_seen,
+                    last_seen: r.last_seen,
+                    title: r.title,
+                    culprit: r.culprit,
+                    level: r.level,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Overwrite each row's app-wide values with its per-environment ones.
+///
+/// **An issue with no entry in `stats` keeps its stored values and stays on
+/// the page.** That is a decision, and these are the three candidates:
+///
+/// 1. *Keep it with the stored app-wide values* — chosen.
+/// 2. *Drop it from the page.* Rejected: it makes `data.len()` disagree with
+///    the `total` counted over the same predicate, and a client that stops
+///    paging when `data.len() < limit` would stop early on a full page.
+/// 3. *Serve it with `times_seen = 0`.* Rejected outright — a row claiming
+///    zero occurrences in an environment it is displayed under is the one
+///    outcome that is actively misleading rather than merely imprecise.
+///
+/// **And the set is empty in the first place under normal operation.** The two
+/// predicates are the same question: [`issue_env_membership`] admits an issue
+/// only if `error_events` holds a row with that `issue_id`, the same `app_id`,
+/// `occurred_at >= since` and the same environment — which is exactly what
+/// [`issue_env_stats`]' aggregate counts. So a paged issue reaches here
+/// without a row only if the underlying rows disappeared BETWEEN the two
+/// statements: retention, a GDPR erasure, or `sauron-tier` exporting and
+/// dropping a partition. The two queries are not in one snapshot, so that race
+/// is real, but it is a race and not a steady state — which is precisely why
+/// keeping the row is right. It was a genuine member moments earlier, and its
+/// stored columns are the only remaining description of it.
+pub fn apply_issue_env_stats(rows: &mut [Issue], stats: &HashMap<Uuid, IssueEnvStats>) {
+    for row in rows.iter_mut() {
+        let Some(s) = stats.get(&row.id) else {
+            continue;
+        };
+        row.times_seen = s.times_seen;
+        row.users_seen = s.users_seen;
+        row.first_seen = s.first_seen;
+        row.last_seen = s.last_seen;
+        // `Option` + `if let` IS the old query's `COALESCE(latest.x, i.x)`:
+        // a legacy occurrence written before migration 30 has a NULL
+        // `title`/`culprit`, and blanking the row would be worse than showing
+        // the app-wide string.
+        if let Some(t) = &s.title {
+            row.title = t.clone();
+        }
+        if let Some(c) = &s.culprit {
+            row.culprit = c.clone();
+        }
+        if let Some(l) = &s.level {
+            row.level = l.clone();
+        }
+    }
+}
+
+#[cfg(test)]
+mod issue_env_stats_tests {
+    use super::*;
+
+    fn issue(id: Uuid) -> Issue {
+        let t = Utc::now();
+        Issue {
+            id,
+            app_id: Uuid::new_v4(),
+            fingerprint: "fp".into(),
+            type_: "Error".into(),
+            title: "stored title".into(),
+            culprit: "stored::culprit".into(),
+            level: "fatal".into(),
+            status: "unresolved".into(),
+            first_seen: t,
+            last_seen: t,
+            times_seen: 1204,
+            users_seen: 99,
+            assignee_id: None,
+            created_at: t,
+            updated_at: t,
+            last_event_at: t,
+        }
+    }
+
+    fn stats(times: i64) -> IssueEnvStats {
+        let t = Utc::now() - chrono::Duration::hours(3);
+        IssueEnvStats {
+            times_seen: times,
+            users_seen: 2,
+            first_seen: t,
+            last_seen: t,
+            title: Some("env title".into()),
+            culprit: Some("env::culprit".into()),
+            level: Some("warning".into()),
+        }
+    }
+
+    #[test]
+    fn a_matched_row_takes_every_per_environment_value() {
+        let id = Uuid::new_v4();
+        let mut rows = vec![issue(id)];
+        let map = HashMap::from([(id, stats(3))]);
+        apply_issue_env_stats(&mut rows, &map);
+        assert_eq!(rows[0].times_seen, 3);
+        assert_eq!(rows[0].users_seen, 2);
+        assert_eq!(rows[0].title, "env title");
+        assert_eq!(rows[0].culprit, "env::culprit");
+        assert_eq!(rows[0].level, "warning");
+        assert_eq!(rows[0].last_seen, map[&id].last_seen);
+    }
+
+    /// The zero-occurrence case, pinned. See [`apply_issue_env_stats`]' doc
+    /// comment for why "keep with the stored values" beat "drop the row" and
+    /// "serve `times_seen = 0`".
+    #[test]
+    fn an_issue_with_no_in_environment_row_keeps_its_stored_values() {
+        let mut rows = vec![issue(Uuid::new_v4())];
+        apply_issue_env_stats(&mut rows, &HashMap::new());
+        assert_eq!(rows.len(), 1, "the row must NOT be dropped from the page");
+        assert_eq!(
+            rows[0].times_seen, 1204,
+            "…and must NOT be served as `times_seen = 0`"
+        );
+        assert_eq!(rows[0].title, "stored title");
+        assert_eq!(rows[0].level, "fatal");
+    }
+
+    /// `COALESCE(latest.title, i.title)`: a pre-migration-30 occurrence
+    /// carries NULL and must not blank the row.
+    #[test]
+    fn a_null_derived_string_falls_back_to_the_stored_one() {
+        let id = Uuid::new_v4();
+        let mut rows = vec![issue(id)];
+        let mut s = stats(7);
+        s.title = None;
+        s.culprit = None;
+        s.level = None;
+        apply_issue_env_stats(&mut rows, &HashMap::from([(id, s)]));
+        assert_eq!(rows[0].times_seen, 7, "the aggregates still apply");
+        assert_eq!(rows[0].title, "stored title");
+        assert_eq!(rows[0].culprit, "stored::culprit");
+        assert_eq!(rows[0].level, "fatal");
+    }
+
+    /// Only the ids present are touched — the map is keyed, not positional.
+    #[test]
+    fn an_unrelated_id_in_the_map_touches_nothing() {
+        let id = Uuid::new_v4();
+        let mut rows = vec![issue(id)];
+        apply_issue_env_stats(&mut rows, &HashMap::from([(Uuid::new_v4(), stats(3))]));
+        assert_eq!(rows[0].times_seen, 1204);
+    }
+}
+
 pub async fn update_issue_status(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
@@ -3247,46 +4885,24 @@ fn error_events_for_issue_query<'a>(
     crate::scope_env!(query, error_events, &scope.env)
 }
 
-/// Occurrence totals for one issue over the same predicate the list uses.
-///
-/// HOT-TIER ONLY. `count(DISTINCT …)` is holistic, not additive, so it cannot
-/// be split at the tier watermark and summed the way `tier_read.rs` merges
-/// per-day counts — the same reason transaction percentiles stay on Postgres.
-/// Once partitions age out to Parquet, a wide range under-reports here exactly
-/// as it already does for the per-environment `users_seen` in `list_issues`.
-pub async fn error_event_stats_for_issue_with_reach(
-    conn: &mut AsyncPgConnection,
-    scope: ReadScope,
-    issue_id: Uuid,
-    filters: &[ParsedFilter],
-    q: Option<&str>,
-    reach: TextSearchReach,
-    since: Option<chrono::DateTime<chrono::Utc>>,
-) -> QueryResult<IssueEventStatsRow> {
-    // `distinct_id`/`session_id` are both nullable: an anonymous occurrence and
-    // a session-less one contribute a NULL, which `count(DISTINCT …)` skips.
-    // That is the intent — "3 users" should not count "no user" as a user.
-    let (events, users, sessions) =
-        error_events_for_issue_query(&scope, issue_id, filters, q, reach, since)
-            .select((
-                diesel::dsl::count_star(),
-                sql::<BigInt>("count(DISTINCT error_events.distinct_id)"),
-                sql::<BigInt>("count(DISTINCT error_events.session_id)"),
-            ))
-            .get_result::<(i64, i64, i64)>(conn)
-            .await?;
-    Ok(IssueEventStatsRow {
-        events,
-        users,
-        sessions,
-    })
-}
-
-// No payload-inclusive shim for the stats query, unlike its two siblings: it
-// had no caller outside `routes/issues.rs`, so there was no pre-D4 signature to
-// preserve. A shim added "for symmetry" would be a fail-OPEN entry point with
-// nothing calling it — surface whose only possible future use is the mistake
-// `TextSearchReach` exists to prevent.
+// `error_event_stats_for_issue_with_reach` lived here until S2c Task 6, when
+// `routes::issues::event_stats` — its only caller in the workspace — moved onto
+// [`occurrence_stats`] and the query language. DELETED rather than kept, by the
+// rule the note it replaces already stated for the shim that was never written:
+// an entry point with nothing calling it is surface whose only possible future
+// use is a mistake. Concretely, this one took the pre-language `ParsedFilter`
+// list, and reaching for it again would silently reintroduce the
+// `ERROR_EVENT_FILTERS` vocabulary that made `filter=level:eq:error` a 400 on
+// the stat strip and a 200 on the list beside it.
+//
+// Nothing about the *counting* was lost: [`occurrence_stats`] selects the same
+// three aggregates and carries the same HOT-TIER caveat, which is worth
+// restating where the function now lives — `count(DISTINCT …)` is holistic, not
+// additive, so it cannot be split at the tier watermark and summed the way
+// `tier_read.rs` merges per-day counts (the same reason transaction percentiles
+// stay on Postgres). Once partitions age out to Parquet, a wide range
+// under-reports there exactly as it already does for the per-environment
+// `users_seen` in `list_issues`.
 
 /// Counts behind the occurrences stat strip. Raw-shape row, so it lives here
 /// beside `IssueStatsRow` rather than in `models.rs`.
@@ -4905,6 +6521,76 @@ fn device_last_distinct_id_join(env: EnvFilter, bind_index: usize) -> String {
     )
 }
 
+/// `devices` carries no `environment_id`, so a device's membership of an
+/// environment is derived from activity keyed by `device_key` in the three
+/// tables that do carry one. Shared by [`list_devices`] and
+/// [`list_device_groups`], which need the identical predicate over the
+/// identical bind index.
+///
+/// `bind_index` only parameterizes where the env fragment's own binds start
+/// (passed through to [`EnvFilter::sql_fragment_for`]) — the `$1`/`$2` this
+/// function emits directly for `app_id`/`since` are hard-coded, not derived
+/// from `bind_index`. Both current callers happen to share that layout, but
+/// it is a caller contract, not something this function enforces: the
+/// caller's query MUST bind `$1 = app_id` and `$2 = since` exactly, or the
+/// membership predicate silently checks the wrong values. A future third
+/// caller with a different bind layout would need this function reworked,
+/// not just a different `bind_index`.
+///
+/// Empty under `All` — every device qualifies, so the whole clause is omitted
+/// rather than emitted as a tautology.
+///
+/// Each leg aliases its subquery and qualifies the correlated column with that
+/// alias (`ae.device_key`, not bare `device_key`). Demonstrated live during
+/// review: with no alias, an unqualified name that happens to also exist on
+/// the inner table resolves there only by luck — if a future copy of this
+/// pattern targets a table with no `device_key` column, Postgres silently
+/// binds the bare name to the *outer* `devices` row instead, collapsing the
+/// whole `EXISTS` into `devices.device_key = devices.device_key` (always true,
+/// no error). Qualifying turns that mistake into a hard query error instead.
+///
+/// The sessions leg carries `started_at >= $2`, matching the `se` LATERAL at
+/// both call sites. Without it, a device whose only env_a session is older
+/// than `since` — but whose `devices.last_seen` is recent from unrelated env_b
+/// activity — would still pass membership and render an all-zero row under
+/// `One(env_a)`, the exact bug this filter exists to prevent.
+///
+/// Takes `&EnvFilter`, unlike the older [`device_last_distinct_id_join`] next
+/// to it: that one keeps its pre-existing owned signature rather than being
+/// reshaped, but a new function has no such constraint.
+fn device_membership_sql(env: &EnvFilter, bind_index: usize) -> String {
+    if matches!(env, EnvFilter::All) {
+        return String::new();
+    }
+    let ae_env = env.sql_fragment_for("ae", bind_index);
+    let ee_env = env.sql_fragment_for("ee", bind_index);
+    let se_env = env.sql_fragment_for("se", bind_index);
+    format!(
+        " AND ( \
+            EXISTS (SELECT 1 FROM analytics_events ae WHERE ae.app_id=$1 AND ae.device_key = devices.device_key{ae_env}) \
+            OR EXISTS (SELECT 1 FROM error_events ee WHERE ee.app_id=$1 AND ee.device_key = devices.device_key{ee_env}) \
+            OR EXISTS (SELECT 1 FROM sessions se WHERE se.app_id=$1 AND se.device_key = devices.device_key AND se.started_at >= $2{se_env}) \
+          )"
+    )
+}
+
+/// The four descriptor columns [`list_device_groups`] groups by, used as an
+/// exact-match filter to drill from one grouped row down to its member devices.
+///
+/// `Option<DeviceGroupKey>` — not four loose `Option<&str>` parameters — because
+/// the two nestings mean different things and collapsing them loses the
+/// distinction: `None` is "do not filter at all", while `Some(key)` with
+/// `key.model == None` is "filter to devices whose model IS NULL". Four loose
+/// options cannot express the second, and the all-NULL group is a real group
+/// (any SDK that reports no descriptors lands in it).
+#[derive(Debug, Clone, Default)]
+pub struct DeviceGroupKey<'a> {
+    pub family: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub os_name: Option<&'a str>,
+    pub os_version: Option<&'a str>,
+}
+
 pub async fn list_devices(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
@@ -4912,6 +6598,7 @@ pub async fn list_devices(
     limit: i64,
     offset: i64,
     search: Option<&str>,
+    group: Option<DeviceGroupKey<'_>>,
 ) -> QueryResult<Vec<DeviceRow>> {
     // Escape LIKE metacharacters: an unescaped `%`/`_` makes a literal search
     // term match the wrong rows, and a pattern of many wildcards makes ILIKE
@@ -4926,41 +6613,38 @@ pub async fn list_devices(
     // as `list_persons`.
     let env_sql = scope.env.sql_fragment(6);
 
+    // The group binds follow env, not precede it, so env keeps index 6 and
+    // every fragment above is untouched. `consumes_bind()` is load-bearing:
+    // `sql_fragment` reserves its index only for `One`/`Subset` — `All` emits
+    // nothing and `Unattributed` emits a literal `IS NULL` — so assuming the
+    // index is always consumed would shift all four group binds by one.
+    let group_base = if scope.env.consumes_bind() { 7 } else { 6 };
+
+    // `IS NOT DISTINCT FROM`, not `=`: the all-NULL group is a real group, and
+    // `model = NULL` is NULL (never true), which would silently return zero
+    // rows for it. Applied inside the paging subquery, alongside the search
+    // predicate, so LIMIT still applies to the filtered set.
+    let group_sql = if group.is_some() {
+        format!(
+            " AND family IS NOT DISTINCT FROM ${} \
+              AND model IS NOT DISTINCT FROM ${} \
+              AND os_name IS NOT DISTINCT FROM ${} \
+              AND os_version IS NOT DISTINCT FROM ${}",
+            group_base,
+            group_base + 1,
+            group_base + 2,
+            group_base + 3,
+        )
+    } else {
+        String::new()
+    };
+
     // See `list_persons`' doc comment: this is a WHERE-clause predicate on the
     // paging subquery, not a join, so it does not disturb where LIMIT is
     // applied. Omitted entirely under `All` — same reasoning as `list_persons`.
-    //
-    // Each leg aliases its subquery and qualifies the correlated column with
-    // that alias (`ae.device_key`, not bare `device_key`). Demonstrated live
-    // during review: with no alias, an unqualified name that happens to also
-    // exist on the inner table resolves there only by luck — if a future copy
-    // of this pattern targets a table with no `device_key` column, Postgres
-    // silently binds the bare name to the *outer* `devices` row instead,
-    // collapsing the whole `EXISTS` into `devices.device_key =
-    // devices.device_key` (always true, no error). Qualifying turns that
-    // mistake into a hard query error instead.
-    //
-    // The sessions leg also carries `started_at >= $2`, matching the `se`
-    // LATERAL below (and matching the `se` LATERAL's own pre-existing time
-    // bound, which predates this task). Without it, a device whose only
-    // env_a session is older than `since` — but whose `devices.last_seen` is
-    // recent from unrelated env_b activity — would still pass membership and
-    // render an all-zero row under `One(env_a)`, the exact bug this filter
-    // exists to prevent.
-    let membership_sql = if matches!(scope.env, EnvFilter::All) {
-        String::new()
-    } else {
-        let ae_env = scope.env.sql_fragment_for("ae", 6);
-        let ee_env = scope.env.sql_fragment_for("ee", 6);
-        let se_env = scope.env.sql_fragment_for("se", 6);
-        format!(
-            " AND ( \
-                EXISTS (SELECT 1 FROM analytics_events ae WHERE ae.app_id=$1 AND ae.device_key = devices.device_key{ae_env}) \
-                OR EXISTS (SELECT 1 FROM error_events ee WHERE ee.app_id=$1 AND ee.device_key = devices.device_key{ee_env}) \
-                OR EXISTS (SELECT 1 FROM sessions se WHERE se.app_id=$1 AND se.device_key = devices.device_key AND se.started_at >= $2{se_env}) \
-              )"
-        )
-    };
+    // See [`device_membership_sql`] for the alias-qualification and
+    // `started_at >= $2` reasoning; shared verbatim with [`list_device_groups`].
+    let membership_sql = device_membership_sql(&scope.env, 6);
 
     // `devices.events_count`/`errors_count` are lifetime counters that
     // `bump_device` increments on every event regardless of environment —
@@ -5057,7 +6741,7 @@ pub async fn list_devices(
              SELECT * FROM devices \
              WHERE app_id = $1 AND last_seen >= $2 \
                AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
-                    COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3{membership_sql} \
+                    COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3{membership_sql}{group_sql} \
              ORDER BY last_seen DESC LIMIT $4 OFFSET $5 \
          ) d{scoped_join} \
          LEFT JOIN LATERAL ( \
@@ -5067,6 +6751,176 @@ pub async fn list_devices(
              WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
          ) se ON TRUE \
          ORDER BY d.last_seen DESC"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(since)
+        .bind::<Text, _>(pattern)
+        .bind::<BigInt, _>(limit)
+        .bind::<BigInt, _>(offset);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    if let Some(k) = group {
+        stmt = stmt
+            .bind::<Nullable<Text>, _>(k.family.map(str::to_owned))
+            .bind::<Nullable<Text>, _>(k.model.map(str::to_owned))
+            .bind::<Nullable<Text>, _>(k.os_name.map(str::to_owned))
+            .bind::<Nullable<Text>, _>(k.os_version.map(str::to_owned));
+    }
+    stmt.get_results(conn).await
+}
+
+/// One row per `(family, model, os_name, os_version)` tuple — the Devices
+/// inventory's default shape. See
+/// `docs/superpowers/specs/2026-08-09-devices-grouped-by-model-and-os-design.md`.
+///
+/// No `last_distinct_id`: it is a per-device value with no meaningful aggregate
+/// over a group, and reproducing it would drag
+/// [`device_last_distinct_id_join`]'s per-device `UNION ALL ... LIMIT 1` into a
+/// query that — unlike [`list_devices`] — runs its joins over every qualifying
+/// device rather than one page of 50.
+///
+/// `browser`/`arch` are likewise absent: they are not part of the grouping key
+/// (a locked decision — every browser on Windows 11 folds into one row), so
+/// they have no single value per group. Both survive on the drill-down, which
+/// returns [`DeviceRow`].
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct DeviceGroupRow {
+    #[diesel(sql_type = Nullable<Text>)]
+    pub family: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub model: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub os_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub os_version: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub device_count: i64,
+    #[diesel(sql_type = BigInt)]
+    pub events_count: i64,
+    #[diesel(sql_type = BigInt)]
+    pub errors_count: i64,
+    #[diesel(sql_type = BigInt)]
+    pub sessions_count: i64,
+    #[diesel(sql_type = Timestamptz)]
+    pub first_seen: DateTime<Utc>,
+    #[diesel(sql_type = Timestamptz)]
+    pub last_seen: DateTime<Utc>,
+}
+
+/// [`list_devices`], but paged over descriptor groups instead of devices.
+///
+/// The qualifying-devices subquery is `list_devices`' verbatim — same
+/// `last_seen >= $2` window, same escaped `ILIKE`, same membership `EXISTS`
+/// legs — minus its `ORDER BY ... LIMIT/OFFSET`, because every qualifying
+/// device must be visible to the aggregate. Paging moves to the outer query,
+/// after `GROUP BY`.
+///
+/// Cost, stated rather than discovered: the count LATERALs run for every
+/// qualifying device in the window, not just the 50 on screen. Each is an index
+/// probe — `sessions_app_device_started_idx`, `analytics_events_app_device_idx`,
+/// `error_events_app_device_idx` — but this is strictly more work per request
+/// than `list_devices`' page-then-count, and is the accepted price of paging
+/// over groups.
+///
+/// The `All`-vs-scoped source split is `list_devices`' unchanged: durable
+/// `devices` columns under `All`, environment-scoped LATERALs otherwise,
+/// inheriting the same `sauron-tier` blind spot documented there.
+///
+/// NULL grouping is intended, not incidental: Postgres `GROUP BY` treats NULLs
+/// as equal, so devices reporting no descriptors collapse into one honest
+/// "Unknown" row rather than scattering into singletons.
+pub async fn list_device_groups(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    since: DateTime<Utc>,
+    limit: i64,
+    offset: i64,
+    search: Option<&str>,
+) -> QueryResult<Vec<DeviceGroupRow>> {
+    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+
+    // $1 app_id, $2 since, $3 pattern, $4 limit, $5 offset, env takes $6.
+    // Identical layout to `list_devices`, so the shared SQL fragments below can
+    // be copied across without renumbering.
+    let env_sql = scope.env.sql_fragment(6);
+
+    // Shared with `list_devices` — see Step 0. Same predicate, same bind index.
+    let membership_sql = device_membership_sql(&scope.env, 6);
+
+    // The aggregate wraps whichever source `list_devices` would have selected.
+    // `device_last_distinct_id_join` is deliberately NOT joined here — see
+    // `DeviceGroupRow`'s doc comment.
+    let (scoped_select, scoped_join) = if matches!(scope.env, EnvFilter::All) {
+        (
+            "sum(d.events_count)::bigint AS events_count, \
+             sum(d.errors_count)::bigint AS errors_count, \
+             min(d.first_seen) AS first_seen, \
+             max(d.last_seen) AS last_seen"
+                .to_string(),
+            String::new(),
+        )
+    } else {
+        (
+            "COALESCE(sum(ae.cnt), 0)::bigint AS events_count, \
+             COALESCE(sum(ee.cnt), 0)::bigint AS errors_count, \
+             min(LEAST(ae.min_occurred, ee.min_occurred, se.min_started)) AS first_seen, \
+             max(GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event)) AS last_seen"
+                .to_string(),
+            format!(
+                " LEFT JOIN LATERAL ( \
+                     SELECT count(*) AS cnt, min(occurred_at) AS min_occurred, \
+                            max(occurred_at) AS max_occurred FROM analytics_events \
+                     WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
+                 ) ae ON TRUE \
+                 LEFT JOIN LATERAL ( \
+                     SELECT count(*) AS cnt, min(occurred_at) AS min_occurred, \
+                            max(occurred_at) AS max_occurred FROM error_events \
+                     WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
+                 ) ee ON TRUE"
+            ),
+        )
+    };
+
+    // `ORDER BY last_seen`, the OUTPUT column, not `max(d.last_seen)`. The two
+    // coincide only under `All`; under a scoped filter the selected `last_seen`
+    // is derived from the LATERALs while `d.last_seen` is the app-wide column,
+    // which can be newer because of activity this scope cannot see. Postgres
+    // resolves a bare ORDER BY name against the select list's output aliases
+    // first. If it ever resolved the other way the query would raise "column
+    // d.last_seen must appear in the GROUP BY clause" — a hard error, not a
+    // silently mis-sorted page.
+    //
+    // The four `GROUP BY` columns are appended as a tiebreaker after
+    // `last_seen DESC` — ties on `last_seen` are not exotic (bulk/backfilled
+    // ingest, second-resolution SDK timestamps) and are otherwise unordered
+    // by Postgres, whose plan can differ between `OFFSET 0` (top-N heapsort)
+    // and a large `OFFSET` (full sort). Without a full tiebreaker, paging
+    // over more than one page of tied groups can show the same group twice
+    // while never showing another at all. `d.family, d.model, d.os_name,
+    // d.os_version` are exactly the `GROUP BY` list, so each group's tuple is
+    // unique and the combined ORDER BY fully determines page order without
+    // changing the primary (most-recent-first) ordering groups already show.
+    let q = format!(
+        "SELECT d.family, d.model, d.os_name, d.os_version, \
+                count(*)::bigint AS device_count, \
+                {scoped_select}, \
+                COALESCE(sum(se.cnt), 0)::bigint AS sessions_count \
+         FROM ( \
+             SELECT * FROM devices \
+             WHERE app_id = $1 AND last_seen >= $2 \
+               AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
+                    COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3{membership_sql} \
+         ) d{scoped_join} \
+         LEFT JOIN LATERAL ( \
+             SELECT count(*) FILTER (WHERE started_at >= $2) AS cnt, \
+                    min(started_at) AS min_started, max(last_event_at) AS max_last_event \
+             FROM sessions \
+             WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
+         ) se ON TRUE \
+         GROUP BY d.family, d.model, d.os_name, d.os_version \
+         ORDER BY last_seen DESC, d.family, d.model, d.os_name, d.os_version \
+         LIMIT $4 OFFSET $5"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -8940,6 +10794,7 @@ pub async fn enabled_metric_alert_rules(
 pub async fn alert_rules_for_monitor(
     conn: &mut AsyncPgConnection,
     project_id: Uuid,
+    monitor_id: Uuid,
     trigger_type: &str,
 ) -> QueryResult<Vec<AlertRule>> {
     let org: Option<Uuid> = projects::table
@@ -8960,8 +10815,34 @@ pub async fn alert_rules_for_monitor(
                 .is_null()
                 .or(alert_rules::project_id.eq(project_id)),
         )
+        // A rule with a NULL `monitor_id` covers every monitor in its scope —
+        // the same widening `project_id` already uses, so every rule stored
+        // before this column existed keeps firing exactly as it did.
+        .filter(
+            alert_rules::monitor_id
+                .is_null()
+                .or(alert_rules::monitor_id.eq(monitor_id)),
+        )
         .select(AlertRule::as_select())
         .load(conn)
+        .await
+}
+
+/// How many alert rules are pinned to `monitor_id` via `alert_rules.monitor_id`.
+///
+/// `monitor_id` is `ON DELETE CASCADE`, so deleting the monitor deletes these
+/// rules along with it. Callers use this count to disclose that blast radius
+/// to the caller *before* (dashboard) or *in the response of* (API) the
+/// delete, since the cascade itself is silent. Backed by
+/// `alert_rules_monitor_idx`.
+pub async fn count_alert_rules_for_monitor(
+    conn: &mut AsyncPgConnection,
+    monitor_id: Uuid,
+) -> QueryResult<i64> {
+    alert_rules::table
+        .filter(alert_rules::monitor_id.eq(monitor_id))
+        .count()
+        .get_result(conn)
         .await
 }
 
@@ -13355,4 +15236,299 @@ pub async fn active_users_by_day_hot(
         .bind::<Timestamptz, _>(to);
     stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_results(conn).await
+}
+
+// ===========================================================================
+// App store connections & daily install metrics
+// ===========================================================================
+
+pub async fn list_store_connections(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+) -> QueryResult<Vec<AppStoreConnection>> {
+    app_store_connections::table
+        .filter(app_store_connections::app_id.eq(app_id))
+        .select(AppStoreConnection::as_select())
+        .order(app_store_connections::store.asc())
+        .load(conn)
+        .await
+}
+
+pub async fn get_store_connection(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    store: &str,
+) -> QueryResult<Option<AppStoreConnection>> {
+    app_store_connections::table
+        .filter(app_store_connections::app_id.eq(app_id))
+        .filter(app_store_connections::store.eq(store))
+        .select(AppStoreConnection::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Create or update one app's connection to one store.
+///
+/// `secret_enc` is deliberately a *double* option: `None` = the caller did not
+/// send the field, leave the stored credential alone; `Some(None)` = the caller
+/// sent an explicit null, clear it; `Some(Some(b))` = replace it. Collapsing
+/// those first two cases means saving an edited package name silently wipes the
+/// service-account key, and the only symptom is a sync that starts failing
+/// hours later. Same idiom as `update_notification_channel`.
+///
+/// The credential is written by a second statement precisely because "leave it
+/// alone" is not something an upsert's `SET` list can express.
+pub async fn upsert_store_connection(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    store: &str,
+    identifiers: &Value,
+    secret_enc: Option<Option<Vec<u8>>>,
+) -> QueryResult<AppStoreConnection> {
+    diesel::insert_into(app_store_connections::table)
+        .values((
+            app_store_connections::app_id.eq(app_id),
+            app_store_connections::store.eq(store),
+            app_store_connections::identifiers.eq(identifiers),
+            app_store_connections::secret_enc.eq(secret_enc.clone().flatten()),
+        ))
+        .on_conflict((app_store_connections::app_id, app_store_connections::store))
+        .do_update()
+        .set((
+            app_store_connections::identifiers.eq(identifiers),
+            app_store_connections::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await?;
+
+    if let Some(s) = secret_enc {
+        diesel::update(
+            app_store_connections::table
+                .filter(app_store_connections::app_id.eq(app_id))
+                .filter(app_store_connections::store.eq(store)),
+        )
+        .set((
+            app_store_connections::secret_enc.eq(s),
+            app_store_connections::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await?;
+    }
+
+    get_store_connection(conn, app_id, store)
+        .await?
+        .ok_or(diesel::result::Error::NotFound)
+}
+
+/// Remove the credential and its configuration.
+///
+/// `store_daily_metrics` is deliberately untouched: collected history is not a
+/// credential, and re-adding the connection resumes against it rather than
+/// starting from nothing.
+pub async fn delete_store_connection(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    store: &str,
+) -> QueryResult<usize> {
+    diesel::delete(
+        app_store_connections::table
+            .filter(app_store_connections::app_id.eq(app_id))
+            .filter(app_store_connections::store.eq(store)),
+    )
+    .execute(conn)
+    .await
+}
+
+/// Make a connection due now. The daemon does the fetching — a multi-minute
+/// store download must never run inside an HTTP request.
+pub async fn queue_store_sync(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    store: &str,
+) -> QueryResult<usize> {
+    diesel::update(
+        app_store_connections::table
+            .filter(app_store_connections::app_id.eq(app_id))
+            .filter(app_store_connections::store.eq(store)),
+    )
+    .set(app_store_connections::next_sync_at.eq(Utc::now()))
+    .execute(conn)
+    .await
+}
+
+/// Atomically claim due connections and push `next_sync_at` forward so no peer
+/// daemon picks the same rows. Shape copied from `claim_due_monitors`.
+pub async fn claim_due_store_connections(
+    conn: &mut AsyncPgConnection,
+    batch: i64,
+    interval_secs: i64,
+) -> QueryResult<Vec<AppStoreConnection>> {
+    diesel::sql_query(
+        "UPDATE app_store_connections \
+            SET next_sync_at = now() + make_interval(secs => $2) \
+          WHERE id IN ( \
+              SELECT id FROM app_store_connections \
+               WHERE enabled AND next_sync_at <= now() \
+               ORDER BY next_sync_at FOR UPDATE SKIP LOCKED LIMIT $1 \
+          ) RETURNING *",
+    )
+    .bind::<BigInt, _>(batch)
+    .bind::<BigInt, _>(interval_secs)
+    .get_results(conn)
+    .await
+}
+
+/// Record the outcome of one sync.
+///
+/// `None` stamps `last_synced_at` and clears any stale error. `Some(msg)`
+/// records the error and deliberately does *not* stamp the success time — a
+/// permanently failing connection must never render as freshly synced.
+pub async fn record_store_sync_result(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    error: Option<&str>,
+) -> QueryResult<usize> {
+    match error {
+        None => {
+            diesel::update(app_store_connections::table.find(id))
+                .set((
+                    app_store_connections::last_synced_at.eq(Some(Utc::now())),
+                    app_store_connections::last_error.eq::<Option<String>>(None),
+                    app_store_connections::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+        }
+        Some(msg) => {
+            diesel::update(app_store_connections::table.find(id))
+                .set((
+                    app_store_connections::last_error.eq(Some(msg.to_string())),
+                    app_store_connections::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+        }
+    }
+}
+
+/// Persist connector-private bookkeeping (Apple's ongoing report-request id).
+pub async fn set_store_sync_state(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    state: &Value,
+) -> QueryResult<usize> {
+    diesel::update(app_store_connections::table.find(id))
+        .set(app_store_connections::sync_state.eq(state))
+        .execute(conn)
+        .await
+}
+
+/// Any one stored store credential, for proving at boot that the configured key
+/// can open what is on disk. Mirrors `any_channel_secret_enc`.
+pub async fn any_store_secret_enc(conn: &mut AsyncPgConnection) -> QueryResult<Option<Vec<u8>>> {
+    app_store_connections::table
+        .filter(app_store_connections::secret_enc.is_not_null())
+        .select(app_store_connections::secret_enc)
+        .first::<Option<Vec<u8>>>(conn)
+        .await
+        .optional()
+        .map(Option::flatten)
+}
+
+/// Write one store's daily counts.
+///
+/// `DO UPDATE SET`, never `+=`. Both stores restate recent days as their
+/// pipelines settle, so the same day is fetched repeatedly; an additive upsert
+/// multiplies every number by the number of syncs and yields a chart that rises
+/// smoothly and is entirely fiction.
+pub async fn upsert_store_daily_metrics(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    store: &str,
+    rows: &[(chrono::NaiveDate, i64, i64)],
+) -> QueryResult<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let values: Vec<_> = rows
+        .iter()
+        .map(|(day, installs, uninstalls)| {
+            (
+                store_daily_metrics::app_id.eq(app_id),
+                store_daily_metrics::store.eq(store),
+                store_daily_metrics::day.eq(*day),
+                store_daily_metrics::installs.eq(*installs),
+                store_daily_metrics::uninstalls.eq(*uninstalls),
+                store_daily_metrics::updated_at.eq(Utc::now()),
+            )
+        })
+        .collect();
+
+    diesel::insert_into(store_daily_metrics::table)
+        .values(values)
+        .on_conflict((
+            store_daily_metrics::app_id,
+            store_daily_metrics::store,
+            store_daily_metrics::day,
+        ))
+        .do_update()
+        .set((
+            store_daily_metrics::installs.eq(excluded(store_daily_metrics::installs)),
+            store_daily_metrics::uninstalls.eq(excluded(store_daily_metrics::uninstalls)),
+            store_daily_metrics::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
+}
+
+/// One app's counts across both stores, from `since` forward.
+pub async fn store_metrics_range(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    since: chrono::NaiveDate,
+) -> QueryResult<Vec<StoreDailyMetric>> {
+    store_daily_metrics::table
+        .filter(store_daily_metrics::app_id.eq(app_id))
+        .filter(store_daily_metrics::day.ge(since))
+        .select(StoreDailyMetric::as_select())
+        .order((
+            store_daily_metrics::day.asc(),
+            store_daily_metrics::store.asc(),
+        ))
+        .load(conn)
+        .await
+}
+
+/// Is this environment enrollment one of `app_id`'s own?
+///
+/// Guards `store_environment_id`: accepting any UUID would store a designation
+/// that can never match the switcher, hiding the Overview section forever with
+/// no error to explain why.
+pub async fn app_environment_belongs_to_app(
+    conn: &mut AsyncPgConnection,
+    env_id: Uuid,
+    app_id: Uuid,
+) -> QueryResult<bool> {
+    let n: i64 = app_environments::table
+        .filter(app_environments::id.eq(env_id))
+        .filter(app_environments::app_id.eq(app_id))
+        .count()
+        .get_result(conn)
+        .await?;
+    Ok(n > 0)
+}
+
+pub async fn set_app_store_environment(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    env_id: Option<Uuid>,
+) -> QueryResult<usize> {
+    diesel::update(apps::table.find(app_id))
+        .set((
+            apps::store_environment_id.eq(env_id),
+            apps::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
 }

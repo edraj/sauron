@@ -139,6 +139,13 @@ pub struct App {
     pub updated_at: DateTime<Utc>,
     pub app_type: String,
     pub project_id: Uuid,
+    /// The environment whose build ships to the app stores, or `None`.
+    ///
+    /// An `app_environments` (enrollment) id, not a catalogue id — the same id
+    /// the dashboard's environment switcher carries, so the Overview gate is a
+    /// plain equality check. The stores themselves have no environment
+    /// dimension; this only decides where the section is shown.
+    pub store_environment_id: Option<Uuid>,
 }
 
 #[derive(Debug, Insertable)]
@@ -996,6 +1003,7 @@ pub struct AlertRule {
     pub org_id: Uuid,
     pub project_id: Option<Uuid>,
     pub app_id: Option<Uuid>,
+    pub monitor_id: Option<Uuid>,
     pub name: String,
     pub trigger_type: String,
     pub enabled: bool,
@@ -1015,6 +1023,7 @@ pub struct NewAlertRule<'a> {
     pub org_id: Uuid,
     pub project_id: Option<Uuid>,
     pub app_id: Option<Uuid>,
+    pub monitor_id: Option<Uuid>,
     pub name: &'a str,
     pub trigger_type: &'a str,
     pub conditions: &'a Value,
@@ -1561,6 +1570,53 @@ pub struct RestoreJob {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// One app's credentials and sync bookkeeping for one store.
+///
+/// Derives **no** `Serialize`, deliberately: `secret_enc` is the AES-GCM
+/// credential, and the API's response type is a separate struct that carries
+/// only `has_secret`. Returning this row from a handler is therefore a compile
+/// error rather than a credential leak.
+///
+/// `identifiers` is public, displayable configuration whose shape depends on
+/// `store`; `sync_state` is connector-private bookkeeping (for Apple, the id of
+/// the ongoing `analyticsReportRequest`, created once and reused).
+// `QueryableByName` is required by `claim_due_store_connections`, which is raw
+// `sql_query` (FOR UPDATE SKIP LOCKED has no query-builder equivalent). Still
+// no `Serialize` — that is the compile-time half of "secrets are write-only".
+#[derive(Debug, Clone, Queryable, Selectable, QueryableByName)]
+#[diesel(table_name = app_store_connections)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AppStoreConnection {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub store: String,
+    pub enabled: bool,
+    pub identifiers: Value,
+    pub secret_enc: Option<Vec<u8>>,
+    pub sync_state: Value,
+    pub next_sync_at: DateTime<Utc>,
+    pub last_synced_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One store's counts for one calendar day.
+///
+/// No `environment_id`: the stores key their data to a package name or bundle
+/// id and have no environment dimension to report. See migration 49.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[diesel(table_name = store_daily_metrics)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct StoreDailyMetric {
+    pub app_id: Uuid,
+    pub store: String,
+    pub day: chrono::NaiveDate,
+    pub installs: i64,
+    pub uninstalls: i64,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

@@ -99,9 +99,15 @@ pub fn from_legacy(filters: &[String], q: Option<&str>) -> Result<Node, QueryErr
         };
 
         if !is_field_ident(&field) {
+            // `resource: None` — this bridge is purely syntactic and is handed
+            // no resource, so it cannot list what is available. It does not
+            // need to: the complaint is that the name is not even an
+            // identifier. Every name that IS one falls through to `resolve`,
+            // which knows the resource and produces the full message.
             return Err(QueryError::UnknownField {
                 field: field.clone(),
                 at: i,
+                resource: None,
             });
         }
 

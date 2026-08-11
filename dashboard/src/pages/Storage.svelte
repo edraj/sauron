@@ -24,6 +24,17 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
+  import {
+    parseWholeDays,
+    isHotDaysValid,
+    parseRestoreDays,
+    isHotDaysDirty,
+    revertWouldLower,
+    describeRevert,
+    RESTORE_MIN_DAYS,
+    RESTORE_MAX_DAYS,
+  } from '../lib/models/tier-policy';
+  import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
 
   let report = $state<StorageReport | null>(null);
   let loading = $state(true);
@@ -34,10 +45,22 @@
   // of one tenant gets a 403 here while the storage report above still renders.
   // Treating that as a page-level error would break Storage for them entirely.
   let policy = $state<TierPolicy | null>(null);
-  let policyError = $state<string | null>(null);
+  /**
+   * Split deliberately. A load failure means there is no policy to show, so it
+   * replaces the card. An ACTION failure — a rejected Apply, a pin that would
+   * not release — must not: it used to share one variable with the load error,
+   * so a single 400 unmounted the input, both buttons, the facts and the pin
+   * list, and the only route back was a page reload (the poll that could have
+   * re-fetched runs only while a restore job is active).
+   */
+  let policyLoadError = $state<string | null>(null);
+  let policyActionError = $state<string | null>(null);
   let policyBusy = $state(false);
   let hotDaysInput = $state('');
+  /** Last value written into the field from the server. See `isHotDaysDirty`. */
+  let seededHotDays = $state('');
   let policySaved = $state(false);
+  const hotDaysDirty = $derived(isHotDaysDirty(hotDaysInput, seededHotDays));
 
   // Which app rows are expanded to show their cold Parquet file inventory.
   let openApp = $state<Record<string, boolean>>({});
@@ -58,41 +81,89 @@
   }
 
   async function loadPolicy() {
-    policyError = null;
+    policyLoadError = null;
     try {
       policy = await getTierPolicy();
-      hotDaysInput = String(policy.effective_hot_days);
+      // Never over an edit in progress: this runs from a 3s poll while a
+      // restore job is active, and reseeding unconditionally is what made the
+      // field impossible to type in. `policy` itself still updates, so the
+      // "In force" row below keeps showing the server's value — the input is
+      // the draft, the facts are the truth.
+      if (!hotDaysDirty) {
+        const seeded = String(policy.effective_hot_days);
+        hotDaysInput = seeded;
+        seededHotDays = seeded;
+      }
     } catch (e) {
       policy = null;
-      policyError = (e as Error).message;
+      policyLoadError = (e as Error).message;
     }
   }
 
-  async function savePolicy(next: number | null) {
+  /**
+   * `next` is deliberately non-nullable, and separate from `revertPolicy`
+   * below. On the wire `hot_days: null` means "clear the override", which is
+   * the Revert button's job — and when the override sits above the configured
+   * default, clearing it lowers the rotation age, the one change this page
+   * warns is irreversible. Keeping null out of this signature makes
+   * `savePolicy(parsedHotDays)` a compile error the moment `parsedHotDays`
+   * becomes nullable again, rather than a silent revert.
+   */
+  async function savePolicy(next: number) {
+    await putPolicy(next);
+  }
+
+  /**
+   * The explicit "back to the configured default" path.
+   *
+   * Guarded when it would LOWER the rotation age, because then it is not an
+   * undo — it is the same irreversible export-and-drop the typed-value warning
+   * covers, reached from one click. Reverting upward destroys nothing, so it
+   * goes straight through rather than training people to dismiss the dialog.
+   */
+  let confirmRevert = $state(false);
+
+  function askRevert() {
+    if (policy !== null && revertWouldLower(policy)) {
+      confirmRevert = true;
+      return;
+    }
+    void revertPolicy();
+  }
+
+  async function revertPolicy() {
+    // Closed AFTER the request, not before, so `loading` on the dialog is real:
+    // the confirm button spins and Cancel is disabled while the PUT is in
+    // flight, rather than the dialog vanishing and leaving a destructive action
+    // with no visible progress.
+    await putPolicy(null);
+    confirmRevert = false;
+  }
+
+  async function putPolicy(next: number | null) {
     policyBusy = true;
-    policyError = null;
+    policyActionError = null;
     policySaved = false;
     try {
       policy = await setTierPolicy(next);
-      hotDaysInput = String(policy.effective_hot_days);
+      const seeded = String(policy.effective_hot_days);
+      hotDaysInput = seeded;
+      seededHotDays = seeded;
       policySaved = true;
     } catch (e) {
-      policyError = (e as Error).message;
+      policyActionError = (e as Error).message;
     } finally {
       policyBusy = false;
     }
   }
 
   // Parsed once so the button's disabled state and the submit path can never
-  // disagree about whether the input is valid.
-  const parsedHotDays = $derived.by(() => {
-    const t = hotDaysInput.trim();
-    if (!/^\d+$/.test(t)) return null;
-    const n = Number(t);
-    return Number.isSafeInteger(n) ? n : null;
-  });
+  // disagree about whether the input is valid. The field is a TEXT input on
+  // purpose — see lib/models/tier-policy.ts for why a number input made this
+  // parse both crash and, worse, silently round a mis-typed value down.
+  const parsedHotDays = $derived(parseWholeDays(hotDaysInput));
   const hotDaysValid = $derived(
-    parsedHotDays !== null && policy !== null && parsedHotDays >= policy.min_hot_days,
+    policy !== null && isHotDaysValid(parsedHotDays, policy.min_hot_days),
   );
   const wouldLower = $derived(
     policy !== null && parsedHotDays !== null && parsedHotDays < policy.effective_hot_days,
@@ -130,12 +201,8 @@
     return { start, end };
   });
 
-  const restoreDaysValid = $derived.by(() => {
-    const t = restoreDays.trim();
-    if (!/^\d+$/.test(t)) return false;
-    const n = Number(t);
-    return n >= 1 && n <= 365;
-  });
+  const parsedRestoreDays = $derived(parseRestoreDays(restoreDays));
+  const restoreDaysValid = $derived(parsedRestoreDays !== null);
 
   const restoreValid = $derived(restoreRange !== null && restoreDaysValid && !restoreBusy);
 
@@ -144,14 +211,15 @@
       jobs = await listRestores();
     } catch {
       // Deliberately quiet: the job list is secondary to the policy card, and
-      // the same 403 that hides the policy hides this. `policyError` above
+      // the same 403 that hides the policy hides this. `policyLoadError` above
       // already says so once.
     }
   }
 
   async function submitRestore() {
     const range = restoreRange;
-    if (!range || !restoreDaysValid) return;
+    const days = parsedRestoreDays;
+    if (!range || days === null) return;
     restoreBusy = true;
     restoreError = null;
     try {
@@ -159,7 +227,7 @@
         table_name: restoreTable,
         range_start: range.start.toISOString(),
         range_end: range.end.toISOString(),
-        expires_in_days: Number(restoreDays.trim()),
+        expires_in_days: days,
       });
       await loadJobs();
     } catch (e) {
@@ -171,11 +239,12 @@
 
   async function doReleasePin(id: string) {
     pinBusy = id;
+    policyActionError = null;
     try {
       await releasePin(id);
       await loadPolicy();
     } catch (e) {
-      policyError = (e as Error).message;
+      policyActionError = (e as Error).message;
     } finally {
       pinBusy = null;
     }
@@ -183,11 +252,12 @@
 
   async function doExtendPin(id: string) {
     pinBusy = id;
+    policyActionError = null;
     try {
       await extendPin(id, 30);
       await loadPolicy();
     } catch (e) {
-      policyError = (e as Error).message;
+      policyActionError = (e as Error).message;
     } finally {
       pinBusy = null;
     }
@@ -267,11 +337,15 @@
 
       <div class="section">
         <Card title="Cold-tier rotation">
-          {#if policyError}
+          {#if policyLoadError}
             <!-- Shown inline, not as a page error: this endpoint needs org:manage in
                  every org, so a single-tenant admin legitimately gets a 403 while the
-                 rest of this page still works for them. -->
-            <p class="policy-denied muted">{policyError}</p>
+                 rest of this page still works for them.
+
+                 Only a LOAD failure belongs here. An action that fails leaves the
+                 policy perfectly displayable, so it renders inside the card below —
+                 replacing the card would strand the user with no way to retry. -->
+            <p class="policy-denied muted">{policyLoadError}</p>
           {:else if policy}
             {@const pol = policy}
             <p class="muted policy-lede">
@@ -283,11 +357,14 @@
             <div class="policy-row">
               <label class="policy-field">
                 <span class="policy-label">Rotation age (days)</span>
+                <!-- Text, not type="number": the binding on a number input
+                     hands back a coerced float, which both broke the parse
+                     below and turned a mis-typed "3.0" into a saved 3-day
+                     rotation. tier-policy.ts has the full reasoning. -->
                 <input
                   class="policy-input"
-                  type="number"
-                  min={pol.min_hot_days}
-                  step="1"
+                  type="text"
+                  inputmode="numeric"
                   bind:value={hotDaysInput}
                   disabled={policyBusy}
                 />
@@ -295,12 +372,18 @@
               <Button
                 variant="primary"
                 disabled={!hotDaysValid || policyBusy}
-                onclick={() => savePolicy(parsedHotDays)}
+                onclick={() => {
+                  // Belt and braces with the `disabled` above: that guard is a
+                  // derived value, and a derived that throws leaves the button
+                  // frozen at its last state — which is exactly how this card
+                  // first broke. submitRestore re-checks for the same reason.
+                  if (parsedHotDays !== null) savePolicy(parsedHotDays);
+                }}
               >
                 {policyBusy ? 'Saving…' : 'Apply'}
               </Button>
               {#if pol.overridden}
-                <Button variant="secondary" disabled={policyBusy} onclick={() => savePolicy(null)}>
+                <Button variant="secondary" disabled={policyBusy} onclick={askRevert}>
                   Revert to default ({pol.configured_hot_days}d)
                 </Button>
               {/if}
@@ -325,7 +408,16 @@
               </p>
             {/if}
 
-            {#if policySaved}
+            {#if policyActionError}
+              <p class="policy-err" role="alert">
+                <Icon name="triangle-alert" size={14} />
+                {policyActionError}
+              </p>
+            {/if}
+
+            <!-- Hidden the moment the field says something else: otherwise the
+                 page goes on asserting that an unsaved number is in force. -->
+            {#if policySaved && !hotDaysDirty}
               <p class="policy-ok">Saved. Takes effect on the tier worker's next cycle.</p>
             {/if}
 
@@ -441,8 +533,9 @@
                 <input class="policy-input" type="date" bind:value={restoreTo} disabled={restoreBusy} />
               </label>
               <label class="policy-field">
-                <span class="policy-label">Keep for (days)</span>
-                <input class="policy-input" type="number" min="1" max="365" bind:value={restoreDays} disabled={restoreBusy} />
+                <span class="policy-label">Keep for ({RESTORE_MIN_DAYS}–{RESTORE_MAX_DAYS} days)</span>
+                <!-- Text for the same reason as the rotation age above. -->
+                <input class="policy-input" type="text" inputmode="numeric" bind:value={restoreDays} disabled={restoreBusy} />
               </label>
               <Button disabled={!restoreValid} onclick={submitRestore}>
                 {restoreBusy ? 'Queueing…' : 'Restore'}
@@ -624,6 +717,17 @@
   </div>
 </AdminShell>
 
+<ConfirmDialog
+  bind:open={confirmRevert}
+  title="Lower the rotation age?"
+  message={policy && revertWouldLower(policy) ? describeRevert(policy) : ''}
+  confirmLabel="Revert"
+  danger
+  loading={policyBusy}
+  onconfirm={revertPolicy}
+  oncancel={() => (confirmRevert = false)}
+/>
+
 <style>
   .policy-lede { margin: 0 0 14px; }
   .policy-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
@@ -646,6 +750,20 @@
     border: 1px solid var(--warning, var(--border-strong));
     border-radius: var(--radius);
     color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  /* Same shape as .policy-warn, error tone: an action that failed is a harder
+     signal than a caution about one that would succeed. */
+  .policy-err {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    margin: 12px 0 0;
+    padding: 9px 11px;
+    border: 1px solid var(--error);
+    border-radius: var(--radius);
+    color: var(--error);
     font-size: 13px;
     line-height: 1.5;
   }

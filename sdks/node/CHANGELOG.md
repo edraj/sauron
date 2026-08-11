@@ -2,6 +2,28 @@
 
 All notable changes to `@edraj/sauron-node` are documented here.
 
+## 1.4.0
+
+### Fixed
+
+- **`trackTransaction` shipped transactions with no duration, silently.** This
+  SDK's input field is `duration_ms`; the browser SDK's is `durationMs`. A
+  snippet moved between the two — or any plain-JavaScript caller, where the type
+  checker is not there to object — produced a transaction item missing the one
+  field it exists to carry, and nothing anywhere complained: the item validated,
+  shipped, and looked delivered.
+
+  `durationMs` is now accepted as an alias, and a transaction with no usable
+  duration is **dropped with a debug log line rather than sent**. Refusing is the
+  point: sending it anyway is what let the misspelling survive unnoticed.
+  `duration_ms: 0` is a legitimate duration and is still sent.
+
+### Changed
+
+- `TransactionInput.duration_ms` is now optional, since `durationMs` may supply
+  it instead. Supply exactly one — `duration_ms` wins if both are present.
+  Supplying neither is the drop above, not a compile error.
+
 ## 1.3.0
 
 ### Added

@@ -1,25 +1,31 @@
 import { api } from './client';
+import { searchParams, type SearchEnvelope, type SearchParams } from './search';
 import type { AnalyticsEvent, SeriesPoint, TopEvent } from '../models';
 
-export interface ListEventsParams {
-  filters?: string[];
-  q?: string;
-  sinceDays?: number;
-  limit?: number;
-  offset?: number;
-}
+/**
+ * `sort` accepts `occurred_at` (the default), `name`, `distinct_id` or
+ * `session_id`, `-`-prefixed for ascending — the columns with a supporting
+ * keyset index on this table. Anything else is a 400 naming what is allowed.
+ * `limit` is clamped server-side to 1..200.
+ *
+ * This route DID have a working `offset` before S2c — it is the one list that
+ * genuinely lost a feature rather than a parameter nobody used. The server now
+ * accepts and ignores it, so the client stopped sending it; page with `cursor`.
+ */
+export type ListEventsParams = SearchParams;
 
+/**
+ * Answers a {@link SearchEnvelope}, not a bare array, since S2c — the last of
+ * the slice's three lists.
+ */
 export async function listEvents(
   appId: string,
   opts: ListEventsParams = {},
-): Promise<AnalyticsEvent[]> {
-  const p = new URLSearchParams();
-  for (const f of opts.filters ?? []) p.append('filter', f);
-  if (opts.q) p.set('q', opts.q);
-  if (opts.sinceDays != null) p.set('since_days', String(opts.sinceDays));
-  if (opts.limit != null) p.set('limit', String(opts.limit));
-  if (opts.offset != null) p.set('offset', String(opts.offset));
-  const { data } = await api.get<AnalyticsEvent[]>(`/v1/apps/${appId}/events/list?${p.toString()}`);
+): Promise<SearchEnvelope<AnalyticsEvent>> {
+  const p = searchParams(opts);
+  const { data } = await api.get<SearchEnvelope<AnalyticsEvent>>(
+    `/v1/apps/${appId}/events/list?${p.toString()}`,
+  );
   return data;
 }
 

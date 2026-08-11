@@ -42,6 +42,89 @@ export function parseFilters(raw: string[], fields: FieldDef[]): Filter[] {
   return out;
 }
 
+// Bounds of the `i64` the server parses numeric filter values into.
+const I64_MIN = BigInt('-9223372036854775808');
+const I64_MAX = BigInt('9223372036854775807');
+
+/**
+ * Whether `value` is acceptable for a `type: 'number'` field.
+ *
+ * Mirrors `FieldType::Num => value.parse::<i64>()` in
+ * `backend/crates/sauron-db/src/filter.rs`: an optionally-signed run of
+ * decimal digits that fits in an i64, and nothing else. Anything this rejects
+ * comes back from the API as `FilterError::BadValue`, which fails the whole
+ * request — so a chip that reaches the server must already satisfy this.
+ *
+ * Deliberately not a `Number()` check. `Number` accepts `1e3`, `3.5`, `0x10`
+ * and `' 7 '`, every one of which Rust's `from_str` refuses, and it silently
+ * loses precision past 2^53 where an i64 is still exact — so it would be
+ * wrong in both directions. The comparison is done in BigInt for the same
+ * reason.
+ *
+ * Signs are allowed because the server allows them. `times_seen`/`users_seen`
+ * are counts where a negative is merely pointless rather than malformed, and
+ * being stricter here than the API would reject a query the API would answer.
+ */
+export function isNumericFilterValue(value: string): boolean {
+  // The `string` in the signature is not enforceable at the call site: these
+  // values arrive from a `bind:value`, which svelte types as `any` on a raw
+  // `<input>`, so TypeScript cannot see a number arriving here. `RegExp.test`
+  // would coerce one to its digits and quietly pass it, which is how a
+  // non-string ends up in `Filter.value` — check the type, not just the shape.
+  if (typeof value !== 'string') return false;
+  if (!/^[+-]?\d+$/.test(value)) return false;
+  const n = BigInt(value);
+  return n >= I64_MIN && n <= I64_MAX;
+}
+
+/**
+ * Whether a draft value may be committed as a filter on `def`.
+ *
+ * This replaces a bare `value === ''` guard in FilterBar. That guard read as
+ * "reject the empty field", but it only ever rejected the empty *string*:
+ * `bind:value` on `<input type="number">` writes back `null` once the field is
+ * cleared (Svelte coerces numberlike inputs — see `to_number` in
+ * `svelte/src/internal/client/dom/elements/bindings/input.js`), and
+ * `null === ''` is false, so a cleared field committed a filter whose value
+ * was `null`. That encodes to `times_seen:eq:null` and fails the request for
+ * the whole list until the chip is removed. The input is plain text now, but
+ * the guard checks the value it is actually about to send either way.
+ *
+ * `tag` is absent on purpose: its value is composed from two separate fields
+ * and FilterBar validates those halves before composing them.
+ */
+export function isFilterValueValid(def: FieldDef | undefined, value: string): boolean {
+  // `typeof` rather than `value === ''`: the whole defect this replaces was a
+  // comparison that assumed the runtime type matched the declared one.
+  if (!def || typeof value !== 'string' || value === '') return false;
+  if (def.type === 'number') return isNumericFilterValue(value);
+  // Mirrors the server's `FieldType::Enum` check. The `<select>` cannot
+  // produce anything else today; this keeps that from being load-bearing.
+  if (def.type === 'enum') return (def.options ?? []).includes(value);
+  return true;
+}
+
+/**
+ * The value a draft filter should store, given the field it is for.
+ *
+ * Number values are trimmed: the server parses them with Rust's
+ * `i64::from_str`, which refuses surrounding whitespace, so a pasted `" 7 "`
+ * would fail the request. Everything else is stored verbatim — for a
+ * `contains` search the spaces may well be the point.
+ *
+ * Takes the non-string shapes for the same reason `isNumericFilterValue`
+ * checks `typeof`: this sits directly on a `bind:value`, so putting a bare
+ * `.trim()` at the call site is what re-adding `type="number"` to the input
+ * would turn back into a TypeError.
+ */
+export function normalizeFilterValue(
+  def: FieldDef | undefined,
+  raw: string | number | null | undefined,
+): string {
+  const text = typeof raw === 'number' ? String(raw) : (raw ?? '');
+  return def?.type === 'number' ? text.trim() : text;
+}
+
 /** Compose a tag key + value into the single `key=value` filter value slot. */
 export function composeTag(key: string, value: string): string {
   return `${key}=${value}`;

@@ -16,6 +16,13 @@ enable sauron-ingest.service
 enable sauron-monitor.service
 enable sauron-alerts.service
 enable sauron-tier.service
+# ENABLED, unlike the inspector below, and for the reason this file exists at
+# all: store credentials are configured in the dashboard, so a disabled syncer
+# means an admin saves a Play or App Store key, sees "Waiting for the first
+# sync" forever, and nothing anywhere says why. Idle cost is one claim query a
+# minute returning zero rows — the daemon does nothing at all until a
+# connection exists, and its pool is lazy.
+enable sauron-storesync.service
 
 # sauron-inspector stays OFF deliberately — the PII inspector is opt-in. Its
 # extra 4-connection pool pushes a stock Postgres past max_connections, and the

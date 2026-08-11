@@ -42,6 +42,20 @@
   // would take the whole page down on `.length`, not just hide a chip.
   const probeHeaders = $derived(detail?.monitor.probe_header_names ?? []);
 
+  // alert_rules.monitor_id is ON DELETE CASCADE, so deleting the monitor
+  // silently deletes any alert rule pinned to it too. The count comes from
+  // the detail payload so the operator sees it before confirming, not after
+  // (the delete response also discloses it, but by then it's too late).
+  const deleteMessage = $derived.by(() => {
+    if (!detail) return '';
+    const n = detail.pinned_alert_rules;
+    const alertClause =
+      n > 0
+        ? ` This will also delete ${n} alert ${n === 1 ? 'rule' : 'rules'} pinned to it.`
+        : '';
+    return `Delete “${detail.monitor.name}”? Its check history and incidents will be removed.${alertClause} This can't be undone.`;
+  });
+
   // Sort by timestamp ourselves rather than trusting the API's order: the newest-
   // first log and the (chronological) availability strip stay correct even if the
   // endpoint's ORDER BY ever changes.
@@ -320,7 +334,7 @@
 <ConfirmDialog
   bind:open={confirmOpen}
   title="Delete monitor"
-  message={detail ? `Delete “${detail.monitor.name}”? Its check history and incidents will be removed. This can't be undone.` : ''}
+  message={deleteMessage}
   confirmLabel="Delete monitor"
   danger
   loading={deleting}

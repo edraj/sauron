@@ -8,6 +8,7 @@
 //! Testable without a database: `diesel::debug_query::<Pg, _>` renders the SQL and
 //! the binds with no connection, so the whole mapping is asserted in CI.
 
+pub mod cursor;
 pub mod events;
 pub mod issues;
 pub mod occurrences;
@@ -516,17 +517,51 @@ mod tests {
         // if these counts ever differ from what S2b's design fixed, the
         // catalog and the plan have drifted apart, which needs investigating
         // rather than just re-pinning the number.
-        assert_eq!(dimensions_for(Resource::Issues).count(), 12);
-        assert_eq!(dimensions_for(Resource::Occurrences).count(), 19);
-        assert_eq!(dimensions_for(Resource::Events).count(), 8);
+        //
+        // The three notes below say a missing entry would be "silently
+        // reinterpreted as a tag key". That was true when they were written;
+        // `resolve_field`'s unknown-field-means-tag fallback has since been
+        // removed, so the same omission is now a 400 instead. Still a
+        // regression on every existing bookmark — just an audible one.
+        // 13, not S2b's 12: S2c Task 4 added `workflow` to `R_ISSUES`. Not a
+        // new capability — `filter=workflow:eq:X` already worked on the issues
+        // list, and bridging that route through `from_legacy` without a
+        // catalog entry would have silently reinterpreted the field as a tag
+        // key. See the dimension's own comment in `catalog.rs`.
+        // 20, not S2b's 19: S2c Task 5 widened `workflow` from `R_ISSUES` to
+        // `R_ISSUE_OCC`. Not a new capability either — `filter=workflow:eq:X`
+        // already worked on the per-issue occurrences list
+        // (`ERROR_EVENT_FILTERS`), and bridging that route through
+        // `from_legacy` without a catalog entry for the resource would have
+        // silently reinterpreted the field as a tag key, exactly as it would
+        // have on Issues. See the dimension's own comment in `catalog.rs`.
+        // 9, not S2b's 8: S2c Task 6 widened `workflow` again, from
+        // `R_ISSUE_OCC` to all three list resources. Not a new capability
+        // either — `filter=workflow:eq:X` already worked on the analytics
+        // Event Explorer (`EVENT_FILTERS`), and bridging that route through
+        // `from_legacy` without a catalog entry for the resource would have
+        // silently reinterpreted the field as a tag key, exactly as it would
+        // have on Issues and on Occurrences.
+        assert_eq!(dimensions_for(Resource::Issues).count(), 13);
+        assert_eq!(dimensions_for(Resource::Occurrences).count(), 20);
+        assert_eq!(dimensions_for(Resource::Events).count(), 9);
 
         let fixed = Uuid::nil();
-        assert_full_coverage(Resource::Issues, &IssuesLower { app_id: fixed });
+        assert_full_coverage(
+            Resource::Issues,
+            &IssuesLower {
+                app_id: fixed,
+                text_reach: crate::repo::TextSearchReach::IncludingBody,
+                env: &crate::scope::EnvFilter::All,
+                since: Utc::now() - chrono::Duration::days(30),
+            },
+        );
         assert_full_coverage(
             Resource::Occurrences,
             &OccurrencesLower {
                 app_id: fixed,
                 issue_id: fixed,
+                text_reach: crate::repo::TextSearchReach::IncludingBody,
             },
         );
         assert_full_coverage(Resource::Events, &EventsLower { app_id: fixed });

@@ -140,22 +140,25 @@ mod tests {
         // seek — unlike on Issues (see `tag_equality_is_indexed_on_occurrences_
         // but_not_on_issues` below), where there is no `tags` column at all.
         assert_eq!(
-            cost("checkout_step:payment", Resource::Occurrences),
+            cost("tag.checkout_step:payment", Resource::Occurrences),
             Cost::Indexed
         );
-        assert_eq!(cost("has:checkout_step", Resource::Issues), Cost::Bounded);
+        assert_eq!(
+            cost("has:tag.checkout_step", Resource::Issues),
+            Cost::Bounded
+        );
     }
 
     #[test]
     fn tag_equality_is_indexed_on_occurrences_but_not_on_issues() {
         // Occurrences hits the tags GIN directly.
         assert_eq!(
-            cost("checkout_step:payment", Resource::Occurrences),
+            cost("tag.checkout_step:payment", Resource::Occurrences),
             Cost::Indexed
         );
         // Issues has no tags column, so this is a correlated EXISTS per candidate.
         assert_eq!(
-            cost("checkout_step:payment", Resource::Issues),
+            cost("tag.checkout_step:payment", Resource::Issues),
             Cost::Bounded
         );
     }

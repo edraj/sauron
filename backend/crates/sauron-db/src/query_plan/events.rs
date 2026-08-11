@@ -494,6 +494,71 @@ fn tag_leaf(
     }
 }
 
+/// `Store::Column("workflow")` on this resource — the real
+/// `analytics_events.workflow_name` column, not `OccurrencesLower`'s plain
+/// `str_leaf!` and not `IssuesLower`'s correlated `EXISTS`.
+///
+/// **Why this one gets its own function instead of `str_leaf!`.** The code this
+/// replaces (`repo::list_analytics_events`' `("workflow", …)` arms) pairs every
+/// POSITIVE match with `workflow_id IS NOT NULL`, and that term is not
+/// decoration: migration `2026-07-29-000032`'s `analytics_events_app_workflow_idx`
+/// is `WHERE workflow_id IS NOT NULL`, and Postgres uses a partial index only
+/// when the query's WHERE *implies* that predicate — `workflow_name = $N` does
+/// not. It is semantically a no-op (the pipeline stamps id and name together),
+/// and it was measured on the largest table in the system at 14 buffers / cost
+/// 2,025 with the term versus 52,744 / 56,190 without. Dropping it while
+/// "unifying" this with `str_leaf!` would be a silent 3,700x regression that no
+/// row-level assertion could see.
+///
+/// **And why the NEGATED arms deliberately omit it.** Their whole purpose is to
+/// RETURN the unstamped rows — `!workflow:x` means "not part of workflow x",
+/// which is true of a row that is part of no workflow — and those are exactly
+/// the rows the partial index excludes. `OR workflow_name IS NULL` is likewise
+/// mandatory: SQL's three-valued logic makes a bare `workflow_name <> 'x'`
+/// drop every NULL, so the same chip would mean two opposite things on the
+/// Events list and on the issues list beside it. See
+/// `list_error_events_for_issue`'s `workflow` arms for the full reasoning.
+fn workflow_leaf(
+    p: &ResolvedPredicate,
+    negate: bool,
+) -> Result<Frag<analytics_events::table>, PlanError> {
+    let field = p.dim.name;
+    let col = analytics_events::workflow_name;
+    // The positive shape, shared by `Eq`/`!Ne` and (with an ILIKE) `Contains`:
+    // the partial-index term ANDed with the name comparison.
+    let stamped = || analytics_events::workflow_id.is_not_null().nullable();
+    match (p.op, negate) {
+        (MatchOp::Eq, false) | (MatchOp::Ne, true) => {
+            let v = as_str(&p.value, field)?.to_string();
+            Ok(Box::new(stamped().and(col.eq(v).nullable())) as Frag<analytics_events::table>)
+        }
+        (MatchOp::Eq, true) | (MatchOp::Ne, false) => {
+            let v = as_str(&p.value, field)?.to_string();
+            Ok(Box::new(col.ne(v).or(col.is_null()).nullable()) as Frag<analytics_events::table>)
+        }
+        (MatchOp::Contains, false) | (MatchOp::Like, false) => {
+            let pat = as_pattern(&p.value, field)?.to_string();
+            Ok(Box::new(stamped().and(col.ilike(pat).nullable())) as Frag<analytics_events::table>)
+        }
+        (MatchOp::Contains, true) | (MatchOp::Like, true) => {
+            let pat = as_pattern(&p.value, field)?.to_string();
+            Ok(Box::new(col.not_ilike(pat).or(col.is_null()).nullable())
+                as Frag<analytics_events::table>)
+        }
+        // `OPS_WORKFLOW` is `[Eq, Ne, Contains]`, so `resolve` never produces
+        // the rest; kept explicit rather than as a catch-all so a widened op
+        // list forces a decision here instead of silently 500ing.
+        (MatchOp::In, _)
+        | (MatchOp::Has, _)
+        | (MatchOp::Gt, _)
+        | (MatchOp::Gte, _)
+        | (MatchOp::Lt, _)
+        | (MatchOp::Lte, _) => Err(PlanError::UnsupportedOnResource {
+            field: field.to_string(),
+        }),
+    }
+}
+
 /// Lowers predicates resolved against `Resource::Events`.
 pub struct EventsLower {
     pub app_id: Uuid,
@@ -575,6 +640,9 @@ impl ResourceLower for EventsLower {
             Store::Column("environment_id") => {
                 environment_leaf!(analytics_events::environment_id, ctx, p, negate)
             }
+            // S2c Task 6 widened the catalog's `workflow` dimension to this
+            // resource; see `workflow_leaf` for why it is not a `str_leaf!`.
+            Store::Column("workflow") => workflow_leaf(p, negate),
             Store::Column(other) => Err(PlanError::UnsupportedOnResource {
                 field: other.to_string(),
             }),
@@ -805,14 +873,14 @@ mod tests {
 
     #[test]
     fn tag_predicate_is_a_direct_column_containment_not_an_exists() {
-        let sql = lower_events_sql("plan:pro");
+        let sql = lower_events_sql("tag.plan:pro");
         assert!(sql.contains(r#""analytics_events"."tags" @>"#), "{sql}");
         assert!(!sql.contains("EXISTS"), "{sql}");
     }
 
     #[test]
     fn tag_never_leaks_the_key_or_value_into_sql_text() {
-        let sql = lower_events_sql("plan:pro");
+        let sql = lower_events_sql("tag.plan:pro");
         let query_text = sql.split("-- binds:").next().unwrap();
         assert!(!query_text.contains("plan"), "{query_text}");
         assert!(!query_text.contains("\"pro\""), "{query_text}");
@@ -820,13 +888,13 @@ mod tests {
 
     #[test]
     fn tag_has_uses_the_question_operator() {
-        let sql = lower_events_sql("has:plan");
+        let sql = lower_events_sql("has:tag.plan");
         assert!(sql.contains(r#""analytics_events"."tags" ?"#), "{sql}");
     }
 
     #[test]
     fn tag_like_uses_the_arrow_operator_and_ilike() {
-        let sql = lower_events_sql("plan:~pro");
+        let sql = lower_events_sql("tag.plan:~pro");
         assert!(sql.contains(r#""analytics_events"."tags" ->>"#), "{sql}");
         assert!(sql.contains("ILIKE"), "{sql}");
     }
@@ -901,6 +969,75 @@ mod tests {
         let sql = lower_events_sql("name:signup boom");
         assert!(sql.contains(r#""analytics_events"."name" = $1"#), "{sql}");
         assert!(sql.contains("AND"), "{sql}");
+    }
+
+    // -- workflow: a real column, with the partial-index term ----------------
+
+    /// The measured reason `workflow_leaf` exists rather than a `str_leaf!`:
+    /// `analytics_events_app_workflow_idx` is a PARTIAL index
+    /// (`WHERE workflow_id IS NOT NULL`), and Postgres only uses one when the
+    /// query's WHERE implies its predicate.
+    #[test]
+    fn positive_workflow_carries_the_partial_index_term() {
+        for q in ["workflow:checkout", "workflow:~check"] {
+            let sql = lower_events_sql(q);
+            assert!(
+                sql.contains(r#""analytics_events"."workflow_id" IS NOT NULL"#),
+                "`{q}` must imply the partial index's predicate: {sql}"
+            );
+            assert!(
+                sql.contains(r#""analytics_events"."workflow_name""#),
+                "{sql}"
+            );
+        }
+    }
+
+    /// …and the negated arms must NOT, because the rows they exist to return
+    /// are exactly the ones that index excludes.
+    #[test]
+    fn negated_workflow_keeps_unstamped_events_and_drops_the_index_term() {
+        let sql = lower_events_sql("!workflow:checkout");
+        assert!(
+            sql.contains(r#""analytics_events"."workflow_name" IS NULL"#),
+            "a bare `<>` would drop every unstamped row: {sql}"
+        );
+        assert!(
+            !sql.contains(r#""analytics_events"."workflow_id" IS NOT NULL"#),
+            "the partial-index term would exclude the very rows this arm returns: {sql}"
+        );
+    }
+
+    #[test]
+    fn negated_workflow_contains_is_also_null_safe() {
+        let sql = lower_events_sql("!workflow:~check");
+        assert!(sql.contains("NOT ILIKE"), "{sql}");
+        assert!(
+            sql.contains(r#""analytics_events"."workflow_name" IS NULL"#),
+            "{sql}"
+        );
+    }
+
+    /// The whole reason the catalog entry was widened to Events: without it,
+    /// `resolve_field`'s step-4 fallback reads the bare field `workflow` as a
+    /// TAG KEY and every `filter=workflow:…` bookmark on the Event Explorer
+    /// silently probes `analytics_events.tags` instead. No error — a different
+    /// answer, which is worse.
+    #[test]
+    fn workflow_is_not_reinterpreted_as_a_tag_key() {
+        let sql = lower_events_sql("workflow:checkout");
+        // The tag OPERATORS, not the bare column name: `tags` appears in the
+        // SELECT list of most queries over this table, so `contains("tags")`
+        // alone would be an assertion that can never fail.
+        for tag_op in [
+            r#""analytics_events"."tags" @>"#,
+            r#""analytics_events"."tags" ?"#,
+            r#""analytics_events"."tags" ->>"#,
+        ] {
+            assert!(
+                !sql.contains(tag_op),
+                "workflow must not fall through to the tag store ({tag_op}): {sql}"
+            );
+        }
     }
 
     // -- Base scope: tenant key + the `$screen` exclusion --------------------

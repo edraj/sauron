@@ -1064,13 +1064,23 @@ async fn issues_events_gives_occurrences_without_bodies_to_issue_read_alone() {
     let route = "issues::events";
     let path = format!("/v1/apps/{}/issues/{}/events", fx.app_id, fx.issue_id);
 
+    // `envelope_rows`, not `rows`: S2c Task 5 moved this route onto a
+    // `SearchEnvelope`. The gate property is unchanged — the assertions below
+    // still run over the whole response TEXT, envelope included — but counting
+    // `data` is what keeps "every occurrence must still be listed" meaning the
+    // rows rather than the wrapper.
     let (coarse, coarse_text) = srv
         .get_ok(&path, &fx.issue_only_token, "issue:read only")
         .await;
     assert_eq!(
-        coarse.as_array().map(Vec::len),
-        Some(SEEDED_EVENTS),
+        envelope_rows(&coarse, "issue:read only"),
+        SEEDED_EVENTS,
         "every occurrence must still be listed: {coarse}"
+    );
+    assert_eq!(
+        coarse["total"], SEEDED_EVENTS,
+        "the envelope's total describes the same rows, and the body gate must not change \
+         which rows match: {coarse}"
     );
     assert_body_stripped(&coarse_text, route);
     assert_shell_survives(&coarse_text, route, SEEDED_EVENTS);
@@ -1078,7 +1088,11 @@ async fn issues_events_gives_occurrences_without_bodies_to_issue_read_alone() {
     let (both, both_text) = srv
         .get_ok(&path, &fx.plain_token, "issue:read + event:read")
         .await;
-    assert_eq!(both.as_array().map(Vec::len), Some(SEEDED_EVENTS), "{both}");
+    assert_eq!(
+        envelope_rows(&both, "issue:read + event:read"),
+        SEEDED_EVENTS,
+        "{both}"
+    );
     assert_body_present(&both_text, route);
 
     srv.shutdown().await;
@@ -1225,10 +1239,27 @@ async fn top_issues_needs_issue_read_on_the_composite_signal_routes() {
 // plus the full-permission caller finding the marker, so a fixture that stopped
 // seeding payloads fails loudly instead of passing vacuously.
 
-/// How many array elements a JSON list response carries.
-fn rows(body: &Value, label: &str) -> usize {
-    body.as_array()
-        .unwrap_or_else(|| panic!("{label}: expected a JSON array, got {body}"))
+/// How many rows a `SearchEnvelope` response carries.
+///
+/// The bare-array counterpart this file used to carry alongside is **gone**,
+/// deliberately: S2c Task 4 put `issues::list` behind an envelope and Task 5
+/// `issues::events`, which were its only two callers. Leaving it behind as
+/// dead code would be an invitation to reach for it on a third route and get a
+/// panic that reads as a broken handler rather than a stale helper.
+///
+/// `issues::event_stats` is NOT an envelope route and must keep using the
+/// plain object accessors: it answers totals, not a page, so there is nothing
+/// to paginate and its `events`/`users`/`sessions` keys stay top-level.
+///
+/// The oracle property these tests pin is unaffected by the wrapper — the
+/// coarse caller's two responses are still compared as whole response TEXT,
+/// envelope included — but a `total` that differed while `data` matched would
+/// be a NEW oracle, so counting rows out of `data` alone would be the weaker
+/// check. See the `total` assertion at each probe site.
+fn envelope_rows(body: &Value, label: &str) -> usize {
+    body["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{label}: expected an envelope with a `data` array, got {body}"))
         .len()
 }
 
@@ -1268,7 +1299,7 @@ async fn q_cannot_probe_a_withheld_payload_column_on_the_occurrences_routes() {
         )
         .await;
     assert_eq!(
-        rows(&absent_list, "absent term"),
+        envelope_rows(&absent_list, "absent term"),
         0,
         "the control term must match nothing, or it is not a control: {absent_list}"
     );
@@ -1296,6 +1327,17 @@ async fn q_cannot_probe_a_withheld_payload_column_on_the_occurrences_routes() {
              caller holding only issue:read. It is not — the response differs, which is a \
              match/no-match oracle over a column this caller's rows arrive with nulled."
         );
+        // Named separately from the whole-body equality above, exactly as on
+        // the issues list: `total` is a SECOND query (`repo::count_occurrences`)
+        // over a separately-lowered copy of the same predicate, so a count built
+        // from a wider one would answer the probe on its own even with `data`
+        // empty. S2c Task 5 is what introduced that second query here.
+        let present_list: Value = serde_json::from_str(&present_list_text).expect("json");
+        assert_eq!(
+            present_list["total"], absent_list["total"],
+            "issues::events: the envelope's `total` must not distinguish `{marker}` from the \
+             control either — it is a count over the same withheld `{column}`: {present_list}"
+        );
 
         let (_, present_stats_text) = srv
             .get_ok(
@@ -1320,7 +1362,7 @@ async fn q_cannot_probe_a_withheld_payload_column_on_the_occurrences_routes() {
             )
             .await;
         assert_eq!(
-            rows(&both_list, "pair, withheld marker"),
+            envelope_rows(&both_list, "pair, withheld marker"),
             SEEDED_EVENTS,
             "a caller holding BOTH permissions must still search `{column}` and match every \
              seeded event — if this fails, the fix broke payload search instead of gating it, \
@@ -1350,7 +1392,7 @@ async fn q_cannot_probe_a_withheld_payload_column_on_the_occurrences_routes() {
         )
         .await;
     assert_eq!(
-        rows(&shell, "issue:read only, shell term"),
+        envelope_rows(&shell, "issue:read only, shell term"),
         SEEDED_EVENTS,
         "a coarse-gated caller must still be able to search the columns it CAN read \
          (`exception_type` here) — the fix narrows the column set, it does not disable \
@@ -1451,12 +1493,14 @@ async fn q_cannot_probe_a_withheld_payload_column_on_the_issues_list() {
     let fx = srv.seed().await;
     let list = format!("/v1/apps/{}/issues", fx.app_id);
 
+    // Both environment branches. Before S2c Task 4 these were two different
+    // query builders (diesel for `All`, raw SQL for `One`) and the fix had to
+    // land in both; they are one builder now, with `One` adding a membership
+    // `EXISTS`. Kept as two branches anyway — the predicate still differs, and
+    // this is the test that would notice the narrowing being lost.
     for (branch, env) in [
-        ("EnvFilter::All (diesel)", String::new()),
-        (
-            "EnvFilter::One (raw SQL)",
-            format!("&environment_id={}", fx.env_id),
-        ),
+        ("EnvFilter::All", String::new()),
+        ("EnvFilter::One", format!("&environment_id={}", fx.env_id)),
     ] {
         let (absent, absent_text) = srv
             .get_ok(
@@ -1466,7 +1510,7 @@ async fn q_cannot_probe_a_withheld_payload_column_on_the_issues_list() {
             )
             .await;
         assert_eq!(
-            rows(&absent, branch),
+            envelope_rows(&absent, branch),
             0,
             "{branch}: the control term must match nothing: {absent}"
         );
@@ -1485,12 +1529,23 @@ async fn q_cannot_probe_a_withheld_payload_column_on_the_issues_list() {
                  events) must be indistinguishable from `?q={ABSENT_MARKER}` for a caller \
                  holding only issue:read"
             );
+            // Whole-body equality above already covers this, but naming it
+            // separately is what keeps the envelope from quietly becoming a
+            // NEW oracle: `total` is computed by a second query
+            // (`repo::count_issues`), and a count built from a different
+            // predicate than the page would answer the probe on its own.
+            let present: Value = serde_json::from_str(&present_text).expect("json");
+            assert_eq!(
+                present["total"], absent["total"],
+                "{branch}: the envelope's `total` must not distinguish `{marker}` from the \
+                 control either — it is a count over the same withheld column: {present}"
+            );
 
             let (both, _) = srv
                 .get_ok(&format!("{list}?q={marker}{env}"), &fx.plain_token, branch)
                 .await;
             assert_eq!(
-                rows(&both, branch),
+                envelope_rows(&both, branch),
                 1,
                 "{branch}: a caller holding BOTH permissions must still reach the issue through \
                  a `{column}` match — otherwise this test proves nothing about gating, only \
@@ -1506,7 +1561,7 @@ async fn q_cannot_probe_a_withheld_payload_column_on_the_issues_list() {
             )
             .await;
         assert_eq!(
-            rows(&shell, branch),
+            envelope_rows(&shell, branch),
             1,
             "{branch}: a coarse-gated caller must still be able to search `culprit`, which it \
              can read: {shell}"
@@ -1594,7 +1649,7 @@ async fn tag_filters_are_refused_without_event_read() {
         )
         .await;
     assert_eq!(
-        rows(&one, "pair, tag:eq"),
+        envelope_rows(&one, "pair, tag:eq"),
         1,
         "`tag:eq` on event #0's own marker must match exactly one occurrence: {one}"
     );
@@ -1682,7 +1737,7 @@ async fn workflow_filters_are_refused_without_event_read() {
         )
         .await;
     assert!(
-        rows(&matched, "pair, workflow:eq") > 0,
+        envelope_rows(&matched, "pair, workflow:eq") > 0,
         "the seeded occurrences carry this workflow name, so the filter must match \
          them: {matched}"
     );

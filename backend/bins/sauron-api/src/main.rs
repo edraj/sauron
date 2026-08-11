@@ -20,7 +20,7 @@ use std::time::Duration;
 use axum::extract::{DefaultBodyLimit, FromRef};
 use axum::http::header::{self, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderValue, Method};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
@@ -391,9 +391,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cors = CorsLayer::new()
         .allow_origin(origins)
+        // Every method any route actually uses. Omitting one does NOT surface
+        // as a failing preflight — the OPTIONS still answers 200 — it surfaces
+        // as `net::ERR_FAILED` on the real request, from the browser only. No
+        // Rust test can catch it, because none of them are subject to CORS.
+        // `PUT` arrived with the store-connection upsert.
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -498,6 +504,25 @@ async fn main() -> anyhow::Result<()> {
             get(routes::apps::get_app)
                 .patch(routes::apps::update_app)
                 .delete(routes::apps::delete_app),
+        )
+        // --- app stores ---
+        // Credentials are write-only: no response here carries a secret. The
+        // sync itself belongs to `sauron-storesync`; `/sync` only queues.
+        .route(
+            "/v1/apps/{app_id}/store-connections",
+            get(routes::stores::list),
+        )
+        .route(
+            "/v1/apps/{app_id}/store-connections/{store}",
+            put(routes::stores::upsert).delete(routes::stores::delete),
+        )
+        .route(
+            "/v1/apps/{app_id}/store-connections/{store}/sync",
+            post(routes::stores::queue_sync),
+        )
+        .route(
+            "/v1/apps/{app_id}/store-metrics",
+            get(routes::stores::metrics),
         )
         // The catalogue: environments as a project defines them. There is no
         // POST under `/v1/apps/{app_id}/environments` any more — an app does not
@@ -633,6 +658,10 @@ async fn main() -> anyhow::Result<()> {
         )
         // --- devices (app-scoped) ---
         .route("/v1/apps/{app_id}/devices", get(routes::devices::list))
+        .route(
+            "/v1/apps/{app_id}/device-groups",
+            get(routes::devices::groups),
+        )
         .route("/v1/apps/{app_id}/device", get(routes::devices::detail))
         // --- screens (app-scoped) ---
         .route("/v1/apps/{app_id}/screens", get(routes::screens::list))

@@ -6,6 +6,7 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
+  import StoreConnectionsCard from '../lib/components/settings/StoreConnectionsCard.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
@@ -160,6 +161,19 @@
           {app.ingest_enabled ? 'Disable ingest' : 'Enable ingest'}
         </Button>
       </Card>
+
+      <StoreConnectionsCard
+        {app}
+        onAppUpdated={(updated) => {
+          sessionStore.upsertApp(updated, false);
+          // Prefix-wide, for the same reason `toggleIngest` does it: the cache
+          // key carries `scopeKey`, so this app has one entry PER ENVIRONMENT
+          // and refreshing only the selected one would repaint the pre-mutation
+          // copy after an environment switch.
+          viewCache.invalidate('settings.app');
+          void load(updated.id, true);
+        }}
+      />
 
       <Card title="Delete app">
           <p class="card-desc muted">

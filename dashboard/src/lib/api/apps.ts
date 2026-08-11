@@ -19,9 +19,16 @@ export async function getApp(appId: string): Promise<App> {
   return data;
 }
 
+/**
+ * `store_environment_id` is three-state on the wire: omit the key to leave the
+ * designation alone, pass `null` to clear it, pass an id to set it. The backend
+ * validates that the id is an environment of THIS app and 400s otherwise —
+ * a foreign id would hide the Overview store section forever with nothing to
+ * explain why.
+ */
 export async function updateApp(
   appId: string,
-  body: { name?: string; ingest_enabled?: boolean },
+  body: { name?: string; ingest_enabled?: boolean; store_environment_id?: string | null },
 ): Promise<App> {
   const { data } = await api.patch<App>(`/v1/apps/${appId}`, body);
   return data;

@@ -494,14 +494,45 @@ async fn deliver_after_defers_into_quiet_hours_and_survives_an_unknown_zone() {
     let ids = db.seed_two_envs().await;
     let mut conn = db.conn().await;
 
-    // A window that covers the whole day but one minute: whatever the wall
-    // clock says, `now()` is inside it, so delivery must be pushed forward.
+    // A window covering the whole day but one minute, with that minute placed
+    // twelve hours from now.
+    //
+    // The placement is computed rather than hard-coded, and that is the point.
+    // This previously used a fixed `(1, 0)` on the stated theory that a
+    // 1439-minute window contains any wall clock. It does not. `[1, 0)` excludes
+    // local minute 0, so the excluded minute sits exactly at local midnight, and
+    // the test failed outright for the whole of 00:00:00-00:00:59 Paris time.
+    // It also failed from 23:59:30, because by then the deferral — correctly
+    // computed, to 00:00:00 — had shrunk below the 30-second margin the
+    // assertion below allows. About ninety seconds a day, reachable only by a
+    // run that straddled midnight, which is how it was eventually found.
+    //
+    // `deliver_after_arithmetic_is_correct_across_local_midnight` now pins that
+    // boundary properly, with fixed instants instead of `now()`.
+    #[derive(diesel::QueryableByName)]
+    struct LocalMinute {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        m: i32,
+    }
+    let local: LocalMinute = diesel::sql_query(
+        "SELECT (EXTRACT(HOUR FROM (now() AT TIME ZONE 'Europe/Paris')) * 60 \
+               + EXTRACT(MINUTE FROM (now() AT TIME ZONE 'Europe/Paris')))::int AS m",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("read the current local minute in Europe/Paris");
+    // The gap is at `quiet_end_min`. Half a day away leaves ~12 hours of
+    // deferral, so no clock position can bring it near the margin — and the
+    // minute can tick between this read and the enqueue without mattering.
+    let quiet_end = (local.m + 720) % 1440;
+    let quiet_start = (quiet_end + 1) % 1440;
+
     let quiet = seed_subscription(
         &mut conn,
         &ids,
         "error_new_issue",
         "immediate",
-        Some((1, 0)),
+        Some((quiet_start as i16, quiet_end as i16)),
         "Europe/Paris",
     )
     .await;
@@ -580,9 +611,16 @@ async fn deliver_after_defers_into_quiet_hours_and_survives_an_unknown_zone() {
         );
     }
 
-    // The Rust twin agrees on the same shape. The exhaustive
-    // agreement check — including the DST case — is the next test.
-    assert!(sauron_alerts::subscription::in_quiet_hours(720, 1, 0));
+    // The Rust twin agrees that the moment this ran is inside the same window
+    // the SQL just deferred past. Asserted over the computed window rather than
+    // a fixed one, so it cannot quietly describe a different case than the rows
+    // above. The exhaustive agreement check — including the DST case — is the
+    // next test.
+    assert!(sauron_alerts::subscription::in_quiet_hours(
+        local.m,
+        quiet_start,
+        quiet_end
+    ));
 
     db.cleanup().await;
 }
@@ -711,6 +749,244 @@ async fn the_quiet_hours_sql_and_the_rust_twin_agree_over_a_shared_table() {
             sauron_alerts::subscription::in_quiet_hours(row.local_min, start, end),
             row.quiet,
             "{tz} at {at}: in_quiet_hours and the SQL CASE have drifted apart"
+        );
+    }
+
+    db.cleanup().await;
+}
+
+/// The `deliver_after` ARITHMETIC, pinned to fixed instants across local
+/// midnight and both DST transitions.
+///
+/// `the_quiet_hours_sql_and_the_rust_twin_agree_over_a_shared_table` pins the
+/// quiet-hours *predicate* — whether a local minute is inside the window.
+/// Nothing pinned the arithmetic that turns "inside" into a timestamp, so the
+/// day boundary was unverified: the only test touching `deliver_after` ran
+/// against `now()` and could not choose which side of midnight it landed on.
+/// It eventually landed on the wrong side and failed, which is how this gap was
+/// found.
+///
+/// Every case here is a real wall-clock instant, so this cannot depend on when
+/// it runs. Expected values were measured against Postgres, not derived by
+/// hand.
+///
+/// Like its sibling, this mirrors the `CASE` inside `enqueue_notifications`
+/// rather than calling it, because that function reads `now()` and Postgres
+/// offers no supported way to override it. The mirror must be updated in the
+/// same change as the original; that coupling is the cost of testing this at
+/// all.
+#[tokio::test]
+async fn deliver_after_arithmetic_is_correct_across_local_midnight() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let mut conn = db.conn().await;
+
+    // (label, tz, instant, quiet_start_min, quiet_end_min, expected deferral in
+    //  seconds). A `(1, 0)` window is quiet for every minute EXCEPT local
+    //  minute 0 — the excluded minute sits at midnight, which is the detail
+    //  that made the old test flaky.
+    let cases: Vec<(&str, &str, &str, i32, i32, i64)> = vec![
+        // Well inside the window: half a day of deferral.
+        (
+            "Paris 12:00",
+            "Europe/Paris",
+            "2026-08-10T10:00:00Z",
+            1,
+            0,
+            43_200,
+        ),
+        // Approaching the window's end. The deferral shrinks continuously and
+        // is still correct at four seconds — the old test called this a failure
+        // because it demanded a 30-second margin.
+        (
+            "Paris 23:58:00",
+            "Europe/Paris",
+            "2026-08-10T21:58:00Z",
+            1,
+            0,
+            120,
+        ),
+        (
+            "Paris 23:59:29",
+            "Europe/Paris",
+            "2026-08-10T21:59:29Z",
+            1,
+            0,
+            31,
+        ),
+        (
+            "Paris 23:59:56",
+            "Europe/Paris",
+            "2026-08-10T21:59:56Z",
+            1,
+            0,
+            4,
+        ),
+        // Local minute 0 — the one minute a `(1, 0)` window does NOT cover.
+        // Zero deferral here is correct, not a bug.
+        (
+            "Paris 00:00:00",
+            "Europe/Paris",
+            "2026-08-10T22:00:00Z",
+            1,
+            0,
+            0,
+        ),
+        (
+            "Paris 00:00:45",
+            "Europe/Paris",
+            "2026-08-10T22:00:45Z",
+            1,
+            0,
+            0,
+        ),
+        // One minute later the window resumes and the deferral is a full day
+        // less a minute. The jump from 0 to 86_340 across one minute is the
+        // boundary this test exists to hold still.
+        (
+            "Paris 00:01:00",
+            "Europe/Paris",
+            "2026-08-10T22:01:00Z",
+            1,
+            0,
+            86_340,
+        ),
+        // Spring forward: 2026-03-29 has 23 local hours, so "next local
+        // midnight" is 22:59 away from 00:01, not 23:59.
+        (
+            "spring-fwd 23:59",
+            "Europe/Paris",
+            "2026-03-28T22:59:00Z",
+            1,
+            0,
+            60,
+        ),
+        (
+            "spring-fwd 00:01",
+            "Europe/Paris",
+            "2026-03-28T23:01:00Z",
+            1,
+            0,
+            82_740,
+        ),
+        // Fall back: 2026-10-25 has 25 local hours, so the same jump is
+        // 24:59 — an implementation doing naive +86400 arithmetic gets both
+        // of these wrong by an hour in opposite directions.
+        (
+            "fall-back 23:59",
+            "Europe/Paris",
+            "2026-10-24T21:59:00Z",
+            1,
+            0,
+            60,
+        ),
+        (
+            "fall-back 00:01",
+            "Europe/Paris",
+            "2026-10-24T22:01:00Z",
+            1,
+            0,
+            89_940,
+        ),
+        // A zero-width window must never defer, or it silences everything
+        // forever.
+        ("zero-width", "UTC", "2026-01-15T05:00:00Z", 300, 300, 0),
+        // Same-day (non-wrapping) window: inside defers to its end, outside
+        // does not defer at all.
+        (
+            "same-day inside",
+            "UTC",
+            "2026-01-15T02:00:00Z",
+            60,
+            180,
+            3_600,
+        ),
+        (
+            "same-day outside",
+            "UTC",
+            "2026-01-15T04:00:00Z",
+            60,
+            180,
+            0,
+        ),
+    ];
+
+    let idx: Vec<i32> = (0..cases.len() as i32).collect();
+    let tzs: Vec<String> = cases.iter().map(|c| c.1.to_string()).collect();
+    let ats: Vec<chrono::DateTime<chrono::Utc>> = cases
+        .iter()
+        .map(|c| c.2.parse().expect("parse the case instant"))
+        .collect();
+    let starts: Vec<i32> = cases.iter().map(|c| c.3).collect();
+    let ends: Vec<i32> = cases.iter().map(|c| c.4).collect();
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        idx: i32,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        local_min: i32,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        deferral_secs: i64,
+    }
+
+    // The branch structure below is the `deliver_after` arm of
+    // `enqueue_notifications`, with `base` supplied per case instead of read
+    // from `now()`.
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT q.idx, q.local_min, \
+                EXTRACT(EPOCH FROM ((CASE \
+                  WHEN q.qs = q.qe THEN q.base \
+                  WHEN q.qs < q.qe THEN \
+                    CASE WHEN q.local_min >= q.qs AND q.local_min < q.qe \
+                         THEN (q.local_day + make_interval(mins => q.qe)) AT TIME ZONE q.tz \
+                         ELSE q.base END \
+                  ELSE \
+                    CASE WHEN q.local_min >= q.qs \
+                         THEN (q.local_day + interval '1 day' \
+                               + make_interval(mins => q.qe)) AT TIME ZONE q.tz \
+                         WHEN q.local_min < q.qe \
+                         THEN (q.local_day + make_interval(mins => q.qe)) AT TIME ZONE q.tz \
+                         ELSE q.base END \
+                END) - q.base))::bigint AS deferral_secs \
+           FROM ( \
+             SELECT c.idx, c.tz, c.base, c.qs, c.qe, \
+                    (EXTRACT(HOUR FROM (c.base AT TIME ZONE c.tz)) * 60 \
+                     + EXTRACT(MINUTE FROM (c.base AT TIME ZONE c.tz)))::int AS local_min, \
+                    date_trunc('day', c.base AT TIME ZONE c.tz) AS local_day \
+               FROM unnest($1::int[], $2::text[], $3::timestamptz[], $4::int[], $5::int[]) \
+                      AS c(idx, tz, base, qs, qe) \
+           ) q \
+          ORDER BY q.idx",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(idx)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(tzs)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Timestamptz>, _>(ats)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(starts)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(ends)
+    .load(&mut conn)
+    .await
+    .expect("evaluate the deliver_after table in SQL");
+
+    assert_eq!(rows.len(), cases.len());
+    for row in rows {
+        let (label, _tz, at, start, end, want_secs) = cases[row.idx as usize];
+        assert_eq!(
+            row.deferral_secs, want_secs,
+            "{label} ({at}, window {start}..{end}, local minute {}): \
+             deferred {}s, expected {want_secs}s",
+            row.local_min, row.deferral_secs
+        );
+        // A deferral of zero must mean the predicate said "not quiet", and a
+        // non-zero one must mean it said "quiet". Without this the arithmetic
+        // could be self-consistently wrong — deferring outside the window, or
+        // declining to defer inside it — and still match the numbers above.
+        assert_eq!(
+            row.deferral_secs > 0,
+            sauron_alerts::subscription::in_quiet_hours(row.local_min, start, end),
+            "{label}: the deferral disagrees with in_quiet_hours"
         );
     }
 
@@ -1190,9 +1466,14 @@ async fn a_project_with_zero_alert_rules_still_has_uptime_subscribers() {
     let mut conn = db.conn().await;
     let sub = seed_subscription(&mut conn, &ids, "uptime", "immediate", None, "UTC").await;
 
-    let rules = sauron_db::repo::alert_rules_for_monitor(&mut conn, ids.project_id, "monitor_down")
-        .await
-        .expect("load rules");
+    let rules = sauron_db::repo::alert_rules_for_monitor(
+        &mut conn,
+        ids.project_id,
+        uuid::Uuid::from_u128(7),
+        "monitor_down",
+    )
+    .await
+    .expect("load rules");
     assert!(rules.is_empty(), "the harness configures no alert rules");
 
     let found = sauron_db::repo::uptime_subscriptions_for_project(&mut conn, ids.project_id)
@@ -1226,4 +1507,190 @@ async fn a_project_with_zero_alert_rules_still_has_uptime_subscribers() {
     assert_eq!(n, 1);
 
     db.cleanup().await;
+}
+
+/// The harness seeds no monitors, and `monitor_id` is a foreign key, so the
+/// test has to make its own. Inserted directly rather than through any repo
+/// helper: the write path is not what is under test here.
+async fn insert_monitor(
+    conn: &mut sauron_db::AsyncPgConnection,
+    project_id: uuid::Uuid,
+    name: &str,
+) -> uuid::Uuid {
+    diesel::insert_into(sauron_db::schema::monitors::table)
+        .values((
+            sauron_db::schema::monitors::project_id.eq(project_id),
+            sauron_db::schema::monitors::name.eq(name),
+            sauron_db::schema::monitors::kind.eq("http"),
+            sauron_db::schema::monitors::target.eq("https://example.test/health"),
+        ))
+        .returning(sauron_db::schema::monitors::id)
+        .get_result(conn)
+        .await
+        .expect("insert monitor")
+}
+
+/// A rule pinned to one monitor must not fire for a sibling monitor in the same
+/// project — the whole point of the column. The un-pinned rule in the same
+/// fixture is the control: it proves the filter narrows rather than just
+/// breaking the query, which a single-rule test cannot distinguish.
+#[tokio::test]
+async fn a_monitor_pinned_rule_matches_only_that_monitor() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let monitor_a = insert_monitor(&mut conn, ids.project_id, "mon-a").await;
+    let monitor_b = insert_monitor(&mut conn, ids.project_id, "mon-b").await;
+
+    let conditions = json!({});
+    let pinned = sauron_db::repo::create_alert_rule(
+        &mut conn,
+        sauron_db::models::NewAlertRule {
+            org_id: ids.org_id,
+            project_id: Some(ids.project_id),
+            app_id: None,
+            monitor_id: Some(monitor_a),
+            name: "pinned to A",
+            trigger_type: "monitor_down",
+            conditions: &conditions,
+            severity: "critical",
+            throttle_seconds: 300,
+            message_template: None,
+            last_evaluated_at: None,
+            created_by: None,
+        },
+    )
+    .await
+    .expect("create pinned rule");
+
+    let wide = sauron_db::repo::create_alert_rule(
+        &mut conn,
+        sauron_db::models::NewAlertRule {
+            org_id: ids.org_id,
+            project_id: Some(ids.project_id),
+            app_id: None,
+            monitor_id: None,
+            name: "all monitors",
+            trigger_type: "monitor_down",
+            conditions: &conditions,
+            severity: "warning",
+            throttle_seconds: 300,
+            message_template: None,
+            last_evaluated_at: None,
+            created_by: None,
+        },
+    )
+    .await
+    .expect("create wide rule");
+
+    let for_a = sauron_db::repo::alert_rules_for_monitor(
+        &mut conn,
+        ids.project_id,
+        monitor_a,
+        "monitor_down",
+    )
+    .await
+    .expect("rules for A");
+    let mut a_ids: Vec<_> = for_a.iter().map(|r| r.id).collect();
+    a_ids.sort();
+    let mut expected = vec![pinned.id, wide.id];
+    expected.sort();
+    assert_eq!(
+        a_ids, expected,
+        "monitor A gets both the pinned and wide rule"
+    );
+
+    let for_b = sauron_db::repo::alert_rules_for_monitor(
+        &mut conn,
+        ids.project_id,
+        monitor_b,
+        "monitor_down",
+    )
+    .await
+    .expect("rules for B");
+    assert_eq!(
+        for_b.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![wide.id],
+        "monitor B must NOT receive the rule pinned to monitor A"
+    );
+}
+
+/// A disabled pinned rule matches neither its own monitor nor a sibling:
+/// `alert_rules_for_monitor` filters on `enabled` before it ever looks at
+/// `monitor_id`, so pinning must not resurrect a rule the org turned off.
+#[tokio::test]
+async fn a_disabled_pinned_rule_matches_neither() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let monitor_a = insert_monitor(&mut conn, ids.project_id, "mon-a-disabled").await;
+    let monitor_b = insert_monitor(&mut conn, ids.project_id, "mon-b-disabled").await;
+
+    let conditions = json!({});
+    let pinned = sauron_db::repo::create_alert_rule(
+        &mut conn,
+        sauron_db::models::NewAlertRule {
+            org_id: ids.org_id,
+            project_id: Some(ids.project_id),
+            app_id: None,
+            monitor_id: Some(monitor_a),
+            name: "pinned to A, disabled",
+            trigger_type: "monitor_down",
+            conditions: &conditions,
+            severity: "critical",
+            throttle_seconds: 300,
+            message_template: None,
+            last_evaluated_at: None,
+            created_by: None,
+        },
+    )
+    .await
+    .expect("create pinned rule");
+
+    sauron_db::repo::update_alert_rule(
+        &mut conn,
+        pinned.id,
+        None,
+        Some(false),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("disable pinned rule");
+
+    let for_a = sauron_db::repo::alert_rules_for_monitor(
+        &mut conn,
+        ids.project_id,
+        monitor_a,
+        "monitor_down",
+    )
+    .await
+    .expect("rules for A");
+    assert!(
+        for_a.is_empty(),
+        "a disabled rule pinned to A must not match A: {for_a:?}"
+    );
+
+    let for_b = sauron_db::repo::alert_rules_for_monitor(
+        &mut conn,
+        ids.project_id,
+        monitor_b,
+        "monitor_down",
+    )
+    .await
+    .expect("rules for B");
+    assert!(
+        for_b.is_empty(),
+        "a disabled rule pinned to A must not match B either: {for_b:?}"
+    );
 }

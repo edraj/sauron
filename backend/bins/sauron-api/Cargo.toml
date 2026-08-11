@@ -17,6 +17,10 @@ sauron-telemetry.workspace = true
 sauron-tier.workspace = true
 sauron-symbols.workspace = true
 sauron-alerts.workspace = true
+# Only for the identifier types and `StoreKind` — the API never fetches from a
+# store. That work belongs to `sauron-storesync`.
+sauron-store.workspace = true
+sauron-query.workspace = true
 sauron-mail.workspace = true
 # `routes/inspector.rs` parses a policy's matcher fields with the SAME pure
 # functions the worker's enqueue uses. A hand-rolled copy in the handler is how

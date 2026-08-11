@@ -112,6 +112,7 @@ fn resolve_pred(
             return Err(QueryError::UnknownField {
                 field: p.value.clone(),
                 at: p.at,
+                resource: Some(r),
             });
         }
         let (dim, path) = resolve_field(&p.value, r, p.at)?;
@@ -185,6 +186,7 @@ fn resolve_pred(
         let dim = tag_dimension(r).ok_or_else(|| QueryError::UnknownField {
             field: "tag".to_string(),
             at: p.at,
+            resource: Some(r),
         })?;
         let (op, value_src) = split_op(rest, p.quoted);
         if !dim.ops.contains(&op) {
@@ -223,8 +225,20 @@ fn resolve_pred(
     })
 }
 
-/// Field resolution order from spec §5: exact catalog match, then a dotted path
-/// under a JSON root, then the tag fallback.
+/// Field resolution: exact catalog match, then the explicit `tag.<key>` prefix,
+/// then a dotted path under a JSON root. Anything else is an error.
+///
+/// **There is deliberately no fourth step.** Spec §5 rule 3 used to read an
+/// unrecognised name as a tag key, on the theory that dev-defined tags should be
+/// first-class without a prefix. The cost was that a typo — `enviroment:prod`,
+/// `checkout_stpe:payment` — resolved to a tag nobody had ever written and
+/// answered 200 with zero rows, which is indistinguishable from an honest "no
+/// matches". A field name the system does not know is a caller mistake and says
+/// so, at both entry points alike: `filter=` and `query=` share this function,
+/// so neither can drift into a laxer vocabulary than the other.
+///
+/// No capability is lost. Step 2 (`tag.<key>`) names any identifier tag key, and
+/// `tag:<key>=<value>` in `resolve_pred` names the rest.
 fn resolve_field(
     field: &str,
     r: Resource,
@@ -260,14 +274,11 @@ fn resolve_field(
         }
     }
 
-    // 4. Unknown → a tag, where the resource has tags at all.
-    match tag_dimension(r) {
-        Some(d) => Ok((d, Some(field.to_string()))),
-        None => Err(QueryError::UnknownField {
-            field: field.to_string(),
-            at,
-        }),
-    }
+    Err(QueryError::UnknownField {
+        field: field.to_string(),
+        at,
+        resource: Some(r),
+    })
 }
 
 /// Peel a comparison prefix, list brackets, or a wildcard off the raw value.
@@ -486,13 +497,56 @@ mod tests {
     }
 
     #[test]
-    fn unknown_field_falls_back_to_a_tag() {
-        // Spec §5 rule 3: this is the behaviour that makes dev-defined tags
-        // first-class without a prefix.
-        let p = one("checkout_step:payment", Resource::Issues);
-        assert!(matches!(p.dim.store, Store::Tag));
-        assert_eq!(p.path.as_deref(), Some("checkout_step"));
-        assert_eq!(p.value, TypedValue::Str("payment".into()));
+    fn unknown_field_is_rejected_rather_than_read_as_a_tag() {
+        // **The ruling this test exists to pin.** An unrecognised name used to
+        // resolve to a TAG KEY, so `checkout_stpe:payment` answered 200 with
+        // zero rows — indistinguishable from an honest "nothing matched", and
+        // the typo stayed invisible. `tag.<key>` (below) remains the explicit
+        // spelling, so no capability is lost.
+        let e = err("checkout_step:payment", Resource::Issues);
+        assert!(matches!(e, QueryError::UnknownField { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn unknown_field_is_rejected_on_every_taggable_resource() {
+        // Issues, Occurrences and Events all carry a `tags` column, and all
+        // three therefore used to swallow a typo. One vocabulary, one
+        // resolution: the answer must not depend on which list you are on.
+        for r in [Resource::Issues, Resource::Occurrences, Resource::Events] {
+            let e = err("checkout_step:payment", r);
+            assert!(matches!(e, QueryError::UnknownField { .. }), "{r:?}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_field_message_names_the_field_and_the_tag_spelling() {
+        // A 400 that only says "unknown field" trades one bad experience for
+        // another: it must name the field AND say what to write instead.
+        let msg = err("checkout_step:payment", Resource::Issues).to_string();
+        assert!(msg.contains("checkout_step"), "must name the field: {msg}");
+        assert!(
+            msg.contains("tag.checkout_step"),
+            "must show the tag spelling: {msg}"
+        );
+        assert!(
+            msg.contains("culprit") && msg.contains("timesSeen"),
+            "must list what IS available on this resource: {msg}"
+        );
+        // Fields belonging to some OTHER resource are not offered.
+        assert!(
+            !msg.contains("os.version"),
+            "must not advertise another resource's fields: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_message_offers_the_escape_hatch_for_a_non_identifier_key() {
+        // `tag.<key>` cannot spell a key the lexer would not accept as an
+        // identifier, so recommending `tag.a b` would be advice that does not
+        // work. The `tag:<key>=<value>` escape hatch is what does.
+        let msg = err(r#"has:"cart@checkout""#, Resource::Issues).to_string();
+        assert!(msg.contains("tag:<key>=<value>"), "{msg}");
+        assert!(!msg.contains("tag.cart@checkout"), "{msg}");
     }
 
     #[test]
@@ -504,11 +558,106 @@ mod tests {
     }
 
     #[test]
+    fn explicit_tag_prefix_is_the_surviving_way_to_reach_a_dev_tag() {
+        // The capability step 4 used to provide, spelled explicitly. Same
+        // dimension, same path, same value — only the spelling is now required.
+        let p = one("tag.checkout_step:payment", Resource::Issues);
+        assert!(matches!(p.dim.store, Store::Tag));
+        assert_eq!(p.path.as_deref(), Some("checkout_step"));
+        assert_eq!(p.value, TypedValue::Str("payment".into()));
+    }
+
+    #[test]
     fn unknown_field_errors_where_tags_do_not_exist() {
         assert!(matches!(
             err("nonsense:1", Resource::Devices),
             QueryError::UnknownField { .. }
         ));
+    }
+
+    #[test]
+    fn unknown_field_message_does_not_offer_tags_where_there_are_none() {
+        // Devices/Persons/Sessions/Transactions have no `tags` column. Telling
+        // that caller to write `tag.nonsense` would be a lie.
+        for r in [
+            Resource::Devices,
+            Resource::Persons,
+            Resource::Sessions,
+            Resource::Transactions,
+        ] {
+            let msg = err("nonsense:1", r).to_string();
+            assert!(msg.contains("nonsense"), "{r:?}: {msg}");
+            assert!(!msg.contains("tag."), "{r:?} has no tags column: {msg}");
+            assert!(
+                !msg.contains("tag:<key>"),
+                "{r:?} has no tags column: {msg}"
+            );
+        }
+        assert!(
+            err("nonsense:1", Resource::Devices)
+                .to_string()
+                .contains("os.version"),
+            "still lists what IS available"
+        );
+    }
+
+    #[test]
+    fn unknown_field_keeps_its_offset_in_the_query_string() {
+        // The caret the UI draws. Step 4 meant this offset was never exercised
+        // on a taggable resource; now it is the common case.
+        let e = err("level:error checkout_step:payment", Resource::Issues);
+        assert!(matches!(e, QueryError::UnknownField { .. }), "{e:?}");
+        assert_eq!(e.at(), 12);
+    }
+
+    /// Every field name the dashboard can put in the `field` slot of
+    /// `filter=<field>:<op>:<value>`, per its three closed registries in
+    /// `dashboard/src/lib/components/filters/filters.ts`. Removing step 4 turns
+    /// any name missing from the catalog into a 400, so a UI chip that no
+    /// longer resolves is a broken page — caught here rather than in a browser.
+    #[test]
+    fn every_field_the_dashboard_can_emit_still_resolves() {
+        let cases: &[(Resource, &[&str])] = &[
+            // ISSUE_FIELDS
+            (
+                Resource::Issues,
+                &[
+                    "level",
+                    "status",
+                    "type",
+                    "culprit",
+                    "times_seen",
+                    "users_seen",
+                ],
+            ),
+            // EVENT_FIELDS (+ `environment`, still reachable from a bookmark)
+            (
+                Resource::Events,
+                &[
+                    "name",
+                    "distinct_id",
+                    "session_id",
+                    "release",
+                    "environment",
+                ],
+            ),
+            // OCCURRENCE_FIELDS carries only `tag`, covered below.
+            (Resource::Occurrences, &[]),
+        ];
+        for (r, fields) in cases {
+            for f in *fields {
+                assert!(
+                    lookup(f, *r).is_some(),
+                    "the dashboard emits `{f}` on {r:?} and it no longer resolves"
+                );
+            }
+            // `workflow` is offered as a permission-gated chip on all three.
+            assert!(lookup("workflow", *r).is_some(), "workflow on {r:?}");
+            // The `tag` chip travels as `tag:<op>:<key>=<value>`, which
+            // `from_legacy` rewrites to `tag.<key>` — step 2, not step 4.
+            let p = one("tag.region:eu", *r);
+            assert!(matches!(p.dim.store, Store::Tag), "tag chip on {r:?}");
+        }
     }
 
     #[test]
@@ -646,10 +795,20 @@ mod tests {
     }
 
     #[test]
-    fn has_works_on_an_unknown_field_as_a_tag() {
-        let p = one("has:checkout_step", Resource::Issues);
+    fn has_rejects_an_unknown_field_rather_than_probing_a_tag() {
+        // `has:` resolves its operand through the same `resolve_field`, so the
+        // ruling has to reach it too — otherwise `has:` becomes a back door to
+        // the fallback that `field:value` just lost.
+        let e = err("has:checkout_step", Resource::Issues);
+        assert!(matches!(e, QueryError::UnknownField { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn has_works_on_an_explicit_tag_key() {
+        let p = one("has:tag.checkout_step", Resource::Issues);
         assert!(matches!(p.dim.store, Store::Tag));
         assert_eq!(p.op, MatchOp::Has);
+        assert_eq!(p.path.as_deref(), Some("checkout_step"));
     }
 
     #[test]
@@ -770,8 +929,10 @@ mod tests {
 
     #[test]
     fn preserves_tree_structure_and_free_text() {
+        // Real field names, not placeholders: `a:1`/`b:2` only resolved because
+        // an unknown name used to become a tag key.
         let got = resolve(
-            &parse("level:error (a:1 OR b:2) !is:resolved timeout").unwrap(),
+            &parse("level:error (culprit:a OR type:b) !is:resolved timeout").unwrap(),
             Resource::Issues,
         )
         .unwrap();

@@ -204,10 +204,15 @@ pub async fn detail(
     let uptime_7d = repo::uptime_pct(&mut conn, monitor_id, 24 * 7).await?;
     let uptime_30d = repo::uptime_pct(&mut conn, monitor_id, 24 * 30).await?;
     let incidents = repo::list_incidents(&mut conn, monitor_id, 20).await?;
+    // Surfaced so the dashboard can warn about it in the delete confirmation
+    // *before* the delete happens — the delete response itself is too late
+    // for that. See `delete()` below for why this exists at all.
+    let pinned_alert_rules = repo::count_alert_rules_for_monitor(&mut conn, monitor_id).await?;
     Ok(Json(json!({
         "monitor": monitor_view(&m),
         "uptime": { "h24": uptime_24h, "d7": uptime_7d, "d30": uptime_30d },
         "incidents": incidents,
+        "pinned_alert_rules": pinned_alert_rules,
     })))
 }
 
@@ -299,8 +304,16 @@ pub async fn delete(
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, _m) =
         load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_WRITE).await?;
+    // `alert_rules.monitor_id` is `ON DELETE CASCADE`: deleting the monitor
+    // silently deletes every alert rule pinned to it too, including ones the
+    // caller (project-scoped `monitor:write`) may have no permission to list
+    // or read. Count them first and disclose the count in the response —
+    // that is the mitigation, since the cascade itself must stay.
+    let cascaded_alert_rules = repo::count_alert_rules_for_monitor(&mut conn, monitor_id).await?;
     repo::delete_monitor(&mut conn, monitor_id).await?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(
+        json!({ "ok": true, "cascaded_alert_rules": cascaded_alert_rules }),
+    ))
 }
 
 pub async fn checks(

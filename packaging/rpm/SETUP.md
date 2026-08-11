@@ -133,13 +133,13 @@ keep `MIGRATE_WAIT_SECS` below it.
 ## 6. Enable and start the services
 
 ```bash
-sudo systemctl enable --now sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier
+sudo systemctl enable --now sauron-api sauron-ingest sauron-monitor sauron-alerts sauron-tier sauron-storesync
 systemctl --no-pager status 'sauron-*'
 ```
 
 - `sauron-api` → `:8080` (dashboard API)
 - `sauron-ingest` → `:8081` (SDK ingest)
-- `sauron-monitor`, `sauron-alerts`, `sauron-tier` → no listener
+- `sauron-monitor`, `sauron-alerts`, `sauron-tier`, `sauron-storesync` → no listener
 - `sauron-inspector` → installed but **off**; see below
 
 **Do not omit `sauron-alerts`.** It is the sole owner of metric-rule evaluation
@@ -149,8 +149,13 @@ simply never fire, and no per-user notification is ever delivered — silently, 
 nothing in the UI indicating a problem. Monitor up/down alerts fire inline from
 `sauron-monitor` and are the only ones that still work.
 
+`sauron-storesync` is idle until an app-store credential is configured in the
+dashboard, and it is enabled for the same reason `sauron-alerts` is: the
+credential is entered in the UI, so a disabled syncer means the admin sees
+"Waiting for the first sync" forever with nothing explaining why.
+
 The shipped vendor preset `/usr/lib/systemd/system-preset/50-sauron.preset`
-enables those same five daemons on **first install**, so on a new host the command
+enables those same six daemons on **first install**, so on a new host the command
 above is belt-and-braces. Run it anyway on a host installed before the preset
 shipped — that is where the missing `sauron-alerts` lives.
 
@@ -394,6 +399,8 @@ ls /etc/sauron/*.rpmnew 2>/dev/null && diff -u /etc/sauron/api.env /etc/sauron/a
 | `2026-08-08-000044_tier_policy_and_pins` | **All tiering stops.** `runtime_settings` is read by the first `?` in `sauron-tier`'s `cycle()`, so the cycle aborts before any export or any drop — one WARN per tick, hourly by default (`TIER_TICK_SECS`), and no error anywhere else. Cold Parquet stops being written and hot partitions stop being dropped, so the disk grows until it fills. The Storage page's policy card 500s. Operationally free to apply: two new tables (`runtime_settings`, `tier_pins`), no lock on any hot table, nothing seeded — a fresh install behaves exactly as before, since absence of a row means "use the `TIER_HOT_DAYS` env value". |
 | `2026-08-09-000045_cold_restore` | Cold-data restore from the dashboard is dead: the restore executor errors on every poll and the restore endpoints 500. Nothing else degrades. **Requires 000044** (`restore_jobs.pin_id` references `tier_pins`). Cheap to apply: `ADD COLUMN restored_pin_id UUID` with no `DEFAULT` on `error_events`, `analytics_events` and `transactions` is catalog-only on a partitioned parent — no rewrite, no table scan, no index build — plus one new `restore_jobs` table. Safe to run with ingest live. |
 | `2026-08-09-000046_channel_config_enc` | **SECURITY FIX — apply it.** Before this migration a notification channel's `config` sat in **cleartext** in Postgres, in every base backup and in every WAL archive. For the generic webhook kind that blob holds the target URL *and* an arbitrary `headers` map, so a developer's `Authorization: Bearer …` was on disk in the clear; for Slack/Discord the `webhook_url` in `config` **is** the credential. This adds `notification_channels.config_enc`, AES-256-GCM under `NOTIFY_SECRET_KEY`, the same cipher already protecting `secret_enc`. Skipping it: every notification-channel read **and** write 500s and no alert of any kind is delivered — alerting is dead, not degraded. Rotating the exposed webhook URLs and headers after upgrading is the honest follow-up; the migration hides the plaintext, it cannot un-leak it. The row conversion is **not** done by `sauron-migrate` (that binary has neither the cipher nor the key) — it runs in Rust at the first `sauron-api` boot, is idempotent, and aborts startup rather than half-converting. See the downgrade warning below. |
+
+| `2026-08-10-000049_store_metrics` | App-store install metrics are dead, but visibly so: `sauron-storesync` logs a missing-relation error every tick, and the "App stores" card in App settings renders its error inline instead of the form (the rest of the page is unaffected — the card catches its own load failure). The Overview store section simply never appears, because the designation it keys on lives in the column this migration adds. Purely additive — two new tables and one nullable column on `apps` — so it is safe to apply at any time with the daemons running. |
 
 ### DOWNGRADE WARNING — this release is one-way for notification channels
 

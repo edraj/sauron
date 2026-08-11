@@ -51,6 +51,35 @@ diesel::table! {
         updated_at -> Timestamptz,
         app_type -> Text,
         project_id -> Uuid,
+        store_environment_id -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
+    app_store_connections (id) {
+        id -> Uuid,
+        app_id -> Uuid,
+        store -> Text,
+        enabled -> Bool,
+        identifiers -> Jsonb,
+        secret_enc -> Nullable<Bytea>,
+        sync_state -> Jsonb,
+        next_sync_at -> Timestamptz,
+        last_synced_at -> Nullable<Timestamptz>,
+        last_error -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    store_daily_metrics (app_id, store, day) {
+        app_id -> Uuid,
+        store -> Text,
+        day -> Date,
+        installs -> BigInt,
+        uninstalls -> BigInt,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -472,6 +501,7 @@ diesel::table! {
         org_id -> Uuid,
         project_id -> Nullable<Uuid>,
         app_id -> Nullable<Uuid>,
+        monitor_id -> Nullable<Uuid>,
         name -> Text,
         trigger_type -> Text,
         enabled -> Bool,
@@ -753,6 +783,8 @@ diesel::joinable!(devices -> apps (app_id));
 diesel::joinable!(transactions -> apps (app_id));
 diesel::joinable!(apps -> projects (project_id));
 diesel::joinable!(app_environments -> apps (app_id));
+diesel::joinable!(app_store_connections -> apps (app_id));
+diesel::joinable!(store_daily_metrics -> apps (app_id));
 diesel::joinable!(app_environments -> environments (environment_id));
 diesel::joinable!(environments -> projects (project_id));
 diesel::joinable!(error_events -> apps (app_id));
@@ -783,6 +815,7 @@ diesel::joinable!(monitor_incidents -> monitors (monitor_id));
 diesel::joinable!(symbol_artifacts -> apps (app_id));
 diesel::joinable!(notification_channels -> organizations (org_id));
 diesel::joinable!(alert_rules -> organizations (org_id));
+diesel::joinable!(alert_rules -> monitors (monitor_id));
 diesel::joinable!(alert_rule_channels -> alert_rules (rule_id));
 diesel::joinable!(alert_rule_channels -> notification_channels (channel_id));
 diesel::joinable!(alert_events -> organizations (org_id));
@@ -856,8 +889,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
     auth_sessions,
     app_environments,
+    app_store_connections,
     apps,
     environments,
+    store_daily_metrics,
     error_events,
     event_users,
     identities,

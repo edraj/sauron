@@ -414,7 +414,11 @@ impl Drop for TestServer {
 /// app with **two** environments, error and analytics rows in both, an owner
 /// whose grant reaches the whole app, and two members each holding exactly one
 /// `role_grants` row — `scope_type = 'env'` — on `granted_env` alone.
-/// `other_env` is a sibling neither member holds any grant on.
+/// `other_env` is a sibling neither member holds any grant on. Also seeds one
+/// `devices` row (via `bump_device`) plus one device-attributed analytics
+/// event, both scoped to `granted_env` only — what the grouped-devices HTTP
+/// tests (Task 3 of the devices-grouped-by-model-and-os plan) need to tell a
+/// granted-env body apart from an other-env one.
 ///
 /// The two members differ *only* in whether their role carries
 /// `perm::SOURCE_READ`, so the source-code gate (fix round 1) has a genuine
@@ -428,6 +432,17 @@ struct EnvScopedFixture {
     app_id: Uuid,
     granted_env: Uuid,
     other_env: Uuid,
+    /// The one `devices` row seeded in `granted_env`. `family`/`model`/
+    /// `os_name` are all non-NULL and pairwise distinct; `os_version` is
+    /// deliberately left NULL. See the grouped-devices HTTP tests (Task 3 of
+    /// the devices-grouped-by-model-and-os plan): the NULL `os_version` is
+    /// what makes their absent-vs-`os_version=`-empty assertion load-bearing
+    /// — with a non-NULL value, omitting the param (`IS NULL`) and sending it
+    /// empty (`= ''`) both fail to match this device for unrelated reasons,
+    /// which would make that assertion pass even if the two wire shapes were
+    /// silently collapsed together upstream (the exact bug class
+    /// `routes::scope`'s module docs are about, for a different parameter).
+    device_key: String,
     /// The issue whose one error event lives in `granted_env`. Carries a
     /// pre-symbolicated frame with source context — see
     /// [`seed_issue_with_error`].
@@ -725,6 +740,63 @@ impl TestServer {
         seed_analytics_event(&mut conn, app.id, Some(granted_env), "env-scoping.fixture").await;
         seed_analytics_event(&mut conn, app.id, Some(other_env), "env-scoping.fixture").await;
 
+        // -- one device, attributed to granted_env only ------------------------
+        // `seed_analytics_event` above hard-codes `device_key: None`, so it
+        // satisfies device membership for NO device (Task 1 already learned
+        // this the hard way). The grouped-devices HTTP tests need one real
+        // device to compare a granted-env body against an other-env one, so
+        // seed it directly here: one `devices` row via `bump_device`, plus one
+        // `NewAnalyticsEvent` with `device_key` set, scoped to `granted_env`
+        // alone.
+        //
+        // `os_version` is left NULL on purpose — see `EnvScopedFixture::device_key`'s
+        // doc comment for why a NULL column, not a non-NULL one, is what the
+        // absent-vs-empty drill-down assertion needs.
+        let device_key = format!("env-scoping-device-{suffix}");
+        let now = Utc::now();
+        repo::bump_device(
+            &mut conn,
+            app.id,
+            &device_key,
+            Some("env-scoping-family"),
+            Some("env-scoping-model"),
+            Some("EnvScopingOS"),
+            None,
+            None,
+            None,
+            None,
+            now,
+            1,
+            0,
+        )
+        .await
+        .expect("bump device");
+        repo::insert_analytics_event(
+            &mut conn,
+            NewAnalyticsEvent {
+                id: Uuid::new_v4(),
+                app_id: app.id,
+                environment_id: Some(granted_env),
+                name: "env-scoping.fixture.device".to_string(),
+                distinct_id: format!("env-scoping-fixture-device-{suffix}"),
+                properties: json!({}),
+                context: json!({}),
+                session_id: None,
+                release: None,
+                ip_address: None,
+                occurred_at: now,
+                device_key: Some(device_key.clone()),
+                screen: None,
+                workflow_id: None,
+                workflow_name: None,
+                tags: json!({}),
+                contexts: json!({}),
+                extra: json!({}),
+            },
+        )
+        .await
+        .expect("insert device-attributed analytics event");
+
         drop(conn);
 
         let keys = JwtKeys::new(JWT_SECRET, 900);
@@ -750,6 +822,7 @@ impl TestServer {
             app_id: app.id,
             granted_env,
             other_env,
+            device_key,
             granted_issue_id,
             other_issue_id,
             owner_token,
@@ -1351,14 +1424,17 @@ async fn env_scoped_member_is_confined_over_http() {
     let owner_all = h
         .get_json(&format!("/v1/apps/{}/issues", f.app_id), &f.owner_token)
         .await;
-    let m = member_all
-        .as_array()
-        .expect("issues response is a JSON array")
-        .len();
-    let o = owner_all
-        .as_array()
-        .expect("issues response is a JSON array")
-        .len();
+    // S2c Task 4: the issues list answers a `SearchEnvelope`, not a bare
+    // array. `total` rather than `data.len()` — `data` is capped at one page
+    // (50 by default), so once a fixture grows past that, two different-sized
+    // row sets would both report 50 and the narrowing assertion below would
+    // stop testing anything.
+    let m = member_all["total"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("issues response has no `total`: {member_all}"));
+    let o = owner_all["total"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("issues response has no `total`: {owner_all}"));
     assert!(
         m < o,
         "absent environment_id must auto-narrow for a partial-reach member: \
@@ -3261,4 +3337,184 @@ async fn the_inspector_policy_list_matches_what_the_caller_can_open_by_id() {
     );
 
     h.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Devices grouped by model+OS (Task 3): the HTTP route.
+// ---------------------------------------------------------------------------
+
+/// The grouped Devices read is a new route on the same `EVENT_READ` +
+/// `environment_id` contract as `/devices`. Both halves matter: a missing
+/// permission gate and a silently-ignored `environment_id` both present as a
+/// perfectly normal 200, so status alone cannot tell them from correct
+/// behaviour — the env assertion below compares two environments' bodies.
+#[tokio::test]
+async fn device_groups_is_permission_gated_and_env_scoped() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+    let granted = f.granted_env;
+    let other = f.other_env;
+
+    // The member holds one env-scoped grant, on `granted_env` only.
+    let ok = srv
+        .get_status(
+            &format!("/v1/apps/{app}/device-groups?environment_id={granted}&since_days=3650"),
+            &f.member_token,
+        )
+        .await;
+    assert_eq!(ok, 200, "device-groups must be readable in the granted env");
+
+    let denied = srv
+        .get_status(
+            &format!("/v1/apps/{app}/device-groups?environment_id={other}&since_days=3650"),
+            &f.member_token,
+        )
+        .await;
+    assert_eq!(
+        denied, 403,
+        "device-groups must refuse an environment the member holds no grant on"
+    );
+
+    // The route reads `environment_id` from the raw query string. If that
+    // wiring were missing, both requests would return the same app-wide body
+    // and the status assertions above would still pass.
+    let granted_body = srv
+        .get_json(
+            &format!("/v1/apps/{app}/device-groups?environment_id={granted}&since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+    let other_body = srv
+        .get_json(
+            &format!("/v1/apps/{app}/device-groups?environment_id={other}&since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+    assert!(granted_body.is_array() && other_body.is_array());
+    assert_ne!(
+        granted_body, other_body,
+        "two environments must not return identical grouped bodies — the \
+         fixture seeds device activity in granted_env only"
+    );
+
+    srv.shutdown().await;
+}
+
+/// The drill-down sentinel. Without `group=1` the four descriptor parameters
+/// are ignored entirely, which is what keeps every existing `/devices` caller
+/// working unchanged.
+#[tokio::test]
+async fn devices_group_filter_applies_only_behind_the_sentinel() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+
+    let unfiltered = srv
+        .get_json(
+            &format!("/v1/apps/{app}/devices?since_days=3650"),
+            &f.owner_token,
+        )
+        .await;
+
+    // Same descriptor parameters, no sentinel: must be byte-identical to the
+    // unfiltered read.
+    let ignored = srv
+        .get_json(
+            &format!("/v1/apps/{app}/devices?since_days=3650&model=no-such-model"),
+            &f.owner_token,
+        )
+        .await;
+    assert_eq!(
+        unfiltered, ignored,
+        "without group=1 the descriptor params must not filter anything"
+    );
+
+    // With the sentinel, a model that matches nothing must return nothing.
+    // On its own this is a weak check: an all-NULL `DeviceGroupKey`, or one
+    // built with `family`/`model` transposed, also returns 0 rows against the
+    // fixture's device (all three of its non-NULL descriptors are distinct
+    // strings, so a wrong mapping fails to match it for the wrong reason just
+    // as reliably as this deliberately-nonexistent model does). The positive
+    // assertions below are what actually pin the mapping.
+    let filtered = srv
+        .get_json(
+            &format!("/v1/apps/{app}/devices?since_days=3650&group=1&model=no-such-model"),
+            &f.owner_token,
+        )
+        .await;
+    assert_eq!(
+        filtered.as_array().map(|a| a.len()),
+        Some(0),
+        "group=1 with an unmatched model must return an empty list"
+    );
+
+    // --- positive drill-down: the fixture's device, matched by its real ----
+    // --- family/model/os_name, os_version left out (it is NULL) ------------
+    let exact_path = format!(
+        "/v1/apps/{app}/devices?since_days=3650&group=1&family=env-scoping-family&model=env-scoping-model&os_name=EnvScopingOS"
+    );
+    let exact = srv.get_json(&exact_path, &f.owner_token).await;
+    let exact_rows = exact
+        .as_array()
+        .unwrap_or_else(|| panic!("GET {exact_path}: expected a JSON array, got {exact}"));
+    assert_eq!(
+        exact_rows.len(),
+        1,
+        "the fixture device's real family/model/os_name (os_version omitted, \
+         which is NULL for this device) must return exactly that one device: {exact_rows:?}"
+    );
+    assert_eq!(
+        exact_rows[0]["device_key"].as_str(),
+        Some(f.device_key.as_str()),
+        "the one row the exact descriptor combination returns must be the \
+         fixture's own device: {exact_rows:?}"
+    );
+
+    // Transposing family and model must NOT still match — this rules out a
+    // `DeviceGroupKey` built with the two fields swapped, which the plain
+    // "unmatched model" check above cannot distinguish from a correct
+    // mapping (both return 0 rows against this fixture either way).
+    let transposed_path = format!(
+        "/v1/apps/{app}/devices?since_days=3650&group=1&family=env-scoping-model&model=env-scoping-family&os_name=EnvScopingOS"
+    );
+    let transposed = srv.get_json(&transposed_path, &f.owner_token).await;
+    assert_eq!(
+        transposed.as_array().map(|a| a.len()),
+        Some(0),
+        "swapping family and model in the query must not match the fixture \
+         device: {transposed:?}"
+    );
+
+    // --- absent vs. present-but-empty must NOT be equivalent for the same --
+    // --- field ---------------------------------------------------------------
+    // `os_version` is NULL for the fixture device (see
+    // `EnvScopedFixture::device_key`'s doc comment for why that, not a real
+    // value, is what this needs). Omitting the parameter maps to `None` ->
+    // "os_version IS NULL", which matches (`exact_rows` above, computed with
+    // `os_version` absent). Sending it present-but-empty must instead map to
+    // `Some("")` -> "os_version = ''", which does NOT match a NULL column —
+    // if a future `Query` extractor swap ever collapsed the two wire shapes
+    // together (the exact defect class this file's module docs describe for
+    // `environment_id`), this would silently start matching too.
+    let empty_os_version_path = format!(
+        "/v1/apps/{app}/devices?since_days=3650&group=1&family=env-scoping-family&model=env-scoping-model&os_name=EnvScopingOS&os_version="
+    );
+    let empty_os_version = srv.get_json(&empty_os_version_path, &f.owner_token).await;
+    assert_eq!(
+        empty_os_version.as_array().map(|a| a.len()),
+        Some(0),
+        "os_version= (present, empty) must filter to the literal empty string, \
+         not NULL, so it must NOT match the fixture device: {empty_os_version:?}"
+    );
+    assert_ne!(
+        exact, empty_os_version,
+        "omitting os_version and sending it empty must not be equivalent"
+    );
+
+    srv.shutdown().await;
 }

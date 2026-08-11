@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -11,10 +12,13 @@
   import TimeValue from '../lib/components/TimeValue.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import StacktraceView from '../lib/components/StacktraceView.svelte';
+  import SymbolicationBadge from '../lib/components/SymbolicationBadge.svelte';
   import BreadcrumbTrail from '../lib/components/BreadcrumbTrail.svelte';
   import KeyValueList from '../lib/components/KeyValueList.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
+  import CursorPagination from '../lib/components/CursorPagination.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import { OCCURRENCE_FIELDS, encodeFilters, type Filter } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -25,6 +29,15 @@
     listIssueEvents,
     getIssueEventStats,
   } from '../lib/api/issues';
+  import type { SearchEnvelope, SearchPredicateParams } from '../lib/api/search';
+  import { canGoBack, cursorOf, emptyPage, pageNumber } from '../lib/models/cursor-page';
+  import {
+    setCursorPage,
+    setCursorSort,
+    cursorBack,
+    type CursorListState,
+  } from '../lib/models/list-state';
+  import { sortParam, type SortDir } from '../lib/models/sort';
   import { errorMessage } from '../lib/api/client';
   import { viewCache } from '../lib/stores/view-cache';
   import { toastStore } from '../lib/stores/toast.svelte';
@@ -74,17 +87,138 @@
     if (aid && id) void load(aid, id);
   });
 
-  let occurrences = $state<ErrorEvent[]>([]);
+  const OCC_LIMIT = 50;
+  /** Default occurrence window: 3650d is the backend's effective-"all" cap. */
+  const OCC_SINCE_DEFAULT = 3650;
+
   let occLoading = $state(false);
   let occFilters = $state<Filter[]>([]);
   let occSearch = $state('');
-  let occSince = $state(3650);
+  let occSince = $state(OCC_SINCE_DEFAULT);
   let occStats = $state<IssueEventStats | null>(null);
   let occTimer: ReturnType<typeof setTimeout> | undefined;
 
-  async function loadOccurrences(appId: string, id: string, enc: string[], term: string, since: number) {
+  /**
+   * The whole `SearchEnvelope` for the occurrences on screen, not just its rows:
+   * `next_cursor` describes this exact page, so holding the two together is what
+   * stops a later refactor pairing one request's rows with another's cursor.
+   *
+   * `$state.raw`, not `$state`: it is replaced wholesale on every load and never
+   * edited in place, so the deep proxy would be pure overhead.
+   */
+  let occEnvelope = $state.raw<SearchEnvelope<ErrorEvent> | null>(null);
+  const occurrences = $derived(occEnvelope?.data ?? []);
+  /**
+   * The cursor for the NEXT page, read off the envelope that produced the rows
+   * rendered — so the Next button's enabled state and the cursor that button
+   * sends come from one payload and cannot disagree.
+   */
+  const occNextCursor = $derived(occEnvelope?.next_cursor ?? null);
+
+  /**
+   * Sort and page position for the occurrences table, changed together — see
+   * `models/list-state.ts` for why the two live in one field.
+   *
+   * Moved by a click (`toOccPage`, `onOccSort`), or reset by the debounced
+   * reload below — never by a response. `models/cursor-page.ts` explains why
+   * that separation is the whole design, and what breaks without it (a reload
+   * on page 2 silently stepping the state to page 3 while the rows stay put).
+   */
+  let occList = $state<CursorListState>({
+    sort: { key: 'occurred_at', dir: 'desc' },
+    page: emptyPage(),
+  });
+
+  /**
+   * True once the reader has moved off page one, and until the reload below
+   * resets the walk.
+   *
+   * "Is a walk in progress?" cannot be read off the rows or off `occList.page`
+   * during a move: `toOccPage` clears the envelope, so `occurrences.length` is 0 while
+   * the request is in flight, and a Prev landing back on page one has
+   * `canGoBack` false as well. A pager keyed on either would unmount for the
+   * length of every move and remount when it lands, jumping out from under the
+   * cursor.
+   */
+  let occWalked = $state(false);
+
+  /**
+   * The pager appears only when there is somewhere else to be — a next page, or
+   * a walk already under way.
+   *
+   * Deliberately NOT `occurrences.length > 0 || occWalked`, which is what Issues
+   * and Events use. There the pager's caption replaced an existing count line,
+   * so rendering it on a single-page list was net-neutral. Here the card header
+   * already states the count (exactly, with the user/session breakdown), so a
+   * pager under a 7-row table would add a second copy of that number and two
+   * permanently dead buttons to the great majority of issues.
+   */
+  const showOccPager = $derived(occNextCursor !== null || occWalked);
+
+  /**
+   * A landed page with no rows on it, which is not the same fact as "nothing
+   * matches" and must not borrow its copy — the stat strip above is a fresh
+   * count of the whole match set while the cursor is a boundary from an earlier
+   * request, so a retention trim or a deletion between two clicks lands here
+   * with "12,431 events" in the header above an empty table.
+   */
+  const occEmptyPastFirstPage = $derived(
+    !occLoading && occurrences.length === 0 && canGoBack(occList.page),
+  );
+
+  /**
+   * The predicate that produced the rows on screen, so Prev/Next can ask for
+   * another page OF THAT RESULT SET.
+   *
+   * A cursor is only a position within the result set that issued it. This page
+   * debounces the LOAD rather than the inputs (Issues and Events debounce
+   * `search` into an `appliedSearch` and can therefore read live state here), so
+   * between a keystroke and the reload 250ms later `occSearch` holds a predicate
+   * that has not been queried yet — and a Next click reading it would pair the
+   * current cursor with a predicate it does not belong to.
+   *
+   * Plain `let`, not `$state`: only the imperative page handlers read it, and
+   * nothing renders it. It is seeded from the same constants `occFilters`,
+   * `occSearch` and `occSince` start at rather than by reading those back — a
+   * read here would capture the initial value of reactive state and mean
+   * nothing, which is precisely what `state_referenced_locally` warns about.
+   */
+  let occQuery: { enc: string[]; term: string; since: number } = {
+    enc: [],
+    term: '',
+    since: OCC_SINCE_DEFAULT,
+  };
+
+  /**
+   * Out-of-order guard. Paging is a second way to get two requests in flight —
+   * a debounced predicate reload and a Prev/Next click can overlap, and nothing
+   * about HTTP returns them in order. Only the newest may write, so a slow
+   * response for a page the reader has already left cannot land under a pager
+   * that has moved on, which would put one page's rows under another's number.
+   */
+  let occGen = 0;
+
+  async function loadOccurrences(
+    appId: string,
+    id: string,
+    enc: string[],
+    term: string,
+    since: number,
+    l: CursorListState,
+  ) {
+    const gen = ++occGen;
+    occQuery = { enc, term, since };
     occLoading = true;
-    const params = { filters: enc, q: term || undefined, sinceDays: since };
+    // ONE predicate object, handed to BOTH requests below.
+    //
+    // Typed as `SearchPredicateParams` rather than left inferred so the split is
+    // enforced at the point it could be broken: excess-property checking makes
+    // it a compile error to slip `limit`/`cursor`/`sort` in here, and the only
+    // way to page is therefore to spread this object into the list's arguments.
+    // Splitting it into a list-params and a stats-params object is what would
+    // let a filter reach one request and not the other, and the symptom is a
+    // caption counting a different set than the table shows.
+    const params: SearchPredicateParams = { filters: enc, q: term || undefined, sinceDays: since };
     try {
       // Issued together so the counts and the rows they describe swap in on the
       // same frame; resolving them separately would briefly caption the new
@@ -96,18 +230,109 @@
       // issue. Under `all`, that would reject the pair and blank a perfectly
       // good occurrence table. Losing the stat strip is the acceptable
       // degradation here; losing the rows is not.
+      //
+      // Only the list moved onto a `SearchEnvelope` in S2c — hence the whole
+      // envelope kept on one side and a bare payload on the other.
+      // `/events/stats` has no rows to page, so it still answers the bare
+      // counts, and those counts stay the ones on screen: the envelope's `total`
+      // stops at the server's 10,000 cap, while `events` here is exact.
+      //
+      // The page half is spread ON TOP of `params` at the call site, never
+      // folded into it. That is the whole reason `getIssueEventStats` can take
+      // the same object untouched: no ordering and no page boundary changes a
+      // total, so the counts describe the entire match set while the list
+      // returns one 50-row window of it.
+      //
+      // Both are re-issued on a page move, the stats included. It is the
+      // expensive half, but it is also the self-healing one: a stats request
+      // that timed out on the previous load leaves the caption with no count,
+      // and re-asking is what puts it back.
       const [rows, stats] = await Promise.allSettled([
-        listIssueEvents(appId, id, { ...params, limit: 50 }),
+        listIssueEvents(appId, id, {
+          ...params,
+          limit: OCC_LIMIT,
+          sort: sortParam(l.sort),
+          cursor: cursorOf(l.page),
+        }),
         getIssueEventStats(appId, id, params),
       ]);
-      occurrences = rows.status === 'fulfilled' ? rows.value : [];
+      if (gen !== occGen) return;
+      occEnvelope = rows.status === 'fulfilled' ? rows.value : null;
       occStats = stats.status === 'fulfilled' ? stats.value : null;
     } catch {
-      occurrences = [];
+      if (gen !== occGen) return;
+      occEnvelope = null;
       occStats = null;
     } finally {
-      occLoading = false;
+      // Left to the newest call: a superseded one clearing this would drop the
+      // spinner while its replacement is still in flight.
+      if (gen === occGen) occLoading = false;
     }
+  }
+
+  /**
+   * Prev/Next/sort load IMPERATIVELY rather than by writing state the reload
+   * effect reads back. An effect that both wrote `occList` and read it to
+   * build its request would re-run on its own write; this way the effect
+   * depends only on the predicate inputs, and neither paging nor sorting ever
+   * enters it.
+   */
+  function toOccPage(next: CursorListState) {
+    const aid = sessionStore.currentAppId;
+    const id = issueId;
+    // The walk does not move unless the request can actually be issued. Written
+    // the other way round — state first, request only `if (aid)` — a click with
+    // no app selected would step the page number with nothing in flight and no
+    // way out but a filter change. `AppShell requireApp` makes that unreachable
+    // in practice, so this guards a shape rather than a live bug.
+    if (!aid || !id) return;
+    occList = next;
+    occWalked = true;
+    // The rows up are the page being left. Clearing them is what stops the pager
+    // labelling one page's rows with another's number while the request is in
+    // flight — the card shows its spinner instead, as it does on a filter
+    // change. The stat strip is NOT cleared: it is scoped to the predicate, and
+    // a page move does not change the predicate.
+    occEnvelope = null;
+    void loadOccurrences(aid, id, occQuery.enc, occQuery.term, occQuery.since, next);
+  }
+
+  function goOccPrev() {
+    // `cursorBack` refuses on the first page by handing `occList` back BY
+    // REFERENCE (see `list-state.ts`) — testing identity skips the reload
+    // rather than refetching the page already on screen.
+    const next = cursorBack(occList);
+    if (next !== occList) toOccPage(next);
+  }
+
+  function goOccNext() {
+    // `setCursorPage` refuses any move it cannot make — no next cursor, an
+    // empty one, or one equal to this page's — and says so by handing back the
+    // very `occList` it was given. Testing identity keeps every one of those
+    // rules in the reducer, and skips the reload rather than refetching the
+    // page on screen.
+    const next = setCursorPage(occList, occNextCursor);
+    if (next !== occList) toOccPage(next);
+  }
+
+  /**
+   * The sort-header click handler passed to every `SortableTh` in the
+   * occurrences table. `setCursorSort` resets the walk onto the new ordering —
+   * a keyset cursor only addresses a position within the ordering that minted
+   * it, so a sort change cannot keep the old page — and this reloads directly
+   * for the same reason `toOccPage` does: the debounced reload below must not
+   * depend on `occList` (see its comment), so nothing else will notice this
+   * write.
+   */
+  function onOccSort(key: string, columnDefault: SortDir) {
+    const aid = sessionStore.currentAppId;
+    const id = issueId;
+    if (!aid || !id) return;
+    const next = setCursorSort(occList, key, columnDefault);
+    occList = next;
+    occWalked = false;
+    occEnvelope = null;
+    void loadOccurrences(aid, id, occQuery.enc, occQuery.term, occQuery.since, next);
   }
 
   function plural(n: number, word: string): string {
@@ -125,7 +350,43 @@
     const since = occSince;
     if (!aid || !id) return;
     clearTimeout(occTimer);
-    occTimer = setTimeout(() => void loadOccurrences(aid, id, enc, term, since), 250);
+    occTimer = setTimeout(() => {
+      // Back to page one, current sort kept. A cursor addresses a position in
+      // ONE result set, so it is meaningless against a different predicate —
+      // and equally meaningless against a different issue or a different
+      // environment, which is why `issueId` and `scopeKey` above have to
+      // reset this too and not merely refetch.
+      //
+      // `occList.sort` is read through `untrack`, the same rule
+      // Events.svelte's equivalent effect follows: this callback must not
+      // create a dependency on `occList`, because `toOccPage`/`onOccSort` both
+      // write it and reload on their own, and a dependency here would
+      // re-trigger this effect on those writes too and undo the very move it
+      // made. Reading inside a `setTimeout` callback is already outside any
+      // effect's tracking context — see the next paragraph — so this is
+      // belt-and-braces, not load bearing, but it keeps the rule legible
+      // without relying on that reasoning.
+      //
+      // Written but never READ by the effect, and the load takes the fresh
+      // list as an ARGUMENT rather than reading the state back: an effect
+      // that depended on `occList` would re-run on its own write. Belt and
+      // braces here, since these writes happen in a timer callback and so are
+      // outside the effect's tracking context entirely.
+      //
+      // The reset sits in the callback rather than in the effect body for a
+      // second reason: it must land at the same moment as the rows it describes.
+      // Reset synchronously and the 250ms of debounce would show "Page 1" over
+      // the page-3 rows still on screen — and a Next click during that window
+      // would step the state to page 2 while the pending reload put page one's
+      // rows underneath it.
+      const next: CursorListState = { sort: untrack(() => occList.sort), page: emptyPage() };
+      occList = next;
+      // The walk is over, so the pager goes with it: page one of a new predicate
+      // gets the plain table it had before any of this, not a pager hovering
+      // over it.
+      occWalked = false;
+      void loadOccurrences(aid, id, enc, term, since, next);
+    }, 250);
     return () => clearTimeout(occTimer);
   });
 
@@ -165,6 +426,19 @@
   );
   const latestEvent = $derived(issue?.latest_event ?? null);
   const latestEventType = $derived(latestEvent?.exception_type ?? issue?.type ?? '');
+
+  // Tags for the rail summary. Same shaping as KeyValueList so the rail and the
+  // full-width Tags card can never disagree about what a value looks like.
+  const tagEntries = $derived(
+    latestEvent?.tags && typeof latestEvent.tags === 'object'
+      ? Object.entries(latestEvent.tags)
+      : [],
+  );
+  function renderTag(value: unknown): string {
+    if (value === null || value === undefined) return '—';
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+  }
 
   const eventMeta = $derived.by(() => {
     const ev = latestEvent;
@@ -308,31 +582,10 @@
               <div class="section">
                 <div class="section-head">
                   <span class="section-label">Stacktrace</span>
-                  {#if latestEvent.symbolication_status}
-                    {@const s = latestEvent.symbolication_status}
-                    {@const isDart = latestEvent.debug_meta?.raw_stacktrace != null}
-                    <span
-                      class="sym-badge"
-                      class:ok={s === 'symbolicated'}
-                      class:partial={s === 'partial'}
-                      class:none={s === 'no_artifacts'}
-                      title={s === 'no_artifacts'
-                        ? `Upload ${isDart ? 'debug symbols' : 'source maps'} for this release to see original frames`
-                        : ''}
-                    >
-                      {s === 'symbolicated'
-                        ? 'Symbolicated'
-                        : s === 'partial'
-                          ? 'Partially symbolicated'
-                          : s === 'no_artifacts'
-                            ? isDart
-                              ? 'No symbols'
-                              : 'No source maps'
-                            : s === 'pending'
-                              ? 'Pending'
-                              : 'Not applicable'}
-                    </span>
-                  {/if}
+                  <SymbolicationBadge
+                    status={latestEvent.symbolication_status}
+                    isDart={latestEvent.debug_meta?.raw_stacktrace != null}
+                  />
                 </div>
                 <StacktraceView
                   frames={latestEvent.stacktrace ?? []}
@@ -398,18 +651,49 @@
             bind:search={occSearch}
             bind:sinceDays={occSince}
           />
+          <!--
+            `payload_searched === false` is the only state worth a line: a
+            free-text search ran, and it silently matched LESS than this member
+            thinks it did, because `event:read` is what opens the payload
+            columns. Nothing else on screen says so — the rows look like a
+            complete answer.
+
+            `=== false` and not a truthiness test. `null` means no search ran at
+            all, and rendering the notice for it would claim a narrowing on
+            every unfiltered visit. See `IssueEventStats.payload_searched`.
+          -->
+          {#if occStats?.payload_searched === false}
+            <p class="scope-note">
+              Searching message and exception text only — matching tags, contexts
+              and extra data needs the event-read permission.
+            </p>
+          {/if}
           {#if occLoading}
             <div class="center"><Spinner size={20} /></div>
+          {:else if occEmptyPastFirstPage}
+            <!--
+              Deliberately not the copy below. That one answers "does anything
+              match?" and the answer here is yes — the count in the card header
+              says so. What happened is that this page of the walk no longer
+              holds any of them, so "No occurrences match this filter" under a
+              header reading "12,431 events" would be the pager lying in prose.
+              No button: Prev is live in the pager directly underneath, which is
+              the way back.
+            -->
+            <p class="faint">
+              Nothing left on this page — these occurrences have gone since it was loaded.
+              Go back for the ones that are still here.
+            </p>
           {:else if occurrences.length === 0}
             <p class="faint">No occurrences match this filter.</p>
           {:else}
             <DataTable class="occ-table">
               {#snippet head()}
                 <tr>
-                  <th>Time</th>
-                  <th>User</th>
-                  <th>Session</th>
-                  <th>Device</th>
+                  <SortableTh key="occurred_at" sort={occList.sort} onsort={onOccSort}>Time</SortableTh>
+                  <SortableTh key="distinct_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>User</SortableTh>
+                  <SortableTh key="session_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>Session</SortableTh>
+                  <SortableTh key="device_key" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>Device</SortableTh>
                 </tr>
               {/snippet}
               {#snippet children()}
@@ -464,6 +748,35 @@
               {/snippet}
             </DataTable>
           {/if}
+
+          <!--
+            The caption counts `occStats.events`, NOT the envelope's `total`.
+            They describe the same set — `event_stats` runs the identical
+            predicate over the identical window as the list, and its `events` is
+            a `count(*)` of the very rows being paged — but the envelope's stops
+            at the server's 10,000 cap while this one is exact. That is why
+            `totalIsCapped` is a flat `false`: it states a fact about this
+            number, not a placeholder. Swapping in `occEnvelope.total` would
+            silently turn an exact count into a lower bound, and put a second,
+            disagreeing figure a few rows under the one in the card header.
+
+            `null` when the stats half of the `allSettled` pair failed — the
+            degradation that pair exists for — which is exactly the "no count to
+            state" the control renders as a bare page number.
+          -->
+          {#if showOccPager}
+            <CursorPagination
+              total={occStats?.events ?? null}
+              totalIsCapped={false}
+              page={pageNumber(occList.page)}
+              canPrev={canGoBack(occList.page)}
+              canNext={occNextCursor !== null}
+              busy={occLoading}
+              noun="occurrence"
+              onprev={goOccPrev}
+              onnext={goOccNext}
+            />
+          {/if}
         </Card>
       </div>
 
@@ -515,6 +828,24 @@
           </dl>
         </Card>
 
+        <!-- Tags again, in the rail. The full-width card further down stays: it
+             is the one that can show long values without truncating. This is the
+             at-a-glance copy, so it sits with the other identity facts rather
+             than below a fold of stack trace and payload. Uses `.side-dl` rather
+             than KeyValueList because that component lays out for full width. -->
+        {#if latestEvent && tagEntries.length > 0}
+          <Card title="Tags">
+            <dl class="side-dl">
+              {#each tagEntries as [key, value] (key)}
+                <div>
+                  <dt class="mono">{key}</dt>
+                  <dd class="mono tag-val" title={renderTag(value)}>{renderTag(value)}</dd>
+                </div>
+              {/each}
+            </dl>
+          </Card>
+        {/if}
+
         {#if distinctId}
           <Card title="Affected user">
             <button class="person" onclick={() => push(`/persons/${encodeURIComponent(distinctId)}`)}>
@@ -551,6 +882,18 @@
     display: grid;
     place-items: center;
     padding: 80px;
+  }
+  /* Issues/Events reserve a line with `min-height` so their caption swapping in
+     beside already-rendered tiles is not a reflow. Deliberately NOT copied: this
+     notice sits above a table that is itself swapping in from a spinner, so
+     there is no steady state to protect — and reserving two blank lines under
+     the filter bar of every issue, for a state most members never hit, costs
+     more than the reflow it would prevent. */
+  .scope-note {
+    font-size: 12px;
+    line-height: 16px;
+    color: var(--text-faint);
+    margin: 8px 0 0;
   }
   .detail-head {
     display: flex;
@@ -654,30 +997,8 @@
     justify-content: space-between;
     gap: 10px;
   }
-  .sym-badge {
-    font-size: 10px;
-    font-weight: 650;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    padding: 2px 7px;
-    border-radius: var(--radius-pill);
-    color: var(--text-muted);
-    background: var(--surface-2, var(--surface));
-    border: 1px solid var(--border);
-  }
-  .sym-badge.ok {
-    color: var(--success, #30a46c);
-    background: color-mix(in srgb, var(--success, #30a46c) 14%, transparent);
-    border-color: transparent;
-  }
-  .sym-badge.partial {
-    color: var(--warning, #f5a623);
-    background: color-mix(in srgb, var(--warning, #f5a623) 16%, transparent);
-    border-color: transparent;
-  }
-  .sym-badge.none {
-    cursor: help;
-  }
+  /* `.sym-badge` moved to lib/components/SymbolicationBadge.svelte, which the
+     session timeline shares. */
   .side-dl {
     display: flex;
     flex-direction: column;
@@ -700,6 +1021,17 @@
     color: var(--text);
     text-align: right;
     word-break: break-word;
+  }
+  /* Tag values are arbitrary strings in a 300px column. Clamped to two lines
+     with the full value on hover, so one long value cannot push the rest of the
+     rail off screen. The full-width Tags card below shows them untruncated. */
+  .tag-val {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    min-width: 0;
   }
   .fp {
     font-size: 11.5px;
