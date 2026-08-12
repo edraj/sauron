@@ -523,9 +523,47 @@ pub struct SchemaQuery {
     pub context: Option<String>,
 }
 
+/// How long a sampled key list is served from cache.
+///
+/// Five minutes: long enough that the bounded scan runs at most a handful of
+/// times an hour per app, short enough that a newly deployed tag shows up in
+/// autocomplete within one coffee.
+const TAG_CACHE_TTL_SECS: u64 = 300;
+
+/// How many recent rows the sampler expands. See `repo::tag_keys_sql` for why
+/// this is bounded at all.
+const TAG_SAMPLE_ROWS: i64 = 2_000;
+
+/// The window the sample reads. Independent of any caller's `since_days`: the
+/// key list describes the APP, not a query.
+const TAG_SAMPLE_DAYS: i64 = 7;
+
+/// Which table a resource's tags live on — `None` when it has none, in which
+/// case no query is issued at all.
+///
+/// Matched exhaustively rather than with a catch-all, so a `Resource` added
+/// later forces a decision here instead of silently defaulting to "no tags",
+/// which would look identical to an app that has simply not sent any.
+pub fn tag_source_for(resource: sauron_query::Resource) -> Option<sauron_db::repo::TagSource> {
+    use sauron_db::repo::TagSource;
+    use sauron_query::Resource;
+    match resource {
+        Resource::Issues | Resource::Occurrences => Some(TagSource::ErrorEvents),
+        Resource::Events => Some(TagSource::AnalyticsEvents),
+        Resource::Sessions | Resource::Devices | Resource::Persons | Resource::Transactions => None,
+    }
+}
+
+/// Keyed per app AND per resource: Issues and Events read different tables, so
+/// a single per-app key would serve analytics tags on the Issues page.
+pub fn tag_cache_key(app_id: Uuid, resource: &str) -> String {
+    format!("search:tagkeys:{app_id}:{resource}")
+}
+
 pub fn build_schema_response(
     context_str: &str,
     resource: sauron_query::Resource,
+    tags: Vec<TagInfo>,
 ) -> SchemaResponse {
     // Advertise only the variables this resource can actually resolve. The
     // catalog declares each dimension's `resources`, and `resolve_field`
@@ -605,29 +643,23 @@ pub fn build_schema_response(
         })
         .collect();
 
+    // Gated on the CATALOG, not on whether the sampler found anything: a
+    // resource with no tag dimension must not be handed a `@tag` prefix that
+    // every query built from it would then be rejected for. The keys
+    // themselves now come from the caller — they used to be a hardcoded
+    // `environment`/`release` fixture served to every app alike, which offered
+    // keys an app may never have emitted and hid the ones it did.
     let available_tags = if sauron_query::catalog::tag_dimension(resource).is_some() {
-        vec![
-            TagInfo {
-                key: "environment".to_string(),
-                sample_values: Some(vec!["production".to_string(), "staging".to_string()]),
-            },
-            TagInfo {
-                key: "release".to_string(),
-                sample_values: None,
-            },
-        ]
+        tags
     } else {
         vec![]
     };
 
-    let available_labels = if sauron_query::catalog::label_dimension(resource).is_some() {
-        vec![LabelInfo {
-            key: "team".to_string(),
-            ty: "string".to_string(),
-        }]
-    } else {
-        vec![]
-    };
+    // Empty, deliberately. This was a hardcoded `team` fixture — false for
+    // every app that does not happen to use that key. There is no label
+    // sampler yet, and advertising nothing is honest where advertising an
+    // invented key is not.
+    let available_labels: Vec<LabelInfo> = vec![];
 
     SchemaResponse {
         resource: context_str.to_string(),
@@ -667,7 +699,69 @@ pub async fn schema(
         other => return Err(ApiError::BadRequest(format!("invalid context: {other}"))),
     };
 
-    Ok(Json(build_schema_response(context_str, resource)))
+    let tags = load_tag_keys(&state, &mut conn, app_id, context_str, resource).await;
+    Ok(Json(build_schema_response(context_str, resource, tags)))
+}
+
+/// Sampled tag keys, cached — and **never a failure**.
+///
+/// Autocomplete is a hint. A sampler that timed out, a Redis that is down, or a
+/// resource with no tags at all must all degrade to "no suggestions", never to
+/// a failed schema request: the input stays usable and the reader types the key
+/// themselves. Every error path here therefore returns an empty list rather
+/// than propagating.
+async fn load_tag_keys(
+    state: &AppState,
+    conn: &mut sauron_db::pool::PgConn,
+    app_id: Uuid,
+    context_str: &str,
+    resource: sauron_query::Resource,
+) -> Vec<TagInfo> {
+    let Some(source) = tag_source_for(resource) else {
+        return vec![];
+    };
+    let cache_key = tag_cache_key(app_id, context_str);
+
+    if let Ok(Some(hit)) = state.redis.get(&cache_key).await {
+        if let Ok(tags) = serde_json::from_str::<Vec<TagInfo>>(&hit) {
+            return tags;
+        }
+    }
+
+    let since = Utc::now() - Duration::days(TAG_SAMPLE_DAYS);
+    let sampled = match sauron_db::repo::sample_tag_keys(
+        conn,
+        app_id,
+        source,
+        since,
+        TAG_SAMPLE_ROWS,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, %app_id, "tag key sample failed; serving no suggestions");
+            return vec![];
+        }
+    };
+
+    let tags: Vec<TagInfo> = sampled
+        .into_iter()
+        .map(|r| TagInfo {
+            key: r.key,
+            sample_values: (!r.sample_values.is_empty()).then_some(r.sample_values),
+        })
+        .collect();
+
+    if let Ok(json) = serde_json::to_string(&tags) {
+        // A cache write failure is not the caller's problem — they still get
+        // the freshly sampled list.
+        let _ = state
+            .redis
+            .set_ex(&cache_key, &json, TAG_CACHE_TTL_SECS)
+            .await;
+    }
+    tags
 }
 
 #[cfg(test)]
@@ -1168,9 +1262,87 @@ mod tests {
         assert_eq!(v["data"], serde_json::json!([1, 2]));
     }
 
+    // -- Real tag keys (search UX overhaul, Task 5) -------------------------
+
+    /// The fixtures were returned for every app, so autocomplete offered keys
+    /// an app may never have emitted and hid the ones it did.
+    #[test]
+    fn the_schema_serves_the_tags_it_is_given_not_a_fixture() {
+        let real = vec![TagInfo {
+            key: "checkout_step".to_string(),
+            sample_values: Some(vec!["payment".to_string()]),
+        }];
+        let resp = build_schema_response("issues", sauron_query::Resource::Issues, real);
+        let keys: Vec<&str> = resp.available_tags.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, ["checkout_step"]);
+        assert!(
+            !keys.contains(&"release"),
+            "the hardcoded fixture must be gone: {keys:?}"
+        );
+    }
+
+    /// A resource with no tag dimension must not be handed tags even if the
+    /// sampler produced some — the autocomplete would offer a prefix every
+    /// query built from it is then rejected for.
+    #[test]
+    fn a_resource_without_a_tag_dimension_is_served_no_tags() {
+        let real = vec![TagInfo {
+            key: "region".to_string(),
+            sample_values: None,
+        }];
+        let resp = build_schema_response("sessions", sauron_query::Resource::Sessions, real);
+        assert!(resp.available_tags.is_empty(), "{:?}", resp.available_tags);
+        assert!(!resp.variables.iter().any(|v| v.prefix == "@tag"));
+    }
+
+    /// Which physical table a resource's tags live on. `None` means the
+    /// resource has no tags to sample, and no query is issued at all.
+    #[test]
+    fn each_resource_samples_its_own_table() {
+        use sauron_db::repo::TagSource;
+        use sauron_query::Resource;
+        assert_eq!(
+            tag_source_for(Resource::Issues),
+            Some(TagSource::ErrorEvents)
+        );
+        assert_eq!(
+            tag_source_for(Resource::Occurrences),
+            Some(TagSource::ErrorEvents)
+        );
+        assert_eq!(
+            tag_source_for(Resource::Events),
+            Some(TagSource::AnalyticsEvents)
+        );
+        assert_eq!(tag_source_for(Resource::Sessions), None);
+    }
+
+    /// The cache is keyed per app AND per resource: Issues and Events read
+    /// different tables, so one key would serve analytics tags on Issues.
+    #[test]
+    fn the_cache_key_separates_apps_and_resources() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        assert_ne!(tag_cache_key(a, "issues"), tag_cache_key(b, "issues"));
+        assert_ne!(tag_cache_key(a, "issues"), tag_cache_key(a, "events"));
+        assert!(tag_cache_key(a, "issues").starts_with("search:tagkeys:"));
+    }
+
+    /// The label fixture claimed every app uses a `team` label. Nothing
+    /// samples labels yet, so the honest answer is none — an invented key in
+    /// autocomplete is a suggestion that resolves to zero rows.
+    #[test]
+    fn no_invented_labels_are_advertised() {
+        let resp = build_schema_response("sessions", sauron_query::Resource::Sessions, vec![]);
+        assert!(
+            resp.available_labels.is_empty(),
+            "{:?}",
+            resp.available_labels
+        );
+    }
+
     #[test]
     fn schema_response_generation() {
-        let resp = build_schema_response("sessions", sauron_query::Resource::Sessions);
+        let resp = build_schema_response("sessions", sauron_query::Resource::Sessions, vec![]);
         assert_eq!(resp.resource, "sessions");
         assert!(resp.dimensions.iter().any(|d| d.name == "startedAt"));
 
@@ -1184,7 +1356,7 @@ mod tests {
 
         // ...and the converse, so this cannot be "fixed" by dropping every
         // variable: Issues have tags but no `context`/`extra` column.
-        let issues = build_schema_response("issues", sauron_query::Resource::Issues);
+        let issues = build_schema_response("issues", sauron_query::Resource::Issues, vec![]);
         assert!(issues.variables.iter().any(|v| v.prefix == "@tag"));
         assert!(!issues.variables.iter().any(|v| v.prefix == "@context"));
     }

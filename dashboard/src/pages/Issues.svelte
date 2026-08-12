@@ -14,6 +14,7 @@
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatusBadge from '../lib/components/StatusBadge.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
+  import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import {
@@ -28,6 +29,8 @@
   import { viewKey } from '../lib/stores/view-cache';
   import { listIssues, getIssueStats } from '../lib/api/issues';
   import type { SearchEnvelope } from '../lib/api/search';
+  import { fetchSchema, type SchemaDefinition } from '../lib/api/schema';
+  import { preflight, queryErrorFor } from '../lib/utils/query-error';
   import { compactNumber } from '../lib/utils/format';
   import {
     advance,
@@ -145,6 +148,47 @@
    */
   const total = $derived(issuesView.data?.total ?? null);
   const totalIsCapped = $derived(issuesView.data?.total_is_capped ?? false);
+
+  /**
+   * The planner narrowed the time window, and by how much.
+   *
+   * `resolve_window` computes this as the TIGHTEST of the caller's own window,
+   * the route's ceiling and the cost clamp, naming the rule that actually
+   * bound — and until `SearchDisclosure` nothing on this page read it, so a
+   * query served 30 days of a 365-day request looked like a complete answer.
+   */
+  const clamped = $derived(issuesView.data?.clamped ?? null);
+
+  /**
+   * The resource's own schema, held for `did you mean`. A failure is silent:
+   * without it the server's 400 still shows, just with no suggestion attached.
+   */
+  let searchSchema = $state<SchemaDefinition | null>(null);
+  $effect(() => {
+    const id = sessionStore.currentAppId;
+    if (!id) return;
+    let cancelled = false;
+    fetchSchema(id, 'issues')
+      .then((s) => {
+        if (!cancelled) searchSchema = s;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /**
+   * What to mark ON the input, as opposed to on the page's error card.
+   *
+   * A local parse problem wins: it is more specific than whatever the last
+   * request said, and it means no request was worth issuing at all. Anything
+   * that is not a 400 or a 403 stays the card's business — a 500 is not a
+   * query the reader can fix by editing it.
+   */
+  const searchError = $derived(
+    preflight(search) ?? queryErrorFor(issuesView.errorStatus, error, searchSchema),
+  );
 
   /**
    * True once the reader has moved off page one, and until the predicate effect
@@ -470,8 +514,8 @@
     <div class="center-sm"><Spinner size={22} /></div>
   {/if}
 
-  <p class="filter-hint">Filter by <code>Tag</code> (key = value); the search box also matches tag &amp; payload content.</p>
-  <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:sinceDays ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" />
+  <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:sinceDays ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" error={searchError} />
+  <SearchDisclosure {clamped} />
 
   <Card padding="none">
     <!--
@@ -609,11 +653,6 @@
 </AppShell>
 
 <style>
-  .filter-hint {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin: -4px 0 8px;
-  }
   .head {
     display: flex;
     align-items: flex-start;

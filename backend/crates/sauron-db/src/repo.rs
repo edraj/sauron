@@ -16654,3 +16654,84 @@ pub async fn session_user(
         .await
         .optional()
 }
+
+// ---------------------------------------------------------------------------
+// Search autocomplete: sampled tag keys
+// ---------------------------------------------------------------------------
+
+/// Which table a tag-key sample reads, and therefore which window column
+/// bounds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagSource {
+    /// `error_events` — Issues and Occurrences.
+    ErrorEvents,
+    /// `analytics_events` — Events.
+    AnalyticsEvents,
+}
+
+impl TagSource {
+    fn table(self) -> &'static str {
+        match self {
+            TagSource::ErrorEvents => "error_events",
+            TagSource::AnalyticsEvents => "analytics_events",
+        }
+    }
+}
+
+/// One tag key an app has actually emitted, with a few of its values.
+#[derive(Debug, Clone, QueryableByName)]
+pub struct TagKeySample {
+    #[diesel(sql_type = Text)]
+    pub key: String,
+    #[diesel(sql_type = Array<Text>)]
+    pub sample_values: Vec<String>,
+}
+
+/// The sampler's SQL, split out so its shape can be pinned without a database.
+///
+/// **Bounded twice, deliberately.** `jsonb_each_text` over a partitioned parent
+/// with no time bound is a seq scan across every partition, with a cost that
+/// scales with retained data rather than with the question asked. The window,
+/// the row limit and the `tags IS NOT NULL` exclusion all sit on the INNER
+/// subquery, so the LATERAL expands at most `row_limit` rows and none of that
+/// budget is spent on rows that can contribute no keys.
+///
+/// This is a HINT, not an authoritative key list: a key that appears only on
+/// rows older than the sample will not be offered. That is the accepted cost of
+/// not paying for it on the write path — the grammar still accepts any key the
+/// user types, including via the `tag:<key>=<value>` escape hatch for keys
+/// outside the identifier charset, so nothing becomes unqueryable.
+///
+/// The table name is the only interpolated part, and it comes from a
+/// [`TagSource`] variant rather than from anything a caller supplied. Every
+/// value is bound.
+pub fn tag_keys_sql(source: TagSource) -> String {
+    format!(
+        "SELECT kv.key AS key, \
+                (array_agg(DISTINCT kv.value))[1:5] AS sample_values \
+         FROM (SELECT tags FROM {table} \
+               WHERE app_id = $1 AND occurred_at > $2 AND tags IS NOT NULL \
+               ORDER BY occurred_at DESC LIMIT $3) s, \
+              LATERAL jsonb_each_text(s.tags) kv \
+         GROUP BY kv.key ORDER BY kv.key",
+        table = source.table()
+    )
+}
+
+/// The tag keys an app has emitted recently, for search autocomplete.
+///
+/// Never fails a caller: see the route, which treats an error as an empty list.
+pub async fn sample_tag_keys(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    source: TagSource,
+    since: DateTime<Utc>,
+    row_limit: i64,
+) -> QueryResult<Vec<TagKeySample>> {
+    diesel::sql_query(tag_keys_sql(source))
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Timestamptz, _>(since)
+        .bind::<BigInt, _>(row_limit)
+        .load::<TagKeySample>(conn)
+        .await
+}

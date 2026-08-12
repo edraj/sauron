@@ -18,6 +18,8 @@
     search: string;
     appId?: string;
     context?: string;
+    /** A query error from the page's last request, marked on the input. */
+    error?: string | null;
     sinceDays: number;
     // Optional custom date-range options; falls back to DateRange's default.
     ranges?: { days: number; label: string }[];
@@ -28,6 +30,7 @@
     search = $bindable(''),
     appId = undefined,
     context = undefined,
+    error = null,
     sinceDays = $bindable(30),
     ranges = undefined,
   }: Props = $props();
@@ -124,14 +127,14 @@
     {/if}
   </div>
 
+  <!--
+    The input sizes itself (`flex: 1; min-width: 260px`). It used to sit in a
+    hardcoded 220px box, which is what clipped long suggestions — and the
+    placeholder was hardcoded too, which is how a page could advertise a
+    prefix its resource does not declare. Both are now the component's job.
+  -->
   <div class="right">
-    <div style="width: 220px">
-      {#if appId}
-        <SearchAutocompleteInput bind:value={search} {appId} {context} placeholder="Search…" />
-      {:else}
-        <SearchAutocompleteInput bind:value={search} appId="" placeholder="Search…" />
-      {/if}
-    </div>
+    <SearchAutocompleteInput bind:value={search} appId={appId ?? ''} {context} {error} />
     <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} {ranges} />
   </div>
 </div>
@@ -179,5 +182,5 @@
     padding: 5px 10px; font-size: 12.5px; font-weight: 540;
   }
   .add:hover, .d-ok:hover { color: var(--text); border-color: var(--border-strong); }
-  .right { display: flex; align-items: center; gap: 10px; }
+  .right { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 320px; justify-content: flex-end; }
 </style>

@@ -38,7 +38,10 @@
     type CursorListState,
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
-  import { errorMessage } from '../lib/api/client';
+  import { errorMessage, errorStatus } from '../lib/api/client';
+  import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
+  import { fetchSchema, type SchemaDefinition } from '../lib/api/schema';
+  import { preflight, queryErrorFor } from '../lib/utils/query-error';
   import { viewCache } from '../lib/stores/view-cache';
   import { toastStore } from '../lib/stores/toast.svelte';
   import {
@@ -108,6 +111,32 @@
    */
   let occEnvelope = $state.raw<SearchEnvelope<ErrorEvent> | null>(null);
   const occurrences = $derived(occEnvelope?.data ?? []);
+  /** Why the occurrence rows failed, and with what status. */
+  let occError = $state<string | null>(null);
+  let occErrorStatus = $state<number | null>(null);
+  /** The planner's narrowing of this issue's occurrence window. */
+  const occClamped = $derived(occEnvelope?.clamped ?? null);
+
+  /** The occurrences schema, held only for `did you mean`. */
+  let occSchema = $state<SchemaDefinition | null>(null);
+  $effect(() => {
+    const id = sessionStore.currentAppId;
+    if (!id) return;
+    let cancelled = false;
+    fetchSchema(id, 'occurrences')
+      .then((s) => {
+        if (!cancelled) occSchema = s;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** A local parse problem wins — it means no request was worth issuing. */
+  const occSearchError = $derived(
+    preflight(occSearch) ?? queryErrorFor(occErrorStatus, occError, occSchema),
+  );
   /**
    * The cursor for the NEXT page, read off the envelope that produced the rows
    * rendered — so the Next button's enabled state and the cursor that button
@@ -259,10 +288,18 @@
       if (gen !== occGen) return;
       occEnvelope = rows.status === 'fulfilled' ? rows.value : null;
       occStats = stats.status === 'fulfilled' ? stats.value : null;
-    } catch {
+      // A rejected rows promise used to be discarded outright, so a query the
+      // server REFUSED rendered as "No occurrences match this filter" — an
+      // empty state that answers a question nobody got to ask. The reason is
+      // kept now, and the search input shows it.
+      occError = rows.status === 'rejected' ? errorMessage(rows.reason) : null;
+      occErrorStatus = rows.status === 'rejected' ? errorStatus(rows.reason) : null;
+    } catch (err) {
       if (gen !== occGen) return;
       occEnvelope = null;
       occStats = null;
+      occError = errorMessage(err);
+      occErrorStatus = errorStatus(err);
     } finally {
       // Left to the newest call: a superseded one clearing this would drop the
       // spinner while its replacement is still in flight.
@@ -645,29 +682,32 @@
               </span>
             {/if}
           {/snippet}
+          <!-- This list is occurrences, not issues — the resource decides
+               which dimensions the schema advertises. -->
           <FilterBar
             fields={OCCURRENCE_FIELDS}
             bind:filters={occFilters}
             bind:search={occSearch}
             bind:sinceDays={occSince}
+            appId={sessionStore.currentAppId ?? undefined}
+            context="occurrences"
+            error={occSearchError}
           />
           <!--
-            `payload_searched === false` is the only state worth a line: a
-            free-text search ran, and it silently matched LESS than this member
-            thinks it did, because `event:read` is what opens the payload
-            columns. Nothing else on screen says so — the rows look like a
-            complete answer.
+            Both notices now come from the shared component, which Issues and
+            Events render too. The `payload_searched === false` line originated
+            here; the `clamped` one is new everywhere, and this page had the
+            same gap as the others — a narrowed window with nothing on screen
+            saying so.
 
-            `=== false` and not a truthiness test. `null` means no search ran at
-            all, and rendering the notice for it would claim a narrowing on
-            every unfiltered visit. See `IssueEventStats.payload_searched`.
+            `=== false` and not a truthiness test, still: `null` means no search
+            ran at all, and rendering the notice for it would claim a narrowing
+            on every unfiltered visit. `disclosuresFor` keeps that distinction.
           -->
-          {#if occStats?.payload_searched === false}
-            <p class="scope-note">
-              Searching message and exception text only — matching tags, contexts
-              and extra data needs the event-read permission.
-            </p>
-          {/if}
+          <SearchDisclosure
+            clamped={occClamped}
+            payloadSearched={occStats?.payload_searched ?? null}
+          />
           {#if occLoading}
             <div class="center"><Spinner size={20} /></div>
           {:else if occEmptyPastFirstPage}
@@ -883,18 +923,13 @@
     place-items: center;
     padding: 80px;
   }
-  /* Issues/Events reserve a line with `min-height` so their caption swapping in
-     beside already-rendered tiles is not a reflow. Deliberately NOT copied: this
-     notice sits above a table that is itself swapping in from a spinner, so
-     there is no steady state to protect — and reserving two blank lines under
-     the filter bar of every issue, for a state most members never hit, costs
-     more than the reflow it would prevent. */
-  .scope-note {
-    font-size: 12px;
-    line-height: 16px;
-    color: var(--text-faint);
-    margin: 8px 0 0;
-  }
+  /* `.scope-note` lived here for the `payload_searched` line, which now comes
+     from `SearchDisclosure` along with the clamp notice — the styling moved
+     with it. The reasoning it carried is still true and still applies there:
+     no `min-height` is reserved, because this notice sits above a table that
+     is itself swapping in from a spinner, so there is no steady state to
+     protect, and holding two blank lines under every issue's filter bar for a
+     state most members never hit costs more than the reflow it prevents. */
   .detail-head {
     display: flex;
     align-items: flex-start;

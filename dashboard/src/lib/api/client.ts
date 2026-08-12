@@ -232,3 +232,23 @@ export function errorMessage(value: unknown): string {
   if (value instanceof Error) return value.message;
   return 'Something went wrong';
 }
+
+/**
+ * The HTTP status behind a caught error, or `null` when there is not one.
+ *
+ * The companion to {@link errorMessage}, for pages that hand-roll their request
+ * state instead of going through `CachedView` (which exposes `errorStatus` of
+ * its own). Callers that must distinguish "the query was rejected" from "the
+ * server broke" need the code, not the prose: a 400 belongs on the search
+ * input, a 500 belongs on the page's error card, and the message text reads
+ * much the same either way.
+ *
+ * `null` rather than `0` for a non-HTTP failure. `0` is what the normalizer
+ * uses for a network drop, and a caller comparing `status === 400` would treat
+ * either as "not a query error" — but a caller doing arithmetic or truthiness
+ * on it would not, and `null` makes the absence explicit.
+ */
+export function errorStatus(value: unknown): number | null {
+  if (isNormalizedError(value)) return value.status || null;
+  return null;
+}

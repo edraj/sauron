@@ -5,11 +5,19 @@ can be narrowed with **search**. There is no global "search everything" box or
 command palette: search is always scoped to the **App** you're viewing (see the
 tenancy model in **[Home](Home.md)**) and to the resource of the page you're on.
 
-Three pages — **Exceptions**, **Events**, and an issue's **Occurrences** list —
-run their search through a real **query language**. You can send
+Four pages — **Exceptions**, **Events**, an issue's **Occurrences** list, and
+**Sessions** — run their search through a real **query language**. You can send
 `is:unresolved level:error timesSeen:>100` as the API's `query=` parameter and
 get exactly those rows. The rest of the pages still use the simpler free-text
 box described further down.
+
+The search box on those four **autocompletes** what it will accept: press `↓`
+to see the fields, and once you have typed a `field:` it offers that field's
+values. What it offers comes from the same catalog the resolver enforces, per
+resource — Sessions carry no developer tags, so `@tag` is not offered there and
+a tag term is rejected. Tag *keys* are sampled from recent events, so a key you
+have not sent lately may be missing from the suggestions; you can still type it,
+since any key is queryable.
 
 See also: **[Dashboard](Dashboard.md)** (the pages these controls live on) ·
 **[Architecture](Architecture.md)** (the queries behind the screens).
