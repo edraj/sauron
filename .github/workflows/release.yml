@@ -148,10 +148,6 @@ jobs:
 
       - name: Compile workspace + dashboard
         run: |
-          # Fast linker for the many-binary final link — best-effort.
-          if command -v ld.lld >/dev/null 2>&1; then
-            export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
-          fi
           (cd dashboard && npm ci && npm run build) &
           dashboard_build=$!
           (cd backend && cargo build --release --workspace)

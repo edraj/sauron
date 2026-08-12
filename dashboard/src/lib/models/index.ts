@@ -472,6 +472,8 @@ export interface ErrorEvent {
   message: string | null;
   exception_type: string | null;
   exception_value: string | null;
+  title?: string | null;
+  culprit?: string | null;
   stacktrace: Frame[];
   breadcrumbs: Breadcrumb[];
   context: Record<string, unknown> | null;

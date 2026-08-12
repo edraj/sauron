@@ -86,7 +86,10 @@
         return { properties: item.event.properties };
       case 'error':
         return {
-          exception: { type: item.error.exception_type, value: item.error.exception_value },
+          exception: {
+            type: item.error.title ?? item.error.exception_type,
+            value: item.error.culprit ?? item.error.exception_value,
+          },
           tags: item.error.tags,
         };
       case 'transaction':
@@ -154,8 +157,8 @@
               {/if}
               <LatencyBadge ms={item.transaction.duration_ms} size="sm" />
               {#if onslice && item.transaction.finished_at}
-                <!-- svelte-ignore a11y_click_events_have_key_events -->
-                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <!-- svelte-ignore a11y-click-events-have-key-events -->
+                <!-- svelte-ignore a11y-no-static-element-interactions -->
                 <span
                   class="in-between-btn"
                   onclick={(e) => {

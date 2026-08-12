@@ -110,7 +110,7 @@ function runRefreshOnce(): Promise<string> {
   return refreshPromise;
 }
 
-type RetriableConfig = InternalAxiosRequestConfig & { _retry?: boolean };
+type RetriableConfig = InternalAxiosRequestConfig & { _retry?: boolean; _retry_429_count?: number };
 
 // ---------------------------------------------------------------------------
 // Response interceptor — normalize errors, refresh-and-replay on 401.
@@ -164,6 +164,20 @@ api.interceptors.response.use(
       } catch {
         bridge.onRefreshFailure();
         return Promise.reject(normalizeError(error));
+      }
+    }
+
+    if (status === 429 && original) {
+      const retryCount = original._retry_429_count ?? 0;
+      if (retryCount < 3) {
+        original._retry_429_count = retryCount + 1;
+        const retryAfter = error.response.headers['retry-after'];
+        const delaySeconds = retryAfter && !isNaN(Number(retryAfter))
+          ? Number(retryAfter)
+          : Math.pow(2, retryCount);
+        
+        await new Promise((resolve) => setTimeout(resolve, delaySeconds * 1000));
+        return api(original);
       }
     }
 

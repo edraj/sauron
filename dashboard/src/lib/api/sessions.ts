@@ -20,8 +20,13 @@ export async function listSessions(
   appId: string,
   params: ListSessionsParams,
 ): Promise<SearchEnvelope<Session>> {
+  const queryParams: any = { ...params, limit: params.limit + 1 };
+  if (queryParams.sinceDays !== undefined) {
+    queryParams.since_days = queryParams.sinceDays;
+    delete queryParams.sinceDays;
+  }
   const { data } = await api.get<SearchEnvelope<Session>>(`/v1/apps/${appId}/sessions`, {
-    params: { ...params, limit: params.limit + 1 },
+    params: queryParams,
   });
   return data;
 }
