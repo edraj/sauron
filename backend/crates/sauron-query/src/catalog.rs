@@ -383,7 +383,7 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Str,
         store: Store::Column("environment_id"),
         ops: OPS_EQ,
-        resources: R_OCC_EVENTS,
+        resources: &[Resource::Occurrences, Resource::Events, Resource::Sessions],
         index: IndexClass::Indexed,
     },
     Dimension {
@@ -392,7 +392,7 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Str,
         store: Store::Column("release"),
         ops: OPS_TEXT,
-        resources: R_OCC_EVENTS,
+        resources: &[Resource::Occurrences, Resource::Events, Resource::Sessions],
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -401,7 +401,12 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Str,
         store: Store::Column("distinct_id"),
         ops: OPS_TEXT,
-        resources: &[Resource::Occurrences, Resource::Events, Resource::Persons],
+        resources: &[
+            Resource::Occurrences,
+            Resource::Events,
+            Resource::Persons,
+            Resource::Sessions,
+        ],
         index: IndexClass::Indexed,
     },
     // OPS_TEXT, not OPS_EQ: the legacy `EVENT_FILTERS` granted `session_id` the
@@ -422,7 +427,7 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Str,
         store: Store::Column("device_key"),
         ops: OPS_EQ,
-        resources: &[Resource::Occurrences, Resource::Devices],
+        resources: &[Resource::Occurrences, Resource::Devices, Resource::Sessions],
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -453,6 +458,18 @@ pub const CATALOG: &[Dimension] = &[
         index: IndexClass::Scan,
     },
     // ---- JSON roots reachable by dynamic path ----
+    Dimension {
+        name: "context",
+        aliases: NO_ALIAS,
+        ty: ValueType::Str,
+        store: Store::JsonRoot {
+            column: "context",
+            prefix: "",
+        },
+        ops: OPS_TEXT,
+        resources: &[Resource::Occurrences, Resource::Events, Resource::Sessions],
+        index: IndexClass::Bounded,
+    },
     Dimension {
         name: "user",
         aliases: NO_ALIAS,
@@ -617,7 +634,7 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Duration,
         store: Store::Column("duration_ms"),
         ops: OPS_ORD,
-        resources: R_TX,
+        resources: &[Resource::Transactions, Resource::Sessions],
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -717,6 +734,24 @@ pub const CATALOG: &[Dimension] = &[
         resources: R_SESSIONS,
         index: IndexClass::Indexed,
     },
+    Dimension {
+        name: "eventsCount",
+        aliases: &["events_count"],
+        ty: ValueType::Int,
+        store: Store::Column("events_count"),
+        ops: OPS_ORD,
+        resources: R_SESSIONS,
+        index: IndexClass::Bounded,
+    },
+    Dimension {
+        name: "errorsCount",
+        aliases: &["errors_count"],
+        ty: ValueType::Int,
+        store: Store::Column("errors_count"),
+        ops: OPS_ORD,
+        resources: R_SESSIONS,
+        index: IndexClass::Bounded,
+    },
 ];
 
 /// Resources that carry a developer-supplied `tags` JSONB column.
@@ -748,6 +783,25 @@ pub const TAG_DIM: Dimension = Dimension {
 pub fn tag_dimension(r: Resource) -> Option<&'static Dimension> {
     if TAG_DIM.resources.contains(&r) {
         Some(&TAG_DIM)
+    } else {
+        None
+    }
+}
+
+/// The synthetic dimension behind the `$label.<key>` / `@$label.<key>` prefix.
+pub const LABEL_DIM: Dimension = Dimension {
+    name: "$label",
+    aliases: &["label"],
+    ty: ValueType::Str,
+    store: Store::Tag,
+    ops: OPS_TEXT,
+    resources: TAGGABLE,
+    index: IndexClass::Indexed,
+};
+
+pub fn label_dimension(r: Resource) -> Option<&'static Dimension> {
+    if LABEL_DIM.resources.contains(&r) {
+        Some(&LABEL_DIM)
     } else {
         None
     }
@@ -908,5 +962,35 @@ mod tests {
     fn tag_dim_is_not_in_the_public_catalog() {
         // It must not show up in autocomplete or the generated docs table.
         assert!(!CATALOG.iter().any(|d| std::ptr::eq(d, &TAG_DIM)));
+        assert!(!CATALOG.iter().any(|d| std::ptr::eq(d, &LABEL_DIM)));
+    }
+
+    #[test]
+    fn label_dimension_resolution() {
+        assert!(label_dimension(Resource::Issues).is_some());
+        assert!(label_dimension(Resource::Occurrences).is_some());
+        assert!(label_dimension(Resource::Events).is_some());
+        assert!(label_dimension(Resource::Sessions).is_none());
+    }
+
+    #[test]
+    fn resolves_session_dimensions() {
+        for dim_name in [
+            "startedAt",
+            "session",
+            "distinctId",
+            "deviceKey",
+            "environment",
+            "release",
+            "eventsCount",
+            "errorsCount",
+            "duration",
+            "context",
+        ] {
+            assert!(
+                lookup(dim_name, Resource::Sessions).is_some(),
+                "missing session dimension `{dim_name}`"
+            );
+        }
     }
 }

@@ -247,7 +247,6 @@ describe('the limit + 1 over-fetch stays inside the server clamp', () => {
   const PAGES = [
     '../../pages/DevicesInventory.svelte', // both the flat and the grouped list
     '../../pages/ScreensList.svelte',
-    '../../pages/SessionsList.svelte',
     '../../pages/UsersExplorer.svelte',
     '../../pages/WorkflowsList.svelte',
   ];

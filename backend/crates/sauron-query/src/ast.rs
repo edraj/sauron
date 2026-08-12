@@ -1,9 +1,11 @@
 //! The syntactic tree. Holds raw strings only — no Sauron field knowledge and
 //! no typed values. `resolve` turns this into the semantic tree.
 
+use serde::{Deserialize, Serialize};
+
 /// Comparison chosen for a predicate. Derived from the value's leading
 /// characters during resolution, not during parsing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchOp {
     Eq,
     /// Not currently produced by the parser: `!field:value` yields `Not(Eq)`.
@@ -28,18 +30,20 @@ pub enum MatchOp {
     Contains,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Predicate {
     pub field: String,
     /// Raw value exactly as typed, minus surrounding quotes. Operator prefixes
     /// (`>`, `>=`, …) and list brackets are still present; the resolver strips them.
     pub value: String,
     /// True when the value was quoted, which makes `*` literal rather than a wildcard.
+    #[serde(default)]
     pub quoted: bool,
+    #[serde(default)]
     pub at: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Node {
     And(Vec<Node>),
     Or(Vec<Node>),

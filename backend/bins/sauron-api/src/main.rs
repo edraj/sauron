@@ -643,6 +643,11 @@ async fn main() -> anyhow::Result<()> {
         )
         // --- exceptions dashboard ---
         .route("/v1/apps/{app_id}/issues/stats", get(routes::issues::stats))
+        // --- search schema ---
+        .route(
+            "/v1/apps/{app_id}/search/schema",
+            get(routes::search::schema),
+        )
         // --- sessions (app-scoped) ---
         .route("/v1/apps/{app_id}/sessions", get(routes::sessions::list))
         .route(

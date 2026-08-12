@@ -4,7 +4,7 @@
 
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -84,6 +84,10 @@ pub(crate) fn session_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError>
 
 #[derive(Deserialize)]
 pub struct ListQuery {
+    pub query: Option<String>,
+    #[serde(default)]
+    pub filter: Vec<String>,
+    pub q: Option<String>,
     #[serde(default = "default_days")]
     pub since_days: i64,
     #[serde(default = "default_limit")]
@@ -114,9 +118,9 @@ pub async fn list(
     Path(app_id): Path<Uuid>,
     Query(q): Query<ListQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<Vec<Session>>, ApiError> {
+) -> Result<Json<super::search::SearchEnvelope<Session>>, ApiError> {
     let mut conn = db(&state).await?;
-    let scope = super::scope::authorized_read_scope(
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
         auth.user_id,
         app_id,
@@ -124,22 +128,57 @@ pub async fn list(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
-    let limit = q.limit.clamp(1, 200);
+
+    let node = super::search::resolve_query(
+        q.query.as_deref(),
+        &q.filter,
+        q.q.as_deref().filter(|s| !s.is_empty()),
+        sauron_query::Resource::Sessions,
+    )?;
+
+    super::search::reject_withheld_dimensions(
+        &node,
+        repo::TextSearchReach::IncludingBody,
+        super::search::EnvNameReach::for_perms(&perms),
+    )?;
+
+    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
+        .await
+        .map_err(super::search::map_plan_error)?;
+
     let sort = session_sort_spec(q.sort.as_deref())?;
-    Ok(Json(
-        repo::list_sessions(
-            &mut conn,
-            scope,
-            since,
-            limit,
-            super::clamp_offset(q.offset),
-            sort,
-            q.distinct_id.as_deref(),
-            q.device_key.as_deref(),
-        )
-        .await?,
-    ))
+    let window =
+        super::search::resolve_window("started_at", Utc::now(), q.since_days, 365, prepared.clamp);
+    let limit = q.limit.clamp(1, 200);
+    let offset = super::clamp_offset(q.offset);
+
+    let search = repo::SessionSearch {
+        node: &node,
+        ctx: &prepared.ctx,
+        since: window.since,
+        sort,
+        limit,
+        offset,
+        distinct_id: q.distinct_id,
+        device_key: q.device_key,
+    };
+
+    let data = repo::search_sessions(&mut conn, &scope, &search)
+        .await
+        .map_err(super::search::map_plan_error)?;
+
+    let (total, total_is_capped) =
+        repo::count_sessions(&mut conn, &scope, &search, super::search::COUNT_CAP)
+            .await
+            .map_err(super::search::map_plan_error)?;
+
+    Ok(Json(super::search::SearchEnvelope {
+        data,
+        total,
+        total_is_capped,
+        next_cursor: None,
+        clamped: window.clamped,
+    }))
 }
 
 /// One entry on the session timeline. Tagged by `kind` so the frontend can

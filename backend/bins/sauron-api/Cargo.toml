@@ -53,3 +53,7 @@ anyhow.workspace = true
 # is test-only: reqwest is not a normal dependency of this crate, so nothing in
 # the shipped binary gains it.
 reqwest = { workspace = true, features = ["json"] }
+# `tests/http_sessions_search.rs` posts an AST as a `query=` parameter and has
+# to percent-encode it. Uses the crate the workspace already vendors rather
+# than pulling in a second encoder.
+percent-encoding = { workspace = true }

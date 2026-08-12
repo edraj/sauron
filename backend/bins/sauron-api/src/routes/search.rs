@@ -16,15 +16,20 @@
 
 use std::collections::HashSet;
 
+use axum::extract::{Path, Query, RawQuery, State};
+use axum::Json;
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use sauron_auth::AuthUser;
 use sauron_db::query_plan::prepare::Clamp;
 use sauron_db::query_plan::PlanError;
 use sauron_db::repo::TextSearchReach;
-use sauron_query::{from_legacy, parse, resolve, ResolvedNode, ResolvedPredicate, Store};
+use sauron_query::{from_legacy, parse, resolve, Node, ResolvedNode, ResolvedPredicate, Store};
 
 use crate::error::ApiError;
+use crate::AppState;
 
 /// Counting stops here when the plan degrades to a scan.
 ///
@@ -116,6 +121,23 @@ pub fn resolve_window(
     }
 }
 
+/// `query=` accepts either the string grammar (`level:error`) or a serialized
+/// `Node` AST — the same JSON the dashboard's client-side parser builds, whose
+/// wire shape `sauron-query`'s `ast_serde` test pins.
+///
+/// A value opening with `{` is JSON *by intent*, so a JSON parse failure is a
+/// 400 rather than a silent fall back to the string grammar: `{"Pred":{invalid`
+/// would otherwise lex as free text, match nothing, and return an empty 200 —
+/// a malformed query reported as "no results".
+fn parse_query_param(text: &str) -> Result<Node, ApiError> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        return serde_json::from_str::<Node>(trimmed)
+            .map_err(|e| ApiError::BadRequest(format!("invalid query AST: {e}")));
+    }
+    parse(text).map_err(|e| ApiError::BadRequest(e.to_string()))
+}
+
 /// Which of the three input shapes the caller used.
 ///
 /// `query=` wins outright when present. `filter=`/`q=` keep working and are
@@ -128,9 +150,7 @@ pub fn resolve_query(
     resource: sauron_query::Resource,
 ) -> Result<ResolvedNode, ApiError> {
     let ast = match query {
-        Some(text) if !text.trim().is_empty() => {
-            parse(text).map_err(|e| ApiError::BadRequest(e.to_string()))?
-        }
+        Some(text) if !text.trim().is_empty() => parse_query_param(text)?,
         // `from_legacy` takes NO resource — it is a purely syntactic bridge and
         // produces the same untyped `Node` that `parse` does. Field validity is
         // decided one line down, by `resolve`, for both paths alike.
@@ -454,6 +474,200 @@ fn reject_withheld_body(p: &ResolvedPredicate, reach: TextSearchReach) -> Result
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaVariable {
+    pub prefix: String,
+    pub description: String,
+    pub chainable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaDimension {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub ops: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagInfo {
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_values: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelInfo {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaResponse {
+    pub resource: String,
+    pub variables: Vec<SchemaVariable>,
+    pub dimensions: Vec<SchemaDimension>,
+    pub available_tags: Vec<TagInfo>,
+    pub available_labels: Vec<LabelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SchemaQuery {
+    pub context: Option<String>,
+}
+
+pub fn build_schema_response(
+    context_str: &str,
+    resource: sauron_query::Resource,
+) -> SchemaResponse {
+    // Advertise only the variables this resource can actually resolve. The
+    // catalog declares each dimension's `resources`, and `resolve_field`
+    // enforces it — `issues` has no `context`/`extra`/`tags` column at all, so
+    // listing them here handed the autocomplete a prefix that every query using
+    // it would then reject as an unknown field.
+    let mut variables = Vec::new();
+    if sauron_query::catalog::tag_dimension(resource).is_some() {
+        variables.push(SchemaVariable {
+            prefix: "@tag".to_string(),
+            description: "Developer tags".to_string(),
+            chainable: true,
+        });
+    }
+    if sauron_query::catalog::lookup("context", resource).is_some() {
+        variables.push(SchemaVariable {
+            prefix: "@context".to_string(),
+            description: "Device/runtime context".to_string(),
+            chainable: true,
+        });
+    }
+    if sauron_query::catalog::lookup("extra", resource).is_some() {
+        variables.push(SchemaVariable {
+            prefix: "@extra".to_string(),
+            description: "Extra metadata".to_string(),
+            chainable: true,
+        });
+    }
+    if sauron_query::catalog::label_dimension(resource).is_some() {
+        variables.push(SchemaVariable {
+            prefix: "@$label".to_string(),
+            description: "Label properties".to_string(),
+            chainable: true,
+        });
+    }
+
+    let dimensions: Vec<SchemaDimension> = sauron_query::catalog::dimensions_for(resource)
+        .map(|d| {
+            let (ty, options) = match d.ty {
+                sauron_query::ValueType::Str => ("string".to_string(), None),
+                sauron_query::ValueType::Enum(opts) => (
+                    "enum".to_string(),
+                    Some(opts.iter().map(|s| s.to_string()).collect()),
+                ),
+                sauron_query::ValueType::Int => ("integer".to_string(), None),
+                sauron_query::ValueType::Bool => ("boolean".to_string(), None),
+                sauron_query::ValueType::Duration => ("duration".to_string(), None),
+                sauron_query::ValueType::Timestamp => ("timestamp".to_string(), None),
+            };
+
+            let ops = d
+                .ops
+                .iter()
+                .map(|op| match op {
+                    sauron_query::MatchOp::Eq => "=".to_string(),
+                    sauron_query::MatchOp::Ne => "!=".to_string(),
+                    sauron_query::MatchOp::Gt => ">".to_string(),
+                    sauron_query::MatchOp::Gte => ">=".to_string(),
+                    sauron_query::MatchOp::Lt => "<".to_string(),
+                    sauron_query::MatchOp::Lte => "<=".to_string(),
+                    sauron_query::MatchOp::In => "in".to_string(),
+                    sauron_query::MatchOp::Has => "has".to_string(),
+                    sauron_query::MatchOp::Like => "like".to_string(),
+                    sauron_query::MatchOp::Contains => "contains".to_string(),
+                })
+                .collect();
+
+            let aliases = d.aliases.iter().map(|s| s.to_string()).collect();
+
+            SchemaDimension {
+                name: d.name.to_string(),
+                ty,
+                ops,
+                options,
+                aliases,
+            }
+        })
+        .collect();
+
+    let available_tags = if sauron_query::catalog::tag_dimension(resource).is_some() {
+        vec![
+            TagInfo {
+                key: "environment".to_string(),
+                sample_values: Some(vec!["production".to_string(), "staging".to_string()]),
+            },
+            TagInfo {
+                key: "release".to_string(),
+                sample_values: None,
+            },
+        ]
+    } else {
+        vec![]
+    };
+
+    let available_labels = if sauron_query::catalog::label_dimension(resource).is_some() {
+        vec![LabelInfo {
+            key: "team".to_string(),
+            ty: "string".to_string(),
+        }]
+    } else {
+        vec![]
+    };
+
+    SchemaResponse {
+        resource: context_str.to_string(),
+        variables,
+        dimensions,
+        available_tags,
+        available_labels,
+    }
+}
+
+pub async fn schema(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<SchemaQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<SchemaResponse>, ApiError> {
+    let mut conn = super::db(&state).await?;
+    let _scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        sauron_auth::perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+
+    let context_str = q.context.as_deref().unwrap_or("issues");
+    let resource = match context_str {
+        "issues" => sauron_query::Resource::Issues,
+        "sessions" => sauron_query::Resource::Sessions,
+        "occurrences" => sauron_query::Resource::Occurrences,
+        "events" => sauron_query::Resource::Events,
+        "devices" => sauron_query::Resource::Devices,
+        "persons" => sauron_query::Resource::Persons,
+        "transactions" => sauron_query::Resource::Transactions,
+        other => return Err(ApiError::BadRequest(format!("invalid context: {other}"))),
+    };
+
+    Ok(Json(build_schema_response(context_str, resource)))
 }
 
 #[cfg(test)]
@@ -952,5 +1166,26 @@ mod tests {
         assert!(v["next_cursor"].is_null());
         assert!(v["clamped"].is_null());
         assert_eq!(v["data"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn schema_response_generation() {
+        let resp = build_schema_response("sessions", sauron_query::Resource::Sessions);
+        assert_eq!(resp.resource, "sessions");
+        assert!(resp.dimensions.iter().any(|d| d.name == "startedAt"));
+
+        // Sessions carry no tags — `TAG_DIM` does not list the resource, and the
+        // sessions lowering refuses `Store::Tag` outright — so `@tag` must NOT
+        // be advertised here. Offering it handed autocomplete a prefix that
+        // every query built from it would then be rejected for as an unknown
+        // field. `context` IS declared for Sessions, so that one is offered.
+        assert!(!resp.variables.iter().any(|v| v.prefix == "@tag"));
+        assert!(resp.variables.iter().any(|v| v.prefix == "@context"));
+
+        // ...and the converse, so this cannot be "fixed" by dropping every
+        // variable: Issues have tags but no `context`/`extra` column.
+        let issues = build_schema_response("issues", sauron_query::Resource::Issues);
+        assert!(issues.variables.iter().any(|v| v.prefix == "@tag"));
+        assert!(!issues.variables.iter().any(|v| v.prefix == "@context"));
     }
 }

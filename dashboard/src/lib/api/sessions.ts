@@ -1,21 +1,13 @@
 import { api } from './client';
-import { overFetched, type ListPage } from '../models/list-state';
 import type { Session, SessionDetail, SessionsAnalytics } from '../models';
+import type { SearchParams, SearchEnvelope } from './search';
 
-export interface ListSessionsParams {
+export interface ListSessionsParams extends SearchParams {
   /** Rows to RENDER; the request asks for one more. See `listSessions`. */
   limit: number;
   offset: number;
-  since_days?: number;
   distinct_id?: string;
   device_key?: string;
-  /**
-   * `sort=` as `sortParam()` encodes it — a BARE column descends, a `-` prefix
-   * ascends. Accepts `started_at`, `distinct_id`, `device_key`, `duration_ms`,
-   * `events_count`, `errors_count`; anything else is a 400. Note the default
-   * is `started_at`, NOT the `last_event_at` this list used to order by.
-   */
-  sort?: string;
 }
 
 /**
@@ -27,11 +19,16 @@ export interface ListSessionsParams {
 export async function listSessions(
   appId: string,
   params: ListSessionsParams,
-): Promise<ListPage<Session>> {
-  const { data } = await api.get<Session[]>(`/v1/apps/${appId}/sessions`, {
-    params: { ...params, limit: params.limit + 1 },
+): Promise<SearchEnvelope<Session>> {
+  const queryParams: any = { ...params, limit: params.limit + 1 };
+  if (queryParams.sinceDays !== undefined) {
+    queryParams.since_days = queryParams.sinceDays;
+    delete queryParams.sinceDays;
+  }
+  const { data } = await api.get<SearchEnvelope<Session>>(`/v1/apps/${appId}/sessions`, {
+    params: queryParams,
   });
-  return overFetched(data, params.limit);
+  return data;
 }
 
 export async function getSession(appId: string, sessionId: string): Promise<SessionDetail> {

@@ -353,6 +353,7 @@ The canonical name is on the left; anything in brackets is an accepted alias
 | `device` | JSON root | `device.model`, … |
 | `app` | JSON root | `app.version`, … |
 | `contexts` | JSON root | needs `event:read` |
+| `context` | JSON root | `context.app_version`, `context.os.name`, … — also `@context.<path>` |
 | `extra` | JSON root | needs `event:read` |
 | `stack` | JSON root | unindexed — a scan |
 | `tag.<key>` | text | needs `event:read` |
@@ -369,6 +370,7 @@ The canonical name is on the left; anything in brackets is an accepted alias
 | `workflow` | text | |
 | `properties` | JSON root | `properties.plan`, … |
 | `contexts` | JSON root | needs `event:read` |
+| `context` | JSON root | `context.app_version`, `context.os.name`, … — also `@context.<path>` |
 | `extra` | JSON root | needs `event:read` |
 | `tag.<key>` | text | needs `event:read` |
 

@@ -135,21 +135,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
+
 [profile.release]
 # Strip symbol tables from release binaries → smaller binaries and RPMs.
 # (debuginfo is already suppressed by `%global debug_package %{nil}` in the spec,
 # and release builds carry no `-g` debug info, so nothing diagnostic is lost.)
 strip = true
-# Cross-crate inlining. The ingest path threads `serde_json`, `chrono`, `uuid`
-# and `diesel` through generic call chains that stop optimizing at every crate
-# boundary without this; `codegen-units = 1` is what lets the fat LTO pass see
-# the whole program rather than 16 independently-optimized slices.
-#
-# The trade is compile time, and it is not small — the measured before/after on
-# both axes is in `docs/benchmarks/`. Note the runtime gain is CPU headroom,
-# not throughput: ingest is I/O-bound, so this buys cycles back rather than
-# events per second. `packaging/rpm/sauron.spec` used to force
-# `-Ccodegen-units=16` through RUSTFLAGS, which silently overrode this line;
-# that override is gone, so packaged binaries now match what is benchmarked.
-lto = "fat"
-codegen-units = 1
+# Thin LTO and parallel codegen units for fast CI release builds.
+lto = "thin"
+codegen-units = 16

@@ -54,10 +54,17 @@ impl Token {
     }
 }
 
-/// True when `s` can be a field name: a leading letter or underscore, then
-/// letters, digits, `_`, `-`, or `.` (for dotted paths like `user.email`).
+/// True when `s` can be a field name: a leading letter, underscore, `@`, or `$`, then
+/// letters, digits, `_`, `-`, `.`, `$`, or `@` (for variables like `@tag`, `@context`, `@$label.xxx`).
 pub(crate) fn is_field_ident(s: &str) -> bool {
-    let mut chars = s.chars();
+    // `@` and `$` are leading SIGILS (`@tag`, `$label`, `@$label.team`), not
+    // ordinary identifier characters. Accepting them mid-string made
+    // `cart@checkout` look like an identifier, which routed non-identifier tag
+    // keys to `tag.<key>` — a spelling the lexer cannot produce — instead of
+    // the `tag:<key>=<value>` escape hatch that exists for exactly those keys.
+    let body = s.strip_prefix('@').unwrap_or(s);
+    let body = body.strip_prefix('$').unwrap_or(body);
+    let mut chars = body.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
         _ => return false,
@@ -173,21 +180,31 @@ pub fn lex(input: &str) -> Result<Vec<Token>, QueryError> {
             continue;
         }
 
-        // field:value, splitting on the FIRST colon. Reject when the value side
-        // is empty or the field side isn't an identifier — those are free text.
+        // field:value or field=value, splitting on the FIRST colon or equals sign.
+        // Reject when the value side is empty or the field side isn't an identifier — those are free text.
         //
         // Note the value side is taken from the ALREADY-UNQUOTED `raw`, so
         // `message:"a b"` yields field `message`, value `a b`.
-        match raw.split_once(':') {
-            Some((field, value)) if is_field_ident(field) && (!value.is_empty() || saw_quote) => {
-                out.push(Token::Term {
-                    field: field.to_string(),
-                    value: value.to_string(),
-                    quoted: saw_quote,
-                    at: start,
-                });
+        let split_pos = raw.find([':', '=']);
+        match split_pos {
+            Some(pos) => {
+                let field = &raw[..pos];
+                let value = &raw[pos + 1..];
+                if is_field_ident(field) && (!value.is_empty() || saw_quote) {
+                    out.push(Token::Term {
+                        field: field.to_string(),
+                        value: value.to_string(),
+                        quoted: saw_quote,
+                        at: start,
+                    });
+                } else {
+                    out.push(Token::Text {
+                        text: raw,
+                        at: start,
+                    });
+                }
             }
-            _ => out.push(Token::Text {
+            None => out.push(Token::Text {
                 text: raw,
                 at: start,
             }),
@@ -383,6 +400,37 @@ mod tests {
                 field: "level".into(),
                 value: String::new(),
                 quoted: true,
+                at: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn lexes_at_and_dollar_identifiers_and_equals_delimiter() {
+        assert_eq!(
+            terms("@tag=v1"),
+            vec![Token::Term {
+                field: "@tag".into(),
+                value: "v1".into(),
+                quoted: false,
+                at: 0,
+            }]
+        );
+        assert_eq!(
+            terms("@context.app_version=3.0.2"),
+            vec![Token::Term {
+                field: "@context.app_version".into(),
+                value: "3.0.2".into(),
+                quoted: false,
+                at: 0,
+            }]
+        );
+        assert_eq!(
+            terms("@$label.xxx=foo"),
+            vec![Token::Term {
+                field: "@$label.xxx".into(),
+                value: "foo".into(),
+                quoted: false,
                 at: 0,
             }]
         );

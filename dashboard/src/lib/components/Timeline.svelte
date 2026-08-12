@@ -86,7 +86,10 @@
         return { properties: item.event.properties };
       case 'error':
         return {
-          exception: { type: item.error.exception_type, value: item.error.exception_value },
+          exception: {
+            type: item.error.title ?? item.error.exception_type,
+            value: item.error.culprit ?? item.error.exception_value,
+          },
           tags: item.error.tags,
         };
       case 'transaction':
@@ -153,8 +156,10 @@
                 {/if}
               {/if}
               <LatencyBadge ms={item.transaction.duration_ms} size="sm" />
-              {#if onslice}
-                <button
+              {#if onslice && item.transaction.finished_at}
+                <!-- svelte-ignore a11y-click-events-have-key-events -->
+                <!-- svelte-ignore a11y-no-static-element-interactions -->
+                <span
                   class="in-between-btn"
                   onclick={(e) => {
                     e.stopPropagation();
@@ -163,7 +168,7 @@
                   title="Slice timeline to this transaction"
                 >
                   In between
-                </button>
+                </span>
               {/if}
             {:else if item.kind === 'error'}
               <LevelBadge level={item.error.level} size="sm" />

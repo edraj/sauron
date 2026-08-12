@@ -20,6 +20,8 @@ jobs:
     name: backend — fmt · clippy · test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         working-directory: backend
@@ -55,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain deps (pkg-config + libzstd for the system-zstd link)
-        run: sudo apt-get update -q && sudo apt-get install -y -q pkg-config libzstd-dev
+        run: sudo apt-get update -q && sudo apt-get install -y -q pkg-config libzstd-dev lld
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

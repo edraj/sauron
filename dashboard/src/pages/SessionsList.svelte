@@ -9,7 +9,7 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
-  import SearchInput from '../lib/components/SearchInput.svelte';
+  import SearchAutocompleteInput from '../lib/components/search/SearchAutocompleteInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
@@ -20,10 +20,10 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { listSessions, getSessionAnalytics } from '../lib/api/sessions';
+  import type { SearchEnvelope } from '../lib/api/search';
   import {
     setOffsetPage,
     setOffsetSort,
-    type ListPage,
     type OffsetListState,
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
@@ -53,14 +53,13 @@
   // Cached views (lib/stores/cached-view.svelte.ts): cached rows paint instantly on
   // return, then refresh behind a spinner. Re-exposed under the template's existing
   // names, so the markup is unchanged.
-  const sessionsView = new CachedView<ListPage<Session>>();
+  const sessionsView = new CachedView<SearchEnvelope<Session>>();
   const analyticsView = new CachedView<SessionsAnalytics>();
 
-  const sessions = $derived(sessionsView.data?.rows ?? []);
-  // Read off the cached payload, not a separate `$state` set on the network
-  // path: a cache HIT repaints rows without fetching, and a `hasNext` only the
-  // fetch updates would be the previous key's answer.
-  const hasNext = $derived(sessionsView.data?.hasNext ?? false);
+  const sessions = $derived(sessionsView.data?.data ?? []);
+  const total = $derived(sessionsView.data?.total ?? 0);
+  // Infer hasNext from offset and total returned by the envelope
+  const hasNext = $derived(list.offset + LIMIT < total);
   const loading = $derived(sessionsView.loading);
   const error = $derived(sessionsView.error);
   const revalidating = $derived(sessionsView.revalidating || analyticsView.revalidating);
@@ -95,11 +94,12 @@
     days: number,
     sort: string,
     off: number,
+    query: string,
     force = false,
   ) {
     await sessionsView.load(
-      viewKey('sessions.list', appId, sessionStore.scopeKey, days, sort, off, LIMIT),
-      () => listSessions(appId, { since_days: days, sort, limit: LIMIT, offset: off }),
+      viewKey('sessions.list', appId, sessionStore.scopeKey, days, sort, off, LIMIT, query),
+      () => listSessions(appId, { sinceDays: days, sort, limit: LIMIT, offset: off, query: query || undefined }),
       force,
     );
   }
@@ -111,7 +111,7 @@
     try {
       // force: an explicit click must reach the network regardless of freshness.
       await Promise.all([
-        load(aid, sinceDays, sortParam(list.sort), list.offset, true),
+        load(aid, sinceDays, sortParam(list.sort), list.offset, search, true),
         loadAnalytics(aid, sinceDays, true),
       ]);
     } finally {
@@ -127,7 +127,8 @@
     const days = sinceDays;
     const sort = sortParam(list.sort);
     const off = list.offset;
-    if (aid) void load(aid, days, sort, off);
+    const q = search;
+    if (aid) void load(aid, days, sort, off, q);
   });
 
   $effect(() => {
@@ -145,18 +146,6 @@
     sinceDays = days;
   }
 
-  // Client-side filter over the loaded page — matches session / user / device.
-  const filtered = $derived.by(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return sessions;
-    return sessions.filter(
-      (s) =>
-        s.session_id.toLowerCase().includes(q) ||
-        (s.distinct_id?.toLowerCase().includes(q) ?? false) ||
-        (s.device_key?.toLowerCase().includes(q) ?? false),
-    );
-  });
-
   function openSession(id: string) {
     push('/sessions/' + encodeURIComponent(id));
   }
@@ -169,7 +158,11 @@
       <p class="muted sub">User sessions — activity, duration and errors over time.</p>
     </div>
     <div class="controls">
-      <SearchInput bind:value={search} placeholder="Filter session / user / device…" width="280px" />
+      {#if sessionStore.currentAppId}
+        <div style="width: 280px">
+          <SearchAutocompleteInput bind:value={search} appId={sessionStore.currentAppId} context="sessions" placeholder="Filter session / user / device or @tag=v1..." />
+        </div>
+      {/if}
       <DateRange value={sinceDays} onchange={onRange} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
@@ -215,6 +208,7 @@
                 sinceDays,
                 sortParam(list.sort),
                 list.offset,
+                search,
                 true,
               )}
           >
@@ -224,15 +218,9 @@
       </EmptyState>
     {:else if sessions.length === 0}
       <EmptyState
-        title="No sessions yet"
-        description="No sessions recorded in this range. Widen the date range or send activity from your SDK."
-        icon="inbox"
-      />
-    {:else if filtered.length === 0}
-      <EmptyState
         title="No matches"
-        description={`No sessions on this page match “${search}”.`}
-        icon="search"
+        description={search ? `No sessions match “${search}”.` : "No sessions recorded in this range. Widen the date range or send activity from your SDK."}
+        icon="inbox"
       />
     {:else}
       <DataTable>
@@ -262,7 +250,7 @@
           </tr>
         {/snippet}
         {#snippet children()}
-          {#each filtered as s (s.id)}
+          {#each sessions as s (s.id)}
             <tr class="clickable" onclick={() => openSession(s.session_id)}>
               <td><span class="mono sid" title={s.session_id}>{s.session_id}</span></td>
               <td>
