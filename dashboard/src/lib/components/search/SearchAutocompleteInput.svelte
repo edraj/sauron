@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import { fetchSchema, getAutocompleteSuggestions, type SchemaDefinition, type SearchContext } from '../../api/schema';
   import { parseQuery, type QueryNode } from '../../utils/query-parser';
 
@@ -116,6 +115,7 @@
       role="combobox"
       aria-expanded={showSuggestions}
       aria-autocomplete="list"
+      aria-controls="autocomplete-listbox"
       class="w-full px-3 py-2 border rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
       {placeholder}
       bind:value
@@ -137,10 +137,13 @@
 
   {#if showSuggestions && suggestions.length > 0}
     <ul
+      id="autocomplete-listbox"
       role="listbox"
       class="absolute z-10 w-full mt-1 bg-white border rounded-md shadow-lg max-h-60 overflow-auto"
     >
       {#each suggestions as item, idx}
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
         <li
           role="option"
           aria-selected={idx === selectedIndex}

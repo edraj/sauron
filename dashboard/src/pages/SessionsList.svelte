@@ -24,7 +24,6 @@
   import {
     setOffsetPage,
     setOffsetSort,
-    type ListPage,
     type OffsetListState,
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
@@ -100,7 +99,7 @@
   ) {
     await sessionsView.load(
       viewKey('sessions.list', appId, sessionStore.scopeKey, days, sort, off, LIMIT, query),
-      () => listSessions(appId, { since_days: days, sort, limit: LIMIT, offset: off, query: query || undefined }),
+      () => listSessions(appId, { sinceDays: days, sort, limit: LIMIT, offset: off, query: query || undefined }),
       force,
     );
   }
@@ -209,6 +208,7 @@
                 sinceDays,
                 sortParam(list.sort),
                 list.offset,
+                search,
                 true,
               )}
           >

@@ -101,7 +101,6 @@ export function lex(input: string): Token[] {
     if (input[pos] === '"' || input[pos] === "'") {
       const quoteChar = input[pos];
       pos++;
-      let start = pos;
       let str = '';
       let closed = false;
       while (pos < len) {

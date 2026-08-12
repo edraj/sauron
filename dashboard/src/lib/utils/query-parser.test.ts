@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseQuery, QueryParseError, type QueryNode } from './query-parser';
+import { parseQuery, QueryParseError } from './query-parser';
 
 describe('query-parser', () => {
   describe('Tier 1: Feature Coverage (AST Node & Operator Parsing)', () => {

@@ -154,7 +154,9 @@
               {/if}
               <LatencyBadge ms={item.transaction.duration_ms} size="sm" />
               {#if onslice && item.transaction.finished_at}
-                <button
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <span
                   class="in-between-btn"
                   onclick={(e) => {
                     e.stopPropagation();
@@ -163,7 +165,7 @@
                   title="Slice timeline to this transaction"
                 >
                   In between
-                </button>
+                </span>
               {/if}
             {:else if item.kind === 'error'}
               <LevelBadge level={item.error.level} size="sm" />
