@@ -225,6 +225,42 @@ SauronOptions(
 );
 ```
 
+## Funnels
+
+Funnels track the conversion rate of users progressing through a defined sequence of steps. By tracking a unique event at each step, the Sauron dashboard can visualize where users drop off.
+
+```dart
+// 1. User arrives at the pricing page
+Sauron.track('pricing_viewed');
+
+// 2. User clicks on a plan
+Sauron.track('plan_selected', properties: <String, Object?>{'plan': 'pro'});
+
+// 3. User successfully checks out
+Sauron.track('checkout_completed', properties: <String, Object?>{'plan': 'pro', 'value': 42.5});
+```
+
+## User Journeys
+
+User journeys track the broader path a user takes through your application. Combine `setScreen` (to track navigation) and `startWorkflow` (to group a multi-step process) to see exactly how a user reached an outcome or encountered an error.
+
+```dart
+// Update the screen when the user navigates
+Sauron.setScreen('OnboardingStep1');
+
+// Start a workflow to group all subsequent events and errors
+Sauron.startWorkflow('user_onboarding');
+
+// Track specific actions within the journey
+Sauron.track('profile_photo_uploaded');
+
+Sauron.setScreen('OnboardingStep2');
+Sauron.track('preferences_saved');
+
+// End the workflow when the journey concludes
+Sauron.endWorkflow();
+```
+
 ## API reference
 
 Convention below: named parameters are written with a trailing colon

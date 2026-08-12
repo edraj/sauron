@@ -25,7 +25,10 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { topEvents, eventSeries, listEvents } from '../lib/api/events';
   import type { SearchEnvelope } from '../lib/api/search';
-  import { errorMessage } from '../lib/api/client';
+  import { errorMessage, errorStatus } from '../lib/api/client';
+  import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
+  import { fetchSchema, type SchemaDefinition } from '../lib/api/schema';
+  import { preflight, queryErrorFor } from '../lib/utils/query-error';
   import { canGoBack, cursorOf, emptyPage, pageNumber } from '../lib/models/cursor-page';
   import {
     setCursorPage,
@@ -158,6 +161,41 @@
   const streamNextCursor = $derived(streamPage?.next_cursor ?? null);
   let loadingStream = $state(true);
   let streamError = $state<string | null>(null);
+  /**
+   * The status behind `streamError`, so a rejected QUERY can be told apart
+   * from a broken server. A 400 belongs on the search input; a 500 belongs on
+   * the page's error card, and the two read much alike as prose.
+   */
+  let streamErrorStatus = $state<number | null>(null);
+
+  /**
+   * The planner narrowed the window. Events runs over the largest table in the
+   * system and bounds its own request at 365 days on top of whatever the cost
+   * clamp does, so this is the page most likely to serve less than was asked
+   * for — and it said nothing until now.
+   */
+  const clamped = $derived(streamPage?.clamped ?? null);
+
+  /** The resource's schema, held only for `did you mean`. */
+  let searchSchema = $state<SchemaDefinition | null>(null);
+  $effect(() => {
+    const id = sessionStore.currentAppId;
+    if (!id) return;
+    let cancelled = false;
+    fetchSchema(id, 'events')
+      .then((s) => {
+        if (!cancelled) searchSchema = s;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** A local parse problem wins — it means no request was worth issuing. */
+  const searchError = $derived(
+    preflight(search) ?? queryErrorFor(streamErrorStatus, streamError, searchSchema),
+  );
   /**
    * The inputs that produced `streamPage`, as a `viewKey` string.
    *
@@ -294,6 +332,7 @@
     );
     loadingStream = true;
     streamError = null;
+    streamErrorStatus = null;
     try {
       const envelope = await listEvents(appId, {
         filters: filterList,
@@ -309,6 +348,7 @@
     } catch (err) {
       if (gen !== streamGen) return;
       streamError = errorMessage(err);
+      streamErrorStatus = errorStatus(err);
       // Keep the rows ONLY when the request that failed was for the very inputs
       // that produced them — a Refresh or a Retry of what is already on screen.
       // Then the rows are still a true answer, merely older than asked for, and
@@ -542,7 +582,21 @@
   </div>
 
   <p class="hint muted">Filter by <code>Tag</code> (key = value); the search box also matches tag &amp; payload content.</p>
-  <FilterBar fields={EVENT_FIELDS} bind:filters bind:search bind:sinceDays />
+  <!--
+    `appId`/`context` are what make the search box's autocomplete work at all:
+    without them `fetchSchema` bails on its own `if (!appId)` guard and the
+    field list silently never loads. This page went without both.
+  -->
+  <FilterBar
+    fields={EVENT_FIELDS}
+    bind:filters
+    bind:search
+    bind:sinceDays
+    appId={sessionStore.currentAppId ?? undefined}
+    context="events"
+    error={searchError}
+  />
+  <SearchDisclosure {clamped} />
 
   {#if error && top.length === 0 && series.length === 0}
     <Card>

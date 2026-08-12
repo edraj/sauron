@@ -64,6 +64,7 @@ env/
 # ── AI / agent tooling scratch (not part of the product) ────
 .claude/
 .superpowers/
+.agents/
 
 # ── Editor / IDE / OS ───────────────────────────────────────
 .idea/

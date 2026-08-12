@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Search controls — render harness</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <!--
+      Must load BEFORE the app module. `config/env.ts` reads
+      `window.__SAURON_CONFIG__` at module scope, and falls back to
+      `http://localhost:8090` when it is absent — which is what sent this
+      harness's schema requests to a port with nothing on it. The dev config's
+      middleware answers this path.
+    -->
+    <script src="/config.js"></script>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

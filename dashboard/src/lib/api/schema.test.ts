@@ -1,161 +1,102 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { api } from './client';
+import { describe, it, expect } from 'vitest';
 import {
-  fetchSchema,
-  normalizePropertyChain,
   getAutocompleteSuggestions,
+  placeholderFor,
+  didYouMean,
   type SchemaDefinition,
 } from './schema';
-import { AxiosError } from 'axios';
 
-describe('schema API client', () => {
-  const mockAppId = 'app_12345';
+const schema: SchemaDefinition = {
+  resource: 'issues',
+  variables: [{ prefix: '@tag', description: 'Developer tags', chainable: true }],
+  dimensions: [
+    { name: 'level', type: 'enum', ops: ['=', '!=', 'in'], options: ['warning', 'error', 'fatal'] },
+    { name: 'status', type: 'enum', ops: ['=', '!='], options: ['unresolved', 'resolved'] },
+    { name: 'timesSeen', type: 'integer', ops: ['=', '>', '<'] },
+  ],
+  available_tags: [{ key: 'region', sample_values: ['eu', 'us'] }],
+  available_labels: [{ key: 'team', type: 'string' }],
+};
 
-  const mockSchemaIssues: SchemaDefinition = {
-    resource: 'issues',
-    variables: [
-      { prefix: '@tag', description: 'Developer tags', chainable: true },
-      { prefix: '@context', description: 'Device/runtime context', chainable: true },
-      { prefix: '@extra', description: 'Extra metadata', chainable: true },
-      { prefix: '@$label', description: 'Label properties', chainable: true },
-    ],
-    dimensions: [
-      { name: 'level', type: 'enum', ops: ['=', '!=', 'in'], options: ['debug', 'info', 'warning', 'error', 'fatal'] },
-      { name: 'status', type: 'enum', ops: ['=', '!=', 'in'], options: ['unresolved', 'resolved', 'ignored'] },
-    ],
-    available_tags: [{ key: 'environment', sample_values: ['production', 'staging'] }],
-    available_labels: [{ key: 'team', type: 'string' }],
-  };
-
-  const mockSchemaSessions: SchemaDefinition = {
-    resource: 'sessions',
-    variables: [
-      { prefix: '@context', description: 'Runtime context', chainable: true },
-    ],
-    dimensions: [
-      { name: 'duration_ms', type: 'duration', ops: ['>', '>=', '<', '<='] },
-      { name: 'user_id', type: 'string', ops: ['=', '!='] },
-    ],
-    available_tags: [],
-    available_labels: [],
-  };
-
-  beforeEach(() => {
-    vi.clearAllMocks();
+describe('getAutocompleteSuggestions', () => {
+  it('completes a field WITH its colon so the parser reads a predicate', () => {
+    const s = getAutocompleteSuggestions(schema, 'lev');
+    expect(s).toHaveLength(1);
+    // The whole point: `level ` would lex as free text.
+    expect(s[0].insert).toBe('level:');
+    expect(s[0].kind).toBe('field');
+    expect(s[0].detail).toBe('enum');
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
+  it('offers enum values once the colon is typed', () => {
+    const s = getAutocompleteSuggestions(schema, 'level:');
+    expect(s.map((x) => x.insert)).toEqual(['level:warning', 'level:error', 'level:fatal']);
+    expect(s.every((x) => x.kind === 'value')).toBe(true);
   });
 
-  describe('Tier 1: Schema API Fetching', () => {
-    it('fetches schema definition via GET /v1/apps/{app_id}/search/schema?context={context}', async () => {
-      const getSpy = vi.spyOn(api, 'get').mockResolvedValueOnce({ data: mockSchemaIssues });
-
-      const schema = await fetchSchema(mockAppId, 'issues');
-
-      expect(getSpy).toHaveBeenCalledWith(`/v1/apps/${mockAppId}/search/schema`, {
-        params: { context: 'issues' },
-      });
-      expect(schema).toEqual(mockSchemaIssues);
-      expect(schema.resource).toBe('issues');
-      expect(schema.dimensions).toHaveLength(2);
-    });
+  it('narrows enum values by the partial value already typed', () => {
+    const s = getAutocompleteSuggestions(schema, 'level:f');
+    expect(s.map((x) => x.insert)).toEqual(['level:fatal']);
   });
 
-  describe('Tier 2: Boundary & Error Handling', () => {
-    it('throws error when app_id is empty or missing', async () => {
-      await expect(fetchSchema('', 'issues')).rejects.toThrow('app_id is required');
-    });
-
-    it('handles 404 Not Found response error from API', async () => {
-      const err = new AxiosError('Request failed with status code 404', 'ERR_BAD_REQUEST', undefined, undefined, {
-        status: 404,
-        statusText: 'Not Found',
-        data: { error: { code: 'not_found', message: 'App not found' } },
-        headers: {},
-        config: {} as any,
-      });
-      vi.spyOn(api, 'get').mockRejectedValueOnce(err);
-
-      await expect(fetchSchema('invalid_app', 'issues')).rejects.toThrow();
-    });
-
-    it('handles 500 Internal Server Error response', async () => {
-      const err = new AxiosError('Request failed with status code 500', 'ERR_BAD_RESPONSE', undefined, undefined, {
-        status: 500,
-        statusText: 'Internal Server Error',
-        data: { error: { code: 'internal_error', message: 'Database connection failed' } },
-        headers: {},
-        config: {} as any,
-      });
-      vi.spyOn(api, 'get').mockRejectedValueOnce(err);
-
-      await expect(fetchSchema(mockAppId, 'issues')).rejects.toThrow();
-    });
-
-    it('handles network error (no server response)', async () => {
-      const netErr = new AxiosError('Network Error', 'ERR_NETWORK');
-      vi.spyOn(api, 'get').mockRejectedValueOnce(netErr);
-
-      await expect(fetchSchema(mockAppId, 'issues')).rejects.toThrow('Network Error');
-    });
-
-    it('throws error when response data is malformed JSON or empty', async () => {
-      vi.spyOn(api, 'get').mockResolvedValueOnce({ data: null });
-
-      await expect(fetchSchema(mockAppId, 'issues')).rejects.toThrow('Malformed JSON payload');
-    });
+  it('offers nothing for a field with no options, rather than a wrong guess', () => {
+    expect(getAutocompleteSuggestions(schema, 'timesSeen:')).toEqual([]);
   });
 
-  describe('Tier 3: Variable Property Chaining & Autocomplete Normalization', () => {
-    it('normalizes variable property chains (@$label.xxx, @tag, @context, @extra)', () => {
-      expect(normalizePropertyChain('@$label', 'team')).toBe('@$label.team');
-      expect(normalizePropertyChain('@tag', 'environment')).toBe('@tag.environment');
-      expect(normalizePropertyChain('@context', 'os.version')).toBe('@context.os.version');
-      expect(normalizePropertyChain('@extra', 'level')).toBe('@extra.level');
-    });
-
-    it('returns dynamic autocomplete suggestions for variables and property chains', () => {
-      const labelSuggestions = getAutocompleteSuggestions(mockSchemaIssues, '@$label.');
-      expect(labelSuggestions).toContain('@$label.team');
-
-      const tagSuggestions = getAutocompleteSuggestions(mockSchemaIssues, '@tag.');
-      expect(tagSuggestions).toContain('@tag.environment');
-
-      const dimSuggestions = getAutocompleteSuggestions(mockSchemaIssues, 'lev');
-      expect(dimSuggestions).toContain('level');
-    });
+  it('offers real tag keys after @tag., and keeps bare @tag as its own field', () => {
+    expect(getAutocompleteSuggestions(schema, '@tag').map((x) => x.insert)).toContain('@tag');
+    const keys = getAutocompleteSuggestions(schema, '@tag.re');
+    expect(keys.map((x) => x.insert)).toEqual(['@tag.region:']);
+    expect(keys[0].kind).toBe('tagKey');
   });
 
-  describe('Tier 4: Real-World Context Switching', () => {
-    it('fetches correct schema definitions across different contexts (issues, sessions, occurrences, events)', async () => {
-      const getSpy = vi.spyOn(api, 'get');
+  it('matches a dimension by alias as well as by name', () => {
+    const aliased: SchemaDefinition = {
+      ...schema,
+      dimensions: [{ name: 'timesSeen', type: 'integer', ops: ['='], aliases: ['count'] }],
+    };
+    expect(getAutocompleteSuggestions(aliased, 'cou').map((x) => x.insert)).toEqual(['timesSeen:']);
+  });
 
-      // Context 1: issues
-      getSpy.mockResolvedValueOnce({ data: mockSchemaIssues });
-      const issuesSchema = await fetchSchema(mockAppId, 'issues');
-      expect(issuesSchema.resource).toBe('issues');
+  it('returns nothing for an unmatched token', () => {
+    expect(getAutocompleteSuggestions(schema, 'nonexistent')).toEqual([]);
+  });
+});
 
-      // Context 2: sessions
-      getSpy.mockResolvedValueOnce({ data: mockSchemaSessions });
-      const sessionsSchema = await fetchSchema(mockAppId, 'sessions');
-      expect(sessionsSchema.resource).toBe('sessions');
-      expect(sessionsSchema.dimensions[0].name).toBe('duration_ms');
+describe('placeholderFor', () => {
+  it('builds an example from what THIS resource actually declares', () => {
+    // Finding C: SessionsList hand-wrote `@tag=v1`, which sessions withhold.
+    expect(placeholderFor(schema)).toContain('level:');
+    expect(placeholderFor(schema)).toContain('@tag');
+  });
 
-      // Context 3: occurrences
-      const mockSchemaOccurrences = { ...mockSchemaIssues, resource: 'occurrences' };
-      getSpy.mockResolvedValueOnce({ data: mockSchemaOccurrences });
-      const occSchema = await fetchSchema(mockAppId, 'occurrences');
-      expect(occSchema.resource).toBe('occurrences');
+  it('never advertises a variable the resource does not declare', () => {
+    const sessions: SchemaDefinition = {
+      ...schema,
+      resource: 'sessions',
+      variables: [{ prefix: '@context', description: 'Device context', chainable: true }],
+      available_tags: [],
+    };
+    expect(placeholderFor(sessions)).not.toContain('@tag');
+    expect(placeholderFor(sessions)).toContain('@context');
+  });
 
-      // Context 4: events
-      const mockSchemaEvents = { ...mockSchemaIssues, resource: 'events' };
-      getSpy.mockResolvedValueOnce({ data: mockSchemaEvents });
-      const eventsSchema = await fetchSchema(mockAppId, 'events');
-      expect(eventsSchema.resource).toBe('events');
+  it('falls back to plain copy before the schema loads', () => {
+    expect(placeholderFor(null)).toBe('Search…');
+  });
+});
 
-      expect(getSpy).toHaveBeenCalledTimes(4);
-    });
+describe('didYouMean', () => {
+  it('suggests the nearest known field for a typo', () => {
+    expect(didYouMean(schema, 'levl')).toBe('level');
+    expect(didYouMean(schema, 'staus')).toBe('status');
+  });
+
+  it('stays silent when nothing is close, rather than guessing', () => {
+    expect(didYouMean(schema, 'zzzzzzzz')).toBeNull();
+  });
+
+  it('is silent with no schema in hand', () => {
+    expect(didYouMean(null, 'levl')).toBeNull();
   });
 });

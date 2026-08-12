@@ -10,6 +10,7 @@
   import TimeValue from '../lib/components/TimeValue.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
   import SearchAutocompleteInput from '../lib/components/search/SearchAutocompleteInput.svelte';
+  import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
@@ -21,6 +22,8 @@
   import { viewKey } from '../lib/stores/view-cache';
   import { listSessions, getSessionAnalytics } from '../lib/api/sessions';
   import type { SearchEnvelope } from '../lib/api/search';
+  import { fetchSchema, type SchemaDefinition } from '../lib/api/schema';
+  import { preflight, queryErrorFor } from '../lib/utils/query-error';
   import {
     setOffsetPage,
     setOffsetSort,
@@ -66,6 +69,30 @@
 
   const analytics = $derived(analyticsView.data ?? null);
   const analyticsError = $derived(analyticsView.error);
+
+  /** The planner's narrowing of the session window, if it bound. */
+  const clamped = $derived(sessionsView.data?.clamped ?? null);
+
+  /** The sessions schema, held only for `did you mean`. */
+  let searchSchema = $state<SchemaDefinition | null>(null);
+  $effect(() => {
+    const id = sessionStore.currentAppId;
+    if (!id) return;
+    let cancelled = false;
+    fetchSchema(id, 'sessions')
+      .then((s) => {
+        if (!cancelled) searchSchema = s;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** A local parse problem wins — it means no request was worth issuing. */
+  const searchError = $derived(
+    preflight(search) ?? queryErrorFor(sessionsView.errorStatus, error, searchSchema),
+  );
 
   let refreshing = $state(false);
 
@@ -160,7 +187,14 @@
     <div class="controls">
       {#if sessionStore.currentAppId}
         <div style="width: 280px">
-          <SearchAutocompleteInput bind:value={search} appId={sessionStore.currentAppId} context="sessions" placeholder="Filter session / user / device or @tag=v1..." />
+          <!--
+            No hand-written placeholder. This one used to advertise `@tag=v1`,
+            which sessions do not carry — the catalog declares no tag dimension
+            for the resource and the lowerer refuses `Store::Tag` outright, so
+            every query built from that hint came back a 400. The component
+            derives its example from the schema it loaded instead.
+          -->
+          <SearchAutocompleteInput bind:value={search} appId={sessionStore.currentAppId} context="sessions" error={searchError} />
         </div>
       {/if}
       <DateRange value={sinceDays} onchange={onRange} />
@@ -192,6 +226,10 @@
   {:else if analyticsError}
     <Card><p class="muted">{analyticsError}</p></Card>
   {/if}
+
+  <!-- Above the session rows, not above the engagement charts: it describes
+       what the LIST leaves out, and the charts run their own query. -->
+  <SearchDisclosure {clamped} />
 
   <Card padding="none">
     {#if loading}

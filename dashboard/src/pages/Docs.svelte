@@ -8,6 +8,7 @@
   import Icon, { type IconName } from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { buildDsn, appTypeIcon, appTypeLabel } from '../lib/utils/format';
+  import { fetchSchema, type SchemaDefinition } from '../lib/api/schema';
 
   type Platform = 'web' | 'flutter' | 'python' | 'node' | 'csharp';
 
@@ -385,22 +386,26 @@ SauronSdk.Track("signup_completed", "u_123");`;
   const searchCoverageRows: { q: string; a: string }[] = [
     {
       q: 'Exceptions (Issues)',
-      a: 'Filter chips + free-text box — both run server-side over the full dataset in the selected date range.',
+      a: 'The query language, with autocomplete, plus filter chips — all server-side over the full dataset in the selected date range.',
     },
     {
       q: 'Events',
-      a: 'Filter chips + free-text box — both run server-side over the full dataset in the selected date range.',
+      a: 'The query language, with autocomplete, plus filter chips — all server-side over the full dataset in the selected date range.',
     },
     {
       q: "An issue's Occurrences (Issue detail page)",
-      a: "The same Tag chip and free-text box, server-side, scoped to just that issue's events — but this view doesn't write its state to the URL.",
+      a: "The query language and the same chips, server-side, scoped to just that issue's events — but this view doesn't write its state to the URL.",
+    },
+    {
+      q: 'Sessions',
+      a: 'The query language, with autocomplete, server-side. Sessions carry no developer tags, so @tag is not offered here and a tag term is rejected.',
     },
     {
       q: 'Users, Devices, Screens',
-      a: 'Free-text box only — no filter chips. Server-side; Users has no date window (searches all time), Devices and Screens are scoped to the selected range.',
+      a: 'A plain free-text box — no query language, no chips. Server-side; Users has no date window (searches all time), Devices and Screens are scoped to the selected range.',
     },
     {
-      q: 'Sessions, Funnels',
+      q: 'Funnels',
       a: "A search box exists, but it only filters rows already loaded on the current page in the browser. It never queries the server — a match sitting on the next page won't show up.",
     },
     {
@@ -408,6 +413,54 @@ SauronSdk.Track("signup_completed", "u_123");`;
       a: 'No search.',
     },
   ];
+
+  /**
+   * The operators the grammar actually resolves.
+   *
+   * Hand-maintained because the grammar is frozen and small; the FIELD lists
+   * below are fetched instead, because those change per resource and per
+   * release and this page has already carried a rotted copy of them once.
+   */
+  const queryOperatorRows: { sig: string; desc: string }[] = [
+    { sig: 'field:value', desc: 'Equals. level:error' },
+    { sig: 'field:!value', desc: 'Not equal. level:!info' },
+    { sig: 'field:>n   field:>=n', desc: 'Greater than, or greater-or-equal. timesSeen:>5' },
+    { sig: 'field:<n   field:<=n', desc: 'Less than, or less-or-equal.' },
+    { sig: 'field:[a,b]', desc: 'Any of. level:[error,fatal]' },
+    {
+      sig: 'field:~text',
+      desc: 'Contains this literal substring, case-insensitive. * is NOT a wildcard here — it matches a literal asterisk.',
+    },
+    { sig: 'has:field', desc: 'The field is present at all. Carries no value.' },
+    { sig: 'bare words', desc: 'Free text against the payload. A term with no field is a payload search.' },
+    { sig: 'A OR B', desc: 'Either. Two terms separated by a space are AND by default.' },
+    { sig: '!term   !(a b)', desc: 'Negation, over a single term or a whole parenthesised group.' },
+    { sig: '"two words"', desc: 'Quote a value containing spaces or a closing parenthesis.' },
+  ];
+
+  /** The variable prefixes, which address JSON rather than a column. */
+  const queryVariableRows: { sig: string; desc: string }[] = [
+    { sig: '@tag:value', desc: 'Matches across EVERY tag key — a bare @tag does not mean the key named "tag".' },
+    { sig: '@tag.key:value', desc: 'One named key. @tag.region:eu' },
+    {
+      sig: 'tag:key=value',
+      desc: 'The escape hatch for keys containing characters outside A-Z a-z 0-9 _ . - — e.g. cart@checkout or 100%off.',
+    },
+    { sig: '@context.os.name:Linux', desc: 'Device and runtime context. Requires event:read.' },
+    { sig: '@extra.key:value', desc: 'Developer-attached extra metadata. Requires event:read.' },
+    { sig: 'sort=col   sort=-col', desc: 'A bare column sorts DESCENDING; a leading - reverses it to ascending.' },
+  ];
+
+  const queryExample = `level:[error,fatal] @tag.region:eu !status:resolved timeout
+
+  level:[error,fatal]   either level
+  @tag.region:eu        the region tag is exactly "eu"
+  !status:resolved      anything not resolved
+  timeout               ...and "timeout" somewhere in the payload
+
+Terms are ANDed. Wrap alternatives in parentheses to mix in an OR:
+
+  (level:error OR level:fatal) @tag.region:~eu`;
 
   const freeTextRows: { q: string; a: string }[] = [
     {
@@ -440,26 +493,60 @@ SauronSdk.Track("signup_completed", "u_123");`;
     { sig: 'tag', desc: 'contains (default)  = — see "The Tag filter" below' },
   ];
 
-  const issueFilterRows: { sig: string; desc: string }[] = [
-    { sig: 'level', desc: 'enum: debug, info, warning, error, fatal' },
-    { sig: 'status', desc: 'enum: unresolved, resolved, ignored' },
-    { sig: 'type', desc: 'text — the exception class' },
-    { sig: 'culprit', desc: 'text — the failing frame' },
-    { sig: 'times_seen', desc: 'number — shown as "Events" in the UI' },
-    { sig: 'users_seen', desc: 'number — shown as "Users" in the UI' },
-    { sig: 'tag', desc: "key + value against the event's tags — see below" },
-  ];
+  /**
+   * The searchable resources, each documented from the schema the server
+   * actually serves.
+   *
+   * These lists used to be hardcoded here — and they rotted: they still named
+   * `times_seen` and `users_seen` long after the resolver had moved to
+   * `timesSeen`/`usersSeen`, and they listed a `tag` field with chip operators
+   * that the query language spells differently. A page that documents a
+   * catalog must read that catalog.
+   */
+  const SEARCHABLE = ['issues', 'events', 'occurrences', 'sessions'] as const;
 
-  const eventFilterRows: { sig: string; desc: string }[] = [
-    { sig: 'name', desc: 'text — the event name' },
-    { sig: 'distinct_id', desc: 'text — shown as "User" in the UI' },
-    { sig: 'session_id', desc: 'text' },
-    { sig: 'release', desc: 'text' },
-    { sig: 'tag', desc: "key + value against the event's tags — see below" },
-  ];
+  let searchSchemas = $state<Record<string, SchemaDefinition>>({});
+  let searchSchemaError = $state<string | null>(null);
 
-  const searchUrlExample =
-    '#/issues?filter=status:eq:unresolved&filter=culprit:contains:checkout&q=timeout&since_days=30';
+  $effect(() => {
+    const id = sessionStore.currentAppId;
+    if (!id) return;
+    let cancelled = false;
+    Promise.all(
+      SEARCHABLE.map((ctx) =>
+        fetchSchema(id, ctx)
+          .then((s) => [ctx, s] as const)
+          .catch(() => null),
+      ),
+    ).then((pairs) => {
+      if (cancelled) return;
+      const next: Record<string, SchemaDefinition> = {};
+      for (const p of pairs) if (p) next[p[0]] = p[1];
+      searchSchemas = next;
+      searchSchemaError = Object.keys(next).length
+        ? null
+        : 'Could not load the field list for this app.';
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** A schema's dimensions as the `apiTable` snippet wants them. */
+  function dimensionRows(schema: SchemaDefinition): { sig: string; desc: string }[] {
+    return schema.dimensions.map((d) => {
+      // Annotated: inferred from `d.type` alone this narrows to the literal
+      // union, and the pushes below stop compiling.
+      const parts: string[] = [d.type];
+      if (d.options?.length) parts.push(d.options.join(', '));
+      if (d.aliases?.length) parts.push(`also: ${d.aliases.join(', ')}`);
+      return { sig: d.name, desc: `${parts.join(' — ')}   ·   ops ${d.ops.join(' ')}` };
+    });
+  }
+
+  const searchUrlExample = `#/issues?filter=status:eq:unresolved&filter=culprit:contains:checkout&q=timeout&since_days=30
+
+#/issues?query=status:unresolved culprit:~checkout timeout&since_days=30`;
 
   const tagFilterExample = `Chip: Tag   contains   key=region   value=eu
 → matches tags.region containing "eu": "eu-central-1", "EU-WEST-2", …
@@ -1067,19 +1154,46 @@ GROUP BY name, op`;
         <div class="card-h"><Icon name="search" size={16} /><h3>Search &amp; filtering</h3></div>
       {/snippet}
       <p class="muted concept-lead">
-        Two independent mechanisms narrow a list: a <b>free-text box</b> (a case-insensitive
-        substring match over a fixed set of columns) and, on two pages, <b>structured filter
-        chips</b> (<code class="ic">field · operator · value</code>). Coverage is uneven by
-        design — know which a page has before you decide a term "isn't there."
+        The four biggest lists — <b>Exceptions</b>, <b>Events</b>, an issue's <b>Occurrences</b>
+        and <b>Sessions</b> — take a real <b>query language</b>:
+        <code class="ic">level:error @tag.region:eu timeout</code>. The box autocompletes the
+        fields and values the resource actually has, and a term with no field is a free-text
+        search over the payload. <b>Filter chips</b> (<code class="ic">field · operator ·
+        value</code>) still sit beside it and still work; they AND with whatever the box holds.
+        Everywhere else there is a plain substring box, or nothing — coverage is uneven by
+        design, so check which a page has before deciding a term "isn't there."
       </p>
 
       <h4 class="q-h">Where each page searches</h4>
       {@render defRows(searchCoverageRows)}
 
-      <h4 class="q-h">Free-text: what each box actually matches</h4>
+      <h4 class="q-h">Query language — operators</h4>
       <p class="muted q-note">
-        Always a case-insensitive substring match (Postgres <code class="ic">ILIKE</code>) — no
-        ranking, no fuzzy matching, no tokenizer. An empty box returns everything in range.
+        Press <b>↓</b> in the search box to see what the current page accepts. An invalid query is
+        rejected with the reason on the box itself — it never silently returns zero rows.
+      </p>
+      {@render apiTable(queryOperatorRows)}
+
+      <h4 class="q-h">Query language — variables</h4>
+      <p class="muted q-note">
+        These address JSON rather than a table column. Which ones a page offers depends on the
+        resource: Issues carry <code class="ic">tags</code> but no
+        <code class="ic">context</code> column, Sessions carry the reverse, and the box only ever
+        suggests what its own resource declares.
+      </p>
+      {@render apiTable(queryVariableRows)}
+
+      <h4 class="q-h">Example</h4>
+      <CodeBlock code={queryExample} language="text" />
+
+      <h4 class="q-h">Free text: what a bare term actually matches</h4>
+      <p class="muted q-note">
+        A term with no <code class="ic">field:</code> in front of it is a free-text search, and it
+        is always a case-insensitive substring match (Postgres <code class="ic">ILIKE</code>) — no
+        ranking, no fuzzy matching, no tokenizer. An empty box returns everything in range. If you
+        hold <code class="ic">issue:read</code> without <code class="ic">event:read</code>, the
+        payload columns are withheld and the search quietly matches fewer of them; the list says
+        so above the rows rather than leaving you to guess.
       </p>
       {@render defRows(freeTextRows)}
 
@@ -1090,20 +1204,42 @@ GROUP BY name, op`;
         page) offers the same mechanism, but only the <code class="ic">Tag</code> field.
       </p>
       {@render apiTable(filterOpRows)}
-      <p class="muted q-note"><b>Exceptions</b> fields:</p>
-      {@render apiTable(issueFilterRows)}
-      <p class="muted q-note"><b>Events</b> fields:</p>
-      {@render apiTable(eventFilterRows)}
+
+      <h4 class="q-h">Fields, per list</h4>
+      <p class="muted q-note">
+        Read live from this app, so it always matches what the server will accept. These names
+        work in the query box; the chips expose a subset of them.
+      </p>
+      {#each SEARCHABLE as ctx (ctx)}
+        {#if searchSchemas[ctx]}
+          <p class="muted q-note"><b>{ctx}</b>:</p>
+          {@render apiTable(dimensionRows(searchSchemas[ctx]))}
+        {/if}
+      {/each}
+      {#if searchSchemaError}
+        <p class="faint fine">{searchSchemaError}</p>
+      {/if}
+      <p class="faint fine">
+        Tag-key suggestions come from a sample of recent events, so a key you have not sent
+        lately may not be offered by autocomplete. You can still type it — any key is queryable.
+      </p>
 
       <h4 class="q-h">Example: find your error</h4>
       <p class="muted q-note">
-        Two chips — <code class="ic">Status = unresolved</code> and
-        <code class="ic">Culprit contains checkout</code> — narrowed to unresolved issues on the
-        checkout path, plus a free-text term for good measure. This is the URL that view produces:
+        Unresolved issues on the checkout path, plus a free-text term. Written as chips it
+        produces the first URL; written in the query box, the second. Both are accepted, and old
+        <code class="ic">filter=</code> bookmarks keep working — they are bridged onto the same
+        query internally, so they return the same rows.
       </p>
       <CodeBlock code={searchUrlExample} language="url" />
 
-      <h4 class="q-h">The Tag filter — read this before you file a bug</h4>
+      <h4 class="q-h">The Tag chip — read this before you file a bug</h4>
+      <p class="muted q-note">
+        This is about the <b>chip</b>. In the query box the same two behaviours are spelled
+        <code class="ic">@tag.region:~eu</code> (substring) and
+        <code class="ic">@tag.region:eu</code> (exact), so the trap below is visible in the query
+        itself rather than hidden behind a dropdown that defaulted for you.
+      </p>
       <p class="muted concept-lead">
         <code class="ic">Tag</code> is a two-input chip — a <b>key</b> and a <b>value</b> — composed
         into one <code class="ic">key=value</code> filter value under the hood (the backend splits

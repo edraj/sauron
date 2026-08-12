@@ -34,13 +34,15 @@ describe('SearchAutocompleteInput component logic & integration', () => {
 
   it('provides autocomplete suggestions when user types variable prefixes', () => {
     const suggestionsTag = schemaApi.getAutocompleteSuggestions(mockSchema, '@tag');
-    expect(suggestionsTag).toContain('@tag');
+    expect(suggestionsTag.map((s) => s.insert)).toContain('@tag');
 
     const suggestionsLabel = schemaApi.getAutocompleteSuggestions(mockSchema, '@$label.t');
-    expect(suggestionsLabel).toEqual(['@$label.team']);
+    expect(suggestionsLabel.map((s) => s.insert)).toEqual(['@$label.team']);
 
+    // A field completion carries its own `:` — inserting a bare `status` would
+    // lex as free text rather than as a predicate.
     const suggestionsDim = schemaApi.getAutocompleteSuggestions(mockSchema, 'stat');
-    expect(suggestionsDim).toEqual(['status']);
+    expect(suggestionsDim.map((s) => s.insert)).toEqual(['status:']);
   });
 
   it('handles property chaining for @tag and @$label variables', () => {
@@ -69,6 +71,6 @@ describe('SearchAutocompleteInput component logic & integration', () => {
     expect(schema.resource).toBe('sessions');
 
     const suggestions = schemaApi.getAutocompleteSuggestions(schema, 'dur');
-    expect(suggestions).toEqual(['duration_ms']);
+    expect(suggestions.map((s) => s.insert)).toEqual(['duration_ms:']);
   });
 });
