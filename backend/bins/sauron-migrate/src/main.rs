@@ -33,5 +33,23 @@ async fn main() -> anyhow::Result<()> {
     sauron_db::run_pending_migrations_waiting(&url, std::time::Duration::from_secs(wait_secs))
         .await?;
     tracing::info!("migrations up to date");
+
+    // Opt-in, and deliberately NOT part of the default no-arg path.
+    //
+    // This binary is the `sauron-migrate.service` oneshot that every RPM daemon
+    // pulls in via `Requires=`, and systemd never retries a failed start job —
+    // so anything slow here delays every daemon's start, and anything that can
+    // fail here takes them all down with it. The backfill aggregates all 29
+    // partitions of the two largest tables, which is exactly that kind of work.
+    // Operators run `sauron-migrate backfill-person-envs` by hand, after the
+    // migrations, at a time of their choosing.
+    //
+    // Until it has run for an app, `repo::list_persons` reads that app through
+    // the pre-rollup query, so skipping this is a performance decision and never
+    // a correctness one.
+    if std::env::args().any(|a| a == "backfill-person-envs") {
+        let pool = sauron_db::build_pool(&url, 4)?;
+        sauron_db::person_env_backfill::backfill_all(&pool).await?;
+    }
     Ok(())
 }

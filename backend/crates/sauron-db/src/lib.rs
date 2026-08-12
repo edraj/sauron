@@ -7,6 +7,7 @@
 pub mod batch;
 pub mod filter;
 pub mod models;
+pub mod person_env_backfill;
 pub mod pool;
 pub mod query_plan;
 pub mod repo;

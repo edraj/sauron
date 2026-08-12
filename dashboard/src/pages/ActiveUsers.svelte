@@ -199,15 +199,23 @@
   });
 
   const chartData = $derived(
-    (report?.series ?? []).map((p) => ({ bucket: p.day, count: p.active_total })),
+    (report?.series ?? []).map((p) => ({
+      bucket: p.day,
+      count: p.active_total,
+      segments: [
+        { count: p.active_guest, color: 'color-mix(in srgb, var(--primary) 35%, transparent)', label: 'Guests' },
+        { count: p.active_identified, color: 'var(--primary)', label: 'Identified' }
+      ]
+    })),
   );
   const identifiedSeries = $derived((report?.series ?? []).map((p) => p.active_identified));
   const guestSeries = $derived((report?.series ?? []).map((p) => p.active_guest));
-  const peak = $derived(
+  const peakDay = $derived(
     report && report.series.length > 0
-      ? Math.max(...report.series.map((p) => p.active_total))
+      ? report.series.reduce((prev, curr) => (curr.active_total > prev.active_total ? curr : prev))
       : null,
   );
+  const peak = $derived(peakDay?.active_total ?? null);
 
   function appName(appId: string): string {
     return apps.find((a) => a.id === appId)?.name ?? appId;
@@ -321,7 +329,7 @@
           label="Active users"
           value={rep.latest ? compactNumber(rep.latest.active_total) : '—'}
           tone="primary"
-          sub={rep.latest ? rep.latest.day : 'no complete day yet'}
+          sub={rep.latest ? `${rep.latest.day} · ${compactNumber(rep.latest.active_identified)} identified / ${compactNumber(rep.latest.active_guest)} guests` : 'no complete day yet'}
         />
         <StatTile
           label="Identified"
@@ -346,7 +354,7 @@
         <StatTile
           label="Peak"
           value={peak === null ? '—' : compactNumber(peak)}
-          sub={rangeLabel()}
+          sub={peakDay ? `${rangeLabel()} · ${compactNumber(peakDay.active_identified)} identified / ${compactNumber(peakDay.active_guest)} guests` : rangeLabel()}
         />
         <StatTile
           label="Apps"

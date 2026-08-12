@@ -1617,6 +1617,8 @@ async fn a_monitor_pinned_rule_matches_only_that_monitor() {
         vec![wide.id],
         "monitor B must NOT receive the rule pinned to monitor A"
     );
+
+    db.cleanup().await;
 }
 
 /// A disabled pinned rule matches neither its own monitor nor a sibling:
@@ -1693,4 +1695,6 @@ async fn a_disabled_pinned_rule_matches_neither() {
         for_b.is_empty(),
         "a disabled rule pinned to A must not match B either: {for_b:?}"
     );
+
+    db.cleanup().await;
 }

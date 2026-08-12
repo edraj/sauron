@@ -108,8 +108,12 @@ async fn rollup(
     let session_id = session_id.filter(|s| !s.is_empty());
     let distinct_id = distinct_id.filter(|s| !s.is_empty());
 
+    // `bump_session` reports whether it INSERTED. A session is bumped again by
+    // every signal it carries, so crediting the person rollup per bump would
+    // count one session many times — the error grows with session length.
+    let mut sessions_delta = 0i64;
     if let Some(sid) = session_id {
-        let _ = repo::bump_session(
+        if let Ok(true) = repo::bump_session(
             conn,
             job.app_id,
             sid,
@@ -123,7 +127,10 @@ async fn rollup(
             events_delta,
             errors_delta,
         )
-        .await;
+        .await
+        {
+            sessions_delta = 1;
+        }
     }
 
     if let Some(dk) = info.device_key.as_deref() {
@@ -141,6 +148,28 @@ async fn rollup(
             at,
             events_delta,
             errors_delta,
+        )
+        .await;
+    }
+
+    // The person/environment rollup. Fed from every signal that names an
+    // identity, not just from the session leg — membership here must admit
+    // exactly the people the live query's three membership legs admit, and a
+    // person whose only signal is a plain event has no session id.
+    //
+    // Deliberately `let _ =`, matching the two bumps above: this path's
+    // roll-up writes are best-effort, and a rollup miss must not fail an event
+    // that is already durable.
+    if let Some(did) = distinct_id {
+        let _ = repo::bump_person_env(
+            conn,
+            job.app_id,
+            did,
+            environment_id,
+            at,
+            events_delta,
+            errors_delta,
+            sessions_delta,
         )
         .await;
     }
