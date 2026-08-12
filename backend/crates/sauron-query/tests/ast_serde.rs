@@ -120,18 +120,25 @@ fn ast_terms(node: &Node) -> usize {
 fn test_ast_depth_limit_constants_and_enforcement() {
     assert_eq!(MAX_DEPTH, 8);
 
-    // Build a nested string expression exceeding MAX_DEPTH (9 levels)
-    let deep_query = "((((((((a:1))))))))";
-    let res = parse(deep_query);
+    // One group deeper than the limit. Built from MAX_DEPTH rather than a
+    // hand-typed run of parens, which is easy to miscount by one — and was.
+    let deep_query = format!(
+        "{}a:1{}",
+        "(".repeat(MAX_DEPTH + 1),
+        ")".repeat(MAX_DEPTH + 1)
+    );
+    let res = parse(&deep_query);
     assert!(res.is_err());
     match res.unwrap_err() {
         QueryError::TooDeep { max } => assert_eq!(max, MAX_DEPTH),
         other => panic!("expected TooDeep error, got {other:?}"),
     }
 
-    // Expression within depth limit (8 levels or fewer) parses OK
-    let valid_query = "((((((a:1))))))";
-    assert!(parse(valid_query).is_ok());
+    // Exactly at the limit still parses.
+    let valid_query = format!("{}a:1{}", "(".repeat(MAX_DEPTH), ")".repeat(MAX_DEPTH));
+    let parsed_ok = parse(&valid_query);
+    assert!(parsed_ok.is_ok());
+    assert!(ast_depth(&parsed_ok.unwrap()) <= MAX_DEPTH);
 }
 
 #[test]
@@ -191,7 +198,10 @@ fn test_semantic_resolution_tag_prefixes() {
     let resolved_tag = resolve(&node_tag, Resource::Issues).expect("resolve @tag");
     if let ResolvedNode::Pred(pred) = resolved_tag {
         assert_eq!(pred.dim.name, "tag");
-        assert_eq!(pred.path, Some("tag".to_string()));
+        // No key was named, so this matches the value under ANY tag key.
+        // `Some("tag")` would instead mean "the tag whose key is literally
+        // `tag`" — a different, and almost always empty, query.
+        assert_eq!(pred.path, None);
     } else {
         panic!("expected ResolvedNode::Pred");
     }
@@ -203,7 +213,8 @@ fn test_semantic_resolution_tag_prefixes() {
         quoted: false,
         at: 0,
     });
-    let resolved_tag_key = resolve(&node_tag_key, Resource::Issues).expect("resolve @tag.environment");
+    let resolved_tag_key =
+        resolve(&node_tag_key, Resource::Issues).expect("resolve @tag.environment");
     if let ResolvedNode::Pred(pred) = resolved_tag_key {
         assert_eq!(pred.dim.name, "tag");
         assert_eq!(pred.path, Some("environment".to_string()));
@@ -221,7 +232,10 @@ fn test_semantic_resolution_context_app_version() {
         quoted: false,
         at: 0,
     });
-    let resolved = resolve(&node, Resource::Issues).expect("resolve @context.app_version");
+    // Occurrences, not Issues: `context` is a `JsonRoot` over a `context`
+    // column, and the `issues` table has no such column — the catalog scopes
+    // the dimension to the resources that do, and `resolve` enforces that.
+    let resolved = resolve(&node, Resource::Occurrences).expect("resolve @context.app_version");
     if let ResolvedNode::Pred(pred) = resolved {
         assert_eq!(pred.dim.name, "context");
         assert_eq!(pred.path, Some("app_version".to_string()));
@@ -239,7 +253,8 @@ fn test_semantic_resolution_extra_level() {
         quoted: false,
         at: 0,
     });
-    let resolved = resolve(&node, Resource::Issues).expect("resolve @extra.level");
+    // Occurrences for the same reason as the `@context` test above.
+    let resolved = resolve(&node, Resource::Occurrences).expect("resolve @extra.level");
     if let ResolvedNode::Pred(pred) = resolved {
         assert_eq!(pred.dim.name, "extra");
         assert_eq!(pred.path, Some("level".to_string()));

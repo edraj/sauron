@@ -50,13 +50,18 @@ fn lower_sessions_query(q: &str) -> String {
 #[test]
 fn test_sessions_lower_base_scope() {
     let test_app_id = Uuid::new_v4();
-    let l = SessionsLower { app_id: test_app_id };
+    let l = SessionsLower {
+        app_id: test_app_id,
+    };
     let query = sessions::table
         .into_boxed()
         .filter(l.base_scope())
         .select(sessions::id);
     let sql = debug_query::<Pg, _>(&query).to_string();
-    assert!(sql.contains(r#""sessions"."app_id" ="#), "base_scope SQL: {sql}");
+    assert!(
+        sql.contains(r#""sessions"."app_id" ="#),
+        "base_scope SQL: {sql}"
+    );
 }
 
 #[test]
@@ -174,7 +179,9 @@ fn test_sessions_lower_negated_predicates() {
     let query_str = "!release:v1.0.0";
     let sql = lower_sessions_query(query_str);
     assert!(
-        sql.contains(r#""sessions"."release" IS DISTINCT FROM"#) || sql.contains("NOT") || sql.contains("OR"),
+        sql.contains(r#""sessions"."release" IS DISTINCT FROM"#)
+            || sql.contains("NOT")
+            || sql.contains("OR"),
         "Negated SQL: {sql}"
     );
 }
@@ -188,15 +195,30 @@ fn test_sessions_lower_complex_real_world_query() {
     let query_str = "(context.app_version:3.0.2 AND duration_ms:>1000) OR (errorsCount:>5 AND environment:production)";
     let sql = lower_sessions_query(query_str);
 
-    assert!(sql.contains(r#""sessions"."context" @>"#), "Complex SQL context: {sql}");
-    assert!(sql.contains(r#""sessions"."errors_count" >"#), "Complex SQL errors_count: {sql}");
-    assert!(sql.contains(r#""sessions"."environment_id" ="#), "Complex SQL environment: {sql}");
+    assert!(
+        sql.contains(r#""sessions"."context" @>"#),
+        "Complex SQL context: {sql}"
+    );
+    assert!(
+        sql.contains(r#""sessions"."errors_count" >"#),
+        "Complex SQL errors_count: {sql}"
+    );
+    assert!(
+        sql.contains(r#""sessions"."environment_id" ="#),
+        "Complex SQL environment: {sql}"
+    );
 }
 
 #[test]
 fn test_sessions_lower_free_text_term() {
     let sql = lower_sessions_query("crash_session_key");
     assert!(sql.contains("ILIKE"), "Free-text SQL contains ILIKE: {sql}");
-    assert!(sql.contains(r#""sessions"."session_id""#), "Free-text SQL session_id: {sql}");
-    assert!(sql.contains(r#""sessions"."distinct_id""#), "Free-text SQL distinct_id: {sql}");
+    assert!(
+        sql.contains(r#""sessions"."session_id""#),
+        "Free-text SQL session_id: {sql}"
+    );
+    assert!(
+        sql.contains(r#""sessions"."distinct_id""#),
+        "Free-text SQL distinct_id: {sql}"
+    );
 }

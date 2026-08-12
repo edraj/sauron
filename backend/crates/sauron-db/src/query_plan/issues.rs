@@ -494,9 +494,10 @@ fn tag_leaf(
     negate: bool,
     env: &EnvFilter,
 ) -> Result<Frag<issues::table>, PlanError> {
-    let key = p.path.as_deref().ok_or_else(|| PlanError::BadValue {
-        field: "tag".to_string(),
-    })?;
+    // No key named (`tag:value`, `@tag=value`) → match across EVERY tag key.
+    let Some(key) = p.path.as_deref() else {
+        return tag_any_leaf(p, negate, env);
+    };
     let positive: Frag<issues::table> = match p.op {
         MatchOp::Eq => {
             let value = as_str(&p.value, key)?;
@@ -609,6 +610,74 @@ fn workflow_exists(
     } else {
         positive
     })
+}
+
+/// `tag:<value>` with no key — the same predicate applied across every key of
+/// the `tags` object, via `jsonb_each_text`. Splitting this out rather than
+/// threading an `Option<&str>` through `tag_contains`/`tag_ilike`/`tag_has`
+/// keeps the keyed path (which can use the `@>` containment index) untouched.
+fn tag_any_leaf(
+    p: &ResolvedPredicate,
+    negate: bool,
+    env: &EnvFilter,
+) -> Result<Frag<issues::table>, PlanError> {
+    let positive: Frag<issues::table> = match p.op {
+        MatchOp::Eq => {
+            let value = as_str(&p.value, "tag")?;
+            tag_any_cmp(" = ", value, env)
+        }
+        MatchOp::In => {
+            let values = as_str_list(&p.value, "tag")?;
+            let mut values = values.into_iter();
+            let first = values.next().ok_or_else(|| PlanError::BadValue {
+                field: "tag".to_string(),
+            })?;
+            let mut acc: Frag<issues::table> = tag_any_cmp(" = ", &first, env);
+            for v in values {
+                acc = Box::new(acc.or(tag_any_cmp(" = ", &v, env)));
+            }
+            acc
+        }
+        // `has:tag` — the row carries at least one tag at all.
+        MatchOp::Has => exists_close_env!(
+            sql::<Nullable<Bool>>(
+                "EXISTS (SELECT 1 FROM error_events e WHERE e.issue_id = issues.id \
+                 AND e.app_id = issues.app_id AND e.tags <> '{}'::jsonb",
+            ),
+            env
+        ),
+        MatchOp::Like | MatchOp::Contains => {
+            let pattern = as_pattern(&p.value, "tag")?;
+            tag_any_cmp(" ILIKE ", pattern, env)
+        }
+        MatchOp::Ne | MatchOp::Gt | MatchOp::Gte | MatchOp::Lt | MatchOp::Lte => {
+            return Err(PlanError::UnsupportedOnResource {
+                field: "tag".to_string(),
+            })
+        }
+    };
+    Ok(if negate {
+        Box::new(diesel::dsl::not(positive))
+    } else {
+        positive
+    })
+}
+
+/// One `jsonb_each_text` scan comparing every tag VALUE with `op` (` = ` or
+/// ` ILIKE `). The operator is a fixed literal chosen by the caller, never
+/// user input, so it cannot carry injection.
+fn tag_any_cmp(op: &'static str, value: &str, env: &EnvFilter) -> Frag<issues::table> {
+    exists_close_env!(
+        sql::<Nullable<Bool>>(
+            "EXISTS (SELECT 1 FROM error_events e WHERE e.issue_id = issues.id \
+             AND e.app_id = issues.app_id AND EXISTS (SELECT 1 FROM \
+             jsonb_each_text(e.tags) kv WHERE kv.value",
+        )
+        .sql(op)
+        .bind::<Text, _>(value.to_string())
+        .sql(")"),
+        env
+    )
 }
 
 fn tag_contains(key: &str, value: &str, env: &EnvFilter) -> Frag<issues::table> {

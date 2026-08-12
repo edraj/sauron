@@ -77,7 +77,11 @@ fn as_duration_ms(v: &TypedValue, field: &str) -> Result<i64, PlanError> {
     }
 }
 
-fn as_time(v: &TypedValue, field: &str, ctx: &PrepCtx) -> Result<chrono::DateTime<chrono::Utc>, PlanError> {
+fn as_time(
+    v: &TypedValue,
+    field: &str,
+    ctx: &PrepCtx,
+) -> Result<chrono::DateTime<chrono::Utc>, PlanError> {
     match v {
         TypedValue::Time(sauron_query::TimeSpec::Absolute(dt)) => Ok(*dt),
         TypedValue::Time(sauron_query::TimeSpec::RelativeSeconds(secs)) => {
@@ -104,8 +108,7 @@ macro_rules! str_leaf {
             MatchOp::Eq => {
                 let v = as_str(&$p.value, field)?.to_string();
                 if $negate {
-                    Ok(Box::new($col.ne(v).or($col.is_null()).nullable())
-                        as Frag<sessions::table>)
+                    Ok(Box::new($col.ne(v).or($col.is_null()).nullable()) as Frag<sessions::table>)
                 } else {
                     Ok(Box::new($col.eq(v).nullable()) as Frag<sessions::table>)
                 }
@@ -115,8 +118,7 @@ macro_rules! str_leaf {
                 if $negate {
                     Ok(Box::new($col.eq(v).nullable()) as Frag<sessions::table>)
                 } else {
-                    Ok(Box::new($col.ne(v).or($col.is_null()).nullable())
-                        as Frag<sessions::table>)
+                    Ok(Box::new($col.ne(v).or($col.is_null()).nullable()) as Frag<sessions::table>)
                 }
             }
             MatchOp::In => {
@@ -176,7 +178,7 @@ macro_rules! int_leaf {
             MatchOp::Gt => {
                 let v = as_int(&$p.value, field)?;
                 if $negate {
-                    Ok(Box::new($col.lte(v).nullable()) as Frag<sessions::table>)
+                    Ok(Box::new($col.le(v).nullable()) as Frag<sessions::table>)
                 } else {
                     Ok(Box::new($col.gt(v).nullable()) as Frag<sessions::table>)
                 }
@@ -186,13 +188,13 @@ macro_rules! int_leaf {
                 if $negate {
                     Ok(Box::new($col.lt(v).nullable()) as Frag<sessions::table>)
                 } else {
-                    Ok(Box::new($col.gte(v).nullable()) as Frag<sessions::table>)
+                    Ok(Box::new($col.ge(v).nullable()) as Frag<sessions::table>)
                 }
             }
             MatchOp::Lt => {
                 let v = as_int(&$p.value, field)?;
                 if $negate {
-                    Ok(Box::new($col.gte(v).nullable()) as Frag<sessions::table>)
+                    Ok(Box::new($col.ge(v).nullable()) as Frag<sessions::table>)
                 } else {
                     Ok(Box::new($col.lt(v).nullable()) as Frag<sessions::table>)
                 }
@@ -202,7 +204,7 @@ macro_rules! int_leaf {
                 if $negate {
                     Ok(Box::new($col.gt(v).nullable()) as Frag<sessions::table>)
                 } else {
-                    Ok(Box::new($col.lte(v).nullable()) as Frag<sessions::table>)
+                    Ok(Box::new($col.le(v).nullable()) as Frag<sessions::table>)
                 }
             }
             MatchOp::In => {
@@ -213,9 +215,16 @@ macro_rules! int_leaf {
                     Ok(Box::new($col.eq_any(vs).nullable()) as Frag<sessions::table>)
                 }
             }
-            MatchOp::Has => Err(PlanError::UnsupportedOnResource {
-                field: field.to_string(),
-            }),
+            // Presence, matching `str_leaf!`/`environment_leaf!` above. The
+            // catalog declares `Has` for these counters, so refusing it here
+            // made `has:eventsCount` a 400 on a field the schema advertises.
+            MatchOp::Has => {
+                if $negate {
+                    Ok(Box::new($col.is_null().nullable()) as Frag<sessions::table>)
+                } else {
+                    Ok(Box::new($col.is_not_null().nullable()) as Frag<sessions::table>)
+                }
+            }
             MatchOp::Like | MatchOp::Contains => Err(PlanError::UnsupportedOnResource {
                 field: field.to_string(),
             }),
@@ -246,7 +255,7 @@ macro_rules! time_leaf {
             MatchOp::Gt => {
                 let t = as_time(&$p.value, field, $ctx)?;
                 if $negate {
-                    Ok(Box::new($col.lte(t).nullable()) as Frag<sessions::table>)
+                    Ok(Box::new($col.le(t).nullable()) as Frag<sessions::table>)
                 } else {
                     Ok(Box::new($col.gt(t).nullable()) as Frag<sessions::table>)
                 }
@@ -256,13 +265,13 @@ macro_rules! time_leaf {
                 if $negate {
                     Ok(Box::new($col.lt(t).nullable()) as Frag<sessions::table>)
                 } else {
-                    Ok(Box::new($col.gte(t).nullable()) as Frag<sessions::table>)
+                    Ok(Box::new($col.ge(t).nullable()) as Frag<sessions::table>)
                 }
             }
             MatchOp::Lt => {
                 let t = as_time(&$p.value, field, $ctx)?;
                 if $negate {
-                    Ok(Box::new($col.gte(t).nullable()) as Frag<sessions::table>)
+                    Ok(Box::new($col.ge(t).nullable()) as Frag<sessions::table>)
                 } else {
                     Ok(Box::new($col.lt(t).nullable()) as Frag<sessions::table>)
                 }
@@ -272,15 +281,23 @@ macro_rules! time_leaf {
                 if $negate {
                     Ok(Box::new($col.gt(t).nullable()) as Frag<sessions::table>)
                 } else {
-                    Ok(Box::new($col.lte(t).nullable()) as Frag<sessions::table>)
+                    Ok(Box::new($col.le(t).nullable()) as Frag<sessions::table>)
                 }
             }
-            MatchOp::In
-            | MatchOp::Has
-            | MatchOp::Like
-            | MatchOp::Contains => Err(PlanError::UnsupportedOnResource {
-                field: field.to_string(),
-            }),
+            // Presence, same as the issues copy of this macro — a timestamp
+            // column can be NULL, so `has:` is a real question about it.
+            MatchOp::Has => {
+                if $negate {
+                    Ok(Box::new($col.is_null().nullable()) as Frag<sessions::table>)
+                } else {
+                    Ok(Box::new($col.is_not_null().nullable()) as Frag<sessions::table>)
+                }
+            }
+            MatchOp::In | MatchOp::Like | MatchOp::Contains => {
+                Err(PlanError::UnsupportedOnResource {
+                    field: field.to_string(),
+                })
+            }
         }
     }};
 }
@@ -338,38 +355,50 @@ macro_rules! environment_leaf {
     }};
 }
 
-fn duration_leaf(
-    p: &ResolvedPredicate,
-    negate: bool,
-) -> Result<Frag<sessions::table>, PlanError> {
+fn duration_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<sessions::table>, PlanError> {
     let field = p.dim.name;
+    // `sql()` yields a non-Copy `SqlLiteral`, and the arms that also test for
+    // NULL need two independent copies of it — so mint one per use.
+    let expr = || {
+        sql::<Nullable<Double>>(
+            "EXTRACT(EPOCH FROM (sessions.last_event_at - sessions.started_at))",
+        )
+    };
+
+    // `has:duration` asks whether the session has a duration AT ALL. There is
+    // no value to parse, so it has to be answered before `as_duration_ms` —
+    // which would otherwise reject the empty value as malformed.
+    if matches!(p.op, MatchOp::Has) {
+        return Ok(if negate {
+            Box::new(expr().is_null().nullable()) as Frag<sessions::table>
+        } else {
+            Box::new(expr().is_not_null().nullable()) as Frag<sessions::table>
+        });
+    }
+
     let ms = as_duration_ms(&p.value, field)?;
     let sec = ms as f64 / 1000.0;
-    let expr = sql::<Nullable<Double>>("EXTRACT(EPOCH FROM (sessions.last_event_at - sessions.started_at))");
     match (p.op, negate) {
         (MatchOp::Eq, false) | (MatchOp::Ne, true) => {
-            Ok(Box::new(expr.eq(sec)) as Frag<sessions::table>)
+            Ok(Box::new(expr().eq(sec)) as Frag<sessions::table>)
         }
         (MatchOp::Eq, true) | (MatchOp::Ne, false) => {
-            Ok(Box::new(expr.ne(sec).or(expr.is_null())) as Frag<sessions::table>)
+            Ok(Box::new(expr().ne(sec).or(expr().is_null())) as Frag<sessions::table>)
         }
         (MatchOp::Gt, false) | (MatchOp::Lte, true) => {
-            Ok(Box::new(expr.gt(sec)) as Frag<sessions::table>)
+            Ok(Box::new(expr().gt(sec)) as Frag<sessions::table>)
         }
         (MatchOp::Gt, true) | (MatchOp::Lte, false) => {
-            Ok(Box::new(expr.lte(sec).or(expr.is_null())) as Frag<sessions::table>)
+            Ok(Box::new(expr().le(sec).or(expr().is_null())) as Frag<sessions::table>)
         }
+        // These two arms also cover (Lt, false) / (Lt, true) — a later duplicate
+        // pair spelled them out again with different NULL handling, which was
+        // dead code the compiler could never reach.
         (MatchOp::Gte, false) | (MatchOp::Lt, true) => {
-            Ok(Box::new(expr.gte(sec)) as Frag<sessions::table>)
+            Ok(Box::new(expr().ge(sec)) as Frag<sessions::table>)
         }
         (MatchOp::Gte, true) | (MatchOp::Lt, false) => {
-            Ok(Box::new(expr.lt(sec).or(expr.is_null())) as Frag<sessions::table>)
-        }
-        (MatchOp::Lt, false) | (MatchOp::Gte, true) => {
-            Ok(Box::new(expr.lt(sec)) as Frag<sessions::table>)
-        }
-        (MatchOp::Lt, true) | (MatchOp::Gte, false) => {
-            Ok(Box::new(expr.gte(sec).or(expr.is_null())) as Frag<sessions::table>)
+            Ok(Box::new(expr().lt(sec).or(expr().is_null())) as Frag<sessions::table>)
         }
         _ => Err(PlanError::UnsupportedOnResource {
             field: field.to_string(),
@@ -380,6 +409,17 @@ fn duration_leaf(
 macro_rules! json_object_leaf {
     ($col:expr, $col_sql:literal, $prefix:expr, $p:expr, $negate:expr) => {{
         let field = $p.dim.name;
+        // `has:<root>` with no path asks whether the row carries the object at
+        // all — column presence, not a path lookup. `json_path_segments` cannot
+        // express that (no path and an empty prefix yields no segments, so it
+        // returns None), so it has to be answered before segments exist.
+        if $p.path.is_none() && $prefix.is_empty() && matches!($p.op, MatchOp::Has) {
+            return Ok(if $negate {
+                Box::new($col.is_null().nullable()) as Frag<sessions::table>
+            } else {
+                Box::new($col.is_not_null().nullable()) as Frag<sessions::table>
+            });
+        }
         let segments =
             json_path_segments($prefix, $p.path.as_deref()).ok_or_else(|| PlanError::BadValue {
                 field: field.to_string(),
@@ -547,15 +587,24 @@ impl ResourceLower for SessionsLower {
 
     fn text(&self, term: &str) -> Frag<sessions::table> {
         let pattern = like_contains(term);
-        let session_id: Frag<sessions::table> = Box::new(sessions::session_id.ilike(pattern.clone()).nullable());
-        let distinct_id: Frag<sessions::table> = Box::new(sessions::distinct_id.ilike(pattern.clone()).nullable());
-        let device_key: Frag<sessions::table> = Box::new(sessions::device_key.ilike(pattern.clone()).nullable());
-        let release: Frag<sessions::table> = Box::new(sessions::release.ilike(pattern.clone()).nullable());
+        let session_id: Frag<sessions::table> =
+            Box::new(sessions::session_id.ilike(pattern.clone()).nullable());
+        let distinct_id: Frag<sessions::table> =
+            Box::new(sessions::distinct_id.ilike(pattern.clone()).nullable());
+        let device_key: Frag<sessions::table> =
+            Box::new(sessions::device_key.ilike(pattern.clone()).nullable());
+        let release: Frag<sessions::table> =
+            Box::new(sessions::release.ilike(pattern.clone()).nullable());
         let context: Frag<sessions::table> = Box::new(
-            sql::<Nullable<Bool>>(r#""sessions"."context"::text ILIKE "#)
-                .bind::<Text, _>(pattern),
+            sql::<Nullable<Bool>>(r#""sessions"."context"::text ILIKE "#).bind::<Text, _>(pattern),
         );
-        Box::new(session_id.or(distinct_id).or(device_key).or(release).or(context))
+        Box::new(
+            session_id
+                .or(distinct_id)
+                .or(device_key)
+                .or(release)
+                .or(context),
+        )
     }
 }
 

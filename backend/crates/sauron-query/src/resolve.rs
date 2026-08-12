@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use crate::ast::{MatchOp, Node, Predicate};
 use crate::catalog::{
     label_dimension, lookup, tag_dimension, Dimension, IndexClass, Resource, Store, ValueType,
-    LABEL_DIM, SHORTHANDS,
+    SHORTHANDS,
 };
 use crate::token::is_field_ident;
 use crate::QueryError;
@@ -167,7 +167,17 @@ fn resolve_pred(
     let clean_field = p.field.strip_prefix('@').unwrap_or(&p.field);
     if (clean_field == "tag" || clean_field == "$label" || clean_field == "label") && !expanded {
         if let Some((key, rest)) = p.value.split_once('=') {
-            if !key.is_empty() {
+            // An EXPLICIT but empty key (`tag:=value`) is malformed — distinct
+            // from omitting the key entirely (`tag:value`), which step 4 of
+            // `resolve_field` reads as "any key".
+            if key.is_empty() {
+                return Err(QueryError::BadValue {
+                    field: p.field.clone(),
+                    value: p.value.clone(),
+                    at: p.at,
+                });
+            }
+            {
                 let dim = if clean_field == "tag" {
                     tag_dimension(r)
                 } else {
@@ -253,17 +263,21 @@ fn resolve_field(
         }
     }
 
-    // 4. Standalone `@tag` or `tag` (without property dot).
+    // 4. Standalone `@tag` or `tag` (without property dot). No key was named,
+    //    so this matches across EVERY tag key — `path: None` is what the
+    //    lowering reads as "any key". It must not be `Some("tag")`: that would
+    //    silently mean "the tag whose key is literally `tag`", which is a
+    //    different (and almost always empty) query.
     if clean == "tag" {
         if let Some(d) = tag_dimension(r) {
-            return Ok((d, Some("tag".to_string())));
+            return Ok((d, None));
         }
     }
 
-    // 5. Standalone `@$label` or `$label` or `label` (without property dot).
+    // 5. Standalone `@$label` / `$label` / `label` — "any label key", as above.
     if clean == "$label" || clean == "label" {
         if let Some(d) = label_dimension(r) {
-            return Ok((d, Some("label".to_string())));
+            return Ok((d, None));
         }
     }
 
@@ -1012,11 +1026,16 @@ mod tests {
     }
 
     #[test]
-    fn tag_without_a_key_value_pair_is_rejected() {
-        assert!(matches!(
-            err("tag:justakey", Resource::Issues),
-            QueryError::BadValue { .. }
-        ));
+    fn tag_without_a_key_searches_every_key() {
+        // Omitting the key entirely is not an error: `tag:justakey` asks for
+        // that value under ANY tag key. `path: None` is how the lowering is
+        // told "every key" — see `tag_leaf`.
+        let p = one("tag:justakey", Resource::Issues);
+        assert!(matches!(p.dim.store, Store::Tag));
+        assert_eq!(p.path, None);
+        assert_eq!(p.value, TypedValue::Str("justakey".into()));
+
+        // An explicitly EMPTY key is still malformed, though.
         assert!(matches!(
             err("tag:=novalue", Resource::Issues),
             QueryError::BadValue { .. }

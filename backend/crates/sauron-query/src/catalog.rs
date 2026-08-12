@@ -401,7 +401,12 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Str,
         store: Store::Column("distinct_id"),
         ops: OPS_TEXT,
-        resources: &[Resource::Occurrences, Resource::Events, Resource::Persons, Resource::Sessions],
+        resources: &[
+            Resource::Occurrences,
+            Resource::Events,
+            Resource::Persons,
+            Resource::Sessions,
+        ],
         index: IndexClass::Indexed,
     },
     // OPS_TEXT, not OPS_EQ: the legacy `EVENT_FILTERS` granted `session_id` the

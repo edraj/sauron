@@ -345,6 +345,16 @@ macro_rules! environment_leaf {
 macro_rules! json_object_leaf {
     ($col:expr, $col_sql:literal, $prefix:expr, $p:expr, $negate:expr) => {{
         let field = $p.dim.name;
+        // `has:<root>` with no path asks whether the row carries the object at
+        // all — column presence, not a path lookup. See the sessions copy of
+        // this macro for the full reasoning.
+        if $p.path.is_none() && $prefix.is_empty() && matches!($p.op, MatchOp::Has) {
+            return Ok(if $negate {
+                Box::new($col.is_null().nullable()) as Frag<error_events::table>
+            } else {
+                Box::new($col.is_not_null().nullable()) as Frag<error_events::table>
+            });
+        }
         let segments =
             json_path_segments($prefix, $p.path.as_deref()).ok_or_else(|| PlanError::BadValue {
                 field: field.to_string(),
@@ -588,10 +598,72 @@ fn stack_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<error_events::
 /// `sauron_query::resolve`) — so the key is always exactly ONE flat segment
 /// and must never be split on `.` the way a `Store::JsonRoot` path is; it
 /// only ever reaches SQL as a bind, alongside the value.
+/// `tag:<value>` with no key — the same predicate across every key of `tags`,
+/// via `jsonb_each_text`. Kept separate from the keyed path so that one can go
+/// on using the `@>` containment index.
+fn tag_any_leaf(
+    p: &ResolvedPredicate,
+    negate: bool,
+) -> Result<Frag<error_events::table>, PlanError> {
+    let positive: Frag<error_events::table> = match p.op {
+        MatchOp::Eq | MatchOp::Ne => {
+            let value = as_str(&p.value, "tag")?;
+            tag_any_cmp(" = ", value)
+        }
+        MatchOp::In => {
+            let values = as_str_list(&p.value, "tag")?;
+            let mut values = values.into_iter();
+            let first = values.next().ok_or_else(|| PlanError::BadValue {
+                field: "tag".to_string(),
+            })?;
+            let mut acc: Frag<error_events::table> = tag_any_cmp(" = ", &first);
+            for v in values {
+                acc = Box::new(acc.or(tag_any_cmp(" = ", &v)));
+            }
+            acc
+        }
+        MatchOp::Has => Box::new(sql::<Nullable<Bool>>(
+            "\"error_events\".\"tags\" <> '{}'::jsonb",
+        )),
+        MatchOp::Like | MatchOp::Contains => {
+            let pattern = as_pattern(&p.value, "tag")?;
+            tag_any_cmp(" ILIKE ", pattern)
+        }
+        MatchOp::Gt | MatchOp::Gte | MatchOp::Lt | MatchOp::Lte => {
+            return Err(PlanError::UnsupportedOnResource {
+                field: "tag".to_string(),
+            })
+        }
+    };
+    // `Ne` means "no key holds this value", which is the negation of the same
+    // EXISTS — so it flips alongside an explicit NOT.
+    let flip = negate ^ matches!(p.op, MatchOp::Ne);
+    Ok(if flip {
+        Box::new(diesel::dsl::not(positive).nullable())
+    } else {
+        positive
+    })
+}
+
+/// One `jsonb_each_text` scan comparing every tag VALUE with `op` (` = ` or
+/// ` ILIKE `). `op` is a fixed literal chosen by the caller, never user input.
+fn tag_any_cmp(op: &'static str, value: &str) -> Frag<error_events::table> {
+    Box::new(
+        sql::<Nullable<Bool>>(
+            "EXISTS (SELECT 1 FROM jsonb_each_text(\"error_events\".\"tags\") kv \
+             WHERE kv.value",
+        )
+        .sql(op)
+        .bind::<Text, _>(value.to_string())
+        .sql(")"),
+    )
+}
+
 fn tag_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<error_events::table>, PlanError> {
-    let key = p.path.as_deref().ok_or_else(|| PlanError::BadValue {
-        field: "tag".to_string(),
-    })?;
+    // No key named (`tag:value`, `@tag=value`) → match across EVERY tag key.
+    let Some(key) = p.path.as_deref() else {
+        return tag_any_leaf(p, negate);
+    };
     let col = error_events::tags;
     match p.op {
         MatchOp::Eq => {

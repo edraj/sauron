@@ -641,6 +641,8 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/transactions/timeseries",
             get(routes::analytics::transaction_timeseries),
         )
+        // --- exceptions dashboard ---
+        .route("/v1/apps/{app_id}/issues/stats", get(routes::issues::stats))
         // --- search schema ---
         .route(
             "/v1/apps/{app_id}/search/schema",

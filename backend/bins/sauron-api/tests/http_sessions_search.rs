@@ -83,7 +83,10 @@ impl TestServer {
             .env("DATABASE_URL", &db_url)
             .env("REDIS_URL", &redis_url)
             .env("JWT_SECRET", JWT_SECRET)
-            .env("NOTIFY_SECRET_KEY", "sauron-test-notify-secret-key-0000000000")
+            .env(
+                "NOTIFY_SECRET_KEY",
+                "sauron-test-notify-secret-key-0000000000",
+            )
             .env("API_PORT", port.to_string())
             .env("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
             .env("RUST_LOG", "error")
@@ -268,7 +271,9 @@ impl TestServer {
             },
         ];
 
-        bump_sessions(&mut conn, &bumps).await.expect("seed sessions");
+        bump_sessions(&mut conn, &bumps)
+            .await
+            .expect("seed sessions");
         drop(conn);
 
         let keys = JwtKeys::new(JWT_SECRET, 900);
@@ -292,7 +297,10 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         if !self.cleaned_up.get() {
-            eprintln!("WARNING: ephemeral test database {} may remain.", self.db_name);
+            eprintln!(
+                "WARNING: ephemeral test database {} may remain.",
+                self.db_name
+            );
         }
     }
 }
@@ -336,7 +344,9 @@ async fn test_http_sessions_search_ast_json_query() {
         }
     });
 
-    let encoded_ast = urlencoding::encode(&ast.to_string());
+    let ast_json = ast.to_string();
+    let encoded_ast =
+        percent_encoding::utf8_percent_encode(&ast_json, percent_encoding::NON_ALPHANUMERIC);
     let path = format!("/v1/apps/{app_id}/sessions?query={encoded_ast}");
     let json_body = server.get_json(&path, &token).await;
 
@@ -421,28 +431,38 @@ async fn test_http_sessions_search_pagination_and_sorting() {
     };
     let (app_id, token, _sids) = server.seed_app_with_sessions("tier4_page").await;
 
-    // Sort by duration_ms ascending
-    let path_sort = format!("/v1/apps/{app_id}/sessions?sort=events_count");
+    // Ascending is the `-` prefix: a bare column sorts DESCENDING across this
+    // API (see `parse_sort`), so `sort=events_count` would return 12, 3, 1.
+    let path_sort = format!("/v1/apps/{app_id}/sessions?sort=-events_count");
     let json_sort = server.get_json(&path_sort, &token).await;
     let items = json_sort["data"].as_array().expect("array");
     assert_eq!(items.len(), 3);
 
     // Verify ordering: events_count (1, 3, 12)
-    let counts: Vec<i64> = items.iter().map(|i| i["events_count"].as_i64().unwrap()).collect();
-    assert!(counts[0] <= counts[1] && counts[1] <= counts[2], "events_count ascending: {counts:?}");
+    let counts: Vec<i64> = items
+        .iter()
+        .map(|i| i["events_count"].as_i64().unwrap())
+        .collect();
+    assert!(
+        counts[0] <= counts[1] && counts[1] <= counts[2],
+        "events_count ascending: {counts:?}"
+    );
 
     // Test limit and offset pagination
-    let path_p1 = format!("/v1/apps/{app_id}/sessions?limit=1&offset=0&sort=events_count");
+    let path_p1 = format!("/v1/apps/{app_id}/sessions?limit=1&offset=0&sort=-events_count");
     let json_p1 = server.get_json(&path_p1, &token).await;
     let page1 = json_p1["data"].as_array().unwrap();
     assert_eq!(page1.len(), 1);
 
-    let path_p2 = format!("/v1/apps/{app_id}/sessions?limit=1&offset=1&sort=events_count");
+    let path_p2 = format!("/v1/apps/{app_id}/sessions?limit=1&offset=1&sort=-events_count");
     let json_p2 = server.get_json(&path_p2, &token).await;
     let page2 = json_p2["data"].as_array().unwrap();
     assert_eq!(page2.len(), 1);
 
-    assert_ne!(page1[0]["id"], page2[0]["id"], "paginated rows do not repeat");
+    assert_ne!(
+        page1[0]["id"], page2[0]["id"],
+        "paginated rows do not repeat"
+    );
 
     server.shutdown().await;
 }

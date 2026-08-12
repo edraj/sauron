@@ -82,7 +82,10 @@ impl TestServer {
             .env("DATABASE_URL", &db_url)
             .env("REDIS_URL", &redis_url)
             .env("JWT_SECRET", JWT_SECRET)
-            .env("NOTIFY_SECRET_KEY", "sauron-test-notify-secret-key-0000000000")
+            .env(
+                "NOTIFY_SECRET_KEY",
+                "sauron-test-notify-secret-key-0000000000",
+            )
             .env("API_PORT", port.to_string())
             .env("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
             .env("RUST_LOG", "error")
@@ -193,15 +196,9 @@ impl TestServer {
         .await
         .expect("create user");
 
-        let role = repo::create_role(
-            &mut conn,
-            org.id,
-            "schema role",
-            "test role",
-            json!(perms),
-        )
-        .await
-        .expect("create role");
+        let role = repo::create_role(&mut conn, org.id, "schema role", "test role", json!(perms))
+            .await
+            .expect("create role");
 
         repo::create_grant(
             &mut conn,
@@ -269,13 +266,14 @@ async fn test_http_search_schema_issues_200_ok() {
 
     // Check variable prefixes presence
     let vars = json_body["variables"].as_array().unwrap();
-    let prefixes: Vec<&str> = vars
-        .iter()
-        .map(|v| v["prefix"].as_str().unwrap())
-        .collect();
+    let prefixes: Vec<&str> = vars.iter().map(|v| v["prefix"].as_str().unwrap()).collect();
+    // Only what this resource can actually resolve. Issues carry tags (via
+    // their occurrences) but have no `context`/`extra` column, so offering
+    // those prefixes would advertise a filter that every query using it gets a
+    // 400 for — see `build_schema_response`.
     assert!(prefixes.contains(&"@tag"));
-    assert!(prefixes.contains(&"@context"));
-    assert!(prefixes.contains(&"@extra"));
+    assert!(!prefixes.contains(&"@context"));
+    assert!(!prefixes.contains(&"@extra"));
 
     server.shutdown().await;
 }
@@ -289,9 +287,7 @@ async fn test_http_search_schema_invalid_context() {
     let Some(mut server) = TestServer::start().await else {
         return;
     };
-    let (app_id, token) = server
-        .seed_app_with_permissions(&[perm::EVENT_READ])
-        .await;
+    let (app_id, token) = server.seed_app_with_permissions(&[perm::EVENT_READ]).await;
 
     let path = format!("/v1/apps/{app_id}/search/schema?context=invalid_context_foo");
     let (status, _body) = server.get_status_and_body(&path, Some(&token)).await;
@@ -329,9 +325,7 @@ async fn test_http_search_schema_permission_denial() {
         return;
     };
     // Token missing event:read (only has issue:read)
-    let (app_id, token) = server
-        .seed_app_with_permissions(&[perm::ISSUE_READ])
-        .await;
+    let (app_id, token) = server.seed_app_with_permissions(&[perm::ISSUE_READ]).await;
 
     let path = format!("/v1/apps/{app_id}/search/schema?context=issues");
     let (status, _body) = server.get_status_and_body(&path, Some(&token)).await;
@@ -382,10 +376,16 @@ fn test_schema_catalog_dimensions_unit() {
     use sauron_query::catalog::{dimensions_for, label_dimension, tag_dimension, Resource};
 
     let issues_dims: Vec<_> = dimensions_for(Resource::Issues).collect();
-    assert!(!issues_dims.is_empty(), "Resource::Issues has catalog dimensions");
+    assert!(
+        !issues_dims.is_empty(),
+        "Resource::Issues has catalog dimensions"
+    );
 
     let sessions_dims: Vec<_> = dimensions_for(Resource::Sessions).collect();
-    assert!(!sessions_dims.is_empty(), "Resource::Sessions has catalog dimensions");
+    assert!(
+        !sessions_dims.is_empty(),
+        "Resource::Sessions has catalog dimensions"
+    );
 
     assert!(tag_dimension(Resource::Issues).is_some());
     assert!(label_dimension(Resource::Issues).is_some());

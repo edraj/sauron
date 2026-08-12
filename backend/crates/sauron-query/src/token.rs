@@ -57,12 +57,19 @@ impl Token {
 /// True when `s` can be a field name: a leading letter, underscore, `@`, or `$`, then
 /// letters, digits, `_`, `-`, `.`, `$`, or `@` (for variables like `@tag`, `@context`, `@$label.xxx`).
 pub(crate) fn is_field_ident(s: &str) -> bool {
-    let mut chars = s.chars();
+    // `@` and `$` are leading SIGILS (`@tag`, `$label`, `@$label.team`), not
+    // ordinary identifier characters. Accepting them mid-string made
+    // `cart@checkout` look like an identifier, which routed non-identifier tag
+    // keys to `tag.<key>` — a spelling the lexer cannot produce — instead of
+    // the `tag:<key>=<value>` escape hatch that exists for exactly those keys.
+    let body = s.strip_prefix('@').unwrap_or(s);
+    let body = body.strip_prefix('$').unwrap_or(body);
+    let mut chars = body.chars();
     match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '@' || c == '$' => {}
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
         _ => return false,
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '$' || c == '@')
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 pub fn lex(input: &str) -> Result<Vec<Token>, QueryError> {
@@ -178,7 +185,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, QueryError> {
         //
         // Note the value side is taken from the ALREADY-UNQUOTED `raw`, so
         // `message:"a b"` yields field `message`, value `a b`.
-        let split_pos = raw.find(|c| c == ':' || c == '=');
+        let split_pos = raw.find([':', '=']);
         match split_pos {
             Some(pos) => {
                 let field = &raw[..pos];

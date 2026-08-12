@@ -86,7 +86,7 @@ describe('query-parser', () => {
       expect(ast).toEqual({
         Not: {
           Not: {
-            Pred: { field: 'status', value: 'unresolved', quoted: false, at: 0 },
+            Pred: { field: 'status', value: 'unresolved', quoted: false, at: 2 },
           },
         },
       });
@@ -119,7 +119,7 @@ describe('query-parser', () => {
       expect(ast).toEqual({
         And: [
           { Pred: { field: '@tag', value: 'v1', quoted: false, at: 0 } },
-          { Pred: { field: '@context.app_version', value: '3.0.2', quoted: false, at: 13 } },
+          { Pred: { field: '@context.app_version', value: '3.0.2', quoted: false, at: 12 } },
         ],
       });
     });
@@ -147,10 +147,10 @@ describe('query-parser', () => {
           {
             And: [
               { Pred: { field: '@tag', value: 'v1', quoted: false, at: 2 } },
-              { Pred: { field: '@context.app_version', value: '3.0.2', quoted: false, at: 15 } },
+              { Pred: { field: '@context.app_version', value: '3.0.2', quoted: false, at: 14 } },
             ],
           },
-          { Pred: { field: '@extra.level', value: 'warn', quoted: false, at: 47 } },
+          { Pred: { field: '@extra.level', value: 'warn', quoted: false, at: 46 } },
         ],
       });
     });

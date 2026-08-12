@@ -85,6 +85,12 @@ export function getAutocompleteSuggestions(schema: SchemaDefinition, input: stri
   // If input starts with `@tag.` or `@tag=` or `@tag`
   if (trimmed.startsWith('@tag.') || trimmed.startsWith('@tag')) {
     const prop = trimmed.startsWith('@tag.') ? trimmed.slice(5) : '';
+    // A bare `@tag` is a filterable field in its own right (`@tag=v1`), not
+    // only a prefix to chain a key onto, so offer it alongside the known keys.
+    // Once the user has typed the `.`, chaining is committed and it isn't.
+    if (trimmed === '@tag') {
+      suggestions.push('@tag');
+    }
     for (const tag of schema.available_tags || []) {
       if (tag.key.startsWith(prop)) {
         suggestions.push(`@tag.${tag.key}`);

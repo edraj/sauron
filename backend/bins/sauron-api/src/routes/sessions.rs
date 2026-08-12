@@ -4,7 +4,7 @@
 
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -147,13 +147,8 @@ pub async fn list(
         .map_err(super::search::map_plan_error)?;
 
     let sort = session_sort_spec(q.sort.as_deref())?;
-    let window = super::search::resolve_window(
-        "started_at",
-        Utc::now(),
-        q.since_days,
-        365,
-        prepared.clamp,
-    );
+    let window =
+        super::search::resolve_window("started_at", Utc::now(), q.since_days, 365, prepared.clamp);
     let limit = q.limit.clamp(1, 200);
     let offset = super::clamp_offset(q.offset);
 

@@ -516,8 +516,8 @@ mod tests {
     #[test]
     fn every_declared_dimension_lowers_or_is_explicitly_deferred() {
         assert_eq!(dimensions_for(Resource::Issues).count(), 13);
-        assert_eq!(dimensions_for(Resource::Occurrences).count(), 20);
-        assert_eq!(dimensions_for(Resource::Events).count(), 9);
+        assert_eq!(dimensions_for(Resource::Occurrences).count(), 21);
+        assert_eq!(dimensions_for(Resource::Events).count(), 10);
         assert_eq!(dimensions_for(Resource::Sessions).count(), 10);
 
         let fixed = Uuid::nil();

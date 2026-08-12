@@ -26,7 +26,7 @@ use sauron_auth::AuthUser;
 use sauron_db::query_plan::prepare::Clamp;
 use sauron_db::query_plan::PlanError;
 use sauron_db::repo::TextSearchReach;
-use sauron_query::{from_legacy, parse, resolve, ResolvedNode, ResolvedPredicate, Store};
+use sauron_query::{from_legacy, parse, resolve, Node, ResolvedNode, ResolvedPredicate, Store};
 
 use crate::error::ApiError;
 use crate::AppState;
@@ -121,6 +121,23 @@ pub fn resolve_window(
     }
 }
 
+/// `query=` accepts either the string grammar (`level:error`) or a serialized
+/// `Node` AST — the same JSON the dashboard's client-side parser builds, whose
+/// wire shape `sauron-query`'s `ast_serde` test pins.
+///
+/// A value opening with `{` is JSON *by intent*, so a JSON parse failure is a
+/// 400 rather than a silent fall back to the string grammar: `{"Pred":{invalid`
+/// would otherwise lex as free text, match nothing, and return an empty 200 —
+/// a malformed query reported as "no results".
+fn parse_query_param(text: &str) -> Result<Node, ApiError> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        return serde_json::from_str::<Node>(trimmed)
+            .map_err(|e| ApiError::BadRequest(format!("invalid query AST: {e}")));
+    }
+    parse(text).map_err(|e| ApiError::BadRequest(e.to_string()))
+}
+
 /// Which of the three input shapes the caller used.
 ///
 /// `query=` wins outright when present. `filter=`/`q=` keep working and are
@@ -133,9 +150,7 @@ pub fn resolve_query(
     resource: sauron_query::Resource,
 ) -> Result<ResolvedNode, ApiError> {
     let ast = match query {
-        Some(text) if !text.trim().is_empty() => {
-            parse(text).map_err(|e| ApiError::BadRequest(e.to_string()))?
-        }
+        Some(text) if !text.trim().is_empty() => parse_query_param(text)?,
         // `from_legacy` takes NO resource — it is a purely syntactic bridge and
         // produces the same untyped `Node` that `parse` does. Field validity is
         // decided one line down, by `resolve`, for both paths alike.
@@ -508,29 +523,44 @@ pub struct SchemaQuery {
     pub context: Option<String>,
 }
 
-pub fn build_schema_response(context_str: &str, resource: sauron_query::Resource) -> SchemaResponse {
-    let variables = vec![
-        SchemaVariable {
+pub fn build_schema_response(
+    context_str: &str,
+    resource: sauron_query::Resource,
+) -> SchemaResponse {
+    // Advertise only the variables this resource can actually resolve. The
+    // catalog declares each dimension's `resources`, and `resolve_field`
+    // enforces it — `issues` has no `context`/`extra`/`tags` column at all, so
+    // listing them here handed the autocomplete a prefix that every query using
+    // it would then reject as an unknown field.
+    let mut variables = Vec::new();
+    if sauron_query::catalog::tag_dimension(resource).is_some() {
+        variables.push(SchemaVariable {
             prefix: "@tag".to_string(),
             description: "Developer tags".to_string(),
             chainable: true,
-        },
-        SchemaVariable {
+        });
+    }
+    if sauron_query::catalog::lookup("context", resource).is_some() {
+        variables.push(SchemaVariable {
             prefix: "@context".to_string(),
             description: "Device/runtime context".to_string(),
             chainable: true,
-        },
-        SchemaVariable {
+        });
+    }
+    if sauron_query::catalog::lookup("extra", resource).is_some() {
+        variables.push(SchemaVariable {
             prefix: "@extra".to_string(),
             description: "Extra metadata".to_string(),
             chainable: true,
-        },
-        SchemaVariable {
+        });
+    }
+    if sauron_query::catalog::label_dimension(resource).is_some() {
+        variables.push(SchemaVariable {
             prefix: "@$label".to_string(),
             description: "Label properties".to_string(),
             chainable: true,
-        },
-    ];
+        });
+    }
 
     let dimensions: Vec<SchemaDimension> = sauron_query::catalog::dimensions_for(resource)
         .map(|d| {
@@ -1142,7 +1172,20 @@ mod tests {
     fn schema_response_generation() {
         let resp = build_schema_response("sessions", sauron_query::Resource::Sessions);
         assert_eq!(resp.resource, "sessions");
-        assert!(resp.variables.iter().any(|v| v.prefix == "@tag"));
         assert!(resp.dimensions.iter().any(|d| d.name == "startedAt"));
+
+        // Sessions carry no tags — `TAG_DIM` does not list the resource, and the
+        // sessions lowering refuses `Store::Tag` outright — so `@tag` must NOT
+        // be advertised here. Offering it handed autocomplete a prefix that
+        // every query built from it would then be rejected for as an unknown
+        // field. `context` IS declared for Sessions, so that one is offered.
+        assert!(!resp.variables.iter().any(|v| v.prefix == "@tag"));
+        assert!(resp.variables.iter().any(|v| v.prefix == "@context"));
+
+        // ...and the converse, so this cannot be "fixed" by dropping every
+        // variable: Issues have tags but no `context`/`extra` column.
+        let issues = build_schema_response("issues", sauron_query::Resource::Issues);
+        assert!(issues.variables.iter().any(|v| v.prefix == "@tag"));
+        assert!(!issues.variables.iter().any(|v| v.prefix == "@context"));
     }
 }
