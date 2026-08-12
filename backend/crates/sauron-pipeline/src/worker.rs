@@ -430,7 +430,21 @@ async fn process_entries(
         // Resolved ONCE per envelope now rather than once per item — every item
         // in an entry shares one `app_id` by construction.
         let masks = policies.get(batch.app_id).await;
-        let jobs = batch.into_jobs();
+        let app_id = batch.app_id;
+        let (jobs, skewed) = batch.into_jobs_counting_skew();
+        if skewed > 0 {
+            // Logged, never silent. The clamp keeps one broken phone off the
+            // top of every `started_at desc` list, but the phone is still
+            // broken — and a correction nobody can see is a correction nobody
+            // ever traces back to the device that needs it.
+            warn!(
+                consumer,
+                %app_id,
+                skewed,
+                tolerance_min = sauron_core::envelope::MAX_CLOCK_SKEW.num_minutes(),
+                "clamped future device timestamps to receive time"
+            );
+        }
         let last = jobs.len() - 1;
         for (i, mut job) in jobs.into_iter().enumerate() {
             // Mask the owned wire payload before anything is persisted or

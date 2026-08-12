@@ -43,11 +43,13 @@
 //! which is what Postgres intends a caller to do with SQLSTATE 40P01 — the
 //! loser of a deadlock has been rolled back cleanly and can simply go again.
 
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
 use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::sql_types::{
-    Array, BigInt, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+    Array, BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
 };
 use diesel::upsert::excluded;
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -217,17 +219,40 @@ pub struct SessionBump {
     pub errors_delta: i64,
 }
 
+/// One row of [`bump_sessions`]' `RETURNING`.
+#[derive(QueryableByName)]
+struct BumpedSession {
+    #[diesel(sql_type = SqlUuid)]
+    app_id: Uuid,
+    #[diesel(sql_type = Text)]
+    session_id: String,
+    /// `xmax = 0` is true for exactly the rows this statement INSERTED. An
+    /// upsert that took the `DO UPDATE` arm stamps the updating transaction's
+    /// id into the row's `xmax`, so a non-zero value means "this already
+    /// existed". It is the only way to tell the two arms apart from a single
+    /// statement — `RETURNING` alone reports both identically.
+    #[diesel(sql_type = Bool)]
+    inserted: bool,
+}
+
 /// Fold N session bumps into `sessions`, one statement.
 ///
 /// The conflict arm is copied from [`crate::repo::bump_session`] unchanged, so
 /// `GREATEST`/`LEAST`/`COALESCE` still decide every field the same way. What
 /// changes is only that the rows arrive together.
+///
+/// Returns the `(app_id, session_id)` of the sessions this call **inserted**,
+/// which `write_rows_once` needs in order to credit
+/// `event_user_environments.sessions_count`. A session is bumped again by every
+/// batch that carries a signal for it, so crediting per bump would count one
+/// session once per batch it spans — an over-count that grows with session
+/// length and that no single-batch test can see.
 pub async fn bump_sessions(
     conn: &mut AsyncPgConnection,
     rows: &[SessionBump],
-) -> QueryResult<usize> {
+) -> QueryResult<Vec<(Uuid, String)>> {
     if rows.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     // Sorted by `(app_id, session_id)` so every concurrent batch takes these row locks in
     // the same order — see the module's ordering rule.
@@ -257,7 +282,8 @@ pub async fn bump_sessions(
             release = COALESCE(EXCLUDED.release, sessions.release), \
             environment_id = COALESCE(EXCLUDED.environment_id, sessions.environment_id), \
             ip_address = COALESCE(EXCLUDED.ip_address, sessions.ip_address), \
-            updated_at = now()",
+            updated_at = now() \
+         RETURNING app_id, session_id, (xmax = 0) AS inserted",
     )
     .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
     .bind::<Array<Text>, _>(ix.iter().map(|&i| rows[i].session_id.clone()).collect::<Vec<_>>())
@@ -271,8 +297,14 @@ pub async fn bump_sessions(
     .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].release.clone()).collect::<Vec<_>>())
     .bind::<Array<Nullable<SqlUuid>>, _>(ix.iter().map(|&i| rows[i].environment_id).collect::<Vec<_>>())
     .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].ip.clone()).collect::<Vec<_>>())
-    .execute(conn)
+    .get_results::<BumpedSession>(conn)
     .await
+    .map(|rows| {
+        rows.into_iter()
+            .filter(|r| r.inserted)
+            .map(|r| (r.app_id, r.session_id))
+            .collect()
+    })
 }
 
 /// One device's folded contribution from a batch.
@@ -373,6 +405,112 @@ pub async fn bump_devices(conn: &mut AsyncPgConnection, rows: &[DeviceBump]) -> 
     .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].last_at).collect::<Vec<_>>())
     .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].events_delta).collect::<Vec<_>>())
     .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].errors_delta).collect::<Vec<_>>())
+    .execute(conn)
+    .await
+}
+
+/// One (person, environment)'s folded contribution from a batch.
+///
+/// `event_users` carries no `environment_id`, so before this rollup existed the
+/// Users Explorer derived membership, first/last-seen and all three counts from
+/// three LATERALs plus a membership predicate, once per admitted person, with no
+/// time bound of any kind.
+#[derive(Debug, Clone)]
+pub struct PersonEnvBump {
+    pub app_id: Uuid,
+    pub distinct_id: String,
+    /// `None` is `EnvFilter::Unattributed` — a real row, not an absence. See
+    /// migration `2026-08-12-000056`'s comment for why.
+    pub environment_id: Option<Uuid>,
+    /// See [`SessionBump::first_at`] — `first_seen`/`last_seen` are driven by
+    /// `LEAST`/`GREATEST` and need the two ends of the fold, not one point.
+    pub first_at: DateTime<Utc>,
+    pub last_at: DateTime<Utc>,
+    pub events_delta: i64,
+    pub errors_delta: i64,
+    /// **Insert-only, and not folded by the caller.** A session is bumped again
+    /// by every batch that carries a signal for it, so `+1` per bump counts one
+    /// session once per batch it spans. [`write_rows_once`] credits this from
+    /// [`bump_sessions`]' inserted-key list, inside the same transaction; every
+    /// other producer leaves it at `0`.
+    pub sessions_delta: i64,
+}
+
+/// Fold N person/environment bumps into `event_user_environments`, one statement.
+///
+/// Subject to the module's dedupe rule, and unusually easy to violate here: this
+/// function's rows come from TWO producers — `Acc::person_env`'s fold and
+/// `write_rows_once`' session crediting — and a person with both an event and a
+/// newly-inserted session in the same batch is one conflict key reached from two
+/// directions. Passing both as separate rows raises `ON CONFLICT DO UPDATE
+/// command cannot affect row a second time` and fails the whole batch, so the
+/// crediting step merges into the existing row by key rather than pushing.
+pub async fn bump_person_envs(
+    conn: &mut AsyncPgConnection,
+    rows: &[PersonEnvBump],
+) -> QueryResult<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    // Sorted by the conflict key so every concurrent batch takes these row locks
+    // in the same order — see the module's ordering rule. This is the third
+    // row-lock participant in `write_rows_once`; the ingest path has already
+    // produced one deadlock (`users_seen` vs. the issue upsert) that stayed
+    // invisible because the worker's stdout was being discarded.
+    let nil = Uuid::nil();
+    let mut ix: Vec<usize> = (0..rows.len()).collect();
+    ix.sort_unstable_by(|&a, &b| {
+        (
+            rows[a].app_id,
+            &rows[a].distinct_id,
+            rows[a].environment_id.unwrap_or(nil),
+        )
+            .cmp(&(
+                rows[b].app_id,
+                &rows[b].distinct_id,
+                rows[b].environment_id.unwrap_or(nil),
+            ))
+    });
+    diesel::sql_query(
+        "INSERT INTO event_user_environments \
+           (app_id, distinct_id, environment_id, first_seen, last_seen, \
+            events_count, errors_count, sessions_count) \
+         SELECT app_id, distinct_id, environment_id, first_at, last_at, \
+                events_delta, errors_delta, sessions_delta \
+         FROM unnest($1::uuid[], $2::text[], $3::uuid[], $4::timestamptz[], \
+                     $5::timestamptz[], $6::bigint[], $7::bigint[], $8::bigint[]) \
+              AS t(app_id, distinct_id, environment_id, first_at, last_at, \
+                   events_delta, errors_delta, sessions_delta) \
+         ON CONFLICT (app_id, distinct_id, \
+                      COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+         DO UPDATE SET \
+            first_seen = LEAST(event_user_environments.first_seen, EXCLUDED.first_seen), \
+            last_seen = GREATEST(event_user_environments.last_seen, EXCLUDED.last_seen), \
+            events_count = event_user_environments.events_count + EXCLUDED.events_count, \
+            errors_count = event_user_environments.errors_count + EXCLUDED.errors_count, \
+            sessions_count = event_user_environments.sessions_count + EXCLUDED.sessions_count, \
+            updated_at = now()",
+    )
+    .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
+    .bind::<Array<Text>, _>(
+        ix.iter()
+            .map(|&i| rows[i].distinct_id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<SqlUuid>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].environment_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].first_at).collect::<Vec<_>>())
+    .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].last_at).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].events_delta).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].errors_delta).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(
+        ix.iter()
+            .map(|&i| rows[i].sessions_delta)
+            .collect::<Vec<_>>(),
+    )
     .execute(conn)
     .await
 }
@@ -608,6 +746,10 @@ pub struct WriteSet<'a> {
     /// Empty when the running schema has no `identified_at` — the caller probes
     /// once and passes nothing rather than letting the statement fail.
     pub identified: &'a [(Uuid, String, &'static str)],
+    /// Per-(person, environment) rollup deltas. `sessions_delta` arrives ZERO
+    /// here and is credited inside the transaction from [`bump_sessions`]'
+    /// inserted-key list — the caller cannot know which sessions are new.
+    pub person_envs: &'a [PersonEnvBump],
 }
 
 /// Write a batch's rows in one transaction.
@@ -658,6 +800,68 @@ fn is_deadlock(e: &diesel::result::Error) -> bool {
     }
 }
 
+/// Add `sessions_count` credit to the batch's person rollup rows.
+///
+/// Separate from the caller because only [`bump_sessions`] knows which sessions
+/// were newly INSERTED, and that is not knowable before the statement runs. A
+/// session is bumped again by every batch that carries a signal for it, so
+/// crediting per bump would count one session once per batch it spans.
+///
+/// Merges by conflict key rather than pushing: a person with both an event and
+/// a new session in one batch is one key reached from two producers, and two
+/// rows sharing a key abort the whole statement with "ON CONFLICT DO UPDATE
+/// command cannot affect row a second time".
+fn credit_sessions(set: &WriteSet<'_>, inserted: Vec<(Uuid, String)>) -> Vec<PersonEnvBump> {
+    let mut rows: Vec<PersonEnvBump> = set.person_envs.to_vec();
+    if inserted.is_empty() {
+        return rows;
+    }
+    let inserted: HashSet<(Uuid, String)> = inserted.into_iter().collect();
+    let nil = Uuid::nil();
+    let mut at: HashMap<(Uuid, String, Uuid), usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                (
+                    p.app_id,
+                    p.distinct_id.clone(),
+                    p.environment_id.unwrap_or(nil),
+                ),
+                i,
+            )
+        })
+        .collect();
+    for s in set.sessions {
+        // An empty distinct_id has no `event_users` row, so a rollup entry for
+        // it could never be joined back to a person.
+        let Some(did) = s.distinct_id.as_deref().filter(|d| !d.is_empty()) else {
+            continue;
+        };
+        if !inserted.contains(&(s.app_id, s.session_id.clone())) {
+            continue;
+        }
+        let key = (s.app_id, did.to_string(), s.environment_id.unwrap_or(nil));
+        match at.get(&key) {
+            Some(&i) => rows[i].sessions_delta += 1,
+            None => {
+                at.insert(key, rows.len());
+                rows.push(PersonEnvBump {
+                    app_id: s.app_id,
+                    distinct_id: did.to_string(),
+                    environment_id: s.environment_id,
+                    first_at: s.first_at,
+                    last_at: s.last_at,
+                    events_delta: 0,
+                    errors_delta: 0,
+                    sessions_delta: 1,
+                });
+            }
+        }
+    }
+    rows
+}
+
 async fn write_rows_once(conn: &mut AsyncPgConnection, set: &WriteSet<'_>) -> QueryResult<()> {
     conn.batch_execute("BEGIN").await?;
     let r = async {
@@ -668,12 +872,14 @@ async fn write_rows_once(conn: &mut AsyncPgConnection, set: &WriteSet<'_>) -> Qu
         // matches rows that already exist.
         touch_event_users(conn, set.touch_users).await?;
         mark_event_users_identified(conn, set.identified).await?;
-        // The two roll-ups go LAST, and `devices` last of all. A row lock is
-        // held until COMMIT, so the later a contended row is taken the shorter
-        // every other worker waits for it — and `devices` is the most contended
-        // row in the set, since every signal from one device folds onto one row.
-        bump_sessions(conn, set.sessions).await?;
+        // The roll-ups go LAST, and `devices` and the person rollup last of all.
+        // A row lock is held until COMMIT, so the later a contended row is taken
+        // the shorter every other worker waits for it — and `devices` is the
+        // most contended row in the set, since every signal from one device
+        // folds onto one row.
+        let inserted = bump_sessions(conn, set.sessions).await?;
         bump_devices(conn, set.devices).await?;
+        bump_person_envs(conn, &credit_sessions(set, inserted)).await?;
         Ok(())
     }
     .await;

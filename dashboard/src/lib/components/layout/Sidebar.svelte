@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { location } from 'svelte-spa-router';
   import EyeMark from '../EyeMark.svelte';
   import Icon, { type IconName } from '../ui/Icon.svelte';
   import { canAccessPage, resolvePageAccess } from '../../models/page-access';
   import { visibleAdminNav } from '../../models/admin-nav';
+  import { navCollapseStore } from '../../stores/nav-collapse.svelte';
 
   interface NavItem {
     href: string;
@@ -90,6 +92,25 @@
       }))
       .filter((g) => g.items.length > 0),
   );
+
+  const groupId = (label: string) => `nav-group-${label.toLowerCase().replace(/\s+/g, '-')}`;
+
+  // Navigating into a collapsed group opens it, so a route change can never
+  // land you on a page whose nav entry is hidden.
+  //
+  // Deliberately reacting to the ROUTE, not to "is the active group collapsed".
+  // The store read is untracked because `expand()` writes the same state this
+  // effect would otherwise depend on: with a live dependency, collapsing the
+  // group you are currently in would re-run this effect and immediately
+  // re-expand it — the toggle would look broken. Untracked, the effect only
+  // fires when `$location` actually changes, so a manual collapse sticks.
+  $effect(() => {
+    const path = $location;
+    untrack(() => {
+      const owner = visibleGroups.find((g) => g.items.some((i) => i.match(path)));
+      if (owner) navCollapseStore.expand(owner.label);
+    });
+  });
 </script>
 
 <aside class="sidebar">
@@ -100,14 +121,32 @@
 
   <nav class="nav">
     {#each visibleGroups as group (group.label)}
-      <div class="group">
-        <span class="group-label">{group.label}</span>
-        {#each group.items as item (item.href)}
-          <a class="nav-item" class:active={item.match($location)} href={item.href}>
-            <span class="ic"><Icon name={item.icon} size={17} /></span>
-            <span class="lb">{item.label}</span>
-          </a>
-        {/each}
+      {@const collapsed = navCollapseStore.isCollapsed(group.label)}
+      <div class="group" class:collapsed>
+        <button
+          class="group-label"
+          type="button"
+          aria-expanded={!collapsed}
+          aria-controls={groupId(group.label)}
+          onclick={() => navCollapseStore.toggle(group.label)}
+        >
+          <span class="chev" aria-hidden="true"><Icon name="chevron-down" size={12} /></span>
+          <span class="gl-text">{group.label}</span>
+        </button>
+        <!-- Items stay in the DOM when collapsed and are hidden with CSS, so
+             the ≤860px rule below can override it. Rendering them behind an
+             `{#if}` would put the decision in JS, which does not know the
+             breakpoint — a group collapsed on desktop would then have its
+             items hidden on the mobile rail, where this toggle is
+             `display: none` and there is no way to bring them back. -->
+        <div class="items" id={groupId(group.label)}>
+          {#each group.items as item (item.href)}
+            <a class="nav-item" class:active={item.match($location)} href={item.href}>
+              <span class="ic"><Icon name={item.icon} size={17} /></span>
+              <span class="lb">{item.label}</span>
+            </a>
+          {/each}
+        </div>
       </div>
     {/each}
   </nav>
@@ -136,6 +175,18 @@
     background: color-mix(in srgb, var(--surface) 60%, var(--bg));
     border-right: 1px solid var(--border);
     padding: 16px 12px;
+    /* The window is the scroll container (`.shell` is `min-height: 100vh`), so
+       without this the nav scrolls off the top of a long page.
+       `align-self: start` is load-bearing: as a grid item spanning both rows
+       this element otherwise stretches to the full row height, is never
+       shorter than its containing block, and `position: sticky` silently does
+       nothing. `height: 100vh` then also gives `.bottom`'s `margin-top: auto`
+       a definite height to push against, and makes `overflow-y` engage once
+       the nav is taller than the viewport. */
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
     overflow-y: auto;
   }
   .brand {
@@ -160,13 +211,42 @@
     flex-direction: column;
     gap: 2px;
   }
+  .items {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .group.collapsed .items {
+    display: none;
+  }
   .group-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    width: 100%;
+    background: none;
+    border: 0;
+    text-align: left;
     font-size: 10px;
     font-weight: 650;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--text-faint);
     padding: 2px 11px 5px;
+    border-radius: var(--radius);
+    transition: color 0.13s ease;
+  }
+  .group-label:hover {
+    color: var(--text-muted);
+  }
+  .chev {
+    display: grid;
+    place-items: center;
+    margin-left: -3px;
+    transition: transform 0.15s ease;
+  }
+  .group.collapsed .chev {
+    transform: rotate(-90deg);
   }
   .nav-item {
     display: flex;
@@ -219,6 +299,11 @@
       border-bottom: 1px solid var(--border);
       overflow-x: auto;
       overflow-y: hidden;
+      /* Here the sidebar is a horizontal rail in the FIRST grid row. Left
+         sticky at 100vh it would eat the viewport and collide with the
+         already-sticky topbar. */
+      position: static;
+      height: auto;
     }
     .brand {
       padding: 4px 8px;
@@ -232,6 +317,14 @@
       flex-direction: row;
       align-items: center;
       gap: 2px;
+    }
+    .items {
+      flex-direction: row;
+    }
+    /* The toggle is hidden on the rail, so a group collapsed on desktop must
+       not stay hidden here — there would be no control left to reopen it. */
+    .group.collapsed .items {
+      display: flex;
     }
     .group-label {
       display: none;

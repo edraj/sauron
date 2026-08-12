@@ -66,6 +66,8 @@ async fn counts_distinct_people_per_day_not_events() {
         vec![("2026-05-10".to_string(), 2), ("2026-05-11".to_string(), 1),],
         "2 people on day 10 despite 3 events, and alice counts again on day 11"
     );
+
+    db.cleanup().await;
 }
 
 /// The clause that separates this metric from an event count. `count(*)` would
@@ -87,6 +89,8 @@ async fn one_person_active_twice_in_a_day_counts_once() {
             .unwrap();
     assert_eq!(series.len(), 1);
     assert_eq!(series[0].count, 1, "three events, one person");
+
+    db.cleanup().await;
 }
 
 /// A person active on two days counts on BOTH. Stated explicitly because the
@@ -112,6 +116,8 @@ async fn the_same_person_counts_on_every_day_they_are_active() {
     // Deliberately NOT asserting a sum of 3 as a "total users" figure — that sum
     // is 1 person, and writing the assertion that way is how a holistic metric
     // gets turned into an additive one by the next reader.
+
+    db.cleanup().await;
 }
 
 /// `distinct_id` is `NOT NULL DEFAULT ''`, so empty means "this client sent no
@@ -147,6 +153,8 @@ async fn events_with_no_identity_are_excluded_not_counted_as_one_person() {
             .unwrap();
     assert_eq!(mixed.len(), 1);
     assert_eq!(mixed[0].count, 1);
+
+    db.cleanup().await;
 }
 
 /// Half-open `[from, to)`, matching every other range in this codebase. An
@@ -177,6 +185,8 @@ async fn the_range_is_half_open() {
         "the instant `to` itself is outside [from, to); got {days:?}"
     );
     assert_eq!(series[0].day.to_string(), "2026-05-10");
+
+    db.cleanup().await;
 }
 
 /// Environment scoping, because the metric is reachable by the lowest-privileged
@@ -220,6 +230,8 @@ async fn the_series_is_scoped_to_one_environment() {
         all[0].count, 2,
         "app-wide sees both, so the scoping is real"
     );
+
+    db.cleanup().await;
 }
 
 /// A range with no activity is an empty series, not a row of zeroes — the chart
@@ -239,6 +251,8 @@ async fn a_quiet_range_yields_no_rows() {
             .await
             .unwrap();
     assert!(series.is_empty());
+
+    db.cleanup().await;
 }
 
 /// The day bucket is UTC regardless of the DATABASE's timezone.
@@ -298,4 +312,6 @@ async fn day_buckets_are_utc_even_when_the_session_timezone_is_not() {
         local.d, "2026-05-09",
         "session timezone is not actually applied, so this test cannot discriminate"
     );
+
+    db.cleanup().await;
 }

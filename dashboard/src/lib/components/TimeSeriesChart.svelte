@@ -52,8 +52,14 @@
 
   // The hover title uses the same function when the prop is supplied;
   // `formatDateTime` would put a time of day on a calendar-day bucket.
-  function tooltip(bucket: string): string {
-    return labelProp ? labelProp(bucket) : formatDateTime(bucket);
+  function tooltip(point: SeriesPoint): string {
+    const base = labelProp ? labelProp(point.bucket) : formatDateTime(point.bucket);
+    const main = `${base} · ${format(point.count)}`;
+    if (point.segments && point.segments.length > 0) {
+      const segs = point.segments.map(s => `${s.label || ''}: ${format(s.count)}`).join(', ');
+      return `${main} (${segs})`;
+    }
+    return main;
   }
 </script>
 
@@ -68,8 +74,15 @@
            the same time). `aria-label` keeps the same text as the accessible
            name without drawing a second box. -->
       {#each data as point (point.bucket)}
-        <div class="col" role="img" aria-label={`${tooltip(point.bucket)} · ${format(point.count)}`}>
-          <div class="bar" style="height:{barHeight(point.count)}%">
+        <div class="col" role="img" aria-label={tooltip(point)}>
+          <div class="bar" class:has-segments={point.segments && point.segments.length > 0} style="height:{barHeight(point.count)}%">
+            <div class="bar-fill">
+              {#if point.segments && point.segments.length > 0}
+                {#each point.segments as seg}
+                  <div class="segment" style="height: {(seg.count / point.count) * 100}%; background-color: {seg.color || 'var(--bar-color)'}"></div>
+                {/each}
+              {/if}
+            </div>
             <span class="tip tip-value">{format(point.count)}</span>
           </div>
           <span class="tip tip-date">{label(point.bucket)}</span>
@@ -111,12 +124,27 @@
     width: 100%;
     max-width: 42px;
     border-radius: 3px 3px 0 0;
+    transition: filter 0.12s ease, transform 0.12s ease;
+  }
+  .bar-fill {
+    position: absolute;
+    inset: 0;
+    border-radius: 3px 3px 0 0;
     background: linear-gradient(
       to top,
       color-mix(in srgb, var(--bar-color) 55%, transparent),
       var(--bar-color)
     );
-    transition: filter 0.12s ease, transform 0.12s ease;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    overflow: hidden;
+  }
+  .bar.has-segments .bar-fill {
+    background: transparent;
+  }
+  .segment {
+    width: 100%;
   }
   .col:hover .bar {
     filter: brightness(1.18);

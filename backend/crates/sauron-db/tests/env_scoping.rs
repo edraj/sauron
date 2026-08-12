@@ -7704,3 +7704,77 @@ async fn user_stats_dau_wau_are_anchored_to_the_supplied_now() {
     drop(conn);
     db.cleanup().await;
 }
+
+/// The `distinct_id` twin of migration 53's device indexes. `list_persons`'
+/// three LATERALs and its three membership legs all probe
+/// `(app_id, distinct_id)` filtered by `environment_id`, but before migration
+/// 55 the only usable index was `analytics_distinct_idx (app_id, distinct_id,
+/// occurred_at DESC)` — no `environment_id` — so every probe matched on the
+/// first two columns and then heap-fetched to test the environment, once per
+/// person, across every partition.
+#[tokio::test]
+async fn env_person_indexes_exist() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let mut conn = db.conn().await;
+
+    #[derive(QueryableByName)]
+    struct Name {
+        #[diesel(sql_type = Text)]
+        indexname: String,
+    }
+
+    let rows: Vec<Name> = diesel::sql_query(
+        "SELECT indexname FROM pg_indexes \
+         WHERE indexname IN ('analytics_events_app_distinct_env_idx', \
+                             'error_events_app_distinct_env_idx', \
+                             'sessions_app_distinct_env_idx') \
+         ORDER BY indexname",
+    )
+    .get_results(&mut conn)
+    .await
+    .expect("pg_indexes query");
+
+    let found: Vec<String> = rows.into_iter().map(|r| r.indexname).collect();
+    assert_eq!(
+        found,
+        vec![
+            "analytics_events_app_distinct_env_idx".to_string(),
+            "error_events_app_distinct_env_idx".to_string(),
+            "sessions_app_distinct_env_idx".to_string(),
+        ],
+        "migration 55 must create all three env-person indexes"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `list_persons` used to open-code the same three correlated `EXISTS` that
+/// `event_user_membership_exists` was rewritten away from (measured 32.6s ->
+/// 3.5s on `overview_totals`). A correlated `EXISTS` is probed per candidate
+/// row across every partition; the uncorrelated `IN (… UNION …)` builds the
+/// membership set once per leg. Asserted on the emitted SQL because both shapes
+/// return identical rows — which is exactly why the duplicate survived.
+#[tokio::test]
+async fn list_persons_membership_is_uncorrelated() {
+    let sql = sauron_db::repo::list_persons_sql_for_test(EnvFilter::One(Uuid::nil()));
+    assert!(
+        sql.contains("event_users.distinct_id IN ("),
+        "membership must be the uncorrelated IN (… UNION …) form, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("EXISTS (SELECT 1 FROM analytics_events ae"),
+        "the open-coded correlated EXISTS block must be gone, got:\n{sql}"
+    );
+    // `All` still emits no membership predicate at all — every `event_users`
+    // row exists because a real signal registered it, so an unfiltered test
+    // would narrow nothing.
+    let all = sauron_db::repo::list_persons_sql_for_test(EnvFilter::All);
+    assert!(
+        !all.contains("event_users.distinct_id IN ("),
+        "EnvFilter::All must emit no membership predicate, got:\n{all}"
+    );
+}

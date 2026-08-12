@@ -1449,13 +1449,29 @@ impl TestDb {
 
 impl Drop for TestDb {
     fn drop(&mut self) {
-        // Async work cannot run in `Drop`. If a test panicked (or otherwise
-        // returned) before reaching `cleanup()`, make the leak loud rather than
-        // attempt a runtime-in-Drop workaround.
+        // Async work cannot run in `Drop`. If a test returned before reaching
+        // `cleanup()`, make the leak loud rather than attempt a
+        // runtime-in-Drop workaround.
+        //
+        // This warning previously blamed a panic outright. That reading is what
+        // let a real leak sit unnoticed: on 2026-08-12 ten tests
+        // (`active_users.rs` ×8, `notifications.rs` ×2) were simply missing the
+        // trailing `db.cleanup().await`, and every one of them PASSED. Two
+        // `cargo test --workspace` runs left 20 databases behind (233 MB).
+        // Anyone who did see the message would have gone hunting for a panic
+        // that never happened.
+        //
+        // It stayed invisible because `cargo test` captures stderr for passing
+        // tests — the diagnostic only appears under `--nocapture`, i.e. exactly
+        // not in the case that actually occurs. `reap_stale_test_databases`
+        // bounds the damage, but only for databases older than
+        // `STALE_DB_MAX_AGE_SECS` (3h) and only when some later `setup()` runs,
+        // so a fresh leak survives until then regardless.
         if !self.cleaned_up.get() {
             eprintln!(
-                "WARNING: ephemeral test database {} may remain (TestDb::cleanup() was \
-                 never reached — the test likely panicked). Drop it manually:\n  \
+                "WARNING: ephemeral test database {} may remain — TestDb::cleanup() was never \
+                 called. Either this test panicked, or (check this first, it is the common \
+                 case) it is missing the trailing `db.cleanup().await`. Drop it manually:\n  \
                  DROP DATABASE \"{}\" WITH (FORCE);",
                 self.db_name, self.db_name
             );

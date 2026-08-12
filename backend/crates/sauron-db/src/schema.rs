@@ -195,6 +195,36 @@ diesel::table! {
     }
 }
 
+// The declared primary keys on the next two tables are a diesel fiction. The
+// real uniqueness on `event_user_environments` is the expression index
+// `event_user_env_key_idx` over `(app_id, distinct_id, COALESCE(environment_id,
+// nil))`, which `table!` cannot express — `environment_id` is nullable because
+// `EnvFilter::Unattributed` is a real row. Every query against these two tables
+// is raw `sql_query`, so nothing depends on the declaration; do not "fix" it by
+// adding `environment_id` to the key, which would be a different constraint
+// than the one the database actually enforces.
+diesel::table! {
+    event_user_environments (app_id, distinct_id) {
+        app_id -> Uuid,
+        distinct_id -> Text,
+        environment_id -> Nullable<Uuid>,
+        first_seen -> Timestamptz,
+        last_seen -> Timestamptz,
+        events_count -> BigInt,
+        errors_count -> BigInt,
+        sessions_count -> BigInt,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    event_user_env_backfill (app_id) {
+        app_id -> Uuid,
+        completed_at -> Timestamptz,
+    }
+}
+
 diesel::table! {
     identities (id) {
         id -> Uuid,
@@ -946,6 +976,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     store_daily_metrics,
     error_events,
     event_users,
+    event_user_environments,
+    event_user_env_backfill,
     identities,
     issues,
     organizations,

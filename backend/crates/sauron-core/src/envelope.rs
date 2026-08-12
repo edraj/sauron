@@ -417,8 +417,27 @@ impl IngestBatch {
     /// the edge used to make — but in process, against an already-parsed
     /// structure, instead of through `serde_json::to_string`, a Redis round
     /// trip and `serde_json::from_str`.
-    pub fn into_jobs(mut self) -> Vec<IngestJob> {
-        let items = std::mem::take(&mut self.items);
+    pub fn into_jobs(self) -> Vec<IngestJob> {
+        self.into_jobs_counting_skew().0
+    }
+
+    /// [`Self::into_jobs`], plus how many timestamps [`EnvelopeItem::clamp_future`]
+    /// had to rewrite — so the worker can meter clock skew instead of correcting
+    /// it invisibly.
+    pub fn into_jobs_counting_skew(mut self) -> (Vec<IngestJob>, usize) {
+        let mut items = std::mem::take(&mut self.items);
+        // THE chokepoint. Both the batched path and the legacy single-item path
+        // reach the pipeline through here (`From<IngestJob> for IngestBatch`
+        // wraps the old shape rather than carrying a second code path), so
+        // clamping once here reaches every downstream consumer — the six
+        // `.timestamp` reads across `batch.rs`/`process.rs` and every
+        // `occurred_at` derived from them. Clamping at those call sites instead
+        // would be six places to keep in agreement forever.
+        let received_at = self.received_at;
+        let skewed = items
+            .iter_mut()
+            .map(|it| it.clamp_future(received_at))
+            .sum();
         let n = items.len();
         let mut out = Vec::with_capacity(n);
         for (i, item) in items.into_iter().enumerate() {
@@ -455,7 +474,7 @@ impl IngestBatch {
                 item,
             });
         }
-        out
+        (out, skewed)
     }
 }
 
@@ -487,6 +506,316 @@ impl EventUser {
     /// The stable analytics identity for this user, if any.
     pub fn distinct_id(&self) -> Option<&str> {
         self.id.as_deref()
+    }
+}
+
+/// How far ahead of `received_at` a device clock may be before the pipeline
+/// stops believing it.
+///
+/// Every item timestamp on the wire is the DEVICE's wall clock — the SDKs all
+/// read it correctly (`DateTime.now().toUtc()`, `new Date().toISOString()`,
+/// `datetime.now(timezone.utc)`, `DateTimeOffset.UtcNow`), so a wrong value
+/// here means the phone itself is wrong, and nothing in the app running on it
+/// can tell. Only the server, which knows when the envelope actually arrived,
+/// is in a position to notice.
+///
+/// 15 minutes is measured, not guessed. Against the live `sessions` table on
+/// 2026-08-12, positive skew (`started_at > created_at`) decayed smoothly:
+/// 65% under one minute, 98.4% within six, then sparse — six rows between 15
+/// and 60 minutes, and no pile-up against the hour. That decay is NTP drift
+/// plus flush latency and MUST survive untouched; the 66 rows an hour or more
+/// ahead (four of them days, one over a month) are the ones that sort to the
+/// top of every `started_at desc` list and make a 4% problem look total.
+///
+/// Retuning: raise it if legitimate offline queues replay stale-but-forward
+/// clocks; lower it only with a fresh version of that skew histogram in hand,
+/// because the cost of clamping honest drift is silently reordered timelines.
+pub const MAX_CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Pin `ts` to `received_at` when it claims to be more than [`MAX_CLOCK_SKEW`]
+/// in the future. Returns whether it was rewritten, so callers can count.
+///
+/// Pinned to `received_at` rather than to the tolerance edge: a clamped value
+/// then reads as "arrived now", which is the one thing about it we actually
+/// know to be true.
+fn clamp_one(ts: &mut DateTime<Utc>, received_at: DateTime<Utc>) -> bool {
+    if *ts > received_at + MAX_CLOCK_SKEW {
+        *ts = received_at;
+        return true;
+    }
+    false
+}
+
+impl EnvelopeItem {
+    /// Clamp every device-clock timestamp this item carries, returning how
+    /// many were rewritten (for the skew counter — a clamp that happens
+    /// silently is a clamp nobody ever fixes at the source).
+    ///
+    /// Deliberately covers nested breadcrumbs and a transaction's
+    /// `finished_at` as well as the top-level `timestamp`: they all come off
+    /// the same broken clock, and clamping only the outer one would leave a
+    /// breadcrumb trail dated after the crash it belongs to, or a span whose
+    /// end precedes its start.
+    pub fn clamp_future(&mut self, received_at: DateTime<Utc>) -> usize {
+        let mut n = 0;
+        match self {
+            EnvelopeItem::Error(e) => {
+                n += clamp_one(&mut e.timestamp, received_at) as usize;
+                for c in &mut e.breadcrumbs {
+                    n += clamp_one(&mut c.timestamp, received_at) as usize;
+                }
+            }
+            EnvelopeItem::Event(e) => n += clamp_one(&mut e.timestamp, received_at) as usize,
+            EnvelopeItem::Identify(i) => n += clamp_one(&mut i.timestamp, received_at) as usize,
+            EnvelopeItem::BreadcrumbBatch(b) => {
+                for c in &mut b.breadcrumbs {
+                    n += clamp_one(&mut c.timestamp, received_at) as usize;
+                }
+            }
+            EnvelopeItem::Transaction(t) => {
+                n += clamp_one(&mut t.timestamp, received_at) as usize;
+                if let Some(f) = t.finished_at.as_mut() {
+                    n += clamp_one(f, received_at) as usize;
+                }
+            }
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod clock_skew_tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// `received_at` for every case below. Item timestamps are expressed
+    /// relative to this so the fixtures read as skew, not as dates.
+    fn recv() -> DateTime<Utc> {
+        at("2026-08-12T18:00:00Z")
+    }
+
+    fn event_at(ts: DateTime<Utc>) -> EnvelopeItem {
+        EnvelopeItem::Event(AnalyticsItem {
+            name: "checkout".into(),
+            distinct_id: "u1".into(),
+            properties: serde_json::Value::Null,
+            timestamp: ts,
+            session_id: None,
+            workflow_id: None,
+            workflow_name: None,
+            screen: None,
+            tags: serde_json::Value::Null,
+            contexts: serde_json::Value::Null,
+            extra: serde_json::Value::Null,
+        })
+    }
+
+    fn crumb_at(ty: &str, ts: DateTime<Utc>) -> Breadcrumb {
+        Breadcrumb {
+            ty: ty.into(),
+            category: None,
+            message: None,
+            level: None,
+            timestamp: ts,
+            data: serde_json::Value::Null,
+        }
+    }
+
+    fn error_at(ts: DateTime<Utc>, breadcrumbs: Vec<Breadcrumb>) -> EnvelopeItem {
+        EnvelopeItem::Error(Box::new(ErrorItem {
+            event_id: Uuid::new_v4(),
+            level: Level::Error,
+            timestamp: ts,
+            exception: None,
+            message: Some("boom".into()),
+            breadcrumbs,
+            tags: serde_json::Value::Null,
+            contexts: serde_json::Value::Null,
+            extra: serde_json::Value::Null,
+            fingerprint: None,
+            user: None,
+            session_id: None,
+            workflow_id: None,
+            workflow_name: None,
+            screen: None,
+            raw_stacktrace: None,
+            debug_meta: None,
+        }))
+    }
+
+    fn txn_at(ts: DateTime<Utc>, finished_at: Option<DateTime<Utc>>) -> EnvelopeItem {
+        EnvelopeItem::Transaction(TransactionItem {
+            name: "/checkout".into(),
+            op: "navigation".into(),
+            duration_ms: 12.0,
+            status: None,
+            http_method: None,
+            http_status: None,
+            url: None,
+            distinct_id: None,
+            session_id: None,
+            workflow_id: None,
+            workflow_name: None,
+            timestamp: ts,
+            finished_at,
+        })
+    }
+
+    fn timestamp_of(item: &EnvelopeItem) -> DateTime<Utc> {
+        match item {
+            EnvelopeItem::Event(e) => e.timestamp,
+            EnvelopeItem::Error(e) => e.timestamp,
+            EnvelopeItem::Identify(i) => i.timestamp,
+            EnvelopeItem::Transaction(t) => t.timestamp,
+            EnvelopeItem::BreadcrumbBatch(b) => b.breadcrumbs[0].timestamp,
+        }
+    }
+
+    /// The overwhelmingly common case: the device clock is BEHIND or equal,
+    /// because the event genuinely happened before it was received. Nothing
+    /// may be rewritten here — this is the 96% of real traffic.
+    #[test]
+    fn past_timestamps_are_never_touched() {
+        let ts = recv() - Duration::hours(3);
+        let mut item = event_at(ts);
+        assert_eq!(item.clamp_future(recv()), 0);
+        assert_eq!(
+            timestamp_of(&item),
+            ts,
+            "a past event must survive verbatim"
+        );
+    }
+
+    /// Measured 2026-08-12 against the live `sessions` table: positive skew
+    /// decays smoothly — 65% under a minute, 98.4% within six. That is NTP
+    /// drift plus flush latency, not a broken clock, and rewriting it would
+    /// corrupt ordering for the bulk of traffic to fix nothing.
+    #[test]
+    fn drift_inside_the_tolerance_is_left_alone() {
+        for minutes in [0, 1, 5, 14] {
+            let ts = recv() + Duration::minutes(minutes);
+            let mut item = event_at(ts);
+            assert_eq!(item.clamp_future(recv()), 0, "{minutes}m must not clamp");
+            assert_eq!(timestamp_of(&item), ts, "{minutes}m must survive verbatim");
+        }
+    }
+
+    /// The 66 rows that put `next month` and `in 10 hours` at the top of a
+    /// `started_at desc` list. Pinned to `received_at` — NOT to the tolerance
+    /// edge, so a clamped row reads as "arrived now", which is true.
+    #[test]
+    fn far_future_is_pinned_to_received_at() {
+        for skew in [
+            Duration::minutes(16),
+            Duration::hours(10),
+            Duration::days(31),
+        ] {
+            let mut item = event_at(recv() + skew);
+            assert_eq!(item.clamp_future(recv()), 1, "{skew} must clamp");
+            assert_eq!(
+                timestamp_of(&item),
+                recv(),
+                "{skew} must pin to received_at"
+            );
+        }
+    }
+
+    /// Every variant carries a device-clock timestamp; missing one leaves a
+    /// hole that only shows up as a wrong chart months later.
+    #[test]
+    fn every_variant_is_covered() {
+        let far = recv() + Duration::days(31);
+        let mut items = vec![
+            event_at(far),
+            error_at(far, vec![crumb_at("navigation", far)]),
+            EnvelopeItem::Identify(IdentifyItem {
+                distinct_id: "u1".into(),
+                anonymous_id: None,
+                traits: serde_json::Value::Null,
+                timestamp: far,
+            }),
+            txn_at(far, Some(far)),
+            EnvelopeItem::BreadcrumbBatch(BreadcrumbBatch {
+                distinct_id: None,
+                session_id: None,
+                breadcrumbs: vec![crumb_at("navigation", far)],
+            }),
+        ];
+        for item in &mut items {
+            assert!(item.clamp_future(recv()) > 0, "variant left unclamped");
+            assert_eq!(timestamp_of(item), recv(), "variant not pinned");
+        }
+    }
+
+    /// A nested breadcrumb rides the same broken clock as its parent error, so
+    /// clamping the error alone would leave the trail dated after the crash.
+    #[test]
+    fn nested_breadcrumbs_clamp_independently_of_the_parent() {
+        // Parent is fine; only the second breadcrumb is skewed.
+        let mut item = error_at(
+            recv() - Duration::minutes(1),
+            vec![
+                crumb_at("ok", recv() - Duration::minutes(2)),
+                crumb_at("skewed", recv() + Duration::days(31)),
+            ],
+        );
+        assert_eq!(item.clamp_future(recv()), 1, "only the skewed crumb counts");
+        let EnvelopeItem::Error(e) = &item else {
+            unreachable!()
+        };
+        assert_eq!(
+            e.timestamp,
+            recv() - Duration::minutes(1),
+            "parent untouched"
+        );
+        assert_eq!(e.breadcrumbs[0].timestamp, recv() - Duration::minutes(2));
+        assert_eq!(e.breadcrumbs[1].timestamp, recv());
+    }
+
+    /// A transaction's `finished_at` shares the clock with its `timestamp`;
+    /// clamping one and not the other invents a negative-length span.
+    #[test]
+    fn transaction_finished_at_clamps_too() {
+        let far = recv() + Duration::days(31);
+        let mut item = txn_at(far, Some(far));
+        assert_eq!(item.clamp_future(recv()), 2, "timestamp and finished_at");
+        let EnvelopeItem::Transaction(t) = &item else {
+            unreachable!()
+        };
+        assert_eq!(t.timestamp, recv());
+        assert_eq!(t.finished_at, Some(recv()));
+    }
+
+    /// The whole point of putting the clamp in `into_jobs`: it is the one
+    /// chokepoint both the batched and the legacy single-item paths pass
+    /// through, so no downstream consumer can be reached un-clamped.
+    #[test]
+    fn into_jobs_clamps_every_item() {
+        let far = recv() + Duration::days(31);
+        let batch = IngestBatch {
+            app_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            environment_id: Uuid::new_v4(),
+            release: None,
+            received_at: recv(),
+            ip: None,
+            user_agent: None,
+            context: EnvelopeContext::default(),
+            sdk: None,
+            // More than one item, so the moved-header final-item branch and
+            // the cloned-header branch are both exercised.
+            items: vec![event_at(far), event_at(far), event_at(recv())],
+        };
+        let jobs = batch.into_jobs();
+        assert_eq!(jobs.len(), 3);
+        for j in &jobs {
+            assert_eq!(timestamp_of(&j.item), recv(), "escaped the chokepoint");
+        }
     }
 }
 

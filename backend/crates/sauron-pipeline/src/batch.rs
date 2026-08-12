@@ -125,6 +125,12 @@ struct Acc {
     session_at: HashMap<(Uuid, String), usize>,
     devices: Vec<db::DeviceBump>,
     device_at: HashMap<(Uuid, String), usize>,
+    person_envs: Vec<db::PersonEnvBump>,
+    /// `(app_id, distinct_id, environment_id-or-nil)` → index into
+    /// `person_envs`, for the same `ON CONFLICT DO UPDATE` dedupe reason as
+    /// `issue_at`. The nil uuid stands in for `EnvFilter::Unattributed`,
+    /// matching the table's `COALESCE` unique index.
+    person_env_at: HashMap<(Uuid, String, Uuid), usize>,
     touch_users: Vec<(Uuid, String)>,
     touch_seen: HashSet<(Uuid, String)>,
     identified: Vec<(Uuid, String, &'static str)>,
@@ -206,9 +212,10 @@ impl Acc {
         }
     }
 
-    /// Fold one signal into its session and device roll-ups. The batch twin of
-    /// `process::rollup`, with the same "no session id / no device key → no
-    /// row" rule.
+    /// Fold one signal into its session, device and person/environment
+    /// roll-ups. The batch twin of `process::rollup`, with the same "no session
+    /// id / no device key → no row" rule, and the same rule for
+    /// `distinct_id` on the person rollup.
     #[allow(clippy::too_many_arguments)]
     fn rollup(
         &mut self,
@@ -325,6 +332,46 @@ impl Acc {
                         last_at: at,
                         events_delta,
                         errors_delta,
+                    });
+                }
+            }
+        }
+
+        // The person/environment rollup. Folded here rather than only on the
+        // session leg because membership in this rollup must admit exactly the
+        // people the live query's three membership legs admit — anyone with an
+        // analytics event, an error event OR a session in that environment. A
+        // person whose only signal is a plain event has no session id, and
+        // would be invisible if this hung off the session branch above.
+        //
+        // `sessions_delta` stays 0: only `write_rows_once` can know which
+        // sessions this batch newly INSERTED, and a session is bumped again by
+        // every batch that carries a signal for it.
+        if let Some(did) = distinct_id {
+            let key = (
+                job.app_id,
+                did.to_string(),
+                environment_id.unwrap_or_else(Uuid::nil),
+            );
+            match self.person_env_at.get(&key) {
+                Some(&i) => {
+                    let b = &mut self.person_envs[i];
+                    b.first_at = b.first_at.min(at);
+                    b.last_at = b.last_at.max(at);
+                    b.events_delta += events_delta;
+                    b.errors_delta += errors_delta;
+                }
+                None => {
+                    self.person_env_at.insert(key, self.person_envs.len());
+                    self.person_envs.push(db::PersonEnvBump {
+                        app_id: job.app_id,
+                        distinct_id: did.to_string(),
+                        environment_id,
+                        first_at: at,
+                        last_at: at,
+                        events_delta,
+                        errors_delta,
+                        sessions_delta: 0,
                     });
                 }
             }
@@ -560,6 +607,7 @@ pub async fn process_batch(
             devices: &acc.devices,
             touch_users: &acc.touch_users,
             identified,
+            person_envs: &acc.person_envs,
         },
     )
     .await?;
@@ -1542,6 +1590,33 @@ mod equivalence_tests {
         let bat_devices = device_aggs(&mut conn, b.app_id).await;
         assert_eq!(seq_devices, bat_devices, "device roll-ups diverge");
 
+        let seq_persons = person_env_aggs(&mut conn, a.app_id).await;
+        let bat_persons = person_env_aggs(&mut conn, b.app_id).await;
+        assert_eq!(
+            seq_persons, bat_persons,
+            "person/environment roll-ups diverge"
+        );
+        // Cross-path equality alone would hold even if both paths folded wrongly
+        // in the same direction, so pin the values. Every signal in `signals()`
+        // names `person-1` in one environment, so there is exactly one row.
+        assert_eq!(seq_persons.len(), 1, "one person, one environment, one row");
+        let p = &seq_persons[0];
+        assert_eq!(p.distinct_id, "person-1");
+        assert_eq!(p.errors_count, 4, "four error signals");
+        assert_eq!(
+            p.sessions_count, 4,
+            "four DISTINCT sessions (sess-a, sess-b, sess-w1, sess-w2) — sess-a \
+             alone carries several signals and must still count once, which is \
+             what a naive +1-per-bump gets wrong"
+        );
+        assert!(
+            p.first_seen < p.last_seen,
+            "the seen window must span the fixture's out-of-order signals, \
+             got first={} last={}",
+            p.first_seen,
+            p.last_seen
+        );
+
         let seq_workflows = workflow_aggs(&mut conn, a.app_id).await;
         let bat_workflows = workflow_aggs(&mut conn, b.app_id).await;
         assert_eq!(seq_workflows, bat_workflows, "workflow roll-ups diverge");
@@ -1627,5 +1702,37 @@ mod equivalence_tests {
         .get_results(conn)
         .await
         .expect("device aggs")
+    }
+
+    #[derive(diesel::QueryableByName, Debug, PartialEq)]
+    struct PersonEnvAgg {
+        #[diesel(sql_type = Text)]
+        distinct_id: String,
+        #[diesel(sql_type = BigInt)]
+        events_count: i64,
+        #[diesel(sql_type = BigInt)]
+        errors_count: i64,
+        #[diesel(sql_type = BigInt)]
+        sessions_count: i64,
+        #[diesel(sql_type = Timestamptz)]
+        first_seen: DateTime<Utc>,
+        #[diesel(sql_type = Timestamptz)]
+        last_seen: DateTime<Utc>,
+    }
+
+    async fn person_env_aggs(
+        conn: &mut sauron_db::AsyncPgConnection,
+        app_id: Uuid,
+    ) -> Vec<PersonEnvAgg> {
+        diesel::sql_query(
+            "SELECT distinct_id, events_count, errors_count, sessions_count, \
+                    first_seen, last_seen \
+             FROM event_user_environments WHERE app_id = $1 \
+             ORDER BY distinct_id, environment_id",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(app_id)
+        .get_results(conn)
+        .await
+        .expect("person/env aggs")
     }
 }

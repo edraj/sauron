@@ -510,6 +510,7 @@ export interface DartDebugMeta {
 export interface SeriesPoint {
   bucket: string;
   count: number;
+  segments?: { count: number; color?: string; label?: string }[];
 }
 
 export interface IssueDetail extends Issue {

@@ -5514,7 +5514,7 @@ pub async fn bump_session(
     ip: Option<&str>,
     events_delta: i64,
     errors_delta: i64,
-) -> QueryResult<usize> {
+) -> QueryResult<bool> {
     diesel::sql_query(
         "INSERT INTO sessions \
            (app_id, session_id, distinct_id, device_key, started_at, last_event_at, \
@@ -5531,7 +5531,8 @@ pub async fn bump_session(
             release = COALESCE(EXCLUDED.release, sessions.release), \
             environment_id = COALESCE(EXCLUDED.environment_id, sessions.environment_id), \
             ip_address = COALESCE(EXCLUDED.ip_address, sessions.ip_address), \
-            updated_at = now()",
+            updated_at = now() \
+         RETURNING (xmax = 0) AS inserted",
     )
     .bind::<SqlUuid, _>(app_id)
     .bind::<Text, _>(session_id)
@@ -5544,6 +5545,64 @@ pub async fn bump_session(
     .bind::<Nullable<Text>, _>(release)
     .bind::<Nullable<SqlUuid>, _>(environment_id)
     .bind::<Nullable<Text>, _>(ip)
+    .get_result::<InsertedFlag>(conn)
+    .await
+    .map(|r| r.inserted)
+}
+
+/// `RETURNING (xmax = 0)` — see [`crate::batch::bump_sessions`]' `BumpedSession`
+/// for why `xmax` is what distinguishes an insert from an update.
+#[derive(QueryableByName)]
+struct InsertedFlag {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    inserted: bool,
+}
+
+/// Single-row twin of [`crate::batch::bump_person_envs`], for the unbatched
+/// `process::rollup` path.
+///
+/// The conflict arm is identical — if one changes, both change, or the two
+/// ingest paths disagree about what a person's counters mean. `sauron-pipeline`'s
+/// equivalence test diffs `event_user_environments` between the two paths, which
+/// is what makes that a checked claim rather than an aspiration.
+#[allow(clippy::too_many_arguments)]
+pub async fn bump_person_env(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    distinct_id: &str,
+    environment_id: Option<Uuid>,
+    at: DateTime<Utc>,
+    events_delta: i64,
+    errors_delta: i64,
+    sessions_delta: i64,
+) -> QueryResult<usize> {
+    // An empty distinct_id has no `event_users` row, so a rollup entry for it
+    // could never be joined back to a person — it would be invisible weight.
+    if distinct_id.is_empty() {
+        return Ok(0);
+    }
+    diesel::sql_query(
+        "INSERT INTO event_user_environments \
+           (app_id, distinct_id, environment_id, first_seen, last_seen, \
+            events_count, errors_count, sessions_count) \
+         VALUES ($1, $2, $3, $4, $4, $5, $6, $7) \
+         ON CONFLICT (app_id, distinct_id, \
+                      COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+         DO UPDATE SET \
+            first_seen = LEAST(event_user_environments.first_seen, EXCLUDED.first_seen), \
+            last_seen = GREATEST(event_user_environments.last_seen, EXCLUDED.last_seen), \
+            events_count = event_user_environments.events_count + EXCLUDED.events_count, \
+            errors_count = event_user_environments.errors_count + EXCLUDED.errors_count, \
+            sessions_count = event_user_environments.sessions_count + EXCLUDED.sessions_count, \
+            updated_at = now()",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(distinct_id.to_string())
+    .bind::<Nullable<SqlUuid>, _>(environment_id)
+    .bind::<Timestamptz, _>(at)
+    .bind::<BigInt, _>(events_delta)
+    .bind::<BigInt, _>(errors_delta)
+    .bind::<BigInt, _>(sessions_delta)
     .execute(conn)
     .await
 }
@@ -7377,19 +7436,43 @@ pub struct PersonRow {
     pub sessions_count: i64,
 }
 
-pub async fn list_persons(
-    conn: &mut AsyncPgConnection,
-    scope: ReadScope,
-    search: Option<&str>,
-    limit: i64,
-    offset: i64,
-    sort: SortSpec,
-) -> QueryResult<Vec<PersonRow>> {
-    // Escape LIKE metacharacters: an unescaped `%`/`_` makes a literal search
-    // term match the wrong rows, and a pattern of many wildcards makes ILIKE
-    // matching super-linear per scanned row.
-    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+/// The exact SQL [`list_persons`] executes, exposed so tests can assert on the
+/// emitted shape.
+///
+/// Two query shapes exist (this one and the rollup — see [`list_persons`]), and
+/// the only thing separating "correct but 30s" from "correct and fast" is which
+/// one is emitted. A behavioural test cannot tell them apart, because they
+/// return identical rows; that is precisely how a duplicate of
+/// [`event_user_membership_exists`] survived in here unnoticed.
+/// Companion to [`list_persons_sql_for_test`] for the rollup shape.
+pub fn list_persons_rollup_sql_for_test(env: EnvFilter) -> String {
+    list_persons_rollup_sql(
+        &env,
+        &SortSpec {
+            column: "last_seen",
+            descending: true,
+            tiebreak: "eu.distinct_id",
+            nulls_last: false,
+        },
+    )
+}
 
+pub fn list_persons_sql_for_test(env: EnvFilter) -> String {
+    list_persons_live_sql(
+        &env,
+        &SortSpec {
+            column: "last_seen",
+            descending: true,
+            tiebreak: "eu.distinct_id",
+            nulls_last: false,
+        },
+    )
+}
+
+/// The pre-rollup shape: membership derived per person, counts and extrema
+/// derived from three LATERALs. Retained as the fallback for apps whose
+/// `event_user_environments` backfill has not completed — see [`list_persons`].
+fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
     // $1 app_id, $2 pattern, $3 limit, $4 offset — env takes $5 when it needs a
     // bind, reused across the three count LATERALs (always emitted, `""` under
     // `All`) and the membership `EXISTS` (only emitted when `scope.env != All`).
@@ -7403,7 +7486,7 @@ pub async fn list_persons(
     // unconditionally. That also means `list_persons` carries none of
     // `list_devices`' tiering blind spot under `All`; it already had it, and
     // still has it, under every scope.
-    let env_sql = scope.env.sql_fragment(5);
+    let env_sql = env.sql_fragment(5);
 
     // `event_users` carries no `environment_id` at all, so a person's
     // membership in a specific environment can only be derived from whether
@@ -7412,27 +7495,19 @@ pub async fn list_persons(
     // does not disturb where LIMIT is applied — see the paging comment below.
     // Omitted entirely under `All`: every `event_users` row exists only because
     // `note_identity` registered it from a real analytics/error event, so an
-    // unfiltered `EXISTS` would add three subquery lookups per candidate row
-    // for no narrowing effect.
+    // unfiltered membership test would add three subquery lookups per candidate
+    // row for no narrowing effect.
     //
-    // Each leg aliases its subquery and qualifies the correlated column with
-    // that alias (`ae.distinct_id`, not bare `distinct_id`) — see
-    // `list_devices`' membership `EXISTS` doc comment for why an unqualified
-    // name is a live footgun, not a style nit.
-    let membership_sql = if matches!(scope.env, EnvFilter::All) {
-        String::new()
-    } else {
-        let ae_env = scope.env.sql_fragment_for("ae", 5);
-        let ee_env = scope.env.sql_fragment_for("ee", 5);
-        let se_env = scope.env.sql_fragment_for("se", 5);
-        format!(
-            " AND ( \
-                EXISTS (SELECT 1 FROM analytics_events ae WHERE ae.app_id=$1 AND ae.distinct_id = event_users.distinct_id{ae_env}) \
-                OR EXISTS (SELECT 1 FROM error_events ee WHERE ee.app_id=$1 AND ee.distinct_id = event_users.distinct_id{ee_env}) \
-                OR EXISTS (SELECT 1 FROM sessions se WHERE se.app_id=$1 AND se.distinct_id = event_users.distinct_id{se_env}) \
-              )"
-        )
-    };
+    // This was three open-coded correlated `EXISTS` — a duplicate of
+    // `event_user_membership_exists`, which had already been rewritten to the
+    // uncorrelated `IN (… UNION …)` form (measured 32.6s -> 3.5s on
+    // `overview_totals`) while this copy was left behind to be probed once per
+    // candidate row across every partition. Deleted rather than ported: one
+    // membership definition, one place to change it.
+    //
+    // Bind index 5 is unchanged — `$1` app_id, `$2` pattern, `$3` limit,
+    // `$4` offset, `$5` env — so no renumbering follows from this.
+    let membership_sql = event_user_membership_exists(env.clone(), 5);
 
     // Count per person via LATERAL subqueries.
     //
@@ -7459,7 +7534,7 @@ pub async fn list_persons(
     // alone) still gets a real value out of the other two `NULL` legs instead
     // of `NULL` itself — membership already guarantees at least one leg is
     // non-null for any row that reaches this point.
-    let seen_select = if matches!(scope.env, EnvFilter::All) {
+    let seen_select = if matches!(env, EnvFilter::All) {
         "eu.first_seen AS first_seen, eu.last_seen AS last_seen".to_string()
     } else {
         "LEAST(ae.min_occurred, ee.min_occurred, se.min_started) AS first_seen, \
@@ -7545,8 +7620,15 @@ pub async fn list_persons(
     // three other tables), and no index is added here. If this becomes a
     // measured problem the answer is a materialized per-(person, environment)
     // rollup, not an index and not a second code path.
+    //
+    // IT DID BECOME A MEASURED PROBLEM, and that rollup now exists —
+    // `event_user_environments`, read by `list_persons_rollup_sql`. Everything
+    // above still describes THIS function, which is now the fallback taken only
+    // for apps whose backfill has not completed; the numbers are still true of
+    // it. The "second code path" the paragraph above rejects was accepted, with
+    // the per-app marker bounding how long both shapes must coexist.
     let order_by = sort.order_by();
-    let q = format!(
+    format!(
         "SELECT eu.distinct_id, eu.properties, {seen_select}, \
                 COALESCE(ae.cnt,0)::bigint AS events_count, \
                 COALESCE(ee.cnt,0)::bigint AS errors_count, \
@@ -7566,7 +7648,88 @@ pub async fn list_persons(
                     WHERE app_id=$1 AND distinct_id = eu.distinct_id{env_sql}) se ON TRUE \
          ORDER BY {order_by} \
          LIMIT $3 OFFSET $4"
-    );
+    )
+}
+
+/// The rollup shape, read for apps whose `event_user_environments` backfill has
+/// completed.
+///
+/// `event_user_environments` carries one row per (person, environment) with the
+/// counts and both timestamps already computed, so the three LATERALs and the
+/// membership predicate all collapse into a join — and, critically, `ORDER BY …
+/// LIMIT` now applies to a single indexed table instead of to a blocking `Sort`
+/// over every person in the app. That is the actual fix for the 30s timeout:
+/// page size caps the work again.
+///
+/// Two things must not drift from [`list_persons_live_sql`]:
+///
+/// 1. `eu` stays the person alias, because `routes::analytics::person_sort_spec`
+///    emits the qualified column `eu.distinct_id`. The other five sort columns
+///    are unqualified output aliases resolved against the select list, so they
+///    must keep these exact names — `first_seen`, `last_seen`, `events_count`,
+///    `errors_count`, `sessions_count` — and then `SortSpec` needs no change.
+/// 2. `first_seen`/`last_seen` keep the live shape's `All`-vs-scoped split:
+///    under `All` they read `eu.first_seen`/`eu.last_seen`, the durable
+///    `event_users` columns, exactly as the live shape does. Deriving them from
+///    the rollup under `All` too would be defensible in isolation, but it would
+///    silently change what an unscoped page displays on the day an operator runs
+///    the backfill — a number moving with no code deploy behind it.
+fn list_persons_rollup_sql(env: &EnvFilter, sort: &SortSpec) -> String {
+    let env_sql = env.sql_fragment_for("r", 5);
+    let order_by = sort.order_by();
+    // The `GROUP BY` is correct for all four variants, not just the summing
+    // ones: under `One`/`Unattributed` the filter admits a single row per
+    // person, so grouping is a no-op; under `All`/`Subset` it sums across the
+    // environments the filter admits. One shape, not four.
+    let seen_select = if matches!(env, EnvFilter::All) {
+        "eu.first_seen AS first_seen, eu.last_seen AS last_seen"
+    } else {
+        "r.first_seen AS first_seen, r.last_seen AS last_seen"
+    };
+    format!(
+        "SELECT eu.distinct_id, eu.properties, {seen_select}, \
+                r.events_count AS events_count, \
+                r.errors_count AS errors_count, \
+                r.sessions_count AS sessions_count \
+         FROM ( \
+             SELECT app_id, distinct_id, \
+                    min(first_seen) AS first_seen, max(last_seen) AS last_seen, \
+                    sum(events_count)::bigint AS events_count, \
+                    sum(errors_count)::bigint AS errors_count, \
+                    sum(sessions_count)::bigint AS sessions_count \
+             FROM event_user_environments r \
+             WHERE app_id=$1{env_sql} \
+             GROUP BY app_id, distinct_id \
+         ) r \
+         JOIN event_users eu ON eu.app_id = r.app_id AND eu.distinct_id = r.distinct_id \
+         WHERE (eu.distinct_id ILIKE $2 OR eu.properties::text ILIKE $2) \
+         ORDER BY {order_by} \
+         LIMIT $3 OFFSET $4"
+    )
+}
+
+pub async fn list_persons(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    search: Option<&str>,
+    limit: i64,
+    offset: i64,
+    sort: SortSpec,
+) -> QueryResult<Vec<PersonRow>> {
+    // Escape LIKE metacharacters: an unescaped `%`/`_` makes a literal search
+    // term match the wrong rows, and a pattern of many wildcards makes ILIKE
+    // matching super-linear per scanned row.
+    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+
+    // Two shapes until every deployment is backfilled. The marker is per-app and
+    // is written in the same transaction as that app's backfill aggregate, so it
+    // can never be visible before the data it claims — a marker that ran ahead of
+    // its data would make this page quiet-wrong rather than error.
+    let q = if crate::person_env_backfill::is_backfilled(conn, scope.app_id).await? {
+        list_persons_rollup_sql(&scope.env, &sort)
+    } else {
+        list_persons_live_sql(&scope.env, &sort)
+    };
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)

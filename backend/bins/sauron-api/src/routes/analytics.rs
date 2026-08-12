@@ -204,7 +204,13 @@ pub(crate) fn person_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> 
     // oversight: `distinct_id`/`first_seen`/`last_seen` are NOT NULL on
     // `event_users`, the three counts are `COALESCE(...,0)`, and under a
     // scoped read `LEAST`/`GREATEST` still return non-NULL because the
-    // membership `EXISTS` guarantees at least one of the three legs matched.
+    // membership predicate guarantees at least one of the three legs matched.
+    //
+    // It now holds for a SECOND reason as well, and a reader who checks only
+    // one of `repo::list_persons`' two query shapes would think the comment had
+    // gone stale: for a backfilled app the page is served from
+    // `event_user_environments`, where all five of those columns are NOT NULL by
+    // schema. Both shapes, same conclusion.
     Ok(SortSpec {
         column,
         descending,
