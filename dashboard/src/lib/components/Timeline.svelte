@@ -153,7 +153,7 @@
                 {/if}
               {/if}
               <LatencyBadge ms={item.transaction.duration_ms} size="sm" />
-              {#if onslice}
+              {#if onslice && item.transaction.finished_at}
                 <button
                   class="in-between-btn"
                   onclick={(e) => {

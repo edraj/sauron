@@ -116,7 +116,10 @@
 
     return detail.timeline.filter(item => {
       const itemMs = new Date(item.at).getTime();
-      return itemMs >= startMs && itemMs <= endMs;
+      const inRange = itemMs >= startMs && itemMs <= endMs;
+      if (!inRange) return false;
+      if (item.kind === 'transaction' && item.transaction.id === currentSlice.id) return false;
+      return true;
     });
   });
 

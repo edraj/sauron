@@ -23,6 +23,7 @@
   const from = $derived(count === 0 ? 0 : offset + 1);
   const to = $derived(offset + count);
   const hasPrev = $derived(offset > 0);
+  const currentPage = $derived(Math.floor(offset / limit) + 1);
 </script>
 
 <div class="pager">
@@ -38,6 +39,24 @@
     >
       <Icon name="chevron-left" size={14} /> Prev
     </button>
+
+    {#if currentPage > 2}
+      <button class="pg num" onclick={() => onchange(0)} type="button">1</button>
+      {#if currentPage > 3}
+        <span class="ellipsis">...</span>
+      {/if}
+    {/if}
+
+    {#if currentPage > 1}
+      <button class="pg num" onclick={() => onchange((currentPage - 2) * limit)} type="button">{currentPage - 1}</button>
+    {/if}
+
+    <button class="pg num active" type="button">{currentPage}</button>
+
+    {#if hasNext}
+      <button class="pg num" onclick={() => onchange(currentPage * limit)} type="button">{currentPage + 1}</button>
+    {/if}
+
     <button
       class="pg"
       disabled={!hasNext}
@@ -64,6 +83,7 @@
   .btns {
     display: flex;
     gap: 6px;
+    align-items: center;
   }
   .pg {
     display: inline-flex;
@@ -78,12 +98,29 @@
     font-weight: 550;
     transition: color 0.12s ease, border-color 0.12s ease;
   }
-  .pg:hover:not(:disabled) {
+  .pg.num {
+    padding: 6px 10px;
+    min-width: 32px;
+    justify-content: center;
+  }
+  .pg:hover:not(:disabled, .active) {
     color: var(--text);
     border-color: var(--border-strong);
+  }
+  .pg.active {
+    background: var(--surface-3);
+    color: var(--text);
+    border-color: var(--border-strong);
+    cursor: default;
   }
   .pg:disabled {
     opacity: 0.4;
     cursor: default;
+  }
+  .ellipsis {
+    color: var(--text-muted);
+    padding: 0 2px;
+    font-size: 12px;
+    user-select: none;
   }
 </style>

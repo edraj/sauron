@@ -1,19 +1,3 @@
-<!--
-  Pager for a keyset-cursor list.
-
-  Separate from `Pagination.svelte` rather than a variant of it because the two
-  take different inputs and can answer different questions. The offset pager
-  derives everything from arithmetic — it knows the row range because rows N to
-  N+limit is what it asked for. A cursor pager knows only what the server told
-  it: how many rows match, and whether another page exists. It cannot name a row
-  range without inferring one, and inferring one is what the offset pager on
-  Events did wrong before this replaced it (it relabelled the same 50 rows
-  "51-100" while the server ignored the offset entirely).
-
-  Everything else is deliberately identical to `Pagination.svelte` — the same
-  `.pg` buttons, the same chevrons, the same spacing — because five pages render
-  that one and Issues and Events should not carry a visibly different control.
--->
 <script lang="ts">
   import Icon from './ui/Icon.svelte';
 
@@ -90,34 +74,25 @@
             total === 1 && !totalIsCapped ? noun : plural
           }`,
   );
-
-  // "Page 1" on a list that has exactly one page is noise; the number earns its
-  // place only once there is somewhere else to be.
-  const showPage = $derived(page > 1 || canNext);
-
-  // Assembled in one string rather than as `{countText}{#if …} · Page {page}`
-  // in the markup: Svelte trims the leading whitespace inside a block, and that
-  // rendered as "7 issues· Page 1".
-  //
-  // With no count, the page number is all there is to say and it is said
-  // unconditionally — including on page 1, where `showPage` would normally
-  // suppress it. That moment is by definition one where there is somewhere else
-  // to be: it only occurs while a move to that page is in flight.
-  const label = $derived(
-    countText === null
-      ? `Page ${page.toLocaleString()}`
-      : showPage
-        ? `${countText} · Page ${page.toLocaleString()}`
-        : countText,
-  );
 </script>
 
 <div class="pager">
-  <span class="range muted">{label}</span>
+  <span class="range muted">{countText ?? ''}</span>
   <div class="btns">
     <button class="pg" disabled={!canPrev || busy} onclick={onprev} type="button">
       <Icon name="chevron-left" size={14} /> Prev
     </button>
+    
+    {#if page > 1}
+      <button class="pg num" disabled={busy} onclick={onprev} type="button">{page - 1}</button>
+    {/if}
+
+    <button class="pg num active" type="button">{page}</button>
+
+    {#if canNext}
+      <button class="pg num" disabled={busy} onclick={onnext} type="button">{page + 1}</button>
+    {/if}
+
     <button class="pg" disabled={!canNext || busy} onclick={onnext} type="button">
       Next <Icon name="chevron-right" size={14} />
     </button>
@@ -139,6 +114,7 @@
   .btns {
     display: flex;
     gap: 6px;
+    align-items: center;
   }
   .pg {
     display: inline-flex;
@@ -153,9 +129,20 @@
     font-weight: 550;
     transition: color 0.12s ease, border-color 0.12s ease;
   }
-  .pg:hover:not(:disabled) {
+  .pg.num {
+    padding: 6px 10px;
+    min-width: 32px;
+    justify-content: center;
+  }
+  .pg:hover:not(:disabled, .active) {
     color: var(--text);
     border-color: var(--border-strong);
+  }
+  .pg.active {
+    background: var(--surface-3);
+    color: var(--text);
+    border-color: var(--border-strong);
+    cursor: default;
   }
   .pg:disabled {
     opacity: 0.4;

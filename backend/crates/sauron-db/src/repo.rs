@@ -4090,6 +4090,76 @@ pub async fn count_events(
     Ok(if n > cap { (cap, true) } else { (n, false) })
 }
 
+// ===========================================================================
+// Searched SESSIONS list — one app's `sessions`
+// ===========================================================================
+
+pub struct SessionSearch<'a> {
+    pub node: &'a sauron_query::ResolvedNode,
+    pub ctx: &'a crate::query_plan::PrepCtx,
+    pub since: DateTime<Utc>,
+    pub sort: SortSpec,
+    pub limit: i64,
+    pub offset: i64,
+    pub distinct_id: Option<String>,
+    pub device_key: Option<String>,
+}
+
+fn session_search_base<'a>(
+    scope: &'a ReadScope,
+    search: &SessionSearch<'_>,
+) -> Result<sessions::BoxedQuery<'a, diesel::pg::Pg>, PlanError> {
+    let lowerer = crate::query_plan::sessions::SessionsLower {
+        app_id: scope.app_id,
+    };
+    let predicate = crate::query_plan::lower(search.node, &lowerer, search.ctx)?;
+    let mut query = sessions::table
+        .filter(sessions::app_id.eq(scope.app_id))
+        .filter(sessions::last_event_at.ge(search.since))
+        .filter(predicate)
+        .into_boxed();
+    query = crate::scope_env!(query, sessions, &scope.env);
+    if let Some(d) = &search.distinct_id {
+        query = query.filter(sessions::distinct_id.eq(d.clone()));
+    }
+    if let Some(dk) = &search.device_key {
+        query = query.filter(sessions::device_key.eq(dk.clone()));
+    }
+    Ok(query)
+}
+
+pub async fn search_sessions(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &SessionSearch<'_>,
+) -> Result<Vec<Session>, PlanError> {
+    let q = session_search_base(scope, search)?;
+    let order_sql = search.sort.order_by();
+    q.select(Session::as_select())
+        .order(sql::<Text>(&order_sql))
+        .limit(search.limit)
+        .offset(search.offset)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))
+}
+
+pub async fn count_sessions(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &SessionSearch<'_>,
+    cap: i64,
+) -> Result<(i64, bool), PlanError> {
+    let ids: Vec<Uuid> = session_search_base(scope, search)?
+        .select(sessions::id)
+        .limit(cap + 1)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    let n = ids.len() as i64;
+    Ok(if n > cap { (cap, true) } else { (n, false) })
+}
+
 /// Pins the exact SQL shape of the raw keyset fragments in
 /// [`event_query_for`]/[`occurrence_query_for`] — specifically, that each one
 /// opens with its own `(` and closes with `))`.

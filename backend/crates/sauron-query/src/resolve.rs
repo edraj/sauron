@@ -10,7 +10,8 @@ use chrono::{DateTime, Utc};
 
 use crate::ast::{MatchOp, Node, Predicate};
 use crate::catalog::{
-    lookup, tag_dimension, Dimension, IndexClass, Resource, Store, ValueType, SHORTHANDS,
+    label_dimension, lookup, tag_dimension, Dimension, IndexClass, Resource, Store, ValueType,
+    LABEL_DIM, SHORTHANDS,
 };
 use crate::token::is_field_ident;
 use crate::QueryError;
@@ -161,49 +162,40 @@ fn resolve_pred(
         );
     }
 
-    // `tag:<key>=<value>` — the escape hatch for tag keys that are not legal
-    // identifiers. Tag keys are entirely unconstrained on the write path (the
-    // ingest edge stores whatever JSON object keys arrive), so the grammar needs
-    // a way to name any of them. The key is everything before the FIRST `=`; the
-    // remainder is an ordinary value, so every operator still composes:
-    // `tag:cart@checkout=~eu` is a literal-substring match on that key.
-    if p.field == "tag" && !expanded {
-        let (key, rest) = p
-            .value
-            .split_once('=')
-            .ok_or_else(|| QueryError::BadValue {
-                field: "tag".to_string(),
-                value: p.value.clone(),
-                at: p.at,
-            })?;
-        if key.is_empty() {
-            return Err(QueryError::BadValue {
-                field: "tag".to_string(),
-                value: p.value.clone(),
-                at: p.at,
-            });
+    // `tag:<key>=<value>` or `label:<key>=<value>` — the escape hatch for tag/label keys
+    // that are not legal identifiers or carry explicit key=value syntax.
+    let clean_field = p.field.strip_prefix('@').unwrap_or(&p.field);
+    if (clean_field == "tag" || clean_field == "$label" || clean_field == "label") && !expanded {
+        if let Some((key, rest)) = p.value.split_once('=') {
+            if !key.is_empty() {
+                let dim = if clean_field == "tag" {
+                    tag_dimension(r)
+                } else {
+                    label_dimension(r)
+                }
+                .ok_or_else(|| QueryError::UnknownField {
+                    field: p.field.clone(),
+                    at: p.at,
+                    resource: Some(r),
+                })?;
+                let (op, value_src) = split_op(rest, p.quoted);
+                if !dim.ops.contains(&op) {
+                    return Err(QueryError::BadOp {
+                        field: p.field.clone(),
+                        at: p.at,
+                    });
+                }
+                let value = type_value(dim, op, value_src, &p.field, p.at)?;
+                return Ok(ResolvedPredicate {
+                    dim,
+                    path: Some(key.to_string()),
+                    op,
+                    value,
+                    at: p.at,
+                    index: effective_index(dim, r),
+                });
+            }
         }
-        let dim = tag_dimension(r).ok_or_else(|| QueryError::UnknownField {
-            field: "tag".to_string(),
-            at: p.at,
-            resource: Some(r),
-        })?;
-        let (op, value_src) = split_op(rest, p.quoted);
-        if !dim.ops.contains(&op) {
-            return Err(QueryError::BadOp {
-                field: "tag".to_string(),
-                at: p.at,
-            });
-        }
-        let value = type_value(dim, op, value_src, "tag", p.at)?;
-        return Ok(ResolvedPredicate {
-            dim,
-            path: Some(key.to_string()),
-            op,
-            value,
-            at: p.at,
-            index: effective_index(dim, r),
-        });
     }
 
     let (op, rest) = split_op(&p.value, p.quoted);
@@ -225,33 +217,23 @@ fn resolve_pred(
     })
 }
 
-/// Field resolution: exact catalog match, then the explicit `tag.<key>` prefix,
+/// Field resolution: exact catalog match, then the explicit `tag.<key>` or `$label.<key>` prefix,
 /// then a dotted path under a JSON root. Anything else is an error.
-///
-/// **There is deliberately no fourth step.** Spec §5 rule 3 used to read an
-/// unrecognised name as a tag key, on the theory that dev-defined tags should be
-/// first-class without a prefix. The cost was that a typo — `enviroment:prod`,
-/// `checkout_stpe:payment` — resolved to a tag nobody had ever written and
-/// answered 200 with zero rows, which is indistinguishable from an honest "no
-/// matches". A field name the system does not know is a caller mistake and says
-/// so, at both entry points alike: `filter=` and `query=` share this function,
-/// so neither can drift into a laxer vocabulary than the other.
-///
-/// No capability is lost. Step 2 (`tag.<key>`) names any identifier tag key, and
-/// `tag:<key>=<value>` in `resolve_pred` names the rest.
 fn resolve_field(
     field: &str,
     r: Resource,
     at: usize,
 ) -> Result<(&'static Dimension, Option<String>), QueryError> {
-    // 1. Exact match. Covers plain names (`level`) and dotted names that are
-    //    real columns (`http.status`, `os.name` on Devices).
-    if let Some(d) = lookup(field, r) {
+    let clean = field.strip_prefix('@').unwrap_or(field);
+
+    // 1. Exact match. Covers plain names (`level`), dotted names that are
+    //    real columns (`http.status`), and registered JSON roots (`context`, `extra`).
+    if let Some(d) = lookup(clean, r) {
         return Ok((d, None));
     }
 
-    // 2. Explicit tag disambiguation.
-    if let Some(key) = field.strip_prefix("tag.") {
+    // 2. Explicit tag disambiguation (`tag.<key>`).
+    if let Some(key) = clean.strip_prefix("tag.") {
         if !key.is_empty() {
             if let Some(d) = tag_dimension(r) {
                 return Ok((d, Some(key.to_string())));
@@ -259,14 +241,39 @@ fn resolve_field(
         }
     }
 
-    // 3. Dotted path under a JSON root.
-    if let Some((root, remainder)) = field.split_once('.') {
+    // 3. Explicit label disambiguation (`$label.<key>` or `label.<key>`).
+    let label_key = clean
+        .strip_prefix("$label.")
+        .or_else(|| clean.strip_prefix("label."));
+    if let Some(key) = label_key {
+        if !key.is_empty() {
+            if let Some(d) = label_dimension(r) {
+                return Ok((d, Some(key.to_string())));
+            }
+        }
+    }
+
+    // 4. Standalone `@tag` or `tag` (without property dot).
+    if clean == "tag" {
+        if let Some(d) = tag_dimension(r) {
+            return Ok((d, Some("tag".to_string())));
+        }
+    }
+
+    // 5. Standalone `@$label` or `$label` or `label` (without property dot).
+    if clean == "$label" || clean == "label" {
+        if let Some(d) = label_dimension(r) {
+            return Ok((d, Some("label".to_string())));
+        }
+    }
+
+    // 6. Dotted path under a JSON root.
+    if let Some((root, remainder)) = clean.split_once('.') {
         if let Some(d) = lookup(root, r) {
             if let Store::JsonRoot { prefix, .. } = d.store {
                 let path = if prefix.is_empty() {
                     remainder.to_string()
                 } else {
-                    // The column holds several namespaces, so keep ours.
                     format!("{prefix}.{remainder}")
                 };
                 return Ok((d, Some(path)));
@@ -1032,5 +1039,39 @@ mod tests {
         assert_eq!(p.path.as_deref(), Some("runtime.name"));
         let alias = one("runtime.name:Chrome", Resource::Occurrences);
         assert_eq!(alias.path.as_deref(), Some("runtime.name"));
+    }
+
+    #[test]
+    fn resolves_at_prefixed_variables_and_labels() {
+        let tag_p = one("@tag.env=prod", Resource::Issues);
+        assert!(matches!(tag_p.dim.store, Store::Tag));
+        assert_eq!(tag_p.path.as_deref(), Some("env"));
+        assert_eq!(tag_p.value, TypedValue::Str("prod".into()));
+
+        let ctx_p = one("@context.app_version=3.0.2", Resource::Occurrences);
+        assert!(matches!(
+            ctx_p.dim.store,
+            Store::JsonRoot {
+                column: "context",
+                ..
+            }
+        ));
+        assert_eq!(ctx_p.path.as_deref(), Some("app_version"));
+        assert_eq!(ctx_p.value, TypedValue::Str("3.0.2".into()));
+
+        let extra_p = one("@extra.level=warn", Resource::Occurrences);
+        assert!(matches!(
+            extra_p.dim.store,
+            Store::JsonRoot {
+                column: "extra",
+                ..
+            }
+        ));
+        assert_eq!(extra_p.path.as_deref(), Some("level"));
+
+        let label_p = one("@$label.team=backend", Resource::Issues);
+        assert_eq!(label_p.dim.name, "$label");
+        assert_eq!(label_p.path.as_deref(), Some("team"));
+        assert_eq!(label_p.value, TypedValue::Str("backend".into()));
     }
 }

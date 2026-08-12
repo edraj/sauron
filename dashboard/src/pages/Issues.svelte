@@ -302,7 +302,7 @@
     const cursor = cursorOf(p);
     await issuesView.load(
       viewKey('issues.list', appId, sessionStore.scopeKey, enc, q, sinceDays, cursor),
-      () => listIssues(appId, { filters: enc, q: q || undefined, sinceDays, limit: 100, cursor }),
+      () => listIssues(appId, { filters: enc, query: q || undefined, sinceDays, limit: 100, cursor }),
       force,
     );
   }
@@ -471,7 +471,7 @@
   {/if}
 
   <p class="filter-hint">Filter by <code>Tag</code> (key = value); the search box also matches tag &amp; payload content.</p>
-  <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:sinceDays ranges={ISSUE_RANGES} />
+  <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:sinceDays ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" />
 
   <Card padding="none">
     <!--

@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from '../ui/Icon.svelte';
-  import SearchInput from '../SearchInput.svelte';
+  import SearchAutocompleteInput from '../search/SearchAutocompleteInput.svelte';
   import DateRange from '../DateRange.svelte';
   import {
     OP_LABEL,
@@ -16,6 +16,8 @@
     fields: FieldDef[];
     filters: Filter[];
     search: string;
+    appId?: string;
+    context?: string;
     sinceDays: number;
     // Optional custom date-range options; falls back to DateRange's default.
     ranges?: { days: number; label: string }[];
@@ -24,6 +26,8 @@
     fields,
     filters = $bindable([]),
     search = $bindable(''),
+    appId = undefined,
+    context = undefined,
     sinceDays = $bindable(30),
     ranges = undefined,
   }: Props = $props();
@@ -121,7 +125,13 @@
   </div>
 
   <div class="right">
-    <SearchInput bind:value={search} placeholder="Search…" width="220px" />
+    <div style="width: 220px">
+      {#if appId}
+        <SearchAutocompleteInput bind:value={search} {appId} {context} placeholder="Search…" />
+      {:else}
+        <SearchAutocompleteInput bind:value={search} appId="" placeholder="Search…" />
+      {/if}
+    </div>
     <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} {ranges} />
   </div>
 </div>
