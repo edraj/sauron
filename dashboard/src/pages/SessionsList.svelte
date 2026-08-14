@@ -13,6 +13,7 @@
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Icon from '../lib/components/ui/Icon.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
@@ -176,6 +177,29 @@
   function openSession(id: string) {
     push('/sessions/' + encodeURIComponent(id));
   }
+
+  function downloadSessionsCsv() {
+    if (!sessions || sessions.length === 0) return;
+    const header = ['Session', 'Started', 'Duration', 'Events', 'Errors'];
+    const rows = sessions.map((s) => [
+      s.session_id,
+      new Date(s.started_at).toISOString(),
+      formatDuration(durationBetween(s.started_at, s.last_event_at)),
+      s.events_count.toString(),
+      s.errors_count.toString(),
+    ]);
+
+    const csvContent = [header, ...rows].map((row) => row.join(',')).join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `sessions.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
 </script>
 
 <AppShell requireApp>
@@ -199,6 +223,15 @@
       {/if}
       <DateRange value={sinceDays} onchange={onRange} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
+      <Button
+        variant="secondary"
+        disabled={sessions.length === 0}
+        onclick={downloadSessionsCsv}
+        title="Download visible sessions as CSV"
+      >
+        <Icon name="download" size={15} />
+        Export CSV
+      </Button>
     </div>
   </div>
 

@@ -26,6 +26,7 @@ export const ADMIN_NAV: AdminNavItem[] = [
   { href: '/admin/privacy', label: 'Privacy', icon: 'shield-alert' },
   { href: '/admin/wall-of-shame', label: 'Wall of Shame', icon: 'scroll-text' },
   { href: '/admin/ingest-failures', label: 'Ingest failures', icon: 'refresh' },
+  { href: '/admin/purge', label: 'Purge data', icon: 'circle-x' },
 ];
 
 /** Admin children the current user may open, in nav order. */

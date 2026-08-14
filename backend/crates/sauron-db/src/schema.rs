@@ -37,6 +37,11 @@ diesel::table! {
         workflow_id -> Nullable<Text>,
         workflow_name -> Nullable<Text>,
         restored_pin_id -> Nullable<Uuid>,
+        // Appended, never inserted mid-list: `models::*` derives `Queryable`,
+        // which decodes POSITIONALLY, and `ALTER TABLE … ADD COLUMN` appends
+        // physically. A field inserted in the middle here would silently bind
+        // every later column to the wrong one.
+        guest_alias -> Nullable<Text>,
     }
 }
 
@@ -144,6 +149,9 @@ diesel::table! {
         workflow_id -> Nullable<Text>,
         workflow_name -> Nullable<Text>,
         restored_pin_id -> Nullable<Uuid>,
+        // Appended, never inserted mid-list — see the same note on
+        // `analytics_events` above.
+        guest_alias -> Nullable<Text>,
     }
 }
 
@@ -232,6 +240,25 @@ diesel::table! {
         alias_id -> Text,
         distinct_id -> Text,
         created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    identity_merges (id) {
+        id -> Uuid,
+        app_id -> Uuid,
+        alias_id -> Text,
+        distinct_id -> Text,
+        state -> Text,
+        attempts -> Integer,
+        last_error -> Nullable<Text>,
+        alias_first_seen -> Nullable<Timestamptz>,
+        alias_last_seen -> Nullable<Timestamptz>,
+        cold_stale -> Bool,
+        claimed_at -> Nullable<Timestamptz>,
+        next_attempt_at -> Timestamptz,
+        created_at -> Timestamptz,
+        completed_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -823,6 +850,7 @@ diesel::joinable!(error_events -> app_environments (environment_id));
 diesel::joinable!(error_events -> issues (issue_id));
 diesel::joinable!(event_users -> apps (app_id));
 diesel::joinable!(identities -> apps (app_id));
+diesel::joinable!(identity_merges -> apps (app_id));
 diesel::joinable!(issues -> apps (app_id));
 diesel::joinable!(issues -> users (assignee_id));
 diesel::joinable!(projects -> organizations (org_id));
@@ -966,6 +994,59 @@ diesel::table! {
 
 diesel::joinable!(ingest_failure_payloads -> ingest_failures (failure_id));
 
+diesel::table! {
+    purge_jobs (id) {
+        id -> Uuid,
+        org_id -> Uuid,
+        // No `joinable!` to `apps` on purpose — there is no FK. Purge history
+        // must outlive the app it purged, so `app_id` is an inert snapshot and
+        // the two columns beside it are what keep the row legible afterwards.
+        app_id -> Uuid,
+        app_slug -> Text,
+        app_name -> Text,
+        // NULL = every environment including unattributed; `[]` = nothing.
+        environment_ids -> Nullable<Jsonb>,
+        kinds -> Jsonb,
+        range_start -> Nullable<Timestamptz>,
+        range_end -> Nullable<Timestamptz>,
+        all_time -> Bool,
+        status -> Text,
+        phase -> Text,
+        estimated_counts -> Jsonb,
+        deleted_counts -> Jsonb,
+        rollups_recomputed -> Int8,
+        rollups_deleted -> Int8,
+        cold_rows_skipped -> Int8,
+        cold_boundary_at -> Nullable<Timestamptz>,
+        kind_cursor -> Nullable<Text>,
+        cursor_occurred_at -> Nullable<Timestamptz>,
+        cursor_id -> Nullable<Uuid>,
+        requested_by -> Nullable<Uuid>,
+        requested_by_email -> Text,
+        cancelled_by -> Nullable<Uuid>,
+        cancelled_by_email -> Text,
+        cancelled_at -> Nullable<Timestamptz>,
+        requested_at -> Timestamptz,
+        previewed_at -> Nullable<Timestamptz>,
+        confirmed_at -> Nullable<Timestamptz>,
+        started_at -> Nullable<Timestamptz>,
+        finished_at -> Nullable<Timestamptz>,
+        confirm_source -> Text,
+        ingest_active -> Bool,
+        worker_id -> Nullable<Text>,
+        claimed_at -> Nullable<Timestamptz>,
+        error -> Text,
+    }
+}
+
+diesel::table! {
+    purge_touched_keys (job_id, kind, key) {
+        job_id -> Uuid,
+        kind -> Text,
+        key -> Text,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
     auth_sessions,
@@ -979,6 +1060,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     event_user_environments,
     event_user_env_backfill,
     identities,
+    identity_merges,
     issues,
     organizations,
     projects,
@@ -1019,4 +1101,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     audit_log,
     ingest_failures,
     ingest_failure_payloads,
+    purge_jobs,
+    purge_touched_keys,
 );

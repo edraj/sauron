@@ -958,8 +958,15 @@ Other scope data:
   `captureException`.
 - **identity** — `device_id` persists in `localStorage` under
   `sauron.device_id`; `session_id` persists in `sessionStorage` under
-  `sauron.session_id`. Both fall back to a per-process in-memory id when Web
-  Storage is unavailable.
+  `sauron.session_id`; `identify()` additionally persists a short one-way
+  digest (never the id itself) of the last identified user in `localStorage`
+  under `sauron.last_identified`, used to detect a login by a different
+  person on a device where `reset()` was never wired — see "Reset on logout"
+  in the wiki. This is not a security boundary (an unkeyed hash over a
+  possibly low-entropy id, e.g. an email, is a confirmation oracle, not a
+  secret) — it exists only so the key isn't a second plaintext copy of the
+  app's user id. All fall back to a per-process in-memory id when Web Storage
+  is unavailable.
 
 ```ts
 Sauron.init({ dsn, tags: { tier: 'free' }, extra: { build: 'ci-42' } });

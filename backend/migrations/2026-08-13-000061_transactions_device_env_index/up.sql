@@ -1,0 +1,42 @@
+-- The twin of migration 53's three indexes, for a fourth table.
+--
+-- Task 11 gives `repo::device_membership_sql` (the live device-membership
+-- predicate behind `list_devices`/`list_device_groups`) and
+-- `device_env_backfill`'s aggregate a fourth `UNION`/`EXISTS` leg over
+-- `transactions`, alongside the existing analytics_events/error_events/
+-- sessions legs — closing a divergence where the write path
+-- (`sauron-pipeline`'s `Acc::rollup`, folding `device_environments` from
+-- analytics events, error events, AND transactions) already counted a
+-- transaction-only device that neither the live query nor the backfill knew
+-- how to see. Both new legs probe the identical shape: `(app_id, device_key,
+-- environment_id)`, matched against `min`/`max(occurred_at)`.
+--
+-- `transactions` is PARTITIONED BY RANGE(occurred_at) and, until this
+-- migration, carried no index touching `device_key` at all — only
+-- `transactions_app_occurred_idx (app_id, occurred_at)`,
+-- `transactions_app_op_name_idx (app_id, op, name)`,
+-- `transactions_app_session_idx (app_id, session_id)`, and
+-- `transactions_app_env_time_idx (app_id, environment_id, occurred_at)`. None
+-- of those serve a `(app_id, device_key, …)` lookup, so without a covering
+-- index the new membership/backfill leg would match on `app_id` alone and
+-- then heap-filter `device_key` once per device, across every partition —
+-- the exact O(devices) cost migration 53's own header measured for
+-- analytics_events/error_events/sessions, now reproduced on a fourth table
+-- unless headed off here.
+--
+-- The trailing `occurred_at` is NOT a filter column — neither new leg bounds
+-- `transactions` by time (see `device_membership_sql`'s doc comment for why
+-- the transactions leg, unlike the sessions leg's `started_at >= $2`, carries
+-- no bound at all). It is the AGGREGATE PAYLOAD: the backfill takes
+-- `min`/`max(occurred_at)` for `first_seen`/`last_seen` over exactly the rows
+-- this index's leading columns locate, so including it turns that aggregate
+-- into an index-only scan instead of a second heap pass — same reasoning as
+-- migration 53's trailing timestamp columns.
+--
+-- Builds SYNCHRONOUSLY across every live child partition inside this
+-- migration's transaction, holding locks on the parent and each child.
+-- `transactions` is a hot-write table: this needs a maintenance window.
+-- CONCURRENTLY is not an option — migrations run in a transaction and this is
+-- a partitioned parent (same constraint as migration 47 and migration 53).
+CREATE INDEX transactions_app_device_env_idx
+    ON transactions (app_id, device_key, environment_id, occurred_at);

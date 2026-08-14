@@ -172,6 +172,7 @@ export const routes = {
   '/admin/privacy': guarded(() => import('./pages/Inspector.svelte')),
   '/admin/wall-of-shame': guarded(() => import('./pages/WallOfShame.svelte')),
   '/admin/ingest-failures': guarded(() => import('./pages/IngestFailures.svelte')),
+  '/admin/purge': guarded(() => import('./pages/Purge.svelte')),
 
   '/account': guarded(() => import('./pages/Account.svelte')),
 

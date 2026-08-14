@@ -131,6 +131,12 @@ struct Acc {
     /// `issue_at`. The nil uuid stands in for `EnvFilter::Unattributed`,
     /// matching the table's `COALESCE` unique index.
     person_env_at: HashMap<(Uuid, String, Uuid), usize>,
+    device_envs: Vec<db::DeviceEnvBump>,
+    /// Index into `device_envs` by conflict key, for the same `ON CONFLICT DO
+    /// UPDATE` dedupe reason as `person_env_at`: two rows sharing a key abort
+    /// the whole statement with `ON CONFLICT DO UPDATE command cannot affect row
+    /// a second time`.
+    device_env_at: HashMap<(Uuid, String, Uuid), usize>,
     touch_users: Vec<(Uuid, String)>,
     touch_seen: HashSet<(Uuid, String)>,
     identified: Vec<(Uuid, String, &'static str)>,
@@ -376,6 +382,45 @@ impl Acc {
                 }
             }
         }
+
+        // The device/environment rollup, folded on the same signal the device
+        // bump above uses. Keyed on device_key rather than distinct_id, and
+        // therefore a SEPARATE fold rather than a branch of the person one: an
+        // anonymous device has a device_key and no distinct_id, and a server
+        // SDK has the reverse. Either fold alone would silently drop one of
+        // them from its rollup.
+        //
+        // `sessions_delta` stays 0: only `write_rows_once` can know which
+        // sessions this batch newly INSERTED.
+        if let Some(dk) = info.device_key.as_deref() {
+            let key = (
+                job.app_id,
+                dk.to_string(),
+                environment_id.unwrap_or_else(Uuid::nil),
+            );
+            match self.device_env_at.get(&key) {
+                Some(&i) => {
+                    let b = &mut self.device_envs[i];
+                    b.first_at = b.first_at.min(at);
+                    b.last_at = b.last_at.max(at);
+                    b.events_delta += events_delta;
+                    b.errors_delta += errors_delta;
+                }
+                None => {
+                    self.device_env_at.insert(key, self.device_envs.len());
+                    self.device_envs.push(db::DeviceEnvBump {
+                        app_id: job.app_id,
+                        device_key: dk.to_string(),
+                        environment_id,
+                        first_at: at,
+                        last_at: at,
+                        events_delta,
+                        errors_delta,
+                        sessions_delta: 0,
+                    });
+                }
+            }
+        }
     }
 
     fn touch_user(&mut self, app_id: Uuid, did: &str) {
@@ -608,6 +653,7 @@ pub async fn process_batch(
             touch_users: &acc.touch_users,
             identified,
             person_envs: &acc.person_envs,
+            device_envs: &acc.device_envs,
         },
     )
     .await?;
@@ -718,9 +764,19 @@ pub async fn process_batch(
                 }
             }
             if let Some(anon) = id.anonymous_id {
-                if !anon.is_empty() {
-                    let _ =
-                        repo::insert_identity(&mut conn, job.app_id, &anon, &id.distinct_id).await;
+                if !anon.is_empty() && !id.distinct_id.is_empty() {
+                    // Same call `process_identify` makes — see its doc comment
+                    // for why claim+enqueue must be atomic, and why `conn` here
+                    // (checked out fresh above, past `write_rows`'s own already-
+                    // closed transaction) must stay outside an open transaction
+                    // for this to be safe.
+                    crate::process::claim_and_enqueue(
+                        &mut conn,
+                        job.app_id,
+                        &anon,
+                        &id.distinct_id,
+                    )
+                    .await;
                 }
             }
         }
@@ -1223,6 +1279,29 @@ mod equivalence_tests {
         })
     }
 
+    /// An event with a device signal but no identity — the shape a mobile SDK
+    /// sends before login. `distinct_id` is empty rather than absent (the
+    /// wire field isn't `Option`), which `Acc::rollup` filters to `None`
+    /// exactly like an omitted one; no `session_id` either, so this signal
+    /// cannot reach the person rollup through the session leg. This is what
+    /// gives `device_environments` a row the person rollup CANNOT have — see
+    /// `signals()`'s doc comment for why that matters.
+    fn anon_event_item(name: &str, at: DateTime<Utc>) -> EnvelopeItem {
+        EnvelopeItem::Event(AnalyticsItem {
+            name: name.to_string(),
+            distinct_id: String::new(),
+            properties: json!({}),
+            timestamp: at,
+            session_id: None,
+            workflow_id: None,
+            workflow_name: None,
+            screen: None,
+            tags: json!({}),
+            contexts: json!({}),
+            extra: json!({}),
+        })
+    }
+
     fn tx_item(name: &str, session: &str, at: DateTime<Utc>) -> EnvelopeItem {
         EnvelopeItem::Transaction(TransactionItem {
             name: name.to_string(),
@@ -1272,8 +1351,14 @@ mod equivalence_tests {
     /// two occurrences of ONE fingerprint plus a third of another (issue
     /// `times_seen` summing), three signals on ONE session (counter summing
     /// and the `LEAST`/`GREATEST` timestamp pair, fed out of chronological
-    /// order so a fold that just takes the last value is caught), and one
-    /// person seen repeatedly (`event_users` dedupe).
+    /// order so a fold that just takes the last value is caught), one
+    /// person seen repeatedly (`event_users` dedupe), and one ANONYMOUS
+    /// signal (device_key, no distinct_id) — the case that justifies
+    /// `Acc::rollup` folding devices and persons SEPARATELY rather than
+    /// nesting one under the other. Without it, every signal here carries
+    /// both a device and a person, so a fold mistakenly hung off the person
+    /// branch would produce byte-identical `device_environments` output to
+    /// the correct one and no assertion below would ever see the difference.
     fn signals(app: &App, t0: DateTime<Utc>) -> Vec<IngestJob> {
         vec![
             job(app, t0, error_item("boom", "TypeError", "sess-a", t0)),
@@ -1362,6 +1447,14 @@ mod equivalence_tests {
                     "wf-2",
                     "onboarding",
                 ),
+            ),
+            // The anonymous device signal — same derived device_key as every
+            // signal above (same fixture UA), no distinct_id, no session. See
+            // this fn's doc comment for why it has to be here.
+            job(
+                app,
+                t0,
+                anon_event_item("device_ping", t0 + Duration::seconds(15)),
             ),
         ]
     }
@@ -1596,6 +1689,37 @@ mod equivalence_tests {
             seq_persons, bat_persons,
             "person/environment roll-ups diverge"
         );
+
+        let seq_devices_env = device_env_aggs(&mut conn, a.app_id).await;
+        let bat_devices_env = device_env_aggs(&mut conn, b.app_id).await;
+        assert_eq!(
+            seq_devices_env, bat_devices_env,
+            "batched writes must produce the same device rollup as sequential ones"
+        );
+        // Cross-path equality alone would still pass if both paths dropped the
+        // SAME counter, so pin the values too — the device twin of the person
+        // pinning block below. Every signal in `signals()` (including the
+        // anonymous one) shares one derived device_key in one environment, so
+        // there is exactly one row.
+        assert_eq!(
+            seq_devices_env.len(),
+            1,
+            "one device, one environment, one row"
+        );
+        assert_eq!(
+            seq_devices_env[0],
+            (
+                "Mac OSX|Chrome".to_string(),
+                Some("production".to_string()),
+                4,
+                4,
+                4
+            ),
+            "device_key, environment name, events_count, errors_count, sessions_count — \
+             events_count is 4 (page_view, wf_step, wf_other, and the anonymous \
+             device_ping), NOT 3: a fold that only reaches devices through the \
+             person branch would miss the anonymous signal and undercount this"
+        );
         // Cross-path equality alone would hold even if both paths folded wrongly
         // in the same direction, so pin the values. Every signal in `signals()`
         // names `person-1` in one environment, so there is exactly one row.
@@ -1734,5 +1858,60 @@ mod equivalence_tests {
         .get_results(conn)
         .await
         .expect("person/env aggs")
+    }
+
+    // Compares by environment NAME, not raw `environment_id`: `seed_app` gives
+    // "seq" and "bat" each their OWN project and their OWN enrollment, so their
+    // `environment_id` UUIDs differ by construction — a raw-UUID comparison
+    // between the two fixture apps can never match, no matter how correct the
+    // write paths are. Both apps' catalogue environment is literally named
+    // "production" (see `seed_app`'s `create_project_environment` call), so
+    // joining through `app_environments` to `environments.name` keeps this
+    // able to catch a row attributed to the WRONG environment while staying
+    // comparable across the two apps. `LEFT JOIN` throughout so an
+    // unattributed row (`environment_id IS NULL`, `EnvFilter::Unattributed`)
+    // still comes through as `environment_name: None` rather than being
+    // dropped.
+    async fn device_env_aggs(
+        conn: &mut sauron_db::AsyncPgConnection,
+        app_id: Uuid,
+    ) -> Vec<(String, Option<String>, i64, i64, i64)> {
+        #[derive(diesel::QueryableByName)]
+        struct R {
+            #[diesel(sql_type = Text)]
+            device_key: String,
+            #[diesel(sql_type = Nullable<Text>)]
+            environment_name: Option<String>,
+            #[diesel(sql_type = BigInt)]
+            events_count: i64,
+            #[diesel(sql_type = BigInt)]
+            errors_count: i64,
+            #[diesel(sql_type = BigInt)]
+            sessions_count: i64,
+        }
+        let rows: Vec<R> = diesel::sql_query(
+            "SELECT de.device_key, e.name AS environment_name, de.events_count, \
+                    de.errors_count, de.sessions_count \
+             FROM device_environments de \
+             LEFT JOIN app_environments ae ON ae.id = de.environment_id \
+             LEFT JOIN environments e ON e.id = ae.environment_id \
+             WHERE de.app_id=$1 \
+             ORDER BY de.device_key, e.name NULLS FIRST",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(app_id)
+        .get_results(conn)
+        .await
+        .expect("device env aggs");
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.device_key,
+                    r.environment_name,
+                    r.events_count,
+                    r.errors_count,
+                    r.sessions_count,
+                )
+            })
+            .collect()
     }
 }

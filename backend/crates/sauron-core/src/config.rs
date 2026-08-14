@@ -216,6 +216,26 @@ pub struct Config {
     /// Measured from `previewed_at` — the preview COMPLETING — not from the
     /// request, or a queued preview expires before it is readable.
     pub inspector_preview_ttl_secs: i64,
+
+    // --- admin data purge ---
+    /// Rows deleted per purge batch, per kind.
+    pub purge_batch_rows: i64,
+    /// Pause between purge batches, so a multi-million-row delete does not
+    /// monopolise WAL and the buffer cache against live ingest.
+    pub purge_batch_pause_ms: u64,
+    /// Rollup keys recomputed per page in the purge's second phase. Also the
+    /// size of the `IN` list sent to DuckDB for the cold half, so it bounds
+    /// both the Postgres and the Parquet side of one step.
+    pub purge_recompute_batch: i64,
+    /// Measured from `previewed_at` — the preview COMPLETING — not from the
+    /// request, for the same reason as the inspector's: a preview queued behind
+    /// a long-running purge would otherwise expire before it was readable.
+    pub purge_preview_ttl_secs: i64,
+    /// A purge job claimed longer ago than this is re-claimable (crash resume).
+    pub purge_claim_stale_secs: i64,
+    /// How recently the app must have received an event for a job to record
+    /// `ingest_active`. Only ever reported, never used to block.
+    pub purge_ingest_active_secs: i64,
     pub inspector_preview_gc_days: i64,
     /// 0 = never prune. This table grows per human action, not per rule
     /// evaluation, and it is the record a compliance question is answered from.
@@ -860,6 +880,12 @@ impl Config {
             inspector_mask_max_rows: parse("INSPECTOR_MASK_MAX_ROWS", 20_000_000),
             inspector_claim_stale_secs: parse("INSPECTOR_CLAIM_STALE_SECS", 300),
             inspector_preview_ttl_secs: parse("INSPECTOR_PREVIEW_TTL_SECS", 900),
+            purge_batch_rows: parse::<i64>("PURGE_BATCH_ROWS", 5_000).clamp(100, 100_000),
+            purge_batch_pause_ms: parse("PURGE_BATCH_PAUSE_MS", 200),
+            purge_recompute_batch: parse::<i64>("PURGE_RECOMPUTE_BATCH", 500).clamp(10, 5_000),
+            purge_preview_ttl_secs: parse("PURGE_PREVIEW_TTL_SECS", 900),
+            purge_claim_stale_secs: parse("PURGE_CLAIM_STALE_SECS", 300),
+            purge_ingest_active_secs: parse("PURGE_INGEST_ACTIVE_SECS", 300),
             inspector_preview_gc_days: parse("INSPECTOR_PREVIEW_GC_DAYS", 7),
             inspector_audit_retention_days: parse("INSPECTOR_AUDIT_RETENTION_DAYS", 0),
             inspector_audit_pii_days: parse("INSPECTOR_AUDIT_PII_DAYS", 730),
@@ -1387,6 +1413,12 @@ mod tests {
             inspector_mask_max_rows: 20_000_000,
             inspector_claim_stale_secs: 300,
             inspector_preview_ttl_secs: 900,
+            purge_batch_rows: 5_000,
+            purge_batch_pause_ms: 200,
+            purge_recompute_batch: 500,
+            purge_preview_ttl_secs: 900,
+            purge_claim_stale_secs: 300,
+            purge_ingest_active_secs: 300,
             inspector_preview_gc_days: 7,
             inspector_audit_retention_days: 0,
             inspector_audit_pii_days: 730,

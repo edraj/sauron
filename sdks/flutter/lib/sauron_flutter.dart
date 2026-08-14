@@ -7,7 +7,7 @@
 /// ```
 library;
 
-export 'src/client.dart' show SauronClient;
+export 'src/client.dart' show IdentifyPreparation, SauronClient;
 export 'src/dsn.dart' show Dsn;
 export 'src/envelope.dart'
     show

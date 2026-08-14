@@ -40,13 +40,31 @@ export class Scope {
     this.trim();
   }
 
+  /**
+   * Replace the scope user.
+   *
+   * `id` is coerced with `String()` for the same reason `SauronClient.
+   * prepareIdentify` coerces its own — a plain-JS caller can (and does) pass
+   * `setUser({ id: user.id })` where `user.id` is a number, and TypeScript
+   * cannot stop them. This path is the one that BYPASSES `identify()`'s
+   * coercion entirely, and the consequence is not cosmetic: the scope user
+   * lands in the envelope context, where the server's `distinct_id` is a
+   * non-`Option` Rust `String`. A JSON number there fails deserialization of
+   * the ENVELOPE, not of the one field — so the whole batch 400s, and a 400
+   * is non-retryable, so every event in it is dropped for good.
+   *
+   * Rebuilding the whole object (rather than merging into the existing one)
+   * is deliberate and is the behaviour the Flutter SDK was fixed to match:
+   * `email` and `traits` come from the input alone, so setting a new user
+   * never inherits the previous person's contact details.
+   */
   setUser(user: UserInput): void {
     if (user === null) {
       this.user = null;
       return;
     }
     this.user = {
-      id: user.id ?? null,
+      id: user.id === null || user.id === undefined ? null : String(user.id),
       email: user.email ?? null,
       traits: user.traits ?? {},
     };

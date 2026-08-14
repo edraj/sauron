@@ -83,7 +83,7 @@ void main() {
     await client.close();
 
     client.track('after_close');
-    client.identify('u_1');
+    await client.identify('u_1');
     client.trackTransaction(
       name: 'late',
       duration: const Duration(milliseconds: 5),

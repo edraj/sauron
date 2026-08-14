@@ -6,6 +6,8 @@
 //! is ever deleted: a partition is dropped only after its rows are verified in
 //! Parquet, which is the permanent copy.
 
+mod purge;
+
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -38,6 +40,17 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move { restore_loop(pool, cfg).await })
     };
 
+    // The admin data purge. Here rather than in `sauron-inspector` (where the
+    // mask job it is modelled on lives) because its recompute phase MUST read
+    // cold Parquet, and that binary is explicitly built not to link DuckDB.
+    // This process already links it and already owns the watermark the purge
+    // derives its boundary from.
+    let purging = {
+        let pool = pool.clone();
+        let cfg = cfg.clone();
+        tokio::spawn(async move { purge::purge_loop(pool, cfg).await })
+    };
+
     let tiering = tokio::spawn(async move {
         loop {
             if let Err(e) = cycle(&pool, &cfg, gran).await {
@@ -47,11 +60,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Neither loop returns. If either task dies the process should too, rather
-    // than silently continuing with half its job undone.
+    // No loop returns. If any task dies the process should too, rather than
+    // silently continuing with part of its job undone.
     tokio::select! {
         r = restore => warn!(?r, "restore loop exited"),
         r = tiering => warn!(?r, "tiering loop exited"),
+        r = purging => warn!(?r, "purge loop exited"),
     }
     Ok(())
 }
@@ -420,9 +434,79 @@ async fn run_one_restore(pool: &PgPool, cfg: &Config, worker_id: &str) -> anyhow
 
     match inserted {
         Ok(n) => {
+            // Heartbeat FIRST, before the repair — not after. The insert
+            // above was already the "no mid-flight progress" case this
+            // heartbeat exists for; the repair is a second, potentially heavy
+            // join-UPDATE over the same range, so leaving the heartbeat after
+            // it would extend the un-heartbeated window to insert+repair
+            // against a single `restore_lease_secs` lease, letting another
+            // worker claim it as lapsed and re-enter the resume path while
+            // this repair is still running.
             repo::beat_restore_job(&mut c, job.id, worker_id, n).await?;
-            repo::finish_restore_job(&mut c, job.id, worker_id, "succeeded", n, "").await?;
-            info!(job = %job.id, rows = n, estimate, "restore complete");
+
+            // Repair BEFORE marking the job finished, not after. A CRASH here
+            // leaves the job `running`; its lease lapses and the resume path
+            // above (`Some(existing) => ...`) deletes every row this pin id
+            // wrote — repaired or not — before re-inserting, so a crash
+            // mid-repair can never leave a partially-repaired range behind.
+            // Once the job is marked `succeeded` it is never reclaimed, so
+            // the repair MUST land before that point or it would have no
+            // recovery path at all.
+            //
+            // A HANDLED repair error (not a crash) is deliberately NOT left to
+            // propagate into the shared poison path below. That path's
+            // `job.attempts > RESTORE_MAX_ATTEMPTS` check runs BEFORE the
+            // resume block's delete, so a repair that fails on every one of
+            // the last allowed attempt's retries would otherwise strand that
+            // attempt's inserted-but-unrepaired rows live and pinned until the
+            // pin's own (operator-set, day-scale) expiry — every reader
+            // double-counting that guest for the whole window. Handled here
+            // instead: delete exactly what this pin wrote, then fail the job
+            // outright, the same immediate-failure shape the insert error arm
+            // below already uses (this is not a crash-recovery case, so it
+            // does not need the attempts-based retry machinery at all).
+            match repo::repair_restored_rows(&mut c, &job.table_name, pin_id, rs, re).await {
+                Ok(repaired) => {
+                    info!(job = %job.id, rows = n, repaired, "resolved restored guest ids at the source");
+                    repo::finish_restore_job(&mut c, job.id, worker_id, "succeeded", n, "")
+                        .await?;
+                    info!(job = %job.id, rows = n, estimate, "restore complete");
+                }
+                Err(e) => {
+                    let removed = match repo::delete_restored_rows(
+                        &mut c,
+                        &job.table_name,
+                        pin_id,
+                        rs,
+                        re,
+                    )
+                    .await
+                    {
+                        Ok(removed) => removed,
+                        Err(del_err) => {
+                            warn!(
+                                job = %job.id, error = %del_err,
+                                "failed to clean up after a repair error; rows may remain \
+                                 live and unrepaired"
+                            );
+                            0
+                        }
+                    };
+                    repo::finish_restore_job(
+                        &mut c,
+                        job.id,
+                        worker_id,
+                        "failed",
+                        0,
+                        &format!("repair failed: {e}"),
+                    )
+                    .await?;
+                    warn!(
+                        job = %job.id, error = %e, removed,
+                        "restore repair failed; discarded partial output, job failed"
+                    );
+                }
+            }
         }
         Err(e) => {
             // Leave the pin: the next attempt reuses it and deletes whatever this

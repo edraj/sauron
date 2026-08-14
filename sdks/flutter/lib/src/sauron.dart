@@ -192,8 +192,10 @@ class Sauron {
       );
 
   /// Identifies the current user.
-  static void identify(String distinctId, {Map<String, Object?>? traits}) =>
-      _client?.identify(distinctId, traits: traits);
+  static Future<void> identify(String distinctId,
+      {Map<String, Object?>? traits}) async {
+    await _client?.identify(distinctId, traits: traits);
+  }
 
   /// The persisted anonymous id this install reports until [identify] names a
   /// user, or null before [init] has completed.

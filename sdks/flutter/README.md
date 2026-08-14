@@ -71,7 +71,7 @@ layer unavailable — see [Startup ordering](#startup-ordering).
 That is enough for uncaught errors. Add analytics and manual capture anywhere:
 
 ```dart
-Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
+await Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
 Sauron.setScreen('Checkout');
 Sauron.track('checkout_completed',
     properties: <String, Object?>{'cart_value': 42.5});
@@ -582,7 +582,7 @@ Sauron.cancelWorkflow('checkout', 'payment declined 3x');
 ### `Sauron.identify`
 
 ```dart
-static void identify(String distinctId, {Map<String, Object?>? traits})
+static Future<void> identify(String distinctId, {Map<String, Object?>? traits})
 ```
 
 | Parameter | Type | Default | Description |
@@ -590,8 +590,8 @@ static void identify(String distinctId, {Map<String, Object?>? traits})
 | `distinctId` | `String` | required | Stable user id; becomes the scope user's `id` and the `distinct_id` on later events. |
 | `traits:` | `Map<String, Object?>?` | `null` | User traits. When `null`, the existing user's traits are preserved. |
 
-Returns `void`. Emits an `identify` item and updates the scope user, keeping the
-existing `email`. Never sampled.
+Returns `Future<void>` — **await it.** Emits an `identify` item and updates the
+scope user, keeping the existing `email`. Never sampled.
 
 The item carries `anonymous_id` only when the [anonymous id](#the-anonymous-id)
 was actually used as a `distinct_id` first — that is what tells the server to
@@ -600,8 +600,18 @@ anonymous activity it is `null`, deliberately: the server writes a permanent
 alias row for any non-empty `anonymous_id`, and a speculative one mis-merges two
 people forever.
 
+**Auto-reset on identity switch.** `identify()` also detects a login by a
+DIFFERENT user than last time on this device — the common case of a forgotten
+[`reset()`](#sauronreset) on logout — and mints a fresh anonymous id (and
+rotates the session id) before sending, so `anonymous_id` is `null` instead of
+an alias to the previous person. This can't undo an alias already sent under
+the old id — still call `reset()` on logout — but it bounds a missed `reset()`
+to one corrupted guest window instead of every one after it. See
+[The anonymous id](#the-anonymous-id) for where the digest this relies on is
+stored.
+
 ```dart
-Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
+await Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
 ```
 
 ### `Sauron.reset`
@@ -610,13 +620,19 @@ Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
 static Future<void> reset()
 ```
 
-Clears the scope user and mints a fresh anonymous id, persisting it.
+Clears the scope user and the last-identified record, and mints a fresh
+anonymous id and session id.
 
 **Call this on logout.** Without it the next person to use the device inherits
 the persisted anonymous id, and their first `identify` aliases that id — and
 with it the previous person's anonymous activity — onto the new account,
 permanently, server-side. Unlike the browser SDK, `setUser(null)` does *not* do
 this for you: persisting the new id is asynchronous and `setUser` is not.
+
+Rotating the session id matters too: the server's `bump_session` is
+last-write-wins on `distinct_id`, so without it one `sessions` row could
+otherwise serially represent two different people and record only whichever
+wrote last.
 
 ```dart
 await Sauron.reset();
@@ -1101,6 +1117,32 @@ retention and consent consequence, not just an implementation detail. Like the
 device id it is written during `init` on every install, error-tracking-only apps
 included; it only ever leaves the device once something is tracked without an
 identified user.
+
+Because it is durable, **not calling `reset()` on logout aliases the next
+person to the last one**: `identify()` sends the current anonymous id as
+`anonymous_id`, and the server records that alias permanently. On a shared or
+kiosk device, the next anonymous user reuses the stored `sauron.anon_id`, and
+their activity is merged into the previous account server-side, forever. There
+is no server-side undo.
+
+As a safety net for exactly that scenario, `identify()` also persists a short
+one-way digest (never the id itself) of the last user who identified, under
+`sauron.last_identified` in the same `sauron_prefs.json` file — the same key
+name and digest algorithm the browser SDK uses in `localStorage`. If the next
+`identify()` on this device is for a DIFFERENT person, the SDK detects the
+mismatch and mints a fresh anonymous id (and rotates the session id) before
+sending — so a forgotten `reset()` corrupts only that one guest window instead
+of every one from then on. This cannot undo an alias already sent under the
+old id, so still call `reset()` on logout regardless.
+
+That digest is not a security boundary — it's an unkeyed hash, so over a
+possibly low-entropy id (an email address, say) it's a confirmation oracle, not
+a secret: anyone with local read access and a guess can verify it instantly. It
+exists only so `sauron.last_identified` isn't a second plaintext copy of your
+users' ids, not to keep those ids confidential.
+
+`reset()` does NOT clear the device id (`sauron.device_id`) — that identifies
+the install, not the person.
 
 ## Stack traces & symbolication
 

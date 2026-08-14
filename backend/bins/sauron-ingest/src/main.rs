@@ -542,6 +542,19 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    // The guest → identified merge drain. One per process; several replicas
+    // share the queue safely via FOR UPDATE SKIP LOCKED.
+    //
+    // No database read here on purpose, unlike the first cut of this call —
+    // deliberately NOT eager, matching the schema probe above: `build_pool`
+    // is lazy and the edge resolves DSNs from Redis, so an ingest replica
+    // must survive a Postgres outage by buffering into the Redis stream
+    // rather than failing to start. `cfg.tier_hot_days` is passed through
+    // as the drain's fallback; `spawn_merge_worker`/`drain_once` resolve the
+    // real, operator-overridable value themselves on every pass (see their
+    // doc comments) rather than once here at boot.
+    let _merge = sauron_pipeline::merge::spawn_merge_worker(pool.clone(), cfg.tier_hot_days);
+
     let port = cfg.ingest_port;
     let max_body = cfg.ingest_max_body_bytes;
     let uds_path = cfg.ingest_uds_path.clone();

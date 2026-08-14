@@ -516,6 +516,28 @@ impl TestDb {
         sauron_db::conn(&self.pool).await.expect("checkout")
     }
 
+    /// The ephemeral database's pool, for the few APIs that take a `PgPool`
+    /// rather than a connection (`*_backfill::backfill_all`). Same database as
+    /// [`TestDb::conn`], so a test may mix the two freely.
+    pub fn pool(&self) -> &sauron_db::PgPool {
+        &self.pool
+    }
+
+    /// A raw, unpooled connection to this test's ephemeral database — for the
+    /// rare test that must hold more concurrent sessions open than the 2-slot
+    /// pool above allows (a deterministic multi-connection race test, e.g. an
+    /// advisory-lock barrier plus the two racing sides plus a probe/holder).
+    /// Session state (`pg_advisory_lock`, `pg_backend_pid()`) behaves exactly
+    /// like a pooled connection's; the only difference is it is not subject to
+    /// the pool's checkout limit, so it cannot deadlock a test against itself
+    /// the way a third `conn()` checkout against a 2-slot pool would.
+    pub async fn extra_conn(&self) -> sauron_db::AsyncPgConnection {
+        let url = swap_database(&self.admin_url, &self.db_name);
+        AsyncPgConnection::establish(&url)
+            .await
+            .expect("establish extra raw connection")
+    }
+
     /// Seed one org → project → app → two environments, then insert a known,
     /// deliberately asymmetric and richly-attributed set of rows into all four
     /// signal tables (`analytics_events`, `error_events`, `sessions`,
@@ -2079,4 +2101,248 @@ pub async fn seed_error_event_with_extra(
     )
     .await
     .expect("seed error event");
+}
+
+/// Devices whose signal mix is deliberately lopsided, for
+/// `device_env_rollup.rs`' live-vs-rollup equivalence test.
+///
+/// Seeds, on `ids.app_id`, every combination that can make the two
+/// `list_device_groups` shapes disagree while both still return plausible
+/// numbers:
+///
+/// - **events only** — 3 analytics events in `env_a`, no session and no error,
+///   so the live shape's `se`/`ee` LATERALs are NULL legs and `LEAST`/
+///   `GREATEST` must skip them rather than propagate the NULL.
+/// - **sessions only** — 2 sessions in `env_a` and nothing else, the case that
+///   only survives because the membership predicate (and the backfill's
+///   `UNION ALL`) has a sessions leg at all. Shares a descriptor tuple with the
+///   events-only device, so one group aggregates across both.
+/// - **errors only** — 1 error event in `env_a`.
+/// - **both environments** — activity in `env_a` AND `env_b`, which is the
+///   device that multiplies under a rollup join that is not pre-aggregated per
+///   device. Under `Subset(env_a, env_b)` an unaggregated join counts it twice.
+/// - **an in-window event plus an OUT-of-window session** — the only shape that
+///   can tell this endpoint's WINDOWED `sessions_count` (`count(*) FILTER (WHERE
+///   started_at >= $2)`) from the rollup's lifetime one. Every other device here
+///   has all its sessions inside any sane `since`, so the two numbers coincide
+///   and a rollup-sourced `sessions_count` passes the equivalence test — checked
+///   by mutation, not assumed. This device's analytics keep it qualifying under
+///   both shapes while its session sits ~400 days back, so the live count is 0
+///   and the rollup carries 1.
+/// - **unattributed** — analytics and a session with `environment_id IS NULL`,
+///   the `EnvFilter::Unattributed` scope. Given its OWN descriptor tuple rather
+///   than the all-NULL one: `seed_two_envs`' devices are already all-NULL (see
+///   `note_identity`, which passes `None` for every descriptor), so they supply
+///   the collapsed "Unknown" group in every scope, and leaving this device
+///   NULL too would fold the one device with a known signal mix into a group
+///   whose other members are the fixture's.
+///
+/// Written with plain `INSERT`s into the three signal tables plus
+/// `repo::bump_device`, not through the ingest write path, because the BACKFILL
+/// is what populates the rollup in that test — mirroring
+/// `device_env_rollup.rs`' own seeding.
+///
+/// All timestamps are computed from `Utc::now()` here rather than from
+/// [`SeedIds::pinned_now`]: that anchor is noon UTC of the current day, which
+/// is in the FUTURE for any run before noon, and a future `occurred_at` silently
+/// escapes every `< cutoff` aggregate.
+pub async fn seed_mixed_device_activity(conn: &mut sauron_db::PgConn, ids: &SeedIds) {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let now = Utc::now();
+    let key = |what: &str| format!("mix-{suffix}-{what}");
+
+    let events_only = key("events-only");
+    let sessions_only = key("sessions-only");
+    let errors_only = key("errors-only");
+    let both_envs = key("both-envs");
+    let null_env = key("null-env");
+    let old_session = key("old-session");
+
+    // (device_key, model, events_delta, errors_delta). `model` is what every
+    // assertion addresses a group by, and each value is unique to this fixture
+    // so it can never collide with `seed_two_envs`' own devices — which report
+    // no descriptors at all (see `note_identity`) and therefore supply the
+    // all-NULL "Unknown" group instead.
+    let fleet: [(&str, &str, i64, i64); 6] = [
+        (&events_only, "MX-1", 3, 0),
+        (&sessions_only, "MX-1", 0, 0),
+        (&errors_only, "MX-2", 0, 1),
+        (&both_envs, "MX-2", 3, 1),
+        (&null_env, "MX-3", 2, 0),
+        (&old_session, "MX-4", 1, 0),
+    ];
+    for (device_key, model, events, errors) in fleet {
+        repo::bump_device(
+            conn,
+            ids.app_id,
+            device_key,
+            Some("Mixbrand"),
+            Some(model),
+            Some("MixOS"),
+            Some("1.0"),
+            None,
+            None,
+            None,
+            now - chrono::Duration::minutes(5),
+            events,
+            errors,
+        )
+        .await
+        .expect("bump_device for the mixed fleet");
+    }
+
+    // -- analytics ---------------------------------------------------------
+    for (device_key, env, count) in [
+        (&events_only, Some(ids.env_a), 3),
+        (&both_envs, Some(ids.env_a), 1),
+        (&both_envs, Some(ids.env_b), 2),
+        (&null_env, None, 2),
+        // In-window, so this device qualifies under BOTH shapes while its only
+        // session sits far outside the window — see the doc comment.
+        (&old_session, Some(ids.env_a), 1),
+    ] {
+        for i in 0..count {
+            seed_mixed_analytics(
+                conn,
+                ids.app_id,
+                env,
+                device_key,
+                now - chrono::Duration::minutes(60 + i * 7),
+            )
+            .await;
+        }
+    }
+
+    // -- errors ------------------------------------------------------------
+    for (device_key, env) in [
+        (&errors_only, Some(ids.env_a)),
+        (&both_envs, Some(ids.env_b)),
+    ] {
+        seed_mixed_error(
+            conn,
+            ids.app_id,
+            env,
+            device_key,
+            now - chrono::Duration::minutes(45),
+        )
+        .await;
+    }
+
+    // -- sessions ----------------------------------------------------------
+    // Every session but the last starts well inside any sane `since` window.
+    // The last one is ~400 days back ON PURPOSE, and note what it is NOT: it is
+    // not a device whose ONLY signal is an out-of-window session (that device
+    // appears under the rollup and not under the live shape — the deliberate
+    // widening documented on `list_device_groups_rollup_sql`, which this fixture
+    // stays clear of so the equivalence test does not assert a documented
+    // difference away as a bug). Its device also has an in-window analytics
+    // event, so it qualifies identically under both shapes and differs only in
+    // the WINDOWED `sessions_count`: 0 live, 1 in the rollup.
+    for (n, (device_key, env, ago)) in [
+        (
+            &sessions_only,
+            Some(ids.env_a),
+            chrono::Duration::minutes(90),
+        ),
+        (
+            &sessions_only,
+            Some(ids.env_a),
+            chrono::Duration::minutes(90),
+        ),
+        (&both_envs, Some(ids.env_a), chrono::Duration::minutes(90)),
+        (&both_envs, Some(ids.env_b), chrono::Duration::minutes(90)),
+        (&null_env, None, chrono::Duration::minutes(90)),
+        (&old_session, Some(ids.env_a), chrono::Duration::days(400)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let started_at = now - ago - chrono::Duration::minutes(n as i64);
+        RunQueryDsl::execute(
+            diesel::sql_query(
+                "INSERT INTO sessions \
+                   (app_id, session_id, device_key, environment_id, started_at, last_event_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind::<SqlUuid, _>(ids.app_id)
+            .bind::<Text, _>(format!("mix-{suffix}-sess-{n}"))
+            .bind::<Text, _>(device_key.clone())
+            .bind::<diesel::sql_types::Nullable<SqlUuid>, _>(env)
+            .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(started_at + chrono::Duration::minutes(10)),
+            conn,
+        )
+        .await
+        .expect("seed mixed session");
+    }
+}
+
+async fn seed_mixed_analytics(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    env: Option<Uuid>,
+    device_key: &str,
+    occurred_at: DateTime<Utc>,
+) {
+    RunQueryDsl::execute(
+        diesel::sql_query(
+            "INSERT INTO analytics_events \
+               (id, app_id, environment_id, name, distinct_id, properties, context, \
+                occurred_at, received_at, device_key, tags, contexts, extra) \
+             VALUES (gen_random_uuid(), $1, $2, 'mix.evt', 'mix-person', '{}', '{}', \
+                     $3, now(), $4, '{}', '{}', '{}')",
+        )
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<diesel::sql_types::Nullable<SqlUuid>, _>(env)
+        .bind::<diesel::sql_types::Timestamptz, _>(occurred_at)
+        .bind::<Text, _>(device_key.to_string()),
+        conn,
+    )
+    .await
+    .expect("seed mixed analytics event");
+}
+
+async fn seed_mixed_error(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    env: Option<Uuid>,
+    device_key: &str,
+    occurred_at: DateTime<Utc>,
+) {
+    // `issue_id`/`fingerprint` are NOT NULL and `issue_id` carries an FK, so a
+    // parent issue has to exist first. One per app, upserted on a fixed
+    // fingerprint, so repeated calls reuse it.
+    let issue_id = repo::upsert_issue(
+        conn,
+        NewIssue {
+            app_id,
+            fingerprint: "mix-harness-fingerprint",
+            type_: "error",
+            title: "mix harness",
+            culprit: "mix harness",
+            level: "error",
+            first_seen: occurred_at,
+            last_seen: occurred_at,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("seed issue for the mixed fleet");
+    RunQueryDsl::execute(
+        diesel::sql_query(
+            "INSERT INTO error_events \
+               (id, app_id, environment_id, issue_id, fingerprint, level, \
+                occurred_at, received_at, device_key) \
+             VALUES (gen_random_uuid(), $1, $2, $3, 'mix-harness-fingerprint', 'error', \
+                     $4, now(), $5)",
+        )
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<diesel::sql_types::Nullable<SqlUuid>, _>(env)
+        .bind::<SqlUuid, _>(issue_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(occurred_at)
+        .bind::<Text, _>(device_key.to_string()),
+        conn,
+    )
+    .await
+    .expect("seed mixed error event");
 }
