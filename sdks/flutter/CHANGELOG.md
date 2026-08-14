@@ -1,5 +1,103 @@
 # Changelog
 
+## 1.7.0 - 2026-08-14
+
+*Minor, not patch: `identify()`'s signature change below is source-breaking
+(`void` → `Future<void>`), consistent with 1.2.0's precedent for other breaking
+changes.*
+
+- **Breaking: `Sauron.identify()` / `SauronClient.identify()` now return
+  `Future<void>` instead of `void`.**
+
+  **If you do nothing, you lose nothing.** `Sauron.identify('u_123');` with no
+  `await` still compiles — Dart doesn't require awaiting a `Future`, and `void`
+  is a top type in return position, so `void Function(String) cb =
+  Sauron.identify;` also compiles with no diagnostic. Detecting an identity
+  switch (below) needs to read persisted on-device state, so the identify item
+  is now queued after an asynchronous gap instead of synchronously.
+
+  An earlier draft of this entry claimed an un-awaited call gets "*exactly*
+  the durability an un-migrated caller already had". That is not true, and the
+  comparison it makes is not available: before this change `identify()`
+  persisted **nothing** — there was no last-identified record to write — so
+  there is no prior durability to be unchanged from. What is actually true is
+  narrower and worth stating plainly: an un-awaited `identify()` returns
+  before the switch-detection record has been written to disk, so a process
+  death in that window loses the record, and the NEXT launch cannot detect a
+  user switch. Nothing else is at risk: the identify item is queued either
+  way, and within a single process run the in-process copy of the digest
+  (`_lastIdentifiedDigest`) makes detection work even if the file write never
+  lands at all. `await` closes the window. Async is otherwise simply the
+  better shape for *new* code — most
+  prominently, code that wants `flush()` immediately after `identify()` to
+  actually include it — so it is being adopted now rather than left to a
+  future breaking release.
+
+  This is nonetheless a real break for two narrower cases:
+  - A hand-written fake or `implements SauronClient` (`void identify(...)`) is
+    a **hard compile error** (`invalid_override`) — not a silent behavior
+    change, `flutter analyze`/`dart analyze` will stop your build.
+  - Consumers on a strict lint set (e.g. `very_good_analysis`, or any config
+    enabling `discarded_futures`/`unawaited_futures`) will see new
+    diagnostics on existing `identify(...)` call sites, which fails CI under
+    `--fatal-infos` or `--fatal-warnings` until those sites are updated
+    (`await` it, or wrap in `unawaited(...)` if it's genuinely fire-and-forget).
+
+- **Auto-reset on identity switch.** `identify()` now detects a login by a
+  DIFFERENT user than last time on this device — the common case of a
+  forgotten `reset()` on logout — and mints a fresh anonymous id (and rotates
+  the session id) before sending, so `anonymous_id` is `null` instead of an
+  alias to the previous person. This can't undo an alias already sent under
+  the old id — still call `reset()` on logout — but it bounds a missed
+  `reset()` to one corrupted guest window instead of every one after it. To
+  detect the switch, `identify()` persists a short one-way digest (never the
+  raw id; see `hashIdentity` in `lib/src/context/last_identified_store.dart`)
+  of the last identified user in `<app-support>/sauron/sauron_prefs.json`
+  under `sauron.last_identified` — the same key name and digest algorithm the
+  browser SDK uses in `localStorage`. Like the anonymous id, this is a durable
+  first-party value stored on the user's device — a retention and consent
+  consequence, not just an implementation detail.
+
+  The stored value carries a format tag: `v1:<digest>`, byte-identical to what
+  the browser SDK writes under the same key. A value with no tag or an
+  unrecognised one reads as "nobody has identified on this device yet" and is
+  rewritten in the current format on the next `identify()`. That matters
+  because the digest's shape is not frozen — if it ever widens again, an
+  untagged store could not tell "a digest I no longer produce" from "a
+  different person", so every returning user's next `identify()` would be read
+  as a switch and would rotate their anonymous id and session, once, silently.
+  The tag turns that into one missed switch per device instead.
+
+  On a detected switch, `identify()` also **clears the scope user's `email`
+  and `traits`** instead of carrying the previous person's forward. The scope
+  user is attached to every envelope, so carrying them over stamped person
+  A's email onto every event, error and session recorded under person B's
+  `distinct_id` — a cross-user leak at exactly the boundary this detection
+  exists to police, and one that lasts for the whole process rather than one
+  guest window. A *same-user* re-`identify()` (adding traits, refreshing after
+  a token renewal) still carries them forward, unchanged. This matches the
+  browser SDK, whose `Scope.setUser` has always rebuilt the user from its
+  input alone.
+
+  `SauronClient.prepareIdentify` accordingly returns `IdentifyPreparation`
+  (`aliasOf` + `switched`) rather than a bare `String?`. Only relevant if you
+  call that method directly — `identify()` is unaffected. `aliasOf` alone
+  could not express the switch: it is `null` both for a switch and for the
+  ordinary "the anonymous id was never used" case.
+- `reset()` now also clears the last-identified record and rotates the
+  session id (`sessionId`). Clearing last-identified matters so the same
+  person logging back in later isn't affected by stale state; rotating the
+  session id matters because the server's `bump_session` is last-write-wins
+  on `distinct_id`, so without it a single `sessions` row could otherwise end
+  up serially representing two different people and recording only whichever
+  wrote last. Unlike the browser SDK's `session_id`, Flutter's `sessionId` was
+  never persisted to disk (it's minted fresh in memory per launch), so
+  rotating it needs no storage I/O.
+- Added `SauronClient.prepareIdentify(String id)` — the primitive `identify()`
+  calls internally to decide the alias/switch behaviour above. Public because
+  it is independently useful to call directly (e.g. to pre-warm the check
+  without sending an item yet) and to test.
+
 ## 1.6.0
 
 *Follows 1.4.0 on pub.dev directly: 1.5.0 was built but never published, and its

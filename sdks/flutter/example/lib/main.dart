@@ -96,8 +96,8 @@ class HomePage extends StatelessWidget {
     );
   }
 
-  void _identifyUser() {
-    Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
+  Future<void> _identifyUser() async {
+    await Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
     Sauron.setUser(const SauronUser(id: 'u_123', email: 'dev@example.com'));
   }
 
@@ -110,7 +110,7 @@ class HomePage extends StatelessWidget {
       ('Crash a spawned isolate', () => unawaited(_crashIsolate())),
       ('Capture manually', _captureManually),
       ('track() an event', _trackEvent),
-      ('identify() a user', _identifyUser),
+      ('identify() a user', () => unawaited(_identifyUser())),
       ('flush() now', () => unawaited(Sauron.flush())),
     ];
 

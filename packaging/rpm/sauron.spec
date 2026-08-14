@@ -8,7 +8,7 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.4.0
+Version:        1.5.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
@@ -364,6 +364,18 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Fri Aug 14 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.5.0-1
+- Admin data purge: delete signal data by app, environment and time range, then
+  recompute the affected rollups (migration 000057).
+- Guest-to-identified identity merge: a guest's history is folded into the
+  person they identify as, instead of being stranded under the anonymous id
+  (migration 000058).
+- Device/environment rollup table backing the device-groups and persons
+  environment-scoped queries, replacing the correlated scans over every event
+  partition (migration 000059).
+- Autovacuum tuning for the event tables and a transactions device/environment
+  index (migrations 000060, 000061).
+
 * Tue Aug 11 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.4.0-1
 - App store install and uninstall metrics. Daily counts are pulled from Google
   Play (monthly CSV reports from the Play Console's Cloud Storage bucket) and

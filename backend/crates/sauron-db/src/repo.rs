@@ -5210,24 +5210,6 @@ pub async fn probe_event_users_identified(conn: &mut AsyncPgConnection) -> Query
         .map(|_| ())
 }
 
-pub async fn insert_identity(
-    conn: &mut AsyncPgConnection,
-    app_id: Uuid,
-    alias_id: &str,
-    distinct_id: &str,
-) -> QueryResult<usize> {
-    diesel::insert_into(identities::table)
-        .values((
-            identities::app_id.eq(app_id),
-            identities::alias_id.eq(alias_id),
-            identities::distinct_id.eq(distinct_id),
-        ))
-        .on_conflict((identities::app_id, identities::alias_id))
-        .do_nothing()
-        .execute(conn)
-        .await
-}
-
 /// `event_users` carries no `environment_id`, so membership in a specific
 /// environment is derived the same way [`list_persons`]' membership `EXISTS`
 /// derives it — activity in `analytics_events`/`error_events`/`sessions`, any
@@ -5565,6 +5547,32 @@ struct InsertedFlag {
 /// ingest paths disagree about what a person's counters mean. `sauron-pipeline`'s
 /// equivalence test diffs `event_user_environments` between the two paths, which
 /// is what makes that a checked claim rather than an aspiration.
+///
+/// ## This table is the guest-merge span's only source, and this write is
+/// best-effort
+///
+/// `process::rollup` calls this as `let _ =` — a rollup miss must not fail an
+/// event that is already durable — and
+/// [`crate::identity_merge::fold_rollups`] sources an alias's
+/// `alias_first_seen`/`alias_last_seen`/`cold_stale` from exactly these rows.
+/// **Re-verified after the F1 fix changed how a NULL span is treated, and it
+/// still fails safe:** a TOTAL drop leaves the alias with no row here, so the
+/// fold's `moved` CTE is empty, its `s.f IS NOT NULL` guard skips the whole
+/// UPDATE, the span stays NULL and `cold_stale` stays at its conservative
+/// `TRUE` default — which `cold_alias_map`'s arm 3 keeps in the overlay. F1
+/// made that MORE conservative, not less: a later re-fold (reachable only
+/// since `rearm_merge`) now discriminates on `completed_at` as well, so such a
+/// row keeps `cold_stale = TRUE` where before F1 it was recomputed down to
+/// `FALSE` off the straggler's own recent timestamp and vanished from every
+/// arm.
+///
+/// The one shape that does NOT fail safe is a PARTIAL drop — this write
+/// failing for a guest's early events and succeeding for a later one — which
+/// gives the fold a `first_seen` newer than the guest's real activity and can
+/// compute `cold_stale = FALSE` for a guest whose oldest rows were already
+/// exported. That is pre-existing and independent of F1 (it is the first
+/// fold's arithmetic, not the re-fold's discriminator), and the `hot_days - 1`
+/// margin is the only thing absorbing it.
 #[allow(clippy::too_many_arguments)]
 pub async fn bump_person_env(
     conn: &mut AsyncPgConnection,
@@ -5598,6 +5606,55 @@ pub async fn bump_person_env(
     )
     .bind::<SqlUuid, _>(app_id)
     .bind::<Text, _>(distinct_id.to_string())
+    .bind::<Nullable<SqlUuid>, _>(environment_id)
+    .bind::<Timestamptz, _>(at)
+    .bind::<BigInt, _>(events_delta)
+    .bind::<BigInt, _>(errors_delta)
+    .bind::<BigInt, _>(sessions_delta)
+    .execute(conn)
+    .await
+}
+
+/// Single-row twin of [`crate::batch::bump_device_envs`], for the unbatched
+/// `process::rollup` path.
+///
+/// The conflict arm is identical — if one changes, both change, or the two
+/// ingest paths disagree about what a device's counters mean. `sauron-pipeline`'s
+/// equivalence test diffs `device_environments` between the two paths, which
+/// is what makes that a checked claim rather than an aspiration.
+#[allow(clippy::too_many_arguments)]
+pub async fn bump_device_env(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    device_key: &str,
+    environment_id: Option<Uuid>,
+    at: DateTime<Utc>,
+    events_delta: i64,
+    errors_delta: i64,
+    sessions_delta: i64,
+) -> QueryResult<usize> {
+    // An empty device_key has no `devices` row, so a rollup entry for it
+    // could never be joined back to a device — it would be invisible weight.
+    if device_key.is_empty() {
+        return Ok(0);
+    }
+    diesel::sql_query(
+        "INSERT INTO device_environments \
+           (app_id, device_key, environment_id, first_seen, last_seen, \
+            events_count, errors_count, sessions_count) \
+         VALUES ($1, $2, $3, $4, $4, $5, $6, $7) \
+         ON CONFLICT (app_id, device_key, \
+                      COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+         DO UPDATE SET \
+            first_seen = LEAST(device_environments.first_seen, EXCLUDED.first_seen), \
+            last_seen = GREATEST(device_environments.last_seen, EXCLUDED.last_seen), \
+            events_count = device_environments.events_count + EXCLUDED.events_count, \
+            errors_count = device_environments.errors_count + EXCLUDED.errors_count, \
+            sessions_count = device_environments.sessions_count + EXCLUDED.sessions_count, \
+            updated_at = now()",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(device_key.to_string())
     .bind::<Nullable<SqlUuid>, _>(environment_id)
     .bind::<Timestamptz, _>(at)
     .bind::<BigInt, _>(events_delta)
@@ -6755,7 +6812,7 @@ fn device_last_distinct_id_join(env: EnvFilter, bind_index: usize) -> String {
 }
 
 /// `devices` carries no `environment_id`, so a device's membership of an
-/// environment is derived from activity keyed by `device_key` in the three
+/// environment is derived from activity keyed by `device_key` in the four
 /// tables that do carry one. Shared by [`list_devices`] and
 /// [`list_device_groups`], which need the identical predicate over the
 /// identical bind index.
@@ -6788,6 +6845,28 @@ fn device_last_distinct_id_join(env: EnvFilter, bind_index: usize) -> String {
 /// activity — would still pass membership and render an all-zero row under
 /// `One(env_a)`, the exact bug this filter exists to prevent.
 ///
+/// The transactions leg carries NO time bound — like the analytics and error
+/// legs, and unlike sessions — because it has no WINDOWED aggregate of its
+/// own to protect the way `se`'s bound protects `count(*) FILTER (WHERE
+/// started_at >= $2)`; there is nothing here for a `>= $2` to guard. Added so
+/// this predicate agrees with the write path: `sauron-pipeline`'s
+/// `Acc::rollup` folds `device_environments` from THREE call sites —
+/// analytics events, error events, and transactions (with `0,0` deltas) — so
+/// a transaction-only device already gets a live rollup row from the moment
+/// it is ingested. Without this leg the live (pre-backfill) shape could not
+/// see that same device: measured `device_count` live=1, rollup=2.
+///
+/// UPDATE (fix round 1): widening membership alone was not safe. A device
+/// admitted ONLY via this leg has no row in `analytics_events`/`error_events`/
+/// `sessions`, so [`list_devices`] and [`list_device_groups_live_sql`]'s
+/// `ae`/`ee`/`se` LATERALs were all NULL for it — and `LEAST`/`GREATEST`
+/// return NULL only when EVERY argument is NULL, which `DeviceRow`/
+/// `DeviceGroupRow`'s non-nullable `first_seen`/`last_seen` cannot decode: a
+/// 500, reproduced live, not a wrong number. Both call sites now carry a
+/// fourth `tx` `LEFT JOIN LATERAL` (no count — see their own comments) folded
+/// into the same `LEAST`/`GREATEST`, so this leg is no longer the only place
+/// `transactions` is consulted.
+///
 /// Takes `&EnvFilter`, unlike the older [`device_last_distinct_id_join`] next
 /// to it: that one keeps its pre-existing owned signature rather than being
 /// reshaped, but a new function has no such constraint.
@@ -6798,11 +6877,13 @@ fn device_membership_sql(env: &EnvFilter, bind_index: usize) -> String {
     let ae_env = env.sql_fragment_for("ae", bind_index);
     let ee_env = env.sql_fragment_for("ee", bind_index);
     let se_env = env.sql_fragment_for("se", bind_index);
+    let tx_env = env.sql_fragment_for("tx", bind_index);
     format!(
         " AND ( \
             EXISTS (SELECT 1 FROM analytics_events ae WHERE ae.app_id=$1 AND ae.device_key = devices.device_key{ae_env}) \
             OR EXISTS (SELECT 1 FROM error_events ee WHERE ee.app_id=$1 AND ee.device_key = devices.device_key{ee_env}) \
             OR EXISTS (SELECT 1 FROM sessions se WHERE se.app_id=$1 AND se.device_key = devices.device_key AND se.started_at >= $2{se_env}) \
+            OR EXISTS (SELECT 1 FROM transactions tx WHERE tx.app_id=$1 AND tx.device_key = devices.device_key{tx_env}) \
           )"
     )
 }
@@ -6927,13 +7008,29 @@ pub async fn list_devices(
     // F4: `first_seen`/`last_seen`/`last_distinct_id` follow the identical
     // `All`-vs-scoped split, folded into this same variable rather than a
     // parallel one — under `All` they read straight off `d`; under
-    // `One`/`Unattributed` they extend the very `ae`/`ee` LATERALs this
+    // `One`/`Unattributed` they extend the `ae`/`ee`/`tx` LATERALs this
     // fixes' counts already join, adding `min`/`max(occurred_at)`, plus
     // [`device_last_distinct_id_join`] for `last_distinct_id` (see its own
     // doc comment). `LEAST`/`GREATEST` ignore `NULL` arguments (Postgres's
     // documented behaviour), so a device that qualifies via only one of
-    // `ae`/`ee`/`se` (e.g. `session_only_device_key`, sessions alone) still
-    // gets a real value from the other two `NULL` legs.
+    // `ae`/`ee`/`se`/`tx` (e.g. `session_only_device_key`, sessions alone)
+    // still gets a real value from the others.
+    //
+    // FIX ROUND 1 (Task 11): `tx` is a fourth `LEFT JOIN LATERAL`, over
+    // `transactions`, added alongside `ae`/`ee`. It carries NO `cnt` — a
+    // transaction is neither an event nor an error, so it must never touch
+    // `events_count`/`errors_count`, only `first_seen`/`last_seen` via the
+    // `LEAST`/`GREATEST` below. It is NOT optional: `device_membership_sql`'s
+    // transactions leg (added earlier in Task 11) admits a device whose ONLY
+    // signal is a transaction into `d` — and such a device has no row in
+    // `analytics_events`/`error_events`/`sessions` at all, so `ae`/`ee`/`se`
+    // are ALL NULL for it. Postgres's `LEAST`/`GREATEST` return NULL only
+    // when EVERY argument is NULL — exactly this case — and `DeviceRow`
+    // declares `first_seen`/`last_seen` non-nullable `Timestamptz`, so that
+    // NULL does not render a wrong number, it fails to DESERIALIZE: widening
+    // membership without also widening these two LATERALs turned a
+    // transaction-only device into a 500, reproduced live. Same reasoning,
+    // same fix, applies verbatim to `list_device_groups_live_sql` below.
     let (scoped_select, scoped_join) = if matches!(scope.env, EnvFilter::All) {
         (
             "d.events_count AS events_count, d.errors_count AS errors_count, \
@@ -6951,8 +7048,8 @@ pub async fn list_devices(
         (
             "COALESCE(ae.cnt, 0)::bigint AS events_count, \
              COALESCE(ee.cnt, 0)::bigint AS errors_count, \
-             LEAST(ae.min_occurred, ee.min_occurred, se.min_started) AS first_seen, \
-             GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event) AS last_seen, \
+             LEAST(ae.min_occurred, ee.min_occurred, se.min_started, tx.min_occurred) AS first_seen, \
+             GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event, tx.max_occurred) AS last_seen, \
              ld.distinct_id AS last_distinct_id"
                 .to_string(),
             format!(
@@ -6965,7 +7062,12 @@ pub async fn list_devices(
                      SELECT count(*) AS cnt, min(occurred_at) AS min_occurred, \
                             max(occurred_at) AS max_occurred FROM error_events \
                      WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
-                 ) ee ON TRUE{ld_join}"
+                 ) ee ON TRUE \
+                 LEFT JOIN LATERAL ( \
+                     SELECT min(occurred_at) AS min_occurred, \
+                            max(occurred_at) AS max_occurred FROM transactions \
+                     WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
+                 ) tx ON TRUE{ld_join}"
             ),
         )
     };
@@ -7038,6 +7140,18 @@ pub async fn list_devices(
     // three other tables. If this becomes a measured problem in production the
     // answer is a materialized per-(device, environment) rollup, not an index
     // and not a second code path here.
+    //
+    // IT DID BECOME A MEASURED PROBLEM, and that rollup now exists —
+    // `device_environments`, read by [`list_device_groups_rollup_sql`]. It was
+    // `list_device_groups` that measured it (4,639ms under `One(env)` on a
+    // 13,333-qualifying-device fixture, versus 596ms unscoped), and that
+    // function is the only reader so far; THIS function has NOT been moved onto
+    // the rollup, so everything above still describes it exactly. The "second
+    // code path" the paragraph above rejects was accepted over there, with a
+    // per-app backfill marker bounding how long both shapes must coexist —
+    // whoever moves `list_devices` too inherits that trade, plus one this
+    // function alone has: `last_distinct_id` is not in the rollup and would
+    // still need [`device_last_distinct_id_join`].
     //
     // The `se` LATERAL's `since` bound moved from a `WHERE` clause to a
     // `count(*) FILTER (...)` — F4 needs `min(started_at)`/`max(last_event_at)`
@@ -7132,13 +7246,31 @@ pub struct DeviceGroupRow {
 /// legs. Paging is on the outer query, after `GROUP BY`, because every
 /// qualifying device must be visible to the aggregate.
 ///
-/// Cost, stated rather than discovered: the count LATERALs run for every
-/// qualifying device in the window, not just the 50 on screen. Each is an index
-/// probe — `sessions_app_device_started_idx`, `analytics_events_app_device_idx`,
-/// `error_events_app_device_idx` — and this is the accepted price of paging
-/// over groups. No sortable column here has an index behind it: the aggregates
-/// cannot, and `last_seen`'s `devices_app_last_seen_idx` cannot survive the
-/// `GROUP BY` either. Deliberate — the sort runs over one app's descriptor
+/// TWO SHAPES, chosen per app by `device_env_backfill::is_backfilled`:
+/// [`list_device_groups_rollup_sql`] once that app's `device_environments`
+/// backfill has completed, [`list_device_groups_live_sql`] until then. Both
+/// return identical rows — `tests/device_env_rollup.rs`'
+/// `rollup_and_live_shapes_return_identical_rows` is what holds that true — so
+/// the only thing separating them is cost.
+///
+/// Cost, stated rather than discovered. The live shape's membership `EXISTS`
+/// run for every device in the window and its count LATERALs for every
+/// *qualifying* device, not just the 50 on screen; `GROUP BY` then collapses
+/// them into ~40 rows, so `limit` bounds nothing. Each probe is an index probe
+/// — `sessions_app_device_started_idx`, `analytics_events_app_device_idx`,
+/// `error_events_app_device_idx` — but there are O(devices) of them across
+/// every event partition, which is why this measured 4,639ms under `One(env)`
+/// against 596ms unscoped on a 13,333-qualifying-device fixture. The rollup
+/// shape replaces the three membership `EXISTS` and the two count LATERALs
+/// with one hash join against `device_environments`: 105ms on that same
+/// fixture, zero row differences in either direction. `sessions_count` stays a
+/// live LATERAL in BOTH shapes — see [`list_device_groups_rollup_sql`] for why
+/// that is deliberate and what sourcing it from the rollup would silently
+/// change.
+///
+/// No sortable column here has an index behind it in either shape: the
+/// aggregates cannot, and `last_seen`'s `devices_app_last_seen_idx` cannot
+/// survive the `GROUP BY`. Deliberate — the sort runs over one app's descriptor
 /// groups, of which there are far fewer than devices.
 ///
 /// The `All`-vs-scoped source split is `list_devices`' unchanged: durable
@@ -7159,18 +7291,88 @@ pub async fn list_device_groups(
 ) -> QueryResult<Vec<DeviceGroupRow>> {
     let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
 
+    // Two shapes until every deployment is backfilled. The marker is per-app and
+    // is written in the same transaction as that app's backfill aggregate, so it
+    // can never be visible before the data it claims — a marker that ran ahead of
+    // its data would make this page quiet-wrong rather than error.
+    //
+    // The bind list below is IDENTICAL for both shapes — `$1` app_id, `$2`
+    // since, `$3` pattern, `$4` limit, `$5` offset, `$6` env — which is what
+    // lets one `bind` chain serve both. Change a bind in either shape and this
+    // is the other place to change.
+    let q = if crate::device_env_backfill::is_backfilled(conn, scope.app_id).await? {
+        list_device_groups_rollup_sql(&scope.env, &sort)
+    } else {
+        list_device_groups_live_sql(&scope.env, &sort)
+    };
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(since)
+        .bind::<Text, _>(pattern)
+        .bind::<BigInt, _>(limit)
+        .bind::<BigInt, _>(offset);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    stmt.get_results(conn).await
+}
+
+/// The exact SQL [`list_device_groups`] executes, exposed so tests can assert on
+/// the emitted shape.
+///
+/// Two shapes now exist and the only thing separating "correct but O(devices)"
+/// from "correct and bounded" is which one is emitted; a behavioural test cannot
+/// tell them apart, because they return identical rows.
+pub fn list_device_groups_sql_for_test(env: EnvFilter) -> String {
+    list_device_groups_live_sql(&env, &group_sort_for_test())
+}
+
+/// Companion to [`list_device_groups_sql_for_test`] for the rollup shape.
+pub fn list_device_groups_rollup_sql_for_test(env: EnvFilter) -> String {
+    list_device_groups_rollup_sql(&env, &group_sort_for_test())
+}
+
+/// The default group sort — `last_seen DESC` with the four `GROUP BY` columns as
+/// tiebreak — matching what `routes::devices::group_sort_spec` builds for an
+/// absent `sort` parameter. Built rather than cloned: [`SortSpec`] is
+/// deliberately not `Clone`.
+fn group_sort_for_test() -> SortSpec {
+    SortSpec {
+        column: "last_seen",
+        descending: true,
+        tiebreak: "d.family, d.model, d.os_name, d.os_version",
+        nulls_last: false,
+    }
+}
+
+/// The pre-rollup shape: membership derived per device by three `EXISTS`, counts
+/// and extrema by three LATERALs, all before `GROUP BY`. Read for apps whose
+/// `device_environments` backfill has not completed — see [`list_device_groups`].
+///
+/// Only `env` and `sort` are parameters: `search` reaches the SQL solely as the
+/// `$3` bind, never as interpolated text, so the emitted string does not vary
+/// with it.
+fn list_device_groups_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
     // $1 app_id, $2 since, $3 pattern, $4 limit, $5 offset, env takes $6.
     // Identical layout to `list_devices`, so the shared SQL fragments below can
     // be copied across without renumbering.
-    let env_sql = scope.env.sql_fragment(6);
+    let env_sql = env.sql_fragment(6);
 
     // Shared with `list_devices` — see Step 0. Same predicate, same bind index.
-    let membership_sql = device_membership_sql(&scope.env, 6);
+    let membership_sql = device_membership_sql(env, 6);
 
     // The aggregate wraps whichever source `list_devices` would have selected.
     // `device_last_distinct_id_join` is deliberately NOT joined here — see
     // `DeviceGroupRow`'s doc comment.
-    let (scoped_select, scoped_join) = if matches!(scope.env, EnvFilter::All) {
+    //
+    // FIX ROUND 1 (Task 11): `tx`, a fourth `LEFT JOIN LATERAL` over
+    // `transactions` — no `cnt`, folded only into `first_seen`/`last_seen` —
+    // mirrors `list_devices`' identical addition; see that function's F4
+    // comment for the full account of why it is required rather than
+    // optional (a group made ENTIRELY of transaction-only devices left
+    // `ae`/`ee`/`se` all NULL, and `DeviceGroupRow.first_seen`/`last_seen`
+    // are non-nullable — this shape 500'd, reproduced live, before this
+    // LATERAL existed).
+    let (scoped_select, scoped_join) = if matches!(env, EnvFilter::All) {
         (
             "sum(d.events_count)::bigint AS events_count, \
              sum(d.errors_count)::bigint AS errors_count, \
@@ -7183,8 +7385,8 @@ pub async fn list_device_groups(
         (
             "COALESCE(sum(ae.cnt), 0)::bigint AS events_count, \
              COALESCE(sum(ee.cnt), 0)::bigint AS errors_count, \
-             min(LEAST(ae.min_occurred, ee.min_occurred, se.min_started)) AS first_seen, \
-             max(GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event)) AS last_seen"
+             min(LEAST(ae.min_occurred, ee.min_occurred, se.min_started, tx.min_occurred)) AS first_seen, \
+             max(GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event, tx.max_occurred)) AS last_seen"
                 .to_string(),
             format!(
                 " LEFT JOIN LATERAL ( \
@@ -7196,7 +7398,12 @@ pub async fn list_device_groups(
                      SELECT count(*) AS cnt, min(occurred_at) AS min_occurred, \
                             max(occurred_at) AS max_occurred FROM error_events \
                      WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
-                 ) ee ON TRUE"
+                 ) ee ON TRUE \
+                 LEFT JOIN LATERAL ( \
+                     SELECT min(occurred_at) AS min_occurred, \
+                            max(occurred_at) AS max_occurred FROM transactions \
+                     WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
+                 ) tx ON TRUE"
             ),
         )
     };
@@ -7226,7 +7433,7 @@ pub async fn list_device_groups(
     // a repeated ORDER BY key is a no-op in Postgres, and one code path for
     // every column beats special-casing two of them.
     let order_by = sort.order_by();
-    let q = format!(
+    format!(
         "SELECT d.family, d.model, d.os_name, d.os_version, \
                 count(*)::bigint AS device_count, \
                 {scoped_select}, \
@@ -7246,22 +7453,143 @@ pub async fn list_device_groups(
          GROUP BY d.family, d.model, d.os_name, d.os_version \
          ORDER BY {order_by} \
          LIMIT $4 OFFSET $5"
-    );
-    let mut stmt = diesel::sql_query(q)
-        .into_boxed()
-        .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
-        .bind::<Text, _>(pattern)
-        .bind::<BigInt, _>(limit)
-        .bind::<BigInt, _>(offset);
-    stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.get_results(conn).await
+    )
+}
+
+/// The rollup shape, read for apps whose `device_environments` backfill has
+/// completed.
+///
+/// `device_environments` carries one row per (device, environment) with the
+/// counts and both timestamps already computed, so the two count LATERALs and
+/// the three membership `EXISTS` all collapse into one join. Measured on a
+/// 13,333-qualifying-device fixture: 4,639ms -> 105ms, zero row differences in
+/// either direction.
+///
+/// THREE things must not drift from [`list_device_groups_live_sql`]:
+///
+/// 1. **`sessions_count` stays live.** It is the one count this endpoint
+///    WINDOWS (`count(*) FILTER (WHERE started_at >= $2)`) while `events_count`
+///    and `errors_count` are lifetime — an inconsistency that predates this
+///    work and is preserved deliberately rather than quietly fixed. Sourcing it
+///    from the rollup measured 36ms instead of 105ms and changed the number on
+///    40 of 40 rows. `sessions` is not partitioned, so the surviving LATERAL is
+///    one index probe per device against the old 45. The pre-aggregating
+///    subquery below therefore does not even select `sessions_count`: the
+///    column cannot leak into this shape by a later `sum(de.…)` edit because it
+///    is not in scope to be summed.
+/// 2. **`first_seen`/`last_seen` keep the `All`-vs-scoped split.** Under `All`
+///    they read the durable `devices` columns exactly as the live shape does.
+///    Deriving them from the rollup under `All` too would be defensible in
+///    isolation, but it would silently change what an unscoped page displays on
+///    the day an operator runs the backfill — a number moving with no code
+///    deploy behind it.
+/// 3. **The output aliases keep these exact names** — `device_count`,
+///    `events_count`, `errors_count`, `sessions_count`, `first_seen`,
+///    `last_seen` — because `routes::devices::group_sort_spec` emits them
+///    unqualified and Postgres resolves a bare ORDER BY name against the select
+///    list. Rename one and the sort silently falls back to a different column.
+///
+/// Membership is now the join itself: a device with no row for this environment
+/// does not join. That is very slightly WIDER than the live predicate, whose
+/// sessions leg is bounded by `since` — a device whose only environment signal
+/// is a session older than the window would newly appear. Not observed on the
+/// measurement fixture (every device there had all three signal kinds); called
+/// out because it is a real difference, not a proven-absent one.
+fn list_device_groups_rollup_sql(env: &EnvFilter, sort: &SortSpec) -> String {
+    // The join must not multiply a device by its environments, so the rollup is
+    // pre-aggregated per device BEFORE it reaches the group. Under
+    // `One`/`Unattributed` the filter admits a single row per device and that
+    // grouping is a no-op; under `Subset` it is load-bearing, and this is the
+    // one place the device rollup diverges from its persons twin's plan.
+    //
+    // WITHOUT it, `Subset` — a real scope, produced by `authorize_env` for a
+    // caller holding environment grants, and exercised by
+    // `tests/env_scoping.rs` — silently doubles `device_count` and
+    // `sessions_count` for every device active in two admitted environments:
+    // the device joins once per rollup row, `count(*)` counts join output rows
+    // rather than devices, and the `se` LATERAL re-runs and re-sums per copy.
+    // `events_count`/`errors_count` stay right, which is what makes it a quiet
+    // wrong answer rather than an obviously broken page. Under `All` the rollup
+    // is not consulted at all (invariant 2 above), so `All` needs no join and
+    // gets none.
+    let (scoped_select, scoped_join) = if matches!(env, EnvFilter::All) {
+        (
+            "sum(d.events_count)::bigint AS events_count, \
+             sum(d.errors_count)::bigint AS errors_count, \
+             min(d.first_seen) AS first_seen, \
+             max(d.last_seen) AS last_seen"
+                .to_string(),
+            String::new(),
+        )
+    } else {
+        let de_env = env.sql_fragment(6);
+        (
+            "COALESCE(sum(de.events_count), 0)::bigint AS events_count, \
+             COALESCE(sum(de.errors_count), 0)::bigint AS errors_count, \
+             min(de.first_seen) AS first_seen, \
+             max(de.last_seen) AS last_seen"
+                .to_string(),
+            format!(
+                " JOIN ( \
+                     SELECT app_id, device_key, \
+                            sum(events_count)::bigint AS events_count, \
+                            sum(errors_count)::bigint AS errors_count, \
+                            min(first_seen) AS first_seen, \
+                            max(last_seen) AS last_seen \
+                     FROM device_environments \
+                     WHERE app_id = $1{de_env} \
+                     GROUP BY app_id, device_key \
+                 ) de ON de.app_id = d.app_id AND de.device_key = d.device_key"
+            ),
+        )
+    };
+    // Same ORDER BY reasoning as the live shape — read that block comment; it
+    // applies verbatim, because these two shapes deliberately emit the same
+    // output aliases.
+    let order_by = sort.order_by();
+    format!(
+        "SELECT d.family, d.model, d.os_name, d.os_version, \
+                count(*)::bigint AS device_count, \
+                {scoped_select}, \
+                COALESCE(sum(se.cnt), 0)::bigint AS sessions_count \
+         FROM ( \
+             SELECT * FROM devices \
+             WHERE app_id = $1 AND last_seen >= $2 \
+               AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
+                    COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3 \
+         ) d{scoped_join} \
+         LEFT JOIN LATERAL ( \
+             SELECT count(*) FILTER (WHERE started_at >= $2) AS cnt \
+             FROM sessions \
+             WHERE app_id = $1 AND device_key = d.device_key{se_env} \
+         ) se ON TRUE \
+         GROUP BY d.family, d.model, d.os_name, d.os_version \
+         ORDER BY {order_by} \
+         LIMIT $4 OFFSET $5",
+        // Both `de` and `se` reference bind `$6`: `bind_env!` binds it once and
+        // Postgres allows a parameter to appear any number of times.
+        se_env = env.sql_fragment(6),
+    )
 }
 
 /// `devices` carries no `environment_id`, so membership is derived the same
-/// way [`list_devices`]' membership `EXISTS` derives it — activity in
-/// `analytics_events`/`error_events`/`sessions`, keyed by `device_key`.
-/// Omitted under `All`, same reasoning.
+/// way [`device_membership_sql`] (shared by [`list_devices`]/
+/// [`list_device_groups`]) derives it — activity keyed by `device_key` in
+/// `analytics_events`/`error_events`/`sessions`/`transactions`. Omitted under
+/// `All`, same reasoning.
+///
+/// NOT a call to that shared function, though: this is a separate,
+/// independently maintained copy of the same four-leg shape — a standing,
+/// user-approved decision for this feature, not an oversight to unify. Two
+/// things here the shared helper's signature does not support: bind index
+/// `$3` for env, not `$6` (no `since`/pattern/limit/offset ahead of it), and
+/// — because there is no `since` at all — none of the four legs carry a time
+/// bound, where the shared helper's sessions leg always does. The cost of
+/// the duplication is not hypothetical: this copy missed the transactions
+/// leg the shared function gained in Task 11 fix round 1, so for one round a
+/// transaction-only device was admitted by `/devices` (the shared predicate)
+/// and 404'd on click (this stale one) — fixed in round 2. Anyone adding a
+/// future leg to one has to remember the other two.
 ///
 /// Returns [`DeviceRow`], not the raw [`Device`] model, and is raw SQL rather
 /// than the diesel query builder `list_devices` used to be — both follow from
@@ -7289,20 +7617,23 @@ pub async fn get_device(
     // aliased and the correlated column qualified with that alias, so an
     // unqualified name colliding with the outer `devices` row is a hard query
     // error rather than a silent always-true tautology. No `started_at` bound
-    // on the sessions leg — unlike `list_devices`, this function has no
-    // `since` parameter to bound it against; a single-identity lookup has no
-    // notion of a page's time window.
+    // on the sessions leg, and — same reason — no bound on the transactions
+    // leg below either: unlike `list_devices`, this function has no `since`
+    // parameter to bound either of them against; a single-identity lookup
+    // has no notion of a page's time window.
     let membership_sql = if matches!(scope.env, EnvFilter::All) {
         String::new()
     } else {
         let ae_env = scope.env.sql_fragment_for("ae", 3);
         let ee_env = scope.env.sql_fragment_for("ee", 3);
         let se_env = scope.env.sql_fragment_for("se", 3);
+        let tx_env = scope.env.sql_fragment_for("tx", 3);
         format!(
             " AND ( \
                 EXISTS (SELECT 1 FROM analytics_events ae WHERE ae.app_id=$1 AND ae.device_key = devices.device_key{ae_env}) \
                 OR EXISTS (SELECT 1 FROM error_events ee WHERE ee.app_id=$1 AND ee.device_key = devices.device_key{ee_env}) \
                 OR EXISTS (SELECT 1 FROM sessions se WHERE se.app_id=$1 AND se.device_key = devices.device_key{se_env}) \
+                OR EXISTS (SELECT 1 FROM transactions tx WHERE tx.app_id=$1 AND tx.device_key = devices.device_key{tx_env}) \
               )"
         )
     };
@@ -7313,6 +7644,16 @@ pub async fn get_device(
     // No `since` bound anywhere in this function (single-identity lookup, no
     // page window), so — unlike `list_devices` — the `se` LATERAL needs no
     // `FILTER` trick: its `min`/`max` were already unbounded.
+    //
+    // FIX ROUND 2 (Task 11): `tx`, a fourth `LEFT JOIN LATERAL` over
+    // `transactions` — no `cnt`, folded only into `first_seen`/`last_seen` —
+    // added for the identical reason `list_devices`/`list_device_groups_live_sql`
+    // needed one in fix round 1. This function's own membership predicate
+    // above just gained a transactions leg, so it now ADMITS a
+    // transaction-only device; without this LATERAL, `ae`/`ee`/`se` would be
+    // all NULL for one, and `DeviceRow.first_seen`/`last_seen` are
+    // non-nullable `Timestamptz` — membership without this LATERAL turns a
+    // 404 into the same `UnexpectedNullError` 500 round 1 fixed elsewhere.
     let (scoped_select, scoped_join) = if matches!(scope.env, EnvFilter::All) {
         (
             "d.events_count AS events_count, d.errors_count AS errors_count, \
@@ -7327,8 +7668,8 @@ pub async fn get_device(
         (
             "COALESCE(ae.cnt, 0)::bigint AS events_count, \
              COALESCE(ee.cnt, 0)::bigint AS errors_count, \
-             LEAST(ae.min_occurred, ee.min_occurred, se.min_started) AS first_seen, \
-             GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event) AS last_seen, \
+             LEAST(ae.min_occurred, ee.min_occurred, se.min_started, tx.min_occurred) AS first_seen, \
+             GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event, tx.max_occurred) AS last_seen, \
              ld.distinct_id AS last_distinct_id"
                 .to_string(),
             format!(
@@ -7341,7 +7682,12 @@ pub async fn get_device(
                      SELECT count(*) AS cnt, min(occurred_at) AS min_occurred, \
                             max(occurred_at) AS max_occurred FROM error_events \
                      WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
-                 ) ee ON TRUE{ld_join}"
+                 ) ee ON TRUE \
+                 LEFT JOIN LATERAL ( \
+                     SELECT min(occurred_at) AS min_occurred, \
+                            max(occurred_at) AS max_occurred FROM transactions \
+                     WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
+                 ) tx ON TRUE{ld_join}"
             ),
         )
     };
@@ -10008,6 +10354,177 @@ pub async fn delete_restored_rows(
     Ok(n as i64)
 }
 
+/// Resolve restored rows' guest ids back to the merged person, at the source.
+///
+/// `restore_to_postgres` copies rows out of Parquet unmodified — Parquet is
+/// immutable, so a merge's `rewrite_hot_rows` (which only ever `UPDATE`s LIVE
+/// Postgres rows) could never have reached them. Without this repair, a
+/// restored row keeps the guest's `distinct_id` forever, and every
+/// `count(DISTINCT distinct_id)` reader — `active_users_by_day_hot`,
+/// `user_stats`, `active_user_series`, `screen_stats`, both `users_seen`
+/// rollup reads, and any future one — counts the guest and the person as two
+/// people again, silently reverting every merge that touched the restored
+/// range.
+///
+/// An earlier version of this fix taught ONE reader (`active_users_by_day`)
+/// a read-time overlay instead. Reverted: it left the other five readers
+/// broken, AND (because `normalize` merges a restore abutting or crossing the
+/// watermark into the WHOLE natural hot half) its blast radius on the one
+/// reader it did fix could reach every live above-watermark row, not just the
+/// restored ones. Repairing the row once, here, fixes every reader there
+/// ever was or will be, with no per-reader special case and no risk of a
+/// join spreading onto ordinary hot data.
+///
+/// Scoped by `restored_pin_id` AND the pin's time range — same reasoning as
+/// [`delete_restored_rows`]: the pin id alone is correct but forces a seq
+/// scan of every partition on a very large table, and the range predicate
+/// prunes to the ones the restore actually touched.
+///
+/// ## Idempotent
+///
+/// After this runs, every touched row's `distinct_id` holds the PERSON id,
+/// never an alias — and `identity_merges`' own claim-time guard
+/// (`a_target_cannot_become_an_alias_and_vice_versa` in `identity_merge.rs`)
+/// means a person id can never later become somebody else's `alias_id`. So a
+/// second run of this exact statement matches zero rows, permanently, not
+/// just on the very next run. Same property [`crate::identity_merge::rewrite_hot_rows`]
+/// documents and relies on for the identical reason.
+///
+/// ## No `state` filter, deliberately — but 'dead' needs its own reasoning
+///
+/// This does NOT filter on `identity_merges.state`. For `pending`/`running`/
+/// `failed`, the merge's own `rewrite_hot_rows` will sweep these same rows
+/// again anyway — that sweep is unbounded by time and matches on plain
+/// `distinct_id = alias`, regardless of when the row arrived — so resolving
+/// eagerly here is both correct (the alias genuinely does belong to this
+/// person, in-flight or not) and harmless (whichever of this repair or the
+/// merge's own eventual sweep runs second finds nothing left to do).
+///
+/// `dead` is different: `claim_next` only reclaims `'pending'`, `'failed'`,
+/// or `'running'` rows, so a `dead` merge's `rewrite_hot_rows` sweep will
+/// NEVER run again. This repair still resolves a `dead` merge's restored
+/// rows — correctly, since the claimed alias→person mapping in
+/// `identity_merges` is truthful independent of whether the merge job
+/// itself ever finished retrying — and for the restored subset specifically,
+/// this repair is likely the ONLY resolution those rows will ever get. Their
+/// non-restored hot siblings may remain unresolved forever, carrying the
+/// alias id — a pre-existing consequence of the merge going `dead`, not
+/// something this repair causes or worsens; it only ever moves a row
+/// TOWARD correctness, never away from it.
+///
+/// ## Chain guard — a chain is representable in the DATA, not reachable
+/// through the claim path
+///
+/// This paragraph used to say `claim_identity_locked`'s guards "check
+/// `identities`, not `identity_merges`", and that they were therefore blind
+/// to a chain a Persons purge had opened up (purge Persons → `identities`
+/// empties → a later `identify()` claiming `B→C` passes cleanly →
+/// `identity_merges` holds BOTH `A→B` and `B→C`). **That route is closed**:
+/// `claim_identity_locked` now evaluates all four `NOT EXISTS` legs over
+/// BOTH tables, so the surviving `A→B` queue row refuses the `B→C` claim
+/// even though its `identities` twin is gone. Do not reintroduce that
+/// example — it now describes a claim that returns
+/// [`crate::identity_merge::Claim::Chain`].
+///
+/// The guard below is still justified, on narrower grounds. A chain remains
+/// representable in this table, just not writable through the claim path:
+///
+/// * **Rows that predate the guard.** Nothing retro-validates
+///   `identity_merges`; a deployment that ran the purge-then-claim sequence
+///   before the guards covered this table still holds the resulting pair, and
+///   no migration removes it.
+/// * **Writers that are not `claim_identity_locked`.** A hand-written
+///   backfill, an admin `UPDATE`, or a future re-enqueue path inserts here
+///   without ever consulting a guard.
+///
+/// The `NOT EXISTS` below is the same guard
+/// [`crate::identity_merge::cold_alias_map`] carries, over the identical
+/// table, for the identical reason — and this reader is the one whose failure
+/// mode is worst, because a partial resolution here is WRITTEN BACK into the
+/// events rather than merely returned:
+///
+/// Without it, a chained row is resolved ONE level per run: the first run
+/// of this statement turns `A→B` into a row whose `distinct_id` is `B` (not
+/// yet the eventual `C`), and only a SECOND run — of a chain that by then
+/// looks unremarkable — would advance it to `C`. That breaks the
+/// idempotence claim above outright (a second run would NOT match zero
+/// rows) and, worse, can silently stop one level short of the true person
+/// if nothing ever triggers that second run.
+///
+/// With the guard, a chained row's `alias_id` (`B`, which is itself
+/// somebody's `distinct_id`/target) is excluded from the join entirely — so
+/// a chain is skipped, not half-resolved. The guest stays unresolved in the
+/// restored range until whatever breaks the chain (a `NOT EXISTS`-covered
+/// state) changes. Leaving a guest unresolved is the conservative
+/// direction this whole feature already treats as safe (see the `state <>
+/// 'done'` prune `cold_alias_map` refuses to apply eagerly); resolving it
+/// PARTWAY is not, because it reports a wrong-but-plausible person instead
+/// of an honestly-unresolved guest.
+///
+/// ## Rollups are NOT touched here, on purpose
+///
+/// `event_users`/`event_user_environments` were already folded into the
+/// person when the merge ran (`fold_rollups`). A restore only copies EVENT
+/// rows back from Parquet; re-folding here would re-apply a fold that
+/// already happened and double every counter. This repair is signal tables
+/// only.
+///
+/// `table` MUST come from [`RESTORABLE_TABLES`] — interpolated, same
+/// constraint as [`delete_restored_rows`]. `analytics_events`/`error_events`
+/// also carry `guest_alias`, so those two set it to the row's OWN
+/// (pre-update) `distinct_id` in the same statement — matching
+/// [`crate::identity_merge::rewrite_hot_rows`]'s shape exactly.
+/// `transactions` has no `guest_alias` column, so only `distinct_id` moves
+/// there.
+///
+/// ## Known gap: no backfill
+///
+/// This repair only runs for restores executed AFTER this code shipped
+/// (`bins/sauron-tier/src/main.rs::run_one_restore` is the one caller). Any
+/// range restored before this code existed keeps its rows carrying the
+/// guest's alias id permanently — nothing sweeps already-restored ranges
+/// retroactively. Low impact today (nothing has shipped this feature yet),
+/// but a real, disclosed gap rather than a silently-assumed-fixed one.
+pub async fn repair_restored_rows(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    pin_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> QueryResult<u64> {
+    if !is_restorable_table(table) {
+        return Err(diesel::result::Error::QueryBuilderError(
+            format!("refusing to repair restored rows on non-restorable table {table}").into(),
+        ));
+    }
+    // Postgres evaluates every SET expression in an UPDATE against the row's
+    // PRE-update values, so `guest_alias = e.distinct_id` here captures the
+    // alias — the same simultaneous-evaluation semantics `rewrite_hot_rows`'
+    // own `SET distinct_id = $3, guest_alias = $2` relies on, just reading the
+    // alias from the row instead of from a bind.
+    let set_clause = if table == "analytics_events" || table == "error_events" {
+        "distinct_id = m.distinct_id, guest_alias = e.distinct_id"
+    } else {
+        "distinct_id = m.distinct_id"
+    };
+    let n = diesel::sql_query(format!(
+        "UPDATE {table} e SET {set_clause} \
+           FROM identity_merges m \
+          WHERE e.restored_pin_id = $1 \
+            AND e.occurred_at >= $2 AND e.occurred_at < $3 \
+            AND m.app_id = e.app_id \
+            AND m.alias_id = e.distinct_id \
+            AND NOT EXISTS (SELECT 1 FROM identity_merges c \
+                             WHERE c.app_id = m.app_id AND c.alias_id = m.distinct_id)"
+    ))
+    .bind::<SqlUuid, _>(pin_id)
+    .bind::<Timestamptz, _>(start)
+    .bind::<Timestamptz, _>(end)
+    .execute(conn)
+    .await?;
+    Ok(n as u64)
+}
+
 /// One pin whose expiry has passed, together with what removing it reclaimed.
 #[derive(Debug, Clone)]
 pub struct ExpiredPin {
@@ -10350,6 +10867,50 @@ pub async fn get_restore_job(
 /// Create a range partition if it does not already exist. `table`/`suffix` are
 /// internal identifiers (never user input); timestamps are formatted as ISO
 /// literals because partition bounds cannot be bound parameters in DDL.
+///
+/// Every new leaf carries the SAME autovacuum tuning migration
+/// `2026-08-13-000060` applied, one time, to every partition that existed
+/// before it — `(autovacuum_vacuum_scale_factor = 0.0,
+/// autovacuum_vacuum_threshold = 20)`. See that migration's comment for the
+/// full measurement (a single guest's `identity_merge::rewrite_hot_rows`
+/// merge left `Heap Fetches: 1974` where it was `0` before, on a partition
+/// far below the DEFAULT autovacuum trigger, permanently, because the
+/// default trigger scales with `reltuples` and a guest's dead-tuple count
+/// does not). A partition created here starts from cluster defaults
+/// regardless of what its siblings carry — storage parameters are not
+/// inherited across sibling leaves the way column defaults are — so without
+/// this, migration 60 would only have fixed the partitions that existed on
+/// the day it ran, and every partition created afterward would silently
+/// reopen the exact regression it exists to close.
+///
+/// Applied UNCONDITIONALLY to every table this function creates a partition
+/// for, not gated on `table` being `analytics_events`/`error_events`
+/// specifically. This function is shared by every entry in
+/// `sauron_tier::TIERED_TABLES` — today that is `error_events`,
+/// `analytics_events`, AND `transactions`
+/// (`crates/sauron-tier/src/lib.rs`) — and `transactions` sits in the exact
+/// same risk class as the other two: it is one of the six tables
+/// `identity_merge::rewrite_hot_rows` rewrites per merge
+/// (`UPDATE transactions SET distinct_id = $3 WHERE app_id = $1 AND
+/// distinct_id = $2`), and like the other two it is otherwise pure INSERT
+/// traffic (its only UPDATE/DELETE sources are identity-merge and
+/// sauron-tier/purge maintenance) — the exact property that makes a low,
+/// table-size-independent dead-tuple threshold safe rather than a source of
+/// spurious extra vacuum passes. A per-table allowlist here would be a
+/// hardcoded list a future `TIERED_TABLES` entry could silently fall
+/// outside of; there is no principled reason found so far to special-case
+/// two of the three tables sharing this exact mutation pattern.
+///
+/// Migration 60 covers `transactions` too — correcting an earlier version of
+/// this comment, which described a "known, flagged gap" where the migration
+/// tuned only the two event tables and left `transactions`' pre-existing
+/// partitions untuned. It does not: its `DO` block enumerates
+/// `pg_partition_tree()` over `analytics_events`, `error_events` AND
+/// `transactions`, and `ALTER`s every leaf of all three. So there is no
+/// split of responsibility to remember here — the migration is the one-time
+/// catch-up for existing partitions on all three tables, and this function
+/// carries the same setting onto every new one, for every table it is called
+/// for.
 pub async fn create_range_partition(
     conn: &mut AsyncPgConnection,
     table: &str,
@@ -10359,7 +10920,8 @@ pub async fn create_range_partition(
 ) -> QueryResult<()> {
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {table}_{suffix} PARTITION OF {table} \
-         FOR VALUES FROM ('{start}') TO ('{end}')",
+         FOR VALUES FROM ('{start}') TO ('{end}') \
+         WITH (autovacuum_vacuum_scale_factor = 0.0, autovacuum_vacuum_threshold = 20)",
         table = table,
         suffix = suffix,
         start = start.to_rfc3339(),

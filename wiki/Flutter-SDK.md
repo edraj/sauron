@@ -84,8 +84,8 @@ The public entry point is the static `Sauron` class:
 | --- | --- |
 | `track` | `Sauron.track(String name, {Map<String, Object?>? properties})` |
 | `captureException` | `Sauron.captureException(Object error, {StackTrace? stackTrace, Mechanism? mechanism, SauronLevel level, String? screen, Map<String, String>? tags, Map<String, Map<String, Object?>>? contexts, Map<String, Object?>? extra})` |
-| `identify` | `Sauron.identify(String distinctId, {Map<String, Object?>? traits})` |
-| `reset` | `Sauron.reset()` → `Future<void>` — **call on logout.** Mints a fresh anonymous id so the next person is not merged into the previous one's history. Skipping it on a shared device is permanent. |
+| `identify` | `Sauron.identify(String distinctId, {Map<String, Object?>? traits})` → `Future<void>` — **await it.** Also auto-detects a login by a different user than last time on this device (a forgotten `reset()` on logout) and mints a fresh anonymous id + rotates the session id first, so a switch never ships a cross-user alias. |
+| `reset` | `Sauron.reset()` → `Future<void>` — **call on logout.** Clears the last-identified record and mints a fresh anonymous id and session id, so the next person is not merged into the previous one's history. Skipping it on a shared device is permanent. |
 | `anonymousId` | `Sauron.anonymousId` → `String?` (getter) — the persisted `anon_<uuidv4>` events are attributed to before `identify()` |
 | `setUser` | `Sauron.setUser(SauronUser? user)` — pass `null` to clear |
 | `setTag` / `setTags` | `Sauron.setTag(String key, String value)` · `Sauron.setTags(Map<String, String> values)` |
@@ -121,10 +121,34 @@ try {
 ### Identify a user
 
 ```dart
-Sauron.identify('u_123', traits: {'plan': 'pro'});
+await Sauron.identify('u_123', traits: {'plan': 'pro'});
 // or set the full user:
 Sauron.setUser(const SauronUser(id: 'u_123', email: 'ada@example.com'));
 ```
+
+### Reset on logout — MUST CALL
+
+```dart
+await Sauron.reset(); // on logout
+```
+
+The anonymous id is persisted in `<app-support>/sauron/sauron_prefs.json` under
+`sauron.anon_id` and survives app restarts — that is what makes the Active
+Users report count people rather than launches. Because it is durable, **not
+calling `reset()` on logout aliases the next person to the last one**: on a
+shared or kiosk device, the next anonymous user reuses the stored id, and
+their activity is merged into the previous account server-side, forever.
+
+As a safety net, `identify()` also persists a short one-way digest (never the
+raw id) of the last user who identified, under `sauron.last_identified` in the
+same prefs file — the same key name and digest algorithm the browser SDK uses
+in `localStorage`. If the next `identify()` on this device is for a DIFFERENT
+person, the SDK mints a fresh anonymous id and rotates the session id before
+sending, so a forgotten `reset()` corrupts only that one guest window instead
+of every one after it. This cannot undo an alias already sent under the old
+id, so still call `reset()` on logout regardless. See
+[the Flutter SDK README](../sdks/flutter/README.md#the-anonymous-id) for the
+full detail, including why that digest is not a security boundary.
 
 ### Tags, contexts & extra
 

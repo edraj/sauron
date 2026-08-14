@@ -28,6 +28,7 @@ sauron-mail.workspace = true
 # which then finishes `succeeded`, `coverage='full'`, zero findings — a
 # confident false negative, the worst thing this feature can emit.
 sauron-inspector.workspace = true
+sauron-purge.workspace = true
 diesel.workspace = true
 diesel-async.workspace = true
 tokio.workspace = true

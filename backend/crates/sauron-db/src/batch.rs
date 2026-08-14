@@ -515,6 +515,108 @@ pub async fn bump_person_envs(
     .await
 }
 
+/// One device/environment pair's folded contribution from a batch.
+///
+/// The device twin of [`PersonEnvBump`]. `sessions_delta` carries the same
+/// insert-only rule: a session is bumped again by every batch that carries a
+/// signal for it, so `+1` per bump would count one session once per batch it
+/// spans. [`write_rows_once`] credits it from [`bump_sessions`]' inserted-key
+/// list, inside the same transaction; every other producer leaves it at `0`.
+#[derive(Debug, Clone)]
+pub struct DeviceEnvBump {
+    pub app_id: Uuid,
+    pub device_key: String,
+    /// `None` is `EnvFilter::Unattributed` — a real row, not an absence. See
+    /// migration `2026-08-12-000059`'s comment for why.
+    pub environment_id: Option<Uuid>,
+    /// See [`SessionBump::first_at`] — `first_seen`/`last_seen` are driven by
+    /// `LEAST`/`GREATEST` and need the two ends of the fold, not one point.
+    pub first_at: DateTime<Utc>,
+    pub last_at: DateTime<Utc>,
+    pub events_delta: i64,
+    pub errors_delta: i64,
+    pub sessions_delta: i64,
+}
+
+/// Fold N device/environment bumps into `device_environments`, one statement.
+///
+/// Subject to the module's dedupe rule, and — exactly like [`bump_person_envs`]
+/// — fed by TWO producers: `Acc::device_env`'s fold and `write_rows_once`'
+/// session crediting. A device with both an event and a newly-inserted session
+/// in the same batch is one conflict key reached from two directions. Passing
+/// both as separate rows raises `ON CONFLICT DO UPDATE command cannot affect
+/// row a second time` and fails the whole batch, so the crediting step merges
+/// into the existing row by key rather than pushing.
+pub async fn bump_device_envs(
+    conn: &mut AsyncPgConnection,
+    rows: &[DeviceEnvBump],
+) -> QueryResult<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    // Sorted by the conflict key so every concurrent batch takes these row locks
+    // in the same order — see the module's ordering rule. This is the fourth
+    // row-lock participant in `write_rows_once`; the ingest path has already
+    // produced one deadlock (`users_seen` vs. the issue upsert) that stayed
+    // invisible because the worker's stdout was being discarded.
+    let nil = Uuid::nil();
+    let mut ix: Vec<usize> = (0..rows.len()).collect();
+    ix.sort_unstable_by(|&a, &b| {
+        (
+            rows[a].app_id,
+            &rows[a].device_key,
+            rows[a].environment_id.unwrap_or(nil),
+        )
+            .cmp(&(
+                rows[b].app_id,
+                &rows[b].device_key,
+                rows[b].environment_id.unwrap_or(nil),
+            ))
+    });
+    diesel::sql_query(
+        "INSERT INTO device_environments \
+           (app_id, device_key, environment_id, first_seen, last_seen, \
+            events_count, errors_count, sessions_count) \
+         SELECT app_id, device_key, environment_id, first_at, last_at, \
+                events_delta, errors_delta, sessions_delta \
+         FROM unnest($1::uuid[], $2::text[], $3::uuid[], $4::timestamptz[], \
+                     $5::timestamptz[], $6::bigint[], $7::bigint[], $8::bigint[]) \
+              AS t(app_id, device_key, environment_id, first_at, last_at, \
+                   events_delta, errors_delta, sessions_delta) \
+         ON CONFLICT (app_id, device_key, \
+                      COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+         DO UPDATE SET \
+            first_seen = LEAST(device_environments.first_seen, EXCLUDED.first_seen), \
+            last_seen = GREATEST(device_environments.last_seen, EXCLUDED.last_seen), \
+            events_count = device_environments.events_count + EXCLUDED.events_count, \
+            errors_count = device_environments.errors_count + EXCLUDED.errors_count, \
+            sessions_count = device_environments.sessions_count + EXCLUDED.sessions_count, \
+            updated_at = now()",
+    )
+    .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
+    .bind::<Array<Text>, _>(
+        ix.iter()
+            .map(|&i| rows[i].device_key.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Nullable<SqlUuid>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].environment_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].first_at).collect::<Vec<_>>())
+    .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].last_at).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].events_delta).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].errors_delta).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(
+        ix.iter()
+            .map(|&i| rows[i].sessions_delta)
+            .collect::<Vec<_>>(),
+    )
+    .execute(conn)
+    .await
+}
+
 /// One workflow's folded contribution from a batch. Fields mirror
 /// [`crate::repo::bump_workflow`]'s arguments; the counters are totals.
 #[derive(Debug, Clone)]
@@ -750,6 +852,11 @@ pub struct WriteSet<'a> {
     /// here and is credited inside the transaction from [`bump_sessions`]'
     /// inserted-key list — the caller cannot know which sessions are new.
     pub person_envs: &'a [PersonEnvBump],
+    /// Per-(device, environment) rollup deltas. `sessions_delta` arrives ZERO
+    /// here and is credited inside the transaction from [`bump_sessions`]'
+    /// inserted-key list, exactly as `person_envs` is — the caller cannot know
+    /// which sessions are new.
+    pub device_envs: &'a [DeviceEnvBump],
 }
 
 /// Write a batch's rows in one transaction.
@@ -811,12 +918,11 @@ fn is_deadlock(e: &diesel::result::Error) -> bool {
 /// a new session in one batch is one key reached from two producers, and two
 /// rows sharing a key abort the whole statement with "ON CONFLICT DO UPDATE
 /// command cannot affect row a second time".
-fn credit_sessions(set: &WriteSet<'_>, inserted: Vec<(Uuid, String)>) -> Vec<PersonEnvBump> {
+fn credit_sessions(set: &WriteSet<'_>, inserted: &HashSet<(Uuid, String)>) -> Vec<PersonEnvBump> {
     let mut rows: Vec<PersonEnvBump> = set.person_envs.to_vec();
     if inserted.is_empty() {
         return rows;
     }
-    let inserted: HashSet<(Uuid, String)> = inserted.into_iter().collect();
     let nil = Uuid::nil();
     let mut at: HashMap<(Uuid, String, Uuid), usize> = rows
         .iter()
@@ -862,6 +968,71 @@ fn credit_sessions(set: &WriteSet<'_>, inserted: Vec<(Uuid, String)>) -> Vec<Per
     rows
 }
 
+/// Add `sessions_count` credit to the batch's DEVICE rollup rows.
+///
+/// The device twin of [`credit_sessions`], and separate from it because the two
+/// key on different columns and neither implies the other: a session can carry
+/// a `device_key` with no `distinct_id` (an anonymous device) or the reverse (a
+/// server SDK with no device). Folding both into one function would drop
+/// whichever key the session lacks.
+///
+/// Merges by conflict key rather than pushing, for the same reason
+/// [`credit_sessions`] does: a device with both an event and a new session in
+/// one batch is one key reached from two producers, and two rows sharing a key
+/// abort the whole statement.
+fn credit_device_sessions(
+    set: &WriteSet<'_>,
+    inserted: &HashSet<(Uuid, String)>,
+) -> Vec<DeviceEnvBump> {
+    let mut rows: Vec<DeviceEnvBump> = set.device_envs.to_vec();
+    if inserted.is_empty() {
+        return rows;
+    }
+    let nil = Uuid::nil();
+    let mut at: HashMap<(Uuid, String, Uuid), usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            (
+                (
+                    d.app_id,
+                    d.device_key.clone(),
+                    d.environment_id.unwrap_or(nil),
+                ),
+                i,
+            )
+        })
+        .collect();
+    for s in set.sessions {
+        // A session with no device_key has no row in `devices` and could never
+        // be joined back to one.
+        let Some(dk) = s.device_key.as_deref().filter(|d| !d.is_empty()) else {
+            continue;
+        };
+        if !inserted.contains(&(s.app_id, s.session_id.clone())) {
+            continue;
+        }
+        let key = (s.app_id, dk.to_string(), s.environment_id.unwrap_or(nil));
+        match at.get(&key) {
+            Some(&i) => rows[i].sessions_delta += 1,
+            None => {
+                at.insert(key, rows.len());
+                rows.push(DeviceEnvBump {
+                    app_id: s.app_id,
+                    device_key: dk.to_string(),
+                    environment_id: s.environment_id,
+                    first_at: s.first_at,
+                    last_at: s.last_at,
+                    events_delta: 0,
+                    errors_delta: 0,
+                    sessions_delta: 1,
+                });
+            }
+        }
+    }
+    rows
+}
+
 async fn write_rows_once(conn: &mut AsyncPgConnection, set: &WriteSet<'_>) -> QueryResult<()> {
     conn.batch_execute("BEGIN").await?;
     let r = async {
@@ -872,14 +1043,16 @@ async fn write_rows_once(conn: &mut AsyncPgConnection, set: &WriteSet<'_>) -> Qu
         // matches rows that already exist.
         touch_event_users(conn, set.touch_users).await?;
         mark_event_users_identified(conn, set.identified).await?;
-        // The roll-ups go LAST, and `devices` and the person rollup last of all.
-        // A row lock is held until COMMIT, so the later a contended row is taken
-        // the shorter every other worker waits for it — and `devices` is the
-        // most contended row in the set, since every signal from one device
+        // The roll-ups go LAST, and `devices` and the two env rollups last of
+        // all. A row lock is held until COMMIT, so the later a contended row is
+        // taken the shorter every other worker waits for it — and `devices` is
+        // the most contended row in the set, since every signal from one device
         // folds onto one row.
         let inserted = bump_sessions(conn, set.sessions).await?;
         bump_devices(conn, set.devices).await?;
-        bump_person_envs(conn, &credit_sessions(set, inserted)).await?;
+        let inserted: HashSet<(Uuid, String)> = inserted.into_iter().collect();
+        bump_person_envs(conn, &credit_sessions(set, &inserted)).await?;
+        bump_device_envs(conn, &credit_device_sessions(set, &inserted)).await?;
         Ok(())
     }
     .await;

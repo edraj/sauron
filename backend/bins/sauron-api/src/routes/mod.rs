@@ -21,6 +21,7 @@ pub mod notifications;
 pub mod orgs;
 pub mod performance;
 pub mod projects;
+pub mod purge;
 pub mod scope;
 pub mod screens;
 pub mod search;

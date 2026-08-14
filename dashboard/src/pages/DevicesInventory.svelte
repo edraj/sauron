@@ -91,6 +91,67 @@
 
   let debounce: ReturnType<typeof setTimeout> | undefined;
 
+  function downloadDevicesCsv() {
+    let header: string[] = [];
+    let rows: any[][] = [];
+
+    if (grouped) {
+      if (!groups || groups.length === 0) return;
+      header = [
+        'Family', 'Model', 'OS Name', 'OS Version', 'Devices',
+        'Events', 'Errors', 'Sessions', 'First Seen', 'Last Seen'
+      ];
+      rows = groups.map((g) => [
+        g.family ?? '',
+        g.model ?? '',
+        g.os_name ?? '',
+        g.os_version ?? '',
+        g.device_count,
+        g.events_count,
+        g.errors_count,
+        g.sessions_count,
+        g.first_seen ? new Date(g.first_seen).toISOString() : '',
+        g.last_seen ? new Date(g.last_seen).toISOString() : ''
+      ]);
+    } else {
+      if (!devices || devices.length === 0) return;
+      header = [
+        'ID', 'Device Key', 'Family', 'Model', 'OS Name', 'OS Version',
+        'Arch', 'Browser', 'Last Distinct ID', 'First Seen', 'Last Seen',
+        'Events', 'Errors', 'Sessions'
+      ];
+      rows = devices.map((d) => [
+        d.id,
+        d.device_key,
+        d.family ?? '',
+        d.model ?? '',
+        d.os_name ?? '',
+        d.os_version ?? '',
+        d.arch ?? '',
+        d.browser ?? '',
+        d.last_distinct_id ?? '',
+        d.first_seen ? new Date(d.first_seen).toISOString() : '',
+        d.last_seen ? new Date(d.last_seen).toISOString() : '',
+        d.events_count,
+        d.errors_count,
+        d.sessions_count
+      ]);
+    }
+
+    const csvContent = [header, ...rows]
+      .map((row) => row.map(v => typeof v === 'string' && v.includes(',') ? `"${v}"` : v).join(','))
+      .join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = grouped ? 'device-groups.csv' : 'devices.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   function onSearch(v: string) {
     clearTimeout(debounce);
     debounce = setTimeout(() => {
@@ -238,6 +299,15 @@
         width="240px"
       />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
+      <Button
+        variant="secondary"
+        disabled={rowCount === 0}
+        onclick={downloadDevicesCsv}
+        title="Download visible devices as CSV"
+      >
+        <Icon name="download" size={15} />
+        Export CSV
+      </Button>
     </div>
   </div>
 

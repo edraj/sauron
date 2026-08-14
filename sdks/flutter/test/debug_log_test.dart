@@ -76,7 +76,7 @@ void main() {
     ));
 
     Sauron.setScreen('Checkout');
-    Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
+    await Sauron.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
     Sauron.track('checkout_completed',
         properties: <String, Object?>{'cart_value': 42.5});
     Sauron.captureException(StateError('card declined'));

@@ -173,6 +173,29 @@ async fn rollup(
         )
         .await;
     }
+
+    // The device/environment rollup. Twin of the person/environment rollup
+    // immediately above, keyed on device instead of identity — this is the
+    // sequential/per-item replay path, and `device_environments` must land the
+    // same rows here as it does from the batched path or a replayed batch
+    // contributes nothing to it.
+    //
+    // Deliberately `let _ =`, matching the bumps above: this path's roll-up
+    // writes are best-effort, and a rollup miss must not fail an event that
+    // is already durable.
+    if let Some(dk) = info.device_key.as_deref().filter(|s| !s.is_empty()) {
+        let _ = repo::bump_device_env(
+            conn,
+            job.app_id,
+            dk,
+            environment_id,
+            at,
+            events_delta,
+            errors_delta,
+            sessions_delta,
+        )
+        .await;
+    }
 }
 
 /// Persist one error event.
@@ -604,11 +627,53 @@ async fn process_identify(
         }
     }
     if let Some(anon) = id.anonymous_id {
-        if !anon.is_empty() {
-            let _ = repo::insert_identity(conn, job.app_id, &anon, &id.distinct_id).await;
+        if !anon.is_empty() && !id.distinct_id.is_empty() {
+            claim_and_enqueue(conn, job.app_id, &anon, &id.distinct_id).await;
         }
     }
     Ok(())
+}
+
+/// Claim an alias and, on a fresh claim, schedule the merge.
+///
+/// Shared by `process_identify` and `batch`'s identify loop. Both call it; a
+/// change to one is a change to both, which is the point — an earlier draft had
+/// the enqueue inlined in one path only, and the other silently never merged.
+///
+/// A thin wrapper, not the transaction owner: `sauron_db::identity_merge::
+/// claim_and_schedule` does the claim AND the (fresh-only) enqueue in one
+/// transaction — see its doc comment for why those two cannot be split into a
+/// separate `claim_identity` call followed by a separate `enqueue_merge` call
+/// here. `conn` must NOT already be inside an open transaction when this is
+/// called (both call sites check out a plain, autocommit connection).
+pub(crate) async fn claim_and_enqueue(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    alias: &str,
+    person: &str,
+) {
+    match sauron_db::identity_merge::claim_and_schedule(conn, app_id, alias, person).await {
+        // The merge was already scheduled atomically with the claim above —
+        // nothing left to do or log.
+        Ok(sauron_db::identity_merge::Claim::Fresh) => {}
+        Ok(sauron_db::identity_merge::Claim::Repeat) => {}
+        Ok(sauron_db::identity_merge::Claim::Conflict { existing }) => {
+            // The burn rule drops this silently by design. This warning is the
+            // ONLY signal an operator ever gets that an app is not calling
+            // reset() on logout.
+            tracing::warn!(
+                app_id = %app_id, alias, claimed_by = %existing, attempted_by = person,
+                "identity alias conflict; alias stays bound to its first claimant"
+            );
+        }
+        Ok(sauron_db::identity_merge::Claim::Chain) => {
+            tracing::warn!(
+                app_id = %app_id, alias, person,
+                "identity alias would form a chain; refused"
+            );
+        }
+        Err(e) => tracing::warn!(app_id = %app_id, error = %e, "claiming an alias failed"),
+    }
 }
 
 async fn process_breadcrumbs(
@@ -1286,6 +1351,92 @@ mod identity_pipeline_tests {
         .await
         .expect("event_users row must exist");
         row.identified_source
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct QueuedMerge {
+        #[diesel(sql_type = Text)]
+        alias_id: String,
+        #[diesel(sql_type = Text)]
+        distinct_id: String,
+    }
+
+    async fn queued(conn: &mut sauron_db::PgConn, app_id: Uuid) -> Vec<QueuedMerge> {
+        diesel::sql_query(
+            "SELECT alias_id, distinct_id FROM identity_merges \
+              WHERE app_id = $1 ORDER BY alias_id",
+        )
+        .bind::<SqlUuid, _>(app_id)
+        .load(conn)
+        .await
+        .expect("queued merges")
+    }
+
+    /// The single-item path must enqueue a merge on a fresh claim.
+    #[tokio::test]
+    async fn process_identify_enqueues_a_merge() {
+        let Some(db) = PipelineTestDb::setup().await else {
+            eprintln!("TEST_DATABASE_URL unset — skipping");
+            return;
+        };
+        let f = seed(&db, None).await;
+        let mut conn = db.conn().await;
+
+        process_identify(
+            &mut conn,
+            &f.job,
+            IdentifyItem {
+                distinct_id: "u-42".to_string(),
+                anonymous_id: Some("anon_single".to_string()),
+                traits: json!({}),
+                timestamp: Utc::now(),
+            },
+        )
+        .await
+        .expect("process identify");
+
+        let q = queued(&mut conn, f.app_id).await;
+        assert_eq!(
+            q.len(),
+            1,
+            "the single-item path must enqueue exactly one merge"
+        );
+        assert_eq!(q[0].alias_id, "anon_single");
+        assert_eq!(q[0].distinct_id, "u-42");
+
+        drop(conn);
+        db.cleanup().await;
+    }
+
+    /// A repeat identify() must NOT enqueue a second merge.
+    #[tokio::test]
+    async fn a_repeat_identify_does_not_enqueue_twice() {
+        let Some(db) = PipelineTestDb::setup().await else {
+            eprintln!("TEST_DATABASE_URL unset — skipping");
+            return;
+        };
+        let f = seed(&db, None).await;
+        let mut conn = db.conn().await;
+
+        for _ in 0..2 {
+            process_identify(
+                &mut conn,
+                &f.job,
+                IdentifyItem {
+                    distinct_id: "u-42".to_string(),
+                    anonymous_id: Some("anon_twice".to_string()),
+                    traits: json!({}),
+                    timestamp: Utc::now(),
+                },
+            )
+            .await
+            .expect("process identify");
+        }
+
+        assert_eq!(queued(&mut conn, f.app_id).await.len(), 1);
+
+        drop(conn);
+        db.cleanup().await;
     }
 
     #[tokio::test]

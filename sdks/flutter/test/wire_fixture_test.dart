@@ -90,7 +90,7 @@ void main() {
     client.track('viewed_pricing', properties: <String, Object?>{'plan': 'pro'});
     client.setScreen('/checkout'); // SDK-emitted `$screen`
 
-    client.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
+    await client.identify('u_123', traits: <String, Object?>{'plan': 'pro'});
     client.setTag('env', 'prod');
     client.addBreadcrumb(Breadcrumb(
       type: 'navigation',
@@ -195,7 +195,7 @@ void main() {
     final SauronClient client = await buildClient();
 
     client.track('viewed_pricing');
-    client.identify('u_123');
+    await client.identify('u_123');
     client.captureException(StateError('boom'));
     await Future<void>.delayed(const Duration(milliseconds: 100));
     await client.flush();

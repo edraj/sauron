@@ -2,7 +2,7 @@
 
 /** SDK identity, embedded in every envelope header. */
 export const SDK_NAME = 'sauron.javascript';
-export const SDK_VERSION = '1.4.0';
+export const SDK_VERSION = '1.4.1';
 
 /** The ambient global, regardless of environment (window / self / global). */
 export function getGlobal(): typeof globalThis {

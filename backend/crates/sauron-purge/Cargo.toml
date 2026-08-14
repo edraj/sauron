@@ -1,0 +1,24 @@
+[package]
+name = "sauron-purge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Deliberately pure, mirroring `sauron-inspector`: no diesel, no axum, no
+# tokio, no DuckDB. Every DECISION the purge makes lives here — which kinds
+# exist, which are recomputable, which can be scoped to an environment, and
+# whether a rollup row falls inside a range — so that all of it is unit-tested
+# without a database. CI runs `cargo test --workspace` with no Postgres and the
+# DB harness skips, so anything that needs a connection is effectively untested
+# by default; keeping the rules here is what stops that mattering.
+#
+# Both `sauron-api` (validating a preview request) and `sauron-inspector`
+# (executing the job) depend on this, which is the other reason it is a crate
+# rather than a module in either of them: the vocabulary must not be able to
+# drift between the process that accepts a purge and the process that performs
+# it.
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

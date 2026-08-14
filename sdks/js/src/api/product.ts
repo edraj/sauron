@@ -66,16 +66,28 @@ export function setScreen(name: string): void {
 export function identify(id: string, traits: Record<string, unknown> = {}): void {
   const client = getClient();
   if (!client) return;
+  // Coerce ONCE, use everywhere below. `IdentifyItem.distinct_id` is a
+  // non-`Option` Rust `String` on the wire (`envelope.rs`), so a plain-JS
+  // caller passing a number (`Sauron.identify(user.id)`, entirely possible —
+  // nothing at runtime enforces the TS `id: string` signature) would send a
+  // JSON number there. That fails to deserialize and rejects the WHOLE
+  // envelope (`400 invalid_envelope`), taking every other item batched
+  // alongside it — the identical failure class `CHANGELOG.md` 1.4.0 documents
+  // for `captureMessage`'s `exception.type: null`.
+  const distinctId = String(id);
   // `null` unless the anon id was actually used as a distinct_id in this
-  // browser session. `process_identify` inserts a permanent
-  // `identities(app_id, alias_id, distinct_id)` row for any non-empty
-  // anonymous_id, and that row is now a LIVE signal (the 000038 backfill reads
-  // it), so a speculative alias is a durable server-side mis-merge.
-  const anonymousId = client.getAnonymousId();
-  client.getScope().setUser({ id, traits });
+  // browser session, or when it belonged to a different person than the last
+  // one who identified on this device (`prepareIdentify` mints a fresh anon id
+  // first in that case, since the old one is already burned server-side).
+  // `process_identify` inserts a permanent `identities(app_id, alias_id,
+  // distinct_id)` row for any non-empty anonymous_id, and that row is now a
+  // LIVE signal (the 000038 backfill reads it), so a speculative or
+  // cross-user alias is a durable server-side mis-merge.
+  const anonymousId = client.prepareIdentify(distinctId);
+  client.getScope().setUser({ id: distinctId, traits });
   const item: IdentifyItem = {
     type: 'identify',
-    distinct_id: id,
+    distinct_id: distinctId,
     anonymous_id: anonymousId,
     traits: traits ?? {},
   };

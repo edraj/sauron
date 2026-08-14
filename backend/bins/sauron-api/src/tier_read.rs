@@ -277,12 +277,26 @@ pub async fn active_users_by_day(
     let cold: Vec<DayCount> = if cold_ranges.is_empty() {
         Vec::new()
     } else {
+        // The bounded cold overlay: guest ids Parquet still holds because cold
+        // is immutable and the hot rewrite could never reach them. Fetched over
+        // the FULL query window (a safe superset of the cold sub-ranges below),
+        // not per sub-range — see `sauron_db::identity_merge::cold_alias_map`'s
+        // doc comment for why the map is already bounded and an extra row here
+        // just costs a slightly bigger overlay, never a wrong answer.
+        let aliases: Vec<(String, String)> = {
+            let mut c = conn(&state.pool).await?;
+            sauron_db::identity_merge::cold_alias_map(&mut c, app_id, from, to)
+                .await?
+                .into_iter()
+                .map(|e| (e.alias, e.person))
+                .collect()
+        };
         let glob = cold_partition_glob(&cold_path, "analytics_events", app_id);
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<DayCount>> {
             let eng = DuckEngine::open()?;
             let mut out = Vec::new();
             for r in &cold_ranges {
-                out.extend(eng.distinct_users_by_day(&glob, app_id, r.start, r.end)?);
+                out.extend(eng.distinct_users_by_day(&glob, app_id, r.start, r.end, &aliases)?);
             }
             Ok(out)
         })

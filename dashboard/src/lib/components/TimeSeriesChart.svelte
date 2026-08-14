@@ -37,6 +37,9 @@
   const max = $derived(data.length ? Math.max(...data.map((d) => d.count), 1) : 1);
   const total = $derived(data.reduce((sum, d) => sum + d.count, 0));
 
+  const hasSegments = $derived(data.length > 0 && data[0].segments && data[0].segments.length > 0);
+  const segmentsDefinition = $derived(hasSegments ? data[0].segments! : []);
+
   function barHeight(count: number): number {
     if (max <= 0) return 0;
     // Give even 0-count buckets a hair of presence, real bars a floor of 4%.
@@ -83,7 +86,20 @@
                 {/each}
               {/if}
             </div>
-            <span class="tip tip-value">{format(point.count)}</span>
+            <div class="tip tip-value" class:detailed={point.segments && point.segments.length > 0}>
+              <div class="total-line">{format(point.count)}{#if point.segments && point.segments.length > 0} total{/if}</div>
+              {#if point.segments && point.segments.length > 0}
+                <div class="segments-list">
+                  {#each point.segments as seg}
+                    <div class="seg-line">
+                      <span class="swatch" style="background-color: {seg.color || 'var(--bar-color)'}"></span>
+                      <span class="seg-label">{seg.label || ''}:</span>
+                      <span class="seg-value">{format(seg.count)}</span>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            </div>
           </div>
           <span class="tip tip-date">{label(point.bucket)}</span>
         </div>
@@ -94,6 +110,16 @@
       {#if showTotal}<span class="total">{total.toLocaleString()} total</span>{/if}
       <span>{label(data[data.length - 1].bucket)}</span>
     </div>
+    {#if hasSegments}
+      <div class="legend">
+        {#each segmentsDefinition as seg}
+          <div class="legend-item">
+            <span class="swatch" style="background-color: {seg.color || 'var(--bar-color)'}"></span>
+            <span class="legend-label">{seg.label}</span>
+          </div>
+        {/each}
+      </div>
+    {/if}
   </div>
 {/if}
 
@@ -175,7 +201,63 @@
     bottom: calc(100% + 6px);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
   }
+  .tip-value.detailed {
+    align-items: stretch;
+    min-width: 120px;
+    padding: 6px 10px;
+  }
+  .total-line {
+    text-align: center;
+  }
+  .tip-value.detailed .total-line {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+    margin-bottom: 4px;
+    text-align: left;
+  }
+  .segments-list {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-weight: normal;
+  }
+  .seg-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .swatch {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+  }
+  .seg-label {
+    flex: 1;
+    color: var(--text-muted);
+  }
+  .seg-value {
+    font-weight: 600;
+  }
+  
+  .legend {
+    display: flex;
+    justify-content: center;
+    gap: 16px;
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
   /* Anchored to the COLUMN, whose bottom is the axis line, so every date sits
      on one baseline instead of stepping up and down with the bars. It overlays
      the axis row on hover; that row is static text, and overlaying keeps the

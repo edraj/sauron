@@ -105,6 +105,15 @@ pub mod action {
     pub const AUTH_LOGOUT: &str = "auth.logout";
     pub const AUTH_PASSWORD_CHANGE: &str = "auth.password_change";
 
+    /// The three admin data-purge transitions.
+    ///
+    /// `preview` is recorded even though it destroys nothing: it is where the
+    /// scope is chosen and frozen, so it is the only entry that records what
+    /// was ASKED for as distinct from what a later confirm executed.
+    pub const DATA_PURGE_PREVIEW: &str = "data_purge.preview";
+    pub const DATA_PURGE_CONFIRM: &str = "data_purge.confirm";
+    pub const DATA_PURGE_CANCEL: &str = "data_purge.cancel";
+
     pub const TIER_POLICY_UPDATE: &str = "tier_policy.update";
     pub const TIER_RESTORE_CREATE: &str = "tier_restore.create";
     pub const TIER_PIN_RELEASE: &str = "tier_pin.release";
@@ -113,6 +122,7 @@ pub mod action {
 
 /// Entity families, used for the `entity_type` column and its filter.
 pub mod entity {
+    pub const DATA_PURGE: &str = "data_purge";
     pub const ORG: &str = "org";
     pub const PROJECT: &str = "project";
     pub const APP: &str = "app";
@@ -242,6 +252,18 @@ pub fn allowlist(entity_type: &str) -> &'static [&'static str] {
             "occurrences",
             "retained",
             "dropped",
+        ],
+        // Scope and counts only. No row contents ever reach the audit log —
+        // the whole point of the purge is that those rows are gone.
+        entity::DATA_PURGE => &[
+            "kinds",
+            "all_time",
+            "range_start",
+            "range_end",
+            "environment_ids",
+            "estimated_counts",
+            "cold_rows_skipped",
+            "status_before",
         ],
         entity::ORG => &["name"],
         // `reason` distinguishes a wrong password from a deactivated account

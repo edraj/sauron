@@ -1814,6 +1814,72 @@ pub struct NewIngestFailurePayload {
     pub attempts: i32,
 }
 
+/// One admin data-purge job: the queue entry, the frozen scope, the resume
+/// cursor, the progress meter and the record of who did it.
+///
+/// Field order MUST match `schema::purge_jobs` exactly — `Queryable` decodes
+/// POSITIONALLY, so a field inserted in the middle silently binds every later
+/// column to the wrong one. Append only.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[diesel(table_name = purge_jobs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct PurgeJob {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub app_id: Uuid,
+    pub app_slug: String,
+    pub app_name: String,
+    /// `None` = every environment, including unattributed. `Some([])` is a
+    /// scope that matches nothing and is refused at the API.
+    pub environment_ids: Option<Value>,
+    pub kinds: Value,
+    pub range_start: Option<DateTime<Utc>>,
+    pub range_end: Option<DateTime<Utc>>,
+    pub all_time: bool,
+    pub status: String,
+    pub phase: String,
+    pub estimated_counts: Value,
+    pub deleted_counts: Value,
+    pub rollups_recomputed: i64,
+    pub rollups_deleted: i64,
+    pub cold_rows_skipped: i64,
+    pub cold_boundary_at: Option<DateTime<Utc>>,
+    pub kind_cursor: Option<String>,
+    pub cursor_occurred_at: Option<DateTime<Utc>>,
+    pub cursor_id: Option<Uuid>,
+    pub requested_by: Option<Uuid>,
+    pub requested_by_email: String,
+    pub cancelled_by: Option<Uuid>,
+    pub cancelled_by_email: String,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub requested_at: DateTime<Utc>,
+    pub previewed_at: Option<DateTime<Utc>>,
+    pub confirmed_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub confirm_source: String,
+    pub ingest_active: bool,
+    pub worker_id: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub error: String,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = purge_jobs)]
+pub struct NewPurgeJob<'a> {
+    pub org_id: Uuid,
+    pub app_id: Uuid,
+    pub app_slug: &'a str,
+    pub app_name: &'a str,
+    pub environment_ids: Option<Value>,
+    pub kinds: Value,
+    pub range_start: Option<DateTime<Utc>>,
+    pub range_end: Option<DateTime<Utc>>,
+    pub all_time: bool,
+    pub requested_by: Option<Uuid>,
+    pub requested_by_email: &'a str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::mask_ip;

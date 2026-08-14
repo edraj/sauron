@@ -5,10 +5,13 @@
 //! migrations run at startup.
 
 pub mod batch;
+pub mod device_env_backfill;
 pub mod filter;
+pub mod identity_merge;
 pub mod models;
 pub mod person_env_backfill;
 pub mod pool;
+pub mod purge;
 pub mod query_plan;
 pub mod repo;
 pub mod schema;

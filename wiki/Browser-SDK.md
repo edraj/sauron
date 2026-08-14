@@ -131,6 +131,21 @@ kiosk browser, the next anonymous visitor reuses the stored `sauron.anon_id`,
 and their activity is merged into the previous account server-side, forever.
 There is no server-side undo.
 
+As a safety net for exactly that scenario, `identify()` also persists a short
+one-way digest (never the id itself) of the last user who identified, under
+`localStorage`'s `sauron.last_identified`. If the next `identify()` on this
+device is for a DIFFERENT person, the SDK detects the mismatch and mints a
+fresh anonymous id (and rotates the session id) before sending — so a
+forgotten `reset()` corrupts only that one guest window instead of every one
+from then on. This cannot undo an alias already sent under the old id, so
+still call `reset()` on logout regardless.
+
+That digest is not a security boundary — it's an unkeyed hash, so over a
+possibly low-entropy id (an email address, say) it's a confirmation oracle,
+not a secret: anyone with local read access and a guess can verify it
+instantly. It exists only so `sauron.last_identified` isn't a second
+plaintext copy of your users' ids, not to keep those ids confidential.
+
 `reset()` does NOT clear the device id (`sauron.device_id`) — that identifies
 the browser installation, not the person.
 

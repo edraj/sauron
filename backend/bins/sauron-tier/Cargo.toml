@@ -12,6 +12,8 @@ path = "src/main.rs"
 sauron-core.workspace = true
 sauron-db.workspace = true
 sauron-tier.workspace = true
+sauron-purge.workspace = true
+serde_json = { workspace = true }
 sauron-telemetry.workspace = true
 tokio = { workspace = true }
 chrono.workspace = true

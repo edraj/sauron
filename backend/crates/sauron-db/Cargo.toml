@@ -8,6 +8,7 @@ license.workspace = true
 sauron-core.workspace = true
 sauron-query.workspace = true
 sauron-inspector = { workspace = true }
+sauron-purge = { workspace = true }
 diesel.workspace = true
 diesel-async.workspace = true
 deadpool.workspace = true

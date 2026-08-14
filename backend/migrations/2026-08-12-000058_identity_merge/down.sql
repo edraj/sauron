@@ -1,0 +1,11 @@
+DROP INDEX IF EXISTS devices_app_last_distinct_idx;
+DROP INDEX IF EXISTS workflows_app_distinct_idx;
+DROP INDEX IF EXISTS transactions_app_distinct_idx;
+DROP INDEX IF EXISTS identity_merges_dead_idx;
+DROP INDEX IF EXISTS identity_merges_cold_window_idx;
+DROP INDEX IF EXISTS identity_merges_app_distinct_idx;
+DROP INDEX IF EXISTS identity_merges_app_span_idx;
+DROP INDEX IF EXISTS identity_merges_runnable_idx;
+DROP TABLE IF EXISTS identity_merges;
+ALTER TABLE error_events     DROP COLUMN IF EXISTS guest_alias;
+ALTER TABLE analytics_events DROP COLUMN IF EXISTS guest_alias;

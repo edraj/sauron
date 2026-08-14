@@ -109,6 +109,13 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // and reports a clean 403 rather than hiding a capability from someone who
   // holds it. See failures.rs for why the endpoint is deployment-wide.
   '/admin/ingest-failures': { perm: 'org:manage', level: 'org', title: 'Ingest failures' },
+  // Same gate as Storage / Wall of Shame / Ingest failures, and the same caveat:
+  // the backend requires org:manage in EVERY org (require_deployment_admin),
+  // which this table cannot express. Org-level org:manage is the closest it
+  // has, so the nav is slightly MORE permissive than the API. That direction is
+  // the safe one — the page loads and reports a clean 403 rather than hiding a
+  // capability from someone who holds it.
+  '/admin/purge': { perm: 'org:manage', level: 'org', title: 'Purge data' },
 
   // --- Self-service --------------------------------------------------------
   // Self-scoped (/v1/me/*). Always reachable — see the fallback note on

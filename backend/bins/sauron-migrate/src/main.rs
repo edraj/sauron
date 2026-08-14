@@ -51,5 +51,18 @@ async fn main() -> anyhow::Result<()> {
         let pool = sauron_db::build_pool(&url, 4)?;
         sauron_db::person_env_backfill::backfill_all(&pool).await?;
     }
+
+    // Opt-in for exactly the same reason as `backfill-person-envs` above: this
+    // binary is the `sauron-migrate.service` oneshot that every RPM daemon pulls
+    // in via `Requires=`, systemd never retries a failed start job, and this
+    // aggregates all 29 partitions of the two largest tables.
+    //
+    // Until it has run for an app, `repo::list_device_groups` reads that app
+    // through the pre-rollup query, so skipping this is a performance decision
+    // and never a correctness one.
+    if std::env::args().any(|a| a == "backfill-device-envs") {
+        let pool = sauron_db::build_pool(&url, 4)?;
+        sauron_db::device_env_backfill::backfill_all(&pool).await?;
+    }
     Ok(())
 }

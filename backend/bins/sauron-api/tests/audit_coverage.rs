@@ -24,6 +24,12 @@ const AUDITED: &[&str] = &[
     "routes::admin::extend_pin",
     "routes::admin::release_pin",
     "routes::admin::set_tier_policy",
+    // All three purge transitions are audited. `preview` destroys nothing but
+    // is where the scope is chosen and frozen, so it is the only record of
+    // what was ASKED for as distinct from what confirm executed.
+    "routes::purge::preview",
+    "routes::purge::confirm",
+    "routes::purge::cancel",
     "routes::auth::change_password",
     "routes::auth::login",
     "routes::auth::logout",
@@ -305,6 +311,7 @@ const SOURCES: &[(&str, &str)] = &[
         "routes::projects",
         include_str!("../src/routes/projects.rs"),
     ),
+    ("routes::purge", include_str!("../src/routes/purge.rs")),
     ("routes::stores", include_str!("../src/routes/stores.rs")),
 ];
 

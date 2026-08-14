@@ -876,6 +876,21 @@ async fn main() -> anyhow::Result<()> {
             "/v1/admin/tier-pins/{id}/extend",
             post(routes::admin::extend_pin),
         )
+        // Admin data purge. Deployment-admin for the same reason as the tier
+        // routes: it is irreversible, and in a multi-tenant deployment a single
+        // tenant's admin must not be able to destroy signal data.
+        //
+        // `preview` returns 202 and a job the client polls — counting three
+        // partitioned tables on a badly-polluted app is exactly the workload
+        // that would sit past the 30s TimeoutLayer, and that app is the one
+        // that most needs purging.
+        .route(
+            "/v1/admin/purge",
+            get(routes::purge::list_jobs).post(routes::purge::preview),
+        )
+        .route("/v1/admin/purge/{id}", get(routes::purge::get_job))
+        .route("/v1/admin/purge/{id}/confirm", post(routes::purge::confirm))
+        .route("/v1/admin/purge/{id}/cancel", post(routes::purge::cancel))
         // Ingest failures. Deployment-wide for the same reason as the tier
         // routes above, plus one of its own: the dominant failure never
         // decoded, so it carries no org_id to scope an org-level grant against.

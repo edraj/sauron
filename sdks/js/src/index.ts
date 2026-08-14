@@ -60,7 +60,16 @@ export function track(
   trackApi(name, properties, options);
 }
 
-/** Associate the session with a known user. */
+/**
+ * Associate the session with a known user.
+ *
+ * The `anonymous_id` sent with the identify item is the current anon id — but
+ * only when it was actually used as a `distinct_id` this session, and never
+ * when it belongs to a different person than the last one who identified on
+ * this device. In that case a fresh anon id is minted first and `null` is
+ * sent instead, since the old one is already permanently bound to the
+ * previous person server-side (see `reset()`).
+ */
 export function identify(id: string, traits?: Record<string, unknown>): void {
   identifyApi(id, traits);
 }
@@ -113,7 +122,7 @@ export function addBreadcrumb(breadcrumb: BreadcrumbInput, hint?: Hint): void {
 /**
  * Set (or clear, with `null`) the current user.
  *
- * `setUser(null)` is a logout, so it also rotates the anonymous id — otherwise
+ * `setUser(null)` is a logout, so it also calls `reset()` for you — otherwise
  * the next anonymous visitor on this browser inherits the previous person's
  * durable id and a later identify() aliases them together server-side.
  */
@@ -126,8 +135,9 @@ export function setUser(user: UserInput): void {
 }
 
 /**
- * Forget the current person: clears the scope user and mints a fresh anonymous
- * id. Call this on logout.
+ * Forget the current person: clears the scope user, mints a fresh anonymous
+ * id, forgets the last identified user, and rotates the session id so a
+ * single session can never span two different people. Call this on logout.
  */
 export function reset(): void {
   getClient()?.reset();

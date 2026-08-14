@@ -277,7 +277,21 @@ async fn backfill_adds_to_rows_the_write_path_already_created() {
     };
     let ids = db.seed_two_envs().await;
     let mut conn = db.conn().await;
-    let cutoff = chrono::Utc::now();
+    // Anchored to the FIXTURE's clock, not the wall clock. `seed_two_envs`
+    // pins every seeded timestamp to today at 12:00 UTC (see its own `now`
+    // local), while this cutoff bounds the backfill's aggregate with
+    // `occurred_at < cutoff`. A plain `Utc::now()` therefore excludes the
+    // entire fixture on any run before ~11:57 UTC — the seeded rows are in
+    // the FUTURE relative to the cutoff — and this test failed its own
+    // "must have pre-cutoff analytics rows" precondition every morning.
+    // Reproduced deliberately (cutoff moved an hour BEFORE `pinned_now`) and
+    // confirmed as the cause before this fix.
+    //
+    // `+ 1 hour` because the fixture's largest positive offset from its
+    // anchor is +5 seconds, so an hour clears every seeded row while staying
+    // inside the same UTC day — which the day-bucketing assertions elsewhere
+    // in the fixture depend on.
+    let cutoff = ids.pinned_now + chrono::Duration::hours(1);
 
     // What the seed put in analytics_events for this identity in env_a, which
     // is what the backfill's cutoff-bounded aggregate should find.
@@ -435,6 +449,7 @@ async fn write_rows_credits_a_session_once_across_batches() {
                 touch_users: &[],
                 identified: &[],
                 person_envs: std::slice::from_ref(&person),
+                device_envs: &[],
             },
         )
         .await
@@ -520,9 +535,20 @@ async fn rollup_branch_matches_live_branch_for_every_scope() {
         "fixture precondition: All must return people to compare"
     );
 
-    sauron_db::person_env_backfill::backfill_app(&mut conn, ids.app_id, chrono::Utc::now())
-        .await
-        .expect("backfill");
+    // Anchored to the FIXTURE's clock — see
+    // `backfill_adds_to_rows_the_write_path_already_created` for the full
+    // reasoning. With `Utc::now()` here, a run before ~11:57 UTC backfilled
+    // an EMPTY aggregate (every seeded row is at 12:00 UTC, i.e. after the
+    // cutoff), the marker was still written, and every scope below compared a
+    // populated live branch against an empty rollup branch: `left: 8, right:
+    // 0`.
+    sauron_db::person_env_backfill::backfill_app(
+        &mut conn,
+        ids.app_id,
+        ids.pinned_now + chrono::Duration::hours(1),
+    )
+    .await
+    .expect("backfill");
 
     // And the branch must actually have switched, or this compares live to live.
     assert!(

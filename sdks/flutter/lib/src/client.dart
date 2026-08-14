@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'context/anonymous_id_store.dart';
 import 'context/device_context.dart';
+import 'context/last_identified_store.dart';
 import 'dsn.dart';
 import 'envelope.dart';
 import 'integrations/flutter_error_integration.dart';
@@ -23,12 +24,36 @@ import 'types.dart';
 import 'util/uuid.dart';
 import 'workflow.dart';
 
+/// What [SauronClient.prepareIdentify] worked out, before the identify item
+/// is built.
+///
+/// Two outputs rather than one, because they are genuinely independent and
+/// `aliasOf` cannot encode both: `aliasOf == null` means "send no
+/// `anonymous_id`", which is true both when a switch was just detected (the
+/// old anonymous id belonged to somebody else and has been replaced) and when
+/// the anonymous id was simply never used as a `distinct_id` in the first
+/// place. Only [switched] separates them, and the distinction decides whether
+/// the previous person's scope `email`/`traits` are carried forward or
+/// dropped.
+@immutable
+class IdentifyPreparation {
+  const IdentifyPreparation({required this.aliasOf, required this.switched});
+
+  /// The `anonymous_id` to put on the wire, or `null` for none.
+  final String? aliasOf;
+
+  /// Whether a DIFFERENT person was identified on this device last time —
+  /// the forgotten-`reset()`-on-logout case. A fresh anonymous id and a fresh
+  /// session id have already been minted by the time this is `true`.
+  final bool switched;
+}
+
 /// The engine behind the [Sauron] facade: owns the scope, sampling, the
 /// `beforeSend` hook, context, and the transport.
 class SauronClient {
   SauronClient(this.options)
       : _scope = Scope(maxBreadcrumbs: options.maxBreadcrumbs),
-        sessionId = generateUuidV4() {
+        _sessionId = generateUuidV4() {
     _currentScreen = options.screen;
     _scope.setTags(options.tags);
     _scope.contexts.addAll(options.contexts);
@@ -45,10 +70,23 @@ class SauronClient {
 
   final SauronOptions options;
 
-  /// The id of the session created when this client was constructed (at init).
-  /// Attached to errors, analytics events, and transactions so the backend can
-  /// tie signals onto a single session timeline.
-  final String sessionId;
+  /// The id of the current session. Minted fresh when this client is
+  /// constructed (at init), and again by [_rotateSessionId] on [reset] and on
+  /// a detected identity switch (see [prepareIdentify]). Attached to errors,
+  /// analytics events, and transactions so the backend can tie signals onto a
+  /// single session timeline — rotation matters because the server's
+  /// `bump_session` is last-write-wins on `distinct_id`, so without it one
+  /// `sessions` row could otherwise serially represent two different people
+  /// and record only whichever wrote last.
+  String get sessionId => _sessionId;
+  String _sessionId;
+
+  /// Mints a fresh session id, in memory only. Unlike the browser SDK's
+  /// `sessionId`, this one is never persisted — it is regenerated once per
+  /// client construction already — so rotating it needs no storage I/O.
+  void _rotateSessionId() {
+    _sessionId = generateUuidV4();
+  }
 
   /// The current screen/route name, stamped on every event and error, or null.
   String? _currentScreen;
@@ -82,6 +120,7 @@ class SauronClient {
   final Scope _scope;
   final DeviceContextProvider _deviceContext = DeviceContextProvider();
   final AnonymousIdStore _anonymousIdStore = const AnonymousIdStore();
+  final LastIdentifiedStore _lastIdentifiedStore = const LastIdentifiedStore();
   final DartStackTraceParser _parser = const DartStackTraceParser();
   final Random _random = Random();
   final List<EnvelopeItem> _pending = <EnvelopeItem>[];
@@ -110,6 +149,18 @@ class SauronClient {
   /// The persisted anonymous id this install reports as `distinct_id` until
   /// [identify] names a user. Null before [bootstrap] has run.
   String? get anonymousId => _anonymousId;
+
+  /// In-memory cache of the digest of the last user who called [identify] on
+  /// this device — mirrors the browser SDK's module-level `lastIdentified`.
+  ///
+  /// Set unconditionally by [_writeLastIdentified], before any persistence is
+  /// attempted, and consulted by [_readLastIdentified] whenever the persisted
+  /// read comes back with nothing. That fallback is load-bearing, not
+  /// belt-and-braces: without it, a persisted write that silently fails (full
+  /// disk, a file the OS refuses to create) reads back exactly like "no one
+  /// has ever identified on this device", which would silently disable switch
+  /// detection for the rest of the process's life — see [prepareIdentify].
+  String? _lastIdentifiedDigest;
 
   /// Whether the SDK is configured and actively able to deliver.
   ///
@@ -555,34 +606,134 @@ class SauronClient {
   /// The item carries `anonymous_id` only when the anonymous id was actually
   /// used as a `distinct_id` first, so the server can stitch that activity onto
   /// the named user. See [_anonymousIdUsed] for why a speculative alias is
-  /// worse than none.
-  void identify(String distinctId, {Map<String, Object?>? traits}) {
+  /// worse than none. [prepareIdentify] additionally detects a login by a
+  /// DIFFERENT user than last time on this device — the common case of a
+  /// forgotten [reset] on logout — and mints a fresh anonymous id first in
+  /// that case, so this never sends a cross-user alias.
+  ///
+  /// `distinctId` is a non-nullable [String] parameter, so — unlike the
+  /// browser SDK, whose `identify(id: string)` a plain-JS caller can violate
+  /// at runtime by passing a number — Dart's type system already rejects a
+  /// non-`String` argument at the call site. No runtime coercion is needed
+  /// here to keep `IdentifyItem.distinctId` a real `String` on the wire.
+  Future<void> identify(String distinctId, {Map<String, Object?>? traits}) async {
     if (!isEnabled) {
       return;
     }
-    final String? aliasOf = _anonymousIdUsed ? _anonymousId : null;
+    final IdentifyPreparation prep = await prepareIdentify(distinctId);
     final SauronUser? existing = _scope.user;
+    // Carry the previous scope user's `email`/`traits` forward ONLY when this
+    // is the same person re-identifying (adding traits, refreshing after a
+    // token renewal). On a DETECTED SWITCH they belong to somebody else, and
+    // the scope user is attached to every envelope sent afterwards — so
+    // carrying them over stamps person A's email onto every event, error and
+    // session recorded under person B's `distinct_id`, at exactly the
+    // boundary the switch detection exists to police. That is a cross-user
+    // PII leak, and it is worse than the alias leak the switch detection was
+    // added to bound, because it is not capped at one guest window: it
+    // persists for the whole process lifetime, or until B happens to supply
+    // an email of their own.
+    //
+    // Matches the browser SDK, whose `Scope.setUser` rebuilds the user from
+    // the input alone (`email: user.email ?? null`) and therefore never
+    // inherits a previous person's contact details.
+    final SauronUser? carried = prep.switched ? null : existing;
     _scope.user = SauronUser(
       id: distinctId,
-      email: existing?.email,
-      traits: traits ?? existing?.traits ?? const <String, Object?>{},
+      email: carried?.email,
+      traits: traits ?? carried?.traits ?? const <String, Object?>{},
     );
     _dispatch(
       IdentifyItem(
         distinctId: distinctId,
-        anonymousId: aliasOf,
+        anonymousId: prep.aliasOf,
         traits: traits,
       ),
     );
   }
 
-  /// Forgets the current person: clears the scope user and mints a fresh
-  /// anonymous id, persisting it.
+  /// Prepares for an [identify]; returns the `anonymous_id` to send.
+  ///
+  /// When a DIFFERENT user identifies than last time on this device, the
+  /// current anonymous id belongs to the previous person and is already
+  /// burned server-side — an anonymous id binds to a person exactly once and
+  /// can never be re-pointed — so it is replaced BEFORE anything else and
+  /// `null` is sent instead of a cross-user alias. This cannot repair events
+  /// already sent under the burned alias — nothing can — but it bounds a
+  /// forgotten [reset] to one guest window instead of every one after it.
+  ///
+  /// `id` is compared as a short one-way digest ([hashIdentity]), never the
+  /// raw value — see [LastIdentifiedStore] for why, and for the digest's
+  /// caveats (not a security boundary: it is an unkeyed hash, so over a
+  /// possibly low-entropy id it is a confirmation oracle, not a secret).
+  ///
+  /// Public on its own, in addition to being reachable through [identify],
+  /// so tests can drive the switch-detection primitive directly without
+  /// needing a full identify item to be dispatched each time.
+  ///
+  /// Returns BOTH outputs, because `aliasOf` alone cannot express the switch:
+  /// it is `null` for a switch and equally `null` for the ordinary case where
+  /// the anonymous id was simply never used as a `distinct_id`. [identify]
+  /// has to tell those apart — one must discard the previous person's scope
+  /// `email`/`traits`, the other must keep them — and a caller that has to
+  /// re-derive the digest comparison itself would be a second copy of this
+  /// logic, free to drift from the copy that actually rotates the ids.
+  Future<IdentifyPreparation> prepareIdentify(String id) async {
+    final String digest = hashIdentity(id);
+    final String? last = await _readLastIdentified();
+    final bool switched = last != null && last != digest;
+    if (switched) {
+      final Directory? dir = _storageDirectory;
+      if (dir != null) {
+        _anonymousId = await _anonymousIdStore.mintFresh(dir);
+      }
+      _anonymousIdUsed = false;
+      _rotateSessionId();
+    }
+    await _writeLastIdentified(digest);
+    return IdentifyPreparation(
+      aliasOf: _anonymousIdUsed ? _anonymousId : null,
+      switched: switched,
+    );
+  }
+
+  /// The digest of the last identified user, preferring the persisted value
+  /// but falling back to [_lastIdentifiedDigest] whenever the persisted read
+  /// comes back empty — see that field's doc for why the fallback is required
+  /// for correctness, not just redundant caution.
+  Future<String?> _readLastIdentified() async {
+    final Directory? dir = _storageDirectory;
+    final String? stored =
+        dir == null ? null : await _lastIdentifiedStore.read(dir);
+    return stored ?? _lastIdentifiedDigest;
+  }
+
+  /// Records [digest] as the last identified user: updates the in-memory
+  /// cache unconditionally (so it is correct even before [bootstrap] or if
+  /// persistence silently fails), then best-effort persists it.
+  Future<void> _writeLastIdentified(String digest) async {
+    _lastIdentifiedDigest = digest;
+    final Directory? dir = _storageDirectory;
+    if (dir != null) {
+      await _lastIdentifiedStore.write(dir, digest);
+    }
+  }
+
+  /// Forgets the current person: clears the scope user, the last-identified
+  /// record, and mints a fresh anonymous id and session id.
   ///
   /// **Call this on logout.** Without it the next person to use the device
   /// inherits the persisted anonymous id, and their first [identify] aliases
   /// that id — and with it the previous person's anonymous activity — onto the
   /// new account, permanently, server-side.
+  ///
+  /// Clearing the last-identified record matters on its own: without it, the
+  /// stale digest can make the very next [identify] on this device — for
+  /// whoever it turns out to be — misread against a person who is no longer
+  /// signed in. Rotating the session id matters too: the server's
+  /// `bump_session` is last-write-wins on `distinct_id`, so without it one
+  /// `sessions` row could otherwise serially represent two different people
+  /// and record only whichever wrote last.
   ///
   /// Unlike the browser SDK, [setUser] with `null` does NOT do this for you:
   /// persisting the new id is asynchronous and [setUser] is not, so an
@@ -591,12 +742,15 @@ class SauronClient {
   Future<void> reset() async {
     _scope.user = null;
     _anonymousIdUsed = false;
+    _lastIdentifiedDigest = null;
+    _rotateSessionId();
     final Directory? dir = _storageDirectory;
     if (dir == null) {
-      // Never bootstrapped: there is no persisted id to replace.
+      // Never bootstrapped: there is no persisted state to replace.
       return;
     }
     _anonymousId = await _anonymousIdStore.mintFresh(dir);
+    await _lastIdentifiedStore.clear(dir);
   }
 
   /// Adds a breadcrumb to the current scope.

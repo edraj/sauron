@@ -9,6 +9,7 @@ pub mod classify;
 pub mod enrich;
 pub mod failures;
 pub mod mask;
+pub mod merge;
 pub mod process;
 pub mod retry;
 pub mod symbolize;

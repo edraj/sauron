@@ -6889,9 +6889,20 @@ async fn migration_000038_backfills_only_rows_with_traits_or_an_alias() {
     sauron_db::repo::touch_event_user(&mut conn, ids.app_id, &with_alias)
         .await
         .expect("seed the alias-bearing row");
-    sauron_db::repo::insert_identity(&mut conn, ids.app_id, "anon_abc", &with_alias)
-        .await
-        .expect("seed the identities alias");
+    // `repo::insert_identity` was removed in favour of
+    // `identity_merge::claim_identity` (Task 2 of the guest-identity-merge
+    // work); this seed only needs a plain row, so it inserts directly rather
+    // than pull in claim/chain semantics this test isn't exercising.
+    diesel::sql_query(
+        "INSERT INTO identities (app_id, alias_id, distinct_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (app_id, alias_id) DO NOTHING",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .bind::<Text, _>("anon_abc")
+    .bind::<Text, _>(&with_alias)
+    .execute(&mut conn)
+    .await
+    .expect("seed the identities alias");
     sauron_db::repo::touch_event_user(&mut conn, ids.app_id, &bare)
         .await
         .expect("seed the bare row");

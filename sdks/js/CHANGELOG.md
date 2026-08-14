@@ -2,6 +2,40 @@
 
 All notable changes to `@edraj/sauron-browser` are documented here.
 
+## 1.4.1
+
+### Added
+
+- **Auto-reset on identity switch.** `identify()` now detects a login by a
+  DIFFERENT user than last time on the same device — the common case of a
+  forgotten `reset()` on logout — and mints a fresh anonymous id (and rotates
+  the session id) before sending, so `anonymous_id` is `null` instead of an
+  alias to the previous person. This can't undo an alias already sent under
+  the old id — still call `reset()` on logout — but it bounds a missed
+  `reset()` to one corrupted guest window instead of every one after it. To
+  detect the switch, `identify()` persists a short one-way digest (never the
+  id itself; see `hashIdentity`) of the last identified user in `localStorage`
+  under `sauron.last_identified`. Like the anonymous id, this is a durable
+  first-party value stored on the user's terminal — a retention and consent
+  consequence, not just an implementation detail.
+
+  The stored value carries a format tag: `v1:<digest>`, byte-identical to what
+  the Flutter SDK writes under the same key. A value with no tag or an
+  unrecognised one reads as "nobody has identified on this device yet" and is
+  rewritten in the current format on the next `identify()`. That matters
+  because the digest's shape is not frozen — if it ever widens again, an
+  untagged store could not tell "a digest I no longer produce" from "a
+  different person", so every returning user's next `identify()` would be read
+  as a switch and would rotate their anonymous id and session, once, silently.
+  The tag turns that into one missed switch per device instead.
+
+### Changed
+
+- `reset()` now also rotates the session id (`sauron.session_id`). The
+  server's `bump_session` is last-write-wins on `distinct_id`, so without
+  this a single `sessions` row could otherwise end up serially representing
+  two different people and recording only whichever wrote last.
+
 ## 1.4.0
 
 ### Fixed

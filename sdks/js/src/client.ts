@@ -1,7 +1,17 @@
 import { buildContext } from './context.js';
 import { parseDsn, type Dsn } from './dsn.js';
 import { buildEnvelope } from './envelope.js';
-import { getAnonymousId, getDeviceId, getSessionId, resetAnonymousId } from './identity.js';
+import {
+  clearLastIdentified,
+  getAnonymousId,
+  getDeviceId,
+  getLastIdentified,
+  getSessionId,
+  hashIdentity,
+  resetAnonymousId,
+  rotateSessionId,
+  setLastIdentified,
+} from './identity.js';
 import { installConsole } from './integrations/console.js';
 import { installDom } from './integrations/dom.js';
 import { installFetch } from './integrations/fetch.js';
@@ -152,17 +162,56 @@ export class SauronClient {
   }
 
   /**
-   * Forget the current person: clear the scope user and mint a fresh anonymous
-   * id.
+   * Forget the current person: clear the scope user, mint a fresh anonymous
+   * id, forget the last identified user, and rotate the session id.
    *
    * MUST BE CALLED ON LOGOUT. Without it, the next anonymous visitor on this
    * browser reuses the persisted anon id, and a later identify() aliases their
-   * activity to the previous account server-side, permanently.
+   * activity to the previous account server-side, permanently. Rotating the
+   * session id matters too: the server's `bump_session` is last-write-wins on
+   * `distinct_id`, so without rotation one `sessions` row could otherwise
+   * serially represent two different people and record only whichever wrote
+   * last.
    */
   reset(): void {
     this.scope.setUser(null);
     resetAnonymousId();
+    clearLastIdentified();
+    rotateSessionId();
     this.anonUsed = false;
+  }
+
+  /**
+   * Prepare for an `identify()`; returns the `anonymous_id` to send.
+   *
+   * When a DIFFERENT user identifies than last time, the current anon id
+   * belongs to the previous person and is already burned server-side, so it is
+   * replaced before anything else happens and `null` is sent instead of a
+   * cross-user alias. This cannot repair events already sent under the burned
+   * alias — nothing can — but it bounds a forgotten `reset()` to one guest
+   * window instead of every future one.
+   *
+   * `id` is coerced with `String()` before comparing/persisting: a plain-JS
+   * caller can pass a number (`Sauron.identify(user.id)`), and `Storage`
+   * itself applies `ToString` on write — so comparing an un-coerced `id`
+   * against a value that already round-tripped through storage would treat
+   * the SAME numeric user as a switch on every single call. The comparison
+   * against `last` is an explicit `!== null` (not a truthiness check) so an
+   * app that (unusually) identifies with `''` still has a later, different id
+   * correctly detected as a real switch — a falsy string is not "no identity
+   * yet". `last`/the persisted value are digests, not the raw id — see
+   * `hashIdentity`.
+   */
+  prepareIdentify(id: string): string | null {
+    const digest = hashIdentity(String(id));
+    const last = getLastIdentified();
+    if (last !== null && last !== digest) {
+      resetAnonymousId();
+      rotateSessionId();
+      this.anonUsed = false;
+    }
+    setLastIdentified(digest);
+    return this.getAnonymousId();
   }
 
   /** Stamp a fresh envelope (new `sent_at`, current context) around `items`. */

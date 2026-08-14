@@ -130,6 +130,23 @@
   function pushSlice(tx: Transaction) {
     sliceStack = [...sliceStack, tx];
   }
+
+  function downloadSessionJson() {
+    if (!detail || !s) return;
+    const exportData = {
+      session: s,
+      timeline: detail.timeline
+    };
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `session-${s.session_id}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
 </script>
 
 <AppShell requireApp>
@@ -199,6 +216,15 @@
       <div class="col-main">
         <Card title="Timeline">
           {#snippet actions()}
+            <Button
+              variant="ghost"
+              size="sm"
+              title="Download session timeline and context as JSON"
+              onclick={downloadSessionJson}
+            >
+              <Icon name="download" size={14} />
+              Download JSON
+            </Button>
             <Button
               variant="ghost"
               size="sm"

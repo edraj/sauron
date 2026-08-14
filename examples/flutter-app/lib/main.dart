@@ -304,13 +304,17 @@ class _DemoHomePageState extends State<DemoHomePage> {
     _record('track("screen_viewed")', Icons.visibility_outlined);
   }
 
-  void _identify() {
+  Future<void> _identify() async {
     final String id = _distinctIdController.text.trim();
     if (id.isEmpty) {
       _record('identify skipped — distinct_id is empty', Icons.info_outline);
       return;
     }
-    Sauron.identify(
+    // Awaited: identify() detects an identity switch by reading persisted
+    // on-device state, so it must complete before setUser below — otherwise
+    // setUser's traits can be clobbered by identify()'s own scope write
+    // resuming afterwards. See CHANGELOG.md.
+    await Sauron.identify(
       id,
       traits: <String, Object?>{'plan': 'pro', 'demo': true},
     );
@@ -596,7 +600,7 @@ class _DemoHomePageState extends State<DemoHomePage> {
                 'Identifies the user from the distinct_id field above and '
                 'attaches a plan=pro trait.',
             buttonLabel: 'Identify',
-            onPressed: _identify,
+            onPressed: () => unawaited(_identify()),
           ),
           const SizedBox(height: 24),
           const _SectionHeader('Workflows'),
