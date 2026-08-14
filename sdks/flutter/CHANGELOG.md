@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.7.0 - 2026-08-14
 
-*Version number not yet assigned — out of scope for this change to decide. `identify()`'s
-signature change below is source-breaking (`void` → `Future<void>`), so this should ship
-as at least a minor bump, consistent with 1.2.0's precedent for other breaking changes.*
+*Minor, not patch: `identify()`'s signature change below is source-breaking
+(`void` → `Future<void>`), consistent with 1.2.0's precedent for other breaking
+changes.*
 
 - **Breaking: `Sauron.identify()` / `SauronClient.identify()` now return
   `Future<void>` instead of `void`.**

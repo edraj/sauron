@@ -196,6 +196,85 @@ async fn isolate_index(conn: &mut sauron_db::PgConn, table: &str, keep: &str) {
     .expect("isolate target index");
 }
 
+/// `VACUUM` until the partition's visibility map is actually set, or fail
+/// saying so.
+///
+/// A single `VACUUM` is not enough here, and the reason is a property of the
+/// harness rather than of anything under test. `VACUUM` can only mark a page
+/// all-visible if every tuple on it is older than the cluster's
+/// oldest-non-removable xid, and `TestDb::setup()`'s migration connection
+/// (`run_pending_migrations` → `AsyncConnectionWrapper` inside
+/// `spawn_blocking`) does not disappear the instant that call returns: for a
+/// short window afterwards its backend is still there, `idle in transaction`,
+/// pinning the horizon. These tests seed and vacuum within a few milliseconds
+/// of setup, i.e. inside that window, so the `VACUUM` succeeds and marks
+/// nothing.
+///
+/// Measured on an idle server, this test as the only client: consecutive runs
+/// left `relallvisible` at 0 of 97 pages, then 53 of 97, then 97 of 97, so
+/// `Heap Fetches` read 5005, then 2273, then 0 — a coin flip that has nothing
+/// to do with `guest_alias`. Four `VACUUM`s back to back all read 0 of 97
+/// (they all land inside the window); one `VACUUM` a second later reads 97 of
+/// 97, as does a `psql` `VACUUM` against the same database once the test
+/// process has exited. That is what proves the covering index was never the
+/// problem.
+///
+/// Retrying rather than sleeping a fixed amount keeps the wait proportional to
+/// the actual cause and also covers the other horizon holders CI can produce —
+/// notably an autovacuum worker on the same partition, which migration
+/// `2026-08-13-000060` deliberately makes likely by tuning these partitions to
+/// `(scale_factor = 0.0, threshold = 20)`, well below `SEEDED_ROWS`. If the map
+/// never converges this panics with the page counts, so a future horizon holder
+/// shows up as itself instead of as an inexplicable `Heap Fetches` number.
+/// `vacuum_sql` is the exact command to repeat — callers pass `VACUUM ANALYZE
+/// <table>` when they also need fresh planner statistics (after a bulk seed),
+/// and a plain `VACUUM <partition>` when they must not disturb the statistics
+/// the assertion under test depends on.
+async fn vacuum_until_all_visible(conn: &mut sauron_db::PgConn, vacuum_sql: &str, partition: &str) {
+    #[derive(QueryableByName)]
+    struct VisMap {
+        #[diesel(sql_type = BigInt)]
+        all_visible: i64,
+        #[diesel(sql_type = BigInt)]
+        pages: i64,
+    }
+
+    let mut last = (0i64, 0i64);
+    for _ in 0..100 {
+        diesel::sql_query(vacuum_sql)
+            .execute(conn)
+            .await
+            .expect("vacuum");
+
+        let rows: Vec<VisMap> = diesel::sql_query(format!(
+            "SELECT relallvisible::bigint AS all_visible, relpages::bigint AS pages \
+             FROM pg_class WHERE relname = '{partition}'"
+        ))
+        .load(conn)
+        .await
+        .expect("read visibility map counters");
+        // `rows.first()` would resolve to diesel's `FirstDsl`, not the slice
+        // method, and fail to compile against `Vec<VisMap>`.
+        let row = rows
+            .into_iter()
+            .next()
+            .expect("partition exists in pg_class");
+        last = (row.all_visible, row.pages);
+        // `relpages = 0` means ANALYZE has not sized it yet, which is not the
+        // same as "fully visible" — keep going rather than pass vacuously.
+        if row.pages > 0 && row.all_visible >= row.pages {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{partition}: visibility map never converged — {} of {} pages all-visible after 100 \
+         VACUUMs. Something is holding the oldest-non-removable xid back for the whole run; \
+         every `Heap Fetches: 0` assertion below is unmeasurable until that is fixed.",
+        last.0, last.1
+    );
+}
+
 /// Bulk-seed `analytics_events` for one app+environment, spread across 137
 /// distinct_ids and the last ~8 hours (well inside any `since` window a test
 /// below uses, and inside whatever partition already covers "now").
@@ -282,10 +361,12 @@ async fn active_users_still_uses_an_index_only_scan() {
     // not yet marked all-visible, `Heap Fetches` would read nonzero for a
     // reason that has nothing to do with `guest_alias`, and this assertion
     // would be meaningless either way it came out.
-    diesel::sql_query("VACUUM ANALYZE analytics_events")
-        .execute(&mut conn)
-        .await
-        .expect("vacuum analyze");
+    vacuum_until_all_visible(
+        &mut conn,
+        "VACUUM ANALYZE analytics_events",
+        "analytics_events_default",
+    )
+    .await;
     diesel::sql_query("SET enable_seqscan = off")
         .execute(&mut conn)
         .await
@@ -368,10 +449,12 @@ async fn active_users_error_leg_still_uses_an_index_only_scan() {
     )
     .await;
 
-    diesel::sql_query("VACUUM ANALYZE error_events")
-        .execute(&mut conn)
-        .await
-        .expect("vacuum analyze");
+    vacuum_until_all_visible(
+        &mut conn,
+        "VACUUM ANALYZE error_events",
+        "error_events_default",
+    )
+    .await;
     diesel::sql_query("SET enable_seqscan = off")
         .execute(&mut conn)
         .await
@@ -443,10 +526,12 @@ async fn issue_aggregate_still_uses_an_index_only_scan() {
     )
     .await;
 
-    diesel::sql_query("VACUUM ANALYZE error_events")
-        .execute(&mut conn)
-        .await
-        .expect("vacuum analyze");
+    vacuum_until_all_visible(
+        &mut conn,
+        "VACUUM ANALYZE error_events",
+        "error_events_default",
+    )
+    .await;
     diesel::sql_query("SET enable_seqscan = off")
         .execute(&mut conn)
         .await
@@ -635,10 +720,12 @@ async fn merging_a_guest_is_repaired_by_a_vacuum() {
     let now = Utc::now();
     seed_analytics_events(&mut conn, ids.app_id, ids.env_a, now, SEEDED_ROWS).await;
 
-    diesel::sql_query("VACUUM ANALYZE analytics_events")
-        .execute(&mut conn)
-        .await
-        .expect("vacuum analyze");
+    vacuum_until_all_visible(
+        &mut conn,
+        "VACUUM ANALYZE analytics_events",
+        "analytics_events_default",
+    )
+    .await;
     diesel::sql_query("SET enable_seqscan = off")
         .execute(&mut conn)
         .await
@@ -710,10 +797,21 @@ async fn merging_a_guest_is_repaired_by_a_vacuum() {
     // The repair: an explicit VACUUM, standing in for "the tuned autovacuum
     // woke up and ran" — see this test's doc comment for why this is not a
     // wall-clock wait.
-    diesel::sql_query("VACUUM analytics_events_default")
-        .execute(&mut conn)
-        .await
-        .expect("vacuum the touched partition");
+    //
+    // Repeated until the map converges, not once: measured, a single VACUUM
+    // here left `Heap Fetches` above zero whenever the other tests in this
+    // binary had run first, while the same test alone passed every time. That
+    // is the harness's horizon window (see `vacuum_until_all_visible`), not a
+    // property of the merge. Converging also states the production mechanism
+    // more honestly than a one-shot would: autovacuum is a repeating process,
+    // so what migration 2026-08-13-000060 actually relies on is that
+    // *vacuuming* repairs this, not that exactly one pass does.
+    vacuum_until_all_visible(
+        &mut conn,
+        "VACUUM analytics_events_default",
+        "analytics_events_default",
+    )
+    .await;
 
     let after_vacuum = explain_analyze_buffers(&mut conn, &query).await;
     assert_eq!(

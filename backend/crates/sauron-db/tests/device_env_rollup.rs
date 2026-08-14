@@ -962,14 +962,16 @@ async fn device_with_only_a_transaction_matches_live_and_rollup_shapes() {
         "first_seen must be PERTURBED to the transaction's earlier timestamp — \
          proves the new `tx` LATERAL is actually wired into LEAST(), not just \
          present; got {:?}, expected close to {:?}",
-        l.first_seen, tx_at
+        l.first_seen,
+        tx_at
     );
     assert!(
         (l.last_seen - anchor_last).num_seconds().abs() < 2,
         "last_seen must stay the anchor's later event — the transaction is not \
          extremal in this direction, proving the `tx` LATERAL doesn't over-widen; \
          got {:?}, expected close to {:?}",
-        l.last_seen, anchor_last
+        l.last_seen,
+        anchor_last
     );
 
     // Directly confirms the backfill leg's own row shape — timestamps from
@@ -985,9 +987,18 @@ async fn device_with_only_a_transaction_matches_live_and_rollup_shapes() {
         (tx_row.last_seen - tx_at).num_seconds().abs() < 2,
         "the backfill's transactions leg must set last_seen to the transaction's occurred_at"
     );
-    assert_eq!(tx_row.events_count, 0, "a transaction must not add to events_count");
-    assert_eq!(tx_row.errors_count, 0, "a transaction must not add to errors_count");
-    assert_eq!(tx_row.sessions_count, 0, "a transaction must not add to sessions_count");
+    assert_eq!(
+        tx_row.events_count, 0,
+        "a transaction must not add to events_count"
+    );
+    assert_eq!(
+        tx_row.errors_count, 0,
+        "a transaction must not add to errors_count"
+    );
+    assert_eq!(
+        tx_row.sessions_count, 0,
+        "a transaction must not add to sessions_count"
+    );
 
     drop(conn);
     db.cleanup().await;
@@ -1144,10 +1155,22 @@ async fn device_group_where_every_device_is_transaction_only_matches_live_and_ro
     .expect("live list_device_groups must not fail to deserialize");
 
     let l = group(&live, model);
-    assert_eq!(l.device_count, 2, "both transaction-only devices must be admitted");
-    assert_eq!(l.events_count, 0, "a transaction must not add to events_count");
-    assert_eq!(l.errors_count, 0, "a transaction must not add to errors_count");
-    assert_eq!(l.sessions_count, 0, "a transaction must not add to sessions_count");
+    assert_eq!(
+        l.device_count, 2,
+        "both transaction-only devices must be admitted"
+    );
+    assert_eq!(
+        l.events_count, 0,
+        "a transaction must not add to events_count"
+    );
+    assert_eq!(
+        l.errors_count, 0,
+        "a transaction must not add to errors_count"
+    );
+    assert_eq!(
+        l.sessions_count, 0,
+        "a transaction must not add to sessions_count"
+    );
     assert!(
         (l.first_seen - tx_a_at).num_seconds().abs() < 2,
         "first_seen must be the earlier transaction's occurred_at, got {:?}, expected close to {:?}",
@@ -1156,7 +1179,8 @@ async fn device_group_where_every_device_is_transaction_only_matches_live_and_ro
     assert!(
         (l.last_seen - tx_b_at).num_seconds().abs() < 2,
         "last_seen must be the later transaction's occurred_at, got {:?}, expected close to {:?}",
-        l.last_seen, tx_b_at
+        l.last_seen,
+        tx_b_at
     );
 
     let cutoff = now + chrono::Duration::days(1);
@@ -1286,25 +1310,39 @@ async fn list_devices_with_a_transaction_only_device_does_not_fail_to_deserializ
     .await
     .expect("list_devices must not fail to deserialize a transaction-only device");
 
-    let d = rows.iter().find(|d| d.device_key == device_key).unwrap_or_else(|| {
-        panic!(
-            "transaction-only device missing from list_devices — got {:?}",
-            rows.iter().map(|d| &d.device_key).collect::<Vec<_>>()
-        )
-    });
+    let d = rows
+        .iter()
+        .find(|d| d.device_key == device_key)
+        .unwrap_or_else(|| {
+            panic!(
+                "transaction-only device missing from list_devices — got {:?}",
+                rows.iter().map(|d| &d.device_key).collect::<Vec<_>>()
+            )
+        });
 
-    assert_eq!(d.events_count, 0, "a transaction must not add to events_count");
-    assert_eq!(d.errors_count, 0, "a transaction must not add to errors_count");
-    assert_eq!(d.sessions_count, 0, "a transaction must not add to sessions_count");
+    assert_eq!(
+        d.events_count, 0,
+        "a transaction must not add to events_count"
+    );
+    assert_eq!(
+        d.errors_count, 0,
+        "a transaction must not add to errors_count"
+    );
+    assert_eq!(
+        d.sessions_count, 0,
+        "a transaction must not add to sessions_count"
+    );
     assert!(
         (d.first_seen - tx_at).num_seconds().abs() < 2,
         "first_seen must be the transaction's occurred_at, got {:?}, expected close to {:?}",
-        d.first_seen, tx_at
+        d.first_seen,
+        tx_at
     );
     assert!(
         (d.last_seen - tx_at).num_seconds().abs() < 2,
         "last_seen must be the transaction's occurred_at, got {:?}, expected close to {:?}",
-        d.last_seen, tx_at
+        d.last_seen,
+        tx_at
     );
 
     drop(conn);
@@ -1406,18 +1444,29 @@ async fn get_device_with_only_a_transaction_signal_is_found_with_non_null_timest
     });
 
     assert_eq!(row.device_key, device_key);
-    assert_eq!(row.events_count, 0, "a transaction must not add to events_count");
-    assert_eq!(row.errors_count, 0, "a transaction must not add to errors_count");
-    assert_eq!(row.sessions_count, 0, "a transaction must not add to sessions_count");
+    assert_eq!(
+        row.events_count, 0,
+        "a transaction must not add to events_count"
+    );
+    assert_eq!(
+        row.errors_count, 0,
+        "a transaction must not add to errors_count"
+    );
+    assert_eq!(
+        row.sessions_count, 0,
+        "a transaction must not add to sessions_count"
+    );
     assert!(
         (row.first_seen - tx_at).num_seconds().abs() < 2,
         "first_seen must be the transaction's occurred_at, got {:?}, expected close to {:?}",
-        row.first_seen, tx_at
+        row.first_seen,
+        tx_at
     );
     assert!(
         (row.last_seen - tx_at).num_seconds().abs() < 2,
         "last_seen must be the transaction's occurred_at, got {:?}, expected close to {:?}",
-        row.last_seen, tx_at
+        row.last_seen,
+        tx_at
     );
 
     // Under `Unattributed`, this device must NOT be found — its only signal

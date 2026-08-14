@@ -468,30 +468,24 @@ async fn run_one_restore(pool: &PgPool, cfg: &Config, worker_id: &str) -> anyhow
             match repo::repair_restored_rows(&mut c, &job.table_name, pin_id, rs, re).await {
                 Ok(repaired) => {
                     info!(job = %job.id, rows = n, repaired, "resolved restored guest ids at the source");
-                    repo::finish_restore_job(&mut c, job.id, worker_id, "succeeded", n, "")
-                        .await?;
+                    repo::finish_restore_job(&mut c, job.id, worker_id, "succeeded", n, "").await?;
                     info!(job = %job.id, rows = n, estimate, "restore complete");
                 }
                 Err(e) => {
-                    let removed = match repo::delete_restored_rows(
-                        &mut c,
-                        &job.table_name,
-                        pin_id,
-                        rs,
-                        re,
-                    )
-                    .await
-                    {
-                        Ok(removed) => removed,
-                        Err(del_err) => {
-                            warn!(
-                                job = %job.id, error = %del_err,
-                                "failed to clean up after a repair error; rows may remain \
-                                 live and unrepaired"
-                            );
-                            0
-                        }
-                    };
+                    let removed =
+                        match repo::delete_restored_rows(&mut c, &job.table_name, pin_id, rs, re)
+                            .await
+                        {
+                            Ok(removed) => removed,
+                            Err(del_err) => {
+                                warn!(
+                                    job = %job.id, error = %del_err,
+                                    "failed to clean up after a repair error; rows may remain \
+                                     live and unrepaired"
+                                );
+                                0
+                            }
+                        };
                     repo::finish_restore_job(
                         &mut c,
                         job.id,

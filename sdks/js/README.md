@@ -989,7 +989,7 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.4.0';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.4.1';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42' });
 </script>
 ```

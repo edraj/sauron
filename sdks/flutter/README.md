@@ -33,7 +33,7 @@ or, in `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  sauron_flutter: ^1.6.0
+  sauron_flutter: ^1.7.0
 ```
 
 Requires Dart SDK `>=3.4.0 <4.0.0` and Flutter `>=3.19.0`.
