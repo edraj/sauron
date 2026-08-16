@@ -213,6 +213,9 @@ export type { Dsn } from './dsn.js';
 export { buildEnvelope } from './envelope.js';
 export { parseStackString, parseError, isInAppFrame } from './stacktrace/parse.js';
 export { SDK_NAME, SDK_VERSION } from './utils.js';
+// Exported so a caller can size a payload BEFORE attaching it — the cap is
+// otherwise invisible until the dashboard shows a truncation marker.
+export { MAX_TRANSACTION_EXTRA_BYTES, capTransactionExtra } from './utils.js';
 export type { BreadcrumbInput } from './api/breadcrumbs.js';
 export type { TransactionInput } from './api/product.js';
 

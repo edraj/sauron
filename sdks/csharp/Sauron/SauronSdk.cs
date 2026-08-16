@@ -72,6 +72,8 @@ public static class SauronSdk
         => Current?.Identify(distinctId, traits);
 
     /// <summary>Emit a performance transaction. <paramref name="distinctId"/> falls back to the scoped user id.</summary>
+    /// <remarks><paramref name="tags"/>/<paramref name="extra"/> are per-call only — the scope is not
+    /// merged in. See <see cref="SauronClient.TrackTransaction"/>.</remarks>
     public static void TrackTransaction(
         string name,
         double durationMs,
@@ -80,8 +82,11 @@ public static class SauronSdk
         string? httpMethod = null,
         int? httpStatus = null,
         string? url = null,
-        string? distinctId = null)
-        => Current?.TrackTransaction(name, durationMs, op, status, httpMethod, httpStatus, url, distinctId);
+        string? distinctId = null,
+        IReadOnlyDictionary<string, object?>? tags = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
+        => Current?.TrackTransaction(
+            name, durationMs, op, status, httpMethod, httpStatus, url, distinctId, tags, extra);
 
     // ---- Workflows -------------------------------------------------------
 

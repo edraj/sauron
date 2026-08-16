@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use sauron_db::models::ErrorEvent;
+use sauron_db::models::{ErrorEvent, Transaction};
 use sauron_db::PgPool;
 use sauron_redis::SymbolBlobCache;
 use sauron_symbols::{ArtifactRef, BlobFetch, RawFrame, Status};
@@ -192,6 +192,84 @@ pub fn strip_event_body(event: &mut ErrorEvent) {
     event.debug_meta = None;
     event.event_user = None;
     event.ip_address = None;
+}
+
+/// Remove a transaction's **developer-supplied** payload, leaving the span.
+///
+/// Withheld — `tags` and `extra`. `extra` is where the request body, the
+/// response body and anything else the call site attached land, which makes it
+/// the same "most likely place for a secret" as `ErrorEvent::extra`; `tags` is
+/// the same family. `ip_address` goes too, matching [`strip_event_body`].
+///
+/// Kept — the span itself: `name`, `op`, `duration_ms`, `status`, `http_method`,
+/// `http_status`, `url`, timestamps, `session_id`, `device_key`, `release`,
+/// `distinct_id`, `workflow_*`. A coarse-gated caller still sees that the
+/// operation happened and how long it took, rather than an empty list that
+/// reads as "no data".
+///
+/// **`url` deliberately stays.** It is the label of an HTTP span — withholding
+/// it would leave `name`, which for HTTP transactions is usually the same
+/// string, so removing one and not the other would withhold nothing while
+/// making every list unreadable.
+pub fn strip_transaction_body(txn: &mut Transaction) {
+    txn.tags = Value::Null;
+    txn.extra = Value::Null;
+    txn.ip_address = None;
+}
+
+/// Whether `perms` may see transaction bodies at all.
+///
+/// `event:read` ALONE, deliberately not [`may_read_event_body`]'s
+/// `issue:read AND event:read`: a performance span is not an issue, and
+/// requiring issue-reading rights to see an HTTP span's payload would read as a
+/// bug to whoever hit it. `sessions::detail` already authorizes on `event:read`,
+/// so this composes there without widening that route's requirement.
+///
+/// Exposed as a named predicate for the same reason [`may_read_event_body`] is:
+/// [`transaction_text_search_reach`] is DERIVED from it rather than restating
+/// it, so "what you may search" and "what you may read back" cannot drift.
+pub fn may_read_transaction_body(perms: &std::collections::HashSet<String>) -> bool {
+    perms.contains(sauron_auth::perm::EVENT_READ)
+}
+
+/// How far a free-text `?q=` may reach over `transactions` for this permission
+/// set.
+///
+/// **A search predicate is a read**, and `extra` on a transaction is where
+/// request and response bodies live. Answering "does this column contain this
+/// substring?" for a column the same response NULLS is not withholding it:
+/// probe `?q=sk_live_a`, `?q=sk_live_ab`, … and the row counts spell the value
+/// out one byte at a time.
+///
+/// Derived from [`may_read_transaction_body`] — the SAME predicate
+/// [`gate_transaction_body`] uses. The invariant is *what you may search is
+/// exactly what you may read back*, and it only holds if one function answers
+/// both questions; two copies would drift, and the drift that matters
+/// (searchable wider than readable) is silent.
+pub fn transaction_text_search_reach(
+    perms: &std::collections::HashSet<String>,
+) -> sauron_db::repo::TextSearchReach {
+    if may_read_transaction_body(perms) {
+        sauron_db::repo::TextSearchReach::IncludingBody
+    } else {
+        sauron_db::repo::TextSearchReach::ShellOnly
+    }
+}
+
+/// Apply [`strip_transaction_body`] to every transaction unless `perms` carries
+/// `event:read`.
+///
+/// Lives here, taking the permission set rather than a `bool`, for the reason
+/// [`gate_event_body`] does: every route that reaches a transaction body is one
+/// forgotten line away from a leak, so the check is a function they call rather
+/// than a condition each of them restates.
+pub fn gate_transaction_body(perms: &std::collections::HashSet<String>, txns: &mut [Transaction]) {
+    if may_read_transaction_body(perms) {
+        return;
+    }
+    for t in txns.iter_mut() {
+        strip_transaction_body(t);
+    }
 }
 
 /// Whether `perms` may see event bodies at all.
@@ -628,5 +706,183 @@ mod tests {
                  exactly the oracle `TextSearchReach` exists to close"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Transactions. `extra` here is where a request or response body lands, so
+    // it is the same class of data as `ErrorEvent::extra` and gets the same
+    // treatment.
+    // -----------------------------------------------------------------------
+
+    fn fully_populated_transaction() -> Transaction {
+        let now = Utc::now();
+        Transaction {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            environment_id: Some(Uuid::nil()),
+            name: "POST /orders".into(),
+            op: "http".into(),
+            duration_ms: 128.4,
+            status: Some("ok".into()),
+            http_method: Some("POST".into()),
+            http_status: Some(201),
+            url: Some("https://api.example.com/orders".into()),
+            distinct_id: Some("u_123".into()),
+            session_id: Some("s_1".into()),
+            device_key: Some("dev_1".into()),
+            release: Some("1.2.3".into()),
+            ip_address: Some("203.0.113.7".into()),
+            occurred_at: now,
+            received_at: now,
+            workflow_id: Some("wf_1".into()),
+            workflow_name: Some("checkout".into()),
+            // Populated like every other field: the assertion below is that
+            // NOTHING starts null, so a `None` here would make the strip's
+            // effect indistinguishable from the fixture's own gaps.
+            restored_pin_id: Some(Uuid::nil()),
+            finished_at: Some(now),
+            tags: json!({ "tier": "premium" }),
+            extra: json!({ "request": "{\"item\":1}", "response": "{\"id\":9}" }),
+        }
+    }
+
+    fn tx_null_keys(v: &Value) -> Vec<String> {
+        let mut ks: Vec<String> = v
+            .as_object()
+            .expect("Transaction serializes to an object")
+            .iter()
+            .filter(|(_, val)| val.is_null())
+            .map(|(k, _)| k.clone())
+            .collect();
+        ks.sort();
+        ks
+    }
+
+    /// The census, for transactions. Pins BOTH halves — which fields exist and
+    /// which the strip withholds — so adding a field to `Transaction` fails
+    /// here and forces a body/shell ruling rather than defaulting it into the
+    /// shell and leaking silently.
+    #[test]
+    fn strip_transaction_body_withholds_exactly_the_developer_payload() {
+        let mut t = fully_populated_transaction();
+        let before = serde_json::to_value(&t).expect("serialize");
+        assert!(
+            tx_null_keys(&before).is_empty(),
+            "the fixture must start with nothing null, or this test proves nothing"
+        );
+
+        strip_transaction_body(&mut t);
+        let v = serde_json::to_value(&t).expect("serialize");
+
+        let mut all: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "app_id",
+                "device_key",
+                "distinct_id",
+                "duration_ms",
+                "environment_id",
+                "extra",
+                "finished_at",
+                "http_method",
+                "http_status",
+                "id",
+                "ip_address",
+                "name",
+                "occurred_at",
+                "op",
+                "received_at",
+                "release",
+                "restored_pin_id",
+                "session_id",
+                "status",
+                "tags",
+                "url",
+                "workflow_id",
+                "workflow_name",
+            ],
+            "a field was added to or removed from `Transaction` — decide whether it is body \
+             or shell and update `strip_transaction_body` before updating this list"
+        );
+
+        assert_eq!(
+            tx_null_keys(&v),
+            ["extra", "ip_address", "tags"],
+            "the withheld set changed"
+        );
+
+        // The shell has to SURVIVE, or a coarse-gated caller gets an empty list
+        // that reads as "no data" rather than "this happened, and you may not
+        // see what was attached to it".
+        assert_eq!(v["name"], "POST /orders");
+        assert_eq!(v["duration_ms"], 128.4);
+        assert_eq!(v["http_status"], 201);
+        // `url` stays on purpose: it is the label of an HTTP span, and `name`
+        // usually repeats it, so withholding one and not the other would
+        // withhold nothing while making every list unreadable.
+        assert_eq!(v["url"], "https://api.example.com/orders");
+    }
+
+    /// **The invariant, asserted as a PAIR in one test.**
+    ///
+    /// What you may search must be exactly what you may read back. Split across
+    /// two tests, the half that matters can pass while the other rots — and the
+    /// rot that matters (searchable wider than readable) is silent, because a
+    /// substring probe over a withheld column returns a row count rather than
+    /// an error.
+    #[test]
+    fn transaction_read_and_search_gates_move_together() {
+        for (label, perms) in [
+            ("no perms", HashSet::<String>::new()),
+            (
+                "issue:read only — a span is not an issue",
+                HashSet::from([perm::ISSUE_READ.to_string()]),
+            ),
+        ] {
+            assert!(
+                !may_read_transaction_body(&perms),
+                "{label}: body must be withheld"
+            );
+            assert_eq!(
+                transaction_text_search_reach(&perms),
+                sauron_db::repo::TextSearchReach::ShellOnly,
+                "{label}: the body is withheld but the free-text scan still reaches it — \
+                 exactly the byte-at-a-time oracle this pairing exists to close"
+            );
+
+            let mut t = fully_populated_transaction();
+            gate_transaction_body(&perms, std::slice::from_mut(&mut t));
+            assert!(t.extra.is_null(), "{label}: extra survived the gate");
+            assert!(t.tags.is_null(), "{label}: tags survived the gate");
+        }
+
+        // And the readable direction, so the test cannot pass by refusing
+        // everyone.
+        let allowed = HashSet::from([perm::EVENT_READ.to_string()]);
+        assert!(may_read_transaction_body(&allowed));
+        assert_eq!(
+            transaction_text_search_reach(&allowed),
+            sauron_db::repo::TextSearchReach::IncludingBody
+        );
+        let mut t = fully_populated_transaction();
+        gate_transaction_body(&allowed, std::slice::from_mut(&mut t));
+        assert_eq!(t.extra["request"], "{\"item\":1}");
+        assert_eq!(t.tags["tier"], "premium");
+    }
+
+    /// A transaction body is gated on `event:read` ALONE — deliberately NOT
+    /// `may_read_event_body`'s `issue:read AND event:read`.
+    ///
+    /// Requiring issue-reading rights to see an HTTP span's payload would read
+    /// as a bug to whoever hit it, and `sessions::detail` already authorizes on
+    /// `event:read`, so this composes there without widening that route.
+    #[test]
+    fn transaction_gating_does_not_require_issue_read() {
+        let perms = HashSet::from([perm::EVENT_READ.to_string()]);
+        assert!(may_read_transaction_body(&perms));
+        // The error-body gate, for contrast, refuses the same caller.
+        assert!(!may_read_event_body(&perms));
     }
 }

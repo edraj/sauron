@@ -2,7 +2,7 @@
 
 /** SDK identity, embedded in every envelope header. */
 export const SDK_NAME = 'sauron.javascript';
-export const SDK_VERSION = '1.4.1';
+export const SDK_VERSION = '1.5.0';
 
 /** The ambient global, regardless of environment (window / self / global). */
 export function getGlobal(): typeof globalThis {
@@ -112,4 +112,68 @@ export function makeLogger(debug: boolean): {
     log: (...args: unknown[]) => console.log('[sauron]', ...args),
     warn: (...args: unknown[]) => console.warn('[sauron]', ...args),
   };
+}
+
+/**
+ * Largest serialized `extra` a single transaction may carry, in bytes.
+ *
+ * Transactions are the highest-volume signal and they ship in BATCHED
+ * envelopes, so one oversized payload does not fail alone — ingest rejects the
+ * whole envelope past `INGEST_MAX_BODY_BYTES` (1 MiB by default) and every
+ * unrelated span batched with it is lost. Since the motivating use of
+ * transaction `extra` is request and response bodies, that is not a remote
+ * hazard.
+ */
+export const MAX_TRANSACTION_EXTRA_BYTES = 16 * 1024;
+
+/**
+ * Cap a transaction's `extra`, substituting a marker when it is too large.
+ *
+ * Replaces the WHOLE map rather than trimming keys: a half-written JSON value
+ * is worse than an honest marker, and per-key trimming would make the result
+ * depend on key iteration order, which differs across the five SDKs. The
+ * marker is deliberately readable on the dashboard — `_truncated` says data
+ * was dropped rather than silently serving a short object that looks complete.
+ *
+ * Returns the input unchanged when it fits. A value that cannot be serialized
+ * at all (a cycle, a BigInt) is replaced by the same marker with `_bytes: -1`,
+ * because the alternative is throwing from inside `trackTransaction` — and an
+ * SDK that crashes the app it is measuring is worse than one that drops a
+ * payload.
+ */
+export function capTransactionExtra(
+  extra: Record<string, unknown>,
+  maxBytes = MAX_TRANSACTION_EXTRA_BYTES,
+): Record<string, unknown> {
+  let bytes: number;
+  try {
+    const json = JSON.stringify(extra);
+    if (json === undefined) return { _truncated: true, _bytes: -1 };
+    // `Blob`/`Buffer` are not available everywhere this SDK runs; UTF-8 byte
+    // length is what the wire actually costs, so it is computed rather than
+    // approximated by `json.length` (which undercounts every non-ASCII byte —
+    // exactly what a response body full of user text contains).
+    bytes = utf8Length(json);
+  } catch {
+    return { _truncated: true, _bytes: -1 };
+  }
+  if (bytes <= maxBytes) return extra;
+  return { _truncated: true, _bytes: bytes };
+}
+
+/** UTF-8 byte length of a string, without depending on `TextEncoder`. */
+function utf8Length(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff) {
+      // A surrogate PAIR is one 4-byte code point; advance past its low half
+      // so it is not counted twice.
+      n += 4;
+      i++;
+    } else n += 3;
+  }
+  return n;
 }

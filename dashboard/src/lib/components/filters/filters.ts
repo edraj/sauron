@@ -199,3 +199,33 @@ export const EVENT_FIELDS: FieldDef[] = [
 export const OCCURRENCE_FIELDS: FieldDef[] = [
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
 ];
+
+/**
+ * The searched transactions list.
+ *
+ * Mirrors the dimensions the query catalog declares for
+ * `Resource::Transactions` — `op`, `name`, `url`, `http.method`,
+ * `http.status`, `duration`, `extra` and `tag`. A chip for a field the
+ * resource does not carry resolves to an "unknown field" 400, so this list is
+ * derived from `catalog.rs` rather than from what looks useful.
+ *
+ * `duration` is deliberately absent as a CHIP: the catalog types it as
+ * `ValueType::Duration`, which accepts `2s`/`500ms` spellings that the
+ * numeric-chip validator (`i64` digits only) would reject before they ever
+ * reached the wire. It is reachable through the query language, where the
+ * parser that owns that grammar is the one doing the parsing.
+ */
+export const TRANSACTION_FIELDS: FieldDef[] = [
+  { key: 'name', label: 'Name', type: 'string', ops: OPS_STR },
+  {
+    key: 'op',
+    label: 'Op',
+    type: 'enum',
+    ops: OPS_ENUM,
+    options: ['navigation', 'http', 'resource', 'screen_load', 'custom'],
+  },
+  { key: 'url', label: 'URL', type: 'string', ops: OPS_STR },
+  { key: 'http.method', label: 'Method', type: 'string', ops: OPS_ENUM },
+  { key: 'http.status', label: 'Status code', type: 'number', ops: OPS_NUM },
+  { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
+];

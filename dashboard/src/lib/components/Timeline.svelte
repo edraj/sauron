@@ -210,6 +210,43 @@
                 />
               </div>
             {/if}
+            <!--
+              Developer-supplied metadata, surfaced ABOVE the raw payload.
+
+              It is already inside `payload(item)` — that returns the whole
+              transaction — but buried among twenty machine columns, which is
+              where it might as well not be. These are the two fields the
+              developer chose to attach, and on an HTTP span they are the
+              request and response bodies; they get their own labelled blocks
+              for the same reason Issue detail gives `extra` a card of its own.
+            -->
+            {#if item.kind === 'transaction'}
+              {#if item.transaction.extra?._truncated === true}
+                <p class="tl-truncated" role="status">
+                  <Icon name="info" size={13} />
+                  <span>
+                    The SDK capped this payload at 16 KB and sent a marker instead. The
+                    span and its timing are accurate; only the attached data was dropped.
+                  </span>
+                </p>
+              {/if}
+              {#if item.transaction.tags && Object.keys(item.transaction.tags).length > 0}
+                <div class="tl-meta">
+                  <span class="section-label">Tags</span>
+                  <div class="tl-tags">
+                    {#each Object.entries(item.transaction.tags) as [k, v] (k)}
+                      <Badge tone="neutral" size="sm">{k}: {v}</Badge>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+              {#if item.transaction.extra && Object.keys(item.transaction.extra).length > 0}
+                <div class="tl-meta">
+                  <span class="section-label">Additional data</span>
+                  <JsonTree value={item.transaction.extra} expandTo={1} />
+                </div>
+              {/if}
+            {/if}
             <JsonTree value={payload(item)} expandTo={2} />
           </div>
         {/if}
@@ -376,6 +413,27 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     overflow-x: auto;
+  }
+  /* `tl-` prefixed for the same reason `.tl-stack` below is. */
+  .tl-meta {
+    margin-bottom: 12px;
+  }
+  .tl-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .tl-truncated {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 12px;
+    padding: 7px 10px;
+    border-radius: var(--radius);
+    background: var(--info-soft);
+    color: var(--info);
+    font-size: 12px;
   }
   /* `tl-`prefixed because `.stack` is a global utility in app.css. */
   .tl-stack {

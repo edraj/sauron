@@ -641,6 +641,14 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/transactions/timeseries",
             get(routes::analytics::transaction_timeseries),
         )
+        // The searched per-span list, as opposed to the two aggregates above
+        // and under `/performance`. Registered AFTER `/transactions/timeseries`
+        // so the literal segment keeps winning; axum matches literals over the
+        // bare path regardless, but the order states the intent.
+        .route(
+            "/v1/apps/{app_id}/transactions",
+            get(routes::transactions::list),
+        )
         // --- exceptions dashboard ---
         .route("/v1/apps/{app_id}/issues/stats", get(routes::issues::stats))
         // --- search schema ---

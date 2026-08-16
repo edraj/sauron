@@ -55,6 +55,7 @@
   import Smartphone from '@lucide/svelte/icons/smartphone';
   import Sun from '@lucide/svelte/icons/sun';
   import Terminal from '@lucide/svelte/icons/terminal';
+  import Timer from '@lucide/svelte/icons/timer';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import User from '@lucide/svelte/icons/user';
   import Users from '@lucide/svelte/icons/users';
@@ -111,6 +112,7 @@
     smartphone: Smartphone,
     sun: Sun,
     terminal: Terminal,
+    timer: Timer,
     'triangle-alert': TriangleAlert,
     user: User,
     users: Users,

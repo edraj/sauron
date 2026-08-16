@@ -14,6 +14,7 @@ pub mod issues;
 pub mod occurrences;
 pub mod prepare;
 pub mod sessions;
+pub mod transactions;
 
 use std::collections::HashMap;
 use std::fmt;

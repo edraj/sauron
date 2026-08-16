@@ -157,3 +157,10 @@ export async function close(): Promise<void> {
   activeClient = null;
   await client.close();
 }
+
+// Exported so a caller can size a payload BEFORE attaching it — the cap is
+// otherwise invisible until the dashboard shows a truncation marker.
+export {
+  MAX_TRANSACTION_EXTRA_BYTES,
+  capTransactionExtra,
+} from './transaction-extra.js';

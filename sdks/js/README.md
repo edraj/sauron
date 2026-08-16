@@ -358,9 +358,27 @@ function trackTransaction(input: TransactionInput): void
 | `httpMethod` | `string \| null` | `null` | For `http` ops. |
 | `httpStatus` | `number \| null` | `null` | For `http` ops. |
 | `url` | `string \| null` | `null` | For `http` ops. |
+| `tags` | `Record<string, string>` | omitted | Indexed string→string labels. Filter with `@tag.key:value` on the Transactions page. |
+| `extra` | `Record<string, unknown>` | omitted | Freeform JSON — request body, response body, SQL text, row counts. Searchable with `extra.key:value`. |
 
 The item is stamped with the current distinct id, session id and timestamp.
 Never sampled. Returns `void`.
+
+**`tags` and `extra` are per-call only.** Unlike `track()` and
+`captureException()`, a transaction does **not** inherit the scope:
+`setTag()` / `setExtra()` defaults are not merged in. Transactions are the
+highest-volume signal a page emits — one per navigation and per fetch — so
+inheriting a global blob would write it onto every row.
+
+`extra` is serialized and capped at **16 KB** (`MAX_TRANSACTION_EXTRA_BYTES`).
+Past that the whole map is replaced with `{ _truncated: true, _bytes: N }` and
+the dashboard says so on the row. The cap is not cosmetic: envelopes are
+batched, and one oversized body would push the whole envelope past the ingest
+limit and drop every unrelated span sent with it. Size is measured in **UTF-8
+bytes**, so a body of non-ASCII text counts what it will actually cost.
+
+Nothing in `extra` is scrubbed. Use `beforeSend` for redaction, and think twice
+before attaching a body that can carry tokens or personal data.
 
 ```ts
 const started = performance.now();
@@ -375,6 +393,115 @@ Sauron.trackTransaction({
   url: '/api/orders',
 });
 ```
+
+#### Example: a `fetch` wrapper that records both bodies
+
+Drop-in replacement for `fetch` on the calls you care about. Note the
+`res.clone()` — reading the body consumes the stream, so the caller would get an
+empty response otherwise.
+
+```ts
+import * as Sauron from '@edraj/sauron-browser';
+
+export async function tracedFetch(
+  input: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const method = (init.method ?? 'GET').toUpperCase();
+  const path = new URL(input, location.origin).pathname;
+  const started = performance.now();
+
+  try {
+    const res = await fetch(input, init);
+    // Clone BEFORE reading: a Response body is a one-shot stream, and
+    // consuming it here would hand the caller an empty one.
+    const responseBody = await res.clone().text();
+
+    Sauron.trackTransaction({
+      name: `${method} ${path}`,          // grouping key — keep it low cardinality
+      op: 'http',
+      durationMs: performance.now() - started,
+      httpMethod: method,
+      httpStatus: res.status,
+      url: input,
+      status: res.ok ? 'ok' : 'error',
+      tags: { api: path.split('/')[2] ?? 'root' },
+      extra: {
+        request: typeof init.body === 'string' ? init.body : undefined,
+        response: responseBody,
+        response_bytes: responseBody.length,
+      },
+    });
+    return res;
+  } catch (err) {
+    Sauron.trackTransaction({
+      name: `${method} ${path}`,
+      op: 'http',
+      durationMs: performance.now() - started,
+      httpMethod: method,
+      url: input,
+      status: 'error',
+      extra: { request: init.body, error: String(err) },
+    });
+    throw err;
+  }
+}
+```
+
+On the dashboard: **Transactions → the row → expand**. Both bodies render as a
+JSON tree, and every one of these finds it:
+
+```text
+extra.response:~9001        # substring, inside the stored response body
+@tag.api:orders             # indexed tag
+op:http http.status:>=500   # the failures
+duration:>2s                # the slow ones
+```
+
+#### Example: a client-side SQL query (`sql.js` / `wa-sqlite`)
+
+If your app runs SQLite in the browser, spans work the same way. Put the
+**statement** in `extra` and keep `name` a stable label — a query with literals
+baked in would mint a new dashboard row per execution.
+
+```ts
+function tracedQuery(db: Database, sql: string, params: unknown[] = []) {
+  const started = performance.now();
+  try {
+    const rows = db.exec(sql, params);
+    Sauron.trackTransaction({
+      // The LABEL, not the statement. `op` accepts only
+      // navigation|http|resource|screen_load|custom — anything else, `'db'`
+      // included, is coerced to 'custom', so pass 'custom' and say it with a tag.
+      name: 'SELECT orders',
+      op: 'custom',
+      durationMs: performance.now() - started,
+      status: 'ok',
+      tags: { db: 'sqlite', table: 'orders' },
+      extra: {
+        statement: sql,
+        row_count: rows[0]?.values.length ?? 0,
+        // Bind PARAMETERS are user data. Log them only if you have decided
+        // that is acceptable, or log their shape instead.
+        params,
+      },
+    });
+    return rows;
+  } catch (err) {
+    Sauron.trackTransaction({
+      name: 'SELECT orders',
+      op: 'custom',
+      durationMs: performance.now() - started,
+      status: 'error',
+      tags: { db: 'sqlite', table: 'orders' },
+      extra: { statement: sql, error: String(err) },
+    });
+    throw err;
+  }
+}
+```
+
+Then `@tag.table:orders duration:>500ms` is your slow-query list.
 
 ### `setScreen(name)`
 
@@ -858,7 +985,7 @@ const appFrames = frames.filter((f) => isInAppFrame(f.filename));
 
 ```ts
 const SDK_NAME: string  // 'sauron.javascript'
-const SDK_VERSION: string // '1.4.0'
+const SDK_VERSION: string // '1.5.0'
 ```
 
 The SDK identity embedded in `header.sdk` of every envelope.
@@ -989,7 +1116,7 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.4.1';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.5.0';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42' });
 </script>
 ```

@@ -247,8 +247,14 @@ def track_transaction(
     http_status: Optional[int] = None,
     url: Optional[str] = None,
     distinct_id: Optional[str] = None,
+    tags: Optional[Dict[str, str]] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Emit a performance transaction. No-op before ``init`` / when disabled."""
+    """Emit a performance transaction. No-op before ``init`` / when disabled.
+
+    ``tags``/``extra`` are per-call only — the scope is not merged in. See
+    :meth:`Client.track_transaction`.
+    """
     if _client is not None:
         _client.track_transaction(
             name,
@@ -259,6 +265,8 @@ def track_transaction(
             http_status=http_status,
             url=url,
             distinct_id=distinct_id,
+            tags=tags,
+            extra=extra,
         )
 
 

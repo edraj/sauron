@@ -183,6 +183,17 @@ export interface TransactionItem {
   workflow_id?: string;
   workflow_name?: string;
   timestamp: string;
+  /**
+   * Developer-supplied flat string tags for THIS transaction. NOT merged with
+   * the scope — see {@link TransactionInput.tags}. Omitted when empty.
+   */
+  tags?: Record<string, string>;
+  /**
+   * Developer-supplied freeform JSON for THIS transaction. Capped and replaced
+   * with a truncation marker past `MAX_TRANSACTION_EXTRA_BYTES`. Omitted when
+   * empty.
+   */
+  extra?: Record<string, unknown>;
 }
 
 /** Caller input for {@link TransactionItem} via `trackTransaction`. */
@@ -210,6 +221,29 @@ export interface TransactionInput {
   url?: string;
   /** Falls back to the scoped user's id when omitted. */
   distinct_id?: string;
+  /**
+   * Flat string tags for this transaction.
+   *
+   * **Per-call only — the scope is NOT merged in**, which is the one place
+   * transactions differ from `track()` and `captureException()`. Those two
+   * merge `setTag`/`setExtra` defaults; a transaction carries only what its own
+   * call site attached. Transactions are the highest-volume signal (one per
+   * navigation and per HTTP call), so inheriting a global blob would write it
+   * onto every row.
+   */
+  tags?: Record<string, string>;
+  /**
+   * Freeform JSON for this transaction — the request body, the response body,
+   * an order id, a retry count.
+   *
+   * Per-call only, for the reason on {@link TransactionInput.tags}. Serialized
+   * and capped at `MAX_TRANSACTION_EXTRA_BYTES`; past that the whole map is
+   * replaced with `{ _truncated: true, _bytes: N }` so one large body cannot
+   * take a batched envelope over the ingest limit and drop every span in it.
+   *
+   * Nothing here is scrubbed. `beforeSend` is the redaction seam.
+   */
+  extra?: Record<string, unknown>;
 }
 
 /** Any item that can appear in an envelope's `items` array. */

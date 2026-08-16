@@ -1086,6 +1086,10 @@ fn prepare_transaction(
         release: job.release.clone(),
         ip_address: job.ip.clone(),
         occurred_at: t.timestamp,
+        // See the single-row path in `process::process_transaction` — same
+        // null->{} guard, same "stored verbatim, never merged" rule.
+        tags: crate::process::object_or_empty(t.tags),
+        extra: crate::process::object_or_empty(t.extra),
     });
 
     acc.rollup(
@@ -1317,6 +1321,8 @@ mod equivalence_tests {
             workflow_id: None,
             workflow_name: None,
             finished_at: None,
+            tags: json!({}),
+            extra: json!({}),
         })
     }
 

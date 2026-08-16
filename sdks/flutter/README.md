@@ -33,7 +33,7 @@ or, in `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  sauron_flutter: ^1.7.0
+  sauron_flutter: ^1.8.0
 ```
 
 Requires Dart SDK `>=3.4.0 <4.0.0` and Flutter `>=3.19.0`.
@@ -402,21 +402,40 @@ static void trackTransaction({
   String? httpMethod,
   int? httpStatus,
   String? url,
+  Map<String, String>? tags,
+  Map<String, Object?>? extra,
 })
 ```
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `name:` | `String` | required | Route / operation label — the grouping key on the dashboard. |
+| `name:` | `String` | required | Route / operation label — the grouping key on the dashboard. Keep it **low cardinality** (`GET /users/:id`, not `GET /users/8412`), or every request becomes its own row. |
 | `duration:` | `Duration` | required | Serialized as fractional milliseconds (`inMicroseconds / 1000.0`). |
 | `op:` | `String` | `'custom'` | One of `navigation`, `http`, `resource`, `screen_load`, `custom`. |
 | `status:` | `String?` | `null` | Free-form outcome, e.g. `ok`, `error`. |
 | `httpMethod:` | `String?` | `null` | HTTP verb for `http` transactions. |
 | `httpStatus:` | `int?` | `null` | HTTP response status for `http` transactions. |
 | `url:` | `String?` | `null` | Request URL for `http` / `resource` transactions. |
+| `tags:` | `Map<String, String>?` | `null` | Indexed string→string labels. Filter with `@tag.key:value` on the Transactions page. |
+| `extra:` | `Map<String, Object?>?` | `null` | Freeform JSON — request body, response body, SQL text, row counts. Searchable with `extra.key:value`. |
 
 Returns `void`. The current distinct id and session id are attached
 automatically.
+
+**`tags` and `extra` are per-call only.** Unlike `captureException()` and
+`track()`, a transaction does **not** inherit the scope: `Sauron.setTag()` /
+`Sauron.setExtra()` defaults are not merged in. Transactions are the
+highest-volume signal an app emits — one per navigation and per HTTP call — so
+inheriting a global blob would write it onto every row.
+
+`extra` is serialized and capped at **16 KB**. Past that the whole map is
+replaced with `{'_truncated': true, '_bytes': N}` and the dashboard says so on
+the row. The cap is not cosmetic: envelopes are batched, and one oversized body
+would push the whole envelope past the ingest limit and drop every unrelated
+span sent with it.
+
+Nothing in `extra` is scrubbed. Use `beforeSend` for redaction, and think twice
+before attaching a body that can carry tokens, passwords or personal data.
 
 ```dart
 final Stopwatch sw = Stopwatch()..start();
@@ -433,6 +452,127 @@ Sauron.trackTransaction(
 );
 ```
 
+#### Example: an HTTP call, with request and response bodies
+
+The `package:http` call and the span around it. `extra` is where the payload
+goes — `name` stays the grouping key.
+
+```dart
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:sauron_flutter/sauron_flutter.dart';
+
+Future<Order> createOrder(Map<String, Object?> payload) async {
+  final Uri url = Uri.parse('https://api.example.com/orders');
+  final String body = jsonEncode(payload);
+  final Stopwatch sw = Stopwatch()..start();
+
+  try {
+    final http.Response res = await http.post(
+      url,
+      headers: <String, String>{'content-type': 'application/json'},
+      body: body,
+    );
+    sw.stop();
+
+    Sauron.trackTransaction(
+      name: 'POST /orders',
+      op: 'http',
+      duration: sw.elapsed,
+      httpMethod: 'POST',
+      httpStatus: res.statusCode,
+      url: url.toString(),
+      status: res.statusCode < 400 ? 'ok' : 'error',
+      tags: <String, String>{'api': 'orders', 'tier': currentPlan},
+      extra: <String, Object?>{
+        'request': body,
+        'response': res.body,
+        'response_bytes': res.bodyBytes.length,
+        // Header VALUES are omitted on purpose — `authorization` lives there.
+        'request_headers': <String>['content-type'],
+      },
+    );
+    return Order.fromJson(jsonDecode(res.body) as Map<String, Object?>);
+  } catch (e) {
+    sw.stop();
+    Sauron.trackTransaction(
+      name: 'POST /orders',
+      op: 'http',
+      duration: sw.elapsed,
+      httpMethod: 'POST',
+      url: url.toString(),
+      status: 'error',
+      extra: <String, Object?>{'request': body, 'error': e.toString()},
+    );
+    rethrow;
+  }
+}
+```
+
+On the dashboard: **Transactions → the row → expand**. Both bodies render as a
+JSON tree, and every one of these finds it:
+
+```text
+extra.response:~9001        # substring, inside the stored response body
+@tag.api:orders             # indexed tag
+op:http http.status:>=500   # the failures
+duration:>2s                # the slow ones
+```
+
+#### Example: a SQL query (`sqflite`)
+
+Same shape, different payload. Put the **statement** in `extra` and keep `name`
+a stable label — a query with literals baked in would mint a new dashboard row
+per execution.
+
+```dart
+import 'package:sqflite/sqflite.dart';
+import 'package:sauron_flutter/sauron_flutter.dart';
+
+Future<List<Map<String, Object?>>> recentOrders(Database db, String userId) async {
+  const String sql =
+      'SELECT id, total, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20';
+  final Stopwatch sw = Stopwatch()..start();
+
+  try {
+    final List<Map<String, Object?>> rows = await db.rawQuery(sql, <Object?>[userId]);
+    sw.stop();
+    Sauron.trackTransaction(
+      // The LABEL, not the statement. This SDK passes any `op` string through
+      // unchanged, so `'db'` would be stored as-is — but the browser SDK
+      // coerces anything outside navigation|http|resource|screen_load|custom
+      // to 'custom', so `custom` + a tag is what keeps the five SDKs agreeing.
+      name: 'SELECT orders',
+      op: 'custom',
+      duration: sw.elapsed,
+      status: 'ok',
+      tags: <String, String>{'db': 'sqflite', 'table': 'orders'},
+      extra: <String, Object?>{
+        'statement': sql,
+        'row_count': rows.length,
+        // Bind PARAMETERS are user data. Log them only if you have decided
+        // that is acceptable, or log their shape instead.
+        'params': <String, Object?>{'user_id': userId},
+      },
+    );
+    return rows;
+  } on DatabaseException catch (e) {
+    sw.stop();
+    Sauron.trackTransaction(
+      name: 'SELECT orders',
+      op: 'custom',
+      duration: sw.elapsed,
+      status: 'error',
+      tags: <String, String>{'db': 'sqflite', 'table': 'orders'},
+      extra: <String, Object?>{'statement': sql, 'error': e.toString()},
+    );
+    rethrow;
+  }
+}
+```
+
+Then `@tag.table:orders duration:>500ms` is your slow-query list.
+
 ### `Sauron.startTransaction` / `ActiveTransaction`
 
 For operations that span time asynchronously, use `startTransaction` to get an `ActiveTransaction` object. You can then call `.end()` or `.cancel()` on it. This ensures the SDK captures exactly when the transaction started and when it ended, automatically computing the correct `duration` for you without requiring manual stopwatches.
@@ -445,6 +585,8 @@ static ActiveTransaction startTransaction({
   String? httpMethod,
   int? httpStatus,
   String? url,
+  Map<String, String>? tags,
+  Map<String, Object?>? extra,
 })
 ```
 
@@ -465,6 +607,30 @@ try {
   tx.cancel('network_error');
 }
 ```
+
+`tags` and `extra` are also **mutable fields** on `ActiveTransaction`, which is
+usually what you want: the interesting facts about a call are known *after* it
+returns, not before.
+
+```dart
+final tx = Sauron.startTransaction(
+  name: 'POST /orders',
+  op: 'http',
+  httpMethod: 'POST',
+  extra: <String, Object?>{'request': body},   // known up front
+);
+
+final res = await http.post(url, body: body);
+
+tx.extra!['response'] = res.body;              // known now
+tx.tags = <String, String>{'api': 'orders'};
+tx.end(status: 'ok', httpStatus: res.statusCode);
+```
+
+`.end(tags: …, extra: …)` also accepts both, but it replaces each map
+**wholesale** — matching how `status` / `httpStatus` / `url` behave there. To
+add to what is already set, mutate the field as above; passing a partial map
+would silently discard the rest.
 
 If you call `.end()` or `.cancel()` multiple times on the same `ActiveTransaction`, it safely ignores subsequent calls and only records the span once.
 

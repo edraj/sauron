@@ -64,7 +64,19 @@ public class WireFixtureTests
             httpMethod: "GET",
             httpStatus: 200,
             url: "/api/users",
-            distinctId: "u_123");
+            distinctId: "u_123",
+            // Exercised in the fixture so the backend's `serde` deserializer sees
+            // real values in these two fields, not just their absence.
+            tags: new Dictionary<string, object?> { ["tier"] = "premium" },
+            extra: new Dictionary<string, object?>
+            {
+                ["request"] = "{\"page\":1}",
+                ["response"] = "{\"users\":[]}",
+            });
+        // A SECOND transaction with neither field set — the omit-when-empty rule is
+        // the half a fixture with only the populated case cannot see, and it is the
+        // half that guarantees an app not using this feature ships identical bytes.
+        client.TrackTransaction("/checkout", durationMs: 42, op: "navigation");
 
         await client.FlushAsync();
 

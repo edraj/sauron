@@ -3,7 +3,7 @@
     "dsn": "https://pub123@example.com/42",
     "sdk": {
       "name": "sauron-dotnet",
-      "version": "1.4.0"
+      "version": "1.5.0"
     },
     "sent_at": "2026-07-12T10:30:00.123Z",
     "release": "svc@1.4.2"
@@ -138,6 +138,26 @@
       "http_method": "GET",
       "http_status": 200,
       "url": "/api/users",
+      "distinct_id": "u_123",
+      "session_id": null,
+      "timestamp": "2026-07-12T10:30:00.123Z",
+      "tags": {
+        "tier": "premium"
+      },
+      "extra": {
+        "request": "{\u0022page\u0022:1}",
+        "response": "{\u0022users\u0022:[]}"
+      }
+    },
+    {
+      "type": "transaction",
+      "name": "/checkout",
+      "op": "navigation",
+      "duration_ms": 42,
+      "status": null,
+      "http_method": null,
+      "http_status": null,
+      "url": null,
       "distinct_id": "u_123",
       "session_id": null,
       "timestamp": "2026-07-12T10:30:00.123Z"

@@ -4105,6 +4105,289 @@ pub async fn count_events(
 }
 
 // ===========================================================================
+// Searched TRANSACTIONS list — one app's `transactions`
+// ===========================================================================
+
+/// Which keyset ordering [`search_transactions`] walks.
+///
+/// `OccurredAt` is backed by the same `(app_id, occurred_at DESC, id DESC)`
+/// shape the other partitioned lists rely on. `DurationMs` is the ordering the
+/// Performance page's "what were the slow ones?" question actually wants, and
+/// it is the reason this list exists as a keyset walk rather than an OFFSET:
+/// durations tie constantly (every cached response is `0.0`), and an
+/// untiebroken OFFSET page boundary landing inside such a group repeats or
+/// skips rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionSort {
+    OccurredAt,
+    DurationMs,
+    Name,
+    Op,
+}
+
+impl TransactionSort {
+    /// The column name as `routes/search.rs`' sort whitelist spells it.
+    pub fn from_column(col: &str) -> Option<Self> {
+        match col {
+            "occurred_at" => Some(TransactionSort::OccurredAt),
+            "duration_ms" => Some(TransactionSort::DurationMs),
+            "name" => Some(TransactionSort::Name),
+            "op" => Some(TransactionSort::Op),
+            _ => None,
+        }
+    }
+
+    pub fn column(self) -> &'static str {
+        match self {
+            TransactionSort::OccurredAt => "occurred_at",
+            TransactionSort::DurationMs => "duration_ms",
+            TransactionSort::Name => "name",
+            TransactionSort::Op => "op",
+        }
+    }
+
+    /// Whether the cursor for this column carries a timestamp or text.
+    ///
+    /// `DurationMs` is a DOUBLE, and [`crate::query_plan::cursor`] carries only
+    /// `Ts` and `Text`. It rides in the `Text` slot as its decimal rendering —
+    /// see [`TransactionSort::cursor_value`] for why that is sound here and
+    /// what would break it.
+    pub fn is_temporal(self) -> bool {
+        matches!(self, TransactionSort::OccurredAt)
+    }
+
+    /// The value a cursor minted under this ordering must carry, read off a
+    /// REAL row rather than re-derived at the route.
+    ///
+    /// **`DurationMs` rides in the `Text` slot as `f64::to_string`, and is
+    /// parsed BACK to an `f64` before it reaches SQL** ([`duration_of`]) — it
+    /// is never compared as text.
+    ///
+    /// The tempting alternative, a zero-padded decimal compared against
+    /// `TO_CHAR(duration_ms, …)`, is wrong in a way that only shows up at a
+    /// page boundary: Rust's `{:.6}` rounds half-to-even and Postgres' `TO_CHAR`
+    /// rounds half-away-from-zero, so the two renderings of the same `f64`
+    /// disagree on the exact tie, and the row at the boundary is silently
+    /// skipped. `f64::to_string` emits the shortest representation that
+    /// round-trips exactly, so parsing it back yields bit-identical value the
+    /// row was minted from, and the comparison happens in `double precision`
+    /// where the ORDER BY already lives.
+    pub fn cursor_value(self, row: &Transaction) -> crate::query_plan::cursor::CursorValue {
+        use crate::query_plan::cursor::CursorValue;
+        match self {
+            TransactionSort::OccurredAt => CursorValue::Ts(row.occurred_at),
+            TransactionSort::DurationMs => CursorValue::Text(row.duration_ms.to_string()),
+            TransactionSort::Name => CursorValue::Text(row.name.clone()),
+            TransactionSort::Op => CursorValue::Text(row.op.clone()),
+        }
+    }
+}
+
+/// The `f64` a `DurationMs` cursor carries, recovered from its text slot.
+///
+/// A malformed value is a `BadValue`, never a silent `0.0`: a cursor that
+/// failed to parse and defaulted to zero would restart the walk at the
+/// fastest transaction and serve the first page again forever.
+fn duration_of(c: &crate::query_plan::cursor::Cursor) -> Result<f64, PlanError> {
+    text_of(c).parse::<f64>().map_err(|_| PlanError::BadValue {
+        field: "duration_ms".to_string(),
+    })
+}
+
+/// Everything [`search_transactions`] needs beyond the connection and the scope.
+///
+/// A struct rather than positional parameters, for the reason [`EventSearch`]
+/// is: `descending` and the timestamp are easy to transpose at a call site.
+pub struct TransactionSearch<'a> {
+    pub node: &'a sauron_query::ResolvedNode,
+    pub ctx: &'a crate::query_plan::PrepCtx,
+    /// Whether the free-text scan may reach `tags`/`extra`. Threaded into the
+    /// lowerer rather than applied afterwards — see
+    /// [`crate::query_plan::transactions::TransactionsLower`].
+    pub text_reach: TextSearchReach,
+    /// Lower bound on `transactions.occurred_at`. Never optional: `transactions`
+    /// is `PARTITION BY RANGE (occurred_at)`, so an unbounded lower bound is a
+    /// MergeAppend across every partition.
+    pub since: DateTime<Utc>,
+    /// EXCLUSIVE upper bound on the same column, when the caller gave one.
+    /// Optional where `since` is not, and for the mirror-image reason
+    /// [`EventSearch::until`] documents.
+    pub until: Option<DateTime<Utc>>,
+    pub sort: TransactionSort,
+    pub descending: bool,
+    pub after: Option<crate::query_plan::cursor::Cursor>,
+    pub limit: i64,
+}
+
+/// Tenant key + environment + window + the lowered query predicate.
+///
+/// Called once per query rather than built once and cloned, for the reason
+/// [`issue_search_base`] documents: `Frag` is a boxed trait object, consumed by
+/// whichever query it is filtered into.
+fn transaction_search_base<'a>(
+    scope: &'a ReadScope,
+    search: &TransactionSearch<'_>,
+) -> Result<transactions::BoxedQuery<'a, diesel::pg::Pg>, PlanError> {
+    let lowerer = crate::query_plan::transactions::TransactionsLower {
+        app_id: scope.app_id,
+        text_reach: search.text_reach,
+    };
+    let predicate = crate::query_plan::lower(search.node, &lowerer, search.ctx)?;
+    let mut query = transactions::table
+        .filter(lowerer.base_scope())
+        .filter(transactions::occurred_at.ge(search.since))
+        .filter(predicate)
+        .into_boxed();
+    if let Some(until) = search.until {
+        query = query.filter(transactions::occurred_at.lt(until));
+    }
+    // `transactions` carries `environment_id` directly, so this is the ordinary
+    // column filter.
+    Ok(crate::scope_env!(query, transactions, &scope.env))
+}
+
+/// The boxed query [`search_transactions`] loads, built but not yet executed.
+///
+/// Split out so a `debug_query` unit test can inspect the exact SQL a real call
+/// produces — in particular whether the raw keyset fragments are correctly
+/// self-parenthesised — without a database connection.
+fn transaction_query_for<'a>(
+    scope: &'a ReadScope,
+    search: &TransactionSearch<'_>,
+) -> Result<transactions::BoxedQuery<'a, diesel::pg::Pg>, PlanError> {
+    let mut q = transaction_search_base(scope, search)?;
+
+    // `url` is nullable on `transactions`; `name`, `op` and `duration_ms` are
+    // not, and none of the four sort columns is nullable, so no `COALESCE`
+    // wrapper is needed here (unlike `event_query_for`'s `session_id` arm).
+    //
+    // `duration_ms` compares as `double precision` against the cursor's
+    // round-tripped `f64` — see `TransactionSort::cursor_value` for why it is
+    // emphatically NOT compared as text.
+    if let Some(c) = &search.after {
+        q = match (search.sort, search.descending) {
+            (TransactionSort::OccurredAt, true) => q.filter(
+                transactions::occurred_at
+                    .lt(ts_of(c))
+                    .or(transactions::occurred_at
+                        .eq(ts_of(c))
+                        .and(transactions::id.lt(c.id))),
+            ),
+            (TransactionSort::OccurredAt, false) => q.filter(
+                transactions::occurred_at
+                    .gt(ts_of(c))
+                    .or(transactions::occurred_at
+                        .eq(ts_of(c))
+                        .and(transactions::id.gt(c.id))),
+            ),
+            (TransactionSort::Name, true) => q.filter(
+                transactions::name.lt(text_of(c)).or(transactions::name
+                    .eq(text_of(c))
+                    .and(transactions::id.lt(c.id))),
+            ),
+            (TransactionSort::Name, false) => q.filter(
+                transactions::name.gt(text_of(c)).or(transactions::name
+                    .eq(text_of(c))
+                    .and(transactions::id.gt(c.id))),
+            ),
+            (TransactionSort::Op, true) => q.filter(
+                transactions::op.lt(text_of(c)).or(transactions::op
+                    .eq(text_of(c))
+                    .and(transactions::id.lt(c.id))),
+            ),
+            (TransactionSort::Op, false) => q.filter(
+                transactions::op.gt(text_of(c)).or(transactions::op
+                    .eq(text_of(c))
+                    .and(transactions::id.gt(c.id))),
+            ),
+            (TransactionSort::DurationMs, true) => {
+                let d = duration_of(c)?;
+                q.filter(
+                    transactions::duration_ms.lt(d).or(transactions::duration_ms
+                        .eq(d)
+                        .and(transactions::id.lt(c.id))),
+                )
+            }
+            (TransactionSort::DurationMs, false) => {
+                let d = duration_of(c)?;
+                q.filter(
+                    transactions::duration_ms.gt(d).or(transactions::duration_ms
+                        .eq(d)
+                        .and(transactions::id.gt(c.id))),
+                )
+            }
+        };
+    }
+    // The ORDER BY must be the same tuple, in the same direction, as the keyset
+    // predicate above — one mechanism split across two clauses, and disagreeing
+    // is how paging silently skips rows.
+    //
+    // `DurationMs` orders on the NUMERIC column, not on the padded text: the
+    // padding exists only so the cursor's text comparison agrees with numeric
+    // order, and ordering by the raw column lets an index on it be used.
+    let q = match (search.sort, search.descending) {
+        (TransactionSort::OccurredAt, true) => {
+            q.order((transactions::occurred_at.desc(), transactions::id.desc()))
+        }
+        (TransactionSort::OccurredAt, false) => {
+            q.order((transactions::occurred_at.asc(), transactions::id.asc()))
+        }
+        (TransactionSort::DurationMs, true) => {
+            q.order((transactions::duration_ms.desc(), transactions::id.desc()))
+        }
+        (TransactionSort::DurationMs, false) => {
+            q.order((transactions::duration_ms.asc(), transactions::id.asc()))
+        }
+        (TransactionSort::Name, true) => {
+            q.order((transactions::name.desc(), transactions::id.desc()))
+        }
+        (TransactionSort::Name, false) => {
+            q.order((transactions::name.asc(), transactions::id.asc()))
+        }
+        (TransactionSort::Op, true) => q.order((transactions::op.desc(), transactions::id.desc())),
+        (TransactionSort::Op, false) => q.order((transactions::op.asc(), transactions::id.asc())),
+    };
+    Ok(q)
+}
+
+/// `limit + 1` transactions for one app, ordered by the requested keyset,
+/// optionally starting after a cursor.
+///
+/// The caller truncates back to `limit`; the surplus row is the has-more probe.
+pub async fn search_transactions(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &TransactionSearch<'_>,
+) -> Result<Vec<Transaction>, PlanError> {
+    transaction_query_for(scope, search)?
+        .select(Transaction::as_select())
+        .limit(search.limit + 1)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))
+}
+
+/// `(total, capped)` over the same predicate [`search_transactions`] pages.
+///
+/// Selects ids rather than `count(*)` so the `cap` is a real `LIMIT` the
+/// planner can stop at — see [`count_issues`].
+pub async fn count_transactions(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &TransactionSearch<'_>,
+    cap: i64,
+) -> Result<(i64, bool), PlanError> {
+    let ids: Vec<Uuid> = transaction_search_base(scope, search)?
+        .select(transactions::id)
+        .limit(cap + 1)
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    let n = ids.len() as i64;
+    Ok(if n > cap { (cap, true) } else { (n, false) })
+}
+
+// ===========================================================================
 // Searched SESSIONS list — one app's `sessions`
 // ===========================================================================
 
@@ -4534,6 +4817,220 @@ mod keyset_predicate_tests {
                 assert_parens_balanced(&sql);
                 assert_fragment_is_self_wrapped(&sql, col, cmp);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Transactions list — plan SHAPE.
+    //
+    // These read the rendered SQL rather than counting rows, deliberately.
+    // Every defect below returns a plausible-looking page: the wrong number of
+    // rows, or the right rows in an order that skips one at the next page
+    // boundary. A counts assertion cannot see any of them, and a DB-backed
+    // test in this repo's sandbox can return early while still printing `ok`.
+    // -----------------------------------------------------------------------
+
+    fn tx_search<'a>(
+        node: &'a sauron_query::ResolvedNode,
+        ctx: &'a PrepCtx,
+        sort: TransactionSort,
+        descending: bool,
+        after: Option<crate::query_plan::cursor::Cursor>,
+    ) -> TransactionSearch<'a> {
+        TransactionSearch {
+            node,
+            ctx,
+            text_reach: TextSearchReach::IncludingBody,
+            since: Utc::now() - chrono::Duration::days(1),
+            until: None,
+            sort,
+            descending,
+            after,
+            limit: 10,
+        }
+    }
+
+    fn tx_sql(search: &TransactionSearch<'_>, scope: &ReadScope) -> String {
+        let query = transaction_query_for(scope, search)
+            .expect("build query")
+            .select(transactions::id);
+        debug_query::<Pg, _>(&query).to_string()
+    }
+
+    /// A cursor whose text slot is valid FOR THIS SORT.
+    ///
+    /// `DurationMs` rides in the text slot as an `f64` rendering and is parsed
+    /// back before it reaches SQL, so the generic `"probe"` value every other
+    /// column accepts is a `BadValue` there — correctly, and
+    /// `a_malformed_duration_cursor_is_refused` below is the test that says so.
+    /// This helper exists so the SHAPE tests are not silently testing the
+    /// error path instead of the plan.
+    fn tx_cursor(sort: TransactionSort) -> crate::query_plan::cursor::Cursor {
+        crate::query_plan::cursor::Cursor {
+            key: sort.column().to_string(),
+            value: crate::query_plan::cursor::CursorValue::Text(
+                match sort {
+                    TransactionSort::DurationMs => "128.4",
+                    _ => "probe",
+                }
+                .to_string(),
+            ),
+            id: Uuid::new_v4(),
+        }
+    }
+
+    /// The keyset predicate and the ORDER BY are one mechanism split across two
+    /// clauses. Disagreeing is how paging silently skips rows — the page
+    /// boundary is computed against one ordering and the rows are walked in
+    /// another, so the gap is invisible until someone counts.
+    #[test]
+    fn transaction_keyset_predicate_and_order_by_name_the_same_column() {
+        let node = resolved(sauron_query::Resource::Transactions);
+        let ctx = ctx();
+        let scope = ReadScope::all(Uuid::new_v4());
+
+        for (sort, col) in [
+            (TransactionSort::OccurredAt, "occurred_at"),
+            (TransactionSort::DurationMs, "duration_ms"),
+            (TransactionSort::Name, "name"),
+            (TransactionSort::Op, "op"),
+        ] {
+            for descending in [true, false] {
+                let search = tx_search(&node, &ctx, sort, descending, Some(tx_cursor(sort)));
+                let sql = tx_sql(&search, &scope);
+                assert_parens_balanced(&sql);
+
+                let (_, order) = sql
+                    .split_once("ORDER BY")
+                    .unwrap_or_else(|| panic!("no ORDER BY for {col}: {sql}"));
+                assert!(
+                    order.contains(col),
+                    "ORDER BY does not name the sort column {col}: {order}"
+                );
+                // `id` is the tiebreaker in BOTH clauses. Without it the tuple
+                // is not a total order — spans arrive in bursts that routinely
+                // share a microsecond, and durations tie constantly (every
+                // cached response is 0.0) — so a boundary inside a tied group
+                // repeats or skips rows.
+                assert!(
+                    order.contains("\"id\""),
+                    "ORDER BY has no id tiebreaker for {col}: {order}"
+                );
+                let dir = if descending { "DESC" } else { "ASC" };
+                assert!(
+                    order.contains(dir),
+                    "ORDER BY direction disagrees with `descending`: {order}"
+                );
+            }
+        }
+    }
+
+    /// Every page is scoped to one app, whatever the ordering.
+    ///
+    /// Cheap to assert and the most expensive thing to get wrong: the failure
+    /// mode is one tenant's request answered with another's spans, and their
+    /// `extra` is where request and response bodies live.
+    #[test]
+    fn every_transaction_ordering_keeps_the_tenant_filter() {
+        let node = resolved(sauron_query::Resource::Transactions);
+        let ctx = ctx();
+        let scope = ReadScope::all(Uuid::new_v4());
+
+        for sort in [
+            TransactionSort::OccurredAt,
+            TransactionSort::DurationMs,
+            TransactionSort::Name,
+            TransactionSort::Op,
+        ] {
+            for descending in [true, false] {
+                let search = tx_search(&node, &ctx, sort, descending, Some(tx_cursor(sort)));
+                let sql = tx_sql(&search, &scope);
+                assert!(
+                    sql.contains("\"transactions\".\"app_id\" = "),
+                    "tenant filter missing: {sql}"
+                );
+                // The window bound is what keeps a query off every partition of
+                // a RANGE-partitioned table. Losing it is a full-history scan
+                // that still returns correct rows.
+                assert!(
+                    sql.contains("\"transactions\".\"occurred_at\" >= "),
+                    "window lower bound missing: {sql}"
+                );
+            }
+        }
+    }
+
+    /// `duration_ms` is compared as a DOUBLE, never as text.
+    ///
+    /// The tempting alternative — a zero-padded decimal compared against
+    /// `TO_CHAR(duration_ms, …)` — is wrong in a way that only shows up at a
+    /// page boundary: Rust's `{:.6}` rounds half-to-even and Postgres'
+    /// `TO_CHAR` rounds half-away-from-zero, so the two renderings of the same
+    /// `f64` disagree on the exact tie and the boundary row is skipped.
+    #[test]
+    fn duration_cursor_compares_as_a_double_not_as_text() {
+        let node = resolved(sauron_query::Resource::Transactions);
+        let ctx = ctx();
+        let scope = ReadScope::all(Uuid::new_v4());
+        let cursor = crate::query_plan::cursor::Cursor {
+            key: "duration_ms".to_string(),
+            value: crate::query_plan::cursor::CursorValue::Text("128.4".to_string()),
+            id: Uuid::new_v4(),
+        };
+
+        let search = tx_search(&node, &ctx, TransactionSort::DurationMs, true, Some(cursor));
+        let sql = tx_sql(&search, &scope);
+        assert!(
+            sql.contains("128.4"),
+            "the cursor's f64 never reached the bind: {sql}"
+        );
+        assert!(
+            !sql.contains("TO_CHAR") && !sql.contains("LPAD"),
+            "duration is being compared as TEXT: {sql}"
+        );
+    }
+
+    /// A malformed `duration_ms` cursor is an error, never a silent `0.0`.
+    ///
+    /// Defaulting to zero would restart the walk at the fastest transaction and
+    /// serve page one forever — a pager that looks like it works and never
+    /// advances.
+    #[test]
+    fn a_malformed_duration_cursor_is_refused() {
+        let node = resolved(sauron_query::Resource::Transactions);
+        let ctx = ctx();
+        let scope = ReadScope::all(Uuid::new_v4());
+        let cursor = crate::query_plan::cursor::Cursor {
+            key: "duration_ms".to_string(),
+            value: crate::query_plan::cursor::CursorValue::Text("not-a-number".to_string()),
+            id: Uuid::new_v4(),
+        };
+
+        let search = tx_search(&node, &ctx, TransactionSort::DurationMs, true, Some(cursor));
+        assert!(matches!(
+            transaction_query_for(&scope, &search),
+            Err(PlanError::BadValue { .. })
+        ));
+    }
+
+    /// `f64 -> String -> f64` must round-trip EXACTLY, since that is the whole
+    /// basis for carrying a double through the cursor's text slot.
+    #[test]
+    fn duration_cursor_values_round_trip_bit_exactly() {
+        for ms in [
+            0.0_f64,
+            0.1,
+            128.4,
+            1.0 / 3.0,
+            9_007_199_254_740_993.0,
+            1e-7,
+        ] {
+            let row_value = ms.to_string();
+            assert_eq!(
+                row_value.parse::<f64>().expect("parses back"),
+                ms,
+                "{ms} did not survive the cursor's text slot"
+            );
         }
     }
 }
@@ -17655,6 +18152,9 @@ pub enum TagSource {
     ErrorEvents,
     /// `analytics_events` — Events.
     AnalyticsEvents,
+    /// `transactions` — Transactions. Same `occurred_at` window column as the
+    /// other two, so [`tag_keys_sql`] needs no special case.
+    Transactions,
 }
 
 impl TagSource {
@@ -17662,6 +18162,7 @@ impl TagSource {
         match self {
             TagSource::ErrorEvents => "error_events",
             TagSource::AnalyticsEvents => "analytics_events",
+            TagSource::Transactions => "transactions",
         }
     }
 }

@@ -11,7 +11,7 @@ import type {
   TransactionOp,
   WorkflowResult,
 } from '../types.js';
-import { makeLogger, nowIso, uuidv4 } from '../utils.js';
+import { capTransactionExtra, makeLogger, nowIso, uuidv4 } from '../utils.js';
 import {
   getWorkflow,
   normalizeReason,
@@ -103,6 +103,29 @@ export interface TransactionInput {
   httpMethod?: string | null;
   httpStatus?: number | null;
   url?: string | null;
+  /**
+   * Flat string tags for this transaction.
+   *
+   * **Per-call only — the scope is NOT merged in**, which is the one place
+   * transactions differ from `track()` and `captureException()`. Those two
+   * merge `setTag`/`setExtra` defaults; a transaction carries only what its own
+   * call site attached. Transactions are the highest-volume signal (one per
+   * navigation and per HTTP call), so inheriting a global blob would write it
+   * onto every row.
+   */
+  tags?: Record<string, string>;
+  /**
+   * Freeform JSON for this transaction — the request body, the response body,
+   * an order id, a retry count.
+   *
+   * Per-call only, for the reason on {@link TransactionInput.tags}. Serialized
+   * and capped at {@link MAX_TRANSACTION_EXTRA_BYTES}; past that the whole map
+   * is replaced with `{ _truncated: true, _bytes: N }` so one large body cannot
+   * take a batched envelope over the ingest limit and drop every span in it.
+   *
+   * Nothing here is scrubbed. `beforeSend` is the redaction seam.
+   */
+  extra?: Record<string, unknown>;
 }
 
 const TRANSACTION_OPS: readonly TransactionOp[] = [
@@ -129,7 +152,7 @@ export function buildTransactionItem(
   distinctId: string | null,
   sessionId: string | null,
 ): TransactionItem {
-  return {
+  const item: TransactionItem = {
     type: 'transaction',
     name: input.name,
     op: normalizeOp(input.op),
@@ -142,6 +165,14 @@ export function buildTransactionItem(
     session_id: sessionId,
     timestamp: nowIso(),
   };
+  // Per-call only — no `mergeMeta(scope.tags, …)` here, unlike `track()` above.
+  // Omitted when empty so an app that never sets them is byte-identical on the
+  // wire to before these fields existed.
+  if (input.tags && Object.keys(input.tags).length > 0) item.tags = { ...input.tags };
+  if (input.extra && Object.keys(input.extra).length > 0) {
+    item.extra = capTransactionExtra({ ...input.extra });
+  }
+  return item;
 }
 
 /** Enqueue a performance transaction item. */

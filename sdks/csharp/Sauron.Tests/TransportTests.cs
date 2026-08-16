@@ -61,7 +61,7 @@ public class TransportTests
 
         var sdk = root.GetProperty("header").GetProperty("sdk");
         Assert.Equal("sauron-dotnet", sdk.GetProperty("name").GetString());
-        Assert.Equal("1.4.0", sdk.GetProperty("version").GetString());
+        Assert.Equal("1.5.0", sdk.GetProperty("version").GetString());
 
         // Removed: environment is now proven by the ingest key, not client-supplied.
         Assert.False(root.GetProperty("header").TryGetProperty("environment", out _));

@@ -43,6 +43,10 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
 
   // --- Explore -------------------------------------------------------------
   '/events': { perm: 'event:read', level: 'app', title: 'Events' },
+  // `routes/transactions.rs:list` authorizes on `event:read` at the app scope,
+  // and the same permission gates the `tags`/`extra` body via
+  // `symbolicate::gate_transaction_body`.
+  '/transactions': { perm: 'event:read', level: 'app', title: 'Transactions' },
   '/sessions': { perm: 'event:read', level: 'app', title: 'Sessions' },
   '/users': { perm: 'event:read', level: 'app', title: 'Users' },
   '/persons': { perm: 'event:read', level: 'app', title: 'Users' },

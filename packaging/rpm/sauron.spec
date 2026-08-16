@@ -8,7 +8,7 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.5.0
+Version:        1.6.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
@@ -364,6 +364,17 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Sun Aug 16 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.6.0-1
+- Developer-supplied `tags` and `extra` on performance transactions: attach a
+  request body, a response body, an order id or a retry count to a span, from
+  any of the five SDKs (migration 000063).
+- New searched per-transaction list (`GET /v1/apps/{id}/transactions`) and a
+  Transactions page, so individual spans are reachable and their `extra` is
+  searchable — the aggregates under /performance group by operation and cannot
+  show a single call.
+- Transaction bodies are gated on `event:read`, with the free-text search reach
+  narrowed from the same predicate so a `?q=` probe cannot read a column the
+  response withholds.
 * Fri Aug 14 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.5.0-1
 - Admin data purge: delete signal data by app, environment and time range, then
   recompute the affected rollups (migration 000057).

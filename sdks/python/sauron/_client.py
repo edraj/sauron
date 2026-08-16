@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from ._autocapture import install_excepthook
 from ._dsn import Dsn, parse_dsn
+from ._transaction_extra import cap_transaction_extra
 from ._scope import (
     build_breadcrumb,
     get_current_scope,
@@ -29,7 +30,7 @@ from ._workflow import (
 )
 
 SDK_NAME = "sauron-python"
-SDK_VERSION = "1.4.0"
+SDK_VERSION = "1.5.0"
 
 # Item types eligible for workflow stamping in ``_dispatch`` — the single
 # chokepoint every error/event/identify/transaction item passes through.
@@ -424,11 +425,27 @@ class Client:
         http_status: Optional[int] = None,
         url: Optional[str] = None,
         distinct_id: Optional[str] = None,
+        tags: Optional[Dict[str, str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Emit a performance transaction (one timed operation).
 
         ``op`` defaults to ``"custom"``. ``distinct_id`` falls back to the
         active scope's user id when omitted.
+
+        ``tags`` and ``extra`` are **per-call only** — the scope is NOT merged
+        in, which is the one place transactions differ from ``track()`` and
+        ``capture_exception()``. Those two merge ``set_tag``/``set_extra``
+        defaults; a transaction carries only what its own call site attached.
+        Transactions are the highest-volume signal (one per navigation and per
+        HTTP call), so inheriting a global blob would write it onto every row.
+
+        ``extra`` is where a request body, a response body, an order id or a
+        retry count goes. It is serialized and capped at
+        ``MAX_TRANSACTION_EXTRA_BYTES``; past that the whole map is replaced
+        with ``{"_truncated": True, "_bytes": N}`` so one large body cannot
+        take a batched envelope over the ingest limit and drop every span in
+        it. Nothing here is scrubbed — ``before_send`` is the redaction seam.
         """
         if not self.enabled:
             return
@@ -449,6 +466,12 @@ class Client:
             "session_id": None,
             "timestamp": _now_iso(),
         }
+        # Omitted entirely when empty, so an app that never sets them is
+        # byte-identical on the wire to before these fields existed.
+        if tags:
+            item["tags"] = dict(tags)
+        if extra:
+            item["extra"] = cap_transaction_extra(dict(extra))
         self._dispatch(item)
 
     # -- workflows -----------------------------------------------------------

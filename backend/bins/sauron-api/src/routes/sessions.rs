@@ -279,7 +279,7 @@ pub async fn detail(
 
     let events = repo::events_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
     let mut errors = repo::errors_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
-    let txns = repo::transactions_for_session(&mut conn, scope, &session_id, 500).await?;
+    let mut txns = repo::transactions_for_session(&mut conn, scope, &session_id, 500).await?;
     drop(conn); // release the pooled conn; symbolication checks out its own
 
     // On-read symbolication, as `issues::detail` and `issues::events` do it. An
@@ -303,6 +303,14 @@ pub async fn detail(
     // the first place, so stripping first would strip nothing.
     crate::symbolicate::gate_source_context(&perms, &mut errors);
     crate::symbolicate::gate_event_body(&perms, &mut errors);
+    // Same reason, same placement, different signal: a transaction's `extra`
+    // is where request/response bodies land, and this route authorizes on
+    // `event:read` — which is exactly the permission `gate_transaction_body`
+    // tests, so in practice nothing is stripped here today. It is not
+    // decoration: the day this route's authorization is widened (or a caller
+    // reaches the timeline through a coarser gate), the strip is already in
+    // place rather than being the line somebody forgot.
+    crate::symbolicate::gate_transaction_body(&perms, &mut txns);
 
     let mut timeline: Vec<TimelineItem> =
         Vec::with_capacity(events.len() + errors.len() + txns.len());

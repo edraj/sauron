@@ -622,6 +622,23 @@ export interface Transaction {
   workflow_name: string | null;
   restored_pin_id: string | null;
   finished_at: string | null;
+  /**
+   * Developer-supplied flat string tags, set per-call on `trackTransaction`.
+   *
+   * `null` means WITHHELD, not empty — `strip_transaction_body` nulls this for
+   * a caller without `event:read`. An empty object means the span carried
+   * none. Rendering code must not conflate the two.
+   */
+  tags: Record<string, string> | null;
+  /**
+   * Developer-supplied freeform JSON — the request body, the response body, a
+   * retry count. `null` means withheld, for the reason on {@link tags}.
+   *
+   * May contain `{ _truncated: true, _bytes: N }` in place of the payload when
+   * the SDK capped it (16 KB serialized). That marker is data, not an error:
+   * the span is real and its timing is accurate.
+   */
+  extra: Record<string, unknown> | null;
 }
 
 // One entry on the session timeline — a discriminated union keyed by `kind`.

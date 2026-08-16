@@ -154,6 +154,19 @@ export interface TransactionItem {
   workflow_id?: string;
   workflow_name?: string;
   timestamp: string;
+  /**
+   * Developer-supplied flat string tags for THIS transaction.
+   *
+   * Unlike {@link EventItem} and the error item, this is NOT merged with the
+   * scope — see {@link TransactionInput.tags}. Omitted entirely when empty.
+   */
+  tags?: Record<string, string>;
+  /**
+   * Developer-supplied freeform JSON for THIS transaction — the request body,
+   * the response body, a retry count. Capped and replaced with a truncation
+   * marker past {@link MAX_TRANSACTION_EXTRA_BYTES}. Omitted when empty.
+   */
+  extra?: Record<string, unknown>;
 }
 
 /** An identity association (PostHog-style `identify`). */

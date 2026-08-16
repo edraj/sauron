@@ -717,6 +717,13 @@ pub struct Transaction {
     pub workflow_name: Option<String>,
     pub restored_pin_id: Option<Uuid>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Dev-supplied flat string tags. Nulled by `strip_transaction_body` for a
+    /// caller without `event:read` — see that function for why the free-text
+    /// search reach must be narrowed in the same breath.
+    pub tags: Value,
+    /// Dev-supplied freeform JSON (request/response bodies and friends).
+    /// Gated exactly as `tags` is.
+    pub extra: Value,
 }
 
 /// **`Insertable`-only, on purpose** — see [`NewErrorEvent`]'s doc comment for
@@ -748,6 +755,10 @@ pub struct NewTransaction {
     pub ip_address: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Dev-supplied, per-call only — the pipeline passes the SDK's blob through
+    /// verbatim and never merges anything into it.
+    pub tags: Value,
+    pub extra: Value,
 }
 
 // ---------------------------------------------------------------------------
