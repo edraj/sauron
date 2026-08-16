@@ -9,6 +9,7 @@ use common::TestDb;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text, Timestamptz, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
+use sauron_db::repo::TimeWindow;
 use sauron_db::scope::{EnvFilter, ReadScope};
 
 /// `environment_id` is NULLABLE and `EnvFilter::Unattributed` is a real row, so
@@ -517,6 +518,10 @@ async fn rollup_branch_matches_live_branch_for_every_scope() {
             200,
             0,
             common::default_person_sort(),
+            TimeWindow::since(
+                "last_seen",
+                chrono::Utc::now() - chrono::Duration::days(3650),
+            ),
         )
         .await
         .unwrap_or_else(|e| panic!("live list_persons under {name}: {e}"));
@@ -567,6 +572,10 @@ async fn rollup_branch_matches_live_branch_for_every_scope() {
             200,
             0,
             common::default_person_sort(),
+            TimeWindow::since(
+                "last_seen",
+                chrono::Utc::now() - chrono::Duration::days(3650),
+            ),
         )
         .await
         .unwrap_or_else(|e| panic!("rollup list_persons under {name}: {e}"));

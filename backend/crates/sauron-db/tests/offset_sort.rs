@@ -18,6 +18,7 @@ use diesel::sql_types::{Text, Timestamptz, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
 use sauron_db::models::NewAnalyticsEvent;
 use sauron_db::repo;
+use sauron_db::repo::TimeWindow;
 use sauron_db::repo::{DeviceGroupRow, DeviceRow, SortSpec, WorkflowAction};
 use sauron_db::scope::ReadScope;
 use serde_json::json;
@@ -261,7 +262,7 @@ async fn device_page(h: &mut Harness, sort: &str, limit: i64, offset: i64) -> Ve
     repo::list_devices(
         &mut h.conn,
         ReadScope::all(h.app_id),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         limit,
         offset,
         device_sort(sort),
@@ -286,7 +287,7 @@ async fn device_group_page(h: &mut Harness, limit: i64, offset: i64) -> Vec<Devi
     repo::list_device_groups(
         &mut h.conn,
         ReadScope::all(h.app_id),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         limit,
         offset,
         group_sort(),
@@ -688,6 +689,10 @@ async fn person_page(h: &mut Harness, sort: &str, limit: i64, offset: i64) -> Ve
         limit,
         offset,
         person_sort(sort),
+        TimeWindow::since(
+            "last_seen",
+            chrono::Utc::now() - chrono::Duration::days(3650),
+        ),
     )
     .await
     .expect("list_persons page")

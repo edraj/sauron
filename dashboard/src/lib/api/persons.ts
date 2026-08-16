@@ -13,6 +13,23 @@ export interface ListPersonsParams {
    * `sessions_count`, `events_count`, `errors_count`; anything else is a 400.
    */
   sort?: string;
+  /**
+   * The time window, as `models/time-filter`'s `toRecord` encodes it.
+   *
+   * New with the time filter, and this list had NO window before it: the Users
+   * page rendered a range picker that only ever drove the stat tiles, while the
+   * table showed every person regardless. Accepts `last_seen` (default) and
+   * `first_seen`; anything else is a 400 naming the pair.
+   *
+   * Note what these filter, because Devices means something different by the
+   * same words: here the predicate is applied to the value the column
+   * DISPLAYS — env-scoped when an environment is selected — so "last seen in
+   * the last 7 days" agrees with the Last seen cell beside it.
+   */
+  time_field?: string;
+  from?: string;
+  to?: string;
+  since_days?: number;
 }
 
 /**

@@ -176,8 +176,10 @@ pub(crate) fn group_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> {
 
 #[derive(Deserialize)]
 pub struct ListQuery {
-    #[serde(default = "default_days")]
-    pub since_days: i64,
+    /// `time_field` / `from` / `to` / `since_days`, flattened so the
+    /// precedence between them is decided once, in `resolve_time_filter`.
+    #[serde(flatten)]
+    pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -209,6 +211,19 @@ pub struct ListQuery {
     pub os_version: Option<String>,
 }
 
+/// The columns this list will window on. Both indexed on `devices` AND on
+/// `device_environments` as of migration 000062.
+///
+/// **The window decides WHICH DEVICES ARE LISTED**, via the durable `devices`
+/// column — it is not a predicate on the value each row displays. Under a
+/// scoped read the displayed `first_seen`/`last_seen` are per-environment
+/// extrema derived from LATERALs, and a device's per-environment first sighting
+/// can postdate its app-level one. That predates this parameter (it is exactly
+/// what `since_days` always did), it is the only form an index can serve, and
+/// it is the OPPOSITE of what `analytics::PERSON_TIME_FIELDS` means by the same
+/// two words. See `repo::device_window_sql` and `repo::person_seen_expr`.
+pub const TIME_FIELDS: &[&str] = &["last_seen", "first_seen"];
+
 fn default_days() -> i64 {
     30
 }
@@ -232,7 +247,21 @@ pub async fn list(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let window = super::search::resolve_time_filter(
+        "last_seen",
+        TIME_FIELDS,
+        &q.window,
+        Utc::now(),
+        default_days(),
+        super::search::MAX_WINDOW_DAYS,
+        // No planner clamp: this list is not query-planner wired.
+        None,
+    )?;
+    let window = repo::TimeWindow {
+        column: window.column,
+        from: window.from,
+        to: window.to,
+    };
     let limit = q.limit.clamp(1, 200);
     let search = q.search.as_deref().filter(|s| !s.is_empty());
     // Any non-empty `group` value turns the filter on; the dashboard sends "1".
@@ -251,7 +280,7 @@ pub async fn list(
         repo::list_devices(
             &mut conn,
             scope,
-            since,
+            window,
             limit,
             super::clamp_offset(q.offset),
             sort,
@@ -281,7 +310,21 @@ pub async fn groups(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let window = super::search::resolve_time_filter(
+        "last_seen",
+        TIME_FIELDS,
+        &q.window,
+        Utc::now(),
+        default_days(),
+        super::search::MAX_WINDOW_DAYS,
+        // No planner clamp: this list is not query-planner wired.
+        None,
+    )?;
+    let window = repo::TimeWindow {
+        column: window.column,
+        from: window.from,
+        to: window.to,
+    };
     let limit = q.limit.clamp(1, 200);
     let search = q.search.as_deref().filter(|s| !s.is_empty());
     let sort = group_sort_spec(q.sort.as_deref())?;
@@ -289,7 +332,7 @@ pub async fn groups(
         repo::list_device_groups(
             &mut conn,
             scope,
-            since,
+            window,
             limit,
             super::clamp_offset(q.offset),
             sort,

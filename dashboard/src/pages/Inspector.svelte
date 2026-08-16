@@ -279,6 +279,7 @@
     </button>
   </nav>
 
+  <div class="content">
   {#if error}
     <Card><p class="err">{error}</p></Card>
   {:else if loading}
@@ -967,6 +968,7 @@
       {/if}
     </Card>
   {/if}
+  </div>
 </AdminShell>
 
 {#if maskTargetFinding && appId}
@@ -983,6 +985,11 @@
 {/if}
 
 <style>
+  .content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
   .head {
     display: flex;
     align-items: baseline;

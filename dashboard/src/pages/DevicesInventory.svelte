@@ -8,7 +8,7 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import DeviceFlatTable from '../lib/components/devices/DeviceFlatTable.svelte';
   import DeviceGroupTable from '../lib/components/devices/DeviceGroupTable.svelte';
-  import DateRange from '../lib/components/DateRange.svelte';
+  import TimeFilter from '../lib/components/TimeFilter.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
@@ -24,9 +24,35 @@
     type OffsetListState,
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
+  import {
+    fromParams,
+    toParams,
+    toRecord,
+    type TimeField,
+    type TimeFilterState,
+  } from '../lib/models/time-filter';
   import type { DeviceRow, DeviceGroupRow } from '../lib/models';
 
   const LIMIT = 50;
+
+  /**
+   * The columns this list can be windowed by, both indexed as of migration
+   * 000062 (`devices_app_first_seen_idx`, `device_env_app_env_first_seen_idx`).
+   *
+   * The window decides WHICH DEVICES ARE LISTED, via the durable `devices`
+   * column — it is not a predicate on the value each row displays. Under a
+   * scoped read the displayed `first_seen`/`last_seen` are per-environment
+   * extrema derived from LATERALs, and a device's per-environment first
+   * sighting can postdate its app-level one. That is what `since_days` has
+   * always meant here, it is the only form an index can serve, and it is the
+   * OPPOSITE of what the Users list means by the same words.
+   */
+  const TIME_FIELDS: TimeField[] = [
+    { key: 'last_seen', label: 'Last seen' },
+    { key: 'first_seen', label: 'First seen' },
+  ];
+  const DEFAULT_TIME_FIELD = 'last_seen';
+  const DEFAULT_DAYS = 30;
 
   // Hydrate the drill-down key from the URL once, at init — not inside an
   // effect, so it never re-runs and never fights the sync effect below. Same
@@ -34,7 +60,18 @@
   let groupKey = $state(decodeGroupKey($querystring ?? null));
   const grouped = $derived(groupKey === null);
 
-  let sinceDays = $state(30);
+  // Hydrated from the URL once, at init, for the same reason `groupKey` is —
+  // not inside an effect, so it never re-runs and never fights the sync effect
+  // that writes the URL back.
+  let timeFilter = $state<TimeFilterState>(
+    fromParams(
+      new URLSearchParams($querystring ?? ''),
+      TIME_FIELDS,
+      DEFAULT_TIME_FIELD,
+      DEFAULT_DAYS,
+    ),
+  );
+
   // `query` is bound to the input; `search` is the debounced value that drives loads.
   let query = $state('');
   let search = $state('');
@@ -160,10 +197,35 @@
     }, 220);
   }
 
-  function onRange(days: number) {
-    sinceDays = days;
+  function onTimeFilter(v: TimeFilterState) {
+    timeFilter = v;
+    // A changed predicate invalidates the page position: row 51 of the old
+    // window is not row 51 of the new one.
     list = setOffsetPage(list, 0);
   }
+
+  /**
+   * Keep the window in the URL, alongside whatever drill-down is active.
+   *
+   * Composed with `encodeGroupKey` rather than written on its own, because the
+   * group and the window share one query string and two writers that each
+   * assume they own it would take turns deleting the other's parameters.
+   *
+   * This also SELF-HEALS the drill-down navigation: `DeviceGroupTable` pushes
+   * `/devices?` + `encodeGroupKey(...)`, which carries no window at all, so
+   * without this effect entering a group would silently drop the filter from
+   * the URL and a refresh would come back on the default window.
+   *
+   * It cannot loop with the `groupKey` sync effect below: that one re-decodes
+   * the group from the string this writes, finds it unchanged, and is stopped
+   * by its own `sameGroupKey` guard before it assigns anything.
+   */
+  $effect(() => {
+    const p = toParams(timeFilter, DEFAULT_TIME_FIELD);
+    const g = groupKey === null ? '' : encodeGroupKey(groupKey);
+    const qs = [g, p.toString()].filter(Boolean).join('&');
+    void replace(qs ? `/devices?${qs}` : '/devices');
+  });
 
   // `scopeKey` must be in the key: it carries the selected environment, which
   // the axios interceptor adds to the request but which appears in none of
@@ -181,16 +243,27 @@
   // Retry means "go to the network now".
   async function load(
     appId: string,
-    days: number,
+    tf: TimeFilterState,
     s: string,
     sort: string,
     off: number,
     force = false,
   ) {
-    const params = { since_days: days, search: s || undefined, sort, limit: LIMIT, offset: off };
+    const params = {
+      search: s || undefined,
+      sort,
+      limit: LIMIT,
+      offset: off,
+      ...toRecord(tf, DEFAULT_TIME_FIELD),
+    };
+    // The window enters the key as its DECLARATION, never as the instant `last`
+    // resolves to: a clock-derived component mints a fresh entry on every load,
+    // so the cache stays wired and typed while hitting zero times — invisible
+    // from the DOM, visible only in the network panel.
+    const windowKey = `${tf.field}:${tf.mode}:${tf.lastDays ?? ''}:${tf.from ?? ''}:${tf.to ?? ''}`;
     if (groupKey === null) {
       await groupView.load(
-        viewKey('devices.groups', appId, sessionStore.scopeKey, days, s, sort, off, LIMIT),
+        viewKey('devices.groups', appId, sessionStore.scopeKey, windowKey, s, sort, off, LIMIT),
         () => listDeviceGroups(appId, params),
         force,
       );
@@ -202,7 +275,7 @@
         'devices.list',
         appId,
         sessionStore.scopeKey,
-        days,
+        windowKey,
         s,
         sort,
         off,
@@ -229,13 +302,13 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
+    const tf = timeFilter;
     const s = search;
     const sort = sortParam(list.sort);
     const off = list.offset;
     // Touch groupKey so entering or leaving a drill-down refetches.
     groupKey;
-    if (aid) void load(aid, days, s, sort, off);
+    if (aid) void load(aid, tf, s, sort, off);
   });
 
   // The router owns the URL; the page follows it. `push`ing a drill-down URL
@@ -275,7 +348,7 @@
     refreshing = true;
     try {
       await Promise.all([
-        load(aid, sinceDays, search, sortParam(list.sort), list.offset, true),
+        load(aid, timeFilter, search, sortParam(list.sort), list.offset, true),
       ]);
     } finally {
       refreshing = false;
@@ -291,7 +364,7 @@
       <p class="muted sub">Fleet-wide hardware, OS and browser breakdown across your users.</p>
     </div>
     <div class="controls">
-      <DateRange value={sinceDays} onchange={onRange} />
+      <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
       <SearchInput
         bind:value={query}
         oninput={onSearch}
@@ -342,7 +415,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, sinceDays, search, sortParam(list.sort), list.offset);
+              if (aid) load(aid, timeFilter, search, sortParam(list.sort), list.offset);
             }}
           >
             Retry

@@ -121,6 +121,219 @@ pub fn resolve_window(
     }
 }
 
+/// The three window parameters every list route accepts, plus the `since_days`
+/// they can override.
+///
+/// `since_days` lives HERE rather than beside each route's own fields so the
+/// precedence rule — explicit bounds win, `since_days` is not consulted at all
+/// when either is present — is decided in one place. A route keeping its own
+/// copy could only re-derive that rule, and two derivations of a precedence
+/// rule is how two lists that look identical start answering differently.
+///
+/// Flattened into each route's `Query<T>` with `#[serde(flatten)]`. Note this
+/// does NOT go through `RawQuery` the way `environment_id` does — these three
+/// are ordinary typed parameters with no extractor trap attached.
+#[derive(Debug, Deserialize)]
+pub struct TimeFilterQuery {
+    /// Validated by equality against the route's whitelist; the RESOLVED value
+    /// is the whitelist's own `&'static str`. This `String` never reaches SQL.
+    pub time_field: Option<String>,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    /// `None` means the caller sent no `since_days`, and the route's own
+    /// default applies.
+    ///
+    /// An `Option` rather than a `#[serde(default = …)]` because these routes do
+    /// NOT share a default — Sessions and Devices window 30 days, Events and
+    /// Persons 365 — and a shared serde default cannot tell "absent" from
+    /// "explicitly sent the shared value". The alternative was probing the raw
+    /// query string, which is the extractor trap `routes::scope` exists to warn
+    /// about; passing the default in as an argument avoids the question.
+    #[serde(default, deserialize_with = "opt_i64_from_str_or_int")]
+    pub since_days: Option<i64>,
+}
+
+/// Accept `since_days` as either a JSON integer or a string of digits.
+///
+/// **Load bearing, and not defensive programming.** `TimeFilterQuery` is
+/// `#[serde(flatten)]`ed into every route's query struct, and flatten forces
+/// each value through `deserialize_any`. `serde_urlencoded` — what
+/// `axum::extract::Query` deserializes with — is a flat text format, so
+/// `deserialize_any` hands the visitor a **string**, and a plain `Option<i64>`
+/// answers `invalid type: string "7", expected i64`.
+///
+/// The failure is a 400 on `?since_days=7`, i.e. on every existing bookmark and
+/// on the dashboard's own default request — and it is invisible to the
+/// compiler, to clippy, and to every test that calls the resolver directly
+/// rather than going through the extractor. `flattened_window_params_survive_the_query_extractor`
+/// is what pins it.
+///
+/// `from`/`to` need no equivalent: chrono's `Deserialize` accepts a `&str`
+/// visitor, so the same string reaches it and parses.
+fn opt_i64_from_str_or_int<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrInt<'a> {
+        Int(i64),
+        Str(&'a str),
+    }
+
+    match Option::<StrOrInt<'_>>::deserialize(d)? {
+        None => Ok(None),
+        Some(StrOrInt::Int(n)) => Ok(Some(n)),
+        Some(StrOrInt::Str(s)) => s
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| D::Error::invalid_value(Unexpected::Str(s), &"a whole number of days")),
+    }
+}
+
+/// The widest window any of these routes will serve. Matches the ceiling
+/// already in force on every one of them (`sessions.rs`, `devices.rs`,
+/// `EVENTS_MAX_SINCE_DAYS`).
+pub const MAX_WINDOW_DAYS: i64 = 365;
+
+/// The window a list actually ran over, as the repo layer receives it.
+///
+/// `from` is never optional and `to` is, and the asymmetry is load bearing:
+/// `analytics_events` is `PARTITION BY RANGE (occurred_at)`, so an unbounded
+/// LOWER bound is a MergeAppend across every partition — the shape behind the
+/// env-scoped analytics timeout. An unbounded UPPER bound costs nothing,
+/// because "up to now" is where the data ends anyway.
+// Not `Clone`: `ClampInfo` isn't, and a window is consumed once per request
+// rather than copied around. Deriving it would mean widening `ClampInfo` for
+// no caller that exists.
+#[derive(Debug)]
+pub struct TimeWindowSpec {
+    pub column: &'static str,
+    pub from: DateTime<Utc>,
+    /// EXCLUSIVE. `from <= col < to`.
+    pub to: Option<DateTime<Utc>>,
+    pub clamped: Option<ClampInfo>,
+}
+
+/// Resolve the window a request will be served, and disclose whatever narrowed
+/// it.
+///
+/// Generalises [`resolve_window`] — same three narrowing rules, still
+/// tightest-wins, still disclosing the rule that actually bound — with two
+/// additions: the caller may name WHICH COLUMN the window applies to, and may
+/// give absolute bounds instead of a day count.
+///
+/// The genuinely new rule is the FLOOR. `to` with no `from` asks for everything
+/// before an instant, which on a partitioned table prunes nothing and scans
+/// every partition. `from` becomes `to - max_days`, and — critically — the
+/// narrowing is REPORTED. A window that was silently narrowed is a wrong answer
+/// carrying a 200, which is the same failure `resolve_window`'s doc comment
+/// describes one field over.
+pub fn resolve_time_filter(
+    default_field: &'static str,
+    allowed: &[&'static str],
+    q: &TimeFilterQuery,
+    now: DateTime<Utc>,
+    default_days: i64,
+    max_days: i64,
+    planner: Option<Clamp>,
+) -> Result<TimeWindowSpec, ApiError> {
+    let column = match q.time_field.as_deref() {
+        None => default_field,
+        // Copied OUT of the whitelist rather than passing the caller's string
+        // through, so the value that reaches SQL construction is always one of
+        // ours even if a future caller forgets to re-check it.
+        Some(name) => *allowed.iter().find(|a| **a == name).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "unknown time_field `{name}`; this list accepts: {}",
+                allowed.join(", ")
+            ))
+        })?,
+    };
+
+    // Explicit bounds win outright; `since_days` is not consulted at all when
+    // either is present. Mixing them would make `?from=…&since_days=7` mean
+    // something no caller could predict.
+    let explicit = q.from.is_some() || q.to.is_some();
+    // Tracked separately from the floor check below, which cannot see this
+    // case: the default we substitute is EXACTLY `to - max_days`, so a
+    // `from < floor` comparison finds them equal and reports nothing. The
+    // caller still asked for an unbounded lower bound and is being served a
+    // bounded one, which is the single most important narrowing to disclose —
+    // it is the one that exists to keep an unbounded `before` from scanning
+    // every partition.
+    let mut floored_open_lower_bound = false;
+    let (mut from, to) = if explicit {
+        let to = q.to;
+        let from = q.from.unwrap_or_else(|| {
+            floored_open_lower_bound = true;
+            to.expect("explicit implies a bound") - Duration::days(max_days)
+        });
+        (from, to)
+    } else {
+        let requested = q.since_days.unwrap_or(default_days);
+        // A `since_days` ABOVE the ceiling is narrowed here, and the narrowing
+        // must be disclosed — the floor check below cannot see it, because the
+        // clamped value it produces is exactly the floor, so `from < floor` is
+        // false. Same shape as the `to`-alone case above, and the reason
+        // `resolve_window` carried its own `requested_days > max_days` test:
+        // a caller served 365 days under `clamped: null` has been told their
+        // window was not narrowed, which is false.
+        //
+        // Only narrowings. `since_days=0` is raised to 1, which hands the
+        // caller MORE than they asked for, and `clamped` exists to warn that
+        // rows may be missing.
+        floored_open_lower_bound |= requested > max_days;
+        (now - Duration::days(requested.clamp(1, max_days)), None)
+    };
+
+    if let Some(t) = to {
+        // `>=`, not `>`: the interval is half-open, so equal bounds select
+        // nothing. Rejecting beats answering with a confidently empty list.
+        if from >= t {
+            return Err(ApiError::BadRequest(
+                "`from` must be earlier than `to`".to_string(),
+            ));
+        }
+    }
+
+    let ceiling = to.unwrap_or(now);
+    let mut reason = None;
+
+    let floor = ceiling - Duration::days(max_days);
+    if from < floor || floored_open_lower_bound {
+        from = floor;
+        reason = Some(format!(
+            "this view bounds its time window at {max_days} days"
+        ));
+    }
+
+    // The planner's clamp, strictly tighter only: one that merely matches the
+    // window already in force changed nothing, and crediting it in `clamped`
+    // would name the wrong rule.
+    if let Some(c) = planner {
+        let planner_from = now - Duration::days(c.to_days);
+        if planner_from > from {
+            from = planner_from;
+            reason = Some(c.reason.to_string());
+        }
+    }
+
+    Ok(TimeWindowSpec {
+        column,
+        from,
+        to,
+        clamped: reason.map(|reason| ClampInfo {
+            field: column.to_string(),
+            to: format!("{}d", (ceiling - from).num_days()),
+            reason,
+        }),
+    })
+}
+
 /// `query=` accepts either the string grammar (`level:error`) or a serialized
 /// `Node` AST — the same JSON the dashboard's client-side parser builds, whose
 /// wire shape `sauron-query`'s `ast_serde` test pins.
@@ -779,6 +992,249 @@ mod tests {
             to_days,
             reason: "unindexed predicate requires a bounded time window",
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_time_filter
+    // -----------------------------------------------------------------------
+
+    const TF_ALLOWED: &[&str] = &["last_seen", "first_seen"];
+
+    fn tf_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn tfq(
+        field: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        days: i64,
+    ) -> TimeFilterQuery {
+        TimeFilterQuery {
+            time_field: field.map(str::to_string),
+            from: from.map(at),
+            to: to.map(at),
+            since_days: Some(days),
+        }
+    }
+
+    fn resolve_tf(q: &TimeFilterQuery, planner: Option<Clamp>) -> TimeWindowSpec {
+        resolve_time_filter("last_seen", TF_ALLOWED, q, tf_now(), 30, 365, planner).unwrap()
+    }
+
+    /// **The extractor, not the resolver.** `axum::extract::Query` deserializes
+    /// with `serde_urlencoded`, which is a flat key/value format — and
+    /// `#[serde(flatten)]` requires the deserializer to support
+    /// `deserialize_map` with self-describing values. Several
+    /// urlencoded backends refuse that outright, which would make every
+    /// `time_field`/`from`/`to` on the wire a 400 (or, worse, silently absent)
+    /// no matter how correct `resolve_time_filter` is.
+    ///
+    /// The four route query structs all flatten `TimeFilterQuery`, so this is
+    /// pinned once here rather than discovered per route in the browser.
+    #[test]
+    fn flattened_window_params_survive_the_query_extractor() {
+        #[derive(Debug, Deserialize)]
+        struct Probe {
+            #[serde(flatten)]
+            window: TimeFilterQuery,
+            #[serde(default)]
+            limit: i64,
+        }
+
+        let p: Probe = serde_urlencoded::from_str(
+            "time_field=first_seen&from=2026-08-01T00:00:00Z&to=2026-08-03T00:00:00Z&limit=50",
+        )
+        .expect("flattened window params must deserialize from a query string");
+        assert_eq!(p.window.time_field.as_deref(), Some("first_seen"));
+        assert_eq!(p.window.from, Some(at("2026-08-01T00:00:00Z")));
+        assert_eq!(p.window.to, Some(at("2026-08-03T00:00:00Z")));
+        assert_eq!(p.limit, 50);
+
+        // Absent means absent, so the route's own default applies rather than
+        // a shared one.
+        let bare: Probe = serde_urlencoded::from_str("limit=10").expect("bare query");
+        assert!(bare.window.time_field.is_none());
+        assert!(bare.window.since_days.is_none());
+
+        let with_days: Probe = serde_urlencoded::from_str("since_days=7").expect("since_days");
+        assert_eq!(with_days.window.since_days, Some(7));
+    }
+
+    #[test]
+    fn time_filter_defaults_to_since_days_on_the_default_column() {
+        let w = resolve_tf(&tfq(None, None, None, 30), None);
+        assert_eq!(w.column, "last_seen");
+        assert_eq!(w.from, tf_now() - Duration::days(30));
+        assert!(w.to.is_none());
+        assert!(w.clamped.is_none());
+    }
+
+    #[test]
+    fn time_filter_explicit_bounds_beat_since_days() {
+        // `since_days: 7` is present and must be IGNORED outright — not
+        // intersected with the bounds, which would serve a window no caller
+        // could predict from what they sent.
+        let q = tfq(
+            Some("first_seen"),
+            Some("2026-08-01T00:00:00Z"),
+            Some("2026-08-03T00:00:00Z"),
+            7,
+        );
+        let w = resolve_tf(&q, None);
+        assert_eq!(w.column, "first_seen");
+        assert_eq!(w.from, at("2026-08-01T00:00:00Z"));
+        assert_eq!(w.to.unwrap(), at("2026-08-03T00:00:00Z"));
+        assert!(w.clamped.is_none());
+    }
+
+    #[test]
+    fn time_filter_rejects_an_unlisted_column_by_name() {
+        let err = resolve_time_filter(
+            "last_seen",
+            TF_ALLOWED,
+            &tfq(Some("occurred_at"), None, None, 30),
+            tf_now(),
+            30,
+            365,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        // Both halves matter: the rejected value so the caller can see their
+        // typo, and the allowed set so they do not have to guess.
+        assert!(msg.contains("occurred_at"), "{msg}");
+        assert!(
+            msg.contains("last_seen") && msg.contains("first_seen"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn time_filter_floors_an_upper_bound_alone_and_discloses_it() {
+        // `to` with no `from` is the case that would otherwise scan every
+        // partition of `analytics_events`.
+        let w = resolve_tf(&tfq(None, None, Some("2026-08-03T00:00:00Z"), 30), None);
+        let to = at("2026-08-03T00:00:00Z");
+        assert_eq!(w.from, to - Duration::days(365));
+        let c = w.clamped.expect("a floored window must be disclosed");
+        assert_eq!(c.field, "last_seen");
+        assert_eq!(c.to, "365d");
+    }
+
+    #[test]
+    fn time_filter_rejects_an_inverted_range() {
+        let err = resolve_time_filter(
+            "last_seen",
+            TF_ALLOWED,
+            &tfq(
+                None,
+                Some("2026-08-05T00:00:00Z"),
+                Some("2026-08-01T00:00:00Z"),
+                30,
+            ),
+            tf_now(),
+            30,
+            365,
+            None,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn time_filter_rejects_equal_bounds() {
+        // Half-open, so equal bounds select nothing at all.
+        let err = resolve_time_filter(
+            "last_seen",
+            TF_ALLOWED,
+            &tfq(
+                None,
+                Some("2026-08-05T00:00:00Z"),
+                Some("2026-08-05T00:00:00Z"),
+                30,
+            ),
+            tf_now(),
+            30,
+            365,
+            None,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn time_filter_narrows_an_oversized_explicit_range_from_the_bottom() {
+        let w = resolve_tf(
+            &tfq(
+                None,
+                Some("2020-01-01T00:00:00Z"),
+                Some("2026-08-03T00:00:00Z"),
+                30,
+            ),
+            None,
+        );
+        assert_eq!(w.from, at("2026-08-03T00:00:00Z") - Duration::days(365));
+        assert!(w.clamped.is_some(), "narrowing must be disclosed");
+    }
+
+    #[test]
+    fn time_filter_lets_a_planner_clamp_tighten_an_explicit_window() {
+        let w = resolve_tf(
+            &tfq(None, Some("2026-01-01T00:00:00Z"), None, 30),
+            planner(7),
+        );
+        assert_eq!(w.from, tf_now() - Duration::days(7));
+        assert_eq!(
+            w.clamped.unwrap().reason,
+            "unindexed predicate requires a bounded time window"
+        );
+    }
+
+    #[test]
+    fn time_filter_ignores_a_planner_clamp_that_does_not_tighten() {
+        // Strictly tighter only. A clamp that merely matches the window already
+        // in force changed nothing, and reporting it would credit the wrong
+        // rule — the same distinction `resolve_window` draws.
+        let w = resolve_tf(
+            &tfq(None, Some("2026-08-15T00:00:00Z"), None, 30),
+            planner(365),
+        );
+        assert_eq!(w.from, at("2026-08-15T00:00:00Z"));
+        assert!(w.clamped.is_none());
+    }
+
+    #[test]
+    fn time_filter_discloses_an_oversized_since_days() {
+        // Regression: this narrowed 3650 -> 365 while reporting `clamped: null`.
+        // The floor check cannot catch it — the clamped value IS the floor — so
+        // it needs its own flag, exactly like the `to`-alone case.
+        let w = resolve_tf(&tfq(None, None, None, 3650), None);
+        let c = w
+            .clamped
+            .expect("a since_days above the ceiling must be disclosed");
+        assert_eq!(c.field, "last_seen");
+        assert_eq!(c.to, "365d");
+    }
+
+    #[test]
+    fn time_filter_does_not_disclose_a_since_days_within_the_ceiling() {
+        assert!(resolve_tf(&tfq(None, None, None, 30), None)
+            .clamped
+            .is_none());
+        assert!(resolve_tf(&tfq(None, None, None, 365), None)
+            .clamped
+            .is_none());
+    }
+
+    #[test]
+    fn time_filter_clamps_an_oversized_since_days() {
+        let w = resolve_tf(&tfq(None, None, None, 3650), None);
+        assert_eq!(w.from, tf_now() - Duration::days(365));
     }
 
     /// Days between `now` and the resolved `since`, which is the only property

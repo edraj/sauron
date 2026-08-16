@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { push } from 'svelte-spa-router';
+  import { push, querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -9,6 +9,7 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import TimeFilter from '../lib/components/TimeFilter.svelte';
   import SearchAutocompleteInput from '../lib/components/search/SearchAutocompleteInput.svelte';
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
@@ -32,6 +33,13 @@
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
   import {
+    fromParams,
+    toParams,
+    toRecord,
+    type TimeField,
+    type TimeFilterState,
+  } from '../lib/models/time-filter';
+  import {
     formatDuration,
     durationBetween,
     compactNumber,
@@ -40,6 +48,36 @@
 
   const LIMIT = 50;
 
+  /**
+   * The columns this list can be windowed by.
+   *
+   * `last_event_at` is the DEFAULT because it is what this list has always
+   * filtered on: the route asked `resolve_window` for `"started_at"` while
+   * `session_search_base` filtered `sessions.last_event_at`, so the envelope
+   * named one column and the predicate used the other. Defaulting to
+   * `started_at` here would silently change which sessions an untouched page
+   * returns — a bigger change than fixing the label.
+   *
+   * Surfaced as "Last activity": `sessions` has no `ended_at` column at all,
+   * and duration is derived, so "Ended" would name something that does not
+   * exist.
+   */
+  const TIME_FIELDS: TimeField[] = [
+    { key: 'last_event_at', label: 'Last activity' },
+    { key: 'started_at', label: 'Started' },
+  ];
+  const DEFAULT_TIME_FIELD = 'last_event_at';
+  const DEFAULT_DAYS = 30;
+
+  const initialQs = new URLSearchParams($querystring ?? '');
+  let timeFilter = $state<TimeFilterState>(
+    fromParams(initialQs, TIME_FIELDS, DEFAULT_TIME_FIELD, DEFAULT_DAYS),
+  );
+
+  // Drives the stat tiles and the engagement chart ONLY. Kept separate from
+  // `timeFilter` deliberately: the summary endpoint takes a plain day count and
+  // cannot express a column choice or an absolute bound, so a shared control
+  // would have to misreport on every card that could not follow it.
   let sinceDays = $state(30);
   let search = $state('');
 
@@ -119,15 +157,25 @@
   // silently did nothing.
   async function load(
     appId: string,
-    days: number,
+    tf: TimeFilterState,
     sort: string,
     off: number,
     query: string,
     force = false,
   ) {
+    // The window enters the key as its DECLARATION, never as the instant `last`
+    // resolves to — a clock-derived component mints a fresh entry per load, so
+    // the cache hits zero times while looking perfectly wired.
+    const windowKey = `${tf.field}:${tf.mode}:${tf.lastDays ?? ''}:${tf.from ?? ''}:${tf.to ?? ''}`;
     await sessionsView.load(
-      viewKey('sessions.list', appId, sessionStore.scopeKey, days, sort, off, LIMIT, query),
-      () => listSessions(appId, { sinceDays: days, sort, limit: LIMIT, offset: off, query: query || undefined }),
+      viewKey('sessions.list', appId, sessionStore.scopeKey, windowKey, sort, off, LIMIT, query),
+      () => listSessions(appId, {
+        sort,
+        limit: LIMIT,
+        offset: off,
+        query: query || undefined,
+        ...toRecord(tf, DEFAULT_TIME_FIELD),
+      }),
       force,
     );
   }
@@ -139,7 +187,7 @@
     try {
       // force: an explicit click must reach the network regardless of freshness.
       await Promise.all([
-        load(aid, sinceDays, sortParam(list.sort), list.offset, search, true),
+        load(aid, timeFilter, sortParam(list.sort), list.offset, search, true),
         loadAnalytics(aid, sinceDays, true),
       ]);
     } finally {
@@ -152,11 +200,11 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
+    const tf = timeFilter;
     const sort = sortParam(list.sort);
     const off = list.offset;
     const q = search;
-    if (aid) void load(aid, days, sort, off, q);
+    if (aid) void load(aid, tf, sort, off, q);
   });
 
   $effect(() => {
@@ -168,11 +216,26 @@
     if (aid) void loadAnalytics(aid, days);
   });
 
+  // Drives the tiles and chart only, so it no longer resets the table's page.
   function onRange(days: number) {
-    if (days === sinceDays) return;
-    list = setOffsetPage(list, 0);
     sinceDays = days;
   }
+
+  function onTimeFilter(v: TimeFilterState) {
+    timeFilter = v;
+    // A changed predicate invalidates the page position: row 51 of the old
+    // window is not row 51 of the new one.
+    list = setOffsetPage(list, 0);
+  }
+
+  // Mirror the window into the URL so a filtered view survives a refresh and
+  // can be shared. `replace`, not `push`: adjusting a filter is not a
+  // navigation. `initialQs` is read once at setup rather than through a
+  // `$derived`, which is what stops this from feeding itself.
+  $effect(() => {
+    const qs = toParams(timeFilter, DEFAULT_TIME_FIELD).toString();
+    void replace(qs ? `/sessions?${qs}` : '/sessions');
+  });
 
   function openSession(id: string) {
     push('/sessions/' + encodeURIComponent(id));
@@ -221,7 +284,7 @@
           <SearchAutocompleteInput bind:value={search} appId={sessionStore.currentAppId} context="sessions" error={searchError} />
         </div>
       {/if}
-      <DateRange value={sinceDays} onchange={onRange} />
+      <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
       <Button
         variant="secondary"
@@ -276,7 +339,7 @@
               sessionStore.currentAppId &&
               load(
                 sessionStore.currentAppId,
-                sinceDays,
+                timeFilter,
                 sortParam(list.sort),
                 list.offset,
                 search,

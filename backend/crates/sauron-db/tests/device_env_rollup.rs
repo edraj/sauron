@@ -5,6 +5,7 @@ mod common;
 
 use common::TestDb;
 use diesel_async::RunQueryDsl;
+use sauron_db::repo::TimeWindow;
 use sauron_db::scope::{EnvFilter, ReadScope};
 
 /// `environment_id` is NULLABLE because `EnvFilter::Unattributed` is a real
@@ -565,7 +566,7 @@ async fn rollup_and_live_shapes_return_identical_rows() {
         let rows = sauron_db::repo::list_device_groups(
             &mut conn,
             ReadScope::new(ids.app_id, env.clone()),
-            since,
+            TimeWindow::since("last_seen", since),
             200,
             0,
             group_sort(),
@@ -644,7 +645,7 @@ async fn rollup_and_live_shapes_return_identical_rows() {
         let after = sauron_db::repo::list_device_groups(
             &mut conn,
             ReadScope::new(ids.app_id, env.clone()),
-            since,
+            TimeWindow::since("last_seen", since),
             200,
             0,
             group_sort(),
@@ -891,7 +892,7 @@ async fn device_with_only_a_transaction_matches_live_and_rollup_shapes() {
     let live = sauron_db::repo::list_device_groups(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        TimeWindow::since("last_seen", since),
         200,
         0,
         group_sort(),
@@ -915,7 +916,7 @@ async fn device_with_only_a_transaction_matches_live_and_rollup_shapes() {
     let rollup = sauron_db::repo::list_device_groups(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        TimeWindow::since("last_seen", since),
         200,
         0,
         group_sort(),
@@ -1145,7 +1146,7 @@ async fn device_group_where_every_device_is_transaction_only_matches_live_and_ro
     let live = sauron_db::repo::list_device_groups(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        TimeWindow::since("last_seen", since),
         200,
         0,
         group_sort(),
@@ -1197,7 +1198,7 @@ async fn device_group_where_every_device_is_transaction_only_matches_live_and_ro
     let rollup = sauron_db::repo::list_device_groups(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        TimeWindow::since("last_seen", since),
         200,
         0,
         group_sort(),
@@ -1300,7 +1301,7 @@ async fn list_devices_with_a_transaction_only_device_does_not_fail_to_deserializ
     let rows = sauron_db::repo::list_devices(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        TimeWindow::since("last_seen", since),
         200,
         0,
         device_sort(),

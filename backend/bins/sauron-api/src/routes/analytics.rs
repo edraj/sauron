@@ -222,6 +222,15 @@ pub(crate) fn person_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> 
 #[derive(Deserialize)]
 pub struct PersonsQuery {
     pub search: Option<String>,
+    /// `time_field` / `from` / `to` / `since_days`, flattened so the precedence
+    /// between them is decided once, in `resolve_time_filter`.
+    ///
+    /// NEW — this list had no time window at all. The Users page rendered a
+    /// range picker that only ever drove the stat tiles while the table showed
+    /// every person regardless, so the control claimed a filter it did not
+    /// apply.
+    #[serde(flatten)]
+    pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_persons_list_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -235,6 +244,22 @@ pub struct PersonsQuery {
 
 fn default_persons_list_limit() -> i64 {
     50
+}
+
+/// This list windows on the value the column DISPLAYS — env-scoped when an
+/// environment is selected — so "last seen in the last 7 days" agrees with the
+/// Last seen cell beside it. See `repo::person_seen_expr`, and note that
+/// `devices::TIME_FIELDS` deliberately means the opposite by the same words.
+pub const PERSON_TIME_FIELDS: &[&str] = &["last_seen", "first_seen"];
+
+/// 365, not the 30 that Sessions and Devices default to.
+///
+/// This table has never had a window, so it has always shown every person.
+/// Defaulting to 30 days would make most of an app's users vanish from a list
+/// that has always shown them all, as a side effect of a filter nobody touched.
+/// 365 is the route's own ceiling, so it is the widest honest default there is.
+fn default_persons_since_days() -> i64 {
+    super::search::MAX_WINDOW_DAYS
 }
 
 pub async fn persons_list(
@@ -255,6 +280,16 @@ pub async fn persons_list(
     .await?;
     let search = q.search.as_deref().filter(|s| !s.is_empty());
     let sort = person_sort_spec(q.sort.as_deref())?;
+    let window = super::search::resolve_time_filter(
+        "last_seen",
+        PERSON_TIME_FIELDS,
+        &q.window,
+        Utc::now(),
+        default_persons_since_days(),
+        super::search::MAX_WINDOW_DAYS,
+        // No planner clamp: this list is not query-planner wired.
+        None,
+    )?;
     Ok(Json(
         repo::list_persons(
             &mut conn,
@@ -263,6 +298,11 @@ pub async fn persons_list(
             q.limit.clamp(1, 200),
             super::clamp_offset(q.offset),
             sort,
+            repo::TimeWindow {
+                column: window.column,
+                from: window.from,
+                to: window.to,
+            },
         )
         .await?,
     ))
@@ -284,8 +324,10 @@ pub struct EventsListQuery {
     pub sort: Option<String>,
     /// Opaque token from the previous page's `next_cursor`.
     pub cursor: Option<String>,
-    #[serde(default = "default_events_since_days")]
-    pub since_days: i64,
+    /// `time_field` / `from` / `to` / `since_days`, flattened so the
+    /// precedence between them is decided once, in `resolve_time_filter`.
+    #[serde(flatten)]
+    pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_events_list_limit")]
     pub limit: i64,
     /// Accepted and IGNORED since S2c — see `issues::ListQuery::offset` for the
@@ -317,6 +359,16 @@ const EVENTS_MAX_SINCE_DAYS: i64 = 365;
 fn default_events_since_days() -> i64 {
     EVENTS_MAX_SINCE_DAYS
 }
+
+/// The one column this list windows on.
+///
+/// A single-entry whitelist on purpose, so `?time_field=received_at` is a 400
+/// that names what IS accepted rather than a parameter that looks honoured and
+/// is not. `received_at` is excluded because it carries no index AND
+/// `analytics_events` is `PARTITION BY RANGE (occurred_at)` — a `received_at`
+/// window prunes no partitions and scans all of them, which is the shape behind
+/// the env-scoped analytics timeout.
+pub const EVENT_TIME_FIELDS: &[&str] = &["occurred_at"];
 
 /// The searched analytics event stream.
 ///
@@ -450,20 +502,23 @@ pub async fn events_list(
     // it to match the siblings would be a performance change wearing a
     // consistency costume. What it must NOT do is stay silent: a caller who
     // asks for 3650 is served 365, and `resolve_window` says so in `clamped`.
-    let window = super::search::resolve_window(
+    let window = super::search::resolve_time_filter(
         "occurred_at",
+        EVENT_TIME_FIELDS,
+        &q.window,
         Utc::now(),
-        q.since_days,
+        default_events_since_days(),
         EVENTS_MAX_SINCE_DAYS,
         prepared.clamp,
-    );
-    let since = window.since;
+    )?;
+    let since = window.from;
     let limit = q.limit.clamp(1, 200);
 
     let search = repo::EventSearch {
         node: &node,
         ctx: &prepared.ctx,
         since,
+        until: window.to,
         sort,
         descending,
         after,

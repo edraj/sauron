@@ -2537,6 +2537,10 @@ async fn list_persons_covers_only_the_selected_environment() {
         50,
         0,
         common::default_person_sort(),
+        TimeWindow::since(
+            "last_seen",
+            chrono::Utc::now() - chrono::Duration::days(3650),
+        ),
     )
     .await
     .unwrap();
@@ -2587,6 +2591,10 @@ async fn list_persons_covers_only_the_selected_environment() {
         50,
         0,
         common::default_person_sort(),
+        TimeWindow::since(
+            "last_seen",
+            chrono::Utc::now() - chrono::Duration::days(3650),
+        ),
     )
     .await
     .unwrap();
@@ -2628,6 +2636,10 @@ async fn list_persons_covers_only_the_selected_environment() {
         50,
         0,
         common::default_person_sort(),
+        TimeWindow::since(
+            "last_seen",
+            chrono::Utc::now() - chrono::Duration::days(3650),
+        ),
     )
     .await
     .unwrap();
@@ -2649,6 +2661,10 @@ async fn list_persons_covers_only_the_selected_environment() {
         50,
         0,
         common::default_person_sort(),
+        TimeWindow::since(
+            "last_seen",
+            chrono::Utc::now() - chrono::Duration::days(3650),
+        ),
     )
     .await
     .unwrap();
@@ -2713,7 +2729,7 @@ async fn list_devices_covers_only_the_selected_environment() {
     let rows_a = sauron_db::repo::list_devices(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         device_sort(),
@@ -2747,7 +2763,7 @@ async fn list_devices_covers_only_the_selected_environment() {
     let rows_b = sauron_db::repo::list_devices(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         device_sort(),
@@ -2789,7 +2805,7 @@ async fn list_devices_covers_only_the_selected_environment() {
     let rows_none = sauron_db::repo::list_devices(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         device_sort(),
@@ -2803,7 +2819,7 @@ async fn list_devices_covers_only_the_selected_environment() {
     let rows_all = sauron_db::repo::list_devices(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         device_sort(),
@@ -3134,6 +3150,10 @@ async fn person_and_device_seen_and_identity_are_derived_per_environment() {
         50,
         0,
         common::default_person_sort(),
+        TimeWindow::since(
+            "last_seen",
+            chrono::Utc::now() - chrono::Duration::days(3650),
+        ),
     )
     .await
     .unwrap();
@@ -3149,6 +3169,10 @@ async fn person_and_device_seen_and_identity_are_derived_per_environment() {
         50,
         0,
         common::default_person_sort(),
+        TimeWindow::since(
+            "last_seen",
+            chrono::Utc::now() - chrono::Duration::days(3650),
+        ),
     )
     .await
     .unwrap();
@@ -3193,7 +3217,7 @@ async fn person_and_device_seen_and_identity_are_derived_per_environment() {
     let devices_a = sauron_db::repo::list_devices(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         device_sort(),
@@ -5437,13 +5461,17 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
         50,
         0,
         common::default_person_sort(),
+        TimeWindow::since(
+            "last_seen",
+            chrono::Utc::now() - chrono::Duration::days(3650),
+        ),
     )
     .await
     .expect("list_persons under Subset");
     sauron_db::repo::list_devices(
         &mut conn,
         scope.clone(),
-        since,
+        TimeWindow::since("last_seen", since),
         50,
         0,
         device_sort(),
@@ -5463,7 +5491,7 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     sauron_db::repo::list_devices(
         &mut conn,
         scope.clone(),
-        since,
+        TimeWindow::since("last_seen", since),
         50,
         0,
         device_sort(),
@@ -5477,9 +5505,17 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     )
     .await
     .expect("list_devices with a group filter under Subset");
-    sauron_db::repo::list_device_groups(&mut conn, scope.clone(), since, 50, 0, group_sort(), None)
-        .await
-        .expect("list_device_groups under Subset");
+    sauron_db::repo::list_device_groups(
+        &mut conn,
+        scope.clone(),
+        TimeWindow::since("last_seen", since),
+        50,
+        0,
+        group_sort(),
+        None,
+    )
+    .await
+    .expect("list_device_groups under Subset");
     sauron_db::repo::list_sessions(
         &mut conn,
         scope.clone(),
@@ -5569,7 +5605,7 @@ async fn list_devices_group_filter_binds_correctly_under_one_and_unattributed() 
     sauron_db::repo::list_devices(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        TimeWindow::since("last_seen", since),
         50,
         0,
         device_sort(),
@@ -5595,7 +5631,7 @@ async fn list_devices_group_filter_binds_correctly_under_one_and_unattributed() 
     sauron_db::repo::list_devices(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        since,
+        TimeWindow::since("last_seen", since),
         50,
         0,
         device_sort(),
@@ -7093,6 +7129,7 @@ async fn the_harness_seeds_guests_not_identified_users() {
 // ===========================================================================
 
 use sauron_db::repo::AppEnvScope;
+use sauron_db::repo::TimeWindow;
 
 /// A second app in the same project, with one environment enrollment.
 /// Returns `(app_id, env_id, issue_id)`.
@@ -7788,4 +7825,119 @@ async fn list_persons_membership_is_uncorrelated() {
         !all.contains("event_users.distinct_id IN ("),
         "EnvFilter::All must emit no membership predicate, got:\n{all}"
     );
+}
+
+/// Every funnel step must be bounded by `since`, not just step 0.
+///
+/// `s0` reads `analytics_events` under `occurred_at>=$2`; each `s{i>0}` re-reads it under
+/// only the *correlated* `a.occurred_at >= s{i-1}.t`. A correlated bound is not a constant,
+/// so it prunes nothing: without an explicit `>=$2` on each step, every step past 0 scanned
+/// EVERY partition — the app's entire retained history of that event name — while step 0
+/// read only the window. That makes the funnel's cost scale with total retained data instead
+/// of `since_days`, which is what eventually crosses `sauron-api`'s 30s `TimeoutLayer` and
+/// returns a 503 to the dashboard.
+///
+/// This is invisible to a counts-based test: the added predicate is implied by the chain
+/// (`s{i}.t >= .. >= s0.t >= since`), so it can never change a result — which is exactly why
+/// it is easy to delete as "redundant" and why the guard has to read the PLAN.
+#[tokio::test]
+async fn funnel_prunes_every_step_to_the_since_window() {
+    #[derive(diesel::QueryableByName)]
+    struct Plan {
+        #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
+        line: String,
+    }
+
+    // Cheap half of the guard: no database needed, and it fails the instant the predicate
+    // is dropped, naming the reason. The EXPLAIN below proves it actually buys pruning.
+    for env in [EnvFilter::All, EnvFilter::One(Uuid::new_v4())] {
+        let sql = sauron_db::repo::funnel_sql(&env, 4);
+        assert_eq!(
+            sql.matches("occurred_at>=$2").count(),
+            4,
+            "all 4 steps must carry the constant `since` bound, not just s0; got:\n{sql}"
+        );
+    }
+
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // Two explicit partitions in ranges the seed never touches, so creating them cannot
+    // collide with rows already sitting in the default partition (Postgres refuses to
+    // attach a partition whose range would capture existing default rows).
+    for (suffix, from, to) in [
+        ("probe_old", "2019-01-01T00:00:00Z", "2019-02-01T00:00:00Z"),
+        ("probe_new", "2020-01-01T00:00:00Z", "2020-02-01T00:00:00Z"),
+    ] {
+        diesel::sql_query(format!(
+            "CREATE TABLE analytics_events_{suffix} PARTITION OF analytics_events \
+             FOR VALUES FROM ('{from}') TO ('{to}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    // One person clearing both steps inside the NEW partition, plus the same event names
+    // sitting in the OLD one. `since` lands between the two partitions.
+    for (occurred, part) in [
+        ("2019-01-15T00:00:00Z", "old"),
+        ("2020-01-15T00:00:00Z", "new"),
+    ] {
+        for step in ["harness.funnel.step1", "harness.funnel.step2"] {
+            diesel::sql_query(
+                "INSERT INTO analytics_events (app_id, environment_id, name, distinct_id, occurred_at) \
+                 VALUES ($1, $2, $3, $4, $5::timestamptz)",
+            )
+            .bind::<SqlUuid, _>(ids.app_id)
+            .bind::<SqlUuid, _>(ids.env_a)
+            .bind::<Text, _>(step)
+            .bind::<Text, _>(format!("prune_probe_{part}"))
+            .bind::<Text, _>(occurred)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    // EXPLAIN the REAL query the repo runs, not a retyped lookalike — retyping would
+    // measure the copy and stay green while the shipped SQL regressed.
+    let sql = sauron_db::repo::funnel_sql(&EnvFilter::One(ids.env_a), 2);
+    let plan: Vec<Plan> = diesel::sql_query(format!("EXPLAIN {sql}"))
+        .bind::<SqlUuid, _>(ids.app_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(
+            "2019-06-01T00:00:00Z"
+                .parse::<chrono::DateTime<Utc>>()
+                .unwrap(),
+        )
+        .bind::<SqlUuid, _>(ids.env_a)
+        .bind::<Text, _>("harness.funnel.step1")
+        .bind::<Text, _>("harness.funnel.step2")
+        .load(&mut conn)
+        .await
+        .unwrap();
+    let text = plan
+        .iter()
+        .map(|p| p.line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        text.contains("analytics_events_probe_new"),
+        "sanity: the in-window partition must be read, else the assertion below passes \
+         vacuously on a plan that touches nothing; plan was:\n{text}"
+    );
+    assert!(
+        !text.contains("analytics_events_probe_old"),
+        "no step may read a partition entirely older than `since` — an unpruned step \
+         scans the whole retained history of its event name on every funnel request; \
+         plan was:\n{text}"
+    );
+
+    drop(conn);
+    db.cleanup().await;
 }
