@@ -14,6 +14,7 @@ use chrono::{DateTime, Duration, SubsecRound, Utc};
 use common::{far_past, seed_env, TestDb};
 use sauron_db::models::NewAnalyticsEvent;
 use sauron_db::repo;
+use sauron_db::repo::TimeWindow;
 use sauron_db::repo::{DeviceGroupKey, SortSpec};
 use sauron_db::scope::{EnvFilter, ReadScope};
 use serde_json::json;
@@ -297,7 +298,7 @@ async fn devices_sharing_model_and_os_collapse_into_one_group() {
     let rows = repo::list_device_groups(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         group_sort(),
@@ -341,7 +342,7 @@ async fn devices_with_null_descriptors_form_one_unknown_group() {
     let rows = repo::list_device_groups(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         group_sort(),
@@ -404,7 +405,7 @@ async fn groups_exclude_devices_from_other_environments() {
     let rows_a = repo::list_device_groups(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         group_sort(),
@@ -523,7 +524,7 @@ async fn group_sessions_and_first_last_seen_use_pinned_timestamps() {
     let rows_all = repo::list_device_groups(
         &mut conn,
         ReadScope::all(ids.app_id),
-        since,
+        TimeWindow::since("last_seen", since),
         50,
         0,
         group_sort(),
@@ -557,7 +558,7 @@ async fn group_sessions_and_first_last_seen_use_pinned_timestamps() {
     let rows_scoped = repo::list_device_groups(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        TimeWindow::since("last_seen", since),
         50,
         0,
         group_sort(),
@@ -605,7 +606,7 @@ async fn group_filter_returns_only_that_groups_devices() {
     let rows = repo::list_devices(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         device_sort(),
@@ -647,7 +648,7 @@ async fn group_filter_matches_the_all_null_group() {
     let rows = repo::list_devices(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         device_sort(),
@@ -759,7 +760,7 @@ async fn group_pagination_is_stable_across_last_seen_ties() {
         let page = repo::list_device_groups(
             &mut conn,
             ReadScope::all(app_id),
-            far_past(),
+            TimeWindow::since("last_seen", far_past()),
             page_size,
             offset,
             group_sort(),
@@ -810,7 +811,7 @@ async fn no_group_filter_returns_every_device() {
     let rows = repo::list_devices(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        TimeWindow::since("last_seen", far_past()),
         50,
         0,
         device_sort(),

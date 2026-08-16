@@ -241,17 +241,18 @@
     </Button>
   </div>
 
-  {#if error}
-    <Card><p class="err">{error}</p></Card>
-  {/if}
+  <div class="content">
+    {#if error}
+      <Card><p class="err">{error}</p></Card>
+    {/if}
 
-  {#if loading}
-    <Spinner />
-  {:else if !app}
-    <EmptyState title="Select an app" description="A purge always targets one app." icon="package" />
-  {:else if !job}
-    <!-- ================= scope form ================= -->
-    <Card>
+    {#if loading}
+      <Spinner />
+    {:else if !app}
+      <EmptyState title="Select an app" description="A purge always targets one app." icon="package" />
+    {:else if !job}
+      <!-- ================= scope form ================= -->
+      <Card>
       <h2>1 — What to purge</h2>
       <p class="hint">
         Raw kinds are deleted. Rollup kinds are recomputed from what survives and removed
@@ -457,9 +458,15 @@
       </DataTable>
     </Card>
   {/if}
+  </div>
 </AdminShell>
 
 <style>
+  .content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
   .head {
     display: flex;
     justify-content: space-between;

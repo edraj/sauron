@@ -12,6 +12,23 @@ export interface ListDevicesParams {
   offset: number;
   since_days?: number;
   /**
+   * The time window column, as `models/time-filter`'s `toRecord` encodes it.
+   * Accepts `last_seen` (default) and `first_seen`; anything else is a 400.
+   *
+   * On this list the window decides WHICH DEVICES ARE LISTED, via the durable
+   * `devices` column — not via the value the row displays. Under a scoped read
+   * the displayed `first_seen`/`last_seen` are per-environment extrema, and a
+   * device's per-environment first sighting can postdate its app-level one.
+   * That predates this parameter (it is what `since_days` always did) and is
+   * also the only form an index can serve. The Persons list deliberately does
+   * the opposite — see `ListPersonsParams`.
+   */
+  time_field?: string;
+  /** RFC3339 UTC, inclusive. Suppresses `since_days` server-side. */
+  from?: string;
+  /** RFC3339 UTC, **exclusive**. Suppresses `since_days` server-side. */
+  to?: string;
+  /**
    * `sort=` as `sortParam()` encodes it — a BARE column descends, a `-` prefix
    * ascends. Build it with `sortParam`, never by hand. Anything outside the
    * endpoint's whitelist is a 400, not a silently ignored parameter, and the

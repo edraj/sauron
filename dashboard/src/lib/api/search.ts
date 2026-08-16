@@ -68,6 +68,20 @@ export interface SearchPredicateParams {
   /** The query language. Wins outright over `filters`/`q` when non-empty. */
   query?: string;
   sinceDays?: number;
+  /**
+   * Which timestamp column the window applies to.
+   *
+   * Validated per route against a whitelist; an unlisted value is a 400 that
+   * names the allowed set, not a silently ignored parameter. Omit it to accept
+   * the route's default column. Build these three from a `TimeFilterState` via
+   * `models/time-filter`'s `toRecord`, never by hand — the precedence rule
+   * below is easy to get wrong at a call site.
+   */
+  timeField?: string;
+  /** RFC3339 UTC, inclusive lower bound. Suppresses `sinceDays` server-side. */
+  from?: string;
+  /** RFC3339 UTC, **exclusive** upper bound. Suppresses `sinceDays` server-side. */
+  to?: string;
 }
 
 /**
@@ -106,7 +120,16 @@ export function predicateParams(opts: SearchPredicateParams): URLSearchParams {
   for (const f of opts.filters ?? []) p.append('filter', f);
   if (opts.q) p.set('q', opts.q);
   if (opts.query) p.set('query', opts.query);
-  if (opts.sinceDays != null) p.set('since_days', String(opts.sinceDays));
+  if (opts.timeField) p.set('time_field', opts.timeField);
+  if (opts.from) p.set('from', opts.from);
+  if (opts.to) p.set('to', opts.to);
+  // Sent only when neither bound is present. The server ignores `since_days`
+  // whenever a bound is set, so including it anyway would put a request on the
+  // wire that reads as two conflicting windows — and would make a bookmarked
+  // URL look like it carried a window it does not.
+  if (opts.sinceDays != null && !opts.from && !opts.to) {
+    p.set('since_days', String(opts.sinceDays));
+  }
   return p;
 }
 

@@ -47,6 +47,9 @@ tracing.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
+# Pins the extractor contract for `#[serde(flatten)]` — see
+# `routes::search::tests::flattened_window_params_survive_the_query_extractor`.
+serde_urlencoded = "0.7"
 # Drives the real, compiled `sauron-api` binary over HTTP in
 # `tests/http_env_scoping.rs`, `tests/http_workflows.rs`,
 # `tests/http_mail_outbox.rs` and `tests/http_sessions.rs` — the only way to

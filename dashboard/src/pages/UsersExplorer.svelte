@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { push } from 'svelte-spa-router';
+  import { push, querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
@@ -12,6 +12,7 @@
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import TimeFilter from '../lib/components/TimeFilter.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import UserActivityChart from '../lib/components/UserActivityChart.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
@@ -29,6 +30,13 @@
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
   import {
+    fromParams,
+    toParams,
+    toRecord,
+    type TimeField,
+    type TimeFilterState,
+  } from '../lib/models/time-filter';
+  import {
     initials,
     hueFromString,
     compactNumber,
@@ -39,8 +47,42 @@
 
   const LIMIT = 50;
 
+  /**
+   * The two columns this table can be windowed by.
+   *
+   * `first_seen` is what makes "new users" askable: a person first seen 90 days
+   * ago but active yesterday matches a `last_seen` window and misses a
+   * `first_seen` one. The stat tiles above have always drawn that distinction
+   * ("Active" vs "New") over a table that could not reproduce either.
+   */
+  const TIME_FIELDS: TimeField[] = [
+    { key: 'last_seen', label: 'Last seen' },
+    { key: 'first_seen', label: 'First seen' },
+  ];
+  const DEFAULT_TIME_FIELD = 'last_seen';
+
+  /**
+   * 365, not the 30 the other lists default to.
+   *
+   * This table has never had a time window at all — the range picker on this
+   * page drove only the stat tiles — so it has always shown every person.
+   * Defaulting to 30 days would make most of an app's users vanish from a list
+   * that has always shown them all, as a side effect of a filter nobody
+   * touched. 365 is the route's own ceiling, so it is the widest honest default
+   * available.
+   */
+  const DEFAULT_DAYS = 365;
+
   let searchTerm = $state('');
   let query = $state('');
+
+  // Restored from the URL on first paint so a shared or refreshed link keeps
+  // its window. An unparseable or unoffered value degrades to the default
+  // rather than 400ing — see `fromParams`.
+  const initial = new URLSearchParams($querystring ?? '');
+  let timeFilter = $state<TimeFilterState>(
+    fromParams(initial, TIME_FIELDS, DEFAULT_TIME_FIELD, DEFAULT_DAYS),
+  );
 
   // `last_seen` descending is the endpoint's own default, so this describes
   // the first request rather than changing it.
@@ -78,7 +120,7 @@
     refreshing = true;
     try {
       await Promise.all([
-        load(aid, query, sortParam(list.sort), list.offset, true),
+        load(aid, query, sortParam(list.sort), list.offset, timeFilter, true),
         loadAnalytics(aid, sinceDays),
       ]);
     } finally {
@@ -124,14 +166,33 @@
   //
   // `force` bypasses the fresh-window short-circuit — an explicit Refresh or
   // Retry means "go to the network now".
-  async function load(appId: string, q: string, sort: string, off: number, force = false) {
+  async function load(
+    appId: string,
+    q: string,
+    sort: string,
+    off: number,
+    tf: TimeFilterState,
+    force = false,
+  ) {
+    // The window is in the key for the same reason `q`, `sort` and `off` are:
+    // without it, changing the filter finds the previous window's rows already
+    // cached under the same key and repaints them with NO request on the wire,
+    // so the filter looks like it silently did nothing.
+    //
+    // It enters the key as the filter's DECLARATION (`last:365:`), never as the
+    // instant `last` resolves to. A clock-derived value in a `viewKey` mints a
+    // fresh entry on every single load — the cache stays wired, typed and green
+    // while hitting zero times, and nothing in the DOM shows it. Only the
+    // network panel does.
+    const windowKey = `${tf.field}:${tf.mode}:${tf.lastDays ?? ''}:${tf.from ?? ''}:${tf.to ?? ''}`;
     await view.load(
-      viewKey('persons.list', appId, sessionStore.scopeKey, q, sort, off, LIMIT),
+      viewKey('persons.list', appId, sessionStore.scopeKey, q, sort, off, LIMIT, windowKey),
       () => listPersons(appId, {
         search: q || undefined,
         sort,
         limit: LIMIT,
         offset: off,
+        ...toRecord(tf, DEFAULT_TIME_FIELD),
       }),
       force,
     );
@@ -145,7 +206,21 @@
     const q = query;
     const sort = sortParam(list.sort);
     const off = list.offset;
-    if (aid) void load(aid, q, sort, off);
+    const tf = timeFilter;
+    if (aid) void load(aid, q, sort, off, tf);
+  });
+
+  // The URL mirrors the window so a filtered view survives a refresh and can be
+  // shared. `replace`, not `push`: adjusting a filter is not a navigation, and
+  // a history entry per keystroke-equivalent would make Back useless.
+  //
+  // This writes the query string that `$querystring` feeds, so it must not be
+  // read back into `timeFilter` — `initial` is read ONCE at setup, above,
+  // rather than through a `$derived`, which is what keeps this from looping.
+  $effect(() => {
+    const p = toParams(timeFilter, DEFAULT_TIME_FIELD);
+    const qs = p.toString();
+    void replace(qs ? `/users?${qs}` : '/users');
   });
 
   // A compact digest of the most useful person traits, shown in the table.
@@ -244,6 +319,23 @@
            header the user just clicked. -->
       <p class="muted section-hint">One row per distinct ID.</p>
     </div>
+    <!-- Governs the TABLE only. The Audience range picker above drives the
+         tiles and chart, and the two are deliberately separate windows: this
+         one can name a column and a bound the summary endpoints cannot
+         express, so a shared control would have to either lie or caption its
+         way out on every card. -->
+    <TimeFilter
+      fields={TIME_FIELDS}
+      value={timeFilter}
+      onchange={(v) => {
+        timeFilter = v;
+        // A changed predicate invalidates the page position: row 51 of the old
+        // window is not row 51 of the new one, and keeping the offset would
+        // land the user in the middle of a result set they have not seen the
+        // start of — or past its end, on an empty page.
+        list = setOffsetPage(list, 0);
+      }}
+    />
   </div>
 
   {#if loading && rows.length === 0}
@@ -256,7 +348,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, query, sortParam(list.sort), list.offset);
+              if (aid) load(aid, query, sortParam(list.sort), list.offset, timeFilter);
             }}
           >
             Retry

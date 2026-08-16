@@ -8,6 +8,24 @@ export interface ListSessionsParams extends SearchParams {
   offset: number;
   distinct_id?: string;
   device_key?: string;
+  /**
+   * The time window, snake_case, as `models/time-filter`'s `toRecord` emits it.
+   *
+   * Deliberately NOT the camelCase `timeField`/`sinceDays` that
+   * `SearchPredicateParams` declares for the `URLSearchParams` encoder: this
+   * client passes a plain object straight to axios, so whatever key is written
+   * here is the key that goes on the wire. `sinceDays` needs the rename below
+   * precisely because it came in through the camelCase door; spreading
+   * `toRecord`'s output avoids that whole class of mismatch.
+   *
+   * Accepts `started_at` and `last_event_at`. Note the default is
+   * `last_event_at` — that is the column this list has always filtered on,
+   * even while the response envelope's `clamped` field claimed `started_at`.
+   */
+  time_field?: string;
+  from?: string;
+  to?: string;
+  since_days?: number;
 }
 
 /**

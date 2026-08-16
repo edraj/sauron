@@ -18,6 +18,12 @@
   import { getPerson } from '../lib/api/persons';
   import { relativeTime, formatTimestamp, initials } from '../lib/utils/format';
   import { timeFormatStore } from '../lib/stores/time-format.svelte';
+  import {
+    formatOffset,
+    personJsonFilename,
+    personOffsetMs,
+    type PersonTimeMode,
+  } from '../lib/models/person-timeline';
   import type { AnalyticsEvent, ErrorEvent, PersonProfile } from '../lib/models';
 
   interface Props {
@@ -111,6 +117,56 @@
   const hasTraits = $derived(
     !!profile?.user?.properties && Object.keys(profile.user.properties).length > 0,
   );
+
+  /**
+   * What the timeline's trailing offsets read against. Deliberately not
+   * persisted: "since the first entry shown" is the right first answer for a
+   * profile you have just opened, and a remembered delta mode would silently
+   * change what every future profile's numbers mean.
+   */
+  let timeMode = $state<PersonTimeMode>('start');
+
+  /**
+   * The trailing offset label. An em dash — not a `+` with nothing after it —
+   * when there is no reference point, which in `delta` mode is the last row.
+   */
+  function offsetLabel(i: number): string {
+    const ms = personOffsetMs(timeline, i, timeMode);
+    return ms === null ? '—' : `+${formatOffset(ms)}`;
+  }
+
+  /**
+   * The timeline as a file. `at` goes out as an ISO instant rather than the
+   * epoch milliseconds the component sorts on, and the rows keep the
+   * newest-first order the card renders — the button sits in the timeline's
+   * header, so what it hands over should be what is on screen.
+   *
+   * Worth knowing when reading an export: the profile pulls a capped window of
+   * events and a capped window of errors *separately*, so on a busy person the
+   * two cover different spans and the tail of this list is not a complete
+   * record of that period.
+   */
+  function downloadPersonJson() {
+    if (!profile) return;
+    const exportData = {
+      distinct_id: distinctId,
+      user: profile.user,
+      timeline: timeline.map((item) => ({
+        kind: item.kind,
+        at: new Date(item.at).toISOString(),
+        data: item.data,
+      })),
+    };
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = personJsonFilename(distinctId);
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
 </script>
 
 <AppShell requireApp>
@@ -183,6 +239,30 @@
     <div class="grid">
       <div class="col-main">
         <Card title="Activity timeline">
+          {#snippet actions()}
+            {#if timeline.length > 0}
+              <Button
+                variant="ghost"
+                size="sm"
+                title="Download this person's activity timeline as JSON"
+                onclick={downloadPersonJson}
+              >
+                <Icon name="download" size={14} />
+                Download JSON
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                title={timeMode === 'delta'
+                  ? 'Showing time since the previous entry — click to measure from the first entry shown'
+                  : 'Showing time since the first entry shown — click to measure from the previous entry'}
+                onclick={() => (timeMode = timeMode === 'delta' ? 'start' : 'delta')}
+              >
+                <Icon name="clock" size={14} />
+                {timeMode === 'delta' ? 'Since previous' : 'Since start'}
+              </Button>
+            {/if}
+          {/snippet}
           {#if timeline.length === 0}
             <EmptyState title="No activity" description="This person has no recorded events or errors." icon="inbox" />
           {:else}
@@ -214,6 +294,12 @@
                         </a>
                       {/if}
                       <span class="tl-time"><TimeValue value={item.data.occurred_at} /></span>
+                      <span
+                        class="tl-offset mono"
+                        title={timeMode === 'delta'
+                          ? 'Since the previous entry'
+                          : 'Since the first entry shown'}
+                      >{offsetLabel(i)}</span>
                     </div>
                     {#if item.kind === 'event' && item.data.properties && Object.keys(item.data.properties).length > 0}
                       <div class="tl-props">
@@ -413,6 +499,16 @@
     font-size: 11.5px;
     color: var(--text-faint);
     margin-left: auto;
+  }
+  /* Tabular figures so the column of offsets stays aligned as the digits
+     change; `min-width` keeps the timestamp beside it from shifting when a
+     label swaps between "1.0s" and "30d 00h". */
+  .tl-offset {
+    font-size: 11px;
+    color: var(--text-faint);
+    min-width: 58px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
   }
   .empty-traits {
     font-size: 13px;

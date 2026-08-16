@@ -16,6 +16,7 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
+  import TimeFilter from '../lib/components/TimeFilter.svelte';
   import {
     EVENT_FIELDS,
     encodeFilters,
@@ -37,6 +38,12 @@
     type CursorListState,
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
+  import {
+    fromParams,
+    toParams,
+    type TimeField,
+    type TimeFilterState,
+  } from '../lib/models/time-filter';
   import { panelScopeNote } from '../lib/models/panel-scope';
   import { viewKey } from '../lib/stores/view-cache';
   import type { AnalyticsEvent, SeriesPoint, TopEvent } from '../lib/models';
@@ -58,6 +65,50 @@
   // apply immediately.
   let appliedSearch = $state(initial.get('q') ?? '');
   let sinceDays = $state(Number(initial.get('since_days')) || 30);
+
+  /**
+   * The stream's own window. ONE field, so the control renders a label rather
+   * than a dropdown — `analytics_events` is `PARTITION BY RANGE (occurred_at)`
+   * and `received_at` carries no index, so a `received_at` window would prune
+   * no partitions and scan all of them. The single-entry whitelist makes
+   * `?time_field=received_at` a 400 that names what is allowed, rather than a
+   * parameter that looks accepted and is not.
+   *
+   * Governs the STREAM only. The two cards above keep `sinceDays` from the
+   * FilterBar, because `/events/top` and `/events/series` take a plain day
+   * count and cannot express an absolute bound.
+   *
+   * `stream_days` in the URL, not `since_days`: this page already spends
+   * `since_days` on the cards' range, and one query string cannot carry two
+   * different meanings for one name. The WIRE parameter is still `since_days`
+   * — they are different endpoints, so there is no collision there — which is
+   * what `streamWindowParams` below translates between.
+   */
+  const STREAM_TIME_FIELDS: TimeField[] = [{ key: 'occurred_at', label: 'Occurred' }];
+  const STREAM_TIME_FIELD = 'occurred_at';
+
+  /** URL shape (`stream_days`) -> model shape (`since_days`). */
+  function readStreamWindow(sp: URLSearchParams): TimeFilterState {
+    const shifted = new URLSearchParams(sp);
+    const d = shifted.get('stream_days');
+    shifted.delete('stream_days');
+    shifted.delete('since_days');
+    if (d) shifted.set('since_days', d);
+    return fromParams(shifted, STREAM_TIME_FIELDS, STREAM_TIME_FIELD, 365);
+  }
+
+  /** Model shape -> URL shape. The inverse of `readStreamWindow`. */
+  function writeStreamWindow(tf: TimeFilterState): URLSearchParams {
+    const p = toParams(tf, STREAM_TIME_FIELD);
+    const d = p.get('since_days');
+    if (d !== null) {
+      p.delete('since_days');
+      p.set('stream_days', d);
+    }
+    return p;
+  }
+
+  let streamWindow = $state<TimeFilterState>(readStreamWindow(initial));
 
   const selectedTopEvent = $derived(
     filters.find((f) => f.field === 'name' && f.op === 'eq')?.value ?? null,
@@ -310,7 +361,7 @@
     appId: string,
     filterList: string[],
     q: string,
-    days: number,
+    tf: TimeFilterState,
     l: CursorListState,
   ) {
     const gen = ++streamGen;
@@ -326,7 +377,10 @@
       appId,
       filterList,
       q.trim(),
-      days,
+      // The window's DECLARATION, never the instant `last` resolves to: a
+      // clock-derived key component mints a fresh entry on every load, so the
+      // cache hits zero times while staying wired, typed and green.
+      `${tf.field}:${tf.mode}:${tf.lastDays ?? ''}:${tf.from ?? ''}:${tf.to ?? ''}`,
       sortParam(l.sort),
       cursorOf(l.page),
     );
@@ -337,7 +391,12 @@
       const envelope = await listEvents(appId, {
         filters: filterList,
         q: q.trim() || undefined,
-        sinceDays: days,
+        // `sinceDays` is sent only in `last` mode; `predicateParams` drops it
+        // whenever a bound is present, so the two can never both reach the wire.
+        sinceDays: tf.mode === 'last' ? tf.lastDays : undefined,
+        timeField: tf.field === STREAM_TIME_FIELD ? undefined : tf.field,
+        from: tf.from,
+        to: tf.to,
         limit: STREAM_LIMIT,
         sort: sortParam(l.sort),
         cursor: cursorOf(l.page),
@@ -394,7 +453,7 @@
     // filter change.
     streamPage = null;
     expandedId = null;
-    void loadStream(aid, encodeFilters(filters), appliedSearch, sinceDays, next);
+    void loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, next);
   }
 
   function goPrev() {
@@ -431,7 +490,7 @@
     walked = false;
     streamPage = null;
     expandedId = null;
-    void loadStream(aid, encodeFilters(filters), appliedSearch, sinceDays, next);
+    void loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, next);
   }
 
   // Re-fetch all page data with the current state (filters, search, date
@@ -448,7 +507,7 @@
       await Promise.all([
         loadTop(aid, sinceDays),
         loadSeries(aid, sinceDays, selectedTopEvent),
-        loadStream(aid, encodeFilters(filters), appliedSearch, sinceDays, list),
+        loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list),
       ]);
     } finally {
       refreshing = false;
@@ -498,11 +557,15 @@
     const enc = encodeFilters(filters);
     const s = appliedSearch;
     const days = sinceDays;
+    const tf = streamWindow;
     if (!aid) return;
     const p = new URLSearchParams();
     for (const f of enc) p.append('filter', f);
     if (s) p.set('q', s);
+    // The CARDS' range. The stream's own window is appended below under
+    // `stream_days`/`from`/`to`, which is why these two can coexist here.
     p.set('since_days', String(days));
+    for (const [k, v] of writeStreamWindow(tf)) p.set(k, v);
     void replace(`/events?${p.toString()}`);
     expandedId = null;
   });
@@ -514,7 +577,11 @@
     sessionStore.scopeKey;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
-    const days = sinceDays;
+    // The STREAM's window, not the cards' `sinceDays`: this effect exists to
+    // discard a cursor that no longer addresses anything, and only the stream's
+    // own predicate can invalidate it. Depending on `sinceDays` here would
+    // reset the walk every time somebody adjusted a chart's range.
+    const tf = streamWindow;
     if (!aid) return;
     // Back to page one, current sort kept. A cursor addresses a position in
     // ONE result set, so it is meaningless against a different predicate —
@@ -542,7 +609,7 @@
     // above it.
     walked = false;
     streamPage = null;
-    void loadStream(aid, enc, s, days, next);
+    void loadStream(aid, enc, s, tf, next);
   });
 
   function selectTopEvent(name: string) {
@@ -654,6 +721,16 @@
     </div>
 
     <Card padding="none" title="Event stream">
+      {#snippet actions()}
+        <!-- Governs the stream only; the two cards above follow the FilterBar's
+             range. Placed on the table's own card so the two windows read as
+             the separate things they are. -->
+        <TimeFilter
+          fields={STREAM_TIME_FIELDS}
+          value={streamWindow}
+          onchange={(v) => (streamWindow = v)}
+        />
+      {/snippet}
       <!--
         A refresh or retry of THESE rows failed. They stay, and so does the
         pager — losing page 4 of a walk to one bad poll is a worse outcome than
@@ -670,7 +747,7 @@
             size="sm"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, sinceDays, list);
+              if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list);
             }}
           >
             Try again
@@ -686,7 +763,7 @@
               variant="secondary"
               onclick={() => {
                 const aid = sessionStore.currentAppId;
-                if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, sinceDays, list);
+                if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list);
               }}
             >
               Retry

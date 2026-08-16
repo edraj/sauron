@@ -88,8 +88,10 @@ pub struct ListQuery {
     #[serde(default)]
     pub filter: Vec<String>,
     pub q: Option<String>,
-    #[serde(default = "default_days")]
-    pub since_days: i64,
+    /// `time_field` / `from` / `to` / `since_days`. Flattened so the
+    /// precedence between them is decided once, in `resolve_time_filter`.
+    #[serde(flatten)]
+    pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -104,6 +106,13 @@ pub struct ListQuery {
     // instead of this `Query<T>` extractor. See `routes::scope`'s module docs
     // for the extractor trap this avoids.
 }
+
+/// The columns this list will window on.
+///
+/// `last_event_at` is surfaced in the UI as **"Last activity"**, not "Ended":
+/// `sessions` has no `ended_at` column at all and duration is derived, so
+/// "Ended" would name something the data does not hold.
+pub const TIME_FIELDS: &[&str] = &["last_event_at", "started_at"];
 
 fn default_days() -> i64 {
     30
@@ -147,15 +156,34 @@ pub async fn list(
         .map_err(super::search::map_plan_error)?;
 
     let sort = session_sort_spec(q.sort.as_deref())?;
-    let window =
-        super::search::resolve_window("started_at", Utc::now(), q.since_days, 365, prepared.clamp);
+    let window = super::search::resolve_time_filter(
+        // `last_event_at`, NOT `started_at`. This list has always filtered on
+        // `last_event_at` (`repo::session_search_base`); the old
+        // `resolve_window("started_at", …)` call named the other column in the
+        // envelope's `clamped.field` while the predicate used this one.
+        // Defaulting to `started_at` here would fix the label by silently
+        // changing which sessions an unparameterised request returns, which is
+        // the larger of the two changes.
+        "last_event_at",
+        TIME_FIELDS,
+        &q.window,
+        Utc::now(),
+        // 30 days, unchanged: `default_days` above used to supply it.
+        default_days(),
+        super::search::MAX_WINDOW_DAYS,
+        prepared.clamp,
+    )?;
     let limit = q.limit.clamp(1, 200);
     let offset = super::clamp_offset(q.offset);
 
     let search = repo::SessionSearch {
         node: &node,
         ctx: &prepared.ctx,
-        since: window.since,
+        window: repo::TimeWindow {
+            column: window.column,
+            from: window.from,
+            to: window.to,
+        },
         sort,
         limit,
         offset,

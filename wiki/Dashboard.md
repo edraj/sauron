@@ -120,6 +120,47 @@ to find events by them, see **[Search & Filtering](Search.md)**.
   per-screen detail view showing the activity on each screen. (Set the screen with
   `setScreen` in the [Browser](Browser-SDK.md) / [Flutter](Flutter-SDK.md) SDKs.)
 
+### Filtering by time
+
+Events, Sessions, Users and Devices each carry a time filter above their table:
+
+    [ Last seen ▾ ]  [ in the last ▾ ]  [ 30 days ▾ ]
+
+Two things are chosen independently — **which timestamp** the window applies to,
+and **what shape** the window is.
+
+| Page | Columns offered | Default |
+|---|---|---|
+| Events | Occurred | in the last 365 days |
+| Sessions | Last activity, Started | Last activity, last 30 days |
+| Users | Last seen, First seen | Last seen, last 365 days |
+| Devices | Last seen, First seen | Last seen, last 30 days |
+
+The shapes are **in the last N**, **after**, **before**, and **between**. Absolute
+values are entered in your own timezone — the control shows the offset it is
+using — and the range is half-open: a whole-day `to` includes that entire day.
+
+Picking the column is what makes "new" askable. A person first seen a year ago
+but active yesterday matches a *Last seen* window and not a *First seen* one, so
+`First seen · in the last · 7 days` is the list of people who arrived this week.
+
+Two details worth knowing:
+
+- **The filter governs the table, not the charts.** The stat tiles and graphs
+  above each table keep their own range picker, because the summary endpoints
+  take a plain day count and cannot express a column choice or an absolute bound.
+- **Devices and Users mean subtly different things by the same words.** On
+  Devices the window decides *which devices are listed*, using each device's
+  app-wide first/last sighting. On Users it filters the value the row actually
+  shows, which is environment-scoped when an environment is selected. So under an
+  environment, a person's "first seen" is when they first appeared *in that
+  environment*.
+
+Every list bounds its window at 365 days. If your request was wider, the response
+says so rather than silently narrowing it, and the UI surfaces that.
+
+The window is kept in the URL, so a filtered view can be bookmarked and shared.
+
 ## Analyze
 
 - **Funnels** — a funnel builder over your event stream. Define ordered steps and see

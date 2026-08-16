@@ -254,9 +254,10 @@
     </div>
   </div>
 
-  <Card>
-    <div class="filters">
-      <label>
+  <div class="content">
+    <Card>
+      <div class="filters">
+        <label>
         <span>Range</span>
         <select bind:value={filters.range}>
           {#each RANGES as r (r.key)}
@@ -406,6 +407,7 @@
       </div>
     {/if}
   {/if}
+  </div>
 </AdminShell>
 
 {#if selected}
@@ -469,6 +471,11 @@
 {/if}
 
 <style>
+  .content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
   .head {
     display: flex;
     align-items: flex-start;

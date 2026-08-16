@@ -3873,6 +3873,17 @@ pub struct EventSearch<'a> {
     /// `analytics_events` is `PARTITION BY RANGE (occurred_at)`, so an
     /// unbounded lower bound is a MergeAppend across every partition.
     pub since: DateTime<Utc>,
+    /// EXCLUSIVE upper bound on the same column, when the caller gave one.
+    ///
+    /// Optional where `since` is not, and for the mirror-image reason: an
+    /// unbounded UPPER bound costs nothing, because "up to now" is where the
+    /// data ends anyway. Supplying one PRUNES partitions, so a bounded window
+    /// is cheaper than the open one, not dearer.
+    ///
+    /// Read by [`event_query_for`], which both `search_events` and
+    /// `count_events` build from — so the count is always taken over the same
+    /// window as the rows, and a caption cannot contradict the table under it.
+    pub until: Option<DateTime<Utc>>,
     /// The ordering this page walks. The cursor in `after` must have been
     /// minted under the same column — `cursor::decode` enforces it at the
     /// route.
@@ -3904,11 +3915,14 @@ fn event_search_base<'a>(
         app_id: scope.app_id,
     };
     let predicate = crate::query_plan::lower(search.node, &lowerer, search.ctx)?;
-    let query = analytics_events::table
+    let mut query = analytics_events::table
         .filter(lowerer.base_scope())
         .filter(analytics_events::occurred_at.ge(search.since))
         .filter(predicate)
         .into_boxed();
+    if let Some(until) = search.until {
+        query = query.filter(analytics_events::occurred_at.lt(until));
+    }
     // `analytics_events` carries `environment_id` directly, so this is the
     // ordinary column filter — see `list_analytics_events`, which this replaces
     // for the list, and `issue_env_membership` for the contrast.
@@ -4094,10 +4108,55 @@ pub async fn count_events(
 // Searched SESSIONS list — one app's `sessions`
 // ===========================================================================
 
+/// The time window a list query runs over, as the repo layer receives it.
+///
+/// `column` arrives already validated against the route's whitelist and is a
+/// `&'static str` for exactly that reason: it is interpolated into raw SQL in
+/// [`list_persons`] and [`list_devices`], so it must be impossible for caller
+/// text to reach it. **Do not widen this to `String`.** The route resolves it by
+/// copying a value OUT of its own whitelist rather than passing the caller's
+/// string through, so the two layers agree by construction.
+///
+/// `to` is EXCLUSIVE: `from <= col < to`. An inclusive upper bound would have to
+/// be expressed as the last representable instant, and `timestamptz` stores
+/// microseconds, so `23:59:59.999` silently drops the final millisecond of every
+/// window.
+///
+/// `from` is NOT optional, and the asymmetry is deliberate. `analytics_events`
+/// is `PARTITION BY RANGE (occurred_at)`, so an unbounded LOWER bound is a
+/// MergeAppend across every partition — the shape behind the env-scoped
+/// analytics timeout. An unbounded UPPER bound costs nothing, because "up to
+/// now" is where the data ends anyway.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeWindow {
+    pub column: &'static str,
+    pub from: DateTime<Utc>,
+    pub to: Option<DateTime<Utc>>,
+}
+
+impl TimeWindow {
+    /// A window with no upper bound — the shape every caller had before the
+    /// time filter existed, kept so untouched call sites read unchanged.
+    pub fn since(column: &'static str, from: DateTime<Utc>) -> Self {
+        Self {
+            column,
+            from,
+            to: None,
+        }
+    }
+}
+
 pub struct SessionSearch<'a> {
     pub node: &'a sauron_query::ResolvedNode,
     pub ctx: &'a crate::query_plan::PrepCtx,
-    pub since: DateTime<Utc>,
+    /// Which column, and both bounds. Replaces the bare `since` lower bound.
+    ///
+    /// The column used to be hard-coded `last_event_at` here while
+    /// `routes::sessions` asked `resolve_window` for `"started_at"` — so the
+    /// response envelope's `clamped.field` named one column and the predicate
+    /// filtered another. Carrying the choice through makes that disagreement
+    /// unrepresentable.
+    pub window: TimeWindow,
     pub sort: SortSpec,
     pub limit: i64,
     pub offset: i64,
@@ -4115,9 +4174,23 @@ fn session_search_base<'a>(
     let predicate = crate::query_plan::lower(search.node, &lowerer, search.ctx)?;
     let mut query = sessions::table
         .filter(sessions::app_id.eq(scope.app_id))
-        .filter(sessions::last_event_at.ge(search.since))
         .filter(predicate)
         .into_boxed();
+    // Matched on the whitelist's own values, so no caller string reaches
+    // diesel. `_` is unreachable given `routes::sessions::TIME_FIELDS`, and
+    // resolving it to `last_event_at` preserves the behaviour every
+    // pre-existing caller had — this list has ALWAYS filtered on that column,
+    // whatever `clamped.field` used to claim.
+    query = match search.window.column {
+        "started_at" => query.filter(sessions::started_at.ge(search.window.from)),
+        _ => query.filter(sessions::last_event_at.ge(search.window.from)),
+    };
+    if let Some(to) = search.window.to {
+        query = match search.window.column {
+            "started_at" => query.filter(sessions::started_at.lt(to)),
+            _ => query.filter(sessions::last_event_at.lt(to)),
+        };
+    }
     query = crate::scope_env!(query, sessions, &scope.env);
     if let Some(d) = &search.distinct_id {
         query = query.filter(sessions::distinct_id.eq(d.clone()));
@@ -4406,6 +4479,7 @@ mod keyset_predicate_tests {
                 node: &node,
                 ctx: &ctx,
                 since: Utc::now() - chrono::Duration::days(1),
+                until: None,
                 sort: EventSort::SessionId,
                 descending,
                 after: Some(text_cursor("session_id")),
@@ -6923,7 +6997,7 @@ pub struct DeviceGroupKey<'a> {
 pub async fn list_devices(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    window: TimeWindow,
     limit: i64,
     offset: i64,
     sort: SortSpec,
@@ -6955,6 +7029,26 @@ pub async fn list_devices(
     // rows for it. Applied inside the qualifying-devices subquery, alongside
     // the search predicate, so the outer LIMIT still applies to the filtered
     // set.
+    // `to` binds LAST — after env AND after the four group binds — so no
+    // existing index moves. Its position is therefore dynamic in two ways at
+    // once: `consumes_bind()` decides whether env took 6, and `group` decides
+    // whether four more follow. Getting this wrong does not fail loudly; it
+    // silently binds the timestamp into `family` and scopes the page to a
+    // group nobody asked for.
+    let to_idx = group_base + if group.is_some() { 4 } else { 0 };
+
+    // One SQL shape serves a bounded and an unbounded window: `to` is bound as
+    // `Nullable<Timestamptz>` and the predicate short-circuits on NULL. A
+    // second `format!` branch would be a second shape to keep in step.
+    //
+    // `window.column` is a `&'static str` copied out of the route's whitelist —
+    // see `TimeWindow`. No caller text reaches this string.
+    //
+    // Note the asymmetry with the `$2` in the sessions LATERAL below: that one
+    // stays, because `$2` means "the window's lower bound" whichever column the
+    // window is on, and the session count has always been bounded by it.
+    let window_sql = device_window_sql(window.column, to_idx);
+
     let group_sql = if group.is_some() {
         format!(
             " AND family IS NOT DISTINCT FROM ${} \
@@ -7170,7 +7264,7 @@ pub async fn list_devices(
                 COALESCE(se.cnt, 0)::bigint AS sessions_count \
          FROM ( \
              SELECT * FROM devices \
-             WHERE app_id = $1 AND last_seen >= $2 \
+             WHERE app_id = $1 AND {window_sql} \
                AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
                     COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3{membership_sql}{group_sql} \
          ) d{scoped_join} \
@@ -7186,7 +7280,7 @@ pub async fn list_devices(
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(window.from)
         .bind::<Text, _>(pattern)
         .bind::<BigInt, _>(limit)
         .bind::<BigInt, _>(offset);
@@ -7198,6 +7292,10 @@ pub async fn list_devices(
             .bind::<Nullable<Text>, _>(k.os_name.map(str::to_owned))
             .bind::<Nullable<Text>, _>(k.os_version.map(str::to_owned));
     }
+    // Last, matching `to_idx` above. This bind is unconditional even when the
+    // window has no upper bound: the placeholder is always present in the SQL,
+    // so omitting the bind on `None` would leave a parameter unfilled.
+    stmt = stmt.bind::<Nullable<Timestamptz>, _>(window.to);
     stmt.get_results(conn).await
 }
 
@@ -7283,7 +7381,7 @@ pub struct DeviceGroupRow {
 pub async fn list_device_groups(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    window: TimeWindow,
     limit: i64,
     offset: i64,
     sort: SortSpec,
@@ -7301,18 +7399,22 @@ pub async fn list_device_groups(
     // lets one `bind` chain serve both. Change a bind in either shape and this
     // is the other place to change.
     let q = if crate::device_env_backfill::is_backfilled(conn, scope.app_id).await? {
-        list_device_groups_rollup_sql(&scope.env, &sort)
+        list_device_groups_rollup_sql(&scope.env, &sort, window.column)
     } else {
-        list_device_groups_live_sql(&scope.env, &sort)
+        list_device_groups_live_sql(&scope.env, &sort, window.column)
     };
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(window.from)
         .bind::<Text, _>(pattern)
         .bind::<BigInt, _>(limit)
         .bind::<BigInt, _>(offset);
     stmt = crate::bind_env!(stmt, &scope.env);
+    // Trailing, matching the `to_idx` both shapes computed. Unconditional: the
+    // placeholder is always emitted, so skipping the bind on `None` would leave
+    // a parameter unfilled.
+    stmt = stmt.bind::<Nullable<Timestamptz>, _>(window.to);
     stmt.get_results(conn).await
 }
 
@@ -7323,12 +7425,12 @@ pub async fn list_device_groups(
 /// from "correct and bounded" is which one is emitted; a behavioural test cannot
 /// tell them apart, because they return identical rows.
 pub fn list_device_groups_sql_for_test(env: EnvFilter) -> String {
-    list_device_groups_live_sql(&env, &group_sort_for_test())
+    list_device_groups_live_sql(&env, &group_sort_for_test(), "last_seen")
 }
 
 /// Companion to [`list_device_groups_sql_for_test`] for the rollup shape.
 pub fn list_device_groups_rollup_sql_for_test(env: EnvFilter) -> String {
-    list_device_groups_rollup_sql(&env, &group_sort_for_test())
+    list_device_groups_rollup_sql(&env, &group_sort_for_test(), "last_seen")
 }
 
 /// The default group sort — `last_seen DESC` with the four `GROUP BY` columns as
@@ -7344,6 +7446,19 @@ fn group_sort_for_test() -> SortSpec {
     }
 }
 
+/// The window predicate both group shapes and [`list_devices`] apply, against
+/// the DURABLE `devices` column.
+///
+/// `to_idx` is passed rather than assumed because it is dynamic: `$6` belongs to
+/// env only when `EnvFilter::consumes_bind()` is true (`All` emits nothing and
+/// `Unattributed` emits a literal `IS NULL`), so a hard-coded `$7` silently
+/// binds the timestamp one slot early under two of the four scopes.
+///
+/// `column` is a `&'static str` from the route's whitelist — see [`TimeWindow`].
+fn device_window_sql(column: &'static str, to_idx: usize) -> String {
+    format!("{column} >= $2 AND (${to_idx}::timestamptz IS NULL OR {column} < ${to_idx})")
+}
+
 /// The pre-rollup shape: membership derived per device by three `EXISTS`, counts
 /// and extrema by three LATERALs, all before `GROUP BY`. Read for apps whose
 /// `device_environments` backfill has not completed — see [`list_device_groups`].
@@ -7351,11 +7466,19 @@ fn group_sort_for_test() -> SortSpec {
 /// Only `env` and `sort` are parameters: `search` reaches the SQL solely as the
 /// `$3` bind, never as interpolated text, so the emitted string does not vary
 /// with it.
-fn list_device_groups_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
+fn list_device_groups_live_sql(
+    env: &EnvFilter,
+    sort: &SortSpec,
+    window_column: &'static str,
+) -> String {
     // $1 app_id, $2 since, $3 pattern, $4 limit, $5 offset, env takes $6.
     // Identical layout to `list_devices`, so the shared SQL fragments below can
     // be copied across without renumbering.
     let env_sql = env.sql_fragment(6);
+
+    // Appended after env, so no existing index moves. Unlike `list_devices`
+    // there are no group binds here, so this is the last slot outright.
+    let window_sql = device_window_sql(window_column, if env.consumes_bind() { 7 } else { 6 });
 
     // Shared with `list_devices` — see Step 0. Same predicate, same bind index.
     let membership_sql = device_membership_sql(env, 6);
@@ -7440,7 +7563,7 @@ fn list_device_groups_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
                 COALESCE(sum(se.cnt), 0)::bigint AS sessions_count \
          FROM ( \
              SELECT * FROM devices \
-             WHERE app_id = $1 AND last_seen >= $2 \
+             WHERE app_id = $1 AND {window_sql} \
                AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
                     COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3{membership_sql} \
          ) d{scoped_join} \
@@ -7495,7 +7618,22 @@ fn list_device_groups_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
 /// is a session older than the window would newly appear. Not observed on the
 /// measurement fixture (every device there had all three signal kinds); called
 /// out because it is a real difference, not a proven-absent one.
-fn list_device_groups_rollup_sql(env: &EnvFilter, sort: &SortSpec) -> String {
+fn list_device_groups_rollup_sql(
+    env: &EnvFilter,
+    sort: &SortSpec,
+    window_column: &'static str,
+) -> String {
+    // Same trailing slot as the live shape, and it must stay the same: one
+    // `bind` chain in `list_device_groups` serves BOTH shapes, so a bind that
+    // moved in only one of them would be filled with the other's value.
+    //
+    // Applied to the durable `devices` column inside the qualifying subquery,
+    // NOT to the rollup's `min(de.first_seen)`/`max(de.last_seen)`. That is
+    // deliberate and matches `list_devices`: the window decides which devices
+    // are LISTED. Filtering the aggregate instead would answer a different
+    // question — and is what the Persons list does, on purpose, for its own.
+    let window_sql = device_window_sql(window_column, if env.consumes_bind() { 7 } else { 6 });
+
     // The join must not multiply a device by its environments, so the rollup is
     // pre-aggregated per device BEFORE it reaches the group. Under
     // `One`/`Unattributed` the filter admits a single row per device and that
@@ -7554,7 +7692,7 @@ fn list_device_groups_rollup_sql(env: &EnvFilter, sort: &SortSpec) -> String {
                 COALESCE(sum(se.cnt), 0)::bigint AS sessions_count \
          FROM ( \
              SELECT * FROM devices \
-             WHERE app_id = $1 AND last_seen >= $2 \
+             WHERE app_id = $1 AND {window_sql} \
                AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
                     COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3 \
          ) d{scoped_join} \
@@ -7800,6 +7938,7 @@ pub fn list_persons_rollup_sql_for_test(env: EnvFilter) -> String {
             tiebreak: "eu.distinct_id",
             nulls_last: false,
         },
+        "last_seen",
     )
 }
 
@@ -7812,13 +7951,52 @@ pub fn list_persons_sql_for_test(env: EnvFilter) -> String {
             tiebreak: "eu.distinct_id",
             nulls_last: false,
         },
+        "last_seen",
     )
 }
 
 /// The pre-rollup shape: membership derived per person, counts and extrema
 /// derived from three LATERALs. Retained as the fallback for apps whose
 /// `event_user_environments` backfill has not completed — see [`list_persons`].
-fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
+/// The SQL expression a given persons shape/scope DISPLAYS for `column`.
+///
+/// Both the select list and the window predicate must read this. They are the
+/// same value by definition — "users last seen in the last 7 days" has to mean
+/// what the Last seen column shows — and deriving them separately is how a page
+/// starts filtering by one number while rendering another.
+///
+/// **This is the opposite of what Devices does**, deliberately. `list_devices`
+/// windows on the durable column and lets the window decide which devices are
+/// LISTED; Persons has no such pre-existing convention to preserve, and its
+/// rollup shape is indexed on both columns
+/// (`event_user_env_{first,last}_seen_idx`) so the displayed value is the
+/// affordable one to filter. Do not "unify" the two — they are different
+/// questions wearing the same words.
+///
+/// `column` is a `&'static str` from the route whitelist; see [`TimeWindow`].
+fn person_seen_expr(env: &EnvFilter, rollup: bool, column: &'static str) -> String {
+    match (rollup, matches!(env, EnvFilter::All)) {
+        // Under `All` BOTH shapes read the durable `event_users` columns — see
+        // `list_persons_rollup_sql`'s invariant 2 for why the rollup does not
+        // derive them there.
+        (_, true) => format!("eu.{column}"),
+        (true, false) => format!("r.{column}"),
+        (false, false) => match column {
+            "first_seen" => "LEAST(ae.min_occurred, ee.min_occurred, se.min_started)".to_string(),
+            _ => "GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event)".to_string(),
+        },
+    }
+}
+
+/// The window predicate for a persons query, given the expression it applies to.
+///
+/// A SQL alias cannot be referenced from `WHERE`, which is why this repeats the
+/// expression rather than saying `WHERE last_seen >= $6`.
+fn person_window_sql(expr: &str, from_idx: usize, to_idx: usize) -> String {
+    format!("{expr} >= ${from_idx} AND (${to_idx}::timestamptz IS NULL OR {expr} < ${to_idx})")
+}
+
+fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec, window_column: &'static str) -> String {
     // $1 app_id, $2 pattern, $3 limit, $4 offset — env takes $5 when it needs a
     // bind, reused across the three count LATERALs (always emitted, `""` under
     // `All`) and the membership `EXISTS` (only emitted when `scope.env != All`).
@@ -7833,6 +8011,39 @@ fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
     // `list_devices`' tiering blind spot under `All`; it already had it, and
     // still has it, under every scope.
     let env_sql = env.sql_fragment(5);
+
+    // `from` and `to` bind AFTER env, so nothing above renumbers. Both indices
+    // are dynamic: `sql_fragment` reserves $5 only for `One`/`Subset` — `All`
+    // emits nothing and `Unattributed` emits a literal `IS NULL` — so assuming
+    // env always consumed a slot shifts BOTH window binds by one and silently
+    // compares the pattern against a timestamp.
+    let from_idx = if env.consumes_bind() { 6 } else { 5 };
+    let window_expr = person_seen_expr(env, false, window_column);
+    let window_pred = person_window_sql(&window_expr, from_idx, from_idx + 1);
+
+    // WHERE the predicate can sit differs by scope, and it is not cosmetic.
+    //
+    // Under `All` the displayed value IS `event_users.first_seen`/`last_seen`,
+    // a real indexed column of the subquery's own table — so the predicate goes
+    // INSIDE, where it narrows the set the outer `LIMIT` pages over and an index
+    // can serve it.
+    //
+    // Under a scoped read it is `LEAST`/`GREATEST` over the three LATERALs,
+    // which do not exist yet at that point in the query — so it must go on the
+    // OUTER query, after those joins. Exactly one of these two is ever
+    // non-empty.
+    let (inner_window_sql, outer_window_sql) = if matches!(env, EnvFilter::All) {
+        // UNQUALIFIED, not `person_seen_expr`'s `eu.first_seen`. Inside the
+        // subquery the alias `eu` does not exist — `eu` is the name the OUTER
+        // query gives to this subquery, so referring to it here is a
+        // "missing FROM-clause entry for table eu" at execution time. The
+        // string composes perfectly either way, which is why only a
+        // database-backed test catches it.
+        let bare = person_window_sql(window_column, from_idx, from_idx + 1);
+        (format!(" AND {bare}"), String::new())
+    } else {
+        (String::new(), format!(" WHERE {window_pred}"))
+    };
 
     // `event_users` carries no `environment_id` at all, so a person's
     // membership in a specific environment can only be derived from whether
@@ -7981,7 +8192,7 @@ fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
                 COALESCE(se.cnt,0)::bigint AS sessions_count \
          FROM ( \
              SELECT distinct_id, properties, first_seen, last_seen FROM event_users \
-             WHERE app_id=$1 AND (distinct_id ILIKE $2 OR properties::text ILIKE $2){membership_sql} \
+             WHERE app_id=$1 AND (distinct_id ILIKE $2 OR properties::text ILIKE $2){membership_sql}{inner_window_sql} \
          ) eu \
          LEFT JOIN LATERAL (SELECT count(*) cnt, min(occurred_at) min_occurred, \
                     max(occurred_at) max_occurred FROM analytics_events \
@@ -7991,7 +8202,7 @@ fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
                     WHERE app_id=$1 AND distinct_id = eu.distinct_id{env_sql}) ee ON TRUE \
          LEFT JOIN LATERAL (SELECT count(*) cnt, min(started_at) min_started, \
                     max(last_event_at) max_last_event FROM sessions \
-                    WHERE app_id=$1 AND distinct_id = eu.distinct_id{env_sql}) se ON TRUE \
+                    WHERE app_id=$1 AND distinct_id = eu.distinct_id{env_sql}) se ON TRUE{outer_window_sql} \
          ORDER BY {order_by} \
          LIMIT $3 OFFSET $4"
     )
@@ -8020,9 +8231,28 @@ fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec) -> String {
 ///    the rollup under `All` too would be defensible in isolation, but it would
 ///    silently change what an unscoped page displays on the day an operator runs
 ///    the backfill — a number moving with no code deploy behind it.
-fn list_persons_rollup_sql(env: &EnvFilter, sort: &SortSpec) -> String {
+fn list_persons_rollup_sql(
+    env: &EnvFilter,
+    sort: &SortSpec,
+    window_column: &'static str,
+) -> String {
     let env_sql = env.sql_fragment_for("r", 5);
     let order_by = sort.order_by();
+
+    // Same trailing slots as the live shape, and they MUST stay identical: one
+    // `bind` chain in `list_persons` serves both, so an index that moved in
+    // only one shape would be filled with the other's value.
+    let from_idx = if env.consumes_bind() { 6 } else { 5 };
+    // Applied on the OUTER query, against the same expression `seen_select`
+    // renders — `eu.x` under `All`, `r.x` otherwise. NOT inside the `r`
+    // subquery: filtering there would drop per-environment rows BEFORE the
+    // `min`/`max` aggregation and answer a different question, one whose
+    // `first_seen` could differ from the value displayed beside it.
+    let window_pred = person_window_sql(
+        &person_seen_expr(env, true, window_column),
+        from_idx,
+        from_idx + 1,
+    );
     // The `GROUP BY` is correct for all four variants, not just the summing
     // ones: under `One`/`Unattributed` the filter admits a single row per
     // person, so grouping is a no-op; under `All`/`Subset` it sums across the
@@ -8049,6 +8279,7 @@ fn list_persons_rollup_sql(env: &EnvFilter, sort: &SortSpec) -> String {
          ) r \
          JOIN event_users eu ON eu.app_id = r.app_id AND eu.distinct_id = r.distinct_id \
          WHERE (eu.distinct_id ILIKE $2 OR eu.properties::text ILIKE $2) \
+           AND {window_pred} \
          ORDER BY {order_by} \
          LIMIT $3 OFFSET $4"
     )
@@ -8061,6 +8292,7 @@ pub async fn list_persons(
     limit: i64,
     offset: i64,
     sort: SortSpec,
+    window: TimeWindow,
 ) -> QueryResult<Vec<PersonRow>> {
     // Escape LIKE metacharacters: an unescaped `%`/`_` makes a literal search
     // term match the wrong rows, and a pattern of many wildcards makes ILIKE
@@ -8072,9 +8304,9 @@ pub async fn list_persons(
     // can never be visible before the data it claims — a marker that ran ahead of
     // its data would make this page quiet-wrong rather than error.
     let q = if crate::person_env_backfill::is_backfilled(conn, scope.app_id).await? {
-        list_persons_rollup_sql(&scope.env, &sort)
+        list_persons_rollup_sql(&scope.env, &sort, window.column)
     } else {
-        list_persons_live_sql(&scope.env, &sort)
+        list_persons_live_sql(&scope.env, &sort, window.column)
     };
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -8083,6 +8315,12 @@ pub async fn list_persons(
         .bind::<BigInt, _>(limit)
         .bind::<BigInt, _>(offset);
     stmt = crate::bind_env!(stmt, &scope.env);
+    // Trailing, matching `from_idx`/`from_idx + 1` in both shapes. `to` is bound
+    // unconditionally: its placeholder is always emitted, so skipping it on
+    // `None` would leave a parameter unfilled.
+    stmt = stmt
+        .bind::<Timestamptz, _>(window.from)
+        .bind::<Nullable<Timestamptz>, _>(window.to);
     stmt.get_results(conn).await
 }
 
@@ -8648,15 +8886,16 @@ pub struct FunnelStepCount {
     pub count: i64,
 }
 
-/// Ordered funnel: how many distinct people did step 0, then step 1 at-or-after
-/// their step-0 time, and so on. Built as a chained-CTE query over the steps.
-pub async fn funnel(
-    conn: &mut AsyncPgConnection,
-    scope: ReadScope,
-    steps: &[String],
-    since: DateTime<Utc>,
-) -> QueryResult<Vec<FunnelStepCount>> {
-    // $1 = app_id, $2 = since, $3 = env (only when scope.env is One), then each step name in
+/// The chained-CTE SQL [`funnel`] runs, for `steps.len()` steps under `env`.
+///
+/// Split out of [`funnel`] only so a test can `EXPLAIN` the *real* query rather
+/// than a hand-transcribed lookalike — the property this query has to keep
+/// (every step prunes to the `since` window) lives in the plan, not in the
+/// counts, so a result-comparing test cannot see it. Retyping the SQL into the
+/// test would measure the copy instead, the trap `device_env_rollup`'s
+/// `EXPLAIN` tests call out.
+pub fn funnel_sql(env: &EnvFilter, steps: usize) -> String {
+    // $1 = app_id, $2 = since, $3 = env (only when env is One), then each step name in
     // order starting at the next free index.
     //
     // The env predicate must apply to EVERY step's CTE, not just s0: each s{i} independently
@@ -8665,13 +8904,13 @@ pub async fn funnel(
     // funnel past the selected environment instead of erroring. `s0` has no table alias
     // (bare `analytics_events`); `s{i>0}` aliases it `a` — `sql_fragment` (unqualified) is
     // right for the former, `sql_fragment_for("a", ..)` for the rest.
-    let base_idx = if scope.env.consumes_bind() { 4 } else { 3 };
-    let env_sql_bare = scope.env.sql_fragment(3);
-    let env_sql_aliased = scope.env.sql_fragment_for("a", 3);
+    let base_idx = if env.consumes_bind() { 4 } else { 3 };
+    let env_sql_bare = env.sql_fragment(3);
+    let env_sql_aliased = env.sql_fragment_for("a", 3);
 
     let mut ctes: Vec<String> = Vec::new();
     let mut selects: Vec<String> = Vec::new();
-    for i in 0..steps.len() {
+    for i in 0..steps {
         let name_param = i + base_idx;
         if i == 0 {
             ctes.push(format!(
@@ -8680,10 +8919,23 @@ pub async fn funnel(
             ));
         } else {
             let prev = i - 1;
+            // `a.occurred_at>=$2` is redundant *by construction* and deliberately kept:
+            // s{i}.t >= s{i-1}.t >= .. >= s0.t >= $2, so every row this predicate could
+            // exclude is one `a.occurred_at >= s{prev}.t` already excludes. It cannot
+            // change a single count — it exists purely so the planner can prune.
+            //
+            // Without it these CTEs carry no constant time bound at all (only the
+            // correlated `>= s{prev}.t`, whose value is not known until the join runs),
+            // so `analytics_events` could not be pruned and every step past 0 scanned
+            // EVERY partition — the whole retained history of that event name — while
+            // step 0 correctly read only the `since` window. Cost therefore scaled with
+            // total retained data instead of `since_days`, which is what eventually
+            // crosses `sauron-api`'s 30s TimeoutLayer and surfaces as a 503.
             ctes.push(format!(
                 "s{i} AS (SELECT a.distinct_id, min(a.occurred_at) AS t FROM analytics_events a \
                  JOIN s{prev} ON s{prev}.distinct_id = a.distinct_id \
-                 WHERE a.app_id=$1 AND a.name=${name_param}{env_sql_aliased} AND a.occurred_at >= s{prev}.t \
+                 WHERE a.app_id=$1 AND a.name=${name_param}{env_sql_aliased} AND a.occurred_at>=$2 \
+                 AND a.occurred_at >= s{prev}.t \
                  GROUP BY a.distinct_id)"
             ));
         }
@@ -8691,11 +8943,22 @@ pub async fn funnel(
             "SELECT {i}::bigint AS step, (SELECT count(*) FROM s{i})::bigint AS count"
         ));
     }
-    let sql = format!(
+    format!(
         "WITH {} {} ORDER BY step",
         ctes.join(", "),
         selects.join(" UNION ALL ")
-    );
+    )
+}
+
+/// Ordered funnel: how many distinct people did step 0, then step 1 at-or-after
+/// their step-0 time, and so on. Built as a chained-CTE query over the steps.
+pub async fn funnel(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    steps: &[String],
+    since: DateTime<Utc>,
+) -> QueryResult<Vec<FunnelStepCount>> {
+    let sql = funnel_sql(&scope.env, steps.len());
 
     let mut query = diesel::sql_query(sql)
         .into_boxed::<diesel::pg::Pg>()
