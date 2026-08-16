@@ -290,6 +290,23 @@ pub struct TransactionItem {
     pub timestamp: DateTime<Utc>,
     #[serde(default)]
     pub finished_at: Option<DateTime<Utc>>,
+    /// Dev-supplied flat string tags for this transaction.
+    ///
+    /// Unlike `ErrorItem`/`AnalyticsItem`, this is NOT merged with the SDK's
+    /// global scope — a transaction carries only what its own call site
+    /// attached. Transactions are the highest-volume signal (one per navigation
+    /// and per HTTP call), so inheriting a global blob would write it onto
+    /// every row.
+    #[serde(default)]
+    pub tags: serde_json::Value,
+    /// Dev-supplied freeform JSON attached to this transaction — the request
+    /// body, response body, retry count, order id, whatever the call site knows.
+    ///
+    /// Per-call only, for the reason on `tags`. SDKs cap the serialized size and
+    /// substitute `{"_truncated": true, "_bytes": N}` past it, so a large body
+    /// cannot take an entire batched envelope over `INGEST_MAX_BODY_BYTES`.
+    #[serde(default)]
+    pub extra: serde_json::Value,
 }
 
 /// An `identify()` call: attach traits to a person, optionally aliasing an
@@ -662,6 +679,8 @@ mod clock_skew_tests {
             workflow_name: None,
             timestamp: ts,
             finished_at,
+            tags: serde_json::Value::Null,
+            extra: serde_json::Value::Null,
         })
     }
 

@@ -763,7 +763,8 @@ pub fn tag_source_for(resource: sauron_query::Resource) -> Option<sauron_db::rep
     match resource {
         Resource::Issues | Resource::Occurrences => Some(TagSource::ErrorEvents),
         Resource::Events => Some(TagSource::AnalyticsEvents),
-        Resource::Sessions | Resource::Devices | Resource::Persons | Resource::Transactions => None,
+        Resource::Transactions => Some(TagSource::Transactions),
+        Resource::Sessions | Resource::Devices | Resource::Persons => None,
     }
 }
 

@@ -38,6 +38,7 @@
       label: 'Explore',
       items: [
         { href: '#/events', label: 'Events', icon: 'diamond', match: (p) => p.startsWith('/events') },
+        { href: '#/transactions', label: 'Transactions', icon: 'timer', match: (p) => p.startsWith('/transactions') },
         { href: '#/sessions', label: 'Sessions', icon: 'clock', match: (p) => p.startsWith('/sessions') },
         { href: '#/users', label: 'Users', icon: 'users', match: (p) => p.startsWith('/users') || p.startsWith('/persons') },
         { href: '#/devices', label: 'Devices', icon: 'monitor-smartphone', match: (p) => p.startsWith('/devices') },

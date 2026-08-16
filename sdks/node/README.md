@@ -275,9 +275,27 @@ function trackTransaction(input: TransactionInput): void
 | `input.http_status` | `number` | omitted | e.g. `200`. |
 | `input.url` | `string` | omitted | Request URL/path. |
 | `input.distinct_id` | `string` | scope user's `id`, else omitted | Explicit value wins over the scope. |
+| `input.tags` | `Record<string, string>` | omitted | Indexed string→string labels. Filter with `@tag.key:value` on the Transactions page. |
+| `input.extra` | `Record<string, unknown>` | omitted | Freeform JSON — request body, response body, SQL text, row counts. Searchable with `extra.key:value`. |
 
 Emits a `transaction` item. Absent optional fields are omitted from the wire JSON
 rather than serialized as `null`. Returns `void`.
+
+**`tags` and `extra` are per-call only.** Unlike `track()` and
+`captureException()`, a transaction does **not** inherit the scope:
+`setTag()` / `setExtra()` defaults are not merged in. Transactions are the
+highest-volume signal a service emits — one per request and per query — so
+inheriting a global blob would write it onto every row.
+
+`extra` is serialized and capped at **16 KB**
+(`MAX_TRANSACTION_EXTRA_BYTES`, exported from `transaction-extra`). Past that
+the whole map is replaced with `{ _truncated: true, _bytes: N }` and the
+dashboard says so on the row. The cap is not cosmetic: envelopes are batched,
+and one oversized body would push the whole envelope past the ingest limit and
+drop every unrelated span sent with it.
+
+Nothing in `extra` is scrubbed. Use `beforeSend` for redaction, and think twice
+before attaching a body that can carry tokens, passwords or personal data.
 
 ```ts
 const started = Date.now();
@@ -292,6 +310,128 @@ trackTransaction({
   url: '/api/users',
 });
 ```
+
+#### Example: an Express route, with request and response bodies
+
+`res.json` is wrapped rather than read afterwards, because by the time the
+`finish` event fires the payload is already on the wire and gone.
+
+```ts
+import express from 'express';
+import { trackTransaction } from '@edraj/sauron-node';
+
+export function tracedRoute(routeLabel: string, handler: express.RequestHandler) {
+  return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const started = Date.now();
+    let responseBody: unknown;
+
+    // Capture on the way out. Reading it in `finish` is too late — the body
+    // has already been serialized and released by then.
+    const json = res.json.bind(res);
+    res.json = (body: unknown) => {
+      responseBody = body;
+      return json(body);
+    };
+
+    res.on('finish', () => {
+      trackTransaction({
+        name: routeLabel,              // 'POST /orders', NOT '/orders/8412'
+        op: 'http',
+        duration_ms: Date.now() - started,
+        http_method: req.method,
+        http_status: res.statusCode,
+        url: req.originalUrl,
+        status: res.statusCode < 400 ? 'ok' : 'error',
+        distinct_id: (req as { userId?: string }).userId,
+        tags: { route: routeLabel, tier: (req as { plan?: string }).plan ?? 'free' },
+        extra: {
+          request: req.body,
+          response: responseBody,
+          query: req.query,
+          // Header VALUES are omitted on purpose — `authorization` and
+          // `cookie` live there.
+          request_headers: Object.keys(req.headers),
+        },
+      });
+    });
+
+    try {
+      await handler(req, res, next);
+    } catch (err) {
+      next(err);
+    }
+  };
+}
+
+const app = express();
+app.post('/orders', tracedRoute('POST /orders', createOrder));
+```
+
+On the dashboard: **Transactions → the row → expand**. Both bodies render as a
+JSON tree, and every one of these finds it:
+
+```text
+extra.response:~9001        # substring, inside the stored response body
+@tag.route:"POST /orders"   # indexed tag
+op:http http.status:>=500   # the failures
+duration:>2s                # the slow ones
+```
+
+#### Example: a SQL query (`pg`)
+
+Put the **statement** in `extra` and keep `name` a stable label — a query with
+literals baked in would mint a new dashboard row per execution.
+
+```ts
+import { Pool } from 'pg';
+import { trackTransaction } from '@edraj/sauron-node';
+
+const pool = new Pool();
+
+export async function tracedQuery<T>(label: string, sql: string, params: unknown[] = []) {
+  const started = Date.now();
+  try {
+    const result = await pool.query<T>(sql, params);
+    trackTransaction({
+      // The LABEL, not the statement. `op` is free-form on this SDK, so a
+      // 'db' op is stored as-is — but note the browser SDK coerces anything
+      // outside navigation|http|resource|screen_load|custom to 'custom', so
+      // use a tag if you need the two to agree.
+      name: label,
+      op: 'db',
+      duration_ms: Date.now() - started,
+      status: 'ok',
+      tags: { db: 'postgres', table: 'orders' },
+      extra: {
+        statement: sql,
+        row_count: result.rowCount,
+        // Bind PARAMETERS are user data. Log them only if you have decided
+        // that is acceptable, or log their shape instead.
+        params,
+      },
+    });
+    return result;
+  } catch (err) {
+    trackTransaction({
+      name: label,
+      op: 'db',
+      duration_ms: Date.now() - started,
+      status: 'error',
+      tags: { db: 'postgres', table: 'orders' },
+      extra: { statement: sql, error: String(err) },
+    });
+    throw err;
+  }
+}
+
+await tracedQuery(
+  'SELECT orders',
+  'SELECT id, total FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20',
+  [userId],
+);
+```
+
+Then `@tag.table:orders duration:>500ms` is your slow-query list.
 
 ### `addBreadcrumb(crumb)`
 

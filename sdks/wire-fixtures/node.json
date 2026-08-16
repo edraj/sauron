@@ -3,7 +3,7 @@
     "dsn": "https://pk_test@localhost:8081/1",
     "sdk": {
       "name": "sauron-node",
-      "version": "1.4.0"
+      "version": "1.5.0"
     },
     "sent_at": "2026-07-12T10:30:00.123Z",
     "release": "svc@1.4.2"
@@ -219,6 +219,21 @@
       "http_method": "GET",
       "http_status": 200,
       "url": "https://api.example.com/api/users",
+      "distinct_id": "u_123",
+      "tags": {
+        "tier": "premium"
+      },
+      "extra": {
+        "request": "{\"page\":1}",
+        "response": "{\"users\":[]}"
+      }
+    },
+    {
+      "type": "transaction",
+      "name": "/checkout",
+      "op": "navigation",
+      "duration_ms": 42,
+      "timestamp": "2026-07-12T10:30:00.123Z",
       "distinct_id": "u_123"
     }
   ]

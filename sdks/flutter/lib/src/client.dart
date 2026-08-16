@@ -18,6 +18,7 @@ import 'sauron_options.dart';
 import 'scope.dart';
 import 'stacktrace/dart_stacktrace_parser.dart';
 import 'transaction.dart';
+import 'transaction_extra.dart';
 import 'transport/queue.dart';
 import 'transport/transport.dart';
 import 'types.dart';
@@ -552,6 +553,8 @@ class SauronClient {
     String? httpMethod,
     int? httpStatus,
     String? url,
+    Map<String, String>? tags,
+    Map<String, Object?>? extra,
   }) {
     return ActiveTransaction(
       this,
@@ -561,6 +564,8 @@ class SauronClient {
       httpMethod: httpMethod,
       httpStatus: httpStatus,
       url: url,
+      tags: tags,
+      extra: extra,
     );
   }
 
@@ -570,6 +575,34 @@ class SauronClient {
   /// [duration] is serialized as fractional milliseconds
   /// (`duration.inMicroseconds / 1000.0`). The current distinct id and session
   /// id are attached automatically.
+  ///
+  /// [tags] and [extra] are **per-call only — the scope is NOT merged in**,
+  /// which is the one place transactions differ from [captureException] and
+  /// [track]. Those two merge the [setTag]/[setExtra] defaults; a transaction
+  /// carries only what its own call site attached. Transactions are the
+  /// highest-volume signal (one per navigation and per HTTP call), so
+  /// inheriting a global blob would write it onto every row.
+  ///
+  /// [extra] is where a request body, a response body, an order id or a retry
+  /// count goes:
+  ///
+  /// ```dart
+  /// client.trackTransaction(
+  ///   name: 'POST /orders',
+  ///   op: 'http',
+  ///   duration: stopwatch.elapsed,
+  ///   httpMethod: 'POST',
+  ///   httpStatus: res.statusCode,
+  ///   tags: {'tier': 'premium'},
+  ///   extra: {'request': body, 'response': res.body},
+  /// );
+  /// ```
+  ///
+  /// It is encoded and capped at [kMaxTransactionExtraBytes]; past that the
+  /// whole map is replaced with `{'_truncated': true, '_bytes': N}` so one
+  /// large body cannot take a batched envelope over the ingest limit and drop
+  /// every span in it. Nothing here is scrubbed — `beforeSend` is the
+  /// redaction seam.
   void trackTransaction({
     required String name,
     required Duration duration,
@@ -578,6 +611,8 @@ class SauronClient {
     String? httpMethod,
     int? httpStatus,
     String? url,
+    Map<String, String>? tags,
+    Map<String, Object?>? extra,
   }) {
     if (!isEnabled) {
       return;
@@ -591,6 +626,14 @@ class SauronClient {
         httpMethod: httpMethod,
         httpStatus: httpStatus,
         url: url,
+        // Copied, not aliased: the caller's map stays theirs to mutate after
+        // the call returns, and the item is queued rather than sent inline.
+        tags: (tags != null && tags.isNotEmpty)
+            ? Map<String, String>.of(tags)
+            : null,
+        extra: (extra != null && extra.isNotEmpty)
+            ? capTransactionExtra(Map<String, Object?>.of(extra))
+            : null,
         distinctId: _analyticsDistinctId,
         sessionId: sessionId,
         // Leaf-site workflow stamp 3 of 3 — see the note on [_currentWorkflow].

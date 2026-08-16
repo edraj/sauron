@@ -134,14 +134,22 @@ class Sauron {
   ///
   /// ```dart
   /// Sauron.trackTransaction(
-  ///   name: 'GET /users',
+  ///   name: 'POST /orders',
   ///   op: 'http',
   ///   duration: stopwatch.elapsed,
-  ///   httpMethod: 'GET',
-  ///   httpStatus: 200,
-  ///   url: 'https://api.example.com/users',
+  ///   httpMethod: 'POST',
+  ///   httpStatus: res.statusCode,
+  ///   url: 'https://api.example.com/orders',
+  ///   tags: {'tier': 'premium'},
+  ///   extra: {'request': requestBody, 'response': res.body},
   /// );
   /// ```
+  ///
+  /// [tags] and [extra] are **per-call only** — unlike [setTag]/[setExtra],
+  /// which feed errors and [track] events, nothing from the scope is merged
+  /// into a transaction. [extra] is capped and replaced with a truncation
+  /// marker past [kMaxTransactionExtraBytes]. See
+  /// [SauronClient.trackTransaction].
   static void trackTransaction({
     required String name,
     required Duration duration,
@@ -150,6 +158,8 @@ class Sauron {
     String? httpMethod,
     int? httpStatus,
     String? url,
+    Map<String, String>? tags,
+    Map<String, Object?>? extra,
   }) =>
       _client?.trackTransaction(
         name: name,
@@ -159,6 +169,8 @@ class Sauron {
         httpMethod: httpMethod,
         httpStatus: httpStatus,
         url: url,
+        tags: tags,
+        extra: extra,
       );
 
   /// Starts a stateful transaction that computes its own duration.
@@ -172,6 +184,8 @@ class Sauron {
     String? httpMethod,
     int? httpStatus,
     String? url,
+    Map<String, String>? tags,
+    Map<String, Object?>? extra,
   }) =>
       _client?.startTransaction(
         name: name,
@@ -180,6 +194,8 @@ class Sauron {
         httpMethod: httpMethod,
         httpStatus: httpStatus,
         url: url,
+        tags: tags,
+        extra: extra,
       ) ??
       ActiveTransaction(
         null,
@@ -189,6 +205,8 @@ class Sauron {
         httpMethod: httpMethod,
         httpStatus: httpStatus,
         url: url,
+        tags: tags,
+        extra: extra,
       );
 
   /// Identifies the current user.

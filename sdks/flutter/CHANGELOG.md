@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.8.0 - 2026-08-16
+
+### Added
+
+- **`tags` and `extra` on transactions.** `trackTransaction` now accepts two
+  developer-supplied maps: `tags` (flat string→string, indexed) and `extra`
+  (freeform JSON). `extra` is where a request body, a response body, an order
+  id or a retry count goes — the span that times an HTTP call can now carry
+  what the call actually sent and received.
+
+  Both are visible on the new **Transactions** page and in the session
+  timeline, and both are searchable: `@tag.tier:premium`,
+  `extra.order_id:9001`, or `extra.response:~9001` to match a substring
+  *inside* a stored response body.
+
+  **They are per-call only.** Unlike `captureException` and `track`, a
+  transaction does not inherit the scope — `setTag()` / `setExtra()` defaults
+  are not merged in. Transactions are the highest-volume signal an app emits,
+  one per navigation and per request, so inheriting a global blob would write
+  it onto every row. This asymmetry is deliberate and is documented on the
+  method.
+
+  `extra` is serialized and capped at **16 KB**. Past that the whole map is
+  replaced with a `{"_truncated": true, "_bytes": N}` marker, and the
+  dashboard says so on the row rather than showing a short object that looks
+  complete. The cap is not cosmetic: envelopes are batched, and one oversized
+  body would push the whole envelope past the ingest limit and take every
+  unrelated span sent with it — a silent loss of data nobody asked about.
+  Size is measured in UTF-8 bytes, so non-ASCII payloads are counted at what
+  they actually cost on the wire.
+
+  Nothing in `extra` is scrubbed. `beforeSend` remains the redaction seam;
+  think twice before attaching a body that can carry tokens or personal data.
+
+  An app that sets neither field serializes byte-identically to before: both
+  keys are omitted when empty, never sent as `null`.
+
+  Signature: `trackTransaction({..., Map<String, String>? tags, Map<String, Object?>? extra})`. `startTransaction` accepts both too, and `ActiveTransaction` exposes them as **mutable fields** — the interesting facts about a call are known after it returns. `end(tags:, extra:)` replaces each map wholesale, matching how `status`/`httpStatus`/`url` already behave there; mutate the field to add to what is set.
+
 ## 1.7.0 - 2026-08-14
 
 *Minor, not patch: `identify()`'s signature change below is source-breaking

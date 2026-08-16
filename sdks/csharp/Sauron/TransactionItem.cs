@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
 namespace Sauron;
@@ -41,4 +42,20 @@ internal sealed class TransactionItem
     public string? WorkflowName { get; set; }
 
     public string Timestamp { get; set; } = string.Empty;
+
+    // Dev-owned metadata for THIS transaction. Omitted from the wire when null (empty)
+    // despite the global JsonIgnoreCondition.Never — the per-property attribute wins,
+    // so an app that never sets them is byte-identical to before these fields existed.
+    //
+    // Per-call only: unlike ErrorItem and EventItem, these are NEVER merged with the
+    // scope. See SauronClient.TrackTransaction for why.
+
+    /// <summary>Dev-supplied flat string tags for this transaction.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, object?>? Tags { get; set; }
+
+    /// <summary>Dev-supplied freeform JSON — request body, response body, retry count.
+    /// Capped by <see cref="TransactionExtra"/> before it lands here.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, object?>? Extra { get; set; }
 }

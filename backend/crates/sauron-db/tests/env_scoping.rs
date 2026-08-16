@@ -339,6 +339,8 @@ async fn seed_cross_env_session_child_rows(
             ip_address: None,
             occurred_at: at,
             finished_at: None,
+            tags: serde_json::json!({}),
+            extra: serde_json::json!({}),
         },
     )
     .await

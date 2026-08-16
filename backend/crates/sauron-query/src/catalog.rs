@@ -158,6 +158,14 @@ const R_OCC: &[Resource] = &[Resource::Occurrences];
 const R_ISSUE_OCC: &[Resource] = &[Resource::Issues, Resource::Occurrences];
 const R_EVENTS: &[Resource] = &[Resource::Events];
 const R_OCC_EVENTS: &[Resource] = &[Resource::Occurrences, Resource::Events];
+/// The `extra` set: the two event resources plus Transactions, which gained a
+/// dev-supplied `extra` column in migration 0063. Kept separate from
+/// [`R_OCC_EVENTS`] because `contexts` deliberately did NOT follow it there.
+const R_OCC_EVENTS_TX: &[Resource] = &[
+    Resource::Occurrences,
+    Resource::Events,
+    Resource::Transactions,
+];
 /// All three list resources S2c bridges onto the language. Only `workflow`
 /// uses it — the one field every one of the three pre-language registries
 /// (`ISSUE_FILTERS`/`ERROR_EVENT_FILTERS`/`EVENT_FILTERS`) accepts.
@@ -560,6 +568,12 @@ pub const CATALOG: &[Dimension] = &[
         resources: R_OCC_EVENTS,
         index: IndexClass::Bounded,
     },
+    // Transactions carry `extra` too (migration 0063), which is what makes
+    // `extra.order_id:123` resolve on the transactions list. Still
+    // `IndexClass::Bounded` there and deliberately unindexed in Postgres: the
+    // probe is containment/ILIKE over freeform JSON of unbounded shape, and a
+    // GIN on the highest-volume table would cost more write throughput than the
+    // read buys.
     Dimension {
         name: "extra",
         aliases: NO_ALIAS,
@@ -569,7 +583,7 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "",
         },
         ops: OPS_TEXT,
-        resources: R_OCC_EVENTS,
+        resources: R_OCC_EVENTS_TX,
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -755,7 +769,12 @@ pub const CATALOG: &[Dimension] = &[
 ];
 
 /// Resources that carry a developer-supplied `tags` JSONB column.
-const TAGGABLE: &[Resource] = &[Resource::Issues, Resource::Occurrences, Resource::Events];
+const TAGGABLE: &[Resource] = &[
+    Resource::Issues,
+    Resource::Occurrences,
+    Resource::Events,
+    Resource::Transactions,
+];
 
 /// The synthetic dimension behind the `tag.<key>` prefix and the
 /// `tag:<key>=<value>` escape hatch.
@@ -778,8 +797,12 @@ pub const TAG_DIM: Dimension = Dimension {
 
 /// `Some` when this resource carries a developer-supplied `tags` column, and so
 /// can answer a `tag.<key>` / `tag:<key>=<value>` predicate at all. Devices,
-/// Persons, Sessions and Transactions cannot, and are told so rather than being
-/// offered a tag spelling that would match nothing.
+/// Persons and Sessions cannot, and are told so rather than being offered a tag
+/// spelling that would match nothing.
+///
+/// Transactions joined the taggable set with migration 0063 — the `tags`
+/// column and its `transactions_tags_gin` index exist, so the `Indexed` class
+/// on [`TAG_DIM`] holds there too.
 pub fn tag_dimension(r: Resource) -> Option<&'static Dimension> {
     if TAG_DIM.resources.contains(&r) {
         Some(&TAG_DIM)
@@ -953,9 +976,23 @@ mod tests {
         assert!(tag_dimension(Resource::Issues).is_some());
         assert!(tag_dimension(Resource::Occurrences).is_some());
         assert!(tag_dimension(Resource::Events).is_some());
+        // Joined the taggable set with migration 0063 (`transactions.tags` +
+        // `transactions_tags_gin`).
+        assert!(tag_dimension(Resource::Transactions).is_some());
         assert!(tag_dimension(Resource::Devices).is_none());
         assert!(tag_dimension(Resource::Persons).is_none());
-        assert!(tag_dimension(Resource::Transactions).is_none());
+        assert!(tag_dimension(Resource::Sessions).is_none());
+    }
+
+    #[test]
+    fn extra_resolves_on_transactions_but_contexts_does_not() {
+        // `extra` followed transactions in 0063; `contexts` deliberately did
+        // not — a span that wants structure nests it inside `extra`.
+        assert!(lookup("extra", Resource::Transactions).is_some());
+        assert!(lookup("contexts", Resource::Transactions).is_none());
+        // The event resources keep both.
+        assert!(lookup("extra", Resource::Events).is_some());
+        assert!(lookup("contexts", Resource::Occurrences).is_some());
     }
 
     #[test]

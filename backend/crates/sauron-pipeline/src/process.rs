@@ -725,6 +725,10 @@ async fn process_transaction(
             ip_address: job.ip.clone(),
             occurred_at: t.timestamp,
             finished_at: t.finished_at,
+            // Stored verbatim, never merged: unlike errors and track() events,
+            // a transaction's metadata is whatever its own call site attached.
+            tags: object_or_empty(t.tags),
+            extra: object_or_empty(t.extra),
         },
     )
     .await?;

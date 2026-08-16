@@ -44,7 +44,7 @@ Or build a local package and consume it from a local feed:
 cd sdks/csharp
 dotnet pack Sauron/Sauron.csproj -c Release -o ./nupkg
 dotnet nuget add source "$(pwd)/nupkg" --name sauron-local
-dotnet add <your-project>.csproj package Sauron --version 1.4.0
+dotnet add <your-project>.csproj package Sauron --version 1.5.0
 ```
 
 Once published, the install command will be:
@@ -407,7 +407,9 @@ public void TrackTransaction(
     string? httpMethod = null,
     int? httpStatus = null,
     string? url = null,
-    string? distinctId = null)
+    string? distinctId = null,
+    IReadOnlyDictionary<string, object?>? tags = null,
+    IReadOnlyDictionary<string, object?>? extra = null)
 ```
 
 | Parameter | Type | Default | Description |
@@ -420,9 +422,24 @@ public void TrackTransaction(
 | `httpStatus` | `int?` | `null` | Response status for `op: "http"`. |
 | `url` | `string?` | `null` | Request URL/path. |
 | `distinctId` | `string?` | `null` | User id. When omitted, falls back to the active scope's user id, then to `null`. |
+| `tags` | `IReadOnlyDictionary<string, object?>?` | `null` | Indexed string→string labels. Filter with `@tag.key:value` on the Transactions page. |
+| `extra` | `IReadOnlyDictionary<string, object?>?` | `null` | Freeform JSON — request body, response body, SQL text, row counts. Searchable with `extra.key:value`. |
 
 Returns `void`. Emits a `transaction` item. Scope tags/contexts/extra are **not**
-merged into transactions — only the user-id fallback applies.
+merged into transactions — only the user-id fallback applies. Transactions are
+the highest-volume signal a service emits (one per request and per query), so
+inheriting a global blob would write it onto every row; pass what this call site
+knows and nothing more.
+
+`extra` is serialized and capped at **16 KB** (`TransactionExtra.MaxBytes`).
+Past that the whole map is replaced with `{ "_truncated": true, "_bytes": N }`
+and the dashboard says so on the row. The cap is not cosmetic: envelopes are
+batched, and one oversized body would push the whole envelope past the ingest
+limit and drop every unrelated span sent with it. A value the serializer cannot
+handle becomes the same marker with `"_bytes": -1` rather than throwing.
+
+Nothing in `extra` is scrubbed. Use `BeforeSend` for redaction, and think twice
+before attaching a body that can carry tokens, passwords or personal data.
 
 ```csharp
 var sw = Stopwatch.StartNew();
@@ -439,6 +456,158 @@ SauronSdk.TrackTransaction(
     url: "/api/users",
     distinctId: "user-123");
 ```
+
+#### Example: an ASP.NET Core request, with request and response bodies
+
+Middleware, so every route gets it. Both streams need help: the request body is
+forward-only until `EnableBuffering()`, and the response body has to be
+swapped for a `MemoryStream` to be readable after the pipeline runs.
+
+```csharp
+using System.Diagnostics;
+using Sauron;
+
+public sealed class SauronTransactionMiddleware
+{
+    private readonly RequestDelegate _next;
+
+    public SauronTransactionMiddleware(RequestDelegate next) => _next = next;
+
+    public async Task InvokeAsync(HttpContext ctx)
+    {
+        // A request body is a forward-only stream; without this it is already
+        // consumed by the time the handler returns.
+        ctx.Request.EnableBuffering();
+        var requestBody = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+        ctx.Request.Body.Position = 0;
+
+        // Same problem downstream: swap in a seekable buffer, then copy it
+        // back to the real stream so the client still gets its response.
+        var original = ctx.Response.Body;
+        using var buffer = new MemoryStream();
+        ctx.Response.Body = buffer;
+
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await _next(ctx);
+        }
+        finally
+        {
+            sw.Stop();
+            buffer.Position = 0;
+            var responseBody = await new StreamReader(buffer).ReadToEndAsync();
+            buffer.Position = 0;
+            await buffer.CopyToAsync(original);
+            ctx.Response.Body = original;
+
+            // The ROUTE PATTERN, not the resolved path: "/orders/{id}" groups,
+            // "/orders/8412" mints a new dashboard row per request.
+            var label = ctx.GetEndpoint()?.DisplayName ?? ctx.Request.Path.Value ?? "unknown";
+
+            SauronSdk.TrackTransaction(
+                name: $"{ctx.Request.Method} {label}",
+                durationMs: sw.Elapsed.TotalMilliseconds,
+                op: "http",
+                status: ctx.Response.StatusCode < 400 ? "ok" : "error",
+                httpMethod: ctx.Request.Method,
+                httpStatus: ctx.Response.StatusCode,
+                url: ctx.Request.Path.Value,
+                distinctId: ctx.User?.Identity?.Name,
+                tags: new Dictionary<string, object?>
+                {
+                    ["route"] = label,
+                    ["tier"] = ctx.User?.FindFirst("plan")?.Value ?? "free",
+                },
+                extra: new Dictionary<string, object?>
+                {
+                    ["request"] = requestBody,
+                    ["response"] = responseBody,
+                    ["query"] = ctx.Request.QueryString.Value,
+                    // Header VALUES are omitted on purpose — `Authorization`
+                    // and `Cookie` live there.
+                    ["request_headers"] = ctx.Request.Headers.Keys.ToArray(),
+                });
+        }
+    }
+}
+
+// Program.cs
+app.UseMiddleware<SauronTransactionMiddleware>();
+```
+
+On the dashboard: **Transactions → the row → expand**. Both bodies render as a
+JSON tree, and every one of these finds it:
+
+```text
+extra.response:~9001        # substring, inside the stored response body
+@tag.route:/orders          # indexed tag
+op:http http.status:>=500   # the failures
+duration:>2s                # the slow ones
+```
+
+#### Example: a SQL query (`Npgsql`)
+
+Put the **statement** in `extra` and keep `name` a stable label — a query with
+literals baked in would mint a new dashboard row per execution.
+
+```csharp
+using System.Diagnostics;
+using Npgsql;
+using Sauron;
+
+public static async Task<List<Order>> RecentOrdersAsync(NpgsqlDataSource db, Guid userId)
+{
+    const string Sql =
+        "SELECT id, total FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20";
+
+    var sw = Stopwatch.StartNew();
+    var extra = new Dictionary<string, object?>
+    {
+        ["statement"] = Sql,
+        // Bind PARAMETERS are user data. Log them only if you have decided
+        // that is acceptable, or log their shape instead.
+        ["params"] = new object?[] { userId },
+    };
+
+    try
+    {
+        await using var cmd = db.CreateCommand(Sql);
+        cmd.Parameters.AddWithValue(userId);
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<Order>();
+        while (await reader.ReadAsync())
+            rows.Add(new Order(reader.GetGuid(0), reader.GetDecimal(1)));
+
+        sw.Stop();
+        extra["row_count"] = rows.Count;
+        SauronSdk.TrackTransaction(
+            name: "SELECT orders",          // the LABEL, not the statement
+            durationMs: sw.Elapsed.TotalMilliseconds,
+            op: "db",
+            status: "ok",
+            tags: new Dictionary<string, object?> { ["db"] = "postgres", ["table"] = "orders" },
+            extra: extra);
+        return rows;
+    }
+    catch (NpgsqlException ex)
+    {
+        sw.Stop();
+        extra["error"] = ex.Message;
+        SauronSdk.TrackTransaction(
+            name: "SELECT orders",
+            durationMs: sw.Elapsed.TotalMilliseconds,
+            op: "db",
+            status: "error",
+            tags: new Dictionary<string, object?> { ["db"] = "postgres", ["table"] = "orders" },
+            extra: extra);
+        throw;
+    }
+}
+```
+
+Then `@tag.table:orders duration:>500ms` is your slow-query list.
 
 ### `StartWorkflow`
 

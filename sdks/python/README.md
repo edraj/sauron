@@ -335,6 +335,8 @@ sauron.track_transaction(
     http_status: Optional[int] = None,
     url: Optional[str] = None,
     distinct_id: Optional[str] = None,
+    tags: Optional[Dict[str, str]] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None
 ```
 
@@ -348,9 +350,28 @@ sauron.track_transaction(
 | `http_status` | `Optional[int]` | `None` | HTTP response status. |
 | `url` | `Optional[str]` | `None` | Request path or URL. |
 | `distinct_id` | `Optional[str]` | `None` | Person identifier. When omitted it falls back to the active scope user's `id` (and stays `None` if there is no scope user). |
+| `tags` | `Optional[Dict[str, str]]` | `None` | Indexed string→string labels. Filter with `@tag.key:value` on the Transactions page. |
+| `extra` | `Optional[Dict[str, Any]]` | `None` | Freeform JSON — request body, response body, SQL text, row counts. Searchable with `extra.key:value`. |
 
 **Returns** `None`. Timing is entirely manual — the SDK does not instrument
 anything for you.
+
+**`tags` and `extra` are per-call only.** Unlike `track()` and
+`capture_exception()`, a transaction does **not** inherit the scope:
+`set_tag()` / `set_extra()` defaults are not merged in. Transactions are the
+highest-volume signal a service emits — one per request and per query — so
+inheriting a global blob would write it onto every row.
+
+`extra` is serialized and capped at **16 KB**
+(`sauron._transaction_extra.MAX_TRANSACTION_EXTRA_BYTES`). Past that the whole
+map is replaced with `{"_truncated": True, "_bytes": N}` and the dashboard says
+so on the row. The cap is not cosmetic: envelopes are batched, and one
+oversized body would push the whole envelope past the ingest limit and drop
+every unrelated span sent with it. A value that cannot be JSON-encoded at all
+becomes the same marker with `"_bytes": -1` rather than raising.
+
+Nothing in `extra` is scrubbed. Use `before_send` for redaction, and think twice
+before attaching a body that can carry tokens, passwords or personal data.
 
 ```python
 import time
@@ -368,6 +389,122 @@ sauron.track_transaction(
     distinct_id="u_123",
 )
 ```
+
+#### Example: an HTTP call, with request and response bodies
+
+```python
+import json
+import time
+
+import requests
+
+import sauron
+
+
+def create_order(payload: dict) -> dict:
+    url = "https://api.example.com/orders"
+    body = json.dumps(payload)
+    started = time.perf_counter()
+
+    try:
+        resp = requests.post(
+            url, data=body, headers={"content-type": "application/json"}, timeout=10
+        )
+        sauron.track_transaction(
+            "POST /orders",  # the grouping key — keep it low cardinality
+            op="http",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            http_method="POST",
+            http_status=resp.status_code,
+            url=url,
+            status="ok" if resp.ok else "error",
+            tags={"api": "orders", "tier": current_plan},
+            extra={
+                "request": body,
+                "response": resp.text,
+                "response_bytes": len(resp.content),
+                # Header VALUES are omitted on purpose — `authorization`
+                # lives there.
+                "request_headers": sorted(resp.request.headers),
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        sauron.track_transaction(
+            "POST /orders",
+            op="http",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            http_method="POST",
+            url=url,
+            status="error",
+            extra={"request": body, "error": str(exc)},
+        )
+        raise
+```
+
+On the dashboard: **Transactions → the row → expand**. Both bodies render as a
+JSON tree, and every one of these finds it:
+
+```text
+extra.response:~9001        # substring, inside the stored response body
+@tag.api:orders             # indexed tag
+op:http http.status:>=500   # the failures
+duration:>2s                # the slow ones
+```
+
+#### Example: a SQL query (`psycopg`)
+
+Put the **statement** in `extra` and keep `name` a stable label — a query with
+literals baked in would mint a new dashboard row per execution. A context
+manager keeps the timing and the error path in one place.
+
+```python
+import time
+from contextlib import contextmanager
+
+import psycopg
+
+import sauron
+
+
+@contextmanager
+def traced_query(label: str, statement: str, params: tuple = ()):
+    # Times a query and records it as a span. Yields the cursor.
+    started = time.perf_counter()
+    extra = {"statement": statement, "params": params}
+    status = "ok"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(statement, params)
+            yield cur
+            extra["row_count"] = cur.rowcount
+    except psycopg.Error as exc:
+        extra["error"] = str(exc)
+        status = "error"
+        raise
+    finally:
+        sauron.track_transaction(
+            label,  # the LABEL, not the statement
+            op="db",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            status=status,
+            tags={"db": "postgres", "table": "orders"},
+            # Bind PARAMETERS are user data. Log them only if you have decided
+            # that is acceptable, or log their shape instead.
+            extra=extra,
+        )
+
+
+with traced_query(
+    "SELECT orders",
+    "SELECT id, total FROM orders WHERE user_id = %s ORDER BY created_at DESC LIMIT 20",
+    (user_id,),
+) as cur:
+    rows = cur.fetchall()
+```
+
+Then `@tag.table:orders duration:>500ms` is your slow-query list.
 
 ### `start_workflow`
 
@@ -891,11 +1028,11 @@ print(dsn.envelope_url)  # https://ingest.sauron.example:8443/api/7/envelope
 ### `SDK_NAME`, `SDK_VERSION`
 
 Module constants (`str`) reported in the envelope header's `sdk` block:
-`"sauron-python"` and `"1.4.0"`.
+`"sauron-python"` and `"1.5.0"`.
 
 ```python
 import sauron
-print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.4.0
+print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.5.0
 ```
 
 ## Scope & metadata

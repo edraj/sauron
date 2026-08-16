@@ -158,10 +158,10 @@ class TestGoldenShapeLock(unittest.TestCase):
         built = self.client._make_envelope(GOLDEN_ITEMS)
         self.assertEqual(
             built["header"]["sdk"],
-            {"name": "sauron-python", "version": "1.4.0"},
+            {"name": "sauron-python", "version": "1.5.0"},
         )
         self.assertEqual(SDK_NAME, "sauron-python")
-        self.assertEqual(SDK_VERSION, "1.4.0")
+        self.assertEqual(SDK_VERSION, "1.5.0")
 
     def test_header_never_carries_environment(self):
         # Removed: environment is now proven by the ingest key, not client-supplied.

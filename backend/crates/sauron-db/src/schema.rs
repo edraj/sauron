@@ -475,6 +475,8 @@ diesel::table! {
         workflow_name -> Nullable<Text>,
         restored_pin_id -> Nullable<Uuid>,
         finished_at -> Nullable<Timestamptz>,
+        tags -> Jsonb,
+        extra -> Jsonb,
     }
 }
 

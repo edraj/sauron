@@ -131,6 +131,7 @@ export const routes = {
 
   // Explore
   '/events': guarded(() => import('./pages/Events.svelte')),
+  '/transactions': guarded(() => import('./pages/Transactions.svelte')),
   '/sessions': guarded(() => import('./pages/SessionsList.svelte')),
   '/sessions/:id': guarded(() => import('./pages/SessionDetail.svelte')),
   '/users': guarded(() => import('./pages/UsersExplorer.svelte')),

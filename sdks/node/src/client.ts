@@ -11,6 +11,7 @@ import {
   normalizeBreadcrumb,
 } from './scope.js';
 import { normalizeReason, normalizeWorkflowName } from './workflow.js';
+import { capTransactionExtra } from './transaction-extra.js';
 import type {
   ActiveWorkflow,
   BreadcrumbInput,
@@ -242,6 +243,14 @@ export class SauronClient {
     if (input.http_status !== undefined) item.http_status = input.http_status;
     if (input.url !== undefined) item.url = input.url;
     if (distinctId != null) item.distinct_id = distinctId;
+    // Per-call only — deliberately no `globalScope.tags`/`.extra` merge here,
+    // unlike `track()` and `captureException` below. See TransactionInput.
+    // Omitted when empty so an app that never sets them is byte-identical on
+    // the wire to before these fields existed.
+    if (input.tags && Object.keys(input.tags).length > 0) item.tags = { ...input.tags };
+    if (input.extra && Object.keys(input.extra).length > 0) {
+      item.extra = capTransactionExtra({ ...input.extra });
+    }
     this.dispatch(item);
   }
 

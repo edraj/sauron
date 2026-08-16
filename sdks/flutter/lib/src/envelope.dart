@@ -6,7 +6,7 @@ import 'types.dart';
 const String kSauronSdkName = 'sauron.flutter';
 
 /// SDK version — keep in sync with `pubspec.yaml`.
-const String kSauronSdkVersion = '1.7.0';
+const String kSauronSdkVersion = '1.8.0';
 
 /// The envelope header: routing + provenance metadata.
 class EnvelopeHeader {
@@ -329,7 +329,7 @@ class BreadcrumbBatchItem extends EnvelopeItem {
 /// Wire shape:
 /// `{ "type": "transaction", "name", "op", "duration_ms", "status"?,
 ///    "http_method"?, "http_status"?, "url"?, "distinct_id"?, "session_id"?,
-///    "workflow_id"?, "workflow_name"?, "timestamp" }`.
+///    "workflow_id"?, "workflow_name"?, "tags"?, "extra"?, "timestamp" }`.
 class TransactionItem extends EnvelopeItem {
   TransactionItem({
     required this.name,
@@ -343,6 +343,8 @@ class TransactionItem extends EnvelopeItem {
     this.sessionId,
     this.workflowId,
     this.workflowName,
+    this.tags,
+    this.extra,
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now().toUtc();
 
@@ -382,6 +384,18 @@ class TransactionItem extends EnvelopeItem {
   /// as a pair with [workflowId].
   final String? workflowName;
 
+  /// Dev-supplied flat string tags for THIS transaction.
+  ///
+  /// Per-call only — unlike [ErrorItem] and [AnalyticsItem], never merged with
+  /// the scope. See `SauronClient.trackTransaction`. Omitted from the wire when
+  /// null or empty.
+  final Map<String, String>? tags;
+
+  /// Dev-supplied freeform JSON for THIS transaction — the request body, the
+  /// response body, a retry count. Already capped by `capTransactionExtra`
+  /// before it reaches here. Omitted from the wire when null or empty.
+  final Map<String, Object?>? extra;
+
   /// When the transaction was recorded (UTC).
   final DateTime timestamp;
 
@@ -407,6 +421,14 @@ class TransactionItem extends EnvelopeItem {
     }
     if (workflowName != null) {
       json['workflow_name'] = workflowName;
+    }
+    // Omitted when null OR empty, so an app that never sets them produces the
+    // exact bytes it did before these fields existed.
+    if (tags != null && tags!.isNotEmpty) {
+      json['tags'] = tags;
+    }
+    if (extra != null && extra!.isNotEmpty) {
+      json['extra'] = extra;
     }
     json['timestamp'] = sauronIso(timestamp);
     return json;

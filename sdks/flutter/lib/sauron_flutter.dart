@@ -28,6 +28,8 @@ export 'src/sauron.dart' show Sauron;
 export 'src/sauron_options.dart' show SauronOptions, BeforeSendCallback;
 export 'src/stacktrace/dart_stacktrace_parser.dart' show DartStackTraceParser;
 export 'src/transaction.dart' show ActiveTransaction;
+export 'src/transaction_extra.dart'
+    show capTransactionExtra, kMaxTransactionExtraBytes;
 export 'src/types.dart'
     show
         AppDescriptor,

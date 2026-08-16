@@ -598,14 +598,13 @@ mod tests {
 
     #[test]
     fn unknown_field_message_does_not_offer_tags_where_there_are_none() {
-        // Devices/Persons/Sessions/Transactions have no `tags` column. Telling
-        // that caller to write `tag.nonsense` would be a lie.
-        for r in [
-            Resource::Devices,
-            Resource::Persons,
-            Resource::Sessions,
-            Resource::Transactions,
-        ] {
+        // Devices/Persons/Sessions have no `tags` column. Telling that caller
+        // to write `tag.nonsense` would be a lie.
+        //
+        // Transactions was in this list until migration 0063 gave it one; it
+        // now belongs to the opposite assertion below, which is the whole
+        // reason that assertion exists rather than this list simply shrinking.
+        for r in [Resource::Devices, Resource::Persons, Resource::Sessions] {
             let msg = err("nonsense:1", r).to_string();
             assert!(msg.contains("nonsense"), "{r:?}: {msg}");
             assert!(!msg.contains("tag."), "{r:?} has no tags column: {msg}");
@@ -620,6 +619,22 @@ mod tests {
                 .contains("os.version"),
             "still lists what IS available"
         );
+    }
+
+    /// The mirror of the test above: a resource that DOES carry `tags` must
+    /// offer the `tag.` spelling, or the hint is missing exactly where it would
+    /// have helped.
+    #[test]
+    fn unknown_field_message_offers_tags_where_they_exist() {
+        for r in [
+            Resource::Issues,
+            Resource::Occurrences,
+            Resource::Events,
+            Resource::Transactions,
+        ] {
+            let msg = err("nonsense:1", r).to_string();
+            assert!(msg.contains("tag.nonsense"), "{r:?}: {msg}");
+        }
     }
 
     #[test]

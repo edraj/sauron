@@ -258,6 +258,19 @@ public sealed class SauronClient : IDisposable
     }
 
     /// <summary>Emit a performance transaction. <paramref name="distinctId"/> falls back to the scoped user id.</summary>
+    /// <remarks>
+    /// <paramref name="tags"/> and <paramref name="extra"/> are <b>per-call only</b> — the scope is
+    /// NOT merged in, which is the one place transactions differ from <c>Track</c> and
+    /// <c>CaptureException</c>. Those two merge <c>SetTag</c>/<c>SetExtra</c> defaults; a transaction
+    /// carries only what its own call site attached. Transactions are the highest-volume signal (one
+    /// per navigation and per HTTP call), so inheriting a global blob would write it onto every row.
+    ///
+    /// <paramref name="extra"/> is where a request body, a response body, an order id or a retry
+    /// count goes. It is serialized and capped at <see cref="TransactionExtra.MaxBytes"/>; past that
+    /// the whole map is replaced with <c>{ "_truncated": true, "_bytes": N }</c> so one large body
+    /// cannot take a batched envelope over the ingest limit and drop every span in it. Nothing here
+    /// is scrubbed — <c>BeforeSend</c> is the redaction seam.
+    /// </remarks>
     public void TrackTransaction(
         string name,
         double durationMs,
@@ -266,7 +279,9 @@ public sealed class SauronClient : IDisposable
         string? httpMethod = null,
         int? httpStatus = null,
         string? url = null,
-        string? distinctId = null)
+        string? distinctId = null,
+        IReadOnlyDictionary<string, object?>? tags = null,
+        IReadOnlyDictionary<string, object?>? extra = null)
     {
         if (!_enabled || _transport is null)
             return;
@@ -285,6 +300,11 @@ public sealed class SauronClient : IDisposable
             DistinctId = distinctId ?? ScopeManager.Current.User?.Id,
             Timestamp = Transport.Iso8601Now(),
         };
+        // Left null when empty so the property attribute omits them from the wire.
+        if (tags is { Count: > 0 })
+            item.Tags = new Dictionary<string, object?>((IDictionary<string, object?>)tags);
+        if (extra is { Count: > 0 })
+            item.Extra = TransactionExtra.Cap(extra);
         Dispatch(item);
     }
 

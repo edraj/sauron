@@ -76,6 +76,18 @@ describe('wire fixture (js)', () => {
       httpMethod: 'GET',
       httpStatus: 200,
       url: 'https://api.example.com/api/users',
+      // Exercised in the fixture so the backend's `serde` deserializer sees
+      // real values in these two fields, not just their absence.
+      tags: { tier: 'premium' },
+      extra: { request: '{"page":1}', response: '{"users":[]}' },
+    });
+    // A SECOND transaction with neither field set — the omit-when-empty rule is
+    // the half a fixture with only the populated case cannot see, and it is the
+    // half that guarantees an app not using this feature ships identical bytes.
+    Sauron.trackTransaction({
+      name: '/checkout',
+      op: 'navigation',
+      durationMs: 42,
     });
 
     const flushed = await getClient()!.flush(5000);
@@ -93,6 +105,17 @@ describe('wire fixture (js)', () => {
     expect(types).toContain('identify');
     expect(types).toContain('transaction');
     expect(types.filter((t) => t === 'error')).toHaveLength(2); // exception + message
+
+    // Both halves of the tags/extra contract are in the captured bytes.
+    const txns = envelope.items.filter((i) => i.type === 'transaction');
+    expect(txns).toHaveLength(2);
+    expect(txns[0].tags).toEqual({ tier: 'premium' });
+    expect(txns[0].extra).toEqual({ request: '{"page":1}', response: '{"users":[]}' });
+    // Absent, not `null`: a null would deserialize into the backend's
+    // `serde_json::Value` as `Value::Null` and defeat the `object_or_empty`
+    // guard's purpose of never storing one.
+    expect('tags' in txns[1]).toBe(false);
+    expect('extra' in txns[1]).toBe(false);
 
     writeWireFixture('js', envelope);
   });

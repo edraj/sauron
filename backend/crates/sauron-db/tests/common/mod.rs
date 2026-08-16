@@ -1668,6 +1668,8 @@ async fn seed_transaction(
             release: None,
             ip_address: None,
             occurred_at,
+            tags: serde_json::json!({}),
+            extra: serde_json::json!({}),
         },
     )
     .await

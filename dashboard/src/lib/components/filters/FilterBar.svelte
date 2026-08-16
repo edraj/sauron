@@ -23,6 +23,18 @@
     sinceDays: number;
     // Optional custom date-range options; falls back to DateRange's default.
     ranges?: { days: number; label: string }[];
+    /**
+     * Render the built-in date range.
+     *
+     * `false` for a page that owns its window through a richer control (a
+     * `<TimeFilter>`, which also picks the timestamp COLUMN and accepts
+     * absolute bounds). Those pages still pass `sinceDays` — the prop is
+     * `$bindable` — but showing this control beside the real one puts two
+     * range pickers on screen where only one is connected to anything, and a
+     * dead control is worse than a missing one: it reports a window the list
+     * is not using.
+     */
+    showRange?: boolean;
   }
   let {
     fields,
@@ -33,6 +45,7 @@
     error = null,
     sinceDays = $bindable(30),
     ranges = undefined,
+    showRange = true,
   }: Props = $props();
 
   let adding = $state(false);
@@ -135,7 +148,9 @@
   -->
   <div class="right">
     <SearchAutocompleteInput bind:value={search} appId={appId ?? ''} {context} {error} />
-    <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} {ranges} />
+    {#if showRange}
+      <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} {ranges} />
+    {/if}
   </div>
 </div>
 
