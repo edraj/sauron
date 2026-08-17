@@ -87,11 +87,24 @@ export interface SearchPredicateParams {
 /**
  * The parameters that decide WHICH SLICE of the matching rows comes back.
  *
- * There is deliberately no `offset`. The backend still *accepts* one so an old
- * bookmark does not 400, but it ignores it — keyset paging replaced it, because
- * an offset cannot page a list stably. Sending a parameter the server ignores
- * would put a request on the wire that reads as "rows 50-100" and answers with
- * rows 0-50, so the clients stopped sending it. Follow `next_cursor` instead.
+ * `offset` is JUMP-ONLY, and `cursor` beats it outright.
+ *
+ * Keyset paging is what STEPS through these lists: it is stable under
+ * concurrent inserts, where an offset is not — a row arriving mid-walk shifts
+ * every later page onto rows an earlier one already returned. That is why the
+ * clients stopped sending an offset at all, and why they still never send one
+ * for a Next or Prev.
+ *
+ * What keyset cannot do is reach a page nobody has visited, because there is no
+ * cursor for it — which is what kept these lists to a three-button pager. So an
+ * offset is sent for exactly one thing: an explicit jump to a numbered page,
+ * where the reader is asking to land near a position rather than to continue a
+ * traversal, and the weaker guarantee is the one they asked for.
+ *
+ * The server ignores an `offset` sent alongside a `cursor` rather than
+ * combining them (see `repo::jump_offset`), and clamps it to its `COUNT_CAP`.
+ * Do not send both: the request would read as "page 3" and answer with the rows
+ * 100 past the cursor.
  */
 export interface SearchPageParams {
   /**
@@ -102,6 +115,13 @@ export interface SearchPageParams {
   sort?: string;
   /** Opaque token from the previous page's `next_cursor`. */
   cursor?: string;
+  /**
+   * Rows to skip — a numbered-page jump only, never a Next/Prev step.
+   *
+   * Mutually exclusive with `cursor` in practice: build these from a
+   * `CursorPage` via `cursorOf`/`offsetOf`, which cannot produce both.
+   */
+  offset?: number;
   limit?: number;
 }
 
@@ -137,6 +157,10 @@ export function predicateParams(opts: SearchPredicateParams): URLSearchParams {
 export function appendPageParams(p: URLSearchParams, opts: SearchPageParams): URLSearchParams {
   if (opts.sort) p.set('sort', opts.sort);
   if (opts.cursor) p.set('cursor', opts.cursor);
+  // Never both. A cursor is the stable mechanism and the server drops the
+  // offset when one is present anyway; sending both would put a request on the
+  // wire that reads as a numbered jump and answers as a keyset step.
+  else if (opts.offset) p.set('offset', String(opts.offset));
   if (opts.limit != null) p.set('limit', String(opts.limit));
   return p;
 }

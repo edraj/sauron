@@ -9,10 +9,13 @@
   the table beneath it. `SearchInput.svelte` is the house reference this now
   follows.
 
-  There is no submit button. The query is already live via the debounced
-  `onChange` every page drives, so a button would only restate what typing
-  already did — and the old one called an `onSearch` prop no call site ever
-  passed.
+  The query is applied on an EXPLICIT submit — the Search button, or Enter —
+  never while typing. A debounce was the wrong instrument for this box: a
+  query-language fragment is invalid for most of the time it takes to type
+  (`http.st`, `duration:>`, `level:[error,`), so a timer that fires mid-token
+  spends requests on queries the reader never asked for and paints 400s under
+  their caret while they are still writing. `value` is the text in the box;
+  `onSearch` is the only thing that means "run this".
 -->
 <script lang="ts">
   import Icon from '../ui/Icon.svelte';
@@ -32,7 +35,12 @@
     placeholder?: string;
     /** A query error to mark inline — fed by the page from its 400/403. */
     error?: string | null;
-    onChange?: (query: string) => void;
+    /**
+     * Run this query. Fired ONLY by the Search button, Enter, and the clear
+     * button — never on input. The page applies the value it receives here;
+     * `bind:value` alone must not drive a request.
+     */
+    onSearch?: (query: string) => void;
   }
 
   let {
@@ -41,7 +49,7 @@
     value = $bindable(''),
     placeholder = undefined,
     error = null,
-    onChange,
+    onSearch,
   }: Props = $props();
 
   let schema = $state<SchemaDefinition | null>(null);
@@ -52,6 +60,15 @@
   let inputEl = $state<HTMLInputElement | null>(null);
   let listEl = $state<HTMLUListElement | null>(null);
   let rootEl = $state<HTMLDivElement | null>(null);
+
+  /**
+   * The text that was last handed to `onSearch`. Seeded from the incoming
+   * `value` so a query hydrated from the URL does not open the page already
+   * claiming to have unrun edits.
+   */
+  let lastSubmitted = $state(value);
+  /** Typed text the list is not showing yet — what the Search button is for. */
+  const pending = $derived(value.trim() !== lastSubmitted.trim());
 
   const effectivePlaceholder = $derived(placeholder ?? placeholderFor(schema));
 
@@ -102,8 +119,14 @@
 
   function handleInput(e: Event) {
     value = (e.target as HTMLInputElement).value;
-    onChange?.(value);
     refresh();
+  }
+
+  /** The one path to the network. Everything else only edits the text. */
+  function submit() {
+    lastSubmitted = value;
+    open = false;
+    onSearch?.(value);
   }
 
   function apply(s: Suggestion) {
@@ -112,7 +135,6 @@
     // A field completion ends in `:` and must NOT gain a trailing space — the
     // caret stays inside the token so the value suggestions open immediately.
     value = parts.join(' ') + (s.insert.endsWith(':') ? '' : ' ');
-    onChange?.(value);
     inputEl?.focus();
     refresh();
   }
@@ -152,18 +174,22 @@
       }
     }
     if (e.key === 'Enter') {
-      // The query is already live via the debounced `onChange`; Enter just
-      // dismisses, so the reader is not left with a list covering their rows.
+      // Enter IS the submit. Nothing else reaches the network, so a page that
+      // forgets `onSearch` has a search box that only ever edits a string.
       e.preventDefault();
-      open = false;
+      submit();
     }
   }
 
   function clear() {
+    // Clearing applies immediately rather than waiting for another Search
+    // click: an X that empties the box while the old query still filters the
+    // rows below states something untrue about what is on screen.
     value = '';
-    onChange?.('');
+    lastSubmitted = '';
     open = false;
     inputEl?.focus();
+    onSearch?.('');
   }
 </script>
 
@@ -213,12 +239,28 @@
         <Icon name="x" size={14} />
       </button>
     {/if}
+    <!--
+      Never `disabled` when the text is unchanged. Re-running the same query is
+      a legitimate thing to want, and a control that greys out the moment it
+      has been used reads as broken to the next person who clicks it.
+    -->
+    <button
+      class="go"
+      class:pending
+      type="button"
+      onclick={submit}
+      title="Search (Enter)"
+    >
+      Search
+    </button>
   </div>
 
   {#if error}
     <p class="msg err" role="alert">{error}</p>
   {:else if schemaError}
     <p class="msg hint">{schemaError} — you can still type a query.</p>
+  {:else if pending}
+    <p class="msg hint">Press Enter or click Search to run this query.</p>
   {/if}
 
   {#if open && suggestions.length}
@@ -293,6 +335,26 @@
   }
   .clear:hover {
     color: var(--text);
+  }
+  .go {
+    flex-shrink: 0;
+    margin: 3px -7px 3px 2px;
+    padding: 5px 11px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    font-size: 12.5px;
+    font-weight: 540;
+  }
+  .go:hover {
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+  .go.pending {
+    background: var(--primary-soft);
+    border-color: var(--primary-border);
+    color: var(--primary);
   }
   .msg {
     margin: 4px 2px 0;

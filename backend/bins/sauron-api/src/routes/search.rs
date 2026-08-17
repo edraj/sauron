@@ -44,6 +44,19 @@ pub struct ClampInfo {
     pub reason: String,
 }
 
+/// The body every `/v1/apps/{app_id}/counts/{resource}` route answers.
+///
+/// Deliberately the same `(total, total_is_capped)` pair [`SearchEnvelope`]
+/// carries, so a caller reads a count the same way whether it arrived beside
+/// its rows or on its own request. The `+` for a capped total stays a display
+/// concern — see `SearchEnvelope`'s note on why this is a number and a boolean
+/// rather than the string `"1204+"`.
+#[derive(Debug, Serialize)]
+pub struct CountEnvelope {
+    pub total: i64,
+    pub total_is_capped: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SearchEnvelope<T> {
     pub data: Vec<T>,
@@ -1047,16 +1060,31 @@ mod tests {
             window: TimeFilterQuery,
             #[serde(default)]
             limit: i64,
+            /// `offset` sits beside the flatten on `transactions::ListQuery`
+            /// and `analytics::EventsListQuery`, so it is pinned here for the
+            /// same reason `limit` is: flatten routes every sibling through
+            /// `deserialize_any`, and a plain integer that silently failed to
+            /// parse would default to 0 — every numbered page jump landing on
+            /// page one, with a 200 and the right-looking rows for page one.
+            #[serde(default)]
+            offset: i64,
         }
 
         let p: Probe = serde_urlencoded::from_str(
-            "time_field=first_seen&from=2026-08-01T00:00:00Z&to=2026-08-03T00:00:00Z&limit=50",
+            "time_field=first_seen&from=2026-08-01T00:00:00Z&to=2026-08-03T00:00:00Z&limit=50&offset=250",
         )
         .expect("flattened window params must deserialize from a query string");
         assert_eq!(p.window.time_field.as_deref(), Some("first_seen"));
         assert_eq!(p.window.from, Some(at("2026-08-01T00:00:00Z")));
         assert_eq!(p.window.to, Some(at("2026-08-03T00:00:00Z")));
         assert_eq!(p.limit, 50);
+        assert_eq!(p.offset, 250);
+
+        // Absent must stay absent rather than becoming a 400 — the whole point
+        // of `#[serde(default)]` here — but it must ALSO not swallow a value
+        // that was sent.
+        let no_offset: Probe = serde_urlencoded::from_str("limit=50").expect("offset absent");
+        assert_eq!(no_offset.offset, 0);
 
         // Absent means absent, so the route's own default applies rather than
         // a shared one.

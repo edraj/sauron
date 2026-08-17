@@ -308,6 +308,69 @@ pub async fn persons_list(
     ))
 }
 
+/// `GET /v1/apps/{app_id}/counts/persons` — how many rows [`persons_list`]
+/// would page.
+///
+/// Takes `PersonsQuery` verbatim so the count and the list are built from one
+/// predicate description. Page fields are ignored; `sort` is still resolved
+/// because `count_persons` wraps the list's own SQL, which embeds an ORDER BY
+/// that cannot change a count.
+///
+/// Same permission and `RawQuery` environment handling as the list — a count
+/// resolved over a wider scope leaks the SIZE of data the caller cannot read.
+///
+/// Note the ROUTE lives at `/counts/persons`, not `/persons/count`. The nested
+/// form would collide: `/v1/apps/{app_id}/persons/{distinct_id}` already
+/// exists, axum resolves a static segment ahead of a `{param}` capture, and
+/// distinct IDs are arbitrary strings from SDK `identify()` calls — so a person
+/// literally named `count` would lose their profile page.
+pub async fn persons_count(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<PersonsQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<super::search::CountEnvelope>, ApiError> {
+    let mut conn = db(&state).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let search = q.search.as_deref().filter(|s| !s.is_empty());
+    let sort = person_sort_spec(q.sort.as_deref())?;
+    let window = super::search::resolve_time_filter(
+        "last_seen",
+        PERSON_TIME_FIELDS,
+        &q.window,
+        Utc::now(),
+        default_persons_since_days(),
+        super::search::MAX_WINDOW_DAYS,
+        // No planner clamp: this list is not query-planner wired.
+        None,
+    )?;
+    let (total, total_is_capped) = repo::count_persons(
+        &mut conn,
+        scope,
+        search,
+        sort,
+        repo::TimeWindow {
+            column: window.column,
+            from: window.from,
+            to: window.to,
+        },
+        super::search::COUNT_CAP,
+    )
+    .await?;
+    Ok(Json(super::search::CountEnvelope {
+        total,
+        total_is_capped,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Event Explorer — the raw analytics event stream with filters.
 // ---------------------------------------------------------------------------
@@ -330,12 +393,21 @@ pub struct EventsListQuery {
     pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_events_list_limit")]
     pub limit: i64,
-    /// Accepted and IGNORED since S2c — see `issues::ListQuery::offset` for the
-    /// full reasoning. Short version: keyset paging replaced it, and dropping
-    /// the field would turn every bookmarked `?offset=50` into a `400` from an
-    /// unknown parameter. This route DID have a working `offset`, so unlike the
-    /// occurrences list it genuinely has such bookmarks. Follow `next_cursor`.
-    #[allow(dead_code)]
+    /// Rows to skip — an explicit page JUMP, and nothing else.
+    ///
+    /// Keyset paging remains the mechanism for STEPPING: `cursor` always wins,
+    /// and an `offset` sent alongside one is ignored by the repo layer rather
+    /// than combined with it. See `repo::jump_offset` — an offset laid on top
+    /// of a keyset predicate skips rows *within* the already-narrowed set,
+    /// which is a wrong page rather than an error.
+    ///
+    /// Offset exists because a page nobody has walked to has no cursor to ask
+    /// for, which is what made a numbered pager impossible. Clamped to
+    /// `COUNT_CAP`, so the deepest reachable jump costs the same row budget the
+    /// count on this very request already spends.
+    ///
+    /// This supersedes the "accepted and IGNORED" contract from S2c: a
+    /// bookmarked `?offset=50` returns the rows it names again.
     #[serde(default)]
     pub offset: i64,
     // See `RangeQuery`'s comment: `environment_id` comes from `RawQuery`, not
@@ -513,6 +585,12 @@ pub async fn events_list(
     )?;
     let since = window.from;
     let limit = q.limit.clamp(1, 200);
+    // Jump-only, and clamped to the same ceiling the count on this request
+    // stops at: pages past `COUNT_CAP` are not numberable anyway, so an offset
+    // beyond it addresses nothing while costing the planner real rows. Clamped
+    // rather than rejected — a stale bookmark deep in a list that has since
+    // shrunk should land on the last reachable page, not 400.
+    let offset = q.offset.clamp(0, super::search::COUNT_CAP);
 
     let search = repo::EventSearch {
         node: &node,
@@ -523,6 +601,7 @@ pub async fn events_list(
         descending,
         after,
         limit,
+        offset,
     };
     let mut rows = repo::search_events(&mut conn, &scope, &search)
         .await

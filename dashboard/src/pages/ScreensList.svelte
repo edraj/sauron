@@ -15,6 +15,8 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { listScreens } from '../lib/api/screens';
+  import { countScreens } from '../lib/api/counts';
+  import { RowCount } from '../lib/stores/row-count.svelte';
   import {
     setOffsetPage,
     setOffsetSort,
@@ -28,7 +30,7 @@
   const LIMIT = 50;
 
   let sinceDays = $state(30);
-  // `query` is bound to the input; `search` is the debounced value that drives loads.
+  // `query` is bound to the input; `search` is the SUBMITTED value that drives loads.
   let query = $state('');
   let search = $state('');
 
@@ -50,19 +52,20 @@
   // path: a cache HIT repaints rows without fetching, and a `hasNext` only the
   // fetch updates would be the previous key's answer.
   const hasNext = $derived(view.data?.hasNext ?? false);
+  const rowCount = new RowCount();
   const revalidating = $derived(view.revalidating);
   const loading = $derived(view.loading);
   let refreshing = $state(false);
   const error = $derived(view.error);
 
-  let debounce: ReturnType<typeof setTimeout> | undefined;
-
+  // Submit-driven, not debounced: `query` is the text in the box and
+  // `search` is what the request carries. Only the Search button, Enter and
+  // the clear button move one into the other, so typing never queries.
   function onSearch(v: string) {
-    clearTimeout(debounce);
-    debounce = setTimeout(() => {
-      search = v.trim();
-      list = setOffsetPage(list, 0);
-    }, 220);
+    search = v.trim();
+    // A changed predicate invalidates the page position: row 51 of the old
+    // result set is not row 51 of the new one.
+    list = setOffsetPage(list, 0);
   }
 
   function onRange(days: number) {
@@ -89,6 +92,14 @@
     off: number,
     force = false,
   ) {
+    // Keyed on the PREDICATE only — no `sort`, no `off`, no `LIMIT`. A total
+    // does not change when you reorder or page, so folding either in would
+    // refetch the count on every click for an answer that cannot differ.
+    void rowCount.load(
+      viewKey('screens.count', appId, sessionStore.scopeKey, days, s),
+      () => countScreens(appId, { sinceDays: days, search: s || undefined }),
+      force,
+    );
     await view.load(
       viewKey('screens.list', appId, sessionStore.scopeKey, days, s, sort, off, LIMIT),
       () => listScreens(appId, {
@@ -136,7 +147,7 @@
     </div>
     <div class="controls">
       <DateRange value={sinceDays} onchange={onRange} />
-      <SearchInput bind:value={query} oninput={onSearch} placeholder="Search screens…" width="240px" />
+      <SearchInput bind:value={query} onsearch={onSearch} placeholder="Search screens…" width="240px" />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
@@ -207,6 +218,8 @@
       limit={LIMIT}
       count={rows.length}
       {hasNext}
+      total={rowCount.total}
+      totalIsCapped={rowCount.isCapped}
       onchange={(o) => (list = setOffsetPage(list, o))}
     />
   {/if}

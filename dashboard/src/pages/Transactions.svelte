@@ -28,8 +28,8 @@
   import { listTransactions } from '../lib/api/transactions';
   import type { SearchEnvelope } from '../lib/api/search';
   import { errorMessage, errorStatus } from '../lib/api/client';
-  import { canGoBack, cursorOf, emptyPage, pageNumber } from '../lib/models/cursor-page';
-  import { setCursorPage, setCursorSort, cursorBack, type CursorListState } from '../lib/models/list-state';
+  import { cursorOf, emptyPage, offsetOf, pageKey, pageNumber } from '../lib/models/cursor-page';
+  import { cursorGoTo, setCursorSort, type CursorListState } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
   import { fromParams, toParams, type TimeField, type TimeFilterState } from '../lib/models/time-filter';
   import { viewKey } from '../lib/stores/view-cache';
@@ -88,21 +88,66 @@
   const nextCursor = $derived(page?.next_cursor ?? null);
   const clamped = $derived(page?.clamped ?? null);
 
+  interface DetailRow {
+    label: string;
+    /** `null` renders an em dash — the field is genuinely absent on this span. */
+    value: string | null;
+    href?: string;
+    mono?: boolean;
+  }
+
   /**
-   * A row carries developer metadata worth expanding.
+   * Every stored field of a span, as label/value pairs for the detail panel.
    *
-   * `null` means WITHHELD (`strip_transaction_body` nulled it for a caller
-   * without `event:read`), not empty — so a null must NOT render a chevron
-   * that opens an empty panel, which would read as "this span had no data"
-   * rather than "you may not see it". An empty object means the span really
-   * carried none, and gets no chevron either; the two look the same here only
-   * because the outcome is the same, and the distinction is preserved in the
-   * type for anything that needs to tell them apart.
+   * Deliberately hand-written rather than iterating the object's keys. A
+   * key-walk would render `id`, `app_id` and `restored_pin_id` beside `url`
+   * with equal weight, invent labels from column names, and — the part that
+   * matters — silently start displaying whatever column the table grows next,
+   * including one nobody decided was safe to show. This list is the decision.
+   *
+   * `ip_address` is omitted on purpose: the API already masks it
+   * (`serialize_masked_ip`) and nulls it for a caller without `event:read`, so
+   * the value here is at best a truncated address and at worst a blank field
+   * that reads as "no IP recorded".
    */
-  function hasMeta(t: Transaction): boolean {
-    const tags = t.tags ? Object.keys(t.tags).length : 0;
-    const extra = t.extra ? Object.keys(t.extra).length : 0;
-    return tags + extra > 0;
+  function detailRows(t: Transaction): DetailRow[] {
+    return [
+      { label: 'Name', value: t.name, mono: true },
+      { label: 'Operation', value: t.op },
+      { label: 'Duration', value: `${t.duration_ms.toLocaleString()} ms` },
+      { label: 'Status', value: t.status },
+      { label: 'HTTP method', value: t.http_method },
+      { label: 'HTTP status', value: t.http_status == null ? null : String(t.http_status) },
+      { label: 'URL', value: t.url, mono: true },
+      {
+        label: 'User',
+        value: t.distinct_id,
+        href: t.distinct_id ? `#/persons/${encodeURIComponent(t.distinct_id)}` : undefined,
+        mono: true,
+      },
+      {
+        label: 'Session',
+        value: t.session_id,
+        href: t.session_id ? `#/sessions/${encodeURIComponent(t.session_id)}` : undefined,
+        mono: true,
+      },
+      {
+        label: 'Device',
+        value: t.device_key,
+        href: t.device_key ? `#/devices/${encodeURIComponent(t.device_key)}` : undefined,
+        mono: true,
+      },
+      { label: 'Release', value: t.release, mono: true },
+      { label: 'Workflow', value: t.workflow_name },
+      { label: 'Occurred at', value: t.occurred_at, mono: true },
+      // Both timestamps, always. The GAP between them is the interesting
+      // number on a mobile SDK — a span that occurred hours before it arrived
+      // came out of an offline queue, or off a device with a skewed clock, and
+      // either fact changes how you read the one above.
+      { label: 'Received at', value: t.received_at, mono: true },
+      { label: 'Finished at', value: t.finished_at, mono: true },
+      { label: 'Transaction id', value: t.id, mono: true },
+    ];
   }
 
   /** The SDK capped this payload — the span is real, the blob is a marker. */
@@ -143,7 +188,11 @@
       // cache hits zero times while staying wired, typed and green.
       `${tf.field}:${tf.mode}:${tf.lastDays ?? ''}:${tf.from ?? ''}:${tf.to ?? ''}`,
       sortParam(l.sort),
-      cursorOf(l.page),
+      // `pageKey`, NOT `cursorOf`: a page reached by a numbered jump carries a
+      // null cursor, which is exactly what page 1 carries — so a key built from
+      // the cursor alone hashes page 7 to page 1's entry and repaints the first
+      // page straight out of the cache, with no request on the wire to notice.
+      pageKey(l.page),
     );
     loading = true;
     error = null;
@@ -169,6 +218,7 @@
         limit: LIMIT,
         sort: sortParam(l.sort),
         cursor: cursorOf(l.page),
+        offset: offsetOf(l.page),
       });
       if (myGen !== gen) return;
       page = envelope;
@@ -228,13 +278,16 @@
     toPage(setCursorSort(list, k, columnDefault));
   }
 
-  function onnext() {
-    if (!nextCursor) return;
-    toPage(setCursorPage(list, nextCursor));
-  }
-
-  function onprev() {
-    toPage(cursorBack(list));
+  /**
+   * Move to a numbered page.
+   *
+   * `cursorGoTo` picks the mechanism — a keyset step when the target is
+   * adjacent and a cursor for it exists, an offset jump otherwise. That choice
+   * is made in one place for all four cursor lists rather than here, so no two
+   * of them can page differently.
+   */
+  function onjump(target: number) {
+    toPage(cursorGoTo(list, target, nextCursor, LIMIT));
   }
 
   function refresh() {
@@ -245,26 +298,22 @@
   }
 
   /**
-   * Commit the search box into `appliedSearch`, debounced.
+   * Commit the search box into `appliedSearch` on an explicit submit.
    *
    * **Not optional plumbing.** `search` is what the FilterBar binds and
-   * `appliedSearch` is what the request reads; without this effect the two
-   * never meet, and the search box types, validates and highlights while every
+   * `appliedSearch` is what the request reads; without this the two never
+   * meet, and the search box types, validates and highlights while every
    * request goes out without a `q` at all — a control that is wired, typed and
    * green and does nothing.
    *
-   * Debounced only for free text. Chips and the date range reload immediately;
-   * typing should settle first, or every keystroke is a request.
+   * Deliberately a callback rather than an effect on `search`: nothing may
+   * observe the typed text and requery, or the box is back to firing per
+   * keystroke with a delay in front of it. Chips and the time filter still
+   * reload immediately — they cannot be half-written the way a query can.
    */
-  let searchTimer: ReturnType<typeof setTimeout>;
-  $effect(() => {
-    const s = search;
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      appliedSearch = s;
-    }, 300);
-    return () => clearTimeout(searchTimer);
-  });
+  function onSearch(q: string) {
+    appliedSearch = q;
+  }
 
   // Predicate changes reset to page one — a cursor minted under one predicate
   // is not a position within another.
@@ -330,6 +379,7 @@
     appId={sessionStore.currentAppId ?? undefined}
     context="transactions"
     error={errorStatusCode === 400 ? error : null}
+    {onSearch}
     showRange={false}
   />
   <SearchDisclosure {clamped} />
@@ -376,23 +426,35 @@
             <SortableTh key="duration_ms" class="num" sort={list.sort} {onsort}>Duration</SortableTh>
             <th>Status</th>
             <th>HTTP</th>
+            <!--
+              Not a `SortableTh`. The backend's sort whitelist is
+              occurred_at/duration_ms/name/op — the four orderings with a
+              keyset index behind them — and asking for anything else is a 400
+              that names the allowed set. A header that looks clickable and
+              answers with an error is worse than one that plainly does not
+              sort. Narrow instead: click the id, or filter `session:<id>`.
+            -->
+            <th>Session</th>
             <SortableTh key="occurred_at" sort={list.sort} {onsort}>When</SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
           {#each rows as t (t.id)}
-            <tr class:has-meta={hasMeta(t)}>
+            <tr class:expanded={expanded.has(t.id)}>
               <td class="chev">
-                {#if hasMeta(t)}
-                  <button
-                    class="chev-btn"
-                    aria-expanded={expanded.has(t.id)}
-                    aria-label={expanded.has(t.id) ? 'Hide data' : 'Show data'}
-                    onclick={() => toggle(t.id)}
-                  >
-                    <Icon name={expanded.has(t.id) ? 'chevron-down' : 'chevron-right'} size={14} />
-                  </button>
-                {/if}
+                <!--
+                  Unconditional. It used to appear only on rows carrying
+                  tags/extra, back when expanding showed nothing else — now it
+                  opens the full span, which every row has.
+                -->
+                <button
+                  class="chev-btn"
+                  aria-expanded={expanded.has(t.id)}
+                  aria-label={expanded.has(t.id) ? 'Hide details' : 'Show details'}
+                  onclick={() => toggle(t.id)}
+                >
+                  <Icon name={expanded.has(t.id) ? 'chevron-down' : 'chevron-right'} size={14} />
+                </button>
               </td>
               <td>
                 <span class="name mono truncate" title={t.name}>{t.name}</span>
@@ -421,11 +483,27 @@
                   <span class="muted">—</span>
                 {/if}
               </td>
+              <td>
+                {#if t.session_id}
+                  <!--
+                    Straight to the session timeline, where this span sits
+                    beside the events and errors around it — the question
+                    somebody asks the moment they see a slow call.
+                  -->
+                  <a
+                    class="session mono truncate"
+                    href={`#/sessions/${encodeURIComponent(t.session_id)}`}
+                    title={t.session_id}
+                  >{t.session_id}</a>
+                {:else}
+                  <span class="muted" title="This span was recorded without a session">—</span>
+                {/if}
+              </td>
               <td><TimeValue value={t.occurred_at} /></td>
             </tr>
             {#if expanded.has(t.id)}
               <tr class="meta-row">
-                <td colspan="7">
+                <td colspan="8">
                   {#if isTruncated(t)}
                     <p class="truncated" role="status">
                       <Icon name="info" size={14} />
@@ -438,21 +516,61 @@
                       </span>
                     </p>
                   {/if}
-                  {#if t.tags && Object.keys(t.tags).length > 0}
-                    <div class="meta-block">
-                      <h4>Tags</h4>
-                      <div class="tag-list">
-                        {#each Object.entries(t.tags) as [k, v] (k)}
-                          <Badge tone="neutral" size="sm">{k}: {v}</Badge>
-                        {/each}
+
+                  <div class="meta-block">
+                    <h4>Span</h4>
+                    <dl class="detail">
+                      {#each detailRows(t) as row (row.label)}
+                        <div class="detail-row">
+                          <dt>{row.label}</dt>
+                          <dd>
+                            {#if row.value === null}
+                              <span class="muted">—</span>
+                            {:else if row.href}
+                              <a class="mono" href={row.href}>{row.value}</a>
+                            {:else}
+                              <span class:mono={row.mono}>{row.value}</span>
+                            {/if}
+                          </dd>
+                        </div>
+                      {/each}
+                    </dl>
+                  </div>
+
+                  {#if t.tags === null}
+                    <!--
+                      `null` is WITHHELD, not empty — `strip_transaction_body`
+                      nulls both for a caller without `event:read`. Saying so
+                      beats rendering nothing, which reads as "this span had no
+                      data" and sends people looking for a bug.
+                    -->
+                    <p class="withheld">
+                      <Icon name="lock" size={13} />
+                      <span>Tags and additional data are withheld — they need the <code>event:read</code> permission.</span>
+                    </p>
+                  {:else}
+                    {#if Object.keys(t.tags).length > 0}
+                      <div class="meta-block">
+                        <h4>Tags</h4>
+                        <div class="tag-list">
+                          {#each Object.entries(t.tags) as [k, v] (k)}
+                            <Badge tone="neutral" size="sm">{k}: {v}</Badge>
+                          {/each}
+                        </div>
                       </div>
-                    </div>
-                  {/if}
-                  {#if t.extra && Object.keys(t.extra).length > 0}
-                    <div class="meta-block">
-                      <h4>Additional data</h4>
-                      <JsonTree value={t.extra} expandTo={1} />
-                    </div>
+                    {/if}
+                    {#if t.extra && Object.keys(t.extra).length > 0}
+                      <div class="meta-block">
+                        <h4>Additional data</h4>
+                        <JsonTree value={t.extra} expandTo={1} />
+                      </div>
+                    {/if}
+                    {#if Object.keys(t.tags).length === 0 && (!t.extra || Object.keys(t.extra).length === 0)}
+                      <p class="muted no-meta">
+                        No tags or additional data on this span. Attach some by passing
+                        <code>tags</code> / <code>extra</code> to <code>trackTransaction()</code>.
+                      </p>
+                    {/if}
                   {/if}
                 </td>
               </tr>
@@ -464,12 +582,11 @@
         {total}
         totalIsCapped={totalCapped}
         page={pageNumber(list.page)}
-        canPrev={canGoBack(list.page)}
+        limit={LIMIT}
         canNext={nextCursor !== null}
         busy={loading}
         noun="transaction"
-        {onprev}
-        {onnext}
+        {onjump}
       />
     {/if}
   </Card>
@@ -554,6 +671,51 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+  }
+  /* Two columns on a wide viewport, one when the pane is narrow. `auto-fill`
+     rather than a fixed count so a maximised window does not stretch a
+     16-row list into two very tall columns of mostly whitespace. */
+  .detail {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 2px 24px;
+    margin: 0;
+  }
+  .detail-row {
+    display: grid;
+    grid-template-columns: 130px 1fr;
+    gap: 10px;
+    align-items: baseline;
+    padding: 3px 0;
+    min-width: 0;
+  }
+  .detail dt {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .detail dd {
+    margin: 0;
+    font-size: 12.5px;
+    /* Long urls and ids wrap instead of widening the grid track, which would
+       otherwise push the whole table into a horizontal scroll. */
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+  .session {
+    display: inline-block;
+    max-width: 200px;
+    vertical-align: bottom;
+  }
+  .withheld,
+  .no-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 14px 0 0;
+    font-size: 12.5px;
+  }
+  .withheld {
+    color: var(--muted);
   }
   .truncated {
     display: flex;

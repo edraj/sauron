@@ -33,20 +33,21 @@ pub struct ListQuery {
     pub since_days: i64,
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// Accepted and IGNORED since S2c. Keyset paging replaced it: `offset`
-    /// cannot page a list stably (a row inserted mid-walk shifts every later
-    /// page onto rows an earlier one already returned), which is the defect
-    /// this slice exists to remove. Kept as a field rather than dropped so an
-    /// existing bookmark carrying `?offset=50` still returns the first page
-    /// instead of a `400` from an unknown parameter — the rows it gets are
-    /// *different* from before, but they are correct rows, and the alternative
-    /// is breaking every saved URL. Follow `next_cursor` instead.
+    /// Rows to skip — an explicit page JUMP, and nothing else.
     ///
-    /// The `allow` is what "accepted and ignored" looks like to rustc: the
-    /// field exists to be *deserialized into* — its whole job is absorbing a
-    /// parameter that must not become a 400 — and nothing reads it back.
-    /// Scoped to this one field, never to the struct or the module.
-    #[allow(dead_code)]
+    /// Keyset paging remains the mechanism for STEPPING: `cursor` always wins,
+    /// and an `offset` sent alongside one is ignored by the repo layer rather
+    /// than combined with it. See `repo::jump_offset` — an offset laid on top
+    /// of a keyset predicate skips rows *within* the already-narrowed set,
+    /// which is a wrong page rather than an error.
+    ///
+    /// Offset exists because a page nobody has walked to has no cursor to ask
+    /// for, which is what made a numbered pager impossible. Clamped to
+    /// `COUNT_CAP`, so the deepest reachable jump costs the same row budget the
+    /// count on this very request already spends.
+    ///
+    /// This supersedes the "accepted and IGNORED" contract from S2c: a
+    /// bookmarked `?offset=50` returns the rows it names again.
     #[serde(default)]
     pub offset: i64,
     // `environment_id` is deliberately NOT a field here — it is read from the
@@ -210,6 +211,12 @@ pub async fn list(
     );
     let since = window.since;
     let limit = q.limit.clamp(1, 200);
+    // Jump-only, and clamped to the same ceiling the count on this request
+    // stops at: pages past `COUNT_CAP` are not numberable anyway, so an offset
+    // beyond it addresses nothing while costing the planner real rows. Clamped
+    // rather than rejected — a stale bookmark deep in a list that has since
+    // shrunk should land on the last reachable page, not 400.
+    let offset = q.offset.clamp(0, super::search::COUNT_CAP);
 
     let search = repo::IssueSearch {
         node: &node,
@@ -219,6 +226,7 @@ pub async fn list(
         descending,
         after,
         limit,
+        offset,
         text_reach: reach,
     };
     let mut rows = repo::search_issues(&mut conn, &scope, &search)
@@ -435,11 +443,25 @@ pub struct EventsQuery {
     pub since_days: i64,
     #[serde(default = "default_events_limit")]
     pub limit: i64,
+    /// Rows to skip — an explicit page JUMP, and nothing else.
+    ///
+    /// Keyset paging remains the mechanism for STEPPING: `cursor` always wins,
+    /// and an `offset` sent alongside one is ignored by the repo layer rather
+    /// than combined with it. See `repo::jump_offset` — an offset laid on top
+    /// of a keyset predicate skips rows *within* the already-narrowed set,
+    /// which is a wrong page rather than an error.
+    ///
+    /// Offset exists because a page nobody has walked to has no cursor to ask
+    /// for, which is what made a numbered pager impossible. Clamped to
+    /// `COUNT_CAP`, so the deepest reachable jump costs the same row budget the
+    /// count on this very request already spends.
+    ///
+    /// This supersedes the "accepted and IGNORED" contract from S2c: a
+    /// bookmarked `?offset=50` returns the rows it names again.
+    #[serde(default)]
+    pub offset: i64,
     // `environment_id` comes from `RawQuery`, not this struct — see `list`'s
     // comment above.
-    //
-    // No `offset` field, unlike `ListQuery`: this route never had one, so there
-    // is no bookmark carrying it to keep from 400ing.
 }
 
 fn default_events_limit() -> i64 {
@@ -573,6 +595,12 @@ pub async fn events(
     );
     let since = window.since;
     let limit = q.limit.clamp(1, 100);
+    // Jump-only, and clamped to the same ceiling the count on this request
+    // stops at: pages past `COUNT_CAP` are not numberable anyway, so an offset
+    // beyond it addresses nothing while costing the planner real rows. Clamped
+    // rather than rejected — a stale bookmark deep in a list that has since
+    // shrunk should land on the last reachable page, not 400.
+    let offset = q.offset.clamp(0, super::search::COUNT_CAP);
 
     let search = repo::OccurrenceSearch {
         node: &node,
@@ -582,6 +610,7 @@ pub async fn events(
         descending,
         after,
         limit,
+        offset,
         text_reach: reach,
     };
     let mut events = repo::search_occurrences(&mut conn, &scope, issue_id, &search)
@@ -757,14 +786,21 @@ pub async fn event_stats(
     )
     .since;
 
-    // `sort`/`descending`/`after`/`limit` are the four fields a count ignores —
-    // no ordering and no page boundary changes a total, and `occurrence_stats`/
-    // `count_occurrences` both build off `occurrence_search_base` alone, which
-    // never reads `search.sort` — but the STRUCT is what is passed, so the
-    // fields that do matter cannot be forgotten. `limit` is set to this
-    // route's own default, and `sort` to the same default the sibling list
-    // uses, rather than either being something meaningless: a value that
-    // looked deliberate is easier to read than a magic `0`.
+    // `sort`/`descending`/`after`/`limit`/`offset` are the five fields a count
+    // ignores — no ordering and no page boundary changes a total, and
+    // `occurrence_stats`/`count_occurrences` both build off
+    // `occurrence_search_base` alone, which never reads `search.sort` — but the
+    // STRUCT is what is passed, so the fields that do matter cannot be
+    // forgotten. `limit` is set to this route's own default, and `sort` to the
+    // same default the sibling list uses, rather than either being something
+    // meaningless: a value that looked deliberate is easier to read than a
+    // magic `0`.
+    //
+    // `offset` is the one exception to that, and 0 IS the deliberate value:
+    // this route captions the whole result set, so a page boundary is not
+    // merely ignored here, it would be wrong. A stats object that described
+    // "the matching rows from 200 onwards" is not what the caption beside the
+    // list claims to be.
     let search = repo::OccurrenceSearch {
         node: &node,
         ctx: &prepared.ctx,
@@ -773,6 +809,7 @@ pub async fn event_stats(
         descending: true,
         after: None,
         limit: default_events_limit(),
+        offset: 0,
         text_reach: reach,
     };
     let counts = repo::occurrence_stats(&mut conn, &scope, issue_id, &search)

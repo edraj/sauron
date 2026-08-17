@@ -638,6 +638,12 @@ impl ResourceLower for TransactionsLower {
             }),
             Store::Column("name") => str_leaf!(transactions::name, p, negate),
             Store::Column("op") => str_leaf!(transactions::op, p, negate),
+            // Both are indexed on this table
+            // (`transactions_app_session_idx`, `transactions_app_distinct_idx`),
+            // which is what lets the Transactions list's Session column be
+            // filtered and not merely read.
+            Store::Column("session_id") => str_leaf!(transactions::session_id, p, negate),
+            Store::Column("distinct_id") => str_leaf!(transactions::distinct_id, p, negate),
             Store::Column("url") => str_leaf!(transactions::url, p, negate),
             Store::Column("http_method") => str_leaf!(transactions::http_method, p, negate),
             Store::Column("http_status") => int_leaf!(transactions::http_status, p, negate),
@@ -779,6 +785,25 @@ mod tests {
         let sql = lower_tx_sql("boom");
         assert!(sql.contains("extra"), "{sql}");
         assert!(sql.contains("tags"), "{sql}");
+    }
+
+    /// The Session column on the Transactions list is filterable, not just
+    /// readable — a column you can see and cannot narrow on is the first thing
+    /// somebody tries and the first thing that disappoints them.
+    #[test]
+    fn session_and_user_resolve_and_lower_on_transactions() {
+        for q in [
+            "session:sess_1",
+            "session_id:sess_1",
+            "distinctId:u_1",
+            "distinct_id:u_1",
+        ] {
+            let sql = lower_tx_sql(q);
+            assert!(
+                sql.contains("session_id") || sql.contains("distinct_id"),
+                "{q} did not reach a column: {sql}"
+            );
+        }
     }
 
     /// `contexts` is not declared for this resource, so it must fail at

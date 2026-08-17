@@ -677,6 +677,39 @@ async fn main() -> anyhow::Result<()> {
             get(routes::devices::groups),
         )
         .route("/v1/apps/{app_id}/device", get(routes::devices::detail))
+        // --- row counts for the offset-paged lists ---
+        //
+        // Separate routes rather than a `total` on each list response: these
+        // four lists page by a `limit + 1` over-fetch probe and have no total,
+        // which is why they could only ever offer Prev/Next. Counting on its
+        // own request keeps a slow count off the latency path of the table it
+        // captions — the rows paint at the speed they always did and the page
+        // strip resolves a beat later.
+        //
+        // `/counts/{resource}` and NOT `{resource}/count`. The nested form
+        // collides on persons: `/v1/apps/{app_id}/persons/{distinct_id}` is
+        // already registered, axum resolves a static segment ahead of a
+        // `{param}` capture, and distinct IDs are arbitrary strings from SDK
+        // `identify()` calls — so `/persons/count` would permanently shadow the
+        // profile page of anyone identified as `count`. One prefix with no
+        // dynamic sibling avoids having to dodge that per resource, the way
+        // `/device` (singular) already dodges it for `/devices`.
+        .route(
+            "/v1/apps/{app_id}/counts/screens",
+            get(routes::screens::count),
+        )
+        .route(
+            "/v1/apps/{app_id}/counts/devices",
+            get(routes::devices::count),
+        )
+        .route(
+            "/v1/apps/{app_id}/counts/persons",
+            get(routes::analytics::persons_count),
+        )
+        .route(
+            "/v1/apps/{app_id}/counts/workflows",
+            get(routes::workflows::count),
+        )
         // --- screens (app-scoped) ---
         .route("/v1/apps/{app_id}/screens", get(routes::screens::list))
         .route(

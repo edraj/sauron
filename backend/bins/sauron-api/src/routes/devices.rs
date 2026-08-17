@@ -342,6 +342,98 @@ pub async fn groups(
     ))
 }
 
+/// `GET /v1/apps/{app_id}/counts/devices` — how many rows the Devices
+/// inventory would page.
+///
+/// Answers for whichever of the two lists the same parameters would have hit:
+/// `group=` non-empty means the drill-down (`list`, one row per device), absent
+/// means the default grouped inventory (`groups`, one row per descriptor
+/// tuple). Choosing here from the SAME field `list`/`groups` choose from is
+/// what keeps the number attached to the table actually on screen — a count
+/// that answered for devices while the table showed groups would be wrong by a
+/// large factor and look merely surprising.
+///
+/// Page fields (`limit`/`offset`/`sort`) are ignored; no page boundary changes
+/// a total. `sort` is still resolved for the grouped shape because
+/// `count_device_groups` wraps the list's own SQL, which embeds an ORDER BY —
+/// it cannot change the count, and passing the caller's own spec keeps the
+/// wrapped query identical to the one being counted.
+///
+/// Same permission and `RawQuery` environment handling as both lists: a count
+/// resolved over a wider scope than the list leaks the SIZE of data the caller
+/// cannot read.
+pub async fn count(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<ListQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<super::search::CountEnvelope>, ApiError> {
+    let mut conn = db(&state).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let window = super::search::resolve_time_filter(
+        "last_seen",
+        TIME_FIELDS,
+        &q.window,
+        Utc::now(),
+        default_days(),
+        super::search::MAX_WINDOW_DAYS,
+        // No planner clamp: this list is not query-planner wired.
+        None,
+    )?;
+    let window = repo::TimeWindow {
+        column: window.column,
+        from: window.from,
+        to: window.to,
+    };
+    let search = q.search.as_deref().filter(|s| !s.is_empty());
+    let group = q
+        .group
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|_| repo::DeviceGroupKey {
+            family: q.family.as_deref(),
+            model: q.model.as_deref(),
+            os_name: q.os_name.as_deref(),
+            os_version: q.os_version.as_deref(),
+        });
+    let (total, total_is_capped) = match group {
+        Some(_) => {
+            repo::count_devices(
+                &mut conn,
+                scope,
+                window,
+                search,
+                group,
+                super::search::COUNT_CAP,
+            )
+            .await?
+        }
+        None => {
+            repo::count_device_groups(
+                &mut conn,
+                scope,
+                window,
+                search,
+                group_sort_spec(q.sort.as_deref())?,
+                super::search::COUNT_CAP,
+            )
+            .await?
+        }
+    };
+    Ok(Json(super::search::CountEnvelope {
+        total,
+        total_is_capped,
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct DetailQuery {
     /// The device key (passed as a query param — keys can contain `/` and spaces).

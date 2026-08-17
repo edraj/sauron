@@ -3311,6 +3311,17 @@ pub struct IssueSearch<'a> {
     /// The previous page's `next_cursor`, decoded.
     pub after: Option<crate::query_plan::cursor::Cursor>,
     pub limit: i64,
+    /// Rows to skip before the page. Serves an explicit page JUMP only.
+    ///
+    /// **Ignored whenever `after` is set**, and the guard lives here rather
+    /// than at the route: an offset applied on top of a keyset predicate skips
+    /// rows *within* the already-narrowed set, which is a silently wrong page
+    /// rather than an error. Keyset stays the mechanism for stepping; offset
+    /// exists because a page nobody has visited has no cursor to ask for.
+    ///
+    /// Clamped to `COUNT_CAP` by the route, so the planner never sees an offset
+    /// larger than the row budget the count on the same request already spends.
+    pub offset: i64,
     /// Whether the free-text term may reach the event payload. Travels into
     /// `IssuesLower`; see [`TextSearchReach`].
     pub text_reach: TextSearchReach,
@@ -3403,6 +3414,24 @@ fn issue_search_base(
     Ok(q)
 }
 
+/// The `OFFSET` a search should apply, if any.
+///
+/// One function rather than four copies of the same `if`, because the rule it
+/// encodes is easy to "simplify" at one of four call sites and the result pages
+/// wrong only there. The rule: **a keyset cursor always wins.** An offset laid
+/// on top of a keyset predicate skips rows *within* the already-narrowed set,
+/// so `?cursor=X&offset=100` would silently serve the rows 100 past X while
+/// reading like a request for page 3 — a wrong page, not an error.
+///
+/// Offset exists only because a page nobody has walked to has no cursor to ask
+/// for. Stepping stays keyset; jumping is the sole caller.
+fn jump_offset(after: &Option<crate::query_plan::cursor::Cursor>, offset: i64) -> Option<i64> {
+    match after {
+        Some(_) => None,
+        None => (offset > 0).then_some(offset),
+    }
+}
+
 /// `limit + 1` rows, ordered by the requested keyset, optionally starting
 /// after a cursor.
 ///
@@ -3461,9 +3490,11 @@ pub async fn search_issues(
         (IssueSort::FirstSeen, true) => q.order((issues::first_seen.desc(), issues::id.desc())),
         (IssueSort::FirstSeen, false) => q.order((issues::first_seen.asc(), issues::id.asc())),
     };
-    q.select(Issue::as_select())
-        .limit(search.limit + 1)
-        .load(conn)
+    let mut q = q.select(Issue::as_select()).limit(search.limit + 1);
+    if let Some(off) = jump_offset(&search.after, search.offset) {
+        q = q.offset(off);
+    }
+    q.load(conn)
         .await
         .map_err(|e| PlanError::Database(e.to_string()))
 }
@@ -3542,6 +3573,17 @@ pub struct OccurrenceSearch<'a> {
     /// The previous page's `next_cursor`, decoded.
     pub after: Option<crate::query_plan::cursor::Cursor>,
     pub limit: i64,
+    /// Rows to skip before the page. Serves an explicit page JUMP only.
+    ///
+    /// **Ignored whenever `after` is set**, and the guard lives here rather
+    /// than at the route: an offset applied on top of a keyset predicate skips
+    /// rows *within* the already-narrowed set, which is a silently wrong page
+    /// rather than an error. Keyset stays the mechanism for stepping; offset
+    /// exists because a page nobody has visited has no cursor to ask for.
+    ///
+    /// Clamped to `COUNT_CAP` by the route, so the planner never sees an offset
+    /// larger than the row budget the count on the same request already spends.
+    pub offset: i64,
     /// Whether the free-text term may reach `contexts`/`extra`/`tags`.
     /// Travels into `OccurrencesLower`; see [`TextSearchReach`].
     pub text_reach: TextSearchReach,
@@ -3747,10 +3789,13 @@ pub async fn search_occurrences(
     issue_id: Uuid,
     search: &OccurrenceSearch<'_>,
 ) -> Result<Vec<ErrorEvent>, PlanError> {
-    occurrence_query_for(scope, issue_id, search)?
+    let mut q = occurrence_query_for(scope, issue_id, search)?
         .select(ErrorEvent::as_select())
-        .limit(search.limit + 1)
-        .load(conn)
+        .limit(search.limit + 1);
+    if let Some(off) = jump_offset(&search.after, search.offset) {
+        q = q.offset(off);
+    }
+    q.load(conn)
         .await
         .map_err(|e| PlanError::Database(e.to_string()))
 }
@@ -3892,6 +3937,17 @@ pub struct EventSearch<'a> {
     /// The previous page's `next_cursor`, decoded.
     pub after: Option<crate::query_plan::cursor::Cursor>,
     pub limit: i64,
+    /// Rows to skip before the page. Serves an explicit page JUMP only.
+    ///
+    /// **Ignored whenever `after` is set**, and the guard lives here rather
+    /// than at the route: an offset applied on top of a keyset predicate skips
+    /// rows *within* the already-narrowed set, which is a silently wrong page
+    /// rather than an error. Keyset stays the mechanism for stepping; offset
+    /// exists because a page nobody has visited has no cursor to ask for.
+    ///
+    /// Clamped to `COUNT_CAP` by the route, so the planner never sees an offset
+    /// larger than the row budget the count on the same request already spends.
+    pub offset: i64,
 }
 
 /// Tenant key + the `$screen` exclusion + environment + window + the lowered
@@ -4070,10 +4126,13 @@ pub async fn search_events(
     scope: &ReadScope,
     search: &EventSearch<'_>,
 ) -> Result<Vec<AnalyticsEvent>, PlanError> {
-    event_query_for(scope, search)?
+    let mut q = event_query_for(scope, search)?
         .select(AnalyticsEvent::as_select())
-        .limit(search.limit + 1)
-        .load(conn)
+        .limit(search.limit + 1);
+    if let Some(off) = jump_offset(&search.after, search.offset) {
+        q = q.offset(off);
+    }
+    q.load(conn)
         .await
         .map_err(|e| PlanError::Database(e.to_string()))
 }
@@ -4217,6 +4276,17 @@ pub struct TransactionSearch<'a> {
     pub descending: bool,
     pub after: Option<crate::query_plan::cursor::Cursor>,
     pub limit: i64,
+    /// Rows to skip before the page. Serves an explicit page JUMP only.
+    ///
+    /// **Ignored whenever `after` is set**, and the guard lives here rather
+    /// than at the route: an offset applied on top of a keyset predicate skips
+    /// rows *within* the already-narrowed set, which is a silently wrong page
+    /// rather than an error. Keyset stays the mechanism for stepping; offset
+    /// exists because a page nobody has visited has no cursor to ask for.
+    ///
+    /// Clamped to `COUNT_CAP` by the route, so the planner never sees an offset
+    /// larger than the row budget the count on the same request already spends.
+    pub offset: i64,
 }
 
 /// Tenant key + environment + window + the lowered query predicate.
@@ -4359,10 +4429,13 @@ pub async fn search_transactions(
     scope: &ReadScope,
     search: &TransactionSearch<'_>,
 ) -> Result<Vec<Transaction>, PlanError> {
-    transaction_query_for(scope, search)?
+    let mut q = transaction_query_for(scope, search)?
         .select(Transaction::as_select())
-        .limit(search.limit + 1)
-        .load(conn)
+        .limit(search.limit + 1);
+    if let Some(off) = jump_offset(&search.after, search.offset) {
+        q = q.offset(off);
+    }
+    q.load(conn)
         .await
         .map_err(|e| PlanError::Database(e.to_string()))
 }
@@ -4559,6 +4632,29 @@ mod keyset_predicate_tests {
             value: crate::query_plan::cursor::CursorValue::Text("probe".to_string()),
             id: Uuid::new_v4(),
         }
+    }
+
+    /// A keyset cursor always beats an offset.
+    ///
+    /// `?cursor=X&offset=100` is reachable from a stale bookmark and from any
+    /// client that sets both. Honouring both would apply the offset *inside*
+    /// the keyset-narrowed set — serving the rows 100 past X while the request
+    /// reads like "page 3 of the whole list". That is a wrong page, and nothing
+    /// downstream can tell it from a right one, so the precedence is pinned
+    /// here rather than left to the four call sites to remember.
+    #[test]
+    fn a_cursor_suppresses_the_offset() {
+        assert_eq!(jump_offset(&Some(text_cursor("occurred_at")), 100), None);
+        assert_eq!(jump_offset(&Some(text_cursor("occurred_at")), 0), None);
+    }
+
+    #[test]
+    fn an_offset_applies_only_without_a_cursor() {
+        assert_eq!(jump_offset(&None, 100), Some(100));
+        // Zero is the default the server already applies; emitting `OFFSET 0`
+        // would put a clause in the plan that means nothing.
+        assert_eq!(jump_offset(&None, 0), None);
+        assert_eq!(jump_offset(&None, -5), None);
     }
 
     /// Asserts `sql` has a properly self-wrapped raw keyset fragment for
@@ -4767,6 +4863,7 @@ mod keyset_predicate_tests {
                 descending,
                 after: Some(text_cursor("session_id")),
                 limit: 10,
+                offset: 0,
             };
             let query = event_query_for(&scope, &search)
                 .expect("build query")
@@ -4806,6 +4903,7 @@ mod keyset_predicate_tests {
                     descending,
                     after: Some(text_cursor(col)),
                     limit: 10,
+                    offset: 0,
                     text_reach: TextSearchReach::ShellOnly,
                 };
                 let query = occurrence_query_for(&scope, issue_id, &search)
@@ -4847,6 +4945,7 @@ mod keyset_predicate_tests {
             descending,
             after,
             limit: 10,
+            offset: 0,
         }
     }
 
@@ -7476,6 +7575,22 @@ pub struct DeviceGroupKey<'a> {
     pub os_version: Option<&'a str>,
 }
 
+/// The `devices` rows a listing qualifies over — no joins, no aggregates, no
+/// per-device LATERALs.
+///
+/// One string shared by [`list_devices`] and [`count_devices`]. The count needs
+/// the predicate and nothing else: `sessions_count` and the scoped-select
+/// columns are per-row costs that change no row's membership, and dropping them
+/// is what makes counting cheaper than listing rather than merely equal to it.
+fn device_qualifying_sql(window_sql: &str, membership_sql: &str, group_sql: &str) -> String {
+    format!(
+        "devices \
+         WHERE app_id = $1 AND {window_sql} \
+           AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
+                COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3{membership_sql}{group_sql}"
+    )
+}
+
 /// One page of devices, ordered by `sort`.
 ///
 /// `sort` is a [`SortSpec`], not a caller string: see that type's doc comment
@@ -7754,16 +7869,21 @@ pub async fn list_devices(
     // $2` for `cnt` specifically (same rows excluded, same count), while
     // leaving the two new aggregates unbounded.
     let order_by = sort.order_by();
+    // The rows that QUALIFY, shared verbatim with `count_devices`. Extracted so
+    // the count's predicate is the same string as the list's rather than a copy
+    // of it: every bind in it is positional ($1 app_id, $3 pattern, plus the
+    // indices `window_sql`/`membership_sql`/`group_sql` reserved), and a copy
+    // that drifted by one index would not error — it would count a different
+    // set of devices and report the number with total confidence.
+    let qualifying = device_qualifying_sql(&window_sql, &membership_sql, &group_sql);
+
     let q = format!(
         "SELECT d.id, d.device_key, d.family, d.model, d.os_name, d.os_version, d.arch, \
                 d.browser, \
                 {scoped_select}, \
                 COALESCE(se.cnt, 0)::bigint AS sessions_count \
          FROM ( \
-             SELECT * FROM devices \
-             WHERE app_id = $1 AND {window_sql} \
-               AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
-                    COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3{membership_sql}{group_sql} \
+             SELECT * FROM {qualifying} \
          ) d{scoped_join} \
          LEFT JOIN LATERAL ( \
              SELECT count(*) FILTER (WHERE started_at >= $2) AS cnt, \
@@ -18223,4 +18343,285 @@ pub async fn sample_tag_keys(
         .bind::<BigInt, _>(row_limit)
         .load::<TagKeySample>(conn)
         .await
+}
+
+// ===========================================================================
+// Bounded counts for the offset-paged lists.
+//
+// These exist so those lists can render a numbered pager: an over-fetch probe
+// answers "is there another page" and nothing more, which is why Screens,
+// Devices, Users and Workflows could only ever offer Prev/Next.
+//
+// Each one is served by its OWN endpoint rather than folded into the list
+// response, so a slow count delays the page strip and never the rows. That is
+// the whole reason the split exists — see the S6 section of
+// `docs/superpowers/specs/2026-08-17-table-pagination-all-pages-design.md`.
+//
+// ## Two rules every count here follows
+//
+// 1. **The predicate is SHARED with the list, never restated.** Each count
+//    calls the same SQL builder its list calls (`screen_ctes`,
+//    `workflow_outcome_subquery`, `device_qualifying_sql`,
+//    `list_persons_*_sql`, `list_device_groups_*_sql`). A hand-copied
+//    predicate would be a second thing to keep in step, and in these
+//    functions the binds are POSITIONAL — a copy that drifted one index would
+//    not error, it would count a different set and report the number with
+//    total confidence.
+//
+// 2. **The bind chain is IDENTICAL to the list's**, `limit` bound to `cap + 1`
+//    and `offset` to 0. Dropping the two trailing binds would shift every
+//    index after them, and `list_devices`' own comment is explicit that such a
+//    shift "does not fail loudly; it silently binds the timestamp into
+//    `family`". Keeping the layout byte-identical makes that class of bug
+//    unreachable rather than merely avoided.
+//
+// ## What is bounded and what is not
+//
+// `LIMIT cap + 1` bounds the ROWS RETURNED in every case. It bounds the WORK
+// only where the plan can stream — true for flat devices (a predicate over one
+// table, no aggregate above it). Where the qualifying set is itself an
+// aggregate — grouped devices, workflows' `GROUP BY w.name`, the persons
+// rollup — a HashAggregate must consume its input before emitting a first row,
+// so the cap limits what crosses the wire and not what the planner reads.
+//
+// This is called out rather than papered over: those three are the ones that
+// need an `EXPLAIN` against real data before anyone treats the cost as known.
+// ===========================================================================
+
+/// One-column result for the bounded counts below.
+#[derive(Debug, QueryableByName)]
+struct BoundedCount {
+    #[diesel(sql_type = BigInt)]
+    total: i64,
+}
+
+/// `cap + 1` rows were asked for; fold that into `(total, capped)`.
+///
+/// `cap + 1` is the sentinel that separates "exactly cap" from "more than cap"
+/// without counting the rest — the same trick `count_issues` uses.
+fn capped(n: i64, cap: i64) -> (i64, bool) {
+    if n > cap {
+        (cap, true)
+    } else {
+        (n, false)
+    }
+}
+
+/// `(total, capped)` over the screens [`screen_list`] pages.
+///
+/// Selects from `keys` alone. `keys` is `ev UNION ex`, so the two aggregates
+/// that decide MEMBERSHIP still run — but `us` (a `count(DISTINCT)` over a
+/// `UNION ALL` of both event tables) and `dw` (a `LEAD` window function over
+/// every session) are never referenced, and Postgres does not execute an
+/// unreferenced CTE. Those two are the expensive half of the list, so this is
+/// materially cheaper than the query it counts rather than a second copy of it.
+pub async fn count_screens(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    since: DateTime<Utc>,
+    q_pattern: &str,
+    cap: i64,
+) -> QueryResult<(i64, bool)> {
+    // Identical index arithmetic to `screen_list` — same `env_sql`, same
+    // trailing shift — because the bind chain below is identical too.
+    let env_sql = scope.env.sql_fragment(4);
+    let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
+    let offset_idx = limit_idx + 1;
+    let q = format!(
+        "{} SELECT count(*)::bigint AS total FROM ( \
+           SELECT k.screen FROM keys k LIMIT ${limit_idx} OFFSET ${offset_idx}) c",
+        screen_ctes(SCREEN_PRED_LIKE, &env_sql)
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(since)
+        .bind::<Text, _>(q_pattern);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    let row: BoundedCount = stmt
+        .bind::<BigInt, _>(cap + 1)
+        .bind::<BigInt, _>(0i64)
+        .get_result(conn)
+        .await?;
+    Ok(capped(row.total, cap))
+}
+
+/// `(total, capped)` over the workflows [`workflow_list`] pages.
+///
+/// Counts the `GROUP BY w.name` groups and drops `WORKFLOW_OUTCOME_SELECT`
+/// entirely: ten aggregates per group change no group's membership.
+pub async fn count_workflows(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    since_days: i32,
+    search: Option<&str>,
+    cap: i64,
+) -> QueryResult<(i64, bool)> {
+    let env_sql = scope.env.sql_fragment_for("w", 3);
+    let search_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let limit_idx = search_idx + 1;
+    let offset_idx = limit_idx + 1;
+    let search_pattern = search.map(like_contains);
+    let q = format!(
+        "SELECT count(*)::bigint AS total FROM ( \
+           SELECT w.name FROM ({}) w \
+           WHERE (${search_idx}::text IS NULL OR w.name ILIKE ${search_idx}) \
+           GROUP BY w.name \
+           LIMIT ${limit_idx} OFFSET ${offset_idx}) c",
+        workflow_outcome_subquery(&env_sql, "")
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Integer, _>(since_days);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    let row: BoundedCount = stmt
+        .bind::<Nullable<Text>, _>(search_pattern)
+        .bind::<BigInt, _>(cap + 1)
+        .bind::<BigInt, _>(0i64)
+        .get_result(conn)
+        .await?;
+    Ok(capped(row.total, cap))
+}
+
+/// `(total, capped)` over the devices [`list_devices`] pages.
+///
+/// The cheapest of the four: [`device_qualifying_sql`] is a predicate over one
+/// table, so the `LEFT JOIN LATERAL` that counts sessions per device — the part
+/// that made the env-scoped device list expensive — is not in the plan at all,
+/// and `LIMIT` genuinely stops the scan.
+pub async fn count_devices(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    window: TimeWindow,
+    search: Option<&str>,
+    group: Option<DeviceGroupKey<'_>>,
+    cap: i64,
+) -> QueryResult<(i64, bool)> {
+    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+    // Every index below is computed exactly as `list_devices` computes it, and
+    // for the same reason: the bind chain that follows is `list_devices`' own.
+    // Note `6` is passed as an INDEX here, matching `list_devices` — the env
+    // FRAGMENT it builds is only needed by the sessions LATERAL, which this
+    // query does not have.
+    let group_base = if scope.env.consumes_bind() { 7 } else { 6 };
+    let to_idx = group_base + if group.is_some() { 4 } else { 0 };
+    let window_sql = device_window_sql(window.column, to_idx);
+    let group_sql = if group.is_some() {
+        format!(
+            " AND family IS NOT DISTINCT FROM ${} \
+              AND model IS NOT DISTINCT FROM ${} \
+              AND os_name IS NOT DISTINCT FROM ${} \
+              AND os_version IS NOT DISTINCT FROM ${}",
+            group_base,
+            group_base + 1,
+            group_base + 2,
+            group_base + 3,
+        )
+    } else {
+        String::new()
+    };
+    let membership_sql = device_membership_sql(&scope.env, 6);
+    let q = format!(
+        "SELECT count(*)::bigint AS total FROM ( \
+           SELECT 1 FROM {} LIMIT $4 OFFSET $5) c",
+        device_qualifying_sql(&window_sql, &membership_sql, &group_sql)
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(window.from)
+        .bind::<Text, _>(pattern)
+        .bind::<BigInt, _>(cap + 1)
+        .bind::<BigInt, _>(0i64);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    if let Some(k) = group {
+        stmt = stmt
+            .bind::<Nullable<Text>, _>(k.family.map(str::to_owned))
+            .bind::<Nullable<Text>, _>(k.model.map(str::to_owned))
+            .bind::<Nullable<Text>, _>(k.os_name.map(str::to_owned))
+            .bind::<Nullable<Text>, _>(k.os_version.map(str::to_owned));
+    }
+    let row: BoundedCount = stmt
+        .bind::<Nullable<Timestamptz>, _>(window.to)
+        .get_result(conn)
+        .await?;
+    Ok(capped(row.total, cap))
+}
+
+/// `(total, capped)` over the device GROUPS [`list_device_groups`] pages.
+///
+/// Wraps the list's own SQL verbatim instead of restating it. The two shapes
+/// here are large, backfill-dependent, and their bind layout is shared by
+/// contract ("the bind list below is IDENTICAL for both shapes"); a third and
+/// fourth hand-written variant of that is a worse trade than paying for the
+/// aggregates.
+///
+/// So this one costs roughly what the list costs. It is off the table's
+/// latency path, which is the point of the separate endpoint — but it is the
+/// count most in need of an `EXPLAIN` before anyone calls its cost known.
+pub async fn count_device_groups(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    window: TimeWindow,
+    search: Option<&str>,
+    sort: SortSpec,
+    cap: i64,
+) -> QueryResult<(i64, bool)> {
+    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+    let inner = if crate::device_env_backfill::is_backfilled(conn, scope.app_id).await? {
+        list_device_groups_rollup_sql(&scope.env, &sort, window.column)
+    } else {
+        list_device_groups_live_sql(&scope.env, &sort, window.column)
+    };
+    let q = format!("SELECT count(*)::bigint AS total FROM ({inner}) c");
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(window.from)
+        .bind::<Text, _>(pattern)
+        .bind::<BigInt, _>(cap + 1)
+        .bind::<BigInt, _>(0i64);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    let row: BoundedCount = stmt
+        .bind::<Nullable<Timestamptz>, _>(window.to)
+        .get_result(conn)
+        .await?;
+    Ok(capped(row.total, cap))
+}
+
+/// `(total, capped)` over the people [`list_persons`] pages.
+///
+/// Wraps the list's own SQL for the reason [`count_device_groups`] does: the
+/// two shapes are backfill-dependent and share one bind chain by contract, and
+/// the qualifying set here IS the expensive part (a rollup `GROUP BY` joined to
+/// `event_users`), so a leaner select would save little of what it risks.
+pub async fn count_persons(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    search: Option<&str>,
+    sort: SortSpec,
+    window: TimeWindow,
+    cap: i64,
+) -> QueryResult<(i64, bool)> {
+    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+    let inner = if crate::person_env_backfill::is_backfilled(conn, scope.app_id).await? {
+        list_persons_rollup_sql(&scope.env, &sort, window.column)
+    } else {
+        list_persons_live_sql(&scope.env, &sort, window.column)
+    };
+    let q = format!("SELECT count(*)::bigint AS total FROM ({inner}) c");
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Text, _>(pattern)
+        .bind::<BigInt, _>(cap + 1)
+        .bind::<BigInt, _>(0i64);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    let row: BoundedCount = stmt
+        .bind::<Timestamptz, _>(window.from)
+        .bind::<Nullable<Timestamptz>, _>(window.to)
+        .get_result(conn)
+        .await?;
+    Ok(capped(row.total, cap))
 }

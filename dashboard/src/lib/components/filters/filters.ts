@@ -227,5 +227,12 @@ export const TRANSACTION_FIELDS: FieldDef[] = [
   { key: 'url', label: 'URL', type: 'string', ops: OPS_STR },
   { key: 'http.method', label: 'Method', type: 'string', ops: OPS_ENUM },
   { key: 'http.status', label: 'Status code', type: 'number', ops: OPS_NUM },
+  // Both are indexed on `transactions` (`transactions_app_session_idx`,
+  // `transactions_app_distinct_idx`), which is what makes them chips rather
+  // than a scan somebody has to be warned about. `session` is also the column
+  // the list renders, and a column you can see but not narrow on is the first
+  // thing people try and the first thing that disappoints them.
+  { key: 'session', label: 'Session', type: 'string', ops: OPS_STR },
+  { key: 'distinctId', label: 'User', type: 'string', ops: OPS_STR },
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
 ];

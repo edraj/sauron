@@ -596,9 +596,11 @@ are used.
 
 On **Exceptions** and **Events**, **+ Add filter** still builds `field ·
 operator · value` chips, and they still encode into the page URL alongside `q=`,
-so a filtered view remains shareable and survives a reload. Typing in the
-free-text box is debounced; adding a chip or changing the date range reloads
-immediately.
+so a filtered view remains shareable and survives a reload. The query box runs
+on an explicit submit — the **Search** button or **Enter** — so typing never
+queries; the button turns blue while you have text the list has not run yet,
+and clearing the box with **×** applies at once. Adding a chip or changing the
+date range still reloads immediately.
 
 **Operators**, by field type:
 

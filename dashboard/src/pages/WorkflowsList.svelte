@@ -18,6 +18,8 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { listWorkflows } from '../lib/api/workflows';
+  import { countWorkflows } from '../lib/api/counts';
+  import { RowCount } from '../lib/stores/row-count.svelte';
   import {
     setOffsetPage,
     setOffsetSort,
@@ -32,7 +34,7 @@
   const LIMIT = 50;
 
   let sinceDays = $state(30);
-  // `search` is bound to the input; `appliedSearch` is the debounced value
+  // `search` is bound to the input; `appliedSearch` is the SUBMITTED value
   // that drives loads (same split as Issues.svelte).
   let search = $state('');
   let appliedSearch = $state('');
@@ -57,6 +59,7 @@
   // path: a cache HIT repaints rows without fetching, and a `hasNext` only the
   // fetch updates would be the previous key's answer.
   const hasNext = $derived(view.data?.hasNext ?? false);
+  const rowCount = new RowCount();
   const loading = $derived(view.loading);
   const revalidating = $derived(view.revalidating);
   const error = $derived(view.error);
@@ -82,7 +85,12 @@
     list = setOffsetPage(list, 0);
   }
 
-  function onSearch() {
+  // Submit-driven, not debounced: only the Search button, Enter and the clear
+  // button commit `search` into `appliedSearch`, so typing queries nothing.
+  function onSearch(v: string) {
+    appliedSearch = v;
+    // A changed predicate invalidates the page position: row 51 of the old
+    // result set is not row 51 of the new one.
     list = setOffsetPage(list, 0);
   }
 
@@ -107,6 +115,12 @@
     off: number,
     force = false,
   ) {
+    // Predicate only: a total is unchanged by ordering or page boundary.
+    void rowCount.load(
+      viewKey('workflows.count', appId, sessionStore.scopeKey, days, s),
+      () => countWorkflows(appId, { sinceDays: days, search: s || undefined }),
+      force,
+    );
     await view.load(
       viewKey('workflows.list', appId, sessionStore.scopeKey, days, s, sort, off, LIMIT),
       () =>
@@ -133,19 +147,6 @@
     }
   }
 
-  // Debounce free-text search only: typing in the search box should settle
-  // before we requery; the date range applies immediately.
-  let searchTimer: ReturnType<typeof setTimeout>;
-  $effect(() => {
-    const s = search;
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      appliedSearch = s;
-      list = setOffsetPage(list, 0);
-    }, 300);
-    return () => clearTimeout(searchTimer);
-  });
-
   $effect(() => {
     const aid = sessionStore.currentAppId;
     // Touch scopeKey so the effect re-runs when the environment changes; the
@@ -167,7 +168,7 @@
     </div>
     <div class="controls">
       <DateRange value={sinceDays} onchange={onRange} />
-      <SearchInput bind:value={search} oninput={onSearch} placeholder="Search workflows…" width="240px" />
+      <SearchInput bind:value={search} onsearch={onSearch} placeholder="Search workflows…" width="240px" />
       <!--
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached rows, fetching fresh" hint, and without it
@@ -280,6 +281,8 @@
         limit={LIMIT}
         count={rows.length}
         {hasNext}
+        total={rowCount.total}
+        totalIsCapped={rowCount.isCapped}
         onchange={(o) => (list = setOffsetPage(list, o))}
       />
     </Card>

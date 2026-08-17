@@ -16,6 +16,8 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { listDevices, listDeviceGroups } from '../lib/api/devices';
+  import { countDevices } from '../lib/api/counts';
+  import { RowCount } from '../lib/stores/row-count.svelte';
   import { decodeGroupKey, encodeGroupKey, groupLabel, sameGroupKey } from '../lib/models/device-groups';
   import {
     setOffsetPage,
@@ -72,7 +74,7 @@
     ),
   );
 
-  // `query` is bound to the input; `search` is the debounced value that drives loads.
+  // `query` is bound to the input; `search` is the SUBMITTED value that drives loads.
   let query = $state('');
   let search = $state('');
 
@@ -115,6 +117,8 @@
   const hasNext = $derived(
     (grouped ? groupView.data?.hasNext : flatView.data?.hasNext) ?? false,
   );
+  /** Total matching rows across all pages — distinct from `rowCount`, which is this page's. */
+  const totalRows = new RowCount();
 
   // Cached view (lib/stores/cached-view.svelte.ts): rows already fetched paint
   // instantly on return, then refresh behind a spinner instead of a skeleton.
@@ -125,8 +129,6 @@
   const loading = $derived(view.loading);
   let refreshing = $state(false);
   const error = $derived(view.error);
-
-  let debounce: ReturnType<typeof setTimeout> | undefined;
 
   function downloadDevicesCsv() {
     let header: string[] = [];
@@ -189,12 +191,14 @@
     URL.revokeObjectURL(url);
   }
 
+  // Submit-driven, not debounced: `query` is the text in the box and
+  // `search` is what the request carries. Only the Search button, Enter and
+  // the clear button move one into the other, so typing never queries.
   function onSearch(v: string) {
-    clearTimeout(debounce);
-    debounce = setTimeout(() => {
-      search = v.trim();
-      list = setOffsetPage(list, 0);
-    }, 220);
+    search = v.trim();
+    // A changed predicate invalidates the page position: row 51 of the old
+    // result set is not row 51 of the new one.
+    list = setOffsetPage(list, 0);
   }
 
   function onTimeFilter(v: TimeFilterState) {
@@ -261,6 +265,24 @@
     // so the cache stays wired and typed while hitting zero times — invisible
     // from the DOM, visible only in the network panel.
     const windowKey = `${tf.field}:${tf.mode}:${tf.lastDays ?? ''}:${tf.from ?? ''}:${tf.to ?? ''}`;
+    // Predicate only, but `grouped` IS part of it: the two shapes count
+    // different things (descriptor tuples vs individual devices) and their
+    // totals differ by a large factor, so a key that ignored it would caption
+    // one table with the other's number and look merely surprising.
+    void totalRows.load(
+      viewKey('devices.count', appId, sessionStore.scopeKey, windowKey, s, String(grouped)),
+      () =>
+        countDevices(appId, {
+          grouped,
+          search: s || undefined,
+          window: toRecord(tf, DEFAULT_TIME_FIELD),
+          family: groupKey?.family ?? undefined,
+          model: groupKey?.model ?? undefined,
+          osName: groupKey?.os_name ?? undefined,
+          osVersion: groupKey?.os_version ?? undefined,
+        }),
+      force,
+    );
     if (groupKey === null) {
       await groupView.load(
         viewKey('devices.groups', appId, sessionStore.scopeKey, windowKey, s, sort, off, LIMIT),
@@ -367,7 +389,7 @@
       <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
       <SearchInput
         bind:value={query}
-        oninput={onSearch}
+        onsearch={onSearch}
         placeholder="Search devices…"
         width="240px"
       />
@@ -452,6 +474,8 @@
       limit={LIMIT}
       count={rowCount}
       {hasNext}
+      total={totalRows.total}
+      totalIsCapped={totalRows.isCapped}
       onchange={(o) => (list = setOffsetPage(list, o))}
     />
   {/if}
