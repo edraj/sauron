@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { Breadcrumb } from '../models';
+  import { breadcrumbSummary, navigationOperation, type NavigationOperation } from '../models/breadcrumb';
   import { formatTime } from '../utils/format';
+  import Icon, { type IconName } from './ui/Icon.svelte';
 
   interface Props {
     breadcrumbs: Breadcrumb[];
@@ -8,14 +10,24 @@
 
   let { breadcrumbs }: Props = $props();
 
-  function summary(b: Breadcrumb): string {
-    if (b.message) return b.message;
-    if (b.data && typeof b.data === 'object') {
-      const entries = Object.entries(b.data);
-      if (entries.length) return entries.map(([k, v]) => `${k}: ${String(v)}`).join(', ');
-    }
-    return b.category ?? b.type;
-  }
+  /**
+   * The glyph replaces the level dot on navigation rows: colour carries the
+   * direction (forward / not-forward / destructive) and the icon names the
+   * exact operation, so neither has to be read alone.
+   */
+  const navIcon: Record<NavigationOperation, IconName> = {
+    push: 'arrow-right',
+    pop: 'arrow-left',
+    replace: 'refresh',
+    remove: 'x',
+  };
+
+  const navColor: Record<NavigationOperation, string> = {
+    push: 'var(--info)',
+    pop: 'var(--neutral)',
+    replace: 'var(--neutral)',
+    remove: 'var(--warning)',
+  };
 
   const toneFor: Record<string, string> = {
     error: 'var(--error)',
@@ -36,9 +48,16 @@
 {:else}
   <ol class="trail">
     {#each breadcrumbs as crumb, i (i)}
+      {@const op = navigationOperation(crumb)}
       <li class="crumb">
         <span class="node">
-          <span class="dot" style="background:{dotColor(crumb)}"></span>
+          {#if op}
+            <span class="glyph" style="color:{navColor[op]}" role="img" aria-label={op}>
+              <Icon name={navIcon[op]} size={14} strokeWidth={2.5} />
+            </span>
+          {:else}
+            <span class="dot" style="background:{dotColor(crumb)}"></span>
+          {/if}
           {#if i < breadcrumbs.length - 1}<span class="line"></span>{/if}
         </span>
         <div class="content">
@@ -47,7 +66,7 @@
             <span class="type-chip">{crumb.type}</span>
             <span class="time mono">{formatTime(crumb.timestamp)}</span>
           </div>
-          <div class="summary">{summary(crumb)}</div>
+          <div class="summary">{breadcrumbSummary(crumb)}</div>
         </div>
       </li>
     {/each}
@@ -70,11 +89,13 @@
     display: flex;
     gap: 12px;
   }
+  /* Width is the same for every crumb, glyph or dot: a per-row width would
+     bend the connecting rail into a zigzag on any trail that mixes them. */
   .node {
     position: relative;
     display: flex;
     justify-content: center;
-    width: 12px;
+    width: 14px;
     flex-shrink: 0;
     padding-top: 5px;
   }
@@ -84,6 +105,15 @@
     border-radius: 50%;
     z-index: 1;
     box-shadow: 0 0 0 3px var(--surface);
+  }
+  /* The line runs behind the mark; the dot hides it with a surface-coloured
+     box-shadow, and the glyph needs an opaque background for the same reason. */
+  .glyph {
+    display: flex;
+    align-items: center;
+    height: 14px;
+    z-index: 1;
+    background: var(--surface);
   }
   .line {
     position: absolute;

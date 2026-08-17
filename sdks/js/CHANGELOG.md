@@ -2,6 +2,31 @@
 
 All notable changes to `@edraj/sauron-browser` are documented here.
 
+## 1.6.0
+
+### Added
+
+- **Navigation direction on history breadcrumbs.** SPA navigation breadcrumbs
+  now carry `operation` alongside `from` and `to`: `push` for
+  `history.pushState`, `replace` for `history.replaceState`, and `pop` for
+  `popstate`. A breadcrumb trail no longer reads the same whether the user
+  advanced through a flow or backed out of it.
+
+  The vocabulary is shared with the Flutter SDK's `SauronNavigatorObserver`
+  (`push` / `pop` / `replace` / `remove`), so a trail reads the same whichever
+  SDK sent it. `remove` has no web equivalent and is never emitted here.
+
+  **A forward navigation is recorded as `pop`.** `history.forward()` fires the
+  same `popstate` event as `history.back()` and carries nothing to separate
+  them, so `pop` means "moved through history" rather than specifically "went
+  back". Telling them apart would mean writing a counter into `history.state`,
+  which the host app's router also owns — not a trade this SDK makes to
+  improve a breadcrumb.
+
+  No API change: `operation` is added to `data` on breadcrumbs the SDK already
+  emitted, and the same-path guard still suppresses a `replaceState` to the
+  current URL before any direction is recorded.
+
 ## 1.5.0
 
 ### Added
