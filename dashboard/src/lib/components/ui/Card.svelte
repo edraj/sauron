@@ -7,6 +7,15 @@
     class?: string;
     header?: Snippet;
     actions?: Snippet;
+    /**
+     * Rendered below the body, flush to the card's edges.
+     *
+     * Unlike `children` it is NOT wrapped in `card-body`, so it receives none
+     * of the `padding` prop — a footer supplies its own inset. That is what
+     * lets a pager sit at the same 18px as `card-head` regardless of how the
+     * body is padded, instead of inheriting one padding and adding another.
+     */
+    footer?: Snippet;
     children: Snippet;
   }
 
@@ -16,6 +25,7 @@
     class: klass = '',
     header,
     actions,
+    footer,
     children,
   }: Props = $props();
 </script>
@@ -32,6 +42,7 @@
   <div class="card-body pad-{padding}">
     {@render children()}
   </div>
+  {#if footer}{@render footer()}{/if}
 </section>
 
 <style>

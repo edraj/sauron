@@ -79,7 +79,16 @@
   // cannot express a column choice or an absolute bound, so a shared control
   // would have to misreport on every card that could not follow it.
   let sinceDays = $state(30);
+  /** The text in the box. Editing it queries nothing on its own. */
   let search = $state('');
+  /**
+   * The query the rows below were actually fetched with — written only by
+   * `onSearch` (button, Enter, clear). This page previously fed `search`
+   * straight into the load effect with no debounce at all, so every keystroke
+   * was a request, and most of those requests carried a half-typed query the
+   * reader never meant to run.
+   */
+  let appliedSearch = $state('');
 
   /**
    * `started_at`, matching the endpoint's default — which slice 3 CHANGED from
@@ -187,7 +196,7 @@
     try {
       // force: an explicit click must reach the network regardless of freshness.
       await Promise.all([
-        load(aid, timeFilter, sortParam(list.sort), list.offset, search, true),
+        load(aid, timeFilter, sortParam(list.sort), list.offset, appliedSearch, true),
         loadAnalytics(aid, sinceDays, true),
       ]);
     } finally {
@@ -203,9 +212,20 @@
     const tf = timeFilter;
     const sort = sortParam(list.sort);
     const off = list.offset;
-    const q = search;
+    // `appliedSearch`, never `search`: reading the typed text here is what
+    // makes the box fire per keystroke.
+    const q = appliedSearch;
     if (aid) void load(aid, tf, sort, off, q);
   });
+
+  /**
+   * Apply the search box. Also resets to page one — a query change is a
+   * predicate change, and row 51 of the old result set is not row 51 of the new.
+   */
+  function onSearch(q: string) {
+    appliedSearch = q;
+    list = setOffsetPage(list, 0);
+  }
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
@@ -281,7 +301,7 @@
             every query built from that hint came back a 400. The component
             derives its example from the schema it loaded instead.
           -->
-          <SearchAutocompleteInput bind:value={search} appId={sessionStore.currentAppId} context="sessions" error={searchError} />
+          <SearchAutocompleteInput bind:value={search} appId={sessionStore.currentAppId} context="sessions" error={searchError} {onSearch} />
         </div>
       {/if}
       <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
@@ -342,7 +362,7 @@
                 timeFilter,
                 sortParam(list.sort),
                 list.offset,
-                search,
+                appliedSearch,
                 true,
               )}
           >
@@ -353,7 +373,7 @@
     {:else if sessions.length === 0}
       <EmptyState
         title="No matches"
-        description={search ? `No sessions match “${search}”.` : "No sessions recorded in this range. Widen the date range or send activity from your SDK."}
+        description={appliedSearch ? `No sessions match “${appliedSearch}”.` : "No sessions recorded in this range. Widen the date range or send activity from your SDK."}
         icon="inbox"
       />
     {:else}
@@ -437,6 +457,8 @@
         limit={LIMIT}
         count={sessions.length}
         {hasNext}
+        {total}
+        totalIsCapped={sessionsView.data?.total_is_capped ?? false}
         onchange={(o) => (list = setOffsetPage(list, o))}
       />
     {/if}

@@ -213,6 +213,7 @@ async fn the_event_pager_reads_through_the_keyset_index() {
             descending: true,
             after: None,
             limit: 50,
+            offset: 0,
         },
     )
     .await
@@ -243,6 +244,7 @@ async fn the_event_pager_reads_through_the_keyset_index() {
                 id: boundary.id,
             }),
             limit: 50,
+            offset: 0,
         },
     )
     .await
@@ -329,6 +331,7 @@ async fn the_ascending_pager_reads_through_the_same_index() {
         descending: false,
         after,
         limit: 50,
+        offset: 0,
     };
 
     let first = repo::search_events(&mut conn, &scope, &search(None))
@@ -549,6 +552,7 @@ async fn page_events_by(
         descending,
         after,
         limit,
+        offset: 0,
     };
     let mut rows = repo::search_events(conn, scope, &search)
         .await
@@ -965,6 +969,7 @@ async fn page_occurrences_by(
         descending,
         after,
         limit,
+        offset: 0,
         text_reach: repo::TextSearchReach::ShellOnly,
     };
     let mut rows = repo::search_occurrences(conn, scope, issue_id, &search)

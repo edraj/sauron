@@ -30,11 +30,16 @@
     getIssueEventStats,
   } from '../lib/api/issues';
   import type { SearchEnvelope, SearchPredicateParams } from '../lib/api/search';
-  import { canGoBack, cursorOf, emptyPage, pageNumber } from '../lib/models/cursor-page';
   import {
-    setCursorPage,
+    canGoBack,
+    cursorOf,
+    emptyPage,
+    offsetOf,
+    pageNumber,
+  } from '../lib/models/cursor-page';
+  import {
+    cursorGoTo,
     setCursorSort,
-    cursorBack,
     type CursorListState,
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
@@ -96,7 +101,10 @@
 
   let occLoading = $state(false);
   let occFilters = $state<Filter[]>([]);
+  /** The text in the search box. Editing it queries nothing on its own. */
   let occSearch = $state('');
+  /** The query the rows below ran — written only by `onOccSearch`. */
+  let occApplied = $state('');
   let occSince = $state(OCC_SINCE_DEFAULT);
   let occStats = $state<IssueEventStats | null>(null);
   let occTimer: ReturnType<typeof setTimeout> | undefined;
@@ -200,11 +208,12 @@
    * another page OF THAT RESULT SET.
    *
    * A cursor is only a position within the result set that issued it. This page
-   * debounces the LOAD rather than the inputs (Issues and Events debounce
-   * `search` into an `appliedSearch` and can therefore read live state here), so
-   * between a keystroke and the reload 250ms later `occSearch` holds a predicate
-   * that has not been queried yet — and a Next click reading it would pair the
-   * current cursor with a predicate it does not belong to.
+   * coalesces the LOAD rather than the inputs, so between a chip change and the
+   * reload 250ms later `occFilters` holds a predicate that has not been queried
+   * yet — and a Next click reading it would pair the current cursor with a
+   * predicate it does not belong to. (`occSearch` has the same gap for a
+   * different reason: it is the *typed* text, and only `onOccSearch` promotes
+   * it into the queried `occApplied`.)
    *
    * Plain `let`, not `$state`: only the imperative page handlers read it, and
    * nothing renders it. It is seeded from the same constants `occFilters`,
@@ -247,7 +256,26 @@
     // Splitting it into a list-params and a stats-params object is what would
     // let a filter reach one request and not the other, and the symptom is a
     // caption counting a different set than the table shows.
-    const params: SearchPredicateParams = { filters: enc, q: term || undefined, sinceDays: since };
+    //
+    // `query`, NOT `q` — the same correction Transactions.svelte carries.
+    // This box is a query-LANGUAGE input: its placeholder and its autocomplete
+    // are generated from the `occurrences` schema, so it offers `release:…`,
+    // `@tag.key:value` and `level:[error,fatal]`. Sent as `q` all of that went
+    // through the legacy bridge as ONE free-text term and was matched
+    // literally, so the box advertised a syntax it then returned zero rows for
+    // — verified against a stored occurrence whose `release` is exactly
+    // `web@1.0.2`, which `release:web@1.0.2` could not find.
+    //
+    // Safe on BOTH requests below: `events` and `events/stats` resolve `query=`
+    // through one shared `resolve_query` (`routes/issues.rs:EventsQuery`), so
+    // the counts cannot end up describing a wider predicate than the rows.
+    // `query` still accepts bare free text, so nothing the old spelling did is
+    // lost.
+    const params: SearchPredicateParams = {
+      filters: enc,
+      query: term || undefined,
+      sinceDays: since,
+    };
     try {
       // Issued together so the counts and the rows they describe swap in on the
       // same frame; resolving them separately would briefly caption the new
@@ -282,6 +310,7 @@
           limit: OCC_LIMIT,
           sort: sortParam(l.sort),
           cursor: cursorOf(l.page),
+          offset: offsetOf(l.page),
         }),
         getIssueEventStats(appId, id, params),
       ]);
@@ -334,21 +363,17 @@
     void loadOccurrences(aid, id, occQuery.enc, occQuery.term, occQuery.since, next);
   }
 
-  function goOccPrev() {
-    // `cursorBack` refuses on the first page by handing `occList` back BY
-    // REFERENCE (see `list-state.ts`) — testing identity skips the reload
-    // rather than refetching the page already on screen.
-    const next = cursorBack(occList);
-    if (next !== occList) toOccPage(next);
-  }
-
-  function goOccNext() {
-    // `setCursorPage` refuses any move it cannot make — no next cursor, an
-    // empty one, or one equal to this page's — and says so by handing back the
-    // very `occList` it was given. Testing identity keeps every one of those
-    // rules in the reducer, and skips the reload rather than refetching the
-    // page on screen.
-    const next = setCursorPage(occList, occNextCursor);
+  /**
+   * Move to a numbered page.
+   *
+   * `cursorGoTo` picks the mechanism — a keyset step when the target is
+   * adjacent and a cursor for it exists, an offset jump otherwise — and refuses
+   * any move it cannot make by handing back the very `occList` it was given.
+   * Testing identity keeps every one of those rules in the reducer, and skips
+   * the reload rather than refetching the page already on screen.
+   */
+  function onOccJump(target: number) {
+    const next = cursorGoTo(occList, target, occNextCursor, OCC_LIMIT);
     if (next !== occList) toOccPage(next);
   }
 
@@ -376,6 +401,12 @@
     return `${n.toLocaleString()} ${n === 1 ? word : `${word}s`}`;
   }
 
+  // The search box applies on submit only (button/Enter/clear); the effect
+  // below watches `occApplied`, so this is the only thing that runs a query.
+  function onOccSearch(q: string) {
+    occApplied = q;
+  }
+
   $effect(() => {
     const aid = sessionStore.currentAppId;
     // Touch scopeKey so the effect re-runs when the environment changes; the
@@ -383,7 +414,9 @@
     sessionStore.scopeKey;
     const id = issueId;
     const enc = encodeFilters(occFilters);
-    const term = occSearch;
+    // `occApplied`, never `occSearch`: reading the typed text here is what
+    // makes the box fire a request per keystroke.
+    const term = occApplied;
     const since = occSince;
     if (!aid || !id) return;
     clearTimeout(occTimer);
@@ -692,6 +725,7 @@
             appId={sessionStore.currentAppId ?? undefined}
             context="occurrences"
             error={occSearchError}
+            onSearch={onOccSearch}
           />
           <!--
             Both notices now come from the shared component, which Issues and
@@ -809,12 +843,11 @@
               total={occStats?.events ?? null}
               totalIsCapped={false}
               page={pageNumber(occList.page)}
-              canPrev={canGoBack(occList.page)}
+              limit={OCC_LIMIT}
               canNext={occNextCursor !== null}
               busy={occLoading}
               noun="occurrence"
-              onprev={goOccPrev}
-              onnext={goOccNext}
+              onjump={onOccJump}
             />
           {/if}
         </Card>

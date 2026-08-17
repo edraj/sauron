@@ -169,6 +169,50 @@ pub async fn list(
     Ok(Json(rows))
 }
 
+/// `GET /v1/apps/{app_id}/counts/workflows` — how many rows ``list`` would page.
+///
+/// Takes ``WorkflowListQuery`` verbatim, so the count and the list are built from ONE
+/// predicate description: a count that answered over a different window, search
+/// term or environment than the table beside it would be a number nobody could
+/// act on. The page fields it receives (`limit`/`offset`/`sort`) are ignored —
+/// no page boundary and no ordering changes a total.
+///
+/// Same permission and the same `RawQuery` environment handling as the list.
+/// That is a disclosure property, not a consistency nicety: a count resolved
+/// over a wider scope than the list would leak the SIZE of data the caller
+/// cannot read.
+pub async fn count(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<WorkflowListQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<super::search::CountEnvelope>, ApiError> {
+    let mut conn = db(&state).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let since_days = q.since_days.clamp(1, 365);
+    let search = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (total, total_is_capped) = repo::count_workflows(
+        &mut conn,
+        scope,
+        since_days,
+        search,
+        super::search::COUNT_CAP,
+    )
+    .await?;
+    Ok(Json(super::search::CountEnvelope {
+        total,
+        total_is_capped,
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct WorkflowDetailQuery {
     #[serde(default = "days30")]

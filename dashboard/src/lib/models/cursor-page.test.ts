@@ -1,5 +1,18 @@
 import { describe, it, expect } from 'vitest';
-import { advance, canGoBack, cursorOf, emptyPage, goBack, pageNumber } from './cursor-page';
+import {
+  advance,
+  canGoBack,
+  cursorOf,
+  emptyPage,
+  goBack,
+  jumpTo,
+  offsetOf,
+  pageKey,
+  pageNumber,
+} from './cursor-page';
+
+/** Page size for the bookkeeping tests, where the value is arbitrary. */
+const L = 10;
 
 describe('cursor paging', () => {
   it('starts with nowhere to go back to', () => {
@@ -16,9 +29,9 @@ describe('cursor paging', () => {
     p = advance(p, 'c2');
     expect(p.current).toBe('c2');
     expect(canGoBack(p)).toBe(true);
-    p = goBack(p);
+    p = goBack(p, L);
     expect(p.current).toBe('c1');
-    p = goBack(p);
+    p = goBack(p, L);
     expect(p.current).toBeNull();
     expect(canGoBack(p)).toBe(false);
   });
@@ -63,9 +76,10 @@ describe('cursor paging', () => {
   });
 
   it('going back past the start is a no-op rather than an error', () => {
-    const p = goBack(goBack(emptyPage()));
+    const p = goBack(goBack(emptyPage(), L), L);
     expect(p.current).toBeNull();
     expect(canGoBack(p)).toBe(false);
+    expect(pageNumber(p)).toBe(1);
   });
 
   it('numbers pages from one and reports the request cursor', () => {
@@ -78,9 +92,9 @@ describe('cursor paging', () => {
     p = advance(p, 'c2');
     expect(pageNumber(p)).toBe(3);
     expect(cursorOf(p)).toBe('c2');
-    p = goBack(p);
+    p = goBack(p, L);
     expect(pageNumber(p)).toBe(2);
-    p = goBack(p);
+    p = goBack(p, L);
     expect(pageNumber(p)).toBe(1);
     expect(cursorOf(p)).toBeUndefined();
   });
@@ -95,7 +109,7 @@ describe('cursor paging', () => {
     const p = advance(advance(emptyPage(), 'c1'), 'c2');
     const before = structuredClone(p);
     const forward = advance(p, 'c3');
-    const back = goBack(p);
+    const back = goBack(p, L);
     expect(p).toEqual(before);
     // Not merely equal afterwards: neither result may SHARE the array, or the
     // next write through one page corrupts the other.
@@ -142,16 +156,25 @@ interface FakeEnvelope {
 }
 
 /**
- * Stands in for `listIssues`/`listEvents`: takes the cursor the client would
- * send (`undefined` on the first page) and answers the envelope shape the real
- * routes answer, `next_cursor` null on the last page only.
+ * Stands in for `listIssues`/`listEvents`: takes the cursor and offset the
+ * client would send (`undefined` for both on the first page) and answers the
+ * envelope shape the real routes answer, `next_cursor` null on the last page
+ * only.
  *
  * The cursor is an opaque token as far as the reducer is concerned; here it
  * happens to encode the keyset boundary as a row index.
+ *
+ * Mirrors the repo-layer precedence exactly: an offset is honoured only when
+ * there is no cursor. A server that applied both would skip rows *within* the
+ * keyset-narrowed set, so a test double that quietly allowed the combination
+ * would pass a reducer that sends it.
  */
-function fetchPage(cursor: string | undefined): FakeEnvelope {
-  const start = cursor === undefined ? 0 : Number(cursor);
-  if (!Number.isInteger(start) || start < 0 || start > ROWS.length) {
+function fetchPage(cursor: string | undefined, offset?: number): FakeEnvelope {
+  if (cursor !== undefined && offset) {
+    throw new Error(`fake server got cursor AND offset together: ${cursor} / ${offset}`);
+  }
+  const start = cursor === undefined ? (offset ?? 0) : Number(cursor);
+  if (!Number.isInteger(start) || start < 0) {
     throw new Error(`fake server got a cursor it never issued: ${String(cursor)}`);
   }
   const data = ROWS.slice(start, start + PAGE_SIZE);
@@ -175,7 +198,7 @@ describe('cursor paging against a fake paged server', () => {
     const pages: string[][] = [];
     const canNext: boolean[] = [];
     const canPrev: boolean[] = [];
-    let env = fetchPage(cursorOf(p));
+    let env = fetchPage(cursorOf(p), offsetOf(p));
     for (;;) {
       pages.push(env.data);
       canNext.push(env.next_cursor !== null);
@@ -185,7 +208,7 @@ describe('cursor paging against a fake paged server', () => {
         throw new Error(`walk did not terminate after ${pages.length} pages — advance is not moving`);
       }
       p = advance(p, env.next_cursor);
-      env = fetchPage(cursorOf(p));
+      env = fetchPage(cursorOf(p), offsetOf(p));
     }
     return { p, pages, canNext, canPrev };
   }
@@ -214,8 +237,8 @@ describe('cursor paging against a fake paged server', () => {
       if (pages.length > MAX_PAGES) {
         throw new Error(`back-walk did not terminate after ${pages.length} pages — goBack is not moving`);
       }
-      p = goBack(p);
-      pages.unshift(fetchPage(cursorOf(p)).data);
+      p = goBack(p, PAGE_SIZE);
+      pages.unshift(fetchPage(cursorOf(p), offsetOf(p)).data);
     }
     return { p, pages };
   }
@@ -258,5 +281,110 @@ describe('cursor paging against a fake paged server', () => {
     // ...and carrying on from there still covers the fixture exactly once.
     const rest = walkForward(p);
     expect([...fetchPage(undefined).data, ...rest.pages.flat()]).toEqual(ROWS);
+  });
+
+  // -------------------------------------------------------------------------
+  // Jumps. Everything above walks; these land somewhere the walk never visited
+  // and then resume walking from there, which is where the two mechanisms meet.
+  // -------------------------------------------------------------------------
+
+  it('lands on the rows the page number promises', () => {
+    const p = jumpTo(emptyPage(), 3, PAGE_SIZE);
+    expect(pageNumber(p)).toBe(3);
+    expect(cursorOf(p)).toBeUndefined();
+    expect(offsetOf(p)).toBe(6);
+    expect(fetchPage(cursorOf(p), offsetOf(p)).data).toEqual(['r7']);
+  });
+
+  it('resumes the keyset walk after a jump', () => {
+    // Jump to page 2, then Next: the cursor comes off the jumped page's own
+    // envelope, so the forward walk continues without another offset.
+    const jumped = jumpTo(emptyPage(), 2, PAGE_SIZE);
+    const env = fetchPage(cursorOf(jumped), offsetOf(jumped));
+    expect(env.data).toEqual(['r4', 'r5', 'r6']);
+
+    const next = advance(jumped, env.next_cursor);
+    expect(pageNumber(next)).toBe(3);
+    expect(offsetOf(next)).toBeUndefined();
+    expect(cursorOf(next)).toBe('6');
+    expect(fetchPage(cursorOf(next), offsetOf(next)).data).toEqual(['r7']);
+  });
+
+  /**
+   * The regression the stored `page` field exists for.
+   *
+   * Jump to 2, walk forward to 3, then Prev. The stack is empty — the jump
+   * discarded it and `advance` off a null cursor pushes nothing — so a `goBack`
+   * that only pops would return `{current: null}` and the old
+   * `pageNumber = stack.length + 2` would call that page 1. The reader clicks
+   * Prev on page 3 and lands on page 1, having skipped page 2 entirely.
+   */
+  it('goes back correctly from a page walked to from a jump', () => {
+    const jumped = jumpTo(emptyPage(), 2, PAGE_SIZE);
+    const onThree = advance(jumped, fetchPage(cursorOf(jumped), offsetOf(jumped)).next_cursor);
+    expect(pageNumber(onThree)).toBe(3);
+    expect(onThree.stack).toEqual([]);
+
+    const back = goBack(onThree, PAGE_SIZE);
+    expect(pageNumber(back)).toBe(2);
+    expect(fetchPage(cursorOf(back), offsetOf(back)).data).toEqual(['r4', 'r5', 'r6']);
+  });
+
+  it('walks all the way back from a jump without skipping a page', () => {
+    let p = jumpTo(emptyPage(), 3, PAGE_SIZE);
+    const seen: string[][] = [];
+    while (canGoBack(p)) {
+      p = goBack(p, PAGE_SIZE);
+      seen.unshift(fetchPage(cursorOf(p), offsetOf(p)).data);
+    }
+    expect(pageNumber(p)).toBe(1);
+    expect(seen).toEqual([
+      ['r1', 'r2', 'r3'],
+      ['r4', 'r5', 'r6'],
+    ]);
+  });
+
+  it('offers Prev on a jumped page', () => {
+    // `current` is null on a jumped page, which is what page 1 carries. The
+    // old `canGoBack` tested exactly that and disabled Prev on a page with two
+    // pages behind it.
+    expect(canGoBack(jumpTo(emptyPage(), 3, PAGE_SIZE))).toBe(true);
+    expect(canGoBack(emptyPage())).toBe(false);
+  });
+
+  it('jumping to page 1 is the first page, offset and all', () => {
+    const p = jumpTo(jumpTo(emptyPage(), 4, PAGE_SIZE), 1, PAGE_SIZE);
+    expect(p).toEqual(emptyPage());
+  });
+
+  it('refuses a jump that does not move, by reference', () => {
+    const p = jumpTo(emptyPage(), 3, PAGE_SIZE);
+    expect(jumpTo(p, 3, PAGE_SIZE)).toBe(p);
+    const first = emptyPage();
+    expect(jumpTo(first, 1, PAGE_SIZE)).toBe(first);
+  });
+
+  it('clamps a jump below page 1', () => {
+    expect(pageNumber(jumpTo(emptyPage(), 0, PAGE_SIZE))).toBe(1);
+    expect(pageNumber(jumpTo(emptyPage(), -5, PAGE_SIZE))).toBe(1);
+  });
+
+  /**
+   * Cache keys. A jumped page carries `current: null`, the same as page 1, so
+   * a key built from the cursor alone hashes page 3 to page 1's entry — Next
+   * would repaint the first page's rows out of the cache with no request on
+   * the wire to notice.
+   */
+  it('keys every distinct page distinctly', () => {
+    const first = emptyPage();
+    const jumped = jumpTo(first, 3, PAGE_SIZE);
+    const walked = advance(advance(first, '3'), '6');
+
+    expect(cursorOf(jumped)).toBe(cursorOf(first)); // the collision, stated
+    expect(pageKey(jumped)).not.toBe(pageKey(first));
+    expect(pageNumber(jumped)).toBe(pageNumber(walked));
+    // Same page number, reached two ways, with different rows in flight —
+    // these must not share a cache entry either.
+    expect(pageKey(jumped)).not.toBe(pageKey(walked));
   });
 });

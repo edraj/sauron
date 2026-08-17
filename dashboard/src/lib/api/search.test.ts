@@ -90,15 +90,28 @@ describe('searchParams', () => {
     expect(p.get('limit')).toBe('100');
   });
 
-  it('never sends `offset`, which the server accepts and ignores', () => {
-    // A request reading "rows 50-100" that is answered with rows 0-50 is worse
-    // than no parameter at all. Keyset paging replaced it; follow `next_cursor`.
-    const p = searchParams({ limit: 50, cursor: 'tok' });
+  // `offset` used to be unsendable: keyset paging replaced it and the server
+  // ignored it. It is sendable again for ONE purpose — a jump to a numbered
+  // page, which has no cursor because nobody has walked there. Stepping is
+  // still keyset, and these three cases are what keeps the two apart.
+  it('never sends `offset` alongside a cursor', () => {
+    // The server drops the offset when a cursor is present, so a request
+    // carrying both reads as "page 3" and answers as a keyset step. Refused
+    // here rather than relied on there.
+    const p = searchParams({ limit: 50, cursor: 'tok', offset: 100 });
+    expect(p.get('cursor')).toBe('tok');
     expect(p.has('offset')).toBe(false);
-    // …and the type has no way to ask for one — this is the compile-time half
-    // of the same rule.
-    // @ts-expect-error -- `offset` is deliberately not part of SearchPageParams
-    searchParams({ offset: 50 });
+  });
+
+  it('sends `offset` for a cursorless jump', () => {
+    const p = searchParams({ limit: 50, offset: 100 });
+    expect(p.get('offset')).toBe('100');
+    expect(p.has('cursor')).toBe(false);
+  });
+
+  it('omits a zero `offset` rather than stating the default', () => {
+    const p = searchParams({ limit: 50, offset: 0 });
+    expect(p.has('offset')).toBe(false);
   });
 
   it('produces a stable query string for an unfiltered first page', () => {

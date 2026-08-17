@@ -1169,7 +1169,8 @@ GROUP BY name, op`;
 
       <h4 class="q-h">Query language — operators</h4>
       <p class="muted q-note">
-        Press <b>↓</b> in the search box to see what the current page accepts. An invalid query is
+        Press <b>↓</b> in the search box to see what the current page accepts, and <b>Enter</b> (or
+        the <b>Search</b> button) to run it — typing alone never queries. An invalid query is
         rejected with the reason on the box itself — it never silently returns zero rows.
       </p>
       {@render apiTable(queryOperatorRows)}

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { advance, emptyPage } from './cursor-page';
+import { advance, cursorOf, emptyPage, offsetOf, pageNumber } from './cursor-page';
 import {
   cursorBack,
+  cursorGoTo,
   overFetched,
   setCursorPage,
   setCursorSort,
@@ -145,18 +146,79 @@ describe('cursorBack', () => {
   };
 
   it('moves back one page', () => {
-    expect(cursorBack(onPageTwo).page).toEqual(emptyPage());
+    expect(cursorBack(onPageTwo, 50).page).toEqual(emptyPage());
   });
 
   it('carries the sort through unchanged, BY REFERENCE, on a successful move', () => {
-    expect(cursorBack(onPageTwo).sort).toBe(onPageTwo.sort);
+    expect(cursorBack(onPageTwo, 50).sort).toBe(onPageTwo.sort);
   });
 
   it('refuses on the first page, returning the SAME list-state reference', () => {
     // `goBack` refuses on the first page the same way `advance` refuses a
     // dead end — by handing back its argument BY REFERENCE — so this reducer
     // has to preserve that the same way `setCursorPage` does.
-    expect(cursorBack(onFirstPage)).toBe(onFirstPage);
+    expect(cursorBack(onFirstPage, 50)).toBe(onFirstPage);
+  });
+});
+
+describe('cursorGoTo', () => {
+  const L = 50;
+  const sort = { key: 'last_seen', dir: 'desc' } as const;
+  const onPageTwo: CursorListState = { sort, page: advance(emptyPage(), 'c1') };
+
+  it('takes the keyset step forward when the target is the next page', () => {
+    const moved = cursorGoTo(onPageTwo, 3, 'c2', L);
+    expect(pageNumber(moved.page)).toBe(3);
+    // Keyset, not offset: the cursor is what went on the wire.
+    expect(cursorOf(moved.page)).toBe('c2');
+    expect(offsetOf(moved.page)).toBeUndefined();
+  });
+
+  it('takes the keyset step back when the target is the previous page', () => {
+    const moved = cursorGoTo(onPageTwo, 1, 'c2', L);
+    expect(moved.page).toEqual(emptyPage());
+  });
+
+  /**
+   * The whole point of the two-mechanism split. A non-adjacent target has no
+   * cursor anywhere — nobody has visited it — so it can only be reached by
+   * offset, and the offset must be the one the page number implies.
+   */
+  it('jumps by offset when the target is not adjacent', () => {
+    const moved = cursorGoTo(onPageTwo, 7, 'c2', L);
+    expect(pageNumber(moved.page)).toBe(7);
+    expect(offsetOf(moved.page)).toBe(300);
+    expect(cursorOf(moved.page)).toBeUndefined();
+  });
+
+  /**
+   * Adjacency alone is not enough — the cursor has to exist.
+   *
+   * At the count cap the last numbered page can still have rows after it, and
+   * a caller can reach a page whose envelope has not landed. Preferring the
+   * keyset step on a null cursor would send no cursor and no offset at all,
+   * which the server answers with page one while the pager says "Page 3".
+   */
+  it('falls back to an offset jump forward when there is no next cursor', () => {
+    const moved = cursorGoTo(onPageTwo, 3, null, L);
+    expect(pageNumber(moved.page)).toBe(3);
+    expect(offsetOf(moved.page)).toBe(100);
+  });
+
+  it('refuses a move to the page already shown, by reference', () => {
+    expect(cursorGoTo(onPageTwo, 2, 'c2', L)).toBe(onPageTwo);
+  });
+
+  it('carries the sort through by reference on every mechanism', () => {
+    expect(cursorGoTo(onPageTwo, 3, 'c2', L).sort).toBe(sort);
+    expect(cursorGoTo(onPageTwo, 7, 'c2', L).sort).toBe(sort);
+    expect(cursorGoTo(onPageTwo, 1, 'c2', L).sort).toBe(sort);
+  });
+
+  // Page numbers reach this straight from a button label, so the degenerate
+  // ones have to be safe rather than merely unlikely.
+  it('clamps a target below page 1', () => {
+    expect(pageNumber(cursorGoTo(onPageTwo, 0, 'c2', L).page)).toBe(1);
   });
 });
 

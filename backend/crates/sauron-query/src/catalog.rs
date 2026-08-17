@@ -414,6 +414,9 @@ pub const CATALOG: &[Dimension] = &[
             Resource::Events,
             Resource::Persons,
             Resource::Sessions,
+            // Backed by `transactions_app_distinct_idx` (migration 000058), so
+            // this keeps the `Indexed` class honest on this resource too.
+            Resource::Transactions,
         ],
         index: IndexClass::Indexed,
     },
@@ -426,7 +429,16 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Str,
         store: Store::Column("session_id"),
         ops: OPS_TEXT,
-        resources: &[Resource::Occurrences, Resource::Events, Resource::Sessions],
+        // Transactions carry `session_id` and index it
+        // (`transactions_app_session_idx`, migration 000013) — which is what
+        // makes the Transactions list's Session column filterable rather than
+        // merely readable.
+        resources: &[
+            Resource::Occurrences,
+            Resource::Events,
+            Resource::Sessions,
+            Resource::Transactions,
+        ],
         index: IndexClass::Bounded,
     },
     Dimension {

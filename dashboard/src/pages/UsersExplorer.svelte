@@ -19,6 +19,8 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
+  import { countPersons } from '../lib/api/counts';
+  import { RowCount } from '../lib/stores/row-count.svelte';
   import { listPersons } from '../lib/api/persons';
   import { getUserAnalytics } from '../lib/api/users';
   import { errorMessage } from '../lib/api/client';
@@ -102,11 +104,10 @@
   // path: a cache HIT repaints rows without fetching, and a `hasNext` only the
   // fetch updates would be the previous key's answer.
   const hasNext = $derived(view.data?.hasNext ?? false);
+  const rowCount = new RowCount();
   const revalidating = $derived(view.revalidating);
   const loading = $derived(view.loading);
   const error = $derived(view.error);
-
-  let debounce: ReturnType<typeof setTimeout> | undefined;
 
   let sinceDays = $state(30);
   let analytics = $state<UsersAnalytics | null>(null);
@@ -147,12 +148,15 @@
     if (aid) void loadAnalytics(aid, days);
   });
 
+  // Submit-driven, not debounced: `searchTerm` is the text in the box and
+  // `query` is what the request carries, and only the Search button, Enter and
+  // the clear button move one into the other. Typing reaches the network
+  // nowhere on this page.
   function onSearch(v: string) {
-    clearTimeout(debounce);
-    debounce = setTimeout(() => {
-      query = v.trim();
-      list = setOffsetPage(list, 0);
-    }, 250);
+    query = v.trim();
+    // A changed predicate invalidates the page position: row 51 of the old
+    // result set is not row 51 of the new one.
+    list = setOffsetPage(list, 0);
   }
 
   // `scopeKey` must be in the key: it carries the selected environment, which the
@@ -185,6 +189,17 @@
     // while hitting zero times, and nothing in the DOM shows it. Only the
     // network panel does.
     const windowKey = `${tf.field}:${tf.mode}:${tf.lastDays ?? ''}:${tf.from ?? ''}:${tf.to ?? ''}`;
+    // Predicate only — `sort`, `off` and `LIMIT` are deliberately absent, so
+    // paging and reordering never refetch a number that cannot have changed.
+    void rowCount.load(
+      viewKey('persons.count', appId, sessionStore.scopeKey, q, windowKey),
+      () =>
+        countPersons(appId, {
+          search: q || undefined,
+          window: toRecord(tf, DEFAULT_TIME_FIELD),
+        }),
+      force,
+    );
     await view.load(
       viewKey('persons.list', appId, sessionStore.scopeKey, q, sort, off, LIMIT, windowKey),
       () => listPersons(appId, {
@@ -257,7 +272,7 @@
       <p class="muted sub">Identified &amp; anonymous people seen by this app — search by distinct ID or trait.</p>
     </div>
     <div class="controls">
-      <SearchInput bind:value={searchTerm} oninput={onSearch} placeholder="Search users…" width="300px" />
+      <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder="Search users…" width="300px" />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
@@ -450,6 +465,8 @@
       limit={LIMIT}
       count={rows.length}
       {hasNext}
+      total={rowCount.total}
+      totalIsCapped={rowCount.isCapped}
       onchange={(o) => (list = setOffsetPage(list, o))}
     />
   {/if}

@@ -1,4 +1,4 @@
-import { advance, emptyPage, goBack, type CursorPage } from './cursor-page';
+import { advance, emptyPage, goBack, goToPage, type CursorPage } from './cursor-page';
 import { toggleSort, type SortDir, type SortState } from './sort';
 
 /**
@@ -87,8 +87,33 @@ export function setCursorPage(
  * `next !== current`, not turn into a structurally-equal copy that such a
  * test cannot tell apart from a real move.
  */
-export function cursorBack(s: CursorListState): CursorListState {
-  const page = goBack(s.page);
+export function cursorBack(s: CursorListState, limit: number): CursorListState {
+  const page = goBack(s.page, limit);
+  return page === s.page ? s : { sort: s.sort, page };
+}
+
+/**
+ * Move to a numbered page, choosing between the two mechanisms.
+ *
+ * This is the ONLY place that decision is made. A keyset step is stable under
+ * concurrent inserts and an offset jump is not, so the cheaper guarantee is
+ * taken whenever the target is adjacent and a cursor for it exists; everything
+ * else falls back to an offset. Duplicating the branch at four call sites would
+ * be four chances for one list to page differently from the others.
+ *
+ * `nextCursor` is the `next_cursor` of the envelope on screen — the same value
+ * that decides whether Next is enabled, so the button's state and the mechanism
+ * this picks cannot disagree.
+ *
+ * Refuses by reference like every other reducer here.
+ */
+export function cursorGoTo(
+  s: CursorListState,
+  target: number,
+  nextCursor: string | null,
+  limit: number,
+): CursorListState {
+  const page = goToPage(s.page, target, nextCursor, limit);
   return page === s.page ? s : { sort: s.sort, page };
 }
 

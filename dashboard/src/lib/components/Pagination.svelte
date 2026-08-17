@@ -1,6 +1,12 @@
 <script lang="ts">
-  import Icon from './ui/Icon.svelte';
+  import PageStrip from './PageStrip.svelte';
 
+  /**
+   * The offset adapter over {@link PageStrip}.
+   *
+   * Turns a page number into the byte offset its caller pages with, and a row
+   * count into the caption. All rendering lives in `PageStrip`.
+   */
   interface Props {
     offset: number;
     limit: number;
@@ -15,112 +21,52 @@
      * total, or by requesting `limit + 1` rows and rendering `limit`.
      */
     hasNext: boolean;
+    /**
+     * Rows matching the query across every page, when the caller knows it.
+     *
+     * `null` means the caller pages by a `limit + 1` over-fetch probe and has
+     * no total to offer, so the strip can only show as far as it has walked.
+     * Everything with a count endpoint or an in-memory list passes a number.
+     */
+    total?: number | null;
+    /** The server stopped counting at its cap, so `total` means "at least this many". */
+    totalIsCapped?: boolean;
     onchange: (offset: number) => void;
   }
 
-  let { offset, limit, count, hasNext, onchange }: Props = $props();
+  let {
+    offset,
+    limit,
+    count,
+    hasNext,
+    total = null,
+    totalIsCapped = false,
+    onchange,
+  }: Props = $props();
 
+  const page = $derived(Math.floor(offset / limit) + 1);
   const from = $derived(count === 0 ? 0 : offset + 1);
   const to = $derived(offset + count);
-  const hasPrev = $derived(offset > 0);
-  const currentPage = $derived(Math.floor(offset / limit) + 1);
+
+  // Never below `page`: a strip whose last slot precedes the page it is
+  // highlighting states a range it does not have. Without a total the best
+  // available answer is "as far as we have walked, plus one if there is more".
+  const totalPages = $derived(
+    Math.max(total !== null ? Math.ceil(total / limit) : page + (hasNext ? 1 : 0), page),
+  );
+
+  const label = $derived.by(() => {
+    if (count === 0) return offset === 0 ? 'No results' : 'End of results';
+    const range = `${from.toLocaleString()}–${to.toLocaleString()}`;
+    if (total === null) return range;
+    return `${range} of ${total.toLocaleString()}${totalIsCapped ? '+' : ''}`;
+  });
 </script>
 
-<div class="pager">
-  <span class="range muted">
-    {#if count === 0 && offset === 0}No results{:else if count === 0}End of results{:else}{from.toLocaleString()}–{to.toLocaleString()}{/if}
-  </span>
-  <div class="btns">
-    <button
-      class="pg"
-      disabled={!hasPrev}
-      onclick={() => onchange(Math.max(0, offset - limit))}
-      type="button"
-    >
-      <Icon name="chevron-left" size={14} /> Prev
-    </button>
-
-    {#if currentPage > 2}
-      <button class="pg num" onclick={() => onchange(0)} type="button">1</button>
-      {#if currentPage > 3}
-        <span class="ellipsis">...</span>
-      {/if}
-    {/if}
-
-    {#if currentPage > 1}
-      <button class="pg num" onclick={() => onchange((currentPage - 2) * limit)} type="button">{currentPage - 1}</button>
-    {/if}
-
-    <button class="pg num active" type="button">{currentPage}</button>
-
-    {#if hasNext}
-      <button class="pg num" onclick={() => onchange(currentPage * limit)} type="button">{currentPage + 1}</button>
-    {/if}
-
-    <button
-      class="pg"
-      disabled={!hasNext}
-      onclick={() => onchange(offset + limit)}
-      type="button"
-    >
-      Next <Icon name="chevron-right" size={14} />
-    </button>
-  </div>
-</div>
-
-<style>
-  .pager {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 10px 2px 0;
-  }
-  .range {
-    font-size: 12.5px;
-    font-variant-numeric: tabular-nums;
-  }
-  .btns {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-  }
-  .pg {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 6px 12px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 550;
-    transition: color 0.12s ease, border-color 0.12s ease;
-  }
-  .pg.num {
-    padding: 6px 10px;
-    min-width: 32px;
-    justify-content: center;
-  }
-  .pg:hover:not(:disabled, .active) {
-    color: var(--text);
-    border-color: var(--border-strong);
-  }
-  .pg.active {
-    background: var(--surface-3);
-    color: var(--text);
-    border-color: var(--border-strong);
-    cursor: default;
-  }
-  .pg:disabled {
-    opacity: 0.4;
-    cursor: default;
-  }
-  .ellipsis {
-    color: var(--text-muted);
-    padding: 0 2px;
-    font-size: 12px;
-    user-select: none;
-  }
-</style>
+<PageStrip
+  {page}
+  {totalPages}
+  canNext={hasNext}
+  {label}
+  onjump={(p) => onchange((p - 1) * limit)}
+/>

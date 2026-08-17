@@ -20,6 +20,12 @@
     context?: string;
     /** A query error from the page's last request, marked on the input. */
     error?: string | null;
+    /**
+     * Run the search box's current text. The box never fires on input, so a
+     * page that binds `search` but omits this gets a control that types and
+     * validates and never queries.
+     */
+    onSearch?: (query: string) => void;
     sinceDays: number;
     // Optional custom date-range options; falls back to DateRange's default.
     ranges?: { days: number; label: string }[];
@@ -43,6 +49,7 @@
     appId = undefined,
     context = undefined,
     error = null,
+    onSearch = undefined,
     sinceDays = $bindable(30),
     ranges = undefined,
     showRange = true,
@@ -147,7 +154,7 @@
     prefix its resource does not declare. Both are now the component's job.
   -->
   <div class="right">
-    <SearchAutocompleteInput bind:value={search} appId={appId ?? ''} {context} {error} />
+    <SearchAutocompleteInput bind:value={search} appId={appId ?? ''} {context} {error} {onSearch} />
     {#if showRange}
       <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} {ranges} />
     {/if}

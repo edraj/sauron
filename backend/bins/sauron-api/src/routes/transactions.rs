@@ -70,6 +70,23 @@ pub struct ListQuery {
     pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_limit")]
     pub limit: i64,
+    /// Rows to skip — an explicit page JUMP, and nothing else.
+    ///
+    /// Keyset paging remains the mechanism for STEPPING: `cursor` always wins,
+    /// and an `offset` sent alongside one is ignored by the repo layer rather
+    /// than combined with it. See `repo::jump_offset` — an offset laid on top
+    /// of a keyset predicate skips rows *within* the already-narrowed set,
+    /// which is a wrong page rather than an error.
+    ///
+    /// Offset exists because a page nobody has walked to has no cursor to ask
+    /// for, which is what made a numbered pager impossible. Clamped to
+    /// `COUNT_CAP`, so the deepest reachable jump costs the same row budget the
+    /// count on this very request already spends.
+    ///
+    /// This supersedes the "accepted and IGNORED" contract from S2c: a
+    /// bookmarked `?offset=50` returns the rows it names again.
+    #[serde(default)]
+    pub offset: i64,
     // `environment_id` comes from `RawQuery`, not this struct — see
     // `routes::scope`'s module docs for the extractor trap that avoids.
 }
@@ -148,6 +165,12 @@ pub async fn list(
         prepared.clamp,
     )?;
     let limit = q.limit.clamp(1, 200);
+    // Jump-only, and clamped to the same ceiling the count on this request
+    // stops at: pages past `COUNT_CAP` are not numberable anyway, so an offset
+    // beyond it addresses nothing while costing the planner real rows. Clamped
+    // rather than rejected — a stale bookmark deep in a list that has since
+    // shrunk should land on the last reachable page, not 400.
+    let offset = q.offset.clamp(0, super::search::COUNT_CAP);
 
     let search = repo::TransactionSearch {
         node: &node,
@@ -159,6 +182,7 @@ pub async fn list(
         descending,
         after,
         limit,
+        offset,
     };
 
     let mut rows = repo::search_transactions(&mut conn, &scope, &search)

@@ -33,11 +33,12 @@
   import { preflight, queryErrorFor } from '../lib/utils/query-error';
   import { compactNumber } from '../lib/utils/format';
   import {
-    advance,
     canGoBack,
     cursorOf,
     emptyPage,
-    goBack,
+    goToPage,
+    offsetOf,
+    pageKey,
     pageNumber,
     type CursorPage,
   } from '../lib/models/cursor-page';
@@ -47,6 +48,14 @@
   // Issues defaults to "All" time (open issues shouldn't drop off the landing
   // view just because they're old); the picker narrows on demand. 3650d is the
   // backend's effective-all cap for the issues list.
+  /**
+   * Rows per page. Was an inline `limit: 100` at the one request; named now
+   * because the pager also needs it — a numbered jump turns a page number into
+   * an offset, and doing that with a different number than the request uses
+   * lands on the wrong rows.
+   */
+  const ISSUES_LIMIT = 100;
+
   const ISSUE_RANGES = [
     { days: 7, label: '7d' },
     { days: 30, label: '30d' },
@@ -271,7 +280,7 @@
    * captions are the part that was missing, which is any acknowledgement that
    * they are a different set from the rows.
    *
-   * `appliedSearch`, not `search`: the list runs the debounced value, so
+   * `appliedSearch`, not `search`: the list runs the SUBMITTED value, so
    * keying off the raw box would post the caption mid-keystroke, while the
    * rows on screen still match the tiles and there is nothing to disclose yet.
    *
@@ -344,9 +353,22 @@
   async function load(appId: string, q: string, p: CursorPage, force = false) {
     const enc = encodeFilters(filters);
     const cursor = cursorOf(p);
+    const offset = offsetOf(p);
     await issuesView.load(
-      viewKey('issues.list', appId, sessionStore.scopeKey, enc, q, sinceDays, cursor),
-      () => listIssues(appId, { filters: enc, query: q || undefined, sinceDays, limit: 100, cursor }),
+      // `pageKey`, NOT `cursor`: a page reached by a numbered jump carries a
+      // null cursor, which is what page 1 carries — keyed on the cursor alone,
+      // page 7 would hash to page 1's entry and repaint the first page out of
+      // the cache with no request on the wire to notice.
+      viewKey('issues.list', appId, sessionStore.scopeKey, enc, q, sinceDays, pageKey(p)),
+      () =>
+        listIssues(appId, {
+          filters: enc,
+          query: q || undefined,
+          sinceDays,
+          limit: ISSUES_LIMIT,
+          cursor,
+          offset,
+        }),
       force,
     );
   }
@@ -370,17 +392,23 @@
     void load(aid, appliedSearch, p);
   }
 
-  function goPrev() {
-    if (canGoBack(page)) toPage(goBack(page));
+  /**
+   * Move to a numbered page.
+   *
+   * `goToPage` refuses any move it cannot make — the target already on screen,
+   * no next cursor to step with, a page below 1 — and says so by handing back
+   * the very object it was given. Testing identity keeps every one of those
+   * rules in the reducer, and skips the reload rather than refetching the page
+   * already on screen.
+   */
+  function onjump(target: number) {
+    const next = goToPage(page, target, nextCursor, ISSUES_LIMIT);
+    if (next !== page) toPage(next);
   }
 
-  function goNext() {
-    // `advance` refuses any move it cannot make — no next cursor, an empty one,
-    // or one equal to this page's — and says so by handing back the very object
-    // it was given. Testing identity keeps every one of those rules in the
-    // reducer, and skips the reload rather than refetching the page on screen.
-    const next = advance(page, nextCursor);
-    if (next !== page) toPage(next);
+  /** The empty-state's "Back a page" escape hatch, in terms of the same reducer. */
+  function goPrev() {
+    onjump(pageNumber(page) - 1);
   }
 
   async function loadStats(appId: string, days: number, force = false) {
@@ -406,20 +434,15 @@
     }
   }
 
-  // Debounce free-text search only: filters + date range should reload
-  // immediately, but typing in the search box should settle before we requery.
-  let searchTimer: ReturnType<typeof setTimeout>;
-  $effect(() => {
-    const s = search;
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      appliedSearch = s;
-    }, 300);
-    return () => clearTimeout(searchTimer);
-  });
+  // The search box applies on submit only (button/Enter/clear). Filters and
+  // the date range still reload immediately; a query, unlike a chip, spends
+  // most of its typing life as an invalid fragment.
+  function onSearch(q: string) {
+    appliedSearch = q;
+  }
 
   // Re-query + rewrite the URL whenever filter/appliedSearch/date-range state
-  // changes. Depends on `appliedSearch` (debounced), not `search`, so this
+  // changes. Depends on `appliedSearch` (submitted), not `search`, so this
   // doesn't fire per keystroke.
   $effect(() => {
     const aid = sessionStore.currentAppId;
@@ -514,7 +537,7 @@
     <div class="center-sm"><Spinner size={22} /></div>
   {/if}
 
-  <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:sinceDays ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" error={searchError} />
+  <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:sinceDays ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" error={searchError} {onSearch} />
   <SearchDisclosure {clamped} />
 
   <Card padding="none">
@@ -641,12 +664,11 @@
         {total}
         {totalIsCapped}
         page={pageNumber(page)}
-        canPrev={canGoBack(page)}
+        limit={ISSUES_LIMIT}
         canNext={nextCursor !== null}
         busy={loading || revalidating}
         noun="issue"
-        onprev={goPrev}
-        onnext={goNext}
+        {onjump}
       />
     {/if}
   </Card>

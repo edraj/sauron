@@ -30,11 +30,17 @@
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import { fetchSchema, type SchemaDefinition } from '../lib/api/schema';
   import { preflight, queryErrorFor } from '../lib/utils/query-error';
-  import { canGoBack, cursorOf, emptyPage, pageNumber } from '../lib/models/cursor-page';
   import {
-    setCursorPage,
+    canGoBack,
+    cursorOf,
+    emptyPage,
+    offsetOf,
+    pageKey,
+    pageNumber,
+  } from '../lib/models/cursor-page';
+  import {
+    cursorGoTo,
     setCursorSort,
-    cursorBack,
     type CursorListState,
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
@@ -131,7 +137,7 @@
    * `since_days` to `topEvents` and `eventSeries` exactly as it is to the
    * stream, so the range is the one control all three panels agree on.
    *
-   * `appliedSearch`, not `search`: the stream runs the debounced value, so
+   * `appliedSearch`, not `search`: the stream runs the SUBMITTED value, so
    * keying off the raw box would post the caption mid-keystroke while the rows
    * on screen still match the cards.
    */
@@ -382,7 +388,9 @@
       // cache hits zero times while staying wired, typed and green.
       `${tf.field}:${tf.mode}:${tf.lastDays ?? ''}:${tf.from ?? ''}:${tf.to ?? ''}`,
       sortParam(l.sort),
-      cursorOf(l.page),
+      // `pageKey`, NOT `cursorOf`: a jumped page carries a null cursor, the
+      // same as page 1, so a cursor-keyed entry would repaint page one.
+      pageKey(l.page),
     );
     loadingStream = true;
     streamError = null;
@@ -400,6 +408,7 @@
         limit: STREAM_LIMIT,
         sort: sortParam(l.sort),
         cursor: cursorOf(l.page),
+        offset: offsetOf(l.page),
       });
       if (gen !== streamGen) return;
       streamPage = envelope;
@@ -456,22 +465,23 @@
     void loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, next);
   }
 
-  function goPrev() {
-    // `cursorBack` refuses on the first page by handing `list` back BY
-    // REFERENCE (see `list-state.ts`) — testing identity skips the reload
-    // rather than refetching the page already on screen.
-    const next = cursorBack(list);
+  /**
+   * Move to a numbered page.
+   *
+   * `cursorGoTo` picks the mechanism — a keyset step when the target is
+   * adjacent and a cursor for it exists, an offset jump otherwise — and refuses
+   * any move it cannot make by handing back the very `list` it was given.
+   * Testing identity keeps every one of those rules in the reducer, and skips
+   * the reload rather than refetching the page already on screen.
+   */
+  function onjump(target: number) {
+    const next = cursorGoTo(list, target, streamNextCursor, STREAM_LIMIT);
     if (next !== list) toPage(next);
   }
 
-  function goNext() {
-    // `setCursorPage` refuses any move it cannot make — no next cursor, an
-    // empty one, or one equal to this page's — and says so by handing back the
-    // very `list` it was given. Testing identity keeps every one of those
-    // rules in the reducer, and skips the reload rather than refetching the
-    // page on screen.
-    const next = setCursorPage(list, streamNextCursor);
-    if (next !== list) toPage(next);
+  /** The empty-state's "Back a page" escape hatch, in terms of the same reducer. */
+  function goPrev() {
+    onjump(pageNumber(list.page) - 1);
   }
 
   /**
@@ -533,21 +543,16 @@
     if (aid) void loadSeries(aid, days, name);
   });
 
-  // Debounce free-text search only: filters + date range should reload
-  // immediately, but typing in the search box should settle before we requery.
-  let searchTimer: ReturnType<typeof setTimeout>;
-  $effect(() => {
-    const s = search;
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      appliedSearch = s;
-    }, 300);
-    return () => clearTimeout(searchTimer);
-  });
+  // The search box applies on submit only (button/Enter/clear). Filters and
+  // the date range still reload immediately; a query, unlike a chip, spends
+  // most of its typing life as an invalid fragment.
+  function onSearch(q: string) {
+    appliedSearch = q;
+  }
 
   // Rewrite the URL whenever filter/appliedSearch/date-range state changes, and
   // collapse any expanded row (its id belongs to the previous result set).
-  // Depends on `appliedSearch` (debounced), not `search`, so this doesn't fire
+  // Depends on `appliedSearch` (submitted), not `search`, so this doesn't fire
   // per keystroke.
   $effect(() => {
     const aid = sessionStore.currentAppId;
@@ -662,6 +667,7 @@
     appId={sessionStore.currentAppId ?? undefined}
     context="events"
     error={searchError}
+    {onSearch}
   />
   <SearchDisclosure {clamped} />
 
@@ -897,12 +903,11 @@
           total={streamTotal}
           totalIsCapped={streamTotalCapped}
           page={pageNumber(list.page)}
-          canPrev={canGoBack(list.page)}
+          limit={STREAM_LIMIT}
           canNext={streamNextCursor !== null}
           busy={loadingStream}
           noun="event"
-          onprev={goPrev}
-          onnext={goNext}
+          {onjump}
         />
       {/if}
     </Card>
