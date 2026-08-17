@@ -34,13 +34,30 @@ export function addBreadcrumb(input: BreadcrumbInput, hint?: Hint): void {
   client.addBreadcrumb(normalizeBreadcrumb(input), hint);
 }
 
-/** Convenience helper for navigation breadcrumbs. */
-export function addNavigationBreadcrumb(from: string | null, to: string | null): void {
+/**
+ * How a navigation moved the history stack. Shared vocabulary with the Flutter
+ * SDK's `SauronNavigatorObserver`, so a trail reads the same whichever SDK sent
+ * it. `remove` has no web equivalent and is never emitted here.
+ */
+export type NavigationOperation = 'push' | 'pop' | 'replace' | 'remove';
+
+/**
+ * Convenience helper for navigation breadcrumbs.
+ *
+ * `operation` is what the *browser* did, which is not always what the user
+ * meant: `history.forward()` fires the same `popstate` as `history.back()` and
+ * carries nothing to separate them, so both arrive here as `pop`.
+ */
+export function addNavigationBreadcrumb(
+  from: string | null,
+  to: string | null,
+  operation: NavigationOperation = 'push',
+): void {
   addBreadcrumb({
     type: 'navigation',
     category: 'history',
     level: 'info',
     message: null,
-    data: { from, to },
+    data: { from, to, operation },
   });
 }

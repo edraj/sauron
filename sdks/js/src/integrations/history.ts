@@ -1,4 +1,4 @@
-import { addNavigationBreadcrumb } from '../api/breadcrumbs.js';
+import { addNavigationBreadcrumb, type NavigationOperation } from '../api/breadcrumbs.js';
 import { isInternal, isWrapped, markWrapped, registerPatch, withInternal } from './instrument.js';
 
 let navHandler: ((path: string) => void) | null = null;
@@ -36,12 +36,12 @@ export function installHistory(): void {
 
   let lastPath = toPath(loc?.href ?? null, loc?.href);
 
-  const emit = (toHref: string | null): void => {
+  const emit = (toHref: string | null, operation: NavigationOperation): void => {
     const to = toPath(toHref, loc?.href);
     const from = lastPath;
     lastPath = to;
     if (from === to) return;
-    withInternal(() => addNavigationBreadcrumb(from, to));
+    withInternal(() => addNavigationBreadcrumb(from, to, operation));
     if (to && navHandler) {
       try {
         navHandler(to);
@@ -54,12 +54,13 @@ export function installHistory(): void {
   const wrap = (name: 'pushState' | 'replaceState'): void => {
     const original = hist[name];
     if (typeof original !== 'function' || isWrapped(original)) return;
+    const operation: NavigationOperation = name === 'pushState' ? 'push' : 'replace';
 
     hist[name] = markWrapped(function sauronHistory(this: History, ...args: unknown[]) {
       const result = (original as (...a: unknown[]) => unknown).apply(this, args);
       if (!isInternal()) {
         const urlArg = args[2];
-        emit(urlArg != null ? String(urlArg) : (loc?.href ?? null));
+        emit(urlArg != null ? String(urlArg) : (loc?.href ?? null), operation);
       }
       return result;
     }) as History[typeof name];
@@ -73,8 +74,10 @@ export function installHistory(): void {
   wrap('replaceState');
 
   if (typeof g.addEventListener === 'function') {
+    // Both `history.back()` and `history.forward()` land here; the event carries
+    // nothing to separate them, so a forward step is recorded as a pop too.
     const onPopState = (): void => {
-      if (!isInternal()) emit(loc?.href ?? null);
+      if (!isInternal()) emit(loc?.href ?? null, 'pop');
     };
     g.addEventListener('popstate', onPopState);
     registerPatch('popstate', () => {

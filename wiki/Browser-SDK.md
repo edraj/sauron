@@ -191,6 +191,14 @@ Sauron.addBreadcrumb({ type: 'navigation', category: 'route', message: '/setting
 `maxBreadcrumbs` (default 50) and attach to errors captured afterwards. A
 `beforeBreadcrumb` hook runs first — return `null` to drop the crumb.
 
+SPA navigations are recorded automatically as
+`data: { from, to, operation }`, where `operation` is `push` (`pushState`),
+`replace` (`replaceState`) or `pop` (`popstate`) — the same vocabulary as the
+Flutter SDK's `SauronNavigatorObserver`. Note that a **forward** navigation is
+recorded as `pop` too: `history.forward()` fires the same `popstate` as
+`history.back()`, so `pop` means "moved through history" rather than
+specifically "went back".
+
 ### `beforeSend` (any item)
 
 `beforeSend` runs on every outgoing item — scrub PII or drop items. Return the item to

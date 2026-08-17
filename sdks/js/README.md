@@ -985,7 +985,7 @@ const appFrames = frames.filter((f) => isInAppFrame(f.filename));
 
 ```ts
 const SDK_NAME: string  // 'sauron.javascript'
-const SDK_VERSION: string // '1.5.0'
+const SDK_VERSION: string // '1.6.0'
 ```
 
 The SDK identity embedded in `header.sdk` of every envelope.
@@ -1027,7 +1027,7 @@ On by default:
 | `window.onunhandledrejection` | Error item from `event.reason`, mechanism `{ type: 'onunhandledrejection', handled: false }`, level `error`. |
 | `console.log/info/warn/error/debug` | Breadcrumb, category `console`, level mapped (`warn`→`warning`, `error`→`error`, `debug`→`debug`, else `info`), message = arguments joined and truncated to 512 chars, `data: { arguments: n }`. Output is untouched. |
 | `document` click listener (capture, passive) | Breadcrumb, category `ui.click`, message = a `tag#id.class` selector (up to 3 classes). Element text and attribute values are never serialized. |
-| `history.pushState` / `replaceState` / `popstate` | Breadcrumb, type `navigation`, category `history`, `data: { from, to }` as paths. Same-path transitions are skipped. |
+| `history.pushState` / `replaceState` / `popstate` | Breadcrumb, type `navigation`, category `history`, `data: { from, to, operation }` — paths plus the direction: `push`, `replace` or `pop`. Same-path transitions are skipped. |
 | `fetch` | Breadcrumb, category `fetch`, message `METHOD url`, `data: { method, url, status_code }`, level `warning` for status >= 400. |
 | `XMLHttpRequest.prototype.open` / `send` | Breadcrumb, category `xhr`, same shape as `fetch`. |
 | `document` `visibilitychange` + window `pagehide` | Beacon flush of the pending batch on unload. |
@@ -1039,6 +1039,16 @@ Opt-in:
 | --- | --- |
 | `performance: true` | A `navigation` transaction for the initial page load (Navigation Timing, captured on `load`), an `http` transaction per instrumented `fetch` (`name` = `METHOD /path`, `status` `ok`/`error`), and a `navigation` transaction per SPA route change measured over one animation frame. No-op when `document` is undefined. |
 | `screenTracking: true` | Sets the screen to the new path on each SPA History navigation, which emits a `$screen` event on change. |
+
+`operation` uses the same vocabulary as the Flutter SDK's
+`SauronNavigatorObserver` (`push` / `pop` / `replace` / `remove`), so a trail
+reads the same whichever SDK sent it. `remove` has no web equivalent and is
+never emitted here. One limit worth knowing: **a forward navigation is recorded
+as `pop`.** `history.forward()` fires the same `popstate` event as
+`history.back()` and carries nothing to separate them, so `pop` means "moved
+through history", not specifically "went back". Distinguishing them would mean
+writing to `history.state`, which the host app's router also owns — not a
+trade the SDK makes.
 
 Two guards keep the SDK from observing itself: a reentrancy flag held while SDK
 code runs, and a denylist on the DSN host. Requests the transport makes are
@@ -1116,7 +1126,7 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.5.0';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.6.0';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42' });
 </script>
 ```
