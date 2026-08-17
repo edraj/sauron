@@ -199,6 +199,38 @@ impl TestServer {
         })
     }
 
+    /// GET an Overview *section* endpoint and return its PAYLOAD.
+    ///
+    /// The app-scoped `/analytics/active-users` is one of the five Overview
+    /// sections, so it now answers from a server-side cache with
+    /// `{state, computed_at, data}` and recomputes in the background rather
+    /// than on the request path — see `overview_cache`'s module docs. The first
+    /// read of any selection therefore reports `computing` with a null `data`.
+    ///
+    /// Polls until a payload lands and unwraps the envelope, so the assertions
+    /// below are unchanged from when this answered synchronously. Panics with
+    /// the recompute's own error rather than timing out opaquely.
+    ///
+    /// Duplicated from `http_env_scoping.rs` rather than shared: these two
+    /// suites each carry their own `TestServer` (different fixtures, different
+    /// spawn paths) and there is no common test module to hang it on.
+    async fn get_section(&self, path: &str, token: &str) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut last = Value::Null;
+        while std::time::Instant::now() < deadline {
+            let v = self.get_json(path, token).await;
+            if let Some(err) = v["error"].as_str() {
+                panic!("GET {path}: section recompute failed: {err}");
+            }
+            if !v["data"].is_null() {
+                return v["data"].clone();
+            }
+            last = v;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("GET {path}: section never left `computing` within 20s; last: {last}");
+    }
+
     async fn shutdown(&mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
@@ -676,7 +708,7 @@ async fn the_app_scoped_active_users_series_is_reachable_and_env_scoped() {
         f.app_a
     );
 
-    let v = h.get_json(&path, &f.owner_token).await;
+    let v = h.get_section(&path, &f.owner_token).await;
     let series = v["series"].as_array().expect("series is an array");
     let day10 = series
         .iter()
@@ -696,7 +728,7 @@ async fn the_app_scoped_active_users_series_is_reachable_and_env_scoped() {
 
     // Env-scoped member sees only their environment's population. This is the
     // assertion that would have caught a handler wired to `app_id` alone.
-    let scoped = h.get_json(&path, &f.env_member_token).await;
+    let scoped = h.get_section(&path, &f.env_member_token).await;
     let scoped_day10 = scoped["series"]
         .as_array()
         .expect("series")

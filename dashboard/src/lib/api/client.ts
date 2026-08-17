@@ -39,6 +39,28 @@ export function configureAuthBridge(next: AuthBridge): void {
   bridge = next;
 }
 
+/**
+ * The current access token, for the one caller that cannot go through axios.
+ *
+ * `overview-stream.ts` reads an SSE response with `fetch()` because the
+ * browser's native `EventSource` cannot set an `Authorization` header, and the
+ * two usual ways around that are both worse: a token in the query string writes
+ * a live JWT into every access log and `Referer`, and cookie auth would open a
+ * CSRF surface this API does not currently have.
+ *
+ * Deliberately narrow — it returns the token and nothing else, so this does not
+ * become a general back door around the interceptors. Anything that CAN use
+ * axios must.
+ */
+export function currentAccessToken(): string | null {
+  return bridge.getAccessToken();
+}
+
+/** Refresh once, shared with in-flight refreshes. See {@link runRefreshOnce}. */
+export function refreshAccessToken(): Promise<string> {
+  return runRefreshOnce();
+}
+
 // ---------------------------------------------------------------------------
 // Axios instances
 // ---------------------------------------------------------------------------

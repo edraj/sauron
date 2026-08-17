@@ -323,6 +323,43 @@ impl TestServer {
         })
     }
 
+    /// GET an Overview *section* endpoint and return its PAYLOAD.
+    ///
+    /// These five endpoints no longer compute on the request path. They answer
+    /// from a server-side cache with `{state, computed_at, data}` and enqueue a
+    /// background recompute when what they have is missing or stale, so the
+    /// FIRST read of any selection returns `state: "computing"` with a null
+    /// `data` — by design, since the alternative was holding the request open
+    /// past the 30s timeout layer and being shed as a 503.
+    ///
+    /// A test therefore has to wait for the recompute rather than read the
+    /// first response. This polls until the section reports a payload, and
+    /// unwraps the envelope so every assertion below is unchanged from when
+    /// these endpoints answered synchronously.
+    ///
+    /// Panics with the recompute's own error rather than timing out silently:
+    /// a failed aggregate is the thing a test most needs to see, and a bare
+    /// "timed out after 10s" hides it behind the symptom.
+    async fn get_section(&self, path: &str, token: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut last = serde_json::Value::Null;
+        while std::time::Instant::now() < deadline {
+            let v = self.get_json(path, token).await;
+            if let Some(err) = v["error"].as_str() {
+                panic!("GET {path}: section recompute failed: {err}");
+            }
+            // `fresh` and `stale` both carry a payload; only `computing` does
+            // not. Accepting either avoids a flake if the freshness window ever
+            // shortens.
+            if !v["data"].is_null() {
+                return v["data"].clone();
+            }
+            last = v;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("GET {path}: section never left `computing` within 20s; last: {last}");
+    }
+
     /// POST `path` with a JSON body against the running server with the
     /// given bearer token. Serializes via `serde_json::Value::to_string` and
     /// sets the content-type header by hand, same reason as [`get_json`]:
@@ -1077,25 +1114,25 @@ async fn overview_sections_agree_with_the_composite_route() {
         )
         .await;
     let totals = srv
-        .get_json(
+        .get_section(
             &format!("/v1/apps/{app}/overview/totals?since_days=3650"),
             &f.owner_token,
         )
         .await;
     let series = srv
-        .get_json(
+        .get_section(
             &format!("/v1/apps/{app}/overview/series?since_days=3650"),
             &f.owner_token,
         )
         .await;
     let top_issues = srv
-        .get_json(
+        .get_section(
             &format!("/v1/apps/{app}/overview/top-issues?since_days=3650"),
             &f.owner_token,
         )
         .await;
     let top_events = srv
-        .get_json(
+        .get_section(
             &format!("/v1/apps/{app}/overview/top-events?since_days=3650"),
             &f.owner_token,
         )
@@ -1176,13 +1213,13 @@ async fn every_overview_section_is_env_scoped_independently() {
     // `totals` because it is the section carrying the aggregate a leak would
     // show up in.
     let scoped = srv
-        .get_json(
+        .get_section(
             &format!("/v1/apps/{app}/overview/totals?environment_id={granted}&since_days=3650"),
             &f.member_token,
         )
         .await;
     let unscoped = srv
-        .get_json(
+        .get_section(
             &format!("/v1/apps/{app}/overview/totals?since_days=3650"),
             &f.owner_token,
         )

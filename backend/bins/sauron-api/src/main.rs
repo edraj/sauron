@@ -9,6 +9,7 @@ mod audit;
 mod csv;
 mod error;
 mod mail;
+mod overview_cache;
 mod routes;
 mod symbolicate;
 mod tasks;
@@ -87,6 +88,10 @@ pub struct AppState {
     /// queueing here would surface as pool-checkout 500s on unrelated
     /// endpoints, including /v1/auth/login and /health.
     pub active_users_gate: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Result cache, recompute single-flight and SSE fan-out for the Overview
+    /// page. Its aggregates outgrew the 30s request timeout, so they no longer
+    /// run on the request path at all — see `overview_cache`'s module docs.
+    pub overview_cache: crate::overview_cache::OverviewCache,
     /// Whether `event_users.identified_at` exists, probed once at boot.
     ///
     /// Probed rather than assumed because RPM upgrades do not re-run
@@ -277,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
         revocations: sauron_auth::SessionRevocations::new(),
         mail,
         active_users_gate: Arc::new(tokio::sync::Semaphore::new(3)),
+        overview_cache: crate::overview_cache::OverviewCache::new(),
         event_users_identified,
     };
 
@@ -624,6 +630,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/apps/{app_id}/overview/top-events",
             get(routes::analytics::overview_top_events),
+        )
+        // The push half of the Overview cache: the five sections above now
+        // answer instantly from Redis and enqueue their own recompute, and the
+        // finished aggregate arrives here rather than on the request that
+        // triggered it.
+        .route(
+            "/v1/apps/{app_id}/overview/stream",
+            get(routes::analytics::overview_stream),
+        )
+        .route(
+            "/v1/apps/{app_id}/overview/refresh",
+            post(routes::analytics::overview_refresh),
         )
         .route(
             "/v1/apps/{app_id}/users/summary",

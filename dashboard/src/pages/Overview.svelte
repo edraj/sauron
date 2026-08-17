@@ -22,13 +22,17 @@
     getOverviewTopIssues,
     getOverviewTopEvents,
     getActiveUsersSeries,
+    refreshOverview,
   } from '../lib/api/overview';
   import type {
     ActiveUsersSeries,
+    OverviewEnvelope,
+    OverviewSectionName,
     OverviewTotalsSection,
     OverviewSeriesSection,
   } from '../lib/api/overview';
-  import { compactNumber, formatPercent } from '../lib/utils/format';
+  import { openOverviewStream } from '../lib/api/overview-stream';
+  import { compactNumber, formatPercent, formatTime, relativeTime } from '../lib/utils/format';
   import type { Issue, TopEvent } from '../lib/models';
 
   const RANGES = [
@@ -60,17 +64,97 @@
   // its own answer lands. Sections are also cached and revalidated separately,
   // which is what lets a return visit show the KPI tiles instantly while only the
   // slow half refreshes.
-  const totalsView = new CachedView<OverviewTotalsSection>();
-  const seriesView = new CachedView<OverviewSeriesSection>();
-  const issuesView = new CachedView<Issue[]>();
-  const eventsView = new CachedView<TopEvent[]>();
-  const activeUsersView = new CachedView<ActiveUsersSeries>();
+  // Each view now holds the ENVELOPE, not the payload.
+  //
+  // These endpoints no longer run their aggregate on the request path — they
+  // answer from a server-side cache in milliseconds and enqueue a background
+  // recompute, with the result pushed over SSE. `data: null` is therefore a
+  // normal 200 meaning "computing", which is what the whole design buys: the
+  // slowest section was past the server's 30s timeout and shed as a 503, so the
+  // KPI tiles rendered as an error rather than slowly.
+  //
+  // Caching the envelope rather than the payload is deliberate. `computed_at`
+  // is what the header reports, and it has to survive a navigation with the
+  // value it describes — split them and the page comes back showing yesterday's
+  // numbers under a timestamp from this visit.
+  const totalsView = new CachedView<OverviewEnvelope<OverviewTotalsSection>>();
+  const seriesView = new CachedView<OverviewEnvelope<OverviewSeriesSection>>();
+  const issuesView = new CachedView<OverviewEnvelope<Issue[]>>();
+  const eventsView = new CachedView<OverviewEnvelope<TopEvent[]>>();
+  const activeUsersView = new CachedView<OverviewEnvelope<ActiveUsersSeries>>();
 
-  const totals = $derived(totalsView.data ?? null);
-  const series = $derived(seriesView.data ?? null);
-  const topIssues = $derived(issuesView.data ?? null);
-  const topEvents = $derived(eventsView.data ?? null);
-  const activeUsers = $derived(activeUsersView.data ?? null);
+  // `?? null` on the INNER data too: an envelope in the `computing` state has a
+  // null payload, and every card below already renders its skeleton for a null.
+  // That is the cold-start UX with no template change — a section shows its
+  // skeleton until its own push lands, rather than the page waiting on the
+  // slowest one.
+  const totals = $derived(totalsView.data?.data ?? null);
+  const series = $derived(seriesView.data?.data ?? null);
+  const topIssues = $derived(issuesView.data?.data ?? null);
+  const topEvents = $derived(eventsView.data?.data ?? null);
+  const activeUsers = $derived(activeUsersView.data?.data ?? null);
+
+  /**
+   * Wire section name -> the view that holds it and its cache-key prefix.
+   *
+   * Keyed by the SERVER's name for each section, which is the same string used
+   * in the cache key and the SSE event, so the three cannot drift apart. The
+   * prefixes are the ones `load()` already passes to `viewKey`; a mismatch here
+   * would write pushes into a key nothing reads, and the only symptom would be
+   * that live updates silently never appear.
+   */
+  const SECTION_VIEWS: Record<
+    OverviewSectionName,
+    { view: CachedView<OverviewEnvelope<unknown>>; key: string }
+  > = {
+    totals: { view: totalsView as CachedView<OverviewEnvelope<unknown>>, key: 'overview.totals' },
+    series: { view: seriesView as CachedView<OverviewEnvelope<unknown>>, key: 'overview.series' },
+    'top-issues': {
+      view: issuesView as CachedView<OverviewEnvelope<unknown>>,
+      key: 'overview.topIssues',
+    },
+    'top-events': {
+      view: eventsView as CachedView<OverviewEnvelope<unknown>>,
+      key: 'overview.topEvents',
+    },
+    'active-users': {
+      view: activeUsersView as CachedView<OverviewEnvelope<unknown>>,
+      key: 'overview.activeUsers',
+    },
+  };
+
+  /**
+   * When the page's numbers were computed — the OLDEST across sections.
+   *
+   * Oldest, not newest, because this one label speaks for the whole page: the
+   * sections refresh independently and drift apart, and reporting the newest
+   * would advertise the page as fresher than its stalest tile actually is.
+   *
+   * `null` while nothing has landed yet, which hides the label rather than
+   * showing "just now" for numbers that do not exist.
+   */
+  const computedAt = $derived.by(() => {
+    const stamps = [totalsView, seriesView, issuesView, eventsView, activeUsersView]
+      .map((v) => v.data?.computed_at)
+      .filter((s): s is string => !!s)
+      .map((s) => new Date(s).getTime())
+      .filter((t) => Number.isFinite(t));
+    return stamps.length > 0 ? new Date(Math.min(...stamps)) : null;
+  });
+
+  /**
+   * True while any section is still waiting on its first server-side compute.
+   *
+   * A 403 on top-issues cannot reach this: that view holds an error and no
+   * envelope, so its `state` is undefined rather than `computing`. No special
+   * case needed — worth stating, because the obvious defensive `!issuesForbidden`
+   * guard would reference a binding declared further down.
+   */
+  const computing = $derived(
+    [totalsView, seriesView, issuesView, eventsView, activeUsersView].some(
+      (v) => v.data?.state === 'computing',
+    ),
+  );
 
   /**
    * `{ day, count }` from the API remapped to the `{ bucket, count }` that
@@ -161,6 +245,47 @@
     if (aid) void load(aid, days);
   });
 
+  /**
+   * The push half: whatever the server finishes recomputing lands here.
+   *
+   * Opened in its OWN effect, not folded into the load effect above, so the
+   * stream's lifetime is tied to the scope it belongs to and torn down by
+   * Svelte on any change. Folding them would leak a stream per environment
+   * switch, each still writing into the shared view cache — one of which would
+   * be writing another environment's numbers.
+   *
+   * The server sends a snapshot of every section on connect, so this converges
+   * regardless of whether it opens before or after `load()` finishes. That
+   * closes the race the HTTP-only version cannot: fetch returns `computing`,
+   * the recompute finishes before the stream is open, and the push is fanned
+   * out to nobody — leaving a permanent skeleton over a value that is sitting
+   * in Redis.
+   */
+  $effect(() => {
+    const aid = sessionStore.currentAppId;
+    const scope = sessionStore.scopeKey;
+    const days = sinceDays;
+    if (!aid) return;
+
+    const handle = openOverviewStream(aid, days, {
+      onSection: (frame) => {
+        const target = SECTION_VIEWS[frame.section];
+        if (!target) return; // unknown section from a newer server — ignore
+        const key = viewKey(target.key, aid, scope, days);
+        // `adopt` writes through to the view cache, so a pushed value survives
+        // navigating away and back. The second argument is the key the page is
+        // CURRENTLY showing: identical here, but passing it explicitly is what
+        // stops a late frame from a previous scope painting over the new one.
+        target.view.adopt(key, key, frame as never);
+      },
+      // A dropped stream is not an error the user can act on — the sections
+      // still hold their last value and the next navigation re-reads them over
+      // plain HTTP. Logged, not surfaced.
+      onError: (err) => console.warn('overview stream closed', err),
+    });
+    return () => handle.close();
+  });
+
   function retry() {
     const aid = sessionStore.currentAppId;
     if (aid) void load(aid, sinceDays, true);
@@ -171,7 +296,18 @@
     if (!aid) return;
     refreshing = true;
     try {
-      // force: an explicit click must reach the network regardless of freshness.
+      // Two calls, and both are needed.
+      //
+      // `refreshOverview` tells the SERVER to recompute all five sections
+      // ignoring its 1h freshness window; it returns 202 as soon as the work is
+      // enqueued, because the aggregates take seconds to tens of seconds and
+      // waiting for them is the failure this design removes. The results arrive
+      // on the stream.
+      //
+      // `load(force)` then re-reads the sections so the page immediately
+      // reflects the new `stale`/`computing` states — without it, clicking
+      // Refresh would appear to do nothing at all until the first push landed.
+      await refreshOverview(aid, sinceDays);
       await load(aid, sinceDays, true);
     } finally {
       refreshing = false;
@@ -206,7 +342,27 @@
   <div class="head">
     <div>
       <h1 class="page-title">Overview</h1>
-      <p class="muted sub">Health and activity at a glance for the last {sinceDays} days.</p>
+      <p class="muted sub">
+        Health and activity at a glance for the last {sinceDays} days.
+        <!--
+          When these numbers were computed, not when they were fetched. The
+          server caches each section for up to an hour and recomputes in the
+          background, so a page that painted instantly can still be showing
+          40-minute-old numbers — saying so is the contract, not a detail.
+
+          The absolute time is the label and the relative one is the qualifier:
+          "42m ago" alone forces the reader to do arithmetic to know whether it
+          crosses something they care about, and it silently goes wrong if the
+          tab is left open.
+        -->
+        {#if computedAt}
+          <span class="stamp" title={computedAt.toISOString()}>
+            · Updated {formatTime(computedAt)} <span class="muted">({relativeTime(computedAt)})</span>
+          </span>
+        {:else if computing}
+          <span class="stamp">· Computing…</span>
+        {/if}
+      </p>
     </div>
     <div class="controls">
       <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} ranges={RANGES} />
@@ -427,6 +583,14 @@
   .sub {
     font-size: 13.5px;
     margin-top: 3px;
+  }
+  /*
+    `white-space: nowrap` so the timestamp and its relative qualifier never
+    break across lines — split over two lines they read as two separate facts.
+    The subtitle itself still wraps, at the space before the leading "·".
+  */
+  .stamp {
+    white-space: nowrap;
   }
   .grid {
     display: grid;

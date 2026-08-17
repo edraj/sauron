@@ -21,6 +21,54 @@ export async function getOverview(appId: string, sinceDays = 30): Promise<Overvi
 // `getOverview` is kept: it is still the right call for anything that wants the
 // whole snapshot in one round trip.
 
+// ---------------------------------------------------------------------------
+// The section envelope
+// ---------------------------------------------------------------------------
+//
+// The five section endpoints no longer run their aggregate on the request path.
+// They answer from a server-side Redis cache and enqueue a background recompute
+// when what they have is stale or missing; the finished aggregate arrives over
+// `/overview/stream` (see `overview-stream.ts`).
+//
+// That is why `data` is nullable. `computing` is a normal, expected, 200-worthy
+// state — a cold read returns in milliseconds with nothing rather than holding
+// the request open for 30s and being shed as a 503 by the server's timeout
+// layer, which is what these endpoints did before. A caller that treats a null
+// `data` as an error has misread the contract: it means "ask again, or wait for
+// the push", and the UI renders a skeleton.
+
+export type OverviewSectionName =
+  | 'totals'
+  | 'series'
+  | 'top-issues'
+  | 'top-events'
+  | 'active-users';
+
+export interface OverviewEnvelope<T> {
+  /**
+   * - `fresh` — computed within the server's freshness window (1h). Nothing running.
+   * - `stale` — older than that. Shown as-is while a recompute runs.
+   * - `computing` — nothing cached; `data` is null and a recompute is running.
+   */
+  state: 'fresh' | 'stale' | 'computing';
+  /**
+   * When the query behind `data` actually ran; null iff `data` is null.
+   *
+   * This is the value the header renders as "Updated 14:32". It is the SERVER's
+   * compute time, not a client receive time — the difference is the whole point
+   * of showing it, since a value can be served from cache long after it was
+   * computed.
+   */
+  computed_at: string | null;
+  data: T | null;
+  /**
+   * Set when the most recent recompute FAILED. Independent of `data`: a failure
+   * must not erase a good stale value, so both can be present — "here are
+   * yesterday's numbers, and the refresh is currently broken".
+   */
+  error?: string;
+}
+
 export interface OverviewTotalsSection {
   totals: Overview['totals'];
   error_rate: number;
@@ -60,20 +108,22 @@ export interface ActiveUsersSeries {
 export async function getOverviewTotals(
   appId: string,
   sinceDays = 30,
-): Promise<OverviewTotalsSection> {
-  const { data } = await api.get<OverviewTotalsSection>(`/v1/apps/${appId}/overview/totals`, {
-    params: { since_days: sinceDays },
-  });
+): Promise<OverviewEnvelope<OverviewTotalsSection>> {
+  const { data } = await api.get<OverviewEnvelope<OverviewTotalsSection>>(
+    `/v1/apps/${appId}/overview/totals`,
+    { params: { since_days: sinceDays } },
+  );
   return data;
 }
 
 export async function getOverviewSeries(
   appId: string,
   sinceDays = 30,
-): Promise<OverviewSeriesSection> {
-  const { data } = await api.get<OverviewSeriesSection>(`/v1/apps/${appId}/overview/series`, {
-    params: { since_days: sinceDays },
-  });
+): Promise<OverviewEnvelope<OverviewSeriesSection>> {
+  const { data } = await api.get<OverviewEnvelope<OverviewSeriesSection>>(
+    `/v1/apps/${appId}/overview/series`,
+    { params: { since_days: sinceDays } },
+  );
   return data;
 }
 
@@ -90,8 +140,8 @@ export async function getOverviewSeries(
 export async function getOverviewTopIssues(
   appId: string,
   sinceDays = 30,
-): Promise<Overview['top_issues']> {
-  const { data } = await api.get<Overview['top_issues']>(
+): Promise<OverviewEnvelope<Overview['top_issues']>> {
+  const { data } = await api.get<OverviewEnvelope<Overview['top_issues']>>(
     `/v1/apps/${appId}/overview/top-issues`,
     { params: { since_days: sinceDays } },
   );
@@ -101,8 +151,8 @@ export async function getOverviewTopIssues(
 export async function getOverviewTopEvents(
   appId: string,
   sinceDays = 30,
-): Promise<Overview['top_events']> {
-  const { data } = await api.get<Overview['top_events']>(
+): Promise<OverviewEnvelope<Overview['top_events']>> {
+  const { data } = await api.get<OverviewEnvelope<Overview['top_events']>>(
     `/v1/apps/${appId}/overview/top-events`,
     { params: { since_days: sinceDays } },
   );
@@ -126,10 +176,26 @@ export async function getOverviewTopEvents(
 export async function getActiveUsersSeries(
   appId: string,
   sinceDays = 30,
-): Promise<ActiveUsersSeries> {
-  const { data } = await api.get<ActiveUsersSeries>(
+): Promise<OverviewEnvelope<ActiveUsersSeries>> {
+  const { data } = await api.get<OverviewEnvelope<ActiveUsersSeries>>(
     `/v1/apps/${appId}/analytics/active-users`,
     { params: { since_days: sinceDays } },
   );
   return data;
+}
+
+/**
+ * Force a recompute of all five sections, ignoring freshness.
+ *
+ * Returns as soon as the work is ENQUEUED — 202, not 200 — because nothing has
+ * been recomputed when it responds. Results arrive on the stream. A caller that
+ * awaits this and then reads the sections will get the old values; the point is
+ * that the button does not block for 30s.
+ *
+ * Server-side single-flight means holding the button down cannot multiply load.
+ */
+export async function refreshOverview(appId: string, sinceDays = 30): Promise<void> {
+  await api.post(`/v1/apps/${appId}/overview/refresh`, null, {
+    params: { since_days: sinceDays },
+  });
 }
