@@ -26,9 +26,24 @@
     // The control that flips it lives with the caller (the Card header).
     timeMode?: TimeMode;
     onslice?: (item: Transaction) => void;
+    /**
+     * What to say when `items` is empty.
+     *
+     * The default speaks for an unfiltered timeline. A caller that narrows the
+     * list MUST override it: "No activity recorded in this session" is a claim
+     * about the session, and repeating it over a filter that hid every row
+     * states something false about the data rather than about the filter.
+     */
+    emptyLabel?: string;
   }
 
-  let { items, startedAt = null, timeMode = 'session', onslice }: Props = $props();
+  let {
+    items,
+    startedAt = null,
+    timeMode = 'session',
+    onslice,
+    emptyLabel = 'No activity recorded in this session.',
+  }: Props = $props();
 
   let expanded = $state<Set<number>>(new Set());
 
@@ -253,7 +268,7 @@
       </div>
     </li>
   {:else}
-    <li class="tl-empty faint">No activity recorded in this session.</li>
+    <li class="tl-empty faint">{emptyLabel}</li>
   {/each}
 </ol>
 

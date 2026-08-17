@@ -40,6 +40,141 @@ export function rowKind(item: TimelineItem): RowKind {
   return item.kind;
 }
 
+/**
+ * The lane a row belongs to in the timeline's category filter — a coarser fold
+ * than [`RowKind`], which stays as the row BADGE.
+ *
+ * The two differ in exactly two places, and both are deliberate. `http` folds
+ * into `transaction` because an HTTP call IS a transaction with a known op, and
+ * the op filter below is where it is reachable; leaving it as a fifth peer would
+ * double-count it against a chip labelled "transaction". And `error` reads as
+ * `issue` because that is what the row links to — a row whose badge says ERROR
+ * and whose chip says "Issues" is the same row, named for its destination.
+ */
+export type RowCategory = 'navigation' | 'transaction' | 'event' | 'issue';
+
+/** Every category, in the order the filter chips render. */
+export const ROW_CATEGORIES: readonly RowCategory[] = [
+  'navigation',
+  'transaction',
+  'event',
+  'issue',
+];
+
+/**
+ * Written as a total `Record` rather than a `switch` with a default: a sixth
+ * `RowKind` added later fails to compile here instead of quietly falling into
+ * some catch-all bucket, which would be a row that no chip can show and that
+ * disappears the moment any filter is applied.
+ */
+const CATEGORY_OF_KIND: Record<RowKind, RowCategory> = {
+  navigation: 'navigation',
+  http: 'transaction',
+  transaction: 'transaction',
+  event: 'event',
+  error: 'issue',
+};
+
+export function rowCategory(item: TimelineItem): RowCategory {
+  return CATEGORY_OF_KIND[rowKind(item)];
+}
+
+/**
+ * A transaction's op, normalized; `null` for a row that is not a transaction.
+ *
+ * The empty string is a real bucket, not an absence. `op` is non-null on the
+ * wire but a hand-rolled `trackTransaction` can send it blank, and those rows
+ * have to be selectable: dropping them here would leave them visible under the
+ * transaction chip and impossible to isolate by op. The UI renders `''` as
+ * "(none)" — the label is a presentation choice, so it does not live here.
+ */
+export function transactionOp(item: TimelineItem): string | null {
+  if (item.kind !== 'transaction') return null;
+  return (item.transaction.op ?? '').trim();
+}
+
+/**
+ * What the timeline is narrowed to.
+ *
+ * An empty set means NO CONSTRAINT, never "match nothing". That is what makes
+ * the page's initial state and its "All" button the same value, and it is why
+ * no sequence of chip toggles can construct a filter that blanks the timeline
+ * while every chip reads as off.
+ *
+ * `ops` describes transactions and only transactions — see [`filterTimeline`].
+ */
+export interface TimelineFilter {
+  categories: ReadonlySet<RowCategory>;
+  ops: ReadonlySet<string>;
+}
+
+/** The unfiltered state: everything through. */
+export const NO_TIMELINE_FILTER: TimelineFilter = {
+  categories: new Set(),
+  ops: new Set(),
+};
+
+export function isTimelineFiltered(filter: TimelineFilter): boolean {
+  return filter.categories.size > 0 || filter.ops.size > 0;
+}
+
+/**
+ * The rows a filter admits, in their original order.
+ *
+ * The op set is consulted only for transactions. If it gated every row, turning
+ * on an op chip would silently empty the navigation and issue lanes the user
+ * had explicitly asked to keep — rows that carry no op at all and so could
+ * never match one.
+ */
+export function filterTimeline(items: TimelineItem[], filter: TimelineFilter): TimelineItem[] {
+  if (!isTimelineFiltered(filter)) return items;
+  return items.filter((item) => {
+    if (filter.categories.size > 0 && !filter.categories.has(rowCategory(item))) return false;
+    const op = transactionOp(item);
+    if (op === null || filter.ops.size === 0) return true;
+    return filter.ops.has(op);
+  });
+}
+
+/**
+ * How many rows sit in each lane, over the WHOLE timeline.
+ *
+ * Deliberately blind to the current filter: a count that moved when you toggled
+ * a different chip would be unreadable, and the zeros are what let a lane this
+ * session never produced render as disabled rather than as a live control that
+ * filters to nothing.
+ */
+export function categoryCounts(items: TimelineItem[]): Record<RowCategory, number> {
+  const counts: Record<RowCategory, number> = {
+    navigation: 0,
+    transaction: 0,
+    event: 0,
+    issue: 0,
+  };
+  for (const item of items) counts[rowCategory(item)] += 1;
+  return counts;
+}
+
+/**
+ * The ops present among this session's transactions, most frequent first and
+ * ties broken by name so the chip order is stable across reloads.
+ *
+ * Derived from the data rather than from a fixed list: the SDKs let an app name
+ * its own ops, and offering ops this session never emitted would be a row of
+ * chips that all filter to nothing.
+ */
+export function opCounts(items: TimelineItem[]): { op: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const op = transactionOp(item);
+    if (op === null) continue;
+    counts.set(op, (counts.get(op) ?? 0) + 1);
+  }
+  return [...counts]
+    .map(([op, count]) => ({ op, count }))
+    .sort((a, b) => b.count - a.count || a.op.localeCompare(b.op));
+}
+
 /** Color bucket for a response status: 2xx green, 3xx neutral, 4xx amber, 5xx red. */
 export type StatusTone = 'success' | 'neutral' | 'warning' | 'error';
 

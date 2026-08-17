@@ -480,6 +480,39 @@ pub fn enforce_schema_status(
 ///
 /// The version is what `__diesel_schema_migrations` stores and the only thing
 /// comparable against it; the name is what an operator can find on disk.
+/// A short, stable hex digest of the migration set compiled into this binary.
+///
+/// Intended as a cache key for anything derived from the schema — notably the
+/// test harness's template database, which must be rebuilt the moment a
+/// migration is added or removed. Two properties matter and neither is
+/// accidental:
+///
+/// * It is content-independent: only migration *identities* (version + name)
+///   feed the hash, not the SQL inside them. Editing an already-applied
+///   migration in place therefore does NOT change this value — which is sound
+///   only because the `migrations` CI job rejects that edit outright. If that
+///   guard is ever removed, this must start hashing file contents.
+/// * The hash is FNV-1a written out here rather than `DefaultHasher`, whose
+///   output is explicitly not stable across Rust releases. A digest that
+///   silently changes on a toolchain bump would quietly invalidate every
+///   cached artifact keyed on it.
+pub fn migrations_fingerprint() -> anyhow::Result<String> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (version, name) in embedded_migrations()? {
+        eat(version.as_bytes());
+        eat(b"\0");
+        eat(name.as_bytes());
+        eat(b"\n");
+    }
+    Ok(format!("{h:016x}"))
+}
+
 fn embedded_migrations() -> anyhow::Result<Vec<(String, String)>> {
     use diesel::migration::MigrationSource;
     let migrations = MigrationSource::<diesel::pg::Pg>::migrations(&MIGRATIONS)
@@ -514,6 +547,46 @@ pub async fn create_database(maintenance_url: &str, db_name: &str) -> anyhow::Re
     .await
 }
 
+/// Create `db_name` as a physical copy of an existing `template` database,
+/// rather than as an empty database that then has DDL replayed into it.
+///
+/// Postgres implements this as a file-level copy of the template's directory,
+/// which is dramatically cheaper than executing the equivalent statements: for
+/// this workspace's 63 migrations, measured against `postgres:16`, a
+/// create + migrate + drop cycle is ~395 ms and a create-from-template + drop
+/// cycle is ~66 ms.
+///
+/// Two constraints the caller owns, both enforced by Postgres rather than here:
+/// no session may be connected to `template` while the copy runs, and the
+/// template must already contain the schema the caller expects — this function
+/// does not verify what it is copying.
+pub async fn create_database_from_template(
+    maintenance_url: &str,
+    db_name: &str,
+    template: &str,
+) -> anyhow::Result<()> {
+    // `run_admin_ddl` validates `db_name`; `template` is interpolated into the
+    // same statement and needs the identical guard.
+    validate_db_ident(template)?;
+    run_admin_ddl(
+        maintenance_url,
+        db_name,
+        &format!("CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\""),
+    )
+    .await
+}
+
+/// Rename `from` to `to`. Requires that no session is connected to `from`.
+pub async fn rename_database(maintenance_url: &str, from: &str, to: &str) -> anyhow::Result<()> {
+    validate_db_ident(to)?;
+    run_admin_ddl(
+        maintenance_url,
+        from,
+        &format!("ALTER DATABASE \"{from}\" RENAME TO \"{to}\""),
+    )
+    .await
+}
+
 /// Drop `db_name` if it exists, terminating any other sessions still connected
 /// (`WITH (FORCE)`, Postgres 13+). Idempotent. `maintenance_url` must not point
 /// at the database being dropped.
@@ -524,6 +597,222 @@ pub async fn drop_database(maintenance_url: &str, db_name: &str) -> anyhow::Resu
         &format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"),
     )
     .await
+}
+
+// ===========================================================================
+// Test-harness support — one migrated template per server, copied per test.
+//
+// Lives here rather than in any single harness because there are twenty of
+// them: `sauron-db`'s `tests/common`, sixteen `sauron-api` HTTP suites, and
+// `sauron-pipeline`'s. Each used to open with the same create-then-migrate
+// pair, so each independently replayed all migrations into every database it
+// made. Centralising the fast path is what lets one change reach all of them;
+// leaving the pair inlined per harness is what let the cost hide.
+// ===========================================================================
+
+/// Prefix of the shared template database. Inside the `sauron_test_%`
+/// namespace so the harnesses' stale-database reapers find it with the pattern
+/// they already use — and so they can recognise and skip it.
+pub const TEST_TEMPLATE_PREFIX: &str = "sauron_test_tmpl_";
+
+static TEST_TEMPLATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Create `db_name` already migrated, for a test harness.
+///
+/// Equivalent in outcome to [`create_database`] followed by
+/// [`run_pending_migrations`], and that is exactly the fallback if anything
+/// about the fast path is unavailable. The fast path instead copies a template
+/// database that was migrated once for this server, which Postgres performs as
+/// a file-level copy: measured on `postgres:16` against this workspace's 63
+/// migrations, 395 ms → 66 ms per database.
+///
+/// The fallback is not a formality. A copy is refused while any session is
+/// connected to the template, so a busy server can legitimately reject it; when
+/// that happens the caller must still get a correctly migrated database, just
+/// more slowly. No failure mode here may turn into a test failure that looks
+/// like a schema bug.
+pub async fn create_test_database(maintenance_url: &str, db_name: &str) -> anyhow::Result<()> {
+    if let Some(template) = ensure_migrated_template(maintenance_url).await {
+        match create_database_from_template(maintenance_url, db_name, &template).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "create_test_database: copying {template} -> {db_name} failed, \
+                     migrating from scratch instead: {e}"
+                );
+                // The failed CREATE may or may not have left the name taken.
+                let _ = drop_database(maintenance_url, db_name).await;
+            }
+        }
+    }
+    create_database(maintenance_url, db_name).await?;
+    run_pending_migrations(&swap_database_url(maintenance_url, db_name)).await
+}
+
+/// Name and advisory-lock key of the template matching the migrations compiled
+/// into this binary.
+///
+/// The fingerprint in the name is what makes adding a migration correct by
+/// construction: it produces a *different* name, so a stale template is never
+/// asked for again rather than being detected and repaired.
+fn test_template_identity() -> Option<(String, i64)> {
+    let fingerprint = migrations_fingerprint().ok()?;
+    let key = u64::from_str_radix(&fingerprint, 16).ok()? as i64;
+    Some((format!("{TEST_TEMPLATE_PREFIX}{fingerprint}"), key))
+}
+
+async fn ensure_migrated_template(maintenance_url: &str) -> Option<String> {
+    if let Some(cached) = TEST_TEMPLATE.get() {
+        return cached.clone();
+    }
+    let resolved = build_migrated_template(maintenance_url).await;
+    // Racing callers all compute the same name and the advisory lock means only
+    // one did any work; whichever result lands first is kept.
+    let _ = TEST_TEMPLATE.set(resolved.clone());
+    resolved
+}
+
+async fn build_migrated_template(maintenance_url: &str) -> Option<String> {
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+    let Some((name, lock_key)) = test_template_identity() else {
+        eprintln!("test template builder: could not fingerprint the embedded migrations");
+        return None;
+    };
+    let mut conn = match AsyncPgConnection::establish(maintenance_url).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("test template builder: connect to maintenance db failed: {e}");
+            return None;
+        }
+    };
+
+    // Serializes every builder pointed at this server, across threads AND
+    // processes — which is what keeps this correct under a process-per-test
+    // runner as well as under `cargo test`. Session-scoped, so a builder that
+    // panics or is killed releases it by disconnecting instead of wedging the
+    // whole suite behind a lock nobody holds any more.
+    if diesel::sql_query("SELECT pg_advisory_lock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(lock_key)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+
+    let built = build_template_locked(maintenance_url, &name, &mut conn).await;
+
+    let _ = diesel::sql_query("SELECT pg_advisory_unlock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(lock_key)
+        .execute(&mut conn)
+        .await;
+    built
+}
+
+async fn build_template_locked(
+    maintenance_url: &str,
+    name: &str,
+    conn: &mut AsyncPgConnection,
+) -> Option<String> {
+    use diesel_async::RunQueryDsl;
+    if database_exists(conn, name).await {
+        return Some(name.to_string());
+    }
+
+    // Migrate under a throwaway name and rename only on success, rather than
+    // creating `name` and filling it in place. The difference shows up on a
+    // crash: a builder killed midway would otherwise leave a half-migrated
+    // database under the canonical name, and every later test would copy that
+    // broken schema and fail somewhere far away from the cause. Here the
+    // canonical name does not exist until it is complete, and the abandoned
+    // scratch database is an ordinary `sauron_test_<ts>_<uuid>` that the
+    // harnesses' reapers already collect.
+    //
+    // `_tb` rather than a readable `_tmplbuild`: `validate_db_ident` caps
+    // identifiers at Postgres's 63-byte limit, and the readable spelling put
+    // this name at exactly 64. It failed the guard before reaching the server,
+    // every builder gave up, and the suite fell back to migrating per test —
+    // still green, still correct, and 2x slower with nothing in the output
+    // saying so. Hence the length check in the debug assertion below.
+    let scratch = format!(
+        "sauron_test_{}_tb{}",
+        chrono::Utc::now().timestamp(),
+        uuid::Uuid::new_v4().simple()
+    );
+    debug_assert!(
+        scratch.len() <= 63,
+        "scratch template name is {} bytes, over Postgres's 63-byte identifier limit: {scratch}",
+        scratch.len()
+    );
+    if let Err(e) = create_database(maintenance_url, &scratch).await {
+        // Loud on purpose. Every other failure here degrades to the old
+        // migrate-per-test path, which is correct but silently costs roughly
+        // double; without this line the only symptom is a slow suite.
+        eprintln!("test template builder: creating {scratch} failed: {e}");
+        return None;
+    }
+    let scratch_url = swap_database_url(maintenance_url, &scratch);
+    if let Err(e) = run_pending_migrations(&scratch_url).await {
+        eprintln!("test template builder: migrating {scratch} failed: {e}");
+        let _ = drop_database(maintenance_url, &scratch).await;
+        return None;
+    }
+
+    // `ALTER DATABASE ... RENAME` refuses while any session is connected. The
+    // migration runner's own connection is finished by now, but a socket
+    // closing and the backend exiting are not the same instant, and the
+    // resulting error would read as a schema problem rather than a timing one.
+    let _ = diesel::sql_query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind::<diesel::sql_types::Text, _>(scratch.clone())
+    .execute(conn)
+    .await;
+
+    match rename_database(maintenance_url, &scratch, name).await {
+        Ok(()) => Some(name.to_string()),
+        Err(e) => {
+            let _ = drop_database(maintenance_url, &scratch).await;
+            // A builder in another process outside this server's lock (a second
+            // checkout, say) may have taken the name first. That is a success
+            // for us: the caller needs a usable template, not authorship of it.
+            if database_exists(conn, name).await {
+                Some(name.to_string())
+            } else {
+                eprintln!("test template builder: renaming {scratch} -> {name} failed: {e}");
+                None
+            }
+        }
+    }
+}
+
+async fn database_exists(conn: &mut AsyncPgConnection, name: &str) -> bool {
+    use diesel_async::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT count(*) AS n FROM pg_database WHERE datname = $1")
+        .bind::<diesel::sql_types::Text, _>(name.to_string())
+        .get_result::<Count>(conn)
+        .await
+        .map(|c| c.n > 0)
+        .unwrap_or(false)
+}
+
+/// `url` with its database (path) segment replaced by `new_db`, preserving
+/// scheme, authority and any `?query`.
+fn swap_database_url(url: &str, new_db: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let auth_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let after = &rest[auth_end..];
+    let query = after.find('?').map(|i| &after[i..]).unwrap_or("");
+    format!("{scheme}://{authority}/{new_db}{query}")
 }
 
 /// Guard against SQL injection through an un-bindable identifier: only a plain,

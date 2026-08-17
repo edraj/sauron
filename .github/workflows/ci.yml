@@ -1,8 +1,23 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # Deliberately NOT `push: branches: [main]`. A merge re-ran this entire matrix
+  # against a tree the pull_request check had already gated — ~11 minutes of
+  # duplicate signal per merge, of which `backend` alone was ~10.
+  #
+  # The duplicate run did produce one thing of value, and it is not obvious:
+  # `Swatinem/rust-cache` writes a 1.19 GB dependency cache, and GitHub scopes
+  # cache entries BY REF. An entry written on `refs/pull/N/merge` is visible to
+  # that PR and to nothing else; only entries on the DEFAULT branch are
+  # inherited by every branch. The push-on-main run was the sole writer of the
+  # shared entry, so simply deleting this trigger would have left each new PR
+  # compiling 492 dependencies from cold — slower PRs, not faster ones.
+  # `release.yml` does not cover the gap: it caches through sccache, a different
+  # key space entirely.
+  #
+  # `cache-warm.yml` now performs that one job on main and asserts nothing else.
+  # If you restore `push:` here, delete cache-warm.yml in the same change —
+  # otherwise both write the same cache key and race.
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -64,6 +79,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend
+          # Pins the cache key rather than letting rust-cache derive one from
+          # the job. `cache-warm.yml` has to WRITE the key this job READS, and
+          # it cannot reach a derived id from another file. Two consequences,
+          # both intended: renaming either job is now free, and changing this
+          # string in one file without the other is what breaks the sharing —
+          # which costs exactly one cold run to notice, not silent slow rot.
+          #
+          # Adding this changed the key once, so the first run after it merges
+          # restores nothing and rebuilds the dependency graph cold.
+          shared-key: backend
       - name: Cache libduckdb download
         uses: actions/cache@v4
         with:

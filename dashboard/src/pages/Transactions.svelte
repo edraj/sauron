@@ -94,6 +94,16 @@
     value: string | null;
     href?: string;
     mono?: boolean;
+    /**
+     * Span the whole panel instead of taking one grid column.
+     *
+     * For the one field with no useful upper bound. A query string with a dozen
+     * parameters wraps to eight lines in a third of the panel and to two across
+     * all of it; every other field here is a uuid, a timestamp or a short label,
+     * all of which fit the narrow column (measured: uuid 271px, ISO timestamp
+     * 203px, value column 283px).
+     */
+    wide?: boolean;
   }
 
   /**
@@ -118,7 +128,7 @@
       { label: 'Status', value: t.status },
       { label: 'HTTP method', value: t.http_method },
       { label: 'HTTP status', value: t.http_status == null ? null : String(t.http_status) },
-      { label: 'URL', value: t.url, mono: true },
+      { label: 'URL', value: t.url, mono: true, wide: true },
       {
         label: 'User',
         value: t.distinct_id,
@@ -503,7 +513,7 @@
             </tr>
             {#if expanded.has(t.id)}
               <tr class="meta-row">
-                <td colspan="8">
+                <td class="wrap" colspan="8">
                   {#if isTruncated(t)}
                     <p class="truncated" role="status">
                       <Icon name="info" size={14} />
@@ -521,7 +531,7 @@
                     <h4>Span</h4>
                     <dl class="detail">
                       {#each detailRows(t) as row (row.label)}
-                        <div class="detail-row">
+                        <div class="detail-row" class:wide={row.wide}>
                           <dt>{row.label}</dt>
                           <dd>
                             {#if row.value === null}
@@ -675,31 +685,54 @@
   /* Two columns on a wide viewport, one when the pane is narrow. `auto-fill`
      rather than a fixed count so a maximised window does not stretch a
      16-row list into two very tall columns of mostly whitespace. */
+  /* 373px = the 92px label + its 10px gap + 271px, the measured width of a
+     uuid at this font. Below that a session id wraps mid-token, which is both
+     ugly and hard to copy; above it the columns just get roomier. `auto-fill`
+     keeps a maximised window from stretching 16 rows into two very tall
+     columns of whitespace. */
   .detail {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(373px, 1fr));
     gap: 2px 24px;
     margin: 0;
   }
   .detail-row {
     display: grid;
-    grid-template-columns: 130px 1fr;
+    /* `minmax(0, 1fr)`, NOT `1fr`. A bare `1fr` is `minmax(auto, 1fr)`, and
+       `auto`'s minimum is MIN-CONTENT — so a 200-char URL inflates the track
+       to its own width instead of wrapping into the space available. The
+       explicit `0` minimum is what lets the track shrink and the text wrap. */
+    grid-template-columns: 92px minmax(0, 1fr);
     gap: 10px;
     align-items: baseline;
     padding: 3px 0;
     min-width: 0;
   }
+  /* The full-width row, for a value with no useful upper bound. `1 / -1` spans
+     however many columns `auto-fill` produced, so it stays correct at every
+     viewport without a media query. */
+  .detail-row.wide {
+    grid-column: 1 / -1;
+  }
   .detail dt {
     font-size: 12px;
     color: var(--muted);
+    /* Labels are short, known, and read as a column — wrapping "Transaction id"
+       onto two lines would ripple the baseline of every row beside it. */
+    white-space: nowrap;
   }
   .detail dd {
     margin: 0;
     font-size: 12.5px;
-    /* Long urls and ids wrap instead of widening the grid track, which would
-       otherwise push the whole table into a horizontal scroll. */
-    overflow-wrap: anywhere;
     min-width: 0;
+    /* Long urls, uuids and release strings have few break opportunities, so
+       normal wrapping leaves them overflowing. `anywhere` breaks mid-token.
+       This is inert without the `wrap` class on the containing `<td>`:
+       DataTable sets `white-space: nowrap` on every cell, and nowrap
+       suppresses line breaking outright — `overflow-wrap` never gets a say.
+       That pairing is what put the session id on top of the next column's
+       label and clipped the transaction id at the panel edge. */
+    overflow-wrap: anywhere;
   }
   .session {
     display: inline-block;
