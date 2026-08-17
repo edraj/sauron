@@ -1,0 +1,86 @@
+name: cache warm
+
+# This workflow is NOT a gate and deliberately asserts nothing. `ci.yml` gates
+# every change on the pull_request event; re-running that matrix on the merge
+# commit only reproved a tree that had already passed.
+#
+# What the old push-on-main run *did* uniquely produce was a cache entry, and
+# that turns out to be load-bearing. GitHub scopes Actions caches by ref: an
+# entry written from `refs/pull/N/merge` can be restored by that pull request
+# and by nothing else, while entries on the DEFAULT branch are inherited by
+# every branch in the repo. The ~1.19 GB `v0-rust-backend-*` dependency cache
+# that makes a PR's `backend` job take ~11 minutes instead of a cold compile of
+# 492 dependencies was therefore written *only* by the merge run. Removing that
+# trigger without replacing this half would have slowed every PR down.
+#
+# So: keep the cache write, drop the redundant assertions. Nothing here fails a
+# merge — see the note on the two warm steps for why that is deliberate rather
+# than sloppy.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Distinct from ci.yml's group on purpose: two merges in quick succession
+  # should not leave the newer one waiting on an older cache rebuild, and the
+  # older one has nothing worth finishing.
+  group: cache-warm-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    name: warm the backend dependency cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      # Mirrors ci.yml's `backend` job. The artifacts this produces are only
+      # reusable there if the toolchain and link environment match, so these
+      # steps are copies on purpose — divergence shows up as a silent cache miss
+      # (a slow PR), never as a failure here.
+      - name: Toolchain deps (pkg-config + libzstd for the system-zstd link)
+        run: sudo apt-get update -q && sudo apt-get install -y -q pkg-config libzstd-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          # MUST stay identical to the `shared-key` on ci.yml's `backend` job —
+          # that string is the entire coupling between the two files.
+          shared-key: backend
+      - name: Cache libduckdb download
+        uses: actions/cache@v4
+        with:
+          path: .cache/duckdb
+          key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
+      - name: Fetch prebuilt libduckdb (DuckDB is linked unbundled)
+        run: |
+          DIR=$(../packaging/rpm/fetch-libduckdb.sh)
+          echo "DUCKDB_LIB_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$DIR" >> "$GITHUB_ENV"
+
+      # Both artifact FORMS are warmed, because the PR job consumes both and
+      # warming one leaves the other cold: `cargo clippy` reads rustc metadata
+      # (.rmeta), `cargo test` reads codegen output (.rlib). Building only the
+      # cheaper half would look like a working cache while the PR still paid for
+      # the expensive one.
+      #
+      # Neither step is a gate. clippy is run WITHOUT `-D warnings` and with its
+      # exit status discarded, and the test step stops at `--no-run`: a lint
+      # regression or a failing test is ci.yml's job to catch on the PR, and
+      # letting either one abort this workflow would leave the shared cache
+      # unwritten and quietly slow down every PR opened afterwards.
+      - name: Warm metadata artifacts (clippy's inputs)
+        run: cargo clippy --workspace --all-targets || true
+      - name: Warm codegen artifacts (builds every test target, runs none)
+        run: cargo test --workspace --no-run

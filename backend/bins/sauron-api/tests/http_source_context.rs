@@ -289,13 +289,13 @@ impl TestServer {
             Utc::now().timestamp(),
             Uuid::new_v4().simple()
         );
-        sauron_db::create_database(&admin_url, &db_name)
-            .await
-            .expect("create ephemeral test database");
         let db_url = swap_database(&admin_url, &db_name);
-        sauron_db::run_pending_migrations(&db_url)
+        // One migrated template, copied per test — see
+        // `sauron_db::create_test_database`. Falls back to replaying the
+        // migrations, so the resulting schema is identical either way.
+        sauron_db::create_test_database(&admin_url, &db_name)
             .await
-            .expect("run migrations on ephemeral test database");
+            .expect("create migrated ephemeral test database");
         let pool = sauron_db::build_pool(&db_url, 2).expect("build test pool");
 
         let port = free_port();

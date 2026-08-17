@@ -411,6 +411,21 @@ async fn reap_stale_test_databases(admin_url: &str) {
         datname: String,
     }
 
+    // Once per process, not once per `setup()`. This is a connect plus a
+    // catalogue scan, and `setup()` is called from ~375 sites; repeating it per
+    // test bought nothing, because anything it would reap was already reaped by
+    // the first call. `compare_exchange` guarantees exactly one winner even with
+    // the whole suite starting at once; a loser skipping the reap is harmless,
+    // since this was always best-effort.
+    static REAPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering;
+    if REAPED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
     let mut conn = match AsyncPgConnection::establish(admin_url).await {
         Ok(c) => c,
         Err(e) => {
@@ -434,6 +449,14 @@ async fn reap_stale_test_databases(admin_url: &str) {
 
     let now = Utc::now().timestamp();
     for row in rows {
+        // The template database matches `sauron_test_%` too, and reaping it
+        // mid-run would fail every in-flight `CREATE DATABASE ... TEMPLATE`.
+        // It survives the timestamp parse below by accident (`tmpl` is not an
+        // integer); this makes that deliberate, so renaming the scheme cannot
+        // silently turn the reaper on its own cache.
+        if row.datname.starts_with(sauron_db::TEST_TEMPLATE_PREFIX) {
+            continue;
+        }
         // Name shape: sauron_test_<unix-seconds>_<uuid-simple>. A name that
         // doesn't parse (hand-created, or from before this scheme existed) is
         // left alone rather than guessed at.
@@ -489,13 +512,14 @@ impl TestDb {
         let admin_url = std::env::var("TEST_DATABASE_URL").ok()?;
         reap_stale_test_databases(&admin_url).await;
         let db_name = ephemeral_db_name();
-        sauron_db::create_database(&admin_url, &db_name)
-            .await
-            .expect("create ephemeral test database");
         let db_url = swap_database(&admin_url, &db_name);
-        sauron_db::run_pending_migrations(&db_url)
+        // Copies the shared migrated template when the server can provide one
+        // and replays the migrations when it cannot; either way `db_name` comes
+        // back holding exactly the schema the migrations describe, so no test
+        // can tell which path ran except by how long it waited.
+        sauron_db::create_test_database(&admin_url, &db_name)
             .await
-            .expect("run migrations on ephemeral test database");
+            .expect("create migrated ephemeral test database");
         // Two, not one. `cleanup()` checks out its own connection, and a test's `conn`
         // local is not dropped until the end of its block — i.e. after `cleanup()` has
         // already been awaited. With a single slot that deadlocks for the full 5s pool

@@ -1,6 +1,22 @@
 import { describe, it, expect } from 'vitest';
 import type { AnalyticsEvent, ErrorEvent, TimelineItem, Transaction } from './index';
-import { httpStatusTone, isHttp, isNavigation, offsetMs, rowKind, rowTitle } from './timeline-row';
+import {
+  NO_TIMELINE_FILTER,
+  ROW_CATEGORIES,
+  categoryCounts,
+  filterTimeline,
+  httpStatusTone,
+  isHttp,
+  isNavigation,
+  isTimelineFiltered,
+  offsetMs,
+  opCounts,
+  rowCategory,
+  rowKind,
+  rowTitle,
+  transactionOp,
+  type TimelineFilter,
+} from './timeline-row';
 
 function ev(
   at: string,
@@ -206,5 +222,162 @@ describe('offsetMs', () => {
     const backwards = [ev('2026-08-11T14:17:05Z', 'a'), ev('2026-08-11T14:17:04Z', 'b')];
     expect(offsetMs(backwards, 1, started, 'delta')).toBeNull();
     expect(offsetMs(backwards, 0, '2026-08-11T14:17:06Z', 'session')).toBeNull();
+  });
+});
+
+describe('rowCategory', () => {
+  // The fold `rowKind` does NOT do: the filter's four buckets are coarser than
+  // the five badges. An HTTP row keeps its HTTP badge but files under
+  // "transaction", because that is the lane a user asking for "transactions"
+  // means — and there is no separate HTTP chip for it to hide behind.
+  it('folds http in with transactions and calls errors issues', () => {
+    expect(rowCategory(http('/api/login'))).toBe('transaction');
+    expect(rowCategory(tx('2026-08-11T14:17:14Z', '/checkout'))).toBe('transaction');
+    expect(rowCategory(err('2026-08-11T14:17:14Z'))).toBe('issue');
+  });
+
+  it('separates $screen events from ordinary events', () => {
+    expect(rowCategory(ev('2026-08-11T14:17:03Z', '$screen'))).toBe('navigation');
+    expect(rowCategory(ev('2026-08-11T14:17:04Z', 'Onboarding menu'))).toBe('event');
+  });
+
+  // Totality is the property that matters: a row with no category is a row no
+  // chip can ever show, and it would vanish the moment a filter is applied.
+  it('gives every timeline row a category drawn from ROW_CATEGORIES', () => {
+    const rows = [
+      ev('2026-08-11T14:17:03Z', '$screen'),
+      ev('2026-08-11T14:17:04Z', 'Onboarding menu'),
+      err('2026-08-11T14:17:14Z'),
+      tx('2026-08-11T14:17:14Z', '/checkout'),
+      http('/api/login'),
+    ];
+    for (const row of rows) {
+      expect(ROW_CATEGORIES).toContain(rowCategory(row));
+    }
+  });
+});
+
+describe('transactionOp', () => {
+  it('reads the op off a transaction and nothing else', () => {
+    expect(transactionOp(http('/api/login'))).toBe('http');
+    expect(transactionOp(ev('2026-08-11T14:17:03Z', '$screen'))).toBeNull();
+    expect(transactionOp(err('2026-08-11T14:17:14Z'))).toBeNull();
+  });
+
+  // A blank op is a real bucket, not a missing one. Dropping it would leave
+  // those rows filterable by category but unreachable by op — visible when the
+  // transaction chip is on, and impossible to isolate.
+  it('normalizes a blank or padded op to the empty bucket', () => {
+    expect(transactionOp(tx('2026-08-11T14:17:14Z', 'a', { op: '  db  ' }))).toBe('db');
+    expect(transactionOp(tx('2026-08-11T14:17:14Z', 'a', { op: '   ' }))).toBe('');
+    expect(transactionOp(tx('2026-08-11T14:17:14Z', 'a', { op: '' }))).toBe('');
+  });
+});
+
+describe('filterTimeline', () => {
+  const rows = [
+    ev('2026-08-11T14:17:03Z', '$screen'),
+    ev('2026-08-11T14:17:04Z', 'Onboarding menu'),
+    tx('2026-08-11T14:17:05Z', '/checkout', { op: 'db' }),
+    http('/api/login'),
+    err('2026-08-11T14:17:14Z'),
+  ];
+
+  function filter(over: Partial<TimelineFilter> = {}): TimelineFilter {
+    return { ...NO_TIMELINE_FILTER, ...over };
+  }
+
+  // An empty set means "no constraint", never "match nothing". It is what the
+  // page starts with and what the All button restores, so the two cannot drift
+  // apart, and no toggle sequence can land on a silently blank timeline.
+  it('passes everything through when no category is selected', () => {
+    expect(filterTimeline(rows, NO_TIMELINE_FILTER)).toEqual(rows);
+    expect(isTimelineFiltered(NO_TIMELINE_FILTER)).toBe(false);
+  });
+
+  it('keeps only the selected category', () => {
+    const only = filterTimeline(rows, filter({ categories: new Set(['navigation']) }));
+    expect(only.map(rowTitle)).toEqual(['$screen']);
+  });
+
+  it('keeps the union of several selected categories', () => {
+    const some = filterTimeline(rows, filter({ categories: new Set(['navigation', 'issue']) }));
+    expect(some.map(rowCategory)).toEqual(['navigation', 'issue']);
+  });
+
+  it('reports itself as filtered once a category or op is chosen', () => {
+    expect(isTimelineFiltered(filter({ categories: new Set(['event']) }))).toBe(true);
+    expect(isTimelineFiltered(filter({ ops: new Set(['http']) }))).toBe(true);
+  });
+
+  it('lets every transaction through when no op is selected', () => {
+    const txs = filterTimeline(rows, filter({ categories: new Set(['transaction']) }));
+    expect(txs.map(transactionOp)).toEqual(['db', 'http']);
+  });
+
+  it('narrows transactions to the selected ops', () => {
+    const only = filterTimeline(
+      rows,
+      filter({ categories: new Set(['transaction']), ops: new Set(['http']) }),
+    );
+    expect(only.map(transactionOp)).toEqual(['http']);
+  });
+
+  // The op set describes transactions and only transactions. If it also gated
+  // the other lanes, turning on an op chip would silently empty the issue and
+  // navigation rows the user had explicitly asked to keep.
+  it('applies the op set to transactions without touching other categories', () => {
+    const mixed = filterTimeline(
+      rows,
+      filter({ categories: new Set(['transaction', 'issue']), ops: new Set(['http']) }),
+    );
+    expect(mixed.map(rowCategory)).toEqual(['transaction', 'issue']);
+  });
+
+  it('isolates the blank-op bucket', () => {
+    const blank = tx('2026-08-11T14:17:06Z', 'anon', { op: '' });
+    const only = filterTimeline(
+      [...rows, blank],
+      filter({ categories: new Set(['transaction']), ops: new Set(['']) }),
+    );
+    expect(only).toEqual([blank]);
+  });
+});
+
+describe('categoryCounts / opCounts', () => {
+  const rows = [
+    ev('2026-08-11T14:17:03Z', '$screen'),
+    ev('2026-08-11T14:17:07Z', '$screen'),
+    ev('2026-08-11T14:17:04Z', 'Onboarding menu'),
+    tx('2026-08-11T14:17:05Z', '/checkout', { op: 'db' }),
+    http('/api/login'),
+    http('/api/me'),
+  ];
+
+  // Zero is a fact worth rendering: "this session had no issues" is what makes
+  // the chip disableable instead of a dead control that filters to nothing.
+  it('reports a count for every category, zeros included', () => {
+    expect(categoryCounts(rows)).toEqual({
+      navigation: 2,
+      transaction: 3,
+      event: 1,
+      issue: 0,
+    });
+  });
+
+  it('counts ops over transactions only, most frequent first', () => {
+    expect(opCounts(rows)).toEqual([
+      { op: 'http', count: 2 },
+      { op: 'db', count: 1 },
+    ]);
+  });
+
+  it('breaks a count tie by op name', () => {
+    const tied = [
+      tx('2026-08-11T14:17:05Z', 'a', { op: 'ui' }),
+      tx('2026-08-11T14:17:06Z', 'b', { op: 'db' }),
+      tx('2026-08-11T14:17:07Z', 'c', { op: '' }),
+    ];
+    expect(opCounts(tied).map((o) => o.op)).toEqual(['', 'db', 'ui']);
   });
 });

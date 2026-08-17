@@ -8,6 +8,7 @@
   import Badge from '../lib/components/ui/Badge.svelte';
   import CopyButton from '../lib/components/ui/CopyButton.svelte';
   import Timeline from '../lib/components/Timeline.svelte';
+  import TimelineFilters from '../lib/components/TimelineFilters.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import JsonTree from '../lib/components/JsonTree.svelte';
@@ -20,7 +21,15 @@
   import { isNormalizedError } from '../lib/api/client';
   import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
   import type { SessionDetail, Transaction } from '../lib/models';
-  import type { TimeMode } from '../lib/models/timeline-row';
+  import {
+    NO_TIMELINE_FILTER,
+    categoryCounts,
+    filterTimeline,
+    isTimelineFiltered,
+    opCounts,
+    type TimeMode,
+    type TimelineFilter,
+  } from '../lib/models/timeline-row';
 
   interface Props {
     params?: { id?: string };
@@ -87,6 +96,12 @@
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
     const id = sessionId;
+    // Reset the timeline filter alongside the load. The router reuses this
+    // component across `#/sessions/A` → `#/sessions/B`, so without this a
+    // filter set on one session would carry into the next and hide rows there
+    // — and the op chips it names may not even exist in the new session.
+    // Safe inside the effect: nothing here reads `timelineFilter`.
+    timelineFilter = NO_TIMELINE_FILTER;
     if (aid && id) void load(aid, id);
   });
 
@@ -95,6 +110,25 @@
   // session you have just opened, and a remembered delta mode would silently
   // change what every future session's numbers mean.
   let timeMode = $state<TimeMode>('session');
+
+  /**
+   * Which lanes of the timeline are on screen. Not persisted, for the reason
+   * `timeMode` is not: a remembered filter would silently hide rows on the next
+   * session you open, and the ops it names belong to the session it was set on.
+   *
+   * Replaced wholesale on every change — never mutated. Svelte 5 does not proxy
+   * `Set`, so mutating one in place would leave both the list and the chips
+   * unchanged.
+   */
+  let timelineFilter = $state<TimelineFilter>(NO_TIMELINE_FILTER);
+
+  const timeline = $derived(detail?.timeline ?? []);
+  // Counts read the FULL timeline: a chip whose number moved when you toggled a
+  // different chip could not be read as "how many of these this session has".
+  const timelineCounts = $derived(categoryCounts(timeline));
+  const timelineOps = $derived(opCounts(timeline));
+  const visibleTimeline = $derived(filterTimeline(timeline, timelineFilter));
+  const timelineFiltered = $derived(isTimelineFiltered(timelineFilter));
 
   const s = $derived(detail?.session ?? null);
   const durationMs = $derived(s ? durationBetween(s.started_at, s.last_event_at) : 0);
@@ -237,7 +271,26 @@
               {timeMode === 'delta' ? 'Since previous' : 'Since start'}
             </Button>
           {/snippet}
-          <Timeline items={detail.timeline} startedAt={s.started_at} {timeMode} onslice={pushSlice} />
+          <!-- Hidden for an empty session: with every count at zero the strip
+               is four disabled chips over a timeline that already says it has
+               nothing in it. -->
+          {#if timeline.length > 0}
+            <TimelineFilters
+              counts={timelineCounts}
+              ops={timelineOps}
+              filter={timelineFilter}
+              onchange={(next) => (timelineFilter = next)}
+            />
+          {/if}
+          <Timeline
+            items={visibleTimeline}
+            startedAt={s.started_at}
+            {timeMode}
+            onslice={pushSlice}
+            emptyLabel={timelineFiltered
+              ? 'No entries match the selected filters.'
+              : undefined}
+          />
         </Card>
       </div>
       <aside class="col-side">
@@ -283,7 +336,18 @@
         </div>
       </div>
       <div class="slice-timeline">
-        <Timeline items={slicedTimeline} startedAt={sliceStack[sliceStack.length - 1][sliceStartTime]} timeMode="delta" onslice={pushSlice} />
+        <!-- The slice deliberately ignores the category filter — it answers
+             "what happened inside this span", which a filter set for the page
+             behind the modal has no bearing on. It does need its own empty
+             text: a span with nothing between its ends is not a session with
+             no activity, and the default would say so. -->
+        <Timeline
+          items={slicedTimeline}
+          startedAt={sliceStack[sliceStack.length - 1][sliceStartTime]}
+          timeMode="delta"
+          onslice={pushSlice}
+          emptyLabel="Nothing else was recorded while this transaction was open."
+        />
       </div>
     {/if}
   </Modal>
