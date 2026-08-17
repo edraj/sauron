@@ -159,6 +159,33 @@ export class CachedView<T> {
   }
 
   /**
+   * Accept a value that arrived WITHOUT a fetch, and cache it under `key`.
+   *
+   * For server-pushed data: the Overview sections are recomputed in the
+   * background and delivered over SSE, so the payload arrives with no request
+   * to attach it to. Writing it through `viewCache.set` rather than only into
+   * `data` is what makes it survive navigation — otherwise leaving the page and
+   * coming back would re-show the pre-push value and re-request it, and the
+   * push would look like it had never happened.
+   *
+   * Does NOT touch `loading`/`revalidating` beyond clearing `loading`: a push
+   * can land while a fetch for the same key is in flight, and that fetch's own
+   * `finally` still owns those flags.
+   *
+   * Ignores stale generations by design — it takes no generation guard, because
+   * a push is keyed data, not a response to a specific load. The `key` is the
+   * correctness boundary: a push for a key the page is no longer showing writes
+   * to the cache under that key and never reaches `data`.
+   */
+  adopt(key: string, currentKey: string, value: T): void {
+    viewCache.set(key, value);
+    if (key !== currentKey) return;
+    this.data = value;
+    this.loading = false;
+    this.#clearError();
+  }
+
+  /**
    * Abandon any in-flight load and reset to the pre-load state. For a page whose
    * inputs became unloadable (no app selected), so a late response from the
    * previous inputs cannot land afterwards.

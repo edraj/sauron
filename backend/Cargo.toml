@@ -130,6 +130,11 @@ base64 = "0.22"
 # --- enrichment ---
 woothee = "0.13"
 
+# Wraps a `tokio::sync::broadcast::Receiver` as a `Stream` so axum's SSE
+# response can consume the Overview recompute bus. The `sync` feature is the
+# only one needed — `BroadcastStream` lives behind it.
+tokio-stream = { version = "0.1", features = ["sync"] }
+
 # --- observability / errors / config ---
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -127,6 +127,13 @@ const EXEMPT: &[(&str, &str)] = &[
         "read-only analysis; POST only because the query is a body",
     ),
     (
+        "routes::analytics::overview_refresh",
+        "writes no domain data at all: it invalidates the caller's own Overview \
+      cache entries and enqueues a recompute of numbers they can already read. \
+      POST only because it triggers server-side work, not because it mutates \
+      anything. Recording it would file a Refresh click on the Wall of Shame",
+    ),
+    (
         "routes::funnels::create_saved",
         "saved analysis view: product data, decision 1",
     ),

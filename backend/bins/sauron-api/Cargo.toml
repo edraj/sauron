@@ -32,6 +32,7 @@ sauron-purge.workspace = true
 diesel.workspace = true
 diesel-async.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 axum.workspace = true
 axum-extra.workspace = true
 form_urlencoded.workspace = true

@@ -4,7 +4,7 @@
 use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 use axum_extra::extract::Query;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -15,6 +15,7 @@ use sauron_db::repo::{EventCount, PersonRow, SeriesPoint, SortSpec};
 
 use super::db;
 use crate::error::ApiError;
+use crate::overview_cache::{self, Envelope, Section};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -799,42 +800,46 @@ async fn overview_scope(
     .await
 }
 
-fn since_of(q: &RangeQuery) -> DateTime<Utc> {
-    Utc::now() - Duration::days(q.since_days.clamp(1, 365))
+// `since_of` used to live here, deriving `Utc::now() - since_days` per request.
+// It is gone rather than kept-and-unused on purpose: the sections no longer
+// compute their own `since`, and leaving a clock-reading helper next to a cache
+// is an invitation to key on its output — which mints a fresh entry per request
+// and hits 0% of the time. `overview_cache::clamp_days` is the replacement, and
+// it deliberately returns the DISCRETE day count, not a timestamp.
+
+/// Whether this request is an explicit Refresh rather than a page load.
+///
+/// Separate from [`RangeQuery`] because it must NOT reach the cache key: a
+/// forced and an unforced read of the same selection are the same question and
+/// have to share an entry. Threading it through the key would give the Refresh
+/// button its own permanently-cold cache — a bug whose only symptom is that
+/// refreshing is always slow, which reads as "refresh does more work", i.e.
+/// correct behaviour.
+#[derive(Debug, Deserialize, Default)]
+pub struct ForceQuery {
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// The KPI tiles: totals plus the two rates derived from them.
+///
+/// Served from the Overview result cache — see `crate::overview_cache`. This
+/// handler no longer runs the aggregate; on a cold or stale entry it enqueues a
+/// background recompute and returns immediately, with the answer arriving over
+/// `/overview/stream`. That is what makes the 30s+ totals query survivable: the
+/// request path never waits on it, so the `TimeoutLayer` cannot fire.
 pub async fn overview_totals(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    Query(f): Query<ForceQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<OverviewTotalsSection>, ApiError> {
+) -> Result<Json<Envelope>, ApiError> {
     let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
-    let mut conn = db(&state).await?;
-    let totals = repo::overview_totals(&mut conn, scope, since_of(&q)).await?;
-
-    // Same formulas as `overview`, deliberately not extracted into a shared
-    // helper: they are three lines each and the two call sites are in one file.
-    let error_rate = {
-        let denom = totals.events + totals.errors;
-        if denom > 0 {
-            totals.errors as f64 / denom as f64
-        } else {
-            0.0
-        }
-    };
-    let crash_free_sessions = if totals.sessions > 0 {
-        1.0 - (totals.crashed_sessions as f64 / totals.sessions as f64)
-    } else {
-        1.0
-    };
-    Ok(Json(OverviewTotalsSection {
-        totals,
-        error_rate,
-        crash_free_sessions,
-    }))
+    Ok(Json(
+        overview_cache::read_section(&state, Section::Totals, &scope, q.since_days, f.force).await,
+    ))
 }
 
 /// The two per-day series, together.
@@ -848,17 +853,13 @@ pub async fn overview_series(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    Query(f): Query<ForceQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<OverviewSeriesSection>, ApiError> {
+) -> Result<Json<Envelope>, ApiError> {
     let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
-    let since = since_of(&q);
-    let mut conn = db(&state).await?;
-    let events_series = repo::event_series(&mut conn, scope.clone(), None, since).await?;
-    let errors_series = repo::error_series(&mut conn, scope, since).await?;
-    Ok(Json(OverviewSeriesSection {
-        events_series,
-        errors_series,
-    }))
+    Ok(Json(
+        overview_cache::read_section(&state, Section::Series, &scope, q.since_days, f.force).await,
+    ))
 }
 
 /// Top issues by occurrence count.
@@ -877,15 +878,22 @@ pub async fn overview_top_issues(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    Query(f): Query<ForceQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<Vec<Issue>>, ApiError> {
+) -> Result<Json<Envelope>, ApiError> {
     let (scope, perms) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    // Checked BEFORE the cache is touched. A cached payload is still `Issue`
+    // rows — title, culprit, fingerprint — so serving one to a caller without
+    // `issue:read` would be the same body leak the coarse gate exists to stop,
+    // merely sourced from Redis instead of Postgres. Caching must never become
+    // a way around an authorization check.
     if !perms.contains(perm::ISSUE_READ) {
         return Err(ApiError::Auth(sauron_auth::AuthError::Forbidden));
     }
-    let mut conn = db(&state).await?;
-    let rows = repo::top_issues(&mut conn, scope, since_of(&q), 5).await?;
-    Ok(Json(rows))
+    Ok(Json(
+        overview_cache::read_section(&state, Section::TopIssues, &scope, q.since_days, f.force)
+            .await,
+    ))
 }
 
 /// Top analytics events by count.
@@ -894,12 +902,126 @@ pub async fn overview_top_events(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    Query(f): Query<ForceQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<Vec<EventCount>>, ApiError> {
+) -> Result<Json<Envelope>, ApiError> {
     let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
-    let mut conn = db(&state).await?;
-    let rows = repo::top_events(&mut conn, scope, since_of(&q), 5).await?;
-    Ok(Json(rows))
+    Ok(Json(
+        overview_cache::read_section(&state, Section::TopEvents, &scope, q.since_days, f.force)
+            .await,
+    ))
+}
+
+/// `GET /v1/apps/{app_id}/overview/stream` — the push half of the design.
+///
+/// Emits one `section` event per Overview section: first a snapshot of whatever
+/// is cached right now, then every recompute as it lands. The browser therefore
+/// paints stale-or-empty immediately and fills in over the following seconds,
+/// instead of holding a request open until the slowest aggregate finishes.
+///
+/// # Why this is not an `EventSource`-shaped endpoint
+///
+/// The dashboard authenticates with `Authorization: Bearer` and the browser's
+/// native `EventSource` cannot set headers. The two usual workarounds are both
+/// rejected here: a token in the query string writes a live JWT into every
+/// access log, proxy log and `Referer`, and cookie auth would open a CSRF
+/// surface on an API that currently has none. The client instead reads the
+/// stream with `fetch()` + `ReadableStream` and parses the frames itself — a
+/// few dozen lines in `sse.ts`, and it reuses the existing 401-refresh
+/// interceptor for free.
+pub async fn overview_stream(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<
+    axum::response::Sse<
+        impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    ApiError,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::StreamExt;
+
+    let (scope, perms) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let days = overview_cache::clamp_days(q.since_days);
+    let want = overview_cache::scope_token(scope.app_id, &scope.env, days);
+
+    // The caller's permission set is captured ONCE, here, and applied to every
+    // frame. A stream is long-lived, so this is deliberately a snapshot of
+    // authorization at connect time; a grant revoked mid-stream is not picked
+    // up until reconnect. Acceptable because the access token itself has a TTL
+    // and the revocation poller closes the session, but stated rather than
+    // implied — it is the one place this design is weaker than per-request
+    // authorization.
+    let sections: Vec<Section> = Section::ALL
+        .into_iter()
+        .filter(|s| *s != Section::TopIssues || perms.contains(perm::ISSUE_READ))
+        .collect();
+
+    // Subscribed BEFORE the snapshot is taken. The other order drops any
+    // recompute that lands between the two — the same lost-wakeup the snapshot
+    // exists to prevent, merely moved.
+    let rx = state.overview_cache.subscribe();
+    let initial = overview_cache::snapshot(&state, &sections, &scope, days).await;
+
+    let allowed: std::collections::HashSet<&'static str> =
+        sections.iter().map(|s| s.wire_name()).collect();
+
+    let live = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |msg| {
+        // `Lagged` is dropped rather than closing the stream: a client that
+        // fell behind gets the next frames, and anything it missed is still in
+        // Redis for its next plain-HTTP read.
+        let update = msg.ok()?;
+        if update.scope != want || !allowed.contains(update.section) {
+            return None;
+        }
+        Some(Ok(Event::default()
+            .event("section")
+            .json_data(&update)
+            .unwrap_or_else(|_| Event::default().event("section"))))
+    });
+
+    let head = tokio_stream::iter(initial.into_iter().map(|u| {
+        Ok(Event::default()
+            .event("section")
+            .json_data(&u)
+            .unwrap_or_else(|_| Event::default().event("section")))
+    }));
+
+    Ok(Sse::new(head.chain(live)).keep_alive(
+        // Without a heartbeat an idle stream is indistinguishable from a dead
+        // one to every proxy in the path, and the usual 60s idle timeout closes
+        // it. 15s is comfortably under that.
+        KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    ))
+}
+
+/// `POST /v1/apps/{app_id}/overview/refresh` — what the Refresh button sends.
+///
+/// Enqueues all five sections ignoring freshness and returns immediately; the
+/// results arrive on the stream. Returns `202`, not `200`, because nothing has
+/// been recomputed yet when this responds — the whole point is that it does not
+/// wait.
+///
+/// Still bounded by single-flight and the permit count, so holding the button
+/// down cannot multiply DB load.
+pub async fn overview_refresh(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<RangeQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let (scope, perms) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    for section in Section::ALL {
+        if section == Section::TopIssues && !perms.contains(perm::ISSUE_READ) {
+            continue;
+        }
+        overview_cache::read_section(&state, section, &scope, q.since_days, true).await;
+    }
+    Ok(axum::http::StatusCode::ACCEPTED)
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,8 +1315,9 @@ pub async fn active_users_series(
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
     Query(q): Query<RangeQuery>,
+    Query(f): Query<ForceQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<ActiveUsersSeries>, ApiError> {
+) -> Result<Json<Envelope>, ApiError> {
     let scope = {
         let mut conn = db(&state).await?;
         super::scope::authorized_read_scope(
@@ -1206,15 +1329,10 @@ pub async fn active_users_series(
         )
         .await?
     };
-    let to = Utc::now();
-    let from = to - Duration::days(q.since_days.clamp(1, 365));
-    let (series, partial_days) = crate::tier_read::active_users_by_day(&state, scope, from, to)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(ActiveUsersSeries {
-        series: series.into_iter().map(DayCountOut::from).collect(),
-        partial_days,
-    }))
+    Ok(Json(
+        overview_cache::read_section(&state, Section::ActiveUsers, &scope, q.since_days, f.force)
+            .await,
+    ))
 }
 
 #[cfg(test)]
