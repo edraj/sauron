@@ -425,8 +425,20 @@ SauronSdk.Track("signup_completed", "u_123");`;
     { sig: 'field:value', desc: 'Equals. level:error' },
     { sig: 'field:!value', desc: 'Not equal. level:!info' },
     { sig: 'field:>n   field:>=n', desc: 'Greater than, or greater-or-equal. timesSeen:>5' },
-    { sig: 'field:<n   field:<=n', desc: 'Less than, or less-or-equal.' },
+    { sig: 'field:<n   field:<=n', desc: 'Less than, or less-or-equal. duration:<500ms' },
+    {
+      sig: 'field:>2day   field:<1month',
+      desc: 'On a timestamp field, a relative offset before now: s/sec, m/min, h/hour, d/day, w/week, mo/month. Months are real calendar months (1 month before 31 Mar is 28 Feb); everything else is a fixed span. m is MINUTES — months are mo or longer. A leading - is optional: 7d and -7d are the same. lastSeen:>=1month',
+    },
+    {
+      sig: 'field:>2026-07-01T00:00:00Z',
+      desc: 'On a timestamp field, a full ISO-8601 instant.',
+    },
     { sig: 'field:[a,b]', desc: 'Any of. level:[error,fatal]' },
+    {
+      sig: 'field:[lo..hi]',
+      desc: 'Inclusive range, on the ordered types only (timestamps, integers, durations) — the same brackets as any-of, told apart by the .. and by the field. Both ends required. firstSeen:[7d..1d], timesSeen:[10..100]',
+    },
     {
       sig: 'field:~text',
       desc: 'Contains this literal substring, case-insensitive. * is NOT a wildcard here — it matches a literal asterisk.',
@@ -573,6 +585,94 @@ Chip: Tag   =   key=region   value=eu
       a: 'Errors are sampled by sampleRate (default 1 = all). Lower values drop a fraction on the client.',
     },
   ];
+
+  /**
+   * Where each SDK is published, so "install the SDK" has somewhere to point.
+   *
+   * `pkg` is the REGISTRY name and is deliberately not the wire name the
+   * envelope header reports (`sauron.javascript`, `sauron.flutter`, …). They
+   * differ on every SDK and conflating them has bitten this repo before —
+   * never "fix" one to match the other.
+   *
+   * C# is `null` on purpose rather than a NuGet URL: `Sauron` has never been
+   * published there, and a link that 404s is worse than no link. It points at
+   * the source instead, which is genuinely where you get it today.
+   */
+  const sdkRegistry: Record<Platform, { pkg: string; registry: string; url: string }> = {
+    web: {
+      pkg: '@edraj/sauron-browser',
+      registry: 'npm',
+      url: 'https://www.npmjs.com/package/@edraj/sauron-browser',
+    },
+    node: {
+      pkg: '@edraj/sauron-node',
+      registry: 'npm',
+      url: 'https://www.npmjs.com/package/@edraj/sauron-node',
+    },
+    flutter: {
+      pkg: 'sauron_flutter',
+      registry: 'pub.dev',
+      url: 'https://pub.dev/packages/sauron_flutter',
+    },
+    python: {
+      pkg: 'sauron-sdk',
+      registry: 'PyPI',
+      url: 'https://pypi.org/project/sauron-sdk/',
+    },
+    csharp: {
+      pkg: 'Sauron',
+      registry: 'source',
+      url: 'https://github.com/edraj/sauron/tree/main/sdks/csharp',
+    },
+  };
+
+  // --- worked examples for the "under the hood" sections --------------------
+  /**
+   * Every one of these is checked against the code it documents, not written
+   * from memory: the fingerprint join and precedence are `sauron-core`'s
+   * `fingerprint()`, the mask sentinel is `sauron-inspector`'s `MASK_SENTINEL`,
+   * and the tier knobs are the `TIER_*` keys `Config::from_env` reads with
+   * their real defaults.
+   */
+  const groupingExample = `// Default: type + the top in-app frames decide the issue.
+// These two land in the SAME issue -- the message differs, the frames don't.
+throw new TypeError("Cannot read 'id' of undefined")   // user 1
+throw new TypeError("Cannot read 'sku' of undefined")  // user 2
+
+// Override when the default splits (or merges) wrongly. The array is
+// joined with newlines and hashed, so it is the WHOLE grouping key:
+Sauron.captureException(err, {
+  fingerprint: ['checkout', 'payment-gateway-timeout'],
+});
+
+// One constant string = one issue for every occurrence, forever.
+// A value that varies per user (an id, a URL with a query string)
+// makes one issue PER USER -- the usual way this goes wrong.`;
+
+  const maskExample = `// Before -- what the SDK sent, sitting in error_events.extra
+{ "customer": { "email": "ana@example.com", "plan": "pro" } }
+
+// After masking extra.customer.email
+{ "customer": { "email": "****", "plan": "pro" } }
+
+// The KEY survives; only the value is replaced. That is deliberate:
+// "this app sends an email here" stays visible to the next audit,
+// and a JSON shape your dashboards read does not change underneath
+// them. Note the type collapses to a string -- a masked number is
+// "****", so anything doing arithmetic on it will stop working.`;
+
+  const tieringExample = `# Hot window: how long signals stay in Postgres. Default 30.
+TIER_HOT_DAYS=30
+
+# Where the Parquet lands, laid out app/year/month.
+TIER_COLD_PATH=/var/lib/sauron/cold
+
+# Export runs on this interval (seconds). Default 3600.
+TIER_TICK_SECS=3600
+
+# Grace between "exported and row counts matched" and "drop the
+# Postgres partition". Late-arriving rows land inside this lag.
+TIER_DROP_LAG_HOURS=24`;
 
   // --- in-page navigation --------------------------------------------------
   const sdkNav: { key: Platform; label: string; icon: IconName }[] = [
@@ -736,6 +836,16 @@ GROUP BY name, op`;
       <CodeBlock {code} language={lang} />
     </div>
   </div>
+{/snippet}
+
+{#snippet registryLink(key: Platform)}
+  {@const reg = sdkRegistry[key]}
+  <a class="reg-link" href={reg.url} target="_blank" rel="noopener noreferrer">
+    <Icon name="package" size={13} />
+    <code class="mono">{reg.pkg}</code>
+    <span class="reg-on">on {reg.registry}</span>
+    <Icon name="arrow-up-right" size={12} />
+  </a>
 {/snippet}
 
 {#snippet apiTable(rows: { sig: string; desc: string }[])}
@@ -924,6 +1034,7 @@ GROUP BY name, op`;
         {#snippet header()}
           <div class="card-h"><Icon name="globe" size={16} /><h3>Web quickstart</h3></div>
         {/snippet}
+        {#snippet actions()}{@render registryLink('web')}{/snippet}
         <div class="steps">
           {@render step(1, 'Install the SDK', '', webInstall, 'bash')}
           {@render step(
@@ -959,6 +1070,7 @@ GROUP BY name, op`;
         {#snippet header()}
           <div class="card-h"><Icon name="smartphone" size={16} /><h3>Flutter quickstart</h3></div>
         {/snippet}
+        {#snippet actions()}{@render registryLink('flutter')}{/snippet}
         <div class="steps">
           {@render step(1, 'Add the dependency', '', flutterInstall, 'yaml')}
           {@render step(
@@ -1001,6 +1113,7 @@ GROUP BY name, op`;
         {#snippet header()}
           <div class="card-h"><Icon name="braces" size={16} /><h3>Python quickstart</h3></div>
         {/snippet}
+        {#snippet actions()}{@render registryLink('python')}{/snippet}
         <div class="steps">
           {@render step(1, 'Install the SDK', '', pyInstall, 'bash')}
           {@render step(
@@ -1035,6 +1148,7 @@ GROUP BY name, op`;
         {#snippet header()}
           <div class="card-h"><Icon name="server" size={16} /><h3>Node.js quickstart</h3></div>
         {/snippet}
+        {#snippet actions()}{@render registryLink('node')}{/snippet}
         <div class="steps">
           {@render step(1, 'Install the SDK', '', nodeInstall, 'bash')}
           {@render step(
@@ -1069,6 +1183,7 @@ GROUP BY name, op`;
         {#snippet header()}
           <div class="card-h"><Icon name="hash" size={16} /><h3>C# quickstart</h3></div>
         {/snippet}
+        {#snippet actions()}{@render registryLink('csharp')}{/snippet}
         <div class="steps">
           {@render step(1, 'Install the package', '', csharpInstall, 'bash')}
           {@render step(
@@ -1303,6 +1418,8 @@ GROUP BY name, op`;
               Owner and Admin hold both; Developer and Viewer hold neither.
             </p>
             {@render defRows(inspectorRows)}
+            <h4 class="q-h">What a mask does to a value</h4>
+            <CodeBlock code={maskExample} language="json" />
             <p class="faint fine">
               Two things not to get wrong, because neither is recoverable.
               <b>Masking rewrites rows in hot Postgres only</b> — cold Parquet, the Redis ingest
@@ -1382,10 +1499,18 @@ GROUP BY name, op`;
               computed with the first rule below that applies:
             </p>
             {@render defRows(fingerprintRows)}
+            <h4 class="q-h">In practice</h4>
+            <CodeBlock code={groupingExample} language="ts" />
             <p class="faint fine">
               Minified and ahead-of-time traces are made readable server-side: JavaScript via
               <b>Source Map v3</b> (needs a <code class="ic">release</code>), Dart via
               <b>DWARF / addr2line</b> — at ingest when symbols are uploaded, otherwise on read.
+              An obfuscated Flutter build needs a <b>second</b> artifact for the exception
+              <i>class</i>: the <code class="ic">--save-obfuscation-map</code> JSON, uploaded under
+              the same debug id. Symbols fix the frames; only the map fixes the type, because the
+              SDK sends <code class="ic">runtimeType.toString()</code> and the build already
+              renamed it. Both are presentational — grouping stays on the raw values, so uploading
+              either one later never re-groups issues you have.
               Affected-user counts use a HyperLogLog sketch, so they stay cheap at any volume.
             </p>
           </Card>
@@ -1486,6 +1611,8 @@ GROUP BY name, op`;
               plus any late arrivals) run concurrently and their per-day partials are summed.
               Holistic metrics like percentiles stay hot-only.
             </p>
+            <h4 class="q-h">The knobs</h4>
+            <CodeBlock code={tieringExample} language="bash" />
           </Card>
         </section>
 
@@ -1646,19 +1773,27 @@ GROUP BY name, op`;
     max-width: 640px;
   }
   .docs-page {
-    max-width: 1120px;
+    /* Was 1120px, which left a third of a wide screen blank while the
+       reference tables and code blocks inside were the things being scrolled.
+       Not uncapped to `--content-max` (2200px): a 2200px measure is unreadable
+       for the prose paragraphs that sit in the same column. 1560 is the width
+       at which the widest reference table stops needing its own scrollbar. */
+    max-width: 1560px;
     margin: 0 auto;
   }
   .docs-layout {
     display: grid;
-    grid-template-columns: 208px minmax(0, 1fr);
-    gap: 40px;
+    grid-template-columns: 232px minmax(0, 1fr);
+    gap: 44px;
     align-items: start;
   }
   .doc {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    /* 22, not 18: each of these children is a full Card with its own border,
+       and at 18 a quickstart and the API reference under it read as one
+       run-on block. */
+    gap: 22px;
     min-width: 0;
   }
   .doc-sec {
@@ -1728,6 +1863,41 @@ GROUP BY name, op`;
     font-size: 14.5px;
     font-weight: 620;
     color: var(--text);
+  }
+  /* Where this SDK is published. Rendered through Card's `actions` slot, which
+     is the header's right-hand cell — putting it in the `header` snippet
+     instead lands it in `head-left`, a content-sized flex item where no amount
+     of `margin-left: auto` reaches the card's right edge. */
+  .reg-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-decoration: none;
+    white-space: nowrap;
+    transition: border-color 0.12s ease, color 0.12s ease;
+  }
+  .reg-link:hover {
+    border-color: var(--primary);
+    color: var(--text);
+  }
+  .reg-link code {
+    font-size: 11.5px;
+    color: var(--text);
+  }
+  .reg-on {
+    color: var(--text-faint);
+  }
+  @media (max-width: 640px) {
+    /* The package name is the long part of a header that already carries a
+       title; below this width it wraps the row instead of sitting beside it. */
+    .reg-on {
+      display: none;
+    }
   }
 
   /* DSN context card */
@@ -1912,9 +2082,13 @@ GROUP BY name, op`;
   }
   .api-row {
     display: grid;
-    grid-template-columns: minmax(0, 320px) 1fr;
-    gap: 16px;
-    padding: 10px 2px;
+    /* The signature column tracks the container rather than sitting at a fixed
+       320px: on the wider page these rows had a short code column against a
+       very long description, which is the ragged look the extra width was
+       supposed to fix. */
+    grid-template-columns: minmax(240px, 26%) 1fr;
+    gap: 20px;
+    padding: 12px 2px;
     border-top: 1px solid var(--border);
   }
   .api-row:first-child {

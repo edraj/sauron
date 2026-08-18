@@ -33,7 +33,8 @@ Three requests per address per hour are allowed.
 - **Exceptions** — the grouped **issues** list (errors fingerprinted into issues).
   Defaults to the all-time range with an "All" range option. Narrow it with
   structured `field · op · value` filters (level, status, type, culprit, event /
-  user counts) or free-text search over the title, type, and culprit — see
+  user counts, tag, workflow) or free-text search over the title, type, and culprit —
+  each row shows the exception type and the crash-site frame beneath the title. See
   **[Search & Filtering](Search.md)**. Drill into an issue to see occurrences, the
   stack trace, breadcrumbs, affected users, and the tie-in to the same person's
   events.

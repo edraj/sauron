@@ -1,6 +1,6 @@
 # Capabilities — SDK feature parity
 
-As of the **v0.3.0** release, all five SDKs converge on one capability model — scope,
+Since the **v0.3.0** release, all five SDKs converge on one capability model — scope,
 breadcrumbs, `beforeSend`, transactions, gzip, retry, a bounded/optional-disk queue, and
 opt-in (or default-on) uncaught-error capture — implemented in each language's native
 idiom but serializing the **identical** [wire shape](Ingest-Wire-Contract.md).
@@ -88,5 +88,23 @@ in the wire contract.
 
 ## Versioning
 
-All five SDKs ship as **v0.3.0** for this release. Confirm the installed version if a
-capability appears missing — see [Troubleshooting](Troubleshooting.md).
+**The five SDKs version independently.** They were reconciled to a single capability
+model at v0.3.0 and have shipped on their own numbers since, so there is no one "SDK
+version" — a page that quotes one is quoting that SDK only.
+
+| SDK | Package | Registry | This repo |
+|---|---|---|---|
+| Browser | `@edraj/sauron-browser` | [npm](https://www.npmjs.com/package/@edraj/sauron-browser) | 1.6.0 |
+| Flutter | `sauron_flutter` | [pub.dev](https://pub.dev/packages/sauron_flutter) | 1.8.0 |
+| Node | `@edraj/sauron-node` | [npm](https://www.npmjs.com/package/@edraj/sauron-node) | 1.5.0 |
+| Python | `sauron-sdk` | [PyPI](https://pypi.org/project/sauron-sdk/) | 1.5.0 |
+| C# | `Sauron` | not yet published | 1.5.0 |
+
+"This repo" is the manifest version, which is **not** necessarily what the registry
+serves — the registries lag. The manifests are the source of truth for this column
+(`sdks/js/package.json`, `sdks/flutter/pubspec.yaml`, `sdks/node/package.json`,
+`sdks/python/pyproject.toml`, `sdks/csharp/Sauron/Sauron.csproj`); publishing state
+lives in `sdks/PUBLISHING.md`.
+
+Confirm the installed version if a capability appears missing — see
+[Troubleshooting](Troubleshooting.md).

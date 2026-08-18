@@ -20,6 +20,14 @@ use crate::QueryError;
 pub enum TimeSpec {
     /// Seconds *before now*, resolved against the clock at query time.
     RelativeSeconds(i64),
+    /// Calendar months *before now*, resolved against the clock at query time.
+    ///
+    /// Its own variant rather than a second count because a month is not one:
+    /// "one month before 31 March" is 28 or 29 February, not 1 or 2 March, and
+    /// no fixed number of seconds produces that for every starting date. The
+    /// lowerers use `chrono::Months`, which clamps to the end of the shorter
+    /// month — the same rule every calendar UI uses.
+    RelativeMonths(i64),
     Absolute(DateTime<Utc>),
 }
 
@@ -93,8 +101,85 @@ pub fn resolve(node: &Node, r: Resource) -> Result<ResolvedNode, QueryError> {
         ),
         Node::Not(b) => ResolvedNode::Not(Box::new(resolve(b, r)?)),
         Node::Text(t) => ResolvedNode::Text(t.clone()),
-        Node::Pred(p) => ResolvedNode::Pred(resolve_pred(p, r, false)?),
+        Node::Pred(p) => resolve_pred_node(p, r)?,
     })
+}
+
+/// One `Node::Pred` → one or TWO resolved predicates.
+///
+/// Everything resolves to a single predicate except a range, `field:[lo..hi]`,
+/// which becomes `field:>=lo AND field:<=hi`. Expanding here rather than
+/// carrying a `Between` operator all the way down is deliberate: a new
+/// `MatchOp` would need a lowering arm in every `query_plan` module and a cost
+/// rule of its own, and would still end up emitting exactly this pair of
+/// comparisons. Two predicates the planner already knows how to index beat one
+/// it has to learn.
+fn resolve_pred_node(p: &Predicate, r: Resource) -> Result<ResolvedNode, QueryError> {
+    if let Some(node) = resolve_range(p, r)? {
+        return Ok(node);
+    }
+    Ok(ResolvedNode::Pred(resolve_pred(p, r, false)?))
+}
+
+/// `field:[lo..hi]` — an INCLUSIVE range, or `None` when `p` is not one.
+///
+/// Shares the bracket syntax with the `[a,b]` any-of list and is told apart by
+/// the `..` separator, which cannot appear in a list (a list splits on commas,
+/// and `2026-01-01..2026-02-01` as a single list item was already a hard error).
+/// So this adds a spelling rather than reinterpreting one that used to work.
+///
+/// Gated on the dimension advertising BOTH `>=` and `<=`, which is what
+/// confines it to the ordered types — timestamps, integers, durations. On a
+/// string or enum field the brackets keep meaning "any of".
+///
+/// Both ends are required. A half-open `[lo..]` is deliberately rejected: it is
+/// spelled `>=lo`, and accepting a second spelling for it would mean deciding
+/// whether the missing end is unbounded or a typo, which only the author knows.
+fn resolve_range(p: &Predicate, r: Resource) -> Result<Option<ResolvedNode>, QueryError> {
+    // A quoted value is literal — `firstSeen:"[a..b]"` is asking for that text.
+    if p.quoted {
+        return Ok(None);
+    }
+    let (op, inner) = split_op(&p.value, false);
+    if op != MatchOp::In {
+        return Ok(None);
+    }
+    let Some((lo, hi)) = inner.split_once("..") else {
+        return Ok(None);
+    };
+    let (lo, hi) = (lo.trim(), hi.trim());
+
+    // Resolve the field before complaining about the ends, so an unknown field
+    // is reported as an unknown field rather than as a bad range.
+    let Ok((dim, path)) = resolve_field(&p.field, r, p.at) else {
+        return Ok(None);
+    };
+    if !dim.ops.contains(&MatchOp::Gte) || !dim.ops.contains(&MatchOp::Lte) {
+        return Ok(None);
+    }
+    if lo.is_empty() || hi.is_empty() {
+        return Err(QueryError::BadValue {
+            field: p.field.clone(),
+            value: p.value.clone(),
+            at: p.at,
+        });
+    }
+
+    let index = effective_index(dim, r);
+    let bound = |op: MatchOp, raw: &str| -> Result<ResolvedNode, QueryError> {
+        Ok(ResolvedNode::Pred(ResolvedPredicate {
+            dim,
+            path: path.clone(),
+            op,
+            value: type_value(dim, op, raw, &p.field, p.at)?,
+            at: p.at,
+            index,
+        }))
+    };
+    Ok(Some(ResolvedNode::And(vec![
+        bound(MatchOp::Gte, lo)?,
+        bound(MatchOp::Lte, hi)?,
+    ])))
 }
 
 fn resolve_pred(
@@ -470,16 +555,79 @@ fn parse_duration_ms(raw: &str) -> Option<i64> {
         .and_then(|v| v.checked_mul(mult))
 }
 
+/// Relative-time unit suffixes and their length in seconds.
+///
+/// **Ordered longest-suffix-first, and the order is load-bearing.** Matching is
+/// "first suffix that fits", so a short unit listed early would swallow a long
+/// one that ends with the same letter: `1month` ends in `h`, `2days` ends in
+/// `s`, `5mins` ends in `s`. With `h`/`s` checked first those parse as hours
+/// and seconds of `1mont` and `2day` — which then fail to parse as integers, so
+/// the bug surfaces as "bad value" on a spelling the docs advertise, not as a
+/// wrong answer. Keep new units in length order.
+///
+/// `week` is exactly 7 days. **`month` is NOT in this table** — it is calendar
+/// arithmetic, handled by [`MONTH_UNITS`] below and carried as
+/// [`TimeSpec::RelativeMonths`], because no fixed number of seconds gives the
+/// right answer for every starting date.
+const TIME_UNITS: &[(&str, i64)] = &[
+    ("seconds", 1),
+    ("minutes", 60),
+    ("minute", 60),
+    ("second", 1),
+    ("hours", 3_600),
+    ("weeks", 604_800),
+    ("mins", 60),
+    ("secs", 1),
+    ("days", 86_400),
+    ("hour", 3_600),
+    ("week", 604_800),
+    ("day", 86_400),
+    ("min", 60),
+    ("sec", 1),
+    ("hrs", 3_600),
+    ("hr", 3_600),
+    ("d", 86_400),
+    ("h", 3_600),
+    ("m", 60),
+    ("s", 1),
+    ("w", 604_800),
+];
+
+/// The calendar-month spellings, checked BEFORE [`TIME_UNITS`].
+///
+/// Order matters between the two tables as much as within them: `1month` ends
+/// in `h` and `1mo` in `o`, but `5m` must stay MINUTES. Checking the month
+/// table first, and requiring at least `mo`, is what keeps `m` unambiguous —
+/// there is no one-letter spelling of "month" and there must not be one.
+const MONTH_UNITS: &[&str] = &["months", "month", "mos", "mo"];
+
 fn parse_time(raw: &str) -> Option<TimeSpec> {
-    // Relative: -7d / -24h / -30m / -45s
-    if let Some(rest) = raw.strip_prefix('-') {
-        let (num, mult) = match rest.chars().last()? {
-            'd' => (&rest[..rest.len() - 1], 86_400),
-            'h' => (&rest[..rest.len() - 1], 3_600),
-            'm' => (&rest[..rest.len() - 1], 60),
-            's' => (&rest[..rest.len() - 1], 1),
-            _ => return None,
-        };
+    // Relative, as a magnitude *before now*: `7d`, `-7d`, `24h`, `2day`,
+    // `1month`. The leading `-` is optional and means nothing on its own — a
+    // time filter reads backwards from now either way, and `lastSeen:>=1month`
+    // is how people write it. It stays accepted because `-7d` was the only
+    // spelling for a while and is in saved views.
+    //
+    // Tried BEFORE RFC3339 rather than after: an ISO timestamp contains no
+    // bare-integer-plus-unit prefix, so the two cannot both match, and running
+    // the cheap check first keeps the common case off the date parser.
+    let rest = raw.strip_prefix('-').unwrap_or(raw);
+    // Months first — see `MONTH_UNITS`.
+    if let Some(num) = MONTH_UNITS.iter().find_map(|s| rest.strip_suffix(s)) {
+        if num.is_empty() {
+            return None;
+        }
+        return num.parse::<i64>().ok().map(TimeSpec::RelativeMonths);
+    }
+    if let Some((num, mult)) = TIME_UNITS
+        .iter()
+        .find_map(|(suffix, mult)| rest.strip_suffix(suffix).map(|n| (n, *mult)))
+    {
+        // Reject a bare unit (`d`, `month`) rather than reading it as 1: it is
+        // far more likely a truncated `7d` than a deliberate "one day".
+        if num.is_empty() {
+            return None;
+        }
         // See `parse_duration_ms` — the same overflow applies to `-<huge>d`.
         return num
             .parse::<i64>()
@@ -947,6 +1095,186 @@ mod tests {
             one("firstSeen:>-24h", Resource::Issues).value,
             TypedValue::Time(TimeSpec::RelativeSeconds(24 * 3600))
         );
+    }
+
+    #[test]
+    fn the_leading_minus_is_optional() {
+        // Both spellings mean the same magnitude before now. The signed one is
+        // the original and lives in saved views, so it cannot stop working.
+        assert_eq!(
+            one("firstSeen:>7d", Resource::Issues).value,
+            one("firstSeen:>-7d", Resource::Issues).value
+        );
+    }
+
+    #[test]
+    fn parses_the_long_unit_spellings() {
+        let secs = |q: &str| match one(q, Resource::Issues).value {
+            TypedValue::Time(TimeSpec::RelativeSeconds(n)) => n,
+            other => panic!("expected relative seconds, got {other:?}"),
+        };
+        assert_eq!(secs("firstSeen:>45sec"), 45);
+        assert_eq!(secs("firstSeen:>45seconds"), 45);
+        assert_eq!(secs("firstSeen:>30min"), 30 * 60);
+        assert_eq!(secs("firstSeen:>30minutes"), 30 * 60);
+        assert_eq!(secs("firstSeen:>2hour"), 2 * 3_600);
+        assert_eq!(secs("firstSeen:>2day"), 2 * 86_400);
+        assert_eq!(secs("firstSeen:>2days"), 2 * 86_400);
+        assert_eq!(secs("firstSeen:>3week"), 3 * 604_800);
+    }
+
+    #[test]
+    fn months_are_calendar_months_not_a_fixed_span() {
+        // Its own variant, deliberately: no number of seconds gives the right
+        // answer for every starting date. `chrono::Months` at the lowerers
+        // clamps to the end of a shorter month.
+        for q in ["firstSeen:>1month", "firstSeen:>1mo", "firstSeen:>1months"] {
+            assert_eq!(
+                one(q, Resource::Issues).value,
+                TypedValue::Time(TimeSpec::RelativeMonths(1)),
+                "{q}"
+            );
+        }
+        assert_eq!(
+            one("firstSeen:>6months", Resource::Issues).value,
+            TypedValue::Time(TimeSpec::RelativeMonths(6))
+        );
+    }
+
+    #[test]
+    fn m_is_minutes_and_there_is_no_one_letter_month() {
+        // The reason months get their own table checked first. `5m` must not
+        // drift into months, and no one-letter month spelling may exist.
+        assert_eq!(
+            one("firstSeen:>5m", Resource::Issues).value,
+            TypedValue::Time(TimeSpec::RelativeSeconds(5 * 60))
+        );
+        assert_eq!(
+            one("firstSeen:>5min", Resource::Issues).value,
+            TypedValue::Time(TimeSpec::RelativeSeconds(5 * 60))
+        );
+    }
+
+    #[test]
+    fn a_long_unit_is_not_swallowed_by_a_short_one_it_ends_with() {
+        // The whole reason `TIME_UNITS` is ordered by length. `1month` ends in
+        // `h` and `2days` in `s`; matched shortest-first they would be read as
+        // hours-of-`1mont` and seconds-of-`2day` and rejected as bad values.
+        let secs = |q: &str| match one(q, Resource::Issues).value {
+            TypedValue::Time(TimeSpec::RelativeSeconds(n)) => n,
+            other => panic!("expected relative seconds, got {other:?}"),
+        };
+        assert_eq!(secs("firstSeen:>2days"), 2 * 86_400);
+        assert_eq!(secs("firstSeen:>5mins"), 5 * 60);
+        // And the short forms keep their old meaning: `m` is MINUTES, not
+        // months, which is why `month` needs its own entry rather than a
+        // prefix rule.
+        assert_eq!(secs("firstSeen:>5m"), 5 * 60);
+    }
+
+    #[test]
+    fn a_bare_unit_with_no_number_is_rejected() {
+        // `firstSeen:>d` is a truncated `7d` far more often than it is a
+        // deliberate "one day"; guessing 1 would answer a query nobody asked.
+        assert!(matches!(
+            err("firstSeen:>d", Resource::Issues),
+            QueryError::BadValue { .. }
+        ));
+        assert!(matches!(
+            err("firstSeen:>month", Resource::Issues),
+            QueryError::BadValue { .. }
+        ));
+    }
+
+    #[test]
+    fn a_timestamp_range_becomes_two_inclusive_bounds() {
+        let node = resolve(&parse("firstSeen:[7d..1d]").unwrap(), Resource::Issues).unwrap();
+        let ResolvedNode::And(parts) = node else {
+            panic!("expected an AND of two bounds, got {node:?}");
+        };
+        assert_eq!(parts.len(), 2);
+        let [ResolvedNode::Pred(lo), ResolvedNode::Pred(hi)] = &parts[..] else {
+            panic!("expected two predicates, got {parts:?}");
+        };
+        assert_eq!(lo.dim.name, "firstSeen");
+        assert_eq!(lo.op, MatchOp::Gte);
+        assert_eq!(
+            lo.value,
+            TypedValue::Time(TimeSpec::RelativeSeconds(7 * 86_400))
+        );
+        assert_eq!(hi.dim.name, "firstSeen");
+        assert_eq!(hi.op, MatchOp::Lte);
+        assert_eq!(
+            hi.value,
+            TypedValue::Time(TimeSpec::RelativeSeconds(86_400))
+        );
+    }
+
+    #[test]
+    fn a_range_accepts_absolute_instants_and_mixed_ends() {
+        for q in [
+            "firstSeen:[2026-07-01T00:00:00Z..2026-08-01T00:00:00Z]",
+            "firstSeen:[1month..2026-08-01T00:00:00Z]",
+        ] {
+            let node = resolve(&parse(q).unwrap(), Resource::Issues).unwrap();
+            assert!(
+                matches!(node, ResolvedNode::And(ref v) if v.len() == 2),
+                "{q}: {node:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_range_works_on_the_other_ordered_types() {
+        // Nothing about the expansion is timestamp-specific — it is gated on the
+        // dimension advertising both `>=` and `<=`.
+        let node = resolve(&parse("timesSeen:[10..100]").unwrap(), Resource::Issues).unwrap();
+        let ResolvedNode::And(parts) = node else {
+            panic!("expected AND, got {node:?}")
+        };
+        let [ResolvedNode::Pred(lo), ResolvedNode::Pred(hi)] = &parts[..] else {
+            panic!("expected two predicates")
+        };
+        assert_eq!((lo.op, &lo.value), (MatchOp::Gte, &TypedValue::Int(10)));
+        assert_eq!((hi.op, &hi.value), (MatchOp::Lte, &TypedValue::Int(100)));
+    }
+
+    #[test]
+    fn brackets_without_a_range_separator_still_mean_any_of() {
+        // The two spellings share the brackets, so this is the test that keeps
+        // the range from swallowing the list it lives beside.
+        let p = one("level:[error,fatal]", Resource::Issues);
+        assert_eq!(p.op, MatchOp::In);
+        assert_eq!(
+            p.value,
+            TypedValue::List(vec![
+                TypedValue::Str("error".into()),
+                TypedValue::Str("fatal".into())
+            ])
+        );
+    }
+
+    #[test]
+    fn a_range_on_an_unordered_field_is_not_a_range() {
+        // `level` is an enum: no `>=`, so brackets keep meaning "any of" and
+        // `error..fatal` is one nonsense list item, reported as a bad enum
+        // rather than silently becoming a comparison.
+        let e = err("level:[error..fatal]", Resource::Issues);
+        assert!(matches!(e, QueryError::BadEnum { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn a_half_open_range_is_rejected_rather_than_guessed() {
+        for q in ["firstSeen:[7d..]", "firstSeen:[..7d]"] {
+            let e = err(q, Resource::Issues);
+            assert!(matches!(e, QueryError::BadValue { .. }), "{q}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_range_is_literal_text_not_a_range() {
+        let node = resolve(&parse(r#"culprit:"[a..b]""#).unwrap(), Resource::Issues).unwrap();
+        assert!(matches!(node, ResolvedNode::Pred(_)), "{node:?}");
     }
 
     #[test]

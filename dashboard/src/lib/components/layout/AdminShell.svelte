@@ -49,7 +49,15 @@
     flex-direction: column;
     gap: 2px;
     position: sticky;
-    top: 0;
+    /* Below the topbar, not at viewport 0. The topbar is itself sticky and
+       paints over this column, so `top: 0` parks the first rail item
+       underneath it. Same offset the Docs table of contents uses. */
+    top: calc(var(--topbar-h) + 16px);
+    align-self: start;
+    /* A rail taller than the viewport has to scroll on its own, or its lower
+       entries become unreachable once it is pinned. */
+    max-height: calc(100vh - var(--topbar-h) - 32px);
+    overflow-y: auto;
   }
   .item {
     display: flex;

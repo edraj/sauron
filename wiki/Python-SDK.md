@@ -1,6 +1,6 @@
 # Python SDK — `sauron-sdk`
 
-Server-side Python SDK (**v0.3.0**). Dispatches product-analytics events and exceptions
+Server-side Python SDK (**v1.5.0**). Dispatches product-analytics events and exceptions
 over a buffered background HTTP transport (a daemon thread draining an in-memory queue
 via `urllib`). **Stdlib only — no runtime dependencies.** Source:
 [`sdks/python`](../sdks/python). SDK header name: `sauron-python`.

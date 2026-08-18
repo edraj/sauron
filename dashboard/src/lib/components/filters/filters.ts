@@ -153,6 +153,7 @@ export const ISSUE_FIELDS: FieldDef[] = [
   { key: 'times_seen', label: 'Events', type: 'number', ops: OPS_NUM },
   { key: 'users_seen', label: 'Users', type: 'number', ops: OPS_NUM },
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
+  { key: 'workflow', label: 'Workflow', type: 'string', ops: OPS_STR },
 ];
 
 /**
@@ -168,10 +169,12 @@ export const ISSUE_FIELDS: FieldDef[] = [
  * showing the standard Retry button offers a recovery that cannot work. With
  * this list a page can offer to drop the offending chip instead.
  *
- * `workflow` is listed even though `ISSUE_FIELDS` has no workflow chip and the
- * FilterBar therefore cannot produce one — the filter is still reachable through
- * a hand-written URL or a saved view, and a list that only covers what the UI
- * happens to offer today is the kind that goes stale silently.
+ * `workflow` now HAS a chip on every list whose backend registry accepts it
+ * (it did not until 2026-08-18, which is why this note used to say the
+ * FilterBar could not produce one). It would belong here regardless: the filter
+ * is also reachable through a hand-written URL or a saved view, and a list that
+ * only covers what the UI happens to offer today is the kind that goes stale
+ * silently.
  */
 export const PERMISSION_GATED_FILTER_FIELDS = ['tag', 'workflow'] as const;
 
@@ -193,11 +196,13 @@ export const EVENT_FIELDS: FieldDef[] = [
   { key: 'session_id', label: 'Session', type: 'string', ops: OPS_STR },
   { key: 'release', label: 'Release', type: 'string', ops: OPS_STR },
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
+  { key: 'workflow', label: 'Workflow', type: 'string', ops: OPS_STR },
 ];
 
-// Issue-detail occurrences: only the per-event `tag` is filterable.
+// Issue-detail occurrences. `ERROR_EVENT_FILTERS` accepts exactly these two.
 export const OCCURRENCE_FIELDS: FieldDef[] = [
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
+  { key: 'workflow', label: 'Workflow', type: 'string', ops: OPS_STR },
 ];
 
 /**

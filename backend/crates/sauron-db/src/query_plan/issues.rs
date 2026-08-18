@@ -84,6 +84,18 @@ fn as_time(ctx: &PrepCtx, v: &TypedValue, field: &str) -> Result<DateTime<Utc>, 
         TypedValue::Time(TimeSpec::RelativeSeconds(secs)) => {
             Ok(ctx.now - chrono::Duration::seconds(*secs))
         }
+        // `checked_sub_months` clamps to the end of a shorter month, so
+        // "1 month before 31 March" is 28/29 February rather than overflowing
+        // into March. Saturating at the epoch floor on the arithmetic's only
+        // failure mode (a count large enough to leave the representable range)
+        // keeps an absurd `>=99999month` as "everything" instead of a 500.
+        TypedValue::Time(TimeSpec::RelativeMonths(months)) => {
+            let n = u32::try_from(*months).unwrap_or(u32::MAX);
+            Ok(ctx
+                .now
+                .checked_sub_months(chrono::Months::new(n))
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC))
+        }
         _ => Err(PlanError::BadValue {
             field: field.to_string(),
         }),

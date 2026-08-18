@@ -29,12 +29,18 @@
     fileLabel,
     formTitle,
     isDart as kindIsDart,
+    requiresDebugId,
     resetAfterUpload,
     uploadMessage,
     type ArtifactKind,
     type DartPlatform,
     type UploadForm,
   } from '../lib/models/artifact-upload';
+  import {
+    coverageGapLabel,
+    dartCoverageGaps,
+    type DartBuildCoverage,
+  } from '../lib/models/dart-coverage';
   import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
   import { ARTIFACT_DEFAULT_SORT, artifactAccessor } from '../lib/models/artifact-sort';
   import { pageSlice } from '../lib/models/paginate';
@@ -97,10 +103,30 @@
   let release = $state('');
   let name = $state('');
   let arch = $state('');
+  let debugId = $state('');
   let file = $state<File | null>(null);
   let uploading = $state(false);
 
   const isDart = $derived(kindIsDart(kind));
+  const needsDebugId = $derived(requiresDebugId(kind));
+
+  /**
+   * Dart builds missing one of their two artifacts.
+   *
+   * Derived from the list already on screen — no extra request, and no query
+   * over `error_events` to work out which builds were obfuscated. See
+   * `models/dart-coverage.ts` for why stating what IS uploaded beats guessing
+   * whether a map is needed.
+   */
+  const coverageGaps = $derived<DartBuildCoverage[]>(dartCoverageGaps(artifacts));
+
+  /** Prefill the upload form for a build that is missing its map. */
+  function uploadMapFor(build: DartBuildCoverage) {
+    kind = 'dart_obfuscation_map';
+    if (build.platform === 'android' || build.platform === 'ios') dartPlatform = build.platform;
+    debugId = build.debugId;
+    clearFile();
+  }
 
   let fileInput = $state<HTMLInputElement | null>(null);
 
@@ -143,7 +169,7 @@
     // sent, not whatever the controls read by the time it comes back. The Kind
     // select is disabled while `uploading`, so this is belt and braces; but the
     // guard that matters is the one that does not depend on the template.
-    const sent: UploadForm = { kind, dartPlatform, release, name, arch };
+    const sent: UploadForm = { kind, dartPlatform, release, name, arch, debugId };
     uploading = true;
     try {
       const res = await uploadArtifact(appId, file, buildUploadParams(sent));
@@ -152,6 +178,7 @@
       release = next.release;
       name = next.name;
       arch = next.arch;
+      debugId = next.debugId;
       clearFile();
       // Prefix-wide, not just this key. The key carries `scopeKey`
       // (`appId:envId`), so this app has one cache entry PER ENVIRONMENT even
@@ -259,7 +286,20 @@
               </div>
             </div>
             <Input bind:value={release} label="Release" placeholder="app@1.4.2+12" />
-            <Input bind:value={arch} label="Arch (optional)" placeholder="arm64" />
+            {#if needsDebugId}
+              <!--
+                The one form with a debug-id input. A map is plain JSON with no
+                build-id note to read, so nothing can derive it and the server
+                refuses the upload without one — see `artifact-upload.ts`.
+              -->
+              <Input
+                bind:value={debugId}
+                label="Debug id"
+                placeholder="the id the symbols upload reported"
+              />
+            {:else}
+              <Input bind:value={arch} label="Arch (optional)" placeholder="arm64" />
+            {/if}
           {:else}
             <Input bind:value={release} label="Release" placeholder="web@1.4.2" />
             <Input bind:value={name} label="Minified file path" placeholder="~/static/app.min.js" />
@@ -272,7 +312,7 @@
         <div class="actions">
           <Button
             variant="primary"
-            disabled={!file || uploading}
+            disabled={!file || uploading || (needsDebugId && debugId.trim() === '')}
             lockedReason={writeLock}
             onclick={upload}
           >
@@ -280,7 +320,13 @@
           </Button>
         </div>
       </div>
-      {#if isDart}
+      {#if needsDebugId}
+        <p class="hint muted">
+          Use the <b>same debug id as this build's symbols</b> — it is the only thing tying the two
+          together, and the upload is refused without it. Flutter emits the map with
+          <code class="mono">--extra-gen-snapshot-options=--save-obfuscation-map</code>.
+        </p>
+      {:else if isDart}
         <p class="hint muted">
           The debug id is read out of the file's own build-id note — nothing to paste. Flutter emits
           these with <code class="mono">--split-debug-info</code>.
@@ -290,6 +336,52 @@
         Or from CI: <code class="mono">{cliHint(kind)}</code>
       </p>
     </Card>
+
+    <!--
+      The gap between "symbols uploaded" and "readable crash". Shown only when a
+      build is actually missing one of its two artifacts, so a fully-covered app
+      never sees it and it stays worth reading when it appears.
+    -->
+    {#if coverageGaps.length > 0}
+      <Card>
+        {#snippet header()}
+          <div class="cov-head">
+            <Icon name="triangle-alert" size={16} />
+            <h3 class="card-title-inline">Incomplete Dart builds</h3>
+          </div>
+        {/snippet}
+        <p class="cov-lead muted">
+          An obfuscated Flutter build needs <b>two</b> artifacts, and they fix different halves of
+          what you read. The symbols file resolves stack <b>frames</b>; only the obfuscation map
+          resolves the exception <b>class name</b> — the SDK sends
+          <code class="mono">runtimeType.toString()</code>, which the build already renamed, and no
+          amount of debug info reverses that.
+        </p>
+        <div class="cov-list">
+          {#each coverageGaps as b (b.debugId)}
+            <div class="cov-row">
+              <div class="cov-what">
+                <code class="mono cov-id">{b.debugId}</code>
+                <span class="cov-meta faint">
+                  {b.platform ?? 'unknown platform'}{b.arches.length ? ` · ${b.arches.join(', ')}` : ''}
+                </span>
+                <span class="cov-gap">{coverageGapLabel(b)}</span>
+              </div>
+              {#if b.hasSymbols && !b.hasObfuscationMap}
+                <Button variant="secondary" lockedReason={writeLock} onclick={() => uploadMapFor(b)}>
+                  Upload map
+                </Button>
+              {/if}
+            </div>
+          {/each}
+        </div>
+        <p class="hint muted">
+          Not every build needs a map — one compiled without
+          <code class="mono">--obfuscate</code> has no renamed names to reverse. This lists what is
+          uploaded, not a guess about how you built.
+        </p>
+      </Card>
+    {/if}
 
     {#if error}
       <div class="err-banner" role="alert">
@@ -362,6 +454,51 @@
 </AdminShell>
 
 <style>
+  .cov-head {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--warning);
+  }
+  .cov-lead {
+    font-size: 13px;
+    margin-bottom: 14px;
+  }
+  .cov-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .cov-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+  }
+  .cov-what {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+    flex: 1;
+  }
+  .cov-id {
+    font-size: 12px;
+    /* A build id is 40 hex characters with no break opportunity in it; without
+       this it forces the row wider than the card on a narrow viewport. */
+    overflow-wrap: anywhere;
+  }
+  .cov-meta {
+    font-size: 11.5px;
+  }
+  .cov-gap {
+    font-size: 12.5px;
+    color: var(--text-muted);
+  }
+
   .page {
     display: flex;
     flex-direction: column;

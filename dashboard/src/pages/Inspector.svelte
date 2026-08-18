@@ -6,6 +6,7 @@
   the sidebar entry's `show` is cosmetic — the endpoint's 403 is the real gate.
 -->
 <script lang="ts">
+  import { querystring, replace } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -39,6 +40,9 @@
     parseKeyInput,
     createPolicyBlockedReason,
     defaultEnvEnrollmentId,
+    inspectorTabFromQuery,
+    inspectorTabRoute,
+    type InspectorTab,
   } from '../lib/models/inspector';
   import { DETECTORS, SUGGESTED_KEYS } from '../lib/constants/inspectorDetectors';
   import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
@@ -60,8 +64,15 @@
     InspectorScan,
   } from '../lib/models';
 
-  type Tab = 'findings' | 'policy' | 'scans' | 'audit';
-  let tab = $state<Tab>('findings');
+  /**
+   * DERIVED from the URL, not held beside it. A `$state` copy synced by an
+   * effect would be a second source of truth for the same fact, and the tab is
+   * exactly the kind of fact that has to survive a reload, a Back press and a
+   * pasted link.
+   */
+  const tab = $derived<InspectorTab>(inspectorTabFromQuery($querystring));
+  const goTab = (next: InspectorTab) => replace(inspectorTabRoute(next, $querystring));
+
 
   let loading = $state(true);
   let error = $state('');
@@ -78,6 +89,50 @@
   let revealed = $state<Record<string, unknown>>({});
   let maskTargetFinding = $state.raw<InspectorFinding | null>(null);
   let newKey = $state('');
+
+  /**
+   * The strip, in order, with the count each tab shows.
+   *
+   * `null` means "this tab has no count", not "zero" — Policy is a single form,
+   * so a badge reading 0 beside it would be describing nothing.
+   */
+  const TAB_META = $derived<{ key: InspectorTab; label: string; count: number | null }[]>([
+    { key: 'findings', label: 'Findings', count: findings.length },
+    { key: 'policy', label: 'Policy', count: null },
+    { key: 'scans', label: 'Scans', count: scans.length },
+    { key: 'audit', label: 'Audit', count: actions.length },
+  ]);
+
+  /**
+   * Left/Right/Home/End across the strip, wrapping at both ends.
+   *
+   * Bound to each TAB, not to the `tablist` container. A tablist must not be
+   * focusable itself — the roving `tabindex` on the tabs is the whole point —
+   * and a container carrying an interactive role plus a key handler is both an
+   * a11y-lint failure and a thing that can never receive the event anyway.
+   *
+   * Moves focus as well as selection: with roving `tabindex` the previously
+   * selected button leaves the tab order the moment selection changes, so
+   * without this the focus ring would land on nothing and keyboard navigation
+   * would dead-end after one press.
+   */
+  function onTabKeydown(e: KeyboardEvent) {
+    const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+    if (!keys.includes(e.key)) return;
+    e.preventDefault();
+    const order = TAB_META.map((t) => t.key);
+    const at = order.indexOf(tab);
+    const next =
+      e.key === 'Home'
+        ? order[0]
+        : e.key === 'End'
+          ? order[order.length - 1]
+          : order[(at + (e.key === 'ArrowRight' ? 1 : order.length - 1)) % order.length];
+    goTab(next);
+    // After the route change re-renders the strip; querying by id rather than
+    // holding element refs keeps this working when the list changes.
+    queueMicrotask(() => document.getElementById(`tab-${next}`)?.focus());
+  }
 
   const appId = $derived(sessionStore.currentAppId);
   // Only the FALLBACK filename — the server's Content-Disposition wins.
@@ -258,7 +313,7 @@
 
 <AdminShell requireApp>
   <div class="head">
-    <h1>Privacy inspector</h1>
+    <h1 class="page-title">Privacy inspector</h1>
     {#if effective}
       <span class="muted">
         New events are masked within about {effective.enforcement_latency_secs} seconds of a change.
@@ -266,24 +321,46 @@
     {/if}
   </div>
 
-  <nav class="tabs" aria-label="Privacy inspector sections">
-    <button class="tab" class:active={tab === 'findings'} onclick={() => (tab = 'findings')}>
-      Findings <span class="count">{findings.length}</span>
-    </button>
-    <button class="tab" class:active={tab === 'policy'} onclick={() => (tab = 'policy')}>Policy</button>
-    <button class="tab" class:active={tab === 'scans'} onclick={() => (tab = 'scans')}>
-      Scans <span class="count">{scans.length}</span>
-    </button>
-    <button class="tab" class:active={tab === 'audit'} onclick={() => (tab = 'audit')}>
-      Audit <span class="count">{actions.length}</span>
-    </button>
-  </nav>
+  <!--
+    A real `tablist`, not four buttons that look like one. They already behaved
+    like tabs to a mouse; to a screen reader they were unlabelled buttons with
+    no indication that one was current or that they controlled the region
+    below, and Left/Right did nothing. `tabindex` is roving — only the selected
+    tab is in the tab order, so Tab moves past the whole strip to the panel,
+    which is the ARIA authoring-practices behaviour people expect from tabs.
+  -->
+  <div class="tabs" role="tablist" aria-label="Privacy inspector sections">
+    {#each TAB_META as t (t.key)}
+      <button
+        class="tab"
+        class:active={tab === t.key}
+        role="tab"
+        id={`tab-${t.key}`}
+        aria-selected={tab === t.key}
+        aria-controls="inspector-panel"
+        tabindex={tab === t.key ? 0 : -1}
+        onclick={() => goTab(t.key)}
+        onkeydown={onTabKeydown}
+      >
+        {t.label}
+        <!--
+          Suppressed until the first load resolves. Rendering `0` while the
+          request is still out states a fact we do not have yet, and "Findings
+          0" is the same shape as a clean scan — so the strip announced "nothing
+          to see" and then silently changed its mind.
+        -->
+        {#if !loading && t.count !== null}
+          <span class="count">{t.count}</span>
+        {/if}
+      </button>
+    {/each}
+  </div>
 
-  <div class="content">
+  <div class="content" id="inspector-panel" role="tabpanel" aria-labelledby={`tab-${tab}`}>
   {#if error}
     <Card><p class="err">{error}</p></Card>
   {:else if loading}
-    <Spinner />
+    <div class="loading-pane"><Spinner /><span class="muted">Loading privacy data…</span></div>
   {:else if tab === 'findings'}
     <Card>
       <!-- Non-dismissible, always. Detection is best-effort: the prefilter
@@ -295,7 +372,14 @@
       {/if}
     </Card>
     {#if findings.length === 0}
-      <EmptyState title="No findings" description="Run a scan from the Scans tab." />
+      <EmptyState
+        title="No findings"
+        description="Nothing has been scanned for this app yet, or the last scan came back clean."
+      >
+        {#snippet action()}
+          <Button variant="secondary" onclick={() => goTab('scans')}>Go to Scans</Button>
+        {/snippet}
+      </EmptyState>
     {:else}
       {#each groups as g (g.key)}
         <!-- Sort the whole group, THEN slice it — reversing these two lines
@@ -745,7 +829,11 @@
         {/if}
       </div>
       {#if scans.length === 0}
-        <EmptyState title="No scans yet" description="Run one, or set a schedule on the Policy tab." />
+        <EmptyState title="No scans yet" description="Run one below, or set a schedule on the Policy tab.">
+          {#snippet action()}
+            <Button variant="secondary" onclick={() => goTab('policy')}>Set a schedule</Button>
+          {/snippet}
+        </EmptyState>
       {:else}
         <DataTable>
           {#snippet head()}
@@ -978,7 +1066,7 @@
     onclose={() => (maskTargetFinding = null)}
     ondone={() => {
       maskTargetFinding = null;
-      tab = 'audit';
+      goTab('audit');
       void loadAll();
     }}
   />
@@ -1024,6 +1112,20 @@
   }
   .tab:hover {
     color: var(--text);
+  }
+  /* Roving tabindex means keyboard users land here with no other affordance —
+     the browser default outline is clipped by the strip's bottom border. */
+  .tab:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  }
+  .loading-pane {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 48px 0;
   }
   .tab.active {
     color: var(--primary);

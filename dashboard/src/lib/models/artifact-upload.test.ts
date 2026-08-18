@@ -9,6 +9,7 @@ import {
   formTitle,
   isDart,
   platformFor,
+  requiresDebugId,
   resetAfterUpload,
   uploadMessage,
   type UploadForm,
@@ -22,6 +23,7 @@ function filled(over: Partial<UploadForm> = {}): UploadForm {
     release: 'web@1.4.2',
     name: '~/static/app.min.js',
     arch: 'arm64',
+    debugId: 'ab36961b44baef9d7e3b9296dff3ce3e59be51a3',
     ...over,
   };
 }
@@ -88,14 +90,43 @@ describe('the Dart symbols path', () => {
     expect(android.platform).toBe('android');
   });
 
-  it('never sends a debug_id — the server derives it from the ELF', () => {
-    // The form deliberately has no debug-id input: a hand-pasted uppercase or
-    // dashed id is the one way to create an artifact that can never match a
-    // real crash. `UploadArtifactParams` still carries the field for the CLI's
-    // sake, so absence here is worth asserting.
-    for (const k of ARTIFACT_KINDS) {
-      expect('debug_id' in buildUploadParams(filled({ kind: k.value }))).toBe(false);
+  it('never sends a debug_id for the kinds that derive one', () => {
+    // Neither of these forms has a debug-id input: a hand-pasted uppercase or
+    // dashed id was the one way to create an artifact that could never match a
+    // real crash, and for these the server reads it out of the file instead.
+    // `dart_obfuscation_map` is the exception and has its own test below — it
+    // is plain JSON with no note to read, so an id must be typed.
+    for (const kind of ['js_sourcemap', 'dart_symbols'] as const) {
+      expect('debug_id' in buildUploadParams(filled({ kind }))).toBe(false);
     }
+  });
+
+  it('sends the typed debug_id for an obfuscation map, and no arch', () => {
+    const params = buildUploadParams(
+      filled({ kind: 'dart_obfuscation_map', dartPlatform: 'android' }),
+    );
+    expect(params).toEqual({
+      kind: 'dart_obfuscation_map',
+      platform: 'android',
+      release: 'web@1.4.2',
+      debug_id: 'ab36961b44baef9d7e3b9296dff3ce3e59be51a3',
+    });
+    // One map covers a whole build. `arch` is what varies between symbol files
+    // and means nothing here; sending it would suggest a per-arch map exists.
+    expect('arch' in params).toBe(false);
+  });
+
+  it('drops a blank debug_id rather than sending an empty one', () => {
+    // The server refuses a map with no id. An empty string would reach it as a
+    // present-but-blank param and change which error comes back.
+    const params = buildUploadParams(filled({ kind: 'dart_obfuscation_map', debugId: '  ' }));
+    expect('debug_id' in params).toBe(false);
+  });
+
+  it('only the obfuscation map requires a typed debug id', () => {
+    expect(requiresDebugId('dart_obfuscation_map')).toBe(true);
+    expect(requiresDebugId('dart_symbols')).toBe(false);
+    expect(requiresDebugId('js_sourcemap')).toBe(false);
   });
 
   it('omits the minified file path, which Dart never matches on', () => {
@@ -163,12 +194,21 @@ describe('kind/platform pairing', () => {
     }
   });
 
-  it('offers exactly the two kinds and the two mobile platforms', () => {
-    expect(ARTIFACT_KINDS.map((k) => k.value)).toEqual(['js_sourcemap', 'dart_symbols']);
+  it('offers exactly the three kinds and the two mobile platforms', () => {
+    expect(ARTIFACT_KINDS.map((k) => k.value)).toEqual([
+      'js_sourcemap',
+      'dart_symbols',
+      'dart_obfuscation_map',
+    ]);
     expect(DART_PLATFORMS.map((p) => p.value)).toEqual(['android', 'ios']);
+    // The two Dart labels name what each one FIXES. They are the only place in
+    // the product that tells an uploader the symbols file does not cover class
+    // names, which is the single thing people get wrong about obfuscated
+    // builds.
     expect(ARTIFACT_KINDS.map((k) => k.label)).toEqual([
       'JavaScript source map',
-      'Dart symbols (Flutter)',
+      'Dart symbols (Flutter) — stack frames',
+      'Dart obfuscation map — class names',
     ]);
   });
 });
@@ -182,6 +222,7 @@ describe('post-upload reset', () => {
       release: 'app@1.4.2+12',
       name: '',
       arch: '',
+      debugId: '',
     });
   });
 
@@ -190,7 +231,17 @@ describe('post-upload reset', () => {
       release: '',
       name: '',
       arch: '',
+      debugId: '',
     });
+  });
+
+  it('clears the debug id after a map upload, unlike the release', () => {
+    // A build needs exactly ONE map, so the id just used is the one value that
+    // cannot be wanted again — leaving it would make the obvious next action
+    // (the map for the next build) a silent dedupe against this one.
+    const after = resetAfterUpload(filled({ kind: 'dart_obfuscation_map', release: 'app@2.0.0' }));
+    expect(after.debugId).toBe('');
+    expect(after.release).toBe('app@2.0.0');
   });
 
   it('reads the kind off the SENT form, not the live one', () => {

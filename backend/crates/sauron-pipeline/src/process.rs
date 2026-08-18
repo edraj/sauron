@@ -11,6 +11,7 @@ use sauron_core::{fingerprint, ids};
 use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewIssue, NewTransaction};
 use sauron_db::{repo, AsyncPgConnection, PgPool};
 use sauron_redis::{keys, RedisStore};
+use sauron_symbols::{culprit_of, CulpritFrame};
 
 use crate::enrich::enrich_context;
 
@@ -205,16 +206,18 @@ async fn rollup(
 /// out its own).
 ///
 /// `conn` is the caller's connection, already checked out for the environment
-/// upsert. It is reused for the issue grouping and released before
-/// symbolication rather than being dropped and immediately re-acquired — the
-/// pool recycles with a liveness check, so each extra checkout costs a
-/// round-trip as well as a pool slot.
+/// upsert. It is released before symbolication rather than being held across
+/// it; the issue grouping and the event write then share phase 2's connection,
+/// because the `culprit` the grouping stores is derived from the symbolicated
+/// frames and so does not exist until symbolication has run. Two checkouts
+/// either way — the pool recycles with a liveness check, so each extra one
+/// costs a round-trip as well as a pool slot, and this reordering adds none.
 #[allow(clippy::too_many_arguments)]
 async fn process_error(
     redis: &RedisStore,
     pool: &PgPool,
     sym: &crate::symbolize::SymbolizeCtx,
-    mut conn: sauron_db::PgConn,
+    conn: sauron_db::PgConn,
     job: &IngestJob,
     environment_id: Option<Uuid>,
     context: Value,
@@ -228,7 +231,6 @@ async fn process_error(
         None => (String::new(), String::new()),
     };
     let title = build_title(exc, e.message.as_deref());
-    let culprit = build_culprit(exc);
     let level = e.level.as_str();
     let now = e.timestamp;
     let device_key = crate::enrich::device_info(&context).device_key;
@@ -245,22 +247,14 @@ async fn process_error(
         .zip(e.workflow_name.as_ref())
         .and_then(|_| device_key.clone());
 
-    // --- phase 1: group the error into an issue, then release the connection.
-    let issue_id = repo::upsert_issue(
-        &mut conn,
-        NewIssue {
-            app_id: job.app_id,
-            fingerprint: &fp,
-            type_: &exception_type,
-            title: &title,
-            culprit: &culprit,
-            level,
-            first_seen: now,
-            last_seen: now,
-            times_seen: 1,
-        },
-    )
-    .await?;
+    // --- phase 1: release the caller's connection before symbolication.
+    //
+    // The issue upsert used to happen here, on this connection. It cannot any
+    // more: `culprit` is derived from the symbolicated frames, and those do not
+    // exist until phase 2's symbolication has run. Grouping and the event write
+    // now share phase 2's connection, so the checkout count is unchanged (this
+    // one, already held for the environment upsert, plus phase 2's) — what
+    // moved is which of the two does the grouping.
     drop(conn);
 
     let user = e.user.as_ref().or(job.context.user.as_ref());
@@ -283,33 +277,84 @@ async fn process_error(
     // Strictly time-boxed and non-fatal — misses/timeouts fall to on-read. Dart
     // AOT traces (raw_stacktrace) go through the ELF/DWARF path; everything else
     // through JS source maps.
-    let (stacktrace_symbolicated, symbolication_status, debug_meta) =
-        if let Some(raw_trace) = e.raw_stacktrace.as_deref() {
-            let dm = crate::symbolize::build_debug_meta(e.debug_meta.as_ref(), raw_trace);
-            let (frames, status) = crate::symbolize::symbolicate_ingest_dart(
-                pool,
-                sym,
-                job.app_id,
-                raw_trace,
-                e.debug_meta.as_ref(),
-            )
-            .await;
-            (frames, status, Some(dm))
-        } else {
-            let raw_frames = exc.map(|x| x.stacktrace.as_slice()).unwrap_or(&[]);
-            let (frames, status) = crate::symbolize::symbolicate_ingest(
-                pool,
-                sym,
-                job.app_id,
-                job.release.as_deref(),
-                raw_frames,
-            )
-            .await;
-            (frames, status, None)
-        };
+    let (symbolicated, debug_meta) = if let Some(raw_trace) = e.raw_stacktrace.as_deref() {
+        let dm = crate::symbolize::build_debug_meta(e.debug_meta.as_ref(), raw_trace);
+        let out = crate::symbolize::symbolicate_ingest_dart(
+            pool,
+            sym,
+            job.app_id,
+            raw_trace,
+            e.debug_meta.as_ref(),
+        )
+        .await;
+        (out, Some(dm))
+    } else {
+        let raw_frames = exc.map(|x| x.stacktrace.as_slice()).unwrap_or(&[]);
+        let out = crate::symbolize::symbolicate_ingest(
+            pool,
+            sym,
+            job.app_id,
+            job.release.as_deref(),
+            raw_frames,
+        )
+        .await;
+        (out, None)
+    };
+    let crate::symbolize::Symbolicated {
+        frames: stacktrace_symbolicated,
+        status: symbolication_status,
+        culprit: resolved_culprit,
+    } = symbolicated;
+
+    // The de-obfuscated culprit when symbolication produced one, else the raw
+    // frames' own. For an obfuscated Dart build the raw side is the EMPTY
+    // string — those events carry no `exception.stacktrace` at all, only a
+    // `raw_stacktrace` blob — which is why the Exceptions list showed a bare
+    // type with nothing after it until this line existed.
+    let culprit = resolved_culprit.unwrap_or_else(|| build_culprit(exc));
+
+    // The de-obfuscated class name, for the DISPLAY fields only.
+    //
+    // `exception_type` and `fp` above keep the raw wire value on purpose: the
+    // fingerprint must not move when a map is uploaded, or every existing issue
+    // for that build re-groups and the history splits in two. What changes is
+    // what a human reads — `issues.type`, and the titles derived from it.
+    let display_type = crate::symbolize::deobfuscate_ingest_type(
+        pool,
+        sym,
+        job.app_id,
+        e.debug_meta.as_ref().and_then(|d| d.build_id.as_deref()),
+        &exception_type,
+    )
+    .await;
+    let issue_type = display_type
+        .clone()
+        .unwrap_or_else(|| exception_type.clone());
+    let title = match display_type.as_deref() {
+        // Rebuild rather than string-replace: `build_title` owns the ": " join
+        // and the 200-char truncation, and a `replace` on the raw type would
+        // also hit an occurrence of it inside the message.
+        Some(t) => build_title_with_type(exc, e.message.as_deref(), t),
+        None => title,
+    };
 
     // --- phase 2: symbolication is done; take a connection again for the writes.
     let mut conn = sauron_db::conn(pool).await?;
+    let issue_id = repo::upsert_issue(
+        &mut conn,
+        NewIssue {
+            app_id: job.app_id,
+            fingerprint: &fp,
+            type_: &issue_type,
+            title: &title,
+            culprit: &culprit,
+            level,
+            first_seen: now,
+            last_seen: now,
+            times_seen: 1,
+        },
+    )
+    .await?;
     repo::insert_error_event(
         &mut conn,
         NewErrorEvent {
@@ -799,16 +844,36 @@ pub(crate) fn handled_of(exc: Option<&ExceptionInfo>) -> Option<bool> {
 }
 
 pub(crate) fn build_title(exc: Option<&ExceptionInfo>, message: Option<&str>) -> String {
+    let ty = exc.map(|x| x.ty.as_str()).unwrap_or_default();
+    build_title_with_type(exc, message, ty)
+}
+
+/// [`build_title`] with the type supplied rather than read off `exc`.
+///
+/// Exists for the one caller that has a BETTER type than the wire carried: an
+/// obfuscated Dart build whose class name we de-obfuscated. Rebuilding the
+/// title through here keeps the `": "` join and the 200-char cap in one place —
+/// a `str::replace` of the raw type on the finished title would be shorter and
+/// wrong, because it would also rewrite any occurrence of that name inside the
+/// message.
+pub(crate) fn build_title_with_type(
+    exc: Option<&ExceptionInfo>,
+    message: Option<&str>,
+    ty: &str,
+) -> String {
     match exc {
         Some(x) => {
             let value = x.value.as_deref().unwrap_or("").trim();
             if value.is_empty() {
-                x.ty.clone()
+                ty.to_string()
             } else {
-                format!("{}: {}", x.ty, truncate(value, 200))
+                format!("{}: {}", ty, truncate(value, 200))
             }
         }
-        None => truncate(message.unwrap_or("Error").trim(), 200).to_string(),
+        None => {
+            let _ = ty;
+            truncate(message.unwrap_or("Error").trim(), 200).to_string()
+        }
     }
 }
 
@@ -816,23 +881,22 @@ pub(crate) fn build_culprit(exc: Option<&ExceptionInfo>) -> String {
     let Some(x) = exc else {
         return String::new();
     };
-    // Prefer the top in-app frame (crashing frame is last).
-    let frame = x
+    // Selection and formatting live in `sauron_symbols::culprit` because the
+    // symbolicated derivation has to produce the SAME shape into the SAME slot
+    // of the same table row — see that module's header. All this side owns is
+    // the raw frame model's `filename`-then-`module` location preference,
+    // which the resolved frame type has no second field for.
+    let frames: Vec<CulpritFrame<'_>> = x
         .stacktrace
         .iter()
-        .rev()
-        .find(|f| f.in_app == Some(true))
-        .or_else(|| x.stacktrace.last());
-    match frame {
-        Some(f) => {
-            let func = f.function.as_deref().unwrap_or("?");
-            match f.filename.as_deref().or(f.module.as_deref()) {
-                Some(loc) => format!("{func} ({loc})"),
-                None => func.to_string(),
-            }
-        }
-        None => String::new(),
-    }
+        .map(|f| CulpritFrame {
+            function: f.function.as_deref(),
+            location: f.filename.as_deref().or(f.module.as_deref()),
+            lineno: f.lineno,
+            in_app: f.in_app,
+        })
+        .collect();
+    culprit_of(&frames)
 }
 
 /// Truncate `s` to at most `max` chars (char-boundary safe). Shared by

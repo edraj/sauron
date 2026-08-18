@@ -48,7 +48,7 @@ than blocking the stream (at-least-once delivery). Per item type:
 
 | Item | What the worker does |
 | --- | --- |
-| `error` | Fingerprint → upsert the issue → symbolicate → insert the event → roll up session/device → bump the affected-user sketch |
+| `error` | Fingerprint → symbolicate → upsert the issue → insert the event → roll up session/device → bump the affected-user sketch |
 | `event` | Insert the analytics event → roll up session/device |
 | `identify` | Upsert the person's traits; alias an anonymous id onto a known one when present |
 | `transaction` | Insert the transaction → freshen the session/device window |
@@ -77,6 +77,17 @@ The issue is an upsert keyed on `(app_id, fingerprint)`: a repeat occurrence bum
 `times_seen` and refreshes `last_seen`, level, title, and culprit. **Affected-user**
 counts use a HyperLogLog sketch per issue, so they stay cheap at any volume.
 
+**The upsert runs after symbolication, not before** — which is why it sits second in
+the worker table above. The `culprit` it stores is the crash-site frame, and it is
+taken from the *symbolicated* frames when there are any, so the Exceptions list and
+the session timeline show `checkout (lib/cart_bloc.dart:88)` rather than a minified
+name. Derived from the raw frames it was worse than minified for obfuscated Dart
+builds: those events carry no `exception.stacktrace` at all — only a `raw_stacktrace`
+blob — so the culprit came out **empty**, and the only place the class name appeared
+was the stack trace on the issue detail page. Fingerprinting still runs on the RAW
+frames, deliberately: symbolication must stay presentational and must never re-group
+existing issues.
+
 **Symbolication** makes minified / ahead-of-time traces readable server-side:
 
 - **JavaScript** — Source Map v3. Requires a `release`; resolves each `(line, column)`
@@ -84,10 +95,20 @@ counts use a HyperLogLog sketch per issue, so they stay cheap at any volume.
   context.
 - **Dart** — DWARF via `addr2line`. Parses the AOT trace's build id and load base,
   resolves each program-counter address, and expands inline frames.
+- **Dart type names** — the obfuscation map (`--save-obfuscation-map`), uploaded
+  as a `dart_obfuscation_map` artifact under the same build id as the symbols.
+  This is the only artifact that de-obfuscates the exception **class**: the SDK
+  sends `error.runtimeType.toString()`, which `--obfuscate` has already renamed
+  on the device, and no amount of DWARF recovers it. It rewrites the DISPLAY
+  columns (`issues.type`/`title`) only — `error_events.exception_type` and the
+  fingerprint keep the verbatim wire value, so a map uploaded later cannot
+  re-group existing issues. See **[Flutter SDK](Flutter-SDK.md#obfuscated-release-builds)**.
 
 It runs at **ingest** when the matching symbol artifacts are already uploaded
 (time-boxed and non-fatal); a miss or timeout leaves the trace to be symbolicated **on
-read** instead.
+read** instead. The on-read path also repairs the stored `culprit` — so uploading
+symbols after a crash has already landed fixes that issue's list row the next time
+anyone opens it, rather than leaving it minified forever.
 
 ## 3. Product analytics & people
 

@@ -22,7 +22,7 @@ use super::db;
 use crate::error::ApiError;
 use crate::AppState;
 
-const KINDS: [&str; 2] = ["js_sourcemap", "dart_symbols"];
+const KINDS: [&str; 3] = ["js_sourcemap", "dart_symbols", "dart_obfuscation_map"];
 const PLATFORMS: [&str; 3] = ["web", "android", "ios"];
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +137,7 @@ pub async fn upload(
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     if !KINDS.contains(&p.kind.as_str()) {
         return Err(ApiError::BadRequest(
-            "kind must be 'js_sourcemap' or 'dart_symbols'".into(),
+            "kind must be 'js_sourcemap', 'dart_symbols' or 'dart_obfuscation_map'".into(),
         ));
     }
     if !PLATFORMS.contains(&p.platform.as_str()) {
@@ -236,7 +236,7 @@ pub async fn upload(
 
     // Idempotency: by debug-id (Dart) or (release, name, content) for JS.
     let existing = match debug_id.as_deref() {
-        Some(did) => repo::find_artifact_by_debug_id(&mut conn, app_id, did).await?,
+        Some(did) => repo::find_artifact_by_debug_id(&mut conn, app_id, &p.kind, did).await?,
         None => {
             repo::find_artifact_by_release_name(
                 &mut conn,
@@ -275,6 +275,9 @@ pub async fn upload(
     // NOTE (slice 2): for kind == "js_sourcemap", parse the map on upload into a
     // compact index, `put_blob` it, and set `prebuilt_index_sha256`.
 
+    // Cloned before the insert moves `p.kind`: the unique-violation recovery
+    // below needs the same kind the lookup used, and the two must not drift.
+    let kind = p.kind.clone();
     let inserted = repo::insert_symbol_artifact(
         &mut conn,
         NewSymbolArtifact {
@@ -295,12 +298,14 @@ pub async fn upload(
 
     // The lookup above and this insert are not atomic, and the gap between them
     // is seconds wide — the zstd level 19 pass over up to
-    // `symbols_max_artifact_mb` sits in it. `symbol_artifacts_debugid_idx` is a
-    // real UNIQUE index on (app_id, debug_id), and now that every `dart_symbols`
-    // upload carries a derived id, that index went from unreachable to routinely
-    // hit: two uploads of the same symbols file (a slow upload plus an impatient
-    // second click on a form is the everyday shape) both miss the lookup, and
-    // the loser's insert violates it.
+    // `symbols_max_artifact_mb` sits in it. `symbol_artifacts_kind_debugid_idx`
+    // is a real UNIQUE index on (app_id, kind, debug_id), and now that every
+    // `dart_symbols` upload carries a derived id, that index went from
+    // unreachable to routinely hit: two uploads of the same symbols file (a slow
+    // upload plus an impatient second click on a form is the everyday shape)
+    // both miss the lookup, and the loser's insert violates it. It gained
+    // `kind` so a build can carry its ELF and its obfuscation map under one id;
+    // the lookup above and the recovery below are kind-scoped to match.
     //
     // A bare 500 is the wrong answer for the loser. The right answer is the same
     // dedupe 200 the winner's re-uploader gets, because by the time the loser is
@@ -314,7 +319,7 @@ pub async fn upload(
         Ok(a) => a,
         Err(e) if is_unique_violation(&e) => {
             let raced = match debug_id.as_deref() {
-                Some(did) => repo::find_artifact_by_debug_id(&mut conn, app_id, did).await?,
+                Some(did) => repo::find_artifact_by_debug_id(&mut conn, app_id, &kind, did).await?,
                 None => None,
             };
             let Some(a) = raced else {

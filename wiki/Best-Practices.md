@@ -1,7 +1,8 @@
 # Best Practices
 
 Field-tested conventions for getting clean, groupable, privacy-safe data out of the
-Sauron SDKs. Everything here matches the **shipped v0.3.0** APIs. For the exact JSON
+Sauron SDKs. Everything here matches the APIs currently in this repo — see the
+version table in **[Capabilities](Capabilities.md#versioning)**. For the exact JSON
 each SDK emits see **[Ingest Wire Contract](Ingest-Wire-Contract.md)**; for per-SDK
 signatures see the **[Browser](Browser-SDK.md)**, **[Flutter](Flutter-SDK.md)**,
 **[Node](Node-SDK.md)**, **[Python](Python-SDK.md)**, and **[C#](CSharp-SDK.md)**

@@ -82,6 +82,26 @@ struct PoolBlobFetch {
     max_uncompressed: usize,
 }
 
+impl PoolBlobFetch {
+    /// One kind of Dart artifact for one build. Kind-scoped because
+    /// `symbol_artifacts` is unique on (app, kind, debug_id): the ELF and the
+    /// obfuscation map for a build share an id and are told apart by kind.
+    async fn dart_artifact(&self, kind: &str, debug_id: &str) -> Vec<ArtifactRef> {
+        let Ok(mut conn) = sauron_db::conn(&self.pool).await else {
+            return Vec::new();
+        };
+        match sauron_db::repo::find_artifact_by_debug_id(&mut conn, self.app_id, kind, debug_id)
+            .await
+        {
+            Ok(Some(a)) => vec![ArtifactRef {
+                name: a.name,
+                blob_sha256: a.blob_sha256,
+            }],
+            _ => Vec::new(),
+        }
+    }
+}
+
 impl BlobFetch for PoolBlobFetch {
     async fn js_artifacts(&self, release: &str) -> Vec<ArtifactRef> {
         let Ok(mut conn) = sauron_db::conn(&self.pool).await else {
@@ -101,16 +121,11 @@ impl BlobFetch for PoolBlobFetch {
 
     async fn dart_symbols(&self, debug_id: &str, _arch: Option<&str>) -> Vec<ArtifactRef> {
         // debug_id is unique per arch, so it alone identifies the ELF.
-        let Ok(mut conn) = sauron_db::conn(&self.pool).await else {
-            return Vec::new();
-        };
-        match sauron_db::repo::find_artifact_by_debug_id(&mut conn, self.app_id, debug_id).await {
-            Ok(Some(a)) if a.kind == "dart_symbols" => vec![ArtifactRef {
-                name: a.name,
-                blob_sha256: a.blob_sha256,
-            }],
-            _ => Vec::new(),
-        }
+        self.dart_artifact("dart_symbols", debug_id).await
+    }
+
+    async fn dart_obfuscation_map(&self, debug_id: &str) -> Vec<ArtifactRef> {
+        self.dart_artifact("dart_obfuscation_map", debug_id).await
     }
 
     async fn blob(&self, sha: &[u8]) -> Option<Vec<u8>> {
@@ -154,18 +169,88 @@ pub fn build_debug_meta(dm: Option<&sauron_core::DebugMeta>, raw_stacktrace: &st
     })
 }
 
-/// Time-boxed Dart pre-symbolication. Returns `(symbolicated frames, status)` — frames carry source context (see the
-/// `Store frames WITH source context` comment at the write); they are not lean.
+/// What one time-boxed pre-symbolication attempt produced.
+///
+/// `culprit` rides along with the frames rather than being re-derived by the
+/// caller because this is the only place the TYPED `ResolvedFrame`s exist —
+/// past here they are an opaque `serde_json::Value`, and rebuilding them from
+/// it to read one frame would be a parse per error event on the hot path.
+pub struct Symbolicated {
+    /// Frames WITH source context (see the `Store frames WITH source context`
+    /// comment at the write); `None` unless something resolved.
+    pub frames: Option<Value>,
+    /// pending | symbolicated | partial | no_artifacts | not_applicable | failed.
+    pub status: String,
+    /// The de-obfuscated culprit, or `None` when nothing resolved — in which
+    /// case the caller KEEPS the raw one rather than blanking it. A miss must
+    /// never cost the reader the minified culprit they had before.
+    pub culprit: Option<String>,
+}
+
+impl Symbolicated {
+    /// A miss: no frames, no culprit, just the status that explains why.
+    fn unresolved(status: &str) -> Self {
+        Self {
+            frames: None,
+            status: status.to_string(),
+            culprit: None,
+        }
+    }
+}
+
+/// The original class name for an obfuscated Dart exception type, or `None`.
+///
+/// Separate from [`symbolicate_ingest_dart`] because it answers a different
+/// question from a different artifact: that one resolves ADDRESSES against
+/// DWARF, this one resolves a NAME against the map Dart emits with
+/// `--save-obfuscation-map`. An app can upload either without the other, and a
+/// build with symbols but no map still symbolicates its frames.
+///
+/// Time-boxed and non-fatal on the same terms as everything else on this path —
+/// a miss returns `None` and the caller keeps the raw type, which the on-read
+/// path can still repair once a map arrives.
+///
+/// **Presentational.** The result must reach only the DISPLAY fields
+/// (`issues.type`/`title`, `error_events.title`). The fingerprint and
+/// `error_events.exception_type` stay raw, so uploading a map cannot re-group
+/// issues that already exist — the same rule the frame symbolication follows.
+pub async fn deobfuscate_ingest_type(
+    pool: &PgPool,
+    sym: &SymbolizeCtx,
+    app_id: Uuid,
+    debug_id: Option<&str>,
+    ty: &str,
+) -> Option<String> {
+    if ty.is_empty() || debug_id.is_none() {
+        return None;
+    }
+    if !sym.app_has_artifacts(pool, app_id).await {
+        return None;
+    }
+    let fetch = PoolBlobFetch {
+        pool: pool.clone(),
+        app_id,
+        cache: sym.cache.clone(),
+        max_uncompressed: sym.max_uncompressed,
+    };
+    let fut = sym.symbolicator.deobfuscate_type(&fetch, debug_id, ty);
+    tokio::time::timeout(std::time::Duration::from_millis(sym.timeout_ms), fut)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Time-boxed Dart pre-symbolication. See [`Symbolicated`] for the result.
 pub async fn symbolicate_ingest_dart(
     pool: &PgPool,
     sym: &SymbolizeCtx,
     app_id: Uuid,
     raw_trace: &str,
     dm: Option<&sauron_core::DebugMeta>,
-) -> (Option<Value>, String) {
+) -> Symbolicated {
     // Apps with no uploaded symbols: skip the artifact lookup entirely.
     if !sym.app_has_artifacts(pool, app_id).await {
-        return (None, "no_artifacts".to_string());
+        return Symbolicated::unresolved("no_artifacts");
     }
     let fetch = PoolBlobFetch {
         pool: pool.clone(),
@@ -180,34 +265,34 @@ pub async fn symbolicate_ingest_dart(
         .symbolicate_dart(&fetch, raw_trace, debug_id, arch);
     match tokio::time::timeout(std::time::Duration::from_millis(sym.timeout_ms), fut).await {
         Ok((resolved, status)) => match status {
-            Status::Symbolicated | Status::Partial => (
-                serde_json::to_value(&resolved).ok(),
-                status.as_str().to_string(),
-            ),
-            other => (None, other.as_str().to_string()),
+            Status::Symbolicated | Status::Partial => Symbolicated {
+                frames: serde_json::to_value(&resolved).ok(),
+                status: status.as_str().to_string(),
+                culprit: sauron_symbols::culprit_of_resolved(&resolved),
+            },
+            other => Symbolicated::unresolved(other.as_str()),
         },
-        Err(_) => (None, "pending".to_string()),
+        Err(_) => Symbolicated::unresolved("pending"),
     }
 }
 
-/// Time-boxed pre-symbolication. Returns `(symbolicated frames, status)` — frames carry source context (see the
-/// `Store frames WITH source context` comment at the write); they are not lean —
-/// frames are `None` unless something resolved. Never returns an error.
+/// Time-boxed pre-symbolication. See [`Symbolicated`] for the result. Never
+/// returns an error.
 pub async fn symbolicate_ingest(
     pool: &PgPool,
     sym: &SymbolizeCtx,
     app_id: Uuid,
     release: Option<&str>,
     frames: &[Frame],
-) -> (Option<Value>, String) {
+) -> Symbolicated {
     if frames.is_empty() {
-        return (None, "not_applicable".to_string());
+        return Symbolicated::unresolved("not_applicable");
     }
     // No release → nothing to match (symbolicate_js would return NotApplicable
     // without a query anyway). A release with no app symbols wastes a query, so
     // gate that on the presence cache.
     if release.is_some() && !sym.app_has_artifacts(pool, app_id).await {
-        return (None, "no_artifacts".to_string());
+        return Symbolicated::unresolved("no_artifacts");
     }
     let fetch = PoolBlobFetch {
         pool: pool.clone(),
@@ -221,13 +306,14 @@ pub async fn symbolicate_ingest(
         Ok((resolved, status)) => match status {
             // Store frames WITH source context so the API can serve them
             // straight from the row without re-symbolicating on every view.
-            Status::Symbolicated | Status::Partial => (
-                serde_json::to_value(&resolved).ok(),
-                status.as_str().to_string(),
-            ),
-            other => (None, other.as_str().to_string()),
+            Status::Symbolicated | Status::Partial => Symbolicated {
+                frames: serde_json::to_value(&resolved).ok(),
+                status: status.as_str().to_string(),
+                culprit: sauron_symbols::culprit_of_resolved(&resolved),
+            },
+            other => Symbolicated::unresolved(other.as_str()),
         },
         // Timed out — leave it pending for the on-read path.
-        Err(_) => (None, "pending".to_string()),
+        Err(_) => Symbolicated::unresolved("pending"),
     }
 }

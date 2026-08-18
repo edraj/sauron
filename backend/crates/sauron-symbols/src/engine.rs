@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::cache::ByteLru;
 use crate::js::ParsedSourceMap;
 use crate::matcher;
+use crate::obfuscation::ObfuscationMap;
 
 /// A raw (minified) stack frame — mirrors `sauron_core::envelope::Frame`.
 /// `Deserialize` tolerates extra fields (e.g. `module`) from the stored JSON.
@@ -27,7 +28,15 @@ pub struct RawFrame {
 }
 
 /// A frame after symbolication. Serializes into the shape the dashboard renders.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` as well as `Serialize` because this shape is not only sent —
+/// it is STORED, in `error_events.stacktrace_symbolicated`, and read back to
+/// re-derive the culprit for rows symbolicated before that derivation existed.
+/// Container-level `default` so a stored row written by an older shape (or one
+/// whose `skip_serializing_if` fields were simply absent) reads back rather
+/// than failing the whole frame list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ResolvedFrame {
     pub function: Option<String>,
     pub filename: Option<String>,
@@ -117,12 +126,26 @@ pub trait BlobFetch {
         debug_id: &str,
         arch: Option<&str>,
     ) -> impl Future<Output = Vec<ArtifactRef>> + Send;
+    /// The `dart_obfuscation_map` for this build, if one was uploaded.
+    ///
+    /// Keyed on the SAME `debug_id` as [`Self::dart_symbols`] — the map is JSON
+    /// with nothing identifying inside it, so the build id of the symbols it
+    /// was emitted beside is the only thing that ties the two together. That is
+    /// why `symbol_artifacts` is unique on (app, **kind**, debug_id) rather
+    /// than (app, debug_id).
+    fn dart_obfuscation_map(&self, debug_id: &str)
+        -> impl Future<Output = Vec<ArtifactRef>> + Send;
     fn blob(&self, sha: &[u8]) -> impl Future<Output = Option<Vec<u8>>> + Send;
 }
 
 /// Symbolication engine holding the in-process parsed-map cache.
 pub struct Symbolicator {
     cache: ByteLru<Vec<u8>, ParsedSourceMap>,
+    /// Parsed Dart obfuscation maps, held separately from `cache` so a build
+    /// with a large source map cannot evict the small name index that every
+    /// error from that build needs. Given its own share of the budget for the
+    /// same reason.
+    obfuscation: ByteLru<Vec<u8>, ObfuscationMap>,
     context_radius: usize,
 }
 
@@ -130,8 +153,68 @@ impl Symbolicator {
     pub fn new(budget_bytes: usize) -> Self {
         Symbolicator {
             cache: ByteLru::new(budget_bytes),
+            // An eighth of the budget. A name index is a few hundred KB against
+            // source maps measured in tens of MB, so this is generous in
+            // practice while still bounded.
+            obfuscation: ByteLru::new((budget_bytes / 8).max(1)),
             context_radius: 5,
         }
+    }
+
+    /// The original class name for an obfuscated Dart type, or `None`.
+    ///
+    /// `None` covers every "leave it alone" case and they must stay
+    /// indistinguishable to the caller: no debug id on the event, no map
+    /// uploaded for that build, a map that does not contain this name, or a
+    /// name that was never obfuscated. In all of them the value already on the
+    /// row is the best one available.
+    ///
+    /// **Presentational only.** The caller must not feed the result into a
+    /// fingerprint: grouping runs on the raw wire values, so that uploading a
+    /// map later cannot re-group existing issues.
+    pub async fn deobfuscate_type<F: BlobFetch + Sync>(
+        &self,
+        fetch: &F,
+        debug_id: Option<&str>,
+        ty: &str,
+    ) -> Option<String> {
+        if ty.is_empty() {
+            return None;
+        }
+        let debug_id = crate::normalize_debug_id(debug_id?);
+        let art = fetch
+            .dart_obfuscation_map(&debug_id)
+            .await
+            .into_iter()
+            .next()?;
+        let map = self.load_obfuscation(fetch, art.blob_sha256).await;
+        map.original_path(ty)
+    }
+
+    async fn load_obfuscation<F: BlobFetch + Sync>(
+        &self,
+        fetch: &F,
+        sha: Vec<u8>,
+    ) -> Arc<ObfuscationMap> {
+        let fetch_sha = sha.clone();
+        self.obfuscation
+            .get_or_insert(
+                sha,
+                |m| m.weight().max(1),
+                || async move {
+                    match fetch.blob(&fetch_sha).await {
+                        Some(bytes) => ObfuscationMap::parse(&bytes).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "obfuscation map parse failed; caching empty");
+                            ObfuscationMap::default()
+                        }),
+                        None => {
+                            tracing::debug!("obfuscation map blob missing; caching empty");
+                            ObfuscationMap::default()
+                        }
+                    }
+                },
+            )
+            .await
     }
 
     /// Resolve every frame against the release's JS source maps.
@@ -418,6 +501,9 @@ mod tests {
         async fn dart_symbols(&self, _id: &str, _arch: Option<&str>) -> Vec<ArtifactRef> {
             Vec::new()
         }
+        async fn dart_obfuscation_map(&self, _id: &str) -> Vec<ArtifactRef> {
+            Vec::new()
+        }
         async fn blob(&self, _sha: &[u8]) -> Option<Vec<u8>> {
             Some(self.raw.clone())
         }
@@ -437,8 +523,38 @@ mod tests {
                 blob_sha256: content::sha256(&self.elf).to_vec(),
             }]
         }
+        async fn dart_obfuscation_map(&self, _id: &str) -> Vec<ArtifactRef> {
+            Vec::new()
+        }
         async fn blob(&self, _sha: &[u8]) -> Option<Vec<u8>> {
             Some(self.elf.clone())
+        }
+    }
+
+    /// Serves an obfuscation map — and, like [`Strict`], only for the exact
+    /// stored id, because that is what the real fetchers do.
+    struct MapMem {
+        stored_debug_id: &'static str,
+        json: Vec<u8>,
+    }
+    impl BlobFetch for MapMem {
+        async fn js_artifacts(&self, _r: &str) -> Vec<ArtifactRef> {
+            Vec::new()
+        }
+        async fn dart_symbols(&self, _id: &str, _arch: Option<&str>) -> Vec<ArtifactRef> {
+            Vec::new()
+        }
+        async fn dart_obfuscation_map(&self, debug_id: &str) -> Vec<ArtifactRef> {
+            if debug_id != self.stored_debug_id {
+                return Vec::new();
+            }
+            vec![ArtifactRef {
+                name: None,
+                blob_sha256: content::sha256(&self.json).to_vec(),
+            }]
+        }
+        async fn blob(&self, _sha: &[u8]) -> Option<Vec<u8>> {
+            Some(self.json.clone())
         }
     }
 
@@ -477,6 +593,9 @@ mod tests {
                 return Vec::new();
             }
             self.artifact(None)
+        }
+        async fn dart_obfuscation_map(&self, _id: &str) -> Vec<ArtifactRef> {
+            Vec::new()
         }
         async fn blob(&self, _sha: &[u8]) -> Option<Vec<u8>> {
             Some(self.blob.clone())
@@ -798,5 +917,73 @@ isolate_dso_base: 7b9c2b7000, vm_dso_base: 7b9c2b7000\n\
         let (out, status) = s.symbolicate_dart(&fetch, trace, Some("x"), None).await;
         assert_eq!(status, Status::NoArtifacts);
         assert!(!out[0].symbolicated);
+    }
+
+    fn map_fetch() -> MapMem {
+        MapMem {
+            stored_debug_id: "ab36961b44baef9d7e3b9296dff3ce3e59be51a3",
+            json: br#"["CartException","xY1","CheckoutBloc","aB2"]"#.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn deobfuscates_a_type_against_the_uploaded_map() {
+        let sym = Symbolicator::new(1 << 20);
+        let got = sym
+            .deobfuscate_type(
+                &map_fetch(),
+                Some("ab36961b44baef9d7e3b9296dff3ce3e59be51a3"),
+                "xY1",
+            )
+            .await;
+        assert_eq!(got.as_deref(), Some("CartException"));
+    }
+
+    #[tokio::test]
+    async fn the_debug_id_is_normalized_before_the_lookup() {
+        // `MapMem` answers only the canonical lowercase id, exactly as the SQL
+        // equality in the real fetchers does. An uppercase id reaching the
+        // query unchanged finds no row and de-obfuscates nothing — the same
+        // write-only-normalization bug `Strict` exists to catch on the frame
+        // path.
+        let sym = Symbolicator::new(1 << 20);
+        let got = sym
+            .deobfuscate_type(
+                &map_fetch(),
+                Some("AB36961B44BAEF9D7E3B9296DFF3CE3E59BE51A3"),
+                "xY1",
+            )
+            .await;
+        assert_eq!(got.as_deref(), Some("CartException"));
+    }
+
+    #[tokio::test]
+    async fn every_miss_is_none_so_the_caller_keeps_what_it_had() {
+        let sym = Symbolicator::new(1 << 20);
+        let f = map_fetch();
+        // No debug id on the event.
+        assert_eq!(sym.deobfuscate_type(&f, None, "xY1").await, None);
+        // Empty type.
+        assert_eq!(
+            sym.deobfuscate_type(&f, Some("ab36961b44baef9d7e3b9296dff3ce3e59be51a3"), "")
+                .await,
+            None
+        );
+        // A build with no map uploaded.
+        assert_eq!(
+            sym.deobfuscate_type(&f, Some("00000000"), "xY1").await,
+            None
+        );
+        // A name the map does not cover — including one that was never
+        // obfuscated, which must be left exactly as it is.
+        assert_eq!(
+            sym.deobfuscate_type(
+                &f,
+                Some("ab36961b44baef9d7e3b9296dff3ce3e59be51a3"),
+                "StateError"
+            )
+            .await,
+            None
+        );
     }
 }

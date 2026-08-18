@@ -46,6 +46,39 @@ impl SqlBlobFetch {
     }
 }
 
+impl SqlBlobFetch {
+    /// One kind of Dart artifact for one build, memoized for this instance's
+    /// lifetime. The memo key carries the KIND as well as the id: the ELF and
+    /// the obfuscation map for a build share a `debug_id` and are distinct rows
+    /// (`symbol_artifacts` is unique on (app, kind, debug_id)), so keying on
+    /// the id alone would serve one where the other was asked for.
+    async fn dart_artifact(&self, kind: &str, debug_id: &str) -> Vec<ArtifactRef> {
+        let memo_key = format!("{kind}\u{1}{debug_id}");
+        if let Some(hit) = self.dart_memo.lock().await.get(&memo_key) {
+            return hit.clone();
+        }
+        let Ok(mut conn) = sauron_db::conn(&self.pool).await else {
+            return Vec::new();
+        };
+        let refs = match sauron_db::repo::find_artifact_by_debug_id(
+            &mut conn,
+            self.app_id,
+            kind,
+            debug_id,
+        )
+        .await
+        {
+            Ok(Some(a)) => vec![ArtifactRef {
+                name: a.name,
+                blob_sha256: a.blob_sha256,
+            }],
+            _ => Vec::new(),
+        };
+        self.dart_memo.lock().await.insert(memo_key, refs.clone());
+        refs
+    }
+}
+
 impl BlobFetch for SqlBlobFetch {
     async fn js_artifacts(&self, release: &str) -> Vec<ArtifactRef> {
         if let Some(hit) = self.js_memo.lock().await.get(release) {
@@ -73,30 +106,11 @@ impl BlobFetch for SqlBlobFetch {
     }
 
     async fn dart_symbols(&self, debug_id: &str, _arch: Option<&str>) -> Vec<ArtifactRef> {
-        if let Some(hit) = self.dart_memo.lock().await.get(debug_id) {
-            return hit.clone();
-        }
-        let Ok(mut conn) = sauron_db::conn(&self.pool).await else {
-            return Vec::new();
-        };
-        let refs = match sauron_db::repo::find_artifact_by_debug_id(
-            &mut conn,
-            self.app_id,
-            debug_id,
-        )
-        .await
-        {
-            Ok(Some(a)) if a.kind == "dart_symbols" => vec![ArtifactRef {
-                name: a.name,
-                blob_sha256: a.blob_sha256,
-            }],
-            _ => Vec::new(),
-        };
-        self.dart_memo
-            .lock()
-            .await
-            .insert(debug_id.to_string(), refs.clone());
-        refs
+        self.dart_artifact("dart_symbols", debug_id).await
+    }
+
+    async fn dart_obfuscation_map(&self, debug_id: &str) -> Vec<ArtifactRef> {
+        self.dart_artifact("dart_obfuscation_map", debug_id).await
     }
 
     async fn blob(&self, sha: &[u8]) -> Option<Vec<u8>> {
@@ -170,12 +184,21 @@ pub fn gate_source_context(perms: &std::collections::HashSet<String>, events: &m
 ///
 /// Kept — what the occurrences table and the issue header render, all of which
 /// `issue:read` already confers at the issue level: identity/ancestry ids,
-/// `level`, `message`, `exception_type`/`exception_value` (the issue's own
-/// `title` and `culprit` are derived from these), `release`, `distinct_id`,
-/// timestamps, `session_id`, `device_key`, `screen`, `symbolication_status`,
-/// `handled`. `distinct_id` stays on purpose: it is the "user" column of the
-/// occurrences list and is already the *key* of the person routes, whereas
-/// `event_user`'s traits are not.
+/// `level`, `message`, `exception_type`/`exception_value`, `title` (which is
+/// just those two joined and truncated, so withholding it would withhold
+/// nothing), `release`, `distinct_id`, timestamps, `session_id`, `device_key`,
+/// `screen`, `symbolication_status`, `handled`. `distinct_id` stays on purpose:
+/// it is the "user" column of the occurrences list and is already the *key* of
+/// the person routes, whereas `event_user`'s traits are not.
+///
+/// **`culprit` goes, though `title` stays** — the two arrived together and are
+/// not the same kind of value. `culprit` is a function name and a source path
+/// lifted out of the frames, which is precisely what `stacktrace` carries and
+/// this gate withholds; handing it over would leak one frame of a stack trace
+/// to a caller denied the trace. The issue-level `issues.culprit` is served
+/// under `issue:read` alone, but that is the issue's own metadata and a caller
+/// holding `event:read` WITHOUT `issue:read` — `sessions::detail`'s
+/// authorization — never sees it.
 ///
 /// Fields are nulled rather than the row being dropped, so a coarse-gated
 /// caller still gets the occurrence — "this happened, at this time, on this
@@ -192,6 +215,7 @@ pub fn strip_event_body(event: &mut ErrorEvent) {
     event.debug_meta = None;
     event.event_user = None;
     event.ip_address = None;
+    event.culprit = None;
 }
 
 /// Remove a transaction's **developer-supplied** payload, leaving the span.
@@ -373,6 +397,59 @@ fn symbolication_permits() -> &'static tokio::sync::Semaphore {
     })
 }
 
+/// Repair a missing `culprit` from frames that are ALREADY stored.
+///
+/// The rows this exists for are the awkward ones: symbolicated at ingest, but
+/// *before* ingest learned to derive the culprit from the resolved frames, so
+/// they carry good frames beside a culprit built from the raw ones — minified
+/// for a JS build, and the empty string for an obfuscated Dart build, whose
+/// events have no raw frames at all. They can never reach the resolver below:
+/// `symbolicate_with`'s fast path exists precisely to skip re-symbolicating
+/// them, and it is right to. So the repair has to happen here, off the frames
+/// on the row, with no artifact lookup and no source-map or DWARF parse.
+///
+/// Costs a deserialize of a column already in memory, and only for rows still
+/// missing the value — the write below means each row pays it at most once.
+async fn backfill_culprit_from_stored(state: &AppState, event: &mut ErrorEvent) {
+    // `Some("")` counts as missing: that is what an obfuscated Dart event got
+    // from the raw derivation, and it is the case this whole path is for.
+    if event.culprit.as_deref().is_some_and(|c| !c.is_empty()) {
+        return;
+    }
+    let Some(frames) = event.stacktrace_symbolicated.as_ref() else {
+        return;
+    };
+    let Ok(resolved) = serde_json::from_value::<Vec<sauron_symbols::ResolvedFrame>>(frames.clone())
+    else {
+        return;
+    };
+    let Some(culprit) = sauron_symbols::culprit_of_resolved(&resolved) else {
+        return;
+    };
+
+    // Same tiering guard as the resolve path: never write into a cold/exported
+    // partition. A cold event still gets the value on its response.
+    if event.occurred_at > Utc::now() - Duration::days(state.cfg.tier_hot_days) {
+        if let Ok(mut conn) = sauron_db::conn(&state.pool).await {
+            let _ = sauron_db::repo::update_event_culprit(
+                &mut conn,
+                event.id,
+                event.occurred_at,
+                &culprit,
+            )
+            .await;
+            let _ = sauron_db::repo::update_issue_culprit_if_latest(
+                &mut conn,
+                event.issue_id,
+                &culprit,
+                event.occurred_at,
+            )
+            .await;
+        }
+    }
+    event.culprit = Some(culprit);
+}
+
 async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut ErrorEvent) {
     // Fast path: already fully symbolicated (at ingest or a prior read) and the
     // frames are stored with context — serve them as-is. This keeps issue/event
@@ -385,6 +462,8 @@ async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut Er
             .as_ref()
             .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()))
     {
+        backfill_culprit_from_stored(state, event).await;
+        deobfuscate_type_on_read(state, fetch, event).await;
         return;
     }
 
@@ -441,6 +520,15 @@ async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut Er
         event.symbolication_status.as_str(),
         "pending" | "no_artifacts"
     );
+    // The culprit the newly-resolved frames name — the readable
+    // `checkout (cart_bloc.dart)` that the Exceptions list and the session
+    // timeline render beside the exception type. Ingest derives this too, but
+    // only for events whose symbols were already uploaded when they arrived;
+    // every crash that landed BEFORE its symbol upload got the raw derivation,
+    // which for an obfuscated Dart build is the empty string. Those rows are
+    // the ones this path repairs.
+    let culprit = sauron_symbols::culprit_of_resolved(&resolved);
+
     if hot && was_unresolved {
         // Persist WITH context so later views short-circuit to the stored frames.
         if let (Ok(frames_json), Ok(mut conn)) = (
@@ -453,9 +541,30 @@ async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut Er
                 event.occurred_at,
                 frames_json,
                 status.as_str(),
+                culprit.as_deref(),
             )
             .await;
+            // Best-effort, and deliberately not gated on the write above
+            // reporting a row: both are repairs of a value that is only ever
+            // displayed, and neither failing may cost the caller the response.
+            if let Some(c) = culprit.as_deref() {
+                let _ = sauron_db::repo::update_issue_culprit_if_latest(
+                    &mut conn,
+                    event.issue_id,
+                    c,
+                    event.occurred_at,
+                )
+                .await;
+            }
         }
+    }
+
+    // On the response regardless of `hot` — a cold-partition event may not be
+    // written back (the tiering drop-guard), but the caller still asked for
+    // this event and should see the resolved name rather than the minified one
+    // the row happens to hold.
+    if let Some(c) = culprit {
+        event.culprit = Some(c);
     }
 
     event.stacktrace_symbolicated = serde_json::to_value(&resolved)
@@ -465,6 +574,80 @@ async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut Er
         event.stacktrace_symbolicated = Some(Value::Array(Vec::new()));
     }
     event.symbolication_status = status.as_str().to_string();
+
+    deobfuscate_type_on_read(state, fetch, event).await;
+}
+
+/// Replace an obfuscated Dart class name with the real one, if a map has been
+/// uploaded for this build.
+///
+/// The counterpart of `backfill_culprit_from_stored` for the OTHER half of what
+/// a reader sees. Symbolication makes the frames readable; only the obfuscation
+/// map makes the *type* readable, because the Flutter SDK sends
+/// `error.runtimeType.toString()` and under `--obfuscate` that string is
+/// already the renamed identifier on the wire. Nothing derived from DWARF can
+/// recover it.
+///
+/// Writes to `title` (and the issue's `type`/`title`), never to
+/// `exception_type` or the fingerprint — see `update_issue_display_if_latest`.
+/// `exception_type` is the verbatim wire value and stays that way, so grouping
+/// cannot move under an app that uploads a map late.
+async fn deobfuscate_type_on_read(state: &AppState, fetch: &SqlBlobFetch, event: &mut ErrorEvent) {
+    // Dart only, and only when there is something to look the name up by.
+    let Some(build_id) = event
+        .debug_meta
+        .as_ref()
+        .and_then(|d| d.get("build_id"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    if event.exception_type.is_empty() {
+        return;
+    }
+    let Some(original) = state
+        .symbolicator
+        .deobfuscate_type(fetch, Some(build_id), &event.exception_type)
+        .await
+    else {
+        return;
+    };
+
+    // `build_title`'s shape, rebuilt here rather than imported: the pipeline
+    // crate owns that function and this is the API. Kept in sync by the fact
+    // that both are "{type}: {value}" truncated at 200, which is asserted in
+    // `sauron-pipeline`'s tests.
+    let value = event.exception_value.trim();
+    let title = if value.is_empty() {
+        original.clone()
+    } else {
+        let mut t = format!("{original}: {value}");
+        if let Some((idx, _)) = t.char_indices().nth(200) {
+            t.truncate(idx);
+        }
+        t
+    };
+    if event.title.as_deref() == Some(title.as_str()) {
+        return;
+    }
+
+    let hot = event.occurred_at > Utc::now() - Duration::days(state.cfg.tier_hot_days);
+    if hot {
+        if let Ok(mut conn) = sauron_db::conn(&state.pool).await {
+            let _ =
+                sauron_db::repo::update_event_title(&mut conn, event.id, event.occurred_at, &title)
+                    .await;
+            let _ = sauron_db::repo::update_issue_display_if_latest(
+                &mut conn,
+                event.issue_id,
+                &original,
+                &title,
+                event.occurred_at,
+            )
+            .await;
+        }
+    }
+    event.title = Some(title);
 }
 
 #[cfg(test)]
@@ -510,6 +693,8 @@ mod tests {
             contexts: json!({ "app": { "build": "42" } }),
             extra: json!({ "api_key": "leak-me" }),
             handled: Some(true),
+            title: Some("TypeError: undefined is not a function".into()),
+            culprit: Some("boom (app.ts)".into()),
         }
     }
 
@@ -560,6 +745,7 @@ mod tests {
                 "breadcrumbs",
                 "context",
                 "contexts",
+                "culprit",
                 "debug_meta",
                 "device_key",
                 "distinct_id",
@@ -585,6 +771,7 @@ mod tests {
                 "stacktrace_symbolicated",
                 "symbolication_status",
                 "tags",
+                "title",
             ],
             "a field was added to or removed from `ErrorEvent` — decide whether it is body or \
              shell and update `strip_event_body` before updating this list"
@@ -596,6 +783,7 @@ mod tests {
                 "breadcrumbs",
                 "context",
                 "contexts",
+                "culprit",
                 "debug_meta",
                 "event_user",
                 "extra",
@@ -619,6 +807,10 @@ mod tests {
         assert_eq!(v["device_key"], "device-1");
         assert_eq!(v["screen"], "Home");
         assert_eq!(v["handled"], true);
+        // The half of the title/culprit pair that survives: it is
+        // `exception_type` and `exception_value` joined, both of which are two
+        // lines above, so withholding it would withhold nothing.
+        assert_eq!(v["title"], "TypeError: undefined is not a function");
     }
 
     #[test]

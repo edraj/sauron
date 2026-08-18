@@ -1,6 +1,6 @@
 # C# SDK — `Sauron`
 
-Server-side .NET SDK (**v0.3.0**, `net8.0`, namespace `Sauron`). Dispatches
+Server-side .NET SDK (**v1.5.0**, `net8.0`, namespace `Sauron`). Dispatches
 product-analytics events and captured exceptions over a buffered background HTTP
 transport (`HttpClient` + a timer flush), with JSON via `System.Text.Json`. **No
 auto-instrumentation** — a plain server-side dispatch API. Source:
