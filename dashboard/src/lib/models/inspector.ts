@@ -252,3 +252,47 @@ export function csvFilename(
 ): string {
   return `sauron-inspector-${kind}_${scope}_${from}_${to}.csv`;
 }
+
+/**
+ * The privacy inspector's four sections, and the URL that addresses each.
+ *
+ * The tab used to be plain component state, which meant it could not be linked
+ * to, Back could not undo it, and every reload — including the one after an
+ * action that jumps you to Audit — landed back on Findings. Reading it out of
+ * the query string instead makes the URL the single source of truth, so there
+ * is no second copy to keep in sync.
+ */
+export const INSPECTOR_TABS = ['findings', 'policy', 'scans', 'audit'] as const;
+export type InspectorTab = (typeof INSPECTOR_TABS)[number];
+
+/**
+ * `?tab=` → a tab, defaulting to `findings`.
+ *
+ * Unknown values fall back rather than erroring: this reads a URL anyone can
+ * hand-edit, and a stale bookmark from before a tab was renamed should open the
+ * page, not break it.
+ */
+export function inspectorTabFromQuery(qs: string | null | undefined): InspectorTab {
+  const raw = new URLSearchParams(qs ?? '').get('tab');
+  return (INSPECTOR_TABS as readonly string[]).includes(raw ?? '')
+    ? (raw as InspectorTab)
+    : 'findings';
+}
+
+/**
+ * The route to navigate to for `tab`, preserving any other query params.
+ *
+ * `findings` drops the parameter instead of writing `?tab=findings`: it is the
+ * default, and a canonical URL for the page's initial state keeps the entry
+ * someone copies out of the address bar as short as what they arrived with.
+ */
+export function inspectorTabRoute(tab: InspectorTab, qs: string | null | undefined): string {
+  const params = new URLSearchParams(qs ?? '');
+  if (tab === 'findings') {
+    params.delete('tab');
+  } else {
+    params.set('tab', tab);
+  }
+  const query = params.toString();
+  return query ? `/admin/privacy?${query}` : '/admin/privacy';
+}

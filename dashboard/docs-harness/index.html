@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Docs page — render harness</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <!--
+      Both scripts must load BEFORE the app module, for the reasons the person
+      harness records: `config/env.ts` reads `window.__SAURON_CONFIG__` at
+      module scope, and `themeStore` reads localStorage in a module-scope
+      constructor, which import hoisting runs before any imported module body.
+    -->
+    <script src="/config.js"></script>
+    <script>
+      (function () {
+        var t = new URLSearchParams(location.search).get('theme');
+        if (t) localStorage.setItem('sauron.theme', t);
+      })();
+    </script>
+    <!-- Capture the first mount error with its stack: a Svelte 5 mount failure
+         reaches the console as a bare object whose `stack` the devtools bridge
+         truncates, and the stack is the only part that names the component. -->
+    <script>
+      window.__err = null;
+      window.addEventListener('error', function (e) {
+        if (!window.__err) window.__err = String((e.error && e.error.stack) || e.message);
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        if (!window.__err) window.__err = String((e.reason && e.reason.stack) || e.reason);
+      });
+    </script>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

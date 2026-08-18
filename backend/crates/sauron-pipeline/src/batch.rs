@@ -52,8 +52,8 @@ use sauron_redis::{keys, RedisStore};
 use crate::enrich::{device_info, enrich_context, DeviceInfo};
 use crate::mask::MaskSet;
 use crate::process::{
-    build_culprit, build_title, distinct_id, handled_of, identified_column_present,
-    object_or_empty, truncate,
+    build_culprit, build_title, build_title_with_type, distinct_id, handled_of,
+    identified_column_present, object_or_empty, truncate,
 };
 use crate::symbolize::SymbolizeCtx;
 
@@ -806,22 +806,9 @@ async fn prepare_error(
         None => (String::new(), String::new()),
     };
     let title = build_title(exc, e.message.as_deref());
-    let culprit = build_culprit(exc);
     let level = e.level.as_str();
     let now = e.timestamp;
     let device_key = info.device_key.clone();
-
-    acc.fold_issue(IssueDraft {
-        app_id: job.app_id,
-        fingerprint: fp.clone(),
-        type_: exception_type.clone(),
-        title: title.clone(),
-        culprit: culprit.clone(),
-        level: level.to_string(),
-        first_seen: now,
-        last_seen: now,
-        times_seen: 1,
-    });
 
     let user = e.user.as_ref().or(job.context.user.as_ref());
     let distinct = distinct_id(user);
@@ -833,30 +820,76 @@ async fn prepare_error(
         .map(|x| serde_json::to_value(&x.stacktrace).unwrap_or_else(|_| json!([])))
         .unwrap_or_else(|| json!([]));
 
-    let (stacktrace_symbolicated, symbolication_status, debug_meta) =
-        if let Some(raw_trace) = e.raw_stacktrace.as_deref() {
-            let dm = crate::symbolize::build_debug_meta(e.debug_meta.as_ref(), raw_trace);
-            let (frames, status) = crate::symbolize::symbolicate_ingest_dart(
-                pool,
-                sym,
-                job.app_id,
-                raw_trace,
-                e.debug_meta.as_ref(),
-            )
-            .await;
-            (frames, status, Some(dm))
-        } else {
-            let raw_frames = exc.map(|x| x.stacktrace.as_slice()).unwrap_or(&[]);
-            let (frames, status) = crate::symbolize::symbolicate_ingest(
-                pool,
-                sym,
-                job.app_id,
-                job.release.as_deref(),
-                raw_frames,
-            )
-            .await;
-            (frames, status, None)
-        };
+    let (symbolicated, debug_meta) = if let Some(raw_trace) = e.raw_stacktrace.as_deref() {
+        let dm = crate::symbolize::build_debug_meta(e.debug_meta.as_ref(), raw_trace);
+        let out = crate::symbolize::symbolicate_ingest_dart(
+            pool,
+            sym,
+            job.app_id,
+            raw_trace,
+            e.debug_meta.as_ref(),
+        )
+        .await;
+        (out, Some(dm))
+    } else {
+        let raw_frames = exc.map(|x| x.stacktrace.as_slice()).unwrap_or(&[]);
+        let out = crate::symbolize::symbolicate_ingest(
+            pool,
+            sym,
+            job.app_id,
+            job.release.as_deref(),
+            raw_frames,
+        )
+        .await;
+        (out, None)
+    };
+    let crate::symbolize::Symbolicated {
+        frames: stacktrace_symbolicated,
+        status: symbolication_status,
+        culprit: resolved_culprit,
+    } = symbolicated;
+
+    // Same rule, same reason as `process::process_error` — see the comment
+    // there. The issue fold has to wait for this value, so it sits below the
+    // symbolication rather than at the top of the function with `title`.
+    let culprit = resolved_culprit.unwrap_or_else(|| build_culprit(exc));
+
+    // The de-obfuscated class name, for the DISPLAY fields only.
+    //
+    // `exception_type` and `fp` above keep the raw wire value on purpose: the
+    // fingerprint must not move when a map is uploaded, or every existing issue
+    // for that build re-groups and the history splits in two. What changes is
+    // what a human reads — `issues.type`, and the titles derived from it.
+    let display_type = crate::symbolize::deobfuscate_ingest_type(
+        pool,
+        sym,
+        job.app_id,
+        e.debug_meta.as_ref().and_then(|d| d.build_id.as_deref()),
+        &exception_type,
+    )
+    .await;
+    let issue_type = display_type
+        .clone()
+        .unwrap_or_else(|| exception_type.clone());
+    let title = match display_type.as_deref() {
+        // Rebuild rather than string-replace: `build_title` owns the ": " join
+        // and the 200-char truncation, and a `replace` on the raw type would
+        // also hit an occurrence of it inside the message.
+        Some(t) => build_title_with_type(exc, e.message.as_deref(), t),
+        None => title,
+    };
+
+    acc.fold_issue(IssueDraft {
+        app_id: job.app_id,
+        fingerprint: fp.clone(),
+        type_: issue_type.clone(),
+        title: title.clone(),
+        culprit: culprit.clone(),
+        level: level.to_string(),
+        first_seen: now,
+        last_seen: now,
+        times_seen: 1,
+    });
 
     acc.errors.push(PendingError {
         row: NewErrorEvent {

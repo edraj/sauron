@@ -49,7 +49,7 @@ scope and resolved as a union down the tree.
   tiering, uptime probing, and RBAC.
 - **[Capabilities](Capabilities.md)** — the SDK feature-parity matrix (scope,
   breadcrumbs, transactions, `beforeSend`, gzip, retry, queue, auto-capture) across all
-  five SDKs, as of **v0.3.0**.
+  five SDKs. Parity was reconciled in v0.3.0; the SDKs version independently now.
 
 ### SDKs
 

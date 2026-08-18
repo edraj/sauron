@@ -8,6 +8,8 @@ import {
   parseKeyInput,
   createPolicyBlockedReason,
   defaultEnvEnrollmentId,
+  inspectorTabFromQuery,
+  inspectorTabRoute,
 } from './inspector';
 
 describe('UNREACHABLE_COPY', () => {
@@ -243,5 +245,52 @@ describe('defaultEnvEnrollmentId', () => {
     // A real state, not an impossible one — the scope must be disabled rather
     // than silently target something.
     expect(defaultEnvEnrollmentId([])).toBeNull();
+  });
+});
+
+describe('inspector tab ↔ URL', () => {
+  it('defaults to findings when ?tab is absent', () => {
+    expect(inspectorTabFromQuery('')).toBe('findings');
+    expect(inspectorTabFromQuery(null)).toBe('findings');
+    expect(inspectorTabFromQuery(undefined)).toBe('findings');
+  });
+
+  it('reads each real tab out of the query string', () => {
+    for (const t of ['findings', 'policy', 'scans', 'audit'] as const) {
+      expect(inspectorTabFromQuery(`tab=${t}`)).toBe(t);
+    }
+  });
+
+  it('falls back rather than erroring on an unknown tab', () => {
+    // This reads a URL anyone can hand-edit or bookmark. A stale link from
+    // before a rename must open the page, not break it.
+    expect(inspectorTabFromQuery('tab=nope')).toBe('findings');
+    expect(inspectorTabFromQuery('tab=')).toBe('findings');
+  });
+
+  it('omits the parameter for the default tab', () => {
+    // Otherwise the URL someone copies out of the address bar on arrival is
+    // longer than the one they arrived with, for no added information.
+    expect(inspectorTabRoute('findings', '')).toBe('/admin/privacy');
+    expect(inspectorTabRoute('findings', 'tab=audit')).toBe('/admin/privacy');
+  });
+
+  it('writes the parameter for every other tab', () => {
+    expect(inspectorTabRoute('audit', '')).toBe('/admin/privacy?tab=audit');
+    expect(inspectorTabRoute('policy', 'tab=audit')).toBe('/admin/privacy?tab=policy');
+  });
+
+  it('preserves other query params', () => {
+    // The page does not own the whole query string; dropping the rest would
+    // silently discard anything a future filter puts there.
+    expect(inspectorTabRoute('scans', 'env=prod')).toBe('/admin/privacy?env=prod&tab=scans');
+    expect(inspectorTabRoute('findings', 'env=prod&tab=scans')).toBe('/admin/privacy?env=prod');
+  });
+
+  it('round-trips every tab through its own route', () => {
+    for (const t of ['findings', 'policy', 'scans', 'audit'] as const) {
+      const route = inspectorTabRoute(t, '');
+      expect(inspectorTabFromQuery(route.split('?')[1] ?? '')).toBe(t);
+    }
   });
 });

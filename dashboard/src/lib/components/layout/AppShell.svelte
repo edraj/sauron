@@ -132,7 +132,17 @@
   }
   .content {
     grid-area: content;
-    overflow-x: hidden;
+    /* `clip`, NOT `hidden`. They clip identically, but `overflow-x: hidden`
+       forces the *other* axis to compute as `auto` (CSS Overflow 3: a
+       non-`visible` value on one axis blockifies `visible` on the other), which
+       made this element a scroll container. It is a grid row sized `1fr` inside
+       a `min-height: 100vh` shell, so it grows to fit its content and never
+       actually scrolls — and every `position: sticky` descendant was resolving
+       against THAT box instead of the viewport, which is why the Docs table of
+       contents and the admin rail sat still while the page scrolled past them.
+       `clip` is the one value that clips without establishing a scroll
+       container, so `overflow-y` stays `visible`. */
+    overflow-x: clip;
   }
   .content-inner {
     max-width: var(--content-max);

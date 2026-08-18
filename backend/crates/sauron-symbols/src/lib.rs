@@ -11,16 +11,20 @@
 pub mod build_id;
 pub mod cache;
 pub mod content;
+pub mod culprit;
 pub mod dart;
 pub mod dart_trace;
 pub mod engine;
 pub mod js;
 pub mod matcher;
 pub mod normalize;
+pub mod obfuscation;
 
 pub use build_id::build_id_hex;
 pub use cache::ByteLru;
 pub use content::{compress, decompress, hex, sha256, SymbolError};
+pub use culprit::{culprit_of, culprit_of_resolved, CulpritFrame};
 pub use engine::{ArtifactRef, BlobFetch, RawFrame, ResolvedFrame, Status, Symbolicator};
 pub use js::{ParsedSourceMap, ResolvedLoc, SourceContext};
 pub use normalize::{normalize_debug_id, normalize_release};
+pub use obfuscation::ObfuscationMap;

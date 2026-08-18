@@ -103,6 +103,75 @@ fn default_since_days() -> i64 {
 /// `from_legacy`), or nothing. That is what makes an old bookmark and its
 /// `query=` rewrite provably select the same rows — there is no second
 /// planner for them to disagree in.
+/// Fill in culprits that are blank because the row predates the symbolicated
+/// derivation.
+///
+/// The Exceptions list reads `issues.culprit` straight out of the table, so an
+/// issue nobody has opened since the fix keeps whatever ingest stored at the
+/// time. For an obfuscated Dart build that is the EMPTY STRING — those events
+/// carry no `exception.stacktrace`, only a `raw_stacktrace` blob, so the raw
+/// derivation had nothing to name — and a blank is precisely the complaint this
+/// whole change exists to answer. Repairing on the detail view alone would fix
+/// the row only for someone who already found it.
+///
+/// **Bounded three ways, because this is a list route.** Only rows whose stored
+/// culprit is blank qualify, so a healed list does no work at all and the
+/// common case never reaches the database. Those are capped at
+/// [`CULPRIT_REPAIR_MAX`] per request. And the derivation runs off frames
+/// ALREADY on the row — no artifact lookup, no source-map parse, no DWARF walk
+/// — so this cannot become the per-row symbolication that the on-read path
+/// bounds with a semaphore.
+///
+/// Best-effort throughout: every failure leaves the row exactly as it was, and
+/// none of them may cost the caller their list.
+async fn repair_blank_culprits(
+    conn: &mut sauron_db::PgConn,
+    rows: &mut [sauron_db::models::Issue],
+) {
+    let blank: Vec<uuid::Uuid> = rows
+        .iter()
+        .filter(|i| i.culprit.trim().is_empty())
+        .map(|i| i.id)
+        .take(CULPRIT_REPAIR_MAX)
+        .collect();
+    if blank.is_empty() {
+        return;
+    }
+    let Ok(latest) = repo::latest_frames_for_issues(conn, &blank).await else {
+        return;
+    };
+
+    for row in latest {
+        let Some(frames) = row.stacktrace_symbolicated else {
+            continue;
+        };
+        let Ok(resolved) = serde_json::from_value::<Vec<sauron_symbols::ResolvedFrame>>(frames)
+        else {
+            continue;
+        };
+        let Some(culprit) = sauron_symbols::culprit_of_resolved(&resolved) else {
+            continue;
+        };
+        // The event's own column too, not just the issue's: an
+        // environment-scoped read derives the displayed culprit from
+        // `error_events.culprit`, so healing one and not the other makes the
+        // same issue read differently depending on the environment filter.
+        let _ = repo::update_event_culprit(conn, row.id, row.occurred_at, &culprit).await;
+        let _ = repo::update_issue_culprit_if_latest(conn, row.issue_id, &culprit, row.occurred_at)
+            .await;
+        if let Some(target) = rows.iter_mut().find(|i| i.id == row.issue_id) {
+            target.culprit = culprit;
+        }
+    }
+}
+
+/// How many blank culprits one list request will repair.
+///
+/// A page is at most 200 rows. This caps the repair well under that so the
+/// added cost is bounded no matter how much history predates the fix; the rest
+/// heal on the next page view, and each row only ever pays once.
+const CULPRIT_REPAIR_MAX: usize = 25;
+
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -236,6 +305,8 @@ pub async fn list(
         repo::count_issues(&mut conn, &scope, &search, super::search::COUNT_CAP)
             .await
             .map_err(super::search::map_plan_error)?;
+
+    repair_blank_culprits(&mut conn, &mut rows).await;
 
     // `limit + 1` rows were fetched; the surplus one is the has-more probe and
     // must not be served.

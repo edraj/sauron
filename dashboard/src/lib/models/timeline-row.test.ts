@@ -12,6 +12,7 @@ import {
   offsetMs,
   opCounts,
   rowCategory,
+  rowCulprit,
   rowKind,
   rowTitle,
   transactionOp,
@@ -118,6 +119,32 @@ describe('httpStatusTone', () => {
     expect(httpStatusTone(NaN)).toBe('neutral');
     expect(httpStatusTone(100)).toBe('neutral');
     expect(httpStatusTone(0)).toBe('neutral');
+  });
+});
+
+describe('rowCulprit', () => {
+  it('labels an error row with the crash site', () => {
+    expect(rowCulprit(err('2026-08-11T14:17:14Z', { culprit: 'checkout (cart_bloc.dart)' }))).toBe(
+      'checkout (cart_bloc.dart)',
+    );
+  });
+
+  it('is null for every non-error row', () => {
+    // Only errors have a culprit. A transaction's `name` and an event's
+    // `properties` are not one, and coercing either into this slot would put a
+    // URL where the reader expects a frame.
+    expect(rowCulprit(ev('2026-08-11T14:17:03Z', '$screen'))).toBeNull();
+    expect(rowCulprit(tx('2026-08-11T14:17:14Z', '/checkout'))).toBeNull();
+  });
+
+  it('is null when the occurrence has no frames, rather than an empty label', () => {
+    // `""` is what `build_culprit` stores for a message-only capture, and the
+    // column is absent entirely on pre-migration-30 rows. Both must render
+    // nothing at all -- an empty span still costs the separator and the gap.
+    expect(rowCulprit(err('2026-08-11T14:17:14Z', { culprit: '' }))).toBeNull();
+    expect(rowCulprit(err('2026-08-11T14:17:14Z', { culprit: '   ' }))).toBeNull();
+    expect(rowCulprit(err('2026-08-11T14:17:14Z', { culprit: null }))).toBeNull();
+    expect(rowCulprit(err('2026-08-11T14:17:14Z'))).toBeNull();
   });
 });
 

@@ -12174,22 +12174,181 @@ pub async fn get_blob(conn: &mut AsyncPgConnection, sha: &[u8]) -> QueryResult<O
 
 /// Persist symbolicated frames + status onto an error event (by its composite
 /// PK: id + occurred_at). Used by the on-read backfill for hot partitions.
+///
+/// `culprit` is `None` when symbolication resolved no frame worth naming, and
+/// then the stored one is LEFT ALONE rather than written as NULL — the raw
+/// culprit this row already carries is what the environment-scoped issue list
+/// reads, and replacing it with nothing would make a backfill that resolved
+/// nothing actively erase information.
 pub async fn update_event_symbolication(
     conn: &mut AsyncPgConnection,
     event_id: Uuid,
     occurred_at: DateTime<Utc>,
     frames: Value,
     status: &str,
+    culprit: Option<&str>,
+) -> QueryResult<usize> {
+    let target = error_events::table
+        .filter(error_events::id.eq(event_id))
+        .filter(error_events::occurred_at.eq(occurred_at));
+    match culprit {
+        Some(c) => {
+            diesel::update(target)
+                .set((
+                    error_events::stacktrace_symbolicated.eq(Some(frames)),
+                    error_events::symbolication_status.eq(status.to_string()),
+                    error_events::culprit.eq(Some(c.to_string())),
+                ))
+                .execute(conn)
+                .await
+        }
+        None => {
+            diesel::update(target)
+                .set((
+                    error_events::stacktrace_symbolicated.eq(Some(frames)),
+                    error_events::symbolication_status.eq(status.to_string()),
+                ))
+                .execute(conn)
+                .await
+        }
+    }
+}
+
+/// Write a backfilled culprit onto an error event, leaving its frames and
+/// status alone.
+///
+/// Distinct from [`update_event_symbolication`] because the row this targets is
+/// already `symbolicated` with frames stored — only the derived label is stale.
+/// Reusing that function would mean re-serializing and rewriting a jsonb column
+/// that is not changing, on a partitioned table, for nothing.
+pub async fn update_event_culprit(
+    conn: &mut AsyncPgConnection,
+    event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+    culprit: &str,
 ) -> QueryResult<usize> {
     diesel::update(
         error_events::table
             .filter(error_events::id.eq(event_id))
             .filter(error_events::occurred_at.eq(occurred_at)),
     )
+    .set(error_events::culprit.eq(Some(culprit.to_string())))
+    .execute(conn)
+    .await
+}
+
+/// The newest occurrence of each of `issue_ids`, with its symbolicated frames.
+///
+/// For the issues-list culprit repair. **Hard-bounded by design**: the caller
+/// passes only the ids on the page whose stored culprit is still empty, and
+/// caps how many. Once a row is repaired it stops qualifying, so a healthy list
+/// runs this with an empty slice and never reaches the database.
+///
+/// `DISTINCT ON (issue_id) … ORDER BY issue_id, occurred_at DESC` rides
+/// `error_events_issue_time_id_idx (issue_id, occurred_at DESC, id DESC)` — one
+/// index descent per id rather than a scan, which is what makes this safe to
+/// put on a list route at all.
+pub async fn latest_frames_for_issues(
+    conn: &mut AsyncPgConnection,
+    issue_ids: &[Uuid],
+) -> QueryResult<Vec<IssueLatestFrames>> {
+    if issue_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    diesel::sql_query(
+        "SELECT DISTINCT ON (issue_id) \
+             issue_id, id, occurred_at, stacktrace_symbolicated \
+         FROM error_events \
+         WHERE issue_id = ANY($1) \
+           AND stacktrace_symbolicated IS NOT NULL \
+         ORDER BY issue_id, occurred_at DESC",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(issue_ids)
+    .load::<IssueLatestFrames>(conn)
+    .await
+}
+
+/// Write a de-obfuscated title onto an error event.
+///
+/// Paired with [`update_issue_display_if_latest`]: the event row is what an
+/// environment-scoped read derives from, the issue row is what the app-wide
+/// list shows, and a repair that touched only one would make the two disagree
+/// about the same crash.
+pub async fn update_event_title(
+    conn: &mut AsyncPgConnection,
+    event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+    title: &str,
+) -> QueryResult<usize> {
+    diesel::update(
+        error_events::table
+            .filter(error_events::id.eq(event_id))
+            .filter(error_events::occurred_at.eq(occurred_at)),
+    )
+    .set(error_events::title.eq(Some(title.to_string())))
+    .execute(conn)
+    .await
+}
+
+/// Write a de-obfuscated `type`/`title` onto the issue row, but ONLY when the
+/// event they came from is its most recent occurrence.
+///
+/// Same guard, and the same reason, as [`update_issue_culprit_if_latest`]:
+/// `upsert_issue` defines these columns as "whatever the newest occurrence
+/// said", and an on-read repair can fire on any event someone happens to be
+/// looking at. `last_seen` is the max `occurred_at` for the issue, so
+/// `last_seen <= occurred_at` is true for exactly the newest one.
+///
+/// **`issues.type` is a display column here, never an identity one.** Grouping
+/// is keyed on `(app_id, fingerprint)` and the fingerprint is computed from the
+/// RAW wire values, so rewriting this cannot move an event between issues.
+pub async fn update_issue_display_if_latest(
+    conn: &mut AsyncPgConnection,
+    issue_id: Uuid,
+    type_: &str,
+    title: &str,
+    occurred_at: DateTime<Utc>,
+) -> QueryResult<usize> {
+    diesel::update(
+        issues::table
+            .filter(issues::id.eq(issue_id))
+            .filter(issues::last_seen.le(occurred_at))
+            .filter(issues::type_.ne(type_.to_string())),
+    )
     .set((
-        error_events::stacktrace_symbolicated.eq(Some(frames)),
-        error_events::symbolication_status.eq(status.to_string()),
+        issues::type_.eq(type_.to_string()),
+        issues::title.eq(title.to_string()),
     ))
+    .execute(conn)
+    .await
+}
+
+/// Write a backfilled culprit onto the issue row, but ONLY when the event it
+/// came from is the issue's most recent occurrence.
+///
+/// `issues.culprit` is one row per (app_id, fingerprint) and `upsert_issue`
+/// overwrites it from whichever occurrence lands last, so it means "the culprit
+/// of the newest event". An on-read backfill can fire on ANY event — an
+/// occurrences list walks old ones — and writing each of those to the issue row
+/// would march the shared value backwards through history as someone pages.
+///
+/// `last_seen` is the max `occurred_at` across the issue's events, so
+/// `last_seen <= occurred_at` is true for exactly the newest one. When it isn't,
+/// this matches no row and writes nothing; the event's own `error_events.culprit`
+/// is still updated, which is what an environment-scoped read derives from.
+pub async fn update_issue_culprit_if_latest(
+    conn: &mut AsyncPgConnection,
+    issue_id: Uuid,
+    culprit: &str,
+    occurred_at: DateTime<Utc>,
+) -> QueryResult<usize> {
+    diesel::update(
+        issues::table
+            .filter(issues::id.eq(issue_id))
+            .filter(issues::last_seen.le(occurred_at))
+            .filter(issues::culprit.ne(culprit.to_string())),
+    )
+    .set(issues::culprit.eq(culprit.to_string()))
     .execute(conn)
     .await
 }
@@ -12253,10 +12412,12 @@ pub async fn get_symbol_artifact(
 pub async fn find_artifact_by_debug_id(
     conn: &mut AsyncPgConnection,
     app_id: Uuid,
+    kind: &str,
     debug_id: &str,
 ) -> QueryResult<Option<SymbolArtifact>> {
     symbol_artifacts::table
         .filter(symbol_artifacts::app_id.eq(app_id))
+        .filter(symbol_artifacts::kind.eq(kind))
         .filter(symbol_artifacts::debug_id.eq(debug_id))
         .select(SymbolArtifact::as_select())
         .first(conn)

@@ -40,7 +40,7 @@ the query string: `.../envelope?k=<public_key>`.
 
 ### Compression
 
-The body may be gzip-compressed. **Every SDK** (as of **v0.3.0**) gzips the JSON body once
+The body may be gzip-compressed. **Every SDK** (since **v0.3.0**) gzips the JSON body once
 it exceeds a threshold (`gzipThresholdBytes`, default 1024) and sets
 `Content-Encoding: gzip`; smaller bodies go out uncompressed and omit the header. The
 ingest gateway transparently decompresses when the header is present, so compression is
@@ -80,8 +80,9 @@ default to now.
 
 - **`header.sdk.name`** identifies the emitting SDK: `sauron.javascript` (browser),
   `sauron-node`, `sauron-python`, `sauron-dotnet`. `header.sdk.version` is the SDK's own
-  release — all five ship as `0.3.0` (the `0.1.0` in the example above mirrors the golden
-  parity fixture).
+  release, and the five version **independently** — see
+  [Capabilities](Capabilities.md#versioning). The `0.1.0` in the example above mirrors
+  the golden parity fixture and is not any SDK's real version.
 - **`context`** blocks (`device`, `os`, `app`, `runtime`) are free-form JSON so SDKs
   stay unopinionated about platform fields. Only `user` is typed (id / email /
   username / ip_address / traits) because the backend resolves it to an identity.
@@ -155,7 +156,7 @@ known one.
 `navigation | http | resource | screen_load | custom`. Aggregated server-side into
 p50/p95/etc.
 
-**Every SDK emits transactions** via `trackTransaction` (as of **v0.3.0**) — the browser
+**Every SDK emits transactions** via `trackTransaction` (since **v0.3.0**) — the browser
 and Flutter can also auto-capture navigation/HTTP/route timings, while the server SDKs
 (Node, Python, C#) record them manually (e.g. per request handler). Wire fields are
 snake_case (`duration_ms`, `http_method`, `http_status`, `distinct_id`).
@@ -180,7 +181,7 @@ a later crash for the same person.
 | `transaction` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `breadcrumb_batch` | ✅ | ✅ | — | — | — |
 
-As of **v0.3.0** the server-side SDKs (Node, Python, C#) reach parity on the dispatch
+Since **v0.3.0** the server-side SDKs (Node, Python, C#) reach parity on the dispatch
 surface: they emit `transaction` items and carry a breadcrumb ring, tags, and user on
 their `error` items. They still do **not** upload a standalone `breadcrumb_batch` — the
 browser and Flutter use that to pre-stage a person's recent activity, whereas the server

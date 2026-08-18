@@ -236,6 +236,26 @@ export function rowTitle(item: TimelineItem): string {
 }
 
 /**
+ * The row's secondary label: WHERE the error happened, as
+ * `function (file)` — the same `culprit` string the Exceptions list renders
+ * under the issue title, so the two surfaces name a crash identically.
+ *
+ * Server-derived rather than read off `stacktrace_symbolicated` here, even
+ * though the session timeline is served those frames. The server picks the
+ * frame (top in-app, else deepest) and de-obfuscates it; re-deriving that in
+ * TypeScript would put a second copy of the rule in a second language, and the
+ * two answers land in the same slot of the same row, where drift is invisible.
+ *
+ * `null` for non-error rows, for an occurrence with no frames (the column holds
+ * `""` — see `build_culprit`), for a row ingested before the column existed,
+ * and for a caller whose permissions had the event body stripped.
+ */
+export function rowCulprit(item: TimelineItem): string | null {
+  if (item.kind !== 'error') return null;
+  return text(item.error.culprit);
+}
+
+/**
  * A transaction's headline, with the method restored when it is missing.
  *
  * The JS SDK's auto-instrumentation already names an HTTP transaction

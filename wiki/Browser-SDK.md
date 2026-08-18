@@ -1,7 +1,7 @@
 # Browser SDK — `@edraj/sauron-browser`
 
 Error reporting **+** product analytics **+** performance for the browser, from one
-SDK (**v0.3.0**). Source: [`sdks/js`](../sdks/js). SDK header name: `sauron.javascript`.
+SDK (**v1.6.0**). Source: [`sdks/js`](../sdks/js). SDK header name: `sauron.javascript`.
 
 See also: **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
 **[Examples](Examples.md)** · the runnable demo:

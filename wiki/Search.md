@@ -163,6 +163,30 @@ release:[2.1.4, 2.1.5]      spaces around the commas are fine
 This runs as a single `= ANY(…)` rather than fanning out into an `OR` chain, so
 a long list stays as cheap as one comparison.
 
+### `field:[lo..hi]` — inclusive range
+
+Same brackets as the any-of list, told apart by the `..`. Available on the
+ordered types — timestamps, integers, durations — i.e. wherever `>=` and `<=`
+are.
+
+```
+firstSeen:[7d..1d]                             first seen between 7 and 1 days ago
+lastSeen:[1month..2026-08-01T00:00:00Z]        mixed ends are fine
+timesSeen:[10..100]                            between 10 and 100 occurrences
+duration:[500ms..2s]                           (Transactions)
+```
+
+Both ends are inclusive, and both are **required**: `[7d..]` is rejected rather
+than guessed at, because it is already spelled `>=7d`.
+
+It expands to `field:>=lo field:<=hi` before the planner sees it, so a range
+costs and indexes exactly what the two comparisons would — there is no separate
+range operator underneath.
+
+On a string or enum field the brackets keep meaning "any of": `level:[error..fatal]`
+is one nonsense list item and is reported as a bad enum value, not read as a
+comparison.
+
 ### `>` `>=` `<` `<=` — comparisons
 
 Available on numbers, durations and timestamps.
@@ -170,7 +194,9 @@ Available on numbers, durations and timestamps.
 ```
 timesSeen:>100                    seen more than 100 times          (Exceptions)
 usersSeen:>=10                    at least 10 distinct users        (Exceptions)
-firstSeen:>-7d                    first seen in the last 7 days     (Exceptions)
+firstSeen:>7d                     first seen in the last 7 days     (Exceptions)
+lastSeen:>=1month                 seen within the last month        (Exceptions)
+lastSeen:<2day                    nothing seen for over two days    (Exceptions)
 lastSeen:<2026-07-01T00:00:00Z    last seen before an instant       (Exceptions)
 duration:>2s                      slower than two seconds           (Transactions)
 duration:>500ms                   …or five hundred milliseconds     (Transactions)
@@ -184,8 +210,34 @@ to be shown.
 
 - **Durations** accept `500ms`, `2s`, `5m`, `1h`, or a bare number, which means
   milliseconds.
-- **Timestamps** accept a relative `-7d` / `-24h` / `-30m` / `-45s`, or a full
-  ISO-8601 instant.
+- **Timestamps** accept a relative offset *before now*, or a full ISO-8601
+  instant. A relative offset is a number plus a unit:
+
+  | Unit | Spellings | Length |
+  |---|---|---|
+  | second | `s` `sec` `secs` `second` `seconds` | 1s |
+  | minute | `m` `min` `mins` `minute` `minutes` | 60s |
+  | hour | `h` `hr` `hrs` `hour` `hours` | 3 600s |
+  | day | `d` `day` `days` | 86 400s |
+  | week | `w` `week` `weeks` | 7 days |
+  | month | `mo` `mos` `month` `months` | **a calendar month** |
+
+  A leading `-` is optional and changes nothing — `firstSeen:>7d` and
+  `firstSeen:>-7d` are the same query. Both spellings work because `-7d` was the
+  only one for a while and is baked into saved views.
+
+  Note `m` is **minutes**, not months; months are `mo` or longer, and there is
+  deliberately no one-letter spelling of "month".
+
+  A month is a **real calendar month**, not a fixed span: `>=1month` on 31 March
+  means 28 (or 29) February, clamping to the end of a shorter month rather than
+  spilling into the next one. Every other unit is a fixed number of seconds, so
+  `4week` and `1month` are not the same query.
+
+  Read the comparison the way you'd read it on a number line: the value is an
+  instant, so `lastSeen:>=1month` is "at or after (now − 1 month)", i.e. *within*
+  the last month, and `lastSeen:<2day` is "before (now − 2 days)", i.e. nothing
+  for over two days.
 - A value that isn't a valid number, duration or timestamp for that field is a
   400 naming the field, not a silently-dropped term.
 
@@ -329,7 +381,7 @@ The canonical name is on the left; anything in brackets is an accepted alias
 | `is` (`status`) | enum | `unresolved` `resolved` `ignored` |
 | `level` | enum | `debug` `info` `warning` `error` `fatal` |
 | `type` | text | the exception class |
-| `culprit` | text | the frame blamed for the error |
+| `culprit` | text | the frame blamed for the error, `function (file:line)` — de-obfuscated when symbols are uploaded |
 | `title` | text | unindexed — a scan |
 | `timesSeen` (`times_seen`) | number | |
 | `usersSeen` (`users_seen`) | number | |

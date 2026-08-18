@@ -1,6 +1,6 @@
 # Node SDK — `@edraj/sauron-node`
 
-Server-side Node/TypeScript SDK (**v0.3.0**). Dispatches product-analytics events and
+Server-side Node/TypeScript SDK (**v1.5.0**). Dispatches product-analytics events and
 captured exceptions from your Node backends over a buffered background HTTP transport
 (Node's global `fetch`). **No browser/DOM/auto-instrumentation** — for the browser use
 the **[Browser SDK](Browser-SDK.md)** (`@edraj/sauron-browser`). Source:

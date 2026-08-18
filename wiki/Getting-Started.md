@@ -57,7 +57,7 @@ types:
 Each SDK exposes the same core surface: **init**, **track**, **captureException**,
 **identify**, **flush/close** — plus **scope** (user/tags/context), **breadcrumbs**,
 **transactions** (`trackTransaction`), and a **`beforeSend`** hook, all reconciled across
-the five SDKs in **v0.3.0**. See **[Capabilities](Capabilities.md)** for the full parity
+the five SDKs in **v0.3.0** and held since. See **[Capabilities](Capabilities.md)** for the full parity
 matrix. Below is the shortest path per SDK; all read the DSN however is idiomatic for that
 platform (client SDKs take it in `init`, the example servers read it from a `SAURON_DSN`
 env var).

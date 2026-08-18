@@ -5,6 +5,7 @@
     isHttp,
     isNavigation,
     offsetMs,
+    rowCulprit,
     rowKind,
     rowTitle,
     type TimeMode,
@@ -101,9 +102,16 @@
         return { properties: item.event.properties };
       case 'error':
         return {
+          // Keyed by what each field IS. These read `title`/`culprit` with
+          // `exception_type`/`exception_value` as the fallback, back when the
+          // API served neither and the fallback was the only branch that ever
+          // ran. It now serves both, and `title` is `"{type}: {value}"` while
+          // `culprit` is a frame — so the old mapping would have labelled the
+          // whole headline "type" and the crash site "value".
           exception: {
-            type: item.error.title ?? item.error.exception_type,
-            value: item.error.culprit ?? item.error.exception_value,
+            type: item.error.exception_type,
+            value: item.error.exception_value,
+            culprit: item.error.culprit,
           },
           tags: item.error.tags,
         };
@@ -158,6 +166,15 @@
             {/if}
           {/if}
           <span class="title truncate">{rowTitle(item)}</span>
+          <!--
+            WHERE it happened, beside WHAT happened. On an obfuscated build the
+            headline is the SDK's `runtimeType` and is unreadable on its own;
+            this is the de-obfuscated frame, and without it the only way to
+            learn the class was to expand the row and read the stacktrace.
+          -->
+          {#if rowCulprit(item)}
+            <span class="culprit mono truncate">{rowCulprit(item)}</span>
+          {/if}
           <span class="trail">
             {#if item.kind === 'transaction'}
               {#if isHttp(item)}
@@ -402,6 +419,18 @@
     min-width: 0;
     font-size: 13px;
     font-weight: 520;
+  }
+  /* `flex: 0 1 auto` against the title's `flex: 1`: on a narrow row the crash
+     site gives up width first. It is the supporting half of the pair, and a
+     truncated headline beside an intact file path reads as the wrong emphasis.
+     `max-width` keeps a deep package path from taking half the row on a wide
+     one. */
+  .culprit {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 40%;
+    font-size: 11px;
+    color: var(--text-faint);
   }
   .trail {
     display: flex;

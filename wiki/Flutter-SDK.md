@@ -1,6 +1,6 @@
 # Flutter SDK — `sauron_flutter`
 
-Error reporting **+** product analytics for Flutter, from one SDK (**v0.3.0**). It binds
+Error reporting **+** product analytics for Flutter, from one SDK (**v1.8.0**). It binds
 four uncaught-error capture layers (`FlutterError.onError`, `PlatformDispatcher.onError`,
 `Isolate.addErrorListener`, and a guarding zone) plus manual capture, analytics,
 screens, and breadcrumbs. Source: [`sdks/flutter`](../sdks/flutter).
@@ -252,3 +252,52 @@ flutter run
 ```
 
 More in **[Examples](Examples.md)**.
+
+## Obfuscated release builds
+
+A `flutter build --obfuscate` release needs **two** artifacts uploaded, and they
+fix different halves of what you read:
+
+| Artifact | Fixes | Without it |
+|---|---|---|
+| `--split-debug-info` symbols (`app.symbols`) | the **stack frames** | frames are bare `0x…` addresses |
+| `--save-obfuscation-map` JSON | the **exception type** | the class name is `xY1` |
+
+The symbols file alone is not enough for the type. The SDK reports an
+exception's class as `error.runtimeType.toString()`, and under `--obfuscate`
+that string is *already* the renamed identifier by the time it leaves the
+device. DWARF maps addresses to functions and says nothing about type names, so
+the obfuscation map is the only artifact that can reverse it.
+
+Build with both:
+
+```bash
+flutter build apk --release \
+  --obfuscate --split-debug-info=build/symbols \
+  --extra-gen-snapshot-options=--save-obfuscation-map=build/obfuscation.json
+```
+
+Upload the symbols first — its response reports the `derived_debug_id`, read out
+of the ELF's build-id note — then upload the map under **that same id**:
+
+```bash
+sauron-symcli upload-dart \
+  --api https://<host> --token <dashboard-jwt> --app <app-uuid> \
+  --platform android --arch arm64 \
+  build/symbols/app.android-arm64.symbols
+
+sauron-symcli upload-obfuscation-map \
+  --api https://<host> --token <dashboard-jwt> --app <app-uuid> \
+  --platform android --debug-id <derived_debug_id from above> \
+  build/obfuscation.json
+```
+
+The map carries nothing identifying inside it — it is a flat JSON array of
+`[original, obfuscated]` pairs — so that shared id is the *only* thing tying it
+to the build it came from. Uploading it without `--debug-id` is refused rather
+than accepted-and-silently-useless.
+
+**Both are presentational.** Grouping runs on the raw values the device sent, so
+uploading either one later never re-groups issues you already have; existing
+rows are rewritten as they are read. And nothing is symbolicated on the device —
+the SDK never ships the map or the symbols to end users.

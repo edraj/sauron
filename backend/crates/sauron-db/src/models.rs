@@ -335,6 +335,24 @@ pub struct NewIssue<'a> {
     pub times_seen: i64,
 }
 
+/// The newest occurrence of one issue, reduced to what a culprit repair needs.
+///
+/// Deliberately NOT a whole `ErrorEvent`: this is fetched on the issues-list
+/// hot path, and the columns left out are the large ones (`stacktrace`,
+/// `breadcrumbs`, `context`, `contexts`, `extra`). Selecting the full row would
+/// pull a crash payload per listed issue to read one string out of it.
+#[derive(Debug, Clone, QueryableByName)]
+pub struct IssueLatestFrames {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    pub issue_id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    pub id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    pub occurred_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    pub stacktrace_symbolicated: Option<Value>,
+}
+
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]
 #[diesel(table_name = error_events)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -376,6 +394,18 @@ pub struct ErrorEvent {
     /// Whether the SDK saw this error caught (`Some(true)`) or uncaught (`Some(false)`).
     /// `None` for rows ingested before this column existed — never backfilled.
     pub handled: Option<bool>,
+    /// The per-occurrence `build_title` string. `None` for rows written before
+    /// migration 30 added the column.
+    pub title: Option<String>,
+    /// The per-occurrence culprit — `function (file)` for the frame nearest the
+    /// crash, de-obfuscated when symbolication resolved one.
+    ///
+    /// Served so the session timeline can label an error row with the same
+    /// string the Exceptions list shows, instead of each surface deriving its
+    /// own from whatever frames it happens to have. `Some("")` is a real value:
+    /// the occurrence had no frames (see `build_culprit`), which is distinct
+    /// from `None`, a pre-migration-30 row that never had the column.
+    pub culprit: Option<String>,
 }
 
 /// **`Insertable`-only, on purpose.** Diesel's `Insertable` maps fields to

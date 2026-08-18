@@ -7,9 +7,18 @@
 //!   sauron-symcli upload-sourcemap --api <url> --token <jwt> --app <uuid> \
 //!       --release <r> --name <minified-path> [--dist <d>] <file.map>
 //!
+//!   sauron-symcli upload-obfuscation-map --api <url> --token <jwt> --app <uuid> \
+//!       --platform <android|ios> --debug-id <build-id> map.json
+//!
 //!   sauron-symcli upload --api <url> --token <jwt> --app <uuid> \
-//!       --kind <js_sourcemap|dart_symbols> --platform <web|android|ios> \
+//!       --kind <js_sourcemap|dart_symbols|dart_obfuscation_map> \
+//!       --platform <web|android|ios> \
 //!       [--arch <a>] [--release <r>] [--dist <d>] [--name <n>] [--debug-id <id>] <file>
+//!
+//! An obfuscation map is what makes an obfuscated Dart EXCEPTION TYPE readable —
+//! the symbols file only covers stack frames. Upload BOTH for an obfuscated
+//! build, under the same `--debug-id`; the id is reported as `derived_debug_id`
+//! in the response to the `upload-dart` for that build.
 //!
 //! (Dart split-debug-info directory walking + build-id derivation lands with the
 //! Flutter pipeline in a later slice.)
@@ -39,6 +48,7 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
         "upload" => upload(rest, None, None).await,
         "upload-sourcemap" => upload(rest, Some("js_sourcemap"), Some("web")).await,
         "upload-dart" => upload(rest, Some("dart_symbols"), None).await,
+        "upload-obfuscation-map" => upload(rest, Some("dart_obfuscation_map"), None).await,
         "-h" | "--help" | "help" => {
             print_help();
             Ok(())
@@ -149,8 +159,16 @@ USAGE:
   sauron-symcli upload-dart --api <url> --token <jwt> --app <uuid> \\
       --platform <android|ios> --arch <arm64|...> --debug-id <build-id> app.symbols
 
+  sauron-symcli upload-obfuscation-map --api <url> --token <jwt> --app <uuid> \\
+      --platform <android|ios> --debug-id <build-id> map.json
+
+      The JSON from --extra-gen-snapshot-options=--save-obfuscation-map. This is
+      what de-obfuscates the exception TYPE; upload-dart only covers frames. Use
+      the same --debug-id as the upload-dart for this build.
+
   sauron-symcli upload --api <url> --token <jwt> --app <uuid> \\
-      --kind <js_sourcemap|dart_symbols> --platform <web|android|ios> \\
+      --kind <js_sourcemap|dart_symbols|dart_obfuscation_map> \\
+      --platform <web|android|ios> \\
       [--arch <a>] [--release <r>] [--dist <d>] [--name <n>] [--debug-id <id>] <file>"
     );
 }
