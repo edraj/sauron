@@ -417,6 +417,16 @@ pub const CATALOG: &[Dimension] = &[
             // Backed by `transactions_app_distinct_idx` (migration 000058), so
             // this keeps the `Indexed` class honest on this resource too.
             Resource::Transactions,
+            // `issues` carries no `distinct_id` column: this lowers to a
+            // correlated EXISTS into `error_events`, the same shape as
+            // `workflow` (see `IssuesLower`). `Indexed` stays honest through
+            // that indirection because `error_events_distinct_idx` is
+            // `(app_id, distinct_id, occurred_at DESC)` — migration 000011
+            // redefined it from migration 000001's `(project_id, …)` — and the
+            // subquery re-asserts `e.app_id = issues.app_id`, so the index is
+            // reachable from inside it. Verified with EXPLAIN, not assumed;
+            // see the note in `resolve::effective_index`.
+            Resource::Issues,
         ],
         index: IndexClass::Indexed,
     },
@@ -447,16 +457,30 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Str,
         store: Store::Column("device_key"),
         ops: OPS_EQ,
-        resources: &[Resource::Occurrences, Resource::Devices, Resource::Sessions],
+        // `Issues` lowers this to a correlated EXISTS into `error_events`,
+        // where `error_events_app_device_idx` (app_id, device_key) is
+        // reachable — the subquery already re-asserts `e.app_id =
+        // issues.app_id`, which is that index's leading column.
+        resources: &[
+            Resource::Occurrences,
+            Resource::Devices,
+            Resource::Sessions,
+            Resource::Issues,
+        ],
         index: IndexClass::Bounded,
     },
+    // `R_ISSUE_OCC`, not `R_OCC`: `issues` has no `screen` column, so on that
+    // resource this lowers to a correlated EXISTS into `error_events` — where
+    // `Eq` can reach the partial `error_events_app_screen_time_idx` (it is
+    // `WHERE screen IS NOT NULL`, which `screen = $1` implies) and
+    // `Like`/`Contains` cannot, exactly as on Occurrences.
     Dimension {
         name: "screen",
         aliases: NO_ALIAS,
         ty: ValueType::Str,
         store: Store::Column("screen"),
         ops: OPS_TEXT,
-        resources: R_OCC,
+        resources: R_ISSUE_OCC,
         index: IndexClass::Bounded,
     },
     Dimension {

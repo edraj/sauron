@@ -426,6 +426,20 @@ impl ResourceLower for IssuesLower<'_> {
             Store::Tag => tag_leaf(p, negate, self.env),
             // Not an `issues` column at all — see `workflow_leaf`.
             Store::Column("workflow") => workflow_leaf(p, negate, self.env),
+            // Nor are these three: `screen`, `distinct_id` and `device_key`
+            // live on `error_events`, so on this resource they take the same
+            // correlated-EXISTS shape — see `occurrence_column_leaf`. The
+            // argument is the literal SQL fragment naming the column, because
+            // every byte of SQL this module emits is a compile-time constant.
+            Store::Column("screen") => {
+                occurrence_column_leaf(" AND e.screen", p, negate, self.env, self.since)
+            }
+            Store::Column("distinct_id") => {
+                occurrence_column_leaf(" AND e.distinct_id", p, negate, self.env, self.since)
+            }
+            Store::Column("device_key") => {
+                occurrence_column_leaf(" AND e.device_key", p, negate, self.env, self.since)
+            }
             // Issues has no JSON-root dimensions in the catalog; kept for
             // exhaustiveness in case the catalog ever grows one.
             Store::JsonRoot { .. } => Err(PlanError::UnsupportedOnResource {
@@ -624,6 +638,155 @@ fn workflow_exists(
     })
 }
 
+// ===========================================================================
+// Occurrence columns — `screen`, `distinct_id`, `device_key`. Same
+// correlated-EXISTS shape as `workflow`, over columns that live on
+// `error_events` rather than on `issues`.
+// ===========================================================================
+
+/// The head of every occurrence-column `EXISTS`, up to and including the time
+/// bound.
+///
+/// A macro and not a function for the reason [`exists_close_env`] is one: each
+/// `.sql()`/`.bind()` step produces a different concrete builder type, and the
+/// intermediate one here — after the `Timestamptz` bind but before the column
+/// fragment — has no name worth writing.
+///
+/// **The `e.occurred_at >= $since` bind is the part that is not copied from
+/// `workflow_exists`, and it is deliberate.** `error_events` is RANGE
+/// partitioned on `occurred_at`; without a bound, the subquery is planned
+/// across every live partition for every candidate issue. The outer window
+/// does not substitute for it — that one tightens `issues.last_seen`, which
+/// says nothing about how far back an issue's occurrences go (the same
+/// argument `text()` makes for the payload scan, which binds the same
+/// `since`).
+///
+/// It is also the honest reading of the control the page already shows: with a
+/// 30-day window selected, "issues on `/checkout`" means issues that hit
+/// `/checkout` *in those 30 days*, not issues that hit it in 2019 and
+/// something else since.
+macro_rules! occurrence_exists_head {
+    ($since:expr) => {
+        sql::<Nullable<Bool>>(
+            "EXISTS (SELECT 1 FROM error_events e WHERE e.issue_id = issues.id \
+             AND e.app_id = issues.app_id AND e.occurred_at >= ",
+        )
+        .bind::<Timestamptz, _>($since)
+    };
+}
+
+/// A predicate over an `error_events` column, asked of an issue.
+///
+/// `col_sql` is the literal SQL naming the column (`" AND e.screen"`), passed
+/// from the `leaf` match arm rather than interpolated from
+/// `Store::Column(name)`: the catalog's column names are compile-time
+/// constants, and keeping the concatenation at the call site is what makes
+/// that visible in review instead of merely true.
+///
+/// Three properties are copied from [`workflow_leaf`] on purpose:
+///
+/// - the tenant key is re-asserted inside the subquery (`e.app_id =
+///   issues.app_id`), as every query in this module does;
+/// - the environment scope is ANDed in via [`exists_close_env`]. This is a
+///   second access boundary, not a repeat of the outer one: without it a
+///   member scoped to `staging` — who sees an issue legitimately, because it
+///   has a staging occurrence — could ask `screen:/admin` about that issue's
+///   PRODUCTION occurrences and read the answer off the row count;
+/// - negation is `NOT EXISTS`, never `EXISTS(… <> …)`. An issue none of whose
+///   occurrences recorded a screen DOES match `!screen:/checkout` — "not seen
+///   on /checkout" is true of an issue seen on no screen at all. `EXISTS` is
+///   never SQL NULL, so wrapping it in `NOT` is NULL-safe in a way a plain
+///   comparison against a nullable column is not. `screen` and `device_key`
+///   are both nullable on `error_events`, so this is load-bearing here rather
+///   than merely defensive.
+///
+/// `Ne` collapses onto negated `Eq` for the same reason it does there: it asks
+/// "no occurrence on /checkout", not "some occurrence on some other screen".
+/// The two differ for an issue seen on both, and the first is what the chip's
+/// `≠` reads as. The STRING grammar cannot produce `Ne` at all — see the arm
+/// itself for what can.
+fn occurrence_column_leaf(
+    col_sql: &'static str,
+    p: &ResolvedPredicate,
+    negate: bool,
+    env: &EnvFilter,
+    since: DateTime<Utc>,
+) -> Result<Frag<issues::table>, PlanError> {
+    let field = p.dim.name;
+    let positive: Frag<issues::table> = match p.op {
+        MatchOp::Eq => exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" = ")
+                .bind::<Text, _>(as_str(&p.value, field)?.to_string()),
+            env
+        ),
+        // The STRING grammar never produces this: `!field:v` arrives as `Eq`
+        // with `negate`, and `field:!=v` lexes `!=v` as an ordinary VALUE.
+        // `MatchOp::Ne` is reachable anyway, through the serialized-`Node`
+        // spelling of `query=` (`OPS_TEXT` and `OPS_EQ` both grant it, so
+        // `resolve` accepts it), which makes this arm live rather than merely
+        // exhaustive — and it must emit exactly what `!field:v` emits. Built
+        // here rather than by recursing with a rewritten predicate so that
+        // claim is visible in one place.
+        MatchOp::Ne => {
+            let eq: Frag<issues::table> = exists_close_env!(
+                occurrence_exists_head!(since)
+                    .sql(col_sql)
+                    .sql(" = ")
+                    .bind::<Text, _>(as_str(&p.value, field)?.to_string()),
+                env
+            );
+            return Ok(if negate {
+                eq
+            } else {
+                Box::new(diesel::dsl::not(eq))
+            });
+        }
+        // The catalog grants `In` to all three of these dimensions (`OPS_EQ`
+        // and `OPS_TEXT` both carry it), so `screen:[/a,/b]` must lower here
+        // rather than 400 on the list while working on the occurrences
+        // drill-down.
+        MatchOp::In => exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" = ANY(")
+                .bind::<Array<Text>, _>(as_str_list(&p.value, field)?)
+                .sql(")"),
+            env
+        ),
+        // `has:screen` — presence, carrying no value. On this resource it asks
+        // whether the issue has any occurrence with the column populated.
+        MatchOp::Has => exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" IS NOT NULL"),
+            env
+        ),
+        // `resolve` has already escaped the pattern; `device_key` is `OPS_EQ`
+        // and never reaches these arms.
+        MatchOp::Like | MatchOp::Contains => exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" ILIKE ")
+                .bind::<Text, _>(as_pattern(&p.value, field)?.to_string()),
+            env
+        ),
+        // No ordering operator is granted to a `ValueType::Str` dimension;
+        // these arms exist for exhaustiveness.
+        MatchOp::Gt | MatchOp::Gte | MatchOp::Lt | MatchOp::Lte => {
+            return Err(PlanError::UnsupportedOnResource {
+                field: field.to_string(),
+            })
+        }
+    };
+    Ok(if negate {
+        Box::new(diesel::dsl::not(positive))
+    } else {
+        positive
+    })
+}
+
 /// `tag:<value>` with no key — the same predicate applied across every key of
 /// the `tags` object, via `jsonb_each_text`. Splitting this out rather than
 /// threading an `Option<&str>` through `tag_contains`/`tag_ilike`/`tag_has`
@@ -744,7 +907,7 @@ mod tests {
     use crate::query_plan::lower;
     use diesel::debug_query;
     use diesel::pg::Pg;
-    use sauron_query::{parse, resolve, Resource};
+    use sauron_query::{parse, resolve, ResolvedNode, Resource};
     use std::collections::HashMap;
 
     fn ctx() -> PrepCtx {
@@ -1031,13 +1194,28 @@ mod tests {
         let one = EnvFilter::One(Uuid::from_u128(7));
         let subset = EnvFilter::Subset(vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
         let unattributed = EnvFilter::Unattributed;
-        // free text (payload scan), tag @>, tag ?, tag ->> ILIKE, workflow
+        // free text (payload scan), tag @>, tag ?, tag ->> ILIKE, workflow,
+        // and the three occurrence columns — every op shape of each, because
+        // the arms are separate builders and one un-fragmented arm is a live
+        // oracle even when its siblings are correct.
         let queries = [
             "boom",
             "tag.checkout_step:payment",
             "has:tag.checkout_step",
             "tag.checkout_step:~payment",
             "workflow:checkout",
+            "screen:checkout",
+            "!screen:checkout",
+            "screen:[checkout,cart]",
+            "has:screen",
+            "screen:~check",
+            "distinctId:u_1",
+            "distinctId:[u_1,u_2]",
+            "has:distinctId",
+            "distinctId:~u_",
+            "deviceKey:d_1",
+            "deviceKey:[d_1,d_2]",
+            "has:deviceKey",
         ];
         for q in queries {
             let sql = lower_issues_sql_env(q, &one);
@@ -1092,6 +1270,152 @@ mod tests {
             sql.contains("e.occurred_at >= "),
             "the payload EXISTS must carry a time bound: {sql}"
         );
+    }
+
+    // -- Occurrence columns on Issues (screen / distinctId / deviceKey) ------
+
+    /// The whole point of the feature: none of these three is an `issues`
+    /// column, so each must become a correlated subquery rather than a
+    /// comparison against a column that is not there.
+    #[test]
+    fn occurrence_columns_lower_to_a_correlated_exists_carrying_the_tenant_key() {
+        for (q, col) in [
+            ("screen:checkout", "e.screen"),
+            ("distinctId:u_1", "e.distinct_id"),
+            ("deviceKey:d_1", "e.device_key"),
+        ] {
+            let sql = lower_issues_sql(q);
+            assert!(
+                sql.contains("EXISTS (SELECT 1 FROM error_events e"),
+                "`{q}` must lower to a correlated EXISTS: {sql}"
+            );
+            assert!(
+                sql.contains("e.issue_id = issues.id") && sql.contains("e.app_id = issues.app_id"),
+                "`{q}` must carry the correlation AND the tenant key: {sql}"
+            );
+            assert!(sql.contains(col), "`{q}` must name {col}: {sql}");
+            // No `issues.screen` etc. — the column does not exist there, and a
+            // fragment naming it would not compile against `schema.rs` but
+            // WOULD if some future edit added a same-named column.
+            assert!(
+                !sql.contains(&format!(r#""issues"."{}""#, col.trim_start_matches("e."))),
+                "`{q}` must not reference an `issues` column: {sql}"
+            );
+        }
+    }
+
+    /// Same argument as `the_payload_scan_is_bounded_by_since`, and the reason
+    /// this differs from `workflow_exists` (which binds no time at all):
+    /// `error_events` is RANGE partitioned on `occurred_at`, so an unbounded
+    /// subquery is planned across every live partition, for every candidate
+    /// issue. The outer window tightens `issues.last_seen`, which says nothing
+    /// about how far back that issue's occurrences reach.
+    #[test]
+    fn every_occurrence_column_predicate_is_bounded_by_since() {
+        for q in [
+            "screen:checkout",
+            "!screen:checkout",
+            "screen:[checkout,cart]",
+            "has:screen",
+            "screen:~check",
+            "distinctId:u_1",
+            "deviceKey:d_1",
+        ] {
+            let sql = lower_issues_sql(q);
+            assert!(
+                sql.contains("e.occurred_at >= "),
+                "`{q}` must bind a partition bound: {sql}"
+            );
+        }
+    }
+
+    /// `NOT EXISTS`, never `EXISTS(… <> …)`. `screen` and `device_key` are
+    /// nullable on `error_events`, so an issue whose occurrences recorded no
+    /// screen at all must still match `!screen:checkout` — "not seen on
+    /// checkout" is true of an issue seen on no screen.
+    #[test]
+    fn a_negated_occurrence_column_is_not_exists_and_keeps_its_scope_inside() {
+        let env = EnvFilter::One(Uuid::from_u128(7));
+        let sql = lower_issues_sql_env("!screen:checkout", &env);
+        assert!(sql.contains("NOT (EXISTS"), "{sql}");
+        assert!(
+            !sql.contains("<>"),
+            "must not compare the column directly: {sql}"
+        );
+        let subquery = sql.split("NOT (EXISTS").nth(1).unwrap();
+        assert!(
+            subquery.contains("e.environment_id = $"),
+            "the env predicate must be INSIDE the negated EXISTS: {sql}"
+        );
+    }
+
+    /// `MatchOp::Ne` and `!field:value` are the same question asked two ways,
+    /// so they must emit the same SQL.
+    ///
+    /// The string grammar cannot express the first — `!screen:x` resolves to
+    /// `Eq` + `negate`, and `screen:!=x` lexes `!=x` as an ordinary value — so
+    /// the predicate is built by hand here. That is not a contrived input:
+    /// `query=` also accepts a serialized `Node`, and `OPS_TEXT` grants `Ne`,
+    /// so a client can send exactly this and reach the arm.
+    ///
+    /// The two readings differ in principle for an issue seen on BOTH checkout
+    /// and cart: "no occurrence on checkout" excludes it, "some occurrence not
+    /// on checkout" keeps it. This pins the first, which is what `NOT EXISTS`
+    /// and the chip's `≠` both mean.
+    #[test]
+    fn the_ne_operator_emits_the_same_sql_as_the_negated_eq_spelling() {
+        // One fixed `since` for both lowerings: `debug_query` renders the
+        // BINDS as well as the SQL, so a per-call `Utc::now()` would make two
+        // identical fragments compare unequal.
+        fn lower_fixed(node: &ResolvedNode) -> String {
+            let l = IssuesLower {
+                app_id: Uuid::nil(),
+                text_reach: TextSearchReach::IncludingBody,
+                env: &EnvFilter::All,
+                since: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            };
+            let frag = lower(node, &l, &ctx()).unwrap();
+            debug_query::<Pg, _>(&issues::table.into_boxed().filter(frag)).to_string()
+        }
+
+        let eq = resolve(&parse("screen:checkout").unwrap(), Resource::Issues).unwrap();
+        let ResolvedNode::Pred(p) = eq else {
+            panic!("`screen:checkout` must resolve to exactly one predicate")
+        };
+        let ne = ResolvedNode::Pred(ResolvedPredicate {
+            op: MatchOp::Ne,
+            ..p.clone()
+        });
+        let negated_eq = ResolvedNode::Not(Box::new(ResolvedNode::Pred(p)));
+        assert_eq!(lower_fixed(&ne), lower_fixed(&negated_eq));
+    }
+
+    #[test]
+    fn in_lowers_to_any_and_has_lowers_to_is_not_null() {
+        let sql = lower_issues_sql("screen:[checkout,cart]");
+        assert!(sql.contains("e.screen = ANY("), "{sql}");
+        let sql = lower_issues_sql("has:deviceKey");
+        assert!(sql.contains("e.device_key IS NOT NULL"), "{sql}");
+        // Presence carries no value, so it must bind nothing beyond `since`
+        // and reach no comparison operator.
+        assert!(!sql.contains("e.device_key ="), "{sql}");
+    }
+
+    #[test]
+    fn contains_lowers_to_ilike_on_the_occurrence_column() {
+        let sql = lower_issues_sql("screen:~check");
+        assert!(sql.contains("e.screen ILIKE "), "{sql}");
+    }
+
+    /// The catalog gives `deviceKey` `OPS_EQ`, so a substring probe must be
+    /// refused at RESOLVE — before the lowerer is reached at all. Pinned
+    /// because the dashboard chip for this field is `OPS_ENUM` on the strength
+    /// of it: if the catalog ever widened, the chip would be the thing that
+    /// looked wrong.
+    #[test]
+    fn device_key_rejects_contains_at_resolve_not_at_lowering() {
+        assert!(resolve(&parse("deviceKey:~d_").unwrap(), Resource::Issues).is_err());
+        assert!(resolve(&parse("screen:~check").unwrap(), Resource::Issues).is_ok());
     }
 
     // -- Composition sanity: predicates and free text combine via AND --------

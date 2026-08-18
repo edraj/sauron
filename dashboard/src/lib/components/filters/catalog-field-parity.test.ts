@@ -2,7 +2,13 @@ import { describe, it, expect } from 'vitest';
 // `?raw`, as in `filter-registry-parity.test.ts`: Vite inlines the file at
 // transform time, so this needs no `@types/node` and no cwd-relative pathing.
 import catalogRs from '../../../../../backend/crates/sauron-query/src/catalog.rs?raw';
-import { SESSION_FIELDS, TRANSACTION_FIELDS, type FieldDef, type Op } from './filters';
+import {
+  ISSUE_FIELDS,
+  SESSION_FIELDS,
+  TRANSACTION_FIELDS,
+  type FieldDef,
+  type Op,
+} from './filters';
 
 /**
  * Chip lists for the query-language lists, against the catalog that decides
@@ -23,8 +29,12 @@ function resourceAliases(): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   // `R_*` and `TAGGABLE` alike — the pattern keys on the type, not the name,
   // so the tag set is resolved by the same pass.
+  // `=\s*&\[`, not `= &\[`: rustfmt wraps a long declaration onto the next
+  // line, and `R_ISSUE_OCC_EVENTS` is wrapped. With the tighter pattern that
+  // const never entered this map, so `workflow` — its only member — resolved
+  // to zero resources and silently vanished from every check below.
   for (const m of catalogRs.matchAll(
-    /const (\w+): &\[Resource\] = &\[([\s\S]*?)\];/g,
+    /const (\w+): &\[Resource\] =\s*&\[([\s\S]*?)\];/g,
   )) {
     out[m[1]] = [...m[2].matchAll(/Resource::(\w+)/g)].map((r) => r[1]);
   }
@@ -33,10 +43,28 @@ function resourceAliases(): Record<string, string[]> {
 
 interface CatalogDim {
   name: string;
+  /**
+   * The spellings a chip may use for this dimension: its `name` plus every
+   * entry in `aliases`.
+   *
+   * Both resolve server-side, and the two lists in `filters.ts` genuinely use
+   * both — `ISSUE_FIELDS` predates the catalog and keys its older chips on the
+   * legacy `status`/`times_seen`/`users_seen` spellings, which are exactly the
+   * `aliases` of `is`/`timesSeen`/`usersSeen`. Matching on `name` alone would
+   * report those three as unknown dimensions and demand a rename that
+   * `parseFilters` would turn into silently-dropped chips on every saved URL.
+   */
+  keys: string[];
   /** `ValueType::Str`, `ValueType::Int`, … — the discriminant only. */
   ty: string;
   /** `OPS_TEXT`, `OPS_EQ`, `OPS_ORD`, … */
   ops: string;
+}
+
+/** `aliases: &["distinct_id"]` → `['distinct_id']`; `NO_ALIAS` → `[]`. */
+function parseAliases(body: string): string[] {
+  const raw = /aliases: ([^\n]+),/.exec(body)?.[1]?.trim() ?? '';
+  return [...raw.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
 }
 
 /** Every dimension the catalog declares for `resource`. */
@@ -50,10 +78,22 @@ function catalogDims(resource: string): CatalogDim[] {
     const ops = /ops: ([^\n,]+)/.exec(body)?.[1]?.trim();
     const rawResources = /resources: ([\s\S]+?),\n\s*index:/.exec(body)?.[1]?.trim();
     if (!name || !ty || !ops || !rawResources) continue;
+    // A bare `R_*` identifier that is not in the map would fall through to
+    // the inline-array branch, find no `Resource::` at all, and drop the
+    // dimension from every assertion in this file without a word. Throw
+    // instead — the whole value of these checks is that they are not silent.
+    if (/^[A-Z][A-Z0-9_]*$/.test(rawResources) && !(rawResources in aliases)) {
+      throw new Error(
+        `${rawResources} is used as a \`resources:\` value but no matching ` +
+          `\`const ${rawResources}: &[Resource]\` was parsed out of catalog.rs`,
+      );
+    }
     const expanded = aliases[rawResources] ?? [
       ...rawResources.matchAll(/Resource::(\w+)/g),
     ].map((m) => m[1]);
-    if (expanded.includes(resource)) dims.push({ name, ty, ops });
+    if (expanded.includes(resource)) {
+      dims.push({ name, keys: [name, ...parseAliases(body)], ty, ops });
+    }
   }
   // `tag` is declared OUTSIDE `CATALOG`, as the standalone `TAG_DIM` whose
   // `resources: TAGGABLE` decides which lists can answer a `tag.<key>`
@@ -66,6 +106,7 @@ function catalogDims(resource: string): CatalogDim[] {
   if ((aliases[tagResources] ?? []).includes(resource)) {
     dims.push({
       name: 'tag',
+      keys: ['tag', ...parseAliases(tagBlock[1])],
       ty: /ty: ([^\n,]+)/.exec(tagBlock[1])?.[1]?.trim() ?? '',
       ops: /ops: ([^\n,]+)/.exec(tagBlock[1])?.[1]?.trim() ?? '',
     });
@@ -94,6 +135,17 @@ const OPS_ALLOWED: Record<string, Op[]> = {
  * an empty-by-default list would let a real gap in as a silent addition.
  */
 const UNCHIPPED: Record<string, Record<string, string>> = {
+  Issues: {
+    title: 'the free-text box already matches title/type/culprit; IndexClass::Scan besides',
+    firstSeen: 'the page owns its window through the range control, which maps onto last_seen',
+    lastSeen: 'the page owns its window through the range control, which maps onto last_seen',
+    environment: 'scoped by the topbar environment switcher, not a per-page chip',
+    // Not "unhelpful" — unanswerable. `IssuesLower` rejects `Store::Rollup`
+    // with `NotYetSupported`, so a chip for either would 400 every request on
+    // the page until the reader worked out which chip to remove.
+    release: 'Store::Rollup — 400s until the issue_dimensions rollup exists',
+    handled: 'Store::Rollup — 400s until the issue_dimensions rollup exists',
+  },
   Sessions: {
     environment: 'scoped by the topbar environment switcher, not a per-page chip',
     startedAt: 'the page owns its window through <TimeFilter>, which also picks the column',
@@ -107,6 +159,12 @@ const UNCHIPPED: Record<string, Record<string, string>> = {
 };
 
 const CASES: { resource: string; fields: FieldDef[]; name: string }[] = [
+  // Issues moved here from `filter-registry-parity.test.ts` when `screen`,
+  // `distinctId` and `deviceKey` were chipped: `routes/issues.rs` resolves
+  // through `resolve_query(…, Resource::Issues)` against `catalog.rs`, so
+  // `sauron_db::filter::ISSUE_FILTERS` is no longer what validates this page's
+  // chips and checking against it both under- and over-reports.
+  { resource: 'Issues', fields: ISSUE_FIELDS, name: 'ISSUE_FIELDS' },
   { resource: 'Sessions', fields: SESSION_FIELDS, name: 'SESSION_FIELDS' },
   { resource: 'Transactions', fields: TRANSACTION_FIELDS, name: 'TRANSACTION_FIELDS' },
 ];
@@ -117,23 +175,26 @@ describe('FilterBar chips ↔ query catalog', () => {
       const chips = new Set(fields.map((f) => f.key));
       const excused = UNCHIPPED[resource] ?? {};
       const missing = catalogDims(resource)
-        .map((d) => d.name)
         // `tag` is declared per-resource in the catalog but chipped from the
         // shared tag registry, so it is matched by key like any other.
-        .filter((n) => !chips.has(n) && !(n in excused));
+        // Reported by canonical `name`, matched on `name` OR any alias.
+        .filter((d) => !d.keys.some((k) => chips.has(k)) && !(d.name in excused))
+        .map((d) => d.name);
       expect(missing, `Resource::${resource} carries these, but no chip can produce them`).toEqual(
         [],
       );
     });
 
     it(`${name} names nothing Resource::${resource} would reject`, () => {
-      const declared = new Set(catalogDims(resource).map((d) => d.name));
+      const declared = new Set(catalogDims(resource).flatMap((d) => d.keys));
       const unknown = fields.map((f) => f.key).filter((k) => !declared.has(k));
       expect(unknown, `no such dimension on Resource::${resource} — these 400`).toEqual([]);
     });
 
     it(`${name} offers only operators Resource::${resource} accepts`, () => {
-      const byName = new Map(catalogDims(resource).map((d) => [d.name, d]));
+      const byName = new Map(
+        catalogDims(resource).flatMap((d) => d.keys.map((k) => [k, d] as const)),
+      );
       const bad: string[] = [];
       for (const f of fields) {
         const dim = byName.get(f.key);

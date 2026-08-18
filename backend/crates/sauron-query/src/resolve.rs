@@ -70,6 +70,22 @@ fn effective_index(dim: &'static Dimension, r: Resource) -> IndexClass {
         Store::Tag if r == Resource::Issues => IndexClass::Bounded,
         // The `issue_dimensions` rollup table does not exist yet.
         Store::Rollup => IndexClass::Bounded,
+        // `screen`, `distinct_id` and `device_key` on Issues are NOT downgraded
+        // here, though they are correlated-EXISTS leaves exactly as `Store::Tag`
+        // is. An earlier revision downgraded them on the reasoning that a
+        // borrowed column cannot reach its index from inside the subquery. That
+        // was measured and is false: all three of the reachable indexes are
+        // `app_id`-led, and the subquery re-asserts `e.app_id = issues.app_id`,
+        // so `EXPLAIN` picks them.
+        //
+        // The one that looked wrong is `distinctId`, whose `Indexed` class rests
+        // on `error_events_distinct_idx` — which migration 000001 created as
+        // `(project_id, …)` but migration 000011 REDEFINED as
+        // `(app_id, distinct_id, occurred_at DESC)` when the table was
+        // partitioned. Reading only the first is what made the downgrade look
+        // justified. Measured on 500 issues x 200 occurrences: a hash semi-join
+        // fed by an index scan on that index, 26 buffers for a matching value
+        // and 3 for a non-matching one.
         _other => dim.index,
     }
 }

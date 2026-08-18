@@ -128,6 +128,27 @@ mod tests {
         assert_eq!(cost("!title:*boom*", Resource::Issues), Cost::Scan);
     }
 
+    /// The three occurrence columns Issues borrows keep their class across the
+    /// correlated `EXISTS` they lower to, because every index that earns them
+    /// that class is `app_id`-led and the subquery re-asserts
+    /// `e.app_id = issues.app_id`.
+    ///
+    /// Pinned because the opposite was assumed first and had to be measured
+    /// away: `error_events_distinct_idx` is `(project_id, …)` in migration
+    /// 000001 and `(app_id, distinct_id, occurred_at DESC)` from migration
+    /// 000011, and reading only the first makes `distinctId` look unreachable
+    /// on this resource. If a future migration moves any of these indexes off
+    /// `app_id`, this test is the one that should start lying — so it names
+    /// the reason rather than just the value.
+    #[test]
+    fn borrowed_occurrence_columns_keep_their_class_on_issues() {
+        for r in [Resource::Occurrences, Resource::Issues] {
+            assert_eq!(cost("distinctId:u_1", r), Cost::Indexed, "{r:?}");
+            assert_eq!(cost("deviceKey:d_1", r), Cost::Bounded, "{r:?}");
+        }
+        assert_eq!(cost("screen:checkout", Resource::Issues), Cost::Bounded);
+    }
+
     #[test]
     fn empty_query_is_indexed() {
         assert_eq!(cost("", Resource::Issues), Cost::Indexed);
