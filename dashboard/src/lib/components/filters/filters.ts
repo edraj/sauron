@@ -154,6 +154,24 @@ export const ISSUE_FIELDS: FieldDef[] = [
   { key: 'users_seen', label: 'Users', type: 'number', ops: OPS_NUM },
   { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
   { key: 'workflow', label: 'Workflow', type: 'string', ops: OPS_STR },
+  // The three below are `error_events` columns, not `issues` columns. On this
+  // page they resolve to "has an occurrence that matches", evaluated inside
+  // the range and environment the page is already scoped to — see
+  // `occurrence_column_leaf` in
+  // `backend/crates/sauron-db/src/query_plan/issues.rs`, and the note under
+  // the Issues table in `wiki/Search.md`.
+  //
+  // Catalog NAMES (`distinctId`, `deviceKey`), not the snake_case aliases the
+  // older chips on this list use. Both resolve server-side; the older keys
+  // stay as they are because `parseFilters` drops a chip whose field is not in
+  // this registry, so renaming them would silently empty every saved
+  // `filter=status:eq:resolved` URL.
+  { key: 'screen', label: 'Screen', type: 'string', ops: OPS_STR },
+  { key: 'distinctId', label: 'User', type: 'string', ops: OPS_STR },
+  // `OPS_ENUM`, not `OPS_STR`: the catalog gives `deviceKey` `OPS_EQ`, with no
+  // `Contains`, so a `contains` chip would 400 rather than narrow. Same call
+  // SESSION_FIELDS already makes for the same dimension.
+  { key: 'deviceKey', label: 'Device', type: 'string', ops: OPS_ENUM },
 ];
 
 /**
@@ -175,6 +193,17 @@ export const ISSUE_FIELDS: FieldDef[] = [
  * is also reachable through a hand-written URL or a saved view, and a list that
  * only covers what the UI happens to offer today is the kind that goes stale
  * silently.
+ */
+/*
+ * `screen`, `distinctId` and `deviceKey` are deliberately NOT here, and the
+ * reason is not "they looked harmless". `reject_withheld_body` gates
+ * `Store::Tag`, non-allowlisted `Store::JsonRoot` columns, and `workflow` by
+ * name; these three are plain `Store::Column`s and pass it. That matches what
+ * the caller can already read: `strip_event_body` in
+ * `backend/bins/sauron-api/src/symbolicate.rs` withholds the crash payload but
+ * explicitly KEEPS `screen`, `distinct_id` and `device_key` as issue-level
+ * shell, so an `issue:read`-only caller reads all three off the occurrences
+ * list already. Filtering by them discloses nothing new.
  */
 export const PERMISSION_GATED_FILTER_FIELDS = ['tag', 'workflow'] as const;
 

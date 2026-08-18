@@ -387,9 +387,24 @@ The canonical name is on the left; anything in brackets is an accepted alias
 | `usersSeen` (`users_seen`) | number | |
 | `firstSeen` (`first_seen`) | timestamp | |
 | `lastSeen` (`last_seen`) | timestamp | |
+| `screen` | text | matches an issue with at least one occurrence on that screen |
+| `distinctId` (`distinct_id`) | text | matches an issue that affected that user |
+| `deviceKey` (`device_key`) | text | matches an issue seen on that device — exact match only, no `~` substring |
 | `workflow` | text | needs `event:read` |
 | `tag.<key>` | text | needs `event:read` |
 | `environment` `release` `handled` | — | **declared but not searchable yet on this page** — they need the issue-dimension rollup, and asking for one returns a 400 saying exactly that. `environment` and `release` *are* searchable on Occurrences and Events, and `handled` on Occurrences. |
+
+`screen`, `distinctId` and `deviceKey` are not columns of an issue — they belong
+to its individual occurrences — so on this page they ask **"does this issue have
+an occurrence that matches?"**, evaluated inside the time range and environment
+the page is already scoped to. Two consequences worth knowing:
+
+- Narrowing the range can drop an issue that still appears without the filter:
+  the issue is in range because it was *seen* in range, but its `/checkout`
+  occurrence may be older than that.
+- Negation reads as "no matching occurrence". `!screen:/checkout` keeps an issue
+  that has never been seen on `/checkout`, including one whose occurrences
+  recorded no screen at all — it does not mean "seen on some other screen".
 
 ### Issue → Occurrences
 

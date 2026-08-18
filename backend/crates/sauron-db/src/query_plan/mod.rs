@@ -516,7 +516,13 @@ mod tests {
     /// works and then 500s at runtime.
     #[test]
     fn every_declared_dimension_lowers_or_is_explicitly_deferred() {
-        assert_eq!(dimensions_for(Resource::Issues).count(), 13);
+        // 16 since `screen`, `distinctId` and `deviceKey` joined Issues — each
+        // an `error_events` column reached through a correlated EXISTS, like
+        // `workflow` before them. `assert_full_coverage` below is what makes
+        // this number mean something: it drives every declared operator on
+        // each of them, including the `In` and `Has` that `OPS_EQ`/`OPS_TEXT`
+        // grant and that `workflow`'s `OPS_WORKFLOW` does not.
+        assert_eq!(dimensions_for(Resource::Issues).count(), 16);
         assert_eq!(dimensions_for(Resource::Occurrences).count(), 21);
         assert_eq!(dimensions_for(Resource::Events).count(), 10);
         assert_eq!(dimensions_for(Resource::Sessions).count(), 10);

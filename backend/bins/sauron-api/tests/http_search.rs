@@ -3355,9 +3355,25 @@ async fn event_paging_inputs_are_validated() {
         )
         .await;
     assert!(body.contains("culprit"), "issues fields: {body}");
+    // `session`, not `distinctId`. `distinctId` was the sentinel here until
+    // Issues gained the three occurrence columns — it is now a legitimate
+    // Issues field, so asserting its ABSENCE stopped testing "the lists are
+    // per-resource" and started testing "this dimension has not been added
+    // yet", which is a different and much less useful claim. `session` has no
+    // `Resource::Issues` in its catalog entry and no reason to gain one: an
+    // issue is a group, and asking which session it belongs to has no answer.
     assert!(
-        !body.contains("distinctId"),
+        !body.contains("session"),
         "issues must not advertise an Events-only field: {body}"
+    );
+    // The converse leg, so this cannot pass again by the lists collapsing into
+    // one another from the other direction.
+    let (_, events_body) = srv
+        .get_status_and_body(&format!("{list}?filter=nope:eq:x"), &fx.full_token)
+        .await;
+    assert!(
+        !events_body.contains("culprit"),
+        "events must not advertise an Issues-only field: {events_body}"
     );
 
     // And the capability the fallback used to provide still exists, spelled
@@ -3823,6 +3839,383 @@ async fn an_event_cursor_with_a_forged_value_kind_is_refused() {
         body.contains("requires a text value"),
         "error should be the cursor's KindMismatch specifically, not merely \
          a 400 that happens to mention the column: {body}"
+    );
+
+    srv.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Occurrence columns on the issues list — `screen`, `distinctId`, `deviceKey`
+// ---------------------------------------------------------------------------
+
+/// One issue plus one occurrence carrying the three occurrence columns the
+/// issues list can now filter on. `screen`/`distinct_id`/`device_key` are all
+/// nullable, and passing `None` is how the "recorded nothing" issue is built —
+/// which is the row the negation cases turn on.
+#[allow(clippy::too_many_arguments)]
+async fn seed_issue_with_occurrence_columns(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    title: &str,
+    screen: Option<&str>,
+    distinct_id: Option<&str>,
+    device_key: Option<&str>,
+    issue_last_seen: DateTime<Utc>,
+    occurred_at: DateTime<Utc>,
+) -> Uuid {
+    let fingerprint = format!("occcol-fp-{}", Uuid::new_v4().simple());
+    let issue_id = repo::upsert_issue(
+        conn,
+        NewIssue {
+            app_id,
+            fingerprint: &fingerprint,
+            type_: "Error",
+            title,
+            culprit: "occcol::seed",
+            level: "error",
+            first_seen: occurred_at,
+            last_seen: issue_last_seen,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("upsert issue");
+    repo::insert_error_event(
+        conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: None,
+            issue_id,
+            fingerprint: fingerprint.clone(),
+            level: "error".into(),
+            message: "occurrence-column fixture".into(),
+            exception_type: "Error".into(),
+            exception_value: "occurrence-column fixture".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: distinct_id.map(str::to_string),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at,
+            session_id: None,
+            device_key: device_key.map(str::to_string),
+            screen: screen.map(str::to_string),
+            workflow_id: None,
+            workflow_name: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(false),
+            title: None,
+            culprit: None,
+        },
+    )
+    .await
+    .expect("insert error event");
+    issue_id
+}
+
+/// `screen`, `distinctId` and `deviceKey` narrow the issues list, in both the
+/// `query=` and the `filter=` spelling.
+///
+/// None of the three is an `issues` column — each lowers to a correlated
+/// `EXISTS` into `error_events` — so this is the test that the plumbing
+/// actually selects rows rather than merely compiling. The third issue records
+/// none of the three columns, which is what makes the negation and `has:`
+/// cases mean something.
+#[tokio::test]
+async fn occurrence_columns_narrow_the_issues_list() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let (app_id, token) = srv.seed_app("occ-columns").await;
+    let at = Utc::now() - ChronoDuration::hours(1);
+    let (alpha, beta, bare) = {
+        let mut conn = srv.conn().await;
+        let alpha = seed_issue_with_occurrence_columns(
+            &mut conn,
+            app_id,
+            "alpha issue",
+            Some("/checkout"),
+            Some("u_alpha"),
+            Some("d_alpha"),
+            at,
+            at,
+        )
+        .await;
+        let beta = seed_issue_with_occurrence_columns(
+            &mut conn,
+            app_id,
+            "beta issue",
+            Some("/cart"),
+            Some("u_beta"),
+            Some("d_beta"),
+            at,
+            at,
+        )
+        .await;
+        let bare = seed_issue_with_occurrence_columns(
+            &mut conn,
+            app_id,
+            "bare issue",
+            None,
+            None,
+            None,
+            at,
+            at,
+        )
+        .await;
+        (alpha, beta, bare)
+    };
+    let list = format!("/v1/apps/{app_id}/issues");
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    let expect = |ids: &[Uuid]| sorted(ids.iter().map(|i| i.to_string()).collect());
+
+    // Sanity: without a filter all three are present. An equivalence between
+    // two empty lists proves nothing.
+    let all = srv.get_json(&list, &token).await;
+    assert_eq!(all["total"], 3, "fixture did not land: {all}");
+
+    for (params, want, why) in [
+        (
+            "query=screen:/checkout",
+            vec![alpha],
+            "an exact screen match",
+        ),
+        (
+            "filter=screen:eq:/checkout",
+            vec![alpha],
+            "the legacy spelling of the same predicate",
+        ),
+        (
+            "query=distinctId:u_beta",
+            vec![beta],
+            "the user who hit the issue",
+        ),
+        (
+            "filter=distinctId:eq:u_beta",
+            vec![beta],
+            "the legacy spelling of the same predicate",
+        ),
+        (
+            "query=deviceKey:d_alpha",
+            vec![alpha],
+            "the device the issue was seen on",
+        ),
+        (
+            "query=screen:[/checkout,/cart]",
+            vec![alpha, beta],
+            "`In` over a bracketed list",
+        ),
+        (
+            "query=screen:~check",
+            vec![alpha],
+            "a literal substring, which `/cart` must not satisfy",
+        ),
+        (
+            "query=has:screen",
+            vec![alpha, beta],
+            "presence excludes only the issue that recorded no screen",
+        ),
+        // The one that would be wrong under `EXISTS(… <> …)`: `bare` recorded
+        // no screen at all, and "not seen on /checkout" is true of it.
+        (
+            "query=!screen:/checkout",
+            vec![beta, bare],
+            "negation keeps the issue whose occurrences recorded no screen",
+        ),
+        (
+            "query=!has:screen",
+            vec![bare],
+            "the complement of the `has:` case",
+        ),
+        (
+            "query=screen:/checkout distinctId:u_alpha",
+            vec![alpha],
+            "two occurrence-column predicates compose",
+        ),
+        (
+            "query=screen:/checkout distinctId:u_beta",
+            vec![],
+            "…and compose as AND, not as OR",
+        ),
+    ] {
+        let got = srv.get_json(&format!("{list}?{params}"), &token).await;
+        assert_eq!(
+            sorted(ids(&got)),
+            expect(&want),
+            "`{params}` — {why}: {got}"
+        );
+        assert_eq!(
+            got["total"],
+            want.len(),
+            "`{params}` — `total` must agree with `data`: {got}"
+        );
+    }
+
+    srv.shutdown().await;
+}
+
+/// The predicate is bounded by the window the caller asked for, because the
+/// subquery binds `e.occurred_at >= since`.
+///
+/// The fixture separates the two clocks that a single `since` is applied to:
+/// the issue's `last_seen` is an hour old, so it is inside every window tested
+/// here and the OUTER filter never excludes it — but its `/checkout`
+/// occurrence is ten days old. Narrowing the range must therefore drop it from
+/// the filtered list while leaving it in the unfiltered one, which is the only
+/// arrangement that can tell the subquery's bound apart from the outer one.
+#[tokio::test]
+async fn an_occurrence_column_filter_respects_the_requested_window() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let (app_id, token) = srv.seed_app("occ-window").await;
+    let now = Utc::now();
+    let issue_id = {
+        let mut conn = srv.conn().await;
+        seed_issue_with_occurrence_columns(
+            &mut conn,
+            app_id,
+            "stale-screen issue",
+            Some("/checkout"),
+            None,
+            None,
+            now - ChronoDuration::hours(1),
+            now - ChronoDuration::days(10),
+        )
+        .await
+    };
+    let list = format!("/v1/apps/{app_id}/issues");
+
+    // Wide enough to contain the occurrence: the filter matches.
+    let wide = srv
+        .get_json(
+            &format!("{list}?since_days=30&query=screen:/checkout"),
+            &token,
+        )
+        .await;
+    assert_eq!(ids(&wide), vec![issue_id.to_string()], "{wide}");
+
+    // Narrower than the occurrence, wider than `last_seen`: the issue is still
+    // listed, but no longer matches the screen.
+    let narrow_unfiltered = srv.get_json(&format!("{list}?since_days=3"), &token).await;
+    assert_eq!(
+        ids(&narrow_unfiltered),
+        vec![issue_id.to_string()],
+        "the issue must still be in range unfiltered, or this test proves nothing: \
+         {narrow_unfiltered}"
+    );
+    let narrow = srv
+        .get_json(
+            &format!("{list}?since_days=3&query=screen:/checkout"),
+            &token,
+        )
+        .await;
+    assert_eq!(
+        ids(&narrow),
+        Vec::<String>::new(),
+        "the /checkout occurrence is older than the requested window: {narrow}"
+    );
+    assert_eq!(narrow["total"], 0, "{narrow}");
+
+    srv.shutdown().await;
+}
+
+/// `deviceKey` is `OPS_EQ` in the catalog, so a substring probe is a 400 —
+/// and it must be refused by NAME, not answered as something else.
+///
+/// Pinned end to end because the dashboard chip for this field is `OPS_ENUM`
+/// on the strength of it: if the catalog were widened, the chip is what would
+/// look wrong, and this is the assertion that would notice first.
+#[tokio::test]
+async fn device_key_refuses_a_substring_probe_on_the_issues_list() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let (app_id, token) = srv.seed_app("occ-ops").await;
+    let list = format!("/v1/apps/{app_id}/issues");
+
+    for probe in ["query=deviceKey:~d_", "filter=deviceKey:contains:d_"] {
+        let (status, body) = srv
+            .get_status_and_body(&format!("{list}?{probe}"), &token)
+            .await;
+        assert_eq!(status, 400, "`{probe}` must be refused: {body}");
+        assert!(
+            body.contains("deviceKey") || body.contains("device_key"),
+            "`{probe}`: the refusal must name the field: {body}"
+        );
+    }
+
+    // The neighbouring dimension DOES accept it, so the refusal above is about
+    // this field's operator set and not about substrings being unsupported.
+    let (status, body) = srv
+        .get_status_and_body(&format!("{list}?query=screen:~check"), &token)
+        .await;
+    assert_eq!(status, 200, "`screen:~check` must be accepted: {body}");
+
+    srv.shutdown().await;
+}
+
+/// The three new filters need no `event:read`, and that is a decision.
+///
+/// `reject_withheld_body` gates `Store::Tag`, non-allowlisted
+/// `Store::JsonRoot` columns, and `workflow` by name. These three are plain
+/// `Store::Column`s and pass it — which matches what the caller can already
+/// read: `strip_event_body` withholds the crash payload but explicitly KEEPS
+/// `screen`, `distinct_id` and `device_key` as issue-level shell. Filtering by
+/// them therefore discloses nothing a caller holding `issue:read` alone cannot
+/// already read off the occurrences list.
+///
+/// The `workflow` leg is the control: same page, same caller, a field that IS
+/// gated. Without it this test would pass just as well against a build that
+/// had stopped gating anything.
+#[tokio::test]
+async fn occurrence_column_filters_need_no_event_read() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let fx = srv.seed_occurrence_fixture().await;
+    let list = format!("/v1/apps/{}/issues", fx.app_id);
+
+    for probe in [
+        "query=screen:/checkout",
+        "query=distinctId:u_alpha",
+        "query=deviceKey:d_alpha",
+        "query=has:screen",
+        "query=!screen:/checkout",
+        "filter=screen:eq:/checkout",
+    ] {
+        let (status, body) = srv
+            .get_status_and_body(&format!("{list}?{probe}"), &fx.shell_token)
+            .await;
+        assert_eq!(
+            status, 200,
+            "`{probe}` is a predicate over a column this caller already reads on the \
+             occurrences list, so it must be answered: {body}"
+        );
+    }
+
+    let (status, body) = srv
+        .get_status_and_body(&format!("{list}?query=workflow:checkout"), &fx.shell_token)
+        .await;
+    assert_eq!(
+        status, 403,
+        "the control: `workflow` IS gated, so a build that gates nothing fails here: {body}"
     );
 
     srv.shutdown().await;

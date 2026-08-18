@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 // `vite/client` already types the import, so this needs no `@types/node` and no
 // path juggling relative to the test runner's cwd.
 import filterRs from '../../../../../backend/crates/sauron-db/src/filter.rs?raw';
-import { EVENT_FIELDS, ISSUE_FIELDS, OCCURRENCE_FIELDS, type FieldDef } from './filters';
+import { EVENT_FIELDS, OCCURRENCE_FIELDS, type FieldDef } from './filters';
 
 /**
  * The FilterBar's chip lists against the registry the API validates against.
@@ -40,8 +40,16 @@ const DELIBERATELY_UNCHIPPED: Record<string, string> = {
   environment: 'scoped by the topbar environment switcher, not a per-page chip',
 };
 
+// `ISSUE_FIELDS` is checked in `catalog-field-parity.test.ts` instead, and was
+// moved there when `screen`/`distinctId`/`deviceKey` were chipped.
+// `routes/issues.rs` validates through `resolve_query(…, Resource::Issues)`
+// against `sauron-query`'s `CATALOG`; `sauron_db::filter::ISSUE_FILTERS` has no
+// remaining call site on that path, so checking chips against it fails in both
+// directions — it rejects a chip the API accepts, and it would demand a chip
+// for a key the API no longer reads. The registry itself is left in place: the
+// other two lists here are still checked against their own, and deleting it is
+// a separate question from this one.
 const CASES: { registry: string; fields: FieldDef[]; name: string }[] = [
-  { registry: 'ISSUE_FILTERS', fields: ISSUE_FIELDS, name: 'ISSUE_FIELDS' },
   { registry: 'EVENT_FILTERS', fields: EVENT_FIELDS, name: 'EVENT_FIELDS' },
   { registry: 'ERROR_EVENT_FILTERS', fields: OCCURRENCE_FIELDS, name: 'OCCURRENCE_FIELDS' },
 ];
