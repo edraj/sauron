@@ -18568,7 +18568,148 @@ fn capped(n: i64, cap: i64) -> (i64, bool) {
     }
 }
 
+/// One screen name, for the candidate enumeration below.
+#[derive(Debug, QueryableByName)]
+struct ScreenName {
+    #[diesel(sql_type = Text)]
+    screen: String,
+}
+
+/// Distinct screen names this app has EVER reported, in name order, at most
+/// `limit` of them — a "loose index scan" (also called a skip scan).
+///
+/// Both event tables carry `(app_id, screen, occurred_at DESC) WHERE screen IS
+/// NOT NULL`, so the newest row for a screen is the FIRST index entry for it.
+/// Walking `screen > previous` therefore costs one index descent per distinct
+/// screen instead of one read per row — the difference between work
+/// proportional to how many screens exist and work proportional to how many
+/// events were sent. On the dev dataset (212k events, 210k errors, 12 screens)
+/// enumerating both tables is ~25ms where the aggregate that used to decide
+/// membership was ~360ms warm and ~820ms cold.
+///
+/// **Each branch is bounded by its own row counter, not by the outer `LIMIT`.**
+/// The union deduplicates, and a `HashAggregate` must consume its whole input
+/// before emitting a first row, so an outer `LIMIT` would not stop the
+/// recursion — it would bound only what crossed the wire. `n <= $3` is what
+/// actually stops the walk. A branch that hits it returns `limit` distinct
+/// names, which is exactly how the caller detects truncation: each branch
+/// yields DISTINCT screens, so a truncated branch alone already exceeds the
+/// caller's cap.
+///
+/// No environment predicate and no window: this enumerates CANDIDATES, and
+/// narrowing them is the probe's job. Putting `occurred_at >= since` here would
+/// not help — within one screen the index is ordered by time descending, so a
+/// screen whose newest row predates the window still costs a walk through every
+/// entry it has before the scan reaches the next name.
+async fn screen_candidates(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    q_pattern: &str,
+    limit: i64,
+) -> QueryResult<Vec<String>> {
+    // `$1` app_id, `$2` ILIKE pattern, `$3` per-branch bound, `$4` outer limit.
+    const SQL: &str = "WITH RECURSIVE ev_c AS ( \
+           (SELECT screen, 1 AS n FROM analytics_events \
+              WHERE app_id = $1 AND screen IS NOT NULL ORDER BY screen LIMIT 1) \
+           UNION ALL \
+           SELECT (SELECT a.screen FROM analytics_events a \
+                     WHERE a.app_id = $1 AND a.screen IS NOT NULL AND a.screen > c.screen \
+                     ORDER BY a.screen LIMIT 1), c.n + 1 \
+             FROM ev_c c WHERE c.screen IS NOT NULL AND c.n <= $3), \
+         ex_c AS ( \
+           (SELECT screen, 1 AS n FROM error_events \
+              WHERE app_id = $1 AND screen IS NOT NULL ORDER BY screen LIMIT 1) \
+           UNION ALL \
+           SELECT (SELECT e.screen FROM error_events e \
+                     WHERE e.app_id = $1 AND e.screen IS NOT NULL AND e.screen > c.screen \
+                     ORDER BY e.screen LIMIT 1), c.n + 1 \
+             FROM ex_c c WHERE c.screen IS NOT NULL AND c.n <= $3) \
+         SELECT screen FROM ( \
+           SELECT screen FROM ev_c WHERE screen IS NOT NULL \
+           UNION \
+           SELECT screen FROM ex_c WHERE screen IS NOT NULL) s \
+         WHERE screen ILIKE $2 ORDER BY screen LIMIT $4";
+    diesel::sql_query(SQL)
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Text, _>(q_pattern.to_string())
+        .bind::<BigInt, _>(limit)
+        .bind::<BigInt, _>(limit)
+        .load::<ScreenName>(conn)
+        .await
+        .map(|rows| rows.into_iter().map(|r| r.screen).collect())
+}
+
 /// `(total, capped)` over the screens [`screen_list`] pages.
+///
+/// **Two small queries, not one big one.** The list's own shape — `keys`, i.e.
+/// `ev UNION ex` out of [`screen_ctes`] — answers "which screens are in this
+/// window" by GROUPing every event and every error row in it. That is work
+/// proportional to EVENT VOLUME for an answer whose size is the number of route
+/// names an app has, and no index can serve it once an environment is selected:
+/// `(app_id, screen, occurred_at)` does not carry `environment_id`, so the
+/// planner falls back to a parallel sequential scan of both tables across every
+/// partition. Measured on the dev dataset (212k events + 210k errors in the
+/// window, one dominant environment): 358ms warm, 823ms cold, ~105k buffers.
+/// It grows linearly with ingest, which is what put this endpoint on the
+/// latency path it was split off the list to stay clear of.
+///
+/// Instead: enumerate the candidate names off the index
+/// ([`screen_candidates`]), then ask each candidate whether it has a single row
+/// in the window — an index probe that stops at the first match rather than a
+/// count. Same dataset, same answer, ~75ms and ~7k buffers, and the probe half
+/// does not grow with event volume at all.
+///
+/// **The fallback is not decoration.** The fast path is proportional to
+/// ALL-TIME distinct screens, so an app that mints screen names dynamically
+/// (`/order/12345`) could enumerate far more candidates than it has screens in
+/// the window. `screen_candidates` bounds that at `cap + 1`; hitting the bound
+/// means the candidate list is truncated and can no longer answer exactly, so
+/// this drops back to the aggregate shape, which is exact and capped by
+/// construction. Slow, but only for the shape that would have been slow anyway.
+pub async fn count_screens(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    since: DateTime<Utc>,
+    q_pattern: &str,
+    cap: i64,
+) -> QueryResult<(i64, bool)> {
+    let candidates = screen_candidates(conn, scope.app_id, q_pattern, cap + 1).await?;
+    if candidates.len() as i64 > cap {
+        return count_screens_by_aggregate(conn, scope, since, q_pattern, cap).await;
+    }
+    if candidates.is_empty() {
+        return Ok((0, false));
+    }
+
+    // `$3` is referenced by BOTH arms; a placeholder may be named any number of
+    // times, and `bind_env!` binds it once. The array therefore lands on `$4`
+    // when an environment is selected and `$3` when none is.
+    let env_a = scope.env.sql_fragment_for("a", 3);
+    let env_e = scope.env.sql_fragment_for("e", 3);
+    let arr_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let q = format!(
+        "SELECT count(*)::bigint AS total FROM unnest(${arr_idx}::text[]) AS s(screen) \
+         WHERE EXISTS (SELECT 1 FROM analytics_events a \
+                 WHERE a.app_id = $1 AND a.screen = s.screen AND a.occurred_at >= $2{env_a}) \
+            OR EXISTS (SELECT 1 FROM error_events e \
+                 WHERE e.app_id = $1 AND e.screen = s.screen AND e.occurred_at >= $2{env_e})"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(since);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    let row: BoundedCount = stmt
+        .bind::<Array<Text>, _>(candidates)
+        .get_result(conn)
+        .await?;
+    // Never above `cap`: the candidate list was already bounded by it, and a
+    // probe can only remove names. `capped` is still the shape the caller
+    // expects, so the pair is built the same way on both paths.
+    Ok(capped(row.total, cap))
+}
+
+/// The pre-2026-08-18 shape, kept as [`count_screens`]' exact fallback.
 ///
 /// Selects from `keys` alone. `keys` is `ev UNION ex`, so the two aggregates
 /// that decide MEMBERSHIP still run — but `us` (a `count(DISTINCT)` over a
@@ -18576,7 +18717,7 @@ fn capped(n: i64, cap: i64) -> (i64, bool) {
 /// every session) are never referenced, and Postgres does not execute an
 /// unreferenced CTE. Those two are the expensive half of the list, so this is
 /// materially cheaper than the query it counts rather than a second copy of it.
-pub async fn count_screens(
+async fn count_screens_by_aggregate(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     since: DateTime<Utc>,

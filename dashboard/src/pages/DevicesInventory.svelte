@@ -385,14 +385,18 @@
       <h1 class="page-title">Devices</h1>
       <p class="muted sub">Fleet-wide hardware, OS and browser breakdown across your users.</p>
     </div>
+    <!-- Search first, then the window, then refresh — the same order Sessions
+         and Users put these controls in. This page keeps them in the header
+         because its table starts directly below: there is no analytics section
+         in between for the toolbar to drift away from. -->
     <div class="controls">
-      <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
       <SearchInput
         bind:value={query}
         onsearch={onSearch}
         placeholder="Search devices…"
         width="240px"
       />
+      <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
       <Button
         variant="secondary"

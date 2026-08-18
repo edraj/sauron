@@ -220,6 +220,47 @@ export const OCCURRENCE_FIELDS: FieldDef[] = [
  * reached the wire. It is reachable through the query language, where the
  * parser that owns that grammar is the one doing the parsing.
  */
+/**
+ * The sessions list.
+ *
+ * Derived from the dimensions `catalog.rs` declares for `Resource::Sessions`,
+ * not from what the table happens to render: `/sessions` bridges
+ * `filter=field:op:value` through `from_legacy` into the same AST `?query=`
+ * produces, and `resolve` then checks the name against the catalog — so a chip
+ * for a dimension this resource does not carry is an "unknown field" 400, and
+ * a dimension with no chip is a filter no amount of clicking can reach.
+ * `catalog-field-parity.test.ts` fails on either.
+ *
+ * Ops mirror the catalog's own sets: `OPS_TEXT` gets `contains`, `OPS_EQ`
+ * (`deviceKey`) does not, and the two counters are `OPS_ORD`.
+ *
+ * Three catalog dimensions are deliberately absent, each for a reason that is
+ * not "it looked unhelpful":
+ *
+ * - `environment` — scoped globally by the topbar switcher, exactly as on the
+ *   other lists. See the note above EVENT_FIELDS.
+ * - `startedAt` — a timestamp, and this page already owns its window through
+ *   `<TimeFilter>`, which also picks the COLUMN. A second, weaker time control
+ *   would let a reader set two windows that disagree.
+ * - `duration` — typed `ValueType::Duration`, which accepts `2s`/`500ms`
+ *   spellings the numeric-chip validator (`i64` digits only) rejects before
+ *   they reach the wire. Same call as TRANSACTION_FIELDS makes: it stays
+ *   reachable through the query box, where the parser that owns that grammar
+ *   does the parsing.
+ * - `context` — a JSON root, addressed as the chainable `@context.<key>` in
+ *   the query language. A flat `key=value` chip cannot express the path.
+ */
+export const SESSION_FIELDS: FieldDef[] = [
+  { key: 'session', label: 'Session', type: 'string', ops: OPS_STR },
+  { key: 'distinctId', label: 'User', type: 'string', ops: OPS_STR },
+  // `OPS_EQ`, not `OPS_STR`: the catalog gives `deviceKey` no `Contains`, so a
+  // `contains` chip would 400 rather than narrow.
+  { key: 'deviceKey', label: 'Device', type: 'string', ops: OPS_ENUM },
+  { key: 'release', label: 'Release', type: 'string', ops: OPS_STR },
+  { key: 'eventsCount', label: 'Events', type: 'number', ops: OPS_NUM },
+  { key: 'errorsCount', label: 'Errors', type: 'number', ops: OPS_NUM },
+];
+
 export const TRANSACTION_FIELDS: FieldDef[] = [
   { key: 'name', label: 'Name', type: 'string', ops: OPS_STR },
   {

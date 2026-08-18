@@ -38,14 +38,26 @@ export async function listSessions(
   appId: string,
   params: ListSessionsParams,
 ): Promise<SearchEnvelope<Session>> {
-  const queryParams: any = { ...params, limit: params.limit + 1 };
+  // `filters` is pulled OUT of the object handed to axios on purpose. The
+  // route reads repeated `filter=` parameters (`Vec<String>`), and axios
+  // serialises an array property as `filters[]=…` — a name the extractor does
+  // not know, so every chip would be dropped silently and the list would come
+  // back unnarrowed while the chips sat on screen claiming otherwise. Written
+  // into the URL directly instead; axios appends its own `params` after the
+  // existing query string.
+  const { filters, ...rest } = params;
+  const queryParams: any = { ...rest, limit: params.limit + 1 };
   if (queryParams.sinceDays !== undefined) {
     queryParams.since_days = queryParams.sinceDays;
     delete queryParams.sinceDays;
   }
-  const { data } = await api.get<SearchEnvelope<Session>>(`/v1/apps/${appId}/sessions`, {
-    params: queryParams,
-  });
+  const encoded = new URLSearchParams();
+  for (const f of filters ?? []) encoded.append('filter', f);
+  const qs = encoded.toString();
+  const { data } = await api.get<SearchEnvelope<Session>>(
+    qs ? `/v1/apps/${appId}/sessions?${qs}` : `/v1/apps/${appId}/sessions`,
+    { params: queryParams },
+  );
   return data;
 }
 
