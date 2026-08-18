@@ -271,10 +271,6 @@
       <h1 class="page-title">Users</h1>
       <p class="muted sub">Identified &amp; anonymous people seen by this app — search by distinct ID or trait.</p>
     </div>
-    <div class="controls">
-      <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder="Search users…" width="300px" />
-      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
-    </div>
   </div>
 
   <div class="analytics-head">
@@ -334,23 +330,31 @@
            header the user just clicked. -->
       <p class="muted section-hint">One row per distinct ID.</p>
     </div>
-    <!-- Governs the TABLE only. The Audience range picker above drives the
-         tiles and chart, and the two are deliberately separate windows: this
-         one can name a column and a bound the summary endpoints cannot
-         express, so a shared control would have to either lie or caption its
-         way out on every card. -->
-    <TimeFilter
-      fields={TIME_FIELDS}
-      value={timeFilter}
-      onchange={(v) => {
-        timeFilter = v;
-        // A changed predicate invalidates the page position: row 51 of the old
-        // window is not row 51 of the new one, and keeping the offset would
-        // land the user in the middle of a result set they have not seen the
-        // start of — or past its end, on an empty page.
-        list = setOffsetPage(list, 0);
-      }}
-    />
+    <!-- Every control that narrows the TABLE lives in this one row, directly
+         above it: search, window, refresh. They used to be split between the
+         page header and here, which read as two unrelated toolbars and left
+         the search box describing a table two sections further down. -->
+    <div class="controls">
+      <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder="Search users…" width="300px" />
+      <!-- Governs the TABLE only. The Audience range picker above drives the
+           tiles and chart, and the two are deliberately separate windows: this
+           one can name a column and a bound the summary endpoints cannot
+           express, so a shared control would have to either lie or caption its
+           way out on every card. -->
+      <TimeFilter
+        fields={TIME_FIELDS}
+        value={timeFilter}
+        onchange={(v) => {
+          timeFilter = v;
+          // A changed predicate invalidates the page position: row 51 of the old
+          // window is not row 51 of the new one, and keeping the offset would
+          // land the user in the middle of a result set they have not seen the
+          // start of — or past its end, on an empty page.
+          list = setOffsetPage(list, 0);
+        }}
+      />
+      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
+    </div>
   </div>
 
   {#if loading && rows.length === 0}
@@ -503,6 +507,10 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
+    /* Wraps because the People row now carries the whole table toolbar — a
+       300px search box, the window picker and refresh — which does not fit
+       beside the heading on a narrow viewport. */
+    flex-wrap: wrap;
     margin: 40px 0 16px;
   }
   /* The People heading owns the space above the table, so this wrapper adds no

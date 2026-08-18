@@ -18,6 +18,7 @@
   import JsonTree from './JsonTree.svelte';
   import StacktraceView from './StacktraceView.svelte';
   import SymbolicationBadge from './SymbolicationBadge.svelte';
+  import IssueQuickView from './IssueQuickView.svelte';
 
   interface Props {
     items: TimelineItem[];
@@ -37,6 +38,16 @@
      */
     emptyLabel?: string;
   }
+
+  /**
+   * The occurrence the quick view is describing, or `null` when it is closed.
+   *
+   * Held here rather than by each caller because the row that opens it lives
+   * here: a callback prop would make every page that renders a timeline
+   * re-implement the same modal, and a page that forgot would show a "View
+   * issue" link that navigated away mid-session instead.
+   */
+  let quickView = $state<ErrorEvent | null>(null);
 
   let {
     items,
@@ -218,7 +229,20 @@
           <div class="detail">
             <div class="detail-links">
               {#if item.kind === 'error'}
-                <a class="issue-link" href={`#/issues/${item.error.issue_id}`}>View issue <Icon name="arrow-right" size={12} /></a>
+                <!-- Opens in place rather than navigating. Reading a crash used
+                     to cost the session: the link left for Issue detail, which
+                     describes the ISSUE across every occurrence, and coming
+                     back re-entered the timeline at the top with the row
+                     collapsed again. The quick view answers the question the
+                     reader actually has here — what happened in THIS session —
+                     and keeps "View more" for the full page. -->
+                <button
+                  type="button"
+                  class="issue-link"
+                  onclick={() => (quickView = item.error)}
+                >
+                  View issue <Icon name="arrow-right" size={12} />
+                </button>
               {/if}
               {#if screenOf(item)}
                 <a class="screen-link" href={`#/screens/${encodeURIComponent(screenOf(item) ?? '')}`}>
@@ -288,6 +312,8 @@
     <li class="tl-empty faint">{emptyLabel}</li>
   {/each}
 </ol>
+
+<IssueQuickView error={quickView} open={quickView !== null} onclose={() => (quickView = null)} />
 
 <style>
   .tl {
@@ -504,6 +530,14 @@
     font-size: 12px;
     font-weight: 560;
     color: var(--primary);
+  }
+  /* `.issue-link` is a <button> since it opens the quick view instead of
+     navigating; these three reset the UA button styling so it still reads as
+     the link it sits beside. */
+  .issue-link {
+    background: none;
+    border: none;
+    padding: 0;
   }
   .issue-link:hover,
   .screen-link:hover {

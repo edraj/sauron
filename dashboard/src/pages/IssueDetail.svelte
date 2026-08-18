@@ -680,10 +680,12 @@
         {/if}
 
         {#if latestEvent}
-          <Card title="Tags">
-            <KeyValueList data={latestEvent.tags} emptyLabel="No tags" />
-          </Card>
-
+          <!-- No Tags card here. The rail already carries one, and two copies of
+               the same six rows on one screen made the reader check whether they
+               said different things. The rail's is the survivor because it sits
+               with the other identity facts (release, environment, affected
+               user) instead of below a fold of stack trace and payload; long
+               values stay readable there through `title` tooltips. -->
           <div class="data-row">
             <Card title="Contexts">
               {#if latestEvent.contexts && Object.keys(latestEvent.contexts).length > 0}
@@ -901,11 +903,12 @@
           </dl>
         </Card>
 
-        <!-- Tags again, in the rail. The full-width card further down stays: it
-             is the one that can show long values without truncating. This is the
-             at-a-glance copy, so it sits with the other identity facts rather
-             than below a fold of stack trace and payload. Uses `.side-dl` rather
-             than KeyValueList because that component lays out for full width. -->
+        <!-- The ONLY Tags card. A second, full-width copy used to sit below the
+             stack trace; it was removed rather than this one because tags are
+             identity facts and belong beside release/environment/affected user,
+             above the fold. Uses `.side-dl` rather than KeyValueList because
+             that component lays out for full width; a long value truncates with
+             its full text on the `title`. -->
         {#if latestEvent && tagEntries.length > 0}
           <Card title="Tags">
             <dl class="side-dl">
@@ -1014,7 +1017,7 @@
     gap: 18px;
     min-width: 0;
   }
-  /* Contexts + Additional data sit side by side under the full-width Tags card. */
+  /* Contexts + Additional data sit side by side under the latest-event card. */
   .data-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -1091,8 +1094,10 @@
     word-break: break-word;
   }
   /* Tag values are arbitrary strings in a 300px column. Clamped to two lines
-     with the full value on hover, so one long value cannot push the rest of the
-     rail off screen. The full-width Tags card below shows them untruncated. */
+     with the full value on the `title`, so one long value cannot push the rest
+     of the rail off screen. The hover text is now the ONLY way to read a
+     clamped value in full — the full-width card that used to show them
+     untruncated was a duplicate and is gone. */
   .tag-val {
     display: -webkit-box;
     -webkit-line-clamp: 2;

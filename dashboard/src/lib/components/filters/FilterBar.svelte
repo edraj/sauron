@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import Icon from '../ui/Icon.svelte';
   import SearchAutocompleteInput from '../search/SearchAutocompleteInput.svelte';
   import DateRange from '../DateRange.svelte';
@@ -41,6 +42,27 @@
      * is not using.
      */
     showRange?: boolean;
+    /**
+     * The page's own list controls — a `<TimeFilter>`, refresh, an export
+     * button — rendered on the same line as the search box.
+     *
+     * They belong here rather than in the page header because every one of
+     * them narrows or reloads the SAME table this bar's chips and search
+     * narrow. Split across two places (the old arrangement) the search box sat
+     * two sections above the rows it filtered, next to charts that ignore it
+     * entirely, and read as if it filtered those instead.
+     */
+    actions?: Snippet;
+    /**
+     * A chip was added or removed.
+     *
+     * `bind:filters` already hands the page the new list; this exists for what
+     * the binding CANNOT express — that the change happened, and so the page
+     * position is now meaningless. Row 51 of the unfiltered set is not row 51
+     * of the filtered one. Pages that page by cursor rebuild their position
+     * from the predicate anyway and can ignore this.
+     */
+    onchange?: (filters: Filter[]) => void;
   }
   let {
     fields,
@@ -53,6 +75,8 @@
     sinceDays = $bindable(30),
     ranges = undefined,
     showRange = true,
+    actions = undefined,
+    onchange = undefined,
   }: Props = $props();
 
   let adding = $state(false);
@@ -84,15 +108,18 @@
       if (!draftTagKey.trim() || !draftTagVal.trim()) return;
       filters = [...filters, { field: draftField, op: draftOp, value: composeTag(draftTagKey.trim(), draftTagVal.trim()) }];
       adding = false;
+      onchange?.(filters);
       return;
     }
     const value = normalizeFilterValue(fieldDef, draftValue);
     if (!isFilterValueValid(fieldDef, value)) return;
     filters = [...filters, { field: draftField, op: draftOp, value }];
     adding = false;
+    onchange?.(filters);
   }
   function remove(i: number) {
     filters = filters.filter((_, idx) => idx !== i);
+    onchange?.(filters);
   }
   function labelFor(key: string): string {
     return fields.find((f) => f.key === key)?.label ?? key;
@@ -158,6 +185,7 @@
     {#if showRange}
       <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} {ranges} />
     {/if}
+    {@render actions?.()}
   </div>
 </div>
 
