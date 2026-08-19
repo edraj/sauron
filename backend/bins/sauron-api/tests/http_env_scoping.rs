@@ -1042,6 +1042,7 @@ async fn seed_issue_with_error(
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await

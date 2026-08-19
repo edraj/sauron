@@ -158,6 +158,26 @@ pub async fn insert_error_events(
     conn: &mut AsyncPgConnection,
     rows: &[NewErrorEvent],
 ) -> QueryResult<usize> {
+    // Tier 1: with INGEST_STACK_POOLING on, traces move to `error_stack_blobs`
+    // and the rows carry a content address instead. The clone is priced by
+    // what it no longer carries: `intern` REPLACES each stacktrace with the
+    // placeholder as it walks, so the duplicated bytes are everything except
+    // the one column this feature exists to deduplicate. Blobs go first, in
+    // this same transaction — the FK on `stacktrace_sha256` requires it, and
+    // same-transaction visibility is what makes the GC sweep race-free.
+    if crate::stack_pool::pooling_enabled() {
+        let mut pooled = rows.to_vec();
+        let blobs = crate::stack_pool::intern(&mut pooled);
+        crate::stack_pool::insert_blobs(conn, &blobs).await?;
+        let mut n = 0;
+        for chunk in pooled.chunks(INSERT_CHUNK) {
+            n += diesel::insert_into(error_events::table)
+                .values(chunk)
+                .execute(conn)
+                .await?;
+        }
+        return Ok(n);
+    }
     let mut n = 0;
     for chunk in rows.chunks(INSERT_CHUNK) {
         n += diesel::insert_into(error_events::table)

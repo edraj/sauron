@@ -346,6 +346,37 @@ async fn main() -> anyhow::Result<()> {
     }
 
     {
+        // `symbol_blobs` orphans: migration 0067's trigger keeps refcounts
+        // honest for every blob an artifact has pointed at, but a blob whose
+        // artifact insert never happened (the upload race) is invisible to a
+        // trigger on `symbol_artifacts`. This sweeps from ground truth — no
+        // referring artifact row — behind a grace age covering in-flight
+        // uploads. Lives here because artifact upload is this process's route,
+        // per the same write-path-owner rule as the reapers above.
+        let pool = state.pool.clone();
+        tasks::supervise(
+            "symbol-blob-sweeper",
+            Duration::from_secs(86_400),
+            move || {
+                let pool = pool.clone();
+                async move {
+                    let mut conn = sauron_db::conn(&pool).await?;
+                    let swept = sauron_db::repo::sweep_orphan_symbol_blobs(
+                        &mut conn,
+                        sauron_db::repo::SYMBOL_BLOB_SWEEP_GRACE_HOURS,
+                    )
+                    .await?;
+                    drop(conn);
+                    if swept > 0 {
+                        tracing::info!(swept, "swept orphaned symbol_blobs");
+                    }
+                    Ok(())
+                }
+            },
+        );
+    }
+
+    {
         // Lives here, not in `sauron-alerts`. packaging/rpm/SETUP.md's shipped
         // install line is
         // `systemctl enable --now sauron-api sauron-ingest sauron-monitor sauron-tier`,

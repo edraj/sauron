@@ -152,6 +152,19 @@ diesel::table! {
         // Appended, never inserted mid-list — see the same note on
         // `analytics_events` above.
         guest_alias -> Nullable<Text>,
+        // Content address of the pooled stacktrace in `error_stack_blobs`.
+        // NULL = the inline `stacktrace` column is the truth (every row
+        // written before migration 0068, and every row written with
+        // INGEST_STACK_POOLING off). Appended, never inserted mid-list.
+        stacktrace_sha256 -> Nullable<Bytea>,
+    }
+}
+
+diesel::table! {
+    error_stack_blobs (sha256) {
+        sha256 -> Bytea,
+        content -> Jsonb,
+        created_at -> Timestamptz,
     }
 }
 

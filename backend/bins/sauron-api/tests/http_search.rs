@@ -856,6 +856,7 @@ async fn seed_occurrence(
             handled: Some(false),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -1395,6 +1396,7 @@ async fn seed_stat_occurrence(
             handled: Some(false),
             title: Some(title.to_string()),
             culprit: Some(culprit.to_string()),
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -1946,6 +1948,7 @@ async fn seed_occ_event(
             handled: Some(false),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -3915,6 +3918,7 @@ async fn seed_issue_with_occurrence_columns(
             handled: Some(false),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await

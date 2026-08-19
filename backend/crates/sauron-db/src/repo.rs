@@ -2251,8 +2251,14 @@ pub async fn upsert_issue(conn: &mut AsyncPgConnection, new: NewIssue<'_>) -> Qu
 
 pub async fn insert_error_event(
     conn: &mut AsyncPgConnection,
-    ev: NewErrorEvent,
+    mut ev: NewErrorEvent,
 ) -> QueryResult<usize> {
+    // Tier 1 pooling — same contract as the batched path in `batch.rs`: blob
+    // first (FK + sweep-race ordering), then the row carrying its address.
+    if crate::stack_pool::pooling_enabled() {
+        let blobs = crate::stack_pool::intern(std::slice::from_mut(&mut ev));
+        crate::stack_pool::insert_blobs(conn, &blobs).await?;
+    }
     diesel::insert_into(error_events::table)
         .values(&ev)
         .execute(conn)
@@ -3795,9 +3801,14 @@ pub async fn search_occurrences(
     if let Some(off) = jump_offset(&search.after, search.offset) {
         q = q.offset(off);
     }
-    q.load(conn)
+    let mut rows: Vec<ErrorEvent> = q
+        .load(conn)
         .await
-        .map_err(|e| PlanError::Database(e.to_string()))
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    crate::stack_pool::hydrate(conn, &mut rows)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    Ok(rows)
 }
 
 /// `(total, capped)` over the same predicate [`search_occurrences`] pages.
@@ -5515,12 +5526,17 @@ pub async fn list_error_events_for_issue_with_reach(
     since: Option<chrono::DateTime<chrono::Utc>>,
     limit: i64,
 ) -> QueryResult<Vec<ErrorEvent>> {
-    error_events_for_issue_query(&scope, issue_id, filters, q, reach, since)
-        .select(ErrorEvent::as_select())
-        .order(error_events::occurred_at.desc())
-        .limit(limit)
-        .load(conn)
-        .await
+    let mut rows: Vec<ErrorEvent> =
+        error_events_for_issue_query(&scope, issue_id, filters, q, reach, since)
+            .select(ErrorEvent::as_select())
+            .order(error_events::occurred_at.desc())
+            .limit(limit)
+            .load(conn)
+            .await?;
+    // Tier 1: pooled rows carry a placeholder trace until hydrated. The whole
+    // page shares a handful of blobs, so this is one small query, not N.
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 /// [`list_error_events_for_issue_with_reach`] with the payload scan ON.
@@ -5700,12 +5716,17 @@ pub async fn latest_error_event(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::issue_id.eq(issue_id))
         .into_boxed();
-    crate::scope_env!(query, error_events, &scope.env)
+    let row: Option<ErrorEvent> = crate::scope_env!(query, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .first(conn)
         .await
-        .optional()
+        .optional()?;
+    let Some(ev) = row else { return Ok(None) };
+    let mut one = [ev];
+    crate::stack_pool::hydrate(conn, &mut one).await?;
+    let [ev] = one;
+    Ok(Some(ev))
 }
 
 /// `error_events` carries its own `environment_id` directly, so this is an
@@ -5721,12 +5742,14 @@ pub async fn error_events_for_person(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::distinct_id.eq(distinct_id))
         .into_boxed();
-    crate::scope_env!(q, error_events, &scope.env)
+    let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)
         .load(conn)
-        .await
+        .await?;
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 // ===========================================================================
@@ -7354,12 +7377,14 @@ pub async fn errors_for_session(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::session_id.eq(session_id.to_string()))
         .into_boxed();
-    crate::scope_env!(q, error_events, &scope.env)
+    let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.asc())
         .limit(limit)
         .load(conn)
-        .await
+        .await?;
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 /// See [`events_for_session`]'s doc comment — same reasoning, `transactions`.
@@ -8483,12 +8508,14 @@ pub async fn errors_for_device(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::device_key.eq(device_key.to_string()))
         .into_boxed();
-    crate::scope_env!(q, error_events, &scope.env)
+    let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)
         .load(conn)
-        .await
+        .await?;
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 // ===========================================================================
@@ -10595,13 +10622,15 @@ pub async fn recent_exceptions_for_screen(
         .filter(error_events::screen.eq(screen))
         .filter(error_events::occurred_at.ge(since))
         .into_boxed();
-    crate::scope_env!(q, error_events, &scope.env)
+    let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order((error_events::occurred_at.desc(), error_events::id.desc()))
         .limit(limit)
         .offset(offset)
         .load(conn)
-        .await
+        .await?;
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 /// The per-screen signal set both [`users_for_screen`] and
@@ -12832,6 +12861,45 @@ pub async fn delete_symbol_artifact(
         .await?;
     }
     Ok(true)
+}
+
+/// Grace age below which an unreferenced blob is NOT swept: long enough that no
+/// in-flight upload (put_blob committed, insert_symbol_artifact not yet) can
+/// still be racing, short enough that a leak never outlives a day.
+pub const SYMBOL_BLOB_SWEEP_GRACE_HOURS: i64 = 24;
+
+/// Delete `symbol_blobs` rows that no artifact references.
+///
+/// Migration 0067's trigger keeps `refcount` honest for every blob an artifact
+/// row has ever pointed at — including CASCADE deletes, which bypass
+/// [`delete_symbol_artifact`] entirely. What the trigger structurally cannot
+/// see is a blob that never acquired an artifact row at all: `put_blob` has
+/// already committed (refcount 1) when `insert_symbol_artifact` loses its
+/// unique-violation race or fails for any other reason, and the recovery arm
+/// deliberately does not decrement. Such orphans are invisible to a trigger on
+/// `symbol_artifacts` because no row of that table is ever written for them.
+///
+/// So this sweeps from the ground truth instead of the counter: a blob with no
+/// referring artifact is unreachable — the FKs from `symbol_artifacts` are the
+/// only pointers into this table — and deleting it cannot race a *future*
+/// reference, because a re-upload goes through `put_blob`, which re-creates the
+/// row from content the client still holds. The grace age is what makes the
+/// present tense safe: a blob younger than it may belong to an upload whose
+/// artifact insert is still in flight.
+pub async fn sweep_orphan_symbol_blobs(
+    conn: &mut AsyncPgConnection,
+    grace_hours: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM symbol_blobs b \
+         WHERE b.created_at < now() - make_interval(hours => $1::int) \
+           AND NOT EXISTS (SELECT 1 FROM symbol_artifacts a \
+                            WHERE a.blob_sha256 = b.sha256 \
+                               OR a.prebuilt_index_sha256 = b.sha256)",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(grace_hours)
+    .execute(conn)
+    .await
 }
 
 // ===========================================================================
@@ -16479,6 +16547,21 @@ pub async fn mask_batch_jsonb(
     // reads `targets` back out of Postgres in a different process from the one
     // that validated it.
     let (t, c) = (table.as_sql(), column.as_sql());
+    // Tier 1: a pooled row's inline `stacktrace` is the placeholder `[]`, so
+    // `sel`'s `{c} #> $6 IS NOT NULL` below is NULL for it — the row would be
+    // silently SKIPPED and the real trace would survive unmasked in the pool.
+    // Masking the shared blob instead is worse: it would rewrite the trace for
+    // every row sharing it, across apps and tenants. De-pooling the day's
+    // window first is the resolution — the scope's rows get their own inline
+    // copies (they diverge once masked anyway), the shared blob is never
+    // touched, and the CTE below then works unchanged. Idempotent per batch,
+    // and independent of the write flag: rows pooled last month must mask
+    // correctly today.
+    if t == "error_events" && c == "stacktrace" {
+        let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let hi = lo + chrono::Duration::days(1);
+        crate::stack_pool::depool_scope(conn, app_id, lo, hi).await?;
+    }
     let sql = format!(
         "WITH sel AS ( \
            SELECT id, occurred_at FROM {t} \
@@ -16596,6 +16679,15 @@ pub async fn mask_batch_jsonb_wildcard(
     worker_id: &str,
 ) -> QueryResult<Option<BatchOutcome>> {
     let (t, c) = (table.as_sql(), column.as_sql());
+    // Tier 1 de-pool — same reasoning as `mask_batch_jsonb`, and this wildcard
+    // shape is the one that actually hits `stacktrace` (an array of frames):
+    // a pooled row's placeholder `[]` has no elements, so `sel`'s EXISTS is
+    // false and the row would be skipped with its real trace unmasked.
+    if t == "error_events" && c == "stacktrace" {
+        let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let hi = lo + chrono::Duration::days(1);
+        crate::stack_pool::depool_scope(conn, app_id, lo, hi).await?;
+    }
     let sql = format!(
         "WITH sel AS ( \
            SELECT id, occurred_at FROM {t} \
@@ -17447,9 +17539,25 @@ pub async fn scan_window_rows(
     {
         return Ok(Vec::new());
     }
+    // Tier 1: a pooled row's inline `stacktrace` is the placeholder `[]`, so
+    // scanning `e.stacktrace` raw would silently miss every finding inside the
+    // pooled trace — PII that then never surfaces for masking. The effective
+    // value comes from the pool when the row carries an address. A scalar
+    // subquery rather than a join so all three shape arms below stay
+    // untouched; the CASE keeps it free for the NULL-sha256 majority.
+    let col_expr = |c: &str| -> String {
+        if table == "error_events" && c == "stacktrace" {
+            "CASE WHEN e.stacktrace_sha256 IS NULL THEN e.stacktrace \
+              ELSE COALESCE((SELECT b.content FROM error_stack_blobs b \
+                              WHERE b.sha256 = e.stacktrace_sha256), e.stacktrace) END"
+                .to_string()
+        } else {
+            format!("e.{c}")
+        }
+    };
     let payload = cols
         .iter()
-        .map(|c| format!("'{c}', to_jsonb(e.{c})"))
+        .map(|c| format!("'{c}', to_jsonb({})", col_expr(c)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -17477,7 +17585,10 @@ pub async fn scan_window_rows(
                 if is_text {
                     format!("e.{c} ILIKE ANY($6)")
                 } else {
-                    format!("e.{c}::text ILIKE ANY($5)")
+                    // Same pool-aware expression as `payload` above: the
+                    // prefilter must match against the EFFECTIVE trace or a
+                    // pooled row is excluded before the detectors ever run.
+                    format!("({})::text ILIKE ANY($5)", col_expr(c))
                 }
             })
             .collect::<Vec<_>>()

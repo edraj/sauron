@@ -312,6 +312,7 @@ async fn seed_cross_env_session_child_rows(
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -3859,6 +3860,7 @@ async fn list_issues_filters_tag_and_free_text_compose_with_scope() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4032,6 +4034,7 @@ async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own()
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4076,6 +4079,7 @@ async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own()
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4227,6 +4231,7 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4267,6 +4272,7 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4344,6 +4350,7 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4672,6 +4679,7 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4718,6 +4726,7 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -5057,6 +5066,7 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -5119,6 +5129,7 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
                 handled: Some(true),
                 title: None,
                 culprit: None,
+                stacktrace_sha256: None,
             },
         )
         .await
@@ -5328,6 +5339,7 @@ async fn top_issues_all_ranks_by_the_stored_times_seen_column() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -5385,6 +5397,7 @@ async fn top_issues_all_ranks_by_the_stored_times_seen_column() {
                 handled: Some(true),
                 title: None,
                 culprit: None,
+                stacktrace_sha256: None,
             },
         )
         .await
@@ -5508,6 +5521,7 @@ async fn top_issues_unattributed_ranks_by_the_unattributed_derived_count() {
                 handled: Some(true),
                 title: None,
                 culprit: None,
+                stacktrace_sha256: None,
             },
         )
         .await
@@ -6753,6 +6767,7 @@ async fn list_issues_filters_agree_with_what_it_displays() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await

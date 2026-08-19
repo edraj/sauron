@@ -1095,6 +1095,7 @@ async fn seed_one_error_event(
             handled: None,
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await

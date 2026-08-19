@@ -926,6 +926,8 @@ async fn prepare_error(
             handled: handled_of(exc),
             title: Some(title),
             culprit: Some(culprit),
+            // Filled by `stack_pool::intern` at write time when pooling is on.
+            stacktrace_sha256: None,
         },
         distinct: distinct.clone(),
     });

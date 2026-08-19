@@ -695,6 +695,10 @@ mod tests {
             handled: Some(true),
             title: Some("TypeError: undefined is not a function".into()),
             culprit: Some("boom (app.ts)".into()),
+            // `#[serde(skip)]` — never serialized, so the census below cannot
+            // see it and no withholding decision applies. Populated anyway to
+            // honour this helper's "every field non-null" contract.
+            stacktrace_sha256: Some(vec![0u8; 32]),
         }
     }
 

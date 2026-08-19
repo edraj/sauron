@@ -222,7 +222,7 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
         } else {
             (scoped_total, None)
         };
-        tables.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        tables.sort_by_key(|t| std::cmp::Reverse(t.total_bytes));
         Ok::<_, anyhow::Error>((
             total_bytes,
             physical_bytes,

@@ -478,6 +478,57 @@ macro_rules! json_object_leaf {
 /// element contain this", never folded into `json_object_leaf!`'s object
 /// nesting (which would build `{"filename": "app.js"}` and never match an
 /// array column at all).
+/// The pooled twin of an inline `stacktrace` predicate (Tier 1, migration
+/// 0068): rows written with pooling on hold the placeholder `[]` inline and
+/// the real trace in `error_stack_blobs`, so every positive predicate below is
+/// `inline-match OR pooled-match` — which IS the effective-value predicate for
+/// both populations, because an inline row's NULL `stacktrace_sha256` makes
+/// the EXISTS false and a pooled row's placeholder makes the inline arm false.
+///
+/// `EXISTS`, not `IN (subquery)`, and that is load-bearing: `NULL IN (...)`
+/// is NULL, and a NULL leaking into the OR would exclude every non-matching
+/// INLINE row from a negated predicate under three-valued logic. `EXISTS` is
+/// never NULL. The pool holds one row per DISTINCT trace, so the subquery
+/// probes a table the size of the issue list, not the event table — the same
+/// prefilter measured at 133x on a bench corpus.
+fn pooled_stack_contains(arr: serde_json::Value) -> Frag<error_events::table> {
+    Box::new(
+        sql::<Nullable<Bool>>(
+            "EXISTS (SELECT 1 FROM error_stack_blobs __esb \
+             WHERE __esb.sha256 = \"error_events\".\"stacktrace_sha256\" \
+               AND __esb.content @> ",
+        )
+        .bind::<diesel::sql_types::Jsonb, _>(arr)
+        .sql(")"),
+    )
+}
+
+/// `has:stack.*` against the pool — see [`pooled_stack_contains`].
+fn pooled_stack_haspath(jsonpath: String) -> Frag<error_events::table> {
+    Box::new(
+        sql::<Nullable<Bool>>(
+            "EXISTS (SELECT 1 FROM error_stack_blobs __esb \
+             WHERE __esb.sha256 = \"error_events\".\"stacktrace_sha256\" \
+               AND __esb.content @? ",
+        )
+        .bind::<Text, _>(jsonpath)
+        .sql("::jsonpath)"),
+    )
+}
+
+/// ILIKE against the pool — see [`pooled_stack_contains`].
+fn pooled_stack_ilike(pattern: String) -> Frag<error_events::table> {
+    Box::new(
+        sql::<Nullable<Bool>>(
+            "EXISTS (SELECT 1 FROM error_stack_blobs __esb \
+             WHERE __esb.sha256 = \"error_events\".\"stacktrace_sha256\" \
+               AND __esb.content::text ILIKE ",
+        )
+        .bind::<Text, _>(pattern)
+        .sql(")"),
+    )
+}
+
 fn stack_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<error_events::table>, PlanError> {
     let field = p.dim.name;
     // `stack`'s `Store::JsonRoot` prefix is always empty — the whole path
@@ -497,27 +548,37 @@ fn stack_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<error_events::
         MatchOp::Eq => {
             let v = as_str(&p.value, field)?.to_string();
             let arr = array_of(v);
+            // Inline OR pooled = the effective-value predicate; see the
+            // helpers above for why the pooled arm is an EXISTS.
+            let positive: Frag<error_events::table> = Box::new(
+                col.contains(arr.clone())
+                    .nullable()
+                    .or(pooled_stack_contains(arr)),
+            );
             if negate {
-                Ok(Box::new(
-                    diesel::dsl::not(col.contains(arr))
-                        .or(col.is_null())
-                        .nullable(),
-                ) as Frag<error_events::table>)
+                Ok(
+                    Box::new(diesel::dsl::not(positive).or(col.is_null()).nullable())
+                        as Frag<error_events::table>,
+                )
             } else {
-                Ok(Box::new(col.contains(arr).nullable()) as Frag<error_events::table>)
+                Ok(positive)
             }
         }
         MatchOp::Ne => {
             let v = as_str(&p.value, field)?.to_string();
             let arr = array_of(v);
+            let positive: Frag<error_events::table> = Box::new(
+                col.contains(arr.clone())
+                    .nullable()
+                    .or(pooled_stack_contains(arr)),
+            );
             if negate {
-                Ok(Box::new(col.contains(arr).nullable()) as Frag<error_events::table>)
+                Ok(positive)
             } else {
-                Ok(Box::new(
-                    diesel::dsl::not(col.contains(arr))
-                        .or(col.is_null())
-                        .nullable(),
-                ) as Frag<error_events::table>)
+                Ok(
+                    Box::new(diesel::dsl::not(positive).or(col.is_null()).nullable())
+                        as Frag<error_events::table>,
+                )
             }
         }
         MatchOp::In => {
@@ -526,10 +587,19 @@ fn stack_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<error_events::
             let first = vs.next().ok_or_else(|| PlanError::BadValue {
                 field: field.to_string(),
             })?;
-            let mut positive: Frag<error_events::table> =
-                Box::new(col.contains(array_of(first)).nullable());
+            let first = array_of(first);
+            let mut positive: Frag<error_events::table> = Box::new(
+                col.contains(first.clone())
+                    .nullable()
+                    .or(pooled_stack_contains(first)),
+            );
             for v in vs {
-                positive = Box::new(positive.or(col.contains(array_of(v)).nullable()));
+                let arr = array_of(v);
+                positive = Box::new(
+                    positive
+                        .or(col.contains(arr.clone()).nullable())
+                        .or(pooled_stack_contains(arr)),
+                );
             }
             if negate {
                 Ok(
@@ -548,8 +618,9 @@ fn stack_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<error_events::
             let jsonpath = format!("$[*].{}", segments.join("."));
             let positive: Frag<error_events::table> = Box::new(
                 sql::<Nullable<Bool>>(r#""error_events"."stacktrace" @? "#)
-                    .bind::<Text, _>(jsonpath)
-                    .sql("::jsonpath"),
+                    .bind::<Text, _>(jsonpath.clone())
+                    .sql("::jsonpath")
+                    .or(pooled_stack_haspath(jsonpath)),
             );
             if negate {
                 Ok(
@@ -571,14 +642,19 @@ fn stack_leaf(p: &ResolvedPredicate, negate: bool) -> Result<Frag<error_events::
             // prices as `Cost::Scan` either way.
             let pattern = as_pattern(&p.value, field)?.to_string();
             let as_text = sql::<Text>(r#""error_events"."stacktrace"::text"#);
+            let positive: Frag<error_events::table> = Box::new(
+                as_text
+                    .ilike(pattern.clone())
+                    .nullable()
+                    .or(pooled_stack_ilike(pattern)),
+            );
             if negate {
-                Ok(Box::new(
-                    diesel::dsl::not(as_text.ilike(pattern))
-                        .or(col.is_null())
-                        .nullable(),
-                ) as Frag<error_events::table>)
+                Ok(
+                    Box::new(diesel::dsl::not(positive).or(col.is_null()).nullable())
+                        as Frag<error_events::table>,
+                )
             } else {
-                Ok(Box::new(as_text.ilike(pattern).nullable()) as Frag<error_events::table>)
+                Ok(positive)
             }
         }
         MatchOp::Gt | MatchOp::Gte | MatchOp::Lt | MatchOp::Lte => {

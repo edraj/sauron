@@ -606,6 +606,7 @@ impl TestServer {
                     handled: Some(true),
                     title: None,
                     culprit: None,
+                    stacktrace_sha256: None,
                 },
             )
             .await
