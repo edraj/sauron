@@ -85,7 +85,7 @@
         },
         "stacktrace": [
           {
-            "function": null,
+            "function": "<fn>",
             "filename": "<file>",
             "lineno": 42,
             "colno": 13,
@@ -99,7 +99,14 @@
             "in_app": false
           },
           {
-            "function": null,
+            "function": "<fn>",
+            "filename": "<file>",
+            "lineno": 42,
+            "colno": 13,
+            "in_app": false
+          },
+          {
+            "function": "<fn>",
             "filename": "<file>",
             "lineno": 42,
             "colno": 13,
