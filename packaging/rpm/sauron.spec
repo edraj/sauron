@@ -8,7 +8,7 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.6.0
+Version:        1.7.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
@@ -364,6 +364,30 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Wed Aug 19 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.7.0-1
+- "Crash-free sessions" now means what it says: it counts only errors the SDK
+  reported as UNCAUGHT (`mechanism.handled = false`), instead of every row in
+  `error_events` at any level. Previously a single handled, caught,
+  warning-level exception marked a whole session "crashed" (migration 000069).
+- The rate is now omitted rather than guessed when it cannot be measured. An SDK
+  that never reports handledness produces zero crashes by construction, which is
+  indistinguishable from a healthy app; the Overview tile shows "no crash data"
+  instead of a confident 100%. Node, Python and C# ship uncaught-error capture
+  OFF by default (`autoCaptureUnhandled`), so this is the common case.
+- Overview cache key bumped v1 -> v2: cached payloads carry the previous
+  meaning, and would otherwise be served for up to 24 h after upgrade.
+- Environment-scoped members can reach the Monitor/Explore/Analyze pages again.
+  The page gate could not express an environment-level grant at all, so a member
+  scoped to one environment reached none of the 28 gated pages and saw an empty
+  sidebar, despite the API supporting exactly that read.
+- Source Maps is gated on the permission its list endpoint actually needs
+  (`issue:read`), so a member who may read the artifact list is no longer shown
+  a full-page denial; the upload and delete controls stay locked.
+- Navigation locks instead of hiding: unreachable pages render disabled with the
+  permission they require, rather than vanishing. Locked controls now stay
+  keyboard-reachable and announce their reason (`aria-disabled` plus a tooltip
+  on hover AND focus), where before they used a plain `disabled` that removed
+  them from the tab order entirely.
 * Sun Aug 16 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.6.0-1
 - Developer-supplied `tags` and `extra` on performance transactions: attach a
   request body, a response body, an order id or a retry count to a span, from

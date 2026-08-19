@@ -240,6 +240,7 @@ impl TestServer {
                 ip: Some("127.0.0.1".to_string()),
                 events_delta: 12,
                 errors_delta: 0,
+                unhandled_delta: 0,
             },
             SessionBump {
                 app_id: app.id,
@@ -254,6 +255,7 @@ impl TestServer {
                 ip: Some("127.0.0.2".to_string()),
                 events_delta: 3,
                 errors_delta: 2,
+                unhandled_delta: 2,
             },
             SessionBump {
                 app_id: app.id,
@@ -268,6 +270,7 @@ impl TestServer {
                 ip: Some("127.0.0.3".to_string()),
                 events_delta: 1,
                 errors_delta: 5,
+                unhandled_delta: 5,
             },
         ];
 

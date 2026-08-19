@@ -106,6 +106,7 @@ async fn bump_sessions_reports_inserts_only_once() {
         ip: None,
         events_delta: 1,
         errors_delta: 0,
+        unhandled_delta: 0,
     };
 
     let first = sauron_db::batch::bump_sessions(&mut conn, &[bump()])
@@ -426,6 +427,7 @@ async fn write_rows_credits_a_session_once_across_batches() {
         ip: None,
         events_delta: 1,
         errors_delta: 0,
+        unhandled_delta: 0,
     };
     let person = sauron_db::batch::PersonEnvBump {
         app_id: ids.app_id,

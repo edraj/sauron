@@ -10,6 +10,19 @@ export const monitor = {
   'overview.stat.newUsers': { en: 'New users', ar: 'مستخدمون جدد' },
   'overview.stat.sessions': { en: 'Sessions', ar: 'الجلسات' },
   'overview.stat.crashFree': { en: 'Crash-free sessions', ar: 'جلسات بلا أعطال' },
+  // Shown instead of a percentage when the app's SDK never reports
+  // `mechanism.handled`, so no crash rate can be computed.
+  // Shown instead of a percentage when the window holds no sessions at all —
+  // distinct from `noSignal`, which blames the SDK. Getting these two the wrong
+  // way round sends someone to debug an integration over a date filter.
+  'overview.stat.crashFree.noSessions': {
+    en: 'No sessions in this range',
+    ar: 'لا توجد جلسات في هذه الفترة',
+  },
+  'overview.stat.crashFree.noSignal': {
+    en: 'No crash data from this SDK',
+    ar: 'لا توجد بيانات أعطال من هذه الحزمة',
+  },
   'overview.card.activeUsers': { en: 'Active users', ar: 'المستخدمون النشطون' },
   'overview.card.errorsOverTime': { en: 'Errors over time', ar: 'الأخطاء عبر الزمن' },
   'overview.card.eventVolume': { en: 'Event volume', ar: 'حجم الأحداث' },

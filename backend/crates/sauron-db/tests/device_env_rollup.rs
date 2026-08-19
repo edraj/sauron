@@ -1538,6 +1538,7 @@ async fn sessions_count_counts_each_session_once_across_batches() {
         ip: None,
         events_delta: ev,
         errors_delta: 0,
+        unhandled_delta: 0,
     };
 
     for _ in 0..2 {
@@ -1618,6 +1619,7 @@ async fn write_rows_merges_an_event_and_a_new_session_for_one_device() {
         ip: None,
         events_delta: 1,
         errors_delta: 0,
+        unhandled_delta: 0,
     };
     let device_env = sauron_db::batch::DeviceEnvBump {
         app_id: ids.app_id,

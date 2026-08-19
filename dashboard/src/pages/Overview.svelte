@@ -315,6 +315,24 @@
     }
   }
 
+  // A null rate means "not measurable", so the subtitle must say why rather
+  // than print "0 crashed" — which reads as a real, perfect number and is the
+  // exact confident-lie this nullability exists to prevent.
+  //
+  // Null has TWO causes and they need different copy. Blaming the SDK for an
+  // empty range is its own small confident lie: verified in a live drive, an
+  // app with no sessions in the window read "No crash data from this SDK",
+  // which sends someone to check their SDK setup over a date filter.
+  const crashFreeSub = $derived.by(() => {
+    if (totals == null) return undefined;
+    if (totals.crash_free_sessions != null) {
+      return `${compactNumber(totals.totals.crashed_sessions)} crashed`;
+    }
+    return totals.totals.sessions === 0
+      ? t('overview.stat.crashFree.noSessions')
+      : t('overview.stat.crashFree.noSignal');
+  });
+
   // Tone helpers — severity-driven coloring for the KPI row.
   const crashFreeTone = $derived.by(() => {
     const v = totals?.crash_free_sessions;
@@ -406,7 +424,7 @@
         label={t('overview.stat.crashFree')}
         value={formatPercent(totals.crash_free_sessions)}
         tone={crashFreeTone}
-        sub={`${compactNumber(totals.totals.crashed_sessions)} crashed`}
+        sub={crashFreeSub}
       />
       <StatTile
         label={t('perf.stat.errorRate')}

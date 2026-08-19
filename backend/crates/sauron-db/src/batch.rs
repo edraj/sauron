@@ -237,6 +237,10 @@ pub struct SessionBump {
     pub ip: Option<String>,
     pub events_delta: i64,
     pub errors_delta: i64,
+    /// Errors the SDK reported as UNCAUGHT (`mechanism.handled = false`).
+    /// Separate from `errors_delta` because an error the application caught and
+    /// reported itself is still an error and is NOT a crash.
+    pub unhandled_delta: i64,
 }
 
 /// One row of [`bump_sessions`]' `RETURNING`.
@@ -283,19 +287,24 @@ pub async fn bump_sessions(
     diesel::sql_query(
         "INSERT INTO sessions \
            (app_id, session_id, distinct_id, device_key, started_at, last_event_at, \
-            events_count, errors_count, context, release, environment_id, ip_address) \
+            events_count, errors_count, unhandled_errors_count, context, release, \
+            environment_id, ip_address) \
          SELECT app_id, session_id, distinct_id, device_key, first_at, last_at, \
-                events_delta, errors_delta, context, release, environment_id, ip_address \
+                events_delta, errors_delta, unhandled_delta, context, release, \
+                environment_id, ip_address \
          FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::timestamptz[], \
                      $6::timestamptz[], $7::bigint[], $8::bigint[], $9::jsonb[], $10::text[], \
-                     $11::uuid[], $12::text[]) \
+                     $11::uuid[], $12::text[], $13::bigint[]) \
               AS t(app_id, session_id, distinct_id, device_key, first_at, last_at, \
-                   events_delta, errors_delta, context, release, environment_id, ip_address) \
+                   events_delta, errors_delta, context, release, environment_id, ip_address, \
+                   unhandled_delta) \
          ON CONFLICT (app_id, session_id) DO UPDATE SET \
             last_event_at = GREATEST(sessions.last_event_at, EXCLUDED.last_event_at), \
             started_at = LEAST(sessions.started_at, EXCLUDED.started_at), \
             events_count = sessions.events_count + EXCLUDED.events_count, \
             errors_count = sessions.errors_count + EXCLUDED.errors_count, \
+            unhandled_errors_count = sessions.unhandled_errors_count \
+                                   + EXCLUDED.unhandled_errors_count, \
             distinct_id = COALESCE(EXCLUDED.distinct_id, sessions.distinct_id), \
             device_key = COALESCE(EXCLUDED.device_key, sessions.device_key), \
             context = CASE WHEN EXCLUDED.context <> '{}'::jsonb THEN EXCLUDED.context ELSE sessions.context END, \
@@ -317,6 +326,7 @@ pub async fn bump_sessions(
     .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].release.clone()).collect::<Vec<_>>())
     .bind::<Array<Nullable<SqlUuid>>, _>(ix.iter().map(|&i| rows[i].environment_id).collect::<Vec<_>>())
     .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].ip.clone()).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].unhandled_delta).collect::<Vec<_>>())
     .get_results::<BumpedSession>(conn)
     .await
     .map(|rows| {

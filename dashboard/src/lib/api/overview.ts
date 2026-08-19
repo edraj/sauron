@@ -72,7 +72,15 @@ export interface OverviewEnvelope<T> {
 export interface OverviewTotalsSection {
   totals: Overview['totals'];
   error_rate: number;
-  crash_free_sessions: number;
+  /**
+   * `null` when the rate cannot be measured — NOT a fallback.
+   *
+   * Either the window holds no sessions, or it holds errors whose SDK never
+   * reported `mechanism.handled` (node, python and csharp default their
+   * uncaught-error capture OFF). Rendering 100% for those would state
+   * "crash-free" about an app that may be crashing constantly.
+   */
+  crash_free_sessions: number | null;
 }
 
 export interface OverviewSeriesSection {

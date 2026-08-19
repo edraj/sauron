@@ -1385,6 +1385,7 @@ impl TestDb {
             None,
             1,
             1,
+            1,
         )
         .await
         .expect("bump session (env_b, errors_delta=1)");
@@ -1446,6 +1447,7 @@ impl TestDb {
             Some(env_a),
             None,
             1,
+            0,
             0,
         )
         .await
@@ -1734,6 +1736,7 @@ async fn seed_session(
         None,
         1,
         0,
+        0,
     )
     .await
     .expect("bump session (start)");
@@ -1749,6 +1752,7 @@ async fn seed_session(
         env,
         None,
         0,
+        errors_delta,
         errors_delta,
     )
     .await

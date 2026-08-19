@@ -4326,6 +4326,7 @@ async fn the_device_detail_sessions_panel_stays_ordered_by_last_event_at() {
                     None,
                     0,
                     0,
+                    0,
                 )
                 .await
                 .expect("bump_session");

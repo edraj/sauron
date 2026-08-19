@@ -117,6 +117,7 @@ async fn seed_group_session(
         None,
         1,
         0,
+        0,
     )
     .await
     .expect("bump session");

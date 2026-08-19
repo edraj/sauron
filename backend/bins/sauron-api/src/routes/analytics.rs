@@ -649,12 +649,50 @@ pub async fn events_list(
 pub struct Overview {
     pub totals: repo::OverviewTotals,
     pub error_rate: f64,
-    pub crash_free_sessions: f64,
+    /// `None` when the rate cannot be measured, NOT a fallback number.
+    ///
+    /// Two ways it is unknowable: the window holds no sessions at all, or it
+    /// holds errors whose SDK never reported `mechanism.handled` (node, python
+    /// and csharp all default uncaught capture OFF). Serving 1.0 for either
+    /// would state "100% crash-free" about an app that may be crashing
+    /// constantly — a confident lie is worse than the over-count this replaced,
+    /// because nothing on screen betrays it.
+    pub crash_free_sessions: Option<f64>,
     pub events_series: Vec<SeriesPoint>,
     pub errors_series: Vec<SeriesPoint>,
     /// Empty — not absent — for a caller without `issue:read`; see `overview`.
     pub top_issues: Vec<Issue>,
     pub top_events: Vec<EventCount>,
+}
+
+/// The crash-free rate, or `None` when it genuinely cannot be measured.
+///
+/// Shared by the live handler and `overview_cache`'s precompute so a rate
+/// computed two ways cannot disagree — the same reason the cache's own comment
+/// gives for computing this server-side rather than on the client.
+///
+/// "Crashed" means a session carrying an error the SDK reported as UNCAUGHT
+/// (`mechanism.handled = false`), which every SDK sets on its own. It used to
+/// mean `errors_count > 0` — any error at any level, including one the
+/// application caught and reported deliberately.
+///
+/// Returns `None` rather than a number in two cases, and the second is the
+/// important one:
+///   * no sessions in the window — there is nothing to take a rate of;
+///   * errors exist but none carries a known `handled` value, i.e. this app's
+///     SDK never reports the mechanism. node, python and csharp default their
+///     uncaught capture OFF, so those apps would otherwise report a confident
+///     100% while crashing constantly.
+///
+/// An app with sessions and NO errors is a real 1.0, not unknown.
+pub(crate) fn crash_free_rate(totals: &sauron_db::repo::OverviewTotals) -> Option<f64> {
+    if totals.sessions == 0 {
+        return None;
+    }
+    if totals.errors > 0 && !totals.has_crash_signal {
+        return None;
+    }
+    Some(1.0 - (totals.crashed_sessions as f64 / totals.sessions as f64))
 }
 
 pub async fn overview(
@@ -708,11 +746,7 @@ pub async fn overview(
             0.0
         }
     };
-    let crash_free_sessions = if totals.sessions > 0 {
-        1.0 - (totals.crashed_sessions as f64 / totals.sessions as f64)
-    } else {
-        1.0
-    };
+    let crash_free_sessions = crash_free_rate(&totals);
 
     Ok(Json(Overview {
         totals,
@@ -761,7 +795,15 @@ pub async fn overview(
 pub struct OverviewTotalsSection {
     pub totals: repo::OverviewTotals,
     pub error_rate: f64,
-    pub crash_free_sessions: f64,
+    /// `None` when the rate cannot be measured, NOT a fallback number.
+    ///
+    /// Two ways it is unknowable: the window holds no sessions at all, or it
+    /// holds errors whose SDK never reported `mechanism.handled` (node, python
+    /// and csharp all default uncaught capture OFF). Serving 1.0 for either
+    /// would state "100% crash-free" about an app that may be crashing
+    /// constantly — a confident lie is worse than the over-count this replaced,
+    /// because nothing on screen betrays it.
+    pub crash_free_sessions: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -1443,5 +1485,70 @@ mod person_sort_tests {
                 "the persons list must refuse `{bad}`"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod crash_free_tests {
+    use super::crash_free_rate;
+    use sauron_db::repo::OverviewTotals;
+
+    /// `sessions`/`crashed_sessions`/`errors`/`has_crash_signal` are the only
+    /// four fields the rate reads; the rest are along for the ride.
+    fn totals(sessions: i64, crashed: i64, errors: i64, signal: bool) -> OverviewTotals {
+        OverviewTotals {
+            events: 0,
+            errors,
+            sessions,
+            users: 0,
+            new_users: 0,
+            crashed_sessions: crashed,
+            has_crash_signal: signal,
+        }
+    }
+
+    #[test]
+    fn rate_is_one_minus_the_crashed_share() {
+        assert_eq!(crash_free_rate(&totals(100, 1, 500, true)), Some(0.99));
+    }
+
+    /// The whole point of the change. Under the old definition
+    /// (`errors_count > 0`) these 500 handled warnings would each mark their
+    /// session crashed; now only genuinely uncaught errors do.
+    #[test]
+    fn handled_errors_do_not_lower_the_rate() {
+        // 500 errors, all handled, so nothing rolled up into crashed_sessions.
+        assert_eq!(crash_free_rate(&totals(100, 0, 500, true)), Some(1.0));
+    }
+
+    /// The confident lie this nullability exists to prevent: an SDK that never
+    /// reports `mechanism.handled` produces zero crashes by construction, which
+    /// is indistinguishable from a genuinely healthy app. node, python and
+    /// csharp all default their uncaught capture OFF, so this is the common
+    /// case rather than a corner one.
+    #[test]
+    fn errors_without_a_mechanism_signal_are_unmeasurable() {
+        assert_eq!(crash_free_rate(&totals(100, 0, 500, false)), None);
+    }
+
+    /// Distinct from the case above: no errors at all is a REAL 1.0, not
+    /// unknown. Returning None here would blank the tile for every healthy app,
+    /// since an app with no errors also has no rows carrying the signal.
+    #[test]
+    fn no_errors_at_all_is_a_real_hundred_percent() {
+        assert_eq!(crash_free_rate(&totals(100, 0, 0, false)), Some(1.0));
+    }
+
+    #[test]
+    fn no_sessions_has_no_rate_to_report() {
+        assert_eq!(crash_free_rate(&totals(0, 0, 0, true)), None);
+        // Even with the signal present — a rate over zero sessions is not 100%,
+        // it is undefined, and the old code returned 1.0 for it.
+        assert_eq!(crash_free_rate(&totals(0, 0, 10, true)), None);
+    }
+
+    #[test]
+    fn every_session_crashed_is_zero_not_none() {
+        assert_eq!(crash_free_rate(&totals(40, 40, 40, true)), Some(0.0));
     }
 }

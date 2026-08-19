@@ -42,6 +42,79 @@ Three requests per address per hour are allowed.
   operation, split by `op` (`navigation`, `http`, `resource`, `screen_load`,
   `custom`), with error rates.
 
+### What "crash-free sessions" means
+
+The Overview's **Crash-free sessions** tile is the share of sessions in the range
+that recorded **no uncaught exception**. It is worth being precise about, because
+"crash" is a word people reasonably read three different ways.
+
+**A crash is an error nothing in your code caught.** The distinction is not a
+label anyone applies by hand — it is decided by where the exception ended up:
+
+| your code | what the SDK records | counts as a crash? |
+|---|---|---|
+| `try { … } catch (e) { Sauron.captureException(e) }` | `mechanism.handled = true` | **No** — you caught it |
+| the exception escapes with no `catch` anywhere | `mechanism.handled = false` | **Yes** — nobody caught it |
+
+To call `captureException` you have to be holding the exception object, which
+means you caught it. An error only ever reaches the SDK's global hooks
+(`FlutterError.onError`, `window.onerror`, `sys.excepthook`, …) *because* no
+`catch` intercepted it first. So the signal is automatic and cannot be forgotten:
+you never tell Sauron that something crashed.
+
+**A handled error is still an error.** It appears in Exceptions, it counts toward
+the error rate, it can page you. It just does not lower crash-free — deliberately,
+because an exception you caught and reported is the system working, not the app
+breaking.
+
+#### What it does not cover
+
+Crash-free measures **uncaught exceptions**, which is narrower than "the app
+died":
+
+- **Native crashes** (SIGSEGV, ANR, an iOS watchdog kill) and **out-of-memory
+  kills** are *not* detected. The process is gone before any SDK code can run —
+  on iOS an OOM delivers no signal even to a native handler. These sessions count
+  as crash-free because nothing was ever reported.
+- **Memory leaks** are not an event at all; they only ever surface as an eventual
+  OOM, which is the case above.
+- Conversely, an uncaught exception that Flutter recovers from (a widget build
+  error behind a red screen) *does* count, even though the process survived.
+
+Read the number as "sessions with no uncaught exception", not "sessions where the
+app stayed alive".
+
+#### When the tile shows "—" instead of a percentage
+
+Crash-free counts only errors whose `handled` state is **known**. An SDK that
+never reports one produces zero crashes by construction, which is
+indistinguishable from a perfectly healthy app — so rather than print a confident
+`100%`, the tile shows `—` and *"No crash data from this SDK"*.
+
+That happens when:
+
+- the SDK does not capture uncaught errors. **[Node](Node-SDK.md)**,
+  **[Python](Python-SDK.md)** and **[C#](CSharp-SDK.md)** ship this **off by
+  default** — turn on `autoCaptureUnhandled` / `auto_capture_unhandled` /
+  `AutoCaptureUnhandled`. **[Flutter](Flutter-SDK.md)** and
+  **[Browser](Browser-SDK.md)** capture automatically with no configuration;
+- or every error in the range predates the release that began recording it.
+
+An app with sessions and no errors at all is a genuine `100%`, not `—`.
+
+#### How it is computed
+
+Each session carries `unhandled_errors_count`, incremented at ingest whenever an
+error arrives with `handled = false`. A session is "crashed" when that count is
+above zero. The **Sessions** list uses the same definition, so the two screens
+cannot disagree.
+
+The same distinction is searchable: `is:unhandled` selects errors nothing caught,
+`is:handled` those your code reported itself, and `has:handled` the rows where the
+state is known at all. Which lists accept each one is tabulated in
+**[Search & Filtering](Search.md)**, whose field tables are kept honest against the
+query catalog by a test.
+
 ## Tags, contexts & additional data
 
 Open an issue (**Exceptions → an issue**) and the detail view surfaces the

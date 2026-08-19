@@ -6189,17 +6189,21 @@ pub async fn bump_session(
     ip: Option<&str>,
     events_delta: i64,
     errors_delta: i64,
+    unhandled_delta: i64,
 ) -> QueryResult<bool> {
     diesel::sql_query(
         "INSERT INTO sessions \
            (app_id, session_id, distinct_id, device_key, started_at, last_event_at, \
-            events_count, errors_count, context, release, environment_id, ip_address) \
-         VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9, $10, $11) \
+            events_count, errors_count, unhandled_errors_count, context, release, \
+            environment_id, ip_address) \
+         VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $12, $8, $9, $10, $11) \
          ON CONFLICT (app_id, session_id) DO UPDATE SET \
             last_event_at = GREATEST(sessions.last_event_at, EXCLUDED.last_event_at), \
             started_at = LEAST(sessions.started_at, EXCLUDED.started_at), \
             events_count = sessions.events_count + EXCLUDED.events_count, \
             errors_count = sessions.errors_count + EXCLUDED.errors_count, \
+            unhandled_errors_count = sessions.unhandled_errors_count \
+                                   + EXCLUDED.unhandled_errors_count, \
             distinct_id = COALESCE(EXCLUDED.distinct_id, sessions.distinct_id), \
             device_key = COALESCE(EXCLUDED.device_key, sessions.device_key), \
             context = CASE WHEN EXCLUDED.context <> '{}'::jsonb THEN EXCLUDED.context ELSE sessions.context END, \
@@ -6220,6 +6224,7 @@ pub async fn bump_session(
     .bind::<Nullable<Text>, _>(release)
     .bind::<Nullable<SqlUuid>, _>(environment_id)
     .bind::<Nullable<Text>, _>(ip)
+    .bind::<BigInt, _>(unhandled_delta)
     .get_result::<InsertedFlag>(conn)
     .await
     .map(|r| r.inserted)
@@ -8986,6 +8991,16 @@ pub struct OverviewTotals {
     pub new_users: i64,
     #[diesel(sql_type = BigInt)]
     pub crashed_sessions: i64,
+    /// Whether ANY error in this window carried a known `handled` value.
+    ///
+    /// `crashed_sessions` counts only errors the SDK reported as UNCAUGHT, so
+    /// an SDK that sends no mechanism at all produces zero of them — which is
+    /// indistinguishable from a genuinely crash-free app unless this is checked.
+    /// node, python and csharp all default their uncaught-error capture OFF, so
+    /// this is the common case, not a corner one: without this flag those apps
+    /// would report a confident 100% crash-free while crashing constantly.
+    #[diesel(sql_type = Bool)]
+    pub has_crash_signal: bool,
 }
 
 /// `event_users` carries no `environment_id` column, so membership in a specific environment
@@ -9103,12 +9118,19 @@ pub async fn overview_totals(
     // adding a clone at the call site instead.
     let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
 
-    // `crashed_sessions` trusts `sessions.errors_count`/`environment_id` directly —
-    // known to be able to mislabel which environment a crash counts against (not
-    // just over/under by a fixed amount). See `bump_session`'s doc comment for the
-    // mechanism and `.superpowers/sdd/2026-07-29-environment-rbac-scope/
-    // task-10-report.md` for why the `EXISTS`-against-`error_events` fix was
-    // measured and declined rather than shipped.
+    // `crashed_sessions` counts `unhandled_errors_count`, NOT `errors_count`:
+    // `errors_count` counts every row in `error_events` at any level, so one
+    // handled warning used to mark a whole session "crashed". Migration 0069
+    // added the rollup column and `bump_session` maintains it from
+    // `mechanism.handled`, which every SDK sets automatically.
+    //
+    // It still trusts the session row's `environment_id` — known to be able to
+    // mislabel which environment a crash counts against (not just over/under by
+    // a fixed amount). See `bump_session`'s doc comment for the mechanism and
+    // `.superpowers/sdd/2026-07-29-environment-rbac-scope/task-10-report.md`
+    // for why the `EXISTS`-against-`error_events` fix was measured and declined.
+    // That is unchanged by this migration: the new counter rides the same row
+    // and therefore inherits the same labelling caveat.
     let q = format!(
         "SELECT \
            (SELECT count(*) FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2{env_sql_analytics})::bigint AS events, \
@@ -9116,7 +9138,8 @@ pub async fn overview_totals(
            (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql_sessions})::bigint AS sessions, \
            (SELECT count(*) FROM event_users WHERE app_id=$1 AND last_seen>=$2{membership_sql})::bigint AS users, \
            (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql})::bigint AS new_users, \
-           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2 AND errors_count>0{env_sql_sessions})::bigint AS crashed_sessions"
+           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2 AND unhandled_errors_count>0{env_sql_sessions})::bigint AS crashed_sessions, \
+           EXISTS(SELECT 1 FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND handled IS NOT NULL{env_sql_errors}) AS has_crash_signal"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -10091,14 +10114,17 @@ pub async fn session_stats(
     // $1 app_id, $2 since, reused across all four sub-selects, all against `sessions` — env
     // takes $3 when it needs a bind, reused the same way.
     //
-    // `crashed` has the same known mislabelling gap as `overview_totals`'
-    // `crashed_sessions` — see `bump_session`'s doc comment and
+    // `crashed` counts `unhandled_errors_count`, matching `overview_totals`'
+    // `crashed_sessions`. The two MUST agree: the same word appears on the
+    // Overview stat and on the Sessions page, and a user comparing them would
+    // read any difference as a bug in one of the two. It also inherits the same
+    // known environment-mislabelling gap — see `bump_session`'s doc comment and
     // `.superpowers/sdd/2026-07-29-environment-rbac-scope/task-10-report.md`.
     let env_sql = scope.env.sql_fragment(3);
     let q = format!(
         "SELECT \
            (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql})::bigint AS sessions, \
-           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2 AND errors_count>0{env_sql})::bigint AS crashed, \
+           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2 AND unhandled_errors_count>0{env_sql})::bigint AS crashed, \
            COALESCE((SELECT avg(EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \
                      FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}), 0)::double precision AS avg_session_ms, \
            COALESCE((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \

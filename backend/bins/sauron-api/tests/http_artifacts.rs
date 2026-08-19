@@ -1403,6 +1403,7 @@ async fn the_session_timeline_symbolicates_on_read() {
             None,
             0,
             1,
+            1,
         )
         .await
         .expect("bump session");

@@ -412,6 +412,11 @@ diesel::table! {
         last_event_at -> Timestamptz,
         events_count -> Int8,
         errors_count -> Int8,
+        /// Sessions carrying at least one error the SDK reported as UNCAUGHT
+        /// (`mechanism.handled = false`). Maintained on the same upsert arm as
+        /// `errors_count` so "crash-free" stays a plain column predicate — see
+        /// migration 0069 for why the read-time derivation was rejected.
+        unhandled_errors_count -> Int8,
         context -> Jsonb,
         release -> Nullable<Text>,
         environment_id -> Nullable<Uuid>,

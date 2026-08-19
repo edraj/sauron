@@ -234,6 +234,7 @@ impl Acc {
         at: DateTime<Utc>,
         events_delta: i64,
         errors_delta: i64,
+        unhandled_delta: i64,
     ) {
         let session_id = session_id.filter(|s| !s.is_empty());
         let distinct_id = distinct_id.filter(|s| !s.is_empty());
@@ -247,6 +248,7 @@ impl Acc {
                     b.last_at = b.last_at.max(at);
                     b.events_delta += events_delta;
                     b.errors_delta += errors_delta;
+                    b.unhandled_delta += unhandled_delta;
                     // `COALESCE(EXCLUDED.x, existing.x)` in the conflict arm
                     // means the last non-null of a sequence wins. Folding must
                     // reproduce that, so a later `None` never clears a value.
@@ -286,6 +288,7 @@ impl Acc {
                         ip: job.ip.clone(),
                         events_delta,
                         errors_delta,
+                        unhandled_delta,
                     });
                 }
             }
@@ -942,6 +945,10 @@ async fn prepare_error(
         now,
         0,
         1,
+        // Mirrors `process::error`'s call exactly — the two ingest paths must
+        // agree on what a counter means, which sauron-pipeline's equivalence
+        // test is there to hold them to.
+        i64::from(handled_of(exc) == Some(false)),
     );
 
     if let (Some(wf_id), Some(wf_name)) = (e.workflow_id.as_deref(), e.workflow_name.as_deref()) {
@@ -1019,6 +1026,7 @@ fn prepare_event(
         Some(distinct_id.as_str()),
         at,
         1,
+        0,
         0,
     );
 
@@ -1135,6 +1143,7 @@ fn prepare_transaction(
         session_id.as_deref(),
         distinct.as_deref(),
         at,
+        0,
         0,
         0,
     );

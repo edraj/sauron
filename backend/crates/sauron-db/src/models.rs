@@ -661,6 +661,10 @@ pub struct Session {
     pub last_event_at: DateTime<Utc>,
     pub events_count: i64,
     pub errors_count: i64,
+    /// Errors in this session the SDK reported as UNCAUGHT. `> 0` is what
+    /// "crashed" means; `errors_count > 0` is what it used to mean and counted
+    /// every handled warning too.
+    pub unhandled_errors_count: i64,
     pub context: Value,
     pub release: Option<String>,
     pub environment_id: Option<Uuid>,
