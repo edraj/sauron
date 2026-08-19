@@ -458,9 +458,13 @@ pub const CATALOG: &[Dimension] = &[
         store: Store::Column("device_key"),
         ops: OPS_EQ,
         // `Issues` lowers this to a correlated EXISTS into `error_events`,
-        // where `error_events_app_device_idx` (app_id, device_key) is
-        // reachable — the subquery already re-asserts `e.app_id =
-        // issues.app_id`, which is that index's leading column.
+        // where `error_events_app_device_env_idx`
+        // (app_id, device_key, environment_id, occurred_at) is reachable by
+        // prefix — the subquery already re-asserts `e.app_id = issues.app_id`,
+        // which is that index's leading column. It used to name the narrower
+        // `error_events_app_device_idx` (app_id, device_key); migration 0065
+        // dropped that one as a strict prefix of this one, which serves the
+        // same equality probe.
         resources: &[
             Resource::Occurrences,
             Resource::Devices,

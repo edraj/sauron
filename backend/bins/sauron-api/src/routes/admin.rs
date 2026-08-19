@@ -28,6 +28,8 @@ pub async fn storage(
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = crate::routes::db(&state).await?;
     let org_ids = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ORG_MANAGE).await?;
+    // Part of the cache key, NOT just a statistic — see below.
+    let deployment_orgs = repo::org_count(&mut conn).await?;
     drop(conn);
     if org_ids.is_empty() {
         return Err(ApiError::Auth(AuthError::Forbidden));
@@ -35,10 +37,21 @@ pub async fn storage(
 
     // Key the cache on the exact visible scope so two callers with different
     // org sets can never be served each other's report.
+    //
+    // `deployment_orgs` is in the key because the report's `full_scope` flag —
+    // and with it whether real `pg_database_size` bytes are disclosed — depends
+    // on the caller's org set covering *every* org. That comparison can flip
+    // without the caller's own grants changing at all: create a second org and
+    // a previously-full-scope caller becomes partial-scope, yet their org set
+    // (and so the rest of this key) is byte-identical. Measured before this was
+    // added: a full-scope report kept serving deployment-wide physical bytes for
+    // 35s after a second tenant appeared, i.e. the whole TTL is a disclosure
+    // window. Including the count invalidates on exactly that transition.
     let mut sorted = org_ids.clone();
     sorted.sort();
     let key = format!(
-        "sauron:storage:{}",
+        "sauron:storage:v2:{}:{}",
+        deployment_orgs,
         sauron_auth::hash_token(
             &sorted
                 .iter()

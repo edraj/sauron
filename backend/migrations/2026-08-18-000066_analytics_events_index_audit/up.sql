@@ -1,0 +1,212 @@
+-- 0066: the `analytics_events` half of the index audit migration 0065 started
+-- on `error_events`. Three of that table's fourteen indexes are duplicates of
+-- indexes it already carries, and they are dropped here.
+--
+-- SEMANTICALLY INERT, in the same sense migration 0065 used the phrase:
+-- dropping an index cannot change a result set. No query returns a different
+-- row, a different value, or a different count after this migration than
+-- before it. What changes is the number of B-tree inserts per persisted event
+-- and the bytes those trees occupy across every partition.
+--
+-- WHAT IT BUYS, measured rather than asserted. 200,000 rows inserted into
+-- `analytics_events` with all fourteen indexes present, then again with these
+-- three gone, same fixture, same server (PostgreSQL 16.11), repeated runs:
+--
+--   INSERT 200k rows      6,217 ms  ->  4,306 ms    -30.7% median, -22.3% min
+--   index bytes                                     -15.5%
+--   total table (heap+idx)                           -5.7%
+--
+-- Independently corroborated while writing this migration on a 400,000-row,
+-- 4,000-person, 9-partition replica: 321 MB of index across the partition tree
+-- before, 264 MB after (-17.8%).
+--
+-- WHY THE WRITE SIDE IS WHERE THIS PAYS. `analytics_events` takes an INSERT per
+-- accepted analytics event and nothing else; there is no UPDATE path on it in
+-- steady state. Every index on the table is therefore pure write cost paid on
+-- every single event, forever, and a duplicate index is that cost bought
+-- twice. The read side, by construction, cannot improve -- the best case for a
+-- drop is "no plan changed", and Part 2 below is the one place where that had
+-- to be established by experiment rather than by argument.
+--
+-- DROP INDEX ON A PARTITIONED PARENT CASCADES. `analytics_events` is a RANGE-
+-- partitioned parent (migration 0012). Naming the parent index here drops the
+-- matching index on every child partition, synchronously, inside this
+-- migration's single transaction -- the same mechanism migrations 0028, 0031,
+-- 0039, 0040, 0047, 0053 and 0055 each rely on to BUILD theirs, running in the
+-- other direction. Verified for this migration specifically, not assumed: on a
+-- parent with eight explicit range partitions plus the DEFAULT partition, all
+-- three statements below left zero orphaned child indexes behind
+-- (`pg_index` over `pg_partition_tree('analytics_events')` returns nothing
+-- matching their auto-generated child names afterwards). There is no
+-- per-partition loop to write.
+--
+-- CONCURRENTLY is unavailable: migrations run inside a transaction and these
+-- are partitioned parents. Each DROP takes ACCESS EXCLUSIVE on the parent and
+-- on every child, but only for a catalog update -- no scan, no rewrite -- so
+-- the locks are held for microseconds each rather than for the duration of a
+-- build. This is the cheap direction. It does NOT need the maintenance window
+-- migrations 0039/0053/0055 demanded, and in particular it does not need
+-- ingest stopped: the "blocked writers let the Redis stream trim away
+-- undelivered entries" hazard migration 0039 documents is a function of how
+-- long the lock is held, and here that is not a table-sized build.
+--
+-- A TEST GUARD MOVED WITH THIS MIGRATION. `crates/sauron-db/tests/keyset_plan.rs`
+-- asserted that the events keyset pager did NOT fall through to
+-- `analytics_project_idx`, resolving that name with `to_regclass`. Once this
+-- migration drops the index, `to_regclass` returns NULL, the scan counter reads
+-- 0 both sides of the measured query, and the assertion becomes `0 == 0` --
+-- passing vacuously, forever. It was rewritten in the same change as this
+-- migration to assert on the SURVIVOR instead (that the page plans as an index
+-- scan on `analytics_events_app_time_id_idx`, by name, out of the real query's
+-- own EXPLAIN). Anyone reverting this migration should read that test's header
+-- before assuming the old assertion can simply come back.
+
+-- ===========================================================================
+-- PART 1 -- two indexes that are strict prefixes of wider ones
+-- ===========================================================================
+--
+-- Established by catalogue query, not by eye. Every migration's CREATE/DROP
+-- INDEX was replayed in order into a clean PostgreSQL 16 (all 65 migrations),
+-- and `pg_index` was asked for pairs where index A's key columns are a strict
+-- prefix of index B's -- same column order, same DESC/NULLS `indoption` flags
+-- on every shared column, neither index partial, both btree. Across all
+-- fourteen indexes on `analytics_events` that query returns EXACTLY TWO pairs,
+-- and they are the two dropped here. (The same query is what found migration
+-- 0065's single pair on `error_events`; run it again after any future index
+-- migration rather than re-deriving this by hand.)
+--
+-- The `indoption` equality in that test is not decoration. Two indexes with
+-- the same column list but different sort directions are NOT a prefix pair --
+-- they are Part 2's case, which needs a different argument entirely.
+
+-- `analytics_events_app_device_idx (app_id, device_key)` -- migration 0004,
+-- recreated verbatim by the partitioning rebuild in 0012 -- is a strict prefix
+-- of `analytics_events_app_device_env_idx (app_id, device_key,
+-- environment_id, occurred_at)` from migration 0053. This is the exact twin of
+-- the drop migration 0065 made on `error_events`, on the same two column
+-- shapes, for the same reason.
+--
+-- The call sites that filter `analytics_events` on `device_key` all lead with
+-- `(app_id, device_key)` equality: the membership `EXISTS` inside
+-- `repo::list_devices` / `repo::list_device_groups`, the count LATERALs beside
+-- it, `repo::events_for_device`, and the `deviceKey` dimension in
+-- `sauron-query`'s catalog (which lowers to that same correlated EXISTS).
+-- The wider index serves every one of them by prefix, and serves the
+-- environment-scoped and time-ordered variants STRICTLY BETTER -- carrying
+-- `environment_id` and `occurred_at` in the key is what lets them stay
+-- index-only instead of heap-fetching per device, which is the entire point
+-- migration 0053 existed for.
+--
+-- Verified on the 400k-row replica: the membership probe
+-- (`app_id = _ AND device_key = _ LIMIT 1`) plans as an Index Only Scan on
+-- every partition both before and after this drop, substituting the wider
+-- index. No sequential scan appeared.
+--
+-- NOTE for whoever greps next: `crates/sauron-db/src/repo.rs`'s doc comment on
+-- `list_device_groups` names `analytics_events_app_device_idx` when it
+-- enumerates which index each membership probe uses. That comment describes a
+-- cost, not a contract, and it goes stale here -- the probe it names now runs
+-- on `analytics_events_app_device_env_idx`. No test asserts on either name.
+DROP INDEX IF EXISTS analytics_events_app_device_idx;
+
+-- `analytics_project_idx (app_id, occurred_at DESC)` -- migration 0001, renamed
+-- onto `app_id` by the 0012 rebuild -- is a strict prefix of
+-- `analytics_events_app_time_id_idx (app_id, occurred_at DESC, id DESC)` from
+-- migration 0047. Migration 0047's own header already said so ("analytics_
+-- project_idx (app_id, occurred_at DESC) -- no id column"); it added the wider
+-- index for the keyset pager's tiebreaker and left the narrower one in place.
+--
+-- Both serve `WHERE app_id = _ [AND occurred_at >= _] ORDER BY occurred_at DESC`
+-- identically. The wider one additionally serves the `(occurred_at, id)` row
+-- comparison the keyset cursor emits, which is why 0047 built it. There is no
+-- query shape the narrow index answers and the wide one does not.
+--
+-- Observed with both present on the 400k-row replica: the app-wide newest-first
+-- read (`ORDER BY occurred_at DESC LIMIT 50`, no cursor) picked
+-- `analytics_project_idx` on five of nine partitions and
+-- `analytics_events_app_time_id_idx` on the other four -- the planner splitting
+-- a tie arbitrarily, per-partition, which is precisely the signature of a
+-- duplicate. After the drop it uses the survivor on all nine, same plan shape,
+-- same Merge Append, no Sort node introduced.
+--
+-- This is the index the keyset plan guard was written to exclude; see the note
+-- in this file's header about what happened to that assertion.
+DROP INDEX IF EXISTS analytics_project_idx;
+
+-- ===========================================================================
+-- PART 2 -- one index that is the same index backwards
+-- ===========================================================================
+--
+-- `analytics_distinct_idx (app_id, distinct_id, occurred_at DESC)` (0001/0012)
+-- and `analytics_events_app_distinct_time_idx (app_id, distinct_id,
+-- occurred_at)` (0020) have the SAME key columns in the SAME order and differ
+-- only in the direction of the third. The catalogue query in Part 1 does not
+-- return them, and should not: they are not a prefix pair. They are a
+-- direction pair, and the argument for dropping one of them is different in
+-- kind.
+--
+-- WHY IT IS SAFE AT ALL. A btree is a doubly-linked structure; PostgreSQL can
+-- walk it in either direction and says so in the plan as `Index Scan
+-- Backward`. So for any query whose ordering demand is satisfiable by one of
+-- these, it is satisfiable by the other, at the same cost -- PROVIDED the
+-- NULLS placement also lines up. It does, trivially: `occurred_at` and
+-- `distinct_id` are both NOT NULL on this table (verified in `pg_attribute`,
+-- not inferred from the DDL), so "DESC NULLS FIRST" versus "ASC NULLS LAST"
+-- describes a distinction with no rows in it. **If a future migration ever
+-- makes `occurred_at` nullable, this paragraph stops being true and the
+-- surviving index stops being a drop-in for the dropped one.**
+--
+-- WHICH ONE SURVIVES -- AND WHY IT IS THE ASCENDING ONE, WHICH IS THE OPPOSITE
+-- OF WHAT "newest-first dominates the call sites" SUGGESTS.
+--
+-- The intuition that the DESC index should survive comes from the read
+-- patterns: person timelines, per-person event lists, everything user-facing
+-- is newest-first. That intuition is measurably a NON-REASON, because those
+-- shapes all pin `distinct_id` with an equality. Once `distinct_id` is a
+-- constant, the only remaining sort key is `occurred_at`, and a backward walk
+-- of the ASC index produces it with no Sort node at all. Measured on the 400k-
+-- row replica, with each index isolated in turn:
+--
+--   query                                  ASC index only        DESC index only
+--   -------------------------------------  --------------------  --------------------
+--   person timeline, ORDER BY ts DESC      Index Scan Backward   Index Scan
+--   person timeline, ORDER BY ts ASC       Index Scan            Index Scan Backward
+--   per-person count/min/max (no order)    Index Only Scan       Index Only Scan
+--
+-- Perfectly symmetric. Direction genuinely is free -- for every shape that
+-- pins `distinct_id`.
+--
+-- Exactly one shape in the codebase does NOT pin it, and it is the one that
+-- decides this: `repo::journey_graph`'s window,
+-- `row_number() OVER (PARTITION BY distinct_id ORDER BY occurred_at)`
+-- (repo.rs, the Sankey CTE; grep confirms it is the only `PARTITION BY
+-- distinct_id` in the repository). With `app_id` pinned and `distinct_id`
+-- free, the window wants rows in `(distinct_id, occurred_at ASC)` order. A
+-- forward walk of the ASC index is exactly that. Neither walk of the DESC
+-- index is: forward gives `(distinct_id ASC, occurred_at DESC)`, backward
+-- gives `(distinct_id DESC, occurred_at ASC)`, and the planner recovers from
+-- the first with an Incremental Sort inside each person's group.
+--
+--   journey_graph, 400k rows / 4,000 people / 9 partitions, 3 runs each way:
+--
+--     ASC index survives    Merge Append -> WindowAgg            211-216 ms
+--     DESC index survives   Merge Append -> Incremental Sort     270-275 ms
+--                           -> WindowAgg
+--
+--   +27% and an extra plan node, repeatable, and it is a REGRESSION against
+--   today's behaviour: with both indexes present the planner already chooses
+--   the ASC one for this query.
+--
+-- So the ASC index is kept. It is a strict superset of the DESC index's
+-- usefulness on this table: equal on every `distinct_id`-pinned shape, and the
+-- only one of the two that serves the journey window without sorting.
+--
+-- ONE THING TO KNOW BEFORE TRUSTING A SCAN COUNTER HERE. With both indexes
+-- present, `pg_stat_all_indexes.idx_scan` does not identify the redundant one:
+-- driving a mixed `distinct_id` workload 5x, the counters came out 115 on the
+-- DESC index and 45 on the ASC one, while an earlier pass over the same shapes
+-- had the split the other way. That is the planner splitting a genuine tie,
+-- re-decided per partition and per ANALYZE, not evidence about which index
+-- earns its place. The plan-shape A/B above is what settles it; a zero-scan
+-- reading on either member of a tied pair would have been an artifact.
+DROP INDEX IF EXISTS analytics_distinct_idx;

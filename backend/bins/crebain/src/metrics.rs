@@ -22,6 +22,14 @@ pub struct Sample {
     /// omission corrected), supplied by the engine. This is the metric of
     /// record for the latency reservoir.
     pub latency: Duration,
+    /// Error occurrences in this request that the generator emitted as REPEATS
+    /// (see `generator::repeat_count`).
+    ///
+    /// Not folded into [`ItemCounts`] because it is not a property of the
+    /// envelope: a genuine duplicate looks exactly like a first sighting on the
+    /// wire, so `ItemCounts::of` could only ever return 0 here and would be a
+    /// silent-zero trap. The engine supplies it from the generator instead.
+    pub repeats: u64,
 }
 
 /// A point-in-time view for the live progress line.
@@ -82,6 +90,11 @@ pub struct Summary {
     /// run — a proxy for the most concurrent sockets it actually held. `0` when
     /// no target PID was sampled.
     pub peak_connections: usize,
+    /// Error occurrences emitted as repeats, over all requests / over accepted
+    /// requests. Reported against `attempted.errors` / `accepted_items.errors`
+    /// to give the achieved duplicate ratio.
+    pub attempted_repeats: u64,
+    pub accepted_repeats: u64,
 }
 
 struct Metrics {
@@ -104,6 +117,8 @@ struct Metrics {
     behind: u64,
     peak_inflight: usize,
     peak_connections: usize,
+    attempted_repeats: u64,
+    accepted_repeats: u64,
 }
 
 /// Mutable running sums of per-type item counts.
@@ -155,6 +170,8 @@ impl Metrics {
             behind: 0,
             peak_inflight: 0,
             peak_connections: 0,
+            attempted_repeats: 0,
+            accepted_repeats: 0,
         }
     }
 
@@ -177,10 +194,12 @@ impl Metrics {
     fn record(&mut self, s: Sample) {
         self.requests += 1;
         self.attempted.add(&s.counts);
+        self.attempted_repeats += s.repeats;
         match s.outcome.kind {
             OutcomeKind::Accepted => {
                 self.accepted += 1;
                 self.accepted_items.add(&s.counts);
+                self.accepted_repeats += s.repeats;
             }
             OutcomeKind::RateLimited => self.rate_limited += 1,
             OutcomeKind::HttpError => self.http_errors += 1,
@@ -244,6 +263,8 @@ impl Metrics {
             peak_inflight: self.peak_inflight,
             offered: self.requests + self.behind,
             peak_connections: self.peak_connections,
+            attempted_repeats: self.attempted_repeats,
+            accepted_repeats: self.accepted_repeats,
             // The engine overwrites these after aggregate returns.
             effective_concurrency: 0,
             source_ips: 0,
@@ -419,14 +440,21 @@ mod tests {
             counts: ItemCounts {
                 events: 1,
                 transactions: 1,
+                errors: 2,
                 ..Default::default()
             },
             latency: Duration::from_millis(5),
+            repeats: 2,
         };
         m.record(sample(OutcomeKind::Accepted, Some(202)));
         m.record(sample(OutcomeKind::RateLimited, Some(429)));
         m.record(sample(OutcomeKind::Transport, None));
         let s = m.finalize(vec![]);
+        // Repeats follow the same accepted/attempted split every other item
+        // count does — a rejected request's duplicates never reached the DB, so
+        // folding them into one number would overstate the achieved ratio.
+        assert_eq!(s.attempted_repeats, 6);
+        assert_eq!(s.accepted_repeats, 2);
         assert_eq!(s.requests, 3);
         assert_eq!(s.accepted, 1);
         assert_eq!(s.rate_limited, 1);
@@ -544,6 +572,7 @@ mod tests {
                 ..Default::default()
             },
             latency: Duration::from_millis(2),
+            repeats: 0,
         };
         for _ in 0..3 {
             tx.send(mk()).unwrap();

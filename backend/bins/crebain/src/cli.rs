@@ -48,6 +48,25 @@ pub struct Args {
     #[arg(long = "workflow-ratio", default_value_t = 0.0)]
     pub workflow_ratio: f64,
 
+    /// Number of DISTINCT issues (backend fingerprints, hence `issues` rows) the
+    /// run can reach across the whole app. The default is the five the generator
+    /// has always produced.
+    #[arg(long = "distinct-issues", default_value_t = generator::DEFAULT_DISTINCT_ISSUES)]
+    pub distinct_issues: usize,
+
+    /// Fraction (0.0..=1.0) of error occurrences emitted as a REPEAT: the same
+    /// exception, value and stacktrace frames, for the same user + device +
+    /// session — i.e. a genuine duplicate of an existing `error_events` row.
+    /// At the default 0.0 the error stream is exactly what it always was.
+    #[arg(long = "repeat-ratio", default_value_t = 0.0)]
+    pub repeat_ratio: f64,
+
+    /// Frames per generated stacktrace, including the 2 in-app identity
+    /// frames. The padding frames are `in_app: false`, so the fingerprint is
+    /// unchanged at any depth — see `generator::Shape::stack_depth`.
+    #[arg(long = "stack-depth", default_value_t = generator::DEFAULT_STACK_DEPTH)]
+    pub stack_depth: usize,
+
     /// Ticks coalesced into ONE envelope (each tick contributes 2 items).
     /// This multiplies items per REQUEST, not the request rate:
     /// --events-per-min/--issues-per-min/--rps keep counting requests.
@@ -241,6 +260,36 @@ impl Args {
                 self.workflow_ratio
             );
         }
+        // Same `contains` trick as above, so `--repeat-ratio nan` is rejected
+        // here rather than quietly repeating nothing.
+        if !(0.0..=1.0).contains(&self.repeat_ratio) {
+            anyhow::bail!(
+                "--repeat-ratio must be between 0.0 and 1.0 (got {})",
+                self.repeat_ratio
+            );
+        }
+        if self.stack_depth < 2 {
+            anyhow::bail!(
+                "--stack-depth must be at least 2 (the two in-app identity frames are mandatory)"
+            );
+        }
+        if self.stack_depth > generator::MAX_STACK_DEPTH {
+            anyhow::bail!(
+                "--stack-depth must be at most {} — that is the largest cap any shipped SDK \
+                 applies, so a deeper trace measures a payload no client can send",
+                generator::MAX_STACK_DEPTH
+            );
+        }
+        if self.distinct_issues == 0 {
+            anyhow::bail!("--distinct-issues must be at least 1");
+        }
+        if self.distinct_issues > generator::MAX_DISTINCT_ISSUES {
+            anyhow::bail!(
+                "--distinct-issues must be at most {} — past that a run measures \
+                 issue-table insert cost rather than duplicate storage",
+                generator::MAX_DISTINCT_ISSUES
+            );
+        }
         if self.batch_items == 0 {
             anyhow::bail!("--batch-items must be at least 1");
         }
@@ -318,6 +367,9 @@ impl Args {
             shape: generator::Shape {
                 workflow_ratio: self.workflow_ratio,
                 batch_items: self.batch_items,
+                distinct_issues: self.distinct_issues,
+                repeat_ratio: self.repeat_ratio,
+                stack_depth: self.stack_depth,
             },
             report_path: self.report,
             max_inflight: self.max_inflight,
@@ -472,6 +524,72 @@ mod tests {
         assert_eq!(cfg.shape, generator::Shape::default());
         assert_eq!(cfg.shape.workflow_ratio, 0.0);
         assert_eq!(cfg.shape.batch_items, 1);
+        // The error stream defaults to the five fingerprints crebain always
+        // produced, with no forced duplicates — so a command captured before
+        // these flags existed still measures the same workload.
+        assert_eq!(
+            cfg.shape.distinct_issues,
+            generator::DEFAULT_DISTINCT_ISSUES
+        );
+        assert_eq!(cfg.shape.distinct_issues, 5);
+        assert_eq!(cfg.shape.repeat_ratio, 0.0);
+    }
+
+    #[test]
+    fn duplicate_knobs_flow_into_runconfig() {
+        let args = Args::try_parse_from([
+            "crebain",
+            "--isolated",
+            "--database-url",
+            "postgres://x/y",
+            "--distinct-issues",
+            "3",
+            "--repeat-ratio",
+            "0.95",
+        ])
+        .unwrap();
+        let (cfg, _m) = args.resolve().unwrap();
+        assert_eq!(cfg.shape.distinct_issues, 3);
+        assert_eq!(cfg.shape.repeat_ratio, 0.95);
+        // A duplicate-heavy run must not change how many REQUESTS are offered:
+        // it changes what those requests carry, so before/after runs stay
+        // comparable on throughput.
+        assert_eq!(cfg.expected().requests.round() as u64, 21_000);
+    }
+
+    #[test]
+    fn rejects_out_of_range_duplicate_knobs() {
+        // `=` form for the negative case: bare `-0.1` looks like a flag to clap.
+        for bad in [
+            "--repeat-ratio=1.5",
+            "--repeat-ratio=-0.1",
+            "--repeat-ratio=nan",
+            "--distinct-issues=0",
+            "--distinct-issues=100001",
+        ] {
+            let args = Args::try_parse_from([
+                "crebain",
+                "--isolated",
+                "--database-url",
+                "postgres://x/y",
+                bad,
+            ])
+            .unwrap();
+            assert!(args.resolve().is_err(), "{bad} was accepted");
+        }
+        // ...and the largest issue pool the guard rail allows is fine.
+        let args = Args::try_parse_from([
+            "crebain",
+            "--isolated",
+            "--database-url",
+            "postgres://x/y",
+            "--distinct-issues",
+            "100000",
+            "--repeat-ratio",
+            "1.0",
+        ])
+        .unwrap();
+        assert!(args.resolve().is_ok());
     }
 
     #[test]

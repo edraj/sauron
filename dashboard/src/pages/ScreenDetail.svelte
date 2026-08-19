@@ -1,7 +1,6 @@
 <script lang="ts">
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
-  import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -13,6 +12,15 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { getScreenDetail } from '../lib/api/screens';
+  import {
+    listScreenDevices,
+    listScreenEvents,
+    listScreenExceptions,
+    listScreenUsers,
+  } from '../lib/api/screen-sections';
+  import CollapsibleFetchCard from '../lib/components/CollapsibleFetchCard.svelte';
+  import SectionRow from '../lib/components/SectionRow.svelte';
+  import KeyValueList from '../lib/components/KeyValueList.svelte';
   import { compactNumber, formatDuration } from '../lib/utils/format';
   import type { ScreenDetail } from '../lib/models';
 
@@ -58,6 +66,60 @@
     const name = screenName;
     if (aid && name) void load(aid, name);
   });
+
+  // -------------------------------------------------------------------------
+  // The four fetch-on-demand sections.
+  //
+  // Each `fetcher` closes over `screenName` and `sessionStore.currentAppId`
+  // rather than receiving them as props, so a card that somehow outlived a
+  // screen change would request the NEW screen rather than silently re-serving
+  // the old one. That is a second line of defence: the `{#key}` block in the
+  // markup already destroys and rebuilds all four whenever the screen or the
+  // environment changes.
+  //
+  // The `{#key}` is load-bearing, not decorative. `svelte-spa-router` REUSES
+  // this component instance across `#/screens/A` -> `#/screens/B`, so every
+  // piece of card state — rows, offset, expanded row, the collapsed flag —
+  // would otherwise survive the navigation and render screen A's rows beneath
+  // screen B's title and stat tiles. A test harness that mounts the page fresh
+  // per case cannot observe this; only an in-place navigation can.
+  const appId = $derived(sessionStore.currentAppId ?? '');
+
+  // `scopeKey` participates for the same reason it does in `load()`: the
+  // environment reaches the wire through the axios interceptor, so nothing in
+  // these arguments changes when it does, and already-fetched cards would keep
+  // showing another environment's rows.
+  const sectionKey = $derived(`${appId}:${sessionStore.scopeKey}:${screenName}`);
+
+  const fetchEvents = (offset: number, limit: number) =>
+    listScreenEvents(appId, { name: screenName, limit, offset });
+  const fetchExceptions = (offset: number, limit: number) =>
+    listScreenExceptions(appId, { name: screenName, limit, offset });
+  const fetchDevices = (offset: number, limit: number) =>
+    listScreenDevices(appId, { name: screenName, limit, offset });
+  const fetchUsers = (offset: number, limit: number) =>
+    listScreenUsers(appId, { name: screenName, limit, offset });
+
+  // The Exceptions card is hidden, not disabled, without `issue:read`: the
+  // endpoint answers 200 with the bodies redacted for such a caller, so a
+  // rendered card would show a list of blanks that reads as "no exceptions".
+  const mayReadIssues = $derived(sessionStore.can('issue:read', { level: 'app' }));
+
+  /**
+   * A never-blank label for an exception row.
+   *
+   * `exception_type` and `message` are BOTH nullable, and a row where both are
+   * null rendered as empty space that was still clickable — an invisible
+   * control that navigates. Inherited verbatim from the static card this
+   * replaced. Falls back to the issue id, which always exists.
+   */
+  function exceptionLabel(x: { exception_type: string | null; message: string | null; issue_id: string }) {
+    return x.exception_type ?? x.message ?? `Issue ${x.issue_id.slice(0, 8)}`;
+  }
+
+  function deviceLabel(d: { family: string | null; model: string | null; device_key: string }) {
+    return [d.family, d.model].filter(Boolean).join(' ') || d.device_key;
+  }
 </script>
 
 <AppShell requireApp>
@@ -90,38 +152,164 @@
       <StatTile label="Total dwell" value={formatDuration(detail.stats.total_dwell_ms)} />
     </StatTiles>
 
-    <div class="lists">
-      <Card title="Recent events">
-        {#if detail.recent_events.length === 0}
-          <p class="muted empty-note">No events on this screen.</p>
-        {:else}
-          <ul class="rows">
-            {#each detail.recent_events as e (e.id)}
-              <li>
+    {#key sectionKey}
+      <div class="lists">
+        <CollapsibleFetchCard
+          title="Events"
+          icon="zap"
+          emptyNote="No events on this screen."
+          fetcher={fetchEvents}
+          rowKey={(e) => e.id}
+        >
+          {#snippet row(e)}
+            <SectionRow>
+              {#snippet children()}
                 <span class="mono truncate">{e.name}</span>
-                <span class="faint"><TimeValue value={e.occurred_at} /></span>
-              </li>
-            {/each}
-          </ul>
+                <span class="faint push"><TimeValue value={e.occurred_at} asText /></span>
+              {/snippet}
+              {#snippet expanded()}
+                <dl class="facts">
+                  <div><dt>Distinct id</dt><dd class="mono">{e.distinct_id}</dd></div>
+                  {#if e.session_id}
+                    <div><dt>Session</dt><dd class="mono">{e.session_id}</dd></div>
+                  {/if}
+                  {#if e.release}
+                    <div><dt>Release</dt><dd class="mono">{e.release}</dd></div>
+                  {/if}
+                </dl>
+                <p class="sub">Properties</p>
+                <KeyValueList data={e.properties} emptyLabel="No properties" />
+                {#if e.tags && Object.keys(e.tags).length > 0}
+                  <p class="sub">Tags</p>
+                  <KeyValueList data={e.tags} />
+                {/if}
+              {/snippet}
+            </SectionRow>
+          {/snippet}
+        </CollapsibleFetchCard>
+
+        {#if mayReadIssues}
+          <CollapsibleFetchCard
+            title="Exceptions"
+            icon="triangle-alert"
+            emptyNote="No exceptions on this screen."
+            fetcher={fetchExceptions}
+            rowKey={(x) => x.id}
+          >
+            {#snippet row(x)}
+              <SectionRow
+                onopen={() => push('/issues/' + x.issue_id)}
+                openLabel="Open issue"
+              >
+                {#snippet children()}
+                  <span class="mono truncate">{exceptionLabel(x)}</span>
+                  <span class="faint push"><TimeValue value={x.occurred_at} asText /></span>
+                {/snippet}
+                {#snippet expanded()}
+                  <dl class="facts">
+                    {#if x.exception_type}
+                      <div><dt>Type</dt><dd class="mono">{x.exception_type}</dd></div>
+                    {/if}
+                    {#if x.message}
+                      <div><dt>Message</dt><dd>{x.message}</dd></div>
+                    {/if}
+                    {#if x.culprit}
+                      <div><dt>Culprit</dt><dd class="mono">{x.culprit}</dd></div>
+                    {/if}
+                    {#if x.distinct_id}
+                      <div><dt>Distinct id</dt><dd class="mono">{x.distinct_id}</dd></div>
+                    {/if}
+                  </dl>
+                {/snippet}
+              </SectionRow>
+            {/snippet}
+          </CollapsibleFetchCard>
         {/if}
-      </Card>
-      <Card title="Recent exceptions">
-        {#if detail.recent_exceptions.length === 0}
-          <p class="muted empty-note">No exceptions on this screen.</p>
-        {:else}
-          <ul class="rows">
-            {#each detail.recent_exceptions as x (x.id)}
-              <li>
-                <button class="link mono truncate" onclick={() => push('/issues/' + x.issue_id)}>
-                  {x.exception_type ?? x.message}
-                </button>
-                <span class="faint"><TimeValue value={x.occurred_at} /></span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      </Card>
-    </div>
+
+        <CollapsibleFetchCard
+          title="Devices"
+          icon="smartphone"
+          emptyNote="No devices seen on this screen."
+          fetcher={fetchDevices}
+          rowKey={(d) => d.device_key}
+        >
+          {#snippet row(d)}
+            <SectionRow
+              onopen={() => push('/devices/' + encodeURIComponent(d.device_key))}
+              openLabel="Open device"
+            >
+              {#snippet children()}
+                <span class="truncate">{deviceLabel(d)}</span>
+                <span class="faint push">
+                  <TimeValue value={d.last_seen_on_screen} asText />
+                </span>
+              {/snippet}
+              {#snippet expanded()}
+                <dl class="facts">
+                  <div><dt>Device key</dt><dd class="mono">{d.device_key}</dd></div>
+                  {#if d.os_name}
+                    <div>
+                      <dt>OS</dt>
+                      <dd>{d.os_name}{d.os_version ? ' ' + d.os_version : ''}</dd>
+                    </div>
+                  {/if}
+                  {#if d.arch}<div><dt>Arch</dt><dd>{d.arch}</dd></div>{/if}
+                  {#if d.browser}<div><dt>Browser</dt><dd>{d.browser}</dd></div>{/if}
+                  <div><dt>Views here</dt><dd>{compactNumber(d.views_on_screen)}</dd></div>
+                  <div><dt>Events here</dt><dd>{compactNumber(d.events_on_screen)}</dd></div>
+                  <div>
+                    <dt>Exceptions here</dt>
+                    <dd>{compactNumber(d.exceptions_on_screen)}</dd>
+                  </div>
+                  <div>
+                    <dt>First seen here</dt>
+                    <dd><TimeValue value={d.first_seen_on_screen} /></dd>
+                  </div>
+                </dl>
+              {/snippet}
+            </SectionRow>
+          {/snippet}
+        </CollapsibleFetchCard>
+
+        <CollapsibleFetchCard
+          title="Users"
+          icon="users"
+          emptyNote="No users seen on this screen."
+          fetcher={fetchUsers}
+          rowKey={(u) => u.distinct_id}
+        >
+          {#snippet row(u)}
+            <SectionRow
+              onopen={() => push('/persons/' + encodeURIComponent(u.distinct_id))}
+              openLabel="Open user"
+            >
+              {#snippet children()}
+                <span class="mono truncate">{u.distinct_id}</span>
+                <span class="faint push">
+                  <TimeValue value={u.last_seen_on_screen} asText />
+                </span>
+              {/snippet}
+              {#snippet expanded()}
+                <dl class="facts">
+                  <div><dt>Views here</dt><dd>{compactNumber(u.views_on_screen)}</dd></div>
+                  <div><dt>Events here</dt><dd>{compactNumber(u.events_on_screen)}</dd></div>
+                  <div>
+                    <dt>Exceptions here</dt>
+                    <dd>{compactNumber(u.exceptions_on_screen)}</dd>
+                  </div>
+                  <div>
+                    <dt>First seen here</dt>
+                    <dd><TimeValue value={u.first_seen_on_screen} /></dd>
+                  </div>
+                </dl>
+                <p class="sub">Traits</p>
+                <KeyValueList data={u.properties} emptyLabel="No traits" />
+              {/snippet}
+            </SectionRow>
+          {/snippet}
+        </CollapsibleFetchCard>
+      </div>
+    {/key}
   {:else}
     <EmptyState
       title="Screen not found"
@@ -162,23 +350,6 @@
     margin-top: 20px;
     align-items: start;
   }
-  .empty-note {
-    font-size: 13px;
-  }
-  .rows {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .rows li {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-  }
   .truncate {
     display: inline-block;
     max-width: 220px;
@@ -188,16 +359,36 @@
     vertical-align: middle;
     font-size: 12.5px;
   }
-  .link {
-    background: none;
-    border: none;
-    color: var(--primary);
-    cursor: pointer;
-    padding: 0;
-    text-align: left;
+  /* Pushes the timestamp to the row's trailing edge, so the times line up in a
+     column regardless of how long each row's leading label is. */
+  .push {
+    margin-left: auto;
   }
-  .link:hover {
-    text-decoration: underline;
+  .facts {
+    display: grid;
+    gap: 4px;
+    margin: 0 0 10px;
+  }
+  .facts div {
+    display: flex;
+    gap: 8px;
+    font-size: 12.5px;
+  }
+  .facts dt {
+    color: var(--text-muted);
+    min-width: 110px;
+    flex: none;
+  }
+  .facts dd {
+    margin: 0;
+    word-break: break-word;
+  }
+  .sub {
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-faint);
+    margin: 10px 0 4px;
   }
   .faint {
     font-size: 12px;

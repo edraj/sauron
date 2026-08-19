@@ -216,6 +216,14 @@ async fn run_request_rate(
                     // per Sample) keeps counting REQUESTS, which is what the
                     // offered rate and `--rps` are expressed in.
                     let counts = ItemCounts::of(&env);
+                    // Duplicate accounting cannot be read back off the envelope
+                    // — a genuine repeat is byte-indistinguishable from a first
+                    // sighting — so it is recomputed from the same pure
+                    // predicate the builder branched on, and can't drift from it.
+                    let repeats = match kind {
+                        Kind::Issue => generator::repeat_count(&u, seq, shape),
+                        Kind::Identify | Kind::Event => 0,
+                    };
                     let body = match transport::encode(&env, gzip) {
                         Ok(b) => b,
                         Err(_) => {
@@ -226,6 +234,7 @@ async fn run_request_rate(
                                 },
                                 counts,
                                 latency: scheduled.elapsed(),
+                                repeats,
                             });
                             return;
                         }
@@ -236,6 +245,7 @@ async fn run_request_rate(
                         outcome,
                         counts,
                         latency,
+                        repeats,
                     });
                 });
             }
@@ -352,6 +362,9 @@ async fn hold_one(
                 },
                 counts: ItemCounts::default(),
                 latency: Duration::ZERO,
+                // `--live-sockets` sends the EVENT stream only, so no error
+                // occurrence — and therefore no repeat — is ever emitted here.
+                repeats: 0,
             });
             return;
         }
@@ -386,6 +399,7 @@ async fn hold_one(
                     outcome,
                     counts,
                     latency: scheduled.elapsed(),
+                    repeats: 0,
                 });
                 // The connection died mid-run; stop holding a dead socket.
                 if dead {

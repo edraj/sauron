@@ -42,18 +42,38 @@ pub struct StorageReport {
 
 #[derive(Serialize, Deserialize)]
 pub struct DatabaseInfo {
-    /// Estimated bytes across the caller's visible apps (NOT the physical size
-    /// of the database, which would disclose other tenants' volume).
+    /// Postgres bytes attributable to the caller's visible apps. For a
+    /// full-scope caller this *is* `pg_database_size`; otherwise it is the
+    /// physical size apportioned by row share (see [`apportion`]).
     pub total_bytes: i64,
+    /// True `pg_database_size(current_database())` — indexes, TOAST, bloat and
+    /// every non-tiered table included. `None` unless the caller manages every
+    /// org in the deployment, because the physical size of a shared database is
+    /// necessarily the sum over all tenants.
+    #[serde(default)]
+    pub physical_bytes: Option<i64>,
+    /// Total cold/Parquet bytes across the caller's visible apps, so the page
+    /// can show hot and cold side by side rather than only the Postgres half.
+    #[serde(default)]
+    pub cold_bytes: i64,
+    /// Whether the caller's org set covers the whole deployment. Drives the
+    /// page's wording: exact sizes vs. an apportioned estimate.
+    #[serde(default)]
+    pub full_scope: bool,
     pub tables: Vec<TableSize>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct TableSize {
     pub name: String,
-    /// Estimated bytes for this table across the caller's visible apps.
+    /// Physical bytes attributed to the caller's visible apps.
     pub total_bytes: i64,
     pub hot_rows: i64,
+    /// True for the hot/cold tiered tables, which are the only ones carrying an
+    /// `app_id` and therefore the only ones with cold counterparts. Non-tiered
+    /// tables are listed only in the full-scope view.
+    #[serde(default)]
+    pub tiered: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,7 +103,9 @@ pub struct AppTableStorage {
     pub hot_rows: i64,
     pub cold_rows: i64,
     pub cold_bytes: i64,
-    /// Approximate (rows × avg row width from pg_stats).
+    /// The table's physical bytes apportioned to this app by row share, so it
+    /// carries this app's share of index, TOAST and page overhead rather than
+    /// bare column widths.
     pub estimated_hot_bytes: i64,
 }
 
@@ -130,13 +152,29 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
         let mut c = conn(&pool).await?;
         let apps = repo::list_apps_with_org_scoped(&mut c, &scope_orgs).await?;
         let app_ids: Vec<Uuid> = apps.iter().map(|a| a.app_id).collect();
+
+        // Does the caller administer every tenant? If so there is no other
+        // tenant whose volume physical sizes could disclose, and the report can
+        // show real bytes instead of an apportioned share.
+        let full_scope = scope_orgs.len() as i64 >= repo::org_count(&mut c).await?;
+
+        // Physical size per table, keyed by name. This is the number that
+        // reconciles with `pg_database_size`; the old rows × pg_stats.avg_width
+        // estimate omitted indexes, TOAST, page overhead and dead tuples, which
+        // is why it read several times low.
+        let physical = repo::all_table_sizes(&mut c).await?;
+        let phys_by_name: HashMap<String, i64> =
+            physical.iter().map(|r| (r.name.clone(), r.bytes)).collect();
+
         let mut tables = Vec::new();
-        // hot_rows[table][app_id] and avg_width[table]
+        // hot_rows[table][app_id], and the per-table (physical, total_rows) pair
+        // the per-app apportioning divides through.
         let mut hot: HashMap<&'static str, HashMap<Uuid, i64>> = HashMap::new();
-        let mut avg_width: HashMap<&'static str, i64> = HashMap::new();
-        let mut total_bytes = 0i64;
+        let mut share: HashMap<&'static str, (i64, i64)> = HashMap::new();
+        let mut scoped_total = 0i64;
         for t in TIERED_TABLES {
-            let width = repo::table_avg_row_width(&mut c, t.name).await?;
+            let table_bytes = phys_by_name.get(t.name).copied().unwrap_or(0);
+            let table_rows = repo::table_row_estimate(&mut c, t.name).await?;
             // Scoped: only the caller's apps are counted, and the app_id filter
             // keeps the planner on the app-keyed index instead of a full scan.
             let rows = if app_ids.is_empty() {
@@ -145,19 +183,55 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
                 repo::hot_rows_by_app_scoped(&mut c, t.name, &app_ids).await?
             };
             let total_hot: i64 = rows.iter().map(|r| r.n).sum();
-            // Estimated (rows × avg width) rather than physical relation size:
-            // the physical size covers every tenant in the deployment.
-            let est_bytes = total_hot.saturating_mul(width);
-            total_bytes = total_bytes.saturating_add(est_bytes);
+            let attributed = if full_scope {
+                table_bytes
+            } else {
+                apportion(table_bytes, total_hot, table_rows)
+            };
+            scoped_total = scoped_total.saturating_add(attributed);
             tables.push(TableSize {
                 name: t.name.to_string(),
-                total_bytes: est_bytes,
+                total_bytes: attributed,
                 hot_rows: total_hot,
+                tiered: true,
             });
             hot.insert(t.name, rows.into_iter().map(|r| (r.app_id, r.n)).collect());
-            avg_width.insert(t.name, width);
+            share.insert(t.name, (table_bytes, table_rows));
         }
-        Ok::<_, anyhow::Error>((total_bytes, tables, apps, hot, avg_width))
+
+        // The rest of the schema (event_users, sessions, issues, …) has no
+        // app_id to apportion by, so it appears only in the full-scope view —
+        // where it is exactly what makes the table list add up to the database
+        // total instead of falling short of it.
+        let db_bytes = repo::db_total_bytes(&mut c).await?;
+        let (total_bytes, physical_bytes) = if full_scope {
+            let tiered: std::collections::HashSet<&str> =
+                TIERED_TABLES.iter().map(|t| t.name).collect();
+            for r in &physical {
+                if tiered.contains(r.name.as_str()) || r.bytes == 0 {
+                    continue;
+                }
+                tables.push(TableSize {
+                    name: r.name.clone(),
+                    total_bytes: r.bytes,
+                    hot_rows: r.rows,
+                    tiered: false,
+                });
+            }
+            (db_bytes, Some(db_bytes))
+        } else {
+            (scoped_total, None)
+        };
+        tables.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        Ok::<_, anyhow::Error>((
+            total_bytes,
+            physical_bytes,
+            full_scope,
+            tables,
+            apps,
+            hot,
+            share,
+        ))
     };
 
     // --- DuckDB branch (blocking): cold rows per (table, app_id) ---
@@ -186,7 +260,7 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
     });
 
     let (pg_res, cold_res, walk_res) = tokio::join!(pg, cold_counts, walked);
-    let (total_bytes, tables, apps, hot, avg_width) = pg_res?;
+    let (total_bytes, physical_bytes, full_scope, tables, apps, hot, share) = pg_res?;
     let cold_counts = cold_res??;
     let walked = walk_res??;
 
@@ -228,7 +302,8 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
                     .copied()
                     .unwrap_or(0);
                 let cold_b = cold_bytes.get(&(a.app_id, t.name)).copied().unwrap_or(0);
-                let est = avg_width.get(t.name).copied().unwrap_or(0) * hot_rows;
+                let (table_bytes, table_rows) = share.get(t.name).copied().unwrap_or((0, 0));
+                let est = apportion(table_bytes, hot_rows, table_rows);
                 hr += hot_rows;
                 cr += cold_rows;
                 cb += cold_b;
@@ -268,13 +343,37 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
     // there to prevent. Reclaiming orphaned Parquet belongs in an operator-side
     // task with deployment-wide access, not in a tenant-facing report.
 
+    let cold_total: i64 = apps_out
+        .iter()
+        .fold(0i64, |acc, a| acc.saturating_add(a.cold_bytes_total));
+
     Ok(StorageReport {
         database: DatabaseInfo {
             total_bytes,
+            physical_bytes,
+            cold_bytes: cold_total,
+            full_scope,
             tables,
         },
         apps: apps_out,
     })
+}
+
+/// Split `table_bytes` in proportion to `part_rows / total_rows`.
+///
+/// This is how a partial-scope caller gets a figure that still carries index,
+/// TOAST and page overhead without ever being told the absolute size of a table
+/// they only partly own. Widened to `i128` because a large table times a large
+/// row count overflows `i64` well before either factor is implausible.
+fn apportion(table_bytes: i64, part_rows: i64, total_rows: i64) -> i64 {
+    if table_bytes <= 0 || part_rows <= 0 || total_rows <= 0 {
+        return 0;
+    }
+    // Row counts come from two different sources (an exact per-app count and a
+    // planner estimate for the whole table), so the ratio can land just above 1.
+    let part = part_rows.min(total_rows) as i128;
+    let scaled = (table_bytes as i128) * part / (total_rows as i128);
+    scaled.min(i64::MAX as i128) as i64
 }
 
 /// Recursively collect `*.parquet` files under `base`, keyed to (table, app_id)
@@ -314,4 +413,40 @@ fn walk_cold(base: &str) -> anyhow::Result<Vec<WalkedFile>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apportion;
+
+    #[test]
+    fn splits_by_row_share() {
+        assert_eq!(apportion(1000, 25, 100), 250);
+        assert_eq!(apportion(1000, 100, 100), 1000);
+    }
+
+    #[test]
+    fn degenerate_inputs_are_zero_not_a_panic() {
+        // A never-analyzed table reports 0 rows; dividing through it must not
+        // divide by zero, and an empty table must not claim bytes.
+        assert_eq!(apportion(1000, 10, 0), 0);
+        assert_eq!(apportion(0, 10, 100), 0);
+        assert_eq!(apportion(1000, 0, 100), 0);
+        assert_eq!(apportion(-1, 10, 100), 0);
+    }
+
+    #[test]
+    fn part_above_total_clamps_to_the_whole_table() {
+        // `part_rows` is an exact count while `total_rows` is a planner
+        // estimate, so the ratio really can exceed 1 between autovacuums. It
+        // must not attribute more than the table's own size.
+        assert_eq!(apportion(1000, 150, 100), 1000);
+    }
+
+    #[test]
+    fn large_tables_do_not_overflow() {
+        // 4 TiB across 2e9 rows: the i64 product would wrap; i128 must not.
+        let bytes = 4i64 << 40;
+        assert_eq!(apportion(bytes, 1_000_000_000, 2_000_000_000), bytes / 2);
+    }
 }

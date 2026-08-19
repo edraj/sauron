@@ -734,6 +734,25 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/screens/detail",
             get(routes::screens::detail),
         )
+        // The four collapsible sections on the screen detail page. Static
+        // path segments, so they cannot collide with `screens/detail` or with
+        // the `screens` list above.
+        .route(
+            "/v1/apps/{app_id}/screens/events",
+            get(routes::screens::section_events),
+        )
+        .route(
+            "/v1/apps/{app_id}/screens/exceptions",
+            get(routes::screens::section_exceptions),
+        )
+        .route(
+            "/v1/apps/{app_id}/screens/devices",
+            get(routes::screens::section_devices),
+        )
+        .route(
+            "/v1/apps/{app_id}/screens/users",
+            get(routes::screens::section_users),
+        )
         // --- funnels & journeys ---
         .route("/v1/apps/{app_id}/funnel", post(routes::funnels::compute))
         .route(

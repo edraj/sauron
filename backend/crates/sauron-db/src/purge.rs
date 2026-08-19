@@ -1136,24 +1136,55 @@ pub async fn apply_recomputed_rollup(
     };
 
     if kind == PurgeKind::Issues {
-        // `times_seen` is the occurrence count and `users_seen` a DISTINCT
-        // count over the surviving rows — not derivable from `counts`.
+        // Only `users_seen` needs the raw table. Everything else comes from
+        // `counts`, which the caller already merged across BOTH tiers.
+        //
+        // This branch used to derive all five fields from a bare
+        // `count(*) FROM error_events`, and that is a data-loss bug rather than
+        // an imprecision: `sauron-tier` DETACHes and DROPs a partition once it
+        // is exported (`detach_and_drop_partition`), so the hot table holds
+        // only the rows inside the retention window. Recomputing from it
+        // OVERWRITES `times_seen` with the hot-only count and silently discards
+        // every exported occurrence. `issues.times_seen` is the only aggregate
+        // for a repeated exception — `error_events` never dedups, one row per
+        // occurrence — so the number the UI shows just drops, with nothing
+        // anywhere reporting that it did.
+        //
+        // The caller does the cross-tier work correctly and fails the job
+        // outright if the cold side is unreadable (see `cold_counts_for_page`);
+        // the bug was purely that this branch threw the merged value away. The
+        // hot-only span (`min`/`max(occurred_at)`) was wrong for the same
+        // reason, so `first_seen`/`last_seen` move to `$3`/`$4` as well.
+        //
+        // `users_seen` is the one field that genuinely cannot be merged:
+        // `Counts` carries no distinct-user figure, and distinct counts do not
+        // sum across tiers anyway — a person appearing in both halves would be
+        // counted twice. So it is written ONLY when the hot table is the whole
+        // truth, which is exactly when `counts.errors` equals the hot row
+        // count. With cold history present it keeps its existing value and
+        // stays OVERCOUNTED, deliberately: overcounting is the direction this
+        // subsystem already treats as the safe failure (the caller's bail
+        // comment says as much), because it is recoverable and visibly
+        // conservative, whereas a deflated count is indistinguishable from
+        // real data loss.
         diesel::sql_query(
             "UPDATE issues i SET \
-               times_seen = s.n, \
-               users_seen = s.u, \
-               first_seen = COALESCE(s.lo, i.first_seen), \
-               last_seen = COALESCE(s.hi, i.last_seen), \
-               last_event_at = COALESCE(s.hi, i.last_event_at), \
+               times_seen = $3, \
+               users_seen = CASE WHEN s.n = $3 THEN s.u ELSE i.users_seen END, \
+               first_seen = COALESCE($4, i.first_seen), \
+               last_seen = COALESCE($5, i.last_seen), \
+               last_event_at = COALESCE($5, i.last_event_at), \
                updated_at = now() \
              FROM (SELECT count(*)::bigint AS n, \
-                          count(DISTINCT NULLIF(distinct_id, ''))::bigint AS u, \
-                          min(occurred_at) AS lo, max(occurred_at) AS hi \
+                          count(DISTINCT NULLIF(distinct_id, ''))::bigint AS u \
                      FROM error_events WHERE app_id = $1 AND issue_id = $2::uuid) s \
              WHERE i.app_id = $1 AND i.id = $2::uuid",
         )
         .bind::<SqlUuid, _>(app_id)
         .bind::<Text, _>(key)
+        .bind::<BigInt, _>(counts.errors)
+        .bind::<Nullable<Timestamptz>, _>(counts.first)
+        .bind::<Nullable<Timestamptz>, _>(counts.last)
         .execute(conn)
         .await?;
         return Ok(false);

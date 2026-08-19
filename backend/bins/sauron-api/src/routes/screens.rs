@@ -1,7 +1,7 @@
 //! Screen analytics: per-screen views/events/users/exceptions + on-read dwell.
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -175,11 +175,21 @@ pub struct ScreenDetailQuery {
     // `ScreenListQuery`'s comment above.
 }
 
+/// The screen detail header: stat tiles and nothing else.
+///
+/// It used to also carry `recent_events` and `recent_exceptions` — 20 rows
+/// each, the exceptions being whole `ErrorEvent`s with `stacktrace` and
+/// `breadcrumbs` attached. The dashboard stopped rendering them when the four
+/// paged sections replaced the static cards, so every load of this page was
+/// shipping (and symbolicating, and permission-gating) two payloads nobody
+/// read. Removed rather than left dead: the gating cost is real, and a
+/// response field with no consumer is one a future reader will assume is live.
+///
+/// The rows now come from `/v1/apps/{app_id}/screens/{events,exceptions}`,
+/// which page properly instead of truncating at 20.
 #[derive(Serialize)]
 pub struct ScreenDetail {
     pub stats: repo::ScreenStats,
-    pub recent_events: Vec<AnalyticsEvent>,
-    pub recent_exceptions: Vec<ErrorEvent>,
 }
 
 pub async fn detail(
@@ -193,11 +203,11 @@ pub async fn detail(
         return Err(ApiError::BadRequest("name is required".into()));
     }
     let mut conn = db(&state).await?;
-    // `_with_perms`: `recent_exceptions` below is whole `ErrorEvent` rows, which
-    // carry two further permission questions — `perm::ISSUE_READ` for the body
-    // at all and `perm::SOURCE_READ` for the de-obfuscated lines inside it. See
-    // `sessions::detail` for the same note.
-    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
+    // Plain `authorized_read_scope`, not `_with_perms`: this response is now
+    // aggregate counts only. The `ErrorEvent` bodies that needed
+    // `perm::ISSUE_READ`/`perm::SOURCE_READ` gating moved to
+    // `section_exceptions`, which still resolves and applies them.
+    let scope = super::scope::authorized_read_scope(
         &mut conn,
         auth.user_id,
         app_id,
@@ -206,18 +216,242 @@ pub async fn detail(
     )
     .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
-    let stats = repo::screen_stats(&mut conn, scope.clone(), since, &q.name).await?;
-    let recent_events =
-        repo::recent_events_for_screen(&mut conn, scope.clone(), &q.name, since, 20).await?;
-    let mut recent_exceptions =
-        repo::recent_exceptions_for_screen(&mut conn, scope, &q.name, since, 20).await?;
-    crate::symbolicate::gate_source_context(&perms, &mut recent_exceptions);
-    crate::symbolicate::gate_event_body(&perms, &mut recent_exceptions);
-    Ok(Json(ScreenDetail {
-        stats,
-        recent_events,
-        recent_exceptions,
-    }))
+    let stats = repo::screen_stats(&mut conn, scope, since, &q.name).await?;
+    Ok(Json(ScreenDetail { stats }))
+}
+
+// ===========================================================================
+// Screen detail sections — Events / Exceptions / Devices / Users
+// ===========================================================================
+//
+// Four sibling routes behind the four collapsible cards on `#/screens/:name`.
+// They are separate endpoints rather than `?filter=screen:eq:…` on the
+// existing lists because the query language reaches none of them: the `screen`
+// dimension in `sauron_query::catalog` is scoped to Issues+Occurrences, there
+// is no app-wide occurrences route for it to land on, and "devices/users on a
+// screen" is not a column filter at all — it is an aggregate over a different
+// table. See the design note in
+// `docs/superpowers/specs/2026-08-18-screen-detail-sections-design.md`.
+//
+// All four answer a BARE ARRAY of at most `limit` rows. The dashboard requests
+// `limit + 1` and treats the surplus row as its has-more probe (the house
+// `overFetched` pattern), so no count endpoint is needed and none is offered.
+
+/// Shared query for all four section routes.
+///
+/// Deliberately NOT `#[serde(flatten)]`-composed out of smaller structs:
+/// `flatten` routes every field through `serde`'s untyped content buffer,
+/// where a query-string `limit=25` arrives as the STRING `"25"` and fails to
+/// deserialize into `i64` — a 422 on a request that looks correct.
+#[derive(Deserialize)]
+pub struct ScreenSectionQuery {
+    pub name: String,
+    #[serde(default = "days30")]
+    pub since_days: i64,
+    #[serde(default = "lim25")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    // `environment_id` is deliberately NOT a field here — see
+    // `ScreenListQuery`'s comment above.
+}
+fn lim25() -> i64 {
+    25
+}
+
+/// Upper bound on a section page. The dashboard asks for 26 (25 + the has-more
+/// probe); this leaves room for a caller that wants larger pages without
+/// letting one request pull an unbounded slice of a partitioned table.
+const SECTION_LIMIT_MAX: i64 = 100;
+
+/// Validate and clamp the parts every section route shares.
+///
+/// One function so the four routes cannot drift into disagreeing about what a
+/// window or a page is — a section answering over a different `since` than its
+/// siblings would put four mutually inconsistent lists under one set of stat
+/// tiles.
+fn section_bounds(q: &ScreenSectionQuery) -> Result<(DateTime<Utc>, i64, i64), ApiError> {
+    if q.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("name is required".into()));
+    }
+    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let limit = q.limit.clamp(1, SECTION_LIMIT_MAX);
+    Ok((since, limit, super::clamp_offset(q.offset)))
+}
+
+/// `GET /v1/apps/{app_id}/screens/events` — a screen's analytics events, paged.
+pub async fn section_events(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<ScreenSectionQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<AnalyticsEvent>>, ApiError> {
+    let (since, limit, offset) = section_bounds(&q)?;
+    let mut conn = db(&state).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let rows =
+        repo::recent_events_for_screen(&mut conn, scope, &q.name, since, limit, offset).await?;
+    Ok(Json(rows))
+}
+
+/// `GET /v1/apps/{app_id}/screens/exceptions` — a screen's exceptions, paged.
+///
+/// `_with_perms` and the two `gate_*` calls, for the reason [`detail`]
+/// documents: `ErrorEvent` rows carry `perm::ISSUE_READ` (the body) and
+/// `perm::SOURCE_READ` (de-obfuscated frames) questions that `EVENT_READ` does
+/// not answer. Gating REDACTS rather than refuses, matching `detail` — the
+/// dashboard hides the card outright for a role without `issue:read`, so a
+/// 403 here would only turn a hidden card into a broken one for anyone
+/// calling the API directly.
+pub async fn section_exceptions(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<ScreenSectionQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<ErrorEvent>>, ApiError> {
+    let (since, limit, offset) = section_bounds(&q)?;
+    let mut conn = db(&state).await?;
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let mut rows =
+        repo::recent_exceptions_for_screen(&mut conn, scope, &q.name, since, limit, offset).await?;
+    crate::symbolicate::gate_source_context(&perms, &mut rows);
+    crate::symbolicate::gate_event_body(&perms, &mut rows);
+    Ok(Json(rows))
+}
+
+/// `GET /v1/apps/{app_id}/screens/devices` — the devices seen on a screen.
+///
+/// `perm::EVENT_READ`, matching `devices::list`: this exposes no device a
+/// caller could not already page from the inventory.
+pub async fn section_devices(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<ScreenSectionQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<repo::ScreenDeviceRow>>, ApiError> {
+    let (since, limit, offset) = section_bounds(&q)?;
+    let mut conn = db(&state).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let rows = repo::devices_for_screen(&mut conn, scope, &q.name, since, limit, offset).await?;
+    Ok(Json(rows))
+}
+
+/// `GET /v1/apps/{app_id}/screens/users` — the users seen on a screen.
+///
+/// `perm::EVENT_READ`, matching `analytics::persons_list`.
+pub async fn section_users(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(q): Query<ScreenSectionQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<repo::ScreenUserRow>>, ApiError> {
+    let (since, limit, offset) = section_bounds(&q)?;
+    let mut conn = db(&state).await?;
+    let scope = super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let rows = repo::users_for_screen(&mut conn, scope, &q.name, since, limit, offset).await?;
+    Ok(Json(rows))
+}
+
+#[cfg(test)]
+mod section_bounds_tests {
+    use super::*;
+
+    fn q(name: &str, since_days: i64, limit: i64, offset: i64) -> ScreenSectionQuery {
+        ScreenSectionQuery {
+            name: name.to_string(),
+            since_days,
+            limit,
+            offset,
+        }
+    }
+
+    /// An empty or whitespace `name` would otherwise reach
+    /// `screen = $3` as `''`, which is a valid query returning an empty list —
+    /// a 200 and a blank card, indistinguishable from "this screen has no
+    /// users" and impossible to tell from the UI.
+    #[test]
+    fn a_blank_name_is_refused() {
+        for blank in ["", "   ", "\t", "\n"] {
+            assert!(
+                section_bounds(&q(blank, 30, 25, 0)).is_err(),
+                "a blank name must be refused, got ok for {blank:?}"
+            );
+        }
+        assert!(section_bounds(&q("Home", 30, 25, 0)).is_ok());
+    }
+
+    /// The clamp must bound BOTH ends. A `limit=0` returns an empty page the
+    /// dashboard reads as "no more rows", silently truncating the list; a
+    /// negative limit is a Postgres error.
+    #[test]
+    fn limit_is_clamped_to_a_usable_page() {
+        let (_, lo, _) = section_bounds(&q("Home", 30, 0, 0)).expect("ok");
+        assert_eq!(lo, 1, "limit=0 must clamp up, not through");
+        let (_, neg, _) = section_bounds(&q("Home", 30, -5, 0)).expect("ok");
+        assert_eq!(neg, 1);
+        let (_, hi, _) = section_bounds(&q("Home", 30, 10_000, 0)).expect("ok");
+        assert_eq!(hi, SECTION_LIMIT_MAX);
+        let (_, exact, _) = section_bounds(&q("Home", 30, 26, 0)).expect("ok");
+        assert_eq!(exact, 26, "the dashboard's 25+1 probe must pass through");
+    }
+
+    /// A negative offset reaches `OFFSET -1` as a Postgres error, i.e. a 500
+    /// on a request a user can produce by hand.
+    #[test]
+    fn offset_is_never_negative() {
+        let (_, _, off) = section_bounds(&q("Home", 30, 25, -1)).expect("ok");
+        assert_eq!(off, 0);
+    }
+
+    /// `since_days` shares `detail`'s 1..=365 clamp. A 0 would make `since`
+    /// equal to now and every card render empty; an unbounded value would
+    /// widen the scan past the retention window for no extra rows.
+    #[test]
+    fn the_window_matches_the_rest_of_the_page() {
+        let before = Utc::now();
+        let (since_zero, _, _) = section_bounds(&q("Home", 0, 25, 0)).expect("ok");
+        assert!(
+            since_zero <= before - Duration::days(1) + Duration::seconds(1),
+            "since_days=0 must clamp to at least one day"
+        );
+        let (since_huge, _, _) = section_bounds(&q("Home", 100_000, 25, 0)).expect("ok");
+        assert!(
+            since_huge >= before - Duration::days(366),
+            "since_days must clamp at 365"
+        );
+    }
 }
 
 #[cfg(test)]

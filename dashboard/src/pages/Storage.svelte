@@ -369,13 +369,21 @@
     <header class="head">
       <div>
         <h1 class="page-title">Storage</h1>
-        <!-- Scoped to the orgs you manage, and estimated (rows × avg width) —
-             not the physical database size, which would leak other tenants'
-             volume. The old "deployment-wide" wording described the pre-scoping
-             behaviour and made the smaller number look like data loss. -->
+        <!-- Wording tracks `full_scope`. When the caller manages every org there
+             is no other tenant to leak, so the figures are real physical bytes
+             (pg_database_size / pg_total_relation_size) and must NOT be called
+             estimates. Otherwise they are the physical size apportioned by row
+             share, which is still an estimate — just a far better one than the
+             old rows × avg_width, which omitted indexes, TOAST, page overhead
+             and bloat and so read several times low. -->
         <p class="sub muted">
-          Estimated storage across the organisations you manage, with per-app hot/cold
-          record counts.
+          {#if report?.database.full_scope}
+            Actual storage on disk across the deployment, with per-app hot/cold record
+            counts. Postgres figures include indexes and overhead.
+          {:else}
+            Estimated storage across the organisations you manage, with per-app hot/cold
+            record counts.
+          {/if}
         </p>
       </div>
     </header>
@@ -391,12 +399,16 @@
       <div class="center"><Spinner size={24} /></div>
     {:else if report}
       {@const rep = report}
+      {@const dbBytes = rep.database.physical_bytes ?? rep.database.total_bytes}
+      {@const coldBytes = rep.database.cold_bytes ?? 0}
       <StatTiles min={180}>
         <StatTile
-          label="Estimated size"
-          value={fmtBytes(rep.database.total_bytes)}
+          label={rep.database.full_scope ? 'Database (Postgres)' : 'Estimated size'}
+          value={fmtBytes(dbBytes)}
           tone="primary"
         />
+        <StatTile label="Cold (Parquet)" value={fmtBytes(coldBytes)} />
+        <StatTile label="Total" value={fmtBytes(dbBytes + coldBytes)} />
         <StatTile label="Tables" value={rep.database.tables.length} />
         <StatTile label="Apps" value={rep.apps.length} />
       </StatTiles>
@@ -652,7 +664,7 @@
       <div class="section">
         <Card title="Database tables" padding="none">
           {#if sortedTables.length === 0}
-            <EmptyState title="No tables" description="No tiered tables were reported." icon="server" />
+            <EmptyState title="No tables" description="No tables were reported." icon="server" />
           {:else}
             <DataTable>
               {#snippet head()}
@@ -709,7 +721,7 @@
                     Cold bytes
                   </SortableTh>
                   <SortableTh key="hot_bytes" class="num" sort={appSort} onsort={onAppSort}>
-                    Est. hot bytes
+                    Hot bytes
                   </SortableTh>
                 </tr>
               {/snippet}
@@ -755,7 +767,7 @@
                               <span class="num" role="columnheader">Hot rows</span>
                               <span class="num" role="columnheader">Cold rows</span>
                               <span class="num" role="columnheader">Cold bytes</span>
-                              <span class="num" role="columnheader">Est. hot bytes</span>
+                              <span class="num" role="columnheader">Hot bytes</span>
                             </div>
                             {#each a.tables as t (t.name)}
                               <div class="mini-row" role="row">

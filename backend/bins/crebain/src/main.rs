@@ -159,7 +159,7 @@ async fn isolated_body(
 fn finish(ran: Option<Result<Summary>>, cfg: &RunConfig, mode_label: &str) -> Result<ExitCode> {
     match ran {
         Some(Ok(summary)) => {
-            report::print_summary(&summary, &cfg.expected());
+            report::print_summary(&summary, &cfg.expected(), &cfg.shape);
             if cfg.live_sockets {
                 eprintln!("crebain: --live-sockets: this run is a connection-capacity demo — read PEAK CONNECTIONS, not req/s.");
             }
@@ -251,6 +251,18 @@ fn print_banner(cfg: &RunConfig, mode: &Mode) {
             "  batch        {} ticks/envelope ({} items/request; --rps is still REQUESTS/s)",
             cfg.shape.batch_items,
             cfg.shape.batch_items * generator::ITEMS_PER_TICK
+        );
+    }
+    if cfg.shape.distinct_issues != generator::DEFAULT_DISTINCT_ISSUES {
+        eprintln!(
+            "  issues       {} distinct fingerprints across the app",
+            cfg.shape.distinct_issues
+        );
+    }
+    if cfg.shape.repeat_ratio > 0.0 {
+        eprintln!(
+            "  repeats      {:.0}% of error occurrences (same fingerprint + user + device + session)",
+            cfg.shape.repeat_ratio * 100.0
         );
     }
 }

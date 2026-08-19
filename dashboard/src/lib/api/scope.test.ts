@@ -32,6 +32,38 @@ describe('shouldScopeUrl', () => {
     expect(shouldScopeUrl('/v1/apps/app-1/funnels/funnel-1')).toBe(false);
   });
 
+  it('scopes all four screen-detail sections', () => {
+    // These four carry per-environment telemetry and the backend NARROWS on
+    // `environment_id` (`authorized_read_scope` in each handler) rather than
+    // rejecting it, so they must stay OUT of every exclusion list.
+    //
+    // This is written as its own case because the failure is silent and the
+    // damage is a disclosure bug, not an error: an exclusion regex broad
+    // enough to swallow `screens/…` — say `/screens(?:[/?].*)?$/` added later
+    // for a genuinely app-scoped screens sub-resource — would stop the
+    // interceptor attaching `environment_id`, and all four cards would render
+    // EVERY environment's rows at HTTP 200, underneath stat tiles that are
+    // still environment-scoped. Nothing would throw and no test but this one
+    // would notice.
+    //
+    // The sibling guard lives on the backend: `http_env_scoping.rs`'s
+    // `the_backend_rejection_set_matches_the_dashboard_exclusion_list` asserts
+    // these are absent from `BACKEND_REJECTS_ENVIRONMENT_ID`. The two fail in
+    // opposite directions, which is the point.
+    for (const section of ['events', 'exceptions', 'devices', 'users']) {
+      expect(shouldScopeUrl(`/v1/apps/app-1/screens/${section}`)).toBe(true);
+      expect(shouldScopeUrl(`/v1/apps/app-1/screens/${section}?name=%2Fhome&limit=26`)).toBe(
+        true,
+      );
+      expect(
+        computeScopeParams(`/v1/apps/app-1/screens/${section}`, 'env-9'),
+      ).toEqual({ environment_id: 'env-9' });
+    }
+    // The list and the pre-existing detail route scope too.
+    expect(shouldScopeUrl('/v1/apps/app-1/screens')).toBe(true);
+    expect(shouldScopeUrl('/v1/apps/app-1/screens/detail?name=%2Fhome')).toBe(true);
+  });
+
   it('does not scope any of the app-configuration exclusions', () => {
     expect(shouldScopeUrl('/v1/apps/app-1/environments')).toBe(false);
     expect(shouldScopeUrl('/v1/apps/app-1/first-event')).toBe(false);
