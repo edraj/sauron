@@ -1042,6 +1042,7 @@ async fn seed_issue_with_error(
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -2168,6 +2169,28 @@ fn build_request_path(template: &str, app_id: Uuid) -> String {
     let extra_query: Option<&str> = match template {
         "/v1/apps/{app_id}/device" => Some("key=task-14-route-enum-device"),
         "/v1/apps/{app_id}/screens/detail" => Some("name=task-14-route-enum-screen"),
+        // The four screen-detail sections take their target screen as a
+        // required `name` query param, exactly like `screens/detail` above.
+        //
+        // Without this arm the probe sends no `name`, `Query<ScreenSectionQuery>`
+        // fails to deserialize BEFORE the handler runs, and the resulting 400 is
+        // indistinguishable from "this route rejects environment_id" — which put
+        // all four in the rejecting set and broke
+        // `the_backend_rejection_set_matches_the_dashboard_exclusion_list`,
+        // while making `every_app_scoped_get_either_narrows_or_rejects_environment_id`
+        // pass VACUOUSLY on them (it accepts any 400, and this one has nothing to
+        // do with environment_id).
+        //
+        // Adding these to `scope.ts`'s BACKEND_REJECTS_ENVIRONMENT_ID instead
+        // would go green and be WRONG: that array is what `shouldScopeUrl` reads,
+        // so the dashboard would stop attaching `environment_id` and all four
+        // cards would render every environment's rows under environment-scoped
+        // stat tiles. These routes genuinely narrow — see `authorized_read_scope`
+        // in each handler.
+        "/v1/apps/{app_id}/screens/events"
+        | "/v1/apps/{app_id}/screens/exceptions"
+        | "/v1/apps/{app_id}/screens/devices"
+        | "/v1/apps/{app_id}/screens/users" => Some("name=task-14-route-enum-screen"),
         "/v1/apps/{app_id}/errors/timeseries"
         | "/v1/apps/{app_id}/events/timeseries"
         | "/v1/apps/{app_id}/transactions/timeseries" => {

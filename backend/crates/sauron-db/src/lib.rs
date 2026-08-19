@@ -16,6 +16,7 @@ pub mod query_plan;
 pub mod repo;
 pub mod schema;
 pub mod scope;
+pub mod stack_pool;
 
 pub use pool::{build_pool, conn, PgConn, PgPool};
 

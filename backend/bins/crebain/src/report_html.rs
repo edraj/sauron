@@ -51,6 +51,15 @@ fn shape_note(shape: &crate::generator::Shape) -> String {
             shape.batch_items * crate::generator::ITEMS_PER_TICK
         ));
     }
+    if shape.distinct_issues != crate::generator::DEFAULT_DISTINCT_ISSUES {
+        out.push_str(&format!(" · {} distinct issues", shape.distinct_issues));
+    }
+    if shape.repeat_ratio > 0.0 {
+        out.push_str(&format!(
+            " · repeats {:.0}% of error occurrences",
+            shape.repeat_ratio * 100.0
+        ));
+    }
     out
 }
 
@@ -544,6 +553,8 @@ mod tests {
             effective_concurrency: 10,
             source_ips: 1,
             peak_connections: 42,
+            attempted_repeats: 360,
+            accepted_repeats: 351,
         }
     }
 
@@ -645,6 +656,8 @@ mod tests {
         let html = render(&s, &expected, &meta());
         assert!(!html.contains("workflows"));
         assert!(!html.contains("ticks/envelope"));
+        assert!(!html.contains("distinct issues"));
+        assert!(!html.contains("repeats"));
 
         // A shaped run must say so, or a benchmark matrix silently compares
         // two different workloads.
@@ -652,6 +665,9 @@ mod tests {
             shape: crate::generator::Shape {
                 workflow_ratio: 0.5,
                 batch_items: 7,
+                distinct_issues: 40,
+                repeat_ratio: 0.9,
+                stack_depth: crate::generator::DEFAULT_STACK_DEPTH,
             },
             ..meta()
         };
@@ -661,5 +677,7 @@ mod tests {
             html.contains("batch 7 ticks/envelope (14 items/request)"),
             "{html}"
         );
+        assert!(html.contains("40 distinct issues"), "{html}");
+        assert!(html.contains("repeats 90% of error occurrences"), "{html}");
     }
 }

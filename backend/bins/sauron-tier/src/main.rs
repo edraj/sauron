@@ -282,6 +282,27 @@ async fn tier_table(
             }
         }
     }
+
+    {
+        // Tier 1 stack-pool GC. Partition DROP just above is the event that
+        // orphans `error_stack_blobs` rows — a trace's referencing events age
+        // out wholesale with their partition, and nothing decrements anything
+        // (there is deliberately no refcount; see `stack_pool`'s module doc).
+        // The sweep deletes what no surviving partition references, the
+        // partial index makes the probe cheap, and the FK downgrades any bug
+        // here to a loud constraint error instead of data loss. Cold files
+        // materialized their traces at export time, so a swept blob is never
+        // needed again.
+        let mut c = sauron_db::conn(pool).await?;
+        let swept = sauron_db::stack_pool::sweep_orphan_stack_blobs(
+            &mut c,
+            sauron_db::stack_pool::STACK_BLOB_SWEEP_GRACE_HOURS,
+        )
+        .await?;
+        if swept > 0 {
+            info!(swept, "swept unreferenced error_stack_blobs");
+        }
+    }
     Ok(())
 }
 

@@ -1424,6 +1424,7 @@ impl TestDb {
                 handled: Some(true),
                 title: None,
                 culprit: None,
+                stacktrace_sha256: None,
             },
         )
         .await
@@ -1639,6 +1640,7 @@ async fn seed_error_event(
             handled: Some(true),
             title: title.map(str::to_string),
             culprit: culprit.map(str::to_string),
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -2079,6 +2081,7 @@ pub async fn seed_signal_error(
             handled: None,
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await

@@ -928,10 +928,63 @@ export interface ScreenStats extends ScreenRow {
   total_dwell_ms: number;
 }
 
+/**
+ * The screen detail header. Stats only — the row lists come from the four
+ * paged section endpoints (see `api/screen-sections.ts`).
+ *
+ * `recent_events` / `recent_exceptions` were removed from both this type and
+ * the wire response once the collapsible sections replaced the static cards:
+ * they were 20 events plus 20 full `ErrorEvent`s (stacktrace, breadcrumbs)
+ * fetched, permission-gated and serialized on every page load with no reader.
+ */
 export interface ScreenDetail {
   stats: ScreenStats;
-  recent_events: AnalyticsEvent[];
-  recent_exceptions: ErrorEvent[];
+}
+
+/**
+ * One user who produced signal on a screen, as the Users section of the screen
+ * detail page lists them.
+ *
+ * **Every count here is scoped to that one screen**, which is why each carries
+ * an `_on_screen` suffix rather than matching `PersonRow`'s bare
+ * `events_count`/`errors_count`. The two are not interchangeable: a person with
+ * 900 lifetime events may have 3 on this screen, and rendering the lifetime
+ * number under a per-screen heading is the misreading the suffix exists to
+ * prevent. The lifetime totals live on the person's own page, behind the row's
+ * link to `/persons/:distinct_id`.
+ */
+export interface ScreenUserRow {
+  distinct_id: string;
+  properties: Record<string, unknown> | null;
+  views_on_screen: number;
+  events_on_screen: number;
+  exceptions_on_screen: number;
+  first_seen_on_screen: string;
+  last_seen_on_screen: string;
+}
+
+/**
+ * One device seen on a screen. Same `_on_screen` rule as {@link ScreenUserRow}.
+ *
+ * The descriptive fields (`family` … `browser`) are joined from the device
+ * record and are lifetime facts, not per-screen ones — they describe the
+ * device itself, so no suffix applies. They are nullable because the join is a
+ * LEFT join: a device can appear in the event stream before its inventory row
+ * is written.
+ */
+export interface ScreenDeviceRow {
+  device_key: string;
+  family: string | null;
+  model: string | null;
+  os_name: string | null;
+  os_version: string | null;
+  arch: string | null;
+  browser: string | null;
+  views_on_screen: number;
+  events_on_screen: number;
+  exceptions_on_screen: number;
+  first_seen_on_screen: string;
+  last_seen_on_screen: string;
 }
 
 // ---------------------------------------------------------------------------

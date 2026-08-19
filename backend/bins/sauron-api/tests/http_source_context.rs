@@ -47,7 +47,7 @@
 //! |---|---|
 //! | `GET /v1/apps/{app}/sessions/{session}` | `sessions::detail` |
 //! | `GET /v1/apps/{app}/device?key=` | `devices::detail` |
-//! | `GET /v1/apps/{app}/screens/detail?name=` | `screens::detail` |
+//! | `GET /v1/apps/{app}/screens/exceptions?name=` | `screens::section_exceptions` |
 //! | `GET /v1/apps/{app}/persons/{distinct_id}` | `analytics::person` |
 //!
 //! All four were measured leaking `context_line`, `pre_context`, `post_context`
@@ -118,8 +118,17 @@ const POST_CONTEXT_LINE: &str = "} // secret_post_context_marker";
 /// **More than one, and that is the whole point.** Each of these four handlers
 /// returns a LIST of events — `analytics::person` up to 200 (`analytics.rs`'s
 /// `limit.clamp(1, 200)`), `sessions::detail` 500, `devices::detail` 50,
-/// `screens::detail` 20 — and the gate strips them in a loop. A one-event
-/// fixture cannot tell "strips every event" from "strips `events[0]`".
+/// `screens::section_exceptions` 25 by default (100 max) — and the gate strips
+/// them in a loop. A one-event fixture cannot tell "strips every event" from
+/// "strips `events[0]`".
+///
+/// The screens entry used to be `screens::detail`, which carried 20
+/// `recent_exceptions` inline. That payload was removed once the paged section
+/// cards replaced the static lists — nothing rendered it — so the gate it
+/// needed moved with the rows, to `section_exceptions`. Retargeted here rather
+/// than deleted: `screens::detail` now returns aggregate counts with no event
+/// body to gate, so testing it would assert nothing, while the new route is a
+/// real gating surface that would otherwise have none.
 ///
 /// Measured 2026-08-08: with ONE seeded event, mutating the gate's
 /// `for ev in events.iter_mut()` to `.iter_mut().take(1)` — a live leak of every
@@ -597,6 +606,7 @@ impl TestServer {
                     handled: Some(true),
                     title: None,
                     culprit: None,
+                    stacktrace_sha256: None,
                 },
             )
             .await
@@ -959,8 +969,11 @@ async fn screens_detail_gates_source_context() {
     assert_gate(
         &srv,
         &fx,
-        &format!("/v1/apps/{}/screens/detail?name={SCREEN_NAME}", fx.app_id),
-        "screens::detail",
+        &format!(
+            "/v1/apps/{}/screens/exceptions?name={SCREEN_NAME}",
+            fx.app_id
+        ),
+        "screens::section_exceptions",
     )
     .await;
 
@@ -1123,8 +1136,11 @@ async fn event_read_alone_gets_no_body_on_the_four_signal_routes() {
             format!("/v1/apps/{}/device?key={DEVICE_KEY}", fx.app_id),
         ),
         (
-            "screens::detail",
-            format!("/v1/apps/{}/screens/detail?name={SCREEN_NAME}", fx.app_id),
+            "screens::section_exceptions",
+            format!(
+                "/v1/apps/{}/screens/exceptions?name={SCREEN_NAME}",
+                fx.app_id
+            ),
         ),
         (
             "analytics::person",

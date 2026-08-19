@@ -1,0 +1,104 @@
+-- Reverses up.sql: recreates all three indexes with the definitions they had
+-- before it ran, byte-for-byte on key columns and sort directions.
+--
+-- Each is built on the PARTITIONED PARENT, which propagates to every child
+-- synchronously inside this transaction, holding ACCESS EXCLUSIVE on the parent
+-- and on each partition for the duration of the build. That is the EXPENSIVE
+-- direction: up.sql's drops are catalog-only and hold their locks for
+-- microseconds, whereas these three scan the whole tree. On a full-size
+-- `analytics_events` this rollback wants the maintenance window migrations
+-- 0039, 0047, 0053 and 0055 each asked for on this table -- including 0039's
+-- warning that blocking the ingest write path lets `XADD ... MAXLEN ~` trim
+-- still-undelivered stream entries, which is permanent silent event loss
+-- rather than backpressure. CONCURRENTLY is not available inside a migration
+-- transaction.
+--
+-- THE DIRECTIONS ARE LOAD-BEARING, especially on the third one. Recreating
+-- `analytics_distinct_idx` without its `DESC` would produce an index identical
+-- to `analytics_events_app_distinct_time_idx`, which up.sql deliberately kept
+-- -- a rollback that silently installs a duplicate of the survivor instead of
+-- restoring the dropped index. `occurred_at` is NOT NULL on this table, so the
+-- implied NULLS FIRST/LAST difference between the two spellings has no rows in
+-- it; the column order and the DESC do all the work.
+
+-- Migration 0004's definition, as recreated by the 0012 partitioning rebuild.
+CREATE INDEX analytics_events_app_device_idx
+    ON analytics_events (app_id, device_key);
+
+-- Migration 0001's definition, as re-keyed onto `app_id` by the 0012 rebuild
+-- (0001 spelled it `project_id`; the rebuild kept the index NAME and changed
+-- the column, which is why the name still says "project").
+CREATE INDEX analytics_project_idx
+    ON analytics_events (app_id, occurred_at DESC);
+
+-- Likewise 0001 via 0012. `DESC` on the third column -- see the header.
+CREATE INDEX analytics_distinct_idx
+    ON analytics_events (app_id, distinct_id, occurred_at DESC);
+
+-- ===========================================================================
+-- LIVE INDEX INVENTORY on `analytics_events` as of migration 0065, replayed
+-- from the migration set into a clean PostgreSQL 16 and read back from
+-- `pg_indexes`. Recorded here because up.sql rests on it, and in the same
+-- place migration 0065 recorded the `error_events` equivalent.
+--
+--   analytics_events_pkey1                  UNIQUE (id, occurred_at)      0012
+--   analytics_project_idx                   (app_id, occurred_at DESC)
+--                                                              0001/0012  <- dropped by 0066
+--   analytics_distinct_idx                  (app_id, distinct_id,
+--                                            occurred_at DESC)
+--                                                              0001/0012  <- dropped by 0066
+--   analytics_name_idx                      (app_id, name, occurred_at DESC)
+--                                                              0001/0012
+--   analytics_events_app_device_idx         (app_id, device_key)
+--                                                              0004/0012  <- dropped by 0066
+--   analytics_events_tags_gin               GIN (tags jsonb_path_ops)     0018
+--   analytics_events_app_screen_time_idx    (app_id, screen,
+--                                            occurred_at DESC)
+--                                            WHERE screen IS NOT NULL     0020
+--   analytics_events_app_distinct_time_idx  (app_id, distinct_id,
+--                                            occurred_at)                 0020
+--   analytics_events_app_rel_time_idx       (app_id, release,
+--                                            occurred_at DESC)            0025
+--   analytics_events_app_workflow_idx       (app_id, workflow_name,
+--                                            occurred_at DESC)
+--                                            WHERE workflow_id IS NOT NULL 0032
+--   analytics_events_app_env_time_users_idx (app_id, environment_id,
+--                                            occurred_at DESC)
+--                                            INCLUDE (distinct_id)        0039
+--   analytics_events_app_time_id_idx        (app_id, occurred_at DESC,
+--                                            id DESC)                     0047
+--   analytics_events_app_device_env_idx     (app_id, device_key,
+--                                            environment_id, occurred_at) 0053
+--   analytics_events_app_distinct_env_idx   (app_id, distinct_id,
+--                                            environment_id, occurred_at) 0055
+--
+-- Considered and KEPT (the near-misses, so the next audit does not re-derive
+-- them):
+--   * `analytics_events_app_distinct_time_idx` vs
+--     `analytics_events_app_distinct_env_idx` -- NOT a prefix. They diverge at
+--     column 3 (`occurred_at` vs `environment_id`). The narrow one is the only
+--     index that can order a person's events by time UNSCOPED by environment,
+--     and the only one that can feed `journey_graph`'s window; the wide one can
+--     do neither until `environment_id` is pinned by equality. Both are
+--     load-bearing. (Same shape of argument migration 0065 made for
+--     `error_events_distinct_idx`, and the reason THAT table keeps its DESC
+--     index while this one drops its DESC index: `error_events` has no
+--     `PARTITION BY distinct_id` window, so nothing there discriminates on
+--     direction.)
+--   * `analytics_events_app_device_env_idx` vs
+--     `analytics_events_app_distinct_env_idx` -- different second column,
+--     unrelated.
+--   * `analytics_events_app_time_id_idx` vs
+--     `analytics_events_app_env_time_users_idx` -- NOT a prefix;
+--     `environment_id` sits between `app_id` and `occurred_at` in the latter,
+--     so it cannot serve app-wide time-ordered reads.
+--   * `analytics_name_idx`, `analytics_events_app_rel_time_idx` -- nothing
+--     wider leads with `(app_id, name)` or `(app_id, release)`.
+--   * The two partial indexes (`..._app_screen_time_idx`,
+--     `..._app_workflow_idx`) and the GIN are not comparable to anything here:
+--     a partial index is only substitutable by an index whose predicate is
+--     implied by it, and no other index on this table carries a predicate.
+--
+-- AFTER 0066 the table carries the PK plus ten secondary indexes, and the
+-- prefix-pair query returns nothing.
+-- ===========================================================================

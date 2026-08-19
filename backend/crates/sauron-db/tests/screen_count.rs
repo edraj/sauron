@@ -259,6 +259,7 @@ async fn a_screen_seen_only_on_an_error_is_counted() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await

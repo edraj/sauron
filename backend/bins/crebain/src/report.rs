@@ -4,7 +4,7 @@
 use std::io::Write;
 
 use crate::cli::Expected;
-use crate::generator::ItemCounts;
+use crate::generator::{ItemCounts, Shape};
 use crate::metrics::{Snapshot, Summary, LATENCY_CAP};
 
 /// Overwrite the current stderr line with live progress.
@@ -31,7 +31,7 @@ pub fn clear_live_line() {
     let _ = err.flush();
 }
 
-pub fn print_summary(s: &Summary, expected: &Expected) {
+pub fn print_summary(s: &Summary, expected: &Expected, shape: &Shape) {
     let rule = "─".repeat(60);
     let achieved_rps = s.requests as f64 / s.elapsed.as_secs_f64().max(1e-9);
     let target_rps = expected.requests / expected.duration_secs.max(1e-9);
@@ -137,6 +137,61 @@ pub fn print_summary(s: &Summary, expected: &Expected) {
         s.attempted.breadcrumbs,
     );
     item_row("total", total(&s.accepted_items), total(&s.attempted));
+
+    // Always printed, even for a default (ratio 0.0) run: a BEFORE baseline that
+    // does not state its own duplicate distribution is not comparable to an
+    // AFTER run that does, and the whole point of the flags is that the two
+    // records differ on exactly this axis.
+    //
+    // `dup groups` is an upper bound rather than a measured count. Every repeat
+    // for one virtual user lands on that user's single canonical issue, so the
+    // groups repeats touch are exactly "the users that emitted at least one
+    // accepted repeat" — at most `min(users, repeats)`, and equal to it once the
+    // scheduler's round-robin has reached every user (any run longer than
+    // `users / issue-rate`). Fewer groups would only mean MORE occurrences each,
+    // which is why the per-group figure is a lower bound.
+    println!(
+        "\n  duplicate load  (--distinct-issues {}  --repeat-ratio {:.2})",
+        shape.distinct_issues, shape.repeat_ratio
+    );
+    println!(
+        "    error occurrences {:>12} / {:<12}  (accepted / attempted)",
+        group(s.accepted_items.errors),
+        group(s.attempted.errors),
+    );
+    println!(
+        "    repeat occurrences{:>12} / {:<12}  achieved {:>6}   target {:.1}%",
+        group(s.accepted_repeats),
+        group(s.attempted_repeats),
+        pct(s.accepted_repeats, s.accepted_items.errors),
+        shape.repeat_ratio * 100.0,
+    );
+    // An em dash rather than a zero when nothing repeated: "0 groups" would
+    // read as a measurement, when in fact the run simply forced no duplicates.
+    let groups = (s.users as u64).min(s.accepted_repeats);
+    let (groups_cell, per_group_cell) = if groups == 0 {
+        ("—".to_string(), "—".to_string())
+    } else {
+        (
+            format!("≤ {}", group(groups)),
+            format!("≥ {:.1}", s.accepted_repeats as f64 / groups as f64),
+        )
+    };
+    println!(
+        "    dup groups        {groups_cell:>12}   (fingerprint × user × device × session, upper bound)"
+    );
+    println!("    per group         {per_group_cell:>12}   occurrences (lower bound)");
+    if shape.repeat_ratio > 0.0 {
+        println!(
+            "    identical on a repeat: exception type + value, stacktrace frames (line/col included),"
+        );
+        println!(
+            "                           level, distinct_id, device_key, session_id, screen, tags"
+        );
+        println!(
+            "    still varying:         event_id, timestamps, breadcrumbs, contexts/extra scalars"
+        );
+    }
 
     println!("\n  latency  (per request, includes failures)");
     println!(

@@ -706,6 +706,98 @@ async fn a_rollup_with_no_surviving_evidence_is_deleted() {
     db.cleanup().await;
 }
 
+/// A purge must not deflate `times_seen` for an issue with cold-tier history.
+///
+/// `sauron-tier` DETACHes and DROPs an exported partition, so the hot table
+/// holds only the retention window. The recompute used to derive `times_seen`
+/// from a bare `count(*) FROM error_events`, which discards every exported
+/// occurrence — and `issues.times_seen` is the ONLY aggregate for a repeated
+/// exception, so the number the UI shows silently drops.
+///
+/// The caller merges hot and cold before calling here (and fails the job if the
+/// cold side is unreadable), so the contract this asserts is simply: the merged
+/// `counts.errors` is what gets written, NOT whatever survives in Postgres.
+/// Passing `errors` GREATER than the seeded hot rows is what makes cold history
+/// present — the sibling test above passes a figure equal to the hot count, so
+/// it cannot tell the two implementations apart.
+#[tokio::test]
+async fn recompute_keeps_cold_tier_occurrences_in_times_seen() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut c = db.conn().await;
+    let issue = seed_issue(&mut c, ids.app_id, 1_000, 7).await;
+
+    // 3 occurrences still hot; 97 already exported to Parquet and dropped with
+    // their partition, so they are unreachable from `error_events`.
+    seed_error(&mut c, ids.app_id, issue, None, Some("alice"), at(20)).await;
+    seed_error(&mut c, ids.app_id, issue, None, Some("alice"), at(20)).await;
+    seed_error(&mut c, ids.app_id, issue, None, Some("bob"), at(20)).await;
+
+    let merged = Counts {
+        events: 0,
+        errors: 100,
+        evidence: 100,
+        first: Some(at(2)),
+        last: Some(at(20)),
+    };
+    purge::apply_recomputed_rollup(
+        &mut c,
+        PurgeKind::Issues,
+        ids.app_id,
+        &issue.to_string(),
+        merged,
+    )
+    .await
+    .unwrap();
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        times_seen: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        users_seen: i64,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        first_seen: DateTime<Utc>,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        last_event_at: DateTime<Utc>,
+    }
+    let r: Row = diesel::sql_query(
+        "SELECT times_seen, users_seen, first_seen, last_event_at FROM issues WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(issue)
+    .get_result(&mut c)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        r.times_seen, 100,
+        "times_seen must be the MERGED count; 3 means the cold rows were discarded"
+    );
+    // The span is merged too: the earliest occurrence is cold, so a hot-only
+    // min(occurred_at) would drag first_seen forward to at(20).
+    assert_eq!(
+        r.first_seen,
+        at(2),
+        "first_seen must come from the merged span"
+    );
+    assert_eq!(
+        r.last_event_at,
+        at(20),
+        "last_event_at must come from the merged span"
+    );
+    // `users_seen` cannot be merged — Counts carries no distinct-user figure and
+    // distinct counts do not sum across tiers. With cold history present it must
+    // therefore be LEFT ALONE (overcounted, the recoverable direction) rather
+    // than rewritten to the hot-only 2.
+    assert_eq!(
+        r.users_seen, 7,
+        "users_seen must be preserved when cold history exists, not deflated to the hot DISTINCT"
+    );
+    db.cleanup().await;
+}
+
 /// `issues.users_seen` is a DISTINCT count, not a sum. This is the concrete
 /// reason the design recomputes instead of decrementing: subtracting a deleted
 /// row count from a distinct count is simply wrong.

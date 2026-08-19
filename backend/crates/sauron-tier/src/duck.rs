@@ -121,12 +121,32 @@ impl DuckEngine {
         self.conn.execute_batch(&format!(
             "ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY);"
         ))?;
+        // Tier 1 (migration 0068): a pooled `error_events` row carries the
+        // placeholder `[]` inline and its real trace in `error_stack_blobs`.
+        // A bare `SELECT *` would ship the placeholder plus a dangling hash
+        // into cold storage — unreadable through the cross-tier router once
+        // the hot pool row is swept. The export therefore MATERIALIZES the
+        // trace (COALESCE keeps pre-0068 and pooling-off rows intact) and
+        // EXCLUDES the hash column, so cold files keep the exact pre-Tier-1
+        // schema and no cold reader needs to know pooling ever existed.
+        let select = if table == "error_events" {
+            "SELECT e.* EXCLUDE (stacktrace_sha256) \
+                    REPLACE (COALESCE(b.content, e.stacktrace) AS stacktrace), \
+                    year(e.occurred_at) AS year, month(e.occurred_at) AS month \
+             FROM pg.error_events e \
+             LEFT JOIN pg.error_stack_blobs b ON e.stacktrace_sha256 = b.sha256"
+                .to_string()
+        } else {
+            format!(
+                "SELECT *, year(occurred_at) AS year, month(occurred_at) AS month \
+                 FROM pg.{table}"
+            )
+        };
         let sql = format!(
-            "COPY (SELECT *, year(occurred_at) AS year, month(occurred_at) AS month \
-                   FROM pg.{table} \
+            "COPY ({select} \
                    WHERE occurred_at >= TIMESTAMPTZ '{start}' AND occurred_at < TIMESTAMPTZ '{end}') \
              TO '{cold_dir}' (FORMAT PARQUET, PARTITION_BY (app_id, year, month), APPEND);",
-            table = table,
+            select = select,
             start = start.to_rfc3339(),
             end = end.to_rfc3339(),
             cold_dir = cold_dir,

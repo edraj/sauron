@@ -406,6 +406,11 @@ pub struct ErrorEvent {
     /// the occurrence had no frames (see `build_culprit`), which is distinct
     /// from `None`, a pre-migration-30 row that never had the column.
     pub culprit: Option<String>,
+    /// `Some` = the trace lives in `error_stack_blobs`; `stacktrace` above is
+    /// a placeholder until `stack_pool::hydrate` swaps the real value in.
+    /// Skipped in serialization — the wire shape is unchanged by pooling.
+    #[serde(skip)]
+    pub stacktrace_sha256: Option<Vec<u8>>,
 }
 
 /// **`Insertable`-only, on purpose.** Diesel's `Insertable` maps fields to
@@ -417,7 +422,7 @@ pub struct ErrorEvent {
 /// today would silently bind each field to whatever column occupies its index
 /// and return garbage — compiling cleanly, with `check_for_backend` none the
 /// wiser. Read rows into `ErrorEvent` instead.
-#[derive(Debug, Insertable)]
+#[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = error_events)]
 pub struct NewErrorEvent {
     pub id: Uuid,
@@ -467,6 +472,10 @@ pub struct NewErrorEvent {
     /// occurrence had no exception, not "unknown" — see `build_culprit`.
     pub title: Option<String>,
     pub culprit: Option<String>,
+    /// Set by `stack_pool::intern` (never by constructors — leave `None`):
+    /// when pooling is on, the trace moves to `error_stack_blobs` and this
+    /// carries its content address while `stacktrace` holds the placeholder.
+    pub stacktrace_sha256: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------

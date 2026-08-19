@@ -37,10 +37,23 @@ export interface TableSize {
   name: string;
   total_bytes: number;
   hot_rows: number;
+  /** Hot/cold tiered tables carry an `app_id`; only these have cold counterparts. */
+  tiered?: boolean;
 }
 
 export interface DatabaseInfo {
+  /** Postgres bytes attributable to the caller's visible apps. */
   total_bytes: number;
+  /**
+   * True `pg_database_size` — indexes, TOAST and bloat included. Absent unless
+   * the caller manages every org, since a shared database's physical size is
+   * necessarily the sum over all tenants.
+   */
+  physical_bytes?: number | null;
+  /** Cold/Parquet bytes across the caller's visible apps. */
+  cold_bytes?: number;
+  /** Caller's org set covers the whole deployment, so sizes are exact. */
+  full_scope?: boolean;
   tables: TableSize[];
 }
 

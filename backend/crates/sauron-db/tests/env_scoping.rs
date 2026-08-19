@@ -312,6 +312,7 @@ async fn seed_cross_env_session_child_rows(
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -2406,6 +2407,237 @@ async fn screen_list_covers_only_the_selected_environment() {
     db.cleanup().await;
 }
 
+/// Distinct `device_key`s with signal on `screen`, computed independently of
+/// `screen_signal_union`.
+///
+/// Deliberately NOT built from the helper it checks: an oracle that reuses the
+/// implementation's own query reproduces its bugs and asserts nothing. This is
+/// hand-written SQL over the same two tables, with the environment filter
+/// spelled out separately.
+async fn distinct_device_count_for_screen(
+    conn: &mut diesel_async::AsyncPgConnection,
+    scope: &ReadScope,
+    screen: &str,
+) -> i64 {
+    use diesel::sql_types::BigInt;
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct N {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+
+    let env = match &scope.env {
+        EnvFilter::All => String::new(),
+        EnvFilter::One(id) => format!(" AND environment_id = '{id}'"),
+        EnvFilter::Unattributed => " AND environment_id IS NULL".to_string(),
+        EnvFilter::Subset(ids) => {
+            let list = ids
+                .iter()
+                .map(|i| format!("'{i}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(" AND environment_id IN ({list})")
+        }
+    };
+    let sql = format!(
+        "SELECT count(*)::bigint AS n FROM ( \
+           SELECT device_key FROM analytics_events \
+            WHERE app_id='{app}' AND screen='{screen}' \
+              AND device_key IS NOT NULL AND device_key<>''{env} \
+           UNION \
+           SELECT device_key FROM error_events \
+            WHERE app_id='{app}' AND screen='{screen}' \
+              AND device_key IS NOT NULL AND device_key<>''{env} \
+         ) d",
+        app = scope.app_id,
+    );
+    let row: N = diesel::sql_query(sql).get_result(conn).await.unwrap();
+    row.n
+}
+
+/// `users_for_screen`/`devices_for_screen` are RAW SQL — the shape where a
+/// mistake costs a 500 at runtime and nothing earlier. Three things are checked
+/// that only a real database can answer:
+///
+/// 1. **The SQL parses and its types line up at all.** `UNION ALL` across
+///    `analytics_events` and `error_events`, a `NULL::text` stand-in for the
+///    column `error_events` does not have, `FILTER (WHERE …)` aggregates, and a
+///    `LEFT JOIN` per query — none of it is checked by `cargo check`.
+/// 2. **The env bind landed on `$4` and did not shift `LIMIT`/`OFFSET`.** The
+///    fragment is interpolated into BOTH union branches referencing the same
+///    placeholder, which is the specific thing a bind-index slip breaks.
+/// 3. **The row count agrees with `screen_stats.users`.** Both derive the
+///    screen's audience from the same union, so a divergence means one of them
+///    is answering a different question than the tile beside it claims.
+#[tokio::test]
+async fn users_and_devices_for_screen_are_scoped_and_agree_with_screen_stats() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    for (label, env) in [
+        ("env_a", EnvFilter::One(ids.env_a)),
+        ("env_b", EnvFilter::One(ids.env_b)),
+        ("all", EnvFilter::All),
+    ] {
+        let scope = ReadScope::new(ids.app_id, env);
+
+        let stats = sauron_db::repo::screen_stats(&mut conn, scope.clone(), far_past(), "home")
+            .await
+            .unwrap();
+
+        // A limit far above the fixture, so this is every row, not a page.
+        let users =
+            sauron_db::repo::users_for_screen(&mut conn, scope.clone(), "home", far_past(), 100, 0)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            users.len() as i64,
+            stats.users,
+            "{label}: users_for_screen must return exactly the identities \
+             screen_stats counts for the same screen and scope"
+        );
+
+        // Every row belongs to the screen: its per-screen signal cannot be zero
+        // on all three counters, or the union admitted a row it should not have.
+        for u in &users {
+            assert!(
+                u.views_on_screen + u.events_on_screen + u.exceptions_on_screen > 0,
+                "{label}: {} has no signal on 'home' yet was listed",
+                u.distinct_id
+            );
+            assert!(
+                u.first_seen_on_screen <= u.last_seen_on_screen,
+                "{label}: {} has first_seen after last_seen",
+                u.distinct_id
+            );
+        }
+
+        let devices = sauron_db::repo::devices_for_screen(
+            &mut conn,
+            scope.clone(),
+            "home",
+            far_past(),
+            100,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // The devices list must be env-scoped INDEPENDENTLY of the users list.
+        // Without this, the only devices assertion was the per-row
+        // `signal > 0` loop below, which a leak cannot fail: drop `env_sql`
+        // from the device branch of `screen_signal_union` and every leaked row
+        // still carries counters > 0, because the same unfiltered union feeds
+        // the aggregate. The suite printed `ok` on that mutation.
+        //
+        // Derived from the same union `screen_stats` counts users over, rather
+        // than hardcoded, so it states the invariant instead of a fixture
+        // constant: a screen's device set is bounded by its identity set, and
+        // under a narrower environment filter it can only shrink.
+        let expected_devices = distinct_device_count_for_screen(&mut conn, &scope, "home").await;
+        assert_eq!(
+            devices.len() as i64,
+            expected_devices,
+            "{label}: devices_for_screen must list exactly the distinct device_keys              with signal on this screen in this scope"
+        );
+
+        for d in &devices {
+            assert!(
+                d.views_on_screen + d.events_on_screen + d.exceptions_on_screen > 0,
+                "{label}: device {} has no signal on 'home' yet was listed",
+                d.device_key
+            );
+        }
+
+        // Paging must partition the list, not resample it. This is the check
+        // that fails when the ORDER BY has no unique tiebreak: each page looks
+        // correct alone while a row appears twice across the boundary.
+        if users.len() >= 2 {
+            let page1 = sauron_db::repo::users_for_screen(
+                &mut conn,
+                scope.clone(),
+                "home",
+                far_past(),
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+            let page2 = sauron_db::repo::users_for_screen(
+                &mut conn,
+                scope.clone(),
+                "home",
+                far_past(),
+                1,
+                1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page1.len(), 1, "{label}: limit=1 must return one row");
+            assert_eq!(
+                page2.len(),
+                1,
+                "{label}: offset=1 must return the second row"
+            );
+            assert_ne!(
+                page1[0].distinct_id, page2[0].distinct_id,
+                "{label}: offset=1 returned the same row as offset=0 — LIMIT/OFFSET \
+                 bound to the wrong placeholders, or the ORDER BY has no unique tiebreak"
+            );
+            assert_eq!(
+                page1[0].distinct_id, users[0].distinct_id,
+                "{label}: the first page must match the head of the unpaged list"
+            );
+        }
+    }
+
+    // Guard against this test passing vacuously. Every assertion above is
+    // inside a loop over scopes, and several are inside `if users.len() >= 2`;
+    // a fixture that stopped seeding `home` would satisfy all of them with
+    // empty vectors and still print `ok`. Pinned to the same number
+    // `screen_stats_covers_only_the_selected_environment` asserts for env_a,
+    // so if the fixture changes, both fail together and say so.
+    let env_a_users = sauron_db::repo::users_for_screen(
+        &mut conn,
+        ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
+        "home",
+        far_past(),
+        100,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        env_a_users.len(),
+        2,
+        "the fixture must seed 2 users on 'home' in env_a, or the loop above          asserted nothing — matches screen_stats' `a.users == 2`"
+    );
+
+    // A screen nobody visited returns nothing rather than erroring — the empty
+    // card, not a 500.
+    let none = sauron_db::repo::users_for_screen(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        "no-such-screen",
+        far_past(),
+        100,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(none.is_empty(), "an unvisited screen must list no users");
+
+    drop(conn);
+    db.cleanup().await;
+}
+
 /// `recent_events_for_screen`/`recent_exceptions_for_screen` are boxed-diesel reads (not raw
 /// SQL, unlike `screen_ctes`' four callers above), scoped via the ordinary `scope_env!` macro.
 /// Counts must match `screen_stats`' `events`/`exceptions` columns for the same screen+scope.
@@ -2424,6 +2656,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         "home",
         far_past(),
         20,
+        0,
     )
     .await
     .unwrap();
@@ -2439,6 +2672,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         "home",
         far_past(),
         20,
+        0,
     )
     .await
     .unwrap();
@@ -2454,6 +2688,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         "home",
         far_past(),
         20,
+        0,
     )
     .await
     .unwrap();
@@ -2469,6 +2704,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         "home",
         far_past(),
         20,
+        0,
     )
     .await
     .unwrap();
@@ -2484,6 +2720,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         "home",
         far_past(),
         20,
+        0,
     )
     .await
     .unwrap();
@@ -3623,6 +3860,7 @@ async fn list_issues_filters_tag_and_free_text_compose_with_scope() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -3796,6 +4034,7 @@ async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own()
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -3840,6 +4079,7 @@ async fn list_issues_since_applies_to_the_derived_last_seen_not_the_issues_own()
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -3991,6 +4231,7 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4031,6 +4272,7 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4108,6 +4350,7 @@ async fn list_issues_orders_by_the_derived_last_seen_not_the_issues_own() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4436,6 +4679,7 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4482,6 +4726,7 @@ async fn list_issues_tag_and_q_do_not_leak_across_environments() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4821,6 +5066,7 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -4883,6 +5129,7 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
                 handled: Some(true),
                 title: None,
                 culprit: None,
+                stacktrace_sha256: None,
             },
         )
         .await
@@ -5092,6 +5339,7 @@ async fn top_issues_all_ranks_by_the_stored_times_seen_column() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await
@@ -5149,6 +5397,7 @@ async fn top_issues_all_ranks_by_the_stored_times_seen_column() {
                 handled: Some(true),
                 title: None,
                 culprit: None,
+                stacktrace_sha256: None,
             },
         )
         .await
@@ -5272,6 +5521,7 @@ async fn top_issues_unattributed_ranks_by_the_unattributed_derived_count() {
                 handled: Some(true),
                 title: None,
                 culprit: None,
+                stacktrace_sha256: None,
             },
         )
         .await
@@ -6517,6 +6767,7 @@ async fn list_issues_filters_agree_with_what_it_displays() {
             handled: Some(true),
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await

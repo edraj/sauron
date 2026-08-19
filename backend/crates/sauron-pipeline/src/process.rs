@@ -396,6 +396,8 @@ async fn process_error(
             // environment's occurrence lands last.
             title: Some(title),
             culprit: Some(culprit),
+            // Filled by `stack_pool::intern` at write time when pooling is on.
+            stacktrace_sha256: None,
         },
     )
     .await?;

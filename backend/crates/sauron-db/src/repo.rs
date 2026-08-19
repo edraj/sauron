@@ -2251,8 +2251,14 @@ pub async fn upsert_issue(conn: &mut AsyncPgConnection, new: NewIssue<'_>) -> Qu
 
 pub async fn insert_error_event(
     conn: &mut AsyncPgConnection,
-    ev: NewErrorEvent,
+    mut ev: NewErrorEvent,
 ) -> QueryResult<usize> {
+    // Tier 1 pooling — same contract as the batched path in `batch.rs`: blob
+    // first (FK + sweep-race ordering), then the row carrying its address.
+    if crate::stack_pool::pooling_enabled() {
+        let blobs = crate::stack_pool::intern(std::slice::from_mut(&mut ev));
+        crate::stack_pool::insert_blobs(conn, &blobs).await?;
+    }
     diesel::insert_into(error_events::table)
         .values(&ev)
         .execute(conn)
@@ -3795,9 +3801,14 @@ pub async fn search_occurrences(
     if let Some(off) = jump_offset(&search.after, search.offset) {
         q = q.offset(off);
     }
-    q.load(conn)
+    let mut rows: Vec<ErrorEvent> = q
+        .load(conn)
         .await
-        .map_err(|e| PlanError::Database(e.to_string()))
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    crate::stack_pool::hydrate(conn, &mut rows)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    Ok(rows)
 }
 
 /// `(total, capped)` over the same predicate [`search_occurrences`] pages.
@@ -5515,12 +5526,17 @@ pub async fn list_error_events_for_issue_with_reach(
     since: Option<chrono::DateTime<chrono::Utc>>,
     limit: i64,
 ) -> QueryResult<Vec<ErrorEvent>> {
-    error_events_for_issue_query(&scope, issue_id, filters, q, reach, since)
-        .select(ErrorEvent::as_select())
-        .order(error_events::occurred_at.desc())
-        .limit(limit)
-        .load(conn)
-        .await
+    let mut rows: Vec<ErrorEvent> =
+        error_events_for_issue_query(&scope, issue_id, filters, q, reach, since)
+            .select(ErrorEvent::as_select())
+            .order(error_events::occurred_at.desc())
+            .limit(limit)
+            .load(conn)
+            .await?;
+    // Tier 1: pooled rows carry a placeholder trace until hydrated. The whole
+    // page shares a handful of blobs, so this is one small query, not N.
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 /// [`list_error_events_for_issue_with_reach`] with the payload scan ON.
@@ -5700,12 +5716,17 @@ pub async fn latest_error_event(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::issue_id.eq(issue_id))
         .into_boxed();
-    crate::scope_env!(query, error_events, &scope.env)
+    let row: Option<ErrorEvent> = crate::scope_env!(query, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .first(conn)
         .await
-        .optional()
+        .optional()?;
+    let Some(ev) = row else { return Ok(None) };
+    let mut one = [ev];
+    crate::stack_pool::hydrate(conn, &mut one).await?;
+    let [ev] = one;
+    Ok(Some(ev))
 }
 
 /// `error_events` carries its own `environment_id` directly, so this is an
@@ -5721,12 +5742,14 @@ pub async fn error_events_for_person(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::distinct_id.eq(distinct_id))
         .into_boxed();
-    crate::scope_env!(q, error_events, &scope.env)
+    let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)
         .load(conn)
-        .await
+        .await?;
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 // ===========================================================================
@@ -7354,12 +7377,14 @@ pub async fn errors_for_session(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::session_id.eq(session_id.to_string()))
         .into_boxed();
-    crate::scope_env!(q, error_events, &scope.env)
+    let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.asc())
         .limit(limit)
         .load(conn)
-        .await
+        .await?;
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 /// See [`events_for_session`]'s doc comment — same reasoning, `transactions`.
@@ -8483,12 +8508,14 @@ pub async fn errors_for_device(
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::device_key.eq(device_key.to_string()))
         .into_boxed();
-    crate::scope_env!(q, error_events, &scope.env)
+    let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
         .limit(limit)
         .load(conn)
-        .await
+        .await?;
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
 }
 
 // ===========================================================================
@@ -10538,12 +10565,26 @@ pub async fn screen_stats(
     stmt.get_result(conn).await
 }
 
+/// One page of a screen's analytics events, most recent first.
+///
+/// `name <> '$screen'` keeps the synthetic screen-view rows the mobile SDKs
+/// emit out of the list — those are the `views` stat tile, not events. The
+/// same exclusion `query_plan::events` applies to the Event Explorer, and for
+/// the same reason.
+///
+/// **`id` is the ORDER BY tiebreak, and it is load-bearing.** `occurred_at`
+/// alone is not unique — a screen transition emits several events inside the
+/// same millisecond routinely — so paging by `OFFSET` over an untiebroken
+/// order lets Postgres return the tied rows in a different arrangement per
+/// page, which both duplicates and drops rows across a page boundary while
+/// every individual page looks correct.
 pub async fn recent_events_for_screen(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     screen: &str,
     since: DateTime<Utc>,
     limit: i64,
+    offset: i64,
 ) -> QueryResult<Vec<AnalyticsEvent>> {
     let q = analytics_events::table
         .filter(analytics_events::app_id.eq(scope.app_id))
@@ -10553,29 +10594,252 @@ pub async fn recent_events_for_screen(
         .into_boxed();
     crate::scope_env!(q, analytics_events, &scope.env)
         .select(AnalyticsEvent::as_select())
-        .order(analytics_events::occurred_at.desc())
+        .order((
+            analytics_events::occurred_at.desc(),
+            analytics_events::id.desc(),
+        ))
         .limit(limit)
+        .offset(offset)
         .load(conn)
         .await
 }
 
+/// One page of a screen's exceptions, most recent first.
+///
+/// `id` tiebreaks the order for the reason [`recent_events_for_screen`]
+/// documents — an unhandled exception commonly arrives alongside its own
+/// breadcrumb events in the same millisecond.
 pub async fn recent_exceptions_for_screen(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     screen: &str,
     since: DateTime<Utc>,
     limit: i64,
+    offset: i64,
 ) -> QueryResult<Vec<ErrorEvent>> {
     let q = error_events::table
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::screen.eq(screen))
         .filter(error_events::occurred_at.ge(since))
         .into_boxed();
-    crate::scope_env!(q, error_events, &scope.env)
+    let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
-        .order(error_events::occurred_at.desc())
+        .order((error_events::occurred_at.desc(), error_events::id.desc()))
         .limit(limit)
+        .offset(offset)
         .load(conn)
+        .await?;
+    crate::stack_pool::hydrate(conn, &mut rows).await?;
+    Ok(rows)
+}
+
+/// The per-screen signal set both [`users_for_screen`] and
+/// [`devices_for_screen`] aggregate over.
+///
+/// `analytics_events` and `error_events` are unioned because a screen's
+/// audience is whoever produced EITHER kind of signal there — a user whose
+/// only trace on a screen is a crash still visited it, and the `users` stat
+/// tile above these lists already counts them (see the `us` CTE in
+/// [`screen_ctes`]). Restricting to one table would put a smaller number under
+/// a tile that disagrees with it.
+///
+/// `key_col` is the grouping key (`distinct_id` or `device_key`); `env_sql` is
+/// interpolated into BOTH branches and may reference the same positional bind
+/// twice, exactly as [`screen_ctes`] does.
+///
+/// `NULL::text AS name` on the error branch: `error_events` has no `name`
+/// column, and a bare `NULL` in a `UNION ALL` leaves Postgres to infer the
+/// column type from the other branch — it works here but is fragile, so the
+/// cast is written out.
+///
+/// Both branches pin `app_id`, an equality on `screen`, and a lower bound on
+/// `occurred_at`, which is precisely the column order of
+/// `analytics_events_app_screen_time_idx` / `error_events_app_screen_time_idx`
+/// (`WHERE screen IS NOT NULL`, a predicate `screen = $3` implies). This is
+/// the difference between an index scan and a scan of every partition.
+fn screen_signal_union(key_col: &str, env_sql: &str) -> String {
+    format!(
+        "SELECT {key_col} AS k, name, occurred_at, 'e'::text AS src \
+         FROM analytics_events \
+         WHERE app_id=$1 AND occurred_at>=$2 AND screen=$3 \
+           AND {key_col} IS NOT NULL AND {key_col}<>''{env_sql} \
+         UNION ALL \
+         SELECT {key_col} AS k, NULL::text AS name, occurred_at, 'x'::text AS src \
+         FROM error_events \
+         WHERE app_id=$1 AND occurred_at>=$2 AND screen=$3 \
+           AND {key_col} IS NOT NULL AND {key_col}<>''{env_sql}"
+    )
+}
+
+/// The aggregate select over [`screen_signal_union`], shared by both callers.
+///
+/// Every count is SCREEN-SCOPED and deliberately so: these lists answer "who
+/// used THIS screen", so `events`/`exceptions`/`first_seen`/`last_seen`
+/// describe activity on this screen alone, not the person's or device's
+/// lifetime totals. Those totals live behind the row's link to
+/// `/persons/:distinct_id` and `/devices/:device_key`.
+///
+/// Reading them as global would be the misinterpretation to guard against, so
+/// the API names them `*_on_screen` on the wire.
+const SCREEN_ACTOR_AGG: &str = "SELECT k, \
+       count(*) FILTER (WHERE src='e' AND name='$screen')::bigint AS views, \
+       count(*) FILTER (WHERE src='e' AND name<>'$screen')::bigint AS events, \
+       count(*) FILTER (WHERE src='x')::bigint AS exceptions, \
+       min(occurred_at) AS first_seen, max(occurred_at) AS last_seen \
+     FROM sig GROUP BY k";
+
+/// One user who produced signal on a given screen, with their activity ON THAT
+/// SCREEN. See [`SCREEN_ACTOR_AGG`] for why the counts are screen-scoped.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct ScreenUserRow {
+    #[diesel(sql_type = Text)]
+    pub distinct_id: String,
+    #[diesel(sql_type = Jsonb)]
+    pub properties: Value,
+    #[diesel(sql_type = BigInt)]
+    pub views_on_screen: i64,
+    #[diesel(sql_type = BigInt)]
+    pub events_on_screen: i64,
+    #[diesel(sql_type = BigInt)]
+    pub exceptions_on_screen: i64,
+    #[diesel(sql_type = Timestamptz)]
+    pub first_seen_on_screen: DateTime<Utc>,
+    #[diesel(sql_type = Timestamptz)]
+    pub last_seen_on_screen: DateTime<Utc>,
+}
+
+/// One device that produced signal on a given screen, with its activity ON
+/// THAT SCREEN plus the device's descriptive attributes.
+///
+/// The descriptive columns come from a plain `LEFT JOIN devices`, which is
+/// safe in a way joining `event_user_environments`/`device_environments` would
+/// not be: family/model/os/arch/browser are per-device facts, not
+/// per-environment counters, so there is nothing to roll up and no fan-out to
+/// get wrong. Every counter in this row is computed here, from the screen's
+/// own signal.
+#[derive(Debug, QueryableByName, serde::Serialize)]
+pub struct ScreenDeviceRow {
+    #[diesel(sql_type = Text)]
+    pub device_key: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub family: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub model: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub os_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub os_version: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub arch: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub browser: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub views_on_screen: i64,
+    #[diesel(sql_type = BigInt)]
+    pub events_on_screen: i64,
+    #[diesel(sql_type = BigInt)]
+    pub exceptions_on_screen: i64,
+    #[diesel(sql_type = Timestamptz)]
+    pub first_seen_on_screen: DateTime<Utc>,
+    #[diesel(sql_type = Timestamptz)]
+    pub last_seen_on_screen: DateTime<Utc>,
+}
+
+/// One page of the users who produced signal on `screen`, most recently active
+/// first.
+///
+/// `properties` is `LEFT JOIN`ed from `event_users` for display only, and
+/// `COALESCE`d: a `distinct_id` can appear in the event stream before the
+/// `event_users` upsert lands, and an `INNER` join would silently drop exactly
+/// the newest users — the ones a screen's audience list is most likely to be
+/// opened for.
+///
+/// The `distinct_id` tiebreak is what makes `OFFSET` paging total; see
+/// [`recent_events_for_screen`].
+pub async fn users_for_screen(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    screen: &str,
+    since: DateTime<Utc>,
+    limit: i64,
+    offset: i64,
+) -> QueryResult<Vec<ScreenUserRow>> {
+    // $1 app_id, $2 since, $3 screen — env takes $4 when it needs a bind,
+    // pushing limit/offset from $4/$5 to $5/$6. The same trailing-index shift
+    // idiom `screen_list` documents; the binds below are supplied in that
+    // order regardless of where `$4` appears in the text.
+    let env_sql = scope.env.sql_fragment(4);
+    let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
+    let offset_idx = limit_idx + 1;
+    let sig = screen_signal_union("distinct_id", &env_sql);
+    let q = format!(
+        "WITH sig AS ({sig}), agg AS ({SCREEN_ACTOR_AGG}) \
+         SELECT agg.k AS distinct_id, \
+                COALESCE(eu.properties, '{{}}'::jsonb) AS properties, \
+                agg.views AS views_on_screen, \
+                agg.events AS events_on_screen, \
+                agg.exceptions AS exceptions_on_screen, \
+                agg.first_seen AS first_seen_on_screen, \
+                agg.last_seen AS last_seen_on_screen \
+         FROM agg \
+         LEFT JOIN event_users eu ON eu.app_id=$1 AND eu.distinct_id=agg.k \
+         ORDER BY agg.last_seen DESC, agg.k ASC \
+         LIMIT ${limit_idx} OFFSET ${offset_idx}"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(since)
+        .bind::<Text, _>(screen);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    stmt.bind::<BigInt, _>(limit)
+        .bind::<BigInt, _>(offset)
+        .get_results(conn)
+        .await
+}
+
+/// One page of the devices that produced signal on `screen`, most recently
+/// active first.
+///
+/// `LEFT JOIN devices` for the same reason [`users_for_screen`] left-joins
+/// `event_users`: the descriptive row may not exist yet, and dropping the
+/// device would understate a list the `devices` count is read against.
+pub async fn devices_for_screen(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    screen: &str,
+    since: DateTime<Utc>,
+    limit: i64,
+    offset: i64,
+) -> QueryResult<Vec<ScreenDeviceRow>> {
+    // Bind layout identical to `users_for_screen` — see its comment.
+    let env_sql = scope.env.sql_fragment(4);
+    let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
+    let offset_idx = limit_idx + 1;
+    let sig = screen_signal_union("device_key", &env_sql);
+    let q = format!(
+        "WITH sig AS ({sig}), agg AS ({SCREEN_ACTOR_AGG}) \
+         SELECT agg.k AS device_key, \
+                d.family, d.model, d.os_name, d.os_version, d.arch, d.browser, \
+                agg.views AS views_on_screen, \
+                agg.events AS events_on_screen, \
+                agg.exceptions AS exceptions_on_screen, \
+                agg.first_seen AS first_seen_on_screen, \
+                agg.last_seen AS last_seen_on_screen \
+         FROM agg \
+         LEFT JOIN devices d ON d.app_id=$1 AND d.device_key=agg.k \
+         ORDER BY agg.last_seen DESC, agg.k ASC \
+         LIMIT ${limit_idx} OFFSET ${offset_idx}"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(since)
+        .bind::<Text, _>(screen);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    stmt.bind::<BigInt, _>(limit)
+        .bind::<BigInt, _>(offset)
+        .get_results(conn)
         .await
 }
 
@@ -11989,7 +12253,9 @@ pub async fn db_total_bytes(conn: &mut AsyncPgConnection) -> QueryResult<i64> {
 
 pub async fn table_total_bytes(conn: &mut AsyncPgConnection, table: &str) -> QueryResult<i64> {
     // A partitioned parent has no storage of its own; sum the whole partition
-    // tree (parent + children). Works for a non-partitioned table too (tree = self).
+    // tree (parent + children). NOTE: `pg_partition_tree` yields no rows at all
+    // for a plain table, so this returns 0 for one — callers must pass a
+    // partitioned table (TIERED_TABLES) or use `all_table_sizes`.
     let row: BytesRow = diesel::sql_query(format!(
         "SELECT COALESCE(sum(pg_total_relation_size(relid)), 0)::bigint AS bytes \
          FROM pg_partition_tree('{table}'::regclass)"
@@ -12017,6 +12283,92 @@ pub async fn table_avg_row_width(conn: &mut AsyncPgConnection, table: &str) -> Q
     .get_result(conn)
     .await?;
     Ok(row.bytes)
+}
+
+/// Number of organisations in the deployment.
+///
+/// Used solely to decide whether a caller's `org:manage` set covers *every*
+/// tenant. When it does, physical sizes disclose nothing the caller cannot
+/// already account for, so the report may report real bytes instead of an
+/// apportioned share. See `admin_storage`.
+pub async fn org_count(conn: &mut AsyncPgConnection) -> QueryResult<i64> {
+    let row: CountRow = diesel::sql_query("SELECT count(*)::bigint AS n FROM organizations")
+        .get_result(conn)
+        .await?;
+    Ok(row.n)
+}
+
+#[derive(diesel::QueryableByName)]
+pub struct TablePhysicalRow {
+    #[diesel(sql_type = Text)]
+    pub name: String,
+    #[diesel(sql_type = BigInt)]
+    pub bytes: i64,
+    #[diesel(sql_type = BigInt)]
+    pub rows: i64,
+}
+
+/// Physical size of every base table in `public`, plus the planner's live-row
+/// estimate.
+///
+/// Two things this gets right that a `rows × pg_stats.avg_width` estimate does
+/// not, and which together account for most of the gap between the two:
+/// `pg_total_relation_size` includes **indexes, TOAST and per-page/per-tuple
+/// overhead**, and it counts **dead tuples still occupying disk**. The width
+/// estimate sees only live heap column bytes.
+///
+/// Child partitions are folded into their parent rather than listed separately:
+/// `pg_total_relation_size` on a partitioned PARENT is 0 (it has no storage of
+/// its own), so the tree must be summed or the largest tables silently read as
+/// empty. `reltuples` is -1 on a never-analyzed relation, hence the clamp.
+pub async fn all_table_sizes(conn: &mut AsyncPgConnection) -> QueryResult<Vec<TablePhysicalRow>> {
+    // `pg_partition_tree` returns ZERO rows for a plain (non-partitioned) table
+    // — it is not "tree = self". Without the fallback every ordinary table in
+    // the schema reports 0 bytes, which is exactly the silent-undercount this
+    // function exists to remove (`event_users` alone is hundreds of MB).
+    diesel::sql_query(
+        "SELECT c.relname AS name, \
+                COALESCE(( SELECT sum(pg_total_relation_size(pt.relid)) \
+                           FROM pg_partition_tree(c.oid) pt ), \
+                         pg_total_relation_size(c.oid), 0)::bigint AS bytes, \
+                COALESCE(( SELECT sum(GREATEST(pc.reltuples, 0)) \
+                           FROM pg_partition_tree(c.oid) pt \
+                           JOIN pg_class pc ON pc.oid = pt.relid \
+                           WHERE pc.relkind <> 'p' ), \
+                         GREATEST(c.reltuples, 0), 0)::bigint AS rows \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') \
+           AND NOT c.relispartition \
+         ORDER BY 2 DESC",
+    )
+    .load(conn)
+    .await
+}
+
+/// Total live rows in `table` across every tenant, as a planner estimate.
+///
+/// Only ever used as the denominator when apportioning a table's physical bytes
+/// to one tenant's row share, so an estimate is adequate and a `count(*)` over
+/// every partition would not be. Falls back to an exact count when the planner
+/// has no statistics yet (a freshly-loaded table), since a 0 denominator would
+/// otherwise zero out the apportioned figure.
+pub async fn table_row_estimate(conn: &mut AsyncPgConnection, table: &str) -> QueryResult<i64> {
+    // `table` is never user input: callers pass a literal from TIERED_TABLES.
+    let row: CountRow = diesel::sql_query(format!(
+        "SELECT COALESCE(sum(GREATEST(pc.reltuples, 0)), 0)::bigint AS n \
+         FROM pg_partition_tree('{table}'::regclass) pt \
+         JOIN pg_class pc ON pc.oid = pt.relid \
+         WHERE pc.relkind <> 'p'"
+    ))
+    .get_result(conn)
+    .await?;
+    if row.n > 0 {
+        return Ok(row.n);
+    }
+    let exact: CountRow = diesel::sql_query(format!("SELECT count(*)::bigint AS n FROM {table}"))
+        .get_result(conn)
+        .await?;
+    Ok(exact.n)
 }
 
 #[derive(diesel::QueryableByName)]
@@ -12509,6 +12861,45 @@ pub async fn delete_symbol_artifact(
         .await?;
     }
     Ok(true)
+}
+
+/// Grace age below which an unreferenced blob is NOT swept: long enough that no
+/// in-flight upload (put_blob committed, insert_symbol_artifact not yet) can
+/// still be racing, short enough that a leak never outlives a day.
+pub const SYMBOL_BLOB_SWEEP_GRACE_HOURS: i64 = 24;
+
+/// Delete `symbol_blobs` rows that no artifact references.
+///
+/// Migration 0067's trigger keeps `refcount` honest for every blob an artifact
+/// row has ever pointed at — including CASCADE deletes, which bypass
+/// [`delete_symbol_artifact`] entirely. What the trigger structurally cannot
+/// see is a blob that never acquired an artifact row at all: `put_blob` has
+/// already committed (refcount 1) when `insert_symbol_artifact` loses its
+/// unique-violation race or fails for any other reason, and the recovery arm
+/// deliberately does not decrement. Such orphans are invisible to a trigger on
+/// `symbol_artifacts` because no row of that table is ever written for them.
+///
+/// So this sweeps from the ground truth instead of the counter: a blob with no
+/// referring artifact is unreachable — the FKs from `symbol_artifacts` are the
+/// only pointers into this table — and deleting it cannot race a *future*
+/// reference, because a re-upload goes through `put_blob`, which re-creates the
+/// row from content the client still holds. The grace age is what makes the
+/// present tense safe: a blob younger than it may belong to an upload whose
+/// artifact insert is still in flight.
+pub async fn sweep_orphan_symbol_blobs(
+    conn: &mut AsyncPgConnection,
+    grace_hours: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM symbol_blobs b \
+         WHERE b.created_at < now() - make_interval(hours => $1::int) \
+           AND NOT EXISTS (SELECT 1 FROM symbol_artifacts a \
+                            WHERE a.blob_sha256 = b.sha256 \
+                               OR a.prebuilt_index_sha256 = b.sha256)",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(grace_hours)
+    .execute(conn)
+    .await
 }
 
 // ===========================================================================
@@ -16156,6 +16547,21 @@ pub async fn mask_batch_jsonb(
     // reads `targets` back out of Postgres in a different process from the one
     // that validated it.
     let (t, c) = (table.as_sql(), column.as_sql());
+    // Tier 1: a pooled row's inline `stacktrace` is the placeholder `[]`, so
+    // `sel`'s `{c} #> $6 IS NOT NULL` below is NULL for it — the row would be
+    // silently SKIPPED and the real trace would survive unmasked in the pool.
+    // Masking the shared blob instead is worse: it would rewrite the trace for
+    // every row sharing it, across apps and tenants. De-pooling the day's
+    // window first is the resolution — the scope's rows get their own inline
+    // copies (they diverge once masked anyway), the shared blob is never
+    // touched, and the CTE below then works unchanged. Idempotent per batch,
+    // and independent of the write flag: rows pooled last month must mask
+    // correctly today.
+    if t == "error_events" && c == "stacktrace" {
+        let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let hi = lo + chrono::Duration::days(1);
+        crate::stack_pool::depool_scope(conn, app_id, lo, hi).await?;
+    }
     let sql = format!(
         "WITH sel AS ( \
            SELECT id, occurred_at FROM {t} \
@@ -16273,6 +16679,15 @@ pub async fn mask_batch_jsonb_wildcard(
     worker_id: &str,
 ) -> QueryResult<Option<BatchOutcome>> {
     let (t, c) = (table.as_sql(), column.as_sql());
+    // Tier 1 de-pool — same reasoning as `mask_batch_jsonb`, and this wildcard
+    // shape is the one that actually hits `stacktrace` (an array of frames):
+    // a pooled row's placeholder `[]` has no elements, so `sel`'s EXISTS is
+    // false and the row would be skipped with its real trace unmasked.
+    if t == "error_events" && c == "stacktrace" {
+        let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let hi = lo + chrono::Duration::days(1);
+        crate::stack_pool::depool_scope(conn, app_id, lo, hi).await?;
+    }
     let sql = format!(
         "WITH sel AS ( \
            SELECT id, occurred_at FROM {t} \
@@ -17124,9 +17539,25 @@ pub async fn scan_window_rows(
     {
         return Ok(Vec::new());
     }
+    // Tier 1: a pooled row's inline `stacktrace` is the placeholder `[]`, so
+    // scanning `e.stacktrace` raw would silently miss every finding inside the
+    // pooled trace — PII that then never surfaces for masking. The effective
+    // value comes from the pool when the row carries an address. A scalar
+    // subquery rather than a join so all three shape arms below stay
+    // untouched; the CASE keeps it free for the NULL-sha256 majority.
+    let col_expr = |c: &str| -> String {
+        if table == "error_events" && c == "stacktrace" {
+            "CASE WHEN e.stacktrace_sha256 IS NULL THEN e.stacktrace \
+              ELSE COALESCE((SELECT b.content FROM error_stack_blobs b \
+                              WHERE b.sha256 = e.stacktrace_sha256), e.stacktrace) END"
+                .to_string()
+        } else {
+            format!("e.{c}")
+        }
+    };
     let payload = cols
         .iter()
-        .map(|c| format!("'{c}', to_jsonb(e.{c})"))
+        .map(|c| format!("'{c}', to_jsonb({})", col_expr(c)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -17154,7 +17585,10 @@ pub async fn scan_window_rows(
                 if is_text {
                     format!("e.{c} ILIKE ANY($6)")
                 } else {
-                    format!("e.{c}::text ILIKE ANY($5)")
+                    // Same pool-aware expression as `payload` above: the
+                    // prefilter must match against the EFFECTIVE trace or a
+                    // pooled row is excluded before the detectors ever run.
+                    format!("({})::text ILIKE ANY($5)", col_expr(c))
                 }
             })
             .collect::<Vec<_>>()

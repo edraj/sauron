@@ -8,10 +8,20 @@
 //! every child partition to build — has been load-bearing and unverified.
 //!
 //! The near miss is what makes this worth a test of its own. `analytics_events`
-//! already carried `analytics_project_idx (app_id, occurred_at DESC)`, which
+//! used to carry `analytics_project_idx (app_id, occurred_at DESC)`, which
 //! serves the same `WHERE` perfectly and differs only in the `id` tiebreaker.
 //! A build that lost the new index would still answer every row assertion, just
 //! with a sort over the matches — invisible until the table is large.
+//!
+//! **That near miss is gone, and how this file reacted to that is the second
+//! thing it is here to record.** Migration `2026-08-18-000066` dropped
+//! `analytics_project_idx` precisely BECAUSE it was a redundant prefix of the
+//! keyset index. The guard below named it in a constant and resolved the name
+//! with `to_regclass`, which answers NULL for a dropped index — so the
+//! assertion silently became `0 == 0` and could never fail again, while still
+//! reading like coverage in a green run. It now asserts against *every other
+//! index on the table*, enumerated from the catalogue rather than named, so no
+//! single migration can disarm it. See [`rival_index_scans`].
 //!
 //! So this measures the plan instead of the rows, and it does so by running the
 //! **real** `repo::search_events` and reading Postgres' own per-index counters
@@ -22,7 +32,7 @@
 mod common;
 
 use chrono::{DateTime, Duration, Utc};
-use diesel::sql_types::{BigInt, Text, Timestamptz, Uuid as SqlUuid};
+use diesel::sql_types::{BigInt, Bool, Text, Timestamptz, Uuid as SqlUuid};
 use diesel::QueryableByName;
 use diesel_async::RunQueryDsl;
 use sauron_db::models::{AnalyticsEvent, ErrorEvent, NewAnalyticsEvent, NewErrorEvent, NewIssue};
@@ -83,9 +93,82 @@ async fn index_scans(conn: &mut sauron_db::PgConn, index: &str) -> i64 {
 /// The index S2c Task 1 added: `(app_id, occurred_at DESC, id DESC)`.
 const KEYSET_INDEX: &str = "analytics_events_app_time_id_idx";
 
-/// The pre-existing `(app_id, occurred_at DESC)` index that differs only by the
-/// tiebreaker — the plan a regression would silently fall back to.
-const NEAR_MISS_INDEX: &str = "analytics_project_idx";
+/// Does this index name resolve at all?
+///
+/// A PRECONDITION, checked before anything is measured, and the reason it
+/// exists is the bug this helper was added to fix.
+///
+/// [`index_scans`] answers `0` for a name that does not resolve — deliberately,
+/// see its own comment. That is the right behaviour for a stats helper and the
+/// wrong behaviour for an assertion built on it: `0 == 0` and `0 > 0` are a
+/// silent pass and a baffling failure respectively, and neither says "that
+/// index is gone". Asking the question separately, up front, means a migration
+/// that drops [`KEYSET_INDEX`] fails this file by NAME on its first line rather
+/// than through arithmetic further down.
+async fn index_exists(conn: &mut sauron_db::PgConn, index: &str) -> bool {
+    #[derive(QueryableByName)]
+    struct Present {
+        #[diesel(sql_type = Bool)]
+        present: bool,
+    }
+    let row: Present = diesel::sql_query("SELECT to_regclass($1) IS NOT NULL AS present")
+        .bind::<Text, _>(index)
+        .get_result(conn)
+        .await
+        .unwrap_or_else(|e| panic!("resolve index name {index}: {e}"));
+    row.present
+}
+
+/// Every index on the `analytics_events` partition tree EXCEPT `keep` and its
+/// children: how many there are, and how many scans they have recorded.
+///
+/// **This replaced a named `NEAR_MISS_INDEX` constant, and the reason is worth
+/// keeping.** The original guard named `analytics_project_idx (app_id,
+/// occurred_at DESC)` — the tiebreaker-less near miss that a lost keyset index
+/// would fall back to — and asserted its counter did not move. Migration
+/// `2026-08-18-000066` then dropped that index as redundant, at which point
+/// `to_regclass` returned NULL, [`index_scans`] returned 0 on both sides, and
+/// the assertion read `0 == 0`: still green, permanently incapable of failing.
+/// A guard that can no longer fail is worse than no guard, because it still
+/// looks like coverage.
+///
+/// So the rival is no longer a NAME. It is "everything else on this table",
+/// enumerated from the catalogue at run time — the same choice
+/// `identity_merge_perf::isolate_index` makes, for the same reason: a future
+/// migration's index joins this set automatically instead of being silently
+/// omitted because a constant forgot it. Dropping any single index can no
+/// longer disarm it.
+///
+/// `indexes` is returned alongside `scans` so the assertion can refuse to run
+/// against an empty rival set — the one remaining way this could go vacuous.
+async fn rival_index_scans(conn: &mut sauron_db::PgConn, keep: &str) -> (i64, i64) {
+    #[derive(QueryableByName)]
+    struct Rivals {
+        #[diesel(sql_type = BigInt)]
+        indexes: i64,
+        #[diesel(sql_type = BigInt)]
+        scans: i64,
+    }
+    // `COALESCE(..., 0::oid)` so an unresolvable `keep` cannot turn the
+    // exclusion into a NULL and quietly empty the whole sum — the same failure
+    // mode this function exists to remove.
+    let row: Rivals = diesel::sql_query(
+        "SELECT count(*)::bigint AS indexes, \
+                COALESCE(SUM(s.idx_scan), 0)::bigint AS scans \
+         FROM pg_stat_all_indexes s JOIN pg_index i ON i.indexrelid = s.indexrelid \
+         WHERE s.relid IN (SELECT relid FROM pg_partition_tree('analytics_events')) \
+           AND s.indexrelid <> COALESCE(to_regclass($1)::oid, 0::oid) \
+           AND NOT i.indisunique \
+           AND NOT EXISTS (SELECT 1 FROM pg_inherits h \
+                            WHERE h.inhrelid = s.indexrelid \
+                              AND h.inhparent = COALESCE(to_regclass($1)::oid, 0::oid))",
+    )
+    .bind::<Text, _>(keep)
+    .get_result(conn)
+    .await
+    .unwrap_or_else(|e| panic!("read rival index stats around {keep}: {e}"));
+    (row.indexes, row.scans)
+}
 
 /// Sequential scans over the whole partition tree.
 async fn seq_scans(conn: &mut sauron_db::PgConn) -> i64 {
@@ -122,11 +205,25 @@ async fn force_flush(conn: &mut sauron_db::PgConn) {
 /// during the post-measurement poll instead. The "did the second page use the
 /// index" assertion then passed on the FIRST page's evidence, and survived a
 /// sabotage run with index scans disabled entirely.
+///
+/// Settles the RIVAL aggregate as well as the keyset counter, and that is not
+/// belt-and-braces. Waiting only on the keyset counter is what made this file
+/// flake: the first page above is served by some index too, and once the keyset
+/// counter had stabilised this returned while the first page's RIVAL increment
+/// was still unflushed. It then landed between `rival_before` and
+/// `rival_after`, and the second page got blamed for a scan the first page
+/// performed — `the_ascending_pager_reads_through_the_same_index` failing with
+/// `10 rival indexes ... went 0 -> 1 scans` on roughly one run in four, while
+/// passing in isolation. The bug was in the baseline, not the assertion, so the
+/// fix is to quiesce both counters rather than to loosen the guard.
 async fn quiesce_stats(conn: &mut sauron_db::PgConn) {
-    let mut last = -1_i64;
-    for _ in 0..40 {
+    let mut last = (-1_i64, -1_i64);
+    for _ in 0..200 {
         force_flush(conn).await;
-        let now = index_scans(conn, KEYSET_INDEX).await;
+        let now = (
+            index_scans(conn, KEYSET_INDEX).await,
+            rival_index_scans(conn, KEYSET_INDEX).await.1,
+        );
         if now == last {
             return;
         }
@@ -140,8 +237,17 @@ async fn quiesce_stats(conn: &mut sauron_db::PgConn) {
 ///
 /// Only ever waits for the counter to RISE, so a run where it never rises times
 /// out into a failed assertion rather than into a fabricated pass.
+///
+/// The budget is 5s rather than the 1s it started at. Observed once: this test
+/// failed inside a back-to-back suite run (immediately after `data_purge`, which
+/// churns ~19 ephemeral databases through the same server) and then passed 11
+/// consecutive times in isolation and 3 more in that same sequence. A flush
+/// arriving late under server load is the only mechanism that fits, and because
+/// the loop exits the instant the counter moves, a longer ceiling costs a
+/// healthy run nothing while removing the false failure. It cannot buy a false
+/// PASS: the exit condition is still strictly `now > before`.
 async fn settled_stats(conn: &mut sauron_db::PgConn, before: i64) -> i64 {
-    for _ in 0..40 {
+    for _ in 0..200 {
         force_flush(conn).await;
         let now = index_scans(conn, KEYSET_INDEX).await;
         if now > before {
@@ -165,7 +271,9 @@ async fn the_event_pager_reads_through_the_keyset_index() {
 
     // Spread across 500 distinct timestamps so ~10 rows share each one. Ties are
     // exactly where the tiebreaker earns its place, and a fixture with none
-    // would let `analytics_project_idx` serve the ordering unaided.
+    // would let a tiebreaker-less `(app_id, occurred_at DESC)` index serve the
+    // ordering unaided — which is what `analytics_project_idx` was, until
+    // migration 0066 dropped it for being exactly that.
     diesel::sql_query(
         "INSERT INTO analytics_events \
            (id, app_id, name, distinct_id, properties, context, occurred_at, received_at, \
@@ -221,9 +329,20 @@ async fn the_event_pager_reads_through_the_keyset_index() {
     assert_eq!(first.len(), 51, "50 rows plus the has-more probe");
     let boundary = &first[49];
 
+    // Before anything is measured: the index this whole file is about has to
+    // exist. Checked by name so its removal reads as its removal — see
+    // `index_exists`.
+    assert!(
+        index_exists(&mut conn, KEYSET_INDEX).await,
+        "`{KEYSET_INDEX}` does not exist. Every assertion below is about \
+         whether the pager READS through it; none of them can mean anything \
+         until it is there. If a migration dropped it, that migration is the \
+         regression."
+    );
+
     quiesce_stats(&mut conn).await;
     let idx_before = index_scans(&mut conn, KEYSET_INDEX).await;
-    let near_before = index_scans(&mut conn, NEAR_MISS_INDEX).await;
+    let (rivals, rival_before) = rival_index_scans(&mut conn, KEYSET_INDEX).await;
     let seq_before = seq_scans(&mut conn).await;
 
     // THE measured query: page two, through the cursor, exactly as the route
@@ -252,7 +371,7 @@ async fn the_event_pager_reads_through_the_keyset_index() {
     assert_eq!(second.len(), 51, "the fixture is far larger than two pages");
 
     let idx_after = settled_stats(&mut conn, idx_before).await;
-    let near_after = index_scans(&mut conn, NEAR_MISS_INDEX).await;
+    let (rivals_after_count, rival_after) = rival_index_scans(&mut conn, KEYSET_INDEX).await;
     let seq_after = seq_scans(&mut conn).await;
 
     assert!(
@@ -267,12 +386,27 @@ async fn the_event_pager_reads_through_the_keyset_index() {
         "the keyset page fell back to a sequential scan over {SEEDED_ROWS} rows \
          ({seq_before} -> {seq_after})"
     );
+    // The rival set must be non-empty, or "no rival was scanned" is a
+    // statement about nothing. `analytics_events` carries ten other indexes
+    // after migration 0066; a run that finds zero is a broken fixture, not a
+    // clean plan.
+    assert!(
+        rivals > 0 && rivals_after_count > 0,
+        "no rival indexes were found on the `analytics_events` partition tree \
+         ({rivals} before, {rivals_after_count} after). The 'nothing else \
+         served this page' assertion below would be vacuous."
+    );
     assert_eq!(
-        near_after, near_before,
-        "the page was served by `analytics_project_idx`, which has no `id` \
-         column ({near_before} -> {near_after}). It satisfies the WHERE clause \
-         but not the `(occurred_at DESC, id DESC)` ordering, so this is the \
-         plan that sorts — the exact regression the new index exists to prevent."
+        rival_after, rival_before,
+        "the keyset page was served by something OTHER than \
+         `analytics_events_app_time_id_idx`: {rivals} rival indexes on the \
+         `analytics_events` tree went {rival_before} -> {rival_after} scans \
+         across the measured query. The fallback this is written to catch is a \
+         tiebreaker-less `(app_id, occurred_at [DESC])` index satisfying the \
+         WHERE clause but not the `(occurred_at DESC, id DESC)` ordering — the \
+         plan that sorts. Naming ONE such index is what made the previous \
+         version of this assertion die silently when migration 0066 dropped it, \
+         so the rival set is read from the catalogue instead."
     );
 
     db.cleanup().await;
@@ -344,8 +478,15 @@ async fn the_ascending_pager_reads_through_the_same_index() {
         id: boundary.id,
     };
 
+    assert!(
+        index_exists(&mut conn, KEYSET_INDEX).await,
+        "`{KEYSET_INDEX}` does not exist; the ascending assertions below cannot \
+         mean anything until it does."
+    );
+
     quiesce_stats(&mut conn).await;
     let idx_before = index_scans(&mut conn, KEYSET_INDEX).await;
+    let (rivals, rival_before) = rival_index_scans(&mut conn, KEYSET_INDEX).await;
     let seq_before = seq_scans(&mut conn).await;
 
     repo::search_events(&mut conn, &scope, &search(Some(boundary)))
@@ -353,6 +494,7 @@ async fn the_ascending_pager_reads_through_the_same_index() {
         .expect("second page");
 
     let idx_after = settled_stats(&mut conn, idx_before).await;
+    let (_, rival_after) = rival_index_scans(&mut conn, KEYSET_INDEX).await;
     let seq_after = seq_scans(&mut conn).await;
 
     assert!(
@@ -362,6 +504,20 @@ async fn the_ascending_pager_reads_through_the_same_index() {
     assert_eq!(
         seq_after, seq_before,
         "the ascending walk fell back to a sequential scan ({seq_before} -> {seq_after})"
+    );
+    // The same catalogue-derived rival guard the descending case carries. It
+    // matters MORE here, not less: an ascending walk is the direction a wrong
+    // index is likeliest to serve by sorting, and "some index scan happened"
+    // is exactly the assertion this file's own header warns is too weak.
+    assert!(
+        rivals > 0,
+        "no rival indexes found; the guard below is vacuous"
+    );
+    assert_eq!(
+        rival_after, rival_before,
+        "the ascending keyset page was served by something other than \
+         `{KEYSET_INDEX}`: {rivals} rival indexes on the `analytics_events` \
+         tree went {rival_before} -> {rival_after} scans"
     );
 
     db.cleanup().await;
@@ -939,6 +1095,7 @@ async fn seed_one_error_event(
             handled: None,
             title: None,
             culprit: None,
+            stacktrace_sha256: None,
         },
     )
     .await

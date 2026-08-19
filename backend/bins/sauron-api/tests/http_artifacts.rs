@@ -1249,6 +1249,7 @@ async fn an_uppercase_reported_build_id_symbolicates_against_the_stored_artifact
                 handled: Some(false),
                 title: Some("StateError".into()),
                 culprit: Some("main.dart".into()),
+                stacktrace_sha256: None,
             },
         )
         .await
@@ -1384,6 +1385,7 @@ async fn the_session_timeline_symbolicates_on_read() {
                 handled: Some(false),
                 title: Some("StateError".into()),
                 culprit: Some("main.dart".into()),
+                stacktrace_sha256: None,
             },
         )
         .await
