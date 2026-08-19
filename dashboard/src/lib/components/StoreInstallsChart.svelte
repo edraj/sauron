@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   import type { StoreDay } from '../api/stores';
   import { dayTotals, divergingScale } from './stores';
   import { utcDayLabel } from '../models/active-users';
@@ -36,7 +37,7 @@
   }
 
   function tip(d: StoreDay): string {
-    const t = dayTotals(d);
+    const totals = dayTotals(d);
     const parts = [label(d.day)];
     if (d.google_play) {
       parts.push(`Play +${d.google_play.installs} / −${d.google_play.uninstalls}`);
@@ -44,7 +45,7 @@
     if (d.app_store) {
       parts.push(`App Store +${d.app_store.installs} / −${d.app_store.uninstalls}`);
     }
-    parts.push(`net ${t.installs - t.uninstalls >= 0 ? '+' : ''}${t.installs - t.uninstalls}`);
+    parts.push(`net ${totals.installs - totals.uninstalls >= 0 ? '+' : ''}${totals.installs - totals.uninstalls}`);
     return parts.join(' · ');
   }
 </script>
@@ -95,9 +96,9 @@
     <div class="axis">
       <span>{label(data[0].day)}</span>
       <span class="legend">
-        <i class="k play"></i> Play
-        <i class="k apple"></i> App Store
-        <span class="dirs">↑ installs · ↓ uninstalls</span>
+        <i class="k play"></i> {t('ui.store.play')}
+        <i class="k apple"></i> {t('ui.store.appStore')}
+        <span class="dirs">{t('prose.store.directions')}</span>
       </span>
       <span>{label(data[data.length - 1].day)}</span>
     </div>
@@ -197,7 +198,7 @@
     background: var(--info);
   }
   .dirs {
-    margin-left: 4px;
+    margin-inline-start: 4px;
     opacity: 0.8;
   }
   .chart-empty {

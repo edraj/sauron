@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { formatNumber, t } from '../i18n';
+  import { localeStore } from '../i18n/locale.svelte';
   import type { SeriesPoint } from '../models';
   import { formatDateTime } from '../utils/format';
 
@@ -29,7 +31,7 @@
     height = 160,
     color = 'var(--primary)',
     emptyLabel = 'No data in this range',
-    format = (n: number) => n.toLocaleString(),
+    format = (n: number) => formatNumber(n),
     showTotal = true,
     label: labelProp,
   }: Props = $props();
@@ -50,7 +52,9 @@
     if (labelProp) return labelProp(bucket);
     const d = new Date(bucket);
     if (Number.isNaN(d.getTime())) return bucket;
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    // The active locale, not the browser's: the month abbreviation on a chart
+    // axis has to match the language the rest of the page is in.
+    return d.toLocaleDateString(localeStore.tag, { month: 'short', day: 'numeric' });
   }
 
   // The hover title uses the same function when the prop is supplied;
@@ -87,7 +91,7 @@
               {/if}
             </div>
             <div class="tip tip-value" class:detailed={point.segments && point.segments.length > 0}>
-              <div class="total-line">{format(point.count)}{#if point.segments && point.segments.length > 0} total{/if}</div>
+              <div class="total-line">{#if point.segments && point.segments.length > 0}{t('ui.chart.total', { n: format(point.count) })}{:else}{format(point.count)}{/if}</div>
               {#if point.segments && point.segments.length > 0}
                 <div class="segments-list">
                   {#each point.segments as seg}
@@ -107,7 +111,7 @@
     </div>
     <div class="axis">
       <span>{label(data[0].bucket)}</span>
-      {#if showTotal}<span class="total">{total.toLocaleString()} total</span>{/if}
+      {#if showTotal}<span class="total">{t('ui.chart.total', { n: formatNumber(total) })}</span>{/if}
       <span>{label(data[data.length - 1].bucket)}</span>
     </div>
     {#if hasSegments}
@@ -217,7 +221,7 @@
     border-bottom: 1px solid var(--border);
     padding-bottom: 4px;
     margin-bottom: 4px;
-    text-align: left;
+    text-align: start;
   }
   .segments-list {
     display: flex;

@@ -93,6 +93,13 @@ pub async fn process_job(
 /// Fold one signal into its `sessions` / `devices` roll-ups. `events_delta` /
 /// `errors_delta` decide which counter to bump. No-ops when there is no session
 /// id / device key to key on.
+///
+/// `unhandled_delta` is the crash signal and is deliberately SEPARATE from
+/// `errors_delta`: an error the application caught and reported itself still
+/// counts as an error, and must not count as a crash. It is only ever 1 when
+/// the SDK told us `mechanism.handled = false` — `None` (SDK sent no mechanism)
+/// stays 0, which is why the reader must ALSO check that the app produces the
+/// signal at all before reporting a rate.
 #[allow(clippy::too_many_arguments)]
 async fn rollup(
     conn: &mut AsyncPgConnection,
@@ -104,6 +111,7 @@ async fn rollup(
     at: chrono::DateTime<chrono::Utc>,
     events_delta: i64,
     errors_delta: i64,
+    unhandled_delta: i64,
 ) {
     let info = crate::enrich::device_info(context);
     let session_id = session_id.filter(|s| !s.is_empty());
@@ -127,6 +135,7 @@ async fn rollup(
             job.ip.as_deref(),
             events_delta,
             errors_delta,
+            unhandled_delta,
         )
         .await
         {
@@ -412,6 +421,9 @@ async fn process_error(
         now,
         0,
         1,
+        // The crash signal. `Some(false)` only — `None` means the SDK sent no
+        // mechanism and is UNKNOWN, which must not inflate the crash count.
+        i64::from(handled_of(exc) == Some(false)),
     )
     .await;
 
@@ -542,6 +554,7 @@ async fn process_event(
         Some(distinct_id.as_str()),
         at,
         1,
+        0,
         0,
     )
     .await;
@@ -789,6 +802,7 @@ async fn process_transaction(
         session_id.as_deref(),
         distinct.as_deref(),
         at,
+        0,
         0,
         0,
     )

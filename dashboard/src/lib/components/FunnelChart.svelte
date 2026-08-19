@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatNumber } from '../i18n';
   import type { FunnelResult } from '../models';
   import { formatPercent } from '../utils/format';
 
@@ -16,7 +17,7 @@
       <div class="fhead">
         <span class="fname"><span class="fnum">{i + 1}</span>{step.name}</span>
         <span class="fstat">
-          <span class="fcount">{step.count.toLocaleString()}</span>
+          <span class="fcount">{formatNumber(step.count)}</span>
           <span class="fconv muted">{formatPercent(step.conv_from_start)}</span>
         </span>
       </div>
@@ -29,7 +30,7 @@
         <div class="fdrop">
           <span class="drop-ic">↓</span>
           {formatPercent(dropoff)} drop-off
-          <span class="faint">· {(step.count).toLocaleString()} of {(result.steps[i - 1].count).toLocaleString()} continued</span>
+          <span class="faint">· {formatNumber(step.count)} of {formatNumber(result.steps[i - 1].count)} continued</span>
         </div>
       {/if}
     </div>
@@ -99,7 +100,7 @@
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    padding-right: 8px;
+    padding-inline-end: 8px;
     background: linear-gradient(90deg, var(--primary-active), var(--primary));
     border-radius: var(--radius-sm);
     transition: width 0.4s ease;

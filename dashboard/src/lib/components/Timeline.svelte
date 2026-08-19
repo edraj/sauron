@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   import type { ErrorEvent, TimelineItem, Transaction } from '../models';
   import {
     httpStatusTone,
@@ -208,9 +209,9 @@
                     e.stopPropagation();
                     onslice(item.transaction);
                   }}
-                  title="Slice timeline to this transaction"
+                  title={t('ui.timeline.sliceToTransaction')}
                 >
-                  In between
+                  {t('ui.timeline.inBetween')}
                 </span>
               {/if}
             {:else if item.kind === 'error'}
@@ -241,7 +242,7 @@
                   class="issue-link"
                   onclick={() => (quickView = item.error)}
                 >
-                  View issue <Icon name="arrow-right" size={12} />
+                  {t('ui.viewIssue')} <Icon name="arrow-right" size={12} />
                 </button>
               {/if}
               {#if screenOf(item)}
@@ -253,7 +254,7 @@
             {#if item.kind === 'error' && hasStack(item.error)}
               <div class="tl-stack">
                 <div class="tl-stack-head">
-                  <span class="section-label">Stacktrace</span>
+                  <span class="section-label">{t('ui.section.stacktrace')}</span>
                   <SymbolicationBadge
                     status={item.error.symbolication_status}
                     isDart={item.error.debug_meta?.raw_stacktrace != null}
@@ -281,14 +282,13 @@
                 <p class="tl-truncated" role="status">
                   <Icon name="info" size={13} />
                   <span>
-                    The SDK capped this payload at 16 KB and sent a marker instead. The
-                    span and its timing are accurate; only the attached data was dropped.
+                    {t('prose.timeline.truncated')}
                   </span>
                 </p>
               {/if}
               {#if item.transaction.tags && Object.keys(item.transaction.tags).length > 0}
                 <div class="tl-meta">
-                  <span class="section-label">Tags</span>
+                  <span class="section-label">{t('ui.section.tags')}</span>
                   <div class="tl-tags">
                     {#each Object.entries(item.transaction.tags) as [k, v] (k)}
                       <Badge tone="neutral" size="sm">{k}: {v}</Badge>
@@ -298,7 +298,7 @@
               {/if}
               {#if item.transaction.extra && Object.keys(item.transaction.extra).length > 0}
                 <div class="tl-meta">
-                  <span class="section-label">Additional data</span>
+                  <span class="section-label">{t('ui.section.extra')}</span>
                   <JsonTree value={item.transaction.extra} expandTo={1} />
                 </div>
               {/if}
@@ -392,7 +392,7 @@
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    text-align: left;
+    text-align: start;
     transition: border-color 0.12s ease;
   }
   .row:hover {

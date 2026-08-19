@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../../i18n';
+  import { formatNumber } from '../../i18n';
   import { push } from 'svelte-spa-router';
   import DataTable from '../DataTable.svelte';
   import SortableTh from '../SortableTh.svelte';
@@ -62,14 +64,14 @@
       order is the tiebreak's, not `arch`'s.
     -->
     <tr>
-      <th>Device</th>
+      <th>{t('sessions.column.device')}</th>
       <th>OS</th>
-      <SortableTh key="browser" columnDefault="asc" {sort} {onsort}>Browser / Arch</SortableTh>
-      <SortableTh key="distinct_id" columnDefault="asc" {sort} {onsort}>Last user</SortableTh>
-      <SortableTh key="sessions_count" class="num" {sort} {onsort}>Sessions</SortableTh>
-      <SortableTh key="events_count" class="num" {sort} {onsort}>Events</SortableTh>
-      <SortableTh key="errors_count" class="num" {sort} {onsort}>Errors</SortableTh>
-      <SortableTh key="last_seen" {sort} {onsort}>Last seen</SortableTh>
+      <SortableTh key="browser" columnDefault="asc" {sort} {onsort}>{t('devices.column.browserArch')}</SortableTh>
+      <SortableTh key="distinct_id" columnDefault="asc" {sort} {onsort}>{t('device.field.lastUser')}</SortableTh>
+      <SortableTh key="sessions_count" class="num" {sort} {onsort}>{t('explore.column.sessions')}</SortableTh>
+      <SortableTh key="events_count" class="num" {sort} {onsort}>{t('explore.column.events')}</SortableTh>
+      <SortableTh key="errors_count" class="num" {sort} {onsort}>{t('explore.column.errors')}</SortableTh>
+      <SortableTh key="last_seen" {sort} {onsort}>{t('explore.column.lastSeen')}</SortableTh>
     </tr>
   {/snippet}
   {#each rows as d (d.device_key)}
@@ -96,10 +98,10 @@
           <span class="cell-muted">—</span>
         {/if}
       </td>
-      <td class="num">{d.sessions_count.toLocaleString()}</td>
-      <td class="num">{d.events_count.toLocaleString()}</td>
+      <td class="num">{formatNumber(d.sessions_count)}</td>
+      <td class="num">{formatNumber(d.events_count)}</td>
       <td class="num">
-        <span class:err={d.errors_count > 0}>{d.errors_count.toLocaleString()}</span>
+        <span class:err={d.errors_count > 0}>{formatNumber(d.errors_count)}</span>
       </td>
       <td><TimeValue value={d.last_seen} muted /></td>
     </tr>

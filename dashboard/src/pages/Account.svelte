@@ -13,12 +13,14 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import NotificationSubscriptions from '../lib/components/account/NotificationSubscriptions.svelte';
+  import LanguagePicker from '../lib/components/account/LanguagePicker.svelte';
   import { authStore } from '../lib/stores/auth.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { errorMessage } from '../lib/api/client';
+  import { t } from '../lib/i18n';
   import { listMySessions, revokeMyOtherSessions, revokeMySession } from '../lib/api/account';
   import {
     allSameIp,
@@ -190,21 +192,21 @@
   function reasonLabel(reason: string | null): string {
     switch (reason) {
       case 'logout':
-        return 'Logged out';
+        return t('account.sessions.reason.logout');
       case 'user_revoked':
-        return 'Signed out from your account page';
+        return t('account.sessions.reason.userRevoked');
       case 'user_revoked_others':
-        return 'Signed out with "other devices"';
+        return t('account.sessions.reason.userRevokedOthers');
       case 'admin_revoked':
-        return 'Signed out by an administrator';
+        return t('account.sessions.reason.adminRevoked');
       case 'password_changed':
-        return 'Password changed';
+        return t('account.sessions.reason.passwordChanged');
       case 'deactivated':
-        return 'Account deactivated';
+        return t('account.sessions.reason.deactivated');
       case 'reuse':
-        return 'Security: token replay detected';
+        return t('account.sessions.reason.reuse');
       default:
-        return 'Ended';
+        return t('account.sessions.reason.ended');
     }
   }
 
@@ -220,8 +222,8 @@
 <AppShell requireProject={false}>
   <div class="head">
     <div>
-      <h1 class="page-title">Account</h1>
-      <p class="sub muted">Your profile and the devices signed in to it.</p>
+      <h1 class="page-title">{t('account.title')}</h1>
+      <p class="sub muted">{t('account.subtitle')}</p>
     </div>
     <!--
       Spins for a background revalidate too, not just an explicit click: that
@@ -240,24 +242,28 @@
   {/if}
 
   <div class="cards">
-    <Card title="Profile">
+    <Card title={t('account.profile.title')}>
       <dl class="profile">
-        <dt>Name</dt>
+        <dt>{t('account.profile.name')}</dt>
         <dd>{authStore.user?.name || '—'}</dd>
-        <dt>Email</dt>
+        <dt>{t('account.profile.email')}</dt>
         <dd class="cell-mono">{authStore.user?.email ?? '—'}</dd>
-        <dt>Last sign-in</dt>
+        <dt>{t('account.profile.lastSignIn')}</dt>
         <dd><TimeValue value={authStore.user?.last_login_at} /></dd>
+        <dt>{t('account.language.label')}</dt>
+        <dd><LanguagePicker /></dd>
       </dl>
       <div class="profile-actions">
-        <Button variant="secondary" href="#/change-password">Change password</Button>
+        <Button variant="secondary" href="#/change-password">
+          {t('account.profile.changePassword')}
+        </Button>
       </div>
     </Card>
 
-    <Card title="Active sessions" padding="none">
+    <Card title={t('account.sessions.title')} padding="none">
       {#snippet actions()}
         <Button variant="ghost" size="sm" onclick={() => void toggleHistory()}>
-          {showRevoked ? 'Hide recent sign-outs' : 'Show recent sign-outs'}
+          {showRevoked ? t('account.sessions.hideRevoked') : t('account.sessions.showRevoked')}
         </Button>
         <Button
           variant="danger"
@@ -265,14 +271,14 @@
           disabled={otherCount === 0 || !hasCurrent}
           onclick={requestRevokeAll}
         >
-          Sign out other devices
+          {t('account.sessions.signOutOthers')}
         </Button>
       {/snippet}
 
       {#if !hasCurrent && !loading && live.length > 0}
         <div class="err-banner inset" role="status">
           <Icon name="info" size={15} />
-          <span>Reload the dashboard to manage your devices.</span>
+          <span>{t('account.sessions.reloadHint')}</span>
         </div>
       {/if}
 
@@ -280,21 +286,24 @@
         <div class="center"><Spinner size={24} /></div>
       {:else if live.length === 0}
         <div class="pad">
-          <EmptyState title="No active sessions" description="Sign in again to see this device." />
+          <EmptyState
+            title={t('account.sessions.empty.title')}
+            description={t('account.sessions.empty.description')}
+          />
         </div>
       {:else}
         <DataTable>
           {#snippet head()}
             <tr>
               <SortableTh key="device" columnDefault="asc" sort={list.sort} {onsort}>
-                Device
+                {t('account.sessions.column.device')}
               </SortableTh>
-              <SortableTh key="ip" columnDefault="asc" sort={list.sort} {onsort}>IP</SortableTh>
-              <SortableTh key="signed_in" sort={list.sort} {onsort}>Signed in</SortableTh>
-              <SortableTh key="last_used" sort={list.sort} {onsort}>Last used</SortableTh>
+              <SortableTh key="ip" columnDefault="asc" sort={list.sort} {onsort}>{t('account.sessions.column.ip')}</SortableTh>
+              <SortableTh key="signed_in" sort={list.sort} {onsort}>{t('account.sessions.column.signedIn')}</SortableTh>
+              <SortableTh key="last_used" sort={list.sort} {onsort}>{t('account.sessions.column.lastUsed')}</SortableTh>
               <!-- The revoke button (and, on a revoked row, the reason it
                    ended) — no value to order by. -->
-              <th aria-label="actions"></th>
+              <th aria-label={t('common.actions')}></th>
             </tr>
           {/snippet}
           {#snippet children()}
@@ -304,7 +313,7 @@
                   <td>
                     <span class="device">
                       {describeSession(s)}
-                      {#if s.current}<Badge tone="primary" size="sm">This device</Badge>{/if}
+                      {#if s.current}<Badge tone="primary" size="sm">{t('account.sessions.current')}</Badge>{/if}
                     </span>
                   </td>
                   <td class="cell-mono cell-muted">{s.ip ?? '—'}</td>
@@ -318,7 +327,7 @@
                         disabled={!hasCurrent}
                         onclick={() => requestRevokeOne(s)}
                       >
-                        Sign out
+                        {t('account.sessions.revoke')}
                       </Button>
                     {/if}
                   </td>
@@ -328,7 +337,7 @@
                   <td>{describeSession(s)}</td>
                   <td class="cell-mono cell-muted">{s.ip ?? '—'}</td>
                   <td><TimeValue value={s.created_at} /></td>
-                  <td>Signed out <TimeValue value={s.revoked_at} /></td>
+                  <td>{t('account.sessions.signedOut')} <TimeValue value={s.revoked_at} /></td>
                   <td class="col-act cell-muted">{reasonLabel(s.revoked_reason)}</td>
                 </tr>
               {/if}
@@ -368,8 +377,7 @@
 
         {#if proxied}
           <p class="hint muted">
-            All sessions show the same address — the API is behind a proxy and
-            <code>API_TRUST_FORWARDED_HEADERS</code> is not set.
+            {t('account.sessions.proxyNote', { setting: 'API_TRUST_FORWARDED_HEADERS' })}
           </p>
         {/if}
       {/if}
@@ -382,11 +390,18 @@
 <ConfirmDialog
   danger
   open={pending !== null}
-  title={pending?.kind === 'all' ? 'Sign out other devices' : 'Sign out this device'}
+  title={pending?.kind === 'all'
+    ? t('account.confirm.revokeAll.title')
+    : t('account.confirm.revokeOne.title')}
   message={pending?.kind === 'all'
-    ? 'Every device except this one will be signed out. You will stay logged in here.'
-    : `${pending?.kind === 'one' ? pending.label : 'That device'} will be signed out within a few seconds and will have to log in again.`}
-  confirmLabel="Sign out"
+    ? t('account.confirm.revokeAll.body')
+    : t('account.confirm.revokeOne.body', {
+        device:
+          pending?.kind === 'one'
+            ? pending.label
+            : t('account.confirm.revokeOne.fallbackDevice'),
+      })}
+  confirmLabel={t('account.sessions.revoke')}
   loading={busy}
   onconfirm={() => void confirmPending()}
   oncancel={() => (pending = null)}
@@ -428,7 +443,7 @@
     gap: 8px;
   }
   .col-act {
-    text-align: right;
+    text-align: end;
     width: 1%;
     white-space: nowrap;
   }

@@ -1,3 +1,4 @@
+import { formatNumber } from '../i18n';
 import type { IngestFailure } from '../api/ingest-failures';
 
 /**
@@ -96,7 +97,7 @@ export function statusTone(status: string): 'error' | 'warning' | 'success' | 'n
 
 /** Thousands separators, so six-figure occurrence counts stay readable. */
 export function fmt(n: number): string {
-  return n.toLocaleString('en-US');
+  return formatNumber(n);
 }
 
 function plural(n: number, word: string): string {

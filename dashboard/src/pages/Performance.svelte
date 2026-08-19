@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -13,6 +15,7 @@
   import StatTile from '../lib/components/StatTile.svelte';
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
+  import OperationTransactionsModal from '../lib/components/OperationTransactionsModal.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -154,6 +157,28 @@
     return o === 'All' ? 'All' : o.replace('_', ' ');
   }
 
+  // --- drill-down ------------------------------------------------------------
+  //
+  // The table is an aggregate over `(name, op)`; this is the row's individual
+  // spans. Held as the ROW, not as a name string, because the modal filters on
+  // both halves of the group key — two rows can share a name under different
+  // ops, and a name-only drill-down would show more spans than the row counted.
+  //
+  // `null` whenever the modal is shut, so a reopen cannot flash the previous
+  // operation's title while the new request is in flight.
+  let selected = $state<PerfSummaryRow | null>(null);
+  let drillOpen = $state(false);
+
+  function openDrill(r: PerfSummaryRow) {
+    selected = r;
+    drillOpen = true;
+  }
+
+  function closeDrill() {
+    drillOpen = false;
+    selected = null;
+  }
+
   function retry() {
     const aid = sessionStore.currentAppId;
     if (aid) void load(aid, sinceDays, op, true);
@@ -175,13 +200,13 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Performance</h1>
+      <h1 class="page-title">{t('perf.title')}</h1>
       <p class="muted sub">
-        Application performance monitoring — latency, throughput, and error rates by operation.
+        {t('perf.subtitle')}
       </p>
     </div>
     <div class="controls">
-      <div class="ops" role="tablist" aria-label="Operation filter">
+      <div class="ops" role="tablist" aria-label={t('perf.operationFilter')}>
         {#each OPS as o (o)}
           <button
             class="op"
@@ -212,17 +237,17 @@
     <div class="center"><Spinner size={24} /></div>
   {:else if error && rows.length === 0}
     <Card>
-      <EmptyState title="Couldn't load performance" description={error} icon="triangle-alert">
+      <EmptyState title={t('perf.error.load')} description={error} icon="triangle-alert">
         {#snippet action()}
-          <Button variant="secondary" onclick={retry}>Retry</Button>
+          <Button variant="secondary" onclick={retry}>{t('common.retry')}</Button>
         {/snippet}
       </EmptyState>
     </Card>
   {:else if rows.length === 0}
     <Card>
       <EmptyState
-        title="No performance data yet"
-        description="Once your SDK sends transactions — navigations, HTTP calls, screen loads and custom spans — their latency and throughput will show up here."
+        title={t('perf.empty.title')}
+        description={t('perf.empty.body')}
         icon="zap"
       />
     </Card>
@@ -235,16 +260,16 @@
     -->
     <div class="body">
       <StatTiles min={170}>
-        <StatTile label="Throughput" value={compactNumber(throughput)} sub="transactions" />
-        <StatTile label="Operations" value={rows.length} sub="tracked" />
+        <StatTile label={t('perf.stat.throughput')} value={compactNumber(throughput)} sub="transactions" />
+        <StatTile label={t('perf.card.operations')} value={rows.length} sub="tracked" />
         <StatTile
-          label="p95 latency"
+          label={t('perf.stat.p95')}
           value={formatMs(maxP95)}
           sub="slowest operation"
           tone={latencyTone(maxP95)}
         />
         <StatTile
-          label="Error rate"
+          label={t('perf.stat.errorRate')}
           value={formatPercent(errorRate)}
           sub="weighted by volume"
           tone={errorRate > 0.01 ? 'error' : 'success'}
@@ -255,7 +280,7 @@
         <Card>
           {#snippet header()}
             <div class="chart-head">
-              <h3 class="ch-title">Latency over time</h3>
+              <h3 class="ch-title">{t('perf.card.latencyOverTime')}</h3>
               <span class="caption">p95 latency (ms)</span>
             </div>
           {/snippet}
@@ -265,38 +290,45 @@
         <Card>
           {#snippet header()}
             <div class="chart-head">
-              <h3 class="ch-title">Throughput over time</h3>
-              <span class="caption">transactions / bucket</span>
+              <h3 class="ch-title">{t('perf.card.throughputOverTime')}</h3>
+              <span class="caption">{t('prose.perf.perBucket')}</span>
             </div>
           {/snippet}
           <TimeSeriesChart data={throughputData} height={200} color="var(--primary)" />
         </Card>
       </div>
 
-      <Card title="Operations" padding="none" class="ops-card">
+      <Card title={t('perf.card.operations')} padding="none" class="ops-card">
         <DataTable>
           {#snippet head()}
             <tr>
-              <SortableTh key="name" columnDefault="asc" {sort} {onsort}>Name</SortableTh>
+              <SortableTh key="name" columnDefault="asc" {sort} {onsort}>{t('perf.column.name')}</SortableTh>
               <SortableTh key="op" columnDefault="asc" {sort} {onsort}>Op</SortableTh>
-              <SortableTh key="throughput" class="num" {sort} {onsort}>Throughput</SortableTh>
+              <SortableTh key="throughput" class="num" {sort} {onsort}>{t('perf.stat.throughput')}</SortableTh>
               <SortableTh key="p50" class="num" {sort} {onsort}>p50</SortableTh>
               <SortableTh key="p95" class="num" {sort} {onsort}>p95</SortableTh>
               <SortableTh key="p99" class="num" {sort} {onsort}>p99</SortableTh>
-              <SortableTh key="avg" class="num" {sort} {onsort}>Avg</SortableTh>
-              <SortableTh key="error_rate" class="num" {sort} {onsort}>Error rate</SortableTh>
+              <SortableTh key="avg" class="num" {sort} {onsort}>{t('perf.column.avg')}</SortableTh>
+              <SortableTh key="error_rate" class="num" {sort} {onsort}>{t('perf.stat.errorRate')}</SortableTh>
             </tr>
           {/snippet}
           {#snippet children()}
             {#each sortedRows as r (r.op + '::' + r.name)}
-              <tr>
+              <!--
+                The whole row opens the drill-down, not just the name cell: every
+                number in the row provokes the same question ("which spans made
+                that p99?"), so every cell is a reasonable place to click. The
+                name still carries the link colouring, because a row of plain
+                text with a pointer cursor advertises nothing.
+              -->
+              <tr class="clickable" onclick={() => openDrill(r)}>
                 <td>
                   <span class="name mono truncate" title={r.name}>{r.name}</span>
                 </td>
                 <td>
                   <Badge tone={opTone(r.op)} size="sm">{opLabel(r.op)}</Badge>
                 </td>
-                <td class="num">{r.count.toLocaleString()}</td>
+                <td class="num">{formatNumber(r.count)}</td>
                 <td class="num"><LatencyBadge ms={r.p50} size="sm" /></td>
                 <td class="num"><LatencyBadge ms={r.p95} size="sm" /></td>
                 <td class="num"><LatencyBadge ms={r.p99} size="sm" /></td>
@@ -313,6 +345,19 @@
       </Card>
     </div>
   {/if}
+
+  <!--
+    Mounted once, outside the loading/error branches, and fed the clicked row.
+    Inside the `{#each}` it would be 100 dialogs; inside the `{:else}` branch a
+    background refresh that emptied `rows` would unmount it mid-read.
+  -->
+  <OperationTransactionsModal
+    bind:open={drillOpen}
+    row={selected}
+    appId={sessionStore.currentAppId}
+    {sinceDays}
+    onclose={closeDrill}
+  />
 </AppShell>
 
 <style>
@@ -397,6 +442,16 @@
     display: inline-block;
     max-width: 340px;
     vertical-align: bottom;
+  }
+  /* The row's affordance. `tr.clickable` gives the pointer and the hover
+     background, but a table of plain text still reads as inert — the colour
+     shift on the name is what says the row goes somewhere. Scoped to a hover
+     on the ROW so it tracks the real click target, not just this cell.
+     `:global` is required: `tr.clickable` lives in DataTable's markup, so
+     Svelte's scoped-CSS pass sees no `.clickable` in THIS component's template
+     and would prune the selector outright. */
+  :global(tr.clickable:hover) .name {
+    color: var(--primary);
   }
   .err-rate {
     font-variant-numeric: tabular-nums;

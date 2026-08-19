@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -14,7 +15,8 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
-  import { lockedBy, lockTitle } from '../lib/models/page-access';
+  import { lockedBy } from '../lib/models/page-access';
+  import { lockTip } from '../lib/actions/lock-tip';
   import { listRoles, listMembers } from '../lib/api/orgs';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { ROLE_DEFAULT_SORT, roleAccessor } from '../lib/models/role-sort';
@@ -220,13 +222,13 @@
 <AdminShell requireProject={false}>
   <div class="head">
     <div>
-      <h1 class="page-title">Roles</h1>
+      <h1 class="page-title">{t('roles.title')}</h1>
       <p class="muted sub">
         Permission sets that can be granted to members of {sessionStore.currentOrg?.name ?? 'this org'}.
       </p>
     </div>
     <Button variant="primary" lockedReason={roleManageLock} onclick={openNewRole}>
-      New role
+      {t('roles.new')}
     </Button>
   </div>
 
@@ -236,13 +238,13 @@
     <Card><p class="err-msg">{error}</p></Card>
   {:else if roles.length === 0}
     <EmptyState
-      title="No roles yet"
-      description="Create a custom role to define a permission set members can be granted."
+      title={t('roles.empty.title')}
+      description={t('roles.empty.body')}
       icon="shield-check"
     >
       {#snippet action()}
         <Button variant="primary" lockedReason={roleManageLock} onclick={openNewRole}>
-          New role
+          {t('roles.new')}
         </Button>
       {/snippet}
     </EmptyState>
@@ -250,13 +252,13 @@
     <DataTable>
       {#snippet head()}
         <tr>
-          <SortableTh key="name" columnDefault="asc" {sort} {onsort}>Name</SortableTh>
-          <SortableTh key="description" columnDefault="asc" {sort} {onsort}>Description</SortableTh>
+          <SortableTh key="name" columnDefault="asc" {sort} {onsort}>{t('common.name')}</SortableTh>
+          <SortableTh key="description" columnDefault="asc" {sort} {onsort}>{t('roles.column.description')}</SortableTh>
           <!-- By COUNT, which is what the cell renders. A header that ordered
                by "whichever permission comes first alphabetically" would be
                worse than one that does not sort. -->
-          <SortableTh key="permissions" class="num" {sort} {onsort}>Permissions</SortableTh>
-          <SortableTh key="members" class="num" {sort} {onsort}>Members</SortableTh>
+          <SortableTh key="permissions" class="num" {sort} {onsort}>{t('roles.column.permissions')}</SortableTh>
+          <SortableTh key="members" class="num" {sort} {onsort}>{t('members.title')}</SortableTh>
           <!-- The row actions menu. Nothing to order by. -->
           <th class="col-act"></th>
         </tr>
@@ -287,8 +289,7 @@
                     type="button"
                     role="menuitem"
                     class="ram-item"
-                    disabled={rowLock !== null}
-                    title={rowLock ? lockTitle(rowLock) : undefined}
+                    use:lockTip={rowLock}
                     onclick={() => {
                       close();
                       openEditRole(role);
@@ -305,8 +306,7 @@
                     type="button"
                     role="menuitem"
                     class="ram-item"
-                    disabled={copyLock !== null}
-                    title={copyLock ? lockTitle(copyLock) : undefined}
+                    use:lockTip={copyLock}
                     onclick={() => {
                       close();
                       openCopyRole(role);
@@ -324,8 +324,7 @@
                       type="button"
                       role="menuitem"
                       class="ram-item danger"
-                      disabled={deleteLock !== null}
-                      title={deleteLock ? lockTitle(deleteLock) : undefined}
+                      use:lockTip={deleteLock}
                       onclick={() => {
                         close();
                         openDeleteRole(role);
@@ -397,7 +396,7 @@
     font-weight: 600;
   }
   .col-act {
-    text-align: right;
+    text-align: end;
     width: 1%;
     white-space: nowrap;
   }

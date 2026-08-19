@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Icon from '../ui/Icon.svelte';
   import SearchInput from '../SearchInput.svelte';
   import {
@@ -189,7 +190,7 @@
     <SearchInput
       bind:value={query}
       oninput={handleSearchInput}
-      placeholder="Search permissions…"
+      placeholder={t('roles.searchPermissions')}
     />
     <span class="count muted">{selectedSet.size} of {TOTAL} selected</span>
   </div>
@@ -357,8 +358,8 @@
     font-size: 11.5px;
     font-weight: 500;
     color: var(--text-faint);
-    margin-left: auto;
-    padding-right: 4px;
+    margin-inline-start: auto;
+    padding-inline-end: 4px;
     white-space: nowrap;
   }
   .permissions {

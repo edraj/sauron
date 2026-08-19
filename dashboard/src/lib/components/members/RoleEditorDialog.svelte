@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
@@ -89,12 +90,12 @@
   {#if readOnly}
     <p class="lede">
       <Badge tone="neutral" size="sm">system</Badge>
-      Built-in roles cannot be edited. Create a custom role to define your own permission set.
+      {t('roles.builtInNote')}
     </p>
   {:else}
     <div class="fields">
-      <Input label="Name" bind:value={name} placeholder="Support" required />
-      <Input label="Description" bind:value={description} placeholder="Read + resolve issues" />
+      <Input label={t('common.name')} bind:value={name} placeholder={t('roles.placeholder.name')} required />
+      <Input label={t('roles.column.description')} bind:value={description} placeholder={t('roles.placeholder.description')} />
     </div>
     {#if isEdit && memberCount > 0}
       <p class="warning">
@@ -104,7 +105,7 @@
     {/if}
   {/if}
 
-  <span class="lbl perms-label">Permissions</span>
+  <span class="lbl perms-label">{t('roles.column.permissions')}</span>
   <PermissionPicker
     selected={permissions}
     disabled={readOnly}

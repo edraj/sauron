@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from './lib/i18n';
   import { onMount } from 'svelte';
   import Router, { location, push } from 'svelte-spa-router';
   import { routes, prefetchLandingRoute } from './routes';
@@ -67,7 +68,7 @@
   <div class="boot">
     <div class="boot-mark" aria-hidden="true"><span class="eye"></span></div>
     <Spinner size={22} />
-    <span class="boot-text">Loading Sauron…</span>
+    <span class="boot-text">{t('prose.boot.loading')}</span>
   </div>
 {:else}
   <Router {routes} on:conditionsFailed={onConditionsFailed} />

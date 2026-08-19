@@ -5,6 +5,7 @@
   SearchInput in a page's `.controls` row (matches the Topbar `.icon-btn`).
 -->
 <script lang="ts">
+  import { t } from '../../i18n';
   import Icon from './Icon.svelte';
 
   interface Props {
@@ -16,14 +17,16 @@
     title?: string;
   }
 
-  let { onclick, loading = false, title = 'Refresh' }: Props = $props();
+  let { onclick, loading = false, title }: Props = $props();
+
+  const titleText = $derived(title ?? t('common.refresh'));
 </script>
 
 <button
   class="refresh-btn"
   type="button"
-  {title}
-  aria-label={title}
+  title={titleText}
+  aria-label={titleText}
   disabled={loading}
   onclick={() => onclick?.()}
 >

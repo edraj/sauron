@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -510,7 +511,7 @@
 <AdminShell requireProject>
   <div class="head">
     <div>
-      <h1 class="page-title">Environments</h1>
+      <h1 class="page-title">{t('environments.title')}</h1>
       <p class="muted sub">
         Defined by {sessionStore.currentProject?.name ?? 'this project'} and shared by every app in
         it — creating, renaming or retiring one below changes it for all of them. Each app's ingest
@@ -519,7 +520,7 @@
     </div>
     {#if catalogueReadable}
       <Button variant="primary" lockedReason={createLock} onclick={() => (creating = true)}>
-        New environment
+        {t('environments.new')}
       </Button>
     {/if}
   </div>
@@ -530,20 +531,20 @@
     <Card><p class="err-msg">{error}</p></Card>
   {:else if catalogueReadable && catalogue.length === 0}
     <EmptyState
-      title="No environments yet"
-      description="Create one to start separating dev, staging and production traffic. Every app in this project is enrolled automatically, each with its own ingest key."
+      title={t('environments.empty.title')}
+      description={t('environments.empty.body')}
       icon="layers"
     >
       {#snippet action()}
         <Button variant="primary" lockedReason={createLock} onclick={() => (creating = true)}>
-          New environment
+          {t('environments.new')}
         </Button>
       {/snippet}
     </EmptyState>
   {:else if !catalogueReadable && catalogueLike.length === 0}
     <EmptyState
-      title="No environments visible"
-      description="The project-wide catalogue needs project-level View environments (env:read), which your role doesn't grant here, and none of your apps are enrolled anywhere you can see. Ask an organization owner for access."
+      title={t('environments.notVisible.title')}
+      description={t('environments.notVisible.body')}
       icon="layers"
     />
   {:else}
@@ -557,9 +558,8 @@
            missing rather than silently rendering a partial catalogue as if
            it were the whole one. -->
       <p class="muted catalogue-note">
-        The project-wide catalogue needs project-level <strong>View environments</strong>
-        (env:read) — showing only the environments your apps are enrolled in. Renaming and
-        retiring are catalogue-level actions and aren't available from here.
+        {t('prose.env.catalogueNote.a')} <strong>{t('environments.viewEnvironments')}</strong>
+        {t('prose.env.catalogueNote.b')}
       </p>
     {/if}
     <div class="env-list">
@@ -591,13 +591,13 @@
                 size="sm"
                 disabled={busyId === env.id}
                 lockedReason={renameLock}
-                title="Renames this environment for every app in the project"
+                title={t('environments.renameTooltip')}
                 onclick={() => {
                   renaming = env;
                   renameValue = env.name;
                 }}
               >
-                Rename
+                {t('projects.rename')}
               </Button>
               <!-- `canRetire` is a business rule, not a permission: an
                    environment that cannot be retired by anyone right now
@@ -609,10 +609,10 @@
                   size="sm"
                   disabled={busyId === env.id}
                   lockedReason={retireLock}
-                  title="Retires this environment for every app in the project"
+                  title={t('environments.retireTooltip')}
                   onclick={() => (confirmRetire = env)}
                 >
-                  Retire
+                  {t('environments.retire')}
                 </Button>
               {/if}
             {/if}
@@ -626,8 +626,8 @@
                 <div class="app-row" class:muted-row={!row.ingest_enabled}>
                   <div class="app-row-head">
                     <span class="app-name">{appNameFor(row.app_id)}</span>
-                    {#if row.is_default}<Badge tone="info" size="sm">Default</Badge>{/if}
-                    {#if !row.ingest_enabled}<Badge tone="warning" size="sm">Muted</Badge>{/if}
+                    {#if row.is_default}<Badge tone="info" size="sm">{t('environments.default')}</Badge>{/if}
+                    {#if !row.ingest_enabled}<Badge tone="warning" size="sm">{t('environments.muted')}</Badge>{/if}
                   </div>
 
                   <div class="dsn">
@@ -653,7 +653,7 @@
                         lockedReason={updateLock}
                         onclick={() => promote(row)}
                       >
-                        Make default
+                        {t('environments.makeDefault')}
                       </Button>
                     {/if}
                     <Button
@@ -663,7 +663,7 @@
                       lockedReason={rotateLock}
                       onclick={() => (confirmRotate = row)}
                     >
-                      Rotate key
+                      {t('environments.rotateKey')}
                     </Button>
                   </div>
                 </div>
@@ -674,8 +674,7 @@
                      rather than letting a filtered list read as the whole
                      project. -->
                 <p class="no-apps muted partial">
-                  Only the apps you can see are listed. Others in this project may be enrolled
-                  too — showing them needs <strong>View apps</strong> (app:read).
+                  {t('prose.env.partialList.a')} <strong>{t('environments.viewApps')}</strong> {t('prose.env.partialList.b')}
                 </p>
               {/if}
               {#if !enrollmentsComplete}
@@ -690,9 +689,8 @@
                      list. Reload rather than a retry button: `load()` is keyed
                      on the project effect, and there is no partial refetch. -->
                 <p class="no-apps muted partial">
-                  Some apps could not be loaded — their ingest keys failed to fetch, so apps that
-                  <em>are</em> enrolled here may be missing from this list. Reload the page to try
-                  again.
+                  {t('prose.env.someFailed.a')}
+                  <em>are</em> {t('prose.env.someFailed.b')}
                 </p>
               {/if}
             </div>
@@ -702,14 +700,12 @@
                  empty list, so the old "No apps enrolled" copy stated as fact
                  something we never learned. -->
             <p class="no-apps muted">
-              Per-app ingest keys aren't shown — listing this project's apps needs the
-              <strong>View apps</strong> (app:read) permission, which your role doesn't grant
-              here. The environments themselves are shown in full.
+              {t('prose.env.keysHidden.a')}
+              <strong>{t('environments.viewApps')}</strong> {t('prose.env.keysHidden.b')}
             </p>
           {:else if apps.length === 0}
             <p class="no-apps muted">
-              No apps in this project yet. Create one and it is enrolled here automatically, with
-              its own ingest key.
+              {t('prose.env.noApps')}
             </p>
           {:else if !enrollmentsComplete}
             <!-- Zero rows AND a failed fan-out leg: "No apps enrolled" would be
@@ -717,11 +713,10 @@
                  the partial note above — same distinction between a permission
                  prediction and a fetch outcome. -->
             <p class="no-apps muted">
-              Ingest keys could not be loaded for this project's apps — the request failed, so
-              whether anything is enrolled here is unknown. Reload the page to try again.
+              {t('prose.env.keysFailed')}
             </p>
           {:else}
-            <p class="no-apps muted">No apps enrolled in this environment yet.</p>
+            <p class="no-apps muted">{t('environments.noAppsEnrolled')}</p>
           {/if}
         </Card>
       {/each}
@@ -740,11 +735,11 @@
             <li class="env">
               <div class="retired-head">
                 <span class="name">{env.name}</span>
-                <Badge tone="neutral" size="sm">Retired</Badge>
+                <Badge tone="neutral" size="sm">{t('environments.retired')}</Badge>
                 <span class="when muted">retired <TimeValue value={env.retired_at} /></span>
               </div>
               <p class="muted note">
-                Ingest is off and its key no longer works. Existing data stays queryable.
+                {t('environments.mutedNote')}
               </p>
             </li>
           {/each}
@@ -753,49 +748,49 @@
     {/if}
   {/if}
 
-  <Modal bind:open={creating} title="New project environment" size="sm">
+  <Modal bind:open={creating} title={t('environments.newTitle')} size="sm">
     <Input
-      label="Name"
+      label={t('common.name')}
       bind:value={newName}
-      placeholder="staging"
-      hint="Added to every app in this project, each with its own ingest key. Lowercase and short works best — this appears in every filter."
+      placeholder={t('environments.placeholder')}
+      hint={t('environments.createHint')}
     />
     {#snippet footer()}
       <Button variant="secondary" disabled={createBusy} onclick={() => (creating = false)}>
-        Cancel
+        {t('common.cancel')}
       </Button>
       <Button loading={createBusy} disabled={!newName.trim()} onclick={submitCreate}>
-        Create
+        {t('common.create')}
       </Button>
     {/snippet}
   </Modal>
 
   <Modal
     open={renaming !== null}
-    title="Rename environment"
+    title={t('environments.renameTitle')}
     size="sm"
     onclose={() => (renaming = null)}
   >
     <Input
-      label="Name"
+      label={t('common.name')}
       bind:value={renameValue}
-      hint="This name belongs to the project — renaming it renames it for every app in the project."
+      hint={t('environments.renameHint')}
     />
     {#snippet footer()}
       <Button variant="secondary" onclick={() => (renaming = null)} disabled={renameBusy}>
-        Cancel
+        {t('common.cancel')}
       </Button>
       <Button loading={renameBusy} disabled={!renameValue.trim()} onclick={submitRename}>
-        Save
+        {t('common.save')}
       </Button>
     {/snippet}
   </Modal>
 
   <ConfirmDialog
     open={confirmRotate !== null}
-    title="Rotate ingest key?"
+    title={t('environments.confirmRotate')}
     message={`Anything ${appNameFor(confirmRotate?.app_id ?? '')} reports to "${confirmRotate?.name ?? ''}" stops until its DSN is updated. There is no grace period.`}
-    confirmLabel="Rotate"
+    confirmLabel={t('environments.rotate')}
     loading={busyId !== null && busyId === confirmRotate?.id}
     onconfirm={doRotate}
     oncancel={() => (confirmRotate = null)}
@@ -803,9 +798,9 @@
 
   <ConfirmDialog
     open={confirmRetire !== null}
-    title="Retire environment for the whole project?"
+    title={t('environments.confirmRetire')}
     message={`"${confirmRetire?.name ?? ''}" will be removed from every app in this project. All of their keys for it stop working immediately and it leaves every picker. Existing data stays queryable and is archived to cold storage on the normal schedule. This cannot be undone.`}
-    confirmLabel="Retire"
+    confirmLabel={t('environments.retire')}
     danger
     loading={busyId !== null && busyId === confirmRetire?.id}
     onconfirm={doRetire}

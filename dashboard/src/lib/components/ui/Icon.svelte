@@ -143,6 +143,14 @@
   const Glyph = $derived(iconRegistry[name]);
 </script>
 
+<!--
+  `data-icon` carries the semantic name onto the rendered `<svg>`. Lucide
+  spreads unknown props straight through, and the attribute is what lets
+  `app.css` mirror the directional glyphs (chevrons, arrows) under `dir="rtl"`
+  from one rule, instead of every call site knowing about direction. Lucide's
+  own `lucide-*` class could serve the same purpose, but it is an internal
+  naming detail of the package; this uses the registry's vocabulary.
+-->
 {#if Glyph}
-  <Glyph {size} {strokeWidth} class={klass} aria-hidden="true" />
+  <Glyph {size} {strokeWidth} class={klass} data-icon={name} aria-hidden="true" />
 {/if}

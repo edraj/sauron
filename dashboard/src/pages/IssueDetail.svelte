@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import { untrack } from 'svelte';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
@@ -398,7 +400,7 @@
   }
 
   function plural(n: number, word: string): string {
-    return `${n.toLocaleString()} ${n === 1 ? word : `${word}s`}`;
+    return `${formatNumber(n)} ${n === 1 ? word : `${word}s`}`;
   }
 
   // The search box applies on submit only (button/Enter/clear); the effect
@@ -578,15 +580,15 @@
 <AppShell requireApp>
   <button class="back" onclick={() => push('/issues')}>
     <Icon name="arrow-left" size={14} />
-    Back to issues
+    {t('issue.backToList')}
   </button>
 
   {#if loading}
     <div class="center"><Spinner size={26} /></div>
   {:else if error}
-    <EmptyState title="Couldn't load issue" description={error} icon="triangle-alert">
+    <EmptyState title={t('issue.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
-        <Button variant="secondary" onclick={() => push('/issues')}>Back to issues</Button>
+        <Button variant="secondary" onclick={() => push('/issues')}>{t('issue.backToList')}</Button>
       {/snippet}
     </EmptyState>
   {:else if issue}
@@ -606,7 +608,7 @@
               lockedReason={writeLock}
               onclick={() => setStatus('resolved')}
             >
-              Resolve
+              {t('issue.action.resolve')}
             </Button>
           {/if}
           {#if issue.status !== 'ignored'}
@@ -616,7 +618,7 @@
               lockedReason={writeLock}
               onclick={() => setStatus('ignored')}
             >
-              Ignore
+              {t('issue.action.ignore')}
             </Button>
           {/if}
           {#if issue.status !== 'unresolved'}
@@ -626,7 +628,7 @@
               lockedReason={writeLock}
               onclick={() => setStatus('unresolved')}
             >
-              Unresolve
+              {t('issue.action.unresolve')}
             </Button>
           {/if}
         </div>
@@ -634,7 +636,7 @@
 
     <div class="issue-body">
       <div class="col-main">
-        <Card title="Events over time">
+        <Card title={t('issue.card.eventsOverTime')}>
           <TimeSeriesChart data={issue.series} height={170} color="var(--error)" />
         </Card>
 
@@ -642,7 +644,7 @@
           <Card>
             {#snippet header()}
               <div class="event-head">
-                <h3 class="card-title-inline">Latest event</h3>
+                <h3 class="card-title-inline">{t('issue.card.latestEvent')}</h3>
                 {#if !metaRedundant}
                   <span class="event-meta mono">{eventMeta}</span>
                 {/if}
@@ -651,7 +653,7 @@
             <div class="event-body">
               <div class="section">
                 <div class="section-head">
-                  <span class="section-label">Stacktrace</span>
+                  <span class="section-label">{t('ui.section.stacktrace')}</span>
                   <SymbolicationBadge
                     status={latestEvent.symbolication_status}
                     isDart={latestEvent.debug_meta?.raw_stacktrace != null}
@@ -664,18 +666,18 @@
                 />
               </div>
               <div class="section">
-                <span class="section-label">Breadcrumbs</span>
+                <span class="section-label">{t('issue.card.breadcrumbs')}</span>
                 <BreadcrumbTrail breadcrumbs={latestEvent.breadcrumbs ?? []} />
               </div>
               <div class="section">
-                <span class="section-label">Context</span>
+                <span class="section-label">{t('ui.section.context')}</span>
                 <KeyValueList data={latestEvent.context} emptyLabel="No context" />
               </div>
             </div>
           </Card>
         {:else}
-          <Card title="Latest event">
-            <p class="muted">No event payload available for this issue.</p>
+          <Card title={t('issue.card.latestEvent')}>
+            <p class="muted">{t('issue.empty.payload')}</p>
           </Card>
         {/if}
 
@@ -687,28 +689,28 @@
                user) instead of below a fold of stack trace and payload; long
                values stay readable there through `title` tooltips. -->
           <div class="data-row">
-            <Card title="Contexts">
+            <Card title={t('ui.section.contexts')}>
               {#if latestEvent.contexts && Object.keys(latestEvent.contexts).length > 0}
                 <JsonTree value={latestEvent.contexts} name="contexts" expandTo={2} />
               {:else}
-                <span class="faint">No contexts</span>
+                <span class="faint">{t('issue.empty.contexts')}</span>
               {/if}
             </Card>
 
-            <Card title="Additional data">
+            <Card title={t('ui.section.extra')}>
               {#if latestEvent.extra && Object.keys(latestEvent.extra).length > 0}
                 <JsonTree value={latestEvent.extra} name="extra" expandTo={2} />
               {:else}
-                <span class="faint">No additional data</span>
+                <span class="faint">{t('issue.empty.extra')}</span>
               {/if}
             </Card>
           </div>
         {/if}
 
-        <Card title="Occurrences">
+        <Card title={t('issues.occurrences')}>
           {#snippet actions()}
             {#if occStats}
-              <span class="occ-stats" title="Across the selected range and filters">
+              <span class="occ-stats" title={t('issue.acrossRange')}>
                 {plural(occStats.events, 'event')}
                 <span class="sep">·</span>
                 {plural(occStats.users, 'user')}
@@ -757,19 +759,18 @@
               the way back.
             -->
             <p class="faint">
-              Nothing left on this page — these occurrences have gone since it was loaded.
-              Go back for the ones that are still here.
+              {t('issue.stale.body')}
             </p>
           {:else if occurrences.length === 0}
-            <p class="faint">No occurrences match this filter.</p>
+            <p class="faint">{t('issue.empty.filtered')}</p>
           {:else}
             <DataTable class="occ-table">
               {#snippet head()}
                 <tr>
-                  <SortableTh key="occurred_at" sort={occList.sort} onsort={onOccSort}>Time</SortableTh>
-                  <SortableTh key="distinct_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>User</SortableTh>
-                  <SortableTh key="session_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>Session</SortableTh>
-                  <SortableTh key="device_key" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>Device</SortableTh>
+                  <SortableTh key="occurred_at" sort={occList.sort} onsort={onOccSort}>{t('events.column.time')}</SortableTh>
+                  <SortableTh key="distinct_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.user')}</SortableTh>
+                  <SortableTh key="session_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.session')}</SortableTh>
+                  <SortableTh key="device_key" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.device')}</SortableTh>
                 </tr>
               {/snippet}
               {#snippet children()}
@@ -856,33 +857,33 @@
       </div>
 
       <aside class="rail">
-        <Card title="Overview">
+        <Card title={t('issue.card.overview')}>
           <dl class="side-dl">
             <div>
-              <dt>Status</dt>
+              <dt>{t('common.status')}</dt>
               <dd><StatusBadge status={issue.status} /></dd>
             </div>
             <div>
-              <dt>Level</dt>
+              <dt>{t('issues.column.level')}</dt>
               <dd><LevelBadge level={issue.level} /></dd>
             </div>
-            <div><dt>Events</dt><dd>{issue.times_seen.toLocaleString()}</dd></div>
-            <div><dt>Users affected</dt><dd>{issue.users_seen.toLocaleString()}</dd></div>
+            <div><dt>{t('explore.column.events')}</dt><dd>{formatNumber(issue.times_seen)}</dd></div>
+            <div><dt>{t('issue.field.usersAffected')}</dt><dd>{formatNumber(issue.users_seen)}</dd></div>
             <div>
-              <dt>First seen</dt>
+              <dt>{t('explore.column.firstSeen')}</dt>
               <dd><TimeValue value={issue.first_seen} /></dd>
             </div>
             <div>
-              <dt>Last seen</dt>
+              <dt>{t('explore.column.lastSeen')}</dt>
               <dd><TimeValue value={issue.last_seen} /></dd>
             </div>
-            <div><dt>Type</dt><dd class="mono">{issue.type}</dd></div>
+            <div><dt>{t('issue.field.type')}</dt><dd class="mono">{issue.type}</dd></div>
             {#if latestEvent?.release}
-              <div><dt>Release</dt><dd class="mono">{latestEvent.release}</dd></div>
+              <div><dt>{t('issue.field.release')}</dt><dd class="mono">{latestEvent.release}</dd></div>
             {/if}
             {#if latestEvent?.screen}
               <div>
-                <dt>Screen</dt>
+                <dt>{t('screens.column.screen')}</dt>
                 <dd>
                   <a class="screen-link mono" href={`#/screens/${encodeURIComponent(latestEvent.screen)}`}>
                     <Icon name="layout-panel-top" size={13} />{latestEvent.screen}
@@ -892,12 +893,12 @@
             {/if}
             {#if latestEvent}
               <div>
-                <dt>Occurred</dt>
+                <dt>{t('issue.field.occurred')}</dt>
                 <dd><TimeValue value={latestEvent.occurred_at} /></dd>
               </div>
             {/if}
             <div>
-              <dt>Fingerprint</dt>
+              <dt>{t('issue.field.fingerprint')}</dt>
               <dd class="mono fp" title={issue.fingerprint}>{issue.fingerprint.slice(0, 16)}…</dd>
             </div>
           </dl>
@@ -910,7 +911,7 @@
              that component lays out for full width; a long value truncates with
              its full text on the `title`. -->
         {#if latestEvent && tagEntries.length > 0}
-          <Card title="Tags">
+          <Card title={t('ui.section.tags')}>
             <dl class="side-dl">
               {#each tagEntries as [key, value] (key)}
                 <div>
@@ -923,7 +924,7 @@
         {/if}
 
         {#if distinctId}
-          <Card title="Affected user">
+          <Card title={t('ui.section.affectedUser')}>
             <button class="person" onclick={() => push(`/persons/${encodeURIComponent(distinctId)}`)}>
               <span class="p-avatar">{(eventUserEmail ?? distinctId).slice(0, 1).toUpperCase()}</span>
               <span class="p-meta">
@@ -1090,7 +1091,7 @@
     margin: 0;
     font-size: 12.5px;
     color: var(--text);
-    text-align: right;
+    text-align: end;
     word-break: break-word;
   }
   /* Tag values are arbitrary strings in a 300px column. Clamped to two lines
@@ -1131,7 +1132,7 @@
     padding: 4px 2px;
     background: none;
     border: none;
-    text-align: left;
+    text-align: start;
   }
   .person:hover .p-arrow {
     transform: translateX(3px);

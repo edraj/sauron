@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -179,10 +180,9 @@
 <AdminShell requireProject={false}>
   <div class="head">
     <div>
-      <h1>Ingest failures</h1>
+      <h1>{t('failures.title')}</h1>
       <p class="sub">
-        Events that never made it into storage, grouped by cause. Transient failures are
-        retried automatically before they appear here.
+        {t('prose.failures.lede')}
       </p>
     </div>
     <RefreshButton onclick={refresh} loading={loading || revalidating} />
@@ -191,12 +191,12 @@
   <Card>
     <div class="filters">
       <label>
-        <span>Status</span>
+        <span>{t('common.status')}</span>
         <select bind:value={statusFilter}>
-          <option value="failed">Needs attention</option>
-          <option value="requeued">Retrying</option>
-          <option value="resolved">Resolved</option>
-          <option value="">All</option>
+          <option value="failed">{t('failures.state.needsAttention')}</option>
+          <option value="requeued">{t('failures.state.retrying')}</option>
+          <option value="resolved">{t('failures.state.resolved')}</option>
+          <option value="">{t('common.all')}</option>
         </select>
       </label>
     </div>
@@ -211,7 +211,7 @@
   {#if loading}
     <div class="centered"><Spinner /></div>
   {:else if error}
-    <EmptyState title="Could not load ingest failures" description={error} icon="triangle-alert" />
+    <EmptyState title={t('failures.error.load')} description={error} icon="triangle-alert" />
   {:else if failures.length === 0}
     <EmptyState
       title={statusFilter === 'failed' ? 'No failing ingest' : 'Nothing here'}
@@ -224,12 +224,12 @@
     <DataTable>
       {#snippet head()}
         <tr>
-          <th>Cause</th>
-          <th>App</th>
-          <th class="num">Occurrences</th>
-          <th class="num">Recoverable</th>
-          <th>Status</th>
-          <th>Last seen</th>
+          <th>{t('failures.column.cause')}</th>
+          <th>{t('nav.selectApp')}</th>
+          <th class="num">{t('failures.column.occurrences')}</th>
+          <th class="num">{t('failures.state.recoverable')}</th>
+          <th>{t('common.status')}</th>
+          <th>{t('explore.column.lastSeen')}</th>
           <th></th>
         </tr>
       {/snippet}
@@ -270,7 +270,7 @@
                   doRetry(f);
                 }}
               >
-                Retry
+                {t('common.retry')}
               </Button>
               <Button
                 size="sm"
@@ -281,7 +281,7 @@
                   confirmDrop = f;
                 }}
               >
-                Drop
+                {t('failures.drop')}
               </Button>
             </td>
           </tr>
@@ -291,7 +291,7 @@
 
     {#if nextCursor}
       <div class="more">
-        <Button variant="secondary" loading={loadingMore} onclick={loadMore}>Load more</Button>
+        <Button variant="secondary" loading={loadingMore} onclick={loadMore}>{t('failures.loadMore')}</Button>
       </div>
     {/if}
   {/if}
@@ -304,12 +304,12 @@
       <p class="detail-msg">{selected.error_message}</p>
 
       <div class="facts">
-        <div><span>Fingerprint</span><code>{selected.fingerprint}</code></div>
-        <div><span>App</span><strong>{selected.app_name || 'unknown'}</strong></div>
-        <div><span>First seen</span><TimeValue value={selected.first_seen_at} /></div>
-        <div><span>Last seen</span><TimeValue value={selected.last_seen_at} /></div>
+        <div><span>{t('failures.column.fingerprint')}</span><code>{selected.fingerprint}</code></div>
+        <div><span>{t('nav.selectApp')}</span><strong>{selected.app_name || 'unknown'}</strong></div>
+        <div><span>{t('explore.column.firstSeen')}</span><TimeValue value={selected.first_seen_at} /></div>
+        <div><span>{t('explore.column.lastSeen')}</span><TimeValue value={selected.last_seen_at} /></div>
         <div>
-          <span>Auto-retried</span>
+          <span>{t('failures.state.autoRetried')}</span>
           <strong>{wasAutoRetried(selected.error_kind) ? 'Yes, 3 attempts' : 'No'}</strong>
         </div>
       </div>
@@ -319,11 +319,11 @@
         <span>{rec.summary}</span>
       </div>
 
-      <h3>Retained payloads</h3>
+      <h3>{t('failures.retainedPayloads')}</h3>
       {#if payloadsLoading}
         <Spinner />
       {:else if payloads.length === 0}
-        <p class="muted">No payloads retained for this group.</p>
+        <p class="muted">{t('failures.noPayloads')}</p>
       {:else}
         {#each payloads as p (p.id)}
           <details>
@@ -340,21 +340,20 @@
 {/if}
 
 {#if confirmDrop}
-  <Modal open title="Drop this failure group?" onclose={() => (confirmDrop = null)}>
+  <Modal open title={t('failures.confirmDrop')} onclose={() => (confirmDrop = null)}>
     <div class="confirm">
       <p>
-        This permanently deletes <strong>{fmt(confirmDrop.retained)}</strong> retained
+        {t('prose.failures.deletes.a')} <strong>{fmt(confirmDrop.retained)}</strong> retained
         {confirmDrop.retained === 1 ? 'payload' : 'payloads'} for
         <strong>{describeKind(confirmDrop.error_kind)}</strong>. They cannot be recovered
         afterwards.
       </p>
       <p class="muted">
-        An entry naming this group and its counts is written to the audit trail first — that
-        record is the only thing that survives.
+        {t('prose.failures.auditFirst')}
       </p>
       <div class="confirm-actions">
-        <Button variant="ghost" onclick={() => (confirmDrop = null)}>Cancel</Button>
-        <Button variant="danger" loading={acting} onclick={doDrop}>Drop permanently</Button>
+        <Button variant="ghost" onclick={() => (confirmDrop = null)}>{t('common.cancel')}</Button>
+        <Button variant="danger" loading={acting} onclick={doDrop}>{t('failures.dropPermanently')}</Button>
       </div>
     </div>
   </Modal>

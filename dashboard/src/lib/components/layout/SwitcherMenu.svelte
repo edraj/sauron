@@ -12,7 +12,7 @@
   import Icon from '../ui/Icon.svelte';
   import type { IconName } from '../ui/Icon.svelte';
   import type { Permission } from '../../models';
-  import { lockTitle } from '../../models/page-access';
+    import { lockTip } from '../../actions/lock-tip';
 
   interface Item {
     id: string;
@@ -208,8 +208,7 @@
         type="button"
         class="create"
         role="menuitem"
-        disabled={createLocked !== null}
-        title={createLocked ? lockTitle(createLocked) : undefined}
+        use:lockTip={createLocked}
         onclick={create}
       >
         {#if createLocked}
@@ -301,7 +300,7 @@
     color: var(--text-muted);
     font-size: 13.5px;
     font-weight: 540;
-    text-align: left;
+    text-align: start;
     cursor: pointer;
     transition: background 0.1s ease, color 0.1s ease;
   }
@@ -347,7 +346,7 @@
     color: var(--text-muted);
     font-size: 13px;
     font-weight: 540;
-    text-align: left;
+    text-align: start;
     cursor: pointer;
     transition: background 0.1s ease, color 0.1s ease;
   }

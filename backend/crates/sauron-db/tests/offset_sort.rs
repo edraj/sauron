@@ -1143,6 +1143,7 @@ async fn seed_session(
         None,
         events,
         0,
+        0,
     )
     .await
     .expect("bump_session start");
@@ -1158,6 +1159,7 @@ async fn seed_session(
             None,
             None,
             None,
+            0,
             0,
             0,
         )

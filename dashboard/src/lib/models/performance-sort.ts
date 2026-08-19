@@ -37,7 +37,7 @@ const ACCESSORS: Record<string, (r: PerfSummaryRow) => SortValue> = {
    */
   op: (r) => r.op,
   // The transaction count. The column is headed Throughput and the cell shows
-  // `count.toLocaleString()`; `count` is the number behind it.
+  // `formatNumber(count)`; `count` is the number behind it.
   throughput: (r) => r.count,
   // Raw milliseconds for all four latencies, never `LatencyBadge`'s label.
   p50: (r) => r.p50,

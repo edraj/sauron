@@ -75,7 +75,7 @@
   }
   .req {
     color: var(--error);
-    margin-left: 2px;
+    margin-inline-start: 2px;
   }
   .control {
     display: flex;
@@ -96,7 +96,7 @@
     box-shadow: 0 0 0 3px var(--error-soft);
   }
   .prefix {
-    padding-left: 12px;
+    padding-inline-start: 12px;
     color: var(--text-faint);
     font-size: 13px;
   }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { onMount } from 'svelte';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -383,36 +384,36 @@ SauronSdk.Track("signup_completed", "u_123");`;
 
   // --- Search & filtering ---------------------------------------------------
 
-  const searchCoverageRows: { q: string; a: string }[] = [
+  const searchCoverageRows: { q: string; a: string }[] = $derived([
     {
-      q: 'Exceptions (Issues)',
-      a: 'The query language, with autocomplete, plus filter chips — all server-side over the full dataset in the selected date range.',
+      q: t('dp.t.cov.exceptionsQ'),
+      a: t('dp.t.coverage.exceptions'),
     },
     {
       q: 'Events',
-      a: 'The query language, with autocomplete, plus filter chips — all server-side over the full dataset in the selected date range.',
+      a: t('dp.t.coverage.exceptions'),
     },
     {
-      q: "An issue's Occurrences (Issue detail page)",
-      a: "The query language and the same chips, server-side, scoped to just that issue's events — but this view doesn't write its state to the URL.",
+      q: t('dp.t.cov.occurrencesQ'),
+      a: t('dp.t.coverage.occurrences'),
     },
     {
       q: 'Sessions',
-      a: 'The query language, with autocomplete, server-side. Sessions carry no developer tags, so @tag is not offered here and a tag term is rejected.',
+      a: t('dp.t.cov.sessionsA'),
     },
     {
-      q: 'Users, Devices, Screens',
-      a: 'A plain free-text box — no query language, no chips. Server-side; Users has no date window (searches all time), Devices and Screens are scoped to the selected range.',
+      q: t('dp.t.cov.plainQ'),
+      a: t('dp.t.cov.plainA'),
     },
     {
       q: 'Funnels',
-      a: "A search box exists, but it only filters rows already loaded on the current page in the browser. It never queries the server — a match sitting on the next page won't show up.",
+      a: t('dp.t.cov.clientA'),
     },
     {
-      q: 'Performance, Journeys, Overview, Members, Monitors, Storage',
+      q: t('dp.t.cov.noneQ'),
       a: 'No search.',
     },
-  ];
+  ]);
 
   /**
    * The operators the grammar actually resolves.
@@ -421,47 +422,47 @@ SauronSdk.Track("signup_completed", "u_123");`;
    * below are fetched instead, because those change per resource and per
    * release and this page has already carried a rotted copy of them once.
    */
-  const queryOperatorRows: { sig: string; desc: string }[] = [
-    { sig: 'field:value', desc: 'Equals. level:error' },
-    { sig: 'field:!value', desc: 'Not equal. level:!info' },
-    { sig: 'field:>n   field:>=n', desc: 'Greater than, or greater-or-equal. timesSeen:>5' },
-    { sig: 'field:<n   field:<=n', desc: 'Less than, or less-or-equal. duration:<500ms' },
+  const queryOperatorRows: { sig: string; desc: string }[] = $derived([
+    { sig: 'field:value', desc: t('dp.t.op.equals') },
+    { sig: 'field:!value', desc: t('dp.t.op.notEqual') },
+    { sig: 'field:>n   field:>=n', desc: t('dp.t.op.greater') },
+    { sig: 'field:<n   field:<=n', desc: t('dp.t.op.less') },
     {
       sig: 'field:>2day   field:<1month',
-      desc: 'On a timestamp field, a relative offset before now: s/sec, m/min, h/hour, d/day, w/week, mo/month. Months are real calendar months (1 month before 31 Mar is 28 Feb); everything else is a fixed span. m is MINUTES — months are mo or longer. A leading - is optional: 7d and -7d are the same. lastSeen:>=1month',
+      desc: t('dp.t.op.relative'),
     },
     {
       sig: 'field:>2026-07-01T00:00:00Z',
-      desc: 'On a timestamp field, a full ISO-8601 instant.',
+      desc: t('dp.t.op.iso'),
     },
-    { sig: 'field:[a,b]', desc: 'Any of. level:[error,fatal]' },
+    { sig: 'field:[a,b]', desc: t('dp.t.op.anyOf') },
     {
       sig: 'field:[lo..hi]',
-      desc: 'Inclusive range, on the ordered types only (timestamps, integers, durations) — the same brackets as any-of, told apart by the .. and by the field. Both ends required. firstSeen:[7d..1d], timesSeen:[10..100]',
+      desc: t('dp.t.op.range'),
     },
     {
       sig: 'field:~text',
-      desc: 'Contains this literal substring, case-insensitive. * is NOT a wildcard here — it matches a literal asterisk.',
+      desc: t('dp.t.op.contains'),
     },
-    { sig: 'has:field', desc: 'The field is present at all. Carries no value.' },
-    { sig: 'bare words', desc: 'Free text against the payload. A term with no field is a payload search.' },
-    { sig: 'A OR B', desc: 'Either. Two terms separated by a space are AND by default.' },
-    { sig: '!term   !(a b)', desc: 'Negation, over a single term or a whole parenthesised group.' },
-    { sig: '"two words"', desc: 'Quote a value containing spaces or a closing parenthesis.' },
-  ];
+    { sig: 'has:field', desc: t('dp.t.op.has') },
+    { sig: 'bare words', desc: t('dp.t.op.freeText') },
+    { sig: 'A OR B', desc: t('dp.t.op.or') },
+    { sig: '!term   !(a b)', desc: t('dp.t.op.not') },
+    { sig: '"two words"', desc: t('dp.t.op.quote') },
+  ]);
 
   /** The variable prefixes, which address JSON rather than a column. */
-  const queryVariableRows: { sig: string; desc: string }[] = [
-    { sig: '@tag:value', desc: 'Matches across EVERY tag key — a bare @tag does not mean the key named "tag".' },
-    { sig: '@tag.key:value', desc: 'One named key. @tag.region:eu' },
+  const queryVariableRows: { sig: string; desc: string }[] = $derived([
+    { sig: '@tag:value', desc: t('dp.t.var.anyTag') },
+    { sig: '@tag.key:value', desc: t('dp.t.var.namedKey') },
     {
       sig: 'tag:key=value',
-      desc: 'The escape hatch for keys containing characters outside A-Z a-z 0-9 _ . - — e.g. cart@checkout or 100%off.',
+      desc: t('dp.t.var.escapeHatch'),
     },
-    { sig: '@context.os.name:Linux', desc: 'Device and runtime context. Requires event:read.' },
-    { sig: '@extra.key:value', desc: 'Developer-attached extra metadata. Requires event:read.' },
-    { sig: 'sort=col   sort=-col', desc: 'A bare column sorts DESCENDING; a leading - reverses it to ascending.' },
-  ];
+    { sig: '@context.os.name:Linux', desc: t('dp.t.var.context') },
+    { sig: '@extra.key:value', desc: t('dp.t.var.extra') },
+    { sig: 'sort=col   sort=-col', desc: t('dp.t.var.sort') },
+  ]);
 
   const queryExample = `level:[error,fatal] @tag.region:eu !status:resolved timeout
 
@@ -474,36 +475,36 @@ Terms are ANDed. Wrap alternatives in parentheses to mix in an OR:
 
   (level:error OR level:fatal) @tag.region:~eu`;
 
-  const freeTextRows: { q: string; a: string }[] = [
+  const freeTextRows: { q: string; a: string }[] = $derived([
     {
       q: 'Exceptions',
-      a: "title, type, culprit — plus the underlying event's tags/contexts/extra payload (matched as text).",
+      a: t('dp.t.free.exceptions'),
     },
     {
       q: 'Events',
-      a: 'name, distinct_id — plus the tags/contexts/extra/properties payload (as text).',
+      a: t('dp.t.free.events'),
     },
     {
       q: 'Occurrences',
-      a: 'message, exception_value, exception_type — plus the tags/contexts/extra payload.',
+      a: t('dp.t.free.occurrences'),
     },
     {
       q: 'Users',
-      a: 'distinct_id — plus the entire traits object as text, so an email, plan, or company typed here finds the person.',
+      a: t('dp.t.free.users'),
     },
     {
       q: 'Devices',
-      a: 'family, model, os_name and device_key, glued together — "iphone 15" or "macos" both work.',
+      a: t('dp.t.free.devices'),
     },
-    { q: 'Screens', a: 'the screen name only.' },
-  ];
+    { q: 'Screens', a: t('dp.t.free.screens') },
+  ]);
 
-  const filterOpRows: { sig: string; desc: string }[] = [
-    { sig: 'text', desc: '=  ≠  contains — exact / not-exact / case-insensitive substring' },
-    { sig: 'enum', desc: '=  ≠ — exact / not-exact against a fixed option list' },
-    { sig: 'number', desc: '=  >  < — numeric compare' },
-    { sig: 'tag', desc: 'contains (default)  = — see "The Tag filter" below' },
-  ];
+  const filterOpRows: { sig: string; desc: string }[] = $derived([
+    { sig: 'text', desc: t('dp.t.chip.text') },
+    { sig: 'enum', desc: t('dp.t.chip.enum') },
+    { sig: 'number', desc: t('dp.t.chip.number') },
+    { sig: 'tag', desc: t('dp.t.chip.tag') },
+  ]);
 
   /**
    * The searchable resources, each documented from the schema the server
@@ -567,24 +568,24 @@ Chip: Tag   =   key=region   value=eu
 → matches ONLY an exact, case-sensitive tags.region of "eu" — zero rows
   if every event actually has "eu-central-1" or "EU-CENTRAL-1"`;
 
-  const troubleshooting: { q: string; a: string }[] = [
+  const troubleshooting: { q: string; a: string }[] = $derived([
     {
-      q: 'Nothing shows up in the dashboard',
-      a: "Confirm the DSN matches the right app and environment (top-bar app switcher, then Settings → Environments) and that the ingest gateway is reachable from your client. Watch for POST /api/<environment_id>/envelope in the Network tab.",
+      q: t('dp.t.ts.nothingQ'),
+      a: t('dp.t.ts.nothingA'),
     },
     {
       q: '401 or 403 responses',
-      a: 'The public key is wrong or was rotated. Copy the current DSN from Settings → Environments. (The Flutter SDK disables itself after a 401/403.)',
+      a: t('dp.t.ts.authA'),
     },
     {
-      q: 'Events arrive but there is no person',
-      a: 'Call identify() before track() so events attach to a user.',
+      q: t('dp.t.ts.noPersonQ'),
+      a: t('dp.t.ts.noPersonA'),
     },
     {
-      q: 'Fewer errors than expected',
-      a: 'Errors are sampled by sampleRate (default 1 = all). Lower values drop a fraction on the client.',
+      q: t('dp.t.ts.fewerQ'),
+      a: t('dp.t.ts.fewerA'),
     },
-  ];
+  ]);
 
   /**
    * Where each SDK is published, so "install the SDK" has somewhere to point.
@@ -682,28 +683,28 @@ TIER_DROP_LAG_HOURS=24`;
     { key: 'node', label: 'Node.js', icon: 'server' },
     { key: 'csharp', label: 'C#', icon: 'hash' },
   ];
-  const startNav: { id: string; label: string; icon: IconName }[] = [
-    { id: 'dsn', label: 'Your DSN', icon: 'key-round' },
-    { id: 'concepts', label: 'How it works', icon: 'compass' },
-  ];
-  const guideNav: { id: string; label: string; icon: IconName }[] = [
-    { id: 'funnels', label: 'Funnels', icon: 'funnel' },
-    { id: 'verify', label: 'Verify setup', icon: 'circle-check' },
-    { id: 'search', label: 'Search & filtering', icon: 'search' },
-    { id: 'privacy-inspector', label: 'Privacy inspector', icon: 'shield-alert' },
-    { id: 'troubleshooting', label: 'Troubleshooting', icon: 'life-buoy' },
-  ];
+  const startNav: { id: string; label: string; icon: IconName }[] = $derived([
+    { id: 'dsn', label: t('docs.nav.item.dsn'), icon: 'key-round' },
+    { id: 'concepts', label: t('docs.nav.item.concepts'), icon: 'compass' },
+  ]);
+  const guideNav: { id: string; label: string; icon: IconName }[] = $derived([
+    { id: 'funnels', label: t('docs.nav.item.funnels'), icon: 'funnel' },
+    { id: 'verify', label: t('docs.nav.item.verify'), icon: 'circle-check' },
+    { id: 'search', label: t('docs.nav.item.search'), icon: 'search' },
+    { id: 'privacy-inspector', label: t('docs.nav.item.privacy'), icon: 'shield-alert' },
+    { id: 'troubleshooting', label: t('docs.nav.item.troubleshooting'), icon: 'life-buoy' },
+  ]);
   // "How it works under the hood" — every feature + its internals.
-  const archNav: { id: string; label: string; icon: IconName }[] = [
-    { id: 'architecture', label: 'Architecture', icon: 'waypoints' },
-    { id: 'grouping', label: 'Error grouping', icon: 'triangle-alert' },
-    { id: 'analytics-internals', label: 'Analytics & people', icon: 'users' },
-    { id: 'queries', label: 'Queries behind it', icon: 'chart-column' },
-    { id: 'tiering', label: 'Data lifecycle', icon: 'package' },
-    { id: 'uptime', label: 'Uptime monitoring', icon: 'monitor' },
-    { id: 'rbac', label: 'Access control', icon: 'lock' },
-    { id: 'sdk-internals', label: 'SDK internals', icon: 'terminal' },
-  ];
+  const archNav: { id: string; label: string; icon: IconName }[] = $derived([
+    { id: 'architecture', label: t('docs.nav.item.architecture'), icon: 'waypoints' },
+    { id: 'grouping', label: t('docs.nav.item.grouping'), icon: 'triangle-alert' },
+    { id: 'analytics-internals', label: t('docs.nav.item.analytics'), icon: 'users' },
+    { id: 'queries', label: t('docs.nav.item.queries'), icon: 'chart-column' },
+    { id: 'tiering', label: t('docs.nav.item.tiering'), icon: 'package' },
+    { id: 'uptime', label: t('docs.nav.item.uptime'), icon: 'monitor' },
+    { id: 'rbac', label: t('docs.nav.item.rbac'), icon: 'lock' },
+    { id: 'sdk-internals', label: t('docs.nav.item.sdkInternals'), icon: 'terminal' },
+  ]);
   // Section anchors in document order — drives scroll-spy highlighting.
   const sectionIds = [
     'dsn', 'concepts', 'quickstart', 'funnels', 'verify', 'search', 'privacy-inspector',
@@ -746,11 +747,11 @@ FROM transactions
 WHERE app_id = $1 AND op = 'http'
 GROUP BY name, op`;
 
-  const fingerprintRows = [
-    { q: '1 · Your override', a: "If the SDK sends a fingerprint[], it's hashed verbatim — you control the grouping." },
-    { q: '2 · Stack frames', a: 'Otherwise: the exception type plus up to five frames (in-app first, crash last), each reduced to module::function. Line numbers, 0x… addresses, UUIDs, and content-hashed filenames (app.4f3a2b.js → app.js) are masked, so the same bug groups across builds and machines.' },
-    { q: '3 · Message', a: 'No usable frames falls back to the type plus a normalized message; no exception at all hashes just the message.' },
-  ];
+  const fingerprintRows = $derived([
+    { q: t('dp.t.fp.override.q'), a: t('dp.t.fp.override.a') },
+    { q: t('dp.t.fp.frames.q'), a: t('dp.t.fp.frames.a') },
+    { q: t('dp.t.fp.message.q'), a: t('dp.t.fp.message.a') },
+  ]);
 
   // The five-step flow of the Privacy page (Manage → Privacy). Steps 4 and 5
   // are one dialog in the UI but two decisions for the reader, and conflating
@@ -874,18 +875,17 @@ GROUP BY name, op`;
   <div class="docs-page">
     <div class="head">
       <div>
-        <h1 class="page-title">Docs</h1>
+        <h1 class="page-title">{t('docs.title')}</h1>
         <p class="muted sub">
-          Integrate Sauron into your web, mobile, and server apps — install, initialize, capture
-          errors, and track product events.
+          {t('docs.subtitle')}
         </p>
       </div>
     </div>
 
     <div class="docs-layout">
-      <nav class="docs-nav" aria-label="Docs sections">
+      <nav class="docs-nav" aria-label={t('docs.sections')}>
         <div class="nav-group">
-          <div class="nav-label">Get started</div>
+          <div class="nav-label">{t('docs.nav.getStarted')}</div>
           <div class="nav-items">
             {#each startNav as n (n.id)}
               <button
@@ -901,7 +901,7 @@ GROUP BY name, op`;
           </div>
         </div>
         <div class="nav-group nav-sdks">
-          <div class="nav-label">SDKs</div>
+          <div class="nav-label">{t('docs.nav.sdks')}</div>
           <div class="nav-items">
             {#each sdkNav as s (s.key)}
               <button
@@ -917,7 +917,7 @@ GROUP BY name, op`;
           </div>
         </div>
         <div class="nav-group">
-          <div class="nav-label">Guides</div>
+          <div class="nav-label">{t('docs.nav.guides')}</div>
           <div class="nav-items">
             {#each guideNav as g (g.id)}
               <button
@@ -933,7 +933,7 @@ GROUP BY name, op`;
           </div>
         </div>
         <div class="nav-group">
-          <div class="nav-label">Under the hood</div>
+          <div class="nav-label">{t('docs.nav.underTheHood')}</div>
           <div class="nav-items">
             {#each archNav as a (a.id)}
               <button
@@ -961,22 +961,21 @@ GROUP BY name, op`;
             {app.name}
           </span>
           <Badge tone="neutral" size="sm">{appTypeLabel(app.app_type)}</Badge>
-          <span class="dsn-note muted">Snippets below use the DSN shown here.</span>
+          <span class="dsn-note muted">{t('docs.snippetsUseDsn')}</span>
         </div>
         <div class="dsn-row">
           <code class="dsn mono">{dsn}</code>
           <CopyButton value={dsn} />
         </div>
         <p class="muted dsn-env-hint">
-          Showing the DSN for the <strong>{defaultEnv?.name ?? 'default'}</strong> environment.
-          Each environment has its own — see <a href="#/admin/environments">Environments</a>.
+          {t('docs.dsnForApp')} <strong>{defaultEnv?.name ?? 'default'}</strong> {t('dp.dsn.perEnv')} <a href="#/admin/environments">{t('notif.column.environments')}</a>.
         </p>
       {:else}
         <div class="dsn-empty">
           <span class="ic"><Icon name="key-round" size={18} /></span>
           <p class="muted">
-            Snippets use a placeholder DSN.
-            <a href="#/admin/projects">Create or select an app</a> to auto-fill your real key.
+            {t('docs.snippetsPlaceholder')}
+            <a href="#/admin/projects">{t('docs.step.createApp')}</a> {t('dp.dsn.autofill')}
           </p>
         </div>
       {/if}
@@ -988,38 +987,35 @@ GROUP BY name, op`;
         <section id="concepts" class="doc-sec">
         <Card>
       {#snippet header()}
-        <div class="card-h"><Icon name="compass" size={16} /><h3>How Sauron works</h3></div>
+        <div class="card-h"><Icon name="compass" size={16} /><h3>{t('docs.nav.howItWorks')}</h3></div>
       {/snippet}
       <div class="hierarchy">
-        <span class="node">Org</span>
+        <span class="node">{t('storage.column.org')}</span>
         <Icon name="chevron-right" size={14} />
-        <span class="node">Project</span>
+        <span class="node">{t('storage.column.project')}</span>
         <Icon name="chevron-right" size={14} />
-        <span class="node">App</span>
+        <span class="node">{t('nav.selectApp')}</span>
         <Icon name="chevron-right" size={14} />
-        <span class="node">Environment</span>
+        <span class="node">{t('nav.env')}</span>
         <Icon name="chevron-right" size={14} />
         <span class="node key">DSN</span>
       </div>
       <p class="muted concept-lead">
-        An <b>environment</b> holds the DSN — a public key plus the environment id. Each
-        environment under an app gets its own, so switching environments means switching DSNs.
-        Your SDK batches, gzips, and posts envelopes to the ingest gateway, where the dashboard
-        sorts them into two signal types:
+        An <b>environment</b> {t('dp.concepts.envHoldsDsn')}
       </p>
       <div class="signals">
         <div class="signal">
           <span class="s-ic err"><Icon name="triangle-alert" size={16} /></span>
           <div>
-            <b>Errors → Exceptions</b>
-            <span class="muted">Stack-traced and grouped into issues.</span>
+            <b>{t('docs.errorsToExceptions')}</b>
+            <span class="muted">{t('docs.stackTracedGrouped')}</span>
           </div>
         </div>
         <div class="signal">
           <span class="s-ic ana"><Icon name="chart-column" size={16} /></span>
           <div>
-            <b>Events → Analytics</b>
-            <span class="muted">track() / identify() feed Users, Sessions & Funnels.</span>
+            <b>{t('docs.eventsToAnalytics')}</b>
+            <span class="muted">{t('dp.concepts.trackIdentify')}</span>
           </div>
         </div>
       </div>
@@ -1032,185 +1028,185 @@ GROUP BY name, op`;
     {#if platform === 'web'}
       <Card class="steps-card">
         {#snippet header()}
-          <div class="card-h"><Icon name="globe" size={16} /><h3>Web quickstart</h3></div>
+          <div class="card-h"><Icon name="globe" size={16} /><h3>{t('docs.quickstart.web')}</h3></div>
         {/snippet}
         {#snippet actions()}{@render registryLink('web')}{/snippet}
         <div class="steps">
-          {@render step(1, 'Install the SDK', '', webInstall, 'bash')}
+          {@render step(1, t('dp.s.install'), '', webInstall, 'bash')}
           {@render step(
             2,
-            'Initialize once at startup',
-            'Call before your app renders — auto-instrumentation binds immediately.',
+            t('dp.s.initStartup'),
+            t('dp.s.initWeb'),
             webInit,
             'ts',
           )}
           {@render step(
             3,
-            'Capture errors',
-            'Uncaught errors are automatic; report handled ones explicitly.',
+            t('dp.s.captureErrors'),
+            t('dp.s.captureWeb'),
             webCapture,
             'ts',
           )}
           {@render step(
             4,
-            'Track product events',
-            'Identify the user, then record events.',
+            t('dp.s.trackEvents'),
+            t('dp.s.trackWeb'),
             webAnalytics,
             'ts',
           )}
-          {@render step(5, 'Full example', '', webFull, 'ts')}
+          {@render step(5, t('dp.s.fullExample'), '', webFull, 'ts')}
         </div>
       </Card>
 
-      <Card title="Web API reference">
+      <Card title={t('docs.apiReference', { language: 'Web' })}>
         {@render apiTable(webApi)}
       </Card>
     {:else if platform === 'flutter'}
       <Card class="steps-card">
         {#snippet header()}
-          <div class="card-h"><Icon name="smartphone" size={16} /><h3>Flutter quickstart</h3></div>
+          <div class="card-h"><Icon name="smartphone" size={16} /><h3>{t('docs.quickstart.flutter')}</h3></div>
         {/snippet}
         {#snippet actions()}{@render registryLink('flutter')}{/snippet}
         <div class="steps">
-          {@render step(1, 'Add the dependency', '', flutterInstall, 'yaml')}
+          {@render step(1, t('dp.s.addDependency'), '', flutterInstall, 'yaml')}
           {@render step(
             2,
-            'Initialize with appRunner',
-            'appRunner launches your app inside runZonedGuarded with all capture layers bound.',
+            t('dp.s.initFlutter'),
+            t('dp.s.initFlutterBody'),
             flutterInit,
             'dart',
           )}
           {@render step(
             3,
-            'Capture errors',
-            'All four Dart error layers are automatic; report handled ones explicitly.',
+            t('dp.s.captureErrors'),
+            t('dp.s.captureFlutter'),
             flutterCapture,
             'dart',
           )}
           {@render step(
             4,
-            'Automatic navigation breadcrumbs',
-            'Add the observer to record route changes.',
+            t('dp.s.navBreadcrumbs'),
+            t('dp.s.navBreadcrumbsBody'),
             flutterNav,
             'dart',
           )}
           {@render step(
             5,
-            'Track product events',
-            'Identify the user, then record events.',
+            t('dp.s.trackEvents'),
+            t('dp.s.trackWeb'),
             flutterAnalytics,
             'dart',
           )}
-          {@render step(6, 'Full example', '', flutterFull, 'dart')}
+          {@render step(6, t('dp.s.fullExample'), '', flutterFull, 'dart')}
         </div>
       </Card>
 
-      <Card title="Flutter API reference">
+      <Card title={t('docs.apiReference', { language: 'Flutter' })}>
         {@render apiTable(flutterApi)}
       </Card>
     {:else if platform === 'python'}
       <Card class="steps-card">
         {#snippet header()}
-          <div class="card-h"><Icon name="braces" size={16} /><h3>Python quickstart</h3></div>
+          <div class="card-h"><Icon name="braces" size={16} /><h3>{t('docs.quickstart.python')}</h3></div>
         {/snippet}
         {#snippet actions()}{@render registryLink('python')}{/snippet}
         <div class="steps">
-          {@render step(1, 'Install the SDK', '', pyInstall, 'bash')}
+          {@render step(1, t('dp.s.install'), '', pyInstall, 'bash')}
           {@render step(
             2,
-            'Initialize once at startup',
-            'Call init() during boot — a missing DSN is a no-op, not a crash.',
+            t('dp.s.initStartup'),
+            t('dp.s.initPython'),
             pyInit,
             'python',
           )}
           {@render step(
             3,
-            'Capture exceptions',
-            'Server SDKs are explicit — report handled exceptions with their traceback.',
+            t('dp.s.captureExceptions'),
+            t('dp.s.captureServerPy'),
             pyCapture,
             'python',
           )}
           {@render step(
             4,
-            'Track product events',
-            'distinct_id is required — it ties the event to a person.',
+            t('dp.s.trackEvents'),
+            t('dp.s.trackPy'),
             pyAnalytics,
             'python',
           )}
         </div>
       </Card>
 
-      <Card title="Python API reference">
+      <Card title={t('docs.apiReference', { language: 'Python' })}>
         {@render apiTable(pythonApi)}
       </Card>
     {:else if platform === 'node'}
       <Card class="steps-card">
         {#snippet header()}
-          <div class="card-h"><Icon name="server" size={16} /><h3>Node.js quickstart</h3></div>
+          <div class="card-h"><Icon name="server" size={16} /><h3>{t('docs.quickstart.node')}</h3></div>
         {/snippet}
         {#snippet actions()}{@render registryLink('node')}{/snippet}
         <div class="steps">
-          {@render step(1, 'Install the SDK', '', nodeInstall, 'bash')}
+          {@render step(1, t('dp.s.install'), '', nodeInstall, 'bash')}
           {@render step(
             2,
-            'Initialize once at startup',
-            'Call init() during boot — a missing DSN is a no-op, not a crash.',
+            t('dp.s.initStartup'),
+            t('dp.s.initPython'),
             nodeInit,
             'ts',
           )}
           {@render step(
             3,
-            'Capture exceptions',
-            'Server SDKs are explicit — report handled exceptions with their stack.',
+            t('dp.s.captureExceptions'),
+            t('dp.s.captureServerCs'),
             nodeCapture,
             'ts',
           )}
           {@render step(
             4,
-            'Track product events',
-            'distinctId is required — it ties the event to a person.',
+            t('dp.s.trackEvents'),
+            t('dp.s.trackCs'),
             nodeAnalytics,
             'ts',
           )}
         </div>
       </Card>
 
-      <Card title="Node.js API reference">
+      <Card title={t('docs.apiReference', { language: 'Node.js' })}>
         {@render apiTable(nodeApi)}
       </Card>
     {:else}
       <Card class="steps-card">
         {#snippet header()}
-          <div class="card-h"><Icon name="hash" size={16} /><h3>C# quickstart</h3></div>
+          <div class="card-h"><Icon name="hash" size={16} /><h3>{t('docs.quickstart.csharp')}</h3></div>
         {/snippet}
         {#snippet actions()}{@render registryLink('csharp')}{/snippet}
         <div class="steps">
-          {@render step(1, 'Install the package', '', csharpInstall, 'bash')}
+          {@render step(1, t('dp.s.installPackage'), '', csharpInstall, 'bash')}
           {@render step(
             2,
-            'Initialize once at startup',
-            'Call Init() during boot — a missing DSN is a no-op, not a crash.',
+            t('dp.s.initStartup'),
+            t('dp.s.initCsharp'),
             csharpInit,
             'csharp',
           )}
           {@render step(
             3,
-            'Capture exceptions',
-            'Server SDKs are explicit — report handled exceptions with their stack.',
+            t('dp.s.captureExceptions'),
+            t('dp.s.captureServerCs'),
             csharpCapture,
             'csharp',
           )}
           {@render step(
             4,
-            'Track product events',
-            'distinctId is required — it ties the event to a person.',
+            t('dp.s.trackEvents'),
+            t('dp.s.trackCs'),
             csharpAnalytics,
             'csharp',
           )}
         </div>
       </Card>
 
-      <Card title="C# API reference">
+      <Card title={t('docs.apiReference', { language: 'C#' })}>
         {@render apiTable(csharpApi)}
       </Card>
     {/if}
@@ -1221,23 +1217,21 @@ GROUP BY name, op`;
         <section id="funnels" class="doc-sec">
     <Card>
       {#snippet header()}
-        <div class="card-h"><Icon name="funnel" size={16} /><h3>Build a funnel</h3></div>
+        <div class="card-h"><Icon name="funnel" size={16} /><h3>{t('docs.analytics.buildFunnel')}</h3></div>
       {/snippet}
       <p class="muted verify-lead">
-        A funnel is an ordered list of <b>event names</b> you already send with
-        <code class="ic">track()</code>. Sauron measures how many distinct people reach each step —
-        counted in order, per person — plus the drop-off between them.
+        {t('docs.analytics.funnelIs')} <b>{t('dp.funnels.eventNames')}</b> {t('dp.r.funnelsSendWith')}
+        <code class="ic">track()</code>{t('dp.r.funnelsMeasures')}
       </p>
       <CodeBlock code={funnelSnippet} language={lang} />
       <ol class="mini-steps">
-        <li>Open <a href="#/funnels">Funnels</a> and add your stage events <b>in order</b> (2–10 steps).</li>
-        <li>Pick a date range — it defaults to the last 30 days.</li>
-        <li><b>Compute</b> to see overall conversion and step-by-step drop-off.</li>
+        <li>{t('projects.open')} <a href="#/funnels">{t('funnels.title')}</a> {t('dp.funnels.addStages')} <b>in order</b> (2–10 steps).</li>
+        <li>{t('docs.analytics.pickRange')}</li>
+        <li><b>{t('docs.analytics.compute')}</b> {t('dp.funnels.seeConversion')}</li>
       </ol>
       <p class="faint fine">
-        Each step is matched per person and only at-or-after the previous step's time, so order
-        matters — call <code class="ic">identify()</code> so events attribute to the same person.
-        Only event names seen in the selected window appear in the picker.
+        {t('docs.analytics.stepOrder.a')} <code class="ic">identify()</code>
+        {t('docs.analytics.stepOrder.b')}
       </p>
     </Card>
 
@@ -1247,16 +1241,15 @@ GROUP BY name, op`;
         <section id="verify" class="doc-sec">
     <Card>
       {#snippet header()}
-        <div class="card-h"><Icon name="circle-check" size={16} /><h3>Verify it works</h3></div>
+        <div class="card-h"><Icon name="circle-check" size={16} /><h3>{t('docs.step.verify')}</h3></div>
       {/snippet}
       <p class="muted verify-lead">
-        Fire a test event from your app, then watch it land here. The first event can take a few
-        seconds.
+        {t('docs.fireTestEvent')}
       </p>
       <CodeBlock code={verifySnippet} language={lang} />
       <div class="verify-links">
-        <a class="vl" href="#/issues"><Icon name="triangle-alert" size={15} /> Exceptions</a>
-        <a class="vl" href="#/events"><Icon name="diamond" size={15} /> Events</a>
+        <a class="vl" href="#/issues"><Icon name="triangle-alert" size={15} /> {t('issues.title')}</a>
+        <a class="vl" href="#/events"><Icon name="diamond" size={15} /> {t('overview.stat.events')}</a>
       </div>
     </Card>
 
@@ -1266,65 +1259,50 @@ GROUP BY name, op`;
         <section id="search" class="doc-sec">
     <Card>
       {#snippet header()}
-        <div class="card-h"><Icon name="search" size={16} /><h3>Search &amp; filtering</h3></div>
+        <div class="card-h"><Icon name="search" size={16} /><h3>{t('docs.nav.searchFiltering')}</h3></div>
       {/snippet}
       <p class="muted concept-lead">
-        The four biggest lists — <b>Exceptions</b>, <b>Events</b>, an issue's <b>Occurrences</b>
-        and <b>Sessions</b> — take a real <b>query language</b>:
-        <code class="ic">level:error @tag.region:eu timeout</code>. The box autocompletes the
-        fields and values the resource actually has, and a term with no field is a free-text
-        search over the payload. <b>Filter chips</b> (<code class="ic">field · operator ·
-        value</code>) still sit beside it and still work; they AND with whatever the box holds.
-        Everywhere else there is a plain substring box, or nothing — coverage is uneven by
-        design, so check which a page has before deciding a term "isn't there."
+        {t('docs.search.fourBiggestLists')} <b>{t('issues.title')}</b>, <b>{t('overview.stat.events')}</b>, an issue's <b>{t('issues.occurrences')}</b>
+        and <b>{t('overview.stat.sessions')}</b> {t('dp.search.takeReal')} <b>{t('dp.search.queryLanguage')}</b>:
+        <code class="ic">level:error @tag.region:eu timeout</code>{t('dp.r.boxAutocompletes')} <b>{t('docs.search.filterChips')}</b> (<code class="ic">field · operator ·
+        value</code>{t('dp.r.chipsBeside')}
       </p>
 
-      <h4 class="q-h">Where each page searches</h4>
+      <h4 class="q-h">{t('docs.search.whereEachPage')}</h4>
       {@render defRows(searchCoverageRows)}
 
-      <h4 class="q-h">Query language — operators</h4>
+      <h4 class="q-h">{t('docs.search.operators')}</h4>
       <p class="muted q-note">
-        Press <b>↓</b> in the search box to see what the current page accepts, and <b>Enter</b> (or
-        the <b>Search</b> button) to run it — typing alone never queries. An invalid query is
-        rejected with the reason on the box itself — it never silently returns zero rows.
+        {t('docs.frag.pressArrow')} <b>↓</b> {t('dp.search.pressArrow')} <b>Enter</b> (or
+        the <b>{t('common.search')}</b> {t('dp.search.runIt')}
       </p>
       {@render apiTable(queryOperatorRows)}
 
-      <h4 class="q-h">Query language — variables</h4>
+      <h4 class="q-h">{t('docs.search.variables')}</h4>
       <p class="muted q-note">
-        These address JSON rather than a table column. Which ones a page offers depends on the
-        resource: Issues carry <code class="ic">tags</code> but no
-        <code class="ic">context</code> column, Sessions carry the reverse, and the box only ever
-        suggests what its own resource declares.
+        {t('docs.search.jsonFields.a')} <code class="ic">tags</code>
+        {t('docs.search.jsonFields.b')} <code class="ic">context</code>{t('docs.search.jsonFields.c')}
       </p>
       {@render apiTable(queryVariableRows)}
 
-      <h4 class="q-h">Example</h4>
+      <h4 class="q-h">{t('docs.example')}</h4>
       <CodeBlock code={queryExample} language="text" />
 
-      <h4 class="q-h">Free text: what a bare term actually matches</h4>
+      <h4 class="q-h">{t('docs.search.freeText')}</h4>
       <p class="muted q-note">
-        A term with no <code class="ic">field:</code> in front of it is a free-text search, and it
-        is always a case-insensitive substring match (Postgres <code class="ic">ILIKE</code>) — no
-        ranking, no fuzzy matching, no tokenizer. An empty box returns everything in range. If you
-        hold <code class="ic">issue:read</code> without <code class="ic">event:read</code>, the
-        payload columns are withheld and the search quietly matches fewer of them; the list says
-        so above the rows rather than leaving you to guess.
+        {t('docs.search.bareTerm')} <code class="ic">field:</code> {t('dp.r.freeTextIs')} <code class="ic">ILIKE</code>{t('dp.r.noRanking')} <code class="ic">issue:read</code> without <code class="ic">event:read</code>{t('dp.r.payloadWithheld')}
       </p>
       {@render defRows(freeTextRows)}
 
-      <h4 class="q-h">Structured filters — Exceptions &amp; Events</h4>
+      <h4 class="q-h">{t('docs.search.structuredFilters')}</h4>
       <p class="muted q-note">
-        Click <b>+ Add filter</b> to build a chip. Chips combine with <b>AND</b>; the free-text
-        box and date range still apply on top. An issue's <b>Occurrences</b> list (Issue detail
-        page) offers the same mechanism, but only the <code class="ic">Tag</code> field.
+        {t('docs.frag.clickAddFilter')} <b>{t('dp.r.addFilter')}</b> {t('dp.search.buildChip')} <b>AND</b>{t('dp.search.freeTextOnTop')} <b>{t('issues.occurrences')}</b> {t('dp.r.occurrencesList')} <code class="ic">{t('events.tag')}</code> field.
       </p>
       {@render apiTable(filterOpRows)}
 
-      <h4 class="q-h">Fields, per list</h4>
+      <h4 class="q-h">{t('docs.search.fieldsPerList')}</h4>
       <p class="muted q-note">
-        Read live from this app, so it always matches what the server will accept. These names
-        work in the query box; the chips expose a subset of them.
+        {t('docs.search.readLive')}
       </p>
       {#each SEARCHABLE as ctx (ctx)}
         {#if searchSchemas[ctx]}
@@ -1336,67 +1314,49 @@ GROUP BY name, op`;
         <p class="faint fine">{searchSchemaError}</p>
       {/if}
       <p class="faint fine">
-        Tag-key suggestions come from a sample of recent events, so a key you have not sent
-        lately may not be offered by autocomplete. You can still type it — any key is queryable.
+        {t('docs.search.tagSuggestions')}
       </p>
 
-      <h4 class="q-h">Example: find your error</h4>
+      <h4 class="q-h">{t('docs.search.example')}</h4>
       <p class="muted q-note">
-        Unresolved issues on the checkout path, plus a free-text term. Written as chips it
-        produces the first URL; written in the query box, the second. Both are accepted, and old
-        <code class="ic">filter=</code> bookmarks keep working — they are bridged onto the same
-        query internally, so they return the same rows.
+        {t('docs.search.exampleQuery.a')} <code class="ic">filter=</code>
+        {t('docs.search.exampleQuery.b')}
       </p>
       <CodeBlock code={searchUrlExample} language="url" />
 
-      <h4 class="q-h">The Tag chip — read this before you file a bug</h4>
+      <h4 class="q-h">{t('docs.search.tagChip')}</h4>
       <p class="muted q-note">
-        This is about the <b>chip</b>. In the query box the same two behaviours are spelled
-        <code class="ic">@tag.region:~eu</code> (substring) and
-        <code class="ic">@tag.region:eu</code> (exact), so the trap below is visible in the query
-        itself rather than hidden behind a dropdown that defaulted for you.
+        {t('docs.search.thisIsAbout')} <b>chip</b>{t('dp.r.spelledInBox')}
+        <code class="ic">@tag.region:~eu</code> {t('dp.r.substringAnd')}
+        <code class="ic">@tag.region:eu</code> {t('dp.r.exactTrap')}
       </p>
       <p class="muted concept-lead">
-        <code class="ic">Tag</code> is a two-input chip — a <b>key</b> and a <b>value</b> — composed
-        into one <code class="ic">key=value</code> filter value under the hood (the backend splits
-        on the <b>first</b> <code class="ic">=</code>, so a value that itself contains
-        <code class="ic">=</code> still round-trips). Both a key and a value are required, or the
-        chip silently doesn't get added. Two operators are offered, and the UI picks the
-        <b>first</b> one — <code class="ic">contains</code> — by default:
+        <code class="ic">{t('events.tag')}</code> {t('dp.search.twoInputChip')} <b>{t('filter.placeholder.key')}</b> and a <b>{t('filter.placeholder.value')}</b> {t('dp.r.composedInto')} <code class="ic">key=value</code> {t('dp.r.filterValueHood')} <b>first</b> <code class="ic">=</code>{t('dp.r.valueContains')}
+        <code class="ic">=</code> {t('dp.r.roundTrips')}
+        <b>first</b> {t('dp.r.oneDash')} <code class="ic">contains</code> {t('dp.r.byDefault')}
       </p>
       <ul class="mini-steps">
         <li>
-          <b>contains</b> <i>(default)</i> — case-insensitive substring match on that key's value.
-          Use this when you know the key but only part of the value, or aren't sure of the casing —
-          key <code class="ic">region</code>, value <code class="ic">eu</code> matches
+          <b>contains</b> <i>(default)</i> {t('dp.r.substringMatch')} <code class="ic">region</code>, value <code class="ic">eu</code> matches
           <code class="ic">eu-central-1</code>, <code class="ic">EU-WEST-2</code>, etc.
         </li>
         <li>
-          <b>=</b> — exact, <b>case-sensitive</b> whole-value match (a JSONB containment check,
-          backed by a GIN index so it stays fast on a large app). Only reach for it when you know
-          the value's exact spelling and casing.
+          <b>=</b> — exact, <b>{t('dp.search.caseSensitive')}</b> {t('dp.search.jsonbContainment')}
         </li>
       </ul>
       <p class="faint fine">
-        This is the one that generates real support tickets: switch to <code class="ic">=</code>
-        and type a partial or wrong-case value, and the filter returns <b>zero rows with no
-        error</b> — indistinguishable from "search doesn't work." If a Tag chip comes back empty,
-        switch it to <code class="ic">contains</code> before concluding the tag isn't there.
-        <code class="ic">Tag</code> only looks at the developer-set <code class="ic">tags</code>
-        map — never <code class="ic">contexts</code>, <code class="ic">extra</code>, or the
-        machine-owned <code class="ic">context</code> (singular) blob; use the free-text box for
-        those.
+        {t('docs.search.realTickets')} <code class="ic">=</code>
+        {t('dp.r.partialReturns')} <b>{t('dp.search.zeroRows')}</b> — indistinguishable from "search doesn't work." If a Tag chip comes back empty,
+        switch it to <code class="ic">contains</code> {t('dp.r.beforeConcluding')}
+        <code class="ic">{t('events.tag')}</code> {t('dp.r.onlyLooksAt')} <code class="ic">tags</code>
+        {t('dp.r.mapNever')} <code class="ic">contexts</code>, <code class="ic">extra</code>{t('dp.r.machineOwned')} <code class="ic">context</code> {t('dp.r.singularBlob')}
       </p>
       <CodeBlock code={tagFilterExample} language="text" />
 
-      <h4 class="q-h">Filters live in the URL</h4>
+      <h4 class="q-h">{t('docs.search.filtersInUrl')}</h4>
       <p class="muted q-note">
-        On <b>Exceptions</b> and <b>Events</b>, every chip and the search term are written into the
-        address bar (<code class="ic">filter=field:op:value</code>, repeated, plus
-        <code class="ic">q=</code> and <code class="ic">since_days=</code>) — copy the URL to hand
-        someone the exact same filtered view. The Occurrences list, and every free-text-only or
-        client-side page above, doesn't do this — reloading or sharing the link loses whatever you
-        typed.
+        On <b>{t('issues.title')}</b> and <b>{t('overview.stat.events')}</b>{t('dp.r.addressBar')}<code class="ic">filter=field:op:value</code>{t('dp.r.repeatedPlus')}
+        <code class="ic">q=</code> and <code class="ic">since_days=</code>{t('dp.r.copyUrl')}
       </p>
     </Card>
 
@@ -1407,27 +1367,20 @@ GROUP BY name, op`;
           <Card>
             {#snippet header()}
               <div class="card-h">
-                <Icon name="shield-alert" size={16} /><h3>Privacy inspector</h3>
+                <Icon name="shield-alert" size={16} /><h3>{t('inspector.title')}</h3>
               </div>
             {/snippet}
             <p class="muted concept-lead">
-              <b>Manage → Privacy</b> finds developer-supplied PII sitting in the telemetry JSON
-              columns, proves what it found <b>without storing a second copy of it</b>, masks it in
-              hot Postgres, and enforces that mask on all future ingest. It needs
-              <code class="ic">pii:read</code>; masking needs <code class="ic">pii:manage</code>.
-              Owner and Admin hold both; Developer and Viewer hold neither.
+              <b>{t('docs.rbac.managePrivacy')}</b> {t('dp.privacy.finds')} <b>{t('dp.privacy.noSecondCopy')}</b>{t('dp.r.masksInHot')}
+              <code class="ic">pii:read</code>{t('dp.r.maskingNeeds')} <code class="ic">pii:manage</code>{t('dp.r.ownerAdminHold')}
             </p>
             {@render defRows(inspectorRows)}
-            <h4 class="q-h">What a mask does to a value</h4>
+            <h4 class="q-h">{t('docs.lifecycle.whatMaskDoes')}</h4>
             <CodeBlock code={maskExample} language="json" />
             <p class="faint fine">
-              Two things not to get wrong, because neither is recoverable.
-              <b>Masking rewrites rows in hot Postgres only</b> — cold Parquet, the Redis ingest
-              stream and DLQ, alerts that already sent, backups and replicas all still hold the
-              original bytes, and the dialog names all twelve places before it lets you confirm.
-              And <b>a mask cannot be undone</b>: there is no reverse operation anywhere in the
-              product. Masking a key an app sends as its identity also stops future
-              <a href="#/active-users">active-users</a> identification through it, permanently.
+              {t('docs.lifecycle.notRecoverable')}
+              <b>{t('docs.lifecycle.maskingHotOnly')}</b> {t('dp.privacy.twelvePlaces')} <b>{t('dp.privacy.cannotUndo')}</b>{t('dp.privacy.noReverse')}
+              <a href="#/active-users">{t('dp.privacy.activeUsers')}</a> {t('dp.privacy.permanently')}
             </p>
           </Card>
         </section>
@@ -1436,13 +1389,13 @@ GROUP BY name, op`;
         <section id="troubleshooting" class="doc-sec">
     <Card>
       {#snippet header()}
-        <div class="card-h"><Icon name="life-buoy" size={16} /><h3>Troubleshooting</h3></div>
+        <div class="card-h"><Icon name="life-buoy" size={16} /><h3>{t('docs.nav.troubleshooting')}</h3></div>
       {/snippet}
       <div class="tshoot">
-        {#each troubleshooting as t (t.q)}
+        {#each troubleshooting as item (item.q)}
           <div class="ts-row">
-            <div class="ts-q">{t.q}</div>
-            <div class="ts-a muted">{t.a}</div>
+            <div class="ts-q">{item.q}</div>
+            <div class="ts-a muted">{item.a}</div>
           </div>
         {/each}
       </div>
@@ -1451,39 +1404,33 @@ GROUP BY name, op`;
         </section>
 
         <!-- ===================== Under the hood ===================== -->
-        <div class="uth-divider"><span>Under the hood</span></div>
+        <div class="uth-divider"><span>{t('docs.nav.underTheHood')}</span></div>
 
         <!-- Architecture -->
         <section id="architecture" class="doc-sec">
           <Card>
             {#snippet header()}
-              <div class="card-h"><Icon name="waypoints" size={16} /><h3>Architecture</h3></div>
+              <div class="card-h"><Icon name="waypoints" size={16} /><h3>{t('docs.nav.architecture')}</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              Everything an SDK sends — errors, events, identifies, transactions, breadcrumbs —
-              travels the same path and lands on <b>one timeline</b> keyed to your app.
+              {t('docs.arch.everythingLandsOn')} <b>{t('dp.arch.oneTimeline')}</b> {t('dp.arch.keyedToApp')}
             </p>
             <div class="hierarchy">
-              <span class="node">SDK batch</span>
+              <span class="node">{t('docs.arch.sdkBatch')}</span>
               <Icon name="chevron-right" size={14} />
-              <span class="node">Ingest edge</span>
+              <span class="node">{t('docs.arch.ingestEdge')}</span>
               <Icon name="chevron-right" size={14} />
-              <span class="node">Redis stream</span>
+              <span class="node">{t('docs.arch.redisStream')}</span>
               <Icon name="chevron-right" size={14} />
-              <span class="node">Workers</span>
+              <span class="node">{t('docs.arch.workers')}</span>
               <Icon name="chevron-right" size={14} />
               <span class="node key">Postgres</span>
             </div>
             <p class="muted concept-lead">
-              The <b>edge</b> authenticates the <code class="ic">X-Sauron-Key</code> (the URL's
-              project id is ignored — tenancy comes from the key), applies a per-app rate limit,
-              splits the envelope into <b>one job per item</b> onto a Redis stream, and answers
-              <code class="ic">202</code> immediately — your app never blocks on processing.
-              <b>Workers</b> in the same process drain the stream as a consumer group
-              (at-least-once, with acknowledgements and a dead-letter queue for poison messages) and
-              write to Postgres. Signals live in time-partitioned tables, all tagged with your
-              <code class="ic">app_id</code> — which is exactly what lets an error and an event for
-              the same person sit side by side.
+              {t('docs.frag.theEdge')} <b>edge</b> the <code class="ic">X-Sauron-Key</code> {t('dp.r.tenancyFromKey')} <b>{t('dp.arch.onePerItem')}</b> {t('dp.r.ontoRedis')}
+              <code class="ic">202</code> {t('dp.r.neverBlocks')}
+              <b>{t('docs.arch.workers')}</b> {t('dp.r.workersDrain')}
+              <code class="ic">app_id</code> {t('dp.r.sideBySide')}
             </p>
           </Card>
         </section>
@@ -1492,26 +1439,19 @@ GROUP BY name, op`;
         <section id="grouping" class="doc-sec">
           <Card>
             {#snippet header()}
-              <div class="card-h"><Icon name="triangle-alert" size={16} /><h3>Error grouping</h3></div>
+              <div class="card-h"><Icon name="triangle-alert" size={16} /><h3>{t('docs.nav.errorGrouping')}</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              Raw exceptions collapse into <b>Issues</b> by a stable <b>fingerprint</b> — a SHA-256
-              computed with the first rule below that applies:
+              {t('docs.grouping.rawCollapse')} <b>{t('docs.grouping.issues')}</b> by a stable <b>fingerprint</b> {t('dp.grouping.sha256')}
             </p>
             {@render defRows(fingerprintRows)}
-            <h4 class="q-h">In practice</h4>
+            <h4 class="q-h">{t('docs.analytics.inPractice')}</h4>
             <CodeBlock code={groupingExample} language="ts" />
             <p class="faint fine">
-              Minified and ahead-of-time traces are made readable server-side: JavaScript via
-              <b>Source Map v3</b> (needs a <code class="ic">release</code>), Dart via
-              <b>DWARF / addr2line</b> — at ingest when symbols are uploaded, otherwise on read.
-              An obfuscated Flutter build needs a <b>second</b> artifact for the exception
-              <i>class</i>: the <code class="ic">--save-obfuscation-map</code> JSON, uploaded under
-              the same debug id. Symbols fix the frames; only the map fixes the type, because the
-              SDK sends <code class="ic">runtimeType.toString()</code> and the build already
-              renamed it. Both are presentational — grouping stays on the raw values, so uploading
-              either one later never re-groups issues you have.
-              Affected-user counts use a HyperLogLog sketch, so they stay cheap at any volume.
+              {t('docs.arch.symbolication')}
+              <b>Source Map v3</b> (needs a <code class="ic">release</code>{t('dp.r.dartVia')}
+              <b>DWARF / addr2line</b> {t('dp.grouping.atIngest')} <b>second</b> {t('dp.grouping.artifactForType')}
+              <i>class</i>: the <code class="ic">--save-obfuscation-map</code> {t('dp.r.jsonSameDebugId')} <code class="ic">runtimeType.toString()</code> {t('dp.r.presentational')}
             </p>
           </Card>
         </section>
@@ -1520,38 +1460,35 @@ GROUP BY name, op`;
         <section id="analytics-internals" class="doc-sec">
           <Card>
             {#snippet header()}
-              <div class="card-h"><Icon name="users" size={16} /><h3>Analytics &amp; people</h3></div>
+              <div class="card-h"><Icon name="users" size={16} /><h3>{t('docs.nav.analyticsPeople')}</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              <code class="ic">track()</code> writes events; <code class="ic">identify()</code>
-              writes people (aliasing an anonymous id onto a known one when you pass one).
-              <b>Sessions</b> and <b>devices</b> are materialized roll-ups, upserted on every signal.
+              <code class="ic">track()</code> {t('dp.r.writesEvents')} <code class="ic">identify()</code>
+              {t('dp.r.writesPeople')}
+              <b>{t('overview.stat.sessions')}</b> and <b>devices</b> {t('dp.analytics.rollups')}
             </p>
             <div class="signals">
               <div class="signal">
                 <span class="s-ic ana"><Icon name="clock" size={16} /></span>
                 <div>
-                  <b>Session</b>
+                  <b>{t('ui.opModal.session')}</b>
                   <span class="muted"
-                    >Keyed on (app, session_id); its span grows to [first seen, last seen] with
-                    running event and error counts.</span
+                    >{t('docs.analytics.sessionKeyed')}</span
                   >
                 </div>
               </div>
               <div class="signal">
                 <span class="s-ic ana"><Icon name="monitor-smartphone" size={16} /></span>
                 <div>
-                  <b>Device</b>
+                  <b>{t('ui.section.device')}</b>
                   <span class="muted"
-                    >Keyed on a stable device_key — your SDK's persistent install id, else a
-                    family|model|os|arch descriptor so web clients still cluster.</span
+                    >{t('docs.analytics.deviceKeyed')}</span
                   >
                 </div>
               </div>
             </div>
             <p class="faint fine">
-              Breadcrumbs don't become rows — they ride ahead of a crash in a capped, expiring Redis
-              list per person, and get attached to the next error for that user.
+              {t('docs.arch.breadcrumbs')}
             </p>
           </Card>
         </section>
@@ -1560,34 +1497,29 @@ GROUP BY name, op`;
         <section id="queries" class="doc-sec">
           <Card>
             {#snippet header()}
-              <div class="card-h"><Icon name="chart-column" size={16} /><h3>Queries behind the screens</h3></div>
+              <div class="card-h"><Icon name="chart-column" size={16} /><h3>{t('docs.nav.queriesBehind')}</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              The harder numbers are computed <b>on read</b>, in SQL — no pre-aggregation service.
+              {t('docs.analytics.harderNumbers')} <b>on read</b>{t('dp.analytics.inSql')}
             </p>
-            <h4 class="q-h">Funnels — distinct people, in order</h4>
+            <h4 class="q-h">{t('docs.analytics.funnelsDistinct')}</h4>
             <CodeBlock code={funnelSql} language="sql" />
             <p class="muted q-note">
-              One CTE per step; each step is matched <b>per person</b> and only at-or-after the
-              previous step's time. A step's count is the distinct people who reached it; conversion
-              and drop-off come from the counts.
+              {t('docs.analytics.oneCte')} <b>{t('dp.analytics.perPerson')}</b> {t('dp.analytics.atOrAfter')}
             </p>
-            <h4 class="q-h">Screen dwell — gap to the next event</h4>
+            <h4 class="q-h">{t('docs.analytics.screenDwell')}</h4>
             <CodeBlock code={dwellSql} language="sql" />
             <p class="muted q-note">
-              Time on a screen is the gap to the next event in that session, capped at 30 minutes.
-              The inner subquery drops each session's <i>last</i> event (no “next”, so
-              <code class="ic">raw_ms</code> is null) — otherwise <code class="ic">LEAST(NULL, …)</code>
-              would hand it a bogus 30-minute dwell.
+              {t('docs.analytics.dwellFull')} <i>last</i> event (no “next”, so
+              <code class="ic">raw_ms</code> {t('dp.r.isNull')} <code class="ic">LEAST(NULL, …)</code>
+              {t('dp.r.bogusDwell')}
             </p>
-            <h4 class="q-h">Performance — interpolated percentiles</h4>
+            <h4 class="q-h">{t('docs.analytics.perfPercentiles')}</h4>
             <CodeBlock code={percentileSql} language="sql" />
             <p class="muted q-note">
-              <code class="ic">percentile_cont</code> gives smooth p50/p95/p99 over
-              <code class="ic">duration_ms</code>; error rate is the share of transactions that
-              failed. <b>Journeys</b> number each person's events into steps
-              (<code class="ic">row_number</code>) and count step→step transitions into a Sankey.
-              <b>DAU/WAU/MAU</b> are rolling 1/7/30-day distinct actives; stickiness is DAU ÷ MAU.
+              <code class="ic">percentile_cont</code> {t('dp.r.smoothPercentiles')}
+              <code class="ic">duration_ms</code>{t('dp.r.errorRateShare')} <b>{t('journeys.title')}</b> {t('dp.r.numberSteps')}<code class="ic">row_number</code>{t('dp.r.sankey')}
+              <b>DAU/WAU/MAU</b> {t('dp.analytics.dauWauMau')}
             </p>
           </Card>
         </section>
@@ -1596,22 +1528,16 @@ GROUP BY name, op`;
         <section id="tiering" class="doc-sec">
           <Card>
             {#snippet header()}
-              <div class="card-h"><Icon name="package" size={16} /><h3>Data lifecycle</h3></div>
+              <div class="card-h"><Icon name="package" size={16} /><h3>{t('docs.nav.dataLifecycle')}</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              Signals stay <b>hot</b> in Postgres for ~30 days, then age into columnar
-              <b>Parquet</b> — and reads span both tiers transparently.
+              {t('docs.lifecycle.signalsStay')} <b>hot</b> {t('dp.tiering.hotThenCold')}
+              <b>Parquet</b> {t('dp.tiering.spanBothTiers')}
             </p>
             <p class="muted concept-lead">
-              An hourly job exports whole partitions older than the hot window to Parquet via DuckDB
-              (laid out by app / year / month), <b>verifies the row counts match</b>, advances a
-              watermark, and only then drops the Postgres partition — after a grace lag and a
-              re-count guard, so a late-arriving row is never dropped. On read, a query's time window
-              is split at the watermark: the hot half (live partitions) and the cold half (Parquet,
-              plus any late arrivals) run concurrently and their per-day partials are summed.
-              Holistic metrics like percentiles stay hot-only.
+              {t('docs.lifecycle.hourlyExportFull')} <b>{t('dp.tiering.verifiesCounts')}</b>{t('dp.tiering.watermark')}
             </p>
-            <h4 class="q-h">The knobs</h4>
+            <h4 class="q-h">{t('docs.uptime.knobs')}</h4>
             <CodeBlock code={tieringExample} language="bash" />
           </Card>
         </section>
@@ -1620,24 +1546,17 @@ GROUP BY name, op`;
         <section id="uptime" class="doc-sec">
           <Card>
             {#snippet header()}
-              <div class="card-h"><Icon name="monitor" size={16} /><h3>Uptime monitoring</h3></div>
+              <div class="card-h"><Icon name="monitor" size={16} /><h3>{t('docs.nav.uptime')}</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              Active HTTP/TCP probes on a fixed schedule (14 presets, 1 second to 24 hours), each
-              with a timeout and failure/recovery thresholds.
+              {t('docs.uptime.probes')}
             </p>
             <p class="muted concept-lead">
-              A prober claims due monitors with a single atomic
-              <code class="ic">UPDATE … FOR UPDATE SKIP LOCKED</code> that advances the next check
-              time <i>before</i> probing — so multiple probers never double-fire and a slow check
-              can't stack. Each probe records up/down, status code and response time;
-              consecutive-failure and -success thresholds debounce flapping, and a transition opens
-              or resolves an incident and fires a webhook.
+              {t('docs.uptime.claim')}
+              <code class="ic">UPDATE … FOR UPDATE SKIP LOCKED</code> {t('dp.r.advancesNextCheck')} <i>before</i> {t('dp.uptime.probing')}
             </p>
             <p class="faint fine">
-              Every target and webhook URL is SSRF-guarded: loopback, private, link-local, CGNAT and
-              cloud-metadata (169.254.169.254) addresses are refused, redirects aren't followed, and
-              response bodies are capped at 1 MiB.
+              {t('docs.uptime.ssrf')}
             </p>
           </Card>
         </section>
@@ -1646,75 +1565,37 @@ GROUP BY name, op`;
         <section id="rbac" class="doc-sec">
           <Card>
             {#snippet header()}
-              <div class="card-h"><Icon name="lock" size={16} /><h3>Access control</h3></div>
+              <div class="card-h"><Icon name="lock" size={16} /><h3>{t('docs.nav.accessControl')}</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              Fine-grained RBAC: <b>30 atomic permissions</b> (<code class="ic">issue:read</code>,
-              <code class="ic">funnel:write</code>, <code class="ic">source:read</code>, …) bundle
-              into <b>roles</b>, which are <b>granted</b> at a scope — org, project, or app. Your
-              effective permissions are the <b>union</b> of every grant that applies, cascading down
-              Org → Project → App: an org grant covers everything beneath it; a project grant covers
-              its apps but not its siblings.
+              {t('docs.rbac.fineGrained')} <b>{t('dp.rbac.thirtyPerms')}</b> (<code class="ic">issue:read</code>,
+              <code class="ic">funnel:write</code>, <code class="ic">source:read</code>{t('dp.r.bundleInto')} <b>roles</b>{t('dp.rbac.whichAre')} <b>granted</b> {t('dp.rbac.atAScope')} <b>union</b> {t('dp.rbac.cascade')}
             </p>
             {@render defRows(presetRows)}
             <p class="muted concept-lead">
-              <b>Create member</b> (Members → Create member) is for someone who doesn't have an
-              account yet. An admin with <code class="ic">member:manage</code> supplies their email
-              and name, picks <b>one role</b>, then ticks any mix of scopes to hand it at — the
-              whole org, whole projects, individual apps — and the server creates the account and
-              every grant together, all or nothing. Ticking a whole project also covers apps added
-              to it later. The response reveals a <b>16-character temporary password exactly once</b>,
-              with a copy button — no endpoint can retrieve it again, so a lost password means
-              deactivating the account and creating it again. The admin can't choose or see a
-              durable password for them.
+              <b>{t('members.create')}</b> {t('dp.r.createMemberFor')} <code class="ic">member:manage</code> {t('dp.r.suppliesEmail')} <b>{t('dp.rbac.oneRole')}</b>{t('dp.rbac.ticksScopes')} <b>{t('dp.rbac.tempPasswordOnce')}</b>{t('dp.rbac.copyButton')}
             </p>
             <p class="faint fine">
-              That temp password grants nothing except replacing itself: every authenticated
-              endpoint but changing the password and logging out is refused until it's replaced, and
-              first sign-in routes straight to a change-password screen. After that they get a fresh
-              session and normal access. <b>Grant access</b> — the other form on the Members page —
-              is still the right tool for someone who already has an account, including a member of
-              another organization; Create member is only for someone who doesn't.
+              {t('docs.rbac.tempPasswordFull')} <b>{t('members.grantAccess')}</b> {t('dp.rbac.grantAccessTool')}
             </p>
             <p class="muted concept-lead">
-              A member's row has <b>Edit</b> and <b>Deactivate</b>. Edit changes their role and
-              scope in place, or adds another grant alongside the ones they already hold — each
-              grant saves independently. Deactivate is a <b>login kill switch, not a removal</b>:
+              {t('docs.rbac.memberRowHas')} <b>{t('common.edit')}</b> and <b>{t('members.deactivate')}</b>{t('dp.rbac.editInPlace')} <b>{t('dp.rbac.killSwitch')}</b>:
               every grant stays intact, the row stays listed with a "Deactivated" badge, and
               Reactivate restores normal sign-in. Their sessions are revoked immediately, and any
               access token already issued stops working within a few seconds — every API replica
               refreshes its revoked-session list on the
-              <code class="ic">AUTH_REVOCATION_POLL_SECS</code> interval (5 seconds by default).
-              Deactivating yourself, a member who also belongs to another organization, or the
-              last holder of <code class="ic">org:manage</code> is refused with an explanation
-              instead.
+              <code class="ic">AUTH_REVOCATION_POLL_SECS</code> {t('dp.r.pollInterval')} <code class="ic">org:manage</code> {t('dp.r.refusedExplanation')}
             </p>
             <p class="faint fine">
-              Custom roles can now be <b>edited</b> in place — the dialog shows how many members hold
-              the role, since saving changes their access immediately. The built-in Owner, Admin,
-              Developer and Viewer roles open in a <b>view-only</b> dialog instead: they're re-synced
-              from the server's own definitions on every restart, so an edit would silently revert.
-              You can't grant a role, edit one, or mint a custom one with permissions you don't
-              already hold at that scope, so access can never escalate itself.
+              {t('docs.rbac.customRoles')} <b>edited</b> {t('dp.rbac.roleInPlace')} <b>{t('dp.rbac.viewOnly')}</b> {t('dp.rbac.resynced')}
             </p>
             <p class="muted concept-lead">
-              Every signed-in user has an <b>Account</b> page listing the devices their
-              account is signed in on — device, address, when they signed in and when the
-              session was last used. The session they are currently using is badged
-              <b>This device</b> and cannot be signed out from there; <b>Log out</b> in the
-              top bar is that verb. <b>Sign out other devices</b> ends every session but
-              the current one. "Show recent sign-outs" reveals the last 30 days of ended
-              sessions with the reason each one ended, which is how a user learns that
-              something other than themselves closed a session.
+              {t('docs.rbac.everyUserHas')} <b>{t('docs.rbac.account')}</b> {t('dp.rbac.devicesList')}
+              <b>{t('docs.rbac.thisDevice')}</b> {t('dp.rbac.cannotSignOutHere')} <b>{t('docs.rbac.logOut')}</b> {t('dp.rbac.topBarVerb')} <b>{t('docs.rbac.signOutOthers')}</b> {t('dp.rbac.endsEverySession')}
             </p>
             <p class="faint fine">
-              An admin holding <code class="ic">member:credential</code> can sign a member
-              out of every device from the Members page. That permission is carved out of
-              <code class="ic">member:manage</code> rather than added beside it, so a role
-              can administer membership without also holding the verbs that act on someone's
-              credentials. The admin surface deliberately shows no per-device detail —
-              only the one coarse verb. Signing someone out does not deactivate them and
-              does not force a password change.
+              {t('docs.rbac.adminHolding')} <code class="ic">member:credential</code> {t('dp.r.canSignOut')}
+              <code class="ic">member:manage</code> {t('dp.r.carvedOut')}
             </p>
           </Card>
         </section>
@@ -1723,18 +1604,16 @@ GROUP BY name, op`;
         <section id="sdk-internals" class="doc-sec">
           <Card>
             {#snippet header()}
-              <div class="card-h"><Icon name="terminal" size={16} /><h3>SDK internals</h3></div>
+              <div class="card-h"><Icon name="terminal" size={16} /><h3>{t('docs.nav.sdkInternals')}</h3></div>
             {/snippet}
             <p class="muted concept-lead">
-              What every SDK does between your call and the wire. Calls accumulate into one
-              <b>envelope</b> — a header (SDK, release), a context block (device, os,
-              app, runtime, user) and a list of typed items (error, event, identify, transaction,
-              breadcrumb batch).
+              {t('docs.arch.sdkBatchNote')}
+              <b>envelope</b> {t('dp.sdk.envelopeShape')}
             </p>
             {@render defRows(transportRows)}
             <p class="faint fine">
-              The full public surface per language is in the
-              <button class="linkish" onclick={() => scrollToId('quickstart')}>SDK quickstarts</button>
+              {t('docs.fullSurface')}
+              <button class="linkish" onclick={() => scrollToId('quickstart')}>{t('docs.quickstarts')}</button>
               above.
             </p>
           </Card>
@@ -1744,17 +1623,17 @@ GROUP BY name, op`;
     <div class="foot-links">
       <a class="fl" href="#/admin/settings">
         <span class="fl-ic"><Icon name="settings" size={16} /></span>
-        <span class="fl-tx"><b>App settings</b><span class="muted">Copy or rotate your DSN</span></span>
+        <span class="fl-tx"><b>{t('settings.title')}</b><span class="muted">{t('docs.step.copyDsn')}</span></span>
         <Icon name="arrow-right" size={15} />
       </a>
       <a class="fl" href="#/admin/projects">
         <span class="fl-ic"><Icon name="folders" size={16} /></span>
-        <span class="fl-tx"><b>Projects & apps</b><span class="muted">Add another platform</span></span>
+        <span class="fl-tx"><b>{t('docs.nav.projectsApps')}</b><span class="muted">{t('docs.addPlatform')}</span></span>
         <Icon name="arrow-right" size={15} />
       </a>
       <a class="fl" href="#/overview">
         <span class="fl-ic"><Icon name="layout-dashboard" size={16} /></span>
-        <span class="fl-tx"><b>Overview</b><span class="muted">See signals roll in</span></span>
+        <span class="fl-tx"><b>{t('overview.title')}</b><span class="muted">{t('docs.step.seeSignals')}</span></span>
         <Icon name="arrow-right" size={15} />
       </a>
         </div>
@@ -1830,7 +1709,7 @@ GROUP BY name, op`;
     align-items: center;
     gap: 9px;
     width: 100%;
-    text-align: left;
+    text-align: start;
     padding: 6px 10px;
     border-radius: var(--radius);
     background: transparent;
@@ -1867,7 +1746,7 @@ GROUP BY name, op`;
   /* Where this SDK is published. Rendered through Card's `actions` slot, which
      is the header's right-hand cell — putting it in the `header` snippet
      instead lands it in `head-left`, a content-sized flex item where no amount
-     of `margin-left: auto` reaches the card's right edge. */
+     of `margin-inline-start: auto` reaches the card's right edge. */
   .reg-link {
     display: inline-flex;
     align-items: center;
@@ -1917,7 +1796,7 @@ GROUP BY name, op`;
   }
   .dsn-note {
     font-size: 12.5px;
-    margin-left: auto;
+    margin-inline-start: auto;
   }
   .dsn-env-hint {
     font-size: 12.5px;
@@ -2117,7 +1996,7 @@ GROUP BY name, op`;
   /* funnel mini-guide */
   .mini-steps {
     margin: 14px 0 0;
-    padding-left: 20px;
+    padding-inline-start: 20px;
     display: flex;
     flex-direction: column;
     gap: 7px;

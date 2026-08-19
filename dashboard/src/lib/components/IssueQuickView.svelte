@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   /**
    * The full picture of one error, without leaving the timeline.
    *
@@ -19,7 +20,7 @@
   import type { ErrorEvent, IssueEventStats } from '../models';
   import { sessionStore } from '../stores/session.svelte';
   import { getIssueEventStats } from '../api/issues';
-  import { plural } from '../utils/format';
+  import { tn } from '../i18n';
   import Modal from './ui/Modal.svelte';
   import Icon from './ui/Icon.svelte';
   import Badge from './ui/Badge.svelte';
@@ -109,7 +110,7 @@
   }
 </script>
 
-<Modal {open} {onclose} size="xl" title="Error details">
+<Modal {open} {onclose} size="xl" title={t('ui.errorDetails')}>
   {#if error}
     <div class="qv">
       <header class="qv-head">
@@ -121,20 +122,20 @@
              rather than beside the occurrence's own timestamp. -->
         <div class="qv-sub">
           {#if stats}
-            <span class="occ" title="Across the last 30 days">
-              {plural(stats.events, 'event')}
+            <span class="occ" title={t('ui.acrossLast30Days')}>
+              {tn('common.plural.event', stats.events)}
               <span class="sep">·</span>
-              {plural(stats.users, 'user')}
+              {tn('common.plural.user', stats.users)}
               <span class="sep">·</span>
-              {plural(stats.sessions, 'session')}
+              {tn('common.plural.session', stats.sessions)}
             </span>
           {:else if statsFailed}
-            <span class="faint">Occurrence counts unavailable</span>
+            <span class="faint">{t('ui.occurrenceCountsUnavailable')}</span>
           {:else}
-            <span class="faint">Counting occurrences…</span>
+            <span class="faint">{t('ui.countingOccurrences')}</span>
           {/if}
           <button class="more" onclick={() => go(`/issues/${error.issue_id}`)}>
-            View more <Icon name="arrow-right" size={13} />
+            {t('ui.viewMore')} <Icon name="arrow-right" size={13} />
           </button>
         </div>
       </header>
@@ -148,7 +149,7 @@
             <button class="qv-link" onclick={() => go(`/persons/${encodeURIComponent(error.distinct_id ?? '')}`)}>
               <span class="ql-icon"><Icon name="user" size={14} /></span>
               <span class="ql-body">
-                <span class="ql-label">Affected user</span>
+                <span class="ql-label">{t('ui.section.affectedUser')}</span>
                 <span class="ql-value mono">{error.distinct_id}</span>
                 {#if userEmail}<span class="ql-extra">{userEmail}</span>{/if}
               </span>
@@ -159,7 +160,7 @@
             <button class="qv-link" onclick={() => go(`/devices/${encodeURIComponent(error.device_key ?? '')}`)}>
               <span class="ql-icon"><Icon name="monitor-smartphone" size={14} /></span>
               <span class="ql-body">
-                <span class="ql-label">Device</span>
+                <span class="ql-label">{t('ui.section.device')}</span>
                 <span class="ql-value mono">{error.device_key}</span>
               </span>
               <Icon name="arrow-right" size={13} />
@@ -169,7 +170,7 @@
             <button class="qv-link" onclick={() => go(`/screens/${encodeURIComponent(error.screen ?? '')}`)}>
               <span class="ql-icon"><Icon name="layout-panel-top" size={14} /></span>
               <span class="ql-body">
-                <span class="ql-label">Screen</span>
+                <span class="ql-label">{t('ui.section.screen')}</span>
                 <span class="ql-value">{error.screen}</span>
               </span>
               <Icon name="arrow-right" size={13} />
@@ -181,7 +182,7 @@
       {#if hasStack}
         <section class="qv-section">
           <div class="qv-section-head">
-            <span class="section-label">Stacktrace</span>
+            <span class="section-label">{t('ui.section.stacktrace')}</span>
             <SymbolicationBadge
               status={error.symbolication_status}
               isDart={error.debug_meta?.raw_stacktrace != null}
@@ -197,7 +198,7 @@
 
       {#if hasTags}
         <section class="qv-section">
-          <span class="section-label">Tags</span>
+          <span class="section-label">{t('ui.section.tags')}</span>
           <div class="qv-tags">
             {#each Object.entries(error.tags ?? {}) as [k, v] (k)}
               <Badge tone="neutral" size="sm">{k}: {String(v)}</Badge>
@@ -208,7 +209,7 @@
 
       {#if hasContext}
         <section class="qv-section">
-          <span class="section-label">Context</span>
+          <span class="section-label">{t('ui.section.context')}</span>
           <KeyValueList data={error.context} emptyLabel="No context" />
         </section>
       {/if}
@@ -217,13 +218,13 @@
         <div class="qv-row">
           {#if hasContexts}
             <section class="qv-section">
-              <span class="section-label">Contexts</span>
+              <span class="section-label">{t('ui.section.contexts')}</span>
               <JsonTree value={error.contexts} name="contexts" expandTo={2} />
             </section>
           {/if}
           {#if hasExtra}
             <section class="qv-section">
-              <span class="section-label">Additional data</span>
+              <span class="section-label">{t('ui.section.extra')}</span>
               <JsonTree value={error.extra} name="extra" expandTo={2} />
             </section>
           {/if}
@@ -294,7 +295,7 @@
     align-items: center;
     gap: 10px;
     width: 100%;
-    text-align: left;
+    text-align: start;
     padding: 10px 12px;
     background: var(--surface-2);
     border: 1px solid var(--border);

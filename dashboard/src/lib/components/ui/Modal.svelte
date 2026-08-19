@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import type { Snippet } from 'svelte';
   import Icon from './Icon.svelte';
 
@@ -76,7 +77,7 @@
     <header class="m-head">
       {#if title}<h2 id={titleId} class="m-title">{title}</h2>{/if}
       {#if dismissible}
-        <button class="m-close" type="button" aria-label="Close" onclick={requestClose}>
+        <button class="m-close" type="button" aria-label={t('common.close')} onclick={requestClose}>
           <Icon name="x" size={16} />
         </button>
       {/if}

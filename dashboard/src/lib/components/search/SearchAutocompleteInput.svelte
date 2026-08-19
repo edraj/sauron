@@ -18,6 +18,7 @@
   `onSearch` is the only thing that means "run this".
 -->
 <script lang="ts">
+  import { t } from '../../i18n';
   import Icon from '../ui/Icon.svelte';
   import {
     fetchSchema,
@@ -235,7 +236,7 @@
       onblur={() => setTimeout(() => (open = false), 120)}
     />
     {#if value}
-      <button class="clear" type="button" aria-label="Clear search" onclick={clear}>
+      <button class="clear" type="button" aria-label={t('ui.search.clear')} onclick={clear}>
         <Icon name="x" size={14} />
       </button>
     {/if}
@@ -249,9 +250,9 @@
       class:pending
       type="button"
       onclick={submit}
-      title="Search (Enter)"
+      title={t('ui.search.submit')}
     >
-      Search
+      {t('common.search')}
     </button>
   </div>
 
@@ -260,7 +261,7 @@
   {:else if schemaError}
     <p class="msg hint">{schemaError} — you can still type a query.</p>
   {:else if pending}
-    <p class="msg hint">Press Enter or click Search to run this query.</p>
+    <p class="msg hint">{t('ui.search.pending')}</p>
   {/if}
 
   {#if open && suggestions.length}
@@ -393,7 +394,7 @@
     border: none;
     border-radius: var(--radius-sm);
     color: var(--text);
-    text-align: left;
+    text-align: start;
     font-size: 12.5px;
   }
   .menu li.sel button,

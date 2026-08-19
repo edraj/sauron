@@ -14,6 +14,7 @@
   primitive, and this is the idiom `ScopeTree`/`PermissionPicker` already use.
 -->
 <script lang="ts">
+  import { t } from '../i18n';
   import Spinner from './ui/Spinner.svelte';
   import { sessionStore } from '../stores/session.svelte';
   import type { AppEnvSelection, EnvChoice } from '../models/active-users';
@@ -104,23 +105,23 @@
             value={value[app.id] ?? 'all'}
             onchange={(e) => chooseEnv(app.id, (e.currentTarget as HTMLSelectElement).value)}
           >
-            <option value="all">All environments</option>
+            <option value="all">{t('ui.env.all')}</option>
             {#each envsByApp[app.id] ?? [] as env (env.id)}
               <option value={env.id}>{env.name}</option>
             {/each}
             {#if canSeeUnattributed(app.id)}
-              <option value="none">Unattributed</option>
+              <option value="none">{t('ui.env.unattributed')}</option>
             {:else}
               <!-- A <select> option cannot host an icon, so the lock is spelled
                    out in the label. -->
-              <option value="none" disabled>Unattributed (needs app-wide access)</option>
+              <option value="none" disabled>{t('ui.env.unattributedNeedsAccess')}</option>
             {/if}
           </select>
         {/if}
         {#if checked}
           {@const summary = envSummary(app.id)}
           {#if summary}
-            <span class="subset" title="Your access reaches only some of this app's environments.">
+            <span class="subset" title={t('ui.env.partialAccess')}>
               {summary}
             </span>
           {/if}
@@ -130,7 +131,7 @@
   {/each}
 
   {#if apps.length === 0}
-    <p class="muted">No apps in this project.</p>
+    <p class="muted">{t('ui.env.noApps')}</p>
   {/if}
 </div>
 

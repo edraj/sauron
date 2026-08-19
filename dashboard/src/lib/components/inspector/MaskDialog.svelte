@@ -8,6 +8,8 @@
   rewrites rows in hot Postgres only.
 -->
 <script lang="ts">
+  import { t } from '../../i18n';
+  import { formatNumber } from '../../i18n';
   import { untrack } from 'svelte';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
@@ -63,7 +65,7 @@
       path: finding.key_path,
     }),
   );
-  const touchesEventUser = $derived(previewTargets.some((t) => t.column === 'event_user'));
+  const touchesEventUser = $derived(previewTargets.some((tgt) => tgt.column === 'event_user'));
 
   // A ticking clock, because `maskConfirmReady` reads `Date.now()` and a clock
   // is not reactive. Without it `ready` recomputes only when `typed`/`action`
@@ -172,47 +174,46 @@
 <!-- `open` is required and defaults to FALSE, so a Modal mounted without it
      never calls showModal(). The parent mounts this component only while a
      finding is selected, so open is a constant here. -->
-<Modal open size="md" title="Mask this value" {onclose}>
+<Modal open size="md" title={t('mask.title')} {onclose}>
   {#if error}
     <p class="err">{error}</p>
   {/if}
 
-  <h4>What will be rewritten</h4>
+  <h4>{t('mask.willRewrite')}</h4>
   <ul>
-    {#each previewTargets as t, i (i)}
-      <li><code>{describeTarget(t)}</code></li>
+    {#each previewTargets as tgt, i (i)}
+      <li><code>{describeTarget(tgt)}</code></li>
     {/each}
   </ul>
   <p class="note">
-    The value becomes the JSON string <code>"****"</code> and the key is kept. The TYPE changes, so
+    {t('mask.becomesJson')} <code>"****"</code> and the key is kept. The TYPE changes, so
     arithmetic, containment filters and range comparisons stop working for masked rows.
   </p>
   {#if touchesEventUser}
     <p class="warn">
-      This masks <code>event_user</code>, which backs the <code>user.email:</code> search dimension.
+      {t('mask.thisMasks')} <code>event_user</code>, which backs the <code>user.email:</code> search dimension.
       Masked rows will silently stop matching those queries.
     </p>
   {/if}
 
-  <h4>Affected rows</h4>
+  <h4>{t('mask.affectedRows')}</h4>
   {#if starting || !action || action.status === 'preview'}
-    <p><Spinner size={14} /> Counting affected rows…</p>
+    <p><Spinner size={14} /> {t('mask.counting')}</p>
   {:else if action.status === 'previewed'}
     <p class="counts">
-      <Badge>{action.estimated_rows.toLocaleString()} rows</Badge>
+      <Badge>{formatNumber(action.estimated_rows)} rows</Badge>
       <Badge tone="neutral"
-        >{action.cold_rows_skipped.toLocaleString()} row(s) already in cold storage, skipped</Badge
+        >{formatNumber(action.cold_rows_skipped)} row(s) already in cold storage, skipped</Badge
       >
     </p>
     <p class="note">
-      The count was taken a moment ago. On an actively ingesting app more rows will match by the
-      time the mask runs, so a larger "rows masked" figure afterwards is normal, not an error.
+      {t('prose.mask.countDrift')}
     </p>
   {:else}
     <p class="err">The preview did not complete: {action.error || action.status}</p>
   {/if}
 
-  <h4>What this does not reach</h4>
+  <h4>{t('mask.doesNotReach')}</h4>
   <div class="unreachable">
     {#each UNREACHABLE_COPY as r, i (i)}
       <p class:headline={r.headline} class:readFirst={r.readFirst}>
@@ -236,21 +237,16 @@
       the operator reading THIS panel is the last person who can decide.
     -->
     <p class="wiki">
-      <strong>A PII mask on an identity-bearing key dismantles cross-app matching.</strong> The mask
-      enforcer runs before identification, so once <code>context.user.id</code> — or whatever key
-      your app uses as its <code>distinct_id</code>; an email address is both a common choice and
-      exactly the kind of value a PII policy flags — is masked, no future person can ever be marked
-      identified through it. Nobody already identified loses the flag, so nothing moves on the day
-      the mask lands: instead <strong>Identified</strong> plateaus and then decays as the existing
-      population churns, while <strong>Guests</strong> climbs to meet it. Nothing labels the cause
-      and nothing can reconstruct it afterwards. Decide before you apply the mask, not after.
+      <strong>{t('mask.identityWarning')}</strong> {t('prose.mask.enforcerOrder.a')} <code>context.user.id</code> {t('prose.mask.identity.b')}
+      <code>distinct_id</code>{t('prose.mask.identity.c')}
+      <strong>{t('mask.stat.identified')}</strong> {t('prose.mask.identity.d')}
+      <strong>{t('mask.stat.guests')}</strong> {t('prose.mask.identity.e')}
       <span class="bounded">
-        wiki/Active-Users.md — the <a href="#/active-users">Active users</a> report is where this
-        shows up, and it shows up as a trend with no event on it.
+        <a href="#/active-users">{t('mask.stat.activeUsers')}</a> {t('prose.mask.identity.f')}
       </span>
     </p>
   </div>
-  <p class="note">A running mask can be stopped, but it cannot be undone. There is no shadow copy.</p>
+  <p class="note">{t('mask.irreversible')}</p>
 
   <label for="mask-confirm">Type the app slug ({slug}) to confirm</label>
   <Input id="mask-confirm" bind:value={typed} placeholder={slug} autocomplete="off" />
@@ -262,7 +258,7 @@
   {/if}
 
   {#snippet footer()}
-    <Button onclick={onclose}>Cancel</Button>
+    <Button onclick={onclose}>{t('common.cancel')}</Button>
     <Button
       variant="danger"
       disabled={!ready || submitting}
@@ -297,7 +293,7 @@
   }
   ul {
     margin: 6px 0;
-    padding-left: 18px;
+    padding-inline-start: 18px;
     font-size: 12.5px;
   }
   .counts {
@@ -324,8 +320,8 @@
   }
   .unreachable .readFirst,
   .unreachable .wiki {
-    border-left: 3px solid var(--warning);
-    padding-left: 8px;
+    border-inline-start: 3px solid var(--warning);
+    padding-inline-start: 8px;
   }
   .bounded {
     display: block;

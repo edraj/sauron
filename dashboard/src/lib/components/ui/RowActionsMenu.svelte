@@ -149,7 +149,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
-    text-align: left;
+    text-align: start;
   }
   /* The parent <td> is `white-space: nowrap` for the trigger's sake; items
      inside the panel must not inherit that or a long label is clipped. */
@@ -162,7 +162,7 @@
     border-radius: calc(var(--radius) - 2px);
     color: var(--text);
     font-size: 13px;
-    text-align: left;
+    text-align: start;
     white-space: normal;
     cursor: pointer;
   }
@@ -185,7 +185,7 @@
   .ram-panel :global(.ram-lock) {
     display: inline-flex;
     vertical-align: -2px;
-    margin-right: 6px;
+    margin-inline-end: 6px;
     color: var(--text-faint);
   }
 </style>

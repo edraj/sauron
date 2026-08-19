@@ -16,6 +16,17 @@ export interface PageAccess {
   perm: Permission;
   level: 'org' | 'project' | 'app';
   title: string;
+  /**
+   * Set when this page's list endpoint takes `sauron-auth`'s ENV-AWARE read
+   * path (`authorized_read_scope` → `authorize_env_read`) rather than the
+   * env-blind `authorize_app`/`_project`/`_org`.
+   *
+   * Only on such a page can an environment-scoped grant satisfy the gate — see
+   * `canAccessPage`. Setting it on an env-blind page produces a page that
+   * renders and then 403s, so `page-access.test.ts` derives the correct set by
+   * reading the backend route files rather than trusting this flag.
+   */
+  envAware?: true;
 }
 
 /**
@@ -37,29 +48,37 @@ export interface PageAccess {
  */
 export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // --- Monitor -------------------------------------------------------------
-  '/overview': { perm: 'event:read', level: 'app', title: 'Overview' },
-  '/issues': { perm: 'issue:read', level: 'app', title: 'Exceptions' },
-  '/performance': { perm: 'event:read', level: 'app', title: 'Performance' },
+  '/overview': { perm: 'event:read', level: 'app', title: 'Overview', envAware: true },
+  '/issues': { perm: 'issue:read', level: 'app', title: 'Exceptions', envAware: true },
+  '/performance': { perm: 'event:read', level: 'app', title: 'Performance', envAware: true },
 
   // --- Explore -------------------------------------------------------------
-  '/events': { perm: 'event:read', level: 'app', title: 'Events' },
+  '/events': { perm: 'event:read', level: 'app', title: 'Events', envAware: true },
   // `routes/transactions.rs:list` authorizes on `event:read` at the app scope,
   // and the same permission gates the `tags`/`extra` body via
   // `symbolicate::gate_transaction_body`.
-  '/transactions': { perm: 'event:read', level: 'app', title: 'Transactions' },
-  '/sessions': { perm: 'event:read', level: 'app', title: 'Sessions' },
-  '/users': { perm: 'event:read', level: 'app', title: 'Users' },
-  '/persons': { perm: 'event:read', level: 'app', title: 'Users' },
-  '/devices': { perm: 'event:read', level: 'app', title: 'Devices' },
-  '/screens': { perm: 'event:read', level: 'app', title: 'Screens' },
-  '/workflows': { perm: 'event:read', level: 'app', title: 'Workflows' },
+  '/transactions': { perm: 'event:read', level: 'app', title: 'Transactions', envAware: true },
+  '/sessions': { perm: 'event:read', level: 'app', title: 'Sessions', envAware: true },
+  '/users': { perm: 'event:read', level: 'app', title: 'Users', envAware: true },
+  '/persons': { perm: 'event:read', level: 'app', title: 'Users', envAware: true },
+  '/devices': { perm: 'event:read', level: 'app', title: 'Devices', envAware: true },
+  '/screens': { perm: 'event:read', level: 'app', title: 'Screens', envAware: true },
+  '/workflows': { perm: 'event:read', level: 'app', title: 'Workflows', envAware: true },
 
   // --- Analyze -------------------------------------------------------------
   // Project-level: active_users.rs:525 resolves reach across every app in the
   // project rather than authorizing one app.
-  '/active-users': { perm: 'event:read', level: 'project', title: 'Active users' },
+  '/active-users': { perm: 'event:read', level: 'project', title: 'Active users', envAware: true },
+  // NOT envAware, unlike its Explore/Analyze neighbours. `funnels::compute`
+  // (the live counts) is environment-aware, but the page LOADS through
+  // `funnels::list_saved`, and `/v1/apps/{id}/funnels` sits in
+  // `api/scope.ts`'s `BACKEND_REJECTS_ENVIRONMENT_ID`: saved funnel
+  // definitions are app-wide config, so that endpoint rejects
+  // `environment_id` outright and authorizes at the app. Marking this page
+  // envAware would admit an environment-scoped member to a page whose first
+  // request 403s.
   '/funnels': { perm: 'event:read', level: 'app', title: 'Funnels' },
-  '/journeys': { perm: 'event:read', level: 'app', title: 'Journeys' },
+  '/journeys': { perm: 'event:read', level: 'app', title: 'Journeys', envAware: true },
 
   // --- Uptime --------------------------------------------------------------
   // monitors.rs:67 authorizes at the project.
@@ -93,9 +112,12 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // page when the project-wide read 403s.
   '/admin/environments': { perm: 'env:read', level: 'app', title: 'Environments' },
   '/admin/settings': { perm: 'app:read', level: 'app', title: 'App settings' },
-  // Listing artifacts only needs issue:read (artifacts.rs:189), but this page
-  // exists to upload, so a member who can only list has nothing to do here.
-  '/admin/source-maps': { perm: 'artifact:write', level: 'app', title: 'Source Maps' },
+  // artifacts.rs:396 lists on issue:read; only upload (:181) and delete (:429)
+  // need artifact:write. Gating the PAGE on the write permission replaced a
+  // readable page with a wall for everyone who could read it — SourceMaps.svelte
+  // already computes a `writeLock` and applies it to all three write controls,
+  // so the page was built to degrade and only this row disagreed.
+  '/admin/source-maps': { perm: 'issue:read', level: 'app', title: 'Source Maps' },
   // notifications.rs:66,313 use authorize_org.
   '/admin/alerts': { perm: 'alert:read', level: 'org', title: 'Alerts' },
   // admin.rs:30 uses authorize_org.
@@ -164,10 +186,42 @@ export function resolvePageAccess(path: string): PageAccess | null {
   return key === null ? null : PAGE_ACCESS[key];
 }
 
-/** Whether the current user satisfies a requirement. `null` is always allowed. */
+/**
+ * Whether the current user satisfies a requirement. `null` is always allowed.
+ *
+ * The org/project/app answer comes first and is unchanged. An `envAware` page
+ * then gets a second chance from an environment-scoped grant, mirroring
+ * `resolve_env_filter` (rbac.rs) arm for arm:
+ *
+ * | picker            | rule                          | server arm                        |
+ * |-------------------|-------------------------------|-----------------------------------|
+ * | a real env id     | must hold it on THAT env      | `EnvFilter::One`                  |
+ * | `null` ("all")    | holding it on any env is enough | `All` → `Ok(Subset(readable))`  |
+ * | `'none'`          | app-level only                | `Err(UnattributedNeedsAppReach)`  |
+ *
+ * The "all" arm is the non-obvious one: the server NARROWS the read to the
+ * environments the caller can see rather than refusing it, so refusing here
+ * would hide a page the server would have served.
+ *
+ * Nothing here lets an environment grant satisfy an env-BLIND page. That is the
+ * security-relevant direction — a control the UI shows and the server then
+ * 403s — and it is why the second chance is opt-in per row rather than global.
+ *
+ * KNOWN IMPRECISION: `canAtAnyEnv` does not check that the granted environment
+ * belongs to the current app, so a member granted on another app's environment
+ * sees the page and gets a clean 403. Consulting `sessionStore.environments`
+ * instead would make this gate flip as that list loads — the flashing-gate
+ * failure `AdminIndex` documents — and this is the same trade-off the
+ * `/admin/ingest-failures` row above already makes deliberately.
+ */
 export function canAccessPage(access: PageAccess | null): boolean {
   if (!access) return true;
-  return sessionStore.can(access.perm, { level: access.level });
+  if (sessionStore.can(access.perm, { level: access.level })) return true;
+  if (!access.envAware) return false;
+  const env = sessionStore.currentEnvId;
+  if (env === null) return sessionStore.canAtAnyEnv(access.perm);
+  if (env === 'none') return false;
+  return sessionStore.can(access.perm, { env });
 }
 
 /**
@@ -178,6 +232,21 @@ export function canAccessPage(access: PageAccess | null): boolean {
  */
 export function lockedBy(perm: Permission, scope?: CanScope): Permission | null {
   return sessionStore.can(perm, scope) ? null : perm;
+}
+
+/**
+ * The permission a nav item is missing, or `null` if the page is reachable —
+ * the same contract as [`lockedBy`], so a locked nav entry and a locked button
+ * cannot describe the same missing grant two different ways.
+ *
+ * `null` for an ungated page and for an unknown path, matching
+ * `resolvePageAccess`'s deliberate fail-open: a path with no entry is a typo in
+ * a link, and there is no permission to name.
+ */
+export function pageLockedBy(path: string): Permission | null {
+  const access = resolvePageAccess(path);
+  if (!access) return null;
+  return canAccessPage(access) ? null : access.perm;
 }
 
 /** Tooltip text for a locked control that cannot take a `Button` prop. */

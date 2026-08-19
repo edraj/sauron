@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 // @ts-expect-error -- no @types/node in this project; the Node runtime that
 // executes vitest provides this builtin regardless.
 import fs from 'node:fs';
@@ -6,7 +6,9 @@ import fs from 'node:fs';
 // executes vitest provides this builtin regardless.
 import path from 'node:path';
 import { ALL_PERMISSIONS } from './permissions';
-import { PAGE_ACCESS, resolvePageAccess, findPageAccessKey, lockTitle } from './page-access';
+import { PAGE_ACCESS, resolvePageAccess, findPageAccessKey, lockTitle, canAccessPage } from './page-access';
+import { sessionStore } from '../stores/session.svelte';
+import type { Permission } from './index';
 
 // routes.ts is read as TEXT, not imported. Importing it pulls in every page
 // component, and this project has no Svelte compilation in its test
@@ -238,5 +240,205 @@ describe('lockTitle', () => {
 
   it('falls back to the bare permission when no label exists', () => {
     expect(lockTitle('future:permission' as never)).toBe('Requires: future:permission');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Environment-scoped members.
+//
+// `sauron-auth` has two authorization paths, and which one a route takes
+// decides whether an environment-scoped grant can ever satisfy it:
+//
+//   env-aware  `authorized_read_scope` → `authorize_env_read`
+//   env-blind  `authorize_app` / `authorize_project` / `authorize_org`
+//
+// `authorize_env_read_with_perms`'s own doc comment records why this matters:
+// the env-blind helper "returned 403 to an env-scoped caller **even for their
+// own environment** — they could list issues but not open one". That was fixed
+// server-side. The gate below is the client half of the same fix.
+//
+// The backend files are read as TEXT, exactly as permissions.test.ts reads
+// rbac.rs: a hand-copied echo of which routes are env-aware would drift the
+// first time a handler switched paths, and drift in the PERMISSIVE direction
+// is a page that renders and then 403s.
+// ---------------------------------------------------------------------------
+const ROUTES_RS_DIR = path.resolve(
+  path.dirname(new URL(import.meta.url).pathname),
+  '../../../../backend/bins/sauron-api/src/routes',
+);
+
+/**
+ * The backend handler that serves each gated page's INITIAL load, as
+ * `file.rs::function`.
+ *
+ * Per HANDLER, not per file. The first version of this test asked only whether
+ * the route file mentioned `authorized_read_scope` anywhere, which is an
+ * over-approximation: `funnels.rs` contains both the environment-aware
+ * `compute` and the environment-blind `list_saved`, so a file-level check
+ * happily marked `/funnels` environment-aware while the page's very first
+ * request authorizes at the app and 403s for the member it just admitted.
+ */
+const PAGE_LOAD_HANDLER: Record<string, string> = {
+  '/overview': 'analytics.rs::overview',
+  '/issues': 'issues.rs::list',
+  '/performance': 'performance.rs::summary',
+  '/events': 'analytics.rs::events_list',
+  '/transactions': 'transactions.rs::list',
+  '/sessions': 'sessions.rs::list',
+  '/users': 'analytics.rs::users_summary',
+  '/persons': 'analytics.rs::persons_list',
+  '/devices': 'devices.rs::list',
+  '/screens': 'screens.rs::list',
+  '/workflows': 'workflows.rs::list',
+  '/journeys': 'journeys.rs::explore',
+  // Environment-BLIND loads. Each is here to be asserted NEGATIVE — the set of
+  // pages that must never carry `envAware` is as load-bearing as the set that
+  // must.
+  '/funnels': 'funnels.rs::list_saved',
+  '/monitors': 'monitors.rs::list',
+  '/admin/members': 'orgs.rs::list_members',
+  '/admin/projects': 'projects.rs::list_projects',
+  '/admin/source-maps': 'artifacts.rs::list',
+  '/admin/alerts': 'notifications.rs::list_rules',
+  '/admin/wall-of-shame': 'audit.rs::list',
+};
+
+/** The body of `pub async fn <name>(` up to the next top-level `pub async fn`. */
+function handlerBody(file: string, fn: string): string {
+  const full = path.join(ROUTES_RS_DIR, file);
+  let source: string;
+  try {
+    source = fs.readFileSync(full, 'utf-8');
+  } catch (err) {
+    throw new Error(
+      `page-access.test.ts could not read the backend route file it validates against at ` +
+        `"${full}" (${err instanceof Error ? err.message : String(err)}). This test must fail ` +
+        `rather than silently skip when the backend moves.`,
+    );
+  }
+  const start = source.indexOf(`pub async fn ${fn}(`);
+  if (start === -1) {
+    throw new Error(
+      `page-access.test.ts expects a handler "pub async fn ${fn}(" in ${file}, and there is ` +
+        `none. Either it was renamed — update PAGE_LOAD_HANDLER — or the page now loads ` +
+        `through something else, which changes whether it may be envAware.`,
+    );
+  }
+  const next = source.indexOf('\npub async fn ', start + 1);
+  return source.slice(start, next === -1 ? source.length : next);
+}
+
+/** Whether that handler authorizes through the environment-aware read path. */
+function handlerIsEnvAware(spec: string): boolean {
+  const [file, fn] = spec.split('::');
+  return handlerBody(file, fn).includes('authorized_read_scope');
+}
+
+describe('PAGE_ACCESS.envAware', () => {
+  it('is set on exactly the pages whose LOAD handler takes the env-aware path', () => {
+    for (const [pagePath, spec] of Object.entries(PAGE_LOAD_HANDLER)) {
+      const entry = PAGE_ACCESS[pagePath];
+      expect(entry, `${pagePath} has no PAGE_ACCESS entry`).toBeTruthy();
+      const aware = handlerIsEnvAware(spec);
+      expect(
+        entry!.envAware === true,
+        `${pagePath} is marked envAware=${entry!.envAware === true} but ${spec} ` +
+          `${aware ? 'DOES' : 'does NOT'} use authorized_read_scope`,
+      ).toBe(aware);
+    }
+  });
+
+  // Named separately from the derived check above because these are the two
+  // rows most likely to be marked by eye. Both sit with the data pages in the
+  // nav and read like them:
+  //   /monitors  — monitors.rs authorizes at the project throughout.
+  //   /funnels   — funnels.rs::compute IS env-aware, but the page loads through
+  //                list_saved, and /v1/apps/{id}/funnels is in api/scope.ts's
+  //                BACKEND_REJECTS_ENVIRONMENT_ID because saved definitions are
+  //                app-wide config.
+  it('is not set on /monitors or /funnels', () => {
+    expect(PAGE_ACCESS['/monitors']?.envAware).toBeUndefined();
+    expect(PAGE_ACCESS['/funnels']?.envAware).toBeUndefined();
+  });
+
+  it('is not set on any admin child', () => {
+    for (const [pagePath, entry] of Object.entries(PAGE_ACCESS)) {
+      if (!pagePath.startsWith('/admin/') || !entry) continue;
+      expect(entry.envAware, `${pagePath} must not be envAware`).toBeUndefined();
+    }
+  });
+});
+
+describe('canAccessPage — environment-scoped grants', () => {
+  const devPerms: Permission[] = ['issue:read', 'event:read', 'monitor:read', 'member:read'];
+
+  beforeEach(() => {
+    sessionStore.currentOrgId = 'org-1';
+    sessionStore.currentProjectId = 'proj-1';
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: devPerms }],
+    };
+  });
+
+  it('admits an env-aware page while the picker is on "all environments"', () => {
+    // `resolve_env_filter` answers All with Ok(Subset(readable)) for an
+    // env-scoped caller — it narrows the read, it does not deny it.
+    sessionStore.currentEnvId = null;
+    expect(canAccessPage(PAGE_ACCESS['/overview'])).toBe(true);
+    expect(canAccessPage(PAGE_ACCESS['/issues'])).toBe(true);
+    // Same permission, same picker state — refused, because the page's first
+    // request rejects environment_id outright.
+    expect(canAccessPage(PAGE_ACCESS['/funnels'])).toBe(false);
+  });
+
+  it('admits an env-aware page for the environment actually granted', () => {
+    sessionStore.currentEnvId = 'env-1';
+    expect(canAccessPage(PAGE_ACCESS['/overview'])).toBe(true);
+  });
+
+  it('refuses an env-aware page for an environment not granted', () => {
+    sessionStore.currentEnvId = 'env-2';
+    expect(canAccessPage(PAGE_ACCESS['/overview'])).toBe(false);
+  });
+
+  // `resolve_env_filter` returns Err(UnattributedNeedsAppReach) for this arm:
+  // reading unattributed rows is an app-level question, so an env grant alone
+  // cannot answer it.
+  it('refuses an env-aware page when the picker is on "unattributed"', () => {
+    sessionStore.currentEnvId = 'none';
+    expect(canAccessPage(PAGE_ACCESS['/overview'])).toBe(false);
+  });
+
+  // The direction that actually matters. An env grant satisfying an
+  // app/project/org-level check is the security-relevant failure — a UI that
+  // shows a control the server then 403s.
+  it('never admits an env-blind page, in any picker state', () => {
+    for (const env of [null, 'env-1', 'env-2', 'none']) {
+      sessionStore.currentEnvId = env;
+      expect(canAccessPage(PAGE_ACCESS['/monitors']), `env=${env}`).toBe(false);
+      expect(canAccessPage(PAGE_ACCESS['/admin/members']), `env=${env}`).toBe(false);
+      expect(canAccessPage(PAGE_ACCESS['/admin/projects']), `env=${env}`).toBe(false);
+    }
+  });
+
+  it('still admits an app-level grant with no environment selected', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'app', scope_id: 'app-1', permissions: devPerms }],
+    };
+    sessionStore.currentEnvId = null;
+    expect(canAccessPage(PAGE_ACCESS['/overview'])).toBe(true);
+    expect(canAccessPage(PAGE_ACCESS['/monitors'])).toBe(false); // project-level
+  });
+});
+
+describe('source maps page gate', () => {
+  // artifacts.rs:396 lists on issue:read; only upload (:181) and delete (:429)
+  // need artifact:write, and SourceMaps.svelte already locks both. Gating the
+  // whole page on the write permission replaced a readable page with a wall.
+  it('requires only the permission its list endpoint requires', () => {
+    expect(PAGE_ACCESS['/admin/source-maps']?.perm).toBe('issue:read');
   });
 });

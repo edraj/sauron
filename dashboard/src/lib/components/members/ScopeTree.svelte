@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Icon from '../ui/Icon.svelte';
   import Spinner from '../ui/Spinner.svelte';
   import {
@@ -193,7 +194,7 @@
   }
 </script>
 
-<div class="scope-tree" class:disabled role="group" aria-label="Access scope">
+<div class="scope-tree" class:disabled role="group" aria-label={t('scope.label')}>
   <div class="tree">
     {#if allowOrg}
       <div class="row">
@@ -201,7 +202,7 @@
         <label class="node">
           <input type="checkbox" checked={value.org} {disabled} onchange={toggleOrg} />
           <span class="n-name">{orgName}</span>
-          <span class="n-hint">entire org</span>
+          <span class="n-hint">{t('prose.scope.entireOrg')}</span>
         </label>
       </div>
     {/if}
@@ -312,10 +313,10 @@
             {:else if envsLoading}
               <div class="row lvl-3">
                 <span class="twisty-gap"></span>
-                <span class="n-hint loading-row"><Spinner size={11} stroke={1.5} /> Loading environments…</span>
+                <span class="n-hint loading-row"><Spinner size={11} stroke={1.5} /> {t('scope.loadingEnvironments')}</span>
               </div>
             {:else}
-              <p class="empty lvl-3-empty">No environments.</p>
+              <p class="empty lvl-3-empty">{t('scope.noEnvironments')}</p>
             {/if}
           {/if}
         {/each}
@@ -323,7 +324,7 @@
     {/each}
 
     {#if projects.length === 0}
-      <p class="empty">No projects yet — the whole org is the only scope.</p>
+      <p class="empty">{t('scope.noProjects')}</p>
     {/if}
   </div>
   <p class="summary">{summary}</p>
@@ -355,13 +356,13 @@
     min-height: 26px;
   }
   .lvl-1 {
-    padding-left: 14px;
+    padding-inline-start: 14px;
   }
   .lvl-2 {
-    padding-left: 34px;
+    padding-inline-start: 34px;
   }
   .lvl-3 {
-    padding-left: 54px;
+    padding-inline-start: 54px;
   }
   .row.implied {
     opacity: 0.55;

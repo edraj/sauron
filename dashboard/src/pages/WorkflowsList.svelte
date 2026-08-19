@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -163,12 +164,12 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Workflows</h1>
-      <p class="muted sub">Named, bounded spans of activity your app reports.</p>
+      <h1 class="page-title">{t('workflows.title')}</h1>
+      <p class="muted sub">{t('workflows.subtitle')}</p>
     </div>
     <div class="controls">
       <DateRange value={sinceDays} onchange={onRange} />
-      <SearchInput bind:value={search} onsearch={onSearch} placeholder="Search workflows…" width="240px" />
+      <SearchInput bind:value={search} onsearch={onSearch} placeholder={t('workflows.search')} width="240px" />
       <!--
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached rows, fetching fresh" hint, and without it
@@ -180,7 +181,7 @@
 
   {#if error && rows.length === 0}
     <Card>
-      <EmptyState title="Couldn't load workflows" description={error} icon="workflow">
+      <EmptyState title={t('workflows.error.load')} description={error} icon="workflow">
         {#snippet action()}
           <Button
             variant="secondary"
@@ -189,7 +190,7 @@
               if (aid) load(aid, sinceDays, appliedSearch, sortParam(list.sort), list.offset, true);
             }}
           >
-            Retry
+            {t('common.retry')}
           </Button>
         {/snippet}
       </EmptyState>
@@ -199,7 +200,7 @@
   {:else if rows.length === 0}
     <Card>
       <EmptyState
-        title="No workflows yet"
+        title={t('workflows.empty.title')}
         description={appliedSearch
           ? `No workflows match “${appliedSearch}”.`
           : 'Call startWorkflow() in your app to group events into named flows.'}
@@ -208,11 +209,11 @@
     </Card>
   {:else}
     <StatTiles min={140}>
-      <StatTile label="Started" value={compactNumber(totals.started)} />
-      <StatTile label="Completed" value={compactNumber(totals.completed)} tone="success" />
-      <StatTile label="Completion rate" value={formatPercent(totalCompletionRate)} />
+      <StatTile label={t('workflows.stat.started')} value={compactNumber(totals.started)} />
+      <StatTile label={t('workflows.stat.completed')} value={compactNumber(totals.completed)} tone="success" />
+      <StatTile label={t('workflows.stat.completionRate')} value={formatPercent(totalCompletionRate)} />
       <StatTile
-        label="Abandoned"
+        label={t('workflows.stat.abandoned')}
         value={compactNumber(totals.abandoned)}
         tone={totals.abandoned > 0 ? 'error' : 'neutral'}
       />
@@ -223,25 +224,25 @@
         {#snippet head()}
           <tr>
             <SortableTh key="name" columnDefault="asc" sort={list.sort} {onsort}>
-              Workflow
+              {t('workflows.column.workflow')}
             </SortableTh>
-            <SortableTh key="started" class="num" sort={list.sort} {onsort}>Started</SortableTh>
+            <SortableTh key="started" class="num" sort={list.sort} {onsort}>{t('workflows.stat.started')}</SortableTh>
             <SortableTh key="completed" class="num" sort={list.sort} {onsort}>
-              Completed
+              {t('workflows.stat.completed')}
             </SortableTh>
             <SortableTh key="cancelled" class="num" sort={list.sort} {onsort}>
-              Cancelled
+              {t('workflows.stat.cancelled')}
             </SortableTh>
             <SortableTh key="abandoned" class="num" sort={list.sort} {onsort}>
-              Abandoned
+              {t('workflows.stat.abandoned')}
             </SortableTh>
             <!-- `completion_rate` has no column: the server orders by the same
                  `completed / started` ratio this cell computes client-side. -->
             <SortableTh key="completion_rate" class="num" sort={list.sort} {onsort}>
-              Completion rate
+              {t('workflows.stat.completionRate')}
             </SortableTh>
             <SortableTh key="median_duration_ms" class="num" sort={list.sort} {onsort}>
-              Median
+              {t('workflows.column.median')}
             </SortableTh>
             <SortableTh key="p95_duration_ms" class="num" sort={list.sort} {onsort}>
               p95
@@ -249,9 +250,9 @@
             <!-- `users` ON THE WIRE, even though the row field and the SQL
                  alias are both `unique_users`. Sending `unique_users` is a
                  400, not a silently ignored parameter. -->
-            <SortableTh key="users" class="num" sort={list.sort} {onsort}>Users</SortableTh>
+            <SortableTh key="users" class="num" sort={list.sort} {onsort}>{t('users.title')}</SortableTh>
             <SortableTh key="last_seen" class="num" sort={list.sort} {onsort}>
-              Last seen
+              {t('explore.column.lastSeen')}
             </SortableTh>
           </tr>
         {/snippet}
@@ -314,7 +315,7 @@
     padding: 80px;
   }
   .num {
-    text-align: right;
+    text-align: end;
   }
   .truncate {
     display: inline-block;

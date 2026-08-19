@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { untrack } from 'svelte';
   import { querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
@@ -11,7 +12,7 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
-  import JsonTree from '../lib/components/JsonTree.svelte';
+  import TransactionDetailPanel from '../lib/components/TransactionDetailPanel.svelte';
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
@@ -87,83 +88,6 @@
   const totalCapped = $derived(page?.total_is_capped ?? false);
   const nextCursor = $derived(page?.next_cursor ?? null);
   const clamped = $derived(page?.clamped ?? null);
-
-  interface DetailRow {
-    label: string;
-    /** `null` renders an em dash — the field is genuinely absent on this span. */
-    value: string | null;
-    href?: string;
-    mono?: boolean;
-    /**
-     * Span the whole panel instead of taking one grid column.
-     *
-     * For the one field with no useful upper bound. A query string with a dozen
-     * parameters wraps to eight lines in a third of the panel and to two across
-     * all of it; every other field here is a uuid, a timestamp or a short label,
-     * all of which fit the narrow column (measured: uuid 271px, ISO timestamp
-     * 203px, value column 283px).
-     */
-    wide?: boolean;
-  }
-
-  /**
-   * Every stored field of a span, as label/value pairs for the detail panel.
-   *
-   * Deliberately hand-written rather than iterating the object's keys. A
-   * key-walk would render `id`, `app_id` and `restored_pin_id` beside `url`
-   * with equal weight, invent labels from column names, and — the part that
-   * matters — silently start displaying whatever column the table grows next,
-   * including one nobody decided was safe to show. This list is the decision.
-   *
-   * `ip_address` is omitted on purpose: the API already masks it
-   * (`serialize_masked_ip`) and nulls it for a caller without `event:read`, so
-   * the value here is at best a truncated address and at worst a blank field
-   * that reads as "no IP recorded".
-   */
-  function detailRows(t: Transaction): DetailRow[] {
-    return [
-      { label: 'Name', value: t.name, mono: true },
-      { label: 'Operation', value: t.op },
-      { label: 'Duration', value: `${t.duration_ms.toLocaleString()} ms` },
-      { label: 'Status', value: t.status },
-      { label: 'HTTP method', value: t.http_method },
-      { label: 'HTTP status', value: t.http_status == null ? null : String(t.http_status) },
-      { label: 'URL', value: t.url, mono: true, wide: true },
-      {
-        label: 'User',
-        value: t.distinct_id,
-        href: t.distinct_id ? `#/persons/${encodeURIComponent(t.distinct_id)}` : undefined,
-        mono: true,
-      },
-      {
-        label: 'Session',
-        value: t.session_id,
-        href: t.session_id ? `#/sessions/${encodeURIComponent(t.session_id)}` : undefined,
-        mono: true,
-      },
-      {
-        label: 'Device',
-        value: t.device_key,
-        href: t.device_key ? `#/devices/${encodeURIComponent(t.device_key)}` : undefined,
-        mono: true,
-      },
-      { label: 'Release', value: t.release, mono: true },
-      { label: 'Workflow', value: t.workflow_name },
-      { label: 'Occurred at', value: t.occurred_at, mono: true },
-      // Both timestamps, always. The GAP between them is the interesting
-      // number on a mobile SDK — a span that occurred hours before it arrived
-      // came out of an offline queue, or off a device with a skewed clock, and
-      // either fact changes how you read the one above.
-      { label: 'Received at', value: t.received_at, mono: true },
-      { label: 'Finished at', value: t.finished_at, mono: true },
-      { label: 'Transaction id', value: t.id, mono: true },
-    ];
-  }
-
-  /** The SDK capped this payload — the span is real, the blob is a marker. */
-  function isTruncated(t: Transaction): boolean {
-    return t.extra?._truncated === true;
-  }
 
   function toggle(id: string) {
     const next = new Set(expanded);
@@ -372,10 +296,10 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1>Transactions</h1>
+      <h1>{t('transactions.title')}</h1>
       <p class="sub muted">
-        Individual timed operations. The
-        <a href="#/performance">Performance</a> page aggregates these by operation.
+        {t('transactions.subtitle')}
+        <a href="#/performance">{t('perf.title')}</a> {t('transactions.aggregatedBy')}
       </p>
     </div>
     <RefreshButton onclick={refresh} loading={refreshing} />
@@ -394,7 +318,7 @@
   />
   <SearchDisclosure {clamped} />
 
-  <Card padding="none" title="Spans">
+  <Card padding="none" title={t('transactions.card.spans')}>
     {#snippet actions()}
       <TimeFilter fields={TIME_FIELDS} value={window_} onchange={(v) => (window_ = v)} />
     {/snippet}
@@ -408,33 +332,33 @@
       <p class="stale-banner" role="status">
         <Icon name="triangle-alert" size={14} />
         <span>Showing the last results that loaded — refreshing failed: {error}</span>
-        <Button variant="ghost" size="sm" onclick={refresh}>Try again</Button>
+        <Button variant="ghost" size="sm" onclick={refresh}>{t('ui.tryAgain')}</Button>
       </p>
     {/if}
 
     {#if loading && rows.length === 0}
       <div class="center"><Spinner size={22} /></div>
     {:else if fatalError}
-      <EmptyState title="Couldn't load transactions" description={error ?? undefined} icon="triangle-alert">
+      <EmptyState title={t('transactions.error.load')} description={error ?? undefined} icon="triangle-alert">
         {#snippet action()}
-          <Button onclick={refresh}>Try again</Button>
+          <Button onclick={refresh}>{t('ui.tryAgain')}</Button>
         {/snippet}
       </EmptyState>
     {:else if rows.length === 0}
       <EmptyState
-        title="No transactions"
-        description="Nothing matched this query in the selected window. Record one with trackTransaction() in any Sauron SDK."
+        title={t('transactions.empty.title')}
+        description={t('transactions.empty.body')}
         icon="timer"
       />
     {:else}
       <DataTable>
         {#snippet head()}
           <tr>
-            <th class="chev" aria-label="Expand"></th>
-            <SortableTh key="name" columnDefault="asc" sort={list.sort} {onsort}>Name</SortableTh>
+            <th class="chev" aria-label={t('ui.opModal.expand')}></th>
+            <SortableTh key="name" columnDefault="asc" sort={list.sort} {onsort}>{t('common.name')}</SortableTh>
             <SortableTh key="op" columnDefault="asc" sort={list.sort} {onsort}>Op</SortableTh>
-            <SortableTh key="duration_ms" class="num" sort={list.sort} {onsort}>Duration</SortableTh>
-            <th>Status</th>
+            <SortableTh key="duration_ms" class="num" sort={list.sort} {onsort}>{t('explore.column.duration')}</SortableTh>
+            <th>{t('common.status')}</th>
             <th>HTTP</th>
             <!--
               Not a `SortableTh`. The backend's sort whitelist is
@@ -444,13 +368,13 @@
               answers with an error is worse than one that plainly does not
               sort. Narrow instead: click the id, or filter `session:<id>`.
             -->
-            <th>Session</th>
-            <SortableTh key="occurred_at" sort={list.sort} {onsort}>When</SortableTh>
+            <th>{t('sessions.column.session')}</th>
+            <SortableTh key="occurred_at" sort={list.sort} {onsort}>{t('ui.opModal.when')}</SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
-          {#each rows as t (t.id)}
-            <tr class:expanded={expanded.has(t.id)}>
+          {#each rows as tx (tx.id)}
+            <tr class:expanded={expanded.has(tx.id)}>
               <td class="chev">
                 <!--
                   Unconditional. It used to appear only on rows carrying
@@ -459,42 +383,42 @@
                 -->
                 <button
                   class="chev-btn"
-                  aria-expanded={expanded.has(t.id)}
-                  aria-label={expanded.has(t.id) ? 'Hide details' : 'Show details'}
-                  onclick={() => toggle(t.id)}
+                  aria-expanded={expanded.has(tx.id)}
+                  aria-label={expanded.has(tx.id) ? 'Hide details' : 'Show details'}
+                  onclick={() => toggle(tx.id)}
                 >
-                  <Icon name={expanded.has(t.id) ? 'chevron-down' : 'chevron-right'} size={14} />
+                  <Icon name={expanded.has(tx.id) ? 'chevron-down' : 'chevron-right'} size={14} />
                 </button>
               </td>
               <td>
-                <span class="name mono truncate" title={t.name}>{t.name}</span>
-                {#if t.url && t.url !== t.name}
-                  <span class="url muted truncate" title={t.url}>{t.url}</span>
+                <span class="name mono truncate" title={tx.name}>{tx.name}</span>
+                {#if tx.url && tx.url !== tx.name}
+                  <span class="url muted truncate" title={tx.url}>{tx.url}</span>
                 {/if}
               </td>
-              <td><Badge tone="neutral" size="sm">{t.op.replace('_', ' ')}</Badge></td>
-              <td class="num"><LatencyBadge ms={t.duration_ms} size="sm" /></td>
+              <td><Badge tone="neutral" size="sm">{tx.op.replace('_', ' ')}</Badge></td>
+              <td class="num"><LatencyBadge ms={tx.duration_ms} size="sm" /></td>
               <td>
-                {#if t.status}
-                  <Badge tone={t.status === 'ok' ? 'success' : 'warning'} size="sm">{t.status}</Badge>
+                {#if tx.status}
+                  <Badge tone={tx.status === 'ok' ? 'success' : 'warning'} size="sm">{tx.status}</Badge>
                 {:else}
                   <span class="muted">—</span>
                 {/if}
               </td>
               <td>
-                {#if t.http_status != null}
-                  <Badge tone={httpStatusTone(t.http_status)} size="sm">
-                    {t.http_method ?? ''}
-                    {t.http_status}
+                {#if tx.http_status != null}
+                  <Badge tone={httpStatusTone(tx.http_status)} size="sm">
+                    {tx.http_method ?? ''}
+                    {tx.http_status}
                   </Badge>
-                {:else if t.http_method}
-                  <Badge tone="neutral" size="sm">{t.http_method}</Badge>
+                {:else if tx.http_method}
+                  <Badge tone="neutral" size="sm">{tx.http_method}</Badge>
                 {:else}
                   <span class="muted">—</span>
                 {/if}
               </td>
               <td>
-                {#if t.session_id}
+                {#if tx.session_id}
                   <!--
                     Straight to the session timeline, where this span sits
                     beside the events and errors around it — the question
@@ -502,86 +426,21 @@
                   -->
                   <a
                     class="session mono truncate"
-                    href={`#/sessions/${encodeURIComponent(t.session_id)}`}
-                    title={t.session_id}
-                  >{t.session_id}</a>
+                    href={`#/sessions/${encodeURIComponent(tx.session_id)}`}
+                    title={tx.session_id}
+                  >{tx.session_id}</a>
                 {:else}
-                  <span class="muted" title="This span was recorded without a session">—</span>
+                  <span class="muted" title={t('ui.opModal.noSession')}>—</span>
                 {/if}
               </td>
-              <td><TimeValue value={t.occurred_at} /></td>
+              <td><TimeValue value={tx.occurred_at} /></td>
             </tr>
-            {#if expanded.has(t.id)}
+            {#if expanded.has(tx.id)}
               <tr class="meta-row">
+                <!-- `wrap`: DataTable's blanket `white-space: nowrap` would
+                     otherwise suppress every line break inside the panel. -->
                 <td class="wrap" colspan="8">
-                  {#if isTruncated(t)}
-                    <p class="truncated" role="status">
-                      <Icon name="info" size={14} />
-                      <span>
-                        The SDK capped this payload at 16 KB and sent a marker instead
-                        ({(t.extra?._bytes as number) < 0
-                          ? 'the value could not be serialized'
-                          : `${(t.extra?._bytes as number).toLocaleString()} bytes`}). The
-                        span and its timing are accurate; only the attached data was dropped.
-                      </span>
-                    </p>
-                  {/if}
-
-                  <div class="meta-block">
-                    <h4>Span</h4>
-                    <dl class="detail">
-                      {#each detailRows(t) as row (row.label)}
-                        <div class="detail-row" class:wide={row.wide}>
-                          <dt>{row.label}</dt>
-                          <dd>
-                            {#if row.value === null}
-                              <span class="muted">—</span>
-                            {:else if row.href}
-                              <a class="mono" href={row.href}>{row.value}</a>
-                            {:else}
-                              <span class:mono={row.mono}>{row.value}</span>
-                            {/if}
-                          </dd>
-                        </div>
-                      {/each}
-                    </dl>
-                  </div>
-
-                  {#if t.tags === null}
-                    <!--
-                      `null` is WITHHELD, not empty — `strip_transaction_body`
-                      nulls both for a caller without `event:read`. Saying so
-                      beats rendering nothing, which reads as "this span had no
-                      data" and sends people looking for a bug.
-                    -->
-                    <p class="withheld">
-                      <Icon name="lock" size={13} />
-                      <span>Tags and additional data are withheld — they need the <code>event:read</code> permission.</span>
-                    </p>
-                  {:else}
-                    {#if Object.keys(t.tags).length > 0}
-                      <div class="meta-block">
-                        <h4>Tags</h4>
-                        <div class="tag-list">
-                          {#each Object.entries(t.tags) as [k, v] (k)}
-                            <Badge tone="neutral" size="sm">{k}: {v}</Badge>
-                          {/each}
-                        </div>
-                      </div>
-                    {/if}
-                    {#if t.extra && Object.keys(t.extra).length > 0}
-                      <div class="meta-block">
-                        <h4>Additional data</h4>
-                        <JsonTree value={t.extra} expandTo={1} />
-                      </div>
-                    {/if}
-                    {#if Object.keys(t.tags).length === 0 && (!t.extra || Object.keys(t.extra).length === 0)}
-                      <p class="muted no-meta">
-                        No tags or additional data on this span. Attach some by passing
-                        <code>tags</code> / <code>extra</code> to <code>trackTransaction()</code>.
-                      </p>
-                    {/if}
-                  {/if}
+                  <TransactionDetailPanel transaction={tx} />
                 </td>
               </tr>
             {/if}
@@ -643,7 +502,7 @@
      rows all carry metadata and one where none do. */
   .chev {
     width: 28px;
-    padding-right: 0;
+    padding-inline-end: 0;
   }
   .chev-btn {
     display: inline-flex;
@@ -666,99 +525,9 @@
     background: var(--surface-2);
     padding: 12px 16px 16px;
   }
-  .meta-block + .meta-block {
-    margin-top: 14px;
-  }
-  .meta-block h4 {
-    margin: 0 0 8px;
-    font-size: 11.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--muted);
-  }
-  .tag-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  /* Two columns on a wide viewport, one when the pane is narrow. `auto-fill`
-     rather than a fixed count so a maximised window does not stretch a
-     16-row list into two very tall columns of mostly whitespace. */
-  /* 373px = the 92px label + its 10px gap + 271px, the measured width of a
-     uuid at this font. Below that a session id wraps mid-token, which is both
-     ugly and hard to copy; above it the columns just get roomier. `auto-fill`
-     keeps a maximised window from stretching 16 rows into two very tall
-     columns of whitespace. */
-  .detail {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(373px, 1fr));
-    gap: 2px 24px;
-    margin: 0;
-  }
-  .detail-row {
-    display: grid;
-    /* `minmax(0, 1fr)`, NOT `1fr`. A bare `1fr` is `minmax(auto, 1fr)`, and
-       `auto`'s minimum is MIN-CONTENT — so a 200-char URL inflates the track
-       to its own width instead of wrapping into the space available. The
-       explicit `0` minimum is what lets the track shrink and the text wrap. */
-    grid-template-columns: 92px minmax(0, 1fr);
-    gap: 10px;
-    align-items: baseline;
-    padding: 3px 0;
-    min-width: 0;
-  }
-  /* The full-width row, for a value with no useful upper bound. `1 / -1` spans
-     however many columns `auto-fill` produced, so it stays correct at every
-     viewport without a media query. */
-  .detail-row.wide {
-    grid-column: 1 / -1;
-  }
-  .detail dt {
-    font-size: 12px;
-    color: var(--muted);
-    /* Labels are short, known, and read as a column — wrapping "Transaction id"
-       onto two lines would ripple the baseline of every row beside it. */
-    white-space: nowrap;
-  }
-  .detail dd {
-    margin: 0;
-    font-size: 12.5px;
-    min-width: 0;
-    /* Long urls, uuids and release strings have few break opportunities, so
-       normal wrapping leaves them overflowing. `anywhere` breaks mid-token.
-       This is inert without the `wrap` class on the containing `<td>`:
-       DataTable sets `white-space: nowrap` on every cell, and nowrap
-       suppresses line breaking outright — `overflow-wrap` never gets a say.
-       That pairing is what put the session id on top of the next column's
-       label and clipped the transaction id at the panel edge. */
-    overflow-wrap: anywhere;
-  }
   .session {
     display: inline-block;
     max-width: 200px;
     vertical-align: bottom;
-  }
-  .withheld,
-  .no-meta {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 14px 0 0;
-    font-size: 12.5px;
-  }
-  .withheld {
-    color: var(--muted);
-  }
-  .truncated {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0 0 14px;
-    padding: 8px 12px;
-    border-radius: var(--radius);
-    background: var(--info-soft);
-    color: var(--info);
-    font-size: 12.5px;
   }
 </style>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -125,37 +126,37 @@
 <AppShell requireApp>
   <button class="back" onclick={() => push('/screens')}>
     <Icon name="arrow-left" size={14} />
-    Screens
+    {t('screens.title')}
   </button>
 
   {#if loading && !detail}
     <div class="center"><Spinner size={26} /></div>
   {:else if error}
-    <EmptyState title="Couldn't load screen" description={error} icon="triangle-alert">
+    <EmptyState title={t('screen.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
-        <Button variant="secondary" onclick={() => push('/screens')}>Back to screens</Button>
+        <Button variant="secondary" onclick={() => push('/screens')}>{t('screen.backToList')}</Button>
       {/snippet}
     </EmptyState>
   {:else if detail}
     <h1 class="page-title mono screen-title">{screenName}</h1>
 
     <StatTiles min={150}>
-      <StatTile label="Views" value={compactNumber(detail.stats.views)} tone="primary" />
-      <StatTile label="Users" value={compactNumber(detail.stats.users)} />
-      <StatTile label="Events" value={compactNumber(detail.stats.events)} />
+      <StatTile label={t('screens.column.views')} value={compactNumber(detail.stats.views)} tone="primary" />
+      <StatTile label={t('users.title')} value={compactNumber(detail.stats.users)} />
+      <StatTile label={t('explore.column.events')} value={compactNumber(detail.stats.events)} />
       <StatTile
-        label="Exceptions"
+        label={t('screens.column.exceptions')}
         value={compactNumber(detail.stats.exceptions)}
         tone={detail.stats.exceptions > 0 ? 'error' : 'neutral'}
       />
-      <StatTile label="Avg dwell" value={formatDuration(detail.stats.avg_dwell_ms)} />
-      <StatTile label="Total dwell" value={formatDuration(detail.stats.total_dwell_ms)} />
+      <StatTile label={t('screens.column.avgDwell')} value={formatDuration(detail.stats.avg_dwell_ms)} />
+      <StatTile label={t('screen.stat.totalDwell')} value={formatDuration(detail.stats.total_dwell_ms)} />
     </StatTiles>
 
     {#key sectionKey}
       <div class="lists">
         <CollapsibleFetchCard
-          title="Events"
+          title={t('explore.column.events')}
           icon="zap"
           emptyNote="No events on this screen."
           fetcher={fetchEvents}
@@ -169,18 +170,18 @@
               {/snippet}
               {#snippet expanded()}
                 <dl class="facts">
-                  <div><dt>Distinct id</dt><dd class="mono">{e.distinct_id}</dd></div>
+                  <div><dt>{t('screen.distinctId')}</dt><dd class="mono">{e.distinct_id}</dd></div>
                   {#if e.session_id}
-                    <div><dt>Session</dt><dd class="mono">{e.session_id}</dd></div>
+                    <div><dt>{t('sessions.column.session')}</dt><dd class="mono">{e.session_id}</dd></div>
                   {/if}
                   {#if e.release}
-                    <div><dt>Release</dt><dd class="mono">{e.release}</dd></div>
+                    <div><dt>{t('issue.field.release')}</dt><dd class="mono">{e.release}</dd></div>
                   {/if}
                 </dl>
-                <p class="sub">Properties</p>
+                <p class="sub">{t('events.properties')}</p>
                 <KeyValueList data={e.properties} emptyLabel="No properties" />
                 {#if e.tags && Object.keys(e.tags).length > 0}
-                  <p class="sub">Tags</p>
+                  <p class="sub">{t('ui.section.tags')}</p>
                   <KeyValueList data={e.tags} />
                 {/if}
               {/snippet}
@@ -190,7 +191,7 @@
 
         {#if mayReadIssues}
           <CollapsibleFetchCard
-            title="Exceptions"
+            title={t('screens.column.exceptions')}
             icon="triangle-alert"
             emptyNote="No exceptions on this screen."
             fetcher={fetchExceptions}
@@ -208,16 +209,16 @@
                 {#snippet expanded()}
                   <dl class="facts">
                     {#if x.exception_type}
-                      <div><dt>Type</dt><dd class="mono">{x.exception_type}</dd></div>
+                      <div><dt>{t('issue.field.type')}</dt><dd class="mono">{x.exception_type}</dd></div>
                     {/if}
                     {#if x.message}
-                      <div><dt>Message</dt><dd>{x.message}</dd></div>
+                      <div><dt>{t('screen.message')}</dt><dd>{x.message}</dd></div>
                     {/if}
                     {#if x.culprit}
-                      <div><dt>Culprit</dt><dd class="mono">{x.culprit}</dd></div>
+                      <div><dt>{t('screen.culprit')}</dt><dd class="mono">{x.culprit}</dd></div>
                     {/if}
                     {#if x.distinct_id}
-                      <div><dt>Distinct id</dt><dd class="mono">{x.distinct_id}</dd></div>
+                      <div><dt>{t('screen.distinctId')}</dt><dd class="mono">{x.distinct_id}</dd></div>
                     {/if}
                   </dl>
                 {/snippet}
@@ -227,7 +228,7 @@
         {/if}
 
         <CollapsibleFetchCard
-          title="Devices"
+          title={t('devices.title')}
           icon="smartphone"
           emptyNote="No devices seen on this screen."
           fetcher={fetchDevices}
@@ -246,23 +247,23 @@
               {/snippet}
               {#snippet expanded()}
                 <dl class="facts">
-                  <div><dt>Device key</dt><dd class="mono">{d.device_key}</dd></div>
+                  <div><dt>{t('screen.deviceKey')}</dt><dd class="mono">{d.device_key}</dd></div>
                   {#if d.os_name}
                     <div>
                       <dt>OS</dt>
                       <dd>{d.os_name}{d.os_version ? ' ' + d.os_version : ''}</dd>
                     </div>
                   {/if}
-                  {#if d.arch}<div><dt>Arch</dt><dd>{d.arch}</dd></div>{/if}
-                  {#if d.browser}<div><dt>Browser</dt><dd>{d.browser}</dd></div>{/if}
-                  <div><dt>Views here</dt><dd>{compactNumber(d.views_on_screen)}</dd></div>
-                  <div><dt>Events here</dt><dd>{compactNumber(d.events_on_screen)}</dd></div>
+                  {#if d.arch}<div><dt>{t('device.field.arch')}</dt><dd>{d.arch}</dd></div>{/if}
+                  {#if d.browser}<div><dt>{t('device.field.browser')}</dt><dd>{d.browser}</dd></div>{/if}
+                  <div><dt>{t('screen.viewsHere')}</dt><dd>{compactNumber(d.views_on_screen)}</dd></div>
+                  <div><dt>{t('screen.eventsHere')}</dt><dd>{compactNumber(d.events_on_screen)}</dd></div>
                   <div>
-                    <dt>Exceptions here</dt>
+                    <dt>{t('screen.exceptionsHere')}</dt>
                     <dd>{compactNumber(d.exceptions_on_screen)}</dd>
                   </div>
                   <div>
-                    <dt>First seen here</dt>
+                    <dt>{t('screen.firstSeenHere')}</dt>
                     <dd><TimeValue value={d.first_seen_on_screen} /></dd>
                   </div>
                 </dl>
@@ -272,7 +273,7 @@
         </CollapsibleFetchCard>
 
         <CollapsibleFetchCard
-          title="Users"
+          title={t('users.title')}
           icon="users"
           emptyNote="No users seen on this screen."
           fetcher={fetchUsers}
@@ -291,18 +292,18 @@
               {/snippet}
               {#snippet expanded()}
                 <dl class="facts">
-                  <div><dt>Views here</dt><dd>{compactNumber(u.views_on_screen)}</dd></div>
-                  <div><dt>Events here</dt><dd>{compactNumber(u.events_on_screen)}</dd></div>
+                  <div><dt>{t('screen.viewsHere')}</dt><dd>{compactNumber(u.views_on_screen)}</dd></div>
+                  <div><dt>{t('screen.eventsHere')}</dt><dd>{compactNumber(u.events_on_screen)}</dd></div>
                   <div>
-                    <dt>Exceptions here</dt>
+                    <dt>{t('screen.exceptionsHere')}</dt>
                     <dd>{compactNumber(u.exceptions_on_screen)}</dd>
                   </div>
                   <div>
-                    <dt>First seen here</dt>
+                    <dt>{t('screen.firstSeenHere')}</dt>
                     <dd><TimeValue value={u.first_seen_on_screen} /></dd>
                   </div>
                 </dl>
-                <p class="sub">Traits</p>
+                <p class="sub">{t('person.card.traits')}</p>
                 <KeyValueList data={u.properties} emptyLabel="No traits" />
               {/snippet}
             </SectionRow>
@@ -312,8 +313,8 @@
     {/key}
   {:else}
     <EmptyState
-      title="Screen not found"
-      description="No data for this screen in the selected range."
+      title={t('screen.notFound')}
+      description={t('screen.empty.body')}
       icon="layout-panel-top"
     />
   {/if}
@@ -362,7 +363,7 @@
   /* Pushes the timestamp to the row's trailing edge, so the times line up in a
      column regardless of how long each row's leading label is. */
   .push {
-    margin-left: auto;
+    margin-inline-start: auto;
   }
   .facts {
     display: grid;

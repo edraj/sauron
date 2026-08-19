@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import { untrack } from 'svelte';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
@@ -124,37 +125,35 @@
 >
   {#if tempPassword}
     <p class="lede">
-      Give <strong>{email}</strong> this temporary password. They must change it the first time
-      they sign in.
+      {t('members.give')} <strong>{email}</strong> {t('prose.members.tempPasswordTail')}
     </p>
     <div class="temp-password">
       <code>{tempPassword}</code>
       <CopyButton value={tempPassword} size="sm" />
     </div>
     <p class="warning">
-      This is the only time it is shown. If you lose it, deactivate the account and create it
-      again.
+      {t('prose.members.oneTimeSecret')}
     </p>
   {:else}
     <div class="fields">
       <Input
-        label="Email"
+        label={t('common.email')}
         type="email"
         bind:value={email}
-        placeholder="teammate@company.com"
+        placeholder={t('members.placeholder.email')}
         required
       />
-      <Input label="Name" bind:value={name} placeholder="Jane Doe" />
+      <Input label={t('common.name')} bind:value={name} placeholder={t('members.placeholder.name')} />
       <div class="gf-field">
-        <span class="lbl">Role</span>
-        <select class="sel" bind:value={roleId} aria-label="Role">
+        <span class="lbl">{t('members.column.role')}</span>
+        <select class="sel" bind:value={roleId} aria-label={t('members.column.role')}>
           {#each roles as role (role.id)}
             <option value={role.id}>{role.name}</option>
           {/each}
         </select>
       </div>
       <div class="gf-field">
-        <span class="lbl">Scope</span>
+        <span class="lbl">{t('members.column.scope')}</span>
         <ScopeTree
           {orgId}
           {orgName}
@@ -174,11 +173,11 @@
 
   {#snippet footer()}
     {#if tempPassword}
-      <Button variant="primary" onclick={onclose}>Done</Button>
+      <Button variant="primary" onclick={onclose}>{t('common.done')}</Button>
     {:else}
-      <Button variant="ghost" onclick={onclose} disabled={saving}>Cancel</Button>
+      <Button variant="ghost" onclick={onclose} disabled={saving}>{t('common.cancel')}</Button>
       <Button variant="primary" disabled={!canSubmit} loading={saving} onclick={submit}>
-        Create member
+        {t('members.create')}
       </Button>
     {/if}
   {/snippet}

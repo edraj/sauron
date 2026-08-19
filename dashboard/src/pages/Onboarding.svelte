@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { onMount, onDestroy } from 'svelte';
   import { push } from 'svelte-spa-router';
   import Input from '../lib/components/ui/Input.svelte';
@@ -146,22 +147,22 @@
       <span class="mark" aria-hidden="true"><span class="eye"></span></span>
       <span class="name">Sauron</span>
     </div>
-    <button class="link" onclick={signOut}>Sign out</button>
+    <button class="link" onclick={signOut}>{t('auth.signOut')}</button>
   </header>
 
   <div class="ob-body">
     {#if step === 1}
       <div class="intro">
-        <span class="step-pill">Step 1 of 3</span>
-        <h1>Create your first project</h1>
+        <span class="step-pill">{t('auth.onboarding.step1')}</span>
+        <h1>{t('auth.onboarding.createProject')}</h1>
         <p class="lead">
-          A project groups related apps — think a product or a team. You'll add an app next.
+          {t('auth.onboarding.projectHelp')}
         </p>
       </div>
       <Card>
         <form class="create-form" onsubmit={handleCreateProject}>
           {#if projectError}<div class="alert">{projectError}</div>{/if}
-          <Input label="Project name" bind:value={projectName} placeholder="Payments" required />
+          <Input label={t('auth.onboarding.projectName')} bind:value={projectName} placeholder={t('auth.placeholder.projectName')} required />
           <Button
             type="submit"
             variant="primary"
@@ -170,32 +171,32 @@
             lockedReason={createProjectLock}
             fullWidth
           >
-            Create project
+            {t('auth.onboarding.createProjectBtn')}
           </Button>
         </form>
       </Card>
     {:else if step === 2}
       <div class="intro">
-        <span class="step-pill">Step 2 of 3</span>
-        <h1>Add an app to <span class="hl">{project?.name}</span></h1>
-        <p class="lead">An app holds the DSN your SDK reports to. Pick the platform it runs on.</p>
+        <span class="step-pill">{t('auth.onboarding.step2')}</span>
+        <h1>{t('auth.onboarding.addApp')} <span class="hl">{project?.name}</span></h1>
+        <p class="lead">{t('auth.onboarding.appHelp')}</p>
       </div>
       <Card>
         <form class="create-form" onsubmit={handleCreateApp}>
           {#if appError}<div class="alert">{appError}</div>{/if}
-          <Input label="App name" bind:value={appName} placeholder="Web App" required />
+          <Input label={t('auth.onboarding.appName')} bind:value={appName} placeholder={t('auth.placeholder.appName')} required />
           <div class="field">
-            <span class="lbl">App type</span>
+            <span class="lbl">{t('auth.onboarding.appType')}</span>
             <div class="type-grid">
-              {#each APP_TYPES as t (t.value)}
+              {#each APP_TYPES as opt (opt.value)}
                 <button
                   type="button"
                   class="type-opt"
-                  class:selected={appType === t.value}
-                  onclick={() => (appType = t.value as AppType)}
+                  class:selected={appType === opt.value}
+                  onclick={() => (appType = opt.value as AppType)}
                 >
-                  <span class="t-icon"><Icon name={appTypeIcon(t.value)} size={18} /></span>
-                  <span class="t-label">{t.label}</span>
+                  <span class="t-icon"><Icon name={appTypeIcon(opt.value)} size={18} /></span>
+                  <span class="t-label">{opt.label}</span>
                 </button>
               {/each}
             </div>
@@ -208,35 +209,35 @@
             lockedReason={createAppLock}
             fullWidth
           >
-            Create app
+            {t('auth.onboarding.createApp')}
           </Button>
         </form>
       </Card>
     {:else if app}
       <div class="intro">
-        <span class="step-pill">Step 3 of 3</span>
-        <h1>Connect <span class="hl"><Icon name={appTypeIcon(app.app_type)} size={18} /> {app.name}</span></h1>
+        <span class="step-pill">{t('auth.onboarding.step3')}</span>
+        <h1>{t('auth.onboarding.connect')} <span class="hl"><Icon name={appTypeIcon(app.app_type)} size={18} /> {app.name}</span></h1>
         <p class="lead">
-          Initialize the SDK with your DSN. We'll light up as soon as the first event arrives.
+          {t('auth.onboarding.connectHelp')}
         </p>
       </div>
 
       {#if dsn}
-        <Card title="Your DSN">
+        <Card title={t('auth.onboarding.yourDsn')}>
           <div class="dsn-row">
             <code class="dsn mono">{dsn}</code>
             <CopyButton value={dsn} />
           </div>
         </Card>
 
-        <Card title="Install snippet">
+        <Card title={t('auth.onboarding.installSnippet')}>
           <CodeBlock code={snippet} language="javascript" />
         </Card>
       {:else}
-        <Card title="Your DSN">
+        <Card title={t('auth.onboarding.yourDsn')}>
           <div class="dsn-loading">
             <Spinner size={18} />
-            <span class="muted">Setting up your environment…</span>
+            <span class="muted">{t('auth.onboarding.settingUp')}</span>
           </div>
         </Card>
       {/if}
@@ -245,7 +246,7 @@
         {#if firstEvent.received}
           <div class="w-icon done-icon"><Icon name="check" size={16} /></div>
           <div class="w-text">
-            <strong>First event received!</strong>
+            <strong>{t('auth.onboarding.received')}</strong>
             <!-- Presence flags, not counts: the API does an existence check so
                  polling this every few seconds need not scan every partition. -->
             <span class="muted">
@@ -259,15 +260,15 @@
             </span>
           </div>
           <Button variant="primary" onclick={() => push('/issues')}>
-            <span class="btn-inline">Go to Issues <Icon name="arrow-right" size={14} /></span>
+            <span class="btn-inline">{t('auth.onboarding.goToIssues')} <Icon name="arrow-right" size={14} /></span>
           </Button>
         {:else}
           <div class="w-icon"><Spinner size={18} /></div>
           <div class="w-text">
-            <strong>Waiting for your first event…</strong>
-            <span class="muted">Send an error or event from your app. Polling every 3s.</span>
+            <strong>{t('auth.onboarding.waiting')}</strong>
+            <span class="muted">{t('auth.onboarding.polling')}</span>
           </div>
-          <button class="link" onclick={() => push('/issues')}>Skip for now</button>
+          <button class="link" onclick={() => push('/issues')}>{t('auth.onboarding.skip')}</button>
         {/if}
       </div>
     {/if}

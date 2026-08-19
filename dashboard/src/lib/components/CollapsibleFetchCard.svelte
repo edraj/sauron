@@ -12,6 +12,7 @@
   state that must not leak between screens lives here, not on the page.
 -->
 <script lang="ts" generics="T">
+  import { t } from '../i18n';
   import type { Snippet } from 'svelte';
   import Card from './ui/Card.svelte';
   import Button from './ui/Button.svelte';
@@ -105,7 +106,7 @@
   <div id={bodyId} class="body" hidden={!open}>
     {#if !section.loaded && !section.loading && !section.error}
       <div class="prompt">
-        <p class="muted">Nothing loaded yet.</p>
+        <p class="muted">{t('ui.empty.notLoaded')}</p>
         <Button variant="secondary" size="sm" onclick={() => section.load(0, call)}>
           Fetch {title.toLowerCase()}
         </Button>
@@ -119,7 +120,7 @@
              still the previous one, and re-fetching THAT would succeed and look
              recovered without ever reaching the page the user asked for. -->
         <Button variant="secondary" size="sm" onclick={() => section.retry(call)}>
-          Try again
+          {t('ui.tryAgain')}
         </Button>
       </div>
     {:else if section.rows.length === 0}
@@ -162,7 +163,7 @@
     font-weight: 620;
     cursor: pointer;
     width: 100%;
-    text-align: left;
+    text-align: start;
   }
   .head-toggle:hover {
     color: var(--primary);

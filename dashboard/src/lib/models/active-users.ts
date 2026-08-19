@@ -1,3 +1,4 @@
+import { localeStore } from '../i18n/locale.svelte';
 // Pure decision logic for the Active Users page. Lives here, not in the
 // component, because the dashboard has no DOM test environment — this module
 // is the only layer of the feature a test can reach.
@@ -105,5 +106,9 @@ export function defaultWindow(rangeDays: number, now: Date): { from: string; to:
 export function utcDayLabel(day: string, locale?: string): string {
   const d = new Date(`${day}T00:00:00Z`);
   if (Number.isNaN(d.getTime())) return day;
-  return d.toLocaleDateString(locale, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  return d.toLocaleDateString(locale ?? localeStore.tag, {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  });
 }

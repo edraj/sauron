@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import type { MonitorStatus } from '../../models';
 
   /**
@@ -16,10 +17,17 @@
    * unrecognised status falls through to its raw value rather than
    * disappearing.
    */
-  const label: Record<MonitorStatus, string> = {
-    up: 'Up', down: 'Down', paused: 'Paused', unknown: 'Pending',
-  };
-  const labelFor: Readonly<Record<string, string | undefined>> = label;
+  // `$derived` so a language switch reaches the pill; the map stays exhaustive
+  // over `MonitorStatus` so a new status cannot ship without a label.
+  const label: Record<MonitorStatus, string> = $derived({
+    up: t('monitor.status.up'),
+    down: t('monitor.status.down'),
+    paused: t('monitor.status.paused'),
+    unknown: t('monitor.status.unknown'),
+  });
+  // Also `$derived`: reading a derived value into a plain const captures its
+  // first evaluation, which would pin the pill to the language it mounted in.
+  const labelFor: Readonly<Record<string, string | undefined>> = $derived(label);
 </script>
 
 <span class="pill {status}">{labelFor[status] ?? status}</span>

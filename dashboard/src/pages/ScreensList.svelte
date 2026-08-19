@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -142,19 +143,19 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Screens</h1>
-      <p class="muted sub">Views, engagement and errors per screen.</p>
+      <h1 class="page-title">{t('screens.title')}</h1>
+      <p class="muted sub">{t('screens.subtitle')}</p>
     </div>
     <div class="controls">
       <DateRange value={sinceDays} onchange={onRange} />
-      <SearchInput bind:value={query} onsearch={onSearch} placeholder="Search screens…" width="240px" />
+      <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('screens.search')} width="240px" />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
 
   {#if error && rows.length === 0}
     <Card>
-      <EmptyState title="Couldn't load screens" description={error} icon="triangle-alert">
+      <EmptyState title={t('screens.error.load')} description={error} icon="triangle-alert">
         {#snippet action()}
           <Button
             variant="secondary"
@@ -163,7 +164,7 @@
               if (aid) load(aid, sinceDays, search, sortParam(list.sort), list.offset);
             }}
           >
-            Retry
+            {t('common.retry')}
           </Button>
         {/snippet}
       </EmptyState>
@@ -173,7 +174,7 @@
   {:else if rows.length === 0}
     <Card>
       <EmptyState
-        title="No screens yet"
+        title={t('screens.empty.title')}
         description={search
           ? `No screens match “${search}”.`
           : 'Call setScreen() in your SDK to attribute events to screens.'}
@@ -184,15 +185,15 @@
     <DataTable>
       {#snippet head()}
         <tr>
-          <SortableTh key="screen" columnDefault="asc" sort={list.sort} {onsort}>Screen</SortableTh>
-          <SortableTh key="views" class="num" sort={list.sort} {onsort}>Views</SortableTh>
-          <SortableTh key="events" class="num" sort={list.sort} {onsort}>Events</SortableTh>
+          <SortableTh key="screen" columnDefault="asc" sort={list.sort} {onsort}>{t('screens.column.screen')}</SortableTh>
+          <SortableTh key="views" class="num" sort={list.sort} {onsort}>{t('screens.column.views')}</SortableTh>
+          <SortableTh key="events" class="num" sort={list.sort} {onsort}>{t('explore.column.events')}</SortableTh>
           <SortableTh key="exceptions" class="num" sort={list.sort} {onsort}>
-            Exceptions
+            {t('screens.column.exceptions')}
           </SortableTh>
-          <SortableTh key="users" class="num" sort={list.sort} {onsort}>Users</SortableTh>
+          <SortableTh key="users" class="num" sort={list.sort} {onsort}>{t('users.title')}</SortableTh>
           <SortableTh key="avg_dwell_ms" class="num" sort={list.sort} {onsort}>
-            Avg dwell
+            {t('screens.column.avgDwell')}
           </SortableTh>
         </tr>
       {/snippet}
@@ -250,7 +251,7 @@
     padding: 80px;
   }
   .num {
-    text-align: right;
+    text-align: end;
   }
   .truncate {
     display: inline-block;

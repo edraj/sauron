@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import type { Snippet } from 'svelte';
   import { location } from 'svelte-spa-router';
   import AppShell from './AppShell.svelte';
   import Icon from '../ui/Icon.svelte';
-  import { visibleAdminNav } from '../../models/admin-nav';
+  import { adminNavLocks } from '../../models/admin-nav';
+  import { lockTip } from '../../actions/lock-tip';
 
   interface Props {
     requireProject?: boolean;
@@ -15,22 +17,33 @@
   // requirements it had as a top-level route.
   let { requireProject = false, requireApp = false, children }: Props = $props();
 
-  const items = $derived(visibleAdminNav());
+  // Every child renders, locked ones included — see `adminNavLocks`. The rail
+  // and the sidebar read the same helper, so they cannot disagree about which
+  // pages exist or about which permission each one needs.
+  const items = $derived(adminNavLocks());
 </script>
 
 <AppShell {requireProject} {requireApp}>
   <div class="admin">
-    <nav class="rail" aria-label="Admin sections">
+    <nav class="rail" aria-label={t('shell.adminSections')}>
       {#each items as item (item.href)}
-        <a
-          href={`#${item.href}`}
-          class="item"
-          class:active={$location.startsWith(item.href)}
-          aria-current={$location.startsWith(item.href) ? 'page' : undefined}
-        >
-          <Icon name={item.icon} size={15} />
-          <span>{item.label}</span>
-        </a>
+        {#if item.locked}
+          <button type="button" class="item locked" use:lockTip={item.locked}>
+            <Icon name={item.icon} size={15} />
+            <span>{item.label}</span>
+            <span class="lk" aria-hidden="true"><Icon name="lock" size={12} /></span>
+          </button>
+        {:else}
+          <a
+            href={`#${item.href}`}
+            class="item"
+            class:active={$location.startsWith(item.href)}
+            aria-current={$location.startsWith(item.href) ? 'page' : undefined}
+          >
+            <Icon name={item.icon} size={15} />
+            <span>{item.label}</span>
+          </a>
+        {/if}
       {/each}
     </nav>
     <div class="body">{@render children()}</div>
@@ -72,6 +85,34 @@
   .item:hover {
     background: var(--surface-2);
     color: var(--text);
+  }
+  /* A locked entry is a <button>: the global reset only sets font and cursor,
+     so the browser default border, background and centred text all need
+     clearing to match the <a> beside it. */
+  .item.locked {
+    width: 100%;
+    border: 0;
+    background: none;
+    font: inherit;
+    font-size: 13px;
+    text-align: start;
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  .item.locked:hover {
+    background: none;
+    color: var(--text-muted);
+  }
+  .item.locked:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+    opacity: 0.75;
+  }
+  .lk {
+    margin-inline-start: auto;
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
   }
   .item.active {
     background: var(--surface-2);

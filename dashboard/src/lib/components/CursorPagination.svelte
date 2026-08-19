@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatNumber, tn } from '../i18n';
   import PageStrip from './PageStrip.svelte';
 
   /**
@@ -38,8 +39,14 @@
     canNext: boolean;
     /** A load is in flight. See `PageStrip`'s `busy`. */
     busy?: boolean;
-    /** Singular noun for the count; pluralised by appending `s`. */
-    noun?: string;
+    /**
+     * Which noun the count is of.
+     *
+     * A catalogue key rather than the singular word: `noun + 's'` is an English
+     * inflection, and Arabic takes four different words for 1, 2, 3 and 11 of
+     * the same thing. `tn()` picks the form through `Intl.PluralRules`.
+     */
+    noun?: 'issue' | 'event' | 'occurrence' | 'transaction' | 'result';
     /** Called with the 1-based page to move to. */
     onjump: (page: number) => void;
   }
@@ -55,7 +62,6 @@
     onjump,
   }: Props = $props();
 
-  const plural = $derived(`${noun}s`);
 
   /**
    * The last page count the server actually stated.
@@ -83,15 +89,21 @@
   //
   // `null` in, `null` out: no count is known, so none is stated. Note this is
   // NOT the same as `total === 0`, which is a count the server did give.
-  const label = $derived(
-    total === null
-      ? null
-      : total === 0 && !totalIsCapped
-        ? `No ${plural}`
-        : `${total.toLocaleString()}${totalIsCapped ? '+' : ''} ${
-            total === 1 && !totalIsCapped ? noun : plural
-          }`,
-  );
+  /** A count that selects the CLDR `other` category in both en and ar. */
+  const OTHER_FORM = 100;
+
+  const label = $derived.by(() => {
+    if (total === null) return null;
+    const key = `common.plural.${noun}` as const;
+    // A capped count reads "at least this many", so the grammatical form must
+    // not be chosen from the number itself: at total === 2 Arabic would pick
+    // the DUAL ("تكراران"), which names exactly two and has no slot for the
+    // "1,000+" the label needs to show. `OTHER_FORM` is any count both
+    // languages map to the `other` category — the one form that is phrased for
+    // an unbounded quantity and does interpolate the number.
+    if (totalIsCapped) return tn(key, OTHER_FORM, { n: `${formatNumber(total)}+` });
+    return tn(key, total);
+  });
 </script>
 
 <PageStrip {page} {totalPages} {canNext} {label} {busy} {onjump} />

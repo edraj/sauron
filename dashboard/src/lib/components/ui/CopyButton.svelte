@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Icon from './Icon.svelte';
 
   interface Props {
@@ -7,7 +8,9 @@
     size?: 'sm' | 'md';
   }
 
-  let { value, label = 'Copy', size = 'md' }: Props = $props();
+  let { value, label, size = 'md' }: Props = $props();
+
+  const labelText = $derived(label ?? t('common.copy'));
 
   let copied = $state(false);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -36,9 +39,9 @@
   }
 </script>
 
-<button class="copy {size}" class:copied onclick={copy} title="Copy to clipboard" type="button">
+<button class="copy {size}" class:copied onclick={copy} title={t('common.copyToClipboard')} type="button">
   <span class="ico"><Icon name={copied ? 'check' : 'copy'} size={13} /></span>
-  <span class="txt">{copied ? 'Copied' : label}</span>
+  <span class="txt">{copied ? t('common.copied') : labelText}</span>
 </button>
 
 <style>

@@ -388,6 +388,7 @@ async fn session_detail_reads_are_scoped_independently_of_the_sessions_own_label
         None,
         1,
         0,
+        0,
     )
     .await
     .expect("bump session into env_a");
@@ -403,6 +404,7 @@ async fn session_detail_reads_are_scoped_independently_of_the_sessions_own_label
         Some(ids.env_b),
         None,
         1,
+        0,
         0,
     )
     .await

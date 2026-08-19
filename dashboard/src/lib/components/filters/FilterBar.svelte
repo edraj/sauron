@@ -1,10 +1,11 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import type { Snippet } from 'svelte';
   import Icon from '../ui/Icon.svelte';
   import SearchAutocompleteInput from '../search/SearchAutocompleteInput.svelte';
   import DateRange from '../DateRange.svelte';
   import {
-    OP_LABEL,
+    opLabel,
     composeTag,
     isFilterValueValid,
     normalizeFilterValue,
@@ -122,7 +123,8 @@
     onchange?.(filters);
   }
   function labelFor(key: string): string {
-    return fields.find((f) => f.key === key)?.label ?? key;
+    const def = fields.find((f) => f.key === key);
+    return def ? t(def.labelKey) : key;
   }
 </script>
 
@@ -131,9 +133,9 @@
     {#each filters as f, i (i)}
       <span class="chip">
         <span class="c-field">{labelFor(f.field)}</span>
-        <span class="c-op">{OP_LABEL[f.op]}</span>
+        <span class="c-op">{opLabel(f.op)}</span>
         <span class="c-val mono">{f.value}</span>
-        <button type="button" class="c-x" aria-label="Remove filter" onclick={() => remove(i)}>
+        <button type="button" class="c-x" aria-label={t('filter.remove')} onclick={() => remove(i)}>
           <Icon name="x" size={12} />
         </button>
       </span>
@@ -141,18 +143,18 @@
 
     {#if adding}
       <span class="draft">
-        <select bind:value={draftField} onchange={onFieldChange} aria-label="Filter field">
-          {#each fields as f (f.key)}<option value={f.key}>{f.label}</option>{/each}
+        <select bind:value={draftField} onchange={onFieldChange} aria-label={t('filter.field')}>
+          {#each fields as f (f.key)}<option value={f.key}>{t(f.labelKey)}</option>{/each}
         </select>
-        <select bind:value={draftOp} aria-label="Operator">
-          {#each fieldDef?.ops ?? [] as op (op)}<option value={op}>{OP_LABEL[op]}</option>{/each}
+        <select bind:value={draftOp} aria-label={t('filter.operator')}>
+          {#each fieldDef?.ops ?? [] as op (op)}<option value={op}>{opLabel(op)}</option>{/each}
         </select>
         {#if fieldDef?.type === 'tag'}
-          <input type="text" bind:value={draftTagKey} placeholder="key" aria-label="Tag key" class="tag-key" />
+          <input type="text" bind:value={draftTagKey} placeholder={t('filter.placeholder.key')} aria-label={t('filter.tagKey')} class="tag-key" />
           <span class="tag-eq">=</span>
-          <input type="text" bind:value={draftTagVal} placeholder="value" aria-label="Tag value" class="tag-val" />
+          <input type="text" bind:value={draftTagVal} placeholder={t('filter.placeholder.value')} aria-label={t('filter.tagValue')} class="tag-val" />
         {:else if fieldDef?.type === 'enum'}
-          <select bind:value={draftValue} aria-label="Value">
+          <select bind:value={draftValue} aria-label={t('filter.value')}>
             {#each fieldDef?.options ?? [] as opt (opt)}<option value={opt}>{opt}</option>{/each}
           </select>
         {:else if fieldDef?.type === 'number'}
@@ -160,17 +162,17 @@
                writes back a number (or null once cleared) rather than the
                string `Filter.value` is declared as, which is what let a
                cleared field commit `times_seen:eq:null`. -->
-          <input type="text" inputmode="numeric" bind:value={draftValue} placeholder="value" aria-label="Value" />
+          <input type="text" inputmode="numeric" bind:value={draftValue} placeholder={t('filter.placeholder.value')} aria-label={t('filter.value')} />
         {:else}
-          <input type="text" bind:value={draftValue} placeholder="value" aria-label="Value" />
+          <input type="text" bind:value={draftValue} placeholder={t('filter.placeholder.value')} aria-label={t('filter.value')} />
         {/if}
-        <button type="button" class="d-ok" onclick={commit}>Add</button>
-        <button type="button" class="d-x" aria-label="Cancel" onclick={() => (adding = false)}>
+        <button type="button" class="d-ok" onclick={commit}>{t('filter.add')}</button>
+        <button type="button" class="d-x" aria-label={t('common.cancel')} onclick={() => (adding = false)}>
           <Icon name="x" size={13} />
         </button>
       </span>
     {:else}
-      <button type="button" class="add" onclick={openAdd}>+ Add filter</button>
+      <button type="button" class="add" onclick={openAdd}>{t('filter.addFilter')}</button>
     {/if}
   </div>
 

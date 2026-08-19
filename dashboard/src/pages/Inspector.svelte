@@ -6,6 +6,8 @@
   the sidebar entry's `show` is cosmetic — the endpoint's 403 is the real gate.
 -->
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -22,7 +24,8 @@
   import JsonTree from '../lib/components/JsonTree.svelte';
   import MaskDialog from '../lib/components/inspector/MaskDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import { lockedBy, lockTitle } from '../lib/models/page-access';
+  import { lockedBy } from '../lib/models/page-access';
+  import { lockTip } from '../lib/actions/lock-tip';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { errorMessage } from '../lib/api/client';
   import * as inspectorApi from '../lib/api/inspector';
@@ -120,7 +123,7 @@
     const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
     if (!keys.includes(e.key)) return;
     e.preventDefault();
-    const order = TAB_META.map((t) => t.key);
+    const order = TAB_META.map((tab) => tab.key);
     const at = order.indexOf(tab);
     const next =
       e.key === 'Home'
@@ -313,7 +316,7 @@
 
 <AdminShell requireApp>
   <div class="head">
-    <h1 class="page-title">Privacy inspector</h1>
+    <h1 class="page-title">{t('inspector.title')}</h1>
     {#if effective}
       <span class="muted">
         New events are masked within about {effective.enforcement_latency_secs} seconds of a change.
@@ -329,28 +332,28 @@
     tab is in the tab order, so Tab moves past the whole strip to the panel,
     which is the ARIA authoring-practices behaviour people expect from tabs.
   -->
-  <div class="tabs" role="tablist" aria-label="Privacy inspector sections">
-    {#each TAB_META as t (t.key)}
+  <div class="tabs" role="tablist" aria-label={t('inspector.sections')}>
+    {#each TAB_META as meta (meta.key)}
       <button
         class="tab"
-        class:active={tab === t.key}
+        class:active={tab === meta.key}
         role="tab"
-        id={`tab-${t.key}`}
-        aria-selected={tab === t.key}
+        id={`tab-${meta.key}`}
+        aria-selected={tab === meta.key}
         aria-controls="inspector-panel"
-        tabindex={tab === t.key ? 0 : -1}
-        onclick={() => goTab(t.key)}
+        tabindex={tab === meta.key ? 0 : -1}
+        onclick={() => goTab(meta.key)}
         onkeydown={onTabKeydown}
       >
-        {t.label}
+        {meta.label}
         <!--
           Suppressed until the first load resolves. Rendering `0` while the
           request is still out states a fact we do not have yet, and "Findings
           0" is the same shape as a clean scan — so the strip announced "nothing
           to see" and then silently changed its mind.
         -->
-        {#if !loading && t.count !== null}
-          <span class="count">{t.count}</span>
+        {#if !loading && meta.count !== null}
+          <span class="count">{meta.count}</span>
         {/if}
       </button>
     {/each}
@@ -360,7 +363,7 @@
   {#if error}
     <Card><p class="err">{error}</p></Card>
   {:else if loading}
-    <div class="loading-pane"><Spinner /><span class="muted">Loading privacy data…</span></div>
+    <div class="loading-pane"><Spinner /><span class="muted">{t('inspector.loading')}</span></div>
   {:else if tab === 'findings'}
     <Card>
       <!-- Non-dismissible, always. Detection is best-effort: the prefilter
@@ -373,11 +376,11 @@
     </Card>
     {#if findings.length === 0}
       <EmptyState
-        title="No findings"
-        description="Nothing has been scanned for this app yet, or the last scan came back clean."
+        title={t('inspector.empty.noFindings')}
+        description={t('inspector.empty.noFindingsBody')}
       >
         {#snippet action()}
-          <Button variant="secondary" onclick={() => goTab('scans')}>Go to Scans</Button>
+          <Button variant="secondary" onclick={() => goTab('scans')}>{t('inspector.goToScans')}</Button>
         {/snippet}
       </EmptyState>
     {:else}
@@ -399,7 +402,7 @@
                   sort={gl.sort}
                   onsort={(k, d) => onFindingSort(g.key, k, d)}
                 >
-                  Path
+                  {t('inspector.column.path')}
                 </SortableTh>
                 <SortableTh
                   key="type"
@@ -407,7 +410,7 @@
                   sort={gl.sort}
                   onsort={(k, d) => onFindingSort(g.key, k, d)}
                 >
-                  Type
+                  {t('monitors.column.type')}
                 </SortableTh>
                 <SortableTh
                   key="matches"
@@ -415,14 +418,14 @@
                   sort={gl.sort}
                   onsort={(k, d) => onFindingSort(g.key, k, d)}
                 >
-                  Matches
+                  {t('inspector.column.matches')}
                 </SortableTh>
                 <SortableTh
                   key="last_seen"
                   sort={gl.sort}
                   onsort={(k, d) => onFindingSort(g.key, k, d)}
                 >
-                  Last seen
+                  {t('explore.column.lastSeen')}
                 </SortableTh>
                 <!-- Badges and the Mask button: no value to order by. -->
                 <th></th>
@@ -458,7 +461,7 @@
                           maskTargetFinding = findings.find((x) => x.id === f.id) ?? null;
                         }}
                       >
-                        <Icon name="eye-off" size={14} /> Mask
+                        <Icon name="eye-off" size={14} /> {t('inspector.mask')}
                       </Button>
                     {/if}
                   </td>
@@ -475,13 +478,13 @@
                       colspan="5"
                       style="background: var(--surface-2); white-space: normal; cursor: default;"
                     >
-                      <div class="detail" role="table" aria-label="Finding detail">
+                      <div class="detail" role="table" aria-label={t('inspector.findingDetail')}>
                         <div role="row">
-                          <span role="cell">Redacted preview</span>
+                          <span role="cell">{t('inspector.redactedPreview')}</span>
                           <span role="cell"><code>{f.sample_preview}</code></span>
                         </div>
                         <div role="row">
-                          <span role="cell">Environment</span>
+                          <span role="cell">{t('nav.env')}</span>
                           <span role="cell">{f.environment_id ?? f.env_scope}</span>
                         </div>
                         {#if revealed[f.id] !== undefined}
@@ -498,7 +501,7 @@
                               }
                             }}
                           >
-                            Reveal one value (recorded in the audit trail)
+                            {t('inspector.revealOne')}
                           </Button>
                         {/if}
                       </div>
@@ -528,7 +531,7 @@
     {/if}
   {:else if tab === 'policy'}
     <Card>
-      <h3>Inspection</h3>
+      <h3>{t('inspector.inspection')}</h3>
       {#if !policy}
         <!-- This used to be a bare EmptyState reading "Create one from the
              organization settings" — a dead pointer: there is no org settings
@@ -536,8 +539,8 @@
              dashboard, so no role could create a policy at all. The form is
              here, where the wall is. -->
         <EmptyState
-          title="No policy covers this app"
-          description="Nothing is being inspected for personal data yet. Create a policy to start."
+          title={t('inspector.empty.noPolicy')}
+          description={t('inspector.empty.noPolicyBody')}
         />
         <form
           class="create"
@@ -561,31 +564,30 @@
           }}
         >
           <fieldset class="field">
-            <legend>Scope</legend>
+            <legend>{t('members.column.scope')}</legend>
             <p class="caveat">
-              The most specific policy covering an app wins whole. A narrower one subtracts its
-              scope from the parent, which is how you exclude one noisy environment.
+              {t('prose.inspector.precedence')}
             </p>
             <div class="chips">
-              {#each TARGET_TYPES as t (t.value)}
+              {#each TARGET_TYPES as tt (tt.value)}
                 <Button
                   size="sm"
-                  variant={newTargetType === t.value ? 'primary' : 'ghost'}
+                  variant={newTargetType === tt.value ? 'primary' : 'ghost'}
                   lockedReason={manageLock}
-                  disabled={t.value === 'app_env' && envOptions.length === 0}
-                  title={t.value === 'app_env' && envOptions.length === 0
+                  disabled={tt.value === 'app_env' && envOptions.length === 0}
+                  title={tt.value === 'app_env' && envOptions.length === 0
                     ? 'This app has no active environments'
-                    : t.hint}
-                  onclick={() => (newTargetType = t.value)}
+                    : tt.hint}
+                  onclick={() => (newTargetType = tt.value)}
                 >
-                  {t.label}
+                  {tt.label}
                 </Button>
               {/each}
             </div>
           </fieldset>
 
           <fieldset class="field">
-            <legend>Target</legend>
+            <legend>{t('inspector.target')}</legend>
             {#if newTargetType === 'app_env'}
               <!-- `env.id` is the app_environments ENROLLMENT id, not the
                    catalogue `environment_id` — `validate_scope_in_org` matches
@@ -593,9 +595,8 @@
                    id would 404 with no hint as to why. -->
               <select
                 class="sel"
-                aria-label="Target environment"
-                disabled={manageLock !== null}
-                title={manageLock ? lockTitle(manageLock) : undefined}
+                aria-label={t('inspector.targetEnvironment')}
+                use:lockTip={manageLock}
                 bind:value={newEnvId}
               >
                 {#each envOptions as env (env.id)}
@@ -613,16 +614,16 @@
           </fieldset>
 
           <fieldset class="field">
-            <legend>Tracked keys</legend>
+            <legend>{t('inspector.trackedKeys')}</legend>
             <p class="caveat">
-              Literal key names, matched case-insensitively and exactly at any depth.
-              <code>Email</code> matches <code>email</code>; <code>user_email</code> does not.
+              {t('inspector.literalKeys')}
+              <code>{t('common.email')}</code> matches <code>email</code>; <code>user_email</code> does not.
               Separate with commas or spaces.
             </p>
             <Input
               bind:value={newKeyInput}
               disabled={manageLock !== null}
-              placeholder="email, phone, password, token"
+              placeholder={t('inspector.placeholder.keys')}
             />
             {#if newKeys.length > 0}
               <div class="chips">
@@ -632,10 +633,9 @@
           </fieldset>
 
           <fieldset class="field">
-            <legend>Detectors</legend>
+            <legend>{t('inspector.detectors')}</legend>
             <p class="caveat">
-              Match by value SHAPE rather than key name — they find PII under a key you did not
-              think to track. They read more rows than a key list does, so a scan takes longer.
+              {t('prose.inspector.shapeDetectors')}
             </p>
             <div class="dets">
               {#each DETECTORS as d (d.id)}
@@ -667,19 +667,19 @@
               lockedReason={manageLock}
               disabled={createBlocked !== null}
             >
-              Create policy
+              {t('inspector.createPolicy')}
             </Button>
             <span class="caveat">
-              Scanning is scheduled separately — a new policy runs when you start a scan.
+              {t('inspector.scanSeparate')}
             </span>
           </div>
         </form>
       {:else}
         <p>
-          Scope: <Badge>{policy.target_type}</Badge>
-          Status:
+          {t('prose.inspector.scopeLabel')} <Badge>{policy.target_type}</Badge>
+          {t('prose.inspector.statusLabel')}
           <Badge tone={policy.enabled ? 'success' : 'neutral'}>
-            {policy.enabled ? 'enabled' : 'disabled'}
+            {policy.enabled ? t('prose.inspector.enabled') : t('prose.inspector.disabled')}
           </Badge>
         </p>
         <!-- There is no Toggle primitive, so this is a Button plus a Badge. -->
@@ -690,10 +690,10 @@
           {policy.enabled ? 'Disable' : 'Enable'}
         </Button>
 
-        <h4>Tracked keys</h4>
+        <h4>{t('inspector.trackedKeys')}</h4>
         <p class="caveat">
-          Matched case-insensitively and exactly against a key name at any depth.
-          <code>Email</code> matches <code>email</code>; <code>user_email</code> does not.
+          {t('inspector.keyMatchNote')}
+          <code>{t('common.email')}</code> matches <code>email</code>; <code>user_email</code> does not.
         </p>
         <div class="chips">
           {#each policy.tracked_keys as k (k.key)}
@@ -732,16 +732,15 @@
               });
             }}
           >
-            <Input bind:value={newKey} placeholder="Add a key and press Enter" />
-            <Button type="submit" size="sm" lockedReason={manageLock}>Add</Button>
+            <Input bind:value={newKey} placeholder={t('inspector.placeholder.addKey')} />
+            <Button type="submit" size="sm" lockedReason={manageLock}>{t('filter.add')}</Button>
           </form>
 
-        <h4>Schedule</h4>
+        <h4>{t('inspector.schedule')}</h4>
         <p>{describeSchedule(policy.schedule_days, policy.schedule_time, policy.schedule_tz)}</p>
         {#if DST_RISK_HOURS.includes(Number.parseInt(policy.schedule_time.slice(0, 2), 10))}
           <p class="caveat">
-            On the spring-forward day this resolves to a valid instant; on the fall-back day it runs
-            once, not twice. Times from 04:00 avoid the question entirely.
+            {t('prose.inspector.dst')}
           </p>
         {/if}
         <div class="chips">
@@ -766,9 +765,8 @@
         <!-- No Select primitive; a raw <select> fed by the constants module. -->
         <select
           class="sel"
-          aria-label="Schedule timezone"
-          disabled={manageLock !== null}
-          title={manageLock ? lockTitle(manageLock) : undefined}
+          aria-label={t('inspector.scheduleTimezone')}
+          use:lockTip={manageLock}
           value={policy.schedule_tz}
           onchange={(e: Event) =>
             act(() =>
@@ -794,12 +792,12 @@
     </Card>
 
     <Card>
-      <h3>Forward enforcement</h3>
+      <h3>{t('inspector.forwardEnforcement')}</h3>
       <p class="caveat">
         New events are masked within about {effective?.enforcement_latency_secs} seconds of a change.
       </p>
       {#if (effective?.masked_keys ?? []).length === 0}
-        <EmptyState title="Nothing is masked yet" description="Mask a finding to start enforcing." />
+        <EmptyState title={t('inspector.empty.nothingMasked')} description={t('inspector.empty.maskToEnforce')} />
       {:else}
         <ul>
           {#each effective?.masked_keys ?? [] as k (k.id)}
@@ -814,7 +812,7 @@
   {:else if tab === 'scans'}
     <Card>
       <div class="head">
-        <h3>Scans</h3>
+        <h3>{t('inspector.tab.scans')}</h3>
         {#if policy}
           <Button
             lockedReason={manageLock}
@@ -824,39 +822,39 @@
                 toastStore.success('Scan queued');
               })}
           >
-            Run scan now
+            {t('inspector.runScan')}
           </Button>
         {/if}
       </div>
       {#if scans.length === 0}
-        <EmptyState title="No scans yet" description="Run one below, or set a schedule on the Policy tab.">
+        <EmptyState title={t('inspector.empty.noScans')} description={t('inspector.empty.noScansBody')}>
           {#snippet action()}
-            <Button variant="secondary" onclick={() => goTab('policy')}>Set a schedule</Button>
+            <Button variant="secondary" onclick={() => goTab('policy')}>{t('inspector.setSchedule')}</Button>
           {/snippet}
         </EmptyState>
       {:else}
         <DataTable>
           {#snippet head()}
             <tr>
-              <SortableTh key="started" sort={scanList.sort} onsort={onScanSort}>Started</SortableTh>
+              <SortableTh key="started" sort={scanList.sort} onsort={onScanSort}>{t('explore.column.started')}</SortableTh>
               <SortableTh key="finished" sort={scanList.sort} onsort={onScanSort}>
-                Finished
+                {t('inspector.column.finished')}
               </SortableTh>
               <!-- `desc` (the default), not `asc`: a RANK — see
                    `SCAN_STATUS_ORDER` — so the first click leads with the
                    scans that failed. Coverage, below, is deliberately still
                    text; its alphabetical order already is its meaning. -->
               <SortableTh key="status" sort={scanList.sort} onsort={onScanSort}>
-                Status
+                {t('common.status')}
               </SortableTh>
               <SortableTh key="rows_scanned" class="num" sort={scanList.sort} onsort={onScanSort}>
-                Rows scanned
+                {t('inspector.column.rowsScanned')}
               </SortableTh>
               <SortableTh key="findings" class="num" sort={scanList.sort} onsort={onScanSort}>
-                Findings
+                {t('inspector.tab.findings')}
               </SortableTh>
               <SortableTh key="coverage" sort={scanList.sort} onsort={onScanSort}>
-                Coverage
+                {t('inspector.coverage')}
               </SortableTh>
               <!-- Stop / CSV buttons: no value to order by. -->
               <th></th>
@@ -873,8 +871,8 @@
                   {/if}
                   <Badge>{s.status}</Badge>
                 </td>
-                <td class="num">{s.rows_scanned.toLocaleString()}</td>
-                <td class="num">{s.findings_count.toLocaleString()}</td>
+                <td class="num">{formatNumber(s.rows_scanned)}</td>
+                <td class="num">{formatNumber(s.findings_count)}</td>
                 <td>
                   <span title={s.coverage_note}>
                     <Badge tone={s.coverage === 'full' ? 'success' : 'warning'}>{s.coverage}</Badge>
@@ -887,7 +885,7 @@
                       lockedReason={manageLock}
                       onclick={() => act(() => inspectorApi.cancelScan(s.id))}
                     >
-                      Stop
+                      {t('inspector.stop')}
                     </Button>
                   {/if}
                   <Button
@@ -929,38 +927,38 @@
     </Card>
   {:else}
     <Card>
-      <h3>Mask audit trail</h3>
+      <h3>{t('inspector.maskAuditTrail')}</h3>
       <p class="caveat">
-        Readable by anyone with <code>pii:read</code> — deliberately, and affordable precisely
+        {t('inspector.readableBy')} <code>pii:read</code> — deliberately, and affordable precisely
         because these rows store paths and counts and never a value.
       </p>
       {#if actions.length === 0}
-        <EmptyState title="Nothing masked yet" description="Mask a finding to start the trail." />
+        <EmptyState title={t('inspector.empty.nothingMaskedTrail')} description={t('inspector.empty.maskToTrail')} />
       {:else}
         <DataTable>
           {#snippet head()}
             <tr>
-              <SortableTh key="when" sort={maskList.sort} onsort={onMaskSort}>When</SortableTh>
+              <SortableTh key="when" sort={maskList.sort} onsort={onMaskSort}>{t('ui.opModal.when')}</SortableTh>
               <SortableTh key="who" columnDefault="asc" sort={maskList.sort} onsort={onMaskSort}>
-                Who
+                {t('audit.column.who')}
               </SortableTh>
               <SortableTh key="targets" class="num" columnDefault="asc" sort={maskList.sort} onsort={onMaskSort}>
-                Targets
+                {t('inspector.targets')}
               </SortableTh>
               <!-- `desc` (the default), not `asc`: a RANK — see
                    `MASK_STATUS_ORDER` — so the first click leads with the mask
                    actions that failed part-way. -->
               <SortableTh key="status" sort={maskList.sort} onsort={onMaskSort}>
-                Status
+                {t('common.status')}
               </SortableTh>
               <SortableTh key="rows_masked" class="num" sort={maskList.sort} onsort={onMaskSort}>
-                Rows masked
+                {t('inspector.column.rowsMasked')}
               </SortableTh>
               <SortableTh key="cold_skipped" class="num" sort={maskList.sort} onsort={onMaskSort}>
-                Cold skipped
+                {t('inspector.column.coldSkipped')}
               </SortableTh>
               <SortableTh key="cancelled_by" columnDefault="asc" sort={maskList.sort} onsort={onMaskSort}>
-                Cancelled by
+                {t('inspector.cancelledBy')}
               </SortableTh>
             </tr>
           {/snippet}
@@ -977,8 +975,8 @@
                 <!-- rows_masked > estimated_rows is NORMAL on an actively
                      ingesting app, because preview and execution are separated
                      in time. Never render it as an error. -->
-                <td class="num">{a.rows_masked.toLocaleString()}</td>
-                <td class="num">{a.cold_rows_skipped.toLocaleString()}</td>
+                <td class="num">{formatNumber(a.rows_masked)}</td>
+                <td class="num">{formatNumber(a.cold_rows_skipped)}</td>
                 <td>{a.cancelled_by_email || '—'}</td>
               </tr>
               {#if expanded[a.id]}
@@ -987,29 +985,29 @@
                     colspan="7"
                     style="background: var(--surface-2); white-space: normal; cursor: default;"
                   >
-                    <div class="detail" role="table" aria-label="Mask action detail">
-                      {#each a.targets as t, i (i)}
+                    <div class="detail" role="table" aria-label={t('inspector.maskActionDetail')}>
+                      {#each a.targets as tgt, i (i)}
                         <div role="row">
-                          <span role="cell">Target</span>
+                          <span role="cell">{t('inspector.target')}</span>
                           <span role="cell">
-                            <code>{t.table}.{t.column}{t.path ? `.${t.path}` : ''}</code>
+                            <code>{tgt.table}.{tgt.column}{tgt.path ? `.${tgt.path}` : ''}</code>
                           </span>
                         </div>
                       {/each}
                       {#if a.error}
                         <div role="row">
-                          <span role="cell">Error</span><span role="cell">{a.error}</span>
+                          <span role="cell">{t('issues.stat.error')}</span><span role="cell">{a.error}</span>
                         </div>
                       {/if}
                       {#if a.vacuum_advised}
                         <div role="row">
-                          <span role="cell">Maintenance</span>
+                          <span role="cell">{t('inspector.maintenance')}</span>
                           <span role="cell">
-                            This pass rewrote enough rows that a VACUUM is worth scheduling.
+                            {t('inspector.vacuumHint')}
                           </span>
                         </div>
                       {/if}
-                      <h4>What this did not reach</h4>
+                      <h4>{t('inspector.notReached')}</h4>
                       {#each UNREACHABLE_COPY as r, i (i)}
                         <div role="row">
                           <span role="cell">{r.headline ? '' : r.what}</span>
@@ -1051,7 +1049,7 @@
             );
           }}
         >
-          Export CSV
+          {t('explore.exportCsv')}
         </Button>
       {/if}
     </Card>
@@ -1133,7 +1131,7 @@
   }
   .count {
     display: inline-block;
-    margin-left: 6px;
+    margin-inline-start: 6px;
     padding: 1px 6px;
     border-radius: 999px;
     background: var(--surface-2);

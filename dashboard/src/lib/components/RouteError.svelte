@@ -39,6 +39,7 @@
   removed. Worth knowing before adding anything else here.
 -->
 <script lang="ts">
+  import { t } from '../i18n';
   import Button from './ui/Button.svelte';
   import Icon from './ui/Icon.svelte';
 
@@ -59,16 +60,15 @@
 
 <div class="route-error" role="alert">
   <Icon name="triangle-alert" size={26} />
-  <h1>This page didn’t load</h1>
+  <h1>{t('ui.route.errorTitle')}</h1>
   <p class="lede">
-    Sauron loads each page on demand and this one’s code could not be downloaded. If Sauron was
-    updated while this tab was open, reloading picks up the new version.
+    {t('prose.route.error')}
   </p>
   <p class="detail"><code>{message}</code></p>
   <div class="actions">
     <Button variant="primary" onclick={reload}>
       <Icon name="refresh" size={14} />
-      Reload Sauron
+      {t('ui.route.reload')}
     </Button>
   </div>
 </div>

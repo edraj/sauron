@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Modal from './Modal.svelte';
   import Button from './Button.svelte';
 
@@ -18,20 +19,26 @@
     open = $bindable(false),
     title,
     message,
-    confirmLabel = 'Confirm',
-    cancelLabel = 'Cancel',
+    confirmLabel,
+    cancelLabel,
     danger = false,
     loading = false,
     onconfirm,
     oncancel,
   }: Props = $props();
+
+  // Defaulted through `$derived` rather than in the destructuring pattern,
+  // so switching language re-renders the buttons instead of leaving whichever
+  // locale was active when the dialog first mounted.
+  const confirmText = $derived(confirmLabel ?? t('common.confirm'));
+  const cancelText = $derived(cancelLabel ?? t('common.cancel'));
 </script>
 
 <Modal bind:open size="sm" {title} onclose={oncancel}>
   <p class="msg">{message}</p>
   {#snippet footer()}
-    <Button variant="secondary" onclick={oncancel} disabled={loading}>{cancelLabel}</Button>
-    <Button variant={danger ? 'danger' : 'primary'} onclick={onconfirm} {loading}>{confirmLabel}</Button>
+    <Button variant="secondary" onclick={oncancel} disabled={loading}>{cancelText}</Button>
+    <Button variant={danger ? 'danger' : 'primary'} onclick={onconfirm} {loading}>{confirmText}</Button>
   {/snippet}
 </Modal>
 

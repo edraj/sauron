@@ -233,6 +233,11 @@ Both are **opt-in** and OFF by default:
 init({ dsn, autoCaptureUnhandled: true, autoShutdown: true });
 ```
 
+> **Leaving this off also blanks the dashboard's crash-free tile.** Crash-free
+> counts only errors whose handled state is known, so an app that never reports
+> an uncaught exception shows "no crash data" rather than a misleading 100%. See
+> **[what crash-free means](Dashboard.md#what-crash-free-sessions-means)**.
+
 - `autoCaptureUnhandled` registers `uncaughtException` / `unhandledRejection` handlers
   that capture with `mechanism.handled = false`, flush, and **preserve** Node's default
   crash/exit behavior (it never swallows the process).

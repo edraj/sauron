@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t, formatNumber } from '../lib/i18n';
   import { push, querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -67,17 +68,29 @@
    * Surfaced as "Last activity": `sessions` has no `ended_at` column at all,
    * and duration is derived, so "Ended" would name something that does not
    * exist.
+   *
+   * Identity and label are separate. `TIME_FIELD_KEYS` is the wire identity and
+   * stays a plain const, because `fromParams` below reads it once at init to
+   * validate the URL's field parameter — a `$derived` read there would be a
+   * stale capture, and the labels are irrelevant to that check. `TIME_FIELDS`
+   * adds the translated labels and IS derived, so the picker follows a
+   * language switch.
    */
-  const TIME_FIELDS: TimeField[] = [
-    { key: 'last_event_at', label: 'Last activity' },
-    { key: 'started_at', label: 'Started' },
-  ];
+  const TIME_FIELD_KEYS = ['last_event_at', 'started_at'] as const;
+  const TIME_FIELD_LABEL_KEYS = {
+    last_event_at: 'sessions.timeField.lastActivity',
+    started_at: 'sessions.column.started',
+  } as const;
+  const STATIC_TIME_FIELDS: TimeField[] = TIME_FIELD_KEYS.map((key) => ({ key, label: key }));
+  const TIME_FIELDS: TimeField[] = $derived(
+    TIME_FIELD_KEYS.map((key) => ({ key, label: t(TIME_FIELD_LABEL_KEYS[key]) })),
+  );
   const DEFAULT_TIME_FIELD = 'last_event_at';
   const DEFAULT_DAYS = 30;
 
   const initialQs = new URLSearchParams($querystring ?? '');
   let timeFilter = $state<TimeFilterState>(
-    fromParams(initialQs, TIME_FIELDS, DEFAULT_TIME_FIELD, DEFAULT_DAYS),
+    fromParams(initialQs, STATIC_TIME_FIELDS, DEFAULT_TIME_FIELD, DEFAULT_DAYS),
   );
 
   // Drives the stat tiles and the engagement chart ONLY. Kept separate from
@@ -338,29 +351,29 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Sessions</h1>
-      <p class="muted sub">User sessions — activity, duration and errors over time.</p>
+      <h1 class="page-title">{t('explore.column.sessions')}</h1>
+      <p class="muted sub">{t('sessions.subtitle')}</p>
     </div>
   </div>
 
   <div class="analytics-head">
-    <h2 class="section-title">Session engagement</h2>
+    <h2 class="section-title">{t('sessions.card.engagement')}</h2>
     <DateRange value={sinceDays} onchange={onRange} />
   </div>
 
   {#if analytics}
     <StatTiles min={160}>
-      <StatTile label="Sessions" value={compactNumber(analytics.stats.sessions)} tone="primary" sub={`last ${sinceDays}d`} />
-      <StatTile label="Crashed" value={compactNumber(analytics.stats.crashed)} tone={analytics.stats.crashed > 0 ? 'warning' : 'neutral'} />
-      <StatTile label="Avg session" value={formatDuration(analytics.stats.avg_session_ms)} />
-      <StatTile label="Median session" value={formatDuration(analytics.stats.median_session_ms)} />
+      <StatTile label={t('explore.column.sessions')} value={compactNumber(analytics.stats.sessions)} tone="primary" sub={`last ${sinceDays}d`} />
+      <StatTile label={t('sessions.stat.crashed')} value={compactNumber(analytics.stats.crashed)} tone={analytics.stats.crashed > 0 ? 'warning' : 'neutral'} />
+      <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
+      <StatTile label={t('sessions.stat.median')} value={formatDuration(analytics.stats.median_session_ms)} />
     </StatTiles>
 
     <div class="session-charts">
-      <Card title="Average session duration per day">
+      <Card title={t('sessions.card.avgPerDay')}>
         <TimeSeriesChart data={durationSeries} format={formatDuration} showTotal={false} />
       </Card>
-      <Card title="Session length distribution">
+      <Card title={t('sessions.card.distribution')}>
         <DurationHistogram data={analytics.duration_histogram} />
       </Card>
     </div>
@@ -404,10 +417,10 @@
           variant="secondary"
           disabled={sessions.length === 0}
           onclick={downloadSessionsCsv}
-          title="Download visible sessions as CSV"
+          title={t('sessions.exportTitle')}
         >
           <Icon name="download" size={15} />
-          Export CSV
+          {t('explore.exportCsv')}
         </Button>
       {/snippet}
     </FilterBar>
@@ -421,7 +434,7 @@
     {#if loading}
       <div class="center"><Spinner size={24} /></div>
     {:else if error}
-      <EmptyState title="Couldn't load sessions" description={error} icon="triangle-alert">
+      <EmptyState title={t('sessions.error.load')} description={error} icon="triangle-alert">
         {#snippet action()}
           <Button
             variant="secondary"
@@ -437,13 +450,13 @@
                 true,
               )}
           >
-            Retry
+            {t('common.retry')}
           </Button>
         {/snippet}
       </EmptyState>
     {:else if sessions.length === 0}
       <EmptyState
-        title="No matches"
+        title={t('sessions.empty.noMatches')}
         description={appliedSearch ? `No sessions match “${appliedSearch}”.` : "No sessions recorded in this range. Widen the date range or send activity from your SDK."}
         icon="inbox"
       />
@@ -455,22 +468,22 @@
                  session-id column, and an unlisted `sort=` is a 400 rather
                  than a silently ignored parameter. An unsorted column is
                  honest; a header that 400s the page is not. -->
-            <th>Session</th>
+            <th>{t('sessions.column.session')}</th>
             <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>
-              User
+              {t('sessions.column.user')}
             </SortableTh>
             <SortableTh key="device_key" columnDefault="asc" sort={list.sort} {onsort}>
-              Device
+              {t('sessions.column.device')}
             </SortableTh>
-            <SortableTh key="started_at" sort={list.sort} {onsort}>Started</SortableTh>
+            <SortableTh key="started_at" sort={list.sort} {onsort}>{t('explore.column.started')}</SortableTh>
             <!-- No stored duration: the server orders by `last_event_at -
                  started_at`, the same interval this column renders. -->
-            <SortableTh key="duration_ms" sort={list.sort} {onsort}>Duration</SortableTh>
+            <SortableTh key="duration_ms" sort={list.sort} {onsort}>{t('explore.column.duration')}</SortableTh>
             <SortableTh key="events_count" class="num" sort={list.sort} {onsort}>
-              Events
+              {t('explore.column.events')}
             </SortableTh>
             <SortableTh key="errors_count" class="num" sort={list.sort} {onsort}>
-              Errors
+              {t('explore.column.errors')}
             </SortableTh>
           </tr>
         {/snippet}
@@ -508,9 +521,9 @@
               </td>
               <td><TimeValue value={s.started_at} /></td>
               <td class="muted">{formatDuration(durationBetween(s.started_at, s.last_event_at))}</td>
-              <td class="num">{s.events_count.toLocaleString()}</td>
+              <td class="num">{formatNumber(s.events_count)}</td>
               <td class="num">
-                <span class:err={s.errors_count > 0}>{s.errors_count.toLocaleString()}</span>
+                <span class:err={s.errors_count > 0}>{formatNumber(s.errors_count)}</span>
               </td>
             </tr>
           {/each}

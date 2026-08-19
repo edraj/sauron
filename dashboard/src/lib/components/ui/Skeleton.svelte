@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   /**
    * A placeholder occupying roughly the space its content will.
    *
@@ -19,7 +20,9 @@
     /** Accessible description of what is loading. */
     label?: string;
   }
-  let { rows = 3, height = '14px', label = 'Loading' }: Props = $props();
+  let { rows = 3, height = '14px', label }: Props = $props();
+
+  const labelText = $derived(label ?? t('common.loading'));
 </script>
 
 <!--
@@ -27,7 +30,7 @@
   reader needs to know the region is filling in, not to track a percentage we do
   not have.
 -->
-<div class="sk" aria-busy="true" aria-live="polite" aria-label={label}>
+<div class="sk" aria-busy="true" aria-live="polite" aria-label={labelText}>
   {#each Array(rows) as _, i (i)}
     <div
       class="sk-row"

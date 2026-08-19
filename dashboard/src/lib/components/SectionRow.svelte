@@ -71,7 +71,7 @@
     padding: 0;
     color: var(--text);
     font-size: 12.5px;
-    text-align: left;
+    text-align: start;
     cursor: pointer;
   }
   .summary:hover {

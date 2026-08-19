@@ -302,7 +302,21 @@ fn env_token(env: &EnvFilter) -> String {
     }
 }
 
-/// `overview:v1:{section}:{app}:{env}:{days}`
+/// `overview:v2:{section}:{app}:{env}:{days}`
+///
+/// # Bump the version whenever a section's PAYLOAD or its MEANING changes
+///
+/// Entries live in Redis for 24 h, so a deploy that changes what a number means
+/// keeps serving the old meaning under the old key until every entry ages out —
+/// per app, per environment, per window, at different times. Nothing errors and
+/// nothing logs; the dashboard just shows the previous answer and then quietly
+/// starts showing the new one.
+///
+/// `v1` → `v2`: `crash_free_sessions` changed from "sessions with any error"
+/// to "sessions with an UNCAUGHT error", and became nullable for apps whose SDK
+/// never reports handledness (migration 0069). A `v1` entry carries the old
+/// formula's number in a field the new client still accepts, so without this
+/// bump the fix would appear not to work for a day.
 ///
 /// # The `since_days` trap
 ///
@@ -316,7 +330,7 @@ fn env_token(env: &EnvFilter) -> String {
 /// both directions, so the guard is a test, not a comment.
 pub fn cache_key(section: Section, app_id: Uuid, env: &EnvFilter, since_days: i64) -> String {
     format!(
-        "overview:v1:{}:{}:{}:{}",
+        "overview:v2:{}:{}:{}:{}",
         section.wire_name(),
         app_id,
         env_token(env),
@@ -601,11 +615,7 @@ async fn compute(
                     0.0
                 }
             };
-            let crash_free_sessions = if totals.sessions > 0 {
-                1.0 - (totals.crashed_sessions as f64 / totals.sessions as f64)
-            } else {
-                1.0
-            };
+            let crash_free_sessions = crate::routes::analytics::crash_free_rate(&totals);
             // Serialized through the section's own struct, not a `json!`
             // literal. The struct stays the single definition of the wire
             // shape, so a field renamed there cannot silently keep working

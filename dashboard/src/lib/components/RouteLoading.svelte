@@ -13,6 +13,7 @@
   LazyRoute/RouteError; this is the part that makes a slow load legible.)
 -->
 <script lang="ts">
+  import { t } from '../i18n';
   import Spinner from './ui/Spinner.svelte';
 </script>
 
@@ -21,7 +22,7 @@
        two nested live regions announce the same event twice. The text below is
        the one that should be read. -->
   <span aria-hidden="true"><Spinner size={22} /></span>
-  <p class="label">Loading page…</p>
+  <p class="label">{t('ui.route.loading')}</p>
 </div>
 
 <style>

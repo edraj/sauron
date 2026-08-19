@@ -1,11 +1,13 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { getMonitor, getMonitorChecks, updateMonitor, deleteMonitor } from '../lib/api/monitors';
   import { viewCache } from '../lib/stores/view-cache';
-  import { MONITOR_INTERVALS } from '../lib/constants/monitorIntervals';
+  import { MONITOR_INTERVALS, formatInterval } from '../lib/constants/monitorIntervals';
   import type { MonitorDetail, MonitorCheck } from '../lib/models';
-  import { lockedBy, lockTitle } from '../lib/models/page-access';
+  import { lockedBy } from '../lib/models/page-access';
+  import { lockTip } from '../lib/actions/lock-tip';
   import StatusPill from '../lib/components/ui/StatusPill.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -39,6 +41,17 @@
   let deleting = $state(false);
   let pausing = $state(false);
   let savingInterval = $state(false);
+  let intervalConfirmOpen = $state(false);
+  // What the user picked but has not confirmed yet. Kept apart from
+  // `selectedInterval` (what the control displays) so a cancel can put the
+  // control back without a request ever having gone out.
+  let pendingInterval = $state<number | null>(null);
+  // Drives the select. It has to be state rather than the monitor's stored
+  // value read straight off `detail`: picking an option mutates the element
+  // directly, and on cancel `detail.monitor.interval_seconds` is unchanged --
+  // so an expression bound to it re-renders nothing and the control is left
+  // displaying an interval the monitor is not running at.
+  let selectedInterval = $state(60);
 
   // monitors.rs:191,223 authorize at the project.
   const writeLock = $derived(
@@ -63,6 +76,13 @@
         ? ` This will also delete ${n} alert ${n === 1 ? 'rule' : 'rules'} pinned to it.`
         : '';
     return `Delete “${detail.monitor.name}”? Its check history and incidents will be removed.${alertClause} This can't be undone.`;
+  });
+
+  const intervalChangeMessage = $derived.by(() => {
+    if (!detail || pendingInterval === null) return '';
+    const from = formatInterval(detail.monitor.interval_seconds);
+    const to = formatInterval(pendingInterval);
+    return `Change the check interval for “${detail.monitor.name}” from ${from} to ${to}? The prober applies the new interval on its next cycle.`;
   });
 
   // Sort by timestamp ourselves rather than trusting the API's order: the newest-
@@ -128,6 +148,11 @@
         getMonitor(params.id),
         getMonitorChecks(params.id, 24),
       ]);
+      // Reseeded here, not at mount: the router reuses this component across
+      // `#/monitors/A` -> `#/monitors/B`, so a mount-time seed would leave the
+      // control showing the interval of the monitor we navigated away from.
+      selectedInterval = detail.monitor.interval_seconds;
+      pendingInterval = null;
     } catch (e) { error = (e as Error).message; }
     finally { loading = false; }
   }
@@ -147,16 +172,38 @@
     finally { pausing = false; }
   }
 
-  async function changeInterval(e: Event) {
+  // Picking an option no longer saves -- it only asks. Changing the interval
+  // re-times every future check, so it goes through the same confirm step the
+  // other two state-changing controls on this page use.
+  function requestIntervalChange(e: Event) {
     const seconds = Number((e.currentTarget as HTMLSelectElement).value);
     if (!detail || seconds === detail.monitor.interval_seconds) return;
+    pendingInterval = seconds;
+    intervalConfirmOpen = true;
+  }
+
+  // Also the Escape/backdrop path: ConfirmDialog forwards Modal's `onclose`
+  // here, so every way out of the dialog reverts the control.
+  function cancelIntervalChange() {
+    intervalConfirmOpen = false;
+    pendingInterval = null;
+    if (detail) selectedInterval = detail.monitor.interval_seconds;
+  }
+
+  async function confirmIntervalChange() {
+    if (!detail || pendingInterval === null) return;
+    const seconds = pendingInterval;
     savingInterval = true; error = null;
     try {
       await updateMonitor(params.id, { interval_seconds: seconds });
       viewCache.invalidate('monitors.list');
+      intervalConfirmOpen = false;
+      // Clears `pendingInterval` and reseeds the control from the saved value.
       await load();
     } catch (err) {
       error = (err as Error).message;
+      // The change did not take, so the control must not keep showing it.
+      cancelIntervalChange();
     } finally {
       savingInterval = false;
     }
@@ -194,15 +241,15 @@
 <AppShell>
   <button class="back" onclick={() => push('/monitors')}>
     <Icon name="arrow-left" size={14} />
-    Uptime
+    {t('monitors.column.uptime')}
   </button>
 
   {#if loading}
     <div class="center"><Spinner size={26} /></div>
   {:else if error && !detail}
-    <EmptyState title="Monitor not found" description={error} icon="triangle-alert">
+    <EmptyState title={t('monitor.notFound')} description={error} icon="triangle-alert">
       {#snippet action()}
-        <Button variant="secondary" onclick={() => push('/monitors')}>Back to Uptime</Button>
+        <Button variant="secondary" onclick={() => push('/monitors')}>{t('monitor.backToList')}</Button>
       {/snippet}
     </EmptyState>
   {:else if detail}
@@ -220,7 +267,7 @@
             that state-change notification and probe auth are actually wired up.
           -->
           {#if detail.monitor.has_webhook}
-            <span class="kindtag" title="A webhook is notified when this monitor changes state">
+            <span class="kindtag" title={t('monitor.webhookNote')}>
               webhook
             </span>
           {/if}
@@ -236,7 +283,7 @@
             {detail.monitor.status === 'paused' ? 'Resume' : 'Pause'}
           </Button>
           <Button variant="danger" lockedReason={writeLock} onclick={() => (confirmOpen = true)}>
-            Delete
+            {t('common.delete')}
           </Button>
         </div>
     </header>
@@ -249,18 +296,18 @@
     {/if}
 
     <StatTiles min={150}>
-      <StatTile label="Uptime 24h" value={fmtPct(detail.uptime.h24)} tone={pctTone(detail.uptime.h24)} />
-      <StatTile label="Uptime 7d" value={fmtPct(detail.uptime.d7)} tone={pctTone(detail.uptime.d7)} />
-      <StatTile label="Uptime 30d" value={fmtPct(detail.uptime.d30)} tone={pctTone(detail.uptime.d30)} />
+      <StatTile label={t('monitors.column.uptime24h')} value={fmtPct(detail.uptime.h24)} tone={pctTone(detail.uptime.h24)} />
+      <StatTile label={t('monitor.stat.uptime7d')} value={fmtPct(detail.uptime.d7)} tone={pctTone(detail.uptime.d7)} />
+      <StatTile label={t('monitor.stat.uptime30d')} value={fmtPct(detail.uptime.d30)} tone={pctTone(detail.uptime.d30)} />
         <div class="interval-tile">
-          <span class="it-label">Interval</span>
+          <span class="it-label">{t('monitors.column.interval')}</span>
           <div class="control select" class:busy={savingInterval}>
             <select
-              aria-label="Check interval"
-              value={detail.monitor.interval_seconds}
-              disabled={savingInterval || writeLock !== null}
-              title={writeLock ? lockTitle(writeLock) : undefined}
-              onchange={changeInterval}
+              aria-label={t('monitor.checkInterval')}
+              bind:value={selectedInterval}
+              disabled={savingInterval}
+              use:lockTip={writeLock}
+              onchange={requestIntervalChange}
             >
               {#each MONITOR_INTERVALS as opt (opt.seconds)}
                 <option value={opt.seconds}>{opt.label}</option>
@@ -278,11 +325,11 @@
     </StatTiles>
 
     <div class="section">
-      <Card title="Recent checks" padding="none">
+      <Card title={t('monitor.card.recentChecks')} padding="none">
         {#if checks.length === 0}
           <EmptyState
-            title="No checks yet"
-            description="This monitor hasn't run a check yet. Results appear here once the prober reports in."
+            title={t('monitor.empty.checks')}
+            description={t('monitor.empty.checksBody')}
             icon="clock"
           />
         {:else}
@@ -297,29 +344,29 @@
               {/each}
             </div>
             <div class="bar-legend">
-              <span>Oldest</span>
+              <span>{t('monitor.sort.oldest')}</span>
               <span>{barChecks.length} checks</span>
-              <span>Newest</span>
+              <span>{t('monitor.sort.newest')}</span>
             </div>
           </div>
 
           <DataTable>
             {#snippet head()}
               <tr>
-                <SortableTh key="time" sort={checkSort} onsort={onCheckSort}>Time</SortableTh>
+                <SortableTh key="time" sort={checkSort} onsort={onCheckSort}>{t('events.column.time')}</SortableTh>
                 <SortableTh key="result" columnDefault="asc" sort={checkSort} onsort={onCheckSort}>
-                  Result
+                  {t('monitor.column.result')}
                 </SortableTh>
                 <SortableTh key="code" class="num" sort={checkSort} onsort={onCheckSort}>
-                  Code
+                  {t('monitor.column.code')}
                 </SortableTh>
                 <SortableTh key="latency" class="num" sort={checkSort} onsort={onCheckSort}>
-                  Latency
+                  {t('monitors.column.latency')}
                 </SortableTh>
                 <!-- Free text, often a whole stack of it, and blank on every
                      healthy check. Ordering it would sort the log by whichever
                      failure message happens to start with the earliest letter. -->
-                <th>Error</th>
+                <th>{t('issues.stat.error')}</th>
               </tr>
             {/snippet}
             {#snippet children()}
@@ -349,11 +396,11 @@
     </div>
 
     <div class="section">
-      <Card title="Incidents" padding="none">
+      <Card title={t('monitor.card.incidents')} padding="none">
         {#if sortedIncidents.length === 0}
           <EmptyState
-            title="No incidents"
-            description="No downtime has been recorded for this monitor."
+            title={t('monitor.empty.incidents')}
+            description={t('monitor.empty.incidentsBody')}
             icon="circle-check"
           />
         {:else}
@@ -361,16 +408,16 @@
             {#snippet head()}
               <tr>
                 <SortableTh key="started" sort={incidentSort} onsort={onIncidentSort}>
-                  Started
+                  {t('explore.column.started')}
                 </SortableTh>
                 <SortableTh key="resolved" sort={incidentSort} onsort={onIncidentSort}>
-                  Resolved
+                  {t('monitor.state.resolved')}
                 </SortableTh>
                 <SortableTh key="duration" class="num" sort={incidentSort} onsort={onIncidentSort}>
-                  Duration
+                  {t('explore.column.duration')}
                 </SortableTh>
                 <SortableTh key="cause" columnDefault="asc" sort={incidentSort} onsort={onIncidentSort}>
-                  Cause
+                  {t('monitor.column.cause')}
                 </SortableTh>
               </tr>
             {/snippet}
@@ -379,7 +426,7 @@
                 <tr>
                   <td>{formatDateTime(i.started_at)}</td>
                   <td>
-                    {#if i.resolved_at}{formatDateTime(i.resolved_at)}{:else}<span class="ongoing">Ongoing</span>{/if}
+                    {#if i.resolved_at}{formatDateTime(i.resolved_at)}{:else}<span class="ongoing">{t('monitor.state.ongoing')}</span>{/if}
                   </td>
                   <td class="num">
                     {#if i.resolved_at}{formatDuration(durationBetween(i.started_at, i.resolved_at))}{:else}<span class="faint">—</span>{/if}
@@ -400,13 +447,23 @@
 
 <ConfirmDialog
   bind:open={confirmOpen}
-  title="Delete monitor"
+  title={t('monitor.delete')}
   message={deleteMessage}
-  confirmLabel="Delete monitor"
+  confirmLabel={t('monitor.delete')}
   danger
   loading={deleting}
   onconfirm={remove}
   oncancel={() => (confirmOpen = false)}
+/>
+
+<ConfirmDialog
+  bind:open={intervalConfirmOpen}
+  title={t('monitor.changeInterval')}
+  message={intervalChangeMessage}
+  confirmLabel={t('monitor.changeIntervalConfirm')}
+  loading={savingInterval}
+  onconfirm={confirmIntervalChange}
+  oncancel={cancelIntervalChange}
 />
 
 <style>
@@ -463,7 +520,7 @@
   }
   .interval-tile .affix {
     position: absolute;
-    right: 11px;
+    inset-inline-end: 11px;
     display: inline-flex;
     align-items: center;
     color: var(--text-faint);
@@ -617,7 +674,7 @@
   }
   .cause {
     font-weight: 550;
-    margin-right: 8px;
+    margin-inline-end: 8px;
   }
   .ongoing {
     display: inline-flex;

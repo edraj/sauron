@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { afterAll, beforeAll, describe, it, expect } from 'vitest';
+import { localeStore } from '../i18n/locale.svelte';
 import { panelScopeNote, type PanelScope } from './panel-scope';
 
 /** Nothing ignored — the shape a caller starts from. */
@@ -13,29 +14,29 @@ describe('panelScopeNote', () => {
   // fetched with the same query as the list below it has nothing to disclose,
   // and a permanent notice would train the reader to stop seeing it.
   it('says nothing when the panel and the list carry the same query', () => {
-    expect(panelScopeNote(AGREES, 'these totals')).toBeNull();
+    expect(panelScopeNote(AGREES, 'totals')).toBeNull();
   });
 
   it('names a single ignored chip in the singular', () => {
-    expect(panelScopeNote({ ...AGREES, ignoredFilters: 1 }, 'these totals')).toBe(
+    expect(panelScopeNote({ ...AGREES, ignoredFilters: 1 }, 'totals')).toBe(
       "The filter doesn't apply to these totals.",
     );
   });
 
   it('names several ignored chips in the plural', () => {
-    expect(panelScopeNote({ ...AGREES, ignoredFilters: 3 }, 'this chart')).toBe(
+    expect(panelScopeNote({ ...AGREES, ignoredFilters: 3 }, 'chart')).toBe(
       "The filters don't apply to this chart.",
     );
   });
 
   it('names the search box on its own', () => {
-    expect(panelScopeNote({ ...AGREES, ignoresSearch: true }, 'this list')).toBe(
+    expect(panelScopeNote({ ...AGREES, ignoresSearch: true }, 'list')).toBe(
       "The search doesn't apply to this list.",
     );
   });
 
   it('names the date range on its own', () => {
-    expect(panelScopeNote({ ...AGREES, ignoresDateRange: true }, 'these totals')).toBe(
+    expect(panelScopeNote({ ...AGREES, ignoresDateRange: true }, 'totals')).toBe(
       "The date range doesn't apply to these totals.",
     );
   });
@@ -47,7 +48,7 @@ describe('panelScopeNote', () => {
     expect(
       panelScopeNote(
         { ignoredFilters: 2, ignoresSearch: true, ignoresDateRange: true },
-        'these totals',
+        'totals',
       ),
     ).toBe("The filters, search and date range don't apply to these totals.");
   });
@@ -56,7 +57,7 @@ describe('panelScopeNote', () => {
     expect(
       panelScopeNote(
         { ignoredFilters: 2, ignoresSearch: false, ignoresDateRange: true },
-        'these totals',
+        'totals',
       ),
     ).toBe("The filters and date range don't apply to these totals.");
   });
@@ -68,7 +69,7 @@ describe('panelScopeNote', () => {
     expect(
       panelScopeNote(
         { ignoredFilters: 1, ignoresSearch: true, ignoresDateRange: false },
-        'this chart',
+        'chart',
       ),
     ).toBe("The filter and search don't apply to this chart.");
   });
@@ -80,7 +81,7 @@ describe('panelScopeNote', () => {
       expect(
         panelScopeNote(
           { ...AGREES, ignoredFilters: 1, appliedFilterLabel: 'Event' },
-          'this chart',
+          'chart',
         ),
       ).toBe('Only the Event filter applies to this chart.');
     });
@@ -89,7 +90,7 @@ describe('panelScopeNote', () => {
       expect(
         panelScopeNote(
           { ...AGREES, ignoresSearch: true, appliedFilterLabel: 'Event' },
-          'this chart',
+          'chart',
         ),
       ).toBe('Only the Event filter applies to this chart.');
     });
@@ -107,7 +108,7 @@ describe('panelScopeNote', () => {
             ignoresDateRange: true,
             appliedFilterLabel: 'Event',
           },
-          'this chart',
+          'chart',
         ),
       ).toBe("Only the Event filter applies to this chart — the date range doesn't.");
     });
@@ -119,13 +120,13 @@ describe('panelScopeNote', () => {
       expect(
         panelScopeNote(
           { ...AGREES, ignoresDateRange: true, appliedFilterLabel: 'Event' },
-          'this chart',
+          'chart',
         ),
       ).toBe("The date range doesn't apply to this chart.");
     });
 
     it('says nothing when the applied filter is the only one there is', () => {
-      expect(panelScopeNote({ ...AGREES, appliedFilterLabel: 'Event' }, 'this chart')).toBeNull();
+      expect(panelScopeNote({ ...AGREES, appliedFilterLabel: 'Event' }, 'chart')).toBeNull();
     });
 
     // `null` is what a page hands over when no `name:eq` chip is up, straight
@@ -135,7 +136,7 @@ describe('panelScopeNote', () => {
       expect(
         panelScopeNote(
           { ...AGREES, ignoredFilters: 1, appliedFilterLabel: null },
-          'this chart',
+          'chart',
         ),
       ).toBe("The filter doesn't apply to this chart.");
     });
@@ -143,9 +144,56 @@ describe('panelScopeNote', () => {
 
   it('ends on whichever subject the caller passes', () => {
     const scope = { ...AGREES, ignoredFilters: 2 };
-    expect(panelScopeNote(scope, 'these totals')).toBe(
+    expect(panelScopeNote(scope, 'totals')).toBe(
       "The filters don't apply to these totals.",
     );
-    expect(panelScopeNote(scope, 'this list')).toBe("The filters don't apply to this list.");
+    expect(panelScopeNote(scope, 'list')).toBe("The filters don't apply to this list.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Arabic. The sentences above pin the English wording; these pin the two
+// places Arabic does NOT simply substitute words:
+//
+//   - it negates ahead of the subject, so the don't/doesn't distinction that
+//     drives two English templates collapses to one;
+//   - it prefixes every item after the first with و and uses no commas, where
+//     English separates with commas and joins only the final pair.
+//
+// Both are easy to lose in a refactor that treats the templates as
+// interchangeable strings, and neither shows up in the English assertions.
+// ---------------------------------------------------------------------------
+describe('panelScopeNote (Arabic)', () => {
+  beforeAll(() => localeStore.set('ar'));
+  afterAll(() => localeStore.set('en'));
+
+  it('negates ahead of the subject for one ignored control', () => {
+    expect(panelScopeNote({ ...AGREES, ignoredFilters: 1 }, 'totals')).toBe(
+      'لا ينطبق المرشّح على هذه الإجماليات.',
+    );
+  });
+
+  it('uses the same form for a plural subject', () => {
+    expect(panelScopeNote({ ...AGREES, ignoredFilters: 3 }, 'chart')).toBe(
+      'لا ينطبق المرشّحات على هذا الرسم البياني.',
+    );
+  });
+
+  it('joins every item with و and no commas', () => {
+    expect(
+      panelScopeNote(
+        { ...AGREES, ignoredFilters: 2, ignoresSearch: true, ignoresDateRange: true },
+        'totals',
+      ),
+    ).toBe('لا ينطبق المرشّحات والبحث والنطاق الزمني على هذه الإجماليات.');
+  });
+
+  it('translates the only-one-filter-applies sentence', () => {
+    expect(
+      panelScopeNote(
+        { ...AGREES, ignoredFilters: 1, appliedFilterLabel: 'Event', ignoresDateRange: true },
+        'chart',
+      ),
+    ).toBe('ينطبق مرشّح Event وحده على هذا الرسم البياني — أما النطاق الزمني فلا.');
   });
 });

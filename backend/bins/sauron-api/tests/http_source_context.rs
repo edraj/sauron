@@ -630,6 +630,7 @@ impl TestServer {
             None,
             0,
             1,
+            1,
         )
         .await
         .expect("bump session");

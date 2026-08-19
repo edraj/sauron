@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import { untrack } from 'svelte';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -14,7 +16,8 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import FunnelChart from '../lib/components/FunnelChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import { lockedBy, lockTitle } from '../lib/models/page-access';
+  import { lockedBy } from '../lib/models/page-access';
+  import { lockTip } from '../lib/actions/lock-tip';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { topEvents } from '../lib/api/events';
   import {
@@ -288,8 +291,8 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Funnels</h1>
-      <p class="muted sub">Define an ordered set of events and track conversion & drop-off between steps.</p>
+      <h1 class="page-title">{t('funnels.title')}</h1>
+      <p class="muted sub">{t('funnels.subtitle')}</p>
     </div>
     <div class="controls">
       <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
@@ -301,25 +304,25 @@
     <Card><div class="center"><Spinner size={22} /></div></Card>
   {:else if error && available.length === 0}
     <Card>
-      <EmptyState title="Couldn't load events" description={error} icon="triangle-alert">
+      <EmptyState title={t('funnels.error.events')} description={error} icon="triangle-alert">
         {#snippet action()}
-          <Button variant="secondary" onclick={retry}>Retry</Button>
+          <Button variant="secondary" onclick={retry}>{t('common.retry')}</Button>
         {/snippet}
       </EmptyState>
     </Card>
   {:else if available.length === 0}
     <Card>
       <EmptyState
-        title="No events yet"
-        description="Send events from your SDK to start building conversion funnels."
+        title={t('funnels.empty.title')}
+        description={t('funnels.empty.body')}
         icon="chart-column"
       />
     </Card>
   {:else}
     {#if saved.length > 0}
-      <Card title="Saved funnels">
+      <Card title={t('funnels.card.saved')}>
         <div class="saved-search">
-          <SearchInput bind:value={funnelSearch} placeholder="Search funnels…" width="280px" />
+          <SearchInput bind:value={funnelSearch} placeholder={t('funnels.search')} width="280px" />
         </div>
         {#if filteredFunnels.length === 0}
           <p class="muted empty-steps">No funnels match “{funnelSearch}”.</p>
@@ -327,23 +330,23 @@
           <ul class="saved-list">
             {#each filteredFunnels as f (f.id)}
               <li class="saved-item" class:active={f.id === loadedId}>
-                <button class="load" type="button" onclick={() => loadFunnel(f)} title="Load this funnel">
+                <button class="load" type="button" onclick={() => loadFunnel(f)} title={t('funnels.loadThis')}>
                   <span class="sf-name truncate">{f.name}</span>
                   <span class="sf-meta">{f.steps.length} steps{#if f.created_by_name} · {f.created_by_name}{/if}</span>
                 </button>
                 <div class="sf-actions">
                   <button
                     type="button"
-                    title={writeLock ? lockTitle(writeLock) : 'Duplicate'}
-                    disabled={writeLock !== null}
+                    title="Duplicate"
+                    use:lockTip={writeLock}
                     onclick={() => duplicateFunnel(f)}
                   >
                     <Icon name={writeLock ? 'lock' : 'copy'} size={14} />
                   </button>
                   <button
                     type="button"
-                    title={writeLock ? lockTitle(writeLock) : 'Delete'}
-                    disabled={writeLock !== null}
+                    title="Delete"
+                    use:lockTip={writeLock}
                     onclick={() => openDeleteConfirm(f)}
                   >
                     <Icon name={writeLock ? 'lock' : 'x'} size={14} />
@@ -357,74 +360,74 @@
     {/if}
 
     <div class="grid">
-      <Card title="Builder">
+      <Card title={t('funnels.card.builder')}>
         {#if steps.length === 0}
-          <p class="muted empty-steps">Add at least two steps to compute a funnel.</p>
+          <p class="muted empty-steps">{t('funnels.addTwoSteps')}</p>
         {:else}
           <ol class="steps">
             {#each steps as step, i (i)}
               <li class="step">
                 <span class="snum">{i + 1}</span>
                 <span class="sname mono truncate">{step}</span>
-                <button class="remove" type="button" title="Remove step" onclick={() => removeStep(i)}><Icon name="x" size={14} /></button>
+                <button class="remove" type="button" title={t('funnels.removeStep')} onclick={() => removeStep(i)}><Icon name="x" size={14} /></button>
               </li>
             {/each}
           </ol>
         {/if}
 
         <div class="add-row">
-          <select class="picker" bind:value={picked} aria-label="Event to add">
+          <select class="picker" bind:value={picked} aria-label={t('funnels.eventToAdd')}>
             {#each available as ev (ev.name)}
               <option value={ev.name}>{ev.name}</option>
             {/each}
           </select>
-          <Button variant="secondary" size="sm" onclick={addStep}>Add step</Button>
+          <Button variant="secondary" size="sm" onclick={addStep}>{t('funnels.addStep')}</Button>
         </div>
 
         <div class="compute-row">
           <Button variant="primary" onclick={onCompute} disabled={steps.length < 2} loading={computing}>
-            Compute funnel
+            {t('funnels.compute')}
           </Button>
           {#if loadedId}
-            <Button variant="secondary" size="sm" onclick={openUpdateDialog} disabled={steps.length < 2} lockedReason={writeLock}>Update</Button>
-            <Button variant="secondary" size="sm" onclick={openSaveDialog} disabled={steps.length < 2} lockedReason={writeLock}>Save as new</Button>
+            <Button variant="secondary" size="sm" onclick={openUpdateDialog} disabled={steps.length < 2} lockedReason={writeLock}>{t('funnels.update')}</Button>
+            <Button variant="secondary" size="sm" onclick={openSaveDialog} disabled={steps.length < 2} lockedReason={writeLock}>{t('funnels.saveAsNew')}</Button>
           {:else}
-            <Button variant="secondary" size="sm" onclick={openSaveDialog} disabled={steps.length < 2} lockedReason={writeLock}>Save template</Button>
+            <Button variant="secondary" size="sm" onclick={openSaveDialog} disabled={steps.length < 2} lockedReason={writeLock}>{t('funnels.saveTemplate')}</Button>
           {/if}
           {#if steps.length < 2}
-            <span class="faint hint">Need at least 2 steps</span>
+            <span class="faint hint">{t('funnels.needTwoSteps')}</span>
           {/if}
         </div>
       </Card>
 
-      <Card title="Results">
+      <Card title={t('funnels.card.results')}>
         {#if computing && !result}
           <div class="center"><Spinner size={22} /></div>
         {:else if error && !result}
-          <EmptyState title="Couldn't compute funnel" description={error} icon="triangle-alert">
+          <EmptyState title={t('funnels.error.compute')} description={error} icon="triangle-alert">
             {#snippet action()}
-              <Button variant="secondary" onclick={onCompute}>Retry</Button>
+              <Button variant="secondary" onclick={onCompute}>{t('common.retry')}</Button>
             {/snippet}
           </EmptyState>
         {:else if result}
           <div class="summary" class:updating={computing}>
             <div class="sum-item">
-              <span class="sum-label section-label">Entered</span>
-              <span class="sum-val">{result.total_entered.toLocaleString()}</span>
+              <span class="sum-label section-label">{t('funnels.entered')}</span>
+              <span class="sum-val">{formatNumber(result.total_entered)}</span>
             </div>
             <div class="sum-item">
-              <span class="sum-label section-label">Overall conversion</span>
+              <span class="sum-label section-label">{t('funnels.overallConversion')}</span>
               <span class="sum-val accent">{formatPercent(overallConv)}</span>
             </div>
             {#if computing}
-              <span class="updating-tag"><Spinner size={13} /> Updating…</span>
+              <span class="updating-tag"><Spinner size={13} /> {t('funnels.updating')}</span>
             {/if}
           </div>
           <div class="chart-wrap">
             <FunnelChart result={result} />
           </div>
         {:else}
-          <p class="muted empty-steps">Compute a funnel to see conversion & drop-off.</p>
+          <p class="muted empty-steps">{t('funnels.computePrompt')}</p>
         {/if}
       </Card>
     </div>
@@ -436,15 +439,15 @@
     onclose={closeDialog}
   >
     <div class="dialog-form">
-      <Input label="Name" bind:value={dialogName} placeholder="Signup flow" required />
+      <Input label={t('common.name')} bind:value={dialogName} placeholder={t('funnels.placeholder.name')} required />
       <div class="ta-field">
-        <label class="ta-label" for="funnel-desc">Description <span class="ta-opt">optional</span></label>
+        <label class="ta-label" for="funnel-desc">{t('funnels.description')} <span class="ta-opt">optional</span></label>
         <textarea
           id="funnel-desc"
           class="ta"
           bind:value={dialogDesc}
           rows="3"
-          placeholder="What this funnel tracks…"
+          placeholder={t('funnels.placeholder.description')}
         ></textarea>
       </div>
       <p class="dialog-hint">
@@ -452,7 +455,7 @@
       </p>
     </div>
     {#snippet footer()}
-      <Button variant="secondary" onclick={closeDialog} disabled={savingDialog}>Cancel</Button>
+      <Button variant="secondary" onclick={closeDialog} disabled={savingDialog}>{t('common.cancel')}</Button>
       <Button
         variant="primary"
         onclick={submitDialog}
@@ -466,11 +469,11 @@
 
   <ConfirmDialog
     bind:open={showDeleteConfirm}
-    title="Delete funnel?"
+    title={t('funnels.deleteTitle')}
     message={pendingDelete
       ? `“${pendingDelete.name}” will be permanently removed. This can't be undone.`
       : ''}
-    confirmLabel="Delete"
+    confirmLabel={t('common.delete')}
     danger
     loading={deleting}
     onconfirm={confirmDelete}
@@ -669,7 +672,7 @@
     background: none;
     border: none;
     cursor: pointer;
-    text-align: left;
+    text-align: start;
   }
   .sf-name {
     font-size: 13px;
@@ -684,7 +687,7 @@
   .sf-actions {
     display: flex;
     gap: 2px;
-    padding-right: 6px;
+    padding-inline-end: 6px;
   }
   .sf-actions button {
     background: none;

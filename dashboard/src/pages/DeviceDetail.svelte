@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -129,15 +131,15 @@
 <AppShell requireApp>
   <button class="back" onclick={() => push('/devices')}>
     <Icon name="arrow-left" size={14} />
-    Devices
+    {t('devices.title')}
   </button>
 
   {#if loading}
     <div class="center"><Spinner size={26} /></div>
   {:else if error}
-    <EmptyState title="Device not found" description={error} icon="triangle-alert">
+    <EmptyState title={t('device.notFound')} description={error} icon="triangle-alert">
       {#snippet action()}
-        <Button variant="secondary" onclick={() => push('/devices')}>Back to devices</Button>
+        <Button variant="secondary" onclick={() => push('/devices')}>{t('device.backToList')}</Button>
       {/snippet}
     </EmptyState>
   {:else if detail && device}
@@ -146,26 +148,26 @@
         <h1 class="dev-title">{title}</h1>
         <div class="key-row">
           <span class="key mono">{device.device_key}</span>
-          <CopyButton value={device.device_key} size="sm" label="Copy key" />
+          <CopyButton value={device.device_key} size="sm" label={t('device.copyKey')} />
         </div>
       </div>
     </header>
 
     <StatTiles min={150}>
-      <StatTile label="Sessions" value={detail.sessions.length.toLocaleString()} />
-      <StatTile label="Events" value={device.events_count.toLocaleString()} />
+      <StatTile label={t('explore.column.sessions')} value={formatNumber(detail.sessions.length)} />
+      <StatTile label={t('explore.column.events')} value={formatNumber(device.events_count)} />
       <StatTile
-        label="Errors"
-        value={device.errors_count.toLocaleString()}
+        label={t('explore.column.errors')}
+        value={formatNumber(device.errors_count)}
         tone={device.errors_count > 0 ? 'error' : 'neutral'}
       />
       <StatTile
-        label="First seen"
+        label={t('explore.column.firstSeen')}
         value={timeFormatStore.mode === 'relative' ? relativeTime(device.first_seen) : formatTimestamp(device.first_seen)}
         sub={timeFormatStore.mode === 'relative' ? formatTimestamp(device.first_seen) : relativeTime(device.first_seen)}
       />
       <StatTile
-        label="Last seen"
+        label={t('explore.column.lastSeen')}
         value={timeFormatStore.mode === 'relative' ? relativeTime(device.last_seen) : formatTimestamp(device.last_seen)}
         sub={timeFormatStore.mode === 'relative' ? formatTimestamp(device.last_seen) : relativeTime(device.last_seen)}
       />
@@ -173,27 +175,27 @@
 
     <div class="grid">
       <div class="col-main">
-        <Card title="Recent sessions" padding="none">
+        <Card title={t('device.card.sessions')} padding="none">
           {#if sortedSessions.length === 0}
-            <p class="empty-note muted">No sessions recorded for this device.</p>
+            <p class="empty-note muted">{t('device.empty.sessions')}</p>
           {:else}
             <DataTable>
               {#snippet head()}
                 <tr>
                   <SortableTh key="session" columnDefault="asc" sort={sessionSort} onsort={onSessionSort}>
-                    Session
+                    {t('sessions.column.session')}
                   </SortableTh>
                   <SortableTh key="started" sort={sessionSort} onsort={onSessionSort}>
-                    Started
+                    {t('explore.column.started')}
                   </SortableTh>
                   <SortableTh key="duration" sort={sessionSort} onsort={onSessionSort}>
-                    Duration
+                    {t('explore.column.duration')}
                   </SortableTh>
                   <SortableTh key="events" class="num" sort={sessionSort} onsort={onSessionSort}>
-                    Events
+                    {t('explore.column.events')}
                   </SortableTh>
                   <SortableTh key="errors" class="num" sort={sessionSort} onsort={onSessionSort}>
-                    Errors
+                    {t('explore.column.errors')}
                   </SortableTh>
                 </tr>
               {/snippet}
@@ -213,9 +215,9 @@
                   </td>
                   <td><TimeValue value={s.started_at} /></td>
                   <td class="cell-muted">{formatDuration(sessionDuration(s))}</td>
-                  <td class="num">{s.events_count.toLocaleString()}</td>
+                  <td class="num">{formatNumber(s.events_count)}</td>
                   <td class="num">
-                    <span class:err={s.errors_count > 0}>{s.errors_count.toLocaleString()}</span>
+                    <span class:err={s.errors_count > 0}>{formatNumber(s.errors_count)}</span>
                   </td>
                 </tr>
               {/each}
@@ -223,22 +225,22 @@
           {/if}
         </Card>
 
-        <Card title="Performance profile" padding="none">
+        <Card title={t('device.card.performance')} padding="none">
           {#if sortedPerf.length === 0}
-            <p class="empty-note muted">No performance data yet.</p>
+            <p class="empty-note muted">{t('device.empty.performance')}</p>
           {:else}
             <DataTable>
               {#snippet head()}
                 <tr>
                   <SortableTh key="name" columnDefault="asc" sort={perfSort} onsort={onPerfSort}>
-                    Name
+                    {t('common.name')}
                   </SortableTh>
                   <SortableTh key="op" columnDefault="asc" sort={perfSort} onsort={onPerfSort}>
                     Op
                   </SortableTh>
                   <SortableTh key="p95" class="num" sort={perfSort} onsort={onPerfSort}>p95</SortableTh>
                   <SortableTh key="count" class="num" sort={perfSort} onsort={onPerfSort}>
-                    Count
+                    {t('explore.column.count')}
                   </SortableTh>
                 </tr>
               {/snippet}
@@ -247,7 +249,7 @@
                   <td><span class="mono truncate perf-name">{p.name}</span></td>
                   <td><Badge tone="neutral" size="sm">{p.op}</Badge></td>
                   <td class="num"><LatencyBadge ms={p.p95} size="sm" /></td>
-                  <td class="num">{p.count.toLocaleString()}</td>
+                  <td class="num">{formatNumber(p.count)}</td>
                 </tr>
               {/each}
             </DataTable>
@@ -256,16 +258,16 @@
       </div>
 
       <aside class="col-side">
-        <Card title="Hardware & OS">
+        <Card title={t('device.card.hardware')}>
           <dl class="kv">
-            <div class="kv-row"><dt>Family</dt><dd>{device.family ?? '—'}</dd></div>
-            <div class="kv-row"><dt>Model</dt><dd>{device.model ?? '—'}</dd></div>
+            <div class="kv-row"><dt>{t('device.field.family')}</dt><dd>{device.family ?? '—'}</dd></div>
+            <div class="kv-row"><dt>{t('device.field.model')}</dt><dd>{device.model ?? '—'}</dd></div>
             <div class="kv-row"><dt>OS</dt><dd>{device.os_name ?? '—'}</dd></div>
-            <div class="kv-row"><dt>OS version</dt><dd class="mono">{device.os_version ?? '—'}</dd></div>
-            <div class="kv-row"><dt>Arch</dt><dd class="mono">{device.arch ?? '—'}</dd></div>
-            <div class="kv-row"><dt>Browser</dt><dd>{device.browser ?? '—'}</dd></div>
+            <div class="kv-row"><dt>{t('device.field.osVersion')}</dt><dd class="mono">{device.os_version ?? '—'}</dd></div>
+            <div class="kv-row"><dt>{t('device.field.arch')}</dt><dd class="mono">{device.arch ?? '—'}</dd></div>
+            <div class="kv-row"><dt>{t('device.field.browser')}</dt><dd>{device.browser ?? '—'}</dd></div>
             <div class="kv-row">
-              <dt>Last user</dt>
+              <dt>{t('device.field.lastUser')}</dt>
               <dd>
                 {#if device.last_distinct_id}
                   <a
@@ -282,9 +284,9 @@
           </dl>
         </Card>
 
-        <Card title="Crash history">
+        <Card title={t('device.card.crashes')}>
           {#if detail.errors.length === 0}
-            <p class="empty-note muted">No crashes reported on this device.</p>
+            <p class="empty-note muted">{t('device.empty.crashes')}</p>
           {:else}
             <ul class="crashes">
               {#each detail.errors as e (e.id)}
@@ -410,7 +412,7 @@
     margin: 0;
     font-size: 12.5px;
     color: var(--text);
-    text-align: right;
+    text-align: end;
     word-break: break-word;
     min-width: 0;
   }
