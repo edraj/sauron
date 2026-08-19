@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   interface Props {
     size?: number;
     stroke?: number;
@@ -10,7 +11,7 @@
   class="spinner"
   style="--s:{size}px; --sw:{stroke}px"
   role="status"
-  aria-label="Loading"
+  aria-label={t('common.loading')}
 ></span>
 
 <style>

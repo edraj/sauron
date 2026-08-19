@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { untrack } from 'svelte';
   import { querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
@@ -57,7 +58,11 @@
   const STREAM_LIMIT = 50;
 
   /** The chip label for `name`, so the caption below names what the bar shows. */
-  const EVENT_NAME_LABEL = EVENT_FIELDS.find((f) => f.key === 'name')?.label ?? 'Event';
+  // `$derived`, so the caption follows a language switch.
+  const EVENT_NAME_LABEL = $derived.by(() => {
+    const def = EVENT_FIELDS.find((f) => f.key === 'name');
+    return def ? t(def.labelKey) : t('filter.field.event');
+  });
 
   // Hydrate filter/search/date-range state from the URL once, at init — not
   // inside an effect, so this never re-runs and never fights the sync effect
@@ -157,7 +162,7 @@
         // "Click an event to filter the chart and stream" hint sets up.
         appliedFilterLabel: selectedTopEvent !== null ? EVENT_NAME_LABEL : null,
       },
-      'this chart',
+      'chart',
     ),
   );
 
@@ -174,7 +179,7 @@
         ignoresSearch: appliedSearch !== '',
         ignoresDateRange: false,
       },
-      'this list',
+      'list',
     ),
   );
 
@@ -645,15 +650,15 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Events</h1>
-      <p class="muted sub">Product analytics — event volume, top events and raw stream.</p>
+      <h1 class="page-title">{t('overview.stat.events')}</h1>
+      <p class="muted sub">{t('events.subtitle')}</p>
     </div>
     <div class="controls">
       <RefreshButton onclick={refresh} loading={refreshing} />
     </div>
   </div>
 
-  <p class="hint muted">Filter by <code>Tag</code> (key = value); the search box also matches tag &amp; payload content.</p>
+  <p class="hint muted">{t('events.filterBy')} <code>{t('events.tag')}</code> (key = value); the search box also matches tag &amp; payload content.</p>
   <!--
     `appId`/`context` are what make the search box's autocomplete work at all:
     without them `fetchSchema` bails on its own `if (!appId)` guard and the
@@ -673,7 +678,7 @@
 
   {#if error && top.length === 0 && series.length === 0}
     <Card>
-      <EmptyState title="Couldn't load analytics" description={error} icon="triangle-alert">
+      <EmptyState title={t('events.error.analytics')} description={error} icon="triangle-alert">
         {#snippet action()}
           <Button
             variant="secondary"
@@ -685,7 +690,7 @@
               }
             }}
           >
-            Retry
+            {t('common.retry')}
           </Button>
         {/snippet}
       </EmptyState>
@@ -704,7 +709,7 @@
         place: "No events yet" under an active filter reads as the filter
         having emptied the list, and it did not.
       -->
-      <Card title="Event volume">
+      <Card title={t('overview.card.eventVolume')}>
         {#if loadingSeries}
           <div class="center"><Spinner size={22} /></div>
         {:else}
@@ -713,20 +718,20 @@
         <p class="scope-note">{volumeNote ?? ''}</p>
       </Card>
 
-      <Card title="Top events">
+      <Card title={t('overview.card.topEvents')}>
         {#if loadingTop}
           <div class="center"><Spinner size={22} /></div>
         {:else if top.length === 0}
-          <EmptyState title="No events yet" description="Send events from your SDK to see them here." icon="chart-column" />
+          <EmptyState title={t('events.empty.title')} description={t('events.empty.body')} icon="chart-column" />
         {:else}
-          <p class="hint muted">Click an event to filter the chart and stream.</p>
+          <p class="hint muted">{t('events.clickToFilter')}</p>
           <BarList items={top} selected={selectedTopEvent} onselect={selectTopEvent} />
         {/if}
         <p class="scope-note">{topNote ?? ''}</p>
       </Card>
     </div>
 
-    <Card padding="none" title="Event stream">
+    <Card padding="none" title={t('events.card.stream')}>
       {#snippet actions()}
         <!-- Governs the stream only; the two cards above follow the FilterBar's
              range. Placed on the table's own card so the two windows read as
@@ -756,14 +761,14 @@
               if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list);
             }}
           >
-            Try again
+            {t('ui.tryAgain')}
           </Button>
         </p>
       {/if}
       {#if loadingStream && streamEvents.length === 0}
         <div class="center"><Spinner size={22} /></div>
       {:else if fatalStreamError}
-        <EmptyState title="Couldn't load events" description={streamError ?? undefined} icon="triangle-alert">
+        <EmptyState title={t('events.error.load')} description={streamError ?? undefined} icon="triangle-alert">
           {#snippet action()}
             <Button
               variant="secondary"
@@ -772,7 +777,7 @@
                 if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list);
               }}
             >
-              Retry
+              {t('common.retry')}
             </Button>
           {/snippet}
         </EmptyState>
@@ -785,19 +790,19 @@
           reading "1,204+ events · Page 4" would be the pager lying in prose.
         -->
         <EmptyState
-          title="Nothing left on this page"
-          description="These events have gone since the previous page was loaded — the stream moved on, or they fell out of retention. Go back for the ones that are still here."
+          title={t('list.stale.title')}
+          description={t('list.stale.eventsBody')}
           icon="search"
         >
           {#snippet action()}
             <Button variant="secondary" onclick={goPrev} disabled={loadingStream}>
-              Back a page
+              {t('list.stale.backAPage')}
             </Button>
           {/snippet}
         </EmptyState>
       {:else if streamEvents.length === 0}
         <EmptyState
-          title="No events"
+          title={t('events.empty.none')}
           description={search || filters.length > 0
             ? 'No events match the current filters.'
             : 'No raw events in this range yet.'}
@@ -807,11 +812,11 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              <SortableTh key="name" columnDefault="asc" class="col-name" sort={list.sort} {onsort}>Event</SortableTh>
-              <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>User</SortableTh>
-              <SortableTh key="session_id" columnDefault="asc" sort={list.sort} {onsort}>Session</SortableTh>
-              <th class="col-props">Properties</th>
-              <SortableTh key="occurred_at" class="col-time" sort={list.sort} {onsort}>Time</SortableTh>
+              <SortableTh key="name" columnDefault="asc" class="col-name" sort={list.sort} {onsort}>{t('events.column.event')}</SortableTh>
+              <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>{t('events.column.user')}</SortableTh>
+              <SortableTh key="session_id" columnDefault="asc" sort={list.sort} {onsort}>{t('events.column.session')}</SortableTh>
+              <th class="col-props">{t('events.properties')}</th>
+              <SortableTh key="occurred_at" class="col-time" sort={list.sort} {onsort}>{t('events.column.time')}</SortableTh>
             </tr>
           {/snippet}
           {#snippet children()}
@@ -873,7 +878,7 @@
                     {#if ev.properties && Object.keys(ev.properties).length > 0}
                       <JsonTree value={ev.properties} name="properties" expandTo={2} />
                     {:else}
-                      <span class="faint">No properties on this event.</span>
+                      <span class="faint">{t('events.noProperties')}</span>
                     {/if}
                     {#if ev.tags && Object.keys(ev.tags).length > 0}
                       <JsonTree value={ev.tags} name="tags" expandTo={2} />
@@ -1012,7 +1017,7 @@
     font-size: 8px;
     color: var(--text-faint);
     transition: transform 0.12s ease;
-    margin-right: 7px;
+    margin-inline-end: 7px;
   }
   .ev-caret.open {
     transform: rotate(90deg);

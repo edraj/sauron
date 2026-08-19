@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -138,7 +139,7 @@
       .map((v) => v.data?.computed_at)
       .filter((s): s is string => !!s)
       .map((s) => new Date(s).getTime())
-      .filter((t) => Number.isFinite(t));
+      .filter((ms) => Number.isFinite(ms));
     return stamps.length > 0 ? new Date(Math.min(...stamps)) : null;
   });
 
@@ -332,16 +333,16 @@
   });
 
   const newUserShare = $derived.by(() => {
-    const t = totals?.totals;
-    if (!t || t.users <= 0) return null;
-    return t.new_users / t.users;
+    const sums = totals?.totals;
+    if (!sums || sums.users <= 0) return null;
+    return sums.new_users / sums.users;
   });
 </script>
 
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Overview</h1>
+      <h1 class="page-title">{t('overview.title')}</h1>
       <p class="muted sub">
         Health and activity at a glance for the last {sinceDays} days.
         <!--
@@ -387,28 +388,28 @@
   -->
   {#if totals}
     <StatTiles min={150}>
-      <StatTile label="Events" value={compactNumber(totals.totals.events)} tone="primary" />
+      <StatTile label={t('overview.stat.events')} value={compactNumber(totals.totals.events)} tone="primary" />
       <StatTile
-        label="Errors"
+        label={t('overview.stat.errors')}
         value={compactNumber(totals.totals.errors)}
         tone={totals.totals.errors > 0 ? 'error' : 'neutral'}
         sub={`${formatPercent(totals.error_rate)} error rate`}
       />
-      <StatTile label="Sessions" value={compactNumber(totals.totals.sessions)} />
-      <StatTile label="Users" value={compactNumber(totals.totals.users)} />
+      <StatTile label={t('overview.stat.sessions')} value={compactNumber(totals.totals.sessions)} />
+      <StatTile label={t('overview.stat.users')} value={compactNumber(totals.totals.users)} />
       <StatTile
-        label="New users"
+        label={t('overview.stat.newUsers')}
         value={compactNumber(totals.totals.new_users)}
         sub={newUserShare != null ? `${formatPercent(newUserShare)} of users` : undefined}
       />
       <StatTile
-        label="Crash-free sessions"
+        label={t('overview.stat.crashFree')}
         value={formatPercent(totals.crash_free_sessions)}
         tone={crashFreeTone}
         sub={`${compactNumber(totals.totals.crashed_sessions)} crashed`}
       />
       <StatTile
-        label="Error rate"
+        label={t('perf.stat.errorRate')}
         value={formatPercent(totals.error_rate)}
         tone={errorRateTone}
         sub="errors / events"
@@ -416,20 +417,20 @@
     </StatTiles>
   {:else if totalsView.error}
     <Card>
-      <EmptyState title="Couldn't load totals" description={totalsView.error} icon="triangle-alert">
+      <EmptyState title={t('overview.error.totals')} description={totalsView.error} icon="triangle-alert">
         {#snippet action()}
-          <Button variant="secondary" onclick={retry}>Retry</Button>
+          <Button variant="secondary" onclick={retry}>{t('common.retry')}</Button>
         {/snippet}
       </EmptyState>
     </Card>
   {:else}
     <!-- Tile-height rows, so the KPI strip does not jump when it fills in. -->
-    <Card><Skeleton rows={2} height="34px" label="Loading totals" /></Card>
+    <Card><Skeleton rows={2} height="34px" label={t('overview.loading.totals')} /></Card>
   {/if}
 
   <div class="grid">
     <div class="col">
-      <Card title="Event volume">
+      <Card title={t('overview.card.eventVolume')}>
         {#if series}
           <TimeSeriesChart
             data={series.events_series}
@@ -438,12 +439,12 @@
             emptyLabel="No events in this range"
           />
         {:else if seriesView.error}
-          <EmptyState title="Couldn't load chart" description={seriesView.error} icon="triangle-alert" />
+          <EmptyState title={t('overview.error.chart')} description={seriesView.error} icon="triangle-alert" />
         {:else}
-          <Skeleton rows={1} height="220px" label="Loading event volume" />
+          <Skeleton rows={1} height="220px" label={t('overview.loading.eventVolume')} />
         {/if}
       </Card>
-      <Card title="Errors over time">
+      <Card title={t('overview.card.errorsOverTime')}>
         {#if series}
           <TimeSeriesChart
             data={series.errors_series}
@@ -452,12 +453,12 @@
             emptyLabel="No errors in this range — nice."
           />
         {:else if seriesView.error}
-          <EmptyState title="Couldn't load chart" description={seriesView.error} icon="triangle-alert" />
+          <EmptyState title={t('overview.error.chart')} description={seriesView.error} icon="triangle-alert" />
         {:else}
-          <Skeleton rows={1} height="180px" label="Loading errors over time" />
+          <Skeleton rows={1} height="180px" label={t('overview.loading.errorsOverTime')} />
         {/if}
       </Card>
-      <Card title="Active users">
+      <Card title={t('overview.card.activeUsers')}>
         {#if activeUsers}
           <TimeSeriesChart
             data={activeUsersChart}
@@ -479,12 +480,12 @@
           {/if}
         {:else if activeUsersView.error}
           <EmptyState
-            title="Couldn't load active users"
+            title={t('overview.error.activeUsers')}
             description={activeUsersView.error}
             icon="triangle-alert"
           />
         {:else}
-          <Skeleton rows={1} height="180px" label="Loading active users" />
+          <Skeleton rows={1} height="180px" label={t('overview.loading.activeUsers')} />
         {/if}
       </Card>
     </div>
@@ -496,12 +497,12 @@
         viewer is not permitted to see.
       -->
       {#if !issuesForbidden}
-        <Card title="Top issues" padding="sm">
+        <Card title={t('overview.card.topIssues')} padding="sm">
           {#if topIssues}
             {#if topIssues.length === 0}
               <EmptyState
-                title="No issues"
-                description="No errors have been grouped into issues yet."
+                title={t('overview.empty.issues')}
+                description={t('overview.empty.issuesBody')}
                 icon="check"
               />
             {:else}
@@ -510,7 +511,7 @@
                   <a class="issue-row" href={`#/issues/${issue.id}`}>
                     <span class="issue-title truncate">{issue.title}</span>
                     <LevelBadge level={issue.level} size="sm" />
-                    <span class="issue-count mono" title="times seen">
+                    <span class="issue-count mono" title={t('overview.timesSeen')}>
                       {compactNumber(issue.times_seen)}
                     </span>
                   </a>
@@ -518,28 +519,28 @@
               </div>
             {/if}
           {:else if issuesView.error}
-            <EmptyState title="Couldn't load issues" description={issuesView.error} icon="triangle-alert" />
+            <EmptyState title={t('overview.error.issues')} description={issuesView.error} icon="triangle-alert" />
           {:else}
-            <Skeleton rows={5} label="Loading top issues" />
+            <Skeleton rows={5} label={t('overview.loading.topIssues')} />
           {/if}
         </Card>
       {/if}
 
-      <Card title="Top events">
+      <Card title={t('overview.card.topEvents')}>
         {#if topEvents}
           {#if topEvents.length === 0}
             <EmptyState
-              title="No events"
-              description="Send events from your SDK to see them here."
+              title={t('events.empty.none')}
+              description={t('events.empty.body')}
               icon="chart-column"
             />
           {:else}
             <BarList items={topEvents} />
           {/if}
         {:else if eventsView.error}
-          <EmptyState title="Couldn't load events" description={eventsView.error} icon="triangle-alert" />
+          <EmptyState title={t('events.error.load')} description={eventsView.error} icon="triangle-alert" />
         {:else}
-          <Skeleton rows={5} label="Loading top events" />
+          <Skeleton rows={5} label={t('overview.loading.topEvents')} />
         {/if}
       </Card>
     </div>

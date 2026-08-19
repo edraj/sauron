@@ -203,6 +203,29 @@ class SessionStore {
     });
   }
 
+  /**
+   * Whether ANY environment-scoped grant carries `perm`.
+   *
+   * The "all environments" arm of `canAccessPage`, and deliberately not part of
+   * `can()`: `can()` asks about one NAMED environment, which is the right
+   * question when the picker is on a specific one and the wrong question when
+   * it is on "all". `resolve_env_filter` (rbac.rs) answers `EnvFilter::All` for
+   * an environment-scoped caller with `Ok(Subset(readable))` rather than a
+   * denial — the server narrows the read to the environments they hold instead
+   * of refusing it — so the gate has to admit them without knowing which one
+   * they will end up reading.
+   *
+   * Org/project/app grants are ignored on purpose. `canAccessPage` asks `can()`
+   * first, so folding them in here would make the two arms overlap and obscure
+   * which one admitted the member. It also keeps this function's name honest.
+   */
+  canAtAnyEnv(perm: Permission): boolean {
+    if (!this.access) return false;
+    return this.access.grants.some(
+      (g) => g.scope_type === 'env' && g.permissions.includes(perm),
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Loading
   // -------------------------------------------------------------------------

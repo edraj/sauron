@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   import { relativeTime, formatTimestamp } from '../utils/format';
   import { timeFormatStore } from '../stores/time-format.svelte';
 
@@ -32,7 +33,9 @@
     class="tv"
     class:muted
     title={other}
-    aria-label={`${shown} — click to show ${isRelative ? 'exact time' : 'relative time'}`}
+    aria-label={isRelative
+      ? t('time.showExact', { shown })
+      : t('time.showRelative', { shown })}
     onclick={(e) => {
       // Many of these sit in `tr.clickable` rows that navigate or expand on
       // click. Stopping here — on the button itself — bounds the guard to the

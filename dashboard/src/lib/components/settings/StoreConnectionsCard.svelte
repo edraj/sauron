@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Card from '../ui/Card.svelte';
   import Button from '../ui/Button.svelte';
   import Spinner from '../ui/Spinner.svelte';
@@ -219,10 +220,9 @@
   }
 </script>
 
-<Card title="App stores">
+<Card title={t('stores.title')}>
   <p class="card-desc muted">
-    Pull daily install and uninstall counts from Google Play and the App Store. Reports are daily
-    and arrive one to three days late — this is the stores' own cadence, not a delay Sauron adds.
+    {t('prose.stores.lede')}
   </p>
 
   {#if loading}
@@ -231,11 +231,9 @@
     <p class="err">{loadError}</p>
   {:else}
     <div class="field env-field">
-      <label for="store-env">Store environment</label>
+      <label for="store-env">{t('stores.environment')}</label>
       <p class="hint">
-        Which environment represents the build that ships to the stores. The Overview section
-        appears only when this environment is selected. Store numbers themselves are app-wide —
-        the stores report per package, not per environment.
+        {t('prose.stores.environment')}
       </p>
       <select
         id="store-env"
@@ -243,7 +241,7 @@
         disabled={savingEnv || !!writeLock}
         onchange={(e) => saveEnvironment((e.currentTarget as HTMLSelectElement).value)}
       >
-        <option value="">None — hide the store section</option>
+        <option value="">{t('stores.none')}</option>
         {#each environments as env (env.id)}
           <option value={env.id}>{env.name}</option>
         {/each}
@@ -302,10 +300,10 @@
             lockedReason={writeLock}
             onclick={() => save(store)}
           >
-            Save
+            {t('common.save')}
           </Button>
           {#if c}
-            <Button lockedReason={writeLock} onclick={() => sync(store)}>Queue sync</Button>
+            <Button lockedReason={writeLock} onclick={() => sync(store)}>{t('stores.queueSync')}</Button>
             {#if confirmRemove === store}
               <Button
                 variant="danger"
@@ -313,19 +311,18 @@
                 lockedReason={writeLock}
                 onclick={() => remove(store)}
               >
-                Yes, remove credentials
+                {t('stores.removeCredentials')}
               </Button>
-              <Button variant="ghost" onclick={() => (confirmRemove = null)}>Cancel</Button>
+              <Button variant="ghost" onclick={() => (confirmRemove = null)}>{t('common.cancel')}</Button>
             {:else}
-              <Button variant="ghost" onclick={() => (confirmRemove = store)}>Remove</Button>
+              <Button variant="ghost" onclick={() => (confirmRemove = store)}>{t('common.remove')}</Button>
             {/if}
           {/if}
         </div>
 
         {#if confirmRemove === store}
           <p class="hint warn">
-            Removes the stored credentials and stops syncing. The install history already
-            collected is kept, and reconnecting resumes against it.
+            {t('prose.stores.remove')}
           </p>
         {/if}
       </section>

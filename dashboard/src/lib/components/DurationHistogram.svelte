@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatNumber } from '../i18n';
   import type { HistoBucket } from '../models';
 
   interface Props {
@@ -24,9 +25,9 @@
   <div class="chart">
     <div class="plot" style="height:{height}px">
       {#each data as b (b.bucket)}
-        <div class="col" title={`${b.bucket}: ${b.count.toLocaleString()} sessions`}>
+        <div class="col" title={`${b.bucket}: ${formatNumber(b.count)} sessions`}>
           <div class="bar" style="height:{barHeight(b.count)}%">
-            <span class="cnt">{b.count.toLocaleString()}</span>
+            <span class="cnt">{formatNumber(b.count)}</span>
           </div>
           <span class="lbl">{b.bucket}</span>
         </div>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   /**
    * The category strip above the session `Timeline`.
    *
@@ -80,7 +81,7 @@
 </script>
 
 <div class="tf">
-  <div class="tf-row" role="group" aria-label="Filter timeline by category">
+  <div class="tf-row" role="group" aria-label={t('ui.timeline.filterByCategory')}>
     <Icon name="funnel" size={13} />
     <button
       class="chip all"
@@ -89,7 +90,7 @@
       disabled={!filtered}
       aria-pressed={!filtered}
     >
-      All
+      {t('common.all')}
     </button>
     <span class="sep" aria-hidden="true"></span>
     {#each ROW_CATEGORIES as c (c)}
@@ -110,7 +111,7 @@
   </div>
 
   {#if showOps}
-    <div class="tf-row ops" role="group" aria-label="Filter transactions by op">
+    <div class="tf-row ops" role="group" aria-label={t('ui.timeline.filterByOp')}>
       <span class="ops-label">op</span>
       {#each ops as o (o.op)}
         <!-- Named explicitly rather than left to name-from-contents: an op chip
@@ -161,7 +162,7 @@
     letter-spacing: 0.05em;
     text-transform: uppercase;
     color: var(--text-faint);
-    padding-left: 3px;
+    padding-inline-start: 3px;
   }
   .chip {
     display: inline-flex;

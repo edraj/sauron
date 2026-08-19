@@ -93,7 +93,7 @@
     padding: 0;
     background: none;
     border: none;
-    text-align: left;
+    text-align: start;
     width: 100%;
     color: var(--text);
   }
@@ -116,18 +116,18 @@
   }
   .j-colon {
     color: var(--text-faint);
-    margin-left: -4px;
+    margin-inline-start: -4px;
   }
   .j-preview {
     color: var(--text-faint);
   }
   .j-children {
-    border-left: 1px solid var(--border);
-    margin-left: 3px;
-    padding-left: 12px;
+    border-inline-start: 1px solid var(--border);
+    margin-inline-start: 3px;
+    padding-inline-start: 12px;
   }
   .j-leaf {
-    padding-left: 14px;
+    padding-inline-start: 14px;
   }
   .j-str {
     color: var(--success);

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Input from '../lib/components/ui/Input.svelte';
@@ -52,30 +53,30 @@
   }
 </script>
 
-<AuthLayout title="Sign in" subtitle="Welcome back. Watch every error and event.">
+<AuthLayout title={t('auth.login.submit')} subtitle={t('auth.login.subtitle')}>
   {#if resetRequiredFor}
     <div class="panel" role="status">
       <p>
-        An administrator reset the password for this account. We have emailed
-        <strong>{resetRequiredFor}</strong> a link to set a new one.
+        {t('auth.login.adminReset')}
+        <strong>{resetRequiredFor}</strong> {t('prose.login.resetSent')}
       </p>
       <p class="muted">
-        Nothing arrived? Check your spam folder, or ask the administrator to send it again.
+        {t('auth.login.checkSpam')}
       </p>
     </div>
   {:else}
     <form onsubmit={submit} class="form">
       {#if error}<div class="alert" role="alert">{error}</div>{/if}
       <Input
-        label="Email"
+        label={t('common.email')}
         type="email"
         bind:value={email}
-        placeholder="you@company.com"
+        placeholder={t('auth.placeholder.email')}
         autocomplete="email"
         required
       />
       <Input
-        label="Password"
+        label={t('common.password')}
         type="password"
         bind:value={password}
         placeholder="••••••••"
@@ -83,15 +84,15 @@
         required
       />
       <Button type="submit" variant="primary" size="lg" fullWidth loading={submitting}>
-        Sign in
+        {t('auth.login.submit')}
       </Button>
     </form>
   {/if}
 
   {#snippet footer()}
-    <span>New to Sauron? <a href="#/register">Create an account</a></span>
+    <span>{t('auth.login.newHere')} <a href="#/register">{t('auth.login.createAccount')}</a></span>
     <span class="sep" aria-hidden="true">·</span>
-    <span><a href="#/forgot-password">Forgot your password?</a></span>
+    <span><a href="#/forgot-password">{t('auth.login.forgot')}</a></span>
   {/snippet}
 </AuthLayout>
 

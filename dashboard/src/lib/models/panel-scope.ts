@@ -43,6 +43,7 @@
  * ever the part of the query the panel's request did not carry, so that is what
  * these sentences name, and they claim nothing else.
  */
+import { joinList, t } from '../i18n';
 
 /**
  * Which of the page's query controls a panel's own request did NOT carry.
@@ -84,6 +85,20 @@ interface Control {
 }
 
 /**
+ * Which panel the sentence is about.
+ *
+ * A key rather than the noun phrase itself: the phrase has to be translated,
+ * and a caller passing raw English would put English into an Arabic sentence.
+ */
+export type PanelSubject = 'totals' | 'chart' | 'list';
+
+const SUBJECT_KEY = {
+  totals: 'panel.subject.totals',
+  chart: 'panel.subject.chart',
+  list: 'panel.subject.list',
+} as const;
+
+/**
  * The ignored controls, in the order they read best — which is also the order
  * they appear in the FilterBar, left to right.
  */
@@ -91,21 +106,15 @@ function ignoredControls(scope: PanelScope): Control[] {
   const out: Control[] = [];
   if (scope.ignoredFilters > 0) {
     out.push({
-      text: scope.ignoredFilters === 1 ? 'filter' : 'filters',
+      text: t(scope.ignoredFilters === 1 ? 'panel.control.filter' : 'panel.control.filters'),
       plural: scope.ignoredFilters > 1,
     });
   }
-  if (scope.ignoresSearch) out.push({ text: 'search', plural: false });
-  if (scope.ignoresDateRange) out.push({ text: 'date range', plural: false });
+  if (scope.ignoresSearch) out.push({ text: t('panel.control.search'), plural: false });
+  if (scope.ignoresDateRange) out.push({ text: t('panel.control.dateRange'), plural: false });
   return out;
 }
 
-/** "filters", "filters and search", "filters, search and date range". */
-function joinControls(items: Control[]): string {
-  const words = items.map((i) => i.text);
-  if (words.length <= 1) return words.join('');
-  return `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
-}
 
 /**
  * The caption for a panel, or `null` when the panel and the list agree and
@@ -121,9 +130,10 @@ function joinControls(items: Control[]): string {
  *   "these totals", "this chart", "this list". Takes no verb, so it needs no
  *   agreement with one.
  */
-export function panelScopeNote(scope: PanelScope, subject: string): string | null {
+export function panelScopeNote(scope: PanelScope, subject: PanelSubject): string | null {
   const ignored = ignoredControls(scope);
   if (ignored.length === 0) return null;
+  const subjectText = t(SUBJECT_KEY[subject]);
 
   // The positive form, for a panel that applies one chip and drops the rest.
   // Gated on there being something filter-shaped to contrast it against: with
@@ -131,13 +141,19 @@ export function panelScopeNote(scope: PanelScope, subject: string): string | nul
   // question nobody asked and bury the one fact that matters.
   const label = scope.appliedFilterLabel;
   if (label && (scope.ignoredFilters > 0 || scope.ignoresSearch)) {
-    return scope.ignoresDateRange
-      ? `Only the ${label} filter applies to ${subject} — the date range doesn't.`
-      : `Only the ${label} filter applies to ${subject}.`;
+    return t(
+      scope.ignoresDateRange ? 'panel.note.onlyFilterNoRange' : 'panel.note.onlyFilter',
+      { label, subject: subjectText },
+    );
   }
 
   // "don't" for a list, or for a lone plural noun ("filters"); "doesn't" for a
-  // lone singular one ("filter", "search", "date range").
+  // lone singular one ("filter", "search", "date range"). Arabic negates ahead
+  // of the subject and does not inflect for number, so both keys carry the
+  // same sentence there — the distinction is English's, and stays English's.
   const plural = ignored.length > 1 || ignored[0].plural;
-  return `The ${joinControls(ignored)} ${plural ? "don't" : "doesn't"} apply to ${subject}.`;
+  return t(plural ? 'panel.note.plural' : 'panel.note.singular', {
+    controls: joinList(ignored.map((c) => c.text)),
+    subject: subjectText,
+  });
 }

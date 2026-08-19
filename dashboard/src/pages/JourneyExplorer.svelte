@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -134,17 +136,17 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Journeys</h1>
-      <p class="muted sub">Trace how users move through your product, one event at a time.</p>
+      <h1 class="page-title">{t('journeys.title')}</h1>
+      <p class="muted sub">{t('journeys.subtitle')}</p>
     </div>
     <div class="controls">
       <div class="control">
-        <span class="ctrl-label">Range</span>
+        <span class="ctrl-label">{t('journeys.range')}</span>
         <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
       </div>
       <div class="control">
-        <span class="ctrl-label">Depth</span>
-        <div class="depths" role="tablist" aria-label="Journey depth">
+        <span class="ctrl-label">{t('journeys.depth')}</span>
+        <div class="depths" role="tablist" aria-label={t('journeys.depthLabel')}>
           {#each DEPTHS as d (d)}
             <button
               class="depth"
@@ -170,9 +172,9 @@
 
   {#if error && !journey}
     <Card>
-      <EmptyState title="Couldn't load journeys" description={error} icon="triangle-alert">
+      <EmptyState title={t('journeys.error.load')} description={error} icon="triangle-alert">
         {#snippet action()}
-          <Button variant="secondary" onclick={retry}>Retry</Button>
+          <Button variant="secondary" onclick={retry}>{t('common.retry')}</Button>
         {/snippet}
       </EmptyState>
     </Card>
@@ -183,8 +185,8 @@
   {:else if journey && journey.nodes.length === 0}
     <Card>
       <EmptyState
-        title="Not enough event data to map journeys"
-        description="Once users trigger a sequence of events in a session, their paths will appear here."
+        title={t('journeys.empty.title')}
+        description={t('journeys.empty.body')}
         icon="compass"
       />
     </Card>
@@ -198,36 +200,35 @@
         written for: a graph on screen with a refresh in flight behind it.
       -->
       {#if revalidating}
-        <div class="reloading"><Spinner size={16} /><span class="faint">Updating…</span></div>
+        <div class="reloading"><Spinner size={16} /><span class="faint">{t('funnels.updating')}</span></div>
       {/if}
-      <Card title="User journeys">
+      <Card title={t('journeys.card.userJourneys')}>
         <SankeyChart {journey} height={480} />
         <p class="caption muted">
-          Each column is the Nth event in a user's session; ribbons show how many users moved
-          from one event to the next.
+          {t('journeys.explainer')}
         </p>
       </Card>
     </div>
 
     <div class="grid">
-      <Card title="Top entry points">
+      <Card title={t('journeys.card.entryPoints')}>
         {#if entryPoints.length === 0}
-          <p class="faint empty-inline">No entry events in this range.</p>
+          <p class="faint empty-inline">{t('journeys.empty.entries')}</p>
         {:else}
-          <p class="hint muted">The first event users fire when a session begins.</p>
+          <p class="hint muted">{t('journeys.entryExplainer')}</p>
           <BarList items={entryPoints} valueLabel="users" />
         {/if}
       </Card>
 
-      <Card title="Top transitions" padding="none">
+      <Card title={t('journeys.card.transitions')} padding="none">
         {#if sortedTransitions.length === 0}
-          <p class="faint empty-inline pad">No transitions between events yet.</p>
+          <p class="faint empty-inline pad">{t('journeys.empty.transitions')}</p>
         {:else}
           <DataTable>
             {#snippet head()}
               <tr>
                 <SortableTh key="from" columnDefault="asc" sort={transitionSort} onsort={onTransitionSort}>
-                  From
+                  {t('journeys.from')}
                 </SortableTh>
                 <!-- The arrow glyph. Nothing to order by. -->
                 <th></th>
@@ -235,7 +236,7 @@
                   To
                 </SortableTh>
                 <SortableTh key="users" class="num" sort={transitionSort} onsort={onTransitionSort}>
-                  Users
+                  {t('users.title')}
                 </SortableTh>
               </tr>
             {/snippet}
@@ -245,15 +246,15 @@
                    cell in place instead of moving the row that moved. The
                    triple is unique — the backend groups links by exactly
                    (from_step, from_event, to_event). -->
-              {#each sortedTransitions as t (t.from_step + ':' + t.from_event + '>' + t.to_event)}
+              {#each sortedTransitions as tr (tr.from_step + ':' + tr.from_event + '>' + tr.to_event)}
                 <tr>
                   <td>
-                    <span class="mono">{t.from_event}</span>
-                    <span class="faint step-tag">step {t.from_step + 1}</span>
+                    <span class="mono">{tr.from_event}</span>
+                    <span class="faint step-tag">step {tr.from_step + 1}</span>
                   </td>
                   <td class="arrow faint">→</td>
-                  <td><span class="mono">{t.to_event}</span></td>
-                  <td class="num">{t.count.toLocaleString()}</td>
+                  <td><span class="mono">{tr.to_event}</span></td>
+                  <td class="num">{formatNumber(tr.count)}</td>
                 </tr>
               {/each}
             {/snippet}
@@ -334,7 +335,7 @@
   .reloading {
     position: absolute;
     top: 14px;
-    right: 18px;
+    inset-inline-end: 18px;
     display: flex;
     align-items: center;
     gap: 7px;
@@ -363,7 +364,7 @@
     padding: 18px;
   }
   .step-tag {
-    margin-left: 8px;
+    margin-inline-start: 8px;
     font-size: 11px;
   }
   .arrow {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -9,7 +10,8 @@
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
-  import { lockedBy, lockTitle } from '../lib/models/page-access';
+  import { lockedBy } from '../lib/models/page-access';
+  import { lockTip } from '../lib/actions/lock-tip';
   import { createProject, updateProject, deleteProject } from '../lib/api/projects';
   import { listApps, createApp } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
@@ -187,8 +189,8 @@
 <AdminShell requireProject={false}>
   <div class="head">
     <div>
-      <h1 class="page-title">Projects</h1>
-      <p class="muted sub">Group your apps by product or team. Each app holds its own DSN.</p>
+      <h1 class="page-title">{t('projects.title')}</h1>
+      <p class="muted sub">{t('projects.subtitle')}</p>
     </div>
     <Button
       variant="primary"
@@ -202,8 +204,8 @@
   {#if showNewProject}
     <Card class="new-project">
       <form class="inline-form" onsubmit={submitNewProject}>
-        <Input label="Project name" bind:value={newProjectName} placeholder="Payments" required />
-        <Button type="submit" variant="primary" loading={creatingProject}>Create project</Button>
+        <Input label={t('projects.name')} bind:value={newProjectName} placeholder={t('auth.placeholder.projectName')} required />
+        <Button type="submit" variant="primary" loading={creatingProject}>{t('projects.create')}</Button>
       </form>
     </Card>
   {/if}
@@ -211,8 +213,8 @@
   {#if sessionStore.projects.length === 0}
     <Card>
       <EmptyState
-        title="No projects yet"
-        description="Create a project to start grouping apps."
+        title={t('projects.empty.title')}
+        description={t('projects.empty.body')}
         icon="folders"
       >
         {#snippet action()}
@@ -221,7 +223,7 @@
             lockedReason={createProjectLock}
             onclick={() => (showNewProject = true)}
           >
-            New project
+            {t('projects.new')}
           </Button>
         {/snippet}
       </EmptyState>
@@ -239,7 +241,7 @@
               class="expander"
               onclick={() => toggleProject(project.id)}
               aria-expanded={!!openProject[project.id]}
-              aria-label="Toggle apps"
+              aria-label={t('projects.toggleApps')}
             >
               <span class="chevron" class:open={openProject[project.id]}><Icon name="chevron-right" size={14} /></span>
             </button>
@@ -254,8 +256,8 @@
                   }}
                 >
                   <Input bind:value={renameValue} required />
-                  <Button type="submit" variant="primary" size="sm" loading={savingRename}>Save</Button>
-                  <Button variant="ghost" size="sm" onclick={() => (renamingId = null)}>Cancel</Button>
+                  <Button type="submit" variant="primary" size="sm" loading={savingRename}>{t('common.save')}</Button>
+                  <Button variant="ghost" size="sm" onclick={() => (renamingId = null)}>{t('common.cancel')}</Button>
                 </form>
               {:else}
                 <button class="p-name-btn" onclick={() => toggleProject(project.id)}>
@@ -273,7 +275,7 @@
                   lockedReason={updateLock}
                   onclick={() => startRename(project.id, project.name)}
                 >
-                  Rename
+                  {t('projects.rename')}
                 </Button>
                 <Button
                   variant="ghost"
@@ -281,7 +283,7 @@
                   lockedReason={deleteLock}
                   onclick={() => (confirmDeleteId = project.id)}
                 >
-                  Delete
+                  {t('common.delete')}
                 </Button>
               </div>
             {/if}
@@ -290,7 +292,7 @@
           {#if confirmDeleteId === project.id}
             <div class="confirm">
               <span class="confirm-text">
-                Delete <strong>{project.name}</strong> and every app beneath it?
+                {t('common.delete')} <strong>{project.name}</strong> {t('prose.projects.confirmDelete')}
               </span>
               <div class="confirm-actions">
                 <Button
@@ -299,9 +301,9 @@
                   loading={deletingId === project.id}
                   onclick={() => doDelete(project.id)}
                 >
-                  Yes, delete
+                  {t('projects.confirmDelete')}
                 </Button>
-                <Button variant="ghost" size="sm" onclick={() => (confirmDeleteId = null)}>Cancel</Button>
+                <Button variant="ghost" size="sm" onclick={() => (confirmDeleteId = null)}>{t('common.cancel')}</Button>
               </div>
             </div>
           {/if}
@@ -323,27 +325,27 @@
                     </Badge>
                     <div class="a-actions">
                       <Button variant="subtle" size="sm" onclick={() => openApp(project.id, app.id)}>
-                        Open
+                        {t('projects.open')}
                       </Button>
                       <Button
                         variant="ghost"
                         size="sm"
                         onclick={() => openAppSettings(project.id, app.id)}
                       >
-                        Settings
+                        {t('projects.settings')}
                       </Button>
                     </div>
                   </div>
                 {:else}
-                  <p class="no-apps muted">No apps in this project yet.</p>
+                  <p class="no-apps muted">{t('projects.noApps')}</p>
                 {/each}
 
                   {#if newAppFor === project.id}
                     <form class="new-app-form" onsubmit={(e) => submitNewApp(e, project.id)}>
-                      <Input bind:value={newAppName} placeholder="App name" required />
-                      <select class="type-select" bind:value={newAppType} aria-label="App type">
-                        {#each APP_TYPES as t (t.value)}
-                          <option value={t.value}>{t.label}</option>
+                      <Input bind:value={newAppName} placeholder={t('projects.appName')} required />
+                      <select class="type-select" bind:value={newAppType} aria-label={t('projects.appType')}>
+                        {#each APP_TYPES as opt (opt.value)}
+                          <option value={opt.value}>{opt.label}</option>
                         {/each}
                       </select>
                       <Button
@@ -353,15 +355,14 @@
                         loading={creatingApp}
                         lockedReason={createAppLock}
                       >
-                        Create app
+                        {t('projects.createApp')}
                       </Button>
-                      <Button variant="ghost" size="sm" onclick={() => (newAppFor = null)}>Cancel</Button>
+                      <Button variant="ghost" size="sm" onclick={() => (newAppFor = null)}>{t('common.cancel')}</Button>
                     </form>
                   {:else}
                     <button
                       class="add-app"
-                      disabled={createAppLock !== null}
-                      title={createAppLock ? lockTitle(createAppLock) : undefined}
+                      use:lockTip={createAppLock}
                       onclick={() => startNewApp(project.id)}
                     >
                       {#if createAppLock}<span class="add-lock" aria-hidden="true"
@@ -442,7 +443,7 @@
     background: none;
     border: none;
     padding: 0;
-    text-align: left;
+    text-align: start;
     min-width: 0;
   }
   .p-name {
@@ -577,6 +578,6 @@
   .add-lock {
     display: inline-flex;
     vertical-align: -2px;
-    margin-right: 6px;
+    margin-inline-end: 6px;
   }
 </style>

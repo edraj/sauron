@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatDateTime } from '../lib/utils/format';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -229,7 +231,7 @@
   }
 
   function fmtDate(s: string): string {
-    return new Date(s).toLocaleString();
+    return formatDateTime(s);
   }
 
   $effect(() => {
@@ -246,10 +248,9 @@
   <div class="page">
     <header class="head">
       <div>
-        <h1 class="page-title">Source Maps</h1>
+        <h1 class="page-title">{t('sourcemaps.title')}</h1>
         <p class="sub muted">
-          Upload JavaScript source maps and Flutter symbol files so minified and obfuscated stack
-          traces resolve to your original code.
+          {t('prose.sourcemaps.subtitle')}
         </p>
       </div>
     </header>
@@ -259,7 +260,7 @@
       <div class="upload">
         <div class="fields">
           <div class="field">
-            <label class="lbl" for="art-kind">Kind</label>
+            <label class="lbl" for="art-kind">{t('sourcemaps.column.kind')}</label>
             <div class="control select">
               <!-- Locked while a request is in flight: switching kind mid-upload
                    changes which fields are on screen (and clears the staged file)
@@ -275,7 +276,7 @@
 
           {#if isDart}
             <div class="field">
-              <label class="lbl" for="art-platform">Platform</label>
+              <label class="lbl" for="art-platform">{t('sourcemaps.column.platform')}</label>
               <div class="control select">
                 <select id="art-platform" bind:value={dartPlatform}>
                   {#each DART_PLATFORMS as p (p.value)}
@@ -285,7 +286,7 @@
                 <span class="affix"><Icon name="chevron-down" size={15} /></span>
               </div>
             </div>
-            <Input bind:value={release} label="Release" placeholder="app@1.4.2+12" />
+            <Input bind:value={release} label={t('sourcemaps.column.release')} placeholder="app@1.4.2+12" />
             {#if needsDebugId}
               <!--
                 The one form with a debug-id input. A map is plain JSON with no
@@ -294,15 +295,15 @@
               -->
               <Input
                 bind:value={debugId}
-                label="Debug id"
-                placeholder="the id the symbols upload reported"
+                label={t('sourcemaps.field.debugId')}
+                placeholder={t('prose.placeholder.debugId')}
               />
             {:else}
-              <Input bind:value={arch} label="Arch (optional)" placeholder="arm64" />
+              <Input bind:value={arch} label={t('sourcemaps.field.arch')} placeholder="arm64" />
             {/if}
           {:else}
-            <Input bind:value={release} label="Release" placeholder="web@1.4.2" />
-            <Input bind:value={name} label="Minified file path" placeholder="~/static/app.min.js" />
+            <Input bind:value={release} label={t('sourcemaps.column.release')} placeholder="web@1.4.2" />
+            <Input bind:value={name} label={t('sourcemaps.field.minifiedPath')} placeholder="~/static/app.min.js" />
           {/if}
         </div>
         <label class="file-field">
@@ -322,18 +323,18 @@
       </div>
       {#if needsDebugId}
         <p class="hint muted">
-          Use the <b>same debug id as this build's symbols</b> — it is the only thing tying the two
-          together, and the upload is refused without it. Flutter emits the map with
+          {t('prose.sourcemaps.sameId.a')} <b>{t('prose.sourcemaps.sameId.b')}</b>
+          {t('prose.sourcemaps.sameId.c')}
           <code class="mono">--extra-gen-snapshot-options=--save-obfuscation-map</code>.
         </p>
       {:else if isDart}
         <p class="hint muted">
-          The debug id is read out of the file's own build-id note — nothing to paste. Flutter emits
-          these with <code class="mono">--split-debug-info</code>.
+          {t('prose.sourcemaps.debugId.a')}
+          <code class="mono">--split-debug-info</code>.
         </p>
       {/if}
       <p class="hint muted">
-        Or from CI: <code class="mono">{cliHint(kind)}</code>
+        {t('sourcemaps.orFromCi')} <code class="mono">{cliHint(kind)}</code>
       </p>
     </Card>
 
@@ -347,15 +348,14 @@
         {#snippet header()}
           <div class="cov-head">
             <Icon name="triangle-alert" size={16} />
-            <h3 class="card-title-inline">Incomplete Dart builds</h3>
+            <h3 class="card-title-inline">{t('sourcemaps.incompleteDart')}</h3>
           </div>
         {/snippet}
         <p class="cov-lead muted">
-          An obfuscated Flutter build needs <b>two</b> artifacts, and they fix different halves of
-          what you read. The symbols file resolves stack <b>frames</b>; only the obfuscation map
-          resolves the exception <b>class name</b> — the SDK sends
-          <code class="mono">runtimeType.toString()</code>, which the build already renamed, and no
-          amount of debug info reverses that.
+          {t('prose.sourcemaps.coverage.a')} <b>2</b> {t('prose.sourcemaps.coverage.b')}
+          <b>{t('sourcemaps.frames')}</b>{t('prose.sourcemaps.coverage.c')}
+          <b>{t('sourcemaps.className')}</b>{t('prose.sourcemaps.coverage.d')}
+          <code class="mono">runtimeType.toString()</code>{t('prose.sourcemaps.coverage.e')}
         </p>
         <div class="cov-list">
           {#each coverageGaps as b (b.debugId)}
@@ -369,16 +369,15 @@
               </div>
               {#if b.hasSymbols && !b.hasObfuscationMap}
                 <Button variant="secondary" lockedReason={writeLock} onclick={() => uploadMapFor(b)}>
-                  Upload map
+                  {t('sourcemaps.upload')}
                 </Button>
               {/if}
             </div>
           {/each}
         </div>
         <p class="hint muted">
-          Not every build needs a map — one compiled without
-          <code class="mono">--obfuscate</code> has no renamed names to reverse. This lists what is
-          uploaded, not a guess about how you built.
+          {t('prose.sourcemaps.noMap.a')}
+          <code class="mono">--obfuscate</code> {t('prose.sourcemaps.noMap.b')}
         </p>
       </Card>
     {/if}
@@ -394,23 +393,23 @@
       <div class="center"><Spinner /></div>
     {:else if artifacts.length === 0}
       <EmptyState
-        title="No source maps or symbols yet"
-        description="Upload a .map or a Flutter symbol file above, or wire the CLI into your deploy."
+        title={t('sourcemaps.empty.title')}
+        description={t('sourcemaps.empty.body')}
       />
     {:else}
       <DataTable>
         {#snippet head()}
           <tr>
             <SortableTh key="release" columnDefault="asc" sort={list.sort} {onsort}>
-              Release
+              {t('sourcemaps.column.release')}
             </SortableTh>
-            <SortableTh key="file" columnDefault="asc" sort={list.sort} {onsort}>File</SortableTh>
+            <SortableTh key="file" columnDefault="asc" sort={list.sort} {onsort}>{t('sourcemaps.column.file')}</SortableTh>
             <SortableTh key="platform" columnDefault="asc" sort={list.sort} {onsort}>
-              Platform
+              {t('sourcemaps.column.platform')}
             </SortableTh>
-            <SortableTh key="kind" columnDefault="asc" sort={list.sort} {onsort}>Kind</SortableTh>
-            <SortableTh key="size" class="num" sort={list.sort} {onsort}>Size</SortableTh>
-            <SortableTh key="uploaded" sort={list.sort} {onsort}>Uploaded</SortableTh>
+            <SortableTh key="kind" columnDefault="asc" sort={list.sort} {onsort}>{t('sourcemaps.column.kind')}</SortableTh>
+            <SortableTh key="size" class="num" sort={list.sort} {onsort}>{t('storage.column.size')}</SortableTh>
+            <SortableTh key="uploaded" sort={list.sort} {onsort}>{t('sourcemaps.column.uploaded')}</SortableTh>
             <!-- The Delete button's column has no value to order by. -->
             <th></th>
           </tr>
@@ -426,7 +425,7 @@
               <td class="cell-muted">{fmtDate(a.created_at)}</td>
               <td>
                 <Button variant="ghost" size="sm" lockedReason={writeLock} onclick={() => remove(a.id)}>
-                  Delete
+                  {t('common.delete')}
                 </Button>
               </td>
             </tr>
@@ -569,7 +568,7 @@
   }
   .control.select select {
     appearance: none;
-    padding-right: 34px;
+    padding-inline-end: 34px;
     cursor: pointer;
   }
   /* The Kind picker locks during an upload; say so visually rather than leaving
@@ -586,7 +585,7 @@
   }
   .control.select .affix {
     position: absolute;
-    right: 11px;
+    inset-inline-end: 11px;
   }
   .file-field {
     display: flex;

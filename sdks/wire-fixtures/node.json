@@ -61,7 +61,7 @@
         },
         "stacktrace": [
           {
-            "function": "<fn>",
+            "function": null,
             "module": null,
             "filename": "<file>",
             "abs_path": "<file>",
@@ -79,16 +79,7 @@
             "in_app": false
           },
           {
-            "function": "<fn>",
-            "module": null,
-            "filename": "<file>",
-            "abs_path": "<file>",
-            "lineno": 42,
-            "colno": 13,
-            "in_app": false
-          },
-          {
-            "function": "<fn>",
+            "function": null,
             "module": null,
             "filename": "<file>",
             "abs_path": "<file>",

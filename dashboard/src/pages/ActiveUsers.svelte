@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import AppEnvPicker from '../lib/components/AppEnvPicker.svelte';
@@ -175,11 +176,11 @@
     const pid = sessionStore.currentProjectId;
     const encoded = encodeSelection(selection);
     const f = from;
-    const t = to;
+    const end = to;
     if (!pid) return;
     const p = new URLSearchParams();
     p.set('from', f);
-    p.set('to', t);
+    p.set('to', end);
     for (const s of encoded) p.append('selection', s);
     void replace(`/active-users?${p.toString()}`);
     if (encoded.length === 0) {
@@ -189,7 +190,7 @@
       view.reset();
       return;
     }
-    void load(pid, { from: f, to: t, selection: encoded });
+    void load(pid, { from: f, to: end, selection: encoded });
   });
 
   // Pre-load environments for anything the URL already had ticked, so a shared
@@ -237,13 +238,12 @@
   <div class="active-users">
     <header class="head">
       <div>
-        <h1 class="page-title">Active users</h1>
+        <h1 class="page-title">{t('activeUsers.title')}</h1>
         <!-- The caveat that qualifies the identified number belongs beside the
              number too (see the Identified tile) — a caveat one scroll away
              gets read after the figure has already been believed. -->
         <p class="sub muted">
-          Distinct people per UTC day, combined across the apps you pick. Users are matched
-          across apps by the distinct ID your SDK sends — apps must use the same identifier.
+          {t('activeUsers.subtitle')}
         </p>
       </div>
       <div class="controls">
@@ -274,12 +274,12 @@
           disabled={!report || !selectionValid.ok}
         >
           <Icon name="download" size={15} />
-          Export CSV
+          {t('explore.exportCsv')}
         </Button>
       </div>
     </header>
 
-    <Card title="Apps and environments">
+    <Card title={t('activeUsers.card.apps')}>
       <AppEnvPicker
         {apps}
         {envsByApp}
@@ -317,8 +317,8 @@
     {:else if !selectionValid.ok}
       <Card>
         <EmptyState
-          title="Pick an app to begin"
-          description="Tick one or more apps above and choose which environment each one's numbers come from."
+          title={t('activeUsers.empty.pickApp')}
+          description={t('activeUsers.empty.pickAppBody')}
           icon="users"
         />
       </Card>
@@ -326,13 +326,13 @@
       {@const rep = report}
       <StatTiles min={150}>
         <StatTile
-          label="Active users"
+          label={t('activeUsers.title')}
           value={rep.latest ? compactNumber(rep.latest.active_total) : '—'}
           tone="primary"
           sub={rep.latest ? `${rep.latest.day} · ${compactNumber(rep.latest.active_identified)} identified / ${compactNumber(rep.latest.active_guest)} guests` : 'no complete day yet'}
         />
         <StatTile
-          label="Identified"
+          label={t('activeUsers.stat.identified')}
           value={rep.latest ? compactNumber(rep.latest.active_identified) : '—'}
           sub={selectionCount(selection) === 1
             ? 'matched by distinct ID'
@@ -343,7 +343,7 @@
           {/snippet}
         </StatTile>
         <StatTile
-          label="Guests"
+          label={t('activeUsers.stat.guests')}
           value={rep.latest ? compactNumber(rep.latest.active_guest) : '—'}
           sub="never merged across apps"
         >
@@ -352,12 +352,12 @@
           {/snippet}
         </StatTile>
         <StatTile
-          label="Peak"
+          label={t('activeUsers.stat.peak')}
           value={peak === null ? '—' : compactNumber(peak)}
           sub={peakDay ? `${rangeLabel()} · ${compactNumber(peakDay.active_identified)} identified / ${compactNumber(peakDay.active_guest)} guests` : rangeLabel()}
         />
         <StatTile
-          label="Apps"
+          label={t('activeUsers.stat.apps')}
           value={selectionCount(selection)}
           sub={describeSelection(selection, appName, envLabel)}
         />
@@ -369,17 +369,17 @@
              three tiles always add up, and the identified half can still
              double-count one person. -->
         <p class="caveat muted">
-          Two apps that name the same person differently count that person twice in
-          <strong>Identified</strong>. Guests are never merged across apps at all, so a large
+          {t('activeUsers.doubleCount')}
+          <strong>{t('activeUsers.stat.identified')}</strong>. Guests are never merged across apps at all, so a large
           guest share means most of the total was never a candidate for merging.
         </p>
       {/if}
 
-      <Card title="Active users per day">
+      <Card title={t('activeUsers.card.perDay')}>
         {#if chartData.length === 0}
           <EmptyState
-            title="No days in range"
-            description="The selected window contains no complete day of data."
+            title={t('activeUsers.empty.noDays')}
+            description={t('activeUsers.empty.noDaysBody')}
             icon="chart-column"
           />
         {:else}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import { push } from 'svelte-spa-router';
   import { authStore } from '../../stores/auth.svelte';
   import { sessionStore } from '../../stores/session.svelte';
@@ -43,9 +44,9 @@
   // warranted if this entry could show environments beyond what is listed
   // right below it, which by construction it cannot.
   const envItems = $derived([
-    { id: '', name: 'All environments' },
+    { id: '', name: t('nav.allEnvironments') },
     ...sessionStore.environments.map((e) => ({ id: e.id, name: e.name })),
-    { id: 'none', name: 'Unattributed' },
+    { id: 'none', name: t('nav.unattributed') },
   ]);
 
   // The current app's icon (falls back to a generic glyph before apps resolve).
@@ -76,11 +77,11 @@
     <!-- Org switcher -->
     {#if orgItems.length > 0}
       <SwitcherMenu
-        label="Org"
+        label={t('nav.org')}
         items={orgItems}
         currentId={sessionStore.currentOrgId}
         onSelect={(id) => void sessionStore.setOrg(id)}
-        ariaLabel="Switch organization"
+        ariaLabel={t('nav.switchOrg')}
       />
     {/if}
 
@@ -89,14 +90,14 @@
       <span class="sep" aria-hidden="true">/</span>
       <div class="project-switcher">
         <SwitcherMenu
-          label="Project"
+          label={t('nav.project')}
           items={projectItems}
           currentId={sessionStore.currentProjectId}
           onSelect={(id) => void sessionStore.setProject(id)}
           createLabel="New project"
           onCreate={() => push('/admin/projects')}
           createLocked={createProjectLock}
-          ariaLabel="Switch project"
+          ariaLabel={t('nav.switchProject')}
         />
       </div>
     {/if}
@@ -112,7 +113,7 @@
         createLabel="New app"
         onCreate={() => push('/admin/projects')}
         createLocked={createAppLock}
-        ariaLabel="Switch app"
+        ariaLabel={t('nav.switchApp')}
       />
     {/if}
 
@@ -122,24 +123,24 @@
     {#if sessionStore.currentAppId}
       <span class="sep" aria-hidden="true">/</span>
       <SwitcherMenu
-        label="Env"
+        label={t('nav.env')}
         items={envItems}
         currentId={sessionStore.currentEnvId ?? ''}
         onSelect={(id) => void sessionStore.setEnvironment(id === '' ? null : id)}
-        ariaLabel="Switch environment"
+        ariaLabel={t('nav.switchEnvironment')}
       />
     {/if}
   </div>
 
   <div class="right">
-    <a class="icon-btn" href="#/docs" title="Docs & integration guides" aria-label="Docs">
+    <a class="icon-btn" href="#/docs" title={t('nav.docsTitle')} aria-label={t('nav.docs')}>
       <Icon name="life-buoy" size={16} />
     </a>
 
     <button
       class="icon-btn"
-      title={themeStore.theme === 'dark' ? 'Switch to light' : 'Switch to dark'}
-      aria-label="Toggle theme"
+      title={themeStore.theme === 'dark' ? t('nav.switchToLight') : t('nav.switchToDark')}
+      aria-label={t('nav.theme.toggle')}
       onclick={() => themeStore.toggle()}
     >
       <Icon name={themeStore.theme === 'dark' ? 'moon' : 'sun'} size={16} />
@@ -150,12 +151,12 @@
         {initials(authStore.user?.name || authStore.user?.email || '?')}
       </span>
       <div class="user-meta">
-        <span class="u-name">{authStore.user?.name || 'Account'}</span>
+        <span class="u-name">{authStore.user?.name || t('nav.account')}</span>
         <span class="u-email">{authStore.user?.email}</span>
       </div>
     </div>
 
-    <button class="logout" onclick={logout} title="Log out">Log out</button>
+    <button class="logout" onclick={logout} title={t('nav.logOut')}>{t('nav.logOut')}</button>
   </div>
 </header>
 
@@ -211,7 +212,7 @@
     display: flex;
     align-items: center;
     gap: 9px;
-    padding-left: 4px;
+    padding-inline-start: 4px;
   }
   .avatar {
     width: 32px;

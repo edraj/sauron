@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   import type { Frame, SymbolicatedFrame } from '../models';
 
   interface Props {
@@ -118,7 +119,7 @@
 {#if ordered.length === 0 && rawTrace}
   <pre class="raw-trace mono">{rawTrace}</pre>
 {:else if ordered.length === 0}
-  <p class="muted empty">No stacktrace on this event.</p>
+  <p class="muted empty">{t('ui.empty.stacktrace')}</p>
 {:else}
   {#if hasSymbolicated}
     <div class="toolbar">
@@ -245,7 +246,7 @@
     padding: 8px 14px;
     font-size: 12px;
     font-weight: 600;
-    text-align: left;
+    text-align: start;
     color: var(--text-muted);
     background: var(--surface-2);
     border: none;
@@ -333,14 +334,14 @@
   .ctx-line .ln {
     flex: 0 0 auto;
     width: 42px;
-    text-align: right;
-    padding-right: 10px;
+    text-align: end;
+    padding-inline-end: 10px;
     color: var(--text-faint);
     user-select: none;
-    border-right: 1px solid var(--border);
+    border-inline-end: 1px solid var(--border);
   }
   .ctx-line .src {
-    padding-left: 10px;
+    padding-inline-start: 10px;
     color: var(--text-muted);
   }
   .ctx-line.crash {

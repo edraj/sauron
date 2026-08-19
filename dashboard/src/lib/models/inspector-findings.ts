@@ -1,3 +1,4 @@
+import { formatNumber } from '../i18n';
 // Grouping, count rendering and badge logic for the Findings tab. Pure.
 
 export interface FindingView {
@@ -28,7 +29,7 @@ export interface FindingBadge {
 const SCAN_ONLY = new Set(['devices', 'identities', 'workflows']);
 
 export function formatMatchCount(n: number, exact: boolean): string {
-  const s = n.toLocaleString();
+  const s = formatNumber(n);
   // A truncated unit makes every count a LOWER BOUND; rendering it as an
   // exact number would be a quiet lie on a privacy report.
   return exact ? s : `at least ${s}`;

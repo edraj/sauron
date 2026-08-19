@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Icon, { type IconName } from './Icon.svelte';
   import { toastStore } from '../../stores/toast.svelte';
 
@@ -14,7 +15,7 @@
     <div class="toast {toast.kind}" role="status">
       <span class="ico"><Icon name={icons[toast.kind]} size={16} /></span>
       <span class="msg">{toast.message}</span>
-      <button class="close" aria-label="Dismiss" onclick={() => toastStore.dismiss(toast.id)}>
+      <button class="close" aria-label={t('common.dismiss')} onclick={() => toastStore.dismiss(toast.id)}>
         <Icon name="x" size={14} />
       </button>
     </div>
@@ -25,7 +26,7 @@
   .toast-host {
     position: fixed;
     bottom: 20px;
-    right: 20px;
+    inset-inline-end: 20px;
     z-index: 1000;
     display: flex;
     flex-direction: column;
@@ -39,19 +40,19 @@
     padding: 12px 14px;
     background: var(--surface);
     border: 1px solid var(--border-strong);
-    border-left-width: 3px;
+    border-inline-start-width: 3px;
     border-radius: var(--radius);
     box-shadow: var(--shadow-lg);
     animation: toast-in 0.22s cubic-bezier(0.2, 0.9, 0.3, 1);
   }
   .toast.success {
-    border-left-color: var(--success);
+    border-inline-start-color: var(--success);
   }
   .toast.error {
-    border-left-color: var(--error);
+    border-inline-start-color: var(--error);
   }
   .toast.info {
-    border-left-color: var(--info);
+    border-inline-start-color: var(--info);
   }
   .ico {
     font-weight: 700;

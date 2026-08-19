@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
   import type { Member } from '../../models';
@@ -29,22 +30,19 @@
       <strong>{member.email} will not be able to sign in until they use the emailed link.</strong>
     </p>
     <p>
-      Their current password stops working immediately and they are signed out of every device
-      within a few seconds. We email them a link that expires in 24 hours. If it does not arrive,
-      come back here to send another or to cancel.
+      {t('prose.members.resetWarning')}
     </p>
   {:else}
     <p class="lead">
       {member.email} will be able to sign in with their existing password again.
     </p>
     <p>
-      They will still be asked to choose a new one when they do. Any reset link already sent stops
-      working.
+      {t('prose.members.resetPending')}
     </p>
   {/if}
 
   {#snippet footer()}
-    <Button variant="ghost" onclick={oncancel} disabled={busy}>Never mind</Button>
+    <Button variant="ghost" onclick={oncancel} disabled={busy}>{t('members.reset.neverMind')}</Button>
     <Button variant={action === 'reset' ? 'danger' : 'primary'} loading={busy} onclick={onconfirm}>
       {action === 'reset' ? 'Reset password' : 'Cancel reset'}
     </Button>

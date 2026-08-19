@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../../i18n';
+  import { formatNumber } from '../../i18n';
   import { push } from 'svelte-spa-router';
   import DataTable from '../DataTable.svelte';
   import SortableTh from '../SortableTh.svelte';
@@ -67,13 +69,13 @@
       swap — an unlisted column is a 400, not a silently ignored parameter.
     -->
     <tr>
-      <SortableTh key="family" columnDefault="asc" {sort} {onsort}>Device</SortableTh>
+      <SortableTh key="family" columnDefault="asc" {sort} {onsort}>{t('sessions.column.device')}</SortableTh>
       <SortableTh key="os_name" columnDefault="asc" {sort} {onsort}>OS</SortableTh>
-      <SortableTh key="device_count" class="num" {sort} {onsort}>Devices</SortableTh>
-      <SortableTh key="sessions_count" class="num" {sort} {onsort}>Sessions</SortableTh>
-      <SortableTh key="events_count" class="num" {sort} {onsort}>Events</SortableTh>
-      <SortableTh key="errors_count" class="num" {sort} {onsort}>Errors</SortableTh>
-      <SortableTh key="last_seen" {sort} {onsort}>Last seen</SortableTh>
+      <SortableTh key="device_count" class="num" {sort} {onsort}>{t('devices.title')}</SortableTh>
+      <SortableTh key="sessions_count" class="num" {sort} {onsort}>{t('explore.column.sessions')}</SortableTh>
+      <SortableTh key="events_count" class="num" {sort} {onsort}>{t('explore.column.events')}</SortableTh>
+      <SortableTh key="errors_count" class="num" {sort} {onsort}>{t('explore.column.errors')}</SortableTh>
+      <SortableTh key="last_seen" {sort} {onsort}>{t('explore.column.lastSeen')}</SortableTh>
     </tr>
   {/snippet}
   {#each rows as g (rowKey(g))}
@@ -82,15 +84,15 @@
         {#if deviceName(g)}
           <span class="dev-name">{deviceName(g)}</span>
         {:else}
-          <span class="cell-muted">Unknown device</span>
+          <span class="cell-muted">{t('devices.unknownDevice')}</span>
         {/if}
       </td>
       <td class="cell-muted">{osLabel(g)}</td>
-      <td class="num">{g.device_count.toLocaleString()}</td>
-      <td class="num">{g.sessions_count.toLocaleString()}</td>
-      <td class="num">{g.events_count.toLocaleString()}</td>
+      <td class="num">{formatNumber(g.device_count)}</td>
+      <td class="num">{formatNumber(g.sessions_count)}</td>
+      <td class="num">{formatNumber(g.events_count)}</td>
       <td class="num">
-        <span class:err={g.errors_count > 0}>{g.errors_count.toLocaleString()}</span>
+        <span class:err={g.errors_count > 0}>{formatNumber(g.errors_count)}</span>
       </td>
       <td><TimeValue value={g.last_seen} muted /></td>
     </tr>

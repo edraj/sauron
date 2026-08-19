@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatNumber } from '../i18n';
   interface Item {
     name: string;
     count: number;
@@ -28,7 +29,7 @@
     >
       <span class="fill" style="width:{(item.count / max) * 100}%"></span>
       <span class="name mono">{item.name}</span>
-      <span class="count">{item.count.toLocaleString()}{valueLabel ? ` ${valueLabel}` : ''}</span>
+      <span class="count">{formatNumber(item.count)}{valueLabel ? ` ${valueLabel}` : ''}</span>
     </button>
   {/each}
 </div>
@@ -50,7 +51,7 @@
     background: transparent;
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    text-align: left;
+    text-align: start;
     overflow: hidden;
     transition: border-color 0.12s ease;
   }

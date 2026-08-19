@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -235,10 +236,10 @@
 <AdminShell requireProject={false}>
   <div class="head">
     <div>
-      <h1>Wall of Shame</h1>
+      <h1>{t('audit.title')}</h1>
       <p class="sub">
-        Every administrative action taken in
-        <strong>{sessionStore.currentOrg?.name ?? 'this organization'}</strong>, newest first.
+        {t('prose.audit.lede')}
+        <strong>{sessionStore.currentOrg?.name ?? 'this organization'}</strong>{t('prose.audit.newestFirst')}
       </p>
     </div>
     <div class="actions">
@@ -258,7 +259,7 @@
     <Card>
       <div class="filters">
         <label>
-        <span>Range</span>
+        <span>{t('journeys.range')}</span>
         <select bind:value={filters.range}>
           {#each RANGES as r (r.key)}
             <option value={r.key}>{r.label}</option>
@@ -267,9 +268,9 @@
       </label>
 
       <label>
-        <span>Project</span>
+        <span>{t('storage.column.project')}</span>
         <select bind:value={filters.project_id}>
-          <option value={null}>All projects</option>
+          <option value={null}>{t('audit.filter.allProjects')}</option>
           {#each projectOptions as p (p.id)}
             <option value={p.id}>{p.label}</option>
           {/each}
@@ -277,9 +278,9 @@
       </label>
 
       <label>
-        <span>App</span>
+        <span>{t('nav.selectApp')}</span>
         <select bind:value={filters.app_id}>
-          <option value={null}>All apps</option>
+          <option value={null}>{t('audit.filter.allApps')}</option>
           {#each appOptions as a (a.id)}
             <option value={a.id}>{a.label}</option>
           {/each}
@@ -287,9 +288,9 @@
       </label>
 
       <label>
-        <span>Environment</span>
+        <span>{t('nav.env')}</span>
         <select bind:value={filters.environment_id}>
-          <option value={null}>All environments</option>
+          <option value={null}>{t('audit.filter.allEnvironments')}</option>
           {#each envOptions as e (e.id)}
             <option value={e.id}>{e.label}</option>
           {/each}
@@ -297,9 +298,9 @@
       </label>
 
       <label>
-        <span>Who</span>
+        <span>{t('audit.column.who')}</span>
         <select bind:value={filters.actor_id}>
-          <option value={null}>Everyone</option>
+          <option value={null}>{t('audit.filter.everyone')}</option>
           {#each actorOptions as a (a.id)}
             <option value={a.id}>{a.label}</option>
           {/each}
@@ -307,9 +308,9 @@
       </label>
 
       <label>
-        <span>Action</span>
+        <span>{t('audit.column.action')}</span>
         <select bind:value={filters.action}>
-          <option value={null}>All actions</option>
+          <option value={null}>{t('audit.filter.allActions')}</option>
           {#each actionOptions as a (a.label)}
             <option value={a.label}>{describeAction(a.label).label}</option>
           {/each}
@@ -324,11 +325,11 @@
       -->
       <label class="toggle">
         <input type="checkbox" bind:checked={filters.include_auth} />
-        <span>Include sign-in activity</span>
+        <span>{t('audit.includeSignIns')}</span>
       </label>
 
       {#if !isDefaultFilter(filters)}
-        <Button variant="ghost" onclick={clearFilters}>Clear</Button>
+        <Button variant="ghost" onclick={clearFilters}>{t('common.clear')}</Button>
       {/if}
     </div>
   </Card>
@@ -341,7 +342,7 @@
     <div class="centered"><Spinner /></div>
   {:else if error}
     <EmptyState
-      title="Could not load the audit trail"
+      title={t('audit.error.load')}
       description={error}
       icon="triangle-alert"
     />
@@ -354,18 +355,18 @@
     -->
     {#if isDefaultFilter(filters)}
       <EmptyState
-        title="Nothing recorded yet"
-        description="Administrative actions — creating projects, apps and environments, adding members, resetting passwords, changing roles — appear here from the moment this feature was deployed. Actions taken before then were never recorded and cannot be reconstructed."
+        title={t('audit.empty.title')}
+        description={t('audit.empty.body')}
         icon="scroll-text"
       />
     {:else}
       <EmptyState
-        title="No actions match these filters"
-        description="Try widening the date range or clearing a filter."
+        title={t('audit.empty.filtered.title')}
+        description={t('audit.empty.filtered.body')}
         icon="search"
       >
         {#snippet action()}
-          <Button variant="secondary" onclick={clearFilters}>Clear filters</Button>
+          <Button variant="secondary" onclick={clearFilters}>{t('audit.filter.clear')}</Button>
         {/snippet}
       </EmptyState>
     {/if}
@@ -373,11 +374,11 @@
     <DataTable>
       {#snippet head()}
         <tr>
-          <th>When</th>
-          <th>Who</th>
-          <th>Action</th>
-          <th>Target</th>
-          <th>Where</th>
+          <th>{t('ui.opModal.when')}</th>
+          <th>{t('audit.column.who')}</th>
+          <th>{t('audit.column.action')}</th>
+          <th>{t('audit.column.target')}</th>
+          <th>{t('audit.column.where')}</th>
         </tr>
       {/snippet}
       {#snippet children()}
@@ -415,20 +416,20 @@
   {@const described = describeAction(entry.action)}
   <Modal open title={described.label} onclose={() => (selected = null)}>
     <dl class="detail">
-      <dt>When</dt>
+      <dt>{t('ui.opModal.when')}</dt>
       <dd><TimeValue value={entry.created_at} asText /></dd>
 
-      <dt>Who</dt>
+      <dt>{t('audit.column.who')}</dt>
       <dd>{entry.actor_email || 'unknown'}</dd>
 
-      <dt>Action</dt>
+      <dt>{t('audit.column.action')}</dt>
       <dd><code>{entry.action}</code></dd>
 
-      <dt>Target</dt>
+      <dt>{t('audit.column.target')}</dt>
       <dd>{entry.entity_name || '—'}</dd>
 
       {#if describeScope(entry)}
-        <dt>Where</dt>
+        <dt>{t('audit.column.where')}</dt>
         <dd>{describeScope(entry)}</dd>
       {/if}
     </dl>
@@ -440,9 +441,9 @@
       <DataTable>
         {#snippet head()}
           <tr>
-            <th>Field</th>
-            <th>Before</th>
-            <th>After</th>
+            <th>{t('audit.column.field')}</th>
+            <th>{t('audit.filter.before')}</th>
+            <th>{t('audit.filter.after')}</th>
           </tr>
         {/snippet}
         {#snippet children()}

@@ -1,11 +1,12 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Card from '../ui/Card.svelte';
   import Badge from '../ui/Badge.svelte';
   import RowActionsMenu from '../ui/RowActionsMenu.svelte';
   import { sessionStore } from '../../stores/session.svelte';
   import { initials } from '../../utils/format';
   import { canCancelPasswordReset, canResetMemberPassword } from '../../models/password-reset';
-  import { lockTitle } from '../../models/page-access';
+    import { lockTip } from '../../actions/lock-tip';
   import Icon from '../ui/Icon.svelte';
   import type {
     App,
@@ -121,9 +122,9 @@
     <table class="members">
       <thead>
         <tr>
-          <th>Member</th>
-          <th>Role</th>
-          <th>Scope</th>
+          <th>{t('members.column.member')}</th>
+          <th>{t('members.column.role')}</th>
+          <th>{t('members.column.scope')}</th>
           <th class="col-act"></th>
         </tr>
       </thead>
@@ -136,12 +137,12 @@
                 <div class="m-meta">
                   <span class="m-name-row">
                     <span class="m-name">{member.name || member.email}</span>
-                    {#if !member.is_active}<Badge tone="warning" size="sm">Deactivated</Badge>{/if}
+                    {#if !member.is_active}<Badge tone="warning" size="sm">{t('members.deactivated')}</Badge>{/if}
                     {#if member.credentials_invalidated_at}
                       <!-- An account nobody can sign in to is a state the table has
                            to show without being opened: the admin who forced it may
                            not be the one fielding "I can't log in". -->
-                      <Badge tone="warning" size="sm">Reset pending</Badge>
+                      <Badge tone="warning" size="sm">{t('members.resetPending')}</Badge>
                     {/if}
                   </span>
                   {#if member.name}<span class="m-email">{member.email}</span>{/if}
@@ -165,8 +166,9 @@
                       class="chip-remove"
                       class:removing={removingId === grant.id}
                       aria-label={`Remove ${scopeLabel(grant)} access`}
-                      title={manageLock ? lockTitle(manageLock) : 'Remove access'}
-                      disabled={removingId !== null || manageLock !== null}
+                      title={t('members.removeAccess')}
+                      use:lockTip={manageLock}
+                      disabled={removingId !== null}
                       onclick={() => onremovegrant(grant.id)}
                     >
                       ×
@@ -182,8 +184,7 @@
                       type="button"
                       role="menuitem"
                       class="ram-item"
-                      disabled={manageLock !== null}
-                      title={manageLock ? lockTitle(manageLock) : undefined}
+                      use:lockTip={manageLock}
                       onclick={() => {
                         close();
                         onedit(member.user_id);
@@ -203,8 +204,7 @@
                         type="button"
                         role="menuitem"
                         class="ram-item"
-                        disabled={credentialLock !== null}
-                        title={credentialLock ? lockTitle(credentialLock) : undefined}
+                        use:lockTip={credentialLock}
                         onclick={() => {
                           close();
                           onresetpassword(member, 'reset');
@@ -219,8 +219,7 @@
                         type="button"
                         role="menuitem"
                         class="ram-item"
-                        disabled={credentialLock !== null}
-                        title={credentialLock ? lockTitle(credentialLock) : undefined}
+                        use:lockTip={credentialLock}
                         onclick={() => {
                           close();
                           onresetpassword(member, 'cancel');
@@ -239,8 +238,8 @@
                         type="button"
                         role="menuitem"
                         class="ram-item"
-                        disabled={revokingUserId === member.user_id || revokeLock !== null}
-                        title={revokeLock ? lockTitle(revokeLock) : undefined}
+                        disabled={revokingUserId === member.user_id}
+                        use:lockTip={revokeLock}
                         onclick={() => {
                           close();
                           onrevokesessions(member);
@@ -255,8 +254,8 @@
                       type="button"
                       role="menuitem"
                       class="ram-item danger"
-                      disabled={togglingUserId === member.user_id || manageLock !== null}
-                      title={manageLock ? lockTitle(manageLock) : undefined}
+                      disabled={togglingUserId === member.user_id}
+                      use:lockTip={manageLock}
                       onclick={() => {
                         close();
                         ontoggle(member);
@@ -286,7 +285,7 @@
     font-size: 13.5px;
   }
   thead th {
-    text-align: left;
+    text-align: start;
     padding: 12px 16px;
     font-size: 11px;
     font-weight: 650;
@@ -308,7 +307,7 @@
     opacity: 0.58;
   }
   .col-act {
-    text-align: right;
+    text-align: end;
     width: 1%;
     white-space: nowrap;
   }

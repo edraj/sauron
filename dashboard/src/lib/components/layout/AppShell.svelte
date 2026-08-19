@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import type { Snippet } from 'svelte';
   import { onMount } from 'svelte';
   // Aliased: an unqualified `location` import shadows `window.location`, and
@@ -81,9 +82,9 @@
   <main class="content">
     <div class="content-inner">
       {#if loadError}
-        <EmptyState title="Couldn't load workspace" description={loadError} icon="triangle-alert">
+        <EmptyState title={t('shell.workspace.errorTitle')} description={loadError} icon="triangle-alert">
           {#snippet action()}
-            <Button variant="primary" onclick={() => location.reload()}>Retry</Button>
+            <Button variant="primary" onclick={() => location.reload()}>{t('common.retry')}</Button>
           {/snippet}
         </EmptyState>
       {:else if !sessionStore.loaded}
@@ -94,18 +95,18 @@
              empties and every action locks — indistinguishable from a real
              no-grants account unless we say so here. -->
         <EmptyState
-          title="Couldn't load permissions"
-          description="We couldn't check what you have access to, so the dashboard is showing nothing rather than guessing. This is usually temporary."
+          title={t('shell.permissions.errorTitle')}
+          description={t('shell.permissions.errorBody')}
           icon="triangle-alert"
         >
           {#snippet action()}
-            <Button variant="primary" onclick={() => location.reload()}>Retry</Button>
+            <Button variant="primary" onclick={() => location.reload()}>{t('common.retry')}</Button>
           {/snippet}
         </EmptyState>
       {:else if noAccess}
         <EmptyState
-          title="No apps available"
-          description="You don't have access to any app in this organization yet. Ask an administrator to grant you access."
+          title={t('shell.noApps.title')}
+          description={t('shell.noApps.body')}
           icon="lock"
         />
       {:else if pageDenied && pageAccess}
@@ -123,7 +124,13 @@
 <style>
   .shell {
     display: grid;
-    grid-template-columns: var(--sidebar-w) 1fr;
+    /* `minmax(0, 1fr)`, not `1fr`. A bare `1fr` is `minmax(auto, 1fr)`, so the
+       content track refuses to shrink below its min-content width — one wide
+       table or long unbroken string and the track outgrows the viewport.
+       Left-to-right that overflows to the right and reads as a stray
+       horizontal scrollbar; right-to-left the same overflow lands at negative
+       x, putting the start of every row off the near edge of the screen. */
+    grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
     grid-template-rows: var(--topbar-h) 1fr;
     grid-template-areas:
       'sidebar topbar'

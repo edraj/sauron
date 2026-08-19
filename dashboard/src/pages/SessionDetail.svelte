@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -184,28 +186,28 @@
 </script>
 
 <AppShell requireApp>
-  <button class="back" onclick={() => push('/sessions')}><Icon name="arrow-left" size={14} /> Sessions</button>
+  <button class="back" onclick={() => push('/sessions')}><Icon name="arrow-left" size={14} /> {t('explore.column.sessions')}</button>
 
   {#if loading}
     <div class="center"><Spinner size={26} /></div>
   {:else if notFound}
     <EmptyState
-      title="Session not found"
-      description="This session no longer exists, or it never reached this app."
+      title={t('session.notFound.title')}
+      description={t('session.notFound.body')}
       icon="inbox"
     >
       {#snippet action()}
-        <Button variant="secondary" onclick={() => push('/sessions')}>Back to sessions</Button>
+        <Button variant="secondary" onclick={() => push('/sessions')}>{t('session.backToList')}</Button>
       {/snippet}
     </EmptyState>
   {:else if error}
-    <EmptyState title="Couldn't load session" description={error} icon="triangle-alert">
+    <EmptyState title={t('session.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
         <Button
           variant="secondary"
           onclick={() => sessionStore.currentAppId && load(sessionStore.currentAppId, sessionId, true)}
         >
-          Retry
+          {t('common.retry')}
         </Button>
       {/snippet}
     </EmptyState>
@@ -236,28 +238,28 @@
     </header>
 
     <StatTiles min={160}>
-      <StatTile label="Duration" value={formatDuration(durationMs)} />
-      <StatTile label="Events" value={s.events_count.toLocaleString()} />
+      <StatTile label={t('explore.column.duration')} value={formatDuration(durationMs)} />
+      <StatTile label={t('explore.column.events')} value={formatNumber(s.events_count)} />
       <StatTile
-        label="Errors"
-        value={s.errors_count.toLocaleString()}
+        label={t('explore.column.errors')}
+        value={formatNumber(s.errors_count)}
         tone={s.errors_count > 0 ? 'error' : 'neutral'}
       />
-      <StatTile label="Started" value={formatDateTime(s.started_at)} />
+      <StatTile label={t('explore.column.started')} value={formatDateTime(s.started_at)} />
     </StatTiles>
 
     <div class="grid">
       <div class="col-main">
-        <Card title="Timeline">
+        <Card title={t('session.card.timeline')}>
           {#snippet actions()}
             <Button
               variant="ghost"
               size="sm"
-              title="Download session timeline and context as JSON"
+              title={t('session.downloadTitle')}
               onclick={downloadSessionJson}
             >
               <Icon name="download" size={14} />
-              Download JSON
+              {t('explore.downloadJson')}
             </Button>
             <Button
               variant="ghost"
@@ -294,18 +296,18 @@
         </Card>
       </div>
       <aside class="col-side">
-        <Card title="Session context">
+        <Card title={t('session.card.context')}>
           {#if hasContext}
             <div class="ctx"><JsonTree value={s.context} expandTo={1} /></div>
           {:else}
-            <p class="muted empty-ctx">No context recorded for this session.</p>
+            <p class="muted empty-ctx">{t('session.noContext')}</p>
           {/if}
         </Card>
       </aside>
     </div>
   {/if}
 
-  <Modal open={sliceStack.length > 0} onclose={closeSliceModal} size="xl" title="In between transaction">
+  <Modal open={sliceStack.length > 0} onclose={closeSliceModal} size="xl" title={t('session.inBetweenTransaction')}>
     {#if sliceStack.length > 0}
       <div class="slice-header">
         <div class="slice-breadcrumbs">

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t, formatNumber } from '../i18n';
   import PageStrip from './PageStrip.svelte';
 
   /**
@@ -56,10 +57,13 @@
   );
 
   const label = $derived.by(() => {
-    if (count === 0) return offset === 0 ? 'No results' : 'End of results';
-    const range = `${from.toLocaleString()}–${to.toLocaleString()}`;
+    if (count === 0) return offset === 0 ? t('common.noResults') : t('ui.pager.endOfResults');
+    const range = `${formatNumber(from)}–${formatNumber(to)}`;
     if (total === null) return range;
-    return `${range} of ${total.toLocaleString()}${totalIsCapped ? '+' : ''}`;
+    return t('ui.pager.range', {
+      range,
+      total: `${formatNumber(total)}${totalIsCapped ? '+' : ''}`,
+    });
   });
 </script>
 

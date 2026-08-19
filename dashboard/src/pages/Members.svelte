@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { untrack } from 'svelte';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -411,7 +412,7 @@
 <AdminShell requireProject={false}>
   <div class="head">
     <div>
-      <h1 class="page-title">Members</h1>
+      <h1 class="page-title">{t('members.title')}</h1>
       <p class="muted sub">People with access to {sessionStore.currentOrg?.name ?? 'this org'}.</p>
     </div>
   </div>
@@ -428,22 +429,22 @@
     <div class="stack">
       <Card>
         {#snippet header()}
-          <h3 class="card-title-inline">Grant access</h3>
-          <p class="muted grant-sub">For someone who already has an account, here or in another org.</p>
+          <h3 class="card-title-inline">{t('members.grantAccess')}</h3>
+          <p class="muted grant-sub">{t('members.existingAccount')}</p>
         {/snippet}
         {#snippet actions()}
           <Button variant="primary" lockedReason={manageLock} onclick={() => (createOpen = true)}>
-            Create member
+            {t('members.create')}
           </Button>
         {/snippet}
         <form class="grant-form" onsubmit={submitGrant}>
           <div class="gf-row">
             <div class="gf-field">
-              <Input label="Email" type="email" bind:value={grantEmail} placeholder="teammate@company.com" required />
+              <Input label={t('common.email')} type="email" bind:value={grantEmail} placeholder={t('members.placeholder.email')} required />
             </div>
             <div class="gf-field">
-              <span class="lbl">Role</span>
-              <select class="sel" bind:value={grantRoleId} aria-label="Role">
+              <span class="lbl">{t('members.column.role')}</span>
+              <select class="sel" bind:value={grantRoleId} aria-label={t('members.column.role')}>
                 {#each roles as role (role.id)}
                   <option value={role.id}>{role.name}</option>
                 {/each}
@@ -451,7 +452,7 @@
             </div>
           </div>
           <div class="gf-field">
-            <span class="lbl">Scope</span>
+            <span class="lbl">{t('members.column.scope')}</span>
             <ScopeTree
               orgId={sessionStore.currentOrg?.id ?? ''}
               orgName={sessionStore.currentOrg?.name ?? 'this org'}
@@ -473,7 +474,7 @@
               disabled={!canGrant}
               lockedReason={manageLock}
             >
-              Grant
+              {t('members.grant')}
             </Button>
           </div>
         </form>
@@ -536,9 +537,9 @@
   {#if deactivateTarget}
     <ConfirmDialog
       open
-      title="Deactivate member?"
+      title={t('members.confirmDeactivate')}
       message={`${deactivateTarget.email} will be signed out of every device and won't be able to sign in until reactivated. Their access grants are kept.`}
-      confirmLabel="Deactivate"
+      confirmLabel={t('members.deactivate')}
       danger
       onconfirm={confirmDeactivate}
       oncancel={() => (deactivateTarget = null)}
@@ -558,9 +559,9 @@
   {#if pendingRevoke}
     <ConfirmDialog
       open
-      title="Sign out all sessions"
+      title={t('members.signOutAll')}
       message={`${pendingRevoke.name || pendingRevoke.email} will be signed out on every device and will have to log in again. Their account stays active.`}
-      confirmLabel="Sign out"
+      confirmLabel={t('auth.signOut')}
       danger
       onconfirm={() => void confirmRevokeSessions()}
       oncancel={() => (pendingRevoke = null)}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import { untrack } from 'svelte';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
@@ -437,11 +438,11 @@
   onclose={onclose}
 >
   {#if !member}
-    <p class="lede">No member selected.</p>
+    <p class="lede">{t('members.edit.noMember')}</p>
   {:else if !ready}
     <div class="center"><Spinner size={24} /></div>
   {:else if results}
-    <p class="err-msg head-msg">Some changes were not applied.</p>
+    <p class="err-msg head-msg">{t('members.edit.partialFailure')}</p>
     <ul class="results">
       {#each results as step, i (i)}
         <li class="result-row">
@@ -459,22 +460,20 @@
     <div class="identity">
       <div class="id-main">
         <span class="id-name">{member.name || member.email}</span>
-        {#if !member.is_active}<Badge tone="warning" size="sm">Deactivated</Badge>{/if}
+        {#if !member.is_active}<Badge tone="warning" size="sm">{t('members.deactivated')}</Badge>{/if}
       </div>
       {#if member.name}<span class="id-email">{member.email}</span>{/if}
     </div>
-    <p class="lede">Tick what they can reach. Each role carries its own scope selection.</p>
+    <p class="lede">{t('members.edit.tickReach')}</p>
 
     {#if !member.is_active}
       <p class="warning">
-        This account is deactivated. You can remove access, but new grants will be refused until
-        it is reactivated.
+        {t('prose.members.deactivated')}
       </p>
     {/if}
     {#if editingSelf}
       <p class="warning">
-        You are editing your own access. Removing these grants can end your ability to manage
-        members.
+        {t('prose.members.selfEdit')}
       </p>
     {/if}
 
@@ -484,11 +483,11 @@
         <div class="block" class:invalid={isEmpty}>
           <div class="b-head">
             <div class="gf-field">
-              <span class="lbl">Role</span>
+              <span class="lbl">{t('members.column.role')}</span>
               <select
                 class="sel"
                 value={block.roleId}
-                aria-label="Role"
+                aria-label={t('members.column.role')}
                 disabled={saving}
                 onchange={(e) => setRole(block.key, e.currentTarget.value)}
               >
@@ -503,12 +502,12 @@
               disabled={saving}
               onclick={() => removeBlock(block.key)}
             >
-              Remove this role
+              {t('members.edit.removeRole')}
             </Button>
           </div>
 
           <div class="gf-field">
-            <span class="lbl">Scope</span>
+            <span class="lbl">{t('members.column.scope')}</span>
             <ScopeTree
               {orgId}
               {orgName}
@@ -525,8 +524,8 @@
 
           {#if block.unmatched.length}
             <div class="unmatched">
-              <span class="lbl">Scopes not visible to you</span>
-              <p class="u-note">Kept as they are unless you remove them.</p>
+              <span class="lbl">{t('members.edit.hiddenScopes')}</span>
+              <p class="u-note">{t('members.edit.hiddenKept')}</p>
               {#each block.unmatched as g (g.id)}
                 <div class="u-row">
                   <code>{g.scope_type} {g.scope_id.slice(0, 8)}…</code>
@@ -536,7 +535,7 @@
                     disabled={saving}
                     onclick={() => dropUnmatched(block.key, g.id)}
                   >
-                    Remove
+                    {t('common.remove')}
                   </Button>
                 </div>
               {/each}
@@ -544,7 +543,7 @@
           {/if}
 
           {#if isEmpty}
-            <p class="err-msg">Pick at least one scope, or remove this role.</p>
+            <p class="err-msg">{t('members.edit.pickScope')}</p>
           {/if}
         </div>
       {/each}
@@ -558,7 +557,7 @@
 
     <div class="add-row">
       <Button variant="secondary" size="sm" disabled={saving || !canAddRole} onclick={addRole}>
-        Add a role
+        {t('members.edit.addRole')}
       </Button>
     </div>
 
@@ -575,7 +574,7 @@
 
     {#if stripsLastOwner}
       <p class="warning">
-        Cannot remove the last grant with org:manage — assign it to another member first.
+        {t('members.edit.lastOrgManage')}
       </p>
     {:else if destructive}
       <p class="warning">
@@ -588,11 +587,11 @@
 
   {#snippet footer()}
     {#if results}
-      <Button variant="ghost" onclick={onclose}>Close</Button>
-      <Button variant="primary" onclick={backToEditing}>Back to editing</Button>
+      <Button variant="ghost" onclick={onclose}>{t('common.close')}</Button>
+      <Button variant="primary" onclick={backToEditing}>{t('members.edit.backToEditing')}</Button>
     {:else}
       {#if progress}<span class="progress">{progress}</span>{/if}
-      <Button variant="ghost" onclick={onclose} disabled={saving}>Cancel</Button>
+      <Button variant="ghost" onclick={onclose} disabled={saving}>{t('common.cancel')}</Button>
       <Button
         variant={destructive ? 'danger' : 'primary'}
         disabled={!canSave}
@@ -751,7 +750,7 @@
   .progress {
     font-size: 12.5px;
     color: var(--text-muted);
-    margin-right: auto;
+    margin-inline-end: auto;
     align-self: center;
   }
   .results {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { localeStore } from '../i18n/locale.svelte';
   import type { UserSeriesPoint } from '../models';
   import { formatDateTime } from '../utils/format';
 
@@ -33,7 +34,7 @@
   function label(bucket: string): string {
     const d = new Date(bucket);
     if (Number.isNaN(d.getTime())) return bucket;
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return d.toLocaleDateString(localeStore.tag, { month: 'short', day: 'numeric' });
   }
 </script>
 

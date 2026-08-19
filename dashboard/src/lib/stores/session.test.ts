@@ -869,3 +869,58 @@ describe('accessError', () => {
     expect(sessionStore.can('issue:read')).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// `canAtAnyEnv` — the "all environments" arm of the page gate.
+//
+// `resolve_env_filter` (rbac.rs) answers `EnvFilter::All` for an env-scoped
+// caller with `Ok(Subset(readable))`, NOT with a denial: the server narrows the
+// read to the environments they hold rather than refusing it. So the page gate
+// for an env-aware page must admit a member who holds the permission on any
+// environment while the picker sits on "all". `can()` cannot answer that — it
+// asks about ONE named environment — which is why this is separate.
+// ---------------------------------------------------------------------------
+describe('canAtAnyEnv()', () => {
+  beforeEach(() => {
+    sessionStore.currentOrgId = 'org-1';
+    sessionStore.currentProjectId = 'proj-1';
+    sessionStore.currentAppId = 'app-1';
+  });
+
+  it('is true when an env grant carries the permission', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: ['event:read'] }],
+    };
+    expect(sessionStore.canAtAnyEnv('event:read')).toBe(true);
+  });
+
+  it('is false when the env grant carries a different permission', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'env', scope_id: 'env-1', permissions: ['event:read'] }],
+    };
+    expect(sessionStore.canAtAnyEnv('issue:write')).toBe(false);
+  });
+
+  // Deliberately NOT true. This function exists only to answer the env arm of
+  // the gate; the app/project/org arms are `can()`'s job and are checked first
+  // by `canAccessPage`. Folding them in here would make the two paths overlap
+  // and hide which one actually admitted the member.
+  it('ignores org, project and app grants', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [
+        { scope_type: 'org', scope_id: 'org-1', permissions: ['event:read'] },
+        { scope_type: 'project', scope_id: 'proj-1', permissions: ['event:read'] },
+        { scope_type: 'app', scope_id: 'app-1', permissions: ['event:read'] },
+      ],
+    };
+    expect(sessionStore.canAtAnyEnv('event:read')).toBe(false);
+  });
+
+  it('is false while access has not loaded', () => {
+    sessionStore.access = null;
+    expect(sessionStore.canAtAnyEnv('event:read')).toBe(false);
+  });
+});

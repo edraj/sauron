@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   /**
    * The time window control for the signal-browsing lists.
    *
@@ -33,12 +34,14 @@
 
   let { fields, value, onchange, presets = [1, 7, 30, 90, 365] }: Props = $props();
 
-  const MODES: { key: TimeMode; label: string }[] = [
-    { key: 'last', label: 'in the last' },
-    { key: 'after', label: 'after' },
-    { key: 'before', label: 'before' },
-    { key: 'between', label: 'between' },
-  ];
+  // `$derived`, not a plain const: `t()` reads the locale store, so a value
+  // computed once at init would freeze these in the mount language.
+  const MODES: { key: TimeMode; label: string }[] = $derived([
+    { key: 'last', label: t('ui.time.mode.last') },
+    { key: 'after', label: t('ui.time.mode.after') },
+    { key: 'before', label: t('ui.time.mode.before') },
+    { key: 'between', label: t('ui.time.mode.between') },
+  ]);
 
   function presetLabel(d: number): string {
     if (d === 1) return '24h';
@@ -141,7 +144,7 @@
 
 <div class="timefilter">
   {#if fields.length > 1}
-    <select value={draft.field} onchange={setField} aria-label="Time field">
+    <select value={draft.field} onchange={setField} aria-label={t('ui.time.field')}>
       {#each fields as f (f.key)}<option value={f.key}>{f.label}</option>{/each}
     </select>
   {:else if fields.length === 1}
@@ -149,7 +152,7 @@
     <span class="static-field">{fields[0].label}</span>
   {/if}
 
-  <select value={draft.mode} onchange={setMode} aria-label="Time comparison">
+  <select value={draft.mode} onchange={setMode} aria-label={t('ui.time.comparison')}>
     {#each MODES as m (m.key)}<option value={m.key}>{m.label}</option>{/each}
   </select>
 
@@ -157,10 +160,10 @@
     <select
       value={custom || !isPreset ? 'custom' : String(draft.lastDays)}
       onchange={setPreset}
-      aria-label="Time range"
+      aria-label={t('ui.time.range')}
     >
       {#each presets as d (d)}<option value={String(d)}>{presetLabel(d)}</option>{/each}
-      <option value="custom">Custom…</option>
+      <option value="custom">{t('ui.time.custom')}</option>
     </select>
     {#if custom || !isPreset}
       <!-- TEXT, never type="number". `bind:value` on a numberlike input writes
@@ -176,7 +179,7 @@
         class="days"
         value={draft.lastDays ?? ''}
         onchange={setCustomDays}
-        aria-label="Number of days"
+        aria-label={t('ui.time.numberOfDays')}
       />
       <span class="unit">days</span>
     {/if}
@@ -186,7 +189,7 @@
         type="datetime-local"
         value={fromInput}
         onchange={(e) => setBound('from', e)}
-        aria-label="From"
+        aria-label={t('ui.time.from')}
       />
     {/if}
     {#if draft.mode === 'between'}<span class="unit">to</span>{/if}
@@ -201,7 +204,7 @@
     <!-- The offset is shown because the value entered is read in the viewer's
          own zone. Without it an absolute window is ambiguous by exactly the
          offset, which is the kind of error that looks like missing data. -->
-    <span class="tz" title="Times are entered in your local timezone">{zone}</span>
+    <span class="tz" title={t('ui.time.localTimezone')}>{zone}</span>
   {/if}
 
   {#if error}

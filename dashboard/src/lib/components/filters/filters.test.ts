@@ -209,7 +209,7 @@ describe('isFilterValueValid', () => {
   });
 
   it('does not crash on an enum def with no options', () => {
-    const broken: FieldDef = { key: 'x', label: 'X', type: 'enum', ops: ['eq'] };
+    const broken: FieldDef = { key: 'x', labelKey: 'common.name', type: 'enum', ops: ['eq'] };
     expect(isFilterValueValid(broken, 'anything')).toBe(false);
   });
 });

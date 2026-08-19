@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Input from '../lib/components/ui/Input.svelte';
@@ -36,39 +37,39 @@
   }
 </script>
 
-<AuthLayout title="Create your account" subtitle="Spin up a workspace in seconds.">
+<AuthLayout title={t('auth.register.title')} subtitle={t('auth.register.subtitle')}>
   <form onsubmit={submit} class="form">
     {#if error}<div class="alert" role="alert">{error}</div>{/if}
-    <Input label="Name" bind:value={name} placeholder="Ada Lovelace" autocomplete="name" />
+    <Input label={t('common.name')} bind:value={name} placeholder={t('auth.placeholder.personName')} autocomplete="name" />
     <Input
-      label="Work email"
+      label={t('auth.register.workEmail')}
       type="email"
       bind:value={email}
-      placeholder="you@company.com"
+      placeholder={t('auth.placeholder.email')}
       autocomplete="email"
       required
     />
     <Input
-      label="Password"
+      label={t('common.password')}
       type="password"
       bind:value={password}
-      placeholder="At least 8 characters"
+      placeholder={t('auth.register.minChars')}
       autocomplete="new-password"
       required
     />
     <Input
-      label="Organization name"
+      label={t('auth.register.orgName')}
       bind:value={orgName}
-      placeholder="Acme Inc."
+      placeholder={t('auth.placeholder.orgName')}
       required
     />
     <Button type="submit" variant="primary" size="lg" fullWidth loading={submitting}>
-      Create account
+      {t('auth.register.submit')}
     </Button>
   </form>
 
   {#snippet footer()}
-    <span>Already have an account? <a href="#/login">Sign in</a></span>
+    <span>{t('auth.register.haveAccount')} <a href="#/login">{t('auth.login.submit')}</a></span>
   {/snippet}
 </AuthLayout>
 

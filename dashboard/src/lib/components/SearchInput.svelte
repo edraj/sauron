@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   import Icon from './ui/Icon.svelte';
 
   interface Props {
@@ -69,10 +70,10 @@
     autocomplete="off"
   />
   {#if value}
-    <button class="clear" onclick={clear} type="button" aria-label="Clear search"><Icon name="x" size={14} /></button>
+    <button class="clear" onclick={clear} type="button" aria-label={t('ui.search.clear')}><Icon name="x" size={14} /></button>
   {/if}
   {#if onsearch}
-    <button class="go" class:pending type="button" onclick={submit} title="Search (Enter)">Search</button>
+    <button class="go" class:pending type="button" onclick={submit} title={t('ui.search.submit')}>{t('common.search')}</button>
   {/if}
 </div>
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
@@ -55,7 +56,7 @@
       {memberCount === 1 ? 'member' : 'members'} will lose this access immediately. This cannot be undone.
     </p>
   {:else}
-    <p class="lede">No members hold this role. This cannot be undone.</p>
+    <p class="lede">{t('roles.deleteSafe')}</p>
   {/if}
 
   <Input
@@ -67,9 +68,9 @@
   {#if error}<p class="err-msg">{error}</p>{/if}
 
   {#snippet footer()}
-    <Button variant="secondary" onclick={onclose} disabled={busy}>Cancel</Button>
+    <Button variant="secondary" onclick={onclose} disabled={busy}>{t('common.cancel')}</Button>
     <Button variant="danger" disabled={!canDelete} loading={busy} onclick={submit}>
-      Delete role
+      {t('roles.delete')}
     </Button>
   {/snippet}
 </Modal>

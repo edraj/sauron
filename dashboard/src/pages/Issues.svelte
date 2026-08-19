@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t, joinList } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import { push, querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -56,18 +58,24 @@
    */
   const ISSUES_LIMIT = 100;
 
-  const ISSUE_RANGES = [
-    { days: 7, label: '7d' },
-    { days: 30, label: '30d' },
-    { days: 90, label: '90d' },
-    { days: 3650, label: 'All' },
-  ];
+  // The day counts are the identity and never move; only the widest one's
+  // label is a word rather than a unit abbreviation, so only the label is
+  // translated. Kept as a plain const so `WIDEST_RANGE` below can read it at
+  // init — a `$derived` array would make that read capture a stale first value.
+  const ISSUE_RANGE_DAYS = [7, 30, 90, 3650];
+  const WIDEST_RANGE = Math.max(...ISSUE_RANGE_DAYS);
+  const ISSUE_RANGES = $derived(
+    ISSUE_RANGE_DAYS.map((days) => ({
+      days,
+      label: days === WIDEST_RANGE ? t('ui.range.all') : `${days}d`,
+    })),
+  );
 
-  // The widest setting the picker offers, read off the list above rather than
-  // written out again: at that setting the range narrows nothing the reader can
-  // perceive, so it cannot be what makes a panel and the list disagree. Derived
-  // so that adding or renaming a range can't leave a hardcoded 3650 behind.
-  const WIDEST_RANGE = Math.max(...ISSUE_RANGES.map((r) => r.days));
+  // `WIDEST_RANGE` is the widest setting the picker offers, read off the list
+  // above rather than written out again: at that setting the range narrows
+  // nothing the reader can perceive, so it cannot be what makes a panel and the
+  // list disagree. Derived so that adding a range can't leave a hardcoded 3650
+  // behind.
 
   // Hydrate filter/search/date-range state from the URL once, at init — not
   // inside an effect, so this never re-runs and never fights the sync effect
@@ -254,9 +262,12 @@
 
   /** "Tag", or "Tag and Workflow" — the chip labels, not the wire keys. */
   const blockedFilterLabels = $derived(
-    blockedFilterFields
-      .map((k) => ISSUE_FIELDS.find((f) => f.key === k)?.label ?? k)
-      .join(' and '),
+    joinList(
+      blockedFilterFields.map((k) => {
+        const def = ISSUE_FIELDS.find((f) => f.key === k);
+        return def ? t(def.labelKey) : k;
+      }),
+    ),
   );
 
   function dropBlockedFilters() {
@@ -300,7 +311,7 @@
         // but the widest, where it narrows nothing anyway.
         ignoresDateRange: sinceDays < WIDEST_RANGE,
       },
-      'these totals',
+      'totals',
     ),
   );
 
@@ -317,7 +328,7 @@
         ignoresSearch: appliedSearch !== '',
         ignoresDateRange: false,
       },
-      'this chart',
+      'chart',
     ),
   );
 
@@ -491,8 +502,8 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Exceptions</h1>
-      <p class="muted sub">Grouped errors across your app, most recent first.</p>
+      <h1 class="page-title">{t('issues.title')}</h1>
+      <p class="muted sub">{t('issues.subtitle')}</p>
     </div>
     <div class="controls">
       <!--
@@ -510,13 +521,13 @@
 
   {#if stats}
     <StatTiles min={140}>
-      <StatTile label="Total" value={compactNumber(stats.total)} />
-      <StatTile label="Unresolved" value={compactNumber(stats.unresolved)} tone="warning" />
-      <StatTile label="Resolved" value={compactNumber(stats.resolved)} tone="success" />
-      <StatTile label="Ignored" value={compactNumber(stats.ignored)} tone="neutral" />
-      <StatTile label="Fatal" value={compactNumber(stats.fatal)} tone="error" />
-      <StatTile label="Error" value={compactNumber(stats.error)} tone="error" />
-      <StatTile label="Warning" value={compactNumber(stats.warning)} tone="warning" />
+      <StatTile label={t('issues.stat.total')} value={compactNumber(stats.total)} />
+      <StatTile label={t('issues.stat.unresolved')} value={compactNumber(stats.unresolved)} tone="warning" />
+      <StatTile label={t('issues.stat.resolved')} value={compactNumber(stats.resolved)} tone="success" />
+      <StatTile label={t('issues.stat.ignored')} value={compactNumber(stats.ignored)} tone="neutral" />
+      <StatTile label={t('issues.stat.fatal')} value={compactNumber(stats.fatal)} tone="error" />
+      <StatTile label={t('issues.stat.error')} value={compactNumber(stats.error)} tone="error" />
+      <StatTile label={t('issues.stat.warning')} value={compactNumber(stats.warning)} tone="warning" />
     </StatTiles>
 
     <!--
@@ -528,7 +539,7 @@
     <p class="scope-note">{tilesNote ?? ''}</p>
 
     <div class="occ">
-      <Card title="Occurrences">
+      <Card title={t('issues.occurrences')}>
         <TimeSeriesChart data={stats.series} height={200} color="var(--error)" />
         <p class="scope-note in-card">{occurrencesNote ?? ''}</p>
       </Card>
@@ -559,7 +570,7 @@
             sessionStore.currentAppId &&
             load(sessionStore.currentAppId, appliedSearch, page, true)}
         >
-          Try again
+          {t('ui.tryAgain')}
         </Button>
       </p>
     {/if}
@@ -587,7 +598,7 @@
                 sessionStore.currentAppId &&
                 load(sessionStore.currentAppId, appliedSearch, page, true)}
             >
-              Retry
+              {t('common.retry')}
             </Button>
           {/if}
         {/snippet}
@@ -601,19 +612,19 @@
         would be the pager lying in prose.
       -->
       <EmptyState
-        title="Nothing left on this page"
-        description="These rows have gone since the previous page was loaded. Go back for the ones that are still here."
+        title={t('list.stale.title')}
+        description={t('list.stale.issuesBody')}
         icon="search"
       >
         {#snippet action()}
           <Button variant="secondary" onclick={goPrev} disabled={loading || revalidating}>
-            Back a page
+            {t('list.stale.backAPage')}
           </Button>
         {/snippet}
       </EmptyState>
     {:else if issues.length === 0}
       <EmptyState
-        title="No issues here"
+        title={t('issues.empty.title')}
         description={isUnresolvedDefault
           ? 'Nothing unresolved right now. Your app is behaving.'
           : 'No issues match these filters.'}
@@ -623,12 +634,12 @@
       <DataTable>
         {#snippet head()}
           <tr>
-            <th class="col-title">Issue</th>
-            <th>Level</th>
-            <th>Status</th>
-            <th class="num">Events</th>
-            <th class="num">Users</th>
-            <th>Last seen</th>
+            <th class="col-title">{t('issues.column.issue')}</th>
+            <th>{t('issues.column.level')}</th>
+            <th>{t('common.status')}</th>
+            <th class="num">{t('overview.stat.events')}</th>
+            <th class="num">{t('overview.stat.users')}</th>
+            <th>{t('issues.column.lastSeen')}</th>
           </tr>
         {/snippet}
         {#snippet children()}
@@ -644,8 +655,8 @@
               </td>
               <td><LevelBadge level={issue.level} size="sm" /></td>
               <td><StatusBadge status={issue.status} size="sm" /></td>
-              <td class="num">{issue.times_seen.toLocaleString()}</td>
-              <td class="num">{issue.users_seen.toLocaleString()}</td>
+              <td class="num">{formatNumber(issue.times_seen)}</td>
+              <td class="num">{formatNumber(issue.users_seen)}</td>
               <td><TimeValue value={issue.last_seen} muted /></td>
             </tr>
           {/each}

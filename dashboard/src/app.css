@@ -274,3 +274,120 @@ kbd {
     transform: none;
   }
 }
+
+/* ==========================================================================
+   Right-to-left & Arabic typography
+   Driven by `lang` / `dir` on <html>, set by `i18n/locale.svelte.ts`.
+   ========================================================================== */
+
+/* Inter carries no Arabic glyphs, so Arabic text would fall through to an
+   arbitrary system default and render inconsistently across machines. Keep
+   Inter first — font stacks resolve per glyph, so Latin characters mixed into
+   Arabic text (SDK names, HTTP verbs, IDs) still get Inter — and name explicit
+   Arabic faces behind it. */
+[lang='ar'] {
+  --font-sans: 'Inter', 'Noto Sans Arabic', 'Noto Naskh Arabic', 'Segoe UI',
+    Tahoma, 'Geeza Pro', 'Arabic Typesetting', sans-serif;
+}
+
+/* Arabic is cursive: letters join, and letter-spacing pries those joins apart
+   into disconnected shapes. The tracking that tightens Latin headings actively
+   damages Arabic, so it is removed rather than reduced. `word-spacing` and
+   `text-transform` are left alone — the first is script-neutral, and the
+   second is a no-op on a caseless script. */
+[lang='ar'] h1,
+[lang='ar'] h2,
+[lang='ar'] h3,
+[lang='ar'] h4,
+[lang='ar'] .page-title,
+[lang='ar'] .section-label {
+  letter-spacing: normal;
+}
+
+/* Arabic's taller ascenders and lower descenders crowd at Latin line heights. */
+[lang='ar'] body {
+  line-height: 1.7;
+}
+
+/* --- LTR islands ----------------------------------------------------------
+   Machine text stays left-to-right inside an RTL page. Stack traces, DSNs,
+   JSON, hashes, IDs, and SDK snippets are not prose: mirroring them makes
+   `at Foo.bar (app.js:42)` unreadable and, worse, silently reorders the parts
+   of an identifier a user is about to copy into a bug report.
+
+   `unicode-bidi: isolate` is the load-bearing half. `direction: ltr` alone
+   still lets the surrounding RTL paragraph direction reorder the element
+   relative to its siblings; isolating it fixes the whole run as one
+   neutral-directional unit. `text-align: left` is needed because `start`
+   resolves to the right inside an RTL ancestor. */
+[dir='rtl'] .mono,
+[dir='rtl'] .cell-mono,
+[dir='rtl'] .codeblock,
+[dir='rtl'] .dsn,
+[dir='rtl'] code,
+[dir='rtl'] pre,
+[dir='rtl'] kbd,
+[dir='rtl'] [data-ltr] {
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: isolate;
+}
+
+/* --- directional icons ----------------------------------------------------
+   Chevrons and arrows encode "forward" and "back", which swap sides in RTL.
+   Mirrored centrally off `data-icon` (set by `ui/Icon.svelte`) so no call site
+   has to reason about direction.
+
+   Only the horizontal glyphs. `chevron-up` / `chevron-down` mean collapsed and
+   expanded — vertical, and unchanged by reading direction. Flipping those
+   would invert sort indicators and disclosure triangles for no reason.
+   `arrow-up-right` marks "opens externally"; it is a corner glyph whose
+   diagonal should follow the text flow, so it mirrors with the rest. */
+[dir='rtl'] [data-icon='chevron-left'],
+[dir='rtl'] [data-icon='chevron-right'],
+[dir='rtl'] [data-icon='arrow-left'],
+[dir='rtl'] [data-icon='arrow-right'],
+[dir='rtl'] [data-icon='arrow-up-right'] {
+  transform: scaleX(-1);
+}
+
+/* --- locked controls ------------------------------------------------------
+   Paired with the `lockTip` action (`lib/actions/lock-tip.ts`), which marks a
+   control the current role may not use. Global rather than component-scoped
+   because the action creates the bubble in `document.body` — Svelte's scoped
+   CSS would never match an element it did not compile, and the action is
+   deliberately usable on any element in any component.
+
+   `.is-locked` deliberately does NOT set `pointer-events: none`: the tooltip
+   is delivered by hover and focus on this very element, so making it
+   untargetable would suppress the explanation along with the interaction.
+   Activation is suppressed by the action's capture-phase click handler
+   instead. */
+.lock-tip {
+  position: fixed;
+  z-index: 9999;
+  transform: translateX(-50%);
+  max-width: 280px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+}
+
+.is-locked {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* Focus must stay obvious. Keeping a locked control in the tab order is the
+   whole point — a keyboard user has to be able to land on it and read why. */
+.is-locked:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+  opacity: 0.75;
+}

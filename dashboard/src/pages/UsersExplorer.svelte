@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import { push, querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -257,7 +259,7 @@
   // them in the cell, so without this the values would be unreachable without
   // opening the person — a compaction that loses data rather than folding it.
   function traitSummary(rest: { key: string; value: string }[]): string {
-    return rest.map((t) => `${t.key}: ${t.value}`).join('\n');
+    return rest.map((tag) => `${tag.key}: ${tag.value}`).join('\n');
   }
 
   function open(distinctId: string) {
@@ -268,17 +270,16 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Users</h1>
-      <p class="muted sub">Identified &amp; anonymous people seen by this app — search by distinct ID or trait.</p>
+      <h1 class="page-title">{t('users.title')}</h1>
+      <p class="muted sub">{t('users.subtitle')}</p>
     </div>
   </div>
 
   <div class="analytics-head">
     <div>
-      <h2 class="section-title">Audience</h2>
+      <h2 class="section-title">{t('users.audience')}</h2>
       <p class="muted sub">
-        This app only. <a href="#/active-users">Combined active users</a> counts people
-        across several apps at once.
+        {t('users.thisAppOnly')} <a href="#/active-users">{t('users.combinedActive')}</a> {t('prose.users.combinedNoteTail')}
       </p>
     </div>
     <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
@@ -290,29 +291,29 @@
   <div class="audience">
     {#if analytics}
       <StatTiles min={150}>
-        <StatTile label="Total users" value={compactNumber(analytics.stats.total_users)} tone="primary" sub="all time" />
-        <StatTile label="Active" value={compactNumber(analytics.stats.active_in_range)} sub={`last ${sinceDays}d`} />
-        <StatTile label="New" value={compactNumber(analytics.stats.new_in_range)} sub={`last ${sinceDays}d`} />
+        <StatTile label={t('users.stat.total')} value={compactNumber(analytics.stats.total_users)} tone="primary" sub="all time" />
+        <StatTile label={t('users.stat.active')} value={compactNumber(analytics.stats.active_in_range)} sub={`last ${sinceDays}d`} />
+        <StatTile label={t('users.stat.new')} value={compactNumber(analytics.stats.new_in_range)} sub={`last ${sinceDays}d`} />
         <!-- `stats.dau` has always been in the payload and in the `UserStats`
              model; the tile was simply never rendered, which is why this page
              shows a stickiness ratio whose numerator is invisible. -->
         <StatTile label="DAU" value={compactNumber(analytics.stats.dau)} sub="24h" />
         <StatTile label="WAU" value={compactNumber(analytics.stats.wau)} sub="7-day" />
         <StatTile label="MAU" value={compactNumber(analytics.stats.mau)} sub="30-day" />
-        <StatTile label="Stickiness" value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
-        <StatTile label="Avg session" value={formatDuration(analytics.stats.avg_session_ms)} />
-        <StatTile label="Median session" value={formatDuration(analytics.stats.median_session_ms)} />
+        <StatTile label={t('users.stat.stickiness')} value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
+        <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
+        <StatTile label={t('sessions.stat.median')} value={formatDuration(analytics.stats.median_session_ms)} />
       </StatTiles>
 
-      <Card title="Active users per day">
+      <Card title={t('users.card.activePerDay')}>
         <UserActivityChart data={analytics.series} />
       </Card>
     {:else if analyticsError}
       <Card><p class="muted">{analyticsError}</p></Card>
     {:else}
-      <Skeleton rows={2} height="70px" label="Loading audience stats" />
+      <Skeleton rows={2} height="70px" label={t('users.loading.stats')} />
       <Card>
-        <Skeleton rows={1} height="200px" label="Loading activity chart" />
+        <Skeleton rows={1} height="200px" label={t('users.loading.chart')} />
       </Card>
     {/if}
   </div>
@@ -324,18 +325,18 @@
        states instead of appearing only once rows land. -->
   <div class="people-head">
     <div>
-      <h2 class="section-title">People</h2>
+      <h2 class="section-title">{t('users.people')}</h2>
       <!-- No longer "most recently seen first": that was true of the fixed
            ordering this table used to have, and would now contradict the
            header the user just clicked. -->
-      <p class="muted section-hint">One row per distinct ID.</p>
+      <p class="muted section-hint">{t('users.onePerDistinctId')}</p>
     </div>
     <!-- Every control that narrows the TABLE lives in this one row, directly
          above it: search, window, refresh. They used to be split between the
          page header and here, which read as two unrelated toolbars and left
          the search box describing a table two sections further down. -->
     <div class="controls">
-      <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder="Search users…" width="300px" />
+      <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder={t('users.search')} width="300px" />
       <!-- Governs the TABLE only. The Audience range picker above drives the
            tiles and chart, and the two are deliberately separate windows: this
            one can name a column and a bound the summary endpoints cannot
@@ -358,10 +359,10 @@
   </div>
 
   {#if loading && rows.length === 0}
-    <Skeleton rows={8} height="48px" label="Loading users" />
+    <Skeleton rows={8} height="48px" label={t('users.loading.users')} />
   {:else if error}
     <Card>
-      <EmptyState title="Couldn't load users" description={error} icon="triangle-alert">
+      <EmptyState title={t('users.error.load')} description={error} icon="triangle-alert">
         {#snippet action()}
           <Button
             variant="secondary"
@@ -370,7 +371,7 @@
               if (aid) load(aid, query, sortParam(list.sort), list.offset, timeFilter);
             }}
           >
-            Retry
+            {t('common.retry')}
           </Button>
         {/snippet}
       </EmptyState>
@@ -391,23 +392,23 @@
         {#snippet head()}
           <tr>
             <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>
-              User
+              {t('sessions.column.user')}
             </SortableTh>
             <!-- Traits stays a plain `<th>`: the cell is a fold of an
                  arbitrary JSON object into one chip plus a "…", so there is no
                  single column to order by and the endpoint offers none. -->
-            <th>Traits</th>
+            <th>{t('users.column.traits')}</th>
             <SortableTh key="sessions_count" class="num" sort={list.sort} {onsort}>
-              Sessions
+              {t('explore.column.sessions')}
             </SortableTh>
             <SortableTh key="events_count" class="num" sort={list.sort} {onsort}>
-              Events
+              {t('explore.column.events')}
             </SortableTh>
             <SortableTh key="errors_count" class="num" sort={list.sort} {onsort}>
-              Errors
+              {t('explore.column.errors')}
             </SortableTh>
-            <SortableTh key="first_seen" sort={list.sort} {onsort}>First seen</SortableTh>
-            <SortableTh key="last_seen" sort={list.sort} {onsort}>Last seen</SortableTh>
+            <SortableTh key="first_seen" sort={list.sort} {onsort}>{t('explore.column.firstSeen')}</SortableTh>
+            <SortableTh key="last_seen" sort={list.sort} {onsort}>{t('explore.column.lastSeen')}</SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
@@ -448,10 +449,10 @@
                   <span class="faint">—</span>
                 {/if}
               </td>
-              <td class="num">{row.sessions_count.toLocaleString()}</td>
-              <td class="num">{row.events_count.toLocaleString()}</td>
+              <td class="num">{formatNumber(row.sessions_count)}</td>
+              <td class="num">{formatNumber(row.events_count)}</td>
               <td class="num">
-                <span class:err={row.errors_count > 0}>{row.errors_count.toLocaleString()}</span>
+                <span class:err={row.errors_count > 0}>{formatNumber(row.errors_count)}</span>
               </td>
               <td class="when"><TimeValue value={row.first_seen} muted /></td>
               <td class="when"><TimeValue value={row.last_seen} muted /></td>

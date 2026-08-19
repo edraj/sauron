@@ -1,9 +1,21 @@
+import { t, type MessageKey } from '../../i18n';
 export type Op = 'eq' | 'neq' | 'contains' | 'gt' | 'lt';
 export type FieldType = 'enum' | 'string' | 'number' | 'tag';
 
 export interface FieldDef {
   key: string;
-  label: string;
+  /**
+   * Catalogue key for the chip's display name.
+   *
+   * A key rather than the word itself: this module is a plain `.ts` const, so
+   * a `t()` call here would resolve once at import and freeze the label in
+   * whichever language loaded first. Consumers translate at render instead.
+   *
+   * `key` above stays the wire identifier — `filter-registry-parity.test.ts`
+   * and `catalog-field-parity.test.ts` both compare on it against the Rust
+   * catalogue, and neither looks at this.
+   */
+  labelKey: MessageKey;
   type: FieldType;
   ops: Op[];
   options?: string[]; // for type 'enum'
@@ -11,9 +23,19 @@ export interface FieldDef {
 
 export interface Filter { field: string; op: Op; value: string; }
 
+/**
+ * Operator glyphs. `=`, `≠`, `>` and `<` are symbols and read the same in both
+ * languages; `contains` is a word, so it comes from the catalogue at render
+ * time — see `opLabel`.
+ */
 export const OP_LABEL: Record<Op, string> = {
   eq: '=', neq: '≠', contains: 'contains', gt: '>', lt: '<',
 };
+
+/** The operator as displayed, with the one word-shaped operator translated. */
+export function opLabel(op: Op): string {
+  return op === 'contains' ? t('filter.op.contains') : OP_LABEL[op];
+}
 
 /** field:op:value — value is URL-encoded so ':' and other chars survive. */
 export function encodeFilters(filters: Filter[]): string[] {
@@ -146,14 +168,14 @@ const OPS_NUM: Op[] = ['eq', 'gt', 'lt'];
 const OPS_TAG: Op[] = ['contains', 'eq'];
 
 export const ISSUE_FIELDS: FieldDef[] = [
-  { key: 'level', label: 'Level', type: 'enum', ops: OPS_ENUM, options: ['debug', 'info', 'warning', 'error', 'fatal'] },
-  { key: 'status', label: 'Status', type: 'enum', ops: OPS_ENUM, options: ['unresolved', 'resolved', 'ignored'] },
-  { key: 'type', label: 'Type', type: 'string', ops: OPS_STR },
-  { key: 'culprit', label: 'Culprit', type: 'string', ops: OPS_STR },
-  { key: 'times_seen', label: 'Events', type: 'number', ops: OPS_NUM },
-  { key: 'users_seen', label: 'Users', type: 'number', ops: OPS_NUM },
-  { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
-  { key: 'workflow', label: 'Workflow', type: 'string', ops: OPS_STR },
+  { key: 'level', labelKey: 'filter.field.level', type: 'enum', ops: OPS_ENUM, options: ['debug', 'info', 'warning', 'error', 'fatal'] },
+  { key: 'status', labelKey: 'filter.field.status', type: 'enum', ops: OPS_ENUM, options: ['unresolved', 'resolved', 'ignored'] },
+  { key: 'type', labelKey: 'filter.field.type', type: 'string', ops: OPS_STR },
+  { key: 'culprit', labelKey: 'filter.field.culprit', type: 'string', ops: OPS_STR },
+  { key: 'times_seen', labelKey: 'filter.field.events', type: 'number', ops: OPS_NUM },
+  { key: 'users_seen', labelKey: 'filter.field.users', type: 'number', ops: OPS_NUM },
+  { key: 'tag', labelKey: 'filter.field.tag', type: 'tag', ops: OPS_TAG },
+  { key: 'workflow', labelKey: 'filter.field.workflow', type: 'string', ops: OPS_STR },
   // The three below are `error_events` columns, not `issues` columns. On this
   // page they resolve to "has an occurrence that matches", evaluated inside
   // the range and environment the page is already scoped to — see
@@ -166,12 +188,12 @@ export const ISSUE_FIELDS: FieldDef[] = [
   // stay as they are because `parseFilters` drops a chip whose field is not in
   // this registry, so renaming them would silently empty every saved
   // `filter=status:eq:resolved` URL.
-  { key: 'screen', label: 'Screen', type: 'string', ops: OPS_STR },
-  { key: 'distinctId', label: 'User', type: 'string', ops: OPS_STR },
+  { key: 'screen', labelKey: 'filter.field.screen', type: 'string', ops: OPS_STR },
+  { key: 'distinctId', labelKey: 'filter.field.user', type: 'string', ops: OPS_STR },
   // `OPS_ENUM`, not `OPS_STR`: the catalog gives `deviceKey` `OPS_EQ`, with no
   // `Contains`, so a `contains` chip would 400 rather than narrow. Same call
   // SESSION_FIELDS already makes for the same dimension.
-  { key: 'deviceKey', label: 'Device', type: 'string', ops: OPS_ENUM },
+  { key: 'deviceKey', labelKey: 'filter.field.device', type: 'string', ops: OPS_ENUM },
 ];
 
 /**
@@ -220,18 +242,18 @@ export function gatedFilterFields(filters: Filter[]): string[] {
 // `filter=environment:eq:<name>` handling (`EVENT_FILTERS`) stays for API
 // back-compatibility; this registry only drives the dashboard's FilterBar.
 export const EVENT_FIELDS: FieldDef[] = [
-  { key: 'name', label: 'Event', type: 'string', ops: OPS_STR },
-  { key: 'distinct_id', label: 'User', type: 'string', ops: OPS_STR },
-  { key: 'session_id', label: 'Session', type: 'string', ops: OPS_STR },
-  { key: 'release', label: 'Release', type: 'string', ops: OPS_STR },
-  { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
-  { key: 'workflow', label: 'Workflow', type: 'string', ops: OPS_STR },
+  { key: 'name', labelKey: 'filter.field.event', type: 'string', ops: OPS_STR },
+  { key: 'distinct_id', labelKey: 'filter.field.user', type: 'string', ops: OPS_STR },
+  { key: 'session_id', labelKey: 'filter.field.session', type: 'string', ops: OPS_STR },
+  { key: 'release', labelKey: 'filter.field.release', type: 'string', ops: OPS_STR },
+  { key: 'tag', labelKey: 'filter.field.tag', type: 'tag', ops: OPS_TAG },
+  { key: 'workflow', labelKey: 'filter.field.workflow', type: 'string', ops: OPS_STR },
 ];
 
 // Issue-detail occurrences. `ERROR_EVENT_FILTERS` accepts exactly these two.
 export const OCCURRENCE_FIELDS: FieldDef[] = [
-  { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
-  { key: 'workflow', label: 'Workflow', type: 'string', ops: OPS_STR },
+  { key: 'tag', labelKey: 'filter.field.tag', type: 'tag', ops: OPS_TAG },
+  { key: 'workflow', labelKey: 'filter.field.workflow', type: 'string', ops: OPS_STR },
 ];
 
 /**
@@ -280,34 +302,34 @@ export const OCCURRENCE_FIELDS: FieldDef[] = [
  *   the query language. A flat `key=value` chip cannot express the path.
  */
 export const SESSION_FIELDS: FieldDef[] = [
-  { key: 'session', label: 'Session', type: 'string', ops: OPS_STR },
-  { key: 'distinctId', label: 'User', type: 'string', ops: OPS_STR },
+  { key: 'session', labelKey: 'filter.field.session', type: 'string', ops: OPS_STR },
+  { key: 'distinctId', labelKey: 'filter.field.user', type: 'string', ops: OPS_STR },
   // `OPS_EQ`, not `OPS_STR`: the catalog gives `deviceKey` no `Contains`, so a
   // `contains` chip would 400 rather than narrow.
-  { key: 'deviceKey', label: 'Device', type: 'string', ops: OPS_ENUM },
-  { key: 'release', label: 'Release', type: 'string', ops: OPS_STR },
-  { key: 'eventsCount', label: 'Events', type: 'number', ops: OPS_NUM },
-  { key: 'errorsCount', label: 'Errors', type: 'number', ops: OPS_NUM },
+  { key: 'deviceKey', labelKey: 'filter.field.device', type: 'string', ops: OPS_ENUM },
+  { key: 'release', labelKey: 'filter.field.release', type: 'string', ops: OPS_STR },
+  { key: 'eventsCount', labelKey: 'filter.field.events', type: 'number', ops: OPS_NUM },
+  { key: 'errorsCount', labelKey: 'filter.field.errors', type: 'number', ops: OPS_NUM },
 ];
 
 export const TRANSACTION_FIELDS: FieldDef[] = [
-  { key: 'name', label: 'Name', type: 'string', ops: OPS_STR },
+  { key: 'name', labelKey: 'filter.field.name', type: 'string', ops: OPS_STR },
   {
     key: 'op',
-    label: 'Op',
+    labelKey: 'filter.field.op',
     type: 'enum',
     ops: OPS_ENUM,
     options: ['navigation', 'http', 'resource', 'screen_load', 'custom'],
   },
-  { key: 'url', label: 'URL', type: 'string', ops: OPS_STR },
-  { key: 'http.method', label: 'Method', type: 'string', ops: OPS_ENUM },
-  { key: 'http.status', label: 'Status code', type: 'number', ops: OPS_NUM },
+  { key: 'url', labelKey: 'filter.field.url', type: 'string', ops: OPS_STR },
+  { key: 'http.method', labelKey: 'filter.field.method', type: 'string', ops: OPS_ENUM },
+  { key: 'http.status', labelKey: 'filter.field.statusCode', type: 'number', ops: OPS_NUM },
   // Both are indexed on `transactions` (`transactions_app_session_idx`,
   // `transactions_app_distinct_idx`), which is what makes them chips rather
   // than a scan somebody has to be warned about. `session` is also the column
   // the list renders, and a column you can see but not narrow on is the first
   // thing people try and the first thing that disappoints them.
-  { key: 'session', label: 'Session', type: 'string', ops: OPS_STR },
-  { key: 'distinctId', label: 'User', type: 'string', ops: OPS_STR },
-  { key: 'tag', label: 'Tag', type: 'tag', ops: OPS_TAG },
+  { key: 'session', labelKey: 'filter.field.session', type: 'string', ops: OPS_STR },
+  { key: 'distinctId', labelKey: 'filter.field.user', type: 'string', ops: OPS_STR },
+  { key: 'tag', labelKey: 'filter.field.tag', type: 'tag', ops: OPS_TAG },
 ];

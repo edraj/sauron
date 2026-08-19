@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -55,17 +56,17 @@
   }
 </script>
 
-<AuthLayout title="Choose a new password">
+<AuthLayout title={t('auth.reset.title')}>
   {#if !token || deadLink}
     <div class="panel" role="status">
-      <p>This reset link is invalid or has expired — request a new one.</p>
-      <p><a href="#/forgot-password">Email me a new link</a></p>
+      <p>{t('auth.reset.invalidLink')}</p>
+      <p><a href="#/forgot-password">{t('auth.reset.requestNew')}</a></p>
     </div>
   {:else}
     <form onsubmit={submit} class="form">
       {#if error}<div class="alert" role="alert">{error}</div>{/if}
       <Input
-        label="New password"
+        label={t('auth.password.new')}
         type="password"
         bind:value={newPassword}
         autocomplete="new-password"
@@ -74,7 +75,7 @@
         required
       />
       <Input
-        label="Confirm new password"
+        label={t('auth.password.confirm')}
         type="password"
         bind:value={confirmPassword}
         autocomplete="new-password"
@@ -89,13 +90,13 @@
         disabled={!rules.canSubmit}
         loading={submitting}
       >
-        Set new password
+        {t('auth.reset.submit')}
       </Button>
     </form>
   {/if}
 
   {#snippet footer()}
-    <span><a href="#/login">Back to sign in</a></span>
+    <span><a href="#/login">{t('auth.forgot.backToSignIn')}</a></span>
   {/snippet}
 </AuthLayout>
 

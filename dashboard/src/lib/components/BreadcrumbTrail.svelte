@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   import type { Breadcrumb } from '../models';
   import { breadcrumbSummary, navigationOperation, type NavigationOperation } from '../models/breadcrumb';
   import { formatTime } from '../utils/format';
@@ -44,7 +45,7 @@
 </script>
 
 {#if breadcrumbs.length === 0}
-  <p class="muted empty">No breadcrumbs recorded.</p>
+  <p class="muted empty">{t('ui.empty.breadcrumbs')}</p>
 {:else}
   <ol class="trail">
     {#each breadcrumbs as crumb, i (i)}
@@ -149,7 +150,7 @@
   .time {
     font-size: 11px;
     color: var(--text-faint);
-    margin-left: auto;
+    margin-inline-start: auto;
   }
   .summary {
     font-size: 12.5px;

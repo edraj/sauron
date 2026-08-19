@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatDateTime } from '../lib/utils/format';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { lockedBy } from '../lib/models/page-access';
@@ -599,7 +601,7 @@
   const statusTone = (s: string) =>
     s === 'sent' ? 'success' : s === 'failed' ? 'error' : 'neutral';
 
-  const fmtTime = (iso: string) => new Date(iso).toLocaleString();
+  const fmtTime = (iso: string) => formatDateTime(iso);
 
   /**
    * The channel a delivery went to, or `null` when there is no name to show.
@@ -686,10 +688,9 @@
   <div class="alerts">
     <header class="head">
       <div>
-        <h1 class="page-title">Alerts</h1>
+        <h1 class="page-title">{t('alerts.title')}</h1>
         <p class="sub muted">
-          Deliver notifications to email, Slack, Discord, Element/Matrix, Telegram or any
-          webhook — on triggers you define.
+          {t('prose.alerts.subtitle')}
         </p>
       </div>
       <div class="controls">
@@ -697,15 +698,15 @@
       </div>
     </header>
 
-    <nav class="tabs" aria-label="Alert settings sections">
+    <nav class="tabs" aria-label={t('alerts.sections')}>
       <button class="tab" class:active={tab === 'channels'} onclick={() => (tab = 'channels')}>
-        Channels <span class="count">{channels.length}</span>
+        {t('alerts.tab.channels')} <span class="count">{channels.length}</span>
       </button>
       <button class="tab" class:active={tab === 'rules'} onclick={() => (tab = 'rules')}>
-        Rules <span class="count">{rules.length}</span>
+        {t('alerts.tab.rules')} <span class="count">{rules.length}</span>
       </button>
       <button class="tab" class:active={tab === 'history'} onclick={() => (tab = 'history')}>
-        History
+        {t('alerts.tab.history')}
       </button>
     </nav>
 
@@ -728,12 +729,11 @@
       <!-- ---------------- Channels ---------------- -->
       <div class="section-head">
         <p class="muted small">
-          A channel is where an alert is delivered. Secrets are encrypted at rest and never
-          returned by the API.
+          {t('prose.alerts.channels')}
         </p>
         {#if !showChannelForm}
           <Button variant="primary" lockedReason={writeLock} onclick={openNewChannel}>
-            New channel
+            {t('alerts.newChannel')}
           </Button>
         {/if}
       </div>
@@ -741,7 +741,7 @@
       {#if showChannelForm}
         <Card title={editingChannelId ? 'Edit channel' : 'New channel'}>
           <div class="form-grid">
-            <Input label="Name" bind:value={chName} placeholder="Ops Slack" required />
+            <Input label={t('common.name')} bind:value={chName} placeholder={t('prose.placeholder.opsSlack')} required />
 
             {#if editingChannelId}
               <!-- Says out loud what the API enforces: kind is fixed, and a
@@ -757,7 +757,7 @@
             {/if}
 
             <div class="field">
-              <label class="lbl" for="ch-kind">Type</label>
+              <label class="lbl" for="ch-kind">{t('monitors.column.type')}</label>
               <div class="control select">
                 <select id="ch-kind" bind:value={chKind} disabled={editingChannelId !== null}>
                   {#each Object.entries(KIND_LABELS) as [k, label] (k)}
@@ -771,85 +771,85 @@
             {#if chKind === 'slack' || chKind === 'discord'}
               <div class="span-2">
                 <Input
-                  label="Incoming webhook URL"
+                  label={t('alerts.field.webhookUrl')}
                   bind:value={chFields.webhook_url}
                   placeholder="https://hooks.slack.com/services/…"
-                  hint="Stored encrypted. Create it in your workspace’s Incoming Webhooks app."
+                  hint={t('alerts.field.webhookHint')}
                   required
                 />
               </div>
             {:else if chKind === 'email'}
               <Input
-                label="SMTP host"
+                label={t('alerts.field.smtpHost')}
                 bind:value={chFields.host}
                 placeholder="smtp.example.com"
                 required
               />
               <Input
-                label="Port"
+                label={t('alerts.field.port')}
                 bind:value={chFields.port}
                 placeholder="587"
-                hint="587 = STARTTLS, 465 = implicit TLS."
+                hint={t('alerts.field.portHint')}
               />
               <Input
-                label="From address"
+                label={t('alerts.field.fromAddress')}
                 bind:value={chFields.from}
                 placeholder="sauron@example.com"
                 required
               />
               <Input
-                label="Recipients"
+                label={t('alerts.field.recipients')}
                 bind:value={chFields.to}
                 placeholder="oncall@example.com, sre@example.com"
-                hint="Comma-separated."
+                hint={t('alerts.field.recipientsHint')}
                 required
               />
               <Input
-                label="Username"
+                label={t('alerts.field.username')}
                 bind:value={chFields.username}
-                placeholder="Optional"
+                placeholder={t('prose.placeholder.optional')}
               />
               <Input
-                label="Password"
+                label={t('common.password')}
                 type="password"
                 bind:value={chFields.password}
-                placeholder="Optional"
-                hint="Encrypted at rest."
+                placeholder={t('prose.placeholder.optional')}
+                hint={t('alerts.field.encryptedHint')}
               />
             {:else if chKind === 'matrix'}
               <Input
-                label="Homeserver"
+                label={t('alerts.field.homeserver')}
                 bind:value={chFields.homeserver}
                 placeholder="https://matrix.org"
                 required
               />
               <Input
-                label="Room ID"
+                label={t('alerts.field.roomId')}
                 bind:value={chFields.room_id}
                 placeholder="!abcdef:matrix.org"
                 required
               />
               <div class="span-2">
                 <Input
-                  label="Access token"
+                  label={t('alerts.field.accessToken')}
                   type="password"
                   bind:value={chFields.access_token}
-                  hint="Encrypted at rest."
+                  hint={t('alerts.field.encryptedHint')}
                   required
                 />
               </div>
             {:else if chKind === 'telegram'}
               <Input
-                label="Chat ID"
+                label={t('alerts.field.chatId')}
                 bind:value={chFields.chat_id}
                 placeholder="-1001234567890"
                 required
               />
               <Input
-                label="Bot token"
+                label={t('alerts.field.botToken')}
                 type="password"
                 bind:value={chFields.bot_token}
-                hint="Encrypted at rest."
+                hint={t('alerts.field.encryptedHint')}
                 required
               />
             {:else}
@@ -863,17 +863,17 @@
               </div>
               <div class="span-2">
                 <Input
-                  label="Signing secret"
+                  label={t('alerts.field.signingSecret')}
                   type="password"
                   bind:value={chFields.signing_secret}
-                  hint="Optional. When set, requests carry an x-sauron-signature HMAC of the body."
+                  hint={t('alerts.field.signingHint')}
                 />
               </div>
             {/if}
           </div>
 
           <div class="form-foot">
-            <Button variant="ghost" onclick={closeChannelForm}>Cancel</Button>
+            <Button variant="ghost" onclick={closeChannelForm}>{t('common.cancel')}</Button>
             <Button
               variant="primary"
               loading={savingChannel}
@@ -881,7 +881,7 @@
               lockedReason={writeLock}
               onclick={submitChannel}
             >
-              Create channel
+              {t('alerts.createChannel')}
             </Button>
           </div>
         </Card>
@@ -889,14 +889,14 @@
 
       {#if channels.length === 0}
         <EmptyState
-          title="No channels yet"
-          description="Add a destination — email, Slack, Discord, Element/Matrix, Telegram or a webhook — before creating rules."
+          title={t('alerts.empty.channels')}
+          description={t('alerts.empty.channelsBody')}
           icon="bell"
         >
           {#snippet action()}
             {#if !showChannelForm}
               <Button variant="primary" lockedReason={writeLock} onclick={openNewChannel}>
-                New channel
+                {t('alerts.newChannel')}
               </Button>
             {/if}
           {/snippet}
@@ -906,19 +906,19 @@
           {#snippet head()}
             <tr>
               <SortableTh key="name" columnDefault="asc" sort={channelList.sort} onsort={onChannelSort}>
-                Name
+                {t('common.name')}
               </SortableTh>
               <SortableTh key="type" columnDefault="asc" sort={channelList.sort} onsort={onChannelSort}>
-                Type
+                {t('monitors.column.type')}
               </SortableTh>
               <!-- Secret is a presence flag rendered as a badge and Actions is
                    a row of buttons; neither is a value to order by, so both
                    stay plain. -->
-              <th>Secret</th>
+              <th>{t('alerts.secret')}</th>
               <SortableTh key="status" columnDefault="asc" sort={channelList.sort} onsort={onChannelSort}>
-                Status
+                {t('common.status')}
               </SortableTh>
-              <th class="num">Actions</th>
+              <th class="num">{t('common.actions')}</th>
             </tr>
           {/snippet}
           {#snippet children()}
@@ -944,9 +944,9 @@
                     loading={testingId === c.id}
                     lockedReason={writeLock}
                     onclick={() => runTest(c)}
-                    title="Send a test notification"
+                    title={t('alerts.testTitle')}
                   >
-                    Test
+                    {t('alerts.test')}
                   </Button>
                   <Button size="sm" lockedReason={writeLock} onclick={() => toggleChannel(c)}>
                     {c.enabled ? 'Disable' : 'Enable'}
@@ -960,7 +960,7 @@
                       : undefined}
                     onclick={() => openEditChannel(c)}
                   >
-                    Edit
+                    {t('common.edit')}
                   </Button>
                   <Button
                     size="sm"
@@ -968,7 +968,7 @@
                     lockedReason={writeLock}
                     onclick={() => (confirmDelete = { kind: 'channel', id: c.id, name: c.name })}
                   >
-                    Delete
+                    {t('common.delete')}
                   </Button>
                 </td>
               </tr>
@@ -997,8 +997,7 @@
       <!-- ---------------- Rules ---------------- -->
       <div class="section-head">
         <p class="muted small">
-          A rule decides when to notify and which channels to fan out to. Repeat alerts for the
-          same cause are suppressed for the throttle window.
+          {t('prose.alerts.rules')}
         </p>
         {#if !showRuleForm}
           <Button
@@ -1008,7 +1007,7 @@
             title={channels.length === 0 ? 'Create a channel first' : undefined}
             onclick={openNewRule}
           >
-            New rule
+            {t('alerts.newRule')}
           </Button>
         {/if}
       </div>
@@ -1016,16 +1015,16 @@
       {#if showRuleForm}
         <Card title={editingRuleId ? 'Edit alert rule' : 'New alert rule'}>
           <div class="form-grid">
-            <Input label="Name" bind:value={rName} placeholder="API down → oncall" required />
+            <Input label={t('common.name')} bind:value={rName} placeholder={t('prose.placeholder.ruleName')} required />
 
             {#if editingRuleId}
               <p class="span-2 muted small">
-                Trigger and scope are fixed after creation; everything else can change.
+                {t('alerts.immutableNote')}
               </p>
             {/if}
 
             <div class="field">
-              <label class="lbl" for="r-trigger">Trigger</label>
+              <label class="lbl" for="r-trigger">{t('alerts.column.trigger')}</label>
               <div class="control select">
                 <select id="r-trigger" bind:value={rTrigger} disabled={editingRuleId !== null}>
                   {#each Object.entries(TRIGGER_LABELS) as [k, label] (k)}
@@ -1038,14 +1037,14 @@
 
             {#if needs.monitor}
               <div class="field">
-                <label class="lbl" for="r-monitor">Monitor</label>
+                <label class="lbl" for="r-monitor">{t('alerts.column.monitor')}</label>
                 <div class="control select">
                   <select
                     id="r-monitor"
                     bind:value={rMonitor}
                     disabled={editingRuleId !== null || !projectId}
                   >
-                    <option value="">All monitors in this project</option>
+                    <option value="">{t('alerts.allMonitors')}</option>
                     {#each monitorOptions as m (m.id)}
                       <option value={m.id}>{m.name}</option>
                     {/each}
@@ -1053,20 +1052,20 @@
                   <span class="affix"><Icon name="chevron-down" size={15} /></span>
                 </div>
                 {#if !projectId}
-                  <p class="muted small">Select a project to pin this rule to one monitor.</p>
+                  <p class="muted small">{t('alerts.pinToMonitor')}</p>
                 {/if}
               </div>
             {/if}
 
             {#if needs.threshold}
               <div class="field">
-                <label class="lbl" for="r-cmp">Condition</label>
+                <label class="lbl" for="r-cmp">{t('alerts.column.condition')}</label>
                 <div class="control select">
                   <select id="r-cmp" bind:value={rComparator}>
                     <option value="gte">is at least</option>
-                    <option value="gt">is more than</option>
+                    <option value="gt">{t('prose.alerts.isMoreThan')}</option>
                     <option value="lte">is at most</option>
-                    <option value="lt">is less than</option>
+                    <option value="lt">{t('prose.alerts.isLessThan')}</option>
                     <option value="eq">equals</option>
                   </select>
                   <span class="affix"><Icon name="chevron-down" size={15} /></span>
@@ -1080,7 +1079,7 @@
 
             {#if needs.metric}
               <div class="field">
-                <label class="lbl" for="r-metric">Metric</label>
+                <label class="lbl" for="r-metric">{t('alerts.column.metric')}</label>
                 <div class="control select">
                   <select id="r-metric" bind:value={rMetric}>
                     {#each meta?.metrics ?? ['p95'] as m (m)}
@@ -1094,60 +1093,60 @@
 
             {#if needs.spike}
               <Input
-                label="Spike factor (×)"
+                label={t('alerts.field.spikeFactor')}
                 bind:value={rSpikeFactor}
-                hint="Fire when the window exceeds the previous window by this multiple."
+                hint={t('alerts.field.spikeHint')}
               />
             {/if}
 
             {#if needs.window}
               <Input
-                label="Window (minutes)"
+                label={t('alerts.field.window')}
                 bind:value={rWindowMinutes}
-                hint="Max 24 hours."
+                hint={t('alerts.field.max24h')}
               />
             {/if}
 
             {#if needs.level}
               <Input
-                label="Level filter"
+                label={t('alerts.field.levelFilter')}
                 bind:value={rLevel}
                 placeholder="error"
-                hint="Optional — debug, info, warning, error, fatal."
+                hint={t('alerts.field.levelHint')}
               />
             {/if}
 
             {#if needs.eventName}
-              <Input label="Event name" bind:value={rEventName} placeholder="checkout_completed" />
+              <Input label={t('alerts.field.eventName')} bind:value={rEventName} placeholder="checkout_completed" />
             {/if}
 
             <Input
-              label="Environment filter"
+              label={t('alerts.field.envFilter')}
               bind:value={rEnvironment}
               placeholder="production"
-              hint="Optional."
+              hint={t('alerts.field.optional')}
             />
 
             <div class="field">
-              <label class="lbl" for="r-sev">Severity</label>
+              <label class="lbl" for="r-sev">{t('alerts.column.severity')}</label>
               <div class="control select">
                 <select id="r-sev" bind:value={rSeverity}>
-                  <option value="info">Info</option>
-                  <option value="warning">Warning</option>
-                  <option value="critical">Critical</option>
+                  <option value="info">{t('alerts.severity.info')}</option>
+                  <option value="warning">{t('alerts.severity.warning')}</option>
+                  <option value="critical">{t('alerts.severity.critical')}</option>
                 </select>
                 <span class="affix"><Icon name="chevron-down" size={15} /></span>
               </div>
             </div>
 
             <Input
-              label="Throttle (seconds)"
+              label={t('alerts.field.throttle')}
               bind:value={rThrottle}
-              hint="Suppress repeats of the same alert for this long."
+              hint={t('alerts.field.throttleHint')}
             />
 
             <div class="span-2">
-              <label class="lbl" for="r-template">Message template</label>
+              <label class="lbl" for="r-template">{t('alerts.messageTemplate')}</label>
               <textarea
                 id="r-template"
                 class="textarea"
@@ -1156,7 +1155,7 @@
                 placeholder="{'{{monitor}}'} is {'{{status}}'} — {'{{cause}}'}"
               ></textarea>
               <p class="hint">
-                Optional. Use <code>{'{{variable}}'}</code> placeholders.
+                {t('alerts.optionalUse')} <code>{'{{variable}}'}</code> placeholders.
                 {#if meta?.template_vars?.[rTrigger]}
                   Available: {meta.template_vars[rTrigger].map((v) => `{{${v}}}`).join(', ')}
                 {/if}
@@ -1164,7 +1163,7 @@
             </div>
 
             <div class="span-2">
-              <span class="lbl">Channels</span>
+              <span class="lbl">{t('alerts.tab.channels')}</span>
               <div class="chips">
                 {#each channels as c (c.id)}
                   <button
@@ -1182,7 +1181,7 @@
           </div>
 
           <div class="form-foot">
-            <Button variant="ghost" onclick={closeRuleForm}>Cancel</Button>
+            <Button variant="ghost" onclick={closeRuleForm}>{t('common.cancel')}</Button>
             <Button
               variant="primary"
               loading={savingRule}
@@ -1190,7 +1189,7 @@
               lockedReason={writeLock}
               onclick={submitRule}
             >
-              Create rule
+              {t('alerts.createRule')}
             </Button>
           </div>
         </Card>
@@ -1198,14 +1197,14 @@
 
       {#if rules.length === 0}
         <EmptyState
-          title="No alert rules yet"
-          description="Define when Sauron should notify you — a monitor going down, a new issue, an error spike, or a latency threshold."
+          title={t('alerts.empty.rules')}
+          description={t('alerts.empty.rulesBody')}
           icon="bell"
         >
           {#snippet action()}
             {#if !showRuleForm && channels.length > 0}
               <Button variant="primary" lockedReason={writeLock} onclick={openNewRule}>
-                New rule
+                {t('alerts.newRule')}
               </Button>
             {/if}
           {/snippet}
@@ -1215,17 +1214,17 @@
           {#snippet head()}
             <tr>
               <SortableTh key="name" columnDefault="asc" sort={ruleList.sort} onsort={onRuleSort}>
-                Name
+                {t('common.name')}
               </SortableTh>
               <SortableTh key="trigger" columnDefault="asc" sort={ruleList.sort} onsort={onRuleSort}>
-                Trigger
+                {t('alerts.column.trigger')}
               </SortableTh>
               <!-- A RANK, not the word — see `SEVERITY_ORDER` in
                    `alert-sort.ts`. `columnDefault` is left at `desc` so the
                    first click leads with `critical`, the same way the count
                    columns lead with their largest value. -->
               <SortableTh key="severity" sort={ruleList.sort} onsort={onRuleSort}>
-                Severity
+                {t('alerts.column.severity')}
               </SortableTh>
               <!-- The brief ruled this column out as a chip list; the chips are
                    in the rule FORM, and the cell is `r.channel_ids.length` — the
@@ -1233,15 +1232,15 @@
                    this slice made sortable. Actions, below, is the genuinely
                    unsortable one: a row of buttons. -->
               <SortableTh key="channels" class="num" sort={ruleList.sort} onsort={onRuleSort}>
-                Channels
+                {t('alerts.tab.channels')}
               </SortableTh>
               <SortableTh key="throttle" class="num" sort={ruleList.sort} onsort={onRuleSort}>
-                Throttle
+                {t('alerts.column.throttle')}
               </SortableTh>
               <SortableTh key="status" columnDefault="asc" sort={ruleList.sort} onsort={onRuleSort}>
-                Status
+                {t('common.status')}
               </SortableTh>
-              <th class="num">Actions</th>
+              <th class="num">{t('common.actions')}</th>
             </tr>
           {/snippet}
           {#snippet children()}
@@ -1271,7 +1270,7 @@
                     {r.enabled ? 'Disable' : 'Enable'}
                   </Button>
                   <Button size="sm" lockedReason={writeLock} onclick={() => openEditRule(r)}>
-                    Edit
+                    {t('common.edit')}
                   </Button>
                   <Button
                     size="sm"
@@ -1279,7 +1278,7 @@
                     lockedReason={writeLock}
                     onclick={() => (confirmDelete = { kind: 'rule', id: r.id, name: r.name })}
                   >
-                    Delete
+                    {t('common.delete')}
                   </Button>
                 </td>
               </tr>
@@ -1300,29 +1299,29 @@
       <!-- ---------------- History ---------------- -->
       {#if history.length === 0}
         <EmptyState
-          title="No alerts delivered yet"
-          description="Once a rule fires, every delivery attempt is recorded here with its outcome."
+          title={t('alerts.empty.history')}
+          description={t('alerts.empty.historyBody')}
           icon="inbox"
         />
       {:else}
         <DataTable>
           {#snippet head()}
             <tr>
-              <SortableTh key="when" sort={historyList.sort} onsort={onHistorySort}>When</SortableTh>
+              <SortableTh key="when" sort={historyList.sort} onsort={onHistorySort}>{t('ui.opModal.when')}</SortableTh>
               <SortableTh key="title" columnDefault="asc" sort={historyList.sort} onsort={onHistorySort}>
-                Title
+                {t('common.name')}
               </SortableTh>
               <SortableTh key="channel" columnDefault="asc" sort={historyList.sort} onsort={onHistorySort}>
-                Channel
+                {t('alerts.column.channel')}
               </SortableTh>
               <!-- `desc` (the default), not `asc`: a RANK — see
                    `DELIVERY_ORDER` — so the first click leads with the
                    deliveries that failed rather than the ones that arrived. -->
               <SortableTh key="status" sort={historyList.sort} onsort={onHistorySort}>
-                Status
+                {t('common.status')}
               </SortableTh>
               <SortableTh key="attempts" class="num" sort={historyList.sort} onsort={onHistorySort}>
-                Attempts
+                {t('alerts.column.attempts')}
               </SortableTh>
             </tr>
           {/snippet}
@@ -1363,7 +1362,7 @@
       open
       title={`Delete ${confirmDelete.kind}?`}
       message={`“${confirmDelete.name}” will be removed. This cannot be undone.`}
-      confirmLabel="Delete"
+      confirmLabel={t('common.delete')}
       danger
       onconfirm={doDelete}
       oncancel={() => (confirmDelete = null)}
@@ -1418,7 +1417,7 @@
   }
   .count {
     display: inline-block;
-    margin-left: 6px;
+    margin-inline-start: 6px;
     padding: 1px 6px;
     border-radius: 999px;
     background: var(--surface-2);
@@ -1470,7 +1469,7 @@
   }
   .affix {
     position: absolute;
-    right: 10px;
+    inset-inline-end: 10px;
     display: grid;
     place-items: center;
     color: var(--text-faint);

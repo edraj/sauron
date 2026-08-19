@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatTime } from '../lib/utils/format';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -134,8 +136,10 @@
     finally { saving = false; }
   }
 
-  const fmtTime = (iso: string) =>
-    new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // `formatTime` rather than a local `toLocaleTimeString([])`: the empty array
+  // means "the browser's locale", which is not necessarily the one the rest of
+  // the page is in.
+  const fmtTime = (iso: string) => formatTime(iso);
 
   // Color the 24h uptime figure so health reads at a glance, independent of the
   // "up right now" status pill. Applied inline so it wins over DataTable's own
@@ -166,12 +170,12 @@
   <div class="mons">
     <header class="head">
       <div>
-        <h1 class="page-title">Uptime</h1>
-        <p class="sub muted">Track availability and latency for your HTTP and TCP endpoints.</p>
+        <h1 class="page-title">{t('monitors.column.uptime')}</h1>
+        <p class="sub muted">{t('monitors.subtitle')}</p>
       </div>
       <div class="controls">
         {#if !showForm}
-          <Button variant="primary" lockedReason={writeLock} onclick={openForm}>New monitor</Button>
+          <Button variant="primary" lockedReason={writeLock} onclick={openForm}>{t('monitors.new')}</Button>
         {/if}
         <!--
           Spins for a background revalidate too, not just an explicit click: that
@@ -190,15 +194,15 @@
     {/if}
 
     {#if showForm}
-      <Card title="New monitor">
+      <Card title={t('monitors.new')}>
         <div class="form-grid">
-          <Input label="Name" bind:value={name} placeholder="API health check" required />
+          <Input label={t('common.name')} bind:value={name} placeholder={t('monitors.placeholder.name')} required />
 
           <div class="field">
-            <label class="lbl" for="mon-kind">Type</label>
+            <label class="lbl" for="mon-kind">{t('monitors.column.type')}</label>
             <div class="control select">
               <select id="mon-kind" bind:value={kind}>
-                <option value="http">HTTP(S)</option>
+                <option value="http">{t('monitors.http')}</option>
                 <option value="tcp">TCP</option>
               </select>
               <span class="affix"><Icon name="chevron-down" size={15} /></span>
@@ -210,7 +214,7 @@
               <Input label="URL" bind:value={target} placeholder="https://example.com/health" required />
             </div>
             <div class="field">
-              <label class="lbl" for="mon-method">Method</label>
+              <label class="lbl" for="mon-method">{t('monitors.column.method')}</label>
               <div class="control select">
                 <select id="mon-method" bind:value={method}>
                   <option>GET</option><option>POST</option><option>HEAD</option>
@@ -220,12 +224,12 @@
             </div>
           {:else}
             <div class="span-2">
-              <Input label="Host & port" bind:value={target} placeholder="db.example.com:5432" required />
+              <Input label={t('monitors.hostPort')} bind:value={target} placeholder={t('monitors.placeholder.hostPort')} required />
             </div>
           {/if}
 
           <div class="field">
-            <label class="lbl" for="mon-interval">Interval</label>
+            <label class="lbl" for="mon-interval">{t('monitors.column.interval')}</label>
             <div class="control select">
               <select id="mon-interval" bind:value={interval}>
                 {#each MONITOR_INTERVALS as opt (opt.seconds)}
@@ -238,16 +242,16 @@
 
           <div class="span-2">
             <Input
-              label="Webhook URL"
+              label={t('monitors.webhookUrl')}
               bind:value={webhook}
               placeholder="https://hooks.example.com/…"
-              hint="Optional — notified when this monitor changes state."
+              hint={t('monitors.webhookHint')}
             />
           </div>
         </div>
 
         <div class="form-foot">
-          <Button variant="ghost" onclick={closeForm}>Cancel</Button>
+          <Button variant="ghost" onclick={closeForm}>{t('common.cancel')}</Button>
           <Button
             variant="primary"
             loading={saving}
@@ -255,7 +259,7 @@
             lockedReason={writeLock}
             onclick={submit}
           >
-            Create monitor
+            {t('monitors.create')}
           </Button>
         </div>
       </Card>
@@ -265,13 +269,13 @@
       <div class="center"><Spinner size={24} /></div>
     {:else if monitors.length === 0}
       <EmptyState
-        title="No monitors yet"
-        description="Add an HTTP or TCP monitor to start tracking uptime, latency, and incidents."
+        title={t('monitors.empty.title')}
+        description={t('monitors.empty.body')}
         icon="zap"
       >
         {#snippet action()}
           {#if !showForm}
-            <Button variant="primary" lockedReason={writeLock} onclick={openForm}>New monitor</Button>
+            <Button variant="primary" lockedReason={writeLock} onclick={openForm}>{t('monitors.new')}</Button>
           {/if}
         {/snippet}
       </EmptyState>
@@ -279,18 +283,18 @@
       <DataTable>
         {#snippet head()}
           <tr>
-            <SortableTh key="name" columnDefault="asc" sort={list.sort} {onsort}>Name</SortableTh>
+            <SortableTh key="name" columnDefault="asc" sort={list.sort} {onsort}>{t('common.name')}</SortableTh>
             <SortableTh key="target" columnDefault="asc" sort={list.sort} {onsort}>
-              Target
+              {t('monitors.column.target')}
             </SortableTh>
             <!-- `desc` (the default), not `asc`: Status is a RANK — see
                  `MONITOR_STATUS_ORDER` — so it behaves like the count columns
                  beside it and the first click leads with the outages. `asc`
                  here would open the column with the healthy monitors on top. -->
-            <SortableTh key="status" sort={list.sort} {onsort}>Status</SortableTh>
-            <SortableTh key="uptime" class="num" sort={list.sort} {onsort}>Uptime 24h</SortableTh>
-            <SortableTh key="latency" class="num" sort={list.sort} {onsort}>Latency</SortableTh>
-            <SortableTh key="checked" class="num" sort={list.sort} {onsort}>Checked</SortableTh>
+            <SortableTh key="status" sort={list.sort} {onsort}>{t('common.status')}</SortableTh>
+            <SortableTh key="uptime" class="num" sort={list.sort} {onsort}>{t('monitors.column.uptime24h')}</SortableTh>
+            <SortableTh key="latency" class="num" sort={list.sort} {onsort}>{t('monitors.column.latency')}</SortableTh>
+            <SortableTh key="checked" class="num" sort={list.sort} {onsort}>{t('monitors.column.checked')}</SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
@@ -428,7 +432,7 @@
   }
   .control.select select {
     appearance: none;
-    padding-right: 34px;
+    padding-inline-end: 34px;
     cursor: pointer;
   }
   .affix {
@@ -439,7 +443,7 @@
   }
   .control.select .affix {
     position: absolute;
-    right: 11px;
+    inset-inline-end: 11px;
   }
 
   /* --- table cells ---------------------------------------------------------- */

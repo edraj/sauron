@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import { untrack } from 'svelte';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
@@ -203,18 +204,18 @@
       at another app, get a green toast, and walk away believing it moved.
     -->
     <label class="fld">
-      <span class="lbl">Notify me about</span>
+      <span class="lbl">{t('notif.dialog.notifyMeAbout')}</span>
       <!-- A raw select: there is no Select primitive in lib/components/ui. -->
       <select class="sel" bind:value={kind} disabled={!!existing}>
-        <option value="error_spike">Error rate increasing</option>
-        <option value="error_new_issue">A new issue appears</option>
-        <option value="error_regression">A resolved issue regresses</option>
-        <option value="uptime">A monitor goes down or recovers</option>
+        <option value="error_spike">{t('notif.dialog.errorRate')}</option>
+        <option value="error_new_issue">{t('notif.dialog.newIssue')}</option>
+        <option value="error_regression">{t('notif.dialog.regression')}</option>
+        <option value="uptime">{t('notif.dialog.monitor')}</option>
       </select>
     </label>
 
     <div class="fld">
-      <span class="lbl">Scope</span>
+      <span class="lbl">{t('notif.dialog.scope')}</span>
       <ScopeTree
         {orgId}
         {orgName}
@@ -230,16 +231,15 @@
       />
       {#if existing}
         <p class="hint">
-          What you are notified about, and where, are fixed when a subscription is
-          created. To change either, delete this one and create a new one.
+          {t('notif.dialog.immutable')}
         </p>
       {/if}
     </div>
 
     {#if needs.envFilter}
       <div class="fld">
-        <span class="lbl">Environments</span>
-        <p class="hint">Leave all unticked to be notified about every environment.</p>
+        <span class="lbl">{t('notif.column.environments')}</span>
+        <p class="hint">{t('notif.dialog.allEnvironments')}</p>
         <div class="chips">
           {#each offeredEnvs as env (env.id)}
             <button
@@ -250,29 +250,29 @@
             >{env.name}</button>
           {/each}
           {#if offeredEnvs.length === 0}
-            <span class="hint">Pick a scope to choose environments.</span>
+            <span class="hint">{t('notif.dialog.pickScopeFirst')}</span>
           {/if}
         </div>
       </div>
     {:else}
       <p class="hint">
-        Monitors belong to a whole project, so the environment filter does not apply to uptime.
+        {t('notif.dialog.monitorsProjectWide')}
       </p>
     {/if}
 
     {#if needs.spike}
       <div class="row">
-        <Input label="Window (seconds)" bind:value={windowSeconds} hint="300 – 86400" />
-        <Input label="Increase factor" bind:value={factor} hint="1.5 – 100" />
-        <Input label="Minimum errors" bind:value={minCount} hint="1 – 100000" />
+        <Input label={t('notif.dialog.window')} bind:value={windowSeconds} hint="300 – 86400" />
+        <Input label={t('notif.dialog.increaseFactor')} bind:value={factor} hint="1.5 – 100" />
+        <Input label={t('notif.dialog.minErrors')} bind:value={minCount} hint="1 – 100000" />
       </div>
     {/if}
 
     {#if needs.level}
       <label class="fld">
-        <span class="lbl">Level</span>
+        <span class="lbl">{t('notif.dialog.level')}</span>
         <select class="sel" bind:value={level}>
-          <option value="">Any level</option>
+          <option value="">{t('notif.dialog.anyLevel')}</option>
           <option value="error">error</option>
           <option value="warning">warning</option>
           <option value="fatal">fatal</option>
@@ -282,24 +282,23 @@
 
     <div class="row">
       <label class="fld">
-        <span class="lbl">Delivery</span>
+        <span class="lbl">{t('notif.column.delivery')}</span>
         <select class="sel" bind:value={delivery}>
-          <option value="immediate">As it happens</option>
-          <option value="hourly">Hourly summary</option>
-          <option value="daily">Daily summary</option>
+          <option value="immediate">{t('notif.dialog.asItHappens')}</option>
+          <option value="hourly">{t('notif.dialog.hourly')}</option>
+          <option value="daily">{t('notif.dialog.daily')}</option>
         </select>
       </label>
-      <Input label="Throttle (seconds)" bind:value={throttleSeconds} hint="0 – 604800" />
+      <Input label={t('notif.dialog.throttle')} bind:value={throttleSeconds} hint="0 – 604800" />
     </div>
 
     <div class="row">
-      <Input label="Quiet from (minute of day)" bind:value={quietStart} hint="e.g. 1320 = 22:00" />
-      <Input label="Quiet until (minute of day)" bind:value={quietEnd} hint="e.g. 360 = 06:00" />
-      <Input label="Timezone" bind:value={quietTz} hint="IANA name, e.g. Europe/Paris" />
+      <Input label={t('notif.dialog.quietFrom')} bind:value={quietStart} hint="e.g. 1320 = 22:00" />
+      <Input label={t('notif.dialog.quietUntil')} bind:value={quietEnd} hint="e.g. 360 = 06:00" />
+      <Input label={t('notif.dialog.timezone')} bind:value={quietTz} hint={t('notif.dialog.timezoneHint')} />
     </div>
     <p class="hint">
-      Quiet hours never drop a notification — they hold it until the window ends, so a
-      night-time outage still reaches you in the morning.
+      {t('notif.dialog.quietHoursHelp')}
     </p>
 
     {#if problems.length > 0}
@@ -311,9 +310,9 @@
   </div>
 
   {#snippet footer()}
-    <Button onclick={onclose}>Cancel</Button>
+    <Button onclick={onclose}>{t('common.cancel')}</Button>
     <Button variant="primary" disabled={problems.length > 0} loading={saving} onclick={save}>
-      Save
+      {t('common.save')}
     </Button>
   {/snippet}
 </Modal>
@@ -347,6 +346,6 @@
     cursor: pointer;
   }
   .chip.on { border-color: var(--primary); color: var(--text); }
-  .problems { margin: 0; padding-left: 18px; font-size: 12px; color: var(--text-faint); }
+  .problems { margin: 0; padding-inline-start: 18px; font-size: 12px; color: var(--text-faint); }
   .err { font-size: 13px; color: var(--error); margin: 0; }
 </style>

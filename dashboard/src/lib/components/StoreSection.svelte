@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../i18n';
   import Card from './ui/Card.svelte';
   import Skeleton from './ui/Skeleton.svelte';
   import StatTiles from './StatTiles.svelte';
@@ -33,7 +34,7 @@
   const lastSynced = $derived(
     (data?.stores ?? [])
       .map((s) => s.last_synced_at)
-      .filter((t): t is string => !!t)
+      .filter((v): v is string => !!v)
       .sort()
       .pop() ?? null,
   );
@@ -52,17 +53,17 @@
   }
 </script>
 
-<Card title="App store installs">
+<Card title={t('ui.store.title')}>
   {#if view.loading && !data}
     <Skeleton rows={4} height="46px" />
   {:else if view.error && !data}
     <p class="err">{view.error}</p>
   {:else}
     <StatTiles>
-      <StatTile label="Installs" value={compactNumber(totals.installs)} tone="success" />
-      <StatTile label="Uninstalls" value={compactNumber(totals.uninstalls)} tone="warning" />
+      <StatTile label={t('ui.store.installs')} value={compactNumber(totals.installs)} tone="success" />
+      <StatTile label={t('ui.store.uninstalls')} value={compactNumber(totals.uninstalls)} tone="warning" />
       <StatTile
-        label="Net change"
+        label={t('ui.store.netChange')}
         value={`${totals.net >= 0 ? '+' : '−'}${compactNumber(Math.abs(totals.net))}`}
         tone={totals.net >= 0 ? 'success' : 'error'}
       />
@@ -80,7 +81,7 @@
       {/if}
       {#if applePending}
         <p class="muted">
-          App Store is still preparing this report. Apple usually takes 24–48 hours after setup.
+          {t('ui.store.preparing')}
         </p>
       {/if}
       {#if pendingCount > 0}

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -170,14 +172,14 @@
 </script>
 
 <AppShell requireApp>
-  <button class="back" onclick={() => push('/events')}><Icon name="arrow-left" size={14} /> Back to events</button>
+  <button class="back" onclick={() => push('/events')}><Icon name="arrow-left" size={14} /> {t('person.backToEvents')}</button>
 
   {#if loading}
     <div class="center"><Spinner size={26} /></div>
   {:else if error}
-    <EmptyState title="Couldn't load person" description={error} icon="triangle-alert">
+    <EmptyState title={t('person.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
-        <Button variant="secondary" onclick={() => push('/events')}>Back</Button>
+        <Button variant="secondary" onclick={() => push('/events')}>{t('common.back')}</Button>
       {/snippet}
     </EmptyState>
   {:else if profile}
@@ -188,11 +190,11 @@
         <div class="id-sub">
           {#if profile.user}
             <span class="muted">
-              First seen <TimeValue value={profile.user.first_seen} /> · Last seen
+              {t('explore.column.firstSeen')} <TimeValue value={profile.user.first_seen} /> {t('prose.person.lastSeen')}
               <TimeValue value={profile.user.last_seen} />
             </span>
           {:else}
-            <span class="muted">Anonymous — no persisted profile record.</span>
+            <span class="muted">{t('person.anonymousNote')}</span>
           {/if}
         </div>
       </div>
@@ -200,15 +202,15 @@
 
     <div class="tiles">
       <StatTiles min={140}>
-        <StatTile label="Events" value={profile.events.length.toLocaleString()} />
+        <StatTile label={t('explore.column.events')} value={formatNumber(profile.events.length)} />
         <StatTile
-          label="Errors"
-          value={profile.errors.length.toLocaleString()}
+          label={t('explore.column.errors')}
+          value={formatNumber(profile.errors.length)}
           tone={profile.errors.length > 0 ? 'error' : 'neutral'}
         />
-        <StatTile label="Sessions" value={sessionCount > 0 ? sessionCount.toLocaleString() : '—'} />
+        <StatTile label={t('explore.column.sessions')} value={sessionCount > 0 ? formatNumber(sessionCount) : '—'} />
         <StatTile
-          label="First seen"
+          label={t('explore.column.firstSeen')}
           value={profile.user
             ? timeFormatStore.mode === 'relative'
               ? relativeTime(profile.user.first_seen)
@@ -221,7 +223,7 @@
             : undefined}
         />
         <StatTile
-          label="Last seen"
+          label={t('explore.column.lastSeen')}
           value={profile.user
             ? timeFormatStore.mode === 'relative'
               ? relativeTime(profile.user.last_seen)
@@ -238,17 +240,17 @@
 
     <div class="grid">
       <div class="col-main">
-        <Card title="Activity timeline">
+        <Card title={t('person.card.timeline')}>
           {#snippet actions()}
             {#if timeline.length > 0}
               <Button
                 variant="ghost"
                 size="sm"
-                title="Download this person's activity timeline as JSON"
+                title={t('person.downloadTitle')}
                 onclick={downloadPersonJson}
               >
                 <Icon name="download" size={14} />
-                Download JSON
+                {t('explore.downloadJson')}
               </Button>
               <Button
                 variant="ghost"
@@ -264,7 +266,7 @@
             {/if}
           {/snippet}
           {#if timeline.length === 0}
-            <EmptyState title="No activity" description="This person has no recorded events or errors." icon="inbox" />
+            <EmptyState title={t('person.empty.title')} description={t('person.empty.body')} icon="inbox" />
           {:else}
             <ol class="timeline">
               {#each timeline as item, i (item.kind + i)}
@@ -322,23 +324,23 @@
       </div>
 
       <aside class="col-side">
-        <Card title="Traits">
+        <Card title={t('users.column.traits')}>
           {#if hasTraits}
             <JsonTree value={profile.user?.properties} expandTo={2} />
           {:else}
-            <p class="muted empty-traits">No traits recorded</p>
+            <p class="muted empty-traits">{t('person.noTraits')}</p>
           {/if}
         </Card>
-        <Card title="Identity">
+        <Card title={t('person.card.identity')}>
           <div class="summary">
             <div class="sm-row">
-              <span class="muted">Distinct ID</span>
+              <span class="muted">{t('person.distinctId')}</span>
               <span class="sm-val mono small">{distinctId}</span>
             </div>
             {#if !profile.user}
               <div class="sm-row">
-                <span class="muted">Profile</span>
-                <span class="sm-val small">Anonymous</span>
+                <span class="muted">{t('person.title')}</span>
+                <span class="sm-val small">{t('person.anonymous')}</span>
               </div>
             {/if}
           </div>
@@ -471,7 +473,7 @@
     background: none;
     border: none;
     padding: 0;
-    text-align: left;
+    text-align: start;
     cursor: pointer;
   }
   .link-title:hover {
@@ -498,7 +500,7 @@
   .tl-time {
     font-size: 11.5px;
     color: var(--text-faint);
-    margin-left: auto;
+    margin-inline-start: auto;
   }
   /* Tabular figures so the column of offsets stays aligned as the digits
      change; `min-width` keeps the timestamp beside it from shifting when a
@@ -507,7 +509,7 @@
     font-size: 11px;
     color: var(--text-faint);
     min-width: 58px;
-    text-align: right;
+    text-align: end;
     font-variant-numeric: tabular-nums;
   }
   .empty-traits {

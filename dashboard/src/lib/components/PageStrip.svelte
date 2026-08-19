@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t, formatNumber } from '../i18n';
   import Icon from './ui/Icon.svelte';
   import { pageWindow } from '../models/page-window';
 
@@ -80,7 +81,7 @@
 
   <div class="nav">
     <button class="pg" disabled={!canPrev || busy} onclick={() => go(page - 1)} type="button">
-      <Icon name="chevron-left" size={14} /> Prev
+      <Icon name="chevron-left" size={14} /> {t('ui.pager.prev')}
     </button>
 
     <div class="strip" style="--pg-digits: {slotDigits}">
@@ -92,7 +93,7 @@
             class="pg num"
             class:active={slot === page}
             aria-current={slot === page ? 'page' : undefined}
-            aria-label="Page {slot}"
+            aria-label={t('ui.pager.page', { n: slot })}
             disabled={busy}
             onclick={() => go(slot)}
             type="button">{slot}</button
@@ -102,10 +103,10 @@
     </div>
 
     <!-- The strip collapses to this below 640px; both are never shown at once. -->
-    <span class="compact muted">Page {page.toLocaleString()} of {totalPages.toLocaleString()}</span>
+    <span class="compact muted">{t('ui.pager.pageOf', { page: formatNumber(page), total: formatNumber(totalPages) })}</span>
 
     <button class="pg" disabled={!canNext || busy} onclick={() => go(page + 1)} type="button">
-      Next <Icon name="chevron-right" size={14} />
+      {t('ui.pager.next')} <Icon name="chevron-right" size={14} />
     </button>
   </div>
 </div>

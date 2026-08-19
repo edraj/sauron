@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t, formatNumber } from '../i18n';
   import type { Journey } from '../models';
   import { hueFromString } from '../utils/format';
 
@@ -96,7 +97,7 @@
 </script>
 
 {#if journey.nodes.length === 0}
-  <div class="sk-empty faint">Not enough event data to map journeys in this range.</div>
+  <div class="sk-empty faint">{t('ui.empty.journeys')}</div>
 {:else}
   <div class="sk-wrap">
     <svg viewBox="0 0 {WIDTH} {height}" width="100%" height={height} preserveAspectRatio="xMidYMid meet">
@@ -106,7 +107,7 @@
       {#each layout.nodes as n (n.key)}
         <g class="node">
           <rect x={n.x} y={n.y} width={NODE_W} height={n.h} rx="3" fill={`hsl(${n.hue} 62% 60%)`}>
-            <title>{n.event} · step {n.step + 1} · {n.count.toLocaleString()}</title>
+            <title>{n.event} · step {n.step + 1} · {formatNumber(n.count)}</title>
           </rect>
           {#if n.h > 14}
             <text

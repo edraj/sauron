@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -230,14 +232,13 @@
 <AdminShell requireProject={false} requireApp={true}>
   <div class="head">
     <div>
-      <h1>Purge data</h1>
+      <h1>{t('prose.purge.title')}</h1>
       <p class="sub">
-        Permanently delete signal data for one app, then repair the session, device, person
-        and issue counters the deletion affects. <strong>There is no undo.</strong>
+        {t('prose.purge.lede')} <strong>{t('purge.noUndo')}</strong>
       </p>
     </div>
     <Button variant="ghost" onclick={reset} disabled={busy}>
-      <Icon name="refresh" /> Reset
+      <Icon name="refresh" /> {t('common.reset')}
     </Button>
   </div>
 
@@ -249,14 +250,13 @@
     {#if loading}
       <Spinner />
     {:else if !app}
-      <EmptyState title="Select an app" description="A purge always targets one app." icon="package" />
+      <EmptyState title={t('purge.selectApp')} description={t('purge.selectAppBody')} icon="package" />
     {:else if !job}
       <!-- ================= scope form ================= -->
       <Card>
-      <h2>1 — What to purge</h2>
+      <h2>{t('prose.purge.step1')}</h2>
       <p class="hint">
-        Raw kinds are deleted. Rollup kinds are recomputed from what survives and removed
-        only when nothing is left — they are repaired whether or not you tick them.
+        {t('prose.purge.rollups')}
       </p>
       <div class="kinds">
         {#each catalog?.kinds ?? [] as k (k.slug)}
@@ -272,7 +272,7 @@
             <Badge tone={k.class === 'raw' ? 'neutral' : 'info'}>{k.class}</Badge>
             {#if isBlocked}
               <span class="why">
-                no environment column — clear the environment filter to purge this
+                {t('prose.purge.blockedKind')}
               </span>
             {/if}
           </label>
@@ -284,11 +284,11 @@
       <h2>2 — Environments</h2>
       <label class="row">
         <input type="checkbox" bind:checked={envFilterActive} />
-        <span>Limit to specific environments</span>
+        <span>{t('prose.purge.limitEnvs')}</span>
       </label>
       {#if !envFilterActive}
         <p class="hint">
-          Every environment, including events that arrived without one attributed.
+          {t('purge.allEnvironments')}
         </p>
       {:else}
         <div class="envs">
@@ -304,28 +304,28 @@
           {/each}
         </div>
         {#if selectedEnvs.size === 0}
-          <p class="hint warn">Select at least one environment.</p>
+          <p class="hint warn">{t('purge.selectEnvironment')}</p>
         {/if}
       {/if}
     </Card>
 
     <Card>
-      <h2>3 — Time range</h2>
+      <h2>{t('prose.purge.step3')}</h2>
       <label class="row">
         <input type="checkbox" bind:checked={allTime} />
-        <span><strong>All time</strong> — the app's entire history for the ticked kinds</span>
+        <span><strong>{t('purge.allTime')}</strong> {t('prose.purge.allTimeNote')}</span>
       </label>
       {#if !allTime}
         <div class="range">
-          <label>From <input type="datetime-local" bind:value={rangeStart} /></label>
+          <label>{t('ui.time.from')} <input type="datetime-local" bind:value={rangeStart} /></label>
           <label>To <input type="datetime-local" bind:value={rangeEnd} /></label>
         </div>
         {#if rangeStart && rangeEnd && rangeStart >= rangeEnd}
-          <p class="hint warn">The start must be before the end.</p>
+          <p class="hint warn">{t('purge.badRange')}</p>
         {/if}
       {:else}
         <p class="hint warn">
-          Every matching row for this app will be removed, with no lower or upper bound.
+          {t('purge.unbounded')}
         </p>
       {/if}
     </Card>
@@ -334,7 +334,7 @@
       <Button onclick={startPreview} disabled={!canPreview || busy}>
         {busy ? 'Counting…' : 'Preview'}
       </Button>
-      <span class="hint">Nothing is deleted until you confirm what the preview shows.</span>
+      <span class="hint">{t('prose.purge.previewFirst')}</span>
     </div>
   {:else}
     <!-- ================= the job ================= -->
@@ -348,26 +348,26 @@
       </div>
 
       {#if job.status === 'previewing'}
-        <p><Spinner /> Counting what matches…</p>
+        <p><Spinner /> {t('purge.counting')}</p>
       {:else}
         <table class="counts">
           <thead>
-            <tr><th>Kind</th><th>Matched</th><th>Deleted</th></tr>
+            <tr><th>{t('sourcemaps.column.kind')}</th><th>{t('prose.purge.matched')}</th><th>{t('purge.deleted')}</th></tr>
           </thead>
           <tbody>
             {#each job.kinds as k (k)}
               <tr>
                 <td>{k.replace(/_/g, ' ')}</td>
-                <td class="n">{(job.estimated_counts?.[k] ?? 0).toLocaleString()}</td>
-                <td class="n">{(job.deleted_counts?.[k] ?? 0).toLocaleString()}</td>
+                <td class="n">{formatNumber(job.estimated_counts?.[k] ?? 0)}</td>
+                <td class="n">{formatNumber(job.deleted_counts?.[k] ?? 0)}</td>
               </tr>
             {/each}
           </tbody>
           <tfoot>
             <tr>
-              <th>Total</th>
-              <th class="n">{totalCount(job.estimated_counts).toLocaleString()}</th>
-              <th class="n">{totalCount(job.deleted_counts).toLocaleString()}</th>
+              <th>{t('common.total')}</th>
+              <th class="n">{formatNumber(totalCount(job.estimated_counts))}</th>
+              <th class="n">{formatNumber(totalCount(job.deleted_counts))}</th>
             </tr>
           </tfoot>
         </table>
@@ -375,7 +375,7 @@
         {#if job.cold_rows_skipped > 0}
           <p class="cold">
             <Icon name="layers" />
-            <strong>{job.cold_rows_skipped.toLocaleString()} rows will survive.</strong>
+            <strong>{formatNumber(job.cold_rows_skipped)} rows will survive.</strong>
             They have already rotated to cold storage
             {#if job.cold_boundary_at}
               (anything before <TimeValue value={job.cold_boundary_at} />)
@@ -387,15 +387,14 @@
 
         {#if job.ingest_active}
           <p class="hint warn">
-            This app was still receiving events when the job started. Recomputed counters can
-            drift; stop the sender first for an exact result.
+            {t('prose.purge.drift')}
           </p>
         {/if}
 
         {#if job.status === 'running' || job.status === 'cancelling'}
           <p class="hint">
-            Recomputed {job.rollups_recomputed.toLocaleString()} rollups, removed
-            {job.rollups_deleted.toLocaleString()} with nothing left.
+            Recomputed {formatNumber(job.rollups_recomputed)} rollups, removed
+            {formatNumber(job.rollups_deleted)} with nothing left.
           </p>
         {/if}
 
@@ -407,40 +406,40 @@
       {#if job.status === 'previewed'}
         <div class="confirm">
           <p>
-            To confirm, type the app slug <code>{job.app_slug}</code>. This deletes the rows
+            {t('purge.confirmSlug')} <code>{job.app_slug}</code>. This deletes the rows
             above and cannot be undone.
           </p>
           <input type="text" bind:value={confirmText} placeholder={job.app_slug} />
           <Button variant="primary" onclick={doConfirm} disabled={!slugMatches || busy}>
-            Purge {totalCount(job.estimated_counts).toLocaleString()} rows
+            Purge {formatNumber(totalCount(job.estimated_counts))} rows
           </Button>
         </div>
       {/if}
 
       {#if isActive(job) && job.status !== 'previewing'}
         <Button variant="ghost" onclick={doCancel} disabled={busy}>
-          Cancel — stops further batches, does not restore what is already deleted
+          {t('purge.cancelNote')}
         </Button>
       {/if}
 
       {#if !isActive(job)}
-        <Button variant="ghost" onclick={reset}>Start another purge</Button>
+        <Button variant="ghost" onclick={reset}>{t('purge.startAnother')}</Button>
       {/if}
     </Card>
   {/if}
 
   {#if catalog?.jobs?.length}
     <Card>
-      <h2>History</h2>
+      <h2>{t('alerts.tab.history')}</h2>
       <DataTable>
         {#snippet head()}
           <tr>
-            <th>App</th>
-            <th>Status</th>
-            <th class="n">Kinds</th>
-            <th class="n">Deleted</th>
-            <th>Requested by</th>
-            <th>When</th>
+            <th>{t('nav.selectApp')}</th>
+            <th>{t('common.status')}</th>
+            <th class="n">{t('prose.purge.kinds')}</th>
+            <th class="n">{t('purge.deleted')}</th>
+            <th>{t('prose.purge.requestedBy')}</th>
+            <th>{t('ui.opModal.when')}</th>
           </tr>
         {/snippet}
         {#snippet children()}
@@ -449,7 +448,7 @@
               <td>{j.app_name}</td>
               <td><Badge tone={statusTone(j.status)}>{j.status}</Badge></td>
               <td class="n">{(j.kinds ?? []).length}</td>
-              <td class="n">{totalCount(j.deleted_counts).toLocaleString()}</td>
+              <td class="n">{formatNumber(totalCount(j.deleted_counts))}</td>
               <td>{j.requested_by_email}</td>
               <td><TimeValue value={j.requested_at} /></td>
             </tr>
@@ -548,12 +547,12 @@
   }
   .counts th,
   .counts td {
-    text-align: left;
+    text-align: start;
     padding: 0.35rem 0.5rem;
     border-bottom: 1px solid var(--border);
   }
   .counts .n {
-    text-align: right;
+    text-align: end;
     font-variant-numeric: tabular-nums;
   }
   .cold {

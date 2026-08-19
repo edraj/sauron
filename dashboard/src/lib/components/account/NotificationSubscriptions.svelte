@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../../i18n';
   import Card from '../ui/Card.svelte';
   import Button from '../ui/Button.svelte';
   import Badge from '../ui/Badge.svelte';
@@ -185,7 +186,7 @@
   });
 </script>
 
-<Card title="Notifications">
+<Card title={t('notif.title')}>
   {#snippet actions()}
     <Button
       variant="primary"
@@ -194,7 +195,7 @@
         editing = null;
         dialogOpen = true;
       }}
-    >New subscription</Button>
+    >{t('notif.new')}</Button>
   {/snippet}
 
   {#if loading}
@@ -204,27 +205,27 @@
   {:else if subs.length === 0}
     <EmptyState
       icon="bell"
-      title="No personal notifications yet"
-      description="Subscribe yourself to uptime or error notifications for a project or app. Only you see and control these."
+      title={t('notif.empty.title')}
+      description={t('notif.empty.body')}
     />
   {:else}
     <DataTable>
       {#snippet head()}
         <tr>
-          <SortableTh key="scope" columnDefault="asc" sort={list.sort} {onsort}>Scope</SortableTh>
+          <SortableTh key="scope" columnDefault="asc" sort={list.sort} {onsort}>{t('notif.dialog.scope')}</SortableTh>
           <SortableTh key="kind" columnDefault="asc" sort={list.sort} {onsort}>
-            Notify about
+            {t('notif.column.notifyAbout')}
           </SortableTh>
           <SortableTh key="environments" columnDefault="asc" sort={list.sort} {onsort}>
-            Environments
+            {t('notif.column.environments')}
           </SortableTh>
           <SortableTh key="delivery" columnDefault="asc" sort={list.sort} {onsort}>
-            Delivery
+            {t('notif.column.delivery')}
           </SortableTh>
           <SortableTh key="quiet_hours" columnDefault="asc" sort={list.sort} {onsort}>
-            Quiet hours
+            {t('notif.column.quietHours')}
           </SortableTh>
-          <SortableTh key="state" columnDefault="asc" sort={list.sort} {onsort}>State</SortableTh>
+          <SortableTh key="state" columnDefault="asc" sort={list.sort} {onsort}>{t('notif.column.state')}</SortableTh>
           <!-- Edit / Enable / Delete: no value to order by. -->
           <th></th>
         </tr>
@@ -249,9 +250,9 @@
                 <!-- Explain rather than look broken: the subscription is off
                      because the owner lost access to its scope, and re-granting
                      access deliberately does not resurrect it. -->
-                <Badge tone="warning" size="sm">Off — access removed</Badge>
+                <Badge tone="warning" size="sm">{t('notif.state.offAccessRemoved')}</Badge>
               {:else}
-                <Badge tone="neutral" size="sm">Off</Badge>
+                <Badge tone="neutral" size="sm">{t('notif.state.off')}</Badge>
               {/if}
             </td>
             <td class="acts">
@@ -262,11 +263,11 @@
                   editing = s;
                   dialogOpen = true;
                 }}
-              >Edit</Button>
+              >{t('common.edit')}</Button>
               <Button size="sm" disabled={busyId === s.id} onclick={() => toggle(s)}>
                 {s.enabled ? 'Disable' : 'Enable'}
               </Button>
-              <Button size="sm" variant="danger" onclick={() => (confirming = s)}>Delete</Button>
+              <Button size="sm" variant="danger" onclick={() => (confirming = s)}>{t('common.delete')}</Button>
             </td>
           </tr>
         {/each}
@@ -307,9 +308,9 @@
 
 <ConfirmDialog
   open={confirming !== null}
-  title="Delete subscription"
-  message="You will stop receiving these notifications. This does not affect anyone else."
-  confirmLabel="Delete"
+  title={t('notif.delete.title')}
+  message={t('notif.delete.body')}
+  confirmLabel={t('common.delete')}
   danger
   loading={busyId === confirming?.id}
   onconfirm={remove}

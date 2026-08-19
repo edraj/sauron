@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { replace } from 'svelte-spa-router';
   import Button from '../lib/components/ui/Button.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -56,14 +57,14 @@
       <span class="mark" aria-hidden="true"><span class="eye"></span></span>
       <span class="name">Sauron</span>
     </div>
-    <button class="link" onclick={signOut}>Sign out</button>
+    <button class="link" onclick={signOut}>{t('auth.signOut')}</button>
   </header>
 
   <div class="cp-body">
     <div class="intro">
-      <h1>Choose a password</h1>
+      <h1>{t('auth.change.title')}</h1>
       <p class="lead">
-        Your account was created with a temporary password. Choose your own before continuing.
+        {t('auth.change.temporary')}
       </p>
     </div>
 
@@ -71,14 +72,14 @@
       <form class="cp-form" onsubmit={submit}>
         {#if error}<div class="alert" role="alert">{error}</div>{/if}
         <Input
-          label="Current password"
+          label={t('auth.password.current')}
           type="password"
           bind:value={currentPassword}
           autocomplete="current-password"
           required
         />
         <Input
-          label="New password"
+          label={t('auth.password.new')}
           type="password"
           bind:value={newPassword}
           autocomplete="new-password"
@@ -91,7 +92,7 @@
           required
         />
         <Input
-          label="Confirm new password"
+          label={t('auth.password.confirm')}
           type="password"
           bind:value={confirmPassword}
           autocomplete="new-password"
@@ -99,7 +100,7 @@
           required
         />
         <Button type="submit" variant="primary" size="lg" fullWidth disabled={!canSubmit} loading={saving}>
-          Update password
+          {t('auth.change.submit')}
         </Button>
       </form>
     </Card>

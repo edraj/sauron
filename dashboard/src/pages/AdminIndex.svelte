@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -35,8 +36,8 @@
       cosmetic reorder silently change which permission gets blamed.
     -->
     <EmptyState
-      title="No admin sections available"
-      description="You don't have access to any admin area in this organization. Ask an organization owner for access."
+      title={t('admin.empty.title')}
+      description={t('admin.empty.body')}
       icon="lock"
     />
   {/if}

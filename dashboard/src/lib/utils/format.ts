@@ -1,6 +1,9 @@
 // Small presentation helpers shared across pages and components.
 import type { IconName } from '../components/ui/Icon.svelte';
 import { ingestBaseUrl } from '../config/env';
+import { localeStore } from '../i18n/locale.svelte';
+import { compactFormat, relativeFormat } from '../i18n/formatters';
+import { t } from '../i18n';
 
 // --- app types ------------------------------------------------------------
 
@@ -97,22 +100,33 @@ const RELATIVE_UNITS: Array<[Intl.RelativeTimeFormatUnit, number]> = [
   ['second', 1],
 ];
 
-const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
-
-/** "3 minutes ago", "just now", "in 2 hours". */
+/**
+ * "3 minutes ago", "just now", "in 2 hours" — and their Arabic equivalents.
+ *
+ * `Intl.RelativeTimeFormat` supplies the wording for every unit in both
+ * languages, including Arabic's dual and paucal forms ("قبل يومين", "قبل 3
+ * أيام"), so the only string this file owns is the sub-five-second case that
+ * `Intl` has no concept of.
+ *
+ * The formatter is fetched per call rather than hoisted: it is memoized by
+ * locale in `i18n/formatters.ts`, so this stays one lookup, while a
+ * module-level constant would pin every timestamp to whichever locale was
+ * active at import time.
+ */
 export function relativeTime(input: string | number | Date | null | undefined): string {
   if (input === null || input === undefined) return '—';
   const then = new Date(input).getTime();
   if (Number.isNaN(then)) return '—';
   const diffSeconds = (then - Date.now()) / 1000;
   const abs = Math.abs(diffSeconds);
-  if (abs < 5) return 'just now';
+  if (abs < 5) return t('time.justNow');
+  const rtf = relativeFormat(localeStore.locale);
   for (const [unit, secs] of RELATIVE_UNITS) {
     if (abs >= secs || unit === 'second') {
       return rtf.format(Math.round(diffSeconds / secs), unit);
     }
   }
-  return 'just now';
+  return t('time.justNow');
 }
 
 /** Absolute, human date-time for tooltips / detail rows. */
@@ -120,7 +134,8 @@ export function formatDateTime(input: string | number | Date | null | undefined)
   if (input === null || input === undefined) return '—';
   const d = new Date(input);
   if (Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleString(undefined, {
+  // The active locale, not the browser's — see `absolute()` below.
+  return d.toLocaleString(localeStore.tag, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -180,7 +195,11 @@ function absolute(
   if (input === null || input === undefined) return '—';
   const d = new Date(input);
   if (Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleString(undefined, {
+  // The active locale's tag, not `undefined` (the browser's). The UI language
+  // is the user's explicit choice; the browser's is a default they may never
+  // have seen. Arabic resolves through `ar-u-nu-latn`, so month names localise
+  // while the digits stay Western.
+  return d.toLocaleString(localeStore.tag, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -195,32 +214,37 @@ export function formatTime(input: string | number | Date | null | undefined): st
   if (input === null || input === undefined) return '—';
   const d = new Date(input);
   if (Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return d.toLocaleTimeString(localeStore.tag, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
 }
 
 /**
- * Hoisted out of `compactNumber`. Constructing an `Intl.NumberFormat` is the
- * expensive part — it resolves locale data — while `.format()` on an existing
- * one is cheap. This function is called once per numeric cell, so a 50-row
- * table built one formatter per cell and threw all of them away. The locale is
- * the hardcoded 'en' below, so a single module-level instance is safe: there is
- * no per-call input that could select a different one.
+ * Compact number: 1_234 -> "1.2k", or "1.2 ألف" in Arabic.
+ *
+ * Constructing an `Intl.NumberFormat` is the expensive part — it resolves
+ * locale data — while `.format()` on an existing one is cheap, and this runs
+ * once per numeric cell, so a 50-row table used to build fifty formatters and
+ * throw them all away. The instance was hoisted to module scope to fix that,
+ * which was sound only while the locale was a hardcoded `'en'`.
+ *
+ * It now comes from the locale-keyed cache in `i18n/formatters.ts` instead:
+ * same single construction per language, but a language switch actually
+ * reaches the numbers rather than leaving them in whichever locale was active
+ * when this module first loaded.
  */
-const COMPACT_NUMBER_FORMAT = new Intl.NumberFormat('en', {
-  notation: 'compact',
-  maximumFractionDigits: 1,
-});
-
-/** Compact number: 1_234 -> "1.2k". */
 export function compactNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) return '0';
-  return COMPACT_NUMBER_FORMAT.format(value);
+  return compactFormat(localeStore.locale).format(value);
 }
 
-export function plural(count: number, singular: string, pluralForm?: string): string {
-  const word = count === 1 ? singular : (pluralForm ?? `${singular}s`);
-  return `${count.toLocaleString()} ${word}`;
-}
+// `plural(count, singular)` used to live here, building the plural by
+// appending an `s`. Arabic cannot be inflected that way — 1, 2, 3, and 11
+// events take four different words, chosen by CLDR plural category — so
+// callers now use `tn()` from `../i18n` with a catalogue key that spells out
+// all six Arabic forms.
 
 /** Stable-ish hue from an arbitrary string (for avatar / person chips). */
 export function hueFromString(value: string): number {
@@ -232,8 +256,19 @@ export function hueFromString(value: string): number {
   return Math.abs(hash) % 360;
 }
 
+/**
+ * Initials for an avatar chip.
+ *
+ * Splits on anything that is not a letter or digit *in any script*, rather
+ * than on `[^a-zA-Z0-9]`. The ASCII class stripped every Arabic character, so
+ * a user named "محمد العربي" cleaned down to an empty string and rendered as
+ * "?" — the placeholder for "unnameable", on a perfectly good name.
+ *
+ * `toUpperCase` is a no-op for Arabic, which is caseless; it stays for the
+ * Latin path.
+ */
 export function initials(value: string): string {
-  const cleaned = value.replace(/[^a-zA-Z0-9]+/g, ' ').trim();
+  const cleaned = value.replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
   if (!cleaned) return '?';
   const parts = cleaned.split(' ');
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();

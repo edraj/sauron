@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { querystring } from 'svelte-spa-router';
   import { get } from 'svelte/store';
   import Card from '../lib/components/ui/Card.svelte';
@@ -29,15 +30,15 @@
 </script>
 
 <div class="wrap">
-  <Card title="Unsubscribe">
+  <Card title={t('auth.unsubscribe.title')}>
     {#if state === 'missing'}
-      <p>This link is missing its token. Open it directly from the notification email.</p>
+      <p>{t('auth.unsubscribe.missingToken')}</p>
     {:else if state === 'working'}
       <Spinner />
     {:else}
-      <p>That subscription is now off. You will not receive those notifications again.</p>
-      <p class="hint">You can turn it back on at any time from your account page.</p>
-      <Button href="#/account" variant="primary">Manage subscriptions</Button>
+      <p>{t('auth.unsubscribe.done')}</p>
+      <p class="hint">{t('auth.unsubscribe.reenable')}</p>
+      <Button href="#/account" variant="primary">{t('auth.unsubscribe.manage')}</Button>
     {/if}
   </Card>
 </div>

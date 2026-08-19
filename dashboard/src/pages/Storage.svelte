@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
+  import { formatNumber } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import {
     getAdminStorage,
@@ -334,13 +336,13 @@
   // turns it into visible progress.
   $effect(() => {
     if (!jobsActive) return;
-    const t = setInterval(() => {
+    const timer = setInterval(() => {
       void loadJobs();
       // The pin appears only once the worker creates it, so the pin list has to
       // refresh alongside the job or a completed restore shows no protection.
       void loadPolicy();
     }, 3000);
-    return () => clearInterval(t);
+    return () => clearInterval(timer);
   });
 
   function jobPercent(j: RestoreJob): number {
@@ -368,7 +370,7 @@
   <div class="storage">
     <header class="head">
       <div>
-        <h1 class="page-title">Storage</h1>
+        <h1 class="page-title">{t('storage.title')}</h1>
         <!-- Wording tracks `full_scope`. When the caller manages every org there
              is no other tenant to leak, so the figures are real physical bytes
              (pg_database_size / pg_total_relation_size) and must NOT be called
@@ -407,14 +409,14 @@
           value={fmtBytes(dbBytes)}
           tone="primary"
         />
-        <StatTile label="Cold (Parquet)" value={fmtBytes(coldBytes)} />
-        <StatTile label="Total" value={fmtBytes(dbBytes + coldBytes)} />
-        <StatTile label="Tables" value={rep.database.tables.length} />
-        <StatTile label="Apps" value={rep.apps.length} />
+        <StatTile label={t('storage.stat.cold')} value={fmtBytes(coldBytes)} />
+        <StatTile label={t('common.total')} value={fmtBytes(dbBytes + coldBytes)} />
+        <StatTile label={t('storage.stat.tables')} value={rep.database.tables.length} />
+        <StatTile label={t('activeUsers.stat.apps')} value={rep.apps.length} />
       </StatTiles>
 
       <div class="section">
-        <Card title="Cold-tier rotation">
+        <Card title={t('storage.card.rotation')}>
           {#if policyLoadError}
             <!-- Shown inline, not as a page error: this endpoint needs org:manage in
                  every org, so a single-tenant admin legitimately gets a 403 while the
@@ -427,14 +429,12 @@
           {:else if policy}
             {@const pol = policy}
             <p class="muted policy-lede">
-              Data older than this moves out of Postgres into Parquet. It stays
-              readable — queries span both tiers — but it no longer occupies
-              database storage.
+              {t('prose.storage.rotation')}
             </p>
 
             <div class="policy-row">
               <label class="policy-field">
-                <span class="policy-label">Rotation age (days)</span>
+                <span class="policy-label">{t('storage.rotationAge')}</span>
                 <!-- Text, not type="number": the binding on a number input
                      hands back a coerced float, which both broke the parse
                      below and turned a mis-typed "3.0" into a saved 3-day
@@ -496,23 +496,23 @@
             <!-- Hidden the moment the field says something else: otherwise the
                  page goes on asserting that an unsaved number is in force. -->
             {#if policySaved && !hotDaysDirty}
-              <p class="policy-ok">Saved. Takes effect on the tier worker's next cycle.</p>
+              <p class="policy-ok">{t('storage.saved')}</p>
             {/if}
 
             <dl class="policy-facts">
               <div>
-                <dt>In force</dt>
+                <dt>{t('storage.inForce')}</dt>
                 <dd>{pol.effective_hot_days} days{pol.overridden ? '' : ' (default)'}</dd>
               </div>
               <div>
-                <dt>Configured</dt>
+                <dt>{t('storage.configured')}</dt>
                 <dd>{pol.configured_hot_days} days (TIER_HOT_DAYS)</dd>
               </div>
             </dl>
 
             {#if pol.follows_on_restart.length > 0}
               <details class="policy-detail">
-                <summary>Not every component picks this up immediately</summary>
+                <summary>{t('storage.notImmediate')}</summary>
                 <p class="muted">
                   Applies without a restart: {pol.follows_immediately.join('; ')}. Still
                   reading start-time configuration, and so able to disagree about where
@@ -528,10 +528,9 @@
 
             {#if pol.pins.length > 0}
               <div class="policy-pins">
-                <h3 class="pins-title">Restored ranges held in Postgres</h3>
+                <h3 class="pins-title">{t('storage.pinnedRanges')}</h3>
                 <p class="muted">
-                  Each pin keeps a restored range from being re-tiered. Without one, a
-                  restore is undone on the next cycle.
+                  {t('prose.storage.pins')}
                 </p>
                 <ul class="pin-list">
                   {#each pol.pins as pin (pin.id)}
@@ -562,7 +561,7 @@
                           disabled={pinBusy === pin.id}
                           onclick={() => doExtendPin(pin.id)}
                         >
-                          Extend 30 days
+                          {t('storage.extend30')}
                         </Button>
                         <Button
                           variant="secondary"
@@ -585,29 +584,26 @@
 
       {#if policy}
         <div class="section">
-          <Card title="Restore from cold">
+          <Card title={t('storage.card.restore')}>
             <p class="muted policy-lede">
-              Copies a range back out of Parquet into Postgres so the rest of the
-              dashboard can query it again. The Parquet copy is never removed, so a
-              restore adds storage rather than moving it — which is why every restore
-              expires.
+              {t('prose.storage.restore')}
             </p>
 
             <div class="restore-form">
               <label class="policy-field">
-                <span class="policy-label">Table</span>
+                <span class="policy-label">{t('storage.column.table')}</span>
                 <select class="policy-input" bind:value={restoreTable} disabled={restoreBusy}>
-                  {#each RESTORABLE_TABLES as t (t)}
-                    <option value={t}>{t}</option>
+                  {#each RESTORABLE_TABLES as tbl (tbl)}
+                    <option value={tbl}>{tbl}</option>
                   {/each}
                 </select>
               </label>
               <label class="policy-field">
-                <span class="policy-label">From (UTC)</span>
+                <span class="policy-label">{t('storage.from')}</span>
                 <input class="policy-input" type="date" bind:value={restoreFrom} disabled={restoreBusy} />
               </label>
               <label class="policy-field">
-                <span class="policy-label">To (inclusive)</span>
+                <span class="policy-label">{t('storage.to')}</span>
                 <input class="policy-input" type="date" bind:value={restoreTo} disabled={restoreBusy} />
               </label>
               <label class="policy-field">
@@ -625,7 +621,7 @@
             {/if}
             {#if restoreFrom && restoreTo && restoreRange === null}
               <p class="policy-warn" role="alert">
-                The end date must be on or after the start date.
+                {t('storage.badRange')}
               </p>
             {/if}
 
@@ -642,12 +638,12 @@
                     {#if job.status === 'running' || job.status === 'queued'}
                       <div class="job-bar"><div class="job-fill" style="width:{jobPercent(job)}%"></div></div>
                       <p class="muted">
-                        {job.rows_restored.toLocaleString()} of
-                        {job.rows_estimated.toLocaleString()} rows
+                        {formatNumber(job.rows_restored)} of
+                        {formatNumber(job.rows_estimated)} rows
                       </p>
                     {:else if job.status === 'succeeded'}
                       <p class="muted">
-                        Restored {job.rows_restored.toLocaleString()} rows. Held until
+                        Restored {formatNumber(job.rows_restored)} rows. Held until
                         {new Date(job.pin_expires_at).toISOString().slice(0, 10)}.
                       </p>
                     {:else if job.error}
@@ -662,30 +658,30 @@
       {/if}
 
       <div class="section">
-        <Card title="Database tables" padding="none">
+        <Card title={t('storage.card.tables')} padding="none">
           {#if sortedTables.length === 0}
-            <EmptyState title="No tables" description="No tables were reported." icon="server" />
+            <EmptyState title={t('storage.empty.tables')} description={t('storage.empty.tablesBody')} icon="server" />
           {:else}
             <DataTable>
               {#snippet head()}
                 <tr>
                   <SortableTh key="table" columnDefault="asc" sort={tableSort} onsort={onTableSort}>
-                    Table
+                    {t('storage.column.table')}
                   </SortableTh>
                   <SortableTh key="size" class="num" sort={tableSort} onsort={onTableSort}>
-                    Size
+                    {t('storage.column.size')}
                   </SortableTh>
                   <SortableTh key="hot_rows" class="num" sort={tableSort} onsort={onTableSort}>
-                    Hot rows
+                    {t('storage.column.hotRows')}
                   </SortableTh>
                 </tr>
               {/snippet}
               {#snippet children()}
-                {#each sortedTables as t (t.name)}
+                {#each sortedTables as tbl (tbl.name)}
                   <tr>
-                    <td><span class="cell-mono">{t.name}</span></td>
-                    <td class="num">{fmtBytes(t.total_bytes)}</td>
-                    <td class="num">{t.hot_rows.toLocaleString()}</td>
+                    <td><span class="cell-mono">{tbl.name}</span></td>
+                    <td class="num">{fmtBytes(tbl.total_bytes)}</td>
+                    <td class="num">{formatNumber(tbl.hot_rows)}</td>
                   </tr>
                 {/each}
               {/snippet}
@@ -695,33 +691,33 @@
       </div>
 
       <div class="section">
-        <Card title="Storage by app" padding="none">
+        <Card title={t('storage.card.byApp')} padding="none">
           {#if sortedApps.length === 0}
-            <EmptyState title="No apps" description="No apps have been created yet." icon="package" />
+            <EmptyState title={t('storage.empty.apps')} description={t('storage.empty.appsBody')} icon="package" />
           {:else}
             <DataTable>
               {#snippet head()}
                 <tr>
                   <SortableTh key="org" columnDefault="asc" sort={appSort} onsort={onAppSort}>
-                    Org
+                    {t('storage.column.org')}
                   </SortableTh>
                   <SortableTh key="project" columnDefault="asc" sort={appSort} onsort={onAppSort}>
-                    Project
+                    {t('storage.column.project')}
                   </SortableTh>
                   <SortableTh key="app" columnDefault="asc" sort={appSort} onsort={onAppSort}>
-                    App
+                    {t('nav.selectApp')}
                   </SortableTh>
                   <SortableTh key="hot_rows" class="num" sort={appSort} onsort={onAppSort}>
-                    Hot rows
+                    {t('storage.column.hotRows')}
                   </SortableTh>
                   <SortableTh key="cold_rows" class="num" sort={appSort} onsort={onAppSort}>
-                    Cold rows
+                    {t('storage.column.coldRows')}
                   </SortableTh>
                   <SortableTh key="cold_bytes" class="num" sort={appSort} onsort={onAppSort}>
-                    Cold bytes
+                    {t('storage.column.coldBytes')}
                   </SortableTh>
                   <SortableTh key="hot_bytes" class="num" sort={appSort} onsort={onAppSort}>
-                    Hot bytes
+                    {t('storage.column.hotBytes')}
                   </SortableTh>
                 </tr>
               {/snippet}
@@ -743,8 +739,8 @@
                          project_name; the next refresh fills it in. -->
                     <td><span class="cell-muted">{a.project_name || '—'}</span></td>
                     <td><span class="name">{a.app_name}</span></td>
-                    <td class="num">{a.hot_rows_total.toLocaleString()}</td>
-                    <td class="num">{a.cold_rows_total.toLocaleString()}</td>
+                    <td class="num">{formatNumber(a.hot_rows_total)}</td>
+                    <td class="num">{formatNumber(a.cold_rows_total)}</td>
                     <td class="num">{fmtBytes(a.cold_bytes_total)}</td>
                     <td class="num">{fmtBytes(a.estimated_hot_bytes_total)}</td>
                   </tr>
@@ -752,7 +748,7 @@
                     <tr class="expand-row">
                       <td colspan="7" style="background: var(--surface-2); white-space: normal; cursor: default;">
                         <div class="expand-body">
-                          <h4 class="expand-title">Per-table breakdown</h4>
+                          <h4 class="expand-title">{t('storage.perTable')}</h4>
                           <!--
                             A CSS grid, not a nested <table> — a raw <table> here would sit
                             inside DataTable's own <tbody>/<td> and pick up its scoped-but-
@@ -761,21 +757,21 @@
                             boundaries. See the `uptimeColor` inline-style note in
                             Monitors.svelte for the same trap on a different property.
                           -->
-                          <div class="mini-grid" role="table" aria-label="Per-table breakdown">
+                          <div class="mini-grid" role="table" aria-label={t('storage.perTable')}>
                             <div class="mini-row mini-head" role="row">
-                              <span role="columnheader">Table</span>
-                              <span class="num" role="columnheader">Hot rows</span>
-                              <span class="num" role="columnheader">Cold rows</span>
-                              <span class="num" role="columnheader">Cold bytes</span>
-                              <span class="num" role="columnheader">Hot bytes</span>
+                              <span role="columnheader">{t('storage.column.table')}</span>
+                              <span class="num" role="columnheader">{t('storage.column.hotRows')}</span>
+                              <span class="num" role="columnheader">{t('storage.column.coldRows')}</span>
+                              <span class="num" role="columnheader">{t('storage.column.coldBytes')}</span>
+                              <span class="num" role="columnheader">{t('storage.column.hotBytes')}</span>
                             </div>
-                            {#each a.tables as t (t.name)}
+                            {#each a.tables as tbl (tbl.name)}
                               <div class="mini-row" role="row">
-                                <span class="cell-mono" role="cell">{t.name}</span>
-                                <span class="num" role="cell">{t.hot_rows.toLocaleString()}</span>
-                                <span class="num" role="cell">{t.cold_rows.toLocaleString()}</span>
-                                <span class="num" role="cell">{fmtBytes(t.cold_bytes)}</span>
-                                <span class="num" role="cell">{fmtBytes(t.estimated_hot_bytes)}</span>
+                                <span class="cell-mono" role="cell">{tbl.name}</span>
+                                <span class="num" role="cell">{formatNumber(tbl.hot_rows)}</span>
+                                <span class="num" role="cell">{formatNumber(tbl.cold_rows)}</span>
+                                <span class="num" role="cell">{fmtBytes(tbl.cold_bytes)}</span>
+                                <span class="num" role="cell">{fmtBytes(tbl.estimated_hot_bytes)}</span>
                               </div>
                             {/each}
                           </div>
@@ -785,7 +781,7 @@
                                out and silently reads as "that's all of them". -->
                           <h4 class="expand-title">Cold Parquet files ({a.cold_files_total})</h4>
                           {#if a.cold_files_total === 0}
-                            <p class="faint">No cold files for this app.</p>
+                            <p class="faint">{t('storage.noColdFiles')}</p>
                           {:else}
                             <ul class="file-list">
                               {#each a.cold_files as f (f.path)}
@@ -817,9 +813,9 @@
 
 <ConfirmDialog
   bind:open={confirmRevert}
-  title="Lower the rotation age?"
+  title={t('storage.confirmLower')}
   message={policy && revertWouldLower(policy) ? describeRevert(policy) : ''}
-  confirmLabel="Revert"
+  confirmLabel={t('storage.revert')}
   danger
   loading={policyBusy}
   onconfirm={revertPolicy}
@@ -880,15 +876,15 @@
   .policy-detail ul { margin: 6px 0 0 18px; }
   .policy-pins { margin-top: 18px; }
   .pins-title { margin: 0 0 4px; font-size: 14px; }
-  .pin-list { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+  .pin-list { margin: 8px 0 0; padding-inline-start: 18px; font-size: 13px; }
   .pin-list li { margin-bottom: 10px; }
   .pin-list li.expired { opacity: 0.55; }
   /* Warning state is a border, not just colour — the row also has to read as
      "about to change" for anyone who cannot distinguish the hue. */
   .pin-list li.soon {
-    border-left: 3px solid var(--warning, #b45309);
-    padding-left: 8px;
-    margin-left: -11px;
+    border-inline-start: 3px solid var(--warning, #b45309);
+    padding-inline-start: 8px;
+    margin-inline-start: -11px;
   }
   .pin-main { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
   .pin-warn { margin: 4px 0; font-size: 12px; color: var(--warning, #b45309); }
@@ -1022,7 +1018,7 @@
     color: var(--text-faint);
   }
   .mini-row .num {
-    text-align: right;
+    text-align: end;
     font-variant-numeric: tabular-nums;
   }
 

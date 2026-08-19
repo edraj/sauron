@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -382,8 +383,8 @@
 <AppShell requireApp>
   <div class="head">
     <div>
-      <h1 class="page-title">Devices</h1>
-      <p class="muted sub">Fleet-wide hardware, OS and browser breakdown across your users.</p>
+      <h1 class="page-title">{t('devices.title')}</h1>
+      <p class="muted sub">{t('devices.subtitle')}</p>
     </div>
     <!-- Search first, then the window, then refresh — the same order Sessions
          and Users put these controls in. This page keeps them in the header
@@ -393,7 +394,7 @@
       <SearchInput
         bind:value={query}
         onsearch={onSearch}
-        placeholder="Search devices…"
+        placeholder={t('devices.search')}
         width="240px"
       />
       <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
@@ -402,10 +403,10 @@
         variant="secondary"
         disabled={rowCount === 0}
         onclick={downloadDevicesCsv}
-        title="Download visible devices as CSV"
+        title={t('devices.exportTitle')}
       >
         <Icon name="download" size={15} />
-        Export CSV
+        {t('explore.exportCsv')}
       </Button>
     </div>
   </div>
@@ -427,7 +428,7 @@
     <div class="crumb">
       <button class="back" onclick={backToGroups} type="button">
         <Icon name="arrow-left" size={14} />
-        All devices
+        {t('devices.all')}
       </button>
       <span class="chip">{groupLabel(groupKey)}</span>
     </div>
@@ -435,7 +436,7 @@
 
   {#if error && rowCount === 0}
     <Card>
-      <EmptyState title="Couldn't load devices" description={error} icon="triangle-alert">
+      <EmptyState title={t('devices.error.load')} description={error} icon="triangle-alert">
         {#snippet action()}
           <Button
             variant="secondary"
@@ -444,7 +445,7 @@
               if (aid) load(aid, timeFilter, search, sortParam(list.sort), list.offset);
             }}
           >
-            Retry
+            {t('common.retry')}
           </Button>
         {/snippet}
       </EmptyState>

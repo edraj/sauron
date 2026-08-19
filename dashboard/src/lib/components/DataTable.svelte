@@ -44,7 +44,7 @@
     position: sticky;
     top: 0;
     z-index: 1;
-    text-align: left;
+    text-align: start;
     font-size: 11px;
     font-weight: 620;
     letter-spacing: 0.05em;
@@ -57,7 +57,7 @@
   }
   .dt :global(th.num),
   .dt :global(td.num) {
-    text-align: right;
+    text-align: end;
     font-variant-numeric: tabular-nums;
   }
   .dt :global(tbody td) {

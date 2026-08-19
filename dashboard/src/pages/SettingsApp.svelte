@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -121,7 +122,7 @@
 
 <AdminShell requireProject={false}>
   <div class="head">
-    <h1 class="page-title">App settings</h1>
+    <h1 class="page-title">{t('settings.title')}</h1>
     {#if app}
       <p class="muted sub">
         <span class="app-badge"><Icon name={appTypeIcon(app.app_type)} size={15} /> {app.name}</span>
@@ -136,17 +137,17 @@
     <Card><p class="err-msg">{error}</p></Card>
   {:else if !app}
     <EmptyState
-      title="No app selected"
-      description="Pick an app from the switcher, or create one from Projects."
+      title={t('settings.noApp.title')}
+      description={t('settings.noApp.body')}
       icon="package"
     >
       {#snippet action()}
-        <Button variant="primary" onclick={() => push('/admin/projects')}>Go to Projects</Button>
+        <Button variant="primary" onclick={() => push('/admin/projects')}>{t('settings.goToProjects')}</Button>
       {/snippet}
     </EmptyState>
   {:else}
     <div class="settings-stack">
-      <Card title="Ingest">
+      <Card title={t('settings.card.ingest')}>
           <p class="card-desc muted">
             {app.ingest_enabled
               ? 'This app is accepting events. Disable to stop ingesting without deleting the app.'
@@ -175,16 +176,16 @@
         }}
       />
 
-      <Card title="Delete app">
+      <Card title={t('settings.deleteApp')}>
           <p class="card-desc muted">
-            Permanently delete this app and all of its issues and events. This can't be undone.
+            {t('settings.deleteWarning')}
           </p>
           {#if confirmDelete}
             <div class="confirm">
-              <span class="confirm-text">Delete <strong>{app.name}</strong> and all its data?</span>
+              <span class="confirm-text">{t('common.delete')} <strong>{app.name}</strong> {t('prose.settings.confirmDelete')}</span>
               <div class="confirm-actions">
-                <Button variant="danger" loading={deleting} lockedReason={deleteLock} onclick={doDelete}>Yes, delete</Button>
-                <Button variant="ghost" onclick={() => (confirmDelete = false)}>Cancel</Button>
+                <Button variant="danger" loading={deleting} lockedReason={deleteLock} onclick={doDelete}>{t('projects.confirmDelete')}</Button>
+                <Button variant="ghost" onclick={() => (confirmDelete = false)}>{t('common.cancel')}</Button>
               </div>
             </div>
           {:else}
@@ -193,7 +194,7 @@
               lockedReason={deleteLock}
               onclick={() => (confirmDelete = true)}
             >
-              Delete app
+              {t('settings.deleteApp')}
             </Button>
           {/if}
       </Card>
