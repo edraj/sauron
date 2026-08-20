@@ -14,7 +14,13 @@ export interface ListWorkflowsParams {
   /** Rows to RENDER; the request asks for one more. See `listWorkflows`. */
   limit: number;
   offset: number;
-  since_days?: number;
+  /**
+   * The window, as `date-range`'s `toParams` encodes it — `since_days` OR
+   * `from`/`to`, never both. Strings, because that is what goes on the wire.
+   */
+  since_days?: string;
+  from?: string;
+  to?: string;
   search?: string;
   /**
    * `sort=` as `sortParam()` encodes it — a BARE column descends, a `-` prefix
@@ -39,7 +45,9 @@ export async function listWorkflows(
   opts: ListWorkflowsParams,
 ): Promise<ListPage<WorkflowRow>> {
   const p = new URLSearchParams();
-  if (opts.since_days !== undefined) p.set('since_days', String(opts.since_days));
+  if (opts.since_days !== undefined) p.set('since_days', opts.since_days);
+  if (opts.from) p.set('from', opts.from);
+  if (opts.to) p.set('to', opts.to);
   if (opts.search) p.set('search', opts.search);
   if (opts.sort) p.set('sort', opts.sort);
   p.set('limit', String(opts.limit + 1));
@@ -49,7 +57,13 @@ export async function listWorkflows(
 }
 
 export interface ListWorkflowRunsParams {
-  since_days?: number;
+  /**
+   * The window, as `date-range`'s `toParams` encodes it — `since_days` OR
+   * `from`/`to`, never both. Strings, because that is what goes on the wire.
+   */
+  since_days?: string;
+  from?: string;
+  to?: string;
   status?: WorkflowStatus;
   limit?: number;
   offset?: number;
@@ -61,7 +75,9 @@ export async function listWorkflowRuns(
   opts: ListWorkflowRunsParams = {},
 ): Promise<WorkflowRun[]> {
   const p = new URLSearchParams();
-  if (opts.since_days !== undefined) p.set('since_days', String(opts.since_days));
+  if (opts.since_days !== undefined) p.set('since_days', opts.since_days);
+  if (opts.from) p.set('from', opts.from);
+  if (opts.to) p.set('to', opts.to);
   if (opts.status) p.set('status', opts.status);
   if (opts.limit !== undefined) p.set('limit', String(opts.limit));
   if (opts.offset !== undefined) p.set('offset', String(opts.offset));

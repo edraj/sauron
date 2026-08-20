@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { t, formatNumber } from '../lib/i18n';
+  import { t, formatNumber, localeStore, intlTag } from '../lib/i18n';
   import { push, querystring, replace } from 'svelte-spa-router';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -10,6 +10,13 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import {
+    formatAbsolute,
+    rangeKey,
+    spanDays,
+    type DateRangeValue,
+  } from '../lib/models/date-range';
   import TimeFilter from '../lib/components/TimeFilter.svelte';
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
@@ -94,10 +101,22 @@
   );
 
   // Drives the stat tiles and the engagement chart ONLY. Kept separate from
-  // `timeFilter` deliberately: the summary endpoint takes a plain day count and
-  // cannot express a column choice or an absolute bound, so a shared control
-  // would have to misreport on every card that could not follow it.
-  let sinceDays = $state(30);
+  // `timeFilter` deliberately: `timeFilter` also picks WHICH timestamp column
+  // the list windows on, which the summary endpoint has no equivalent for, so
+  // a shared control would have to misreport on every card that could not
+  // follow it. (The summary now does accept absolute bounds — only the column
+  // choice is still exclusive to the list.)
+  let range = $state<DateRangeValue>(rangeStore.effective(30));
+  /**
+   * The window in words, under the tiles it applies to. A custom range reads as
+   * its own label ("July 2026") rather than "last 31d", which would be true but
+   * is not the question the user asked.
+   */
+  const rangeCaption = $derived(
+    range.kind === 'last'
+      ? `last ${spanDays(range)}d`
+      : formatAbsolute(range, intlTag(localeStore.locale)),
+  );
   /**
    * The chips, restored from the URL so a filtered list survives a reload and
    * can be shared. `parseFilters` drops anything whose field or operator
@@ -179,10 +198,10 @@
   // `scopeKey` belongs in every key: it carries the selected environment, which
   // the axios interceptor adds to the request but which appears in none of these
   // arguments. Omit it and one environment's sessions are served as another's.
-  async function loadAnalytics(appId: string, days: number, force = false) {
+  async function loadAnalytics(appId: string, win: DateRangeValue, force = false) {
     await analyticsView.load(
-      viewKey('sessions.analytics', appId, sessionStore.scopeKey, days),
-      () => getSessionAnalytics(appId, days),
+      viewKey('sessions.analytics', appId, sessionStore.scopeKey, rangeKey(win)),
+      () => getSessionAnalytics(appId, win),
       force,
     );
   }
@@ -241,7 +260,7 @@
       // force: an explicit click must reach the network regardless of freshness.
       await Promise.all([
         load(aid, timeFilter, sortParam(list.sort), list.offset, appliedSearch, filters, true),
-        loadAnalytics(aid, sinceDays, true),
+        loadAnalytics(aid, range, true),
       ]);
     } finally {
       refreshing = false;
@@ -279,13 +298,14 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
-    if (aid) void loadAnalytics(aid, days);
+    const win = range;
+    if (aid) void loadAnalytics(aid, win);
   });
 
   // Drives the tiles and chart only, so it no longer resets the table's page.
-  function onRange(days: number) {
-    sinceDays = days;
+  function onRange(v: DateRangeValue) {
+    range = v;
+    rangeStore.set(v);
   }
 
   function onTimeFilter(v: TimeFilterState) {
@@ -358,12 +378,12 @@
 
   <div class="analytics-head">
     <h2 class="section-title">{t('sessions.card.engagement')}</h2>
-    <DateRange value={sinceDays} onchange={onRange} />
+    <DateRange value={range} onchange={onRange} />
   </div>
 
   {#if analytics}
     <StatTiles min={160}>
-      <StatTile label={t('explore.column.sessions')} value={compactNumber(analytics.stats.sessions)} tone="primary" sub={`last ${sinceDays}d`} />
+      <StatTile label={t('explore.column.sessions')} value={compactNumber(analytics.stats.sessions)} tone="primary" sub={rangeCaption} />
       <StatTile label={t('sessions.stat.crashed')} value={compactNumber(analytics.stats.crashed)} tone={analytics.stats.crashed > 0 ? 'warning' : 'neutral'} />
       <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
       <StatTile label={t('sessions.stat.median')} value={formatDuration(analytics.stats.median_session_ms)} />
@@ -402,7 +422,7 @@
       fields={SESSION_FIELDS}
       bind:filters
       bind:search
-      bind:sinceDays
+      bind:range
       showRange={false}
       appId={sessionStore.currentAppId ?? undefined}
       context="sessions"

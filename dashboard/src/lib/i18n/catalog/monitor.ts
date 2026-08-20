@@ -9,9 +9,19 @@ export const monitor = {
   'overview.stat.users': { en: 'Users', ar: 'المستخدمون' },
   'overview.stat.newUsers': { en: 'New users', ar: 'مستخدمون جدد' },
   'overview.stat.sessions': { en: 'Sessions', ar: 'الجلسات' },
-  'overview.stat.crashFree': { en: 'Crash-free sessions', ar: 'جلسات بلا أعطال' },
-  // Shown instead of a percentage when the app's SDK never reports
-  // `mechanism.handled`, so no crash rate can be computed.
+  // NOT "crash-free". This counts sessions with no UNCAUGHT exception, which is
+  // narrower than "the app died": a native crash or an OOM kill produces no
+  // event at all (the process is gone before any SDK code runs) and so counts
+  // as clean here. The longer name is the honest one — see the wiki's
+  // "What this measures" section.
+  //
+  // The key keeps the `crashFree` name deliberately: it matches the API field
+  // (`crash_free_sessions`) and the column (`crashed_sessions`) it renders, so
+  // renaming it would put a third vocabulary between the wire and the screen.
+  'overview.stat.crashFree': {
+    en: 'Unhandled-exception-free sessions',
+    ar: 'جلسات بلا استثناءات غير معالجة',
+  },
   // Shown instead of a percentage when the window holds no sessions at all —
   // distinct from `noSignal`, which blames the SDK. Getting these two the wrong
   // way round sends someone to debug an integration over a date filter.
@@ -19,9 +29,11 @@ export const monitor = {
     en: 'No sessions in this range',
     ar: 'لا توجد جلسات في هذه الفترة',
   },
+  // Shown instead of a percentage when this app's SDK never reports
+  // `mechanism.handled`, so caught and uncaught cannot be told apart at all.
   'overview.stat.crashFree.noSignal': {
-    en: 'No crash data from this SDK',
-    ar: 'لا توجد بيانات أعطال من هذه الحزمة',
+    en: "This SDK doesn't report caught vs uncaught",
+    ar: 'هذه الحزمة لا تُبلّغ عن المعالَج مقابل غير المعالَج',
   },
   'overview.card.activeUsers': { en: 'Active users', ar: 'المستخدمون النشطون' },
   'overview.card.errorsOverTime': { en: 'Errors over time', ar: 'الأخطاء عبر الزمن' },

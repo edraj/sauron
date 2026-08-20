@@ -12,6 +12,7 @@ use sauron_auth::{authorize_app, perm, AuthUser};
 use sauron_db::models::{AnalyticsEvent, ErrorEvent, Issue};
 use sauron_db::repo;
 use sauron_db::repo::{EventCount, PersonRow, SeriesPoint, SortSpec};
+use sauron_db::scope::Range;
 
 use super::db;
 use crate::error::ApiError;
@@ -22,6 +23,21 @@ use crate::AppState;
 pub struct RangeQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
+    /// Absolute window bounds. `from` is INCLUSIVE, `to` EXCLUSIVE.
+    ///
+    /// Plain `Option<DateTime<Utc>>` fields rather than a `#[serde(flatten)]`ed
+    /// shared struct: flatten forces every value in this struct through
+    /// `deserialize_any`, and `serde_html_form` is a flat text format, so the
+    /// neighbouring `since_days: i64` would start answering
+    /// `invalid type: string "7", expected i64` — a 400 on every existing
+    /// bookmark. `TimeFilterQuery` pays that cost with a custom deserializer
+    /// because it genuinely is flattened; these structs are not, so the
+    /// cheapest correct thing is two more fields.
+    ///
+    /// Precedence lives in `search::resolve_range`, not here: either bound
+    /// present means `since_days` is not consulted at all.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default = "default_top")]
     pub limit: i64,
     pub name: Option<String>,
@@ -56,11 +72,10 @@ pub async fn top_events(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let win =
+        super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
     let limit = q.limit.clamp(1, 100);
-    Ok(Json(
-        repo::top_events(&mut conn, scope, since, limit).await?,
-    ))
+    Ok(Json(repo::top_events(&mut conn, scope, win, limit).await?))
 }
 
 pub async fn event_series(
@@ -79,9 +94,10 @@ pub async fn event_series(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let win =
+        super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
     Ok(Json(
-        repo::event_series(&mut conn, scope, q.name.as_deref(), since).await?,
+        repo::event_series(&mut conn, scope, q.name.as_deref(), win).await?,
     ))
 }
 
@@ -721,22 +737,23 @@ pub async fn overview(
     let include_issues = perms.contains(perm::ISSUE_READ);
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
-    let totals = repo::overview_totals(&mut conn, scope.clone(), since).await?;
-    let events_series = repo::event_series(&mut conn, scope.clone(), None, since).await?;
+    let totals = repo::overview_totals(&mut conn, scope.clone(), Range::since(since)).await?;
+    let events_series =
+        repo::event_series(&mut conn, scope.clone(), None, Range::since(since)).await?;
     // Deliberately `event:read`, even though the sibling `error_timeseries`
     // route gates the same signal on `issue:read`: both are per-day counts with
     // no issue identity attached, and the coarse gate is about *which issues
     // exist*, not *how many errors happened*. The inconsistency is real but
     // benign; recorded here so it is not "fixed" in the wrong direction.
-    let errors_series = repo::error_series(&mut conn, scope.clone(), since).await?;
+    let errors_series = repo::error_series(&mut conn, scope.clone(), Range::since(since)).await?;
     // Skipped, not fetched-then-cleared: an omitted query is one fewer round
     // trip, and there is no way to accidentally serialize what was never read.
     let top_issues = if include_issues {
-        repo::top_issues(&mut conn, scope.clone(), since, 5).await?
+        repo::top_issues(&mut conn, scope.clone(), Range::since(since), 5).await?
     } else {
         Vec::new()
     };
-    let top_events = repo::top_events(&mut conn, scope, since, 5).await?;
+    let top_events = repo::top_events(&mut conn, scope, Range::since(since), 5).await?;
 
     let error_rate = {
         let denom = totals.events + totals.errors;
@@ -879,8 +896,9 @@ pub async fn overview_totals(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Envelope>, ApiError> {
     let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let window = overview_cache::Window::from_query(q.since_days, q.from, q.to);
     Ok(Json(
-        overview_cache::read_section(&state, Section::Totals, &scope, q.since_days, f.force).await,
+        overview_cache::read_section(&state, Section::Totals, &scope, window, f.force).await,
     ))
 }
 
@@ -899,8 +917,9 @@ pub async fn overview_series(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Envelope>, ApiError> {
     let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let window = overview_cache::Window::from_query(q.since_days, q.from, q.to);
     Ok(Json(
-        overview_cache::read_section(&state, Section::Series, &scope, q.since_days, f.force).await,
+        overview_cache::read_section(&state, Section::Series, &scope, window, f.force).await,
     ))
 }
 
@@ -924,6 +943,7 @@ pub async fn overview_top_issues(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Envelope>, ApiError> {
     let (scope, perms) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let window = overview_cache::Window::from_query(q.since_days, q.from, q.to);
     // Checked BEFORE the cache is touched. A cached payload is still `Issue`
     // rows — title, culprit, fingerprint — so serving one to a caller without
     // `issue:read` would be the same body leak the coarse gate exists to stop,
@@ -933,8 +953,7 @@ pub async fn overview_top_issues(
         return Err(ApiError::Auth(sauron_auth::AuthError::Forbidden));
     }
     Ok(Json(
-        overview_cache::read_section(&state, Section::TopIssues, &scope, q.since_days, f.force)
-            .await,
+        overview_cache::read_section(&state, Section::TopIssues, &scope, window, f.force).await,
     ))
 }
 
@@ -948,9 +967,9 @@ pub async fn overview_top_events(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Envelope>, ApiError> {
     let (scope, _) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let window = overview_cache::Window::from_query(q.since_days, q.from, q.to);
     Ok(Json(
-        overview_cache::read_section(&state, Section::TopEvents, &scope, q.since_days, f.force)
-            .await,
+        overview_cache::read_section(&state, Section::TopEvents, &scope, window, f.force).await,
     ))
 }
 
@@ -987,8 +1006,8 @@ pub async fn overview_stream(
     use tokio_stream::StreamExt;
 
     let (scope, perms) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
-    let days = overview_cache::clamp_days(q.since_days);
-    let want = overview_cache::scope_token(scope.app_id, &scope.env, days);
+    let window = overview_cache::Window::from_query(q.since_days, q.from, q.to);
+    let want = overview_cache::scope_token(scope.app_id, &scope.env, &window);
 
     // The caller's permission set is captured ONCE, here, and applied to every
     // frame. A stream is long-lived, so this is deliberately a snapshot of
@@ -1006,7 +1025,7 @@ pub async fn overview_stream(
     // recompute that lands between the two — the same lost-wakeup the snapshot
     // exists to prevent, merely moved.
     let rx = state.overview_cache.subscribe();
-    let initial = overview_cache::snapshot(&state, &sections, &scope, days).await;
+    let initial = overview_cache::snapshot(&state, &sections, &scope, window).await;
 
     let allowed: std::collections::HashSet<&'static str> =
         sections.iter().map(|s| s.wire_name()).collect();
@@ -1057,11 +1076,12 @@ pub async fn overview_refresh(
     RawQuery(raw_query): RawQuery,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let (scope, perms) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    let window = overview_cache::Window::from_query(q.since_days, q.from, q.to);
     for section in Section::ALL {
         if section == Section::TopIssues && !perms.contains(perm::ISSUE_READ) {
             continue;
         }
-        overview_cache::read_section(&state, section, &scope, q.since_days, true).await;
+        overview_cache::read_section(&state, section, &scope, window, true).await;
     }
     Ok(axum::http::StatusCode::ACCEPTED)
 }
@@ -1105,8 +1125,8 @@ pub async fn users_summary(
     let now = Utc::now();
     let since = now - Duration::days(q.since_days.clamp(1, 365));
 
-    let stats = repo::user_stats(&mut conn, scope.clone(), since, now).await?;
-    let series = repo::active_user_series(&mut conn, scope, since).await?;
+    let stats = repo::user_stats(&mut conn, scope.clone(), Range::since(since), now).await?;
+    let series = repo::active_user_series(&mut conn, scope, Range::since(since)).await?;
     let stickiness = stickiness(stats.dau, stats.mau);
 
     Ok(Json(UsersAnalytics {
@@ -1145,9 +1165,11 @@ pub async fn sessions_summary(
     .await?;
     let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
 
-    let stats = repo::session_stats(&mut conn, scope.clone(), since).await?;
-    let duration_series = repo::session_duration_series(&mut conn, scope.clone(), since).await?;
-    let duration_histogram = repo::session_duration_histogram(&mut conn, scope, since).await?;
+    let stats = repo::session_stats(&mut conn, scope.clone(), Range::since(since)).await?;
+    let duration_series =
+        repo::session_duration_series(&mut conn, scope.clone(), Range::since(since)).await?;
+    let duration_histogram =
+        repo::session_duration_histogram(&mut conn, scope, Range::since(since)).await?;
 
     Ok(Json(SessionsAnalytics {
         stats,
@@ -1371,9 +1393,9 @@ pub async fn active_users_series(
         )
         .await?
     };
+    let window = overview_cache::Window::from_query(q.since_days, q.from, q.to);
     Ok(Json(
-        overview_cache::read_section(&state, Section::ActiveUsers, &scope, q.since_days, f.force)
-            .await,
+        overview_cache::read_section(&state, Section::ActiveUsers, &scope, window, f.force).await,
     ))
 }
 
@@ -1485,6 +1507,90 @@ mod person_sort_tests {
                 "the persons list must refuse `{bad}`"
             );
         }
+    }
+}
+
+/// The query EXTRACTOR, not the resolver.
+///
+/// `RangeQuery` is what every analytics route deserializes its window from, and
+/// the failure this pins is invisible one layer up: a resolver test calls
+/// `resolve_range` with already-typed values and cannot see whether the query
+/// string ever produced them. The neighbouring `TimeFilterQuery` needed a
+/// hand-written deserializer for exactly this reason — `#[serde(flatten)]`
+/// forces every field through `deserialize_any`, and a flat text format hands
+/// the visitor a string, so a plain `i64` answers
+/// `invalid type: string "7", expected i64` and 400s every existing bookmark.
+///
+/// `RangeQuery` is NOT flattened anywhere, so it should not have that problem —
+/// but "should not" is the part worth checking, because the symptom is a 400 on
+/// the dashboard's own default request and nothing in the type system says a
+/// word about it.
+#[cfg(test)]
+mod range_query_extractor_tests {
+    use super::RangeQuery;
+    use chrono::{TimeZone, Utc};
+
+    fn parse(qs: &str) -> RangeQuery {
+        serde_urlencoded::from_str(qs).unwrap_or_else(|e| panic!("`?{qs}` must deserialize: {e}"))
+    }
+
+    #[test]
+    fn a_bare_query_takes_the_defaults() {
+        let q = parse("");
+        assert_eq!(q.since_days, 30);
+        assert_eq!(q.limit, 20);
+        assert!(q.from.is_none() && q.to.is_none());
+    }
+
+    /// The dashboard's own default request, and every bookmark ever taken of
+    /// one.
+    #[test]
+    fn since_days_still_deserializes_from_a_query_string() {
+        assert_eq!(parse("since_days=7").since_days, 7);
+        assert_eq!(parse("since_days=7&limit=5").limit, 5);
+        // `Issues` really sends this one.
+        assert_eq!(parse("since_days=3650").since_days, 3650);
+    }
+
+    #[test]
+    fn absolute_bounds_deserialize_alongside_everything_else() {
+        let q = parse("from=2026-08-01T00:00:00Z&to=2026-08-08T00:00:00Z&limit=5&name=checkout");
+        assert_eq!(
+            q.from,
+            Some(Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap())
+        );
+        assert_eq!(
+            q.to,
+            Some(Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 0).unwrap())
+        );
+        assert_eq!(q.limit, 5);
+        assert_eq!(q.name.as_deref(), Some("checkout"));
+        // Absent, so the route's clamp applies to the default rather than to
+        // something the caller sent.
+        assert_eq!(q.since_days, 30);
+    }
+
+    /// The exact spelling `date-range.ts`'s `toParams` emits — millisecond
+    /// precision and a `Z` suffix, straight out of `Date.prototype.toISOString`.
+    /// A server that only accepted second precision would 400 every custom
+    /// range the picker produces.
+    #[test]
+    fn the_dashboards_own_spelling_of_an_instant_parses() {
+        let q = parse("from=2026-08-12T00%3A00%3A00.000Z&to=2026-08-13T00%3A00%3A00.000Z");
+        assert_eq!(
+            q.from,
+            Some(Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap())
+        );
+        assert!(q.to.is_some());
+    }
+
+    /// An unparseable bound is a 400 rather than a silently-ignored parameter.
+    /// Dropping it would serve an unbounded window under a URL that asks for a
+    /// bounded one — the silent-wrong-answer shape this whole layer exists to
+    /// avoid.
+    #[test]
+    fn a_malformed_bound_is_refused_rather_than_ignored() {
+        assert!(serde_urlencoded::from_str::<RangeQuery>("from=yesterday").is_err());
     }
 }
 

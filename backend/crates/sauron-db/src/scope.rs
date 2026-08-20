@@ -8,6 +8,7 @@
 //! ignore `env`, and it will compile. `tests/env_scoping.rs` is what closes
 //! that gap, and for the raw-SQL reads it is the only thing that can.
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// Which environments a read covers.
@@ -111,6 +112,81 @@ impl ReadScope {
     }
 }
 
+/// The time window a telemetry read covers: half-open, `from <= col < to`.
+///
+/// `from` is never optional and `to` is, and the asymmetry is load bearing —
+/// the same asymmetry [`crate::repo::TimeWindow`] documents one layer up.
+/// `analytics_events` is `PARTITION BY RANGE (occurred_at)`, so an unbounded
+/// LOWER bound is a MergeAppend across every partition, which is the shape
+/// behind the env-scoped analytics timeouts. An unbounded UPPER bound costs
+/// nothing, because "up to now" is where the data ends anyway.
+///
+/// # Why this is a type rather than an extra `until` parameter
+///
+/// Twenty-five read functions used to take a bare `since: DateTime<Utc>`.
+/// Adding `until: Option<…>` beside it would have let every function that was
+/// not taught the new bound keep compiling while silently ignoring one the
+/// caller believed it had applied — a wrong answer carrying a 200. Changing
+/// the parameter's TYPE instead makes the signature the documentation: a
+/// function taking `Range` honours both bounds, a function still taking
+/// `since` honours only the lower one, and the compiler forces every call
+/// site to be revisited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    pub from: DateTime<Utc>,
+    /// EXCLUSIVE. `None` means "up to now", i.e. no upper predicate at all.
+    pub to: Option<DateTime<Utc>>,
+}
+
+impl Range {
+    /// A window open above — what every caller had before closed windows
+    /// existed.
+    pub fn since(from: DateTime<Utc>) -> Self {
+        Self { from, to: None }
+    }
+
+    pub fn new(from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> Self {
+        Self { from, to }
+    }
+
+    /// SQL to AND onto a raw `sql_query`'s WHERE, or `""` when open above.
+    ///
+    /// # Always bind LAST
+    ///
+    /// The raw queries in `repo.rs` compute their bind indices by hand —
+    /// `let limit_idx = if scope.env.consumes_bind() { 4 } else { 3 }` is
+    /// typical. Inserting a bind in the MIDDLE of that sequence shifts every
+    /// index after it, in twenty-five functions at once, and the result
+    /// compiles, passes clippy, and returns wrong rows. So the upper bound is
+    /// appended to the end of the WHERE clause and bound after everything
+    /// else: existing indices are untouched, and the only new number a caller
+    /// needs is the next free one, which it already computed for its own env
+    /// fragment.
+    ///
+    /// Pair every call with [`bind_range!`], exactly as `sql_fragment` is
+    /// paired with [`bind_env!`] — and note this consumes an index only when
+    /// the window is actually closed.
+    pub fn upper_sql(&self, column: &str, bind_index: usize) -> String {
+        match self.to {
+            None => String::new(),
+            Some(_) => format!(" AND {column} < ${bind_index}"),
+        }
+    }
+
+    /// [`Range::upper_sql`] for a query where the column needs a table alias.
+    pub fn upper_sql_for(&self, alias: &str, column: &str, bind_index: usize) -> String {
+        match self.to {
+            None => String::new(),
+            Some(_) => format!(" AND {alias}.{column} < ${bind_index}"),
+        }
+    }
+
+    /// Whether [`Range::upper_sql`] reserved the index it was given.
+    pub fn consumes_bind(&self) -> bool {
+        self.to.is_some()
+    }
+}
+
 /// Apply an [`EnvFilter`] to a boxed diesel query over a table with an
 /// `environment_id` column.
 ///
@@ -154,6 +230,24 @@ macro_rules! scope_env {
 /// changes with each bind, so a generic helper cannot name the return type.
 /// Both arms produce the same `BoxedSqlQuery` type at the call site, so this
 /// expands cleanly into an assignment.
+/// Bind a [`Range`]'s upper bound onto a boxed raw query, if it has one.
+///
+/// The mirror of [`bind_env!`], and used the same way: emit the fragment with
+/// [`Range::upper_sql`], then apply this **after every other bind** so the
+/// index the fragment named is the one this fills. A macro rather than a
+/// function because the two arms produce different builder types — diesel's
+/// `BoxedSqlQuery` changes type with each `.bind()`, so no function signature
+/// can name both.
+#[macro_export]
+macro_rules! bind_range {
+    ($stmt:expr, $range:expr) => {
+        match $range.to {
+            None => $stmt,
+            Some(t) => $stmt.bind::<diesel::sql_types::Timestamptz, _>(t),
+        }
+    };
+}
+
 #[macro_export]
 macro_rules! bind_env {
     ($stmt:expr, $env:expr) => {
@@ -329,5 +423,70 @@ mod tests {
             sql.contains(r#""analytics_events"."environment_id" = ANY"#),
             "{sql}"
         );
+    }
+}
+
+/// `Range`'s SQL shape.
+///
+/// Asserted on the emitted string for the reason the `EnvFilter` tests above
+/// give: an arm that returns the wrong fragment still typechecks, and only
+/// looking at the SQL can tell the two apart. The bind INDEX is the part that
+/// has historically gone wrong here, so it is asserted literally rather than
+/// via `contains("<")`.
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn at(day: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, day, 0, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn an_open_window_emits_no_upper_bound_and_consumes_no_bind() {
+        let r = Range::since(at(1));
+        assert_eq!(r.upper_sql("occurred_at", 3), "");
+        assert_eq!(r.upper_sql_for("e", "occurred_at", 3), "");
+        assert!(!r.consumes_bind());
+    }
+
+    #[test]
+    fn a_closed_window_emits_a_strict_upper_bound_at_the_given_index() {
+        let r = Range::new(at(1), Some(at(8)));
+        assert_eq!(r.upper_sql("occurred_at", 4), " AND occurred_at < $4");
+        assert_eq!(
+            r.upper_sql_for("ee", "occurred_at", 7),
+            " AND ee.occurred_at < $7"
+        );
+        assert!(r.consumes_bind());
+    }
+
+    /// `<`, never `<=`. The interval is half-open everywhere else in this
+    /// codebase — `TimeWindowSpec`, `TimeFilterState`, `resolve_time_filter` —
+    /// and an inclusive upper bound would have to be spelled as the last
+    /// representable microsecond, which silently drops the tail of every
+    /// window.
+    #[test]
+    fn the_upper_bound_is_exclusive() {
+        let sql = Range::new(at(1), Some(at(8))).upper_sql("occurred_at", 2);
+        assert!(sql.contains('<'), "{sql}");
+        assert!(!sql.contains("<="), "{sql}");
+    }
+
+    /// The whole point of binding LAST. A caller derives the next free index
+    /// from what it already knows about the env fragment; `Range` never
+    /// displaces an index that was already allocated.
+    #[test]
+    fn the_index_is_whatever_the_caller_says() {
+        let r = Range::new(at(1), Some(at(2)));
+        assert_eq!(r.upper_sql("c", 3), " AND c < $3");
+        assert_eq!(r.upper_sql("c", 9), " AND c < $9");
+    }
+
+    #[test]
+    fn since_is_open_above_and_new_carries_the_bound() {
+        assert_eq!(Range::since(at(3)).to, None);
+        assert_eq!(Range::new(at(3), Some(at(4))).to, Some(at(4)));
+        assert_eq!(Range::new(at(3), None).from, at(3));
     }
 }

@@ -9,7 +9,7 @@ use sauron_auth::{authorize_env_read, perm, AuthError};
 use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewTransaction, Workflow};
 use sauron_db::repo::SortSpec;
 use sauron_db::schema::workflows;
-use sauron_db::scope::{EnvFilter, ReadScope};
+use sauron_db::scope::{EnvFilter, Range, ReadScope};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -683,7 +683,7 @@ async fn top_events_counts_only_the_selected_environment() {
     let a = sauron_db::repo::top_events(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         50,
     )
     .await
@@ -691,9 +691,14 @@ async fn top_events_counts_only_the_selected_environment() {
     let a_total: i64 = a.iter().map(|r| r.count).sum();
     assert_eq!(a_total, 5, "analytics_events is seeded 5/5/1");
 
-    let all = sauron_db::repo::top_events(&mut conn, ReadScope::all(ids.app_id), far_past(), 50)
-        .await
-        .unwrap();
+    let all = sauron_db::repo::top_events(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+        50,
+    )
+    .await
+    .unwrap();
     let all_total: i64 = all.iter().map(|r| r.count).sum();
     assert_eq!(all_total, 11, "All includes the unattributed row");
 
@@ -722,7 +727,7 @@ async fn top_events_counts_only_the_selected_environment() {
     let b = sauron_db::repo::top_events(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
         50,
     )
     .await
@@ -743,7 +748,7 @@ async fn top_events_counts_only_the_selected_environment() {
     let none = sauron_db::repo::top_events(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
         50,
     )
     .await
@@ -773,7 +778,7 @@ async fn event_series_counts_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         None,
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -787,7 +792,7 @@ async fn event_series_counts_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         None,
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -798,17 +803,21 @@ async fn event_series_counts_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
         None,
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
     let none_total: i64 = none.iter().map(|p| p.count).sum();
     assert_eq!(none_total, 1);
 
-    let all =
-        sauron_db::repo::event_series(&mut conn, ReadScope::all(ids.app_id), None, far_past())
-            .await
-            .unwrap();
+    let all = sauron_db::repo::event_series(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        None,
+        Range::since(far_past()),
+    )
+    .await
+    .unwrap();
     let all_total: i64 = all.iter().map(|p| p.count).sum();
     assert_eq!(
         all_total, 11,
@@ -823,7 +832,7 @@ async fn event_series_counts_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         Some("harness.event"),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -834,7 +843,7 @@ async fn event_series_counts_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         Some("harness.event"),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -862,7 +871,7 @@ async fn error_series_counts_only_the_selected_environment() {
     let a = sauron_db::repo::error_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -872,7 +881,7 @@ async fn error_series_counts_only_the_selected_environment() {
     let b = sauron_db::repo::error_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -882,16 +891,20 @@ async fn error_series_counts_only_the_selected_environment() {
     let none = sauron_db::repo::error_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
     let none_total: i64 = none.iter().map(|p| p.count).sum();
     assert_eq!(none_total, 1);
 
-    let all = sauron_db::repo::error_series(&mut conn, ReadScope::all(ids.app_id), far_past())
-        .await
-        .unwrap();
+    let all = sauron_db::repo::error_series(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+    )
+    .await
+    .unwrap();
     let all_total: i64 = all.iter().map(|p| p.count).sum();
     assert_eq!(
         all_total, 7,
@@ -921,7 +934,7 @@ async fn journey_graph_counts_only_the_selected_environment() {
     let (nodes_a, _) = sauron_db::repo::journey_graph(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         10,
     )
     .await
@@ -935,7 +948,7 @@ async fn journey_graph_counts_only_the_selected_environment() {
     let (nodes_b, _) = sauron_db::repo::journey_graph(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
         10,
     )
     .await
@@ -966,7 +979,7 @@ async fn journey_graph_counts_only_the_selected_environment() {
     let (nodes_none, _) = sauron_db::repo::journey_graph(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
         10,
     )
     .await
@@ -974,10 +987,14 @@ async fn journey_graph_counts_only_the_selected_environment() {
     let none_total: i64 = nodes_none.iter().map(|n| n.count).sum();
     assert_eq!(none_total, 1);
 
-    let (nodes_all, _) =
-        sauron_db::repo::journey_graph(&mut conn, ReadScope::all(ids.app_id), far_past(), 10)
-            .await
-            .unwrap();
+    let (nodes_all, _) = sauron_db::repo::journey_graph(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+        10,
+    )
+    .await
+    .unwrap();
     let all_total: i64 = nodes_all.iter().map(|n| n.count).sum();
     assert_eq!(
         all_total, 11,
@@ -1004,7 +1021,7 @@ async fn performance_summary_counts_only_the_selected_environment() {
     let a = sauron_db::repo::performance_summary(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         None,
         None,
     )
@@ -1030,7 +1047,7 @@ async fn performance_summary_counts_only_the_selected_environment() {
     let b = sauron_db::repo::performance_summary(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
         None,
         None,
     )
@@ -1052,7 +1069,7 @@ async fn performance_summary_counts_only_the_selected_environment() {
     let none = sauron_db::repo::performance_summary(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
         None,
         None,
     )
@@ -1064,7 +1081,7 @@ async fn performance_summary_counts_only_the_selected_environment() {
     let all = sauron_db::repo::performance_summary(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        Range::since(far_past()),
         None,
         None,
     )
@@ -1095,7 +1112,7 @@ async fn performance_series_counts_only_the_selected_environment() {
     let a = sauron_db::repo::performance_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         None,
         None,
     )
@@ -1107,7 +1124,7 @@ async fn performance_series_counts_only_the_selected_environment() {
     let b = sauron_db::repo::performance_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
         None,
         None,
     )
@@ -1119,7 +1136,7 @@ async fn performance_series_counts_only_the_selected_environment() {
     let none = sauron_db::repo::performance_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
         None,
         None,
     )
@@ -1131,7 +1148,7 @@ async fn performance_series_counts_only_the_selected_environment() {
     let all = sauron_db::repo::performance_series(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        Range::since(far_past()),
         None,
         None,
     )
@@ -1183,7 +1200,7 @@ async fn overview_totals_counts_only_the_selected_environment() {
     let a = sauron_db::repo::overview_totals(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1203,7 +1220,7 @@ async fn overview_totals_counts_only_the_selected_environment() {
     let b = sauron_db::repo::overview_totals(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1223,7 +1240,7 @@ async fn overview_totals_counts_only_the_selected_environment() {
     let none = sauron_db::repo::overview_totals(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1237,9 +1254,13 @@ async fn overview_totals_counts_only_the_selected_environment() {
     );
     assert_eq!(none.new_users, 2);
 
-    let all = sauron_db::repo::overview_totals(&mut conn, ReadScope::all(ids.app_id), far_past())
-        .await
-        .unwrap();
+    let all = sauron_db::repo::overview_totals(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         all.events, 11,
         "All must equal the sum of the parts, including unattributed"
@@ -1290,7 +1311,7 @@ async fn user_stats_covers_only_the_selected_environment() {
     let a = sauron_db::repo::user_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         Utc::now(),
     )
     .await
@@ -1334,7 +1355,7 @@ async fn user_stats_covers_only_the_selected_environment() {
     let b = sauron_db::repo::user_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
         Utc::now(),
     )
     .await
@@ -1362,7 +1383,7 @@ async fn user_stats_covers_only_the_selected_environment() {
     let none = sauron_db::repo::user_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
         Utc::now(),
     )
     .await
@@ -1385,7 +1406,7 @@ async fn user_stats_covers_only_the_selected_environment() {
     let all = sauron_db::repo::user_stats(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        Range::since(far_past()),
         Utc::now(),
     )
     .await
@@ -1429,7 +1450,7 @@ async fn active_user_series_covers_only_the_selected_environment() {
     let a = sauron_db::repo::active_user_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1447,7 +1468,7 @@ async fn active_user_series_covers_only_the_selected_environment() {
     let b = sauron_db::repo::active_user_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1462,7 +1483,7 @@ async fn active_user_series_covers_only_the_selected_environment() {
     let none = sauron_db::repo::active_user_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1474,10 +1495,13 @@ async fn active_user_series_covers_only_the_selected_environment() {
         "unattributed-only members: none-an-0, none-er-0"
     );
 
-    let all =
-        sauron_db::repo::active_user_series(&mut conn, ReadScope::all(ids.app_id), far_past())
-            .await
-            .unwrap();
+    let all = sauron_db::repo::active_user_series(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+    )
+    .await
+    .unwrap();
     let all_active: i64 = all.iter().map(|p| p.active).sum();
     let all_new: i64 = all.iter().map(|p| p.new_users).sum();
     assert_eq!(
@@ -1509,7 +1533,7 @@ async fn session_stats_covers_only_the_selected_environment() {
     let a = sauron_db::repo::session_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1538,7 +1562,7 @@ async fn session_stats_covers_only_the_selected_environment() {
     let b = sauron_db::repo::session_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1558,7 +1582,7 @@ async fn session_stats_covers_only_the_selected_environment() {
     let none = sauron_db::repo::session_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1570,9 +1594,13 @@ async fn session_stats_covers_only_the_selected_environment() {
         none.median_session_ms
     );
 
-    let all = sauron_db::repo::session_stats(&mut conn, ReadScope::all(ids.app_id), far_past())
-        .await
-        .unwrap();
+    let all = sauron_db::repo::session_stats(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         all.sessions, 7,
         "All must equal the sum of the parts, including unattributed"
@@ -1648,14 +1676,14 @@ async fn crashed_sessions_are_counted_only_in_the_environment_that_crashed() {
     let a = sauron_db::repo::session_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        Range::since(since),
     )
     .await
     .unwrap();
     let b = sauron_db::repo::session_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        since,
+        Range::since(since),
     )
     .await
     .unwrap();
@@ -1671,7 +1699,7 @@ async fn crashed_sessions_are_counted_only_in_the_environment_that_crashed() {
     let ov_a = sauron_db::repo::overview_totals(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        since,
+        Range::since(since),
     )
     .await
     .unwrap();
@@ -1696,7 +1724,7 @@ async fn session_duration_series_covers_only_the_selected_environment() {
     let a = sauron_db::repo::session_duration_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1706,7 +1734,7 @@ async fn session_duration_series_covers_only_the_selected_environment() {
     let b = sauron_db::repo::session_duration_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1716,7 +1744,7 @@ async fn session_duration_series_covers_only_the_selected_environment() {
     let none = sauron_db::repo::session_duration_series(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1727,10 +1755,13 @@ async fn session_duration_series_covers_only_the_selected_environment() {
         none[0].avg_ms
     );
 
-    let all =
-        sauron_db::repo::session_duration_series(&mut conn, ReadScope::all(ids.app_id), far_past())
-            .await
-            .unwrap();
+    let all = sauron_db::repo::session_duration_series(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+    )
+    .await
+    .unwrap();
     assert_eq!(all.len(), 1, "still one bucket under All");
 
     drop(conn);
@@ -1759,7 +1790,7 @@ async fn session_duration_histogram_covers_only_the_selected_environment() {
     let a = sauron_db::repo::session_duration_histogram(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1773,7 +1804,7 @@ async fn session_duration_histogram_covers_only_the_selected_environment() {
     let b = sauron_db::repo::session_duration_histogram(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1787,7 +1818,7 @@ async fn session_duration_histogram_covers_only_the_selected_environment() {
     let none = sauron_db::repo::session_duration_histogram(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1800,7 +1831,7 @@ async fn session_duration_histogram_covers_only_the_selected_environment() {
     let all = sauron_db::repo::session_duration_histogram(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1840,7 +1871,7 @@ async fn funnel_counts_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         &steps,
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1858,7 +1889,7 @@ async fn funnel_counts_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         &steps,
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1872,7 +1903,7 @@ async fn funnel_counts_only_the_selected_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
         &steps,
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -1882,9 +1913,14 @@ async fn funnel_counts_only_the_selected_environment() {
     );
     assert_eq!(none[1].count, 0);
 
-    let all = sauron_db::repo::funnel(&mut conn, ReadScope::all(ids.app_id), &steps, far_past())
-        .await
-        .unwrap();
+    let all = sauron_db::repo::funnel(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        &steps,
+        Range::since(far_past()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         all[0].count, 3,
         "all three identities did step1 somewhere: shared, cross_env, b_only"
@@ -2048,7 +2084,7 @@ async fn event_series_named_arm_covers_all_and_unattributed() {
         &mut conn,
         ReadScope::all(ids.app_id),
         Some("harness.event"),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -2062,7 +2098,7 @@ async fn event_series_named_arm_covers_all_and_unattributed() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
         Some("harness.event"),
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -2100,7 +2136,7 @@ async fn screen_stats_covers_only_the_selected_environment() {
     let a = sauron_db::repo::screen_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         "home",
     )
     .await
@@ -2132,7 +2168,7 @@ async fn screen_stats_covers_only_the_selected_environment() {
     let b = sauron_db::repo::screen_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
         "home",
     )
     .await
@@ -2164,7 +2200,7 @@ async fn screen_stats_covers_only_the_selected_environment() {
     let none = sauron_db::repo::screen_stats(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
         "home",
     )
     .await
@@ -2184,10 +2220,14 @@ async fn screen_stats_covers_only_the_selected_environment() {
         "the unattributed analytics row has no session_id, so no dwell partner"
     );
 
-    let all =
-        sauron_db::repo::screen_stats(&mut conn, ReadScope::all(ids.app_id), far_past(), "home")
-            .await
-            .unwrap();
+    let all = sauron_db::repo::screen_stats(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+        "home",
+    )
+    .await
+    .unwrap();
     assert_eq!(all.views, 3, "All is the sum of the parts: 1 + 2 + 0");
     assert_eq!(all.events, 5, "3 + 1 + 1");
     assert_eq!(all.exceptions, 4, "2 + 1 + 1");
@@ -2245,7 +2285,7 @@ async fn screen_list_covers_only_the_selected_environment() {
     let a = sauron_db::repo::screen_list(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         "%",
         50,
         0,
@@ -2284,7 +2324,7 @@ async fn screen_list_covers_only_the_selected_environment() {
     let b = sauron_db::repo::screen_list(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        far_past(),
+        Range::since(far_past()),
         "%",
         50,
         0,
@@ -2318,7 +2358,7 @@ async fn screen_list_covers_only_the_selected_environment() {
     let none = sauron_db::repo::screen_list(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
         "%",
         50,
         0,
@@ -2340,7 +2380,7 @@ async fn screen_list_covers_only_the_selected_environment() {
     let all = sauron_db::repo::screen_list(
         &mut conn,
         ReadScope::all(ids.app_id),
-        far_past(),
+        Range::since(far_past()),
         "%",
         50,
         0,
@@ -2373,7 +2413,7 @@ async fn screen_list_covers_only_the_selected_environment() {
     let page1 = sauron_db::repo::screen_list(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         "%",
         1,
         0,
@@ -2390,7 +2430,7 @@ async fn screen_list_covers_only_the_selected_environment() {
     let page2 = sauron_db::repo::screen_list(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         "%",
         1,
         1,
@@ -2489,15 +2529,26 @@ async fn users_and_devices_for_screen_are_scoped_and_agree_with_screen_stats() {
     ] {
         let scope = ReadScope::new(ids.app_id, env);
 
-        let stats = sauron_db::repo::screen_stats(&mut conn, scope.clone(), far_past(), "home")
-            .await
-            .unwrap();
+        let stats = sauron_db::repo::screen_stats(
+            &mut conn,
+            scope.clone(),
+            Range::since(far_past()),
+            "home",
+        )
+        .await
+        .unwrap();
 
         // A limit far above the fixture, so this is every row, not a page.
-        let users =
-            sauron_db::repo::users_for_screen(&mut conn, scope.clone(), "home", far_past(), 100, 0)
-                .await
-                .unwrap();
+        let users = sauron_db::repo::users_for_screen(
+            &mut conn,
+            scope.clone(),
+            "home",
+            Range::since(far_past()),
+            100,
+            0,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             users.len() as i64,
@@ -2525,7 +2576,7 @@ async fn users_and_devices_for_screen_are_scoped_and_agree_with_screen_stats() {
             &mut conn,
             scope.clone(),
             "home",
-            far_past(),
+            Range::since(far_past()),
             100,
             0,
         )
@@ -2566,7 +2617,7 @@ async fn users_and_devices_for_screen_are_scoped_and_agree_with_screen_stats() {
                 &mut conn,
                 scope.clone(),
                 "home",
-                far_past(),
+                Range::since(far_past()),
                 1,
                 0,
             )
@@ -2576,7 +2627,7 @@ async fn users_and_devices_for_screen_are_scoped_and_agree_with_screen_stats() {
                 &mut conn,
                 scope.clone(),
                 "home",
-                far_past(),
+                Range::since(far_past()),
                 1,
                 1,
             )
@@ -2610,7 +2661,7 @@ async fn users_and_devices_for_screen_are_scoped_and_agree_with_screen_stats() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         "home",
-        far_past(),
+        Range::since(far_past()),
         100,
         0,
     )
@@ -2628,7 +2679,7 @@ async fn users_and_devices_for_screen_are_scoped_and_agree_with_screen_stats() {
         &mut conn,
         ReadScope::all(ids.app_id),
         "no-such-screen",
-        far_past(),
+        Range::since(far_past()),
         100,
         0,
     )
@@ -2656,7 +2707,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         "home",
-        far_past(),
+        Range::since(far_past()),
         20,
         0,
     )
@@ -2672,7 +2723,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         "home",
-        far_past(),
+        Range::since(far_past()),
         20,
         0,
     )
@@ -2688,7 +2739,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         "home",
-        far_past(),
+        Range::since(far_past()),
         20,
         0,
     )
@@ -2704,7 +2755,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         "home",
-        far_past(),
+        Range::since(far_past()),
         20,
         0,
     )
@@ -2720,7 +2771,7 @@ async fn recent_events_and_exceptions_for_screen_are_scoped() {
         &mut conn,
         ReadScope::all(ids.app_id),
         "home",
-        far_past(),
+        Range::since(far_past()),
         20,
         0,
     )
@@ -4456,7 +4507,7 @@ async fn issue_detail_reads_are_scoped_by_environment() {
     let top_a = sauron_db::repo::top_issues(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        far_past(),
+        Range::since(far_past()),
         50,
     )
     .await
@@ -4501,7 +4552,7 @@ async fn issue_detail_reads_are_scoped_by_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         ids.issue_id,
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -4510,7 +4561,7 @@ async fn issue_detail_reads_are_scoped_by_environment() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         ids.issue_id,
-        far_past(),
+        Range::since(far_past()),
     )
     .await
     .unwrap();
@@ -5206,7 +5257,7 @@ async fn list_issues_and_top_issues_page_by_environment_membership_not_app_wide_
     // rank by the *derived* count, not the app-wide one — r2 (derived 5)
     // ahead of issue_id (derived 4) ahead of r1 (derived 1), the exact
     // reverse of ranking by app-wide times_seen (r1=10, issue_id=6, r2=1).
-    let top = sauron_db::repo::top_issues(&mut conn, scope_a, far_past(), 10)
+    let top = sauron_db::repo::top_issues(&mut conn, scope_a, Range::since(far_past()), 10)
         .await
         .unwrap();
     assert!(
@@ -5406,9 +5457,14 @@ async fn top_issues_all_ranks_by_the_stored_times_seen_column() {
         .expect("insert low_stored_high_real occurrence");
     }
 
-    let top = sauron_db::repo::top_issues(&mut conn, ReadScope::all(ids.app_id), far_past(), 50)
-        .await
-        .unwrap();
+    let top = sauron_db::repo::top_issues(
+        &mut conn,
+        ReadScope::all(ids.app_id),
+        Range::since(far_past()),
+        50,
+    )
+    .await
+    .unwrap();
 
     let high_row = top
         .iter()
@@ -5533,7 +5589,7 @@ async fn top_issues_unattributed_ranks_by_the_unattributed_derived_count() {
     let top = sauron_db::repo::top_issues(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::Unattributed),
-        far_past(),
+        Range::since(far_past()),
         50,
     )
     .await
@@ -5634,19 +5690,19 @@ async fn subset_equals_the_union_of_its_environments_and_excludes_unattributed()
     let unattributed = ReadScope::new(ids.app_id, EnvFilter::Unattributed);
     let all = ReadScope::all(ids.app_id);
 
-    let t_both = sauron_db::repo::overview_totals(&mut conn, both, since)
+    let t_both = sauron_db::repo::overview_totals(&mut conn, both, Range::since(since))
         .await
         .unwrap();
-    let t_a = sauron_db::repo::overview_totals(&mut conn, only_a, since)
+    let t_a = sauron_db::repo::overview_totals(&mut conn, only_a, Range::since(since))
         .await
         .unwrap();
-    let t_b = sauron_db::repo::overview_totals(&mut conn, only_b, since)
+    let t_b = sauron_db::repo::overview_totals(&mut conn, only_b, Range::since(since))
         .await
         .unwrap();
-    let t_un = sauron_db::repo::overview_totals(&mut conn, unattributed, since)
+    let t_un = sauron_db::repo::overview_totals(&mut conn, unattributed, Range::since(since))
         .await
         .unwrap();
-    let t_all = sauron_db::repo::overview_totals(&mut conn, all, since)
+    let t_all = sauron_db::repo::overview_totals(&mut conn, all, Range::since(since))
         .await
         .unwrap();
 
@@ -5670,7 +5726,7 @@ async fn subset_equals_the_union_of_its_environments_and_excludes_unattributed()
 
     // A single-element Subset must agree exactly with One.
     let single = ReadScope::new(ids.app_id, EnvFilter::Subset(vec![ids.env_a]));
-    let t_single = sauron_db::repo::overview_totals(&mut conn, single, since)
+    let t_single = sauron_db::repo::overview_totals(&mut conn, single, Range::since(since))
         .await
         .unwrap();
     assert_eq!(t_single.events, t_a.events);
@@ -5705,7 +5761,7 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     sauron_db::repo::issue_stats(&mut conn, scope.clone())
         .await
         .expect("issue_stats under Subset");
-    sauron_db::repo::top_issues(&mut conn, scope.clone(), since, 10)
+    sauron_db::repo::top_issues(&mut conn, scope.clone(), Range::since(since), 10)
         .await
         .expect("top_issues under Subset");
     sauron_db::repo::list_persons(
@@ -5782,22 +5838,22 @@ async fn every_scoped_read_accepts_subset_without_a_bind_mismatch() {
     )
     .await
     .expect("list_sessions under Subset");
-    sauron_db::repo::session_stats(&mut conn, scope.clone(), since)
+    sauron_db::repo::session_stats(&mut conn, scope.clone(), Range::since(since))
         .await
         .expect("session_stats under Subset");
-    sauron_db::repo::user_stats(&mut conn, scope.clone(), since, Utc::now())
+    sauron_db::repo::user_stats(&mut conn, scope.clone(), Range::since(since), Utc::now())
         .await
         .expect("user_stats under Subset");
-    sauron_db::repo::active_user_series(&mut conn, scope.clone(), since)
+    sauron_db::repo::active_user_series(&mut conn, scope.clone(), Range::since(since))
         .await
         .expect("active_user_series under Subset");
-    sauron_db::repo::session_duration_series(&mut conn, scope.clone(), since)
+    sauron_db::repo::session_duration_series(&mut conn, scope.clone(), Range::since(since))
         .await
         .expect("session_duration_series under Subset");
-    sauron_db::repo::session_duration_histogram(&mut conn, scope.clone(), since)
+    sauron_db::repo::session_duration_histogram(&mut conn, scope.clone(), Range::since(since))
         .await
         .expect("session_duration_histogram under Subset");
-    sauron_db::repo::journey_graph(&mut conn, scope.clone(), since, 20)
+    sauron_db::repo::journey_graph(&mut conn, scope.clone(), Range::since(since), 20)
         .await
         .expect("journey_graph under Subset");
 
@@ -7989,7 +8045,7 @@ async fn user_stats_dau_wau_are_anchored_to_the_supplied_now() {
     let s = sauron_db::repo::user_stats(
         &mut conn,
         ReadScope::new(app, EnvFilter::One(env)),
-        far_past(),
+        Range::since(far_past()),
         pinned,
     )
     .await
@@ -8106,7 +8162,11 @@ async fn funnel_prunes_every_step_to_the_since_window() {
     // Cheap half of the guard: no database needed, and it fails the instant the predicate
     // is dropped, naming the reason. The EXPLAIN below proves it actually buys pruning.
     for env in [EnvFilter::All, EnvFilter::One(Uuid::new_v4())] {
-        let sql = sauron_db::repo::funnel_sql(&env, 4);
+        let sql = sauron_db::repo::funnel_sql(
+            &env,
+            &Range::since(Utc::now() - chrono::Duration::days(30)),
+            4,
+        );
         assert_eq!(
             sql.matches("occurred_at>=$2").count(),
             4,
@@ -8161,7 +8221,11 @@ async fn funnel_prunes_every_step_to_the_since_window() {
 
     // EXPLAIN the REAL query the repo runs, not a retyped lookalike — retyping would
     // measure the copy and stay green while the shipped SQL regressed.
-    let sql = sauron_db::repo::funnel_sql(&EnvFilter::One(ids.env_a), 2);
+    let sql = sauron_db::repo::funnel_sql(
+        &EnvFilter::One(ids.env_a),
+        &Range::since(Utc::now() - chrono::Duration::days(3000)),
+        2,
+    );
     let plan: Vec<Plan> = diesel::sql_query(format!("EXPLAIN {sql}"))
         .bind::<SqlUuid, _>(ids.app_id)
         .bind::<diesel::sql_types::Timestamptz, _>(

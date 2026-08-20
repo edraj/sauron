@@ -9,15 +9,16 @@
   import { viewKey } from '../stores/view-cache';
   import { sessionStore } from '../stores/session.svelte';
   import { getStoreMetrics, type StoreMetrics } from '../api/stores';
+  import { rangeKey, spanDays, type DateRangeValue } from '../models/date-range';
   import { rangeTotals } from './stores';
   import { compactNumber, relativeTime } from '../utils/format';
 
   interface Props {
     appId: string;
-    sinceDays: number;
+    range: DateRangeValue;
   }
 
-  let { appId, sinceDays }: Props = $props();
+  let { appId, range }: Props = $props();
 
   // Its own view, loaded independently of Overview's other five sections: a
   // store outage or a 403 here must not blank the rest of the page.
@@ -44,8 +45,8 @@
   // renders in one of them. Omitting it would serve one scope's answer under
   // another's.
   $effect(() => {
-    const key = viewKey('overview.stores', appId, sessionStore.scopeKey, sinceDays);
-    void view.load(key, () => getStoreMetrics(appId, sinceDays));
+    const key = viewKey('overview.stores', appId, sessionStore.scopeKey, rangeKey(range));
+    void view.load(key, () => getStoreMetrics(appId, spanDays(range)));
   });
 
   function storeLabel(store: string): string {

@@ -31,7 +31,7 @@ export async function listEvents(
 
 export async function topEvents(
   appId: string,
-  params: { since_days?: number; limit?: number } = {},
+  params: { since_days?: string; from?: string; to?: string; limit?: number } = {},
 ): Promise<TopEvent[]> {
   const { data } = await api.get<TopEvent[]>(`/v1/apps/${appId}/events/top`, {
     params,
@@ -41,7 +41,7 @@ export async function topEvents(
 
 export async function eventSeries(
   appId: string,
-  params: { name?: string; since_days?: number } = {},
+  params: { name?: string; since_days?: string; from?: string; to?: string } = {},
 ): Promise<SeriesPoint[]> {
   const { data } = await api.get<SeriesPoint[]>(`/v1/apps/${appId}/events/series`, {
     params,

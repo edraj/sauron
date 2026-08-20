@@ -26,4 +26,33 @@ export const time = {
   'time.range.last90d': { en: 'Last 90 days', ar: 'آخر 90 يومًا' },
   'time.range.custom': { en: 'Custom range', ar: 'نطاق مخصص' },
   'time.to': { en: 'To', ar: 'إلى' },
+  // --- the date-range picker -----------------------------------------------
+  // `dateRange.*`, distinct from the `time.range.*` labels above: those name
+  // the four preset chips, these name the custom-window control that sits
+  // beside them.
+  'dateRange.custom': { en: 'Custom', ar: 'مخصص' },
+  'dateRange.open': { en: 'Choose a custom date range', ar: 'اختر نطاقًا زمنيًا مخصصًا' },
+  'dateRange.mode.day': { en: 'Day', ar: 'يوم' },
+  'dateRange.mode.week': { en: 'Week', ar: 'أسبوع' },
+  'dateRange.mode.month': { en: 'Month', ar: 'شهر' },
+  'dateRange.mode.range': { en: 'Range', ar: 'نطاق' },
+  'dateRange.prevMonth': { en: 'Previous month', ar: 'الشهر السابق' },
+  'dateRange.nextMonth': { en: 'Next month', ar: 'الشهر التالي' },
+  'dateRange.selectMonth': { en: 'Select this whole month', ar: 'اختر هذا الشهر بالكامل' },
+  'dateRange.selectWeek': { en: 'Select this week', ar: 'اختر هذا الأسبوع' },
+  'dateRange.pickStart': { en: 'Pick the first day', ar: 'اختر اليوم الأول' },
+  'dateRange.pickEnd': { en: 'Pick the last day', ar: 'اختر اليوم الأخير' },
+  'dateRange.saved': { en: 'Saved ranges', ar: 'النطاقات المحفوظة' },
+  'dateRange.saveThis': { en: 'Save this range', ar: 'احفظ هذا النطاق' },
+  'dateRange.namePrompt': { en: 'Name this range', ar: 'سمِّ هذا النطاق' },
+  'dateRange.removeSaved': { en: 'Remove this saved range', ar: 'احذف هذا النطاق المحفوظ' },
+  'dateRange.clear': { en: 'Back to a preset', ar: 'العودة إلى نطاق جاهز' },
+  // Shown when a would-be selection exceeds what the server will serve. The
+  // server refuses rather than narrows an explicit window, so this is what
+  // stops the page from 400ing on every request.
+  'dateRange.tooWide': {
+    en: 'A custom range covers at most {days} days',
+    ar: 'النطاق المخصص يغطي {days} يومًا كحد أقصى',
+  },
+  'dateRange.future': { en: 'Dates after today hold no data yet', ar: 'التواريخ بعد اليوم لا تحتوي على بيانات بعد' },
 } as const satisfies Record<string, Message>;

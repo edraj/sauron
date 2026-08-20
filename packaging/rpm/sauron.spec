@@ -365,7 +365,8 @@ fi
 
 %changelog
 * Wed Aug 19 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.7.0-1
-- "Crash-free sessions" now means what it says: it counts only errors the SDK
+- "Crash-free sessions" is renamed "Unhandled-exception-free sessions" and now
+  means what the new name says: it counts only errors the SDK
   reported as UNCAUGHT (`mechanism.handled = false`), instead of every row in
   `error_events` at any level. Previously a single handled, caught,
   warning-level exception marked a whole session "crashed" (migration 000069).

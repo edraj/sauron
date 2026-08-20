@@ -17,6 +17,7 @@
 
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
+use chrono::Utc;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -120,6 +121,11 @@ const WORKFLOW_STATUSES: &[&str] = &["active", "completed", "cancelled", "abando
 pub struct WorkflowListQuery {
     #[serde(default = "days30")]
     pub since_days: i32,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     pub search: Option<String>,
     #[serde(default = "lim50")]
     pub limit: i64,
@@ -153,13 +159,24 @@ pub async fn list(
         raw_query.as_deref(),
     )
     .await?;
-    let since_days = q.since_days.clamp(1, 365);
+    // `started_at` for the workflow queries, `occurred_at` for the two signal
+    // reads inside `workflow_detail` — one window, whichever column each
+    // statement bounds. The field name only labels a disclosure this route has
+    // no envelope to carry, so it names the primary one.
+    let win = super::search::resolve_range(
+        "started_at",
+        q.from,
+        q.to,
+        i64::from(q.since_days),
+        Utc::now(),
+        365,
+    )?;
     let search = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let sort = workflow_sort_spec(q.sort.as_deref())?;
     let rows = repo::workflow_list(
         &mut conn,
         scope,
-        since_days,
+        win,
         search,
         q.limit.clamp(1, 200),
         super::clamp_offset(q.offset),
@@ -197,16 +214,21 @@ pub async fn count(
         raw_query.as_deref(),
     )
     .await?;
-    let since_days = q.since_days.clamp(1, 365);
+    // `started_at` for the workflow queries, `occurred_at` for the two signal
+    // reads inside `workflow_detail` — one window, whichever column each
+    // statement bounds. The field name only labels a disclosure this route has
+    // no envelope to carry, so it names the primary one.
+    let win = super::search::resolve_range(
+        "started_at",
+        q.from,
+        q.to,
+        i64::from(q.since_days),
+        Utc::now(),
+        365,
+    )?;
     let search = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let (total, total_is_capped) = repo::count_workflows(
-        &mut conn,
-        scope,
-        since_days,
-        search,
-        super::search::COUNT_CAP,
-    )
-    .await?;
+    let (total, total_is_capped) =
+        repo::count_workflows(&mut conn, scope, win, search, super::search::COUNT_CAP).await?;
     Ok(Json(super::search::CountEnvelope {
         total,
         total_is_capped,
@@ -217,6 +239,11 @@ pub async fn count(
 pub struct WorkflowDetailQuery {
     #[serde(default = "days30")]
     pub since_days: i32,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     // `environment_id` is deliberately NOT a field here — see
     // `WorkflowListQuery`'s comment above.
 }
@@ -252,8 +279,19 @@ pub async fn detail(
         raw_query.as_deref(),
     )
     .await?;
-    let since_days = q.since_days.clamp(1, 365);
-    let mut detail = repo::workflow_detail(&mut conn, scope, &name, since_days).await?;
+    // `started_at` for the workflow queries, `occurred_at` for the two signal
+    // reads inside `workflow_detail` — one window, whichever column each
+    // statement bounds. The field name only labels a disclosure this route has
+    // no envelope to carry, so it names the primary one.
+    let win = super::search::resolve_range(
+        "started_at",
+        q.from,
+        q.to,
+        i64::from(q.since_days),
+        Utc::now(),
+        365,
+    )?;
+    let mut detail = repo::workflow_detail(&mut conn, scope, &name, win).await?;
     // Cleared rather than skipped: `workflow_detail` runs its four queries as
     // one unit, so there is no query to omit here — unlike `overview`, where
     // `top_issues` is a separate call.
@@ -267,6 +305,11 @@ pub async fn detail(
 pub struct WorkflowRunsQuery {
     #[serde(default = "days30")]
     pub since_days: i32,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     pub status: Option<String>,
     #[serde(default = "lim50")]
     pub limit: i64,
@@ -302,12 +345,23 @@ pub async fn runs(
         raw_query.as_deref(),
     )
     .await?;
-    let since_days = q.since_days.clamp(1, 365);
+    // `started_at` for the workflow queries, `occurred_at` for the two signal
+    // reads inside `workflow_detail` — one window, whichever column each
+    // statement bounds. The field name only labels a disclosure this route has
+    // no envelope to carry, so it names the primary one.
+    let win = super::search::resolve_range(
+        "started_at",
+        q.from,
+        q.to,
+        i64::from(q.since_days),
+        Utc::now(),
+        365,
+    )?;
     let rows = repo::workflow_runs(
         &mut conn,
         scope,
         &name,
-        since_days,
+        win,
         q.status.as_deref(),
         q.limit.clamp(1, 200),
         super::clamp_offset(q.offset),

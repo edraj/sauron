@@ -14,6 +14,16 @@
     tone?: Tone;
     // Optional inline visual (sparkline etc.).
     visual?: Snippet;
+    /**
+     * Span two grid columns.
+     *
+     * For a label too long to sit on one line in a 150px tile. `.stat-tile` is
+     * a flex COLUMN with the label above the value, so a label that wraps to
+     * three lines drops that tile's value ~34px below every neighbour's — the
+     * numbers stop reading as a row. Measured: "Unhandled-exception-free
+     * sessions" needs 246px, a single tile gives 150 and a spanned one 312.
+     */
+    wide?: boolean;
     // Makes the whole tile a link target.
     href?: string;
   }
@@ -26,6 +36,7 @@
     deltaTone = 'flat',
     tone = 'neutral',
     visual,
+    wide = false,
     href,
   }: Props = $props();
 </script>
@@ -41,9 +52,9 @@
 {/snippet}
 
 {#if href}
-  <a class="stat-tile interactive" {href}>{@render body()}</a>
+  <a class="stat-tile interactive" class:wide {href}>{@render body()}</a>
 {:else}
-  <div class="stat-tile">{@render body()}</div>
+  <div class="stat-tile" class:wide>{@render body()}</div>
 {/if}
 
 <style>
@@ -58,6 +69,16 @@
     min-width: 0;
     position: relative;
     overflow: hidden;
+  }
+  .stat-tile.wide {
+    grid-column: span 2;
+  }
+  /* At the narrow breakpoint the grid is already down to one or two columns,
+     so spanning two would leave this tile alone on its own row. */
+  @media (max-width: 700px) {
+    .stat-tile.wide {
+      grid-column: auto;
+    }
   }
   .stat-tile.interactive {
     transition: border-color 0.13s ease, background 0.13s ease;

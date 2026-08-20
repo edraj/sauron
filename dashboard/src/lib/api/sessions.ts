@@ -1,4 +1,8 @@
 import { api } from './client';
+import { lastDays, toParams, type DateRangeValue } from '../models/date-range';
+/** The window this read defaults to when a caller passes none — unchanged. */
+const DEFAULT_WINDOW: DateRangeValue = lastDays(30);
+
 import type { Session, SessionDetail, SessionsAnalytics } from '../models';
 import type { SearchParams, SearchEnvelope } from './search';
 
@@ -70,10 +74,10 @@ export async function getSession(appId: string, sessionId: string): Promise<Sess
 
 export async function getSessionAnalytics(
   appId: string,
-  sinceDays = 30,
+  win: DateRangeValue = DEFAULT_WINDOW,
 ): Promise<SessionsAnalytics> {
   const { data } = await api.get<SessionsAnalytics>(`/v1/apps/${appId}/sessions/summary`, {
-    params: { since_days: sinceDays },
+    params: toParams(win),
   });
   return data;
 }

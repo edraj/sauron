@@ -14,6 +14,8 @@
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import { rangeKey, toParams, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -34,7 +36,8 @@
 
   const LIMIT = 50;
 
-  let sinceDays = $state(30);
+  // The shared selection, falling back to this page's own 30 days.
+  let range = $state<DateRangeValue>(rangeStore.effective(30));
   // `search` is bound to the input; `appliedSearch` is the SUBMITTED value
   // that drives loads (same split as Issues.svelte).
   let search = $state('');
@@ -81,8 +84,9 @@
     totals.started === 0 ? 0 : totals.completed / totals.started,
   );
 
-  function onRange(days: number) {
-    sinceDays = days;
+  function onRange(v: DateRangeValue) {
+    range = v;
+    rangeStore.set(v);
     list = setOffsetPage(list, 0);
   }
 
@@ -110,23 +114,25 @@
    */
   async function load(
     appId: string,
-    days: number,
+    win: DateRangeValue,
     s: string,
     sort: string,
     off: number,
     force = false,
   ) {
+    // `rangeKey`, never the resolved instants — a clock-derived key hits zero.
+    const rk = rangeKey(win);
     // Predicate only: a total is unchanged by ordering or page boundary.
     void rowCount.load(
-      viewKey('workflows.count', appId, sessionStore.scopeKey, days, s),
-      () => countWorkflows(appId, { sinceDays: days, search: s || undefined }),
+      viewKey('workflows.count', appId, sessionStore.scopeKey, rk, s),
+      () => countWorkflows(appId, { range: win, search: s || undefined }),
       force,
     );
     await view.load(
-      viewKey('workflows.list', appId, sessionStore.scopeKey, days, s, sort, off, LIMIT),
+      viewKey('workflows.list', appId, sessionStore.scopeKey, rk, s, sort, off, LIMIT),
       () =>
         listWorkflows(appId, {
-          since_days: days,
+          ...toParams(win),
           search: s || undefined,
           sort,
           limit: LIMIT,
@@ -142,7 +148,7 @@
     refreshing = true;
     try {
       // force: an explicit click must reach the network regardless of freshness.
-      await load(aid, sinceDays, appliedSearch, sortParam(list.sort), list.offset, true);
+      await load(aid, range, appliedSearch, sortParam(list.sort), list.offset, true);
     } finally {
       refreshing = false;
     }
@@ -153,11 +159,11 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
+    const win = range;
     const s = appliedSearch;
     const sort = sortParam(list.sort);
     const off = list.offset;
-    if (aid) void load(aid, days, s, sort, off);
+    if (aid) void load(aid, win, s, sort, off);
   });
 </script>
 
@@ -168,7 +174,7 @@
       <p class="muted sub">{t('workflows.subtitle')}</p>
     </div>
     <div class="controls">
-      <DateRange value={sinceDays} onchange={onRange} />
+      <DateRange value={range} onchange={onRange} />
       <SearchInput bind:value={search} onsearch={onSearch} placeholder={t('workflows.search')} width="240px" />
       <!--
         Spins for a background revalidate too, not just an explicit click: that
@@ -187,7 +193,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, sinceDays, appliedSearch, sortParam(list.sort), list.offset, true);
+              if (aid) load(aid, range, appliedSearch, sortParam(list.sort), list.offset, true);
             }}
           >
             {t('common.retry')}

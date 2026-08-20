@@ -1,4 +1,5 @@
 import { apiBaseUrl } from '../config/env';
+import { toParams, type DateRangeValue } from '../models/date-range';
 import { currentAccessToken, refreshAccessToken } from './client';
 import { currentEnvironmentId } from './scope';
 import type { OverviewEnvelope, OverviewSectionName } from './overview';
@@ -58,7 +59,7 @@ export interface StreamHandle {
  */
 export function openOverviewStream(
   appId: string,
-  sinceDays: number,
+  win: DateRangeValue,
   handlers: {
     onSection: (frame: SectionFrame) => void;
     onError?: (err: unknown) => void;
@@ -76,7 +77,7 @@ export function openOverviewStream(
 
   void (async () => {
     try {
-      const res = await fetchStream(appId, sinceDays, controller.signal);
+      const res = await fetchStream(appId, win, controller.signal);
       if (!res.body) throw new Error('overview stream: response had no body');
       handlers.onOpen?.();
       await readFrames(res.body, (frame) => {
@@ -105,10 +106,10 @@ export function openOverviewStream(
  */
 async function fetchStream(
   appId: string,
-  sinceDays: number,
+  win: DateRangeValue,
   signal: AbortSignal,
 ): Promise<Response> {
-  const url = streamUrl(appId, sinceDays);
+  const url = streamUrl(appId, win);
 
   const attempt = (token: string | null) =>
     fetch(url, {
@@ -144,9 +145,12 @@ async function fetchStream(
  * A null environment omits the parameter entirely rather than sending it empty,
  * matching the wire contract in `scope.ts`.
  */
-function streamUrl(appId: string, sinceDays: number): string {
+function streamUrl(appId: string, win: DateRangeValue): string {
   const url = new URL(`${apiBaseUrl}/v1/apps/${appId}/overview/stream`);
-  url.searchParams.set('since_days', String(sinceDays));
+  // The SAME encoder the section reads use. The server filters the stream on a
+  // token derived from this window, so a stream opened over a different
+  // encoding of the same selection would receive nothing at all.
+  for (const [k, v] of Object.entries(toParams(win))) url.searchParams.set(k, v);
   const envId = currentEnvironmentId();
   if (envId) url.searchParams.set('environment_id', envId);
   return url.toString();

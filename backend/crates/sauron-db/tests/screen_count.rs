@@ -4,7 +4,7 @@ use chrono::{Duration, Utc};
 use common::{far_past, TestDb};
 use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewIssue};
 use sauron_db::repo;
-use sauron_db::scope::{EnvFilter, ReadScope};
+use sauron_db::scope::{EnvFilter, Range, ReadScope};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -32,7 +32,7 @@ async fn list_len(
     repo::screen_list(
         conn,
         scope,
-        since,
+        Range::since(since),
         pattern,
         // Far above any screen count these fixtures produce: a truncated list
         // would make the comparison pass by measuring the limit instead.
@@ -62,9 +62,10 @@ async fn count_matches_the_list_under_every_environment_scope() {
         ("unattributed", EnvFilter::Unattributed),
     ] {
         let scope = ReadScope::new(ids.app_id, env);
-        let (total, capped) = repo::count_screens(&mut conn, scope.clone(), far_past(), "%", CAP)
-            .await
-            .expect("count_screens");
+        let (total, capped) =
+            repo::count_screens(&mut conn, scope.clone(), Range::since(far_past()), "%", CAP)
+                .await
+                .expect("count_screens");
         let rows = list_len(&mut conn, scope, far_past(), "%").await;
         assert!(!capped, "{label}: the fixture is far below the cap");
         assert_eq!(
@@ -95,7 +96,7 @@ async fn a_screen_seen_only_before_the_window_is_not_counted() {
 
     let scope = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
     let since = Utc::now() - Duration::days(7);
-    let (before, _) = repo::count_screens(&mut conn, scope.clone(), since, "%", CAP)
+    let (before, _) = repo::count_screens(&mut conn, scope.clone(), Range::since(since), "%", CAP)
         .await
         .expect("count before");
 
@@ -127,7 +128,7 @@ async fn a_screen_seen_only_before_the_window_is_not_counted() {
     .await
     .expect("insert out-of-window event");
 
-    let (after, _) = repo::count_screens(&mut conn, scope.clone(), since, "%", CAP)
+    let (after, _) = repo::count_screens(&mut conn, scope.clone(), Range::since(since), "%", CAP)
         .await
         .expect("count after");
     assert_eq!(
@@ -169,7 +170,7 @@ async fn a_screen_seen_only_before_the_window_is_not_counted() {
     .await
     .expect("insert in-window event");
 
-    let (revived, _) = repo::count_screens(&mut conn, scope.clone(), since, "%", CAP)
+    let (revived, _) = repo::count_screens(&mut conn, scope.clone(), Range::since(since), "%", CAP)
         .await
         .expect("count revived");
     assert_eq!(
@@ -203,9 +204,10 @@ async fn a_screen_seen_only_on_an_error_is_counted() {
     let mut conn = db.conn().await;
 
     let scope = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
-    let (before, _) = repo::count_screens(&mut conn, scope.clone(), far_past(), "%", CAP)
-        .await
-        .expect("count before");
+    let (before, _) =
+        repo::count_screens(&mut conn, scope.clone(), Range::since(far_past()), "%", CAP)
+            .await
+            .expect("count before");
 
     let now = Utc::now();
     let issue_id = repo::upsert_issue(
@@ -265,9 +267,10 @@ async fn a_screen_seen_only_on_an_error_is_counted() {
     .await
     .expect("insert error-only screen");
 
-    let (after, _) = repo::count_screens(&mut conn, scope.clone(), far_past(), "%", CAP)
-        .await
-        .expect("count after");
+    let (after, _) =
+        repo::count_screens(&mut conn, scope.clone(), Range::since(far_past()), "%", CAP)
+            .await
+            .expect("count after");
     assert_eq!(after, before + 1, "an error-only screen is still a screen");
     assert_eq!(
         after,
@@ -297,9 +300,15 @@ async fn the_search_pattern_narrows_the_count_the_way_it_narrows_the_list() {
         repo::like_contains("out"), // 'checkout', by substring
         repo::like_contains("no-such-screen"),
     ] {
-        let (total, _) = repo::count_screens(&mut conn, scope.clone(), far_past(), &pattern, CAP)
-            .await
-            .expect("count_screens");
+        let (total, _) = repo::count_screens(
+            &mut conn,
+            scope.clone(),
+            Range::since(far_past()),
+            &pattern,
+            CAP,
+        )
+        .await
+        .expect("count_screens");
         assert_eq!(
             total,
             list_len(&mut conn, scope.clone(), far_past(), &pattern).await as i64,
@@ -334,17 +343,19 @@ async fn a_cap_below_the_candidate_count_falls_back_and_still_caps_honestly() {
         "fixture must carry at least two screens for this to exercise the fallback"
     );
 
-    let (total, capped) = repo::count_screens(&mut conn, scope.clone(), far_past(), "%", 1)
-        .await
-        .expect("count_screens at cap 1");
+    let (total, capped) =
+        repo::count_screens(&mut conn, scope.clone(), Range::since(far_past()), "%", 1)
+            .await
+            .expect("count_screens at cap 1");
     assert_eq!(total, 1, "capped counts report the cap, not the true total");
     assert!(capped, "and say so");
 
     // A cap at exactly the true total is the boundary the `cap + 1` sentinel
     // exists for: it must NOT report capped, on either path.
-    let (exact, exact_capped) = repo::count_screens(&mut conn, scope, far_past(), "%", rows)
-        .await
-        .expect("count_screens at the exact total");
+    let (exact, exact_capped) =
+        repo::count_screens(&mut conn, scope, Range::since(far_past()), "%", rows)
+            .await
+            .expect("count_screens at the exact total");
     assert_eq!(exact, rows);
     assert!(
         !exact_capped,

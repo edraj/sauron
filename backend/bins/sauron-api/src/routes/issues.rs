@@ -12,6 +12,7 @@ use sauron_auth::{authorize_app, perm, AuthUser};
 use sauron_db::models::{ErrorEvent, Issue};
 use sauron_db::repo;
 use sauron_db::repo::SeriesPoint;
+use sauron_db::scope::Range;
 
 use super::db;
 use crate::error::ApiError;
@@ -436,7 +437,8 @@ pub async fn detail(
         .ok_or(ApiError::NotFound)?;
     let mut latest_event = repo::latest_error_event(&mut conn, scope.clone(), issue_id).await?;
     let since = Utc::now() - Duration::days(30);
-    let series = repo::issue_occurrence_series(&mut conn, scope, issue_id, since).await?;
+    let series =
+        repo::issue_occurrence_series(&mut conn, scope, issue_id, Range::since(since)).await?;
     drop(conn); // release the pooled conn; symbolication checks out its own
 
     if let Some(ev) = latest_event.as_mut() {
@@ -907,6 +909,11 @@ pub async fn event_stats(
 pub struct StatsQuery {
     #[serde(default = "default_stats_days")]
     pub since_days: i64,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     // `environment_id` comes from `RawQuery`, not this struct — see `list`'s
     // comment above.
 }
@@ -939,7 +946,8 @@ pub async fn stats(
     )
     .await?;
     let counts = repo::issue_stats(&mut conn, scope.clone()).await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
-    let series = repo::error_series(&mut conn, scope, since).await?;
+    let win =
+        super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
+    let series = repo::error_series(&mut conn, scope, win).await?;
     Ok(Json(IssueStats { counts, series }))
 }

@@ -26,6 +26,7 @@
   import TransactionDetailPanel from './TransactionDetailPanel.svelte';
   import { encodeFilters, type Filter } from './filters/filters';
   import { sessionStore } from '../stores/session.svelte';
+  import { rangeKey, toParams, toPredicate, type DateRangeValue } from '../models/date-range';
   import { listTransactions } from '../api/transactions';
   import type { SearchEnvelope } from '../api/search';
   import { errorMessage } from '../api/client';
@@ -41,11 +42,11 @@
     row: PerfSummaryRow | null;
     appId: string | null;
     /** The window the Performance page is showing, so both agree. */
-    sinceDays: number;
+    range: DateRangeValue;
     onclose?: () => void;
   }
 
-  let { open = $bindable(false), row, appId, sinceDays, onclose }: Props = $props();
+  let { open = $bindable(false), row, appId, range, onclose }: Props = $props();
 
   /**
    * Slowest-first by default, not newest-first.
@@ -88,7 +89,7 @@
     if (!row) return '#/transactions';
     const p = new URLSearchParams();
     for (const f of encoded) p.append('filter', f);
-    p.set('since_days', String(sinceDays));
+    for (const [k, v] of Object.entries(toParams(range))) p.set(k, v);
     p.set('sort', sortMode === 'duration_ms' ? 'duration_ms' : 'occurred_at');
     return `#/transactions?${p.toString()}`;
   });
@@ -103,7 +104,7 @@
     try {
       const envelope = await listTransactions(appId, {
         filters: encoded,
-        sinceDays,
+        ...toPredicate(range),
         limit: LIMIT,
         sort: sortMode,
       });
@@ -133,7 +134,7 @@
     const isOpen = open;
     const r = row;
     const aid = appId;
-    const days = sinceDays;
+    const days = rangeKey(range);
     const mode = sortMode;
     // Touch scopeKey so a mid-view environment switch refetches; the axios
     // interceptor supplies the value but nothing here would notice it changed.

@@ -20,6 +20,7 @@ use sauron_db::models::NewAnalyticsEvent;
 use sauron_db::repo;
 use sauron_db::repo::TimeWindow;
 use sauron_db::repo::{DeviceGroupRow, DeviceRow, SortSpec, WorkflowAction};
+use sauron_db::scope::Range;
 use sauron_db::scope::ReadScope;
 use serde_json::json;
 use uuid::Uuid;
@@ -904,7 +905,7 @@ async fn screen_page(h: &mut Harness, sort: &str, limit: i64, offset: i64) -> Ve
     repo::screen_list(
         &mut h.conn,
         ReadScope::all(h.app_id),
-        far_past(),
+        Range::since(far_past()),
         "%",
         limit,
         offset,
@@ -1403,7 +1404,7 @@ async fn workflow_page(
     repo::workflow_list(
         &mut h.conn,
         ReadScope::all(h.app_id),
-        WORKFLOW_DAYS,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(WORKFLOW_DAYS))),
         None,
         limit,
         offset,

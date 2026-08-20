@@ -3,7 +3,7 @@
 
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,6 +19,11 @@ use crate::AppState;
 pub struct JourneyQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default = "default_depth")]
     pub depth: i64,
     // `environment_id` is deliberately NOT a field here — it is read from the
@@ -59,10 +64,11 @@ pub async fn explore(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let win =
+        super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
     let depth = q.depth.clamp(2, 10);
 
-    let (nodes, links) = repo::journey_graph(&mut conn, scope, since, depth).await?;
+    let (nodes, links) = repo::journey_graph(&mut conn, scope, win, depth).await?;
 
     Ok(Json(Journey {
         depth,
