@@ -240,11 +240,39 @@ jobs:
             rpmbuild/SRPMS/*.rpm
           if-no-files-found: error
 
+  sbom:
+    # CycloneDX SBOM of the Rust workspace, read from backend/Cargo.lock. The
+    # server ships as a self-contained binary, so its crate graph cannot be
+    # recovered from the RPM by a scanner -- it only exists in the lockfile.
+    # syft emits spec 1.6; Dependency-Track rejects 1.7.
+    name: CycloneDX SBOM
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install syft
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$HOME/.local/bin"
+      - name: Generate SBOM
+        env:
+          VER: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          "$HOME/.local/bin/syft" dir:backend -o "cyclonedx-json@1.6"="sauron-${VER}.cdx.json" -q
+          n=$(grep -c '"purl"' "sauron-${VER}.cdx.json" || true)
+          echo "SBOM components: $n"
+          [ "${n:-0}" -ge 1 ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sauron-*.cdx.json
+          if-no-files-found: error
+
   release:
     name: publish GitHub release
     # Real merges to main publish; workflow_dispatch is a build-only dry run.
     if: github.event_name == 'push'
-    needs: [version, package]
+    needs: [version, package, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -256,6 +284,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist
+
       - name: Create release and attach RPMs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -264,7 +297,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mapfile -t FILES < <(find dist -name '*.rpm' | sort)
+          mapfile -t FILES < <(find dist \( -name '*.rpm' -o -name '*.cdx.json'  \) | sort)
           [ "${#FILES[@]}" -gt 0 ] || { echo "::error::no RPMs found to release"; exit 1; }
           printf 'asset: %s\n' "${FILES[@]}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
