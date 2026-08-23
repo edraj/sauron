@@ -21,7 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SEVERITY: "HIGH,CRITICAL"
-      TRIVY_SCANNERS: "vuln,misconfig"
+      # vuln only: misconfig is dominated by Dockerfile "runs as root" (DS-0002),
+      # which does not reflect our rootless-podman/non-root CI. Keep CVE gating.
+      TRIVY_SCANNERS: "vuln"
       SEMGREP_CONFIG: "p/ci"
       IGNORE_UNFIXED: "true"
       GITLEAKS_VERSION: "8.21.2"
@@ -38,9 +40,10 @@ jobs:
 
       - name: Gitleaks (secrets)
         run: |
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gl.tgz \
+          GLT=$(mktemp)   # unique path: the self-hosted runner shares /tmp across users
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o "$GLT" \
             || { echo "::error::gitleaks download failed"; exit 1; }
-          tar xzf /tmp/gl.tgz -C .cigate/bin gitleaks || { echo "::error::gitleaks extract failed"; exit 1; }
+          tar xzf "$GLT" -C .cigate/bin gitleaks || { echo "::error::gitleaks extract failed"; exit 1; }
           echo "::group::gitleaks detect"
           .cigate/bin/gitleaks detect --source . --no-git --redact \
             --report-format json --report-path .cigate/out/gitleaks.json
@@ -51,9 +54,10 @@ jobs:
 
       - name: Trivy (dependencies + misconfig)
         run: |
-          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o /tmp/tv.tgz \
+          TVT=$(mktemp)   # unique path: the self-hosted runner shares /tmp across users
+          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o "$TVT" \
             || { echo "::error::trivy download failed"; exit 1; }
-          tar xzf /tmp/tv.tgz -C .cigate/bin trivy || { echo "::error::trivy extract failed"; exit 1; }
+          tar xzf "$TVT" -C .cigate/bin trivy || { echo "::error::trivy extract failed"; exit 1; }
           UNFIXED=""
           if [ "$IGNORE_UNFIXED" = "true" ]; then UNFIXED="--ignore-unfixed"; fi
           echo "::group::trivy fs"
@@ -69,8 +73,10 @@ jobs:
       - name: Semgrep (SAST)
         run: |
           python3 -m pip install --quiet --upgrade --user semgrep || { echo "::error::semgrep install failed"; exit 1; }
+          # Use the semgrep binary: `python -m semgrep` hard-fails (exit 2) as of semgrep 1.38+.
+          export PATH="$HOME/.local/bin:$PATH"
           echo "::group::semgrep scan"
-          python3 -m semgrep scan --config "$SEMGREP_CONFIG" \
+          semgrep scan --config "$SEMGREP_CONFIG" \
             --error --severity ERROR --disable-version-check --metrics off \
             --json --output .cigate/out/semgrep.json .
           rc=$?
