@@ -1,0 +1,18 @@
+# gitleaks config for sauron. Extends the default ruleset; allowlists known
+# false positives (test fixtures, example docs, mock data). No real secret is
+# stored in the repo — runtime secrets come from the environment.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholder / test / example / mock values, not real secrets"
+regexes = [
+  # WorkflowsList.svelte: a <SortableTh key="p95_duration_ms"> UI attribute the
+  # generic-api-key rule mis-flags. Narrow, so real secrets in that file still gate.
+  '''p95_duration_ms''',
+]
+paths = [
+  '''backend/bins/sauron-api/tests/http_monitors\.rs$''',   # test probe body
+  '''examples/flutter-app/README\.md$''',                    # example app docs (pk_ demo key)
+  '''dashboard/vite\.config\.i18n-harness\.mjs$''',          # i18n test harness (mock sessions)
+]
