@@ -109,8 +109,9 @@ jobs:
 
       - name: Install Rust (rustup — uniform across distros)
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+          # Download then run (not curl|sh): the script hits disk before it runs.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
+          sh rustup-init.sh -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install Node 22
@@ -118,7 +119,8 @@ jobs:
           . /etc/os-release
           case "$ID" in
             fedora) dnf install -y nodejs npm ;;
-            *)      curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+            *)      curl -fsSL https://rpm.nodesource.com/setup_22.x -o nodesource_setup.sh
+                    bash nodesource_setup.sh
                     dnf install -y nodejs ;;
           esac
           node --version && npm --version
@@ -252,7 +254,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install syft
-        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$HOME/.local/bin"
+        # Pin the installer to a tag (not the moving `main`) and download-then-run.
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.18.1/install.sh -o syft-install.sh
+          sh syft-install.sh -b "$HOME/.local/bin" v1.18.1
       - name: Generate SBOM
         env:
           VER: ${{ needs.version.outputs.version }}
