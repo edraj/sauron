@@ -98,7 +98,9 @@ fn field_pairs(v: &redis::Value) -> Vec<(String, redis::Value)> {
             .filter_map(|(k, v)| Some((as_string(k)?, v.clone())))
             .collect(),
         redis::Value::Array(flat) => flat
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter_map(|kv| Some((as_string(&kv[0])?, kv[1].clone())))
             .collect(),
         _ => Vec::new(),

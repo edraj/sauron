@@ -109,8 +109,9 @@ jobs:
 
       - name: Install Rust (rustup — uniform across distros)
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+          # Download then run (not curl|sh): the script hits disk before it runs.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
+          sh rustup-init.sh -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install Node 22
@@ -118,7 +119,8 @@ jobs:
           . /etc/os-release
           case "$ID" in
             fedora) dnf install -y nodejs npm ;;
-            *)      curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+            *)      curl -fsSL https://rpm.nodesource.com/setup_22.x -o nodesource_setup.sh
+                    bash nodesource_setup.sh
                     dnf install -y nodejs ;;
           esac
           node --version && npm --version
@@ -240,11 +242,42 @@ jobs:
             rpmbuild/SRPMS/*.rpm
           if-no-files-found: error
 
+  sbom:
+    # CycloneDX SBOM of the Rust workspace, read from backend/Cargo.lock. The
+    # server ships as a self-contained binary, so its crate graph cannot be
+    # recovered from the RPM by a scanner -- it only exists in the lockfile.
+    # syft emits spec 1.6; Dependency-Track rejects 1.7.
+    name: CycloneDX SBOM
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install syft
+        # Pin the installer to a tag (not the moving `main`) and download-then-run.
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.18.1/install.sh -o syft-install.sh
+          sh syft-install.sh -b "$HOME/.local/bin" v1.18.1
+      - name: Generate SBOM
+        env:
+          VER: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          "$HOME/.local/bin/syft" dir:backend -o "cyclonedx-json@1.6"="sauron-${VER}.cdx.json" -q
+          n=$(grep -c '"purl"' "sauron-${VER}.cdx.json" || true)
+          echo "SBOM components: $n"
+          [ "${n:-0}" -ge 1 ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sauron-*.cdx.json
+          if-no-files-found: error
+
   release:
     name: publish GitHub release
     # Real merges to main publish; workflow_dispatch is a build-only dry run.
     if: github.event_name == 'push'
-    needs: [version, package]
+    needs: [version, package, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -256,6 +289,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist
+
       - name: Create release and attach RPMs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -264,7 +302,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mapfile -t FILES < <(find dist -name '*.rpm' | sort)
+          mapfile -t FILES < <(find dist \( -name '*.rpm' -o -name '*.cdx.json'  \) | sort)
           [ "${#FILES[@]}" -gt 0 ] || { echo "::error::no RPMs found to release"; exit 1; }
           printf 'asset: %s\n' "${FILES[@]}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
