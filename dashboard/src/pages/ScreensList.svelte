@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
-  import { push } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -206,8 +206,15 @@
       {/snippet}
       {#snippet children()}
         {#each rows as r (r.screen)}
-          <tr class="clickable" onclick={() => push('/screens/' + encodeURIComponent(r.screen))}>
-            <td><span class="cell-mono truncate">{r.screen}</span></td>
+          {@const path = '/screens/' + encodeURIComponent(r.screen)}
+          <tr
+            class="clickable"
+            onclick={(e) => rowNav(e, path)}
+            onauxclick={(e) => rowNav(e, path)}
+          >
+            <td>
+              <a class="row-link cell-mono truncate" href={rowHref(path)}>{r.screen}</a>
+            </td>
             <td class="num">{compactNumber(r.views)}</td>
             <td class="num">{compactNumber(r.events)}</td>
             <td class="num"><span class:err={r.exceptions > 0}>{compactNumber(r.exceptions)}</span></td>

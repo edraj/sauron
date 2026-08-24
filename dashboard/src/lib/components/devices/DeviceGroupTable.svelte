@@ -1,7 +1,7 @@
 <script lang="ts">
   import { t } from '../../i18n';
   import { formatNumber } from '../../i18n';
-  import { push } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../../utils/row-link';
   import DataTable from '../DataTable.svelte';
   import SortableTh from '../SortableTh.svelte';
   import TimeValue from '../TimeValue.svelte';
@@ -45,13 +45,13 @@
     return [g.family, g.model, g.os_name, g.os_version].map((v) => v ?? '').join('\0');
   }
 
-  function openGroup(g: DeviceGroupRow) {
-    push('/devices?' + encodeGroupKey({
+  function groupPath(g: DeviceGroupRow): string {
+    return '/devices?' + encodeGroupKey({
       family: g.family,
       model: g.model,
       os_name: g.os_name,
       os_version: g.os_version,
-    }));
+    });
   }
 </script>
 
@@ -79,12 +79,14 @@
     </tr>
   {/snippet}
   {#each rows as g (rowKey(g))}
-    <tr class="clickable" onclick={() => openGroup(g)}>
+    {@const path = groupPath(g)}
+    {@const name = deviceName(g)}
+    <tr class="clickable" onclick={(e) => rowNav(e, path)} onauxclick={(e) => rowNav(e, path)}>
       <td>
-        {#if deviceName(g)}
-          <span class="dev-name">{deviceName(g)}</span>
+        {#if name}
+          <a class="row-link dev-name" href={rowHref(path)}>{name}</a>
         {:else}
-          <span class="cell-muted">{t('devices.unknownDevice')}</span>
+          <a class="row-link cell-muted" href={rowHref(path)}>{t('devices.unknownDevice')}</a>
         {/if}
       </td>
       <td class="cell-muted">{osLabel(g)}</td>

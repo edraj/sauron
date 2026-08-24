@@ -622,3 +622,97 @@ async fn print_person_sql() {
     println!("=====ROLLUP=====");
     println!("{}", sauron_db::repo::list_persons_rollup_sql_for_test(env));
 }
+
+/// The persons twin of `device_env_rollup.rs`'s
+/// `backfill_all_sources_its_cutoff_from_the_epoch_not_now`.
+///
+/// `backfill_app` aggregates raw signals strictly BEFORE its cutoff on the
+/// assumption that the live write path has counted everything from the cutoff
+/// onward. That disjointness only holds if the cutoff is the instant the live
+/// path began maintaining `event_user_environments` — not the instant the
+/// operator happens to run the backfill. With `let cutoff = Utc::now()`, every
+/// signal ingested between the migration landing and the backfill running is
+/// counted twice: once live, once re-aggregated from the raw tables.
+///
+/// Drives the real production entry point, `backfill_all`, rather than
+/// `backfill_app` with an explicit cutoff — the cutoff choice is exactly what
+/// is under test, and passing one in would assert nothing about it.
+///
+/// Deliberately does NOT mark the app backfilled first (`backfill_all` skips
+/// any app already in `event_user_env_backfill`), and asserts on this test's
+/// own app/person rather than a global count, since `backfill_all` iterates
+/// every unbackfilled app in the database.
+#[tokio::test]
+async fn person_backfill_all_sources_its_cutoff_from_the_epoch_not_now() {
+    let Some(db) = TestDb::setup().await else {
+        panic!("TEST_DATABASE_URL unset — this test must not silently skip");
+    };
+    let mut conn = db.conn().await;
+    let ids = db.seed_two_envs().await;
+
+    // Timestamped now, i.e. after any epoch the migrations stamped: squarely
+    // inside the live write path's window. Only an after-epoch timestamp can
+    // tell an epoch cutoff from a `Utc::now()` cutoff — a before-epoch one is
+    // `< cutoff` under either choice.
+    let occurred_at = chrono::Utc::now();
+
+    diesel::sql_query(
+        "INSERT INTO analytics_events \
+           (id, app_id, environment_id, name, distinct_id, properties, context, \
+            occurred_at, received_at, device_key, tags, contexts, extra) \
+         VALUES (gen_random_uuid(), $1, $2, 'evt', 'epoch-person', '{}', '{}', \
+                 $3, now(), 'dev-epoch', '{}', '{}', '{}')",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .bind::<SqlUuid, _>(ids.env_a)
+    .bind::<Timestamptz, _>(occurred_at)
+    .execute(&mut conn)
+    .await
+    .expect("seed live-window event");
+
+    // The live write path counting that same signal — what really happens to
+    // every event ingested after the rollup migration lands.
+    sauron_db::batch::bump_person_envs(
+        &mut conn,
+        &[sauron_db::batch::PersonEnvBump {
+            app_id: ids.app_id,
+            distinct_id: "epoch-person".into(),
+            environment_id: Some(ids.env_a),
+            first_at: occurred_at,
+            last_at: occurred_at,
+            events_delta: 1,
+            errors_delta: 0,
+            sessions_delta: 0,
+        }],
+    )
+    .await
+    .expect("live bump for the same signal");
+
+    sauron_db::person_env_backfill::backfill_all(db.pool())
+        .await
+        .expect("backfill_all");
+
+    #[derive(QueryableByName)]
+    struct N {
+        #[diesel(sql_type = BigInt)]
+        events_count: i64,
+    }
+    let r: N = diesel::sql_query(
+        "SELECT events_count FROM event_user_environments \
+         WHERE app_id=$1 AND distinct_id='epoch-person' AND environment_id=$2",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .bind::<SqlUuid, _>(ids.env_a)
+    .get_result(&mut conn)
+    .await
+    .expect("read back");
+
+    assert_eq!(
+        r.events_count, 1,
+        "backfill_all must source its cutoff from the rollup epoch, not Utc::now(), \
+         or this live-counted signal is re-aggregated a second time"
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}

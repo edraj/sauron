@@ -1,7 +1,8 @@
 <script lang="ts">
   import { t, joinList } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
-  import { push, querystring, replace } from 'svelte-spa-router';
+  import { querystring, replace } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -662,14 +663,19 @@
         {/snippet}
         {#snippet children()}
           {#each issues as issue (issue.id)}
-            <tr class="clickable" onclick={() => push(`/issues/${issue.id}`)}>
+            {@const path = `/issues/${issue.id}`}
+            <tr
+              class="clickable"
+              onclick={(e) => rowNav(e, path)}
+              onauxclick={(e) => rowNav(e, path)}
+            >
               <td class="col-title">
-                <div class="title-cell">
+                <a class="row-link title-cell" href={rowHref(path)}>
                   <span class="issue-title">{issue.title}</span>
                   <span class="issue-sub mono">
                     {issue.type}{issue.culprit ? ` · ${issue.culprit}` : ''}
                   </span>
-                </div>
+                </a>
               </td>
               <td><LevelBadge level={issue.level} size="sm" /></td>
               <td><StatusBadge status={issue.status} size="sm" /></td>

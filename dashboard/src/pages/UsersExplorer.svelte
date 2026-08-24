@@ -1,7 +1,8 @@
 <script lang="ts">
   import { t, localeStore, intlTag } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
-  import { push, querystring, replace } from 'svelte-spa-router';
+  import { querystring, replace } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
@@ -270,8 +271,8 @@
     return rest.map((tag) => `${tag.key}: ${tag.value}`).join('\n');
   }
 
-  function open(distinctId: string) {
-    push('/persons/' + encodeURIComponent(distinctId));
+  function personPath(distinctId: string): string {
+    return '/persons/' + encodeURIComponent(distinctId);
   }
 </script>
 
@@ -428,9 +429,14 @@
         {#snippet children()}
           {#each rows as row (row.distinct_id)}
             {@const rowTraits = traits(row.properties)}
-            <tr class="clickable" onclick={() => open(row.distinct_id)}>
+            {@const path = personPath(row.distinct_id)}
+            <tr
+              class="clickable"
+              onclick={(e) => rowNav(e, path)}
+              onauxclick={(e) => rowNav(e, path)}
+            >
               <td>
-                <span class="user">
+                <a class="row-link user" href={rowHref(path)}>
                   <span
                     class="avatar"
                     style="background: hsl({hueFromString(row.distinct_id)} 50% 45%)"
@@ -438,7 +444,7 @@
                     {initials(row.distinct_id)}
                   </span>
                   <span class="mono uid" title={row.distinct_id}>{row.distinct_id}</span>
-                </span>
+                </a>
               </td>
               <td>
                 {#if rowTraits.length > 0}

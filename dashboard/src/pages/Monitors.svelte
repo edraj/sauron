@@ -1,7 +1,7 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { formatTime } from '../lib/utils/format';
-  import { push } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -299,12 +299,17 @@
         {/snippet}
         {#snippet children()}
           {#each page.rows as m (m.id)}
-            <tr class="clickable" onclick={() => push(`/monitors/${m.id}`)}>
+            {@const path = `/monitors/${m.id}`}
+            <tr
+              class="clickable"
+              onclick={(e) => rowNav(e, path)}
+              onauxclick={(e) => rowNav(e, path)}
+            >
               <td>
-                <div class="name-cell">
+                <a class="row-link name-cell" href={rowHref(path)}>
                   <span class="name">{m.name}</span>
                   <span class="kind">{m.kind}</span>
-                </div>
+                </a>
               </td>
               <td><span class="cell-mono cell-muted target" title={m.target}>{m.target}</span></td>
               <td><StatusPill status={m.status} /></td>

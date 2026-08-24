@@ -77,6 +77,21 @@
   .dt :global(tbody tr.clickable:hover) {
     background: var(--surface-2);
   }
+  /* The first cell of a navigable row is a real `<a href>`, so the row can be
+     opened in a new tab with the middle button or the context menu. It has to
+     read as the cell it replaced until hovered, or every list grows a column of
+     blue: the colour is inherited and only the underline marks it as a link. */
+  .dt :global(td .row-link) {
+    color: inherit;
+    text-decoration: none;
+  }
+  /* Keyed off a hover on the ROW, not the anchor, so the underline tracks the
+     real click target — the whole row navigates, not just the link.
+     `tr.clickable` lives in this component's own markup, so no `:global` gymnastics
+     are needed here the way they are in the pages that style their own cells. */
+  .dt :global(tbody tr.clickable:hover td .row-link) {
+    text-decoration: underline;
+  }
   .dt :global(td .cell-mono) {
     font-family: var(--font-mono);
     font-size: 12px;

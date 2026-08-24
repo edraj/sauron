@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t, formatNumber, localeStore, intlTag } from '../lib/i18n';
-  import { push, querystring, replace } from 'svelte-spa-router';
+  import { querystring, replace } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -340,8 +341,8 @@
     void replace(qs ? `/sessions?${qs}` : '/sessions');
   });
 
-  function openSession(id: string) {
-    push('/sessions/' + encodeURIComponent(id));
+  function sessionPath(id: string): string {
+    return '/sessions/' + encodeURIComponent(id);
   }
 
   function downloadSessionsCsv() {
@@ -509,8 +510,17 @@
         {/snippet}
         {#snippet children()}
           {#each sessions as s (s.id)}
-            <tr class="clickable" onclick={() => openSession(s.session_id)}>
-              <td><span class="mono sid" title={s.session_id}>{s.session_id}</span></td>
+            {@const path = sessionPath(s.session_id)}
+            <tr
+              class="clickable"
+              onclick={(e) => rowNav(e, path)}
+              onauxclick={(e) => rowNav(e, path)}
+            >
+              <td>
+                <a class="row-link mono sid" href={rowHref(path)} title={s.session_id}>
+                  {s.session_id}
+                </a>
+              </td>
               <td>
                 {#if s.distinct_id}
                   <a
