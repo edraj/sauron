@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
-  import { push } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -11,6 +11,8 @@
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import { rangeKey, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -30,7 +32,8 @@
 
   const LIMIT = 50;
 
-  let sinceDays = $state(30);
+  // The shared selection, falling back to this page's own 30 days.
+  let range = $state<DateRangeValue>(rangeStore.effective(30));
   // `query` is bound to the input; `search` is the SUBMITTED value that drives loads.
   let query = $state('');
   let search = $state('');
@@ -69,8 +72,9 @@
     list = setOffsetPage(list, 0);
   }
 
-  function onRange(days: number) {
-    sinceDays = days;
+  function onRange(v: DateRangeValue) {
+    range = v;
+    rangeStore.set(v);
     list = setOffsetPage(list, 0);
   }
 
@@ -87,25 +91,28 @@
   // Retry means "go to the network now".
   async function load(
     appId: string,
-    days: number,
+    win: DateRangeValue,
     s: string,
     sort: string,
     off: number,
     force = false,
   ) {
+    // `rangeKey`, never the resolved instants: a key derived from the clock
+    // mints a fresh entry per load and hits zero times.
+    const rk = rangeKey(win);
     // Keyed on the PREDICATE only — no `sort`, no `off`, no `LIMIT`. A total
     // does not change when you reorder or page, so folding either in would
     // refetch the count on every click for an answer that cannot differ.
     void rowCount.load(
-      viewKey('screens.count', appId, sessionStore.scopeKey, days, s),
-      () => countScreens(appId, { sinceDays: days, search: s || undefined }),
+      viewKey('screens.count', appId, sessionStore.scopeKey, rk, s),
+      () => countScreens(appId, { range: win, search: s || undefined }),
       force,
     );
     await view.load(
-      viewKey('screens.list', appId, sessionStore.scopeKey, days, s, sort, off, LIMIT),
+      viewKey('screens.list', appId, sessionStore.scopeKey, rk, s, sort, off, LIMIT),
       () => listScreens(appId, {
         q: s || undefined,
-        sinceDays: days,
+        window: win,
         sort,
         limit: LIMIT,
         offset: off,
@@ -120,7 +127,7 @@
     refreshing = true;
     try {
       await Promise.all([
-        load(aid, sinceDays, search, sortParam(list.sort), list.offset, true),
+        load(aid, range, search, sortParam(list.sort), list.offset, true),
       ]);
     } finally {
       refreshing = false;
@@ -132,11 +139,11 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
+    const win = range;
     const s = search;
     const sort = sortParam(list.sort);
     const off = list.offset;
-    if (aid) void load(aid, days, s, sort, off);
+    if (aid) void load(aid, win, s, sort, off);
   });
 </script>
 
@@ -147,7 +154,7 @@
       <p class="muted sub">{t('screens.subtitle')}</p>
     </div>
     <div class="controls">
-      <DateRange value={sinceDays} onchange={onRange} />
+      <DateRange value={range} onchange={onRange} />
       <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('screens.search')} width="240px" />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
@@ -161,7 +168,7 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, sinceDays, search, sortParam(list.sort), list.offset);
+              if (aid) load(aid, range, search, sortParam(list.sort), list.offset);
             }}
           >
             {t('common.retry')}
@@ -199,8 +206,15 @@
       {/snippet}
       {#snippet children()}
         {#each rows as r (r.screen)}
-          <tr class="clickable" onclick={() => push('/screens/' + encodeURIComponent(r.screen))}>
-            <td><span class="cell-mono truncate">{r.screen}</span></td>
+          {@const path = '/screens/' + encodeURIComponent(r.screen)}
+          <tr
+            class="clickable"
+            onclick={(e) => rowNav(e, path)}
+            onauxclick={(e) => rowNav(e, path)}
+          >
+            <td>
+              <a class="row-link cell-mono truncate" href={rowHref(path)}>{r.screen}</a>
+            </td>
             <td class="num">{compactNumber(r.views)}</td>
             <td class="num">{compactNumber(r.events)}</td>
             <td class="num"><span class:err={r.exceptions > 0}>{compactNumber(r.exceptions)}</span></td>

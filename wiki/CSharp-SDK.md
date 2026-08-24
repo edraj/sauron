@@ -226,10 +226,11 @@ SauronSdk.TrackTransaction(
 
 ## Auto-capture & graceful shutdown
 
-> **Leaving this off also blanks the dashboard's crash-free tile.** Crash-free
-> counts only errors whose handled state is known, so an app that never reports
-> an uncaught exception shows "no crash data" rather than a misleading 100%. See
-> **[what crash-free means](Dashboard.md#what-crash-free-sessions-means)**.
+> **Leaving this off also blanks the dashboard's
+> Unhandled-exception-free sessions tile.** It counts only errors whose handled
+> state is known, so an app that never reports an uncaught exception shows
+> "This SDK doesn't report caught vs uncaught" rather than a misleading 100%.
+> See **[what that tile measures](Dashboard.md#what-unhandled-exception-free-sessions-means)**.
 
 `AutoCaptureUnhandled = true` (opt-in, default `false`, enabled clients only) subscribes
 to `AppDomain.CurrentDomain.UnhandledException` and

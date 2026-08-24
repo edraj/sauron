@@ -15,6 +15,11 @@
 //! ADDS them to whatever is there; live bumps carry signals at or after
 //! `cutoff`, so the two sets are disjoint and the addition is exact.
 //!
+//! That disjointness is a property of the CUTOFF, not of this SQL: it holds
+//! only when the cutoff is the instant the live path started counting. See
+//! [`rollup_epoch`] for where that instant comes from and why it is not
+//! `Utc::now()`.
+//!
 //! KNOWN RESIDUAL: a backdated event — an SDK offline queue replaying with an
 //! old `occurred_at` — that arrives between `cutoff` and the backfill finishing
 //! is counted twice. Bounded by the backfill's duration, and counter drift is
@@ -121,6 +126,36 @@ async fn backfill_app_inner(
     Ok(n)
 }
 
+/// The moment the live write path's counts became the only thing in
+/// `event_user_environments` — i.e. when migration 70 applied.
+///
+/// [`backfill_app`] must only ever aggregate signals strictly BEFORE this, or
+/// it re-counts what `batch::bump_person_envs` has already counted since.
+///
+/// Read from `event_user_env_rollup_epoch`, a one-row table migration 70
+/// stamps with `now()` at apply time. Deliberately NOT
+/// `__diesel_schema_migrations.run_on` (diesel declares that column a naive
+/// `Timestamp`, whose UTC meaning depends on the session `TimeZone` in effect
+/// when the migration ran) and NOT `Utc::now()` called from here — that is
+/// precisely the defect this replaces.
+///
+/// Note what migration 70 is NOT: the instant the live path started writing.
+/// That was migration 56, and it stamped nothing recoverable. 70 makes its own
+/// stamp true instead, by deleting the rows accumulated before it for every app
+/// that has no backfill marker — apps for which nothing reads this table yet.
+/// Its `up.sql` carries the full argument.
+pub async fn rollup_epoch(conn: &mut AsyncPgConnection) -> QueryResult<DateTime<Utc>> {
+    #[derive(QueryableByName)]
+    struct Epoch {
+        #[diesel(sql_type = Timestamptz)]
+        started_at: DateTime<Utc>,
+    }
+    let r: Epoch = diesel::sql_query("SELECT started_at FROM event_user_env_rollup_epoch")
+        .get_result(conn)
+        .await?;
+    Ok(r.started_at)
+}
+
 /// Whether `repo::list_persons` may read the rollup for this app.
 pub async fn is_backfilled(conn: &mut AsyncPgConnection, app_id: Uuid) -> QueryResult<bool> {
     #[derive(QueryableByName)]
@@ -142,8 +177,14 @@ pub async fn is_backfilled(conn: &mut AsyncPgConnection, app_id: Uuid) -> QueryR
 /// One app at a time rather than one statement for everything: a single
 /// transaction over every app's history would hold locks for its whole duration
 /// and lose all progress on any failure.
+///
+/// The cutoff is [`rollup_epoch`], read ONCE before the loop — not `Utc::now()`,
+/// and not re-read per app. It is a property of the DEPLOYMENT (when this
+/// table's contents became live-path-only), not of any one app, and not of how
+/// long an earlier app in this loop happened to take.
 pub async fn backfill_all(pool: &PgPool) -> anyhow::Result<()> {
     let mut conn = crate::conn(pool).await?;
+    let cutoff = rollup_epoch(&mut conn).await?;
 
     #[derive(QueryableByName)]
     struct AppId {
@@ -159,10 +200,6 @@ pub async fn backfill_all(pool: &PgPool) -> anyhow::Result<()> {
 
     tracing::info!(apps = apps.len(), "person/environment backfill starting");
     for a in apps {
-        // One cutoff per app, taken immediately before that app's aggregate, so
-        // the disjointness argument holds per app rather than depending on how
-        // long the earlier apps took.
-        let cutoff = Utc::now();
         let n = backfill_app(&mut conn, a.id, cutoff).await?;
         tracing::info!(app_id = %a.id, rows = n, "person/environment backfill done");
     }

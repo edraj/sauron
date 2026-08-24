@@ -23,7 +23,7 @@ use common::{seed_signal_event, TestDb};
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
 use sauron_db::repo;
-use sauron_db::scope::{EnvFilter, ReadScope};
+use sauron_db::scope::{EnvFilter, Range, ReadScope};
 use uuid::Uuid;
 
 /// `user_stats`/`active_user_series` are both open-ended forward from `since`
@@ -182,7 +182,7 @@ async fn restoring_a_merged_guest_then_repairing_collapses_active_user_series_to
     );
     seed_merge(&mut c, ids.app_id, "anon_x", "u-42", "done").await;
 
-    let before = repo::active_user_series(&mut c, app_scope(ids.app_id), day(10, 0))
+    let before = repo::active_user_series(&mut c, app_scope(ids.app_id), Range::since(day(10, 0)))
         .await
         .unwrap();
     assert_eq!(
@@ -199,7 +199,7 @@ async fn restoring_a_merged_guest_then_repairing_collapses_active_user_series_to
         "exactly the one guest row, not the person's own row"
     );
 
-    let after = repo::active_user_series(&mut c, app_scope(ids.app_id), day(10, 0))
+    let after = repo::active_user_series(&mut c, app_scope(ids.app_id), Range::since(day(10, 0)))
         .await
         .unwrap();
     assert_eq!(

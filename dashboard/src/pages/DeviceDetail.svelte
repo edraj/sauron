@@ -2,6 +2,7 @@
   import { t } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -200,16 +201,14 @@
                 </tr>
               {/snippet}
               {#each sortedSessions as s (s.id)}
+                {@const path = '/sessions/' + encodeURIComponent(s.session_id)}
                 <tr
                   class="clickable"
-                  onclick={() => push('/sessions/' + encodeURIComponent(s.session_id))}
+                  onclick={(e) => rowNav(e, path)}
+                  onauxclick={(e) => rowNav(e, path)}
                 >
                   <td>
-                    <a
-                      class="lnk mono truncate"
-                      href={`#/sessions/${encodeURIComponent(s.session_id)}`}
-                      onclick={(e) => e.stopPropagation()}
-                    >
+                    <a class="lnk mono truncate" href={rowHref(path)}>
                       {s.session_id}
                     </a>
                   </td>

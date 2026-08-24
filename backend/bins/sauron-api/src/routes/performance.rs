@@ -3,7 +3,7 @@
 
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -19,6 +19,11 @@ use crate::AppState;
 pub struct SummaryQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     pub op: Option<String>,
     // `environment_id` is deliberately NOT a field here — it is read from the
     // raw query string via `RawQuery` + `scope::authorized_read_scope`
@@ -30,6 +35,11 @@ pub struct SummaryQuery {
 pub struct SeriesQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     pub name: Option<String>,
     pub op: Option<String>,
     // `environment_id` comes from `RawQuery` — see `SummaryQuery`'s comment
@@ -63,10 +73,17 @@ pub async fn summary(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, MAX_PERF_WINDOW_DAYS));
+    let win = super::search::resolve_range(
+        "occurred_at",
+        q.from,
+        q.to,
+        q.since_days,
+        Utc::now(),
+        MAX_PERF_WINDOW_DAYS,
+    )?;
     let op = q.op.as_deref().filter(|s| !s.is_empty());
     Ok(Json(
-        repo::performance_summary(&mut conn, scope, since, op, None).await?,
+        repo::performance_summary(&mut conn, scope, win, op, None).await?,
     ))
 }
 
@@ -86,10 +103,17 @@ pub async fn series(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, MAX_PERF_WINDOW_DAYS));
+    let win = super::search::resolve_range(
+        "occurred_at",
+        q.from,
+        q.to,
+        q.since_days,
+        Utc::now(),
+        MAX_PERF_WINDOW_DAYS,
+    )?;
     let name = q.name.as_deref().filter(|s| !s.is_empty());
     let op = q.op.as_deref().filter(|s| !s.is_empty());
     Ok(Json(
-        repo::performance_series(&mut conn, scope, since, name, op).await?,
+        repo::performance_series(&mut conn, scope, win, name, op).await?,
     ))
 }

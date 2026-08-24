@@ -1,14 +1,22 @@
 import { api } from './client';
 import type { FunnelResult, SavedFunnel } from '../models';
+import { lastDays, toParams, type DateRangeValue } from '../models/date-range';
+
+/** The window these reads default to when a caller passes none — unchanged. */
+const DEFAULT_WINDOW: DateRangeValue = lastDays(30);
+
 
 export async function computeFunnel(
   appId: string,
   steps: string[],
-  sinceDays = 30,
+  win: DateRangeValue = DEFAULT_WINDOW,
 ): Promise<FunnelResult> {
+  // A JSON body rather than a query string, but the same three field names —
+  // `FunnelReq` accepts `since_days` OR `from`/`to`, and `toParams` decides
+  // which, so the precedence rule is not restated here.
   const { data } = await api.post<FunnelResult>(`/v1/apps/${appId}/funnel`, {
     steps,
-    since_days: sinceDays,
+    ...toParams(win),
   });
   return data;
 }

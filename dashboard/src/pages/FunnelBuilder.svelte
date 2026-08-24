@@ -13,6 +13,8 @@
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import { type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import FunnelChart from '../lib/components/FunnelChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -31,7 +33,8 @@
   import { formatPercent } from '../lib/utils/format';
   import type { TopEvent, FunnelResult, SavedFunnel } from '../lib/models';
 
-  let sinceDays = $state(30);
+  // The shared selection, falling back to this page's own 30 days.
+  let range = $state<DateRangeValue>(rangeStore.effective(30));
 
   let available = $state<TopEvent[]>([]);
   let steps = $state<string[]>([]);
@@ -131,7 +134,7 @@
     steps = [...f.steps];
     loadedId = f.id;
     const aid = sessionStore.currentAppId;
-    if (aid) void compute(aid, sinceDays);
+    if (aid) void compute(aid, range);
   }
 
   async function duplicateFunnel(f: SavedFunnel) {
@@ -179,12 +182,12 @@
     }
   }
 
-  async function compute(aid: string, days: number) {
+  async function compute(aid: string, win: DateRangeValue) {
     if (steps.length < 2) return;
     computing = true;
     error = null;
     try {
-      result = await computeFunnel(aid, [...steps], days);
+      result = await computeFunnel(aid, [...steps], win);
     } catch (err) {
       error = errorMessage(err);
       result = null;
@@ -199,13 +202,16 @@
     steps = [];
     result = null;
     try {
-      available = await topEvents(aid, { since_days: 90, limit: 50 });
+      // A fixed 90 days, NOT the picker's window: this list is the CATALOGUE
+      // of event names to build a funnel from, and narrowing it to the
+      // reporting window would hide steps the user wants to measure.
+      available = await topEvents(aid, { since_days: '90', limit: 50 });
       picked = available[0]?.name ?? '';
       if (available.length >= 2) {
         // Prefill the first 3 (or 2) events and compute so the page isn't empty.
         const n = Math.min(3, available.length);
         steps = available.slice(0, n).map((e) => e.name);
-        void compute(aid, sinceDays);
+        void compute(aid, range);
       }
     } catch (err) {
       error = errorMessage(err);
@@ -248,11 +254,11 @@
   // directly is the only new trigger this effect actually needs, and it
   // removes the dependency on that ordering instead of relying on it.
   $effect(() => {
-    const days = sinceDays;
+    const win = range;
     sessionStore.currentEnvId;
     untrack(() => {
       const aid = sessionStore.currentAppId;
-      if (aid && steps.length >= 2) void compute(aid, days);
+      if (aid && steps.length >= 2) void compute(aid, win);
     });
   });
 
@@ -266,7 +272,7 @@
 
   function onCompute() {
     const aid = sessionStore.currentAppId;
-    if (aid) void compute(aid, sinceDays);
+    if (aid) void compute(aid, range);
   }
 
   function retry() {
@@ -295,7 +301,13 @@
       <p class="muted sub">{t('funnels.subtitle')}</p>
     </div>
     <div class="controls">
-      <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
+      <DateRange
+        value={range}
+        onchange={(v) => {
+          range = v;
+          rangeStore.set(v);
+        }}
+      />
       <RefreshButton onclick={refresh} loading={refreshing} />
     </div>
   </div>

@@ -20,6 +20,7 @@ use diesel_async::RunQueryDsl;
 use sauron_db::models::{NewAnalyticsEvent, NewErrorEvent, NewIssue, Workflow};
 use sauron_db::repo::{self, WorkflowAction, DURATION_BUCKETS};
 use sauron_db::schema::workflows;
+use sauron_db::scope::Range;
 use sauron_db::scope::{EnvFilter, ReadScope};
 use serde_json::json;
 use uuid::Uuid;
@@ -855,7 +856,7 @@ async fn workflow_list_derives_abandoned_from_staleness() {
     let rows = repo::workflow_list(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         None,
         50,
         0,
@@ -950,7 +951,7 @@ async fn workflow_list_is_environment_scoped() {
     let rows_a = repo::workflow_list(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         None,
         50,
         0,
@@ -964,7 +965,7 @@ async fn workflow_list_is_environment_scoped() {
     let rows_b = repo::workflow_list(
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         None,
         50,
         0,
@@ -978,7 +979,7 @@ async fn workflow_list_is_environment_scoped() {
     let rows_all = repo::workflow_list(
         &mut conn,
         ReadScope::all(ids.app_id),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         None,
         50,
         0,
@@ -1071,7 +1072,7 @@ async fn workflow_list_search_filters_by_name_substring() {
     let rows = repo::workflow_list(
         &mut conn,
         ReadScope::all(ids.app_id),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         Some("check"),
         50,
         0,
@@ -1085,7 +1086,7 @@ async fn workflow_list_search_filters_by_name_substring() {
     let all_rows = repo::workflow_list(
         &mut conn,
         ReadScope::all(ids.app_id),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         None,
         50,
         0,
@@ -1102,7 +1103,7 @@ async fn workflow_list_search_filters_by_name_substring() {
     let pct = repo::workflow_list(
         &mut conn,
         ReadScope::all(ids.app_id),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         Some("%"),
         50,
         0,
@@ -1120,7 +1121,7 @@ async fn workflow_list_search_filters_by_name_substring() {
     let underscore = repo::workflow_list(
         &mut conn,
         ReadScope::all(ids.app_id),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         Some("sign_up"),
         50,
         0,
@@ -1138,7 +1139,7 @@ async fn workflow_list_search_filters_by_name_substring() {
     let underscore_is_not_wildcard = repo::workflow_list(
         &mut conn,
         ReadScope::all(ids.app_id),
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         Some("sign_u"),
         50,
         0,
@@ -1291,10 +1292,17 @@ async fn workflow_runs_filters_by_status_and_paginates() {
 
     let scope = || ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
 
-    let abandoned_runs =
-        repo::workflow_runs(&mut conn, scope(), "checkout", 1, Some("abandoned"), 50, 0)
-            .await
-            .expect("workflow_runs status=abandoned");
+    let abandoned_runs = repo::workflow_runs(
+        &mut conn,
+        scope(),
+        "checkout",
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
+        Some("abandoned"),
+        50,
+        0,
+    )
+    .await
+    .expect("workflow_runs status=abandoned");
     assert_eq!(abandoned_runs.len(), 1);
     let abandoned = &abandoned_runs[0];
     assert_eq!(abandoned.workflow_id, wf_abandoned);
@@ -1330,10 +1338,17 @@ async fn workflow_runs_filters_by_status_and_paginates() {
         "no ended_at means no duration, rather than a zero or a now()-based one"
     );
 
-    let completed_runs =
-        repo::workflow_runs(&mut conn, scope(), "checkout", 1, Some("completed"), 50, 0)
-            .await
-            .expect("workflow_runs status=completed");
+    let completed_runs = repo::workflow_runs(
+        &mut conn,
+        scope(),
+        "checkout",
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
+        Some("completed"),
+        50,
+        0,
+    )
+    .await
+    .expect("workflow_runs status=completed");
     assert_eq!(completed_runs.len(), 1);
     assert_eq!(completed_runs[0].workflow_id, wf_completed);
     assert_eq!(
@@ -1345,12 +1360,28 @@ async fn workflow_runs_filters_by_status_and_paginates() {
     // Pagination: newest-first, page 1 then page 2, no overlap — a shifted
     // `limit`/`offset` bind would show up here as a wrong or duplicated
     // ordering, not just a wrong count.
-    let page1 = repo::workflow_runs(&mut conn, scope(), "checkout", 1, None, 2, 0)
-        .await
-        .expect("workflow_runs page 1");
-    let page2 = repo::workflow_runs(&mut conn, scope(), "checkout", 1, None, 2, 2)
-        .await
-        .expect("workflow_runs page 2");
+    let page1 = repo::workflow_runs(
+        &mut conn,
+        scope(),
+        "checkout",
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
+        None,
+        2,
+        0,
+    )
+    .await
+    .expect("workflow_runs page 1");
+    let page2 = repo::workflow_runs(
+        &mut conn,
+        scope(),
+        "checkout",
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
+        None,
+        2,
+        2,
+    )
+    .await
+    .expect("workflow_runs page 2");
     assert_eq!(
         page1
             .iter()
@@ -1373,9 +1404,17 @@ async fn workflow_runs_filters_by_status_and_paginates() {
     // env fragment were dropped — the two pagination assertions above already
     // fail in that case, but assert it directly too, so the *reason* is named
     // rather than read as an off-by-one in the paging.
-    let unpaged = repo::workflow_runs(&mut conn, scope(), "checkout", 1, None, 50, 0)
-        .await
-        .expect("workflow_runs env_a, unpaged");
+    let unpaged = repo::workflow_runs(
+        &mut conn,
+        scope(),
+        "checkout",
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
+        None,
+        50,
+        0,
+    )
+    .await
+    .expect("workflow_runs env_a, unpaged");
     assert_eq!(unpaged.len(), 4, "env_a has exactly its own four runs");
     assert!(
         !unpaged.iter().any(|r| r.workflow_id == wf_env_b),
@@ -1386,7 +1425,7 @@ async fn workflow_runs_filters_by_status_and_paginates() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         "checkout",
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
         None,
         50,
         0,
@@ -1584,7 +1623,7 @@ async fn workflow_detail_counts_contained_events_and_issues() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         "checkout",
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
     )
     .await
     .expect("workflow_detail");
@@ -1647,7 +1686,7 @@ async fn workflow_detail_counts_contained_events_and_issues() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_b)),
         "checkout",
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
     )
     .await
     .expect("workflow_detail env_b");
@@ -1768,7 +1807,7 @@ async fn workflow_detail_buckets_finished_runs_by_duration() {
         &mut conn,
         ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a)),
         "checkout",
-        1,
+        Range::since(Utc::now() - chrono::Duration::days(i64::from(1))),
     )
     .await
     .expect("workflow_detail");

@@ -1,7 +1,7 @@
 //! Screen analytics: per-screen views/events/users/exceptions + on-read dwell.
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
-use chrono::{DateTime, Duration, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -9,6 +9,7 @@ use sauron_auth::{perm, AuthUser};
 use sauron_db::models::{AnalyticsEvent, ErrorEvent};
 use sauron_db::repo;
 use sauron_db::repo::SortSpec;
+use sauron_db::scope::Range;
 
 use super::db;
 use crate::error::ApiError;
@@ -70,6 +71,11 @@ pub(crate) fn screen_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> 
 pub struct ScreenListQuery {
     #[serde(default = "days30")]
     pub since_days: i64,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     pub q: Option<String>,
     #[serde(default = "lim50")]
     pub limit: i64,
@@ -106,7 +112,8 @@ pub async fn list(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let win =
+        super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
     let pattern = match q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(term) => repo::like_contains(term),
         None => "%".to_string(),
@@ -115,7 +122,7 @@ pub async fn list(
     let rows = repo::screen_list(
         &mut conn,
         scope,
-        since,
+        win,
         &pattern,
         q.limit.clamp(1, 200),
         super::clamp_offset(q.offset),
@@ -153,13 +160,14 @@ pub async fn count(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let win =
+        super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
     let pattern = match q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(term) => repo::like_contains(term),
         None => "%".to_string(),
     };
     let (total, total_is_capped) =
-        repo::count_screens(&mut conn, scope, since, &pattern, super::search::COUNT_CAP).await?;
+        repo::count_screens(&mut conn, scope, win, &pattern, super::search::COUNT_CAP).await?;
     Ok(Json(super::search::CountEnvelope {
         total,
         total_is_capped,
@@ -171,6 +179,11 @@ pub struct ScreenDetailQuery {
     pub name: String,
     #[serde(default = "days30")]
     pub since_days: i64,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     // `environment_id` is deliberately NOT a field here — see
     // `ScreenListQuery`'s comment above.
 }
@@ -215,8 +228,9 @@ pub async fn detail(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
-    let stats = repo::screen_stats(&mut conn, scope, since, &q.name).await?;
+    let win =
+        super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
+    let stats = repo::screen_stats(&mut conn, scope, win, &q.name).await?;
     Ok(Json(ScreenDetail { stats }))
 }
 
@@ -248,6 +262,11 @@ pub struct ScreenSectionQuery {
     pub name: String,
     #[serde(default = "days30")]
     pub since_days: i64,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. See `analytics::RangeQuery` for why
+    /// these are two plain fields rather than a flattened shared struct.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default = "lim25")]
     pub limit: i64,
     #[serde(default)]
@@ -270,13 +289,14 @@ const SECTION_LIMIT_MAX: i64 = 100;
 /// window or a page is — a section answering over a different `since` than its
 /// siblings would put four mutually inconsistent lists under one set of stat
 /// tiles.
-fn section_bounds(q: &ScreenSectionQuery) -> Result<(DateTime<Utc>, i64, i64), ApiError> {
+fn section_bounds(q: &ScreenSectionQuery) -> Result<(Range, i64, i64), ApiError> {
     if q.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
-    let since = Utc::now() - Duration::days(q.since_days.clamp(1, 365));
+    let win =
+        super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
     let limit = q.limit.clamp(1, SECTION_LIMIT_MAX);
-    Ok((since, limit, super::clamp_offset(q.offset)))
+    Ok((win, limit, super::clamp_offset(q.offset)))
 }
 
 /// `GET /v1/apps/{app_id}/screens/events` — a screen's analytics events, paged.
@@ -287,7 +307,7 @@ pub async fn section_events(
     Query(q): Query<ScreenSectionQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<AnalyticsEvent>>, ApiError> {
-    let (since, limit, offset) = section_bounds(&q)?;
+    let (range, limit, offset) = section_bounds(&q)?;
     let mut conn = db(&state).await?;
     let scope = super::scope::authorized_read_scope(
         &mut conn,
@@ -298,7 +318,7 @@ pub async fn section_events(
     )
     .await?;
     let rows =
-        repo::recent_events_for_screen(&mut conn, scope, &q.name, since, limit, offset).await?;
+        repo::recent_events_for_screen(&mut conn, scope, &q.name, range, limit, offset).await?;
     Ok(Json(rows))
 }
 
@@ -318,7 +338,7 @@ pub async fn section_exceptions(
     Query(q): Query<ScreenSectionQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<ErrorEvent>>, ApiError> {
-    let (since, limit, offset) = section_bounds(&q)?;
+    let (range, limit, offset) = section_bounds(&q)?;
     let mut conn = db(&state).await?;
     let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
@@ -329,7 +349,7 @@ pub async fn section_exceptions(
     )
     .await?;
     let mut rows =
-        repo::recent_exceptions_for_screen(&mut conn, scope, &q.name, since, limit, offset).await?;
+        repo::recent_exceptions_for_screen(&mut conn, scope, &q.name, range, limit, offset).await?;
     crate::symbolicate::gate_source_context(&perms, &mut rows);
     crate::symbolicate::gate_event_body(&perms, &mut rows);
     Ok(Json(rows))
@@ -346,7 +366,7 @@ pub async fn section_devices(
     Query(q): Query<ScreenSectionQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<repo::ScreenDeviceRow>>, ApiError> {
-    let (since, limit, offset) = section_bounds(&q)?;
+    let (range, limit, offset) = section_bounds(&q)?;
     let mut conn = db(&state).await?;
     let scope = super::scope::authorized_read_scope(
         &mut conn,
@@ -356,7 +376,7 @@ pub async fn section_devices(
         raw_query.as_deref(),
     )
     .await?;
-    let rows = repo::devices_for_screen(&mut conn, scope, &q.name, since, limit, offset).await?;
+    let rows = repo::devices_for_screen(&mut conn, scope, &q.name, range, limit, offset).await?;
     Ok(Json(rows))
 }
 
@@ -370,7 +390,7 @@ pub async fn section_users(
     Query(q): Query<ScreenSectionQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<repo::ScreenUserRow>>, ApiError> {
-    let (since, limit, offset) = section_bounds(&q)?;
+    let (range, limit, offset) = section_bounds(&q)?;
     let mut conn = db(&state).await?;
     let scope = super::scope::authorized_read_scope(
         &mut conn,
@@ -380,18 +400,21 @@ pub async fn section_users(
         raw_query.as_deref(),
     )
     .await?;
-    let rows = repo::users_for_screen(&mut conn, scope, &q.name, since, limit, offset).await?;
+    let rows = repo::users_for_screen(&mut conn, scope, &q.name, range, limit, offset).await?;
     Ok(Json(rows))
 }
 
 #[cfg(test)]
 mod section_bounds_tests {
     use super::*;
+    use chrono::Duration;
 
     fn q(name: &str, since_days: i64, limit: i64, offset: i64) -> ScreenSectionQuery {
         ScreenSectionQuery {
             name: name.to_string(),
             since_days,
+            from: None,
+            to: None,
             limit,
             offset,
         }
@@ -441,16 +464,19 @@ mod section_bounds_tests {
     #[test]
     fn the_window_matches_the_rest_of_the_page() {
         let before = Utc::now();
-        let (since_zero, _, _) = section_bounds(&q("Home", 0, 25, 0)).expect("ok");
+        let (zero, _, _) = section_bounds(&q("Home", 0, 25, 0)).expect("ok");
         assert!(
-            since_zero <= before - Duration::days(1) + Duration::seconds(1),
+            zero.from <= before - Duration::days(1) + Duration::seconds(1),
             "since_days=0 must clamp to at least one day"
         );
-        let (since_huge, _, _) = section_bounds(&q("Home", 100_000, 25, 0)).expect("ok");
+        let (huge, _, _) = section_bounds(&q("Home", 100_000, 25, 0)).expect("ok");
         assert!(
-            since_huge >= before - Duration::days(366),
+            huge.from >= before - Duration::days(366),
             "since_days must clamp at 365"
         );
+        // Open above unless the caller asked for a closed window — the whole
+        // point of `to` being an `Option`.
+        assert_eq!(huge.to, None);
     }
 }
 

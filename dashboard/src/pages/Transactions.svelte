@@ -17,6 +17,12 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
+  // Aliased: this page already imports `fromParams` from `time-filter` for
+  // its own richer window control.
+  import {
+    fromParams as rangeFromParams,
+    type DateRangeValue,
+  } from '../lib/models/date-range';
   import TimeFilter from '../lib/components/TimeFilter.svelte';
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import {
@@ -64,10 +70,11 @@
   // The reload effect depends on this, not on `search`, so free-text typing
   // doesn't fire a request on every keystroke. Chips apply immediately.
   let appliedSearch = $state(initial.get('q') ?? '');
-  // Present only to satisfy FilterBar's bindable range control; this page's
-  // window lives in `window` below, on the table's own card. Kept in sync so
-  // the two never disagree on screen.
-  let sinceDays = $state(Number(initial.get('since_days')) || 7);
+  // Present only to satisfy FilterBar's bindable range control — this page
+  // renders it with `showRange={false}` and owns its window through the
+  // `<TimeFilter>` on the table's own card, which also picks the timestamp
+  // COLUMN. Seeded from the URL so the two never disagree on screen.
+  let range = $state<DateRangeValue>(rangeFromParams(initial, 7));
   let window_ = $state<TimeFilterState>(fromParams(initial, TIME_FIELDS, DEFAULT_TIME_FIELD, 365));
 
   let list = $state<CursorListState>({
@@ -309,7 +316,7 @@
     fields={TRANSACTION_FIELDS}
     bind:filters
     bind:search
-    bind:sinceDays
+    bind:range
     appId={sessionStore.currentAppId ?? undefined}
     context="transactions"
     error={errorStatusCode === 400 ? error : null}

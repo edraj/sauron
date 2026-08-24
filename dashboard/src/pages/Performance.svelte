@@ -8,6 +8,8 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import { rangeKey, toParams, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
@@ -30,7 +32,9 @@
 
   const OPS = ['All', 'navigation', 'http', 'screen_load', 'resource', 'custom'] as const;
 
-  let sinceDays = $state(7);
+  // The shared selection, falling back to this page's own 7 days until the
+  // user has chosen one — see `stores/range.svelte.ts`.
+  let range = $state<DateRangeValue>(rangeStore.effective(7));
   let op = $state<string>('All');
 
   /**
@@ -69,14 +73,15 @@
    * the axios interceptor adds to the request but which appears in none of these
    * arguments — omit it and one environment's transactions are served as another's.
    */
-  async function load(appId: string, days: number, opv: string, force = false) {
+  async function load(appId: string, win: DateRangeValue, opv: string, force = false) {
     const opParam = opv === 'All' ? undefined : opv;
     await view.load(
-      viewKey('performance.summary', appId, sessionStore.scopeKey, days, opParam),
+      viewKey('performance.summary', appId, sessionStore.scopeKey, rangeKey(win), opParam),
       async () => {
+        const w = toParams(win);
         const [summary, ser] = await Promise.all([
-          perfSummary(appId, { since_days: days, op: opParam }),
-          perfSeries(appId, { since_days: days, op: opParam }),
+          perfSummary(appId, { ...w, op: opParam }),
+          perfSeries(appId, { ...w, op: opParam }),
         ]);
         return { rows: summary, series: ser };
       },
@@ -89,9 +94,9 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
+    const win = range;
     const opv = op;
-    if (aid) void load(aid, days, opv);
+    if (aid) void load(aid, win, opv);
   });
 
   // The table arrives whole — `performance_summary` returns its top 100
@@ -181,7 +186,7 @@
 
   function retry() {
     const aid = sessionStore.currentAppId;
-    if (aid) void load(aid, sinceDays, op, true);
+    if (aid) void load(aid, range, op, true);
   }
 
   async function refresh() {
@@ -190,7 +195,7 @@
     refreshing = true;
     try {
       // force: an explicit click must reach the network regardless of freshness.
-      await load(aid, sinceDays, op, true);
+      await load(aid, range, op, true);
     } finally {
       refreshing = false;
     }
@@ -220,7 +225,13 @@
           </button>
         {/each}
       </div>
-      <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
+      <DateRange
+        value={range}
+        onchange={(v) => {
+          range = v;
+          rangeStore.set(v);
+        }}
+      />
       <!--
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached data, fetching fresh" hint.
@@ -355,7 +366,7 @@
     bind:open={drillOpen}
     row={selected}
     appId={sessionStore.currentAppId}
-    {sinceDays}
+    {range}
     onclose={closeDrill}
   />
 </AppShell>

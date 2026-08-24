@@ -1,4 +1,5 @@
 import { api } from './client';
+import { toParams, type DateRangeValue } from '../models/date-range';
 
 /**
  * Row counts for the four offset-paged lists that have no total of their own.
@@ -44,7 +45,8 @@ export interface CountEnvelope {
  * caller cannot accidentally count one environment while displaying another.
  */
 export interface CountParams {
-  sinceDays?: number;
+  /** The date-range picker's window, encoded by `date-range`'s `toParams`. */
+  range?: DateRangeValue;
   /** Free-text filter. Sent as `q` for screens, `search` for the other three. */
   search?: string;
   /** `time_field`/`from`/`to`, already encoded by `models/time-filter`'s `toRecord`. */
@@ -52,7 +54,9 @@ export interface CountParams {
 }
 
 function withPredicate(p: URLSearchParams, opts: CountParams): URLSearchParams {
-  if (opts.sinceDays != null) p.set('since_days', String(opts.sinceDays));
+  if (opts.range) {
+    for (const [k, v] of Object.entries(toParams(opts.range))) p.set(k, v);
+  }
   for (const [k, v] of Object.entries(opts.window ?? {})) {
     if (v) p.set(k, v);
   }

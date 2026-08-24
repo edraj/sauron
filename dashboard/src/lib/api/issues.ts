@@ -14,10 +14,17 @@ import type {
   IssueStats,
   IssueStatus,
 } from '../models';
+import { lastDays, toParams, type DateRangeValue } from '../models/date-range';
+/** The window these reads default to when a caller passes none — unchanged. */
+const DEFAULT_WINDOW: DateRangeValue = lastDays(30);
 
-export async function getIssueStats(appId: string, sinceDays = 30): Promise<IssueStats> {
+
+export async function getIssueStats(
+  appId: string,
+  win: DateRangeValue = DEFAULT_WINDOW,
+): Promise<IssueStats> {
   const { data } = await api.get<IssueStats>(`/v1/apps/${appId}/issues/stats`, {
-    params: { since_days: sinceDays },
+    params: toParams(win),
   });
   return data;
 }

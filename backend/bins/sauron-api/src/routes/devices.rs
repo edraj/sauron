@@ -11,6 +11,7 @@ use sauron_auth::{perm, AuthUser};
 use sauron_db::models::{ErrorEvent, Session};
 use sauron_db::repo;
 use sauron_db::repo::{DeviceGroupRow, DeviceRow, PerfSummaryRow, SortSpec};
+use sauron_db::scope::Range;
 
 use super::db;
 use crate::error::ApiError;
@@ -499,7 +500,14 @@ pub async fn detail(
     let mut errors = repo::errors_for_device(&mut conn, scope.clone(), &device_key, 50).await?;
     crate::symbolicate::gate_source_context(&perms, &mut errors);
     crate::symbolicate::gate_event_body(&perms, &mut errors);
-    let perf = repo::performance_summary(&mut conn, scope, since, None, Some(&device_key)).await?;
+    let perf = repo::performance_summary(
+        &mut conn,
+        scope,
+        Range::since(since),
+        None,
+        Some(&device_key),
+    )
+    .await?;
 
     Ok(Json(DeviceDetail {
         device,

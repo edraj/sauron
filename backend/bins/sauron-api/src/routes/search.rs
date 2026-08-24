@@ -26,6 +26,7 @@ use sauron_auth::AuthUser;
 use sauron_db::query_plan::prepare::Clamp;
 use sauron_db::query_plan::PlanError;
 use sauron_db::repo::TextSearchReach;
+use sauron_db::scope::Range;
 use sauron_query::{from_legacy, parse, resolve, Node, ResolvedNode, ResolvedPredicate, Store};
 
 use crate::error::ApiError;
@@ -267,10 +268,95 @@ pub fn resolve_time_filter(
         })?,
     };
 
+    let b = resolve_bounds(
+        column,
+        q.from,
+        q.to,
+        q.since_days.unwrap_or(default_days),
+        now,
+        max_days,
+        planner,
+    )?;
+    Ok(TimeWindowSpec {
+        column,
+        from: b.from,
+        to: b.to,
+        clamped: b.clamped,
+    })
+}
+
+/// Resolve an analytics route's window from `from`/`to`/`since_days`.
+///
+/// Delegates every rule to [`resolve_bounds`], which [`resolve_time_filter`]
+/// also uses. That sharing is the point: the list routes and the analytics
+/// routes now accept the same three parameters, and two derivations of one
+/// precedence rule is how two views that look identical start answering
+/// differently.
+///
+/// # Why an over-wide EXPLICIT window is a 400 here, when the lists narrow it
+///
+/// The list routes answer inside a `SearchEnvelope`, which has a `clamped`
+/// field to say "you asked for more than we served". These routes return bare
+/// arrays — `Json<Vec<EventCount>>`, `Json<Vec<SeriesPoint>>` — with nowhere to
+/// put that disclosure, so a narrowing here would be silent, and a silently
+/// narrowed window is a wrong answer carrying a 200.
+///
+/// The rule therefore splits by which parameter asked:
+///
+/// - `since_days` keeps its long-standing silent clamp. `Issues` ships 3650 as
+///   its widest setting and has always been served 365; turning that into a
+///   400 would break a shipped contract to fix a disclosure gap nobody hit.
+/// - `from`/`to` are new, so there is no compatibility to keep, and a 400
+///   naming the ceiling is the only honest answer available without an
+///   envelope. That also covers `to` alone, which asks for an unbounded lower
+///   bound — the shape that scans every partition.
+///
+/// `since_days` is an `i64` rather than an `Option` because `RangeQuery`
+/// already applies its own serde default — unlike `TimeFilterQuery`, whose
+/// routes do not share one. Absent and explicitly-30 need not be told apart
+/// here, since explicit bounds win outright either way.
+pub fn resolve_range(
+    field: &'static str,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    since_days: i64,
+    now: DateTime<Utc>,
+    max_days: i64,
+) -> Result<Range, ApiError> {
+    let explicit = from.is_some() || to.is_some();
+    let b = resolve_bounds(field, from, to, since_days, now, max_days, None)?;
+    if explicit {
+        if let Some(c) = b.clamped {
+            return Err(ApiError::BadRequest(format!(
+                "{}; requested window was narrowed to {} — send a narrower `from`/`to`, \
+                 and note that `to` alone is not accepted",
+                c.reason, c.to
+            )));
+        }
+    }
+    Ok(Range::new(b.from, b.to))
+}
+
+/// The bounds half of [`resolve_time_filter`], with no column attached.
+struct Bounds {
+    from: DateTime<Utc>,
+    to: Option<DateTime<Utc>>,
+    clamped: Option<ClampInfo>,
+}
+
+fn resolve_bounds(
+    field: &str,
+    q_from: Option<DateTime<Utc>>,
+    q_to: Option<DateTime<Utc>>,
+    requested_days: i64,
+    now: DateTime<Utc>,
+    max_days: i64,
+    planner: Option<Clamp>,
+) -> Result<Bounds, ApiError> {
     // Explicit bounds win outright; `since_days` is not consulted at all when
     // either is present. Mixing them would make `?from=…&since_days=7` mean
     // something no caller could predict.
-    let explicit = q.from.is_some() || q.to.is_some();
+    let explicit = q_from.is_some() || q_to.is_some();
     // Tracked separately from the floor check below, which cannot see this
     // case: the default we substitute is EXACTLY `to - max_days`, so a
     // `from < floor` comparison finds them equal and reports nothing. The
@@ -280,14 +366,14 @@ pub fn resolve_time_filter(
     // every partition.
     let mut floored_open_lower_bound = false;
     let (mut from, to) = if explicit {
-        let to = q.to;
-        let from = q.from.unwrap_or_else(|| {
+        let to = q_to;
+        let from = q_from.unwrap_or_else(|| {
             floored_open_lower_bound = true;
             to.expect("explicit implies a bound") - Duration::days(max_days)
         });
         (from, to)
     } else {
-        let requested = q.since_days.unwrap_or(default_days);
+        let requested = requested_days;
         // A `since_days` ABOVE the ceiling is narrowed here, and the narrowing
         // must be disclosed — the floor check below cannot see it, because the
         // clamped value it produces is exactly the floor, so `from < floor` is
@@ -335,12 +421,11 @@ pub fn resolve_time_filter(
         }
     }
 
-    Ok(TimeWindowSpec {
-        column,
+    Ok(Bounds {
         from,
         to,
         clamped: reason.map(|reason| ClampInfo {
-            field: column.to_string(),
+            field: field.to_string(),
             to: format!("{}d", (ceiling - from).num_days()),
             reason,
         }),
@@ -1194,6 +1279,111 @@ mod tests {
             None,
         );
         assert!(err.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_range — the analytics half of the same rules
+    // -----------------------------------------------------------------------
+
+    fn resolve_r(from: Option<&str>, to: Option<&str>, days: i64) -> Result<Range, ApiError> {
+        resolve_range("occurred_at", from.map(at), to.map(at), days, tf_now(), 365)
+    }
+
+    #[test]
+    fn range_without_bounds_is_since_days_open_above() {
+        let r = resolve_r(None, None, 7).unwrap();
+        assert_eq!(r.from, tf_now() - Duration::days(7));
+        assert_eq!(r.to, None);
+    }
+
+    /// The precedence rule, and the whole reason `resolve_range` exists rather
+    /// than each handler deriving its own: explicit bounds win OUTRIGHT.
+    /// Mixing them would make `?from=…&since_days=7` mean something no caller
+    /// could predict.
+    #[test]
+    fn explicit_bounds_beat_since_days_outright() {
+        let r = resolve_r(
+            Some("2026-07-01T00:00:00Z"),
+            Some("2026-08-01T00:00:00Z"),
+            7,
+        )
+        .unwrap();
+        assert_eq!(r.from, at("2026-07-01T00:00:00Z"));
+        assert_eq!(r.to, Some(at("2026-08-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn a_lower_bound_alone_stays_open_above() {
+        let r = resolve_r(Some("2026-08-01T00:00:00Z"), None, 30).unwrap();
+        assert_eq!(r.from, at("2026-08-01T00:00:00Z"));
+        assert_eq!(r.to, None);
+    }
+
+    /// `to` with no `from` asks for an unbounded lower bound, which on a
+    /// partitioned table prunes nothing. The lists answer it by flooring and
+    /// disclosing through their envelope; these routes have no envelope, so
+    /// the only honest answer is to refuse — and to SAY that `to` alone is the
+    /// problem, since "narrowed to 365d" alone would not tell the caller what
+    /// to change.
+    #[test]
+    fn range_refuses_an_upper_bound_alone() {
+        let err = resolve_r(None, Some("2026-08-03T00:00:00Z"), 30).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("365"), "{msg}");
+        assert!(msg.contains("`to` alone"), "{msg}");
+    }
+
+    #[test]
+    fn range_rejects_an_inverted_or_equal_pair() {
+        assert!(resolve_r(
+            Some("2026-08-05T00:00:00Z"),
+            Some("2026-08-01T00:00:00Z"),
+            30
+        )
+        .is_err());
+        // Half-open, so equal bounds select nothing at all.
+        assert!(resolve_r(
+            Some("2026-08-05T00:00:00Z"),
+            Some("2026-08-05T00:00:00Z"),
+            30
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn range_refuses_an_oversized_explicit_span_rather_than_narrowing_it() {
+        assert!(resolve_r(
+            Some("2020-01-01T00:00:00Z"),
+            Some("2026-08-01T00:00:00Z"),
+            30
+        )
+        .is_err());
+        // One day inside the ceiling is served, so the boundary is the ceiling
+        // itself and not some rounding of it.
+        let ok = resolve_r(
+            Some("2025-08-02T00:00:00Z"),
+            Some("2026-08-01T00:00:00Z"),
+            30,
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    /// The asymmetry, pinned. `since_days` above the ceiling is still narrowed
+    /// silently — `Issues` ships 3650 and has always been served 365, and
+    /// turning that into a 400 would break a shipped contract.
+    #[test]
+    fn an_oversized_since_days_is_still_narrowed_silently() {
+        let r = resolve_r(None, None, 3650).unwrap();
+        assert_eq!(r.from, tf_now() - Duration::days(365));
+        assert_eq!(r.to, None);
+    }
+
+    /// Only NARROWINGS are refused. `since_days=0` is raised to 1, which hands
+    /// the caller more than they asked for.
+    #[test]
+    fn range_raises_a_zero_window() {
+        let r = resolve_r(None, None, 0).unwrap();
+        assert_eq!(r.from, tf_now() - Duration::days(1));
     }
 
     #[test]

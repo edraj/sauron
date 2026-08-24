@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::models::*;
 use crate::query_plan::{Frag, PlanError};
 use crate::schema::*;
-use crate::scope::{EnvFilter, ReadScope};
+use crate::scope::{EnvFilter, Range, ReadScope};
 
 /// A validated ORDER BY.
 ///
@@ -6037,7 +6037,7 @@ pub struct EventCount {
 pub async fn top_events(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     limit: i64,
 ) -> QueryResult<Vec<EventCount>> {
     // The env fragment takes $3 when it needs a bind; `limit` therefore lands on
@@ -6046,18 +6046,22 @@ pub async fn top_events(
     // `EnvFilter::sql_fragment`'s doc for why only `One` consumes an index.
     let env_sql = scope.env.sql_fragment(3);
     let limit_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    // The window's upper bound is LAST, after `limit` — see `Range::upper_sql`
+    // for why it is never interleaved.
+    let upper_sql = range.upper_sql("occurred_at", limit_idx + 1);
 
     let q = format!(
         "SELECT name, count(*)::bigint AS count FROM analytics_events \
-         WHERE app_id = $1 AND occurred_at >= $2{env_sql} \
+         WHERE app_id = $1 AND occurred_at >= $2{env_sql}{upper_sql} \
          GROUP BY name ORDER BY count DESC LIMIT ${limit_idx}"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.bind::<BigInt, _>(limit).get_results(conn).await
+    stmt = stmt.bind::<BigInt, _>(limit);
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 #[derive(Debug, QueryableByName, serde::Serialize)]
@@ -6072,41 +6076,47 @@ pub async fn event_series(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     name: Option<&str>,
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<Vec<SeriesPoint>> {
     match name {
         Some(n) => {
-            // $1 app_id, $2 since, $3 name — env takes $4 when it needs a bind.
+            // $1 app_id, $2 since, $3 name — env takes $4 when it needs a bind,
+            // and the window's upper bound the next index after that.
             let env_sql = scope.env.sql_fragment(4);
+            let upper_idx = if scope.env.consumes_bind() { 5 } else { 4 };
+            let upper_sql = range.upper_sql("occurred_at", upper_idx);
             let q = format!(
                 "SELECT date_trunc('day', occurred_at) AS bucket, count(*)::bigint AS count \
                  FROM analytics_events \
-                 WHERE app_id = $1 AND occurred_at >= $2 AND name = $3{env_sql} \
+                 WHERE app_id = $1 AND occurred_at >= $2 AND name = $3{env_sql}{upper_sql} \
                  GROUP BY bucket ORDER BY bucket"
             );
             let mut stmt = diesel::sql_query(q)
                 .into_boxed()
                 .bind::<SqlUuid, _>(scope.app_id)
-                .bind::<Timestamptz, _>(since)
+                .bind::<Timestamptz, _>(range.from)
                 .bind::<Text, _>(n);
             stmt = crate::bind_env!(stmt, &scope.env);
-            stmt.get_results(conn).await
+            crate::bind_range!(stmt, range).get_results(conn).await
         }
         None => {
-            // $1 app_id, $2 since — env takes $3 when it needs a bind.
+            // $1 app_id, $2 since — env takes $3 when it needs a bind, and the
+            // window's upper bound the next index after that.
             let env_sql = scope.env.sql_fragment(3);
+            let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+            let upper_sql = range.upper_sql("occurred_at", upper_idx);
             let q = format!(
                 "SELECT date_trunc('day', occurred_at) AS bucket, count(*)::bigint AS count \
                  FROM analytics_events \
-                 WHERE app_id = $1 AND occurred_at >= $2{env_sql} \
+                 WHERE app_id = $1 AND occurred_at >= $2{env_sql}{upper_sql} \
                  GROUP BY bucket ORDER BY bucket"
             );
             let mut stmt = diesel::sql_query(q)
                 .into_boxed()
                 .bind::<SqlUuid, _>(scope.app_id)
-                .bind::<Timestamptz, _>(since);
+                .bind::<Timestamptz, _>(range.from);
             stmt = crate::bind_env!(stmt, &scope.env);
-            stmt.get_results(conn).await
+            crate::bind_range!(stmt, range).get_results(conn).await
         }
     }
 }
@@ -6118,21 +6128,25 @@ pub async fn issue_occurrence_series(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     issue_id: Uuid,
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<Vec<SeriesPoint>> {
-    // $1 issue_id, $2 app_id, $3 since — env takes $4 when it needs a bind.
+    // $1 issue_id, $2 app_id, $3 since — env takes $4 when it needs a bind, and
+    // the window's upper bound the next index after that.
     let env_sql = scope.env.sql_fragment(4);
+    let upper_idx = if scope.env.consumes_bind() { 5 } else { 4 };
+    let upper_sql = range.upper_sql("occurred_at", upper_idx);
     let mut stmt = diesel::sql_query(format!(
         "SELECT date_trunc('day', occurred_at) AS bucket, count(*)::bigint AS count \
          FROM error_events \
-         WHERE issue_id = $1 AND app_id = $2 AND occurred_at >= $3{env_sql} \
+         WHERE issue_id = $1 AND app_id = $2 AND occurred_at >= $3{env_sql}{upper_sql} \
          GROUP BY bucket ORDER BY bucket"
     ))
     .into_boxed()
     .bind::<SqlUuid, _>(issue_id)
     .bind::<SqlUuid, _>(scope.app_id)
-    .bind::<Timestamptz, _>(since);
+    .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
+    let stmt = crate::bind_range!(stmt, range);
     stmt.get_results(conn).await
 }
 
@@ -6714,14 +6728,14 @@ fn workflow_effective_status_sql() -> String {
 /// this subquery selects, and even if `environment_id` were visible there,
 /// filtering after the aggregate `eff`/`dur` projection would still compute
 /// them from every environment's rows first.
-fn workflow_outcome_subquery(env_sql: &str, name_pred: &str) -> String {
+fn workflow_outcome_subquery(env_sql: &str, name_pred: &str, up: &str) -> String {
     let eff = workflow_effective_status_sql();
     format!(
         "SELECT w.*, {eff} AS eff, \
                 CASE WHEN w.ended_at IS NOT NULL \
                      THEN EXTRACT(EPOCH FROM (w.ended_at - w.started_at)) * 1000 END AS dur \
          FROM workflows w \
-         WHERE w.app_id = $1 AND w.started_at >= now() - make_interval(days => $2){env_sql}{name_pred}"
+         WHERE w.app_id = $1 AND w.started_at >= $2{env_sql}{name_pred}{up}"
     )
 }
 
@@ -6794,7 +6808,7 @@ const WORKFLOW_OUTCOME_SELECT: &str = "\
 pub async fn workflow_list(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since_days: i32,
+    range: Range,
     search: Option<&str>,
     limit: i64,
     offset: i64,
@@ -6804,6 +6818,7 @@ pub async fn workflow_list(
     let search_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let limit_idx = search_idx + 1;
     let offset_idx = limit_idx + 1;
+    let up = range.upper_sql_for("w", "started_at", offset_idx + 1);
     let search_pattern = search.map(like_contains);
 
     // `sort` replaces a hard-coded `ORDER BY started DESC, w.name ASC`, which
@@ -6836,19 +6851,19 @@ pub async fn workflow_list(
          GROUP BY w.name \
          ORDER BY {order_by} \
          LIMIT ${limit_idx} OFFSET ${offset_idx}",
-        workflow_outcome_subquery(&env_sql, "")
+        workflow_outcome_subquery(&env_sql, "", &up)
     );
 
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Integer, _>(since_days);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.bind::<Nullable<Text>, _>(search_pattern)
+    let stmt = stmt
+        .bind::<Nullable<Text>, _>(search_pattern)
         .bind::<BigInt, _>(limit)
-        .bind::<BigInt, _>(offset)
-        .get_results(conn)
-        .await
+        .bind::<BigInt, _>(offset);
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 /// One contained event name and its count within a workflow — `top_events`'
@@ -6938,22 +6953,28 @@ pub async fn workflow_detail(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     name: &str,
-    since_days: i32,
+    range: Range,
 ) -> QueryResult<WorkflowDetail> {
     const NAME_PRED: &str = " AND w.name = $3";
+    // $1 app_id, $2 since, $3 name, $4 env — so the window's upper bound is
+    // $5 when an environment is selected and $4 when none is. The same number
+    // serves all three statements below, which share that bind layout.
+    let up_idx = if scope.env.consumes_bind() { 5 } else { 4 };
+    let up_w = range.upper_sql_for("w", "started_at", up_idx);
 
     // --- outcome/duration aggregate (one row) ------------------------------
     let env_sql = scope.env.sql_fragment_for("w", 4);
     let outcome_q = format!(
         "SELECT {WORKFLOW_OUTCOME_SELECT} FROM ({}) w GROUP BY w.name",
-        workflow_outcome_subquery(&env_sql, NAME_PRED)
+        workflow_outcome_subquery(&env_sql, NAME_PRED, &up_w)
     );
     let mut outcome_stmt = diesel::sql_query(outcome_q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Integer, _>(since_days)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(name);
     outcome_stmt = crate::bind_env!(outcome_stmt, &scope.env);
+    let outcome_stmt = crate::bind_range!(outcome_stmt, range);
     let outcome: WorkflowRow = outcome_stmt.get_result(conn).await?;
 
     // --- duration histogram (finished runs only) ---------------------------
@@ -6967,16 +6988,17 @@ pub async fn workflow_detail(
            SELECT {DURATION_BUCKET_CASE_SQL} AS bucket \
            FROM (SELECT EXTRACT(EPOCH FROM (w.ended_at - w.started_at)) * 1000 AS d \
                  FROM workflows w \
-                 WHERE w.app_id = $1 AND w.started_at >= now() - make_interval(days => $2) \
-                   AND w.name = $3 AND w.ended_at IS NOT NULL{env_sql}) s \
+                 WHERE w.app_id = $1 AND w.started_at >= $2 \
+                   AND w.name = $3 AND w.ended_at IS NOT NULL{env_sql}{up_w}) s \
          ) b GROUP BY bucket"
     );
     let mut buckets_stmt = diesel::sql_query(buckets_q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Integer, _>(since_days)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(name);
     buckets_stmt = crate::bind_env!(buckets_stmt, &scope.env);
+    let buckets_stmt = crate::bind_range!(buckets_stmt, range);
     let bucket_rows: Vec<HistoBucket> = buckets_stmt.get_results(conn).await?;
     let duration_buckets = order_histogram(bucket_rows);
 
@@ -6998,20 +7020,24 @@ pub async fn workflow_detail(
     // with a name always has an id. See task-4-report.md's "Fix round 1" for
     // both full plans.
     let env_sql = scope.env.sql_fragment(4);
+    // These two read the SIGNAL tables, so they bound `occurred_at` rather
+    // than `workflows.started_at` — the same window, a different column.
+    let up_occurred = range.upper_sql("occurred_at", up_idx);
     let events_q = format!(
         "SELECT name, COUNT(*)::bigint AS count \
          FROM analytics_events \
-         WHERE app_id = $1 AND occurred_at >= now() - make_interval(days => $2) \
+         WHERE app_id = $1 AND occurred_at >= $2 \
            AND workflow_name = $3 AND workflow_id IS NOT NULL \
-           AND name NOT LIKE '{WORKFLOW_LIFECYCLE_EVENT_PATTERN}'{env_sql} \
+           AND name NOT LIKE '{WORKFLOW_LIFECYCLE_EVENT_PATTERN}'{env_sql}{up_occurred} \
          GROUP BY name ORDER BY count DESC LIMIT 10"
     );
     let mut events_stmt = diesel::sql_query(events_q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Integer, _>(since_days)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(name);
     events_stmt = crate::bind_env!(events_stmt, &scope.env);
+    let events_stmt = crate::bind_range!(events_stmt, range);
     let top_events: Vec<NameCount> = events_stmt.get_results(conn).await?;
 
     // --- top contained issues -----------------------------------------------
@@ -7023,21 +7049,23 @@ pub async fn workflow_detail(
     // partial index. Measured on the dev app (210k error events): 52,559
     // buffers / cost 56,267 without it, 14 buffers / cost 2,043 with it.
     let env_sql = scope.env.sql_fragment_for("e", 4);
+    let up_e = range.upper_sql_for("e", "occurred_at", up_idx);
     let issues_q = format!(
         "SELECT i.id AS issue_id, i.title, COUNT(*)::bigint AS count \
          FROM error_events e \
          JOIN issues i ON i.id = e.issue_id \
-         WHERE e.app_id = $1 AND e.occurred_at >= now() - make_interval(days => $2) \
-           AND e.workflow_name = $3 AND e.workflow_id IS NOT NULL{env_sql} \
+         WHERE e.app_id = $1 AND e.occurred_at >= $2 \
+           AND e.workflow_name = $3 AND e.workflow_id IS NOT NULL{env_sql}{up_e} \
          GROUP BY i.id, i.title \
          ORDER BY count DESC LIMIT 10"
     );
     let mut issues_stmt = diesel::sql_query(issues_q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Integer, _>(since_days)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(name);
     issues_stmt = crate::bind_env!(issues_stmt, &scope.env);
+    let issues_stmt = crate::bind_range!(issues_stmt, range);
     let top_issues: Vec<WorkflowIssue> = issues_stmt.get_results(conn).await?;
 
     Ok(WorkflowDetail {
@@ -7097,7 +7125,7 @@ pub async fn workflow_runs(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     name: &str,
-    since_days: i32,
+    range: Range,
     status: Option<&str>,
     limit: i64,
     offset: i64,
@@ -7106,6 +7134,7 @@ pub async fn workflow_runs(
     let status_idx = if scope.env.consumes_bind() { 5 } else { 4 };
     let limit_idx = status_idx + 1;
     let offset_idx = limit_idx + 1;
+    let up = range.upper_sql_for("w", "started_at", offset_idx + 1);
     let eff = workflow_effective_status_sql();
 
     let q = format!(
@@ -7115,8 +7144,8 @@ pub async fn workflow_runs(
                      THEN (EXTRACT(EPOCH FROM (w.ended_at - w.started_at)) * 1000)::bigint END AS duration_ms, \
                 w.events_count, w.errors_count \
          FROM workflows w \
-         WHERE w.app_id = $1 AND w.started_at >= now() - make_interval(days => $2) \
-           AND w.name = $3{env_sql} \
+         WHERE w.app_id = $1 AND w.started_at >= $2 \
+           AND w.name = $3{env_sql}{up} \
            AND (${status_idx}::text IS NULL OR {eff} = ${status_idx}) \
          ORDER BY w.started_at DESC \
          LIMIT ${limit_idx} OFFSET ${offset_idx}"
@@ -7125,14 +7154,14 @@ pub async fn workflow_runs(
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Integer, _>(since_days)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(name);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.bind::<Nullable<Text>, _>(status)
+    let stmt = stmt
+        .bind::<Nullable<Text>, _>(status)
         .bind::<BigInt, _>(limit)
-        .bind::<BigInt, _>(offset)
-        .get_results(conn)
-        .await
+        .bind::<BigInt, _>(offset);
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 /// One workflow span within a session — for the session timeline lane.
@@ -7227,20 +7256,22 @@ pub async fn app_has_events(
 pub async fn error_series(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<Vec<SeriesPoint>> {
     let env_sql = scope.env.sql_fragment(3);
+    let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let upper_sql = range.upper_sql("occurred_at", upper_idx);
     let q = format!(
         "SELECT date_trunc('day', occurred_at) AS bucket, count(*)::bigint AS count \
-         FROM error_events WHERE app_id = $1 AND occurred_at >= $2{env_sql} \
+         FROM error_events WHERE app_id = $1 AND occurred_at >= $2{env_sql}{upper_sql} \
          GROUP BY bucket ORDER BY bucket"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.get_results(conn).await
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 // ===========================================================================
@@ -9083,7 +9114,7 @@ fn event_user_membership_exists(env: EnvFilter, bind_index: usize) -> String {
 pub async fn overview_totals(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<OverviewTotals> {
     // $1 app_id, $2 since, reused across all six sub-selects (as before). Env takes $3 when
     // it needs a bind, reused across the four sub-selects whose table actually carries
@@ -9096,6 +9127,17 @@ pub async fn overview_totals(
     let env_sql_analytics = scope.env.sql_fragment_for("analytics_events", 3);
     let env_sql_errors = scope.env.sql_fragment_for("error_events", 3);
     let env_sql_sessions = scope.env.sql_fragment_for("sessions", 3);
+
+    // The window's upper bound is one index past whatever the env fragment
+    // took, and is bound LAST. Each sub-select bounds the SAME column it
+    // already bounds below with `$2` — `occurred_at` for the two event tables,
+    // `last_event_at` for sessions, and `last_seen`/`first_seen` for the two
+    // `event_users` legs, whose lower bounds differ from each other.
+    let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let up_occurred = range.upper_sql("occurred_at", upper_idx);
+    let up_last_event = range.upper_sql("last_event_at", upper_idx);
+    let up_last_seen = range.upper_sql("last_seen", upper_idx);
+    let up_first_seen = range.upper_sql("first_seen", upper_idx);
 
     // `users`/`new_users` read `event_users`, which carries no `environment_id` — scoped by
     // membership (see `event_user_membership_exists`'s doc comment), the gap Task 8 deferred
@@ -9133,20 +9175,20 @@ pub async fn overview_totals(
     // and therefore inherits the same labelling caveat.
     let q = format!(
         "SELECT \
-           (SELECT count(*) FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2{env_sql_analytics})::bigint AS events, \
-           (SELECT count(*) FROM error_events WHERE app_id=$1 AND occurred_at>=$2{env_sql_errors})::bigint AS errors, \
-           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql_sessions})::bigint AS sessions, \
-           (SELECT count(*) FROM event_users WHERE app_id=$1 AND last_seen>=$2{membership_sql})::bigint AS users, \
-           (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql})::bigint AS new_users, \
-           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2 AND unhandled_errors_count>0{env_sql_sessions})::bigint AS crashed_sessions, \
-           EXISTS(SELECT 1 FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND handled IS NOT NULL{env_sql_errors}) AS has_crash_signal"
+           (SELECT count(*) FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2{env_sql_analytics}{up_occurred})::bigint AS events, \
+           (SELECT count(*) FROM error_events WHERE app_id=$1 AND occurred_at>=$2{env_sql_errors}{up_occurred})::bigint AS errors, \
+           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql_sessions}{up_last_event})::bigint AS sessions, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND last_seen>=$2{membership_sql}{up_last_seen})::bigint AS users, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql}{up_first_seen})::bigint AS new_users, \
+           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2 AND unhandled_errors_count>0{env_sql_sessions}{up_last_event})::bigint AS crashed_sessions, \
+           EXISTS(SELECT 1 FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND handled IS NOT NULL{env_sql_errors}{up_occurred}) AS has_crash_signal"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.get_result(conn).await
+    crate::bind_range!(stmt, range).get_result(conn).await
 }
 
 /// Same derivation as [`list_issues`] under `One`/`Unattributed` — see its
@@ -9183,13 +9225,18 @@ pub async fn overview_totals(
 pub async fn top_issues(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     limit: i64,
 ) -> QueryResult<Vec<Issue>> {
     if matches!(scope.env, EnvFilter::All) {
-        return issues::table
+        let mut q = issues::table
             .filter(issues::app_id.eq(scope.app_id))
-            .filter(issues::last_seen.ge(since))
+            .filter(issues::last_seen.ge(range.from))
+            .into_boxed();
+        if let Some(t) = range.to {
+            q = q.filter(issues::last_seen.lt(t));
+        }
+        return q
             .select(Issue::as_select())
             .order(issues::times_seen.desc())
             .limit(limit)
@@ -9200,6 +9247,17 @@ pub async fn top_issues(
     let env_bind_idx = 4usize;
     let env_sql = scope.env.sql_fragment_for("e", env_bind_idx);
     let member_env_sql = scope.env.sql_fragment_for("m", env_bind_idx);
+    // The window's upper bound goes on the `agg` LATERAL alone, and that is a
+    // correctness choice rather than an economy. The `i` subquery's
+    // `last_seen >= $2` reads the issue's APP-WIDE last_seen, which is only
+    // sound as a pre-filter in one direction: it can never be earlier than the
+    // windowed max, so a lower bound only drops rows the outer WHERE would
+    // drop anyway. An UPPER bound there is not sound — an issue last seen
+    // yesterday can still have occurrences inside a window that ended last
+    // week, and bounding the pre-filter would silently drop it. `agg.last_seen`
+    // is derived from the bounded LATERAL, so the outer `WHERE agg.last_seen >=
+    // $2` needs nothing either.
+    let up_occurred = range.upper_sql_for("e", "occurred_at", env_bind_idx + 1);
     // Task 9: same `latest` LATERAL as `list_issues`/`get_issue`, reusing
     // the identical `$4` env bind `agg` already consumes — see
     // `list_issues`' doc comment for the full title/culprit/level
@@ -9223,7 +9281,7 @@ pub async fn top_issues(
                     min(occurred_at) AS first_seen, \
                     max(occurred_at) AS last_seen \
              FROM error_events e \
-             WHERE e.issue_id = i.id AND e.occurred_at >= $2{env_sql} \
+             WHERE e.issue_id = i.id AND e.occurred_at >= $2{env_sql}{up_occurred} \
              HAVING count(*) > 0 \
          ) agg ON TRUE \
          LEFT JOIN LATERAL ( \
@@ -9240,9 +9298,10 @@ pub async fn top_issues(
     let mut stmt = diesel::sql_query(sql_text)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<BigInt, _>(limit);
     stmt = crate::bind_env!(stmt, &scope.env);
+    let stmt = crate::bind_range!(stmt, range);
     let rows: Vec<IssueRow> = stmt.get_results(conn).await?;
     Ok(rows.into_iter().map(Issue::from).collect())
 }
@@ -9561,7 +9620,7 @@ pub struct FunnelStepCount {
 /// counts, so a result-comparing test cannot see it. Retyping the SQL into the
 /// test would measure the copy instead, the trap `device_env_rollup`'s
 /// `EXPLAIN` tests call out.
-pub fn funnel_sql(env: &EnvFilter, steps: usize) -> String {
+pub fn funnel_sql(env: &EnvFilter, range: &Range, steps: usize) -> String {
     // $1 = app_id, $2 = since, $3 = env (only when env is One), then each step name in
     // order starting at the next free index.
     //
@@ -9574,6 +9633,15 @@ pub fn funnel_sql(env: &EnvFilter, steps: usize) -> String {
     let base_idx = if env.consumes_bind() { 4 } else { 3 };
     let env_sql_bare = env.sql_fragment(3);
     let env_sql_aliased = env.sql_fragment_for("a", 3);
+    // After every step name, which is the last bind the loop below allocates.
+    //
+    // Unlike the lower bound on steps 1..N, this one is NOT redundant by
+    // construction: `s{i}.t >= s{i-1}.t` bounds a step from BELOW only, so a
+    // step that happened after the window's end would still be counted. Every
+    // step therefore carries it.
+    let upper_idx = base_idx + steps;
+    let up_bare = range.upper_sql("occurred_at", upper_idx);
+    let up_aliased = range.upper_sql_for("a", "occurred_at", upper_idx);
 
     let mut ctes: Vec<String> = Vec::new();
     let mut selects: Vec<String> = Vec::new();
@@ -9582,7 +9650,7 @@ pub fn funnel_sql(env: &EnvFilter, steps: usize) -> String {
         if i == 0 {
             ctes.push(format!(
                 "s0 AS (SELECT distinct_id, min(occurred_at) AS t FROM analytics_events \
-                 WHERE app_id=$1 AND occurred_at>=$2 AND name=${name_param}{env_sql_bare} GROUP BY distinct_id)"
+                 WHERE app_id=$1 AND occurred_at>=$2 AND name=${name_param}{env_sql_bare}{up_bare} GROUP BY distinct_id)"
             ));
         } else {
             let prev = i - 1;
@@ -9601,7 +9669,7 @@ pub fn funnel_sql(env: &EnvFilter, steps: usize) -> String {
             ctes.push(format!(
                 "s{i} AS (SELECT a.distinct_id, min(a.occurred_at) AS t FROM analytics_events a \
                  JOIN s{prev} ON s{prev}.distinct_id = a.distinct_id \
-                 WHERE a.app_id=$1 AND a.name=${name_param}{env_sql_aliased} AND a.occurred_at>=$2 \
+                 WHERE a.app_id=$1 AND a.name=${name_param}{env_sql_aliased}{up_aliased} AND a.occurred_at>=$2 \
                  AND a.occurred_at >= s{prev}.t \
                  GROUP BY a.distinct_id)"
             ));
@@ -9623,19 +9691,19 @@ pub async fn funnel(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     steps: &[String],
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<Vec<FunnelStepCount>> {
-    let sql = funnel_sql(&scope.env, steps.len());
+    let sql = funnel_sql(&scope.env, &range, steps.len());
 
     let mut query = diesel::sql_query(sql)
         .into_boxed::<diesel::pg::Pg>()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     query = crate::bind_env!(query, &scope.env);
     for step in steps {
         query = query.bind::<Text, _>(step.clone());
     }
-    query.get_results(conn).await
+    crate::bind_range!(query, range).get_results(conn).await
 }
 
 // ===========================================================================
@@ -9688,7 +9756,7 @@ struct JourneyGraphRow {
 pub async fn journey_graph(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     depth: i64,
 ) -> QueryResult<(Vec<JourneyNode>, Vec<JourneyLink>)> {
     // $1 app_id, $2 since — env takes $3 when it needs a bind, which pushes depth/max_rows
@@ -9697,12 +9765,13 @@ pub async fn journey_graph(
     let env_sql = scope.env.sql_fragment(3);
     let depth_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let max_rows_idx = depth_idx + 1;
+    let up = range.upper_sql("occurred_at", max_rows_idx + 1);
 
     let q = format!(
         "WITH ordered AS ( \
            SELECT distinct_id, name, \
              (row_number() OVER (PARTITION BY distinct_id ORDER BY occurred_at) - 1) AS step \
-           FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2{env_sql}), \
+           FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2{env_sql}{up}), \
          capped AS (SELECT * FROM ordered WHERE step < ${depth_idx}), \
          nodes AS ( \
            SELECT step, name AS event, count(*)::bigint AS count \
@@ -9721,13 +9790,12 @@ pub async fn journey_graph(
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    let row: JourneyGraphRow = stmt
+    let stmt = stmt
         .bind::<BigInt, _>(depth)
-        .bind::<BigInt, _>(JOURNEY_MAX_ROWS)
-        .get_result(conn)
-        .await?;
+        .bind::<BigInt, _>(JOURNEY_MAX_ROWS);
+    let row: JourneyGraphRow = crate::bind_range!(stmt, range).get_result(conn).await?;
 
     let nodes = row
         .data
@@ -9773,7 +9841,7 @@ pub struct PerfSummaryRow {
 pub async fn performance_summary(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     op: Option<&str>,
     device_key: Option<&str>,
 ) -> QueryResult<Vec<PerfSummaryRow>> {
@@ -9782,6 +9850,7 @@ pub async fn performance_summary(
     // next free index ($5), rather than interleaved among them, so $3/$4 never renumber and
     // there's no collision to reason about.
     let env_sql = scope.env.sql_fragment(5);
+    let up = range.upper_sql("occurred_at", if scope.env.consumes_bind() { 6 } else { 5 });
     let q = format!(
         "SELECT name, op, count(*)::bigint AS count, \
            percentile_cont(0.5)  WITHIN GROUP (ORDER BY duration_ms) AS p50, \
@@ -9793,17 +9862,17 @@ pub async fn performance_summary(
              / NULLIF(count(*),0) AS error_rate \
          FROM transactions \
          WHERE app_id=$1 AND occurred_at>=$2 \
-           AND ($3::text IS NULL OR op=$3) AND ($4::text IS NULL OR device_key=$4){env_sql} \
+           AND ($3::text IS NULL OR op=$3) AND ($4::text IS NULL OR device_key=$4){env_sql}{up} \
          GROUP BY name, op ORDER BY count DESC LIMIT 100"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Nullable<Text>, _>(op)
         .bind::<Nullable<Text>, _>(device_key);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.get_results(conn).await
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 #[derive(Debug, QueryableByName, serde::Serialize)]
@@ -9821,13 +9890,14 @@ pub struct PerfSeriesPoint {
 pub async fn performance_series(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     name: Option<&str>,
     op: Option<&str>,
 ) -> QueryResult<Vec<PerfSeriesPoint>> {
     // Same shape as `performance_summary`: env appended after the pre-existing $3/$4
     // optional-filter idiom, at the next free index ($5), so those two never renumber.
     let env_sql = scope.env.sql_fragment(5);
+    let up = range.upper_sql("occurred_at", if scope.env.consumes_bind() { 6 } else { 5 });
     let q = format!(
         "SELECT date_trunc('hour', occurred_at) AS bucket, \
            percentile_cont(0.5)  WITHIN GROUP (ORDER BY duration_ms) AS p50, \
@@ -9835,17 +9905,17 @@ pub async fn performance_series(
            count(*)::bigint AS throughput \
          FROM transactions \
          WHERE app_id=$1 AND occurred_at>=$2 \
-           AND ($3::text IS NULL OR name=$3) AND ($4::text IS NULL OR op=$4){env_sql} \
+           AND ($3::text IS NULL OR name=$3) AND ($4::text IS NULL OR op=$4){env_sql}{up} \
          GROUP BY bucket ORDER BY bucket LIMIT 5000"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Nullable<Text>, _>(name)
         .bind::<Nullable<Text>, _>(op);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.get_results(conn).await
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 // ---------------------------------------------------------------------------
@@ -9907,7 +9977,7 @@ pub struct UserStats {
 pub async fn user_stats(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     now: DateTime<Utc>,
 ) -> QueryResult<UserStats> {
     let env_sql = scope.env.sql_fragment(3);
@@ -9920,11 +9990,18 @@ pub async fn user_stats(
     // compares a timestamp against a uuid.
     let n = if scope.env.consumes_bind() { 4 } else { 3 };
     let (b1, b7, b30) = (n, n + 1, n + 2);
+    // Last of all, after the three cutoffs. Only the three window-scoped legs
+    // take it: `total_users` is all-time by definition, and dau/wau/mau are
+    // rolling spans anchored on `now`, which the caller sets to the window's
+    // own end — bounding them again here would double-apply it.
+    let up_last_seen = range.upper_sql("last_seen", b30 + 1);
+    let up_first_seen = range.upper_sql("first_seen", b30 + 1);
+    let up_last_event = range.upper_sql("last_event_at", b30 + 1);
     let q = format!(
         "SELECT \
            (SELECT count(*) FROM event_users WHERE app_id=$1{membership_sql})::bigint AS total_users, \
-           (SELECT count(*) FROM event_users WHERE app_id=$1 AND last_seen>=$2{membership_sql})::bigint AS active_in_range, \
-           (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql})::bigint AS new_in_range, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND last_seen>=$2{membership_sql}{up_last_seen})::bigint AS active_in_range, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql}{up_first_seen})::bigint AS new_in_range, \
            (SELECT count(DISTINCT distinct_id) FROM ( \
               SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= ${b1}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
               UNION ALL \
@@ -9941,14 +10018,14 @@ pub async fn user_stats(
               SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= ${b30}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
             ) d30)::bigint AS mau, \
            COALESCE((SELECT avg(EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \
-                     FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}), 0)::double precision AS avg_session_ms, \
+                     FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}{up_last_event}), 0)::double precision AS avg_session_ms, \
            COALESCE((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \
-                     FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}), 0)::double precision AS median_session_ms"
+                     FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}{up_last_event}), 0)::double precision AS median_session_ms"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     // `bind_env!` sits BETWEEN `since` and the three cutoffs so positional
     // order matches the indices computed above.
     stmt = crate::bind_env!(stmt, &scope.env);
@@ -9956,7 +10033,7 @@ pub async fn user_stats(
         .bind::<Timestamptz, _>(now - chrono::Duration::days(1))
         .bind::<Timestamptz, _>(now - chrono::Duration::days(7))
         .bind::<Timestamptz, _>(now - chrono::Duration::days(30));
-    stmt.get_result(conn).await
+    crate::bind_range!(stmt, range).get_result(conn).await
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -9998,25 +10075,28 @@ pub fn merge_user_series(active: Vec<SeriesPoint>, new: Vec<SeriesPoint>) -> Vec
 pub async fn active_user_series(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<Vec<UserSeriesPoint>> {
     let env_sql = scope.env.sql_fragment(3);
+    let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let up_occurred = range.upper_sql("occurred_at", upper_idx);
     let active_q = format!(
         "SELECT date_trunc('day', occurred_at) AS bucket, count(DISTINCT distinct_id)::bigint AS count \
          FROM ( \
             SELECT occurred_at, distinct_id FROM analytics_events \
-              WHERE app_id=$1 AND occurred_at>=$2{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              WHERE app_id=$1 AND occurred_at>=$2{env_sql}{up_occurred} AND distinct_id IS NOT NULL AND distinct_id <> '' \
             UNION ALL \
             SELECT occurred_at, distinct_id FROM error_events \
-              WHERE app_id=$1 AND occurred_at>=$2{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              WHERE app_id=$1 AND occurred_at>=$2{env_sql}{up_occurred} AND distinct_id IS NOT NULL AND distinct_id <> '' \
          ) u \
          GROUP BY bucket ORDER BY bucket"
     );
     let mut active_stmt = diesel::sql_query(active_q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     active_stmt = crate::bind_env!(active_stmt, &scope.env);
+    let active_stmt = crate::bind_range!(active_stmt, range);
     let active: Vec<SeriesPoint> = active_stmt.get_results(conn).await?;
 
     // `.clone()`, not a move: the second `bind_env!` call below (for
@@ -10024,16 +10104,18 @@ pub async fn active_user_series(
     // call for why `event_user_membership_exists` itself is not reshaped to
     // take `&EnvFilter` instead.
     let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
+    let up_first_seen = range.upper_sql("first_seen", upper_idx);
     let new_q = format!(
         "SELECT date_trunc('day', first_seen) AS bucket, count(*)::bigint AS count \
-         FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql} \
+         FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql}{up_first_seen} \
          GROUP BY bucket ORDER BY bucket"
     );
     let mut new_stmt = diesel::sql_query(new_q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     new_stmt = crate::bind_env!(new_stmt, &scope.env);
+    let new_stmt = crate::bind_range!(new_stmt, range);
     let new: Vec<SeriesPoint> = new_stmt.get_results(conn).await?;
 
     Ok(merge_user_series(active, new))
@@ -10109,7 +10191,7 @@ pub fn order_histogram(rows: Vec<HistoBucket>) -> Vec<HistoBucket> {
 pub async fn session_stats(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<SessionStats> {
     // $1 app_id, $2 since, reused across all four sub-selects, all against `sessions` — env
     // takes $3 when it needs a bind, reused the same way.
@@ -10121,61 +10203,71 @@ pub async fn session_stats(
     // known environment-mislabelling gap — see `bump_session`'s doc comment and
     // `.superpowers/sdd/2026-07-29-environment-rbac-scope/task-10-report.md`.
     let env_sql = scope.env.sql_fragment(3);
+    let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let up = range.upper_sql("last_event_at", upper_idx);
     let q = format!(
         "SELECT \
-           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql})::bigint AS sessions, \
-           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2 AND unhandled_errors_count>0{env_sql})::bigint AS crashed, \
+           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}{up})::bigint AS sessions, \
+           (SELECT count(*) FROM sessions WHERE app_id=$1 AND last_event_at>=$2 AND unhandled_errors_count>0{env_sql}{up})::bigint AS crashed, \
            COALESCE((SELECT avg(EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \
-                     FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}), 0)::double precision AS avg_session_ms, \
+                     FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}{up}), 0)::double precision AS avg_session_ms, \
            COALESCE((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \
-                     FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}), 0)::double precision AS median_session_ms"
+                     FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}{up}), 0)::double precision AS median_session_ms"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.get_result(conn).await
+    crate::bind_range!(stmt, range).get_result(conn).await
 }
 
 pub async fn session_duration_series(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<Vec<SeriesAvgPoint>> {
     let env_sql = scope.env.sql_fragment(3);
+    let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    // `started_at`, matching this query's own lower bound — the bucket column.
+    // `session_stats` next door bounds `last_event_at`; they window different
+    // columns on purpose and the upper bound has to follow each one.
+    let up = range.upper_sql("started_at", upper_idx);
     let q = format!(
         "SELECT date_trunc('day', started_at) AS bucket, \
                 COALESCE(avg(EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000), 0)::double precision AS avg_ms \
-         FROM sessions WHERE app_id=$1 AND started_at>=$2{env_sql} \
+         FROM sessions WHERE app_id=$1 AND started_at>=$2{env_sql}{up} \
          GROUP BY bucket ORDER BY bucket"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.get_results(conn).await
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 pub async fn session_duration_histogram(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
 ) -> QueryResult<Vec<HistoBucket>> {
     let env_sql = scope.env.sql_fragment(3);
+    let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let up = range.upper_sql("last_event_at", upper_idx);
     let q = format!(
         "SELECT bucket, count(*)::bigint AS count FROM ( \
            SELECT {DURATION_BUCKET_CASE_SQL} AS bucket \
            FROM (SELECT EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000 AS d \
-                 FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}) s \
+                 FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}{up}) s \
          ) b GROUP BY bucket"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
+    let stmt = crate::bind_range!(stmt, range);
     let rows: Vec<HistoBucket> = stmt.get_results(conn).await?;
     Ok(order_histogram(rows))
 }
@@ -10463,27 +10555,27 @@ pub fn avg_dwell(total_ms: f64, views: i64) -> f64 {
 ///   the first place (a session's own events are expected to share one
 ///   environment, matching `pred`'s screen-membership semantics: restrict
 ///   *inputs*, not just outputs, for correctness).
-fn screen_ctes(pred: &str, env_sql: &str) -> String {
+fn screen_ctes(pred: &str, env_sql: &str, up: &str) -> String {
     format!(
         "WITH ev AS ( \
         SELECT screen, \
           count(*) FILTER (WHERE name='$screen')::bigint AS views, \
           count(*) FILTER (WHERE name<>'$screen')::bigint AS events \
-        FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred}{env_sql} GROUP BY screen), \
+        FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred}{env_sql}{up} GROUP BY screen), \
       ex AS ( \
         SELECT screen, count(*)::bigint AS exceptions \
-        FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred}{env_sql} GROUP BY screen), \
+        FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred}{env_sql}{up} GROUP BY screen), \
       us AS ( \
         SELECT screen, count(DISTINCT distinct_id)::bigint AS users FROM ( \
-          SELECT screen, distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred}{env_sql} AND distinct_id IS NOT NULL AND distinct_id<>'' \
+          SELECT screen, distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred}{env_sql}{up} AND distinct_id IS NOT NULL AND distinct_id<>'' \
           UNION ALL \
-          SELECT screen, distinct_id FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred}{env_sql} AND distinct_id IS NOT NULL AND distinct_id<>'' \
+          SELECT screen, distinct_id FROM error_events WHERE app_id=$1 AND occurred_at>=$2 AND screen IS NOT NULL AND {pred}{env_sql}{up} AND distinct_id IS NOT NULL AND distinct_id<>'' \
         ) u GROUP BY screen), \
       dw AS ( \
         SELECT screen, sum(LEAST(raw_ms, 1800000))::double precision AS total_dwell_ms FROM ( \
           SELECT screen, EXTRACT(EPOCH FROM ( \
             LEAD(occurred_at) OVER (PARTITION BY session_id ORDER BY occurred_at) - occurred_at)) * 1000 AS raw_ms \
-          FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND session_id IS NOT NULL AND screen IS NOT NULL{env_sql}) g \
+          FROM analytics_events WHERE app_id=$1 AND occurred_at>=$2 AND session_id IS NOT NULL AND screen IS NOT NULL{env_sql}{up}) g \
         WHERE raw_ms IS NOT NULL AND raw_ms > 0 AND {pred} GROUP BY screen), \
       keys AS (SELECT screen FROM ev UNION SELECT screen FROM ex) "
     )
@@ -10512,7 +10604,7 @@ const SCREEN_PRED_LIKE: &str = "screen ILIKE $3";
 pub async fn screen_list(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     q_pattern: &str, // '%' for no filter, else like_contains(term)
     limit: i64,
     offset: i64,
@@ -10525,6 +10617,7 @@ pub async fn screen_list(
     let env_sql = scope.env.sql_fragment(4);
     let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
     let offset_idx = limit_idx + 1;
+    let up = range.upper_sql("occurred_at", offset_idx + 1);
     // Every sortable name here is an OUTPUT ALIAS of this select list (or
     // `k.screen`, the tiebreak), which is what lets a bare `views`/`users`
     // resolve at all: `ev.views` and the aliased `views` are the same value,
@@ -10543,30 +10636,29 @@ pub async fn screen_list(
          LEFT JOIN ev ON ev.screen=k.screen LEFT JOIN ex ON ex.screen=k.screen \
          LEFT JOIN us ON us.screen=k.screen LEFT JOIN dw ON dw.screen=k.screen \
          ORDER BY {order_by} LIMIT ${limit_idx} OFFSET ${offset_idx}",
-        screen_ctes(SCREEN_PRED_LIKE, &env_sql)
+        screen_ctes(SCREEN_PRED_LIKE, &env_sql, &up)
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(q_pattern);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.bind::<BigInt, _>(limit)
-        .bind::<BigInt, _>(offset)
-        .get_results(conn)
-        .await
+    let stmt = stmt.bind::<BigInt, _>(limit).bind::<BigInt, _>(offset);
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 pub async fn screen_stats(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     name: &str,
 ) -> QueryResult<ScreenStats> {
     // $1 app_id, $2 since, $3 name (SCREEN_PRED_EXACT's own bind) — env takes
     // $4 when it needs a bind. No trailing binds after it, so unlike
     // `screen_list` nothing needs to shift.
     let env_sql = scope.env.sql_fragment(4);
+    let up = range.upper_sql("occurred_at", if scope.env.consumes_bind() { 5 } else { 4 });
     let q = format!(
         "{} \
          SELECT k.screen, \
@@ -10580,15 +10672,15 @@ pub async fn screen_stats(
          LEFT JOIN ev ON ev.screen=k.screen LEFT JOIN ex ON ex.screen=k.screen \
          LEFT JOIN us ON us.screen=k.screen LEFT JOIN dw ON dw.screen=k.screen \
          WHERE k.screen = $3",
-        screen_ctes(SCREEN_PRED_EXACT, &env_sql)
+        screen_ctes(SCREEN_PRED_EXACT, &env_sql, &up)
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(name);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.get_result(conn).await
+    crate::bind_range!(stmt, range).get_result(conn).await
 }
 
 /// One page of a screen's analytics events, most recent first.
@@ -10608,16 +10700,19 @@ pub async fn recent_events_for_screen(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     screen: &str,
-    since: DateTime<Utc>,
+    range: Range,
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<AnalyticsEvent>> {
-    let q = analytics_events::table
+    let mut q = analytics_events::table
         .filter(analytics_events::app_id.eq(scope.app_id))
         .filter(analytics_events::screen.eq(screen))
-        .filter(analytics_events::occurred_at.ge(since))
+        .filter(analytics_events::occurred_at.ge(range.from))
         .filter(analytics_events::name.ne("$screen"))
         .into_boxed();
+    if let Some(t) = range.to {
+        q = q.filter(analytics_events::occurred_at.lt(t));
+    }
     crate::scope_env!(q, analytics_events, &scope.env)
         .select(AnalyticsEvent::as_select())
         .order((
@@ -10639,15 +10734,18 @@ pub async fn recent_exceptions_for_screen(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     screen: &str,
-    since: DateTime<Utc>,
+    range: Range,
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<ErrorEvent>> {
-    let q = error_events::table
+    let mut q = error_events::table
         .filter(error_events::app_id.eq(scope.app_id))
         .filter(error_events::screen.eq(screen))
-        .filter(error_events::occurred_at.ge(since))
+        .filter(error_events::occurred_at.ge(range.from))
         .into_boxed();
+    if let Some(t) = range.to {
+        q = q.filter(error_events::occurred_at.lt(t));
+    }
     let mut rows: Vec<ErrorEvent> = crate::scope_env!(q, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order((error_events::occurred_at.desc(), error_events::id.desc()))
@@ -10683,17 +10781,17 @@ pub async fn recent_exceptions_for_screen(
 /// `analytics_events_app_screen_time_idx` / `error_events_app_screen_time_idx`
 /// (`WHERE screen IS NOT NULL`, a predicate `screen = $3` implies). This is
 /// the difference between an index scan and a scan of every partition.
-fn screen_signal_union(key_col: &str, env_sql: &str) -> String {
+fn screen_signal_union(key_col: &str, env_sql: &str, up: &str) -> String {
     format!(
         "SELECT {key_col} AS k, name, occurred_at, 'e'::text AS src \
          FROM analytics_events \
          WHERE app_id=$1 AND occurred_at>=$2 AND screen=$3 \
-           AND {key_col} IS NOT NULL AND {key_col}<>''{env_sql} \
+           AND {key_col} IS NOT NULL AND {key_col}<>''{env_sql}{up} \
          UNION ALL \
          SELECT {key_col} AS k, NULL::text AS name, occurred_at, 'x'::text AS src \
          FROM error_events \
          WHERE app_id=$1 AND occurred_at>=$2 AND screen=$3 \
-           AND {key_col} IS NOT NULL AND {key_col}<>''{env_sql}"
+           AND {key_col} IS NOT NULL AND {key_col}<>''{env_sql}{up}"
     )
 }
 
@@ -10786,7 +10884,7 @@ pub async fn users_for_screen(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     screen: &str,
-    since: DateTime<Utc>,
+    range: Range,
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<ScreenUserRow>> {
@@ -10797,7 +10895,8 @@ pub async fn users_for_screen(
     let env_sql = scope.env.sql_fragment(4);
     let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
     let offset_idx = limit_idx + 1;
-    let sig = screen_signal_union("distinct_id", &env_sql);
+    let up = range.upper_sql("occurred_at", offset_idx + 1);
+    let sig = screen_signal_union("distinct_id", &env_sql, &up);
     let q = format!(
         "WITH sig AS ({sig}), agg AS ({SCREEN_ACTOR_AGG}) \
          SELECT agg.k AS distinct_id, \
@@ -10815,13 +10914,11 @@ pub async fn users_for_screen(
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(screen);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.bind::<BigInt, _>(limit)
-        .bind::<BigInt, _>(offset)
-        .get_results(conn)
-        .await
+    let stmt = stmt.bind::<BigInt, _>(limit).bind::<BigInt, _>(offset);
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 /// One page of the devices that produced signal on `screen`, most recently
@@ -10834,7 +10931,7 @@ pub async fn devices_for_screen(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     screen: &str,
-    since: DateTime<Utc>,
+    range: Range,
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<ScreenDeviceRow>> {
@@ -10842,7 +10939,8 @@ pub async fn devices_for_screen(
     let env_sql = scope.env.sql_fragment(4);
     let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
     let offset_idx = limit_idx + 1;
-    let sig = screen_signal_union("device_key", &env_sql);
+    let up = range.upper_sql("occurred_at", offset_idx + 1);
+    let sig = screen_signal_union("device_key", &env_sql, &up);
     let q = format!(
         "WITH sig AS ({sig}), agg AS ({SCREEN_ACTOR_AGG}) \
          SELECT agg.k AS device_key, \
@@ -10860,13 +10958,11 @@ pub async fn devices_for_screen(
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(screen);
     stmt = crate::bind_env!(stmt, &scope.env);
-    stmt.bind::<BigInt, _>(limit)
-        .bind::<BigInt, _>(offset)
-        .get_results(conn)
-        .await
+    let stmt = stmt.bind::<BigInt, _>(limit).bind::<BigInt, _>(offset);
+    crate::bind_range!(stmt, range).get_results(conn).await
 }
 
 #[cfg(test)]
@@ -19129,13 +19225,13 @@ async fn screen_candidates(
 pub async fn count_screens(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     q_pattern: &str,
     cap: i64,
 ) -> QueryResult<(i64, bool)> {
     let candidates = screen_candidates(conn, scope.app_id, q_pattern, cap + 1).await?;
     if candidates.len() as i64 > cap {
-        return count_screens_by_aggregate(conn, scope, since, q_pattern, cap).await;
+        return count_screens_by_aggregate(conn, scope, range, q_pattern, cap).await;
     }
     if candidates.is_empty() {
         return Ok((0, false));
@@ -19147,22 +19243,22 @@ pub async fn count_screens(
     let env_a = scope.env.sql_fragment_for("a", 3);
     let env_e = scope.env.sql_fragment_for("e", 3);
     let arr_idx = if scope.env.consumes_bind() { 4 } else { 3 };
+    let up_a = range.upper_sql_for("a", "occurred_at", arr_idx + 1);
+    let up_e = range.upper_sql_for("e", "occurred_at", arr_idx + 1);
     let q = format!(
         "SELECT count(*)::bigint AS total FROM unnest(${arr_idx}::text[]) AS s(screen) \
          WHERE EXISTS (SELECT 1 FROM analytics_events a \
-                 WHERE a.app_id = $1 AND a.screen = s.screen AND a.occurred_at >= $2{env_a}) \
+                 WHERE a.app_id = $1 AND a.screen = s.screen AND a.occurred_at >= $2{env_a}{up_a}) \
             OR EXISTS (SELECT 1 FROM error_events e \
-                 WHERE e.app_id = $1 AND e.screen = s.screen AND e.occurred_at >= $2{env_e})"
+                 WHERE e.app_id = $1 AND e.screen = s.screen AND e.occurred_at >= $2{env_e}{up_e})"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    let row: BoundedCount = stmt
-        .bind::<Array<Text>, _>(candidates)
-        .get_result(conn)
-        .await?;
+    let stmt = stmt.bind::<Array<Text>, _>(candidates);
+    let row: BoundedCount = crate::bind_range!(stmt, range).get_result(conn).await?;
     // Never above `cap`: the candidate list was already bounded by it, and a
     // probe can only remove names. `capped` is still the shape the caller
     // expects, so the pair is built the same way on both paths.
@@ -19180,7 +19276,7 @@ pub async fn count_screens(
 async fn count_screens_by_aggregate(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since: DateTime<Utc>,
+    range: Range,
     q_pattern: &str,
     cap: i64,
 ) -> QueryResult<(i64, bool)> {
@@ -19189,22 +19285,20 @@ async fn count_screens_by_aggregate(
     let env_sql = scope.env.sql_fragment(4);
     let limit_idx = if scope.env.consumes_bind() { 5 } else { 4 };
     let offset_idx = limit_idx + 1;
+    let up = range.upper_sql("occurred_at", offset_idx + 1);
     let q = format!(
         "{} SELECT count(*)::bigint AS total FROM ( \
            SELECT k.screen FROM keys k LIMIT ${limit_idx} OFFSET ${offset_idx}) c",
-        screen_ctes(SCREEN_PRED_LIKE, &env_sql)
+        screen_ctes(SCREEN_PRED_LIKE, &env_sql, &up)
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Timestamptz, _>(since)
+        .bind::<Timestamptz, _>(range.from)
         .bind::<Text, _>(q_pattern);
     stmt = crate::bind_env!(stmt, &scope.env);
-    let row: BoundedCount = stmt
-        .bind::<BigInt, _>(cap + 1)
-        .bind::<BigInt, _>(0i64)
-        .get_result(conn)
-        .await?;
+    let stmt = stmt.bind::<BigInt, _>(cap + 1).bind::<BigInt, _>(0i64);
+    let row: BoundedCount = crate::bind_range!(stmt, range).get_result(conn).await?;
     Ok(capped(row.total, cap))
 }
 
@@ -19215,7 +19309,7 @@ async fn count_screens_by_aggregate(
 pub async fn count_workflows(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
-    since_days: i32,
+    range: Range,
     search: Option<&str>,
     cap: i64,
 ) -> QueryResult<(i64, bool)> {
@@ -19223,6 +19317,7 @@ pub async fn count_workflows(
     let search_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let limit_idx = search_idx + 1;
     let offset_idx = limit_idx + 1;
+    let up = range.upper_sql_for("w", "started_at", offset_idx + 1);
     let search_pattern = search.map(like_contains);
     let q = format!(
         "SELECT count(*)::bigint AS total FROM ( \
@@ -19230,19 +19325,18 @@ pub async fn count_workflows(
            WHERE (${search_idx}::text IS NULL OR w.name ILIKE ${search_idx}) \
            GROUP BY w.name \
            LIMIT ${limit_idx} OFFSET ${offset_idx}) c",
-        workflow_outcome_subquery(&env_sql, "")
+        workflow_outcome_subquery(&env_sql, "", &up)
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)
-        .bind::<Integer, _>(since_days);
+        .bind::<Timestamptz, _>(range.from);
     stmt = crate::bind_env!(stmt, &scope.env);
-    let row: BoundedCount = stmt
+    let stmt = stmt
         .bind::<Nullable<Text>, _>(search_pattern)
         .bind::<BigInt, _>(cap + 1)
-        .bind::<BigInt, _>(0i64)
-        .get_result(conn)
-        .await?;
+        .bind::<BigInt, _>(0i64);
+    let row: BoundedCount = crate::bind_range!(stmt, range).get_result(conn).await?;
     Ok(capped(row.total, cap))
 }
 

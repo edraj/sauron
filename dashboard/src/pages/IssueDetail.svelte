@@ -22,6 +22,7 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
+  import { lastDays, toPredicate, type DateRangeValue } from '../lib/models/date-range';
   import { OCCURRENCE_FIELDS, encodeFilters, type Filter } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { lockedBy } from '../lib/models/page-access';
@@ -100,6 +101,7 @@
   const OCC_LIMIT = 50;
   /** Default occurrence window: 3650d is the backend's effective-"all" cap. */
   const OCC_SINCE_DEFAULT = 3650;
+  const OCC_RANGE_DEFAULT: DateRangeValue = lastDays(OCC_SINCE_DEFAULT);
 
   let occLoading = $state(false);
   let occFilters = $state<Filter[]>([]);
@@ -107,7 +109,11 @@
   let occSearch = $state('');
   /** The query the rows below ran — written only by `onOccSearch`. */
   let occApplied = $state('');
-  let occSince = $state(OCC_SINCE_DEFAULT);
+  // NOT seeded from `rangeStore`: this window is the issue's own occurrence
+  // history, which defaults to everything. Adopting a 7-day global
+  // selection here would open an issue page showing none of its
+  // occurrences, which reads as a missing-data bug.
+  let occRange = $state<DateRangeValue>(OCC_RANGE_DEFAULT);
   let occStats = $state<IssueEventStats | null>(null);
   let occTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -219,14 +225,14 @@
    *
    * Plain `let`, not `$state`: only the imperative page handlers read it, and
    * nothing renders it. It is seeded from the same constants `occFilters`,
-   * `occSearch` and `occSince` start at rather than by reading those back — a
+   * `occSearch` and `occRange` start at rather than by reading those back — a
    * read here would capture the initial value of reactive state and mean
    * nothing, which is precisely what `state_referenced_locally` warns about.
    */
-  let occQuery: { enc: string[]; term: string; since: number } = {
+  let occQuery: { enc: string[]; term: string; since: DateRangeValue } = {
     enc: [],
     term: '',
-    since: OCC_SINCE_DEFAULT,
+    since: OCC_RANGE_DEFAULT,
   };
 
   /**
@@ -243,7 +249,7 @@
     id: string,
     enc: string[],
     term: string,
-    since: number,
+    since: DateRangeValue,
     l: CursorListState,
   ) {
     const gen = ++occGen;
@@ -276,7 +282,7 @@
     const params: SearchPredicateParams = {
       filters: enc,
       query: term || undefined,
-      sinceDays: since,
+      ...toPredicate(since),
     };
     try {
       // Issued together so the counts and the rows they describe swap in on the
@@ -419,7 +425,7 @@
     // `occApplied`, never `occSearch`: reading the typed text here is what
     // makes the box fire a request per keystroke.
     const term = occApplied;
-    const since = occSince;
+    const since = occRange;
     if (!aid || !id) return;
     clearTimeout(occTimer);
     occTimer = setTimeout(() => {
@@ -725,7 +731,7 @@
             fields={OCCURRENCE_FIELDS}
             bind:filters={occFilters}
             bind:search={occSearch}
-            bind:sinceDays={occSince}
+            bind:range={occRange}
             appId={sessionStore.currentAppId ?? undefined}
             context="occurrences"
             error={occSearchError}

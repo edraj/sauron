@@ -4,7 +4,7 @@
 
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::Json;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -20,6 +20,12 @@ pub struct FunnelReq {
     pub steps: Vec<String>,
     #[serde(default = "default_days")]
     pub since_days: i64,
+    /// Absolute window bounds, `from` INCLUSIVE and `to` EXCLUSIVE, overriding
+    /// `since_days` when either is present. A JSON body rather than a query
+    /// string here, so the flatten trap `analytics::RangeQuery` documents does
+    /// not apply — but the same two fields keep the shape recognisable.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // No bespoke query struct for `compute`: it takes only `environment_id`,
@@ -72,9 +78,16 @@ pub async fn compute(
         raw_query.as_deref(),
     )
     .await?;
-    let since = Utc::now() - Duration::days(req.since_days.clamp(1, 365));
+    let win = super::search::resolve_range(
+        "occurred_at",
+        req.from,
+        req.to,
+        req.since_days,
+        Utc::now(),
+        365,
+    )?;
 
-    let rows = repo::funnel(&mut conn, scope, &req.steps, since).await?;
+    let rows = repo::funnel(&mut conn, scope, &req.steps, win).await?;
     // rows come back ordered by step; index defensively by step id.
     let mut counts = vec![0i64; req.steps.len()];
     for r in rows {

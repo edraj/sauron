@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
+  import { t, localeStore, intlTag } from '../lib/i18n';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -7,6 +7,13 @@
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import {
+    formatAbsolute,
+    rangeKey,
+    spanDays,
+    type DateRangeValue,
+  } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import BarList from '../lib/components/BarList.svelte';
@@ -42,7 +49,21 @@
     { days: 90, label: '90d' },
   ];
 
-  let sinceDays = $state(30);
+  // The SHARED selection, falling back to this page's own 30 days until the
+  // user has chosen one. See `stores/range.svelte.ts`.
+  let range = $state<DateRangeValue>(rangeStore.effective(30));
+  /** The cache-key component. Never the resolved instants — those move. */
+  const rkey = $derived(rangeKey(range));
+  /**
+   * The window, in words. A custom range reads as its own label ("July 2026")
+   * rather than "the last 31 days", which would be true but is not what the
+   * user asked for.
+   */
+  const rangeCaption = $derived(
+    range.kind === 'last'
+      ? `the last ${spanDays(range)} days`
+      : formatAbsolute(range, intlTag(localeStore.locale)),
+  );
 
   /**
    * The current app, for the store-section gate.
@@ -202,7 +223,8 @@
    * the axios interceptor adds to the request but which appears in none of these
    * arguments — omit it and one environment's overview is served as another's.
    */
-  async function load(appId: string, days: number, force = false) {
+  async function load(appId: string, win: DateRangeValue, force = false) {
+    const key = rangeKey(win);
     const scope = sessionStore.scopeKey;
     // Started together and NOT awaited in sequence: awaiting them one after
     // another here would rebuild exactly the sum-of-latencies the split exists to
@@ -210,28 +232,28 @@
     // through its own view, and one 403 or timeout must not abort the others.
     await Promise.allSettled([
       totalsView.load(
-        viewKey('overview.totals', appId, scope, days),
-        () => getOverviewTotals(appId, days),
+        viewKey('overview.totals', appId, scope, key),
+        () => getOverviewTotals(appId, win),
         force,
       ),
       seriesView.load(
-        viewKey('overview.series', appId, scope, days),
-        () => getOverviewSeries(appId, days),
+        viewKey('overview.series', appId, scope, key),
+        () => getOverviewSeries(appId, win),
         force,
       ),
       issuesView.load(
-        viewKey('overview.topIssues', appId, scope, days),
-        () => getOverviewTopIssues(appId, days),
+        viewKey('overview.topIssues', appId, scope, key),
+        () => getOverviewTopIssues(appId, win),
         force,
       ),
       eventsView.load(
-        viewKey('overview.topEvents', appId, scope, days),
-        () => getOverviewTopEvents(appId, days),
+        viewKey('overview.topEvents', appId, scope, key),
+        () => getOverviewTopEvents(appId, win),
         force,
       ),
       activeUsersView.load(
-        viewKey('overview.activeUsers', appId, scope, days),
-        () => getActiveUsersSeries(appId, days),
+        viewKey('overview.activeUsers', appId, scope, key),
+        () => getActiveUsersSeries(appId, win),
         force,
       ),
     ]);
@@ -242,8 +264,8 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
-    if (aid) void load(aid, days);
+    const win = range;
+    if (aid) void load(aid, win);
   });
 
   /**
@@ -265,19 +287,20 @@
   $effect(() => {
     const aid = sessionStore.currentAppId;
     const scope = sessionStore.scopeKey;
-    const days = sinceDays;
+    const win = range;
+    const key = rkey;
     if (!aid) return;
 
-    const handle = openOverviewStream(aid, days, {
+    const handle = openOverviewStream(aid, win, {
       onSection: (frame) => {
         const target = SECTION_VIEWS[frame.section];
         if (!target) return; // unknown section from a newer server — ignore
-        const key = viewKey(target.key, aid, scope, days);
+        const vk = viewKey(target.key, aid, scope, key);
         // `adopt` writes through to the view cache, so a pushed value survives
         // navigating away and back. The second argument is the key the page is
         // CURRENTLY showing: identical here, but passing it explicitly is what
         // stops a late frame from a previous scope painting over the new one.
-        target.view.adopt(key, key, frame as never);
+        target.view.adopt(vk, vk, frame as never);
       },
       // A dropped stream is not an error the user can act on — the sections
       // still hold their last value and the next navigation re-reads them over
@@ -289,7 +312,7 @@
 
   function retry() {
     const aid = sessionStore.currentAppId;
-    if (aid) void load(aid, sinceDays, true);
+    if (aid) void load(aid, range, true);
   }
 
   async function refresh() {
@@ -308,8 +331,8 @@
       // `load(force)` then re-reads the sections so the page immediately
       // reflects the new `stale`/`computing` states — without it, clicking
       // Refresh would appear to do nothing at all until the first push landed.
-      await refreshOverview(aid, sinceDays);
-      await load(aid, sinceDays, true);
+      await refreshOverview(aid, range);
+      await load(aid, range, true);
     } finally {
       refreshing = false;
     }
@@ -362,7 +385,7 @@
     <div>
       <h1 class="page-title">{t('overview.title')}</h1>
       <p class="muted sub">
-        Health and activity at a glance for the last {sinceDays} days.
+        Health and activity at a glance for {rangeCaption}.
         <!--
           When these numbers were computed, not when they were fetched. The
           server caches each section for up to an hour and recomputes in the
@@ -384,7 +407,14 @@
       </p>
     </div>
     <div class="controls">
-      <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} ranges={RANGES} />
+      <DateRange
+        value={range}
+        onchange={(v) => {
+          range = v;
+          rangeStore.set(v);
+        }}
+        ranges={RANGES}
+      />
       <!--
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached data, fetching fresh" hint.
@@ -421,6 +451,7 @@
         sub={newUserShare != null ? `${formatPercent(newUserShare)} of users` : undefined}
       />
       <StatTile
+        wide
         label={t('overview.stat.crashFree')}
         value={formatPercent(totals.crash_free_sessions)}
         tone={crashFreeTone}
@@ -571,7 +602,7 @@
     -->
     {#if storeApp && shouldShowStoreSection(storeApp, sessionStore.currentEnvId)}
       <div class="store-row">
-        <StoreSection appId={storeApp.id} {sinceDays} />
+        <StoreSection appId={storeApp.id} {range} />
       </div>
     {/if}
   </div>

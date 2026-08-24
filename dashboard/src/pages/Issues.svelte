@@ -1,7 +1,8 @@
 <script lang="ts">
   import { t, joinList } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
-  import { push, querystring, replace } from 'svelte-spa-router';
+  import { querystring, replace } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -19,6 +20,14 @@
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import {
+    fromParams,
+    rangeKey,
+    toParams,
+    toPredicate,
+    type DateRangeValue,
+  } from '../lib/models/date-range';
   import {
     ISSUE_FIELDS,
     encodeFilters,
@@ -94,7 +103,15 @@
   // so free-text typing doesn't fire a backend request + history.replaceState
   // on every keystroke. Filters and the date range still apply immediately.
   let appliedSearch = $state(initial.get('q') ?? '');
-  let sinceDays = $state(Number(initial.get('since_days')) || 3650);
+  // The URL wins over the shared selection when it carries one: a link is an
+  // explicit request for a specific window, and honouring the store instead
+  // would make a shared link open on someone else's range. Otherwise the
+  // shared selection applies, falling back to this page's own widest setting.
+  let range = $state<DateRangeValue>(
+    initial.get('since_days') || initial.get('from')
+      ? fromParams(initial, WIDEST_RANGE)
+      : rangeStore.effective(WIDEST_RANGE),
+  );
 
   // Two cached views: the issue list and the stat tiles. Each owns its own
   // data/loading/revalidating/error state and the stale-while-revalidate policy
@@ -309,7 +326,7 @@
         // date predicate at all, so `since_days` reaches the handler and is
         // used only for the series below. Counted as ignored at every setting
         // but the widest, where it narrows nothing anyway.
-        ignoresDateRange: sinceDays < WIDEST_RANGE,
+        ignoresDateRange: range.kind === 'absolute' || range.days < WIDEST_RANGE,
       },
       'totals',
     ),
@@ -370,12 +387,12 @@
       // null cursor, which is what page 1 carries — keyed on the cursor alone,
       // page 7 would hash to page 1's entry and repaint the first page out of
       // the cache with no request on the wire to notice.
-      viewKey('issues.list', appId, sessionStore.scopeKey, enc, q, sinceDays, pageKey(p)),
+      viewKey('issues.list', appId, sessionStore.scopeKey, enc, q, rangeKey(range), pageKey(p)),
       () =>
         listIssues(appId, {
           filters: enc,
           query: q || undefined,
-          sinceDays,
+          ...toPredicate(range),
           limit: ISSUES_LIMIT,
           cursor,
           offset,
@@ -422,10 +439,10 @@
     onjump(pageNumber(page) - 1);
   }
 
-  async function loadStats(appId: string, days: number, force = false) {
+  async function loadStats(appId: string, win: DateRangeValue, force = false) {
     await statsView.load(
-      viewKey('issues.stats', appId, sessionStore.scopeKey, days),
-      () => getIssueStats(appId, days),
+      viewKey('issues.stats', appId, sessionStore.scopeKey, rangeKey(win)),
+      () => getIssueStats(appId, win),
       force,
     );
   }
@@ -439,7 +456,7 @@
       // `page` unchanged: Refresh means "this page again, current data", and a
       // refresh that also moved you off the rows you were reading would be a
       // different control.
-      await Promise.all([load(aid, appliedSearch, page, true), loadStats(aid, sinceDays, true)]);
+      await Promise.all([load(aid, appliedSearch, page, true), loadStats(aid, range, true)]);
     } finally {
       refreshing = false;
     }
@@ -462,12 +479,14 @@
     sessionStore.scopeKey;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
-    const days = sinceDays;
+    const win = range;
     if (!aid) return;
     const p = new URLSearchParams();
     for (const f of enc) p.append('filter', f);
     if (s) p.set('q', s);
-    p.set('since_days', String(days));
+    // `toParams` decides between `since_days` and `from`/`to`, so a shared URL
+    // cannot carry both — the same encoder the request uses.
+    for (const [k, v] of Object.entries(toParams(win))) p.set(k, v);
     void replace(`/issues?${p.toString()}`);
     // Back to page one. A cursor addresses a position in ONE result set, so it
     // is meaningless against a different predicate — and equally meaningless
@@ -492,9 +511,9 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
+    const win = range;
     if (aid) {
-      void loadStats(aid, days);
+      void loadStats(aid, win);
     }
   });
 </script>
@@ -548,7 +567,7 @@
     <div class="center-sm"><Spinner size={22} /></div>
   {/if}
 
-  <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:sinceDays ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" error={searchError} {onSearch} />
+  <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:range ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" error={searchError} {onSearch} />
   <SearchDisclosure {clamped} />
 
   <Card padding="none">
@@ -644,14 +663,19 @@
         {/snippet}
         {#snippet children()}
           {#each issues as issue (issue.id)}
-            <tr class="clickable" onclick={() => push(`/issues/${issue.id}`)}>
+            {@const path = `/issues/${issue.id}`}
+            <tr
+              class="clickable"
+              onclick={(e) => rowNav(e, path)}
+              onauxclick={(e) => rowNav(e, path)}
+            >
               <td class="col-title">
-                <div class="title-cell">
+                <a class="row-link title-cell" href={rowHref(path)}>
                   <span class="issue-title">{issue.title}</span>
                   <span class="issue-sub mono">
                     {issue.type}{issue.culprit ? ` · ${issue.culprit}` : ''}
                   </span>
-                </div>
+                </a>
               </td>
               <td><LevelBadge level={issue.level} size="sm" /></td>
               <td><StatusBadge status={issue.status} size="sm" /></td>

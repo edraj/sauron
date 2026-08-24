@@ -15,6 +15,7 @@
   import Bell from '@lucide/svelte/icons/bell';
   import BookOpen from '@lucide/svelte/icons/book-open';
   import Braces from '@lucide/svelte/icons/braces';
+  import Calendar from '@lucide/svelte/icons/calendar';
   import ChartColumn from '@lucide/svelte/icons/chart-column';
   import Check from '@lucide/svelte/icons/check';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
@@ -72,6 +73,7 @@
     bell: Bell,
     'book-open': BookOpen,
     braces: Braces,
+    calendar: Calendar,
     'chart-column': ChartColumn,
     check: Check,
     'chevron-down': ChevronDown,

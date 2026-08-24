@@ -1,7 +1,7 @@
 <script lang="ts">
   import { t } from '../../i18n';
   import { formatNumber } from '../../i18n';
-  import { push } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../../utils/row-link';
   import DataTable from '../DataTable.svelte';
   import SortableTh from '../SortableTh.svelte';
   import TimeValue from '../TimeValue.svelte';
@@ -75,12 +75,17 @@
     </tr>
   {/snippet}
   {#each rows as d (d.device_key)}
-    <tr class="clickable" onclick={() => push('/devices/' + encodeURIComponent(d.device_key))}>
+    {@const path = '/devices/' + encodeURIComponent(d.device_key)}
+    {@const name = deviceName(d)}
+    <tr class="clickable" onclick={(e) => rowNav(e, path)} onauxclick={(e) => rowNav(e, path)}>
       <td>
-        {#if deviceName(d)}
-          <span class="dev-name">{deviceName(d)}</span>
+        <!-- The anchor is repeated per branch rather than wrapped around the
+             `{#if}`: the classes carry the two looks, and a wrapper would pad
+             the hover underline with the whitespace around the branch. -->
+        {#if name}
+          <a class="row-link dev-name" href={rowHref(path)}>{name}</a>
         {:else}
-          <span class="cell-mono truncate key">{d.device_key}</span>
+          <a class="row-link cell-mono truncate key" href={rowHref(path)}>{d.device_key}</a>
         {/if}
       </td>
       <td class="cell-muted">{osLabel(d)}</td>

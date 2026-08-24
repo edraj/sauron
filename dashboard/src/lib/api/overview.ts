@@ -1,9 +1,22 @@
 import { api } from './client';
 import type { Overview } from '../models';
+import { lastDays, toParams, type DateRangeValue } from '../models/date-range';
 
-export async function getOverview(appId: string, sinceDays = 30): Promise<Overview> {
+/**
+ * The window these reads default to when a caller passes none.
+ *
+ * Every one of them took `sinceDays = 30` before; the default is kept so the
+ * change is a widening of what can be expressed, not a change to what an
+ * unchanged caller gets.
+ */
+const DEFAULT_WINDOW: DateRangeValue = lastDays(30);
+
+export async function getOverview(
+  appId: string,
+  win: DateRangeValue = DEFAULT_WINDOW,
+): Promise<Overview> {
   const { data } = await api.get<Overview>(`/v1/apps/${appId}/overview`, {
-    params: { since_days: sinceDays },
+    params: toParams(win),
   });
   return data;
 }
@@ -115,22 +128,22 @@ export interface ActiveUsersSeries {
 
 export async function getOverviewTotals(
   appId: string,
-  sinceDays = 30,
+  win: DateRangeValue = DEFAULT_WINDOW,
 ): Promise<OverviewEnvelope<OverviewTotalsSection>> {
   const { data } = await api.get<OverviewEnvelope<OverviewTotalsSection>>(
     `/v1/apps/${appId}/overview/totals`,
-    { params: { since_days: sinceDays } },
+    { params: toParams(win) },
   );
   return data;
 }
 
 export async function getOverviewSeries(
   appId: string,
-  sinceDays = 30,
+  win: DateRangeValue = DEFAULT_WINDOW,
 ): Promise<OverviewEnvelope<OverviewSeriesSection>> {
   const { data } = await api.get<OverviewEnvelope<OverviewSeriesSection>>(
     `/v1/apps/${appId}/overview/series`,
-    { params: { since_days: sinceDays } },
+    { params: toParams(win) },
   );
   return data;
 }
@@ -147,22 +160,22 @@ export async function getOverviewSeries(
  */
 export async function getOverviewTopIssues(
   appId: string,
-  sinceDays = 30,
+  win: DateRangeValue = DEFAULT_WINDOW,
 ): Promise<OverviewEnvelope<Overview['top_issues']>> {
   const { data } = await api.get<OverviewEnvelope<Overview['top_issues']>>(
     `/v1/apps/${appId}/overview/top-issues`,
-    { params: { since_days: sinceDays } },
+    { params: toParams(win) },
   );
   return data;
 }
 
 export async function getOverviewTopEvents(
   appId: string,
-  sinceDays = 30,
+  win: DateRangeValue = DEFAULT_WINDOW,
 ): Promise<OverviewEnvelope<Overview['top_events']>> {
   const { data } = await api.get<OverviewEnvelope<Overview['top_events']>>(
     `/v1/apps/${appId}/overview/top-events`,
-    { params: { since_days: sinceDays } },
+    { params: toParams(win) },
   );
   return data;
 }
@@ -183,11 +196,11 @@ export async function getOverviewTopEvents(
  */
 export async function getActiveUsersSeries(
   appId: string,
-  sinceDays = 30,
+  win: DateRangeValue = DEFAULT_WINDOW,
 ): Promise<OverviewEnvelope<ActiveUsersSeries>> {
   const { data } = await api.get<OverviewEnvelope<ActiveUsersSeries>>(
     `/v1/apps/${appId}/analytics/active-users`,
-    { params: { since_days: sinceDays } },
+    { params: toParams(win) },
   );
   return data;
 }
@@ -202,8 +215,11 @@ export async function getActiveUsersSeries(
  *
  * Server-side single-flight means holding the button down cannot multiply load.
  */
-export async function refreshOverview(appId: string, sinceDays = 30): Promise<void> {
+export async function refreshOverview(
+  appId: string,
+  win: DateRangeValue = DEFAULT_WINDOW,
+): Promise<void> {
   await api.post(`/v1/apps/${appId}/overview/refresh`, null, {
-    params: { since_days: sinceDays },
+    params: toParams(win),
   });
 }

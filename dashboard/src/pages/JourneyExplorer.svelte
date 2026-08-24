@@ -13,6 +13,8 @@
   import SankeyChart from '../lib/components/SankeyChart.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import { rangeKey, toParams, type DateRangeValue } from '../lib/models/date-range';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { getJourney } from '../lib/api/journeys';
@@ -26,7 +28,10 @@
 
   const DEPTHS = [2, 3, 4, 5, 6, 7, 8];
 
-  let sinceDays = $state(30);
+  // Seeded from the SHARED selection, falling back to this page's own 30
+  // days until the user has chosen one — see `stores/range.svelte.ts` for
+  // why the store starts empty rather than defaulting.
+  let range = $state<DateRangeValue>(rangeStore.effective(30));
   let depth = $state(5);
 
   // Cached view (lib/stores/cached-view.svelte.ts): the cached graph paints
@@ -51,10 +56,12 @@
    * the axios interceptor adds to the request but which appears in none of these
    * arguments — omit it and one environment's journey would be served as another's.
    */
-  async function load(appId: string, days: number, d: number, force = false) {
+  async function load(appId: string, win: DateRangeValue, d: number, force = false) {
     await journeyView.load(
-      viewKey('journeys.graph', appId, sessionStore.scopeKey, days, d),
-      () => getJourney(appId, { since_days: days, depth: d }),
+      // `rangeKey`, never the resolved instants: a key derived from the clock
+      // mints a fresh entry per load and hits zero times.
+      viewKey('journeys.graph', appId, sessionStore.scopeKey, rangeKey(win), d),
+      () => getJourney(appId, { ...toParams(win), depth: d }),
       force,
     );
   }
@@ -64,9 +71,9 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
+    const win = range;
     const d = depth;
-    if (aid) void load(aid, days, d);
+    if (aid) void load(aid, win, d);
   });
 
   const entryPoints = $derived(
@@ -117,7 +124,7 @@
   function retry() {
     const aid = sessionStore.currentAppId;
     // force: a Retry that honoured the cache would re-show the same failure.
-    if (aid) void load(aid, sinceDays, depth, true);
+    if (aid) void load(aid, range, depth, true);
   }
 
   async function refresh() {
@@ -126,7 +133,7 @@
     refreshing = true;
     try {
       // force: an explicit click must reach the network regardless of freshness.
-      await load(aid, sinceDays, depth, true);
+      await load(aid, range, depth, true);
     } finally {
       refreshing = false;
     }
@@ -142,7 +149,13 @@
     <div class="controls">
       <div class="control">
         <span class="ctrl-label">{t('journeys.range')}</span>
-        <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
+        <DateRange
+          value={range}
+          onchange={(v) => {
+            range = v;
+            rangeStore.set(v);
+          }}
+        />
       </div>
       <div class="control">
         <span class="ctrl-label">{t('journeys.depth')}</span>

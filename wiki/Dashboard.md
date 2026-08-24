@@ -42,11 +42,15 @@ Three requests per address per hour are allowed.
   operation, split by `op` (`navigation`, `http`, `resource`, `screen_load`,
   `custom`), with error rates.
 
-### What "crash-free sessions" means
+### What "unhandled-exception-free sessions" means
 
-The Overview's **Crash-free sessions** tile is the share of sessions in the range
-that recorded **no uncaught exception**. It is worth being precise about, because
-"crash" is a word people reasonably read three different ways.
+The Overview's **Unhandled-exception-free sessions** tile is the share of
+sessions in the range that recorded **no uncaught exception**.
+
+The long name is deliberate. It was called "crash-free sessions" — the term every
+comparable tool uses — and that turned out to promise more than it delivers:
+"crash" is read as "the app died", and this number cannot see that (below). The
+name now says exactly what is counted.
 
 **A crash is an error nothing in your code caught.** The distinction is not a
 label anyone applies by hand — it is decided by where the exception ended up:
@@ -63,19 +67,18 @@ means you caught it. An error only ever reaches the SDK's global hooks
 you never tell Sauron that something crashed.
 
 **A handled error is still an error.** It appears in Exceptions, it counts toward
-the error rate, it can page you. It just does not lower crash-free — deliberately,
-because an exception you caught and reported is the system working, not the app
-breaking.
+the error rate, it can page you. It just does not lower this number —
+deliberately, because an exception you caught and reported is the system working,
+not the app breaking.
 
 #### What it does not cover
 
-Crash-free measures **uncaught exceptions**, which is narrower than "the app
-died":
+This measures **uncaught exceptions**, which is narrower than "the app died":
 
 - **Native crashes** (SIGSEGV, ANR, an iOS watchdog kill) and **out-of-memory
   kills** are *not* detected. The process is gone before any SDK code can run —
   on iOS an OOM delivers no signal even to a native handler. These sessions count
-  as crash-free because nothing was ever reported.
+  as clean because nothing was ever reported.
 - **Memory leaks** are not an event at all; they only ever surface as an eventual
   OOM, which is the case above.
 - Conversely, an uncaught exception that Flutter recovers from (a widget build
@@ -86,7 +89,7 @@ app stayed alive".
 
 #### When the tile shows "—" instead of a percentage
 
-Crash-free counts only errors whose `handled` state is **known**. An SDK that
+The tile counts only errors whose `handled` state is **known**. An SDK that
 never reports one produces zero crashes by construction, which is
 indistinguishable from a perfectly healthy app — so rather than print a confident
 `100%`, the tile shows `—` and *"No crash data from this SDK"*.
@@ -221,8 +224,9 @@ but active yesterday matches a *Last seen* window and not a *First seen* one, so
 Two details worth knowing:
 
 - **The filter governs the table, not the charts.** The stat tiles and graphs
-  above each table keep their own range picker, because the summary endpoints
-  take a plain day count and cannot express a column choice or an absolute bound.
+  above each table keep their own range picker, because it cannot express a
+  choice of timestamp column. (It *can* express an absolute range — see
+  "The date range" below.)
 - **Devices and Users mean subtly different things by the same words.** On
   Devices the window decides *which devices are listed*, using each device's
   app-wide first/last sighting. On Users it filters the value the row actually
@@ -234,6 +238,44 @@ Every list bounds its window at 365 days. If your request was wider, the respons
 says so rather than silently narrowing it, and the UI surfaces that.
 
 The window is kept in the URL, so a filtered view can be bookmarked and shared.
+
+### The date range
+
+Every analytics page — Overview, Exceptions, Performance, Screens, Funnels,
+Journeys, Workflows — carries the same strip:
+
+    [ 24h ] [ 7d ] [ 30d ] [ 90d ] [ 📅 Custom ]
+
+The four presets are rolling windows ending now. **Custom** opens a calendar
+offering four things:
+
+| Mode | What you click | What you get |
+|---|---|---|
+| Day | a date | that whole day |
+| Week | a date | the week containing it |
+| Month | the month heading | that whole calendar month |
+| Range | a start date, then an end date | everything from the first through the last, both included |
+
+Days are your own local days, not UTC ones, and both ends are inclusive as you
+would say them out loud: "10 to 14 August" covers all of the 14th.
+
+Three things worth knowing:
+
+- **The selection follows you.** Whatever you pick applies on every analytics
+  page and survives a reload. Until you pick something, each page keeps the
+  default it always had — so nothing changes until you ask it to.
+- **You can name a range and keep it.** *Save this range* stores it under a name
+  you choose; saved ranges are listed in the calendar for one-click reuse, and
+  live in your browser rather than your account, so they are per-device.
+- **A custom range covers at most 365 days.** Ask for more and the picker says
+  so rather than quietly serving you a narrower window. The presets are
+  unaffected, as is Exceptions' *All* setting.
+
+Two places deliberately do **not** follow the shared selection. An issue's own
+occurrence list defaults to its whole history — adopting a 7-day selection there
+would open the page showing none of that issue's occurrences. And Events,
+Sessions, Users and Devices keep the richer time filter described above for
+their tables, because that one also picks the timestamp column.
 
 ## Analyze
 

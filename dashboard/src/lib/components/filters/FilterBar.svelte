@@ -4,6 +4,8 @@
   import Icon from '../ui/Icon.svelte';
   import SearchAutocompleteInput from '../search/SearchAutocompleteInput.svelte';
   import DateRange from '../DateRange.svelte';
+  import { rangeStore } from '../../stores/range.svelte';
+  import { lastDays, type DateRangeValue } from '../../models/date-range';
   import {
     opLabel,
     composeTag,
@@ -28,7 +30,8 @@
      * validates and never queries.
      */
     onSearch?: (query: string) => void;
-    sinceDays: number;
+    /** The window the page is filtered by. Bindable — the chip strip writes it. */
+    range: DateRangeValue;
     // Optional custom date-range options; falls back to DateRange's default.
     ranges?: { days: number; label: string }[];
     /**
@@ -36,7 +39,7 @@
      *
      * `false` for a page that owns its window through a richer control (a
      * `<TimeFilter>`, which also picks the timestamp COLUMN and accepts
-     * absolute bounds). Those pages still pass `sinceDays` — the prop is
+     * absolute bounds). Those pages still pass `range` — the prop is
      * `$bindable` — but showing this control beside the real one puts two
      * range pickers on screen where only one is connected to anything, and a
      * dead control is worse than a missing one: it reports a window the list
@@ -73,7 +76,7 @@
     context = undefined,
     error = null,
     onSearch = undefined,
-    sinceDays = $bindable(30),
+    range = $bindable(lastDays(30)),
     ranges = undefined,
     showRange = true,
     actions = undefined,
@@ -185,7 +188,14 @@
   <div class="right">
     <SearchAutocompleteInput bind:value={search} appId={appId ?? ''} {context} {error} {onSearch} />
     {#if showRange}
-      <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} {ranges} />
+      <DateRange
+        value={range}
+        onchange={(v) => {
+          range = v;
+          rangeStore.set(v);
+        }}
+        {ranges}
+      />
     {/if}
     {@render actions?.()}
   </div>

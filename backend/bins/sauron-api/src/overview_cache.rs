@@ -64,7 +64,7 @@ use tokio::sync::{broadcast, Semaphore};
 use uuid::Uuid;
 
 use sauron_db::repo;
-use sauron_db::scope::{EnvFilter, ReadScope};
+use sauron_db::scope::{EnvFilter, Range, ReadScope};
 
 use crate::AppState;
 
@@ -328,14 +328,95 @@ fn env_token(env: &EnvFilter) -> String {
 /// `computed_at` in the UI. The dashboard shipped this exact bug once already
 /// on the client side (`CachedView`'s clock-derived `viewKey`); it is silent in
 /// both directions, so the guard is a test, not a comment.
-pub fn cache_key(section: Section, app_id: Uuid, env: &EnvFilter, since_days: i64) -> String {
+pub fn cache_key(section: Section, app_id: Uuid, env: &EnvFilter, window: &Window) -> String {
     format!(
-        "overview:v2:{}:{}:{}:{}",
+        "overview:v3:{}:{}:{}:{}",
         section.wire_name(),
         app_id,
         env_token(env),
-        since_days
+        window.token()
     )
+}
+
+/// The window one Overview view covers.
+///
+/// Three variants rather than a plain `Range`, and the distinction is exactly
+/// what keeps this cacheable. A `Range` built from `since_days` carries
+/// `now - days`, which is a different value on every request; keying on it is
+/// the 0%-hit-rate trap documented on [`cache_key`]. Every variant here has a
+/// token that does NOT move with the clock:
+///
+/// - `Last(n)`  — the discrete day count, resolved against the clock only at
+///   compute time, where it never reaches a key.
+/// - `Since(t)` / `Between(f, t)` — instants the user picked, so they are
+///   stable across requests and across users, which is what makes an absolute
+///   custom range safe to cache at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    Last(i64),
+    Since(DateTime<Utc>),
+    /// `from` INCLUSIVE, `to` EXCLUSIVE.
+    Between(DateTime<Utc>, DateTime<Utc>),
+}
+
+impl Window {
+    /// `Last`, with the day count already through [`clamp_days`].
+    ///
+    /// The clamp has to happen BEFORE the token is built or a request for 4000
+    /// days writes its answer under `4000d` and reads it back under `365d`
+    /// forever after — the reason `clamp_days` exists as one function.
+    pub fn last(since_days: i64) -> Self {
+        Window::Last(clamp_days(since_days))
+    }
+
+    /// The window a caller's `since_days`/`from`/`to` describe.
+    ///
+    /// Precedence matches `search::resolve_range` exactly — explicit bounds
+    /// win outright — because the two must agree: this decides what is CACHED
+    /// and that decides what is QUERIED, and a disagreement would file one
+    /// window's answer under another window's key.
+    pub fn from_query(
+        since_days: i64,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Self {
+        match (from, to) {
+            (Some(f), Some(t)) => Window::Between(f, t),
+            (Some(f), None) => Window::Since(f),
+            // `to` alone is refused by `resolve_range` before it reaches here;
+            // falling back to the relative window keeps this total without
+            // inventing a second answer for a request that will 400 anyway.
+            (None, _) => Window::last(since_days),
+        }
+    }
+
+    /// The cache-key and SSE-filter component. Stable across requests.
+    pub fn token(&self) -> String {
+        match self {
+            Window::Last(n) => format!("{n}d"),
+            Window::Since(f) => format!("{}..", iso(*f)),
+            Window::Between(f, t) => format!("{}..{}", iso(*f), iso(*t)),
+        }
+    }
+
+    /// The bounds the query actually runs over. `now` is passed in rather than
+    /// read here so the clock is visible at the one call site that needs it.
+    pub fn range(&self, now: DateTime<Utc>) -> Range {
+        match self {
+            Window::Last(n) => Range::since(now - Duration::days(*n)),
+            Window::Since(f) => Range::since(*f),
+            Window::Between(f, t) => Range::new(*f, Some(*t)),
+        }
+    }
+}
+
+/// Second-precision RFC3339, always in `Z`.
+///
+/// Truncated deliberately: the dashboard sends local midnights, which carry no
+/// sub-second component, and a format that could vary in precision would let
+/// two spellings of the same instant key two entries.
+fn iso(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Key of the short-lived failure marker paired with `key`. See
@@ -348,8 +429,8 @@ fn fail_key(key: &str) -> String {
 ///
 /// The SSE stream filters on this so a subscriber only receives sections for
 /// the app, environment and window it actually asked for.
-pub fn scope_token(app_id: Uuid, env: &EnvFilter, since_days: i64) -> String {
-    format!("{}:{}:{}", app_id, env_token(env), since_days)
+pub fn scope_token(app_id: Uuid, env: &EnvFilter, window: &Window) -> String {
+    format!("{}:{}:{}", app_id, env_token(env), window.token())
 }
 
 /// The one place `since_days` is clamped.
@@ -429,11 +510,10 @@ pub async fn read_section(
     state: &AppState,
     section: Section,
     scope: &ReadScope,
-    since_days: i64,
+    window: Window,
     force: bool,
 ) -> Envelope {
-    let days = clamp_days(since_days);
-    let key = cache_key(section, scope.app_id, &scope.env, days);
+    let key = cache_key(section, scope.app_id, &scope.env, &window);
     let entry = cache_get(state, &key).await;
     let error = fail_get(state, &key).await;
 
@@ -447,7 +527,7 @@ pub async fn read_section(
     // hurts most.
     let should_recompute = (force || !fresh) && error.is_none();
     if should_recompute {
-        enqueue(state, section, scope.clone(), days, &key);
+        enqueue(state, section, scope.clone(), window, &key);
     }
 
     match entry {
@@ -493,16 +573,15 @@ pub async fn snapshot(
     state: &AppState,
     sections: &[Section],
     scope: &ReadScope,
-    since_days: i64,
+    window: Window,
 ) -> Vec<SectionUpdate> {
-    let days = clamp_days(since_days);
-    let scope_tok = scope_token(scope.app_id, &scope.env, days);
+    let scope_tok = scope_token(scope.app_id, &scope.env, &window);
     let mut out = Vec::with_capacity(sections.len());
     for &section in sections {
         // `force = false`: opening a stream is not a refresh request. It still
         // enqueues anything stale or missing, which is what makes a cold page
         // load start work without a separate kick.
-        let env = read_section(state, section, scope, days, false).await;
+        let env = read_section(state, section, scope, window, false).await;
         out.push(SectionUpdate {
             scope: scope_tok.clone(),
             section: section.wire_name(),
@@ -521,11 +600,11 @@ pub async fn snapshot(
 /// around it from the caller: a permit held while waiting for a pool connection
 /// (or vice versa) is a two-resource ordering that deadlocks under load, which
 /// is the failure the ingest path already hit once.
-fn enqueue(state: &AppState, section: Section, scope: ReadScope, days: i64, key: &str) {
+fn enqueue(state: &AppState, section: Section, scope: ReadScope, window: Window, key: &str) {
     let Some(guard) = state.overview_cache.claim(key) else {
         return; // already running; the SSE push will serve both callers
     };
-    let scope_tok = scope_token(scope.app_id, &scope.env, days);
+    let scope_tok = scope_token(scope.app_id, &scope.env, &window);
     let state = state.clone();
     let key = key.to_string();
     tokio::spawn(async move {
@@ -537,7 +616,7 @@ fn enqueue(state: &AppState, section: Section, scope: ReadScope, days: i64, key:
         };
 
         let started = Utc::now();
-        let update = match compute(&state, section, scope, days).await {
+        let update = match compute(&state, section, scope, window).await {
             Ok(data) => {
                 let entry = CacheEntry {
                     data: data.clone(),
@@ -593,15 +672,18 @@ async fn compute(
     state: &AppState,
     section: Section,
     scope: ReadScope,
-    days: i64,
+    window: Window,
 ) -> Result<Value, String> {
-    let to = Utc::now();
-    let since = to - Duration::days(days);
+    let now = Utc::now();
+    let range = window.range(now);
+    // `active_users_by_day` predates `Range` and still takes two instants; an
+    // open-above window ends at "now" for it, which is where the data ends.
+    let to = range.to.unwrap_or(now);
 
     let value = match section {
         Section::Totals => {
             let mut conn = conn(state).await?;
-            let totals = repo::overview_totals(&mut conn, scope, since)
+            let totals = repo::overview_totals(&mut conn, scope, range)
                 .await
                 .map_err(|e| e.to_string())?;
             // Same two formulas the handler used to apply inline. Kept here
@@ -629,10 +711,10 @@ async fn compute(
         }
         Section::Series => {
             let mut conn = conn(state).await?;
-            let events_series = repo::event_series(&mut conn, scope.clone(), None, since)
+            let events_series = repo::event_series(&mut conn, scope.clone(), None, range)
                 .await
                 .map_err(|e| e.to_string())?;
-            let errors_series = repo::error_series(&mut conn, scope, since)
+            let errors_series = repo::error_series(&mut conn, scope, range)
                 .await
                 .map_err(|e| e.to_string())?;
             to_value(crate::routes::analytics::OverviewSeriesSection {
@@ -642,14 +724,14 @@ async fn compute(
         }
         Section::TopIssues => {
             let mut conn = conn(state).await?;
-            let rows = repo::top_issues(&mut conn, scope, since, 5)
+            let rows = repo::top_issues(&mut conn, scope, range, 5)
                 .await
                 .map_err(|e| e.to_string())?;
             to_value(rows)?
         }
         Section::TopEvents => {
             let mut conn = conn(state).await?;
-            let rows = repo::top_events(&mut conn, scope, since, 5)
+            let rows = repo::top_events(&mut conn, scope, range, 5)
                 .await
                 .map_err(|e| e.to_string())?;
             to_value(rows)?
@@ -659,7 +741,7 @@ async fn compute(
             // partly from the cold Parquet tier, and bypassing the router would
             // silently drop every rotated day.
             let (series, partial_days) =
-                crate::tier_read::active_users_by_day(state, scope, since, to)
+                crate::tier_read::active_users_by_day(state, scope, range.from, to)
                     .await
                     .map_err(|e| e.to_string())?;
             to_value(crate::routes::analytics::ActiveUsersSeries {
@@ -698,6 +780,105 @@ mod tests {
         Uuid::from_bytes([n; 16])
     }
 
+    // -----------------------------------------------------------------------
+    // Window tokens
+    // -----------------------------------------------------------------------
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// The whole `since_days` trap, as a test rather than a comment. A key
+    /// built from `now - days` differs on every request, so the entry written
+    /// by one request is never read by the next — a 0% hit rate that compiles,
+    /// passes every other test, and shows a plausible `computed_at` in the UI.
+    #[test]
+    fn a_relative_window_tokenizes_to_the_discrete_day_count() {
+        let w = Window::Last(30);
+        assert_eq!(w.token(), "30d");
+        // Two "requests" a clock tick apart must agree.
+        assert_eq!(Window::Last(30).token(), Window::Last(30).token());
+        assert_ne!(Window::Last(30).token(), Window::Last(7).token());
+    }
+
+    /// Absolute bounds are chosen by the user, not derived from the clock, so
+    /// they are stable across requests AND across users — which is what makes
+    /// them safe to key on at all.
+    #[test]
+    fn absolute_windows_tokenize_to_their_bounds() {
+        let w = Window::Between(at("2026-08-01T00:00:00Z"), at("2026-08-08T00:00:00Z"));
+        assert_eq!(w.token(), "2026-08-01T00:00:00Z..2026-08-08T00:00:00Z");
+        let open = Window::Since(at("2026-08-01T00:00:00Z"));
+        assert_eq!(open.token(), "2026-08-01T00:00:00Z..");
+        assert_ne!(w.token(), open.token());
+    }
+
+    /// `Last(30)` and an absolute window that happens to span thirty days are
+    /// different questions — one moves with the clock and one does not — so
+    /// they must never share an entry.
+    #[test]
+    fn a_relative_and_an_absolute_window_never_collide() {
+        let rel = cache_key(Section::Totals, uuid(1), &EnvFilter::All, &Window::Last(30));
+        let abs = cache_key(
+            Section::Totals,
+            uuid(1),
+            &EnvFilter::All,
+            &Window::Between(at("2026-07-09T00:00:00Z"), at("2026-08-08T00:00:00Z")),
+        );
+        assert_ne!(rel, abs);
+    }
+
+    /// `v2` keys ended in a bare `{days}`; `v3` ends in `{days}d`. Without the
+    /// bump a `v2` entry written under `…:30` would be read back under the new
+    /// code for up to 24 h — the same silent staleness the `v1` → `v2` bump
+    /// exists to prevent.
+    #[test]
+    fn the_key_version_moved_with_the_format() {
+        let k = cache_key(Section::Totals, uuid(1), &EnvFilter::All, &Window::Last(30));
+        assert!(k.starts_with("overview:v3:"), "{k}");
+        assert!(k.ends_with(":30d"), "{k}");
+    }
+
+    /// The SSE filter has to partition exactly as the cache key does, or a
+    /// browser watching an absolute window is pushed a section computed for a
+    /// relative one.
+    #[test]
+    fn the_scope_token_partitions_windows_too() {
+        let a = scope_token(uuid(1), &EnvFilter::All, &Window::Last(30));
+        let b = scope_token(uuid(1), &EnvFilter::All, &Window::Last(7));
+        let c = scope_token(
+            uuid(1),
+            &EnvFilter::All,
+            &Window::Between(at("2026-07-09T00:00:00Z"), at("2026-08-08T00:00:00Z")),
+        );
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    /// `Last` is resolved against the clock at COMPUTE time, which is the one
+    /// place a derived timestamp belongs: it never reaches a key.
+    #[test]
+    fn a_window_resolves_to_the_range_the_query_runs() {
+        let now = at("2026-08-20T12:00:00Z");
+        assert_eq!(Window::Last(7).range(now).from, now - Duration::days(7));
+        assert_eq!(Window::Last(7).range(now).to, None);
+
+        let f = at("2026-08-01T00:00:00Z");
+        let t = at("2026-08-08T00:00:00Z");
+        assert_eq!(Window::Between(f, t).range(now).from, f);
+        assert_eq!(Window::Between(f, t).range(now).to, Some(t));
+        assert_eq!(Window::Since(f).range(now).to, None);
+    }
+
+    /// The clamp is the one place a day count is bounded, and `Window::Last`
+    /// must go through it — a request for 4000 days that wrote under key
+    /// `4000d` and read back under `365d` would never hit.
+    #[test]
+    fn a_relative_window_is_clamped_before_it_becomes_a_token() {
+        assert_eq!(Window::last(4000).token(), "365d");
+        assert_eq!(Window::last(0).token(), "1d");
+    }
+
     /// The bug that makes a cache silently useless: keying on a clock-derived
     /// value. Two requests for the same selection, made at different instants,
     /// MUST share a key.
@@ -707,10 +888,10 @@ mod tests {
     /// to assert about what the key is built FROM.
     #[test]
     fn the_key_is_stable_across_time() {
-        let a = cache_key(Section::Totals, uuid(1), &EnvFilter::All, 30);
+        let a = cache_key(Section::Totals, uuid(1), &EnvFilter::All, &Window::Last(30));
         // Nothing here reads the clock, which is the property under test:
         // rebuilding the key later must reproduce it byte for byte.
-        let b = cache_key(Section::Totals, uuid(1), &EnvFilter::All, 30);
+        let b = cache_key(Section::Totals, uuid(1), &EnvFilter::All, &Window::Last(30));
         assert_eq!(a, b);
         assert!(
             !a.contains(&Utc::now().year().to_string()),
@@ -722,12 +903,17 @@ mod tests {
     /// matches NULL — so they must not share an entry.
     #[test]
     fn one_and_a_singleton_subset_are_distinct_keys() {
-        let one = cache_key(Section::Totals, uuid(1), &EnvFilter::One(uuid(9)), 30);
+        let one = cache_key(
+            Section::Totals,
+            uuid(1),
+            &EnvFilter::One(uuid(9)),
+            &Window::Last(30),
+        );
         let sub = cache_key(
             Section::Totals,
             uuid(1),
             &EnvFilter::Subset(vec![uuid(9)]),
-            30,
+            &Window::Last(30),
         );
         assert_ne!(one, sub);
     }
@@ -738,8 +924,13 @@ mod tests {
     #[test]
     fn all_and_unattributed_are_distinct_keys() {
         assert_ne!(
-            cache_key(Section::Totals, uuid(1), &EnvFilter::All, 30),
-            cache_key(Section::Totals, uuid(1), &EnvFilter::Unattributed, 30)
+            cache_key(Section::Totals, uuid(1), &EnvFilter::All, &Window::Last(30)),
+            cache_key(
+                Section::Totals,
+                uuid(1),
+                &EnvFilter::Unattributed,
+                &Window::Last(30)
+            )
         );
     }
 
@@ -751,30 +942,55 @@ mod tests {
         let forward = EnvFilter::Subset(vec![uuid(1), uuid(2), uuid(3)]);
         let reversed = EnvFilter::Subset(vec![uuid(3), uuid(2), uuid(1)]);
         assert_eq!(
-            cache_key(Section::Totals, uuid(7), &forward, 7),
-            cache_key(Section::Totals, uuid(7), &reversed, 7)
+            cache_key(Section::Totals, uuid(7), &forward, &Window::Last(7)),
+            cache_key(Section::Totals, uuid(7), &reversed, &Window::Last(7))
         );
     }
 
     /// Two apps, two environments and two windows must never share an entry.
     #[test]
     fn every_scope_component_separates_keys() {
-        let base = cache_key(Section::Totals, uuid(1), &EnvFilter::One(uuid(5)), 30);
-        assert_ne!(
-            base,
-            cache_key(Section::Totals, uuid(2), &EnvFilter::One(uuid(5)), 30)
+        let base = cache_key(
+            Section::Totals,
+            uuid(1),
+            &EnvFilter::One(uuid(5)),
+            &Window::Last(30),
         );
         assert_ne!(
             base,
-            cache_key(Section::Totals, uuid(1), &EnvFilter::One(uuid(6)), 30)
+            cache_key(
+                Section::Totals,
+                uuid(2),
+                &EnvFilter::One(uuid(5)),
+                &Window::Last(30)
+            )
         );
         assert_ne!(
             base,
-            cache_key(Section::Totals, uuid(1), &EnvFilter::One(uuid(5)), 7)
+            cache_key(
+                Section::Totals,
+                uuid(1),
+                &EnvFilter::One(uuid(6)),
+                &Window::Last(30)
+            )
         );
         assert_ne!(
             base,
-            cache_key(Section::Series, uuid(1), &EnvFilter::One(uuid(5)), 30)
+            cache_key(
+                Section::Totals,
+                uuid(1),
+                &EnvFilter::One(uuid(5)),
+                &Window::Last(7)
+            )
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                Section::Series,
+                uuid(1),
+                &EnvFilter::One(uuid(5)),
+                &Window::Last(30)
+            )
         );
     }
 

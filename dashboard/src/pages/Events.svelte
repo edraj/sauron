@@ -17,6 +17,15 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  // Aliased: this page already imports `fromParams`/`toParams` from
+  // `time-filter` for the STREAM's own window, and the two encode different
+  // things — the stream picks a timestamp COLUMN as well as bounds.
+  import {
+    fromParams as rangeFromParams,
+    toParams as rangeToParams,
+    type DateRangeValue,
+  } from '../lib/models/date-range';
   import TimeFilter from '../lib/components/TimeFilter.svelte';
   import {
     EVENT_FIELDS,
@@ -75,7 +84,14 @@
   // history.replaceState on every keystroke. Filters and the date range still
   // apply immediately.
   let appliedSearch = $state(initial.get('q') ?? '');
-  let sinceDays = $state(Number(initial.get('since_days')) || 30);
+  // The two cards' window. A URL that carries one wins — a link is an explicit
+  // request for a window — otherwise the shared selection applies, falling back
+  // to this page's own 30 days.
+  let range = $state<DateRangeValue>(
+    initial.get('since_days') || initial.get('from')
+      ? rangeFromParams(initial, 30)
+      : rangeStore.effective(30),
+  );
 
   /**
    * The stream's own window. ONE field, so the control renders a label rather
@@ -85,7 +101,7 @@
    * `?time_field=received_at` a 400 that names what is allowed, rather than a
    * parameter that looks accepted and is not.
    *
-   * Governs the STREAM only. The two cards above keep `sinceDays` from the
+   * Governs the STREAM only. The two cards above keep `range` from the
    * FilterBar, because `/events/top` and `/events/series` take a plain day
    * count and cannot express an absolute bound.
    *
@@ -329,13 +345,13 @@
     !loadingStream && !fatalStreamError && streamEvents.length === 0 && canGoBack(list.page),
   );
 
-  async function loadTop(appId: string, days: number) {
+  async function loadTop(appId: string, win: DateRangeValue) {
     loadingTop = true;
     error = null;
     try {
       // Five, not twelve: the list sits beside the volume chart and the pair is
       // one row, so a long list is what made the two cards different heights.
-      top = await topEvents(appId, { since_days: days, limit: 5 });
+      top = await topEvents(appId, { ...rangeToParams(win), limit: 5 });
     } catch (err) {
       error = errorMessage(err);
       top = [];
@@ -344,11 +360,11 @@
     }
   }
 
-  async function loadSeries(appId: string, days: number, name: string | null) {
+  async function loadSeries(appId: string, win: DateRangeValue, name: string | null) {
     loadingSeries = true;
     try {
       series = await eventSeries(appId, {
-        since_days: days,
+        ...rangeToParams(win),
         name: name ?? undefined,
       });
     } catch (err) {
@@ -520,8 +536,8 @@
     refreshing = true;
     try {
       await Promise.all([
-        loadTop(aid, sinceDays),
-        loadSeries(aid, sinceDays, selectedTopEvent),
+        loadTop(aid, range),
+        loadSeries(aid, range, selectedTopEvent),
         loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list),
       ]);
     } finally {
@@ -534,8 +550,8 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
-    if (aid) void loadTop(aid, days);
+    const win = range;
+    if (aid) void loadTop(aid, win);
   });
 
   $effect(() => {
@@ -543,9 +559,9 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
+    const win = range;
     const name = selectedTopEvent;
-    if (aid) void loadSeries(aid, days, name);
+    if (aid) void loadSeries(aid, win, name);
   });
 
   // The search box applies on submit only (button/Enter/clear). Filters and
@@ -566,7 +582,7 @@
     sessionStore.scopeKey;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
-    const days = sinceDays;
+    const win = range;
     const tf = streamWindow;
     if (!aid) return;
     const p = new URLSearchParams();
@@ -574,7 +590,7 @@
     if (s) p.set('q', s);
     // The CARDS' range. The stream's own window is appended below under
     // `stream_days`/`from`/`to`, which is why these two can coexist here.
-    p.set('since_days', String(days));
+    for (const [k, v] of Object.entries(rangeToParams(win))) p.set(k, v);
     for (const [k, v] of writeStreamWindow(tf)) p.set(k, v);
     void replace(`/events?${p.toString()}`);
     expandedId = null;
@@ -587,9 +603,9 @@
     sessionStore.scopeKey;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
-    // The STREAM's window, not the cards' `sinceDays`: this effect exists to
+    // The STREAM's window, not the cards' `range`: this effect exists to
     // discard a cursor that no longer addresses anything, and only the stream's
-    // own predicate can invalidate it. Depending on `sinceDays` here would
+    // own predicate can invalidate it. Depending on `range` here would
     // reset the walk every time somebody adjusted a chart's range.
     const tf = streamWindow;
     if (!aid) return;
@@ -668,7 +684,7 @@
     fields={EVENT_FIELDS}
     bind:filters
     bind:search
-    bind:sinceDays
+    bind:range
     appId={sessionStore.currentAppId ?? undefined}
     context="events"
     error={searchError}
@@ -685,8 +701,8 @@
             onclick={() => {
               const aid = sessionStore.currentAppId;
               if (aid) {
-                loadTop(aid, sinceDays);
-                loadSeries(aid, sinceDays, selectedTopEvent);
+                loadTop(aid, range);
+                loadSeries(aid, range, selectedTopEvent);
               }
             }}
           >

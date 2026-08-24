@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
+  import { t, localeStore, intlTag } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
-  import { push, querystring, replace } from 'svelte-spa-router';
+  import { querystring, replace } from 'svelte-spa-router';
+  import { rowHref, rowNav } from '../lib/utils/row-link';
   import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
@@ -14,6 +15,8 @@
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
+  import { rangeStore } from '../lib/stores/range.svelte';
+  import { formatAbsolute, spanDays, type DateRangeValue } from '../lib/models/date-range';
   import TimeFilter from '../lib/components/TimeFilter.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import UserActivityChart from '../lib/components/UserActivityChart.svelte';
@@ -111,7 +114,13 @@
   const loading = $derived(view.loading);
   const error = $derived(view.error);
 
-  let sinceDays = $state(30);
+  let range = $state<DateRangeValue>(rangeStore.effective(30));
+  /** The window in words, under the tiles it applies to. */
+  const rangeCaption = $derived(
+    range.kind === 'last'
+      ? `last ${spanDays(range)}d`
+      : formatAbsolute(range, intlTag(localeStore.locale)),
+  );
   let analytics = $state<UsersAnalytics | null>(null);
   let analyticsError = $state<string | null>(null);
 
@@ -124,17 +133,17 @@
     try {
       await Promise.all([
         load(aid, query, sortParam(list.sort), list.offset, timeFilter, true),
-        loadAnalytics(aid, sinceDays),
+        loadAnalytics(aid, range),
       ]);
     } finally {
       refreshing = false;
     }
   }
 
-  async function loadAnalytics(appId: string, days: number) {
+  async function loadAnalytics(appId: string, win: DateRangeValue) {
     analyticsError = null;
     try {
-      analytics = await getUserAnalytics(appId, days);
+      analytics = await getUserAnalytics(appId, win);
     } catch (err) {
       analyticsError = errorMessage(err);
       analytics = null;
@@ -146,8 +155,8 @@
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
     sessionStore.scopeKey;
-    const days = sinceDays;
-    if (aid) void loadAnalytics(aid, days);
+    const win = range;
+    if (aid) void loadAnalytics(aid, win);
   });
 
   // Submit-driven, not debounced: `searchTerm` is the text in the box and
@@ -262,8 +271,8 @@
     return rest.map((tag) => `${tag.key}: ${tag.value}`).join('\n');
   }
 
-  function open(distinctId: string) {
-    push('/persons/' + encodeURIComponent(distinctId));
+  function personPath(distinctId: string): string {
+    return '/persons/' + encodeURIComponent(distinctId);
   }
 </script>
 
@@ -282,7 +291,13 @@
         {t('users.thisAppOnly')} <a href="#/active-users">{t('users.combinedActive')}</a> {t('prose.users.combinedNoteTail')}
       </p>
     </div>
-    <DateRange value={sinceDays} onchange={(d) => (sinceDays = d)} />
+    <DateRange
+      value={range}
+      onchange={(v) => {
+        range = v;
+        rangeStore.set(v);
+      }}
+    />
   </div>
 
   <!-- The spacing lives on this wrapper rather than on `StatTiles` / `Card`:
@@ -292,8 +307,8 @@
     {#if analytics}
       <StatTiles min={150}>
         <StatTile label={t('users.stat.total')} value={compactNumber(analytics.stats.total_users)} tone="primary" sub="all time" />
-        <StatTile label={t('users.stat.active')} value={compactNumber(analytics.stats.active_in_range)} sub={`last ${sinceDays}d`} />
-        <StatTile label={t('users.stat.new')} value={compactNumber(analytics.stats.new_in_range)} sub={`last ${sinceDays}d`} />
+        <StatTile label={t('users.stat.active')} value={compactNumber(analytics.stats.active_in_range)} sub={rangeCaption} />
+        <StatTile label={t('users.stat.new')} value={compactNumber(analytics.stats.new_in_range)} sub={rangeCaption} />
         <!-- `stats.dau` has always been in the payload and in the `UserStats`
              model; the tile was simply never rendered, which is why this page
              shows a stickiness ratio whose numerator is invisible. -->
@@ -414,9 +429,14 @@
         {#snippet children()}
           {#each rows as row (row.distinct_id)}
             {@const rowTraits = traits(row.properties)}
-            <tr class="clickable" onclick={() => open(row.distinct_id)}>
+            {@const path = personPath(row.distinct_id)}
+            <tr
+              class="clickable"
+              onclick={(e) => rowNav(e, path)}
+              onauxclick={(e) => rowNav(e, path)}
+            >
               <td>
-                <span class="user">
+                <a class="row-link user" href={rowHref(path)}>
                   <span
                     class="avatar"
                     style="background: hsl({hueFromString(row.distinct_id)} 50% 45%)"
@@ -424,7 +444,7 @@
                     {initials(row.distinct_id)}
                   </span>
                   <span class="mono uid" title={row.distinct_id}>{row.distinct_id}</span>
-                </span>
+                </a>
               </td>
               <td>
                 {#if rowTraits.length > 0}
