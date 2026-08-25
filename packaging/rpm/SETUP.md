@@ -343,6 +343,19 @@ journalctl -u sauron-migrate --no-pager | tail
 if `systemctl is-failed sauron-migrate` says `failed`, no daemon will start until
 the database is fixed.
 
+**The whole post-upgrade sequence below is also available as a script** —
+migrations, the sessions cutover, all three backfills, daemon start, health
+checks and a database verification pass, each step idempotent:
+
+```bash
+sudo bash /usr/share/doc/sauron-server/post-upgrade.sh
+```
+
+Run it inside tmux/screen (the first rollup backfill can take an hour+). It
+refuses to run against a sauron-migrate binary older than its own
+subcommands, so it cannot silently no-op the way a hand-typed command against
+a stale binary once did.
+
 **Upgrading across the sessions partitioning (migration 0073) has one extra,
 mandatory step.** The migration itself is schema-only and finishes in seconds
 whatever your history size or `max_locks_per_transaction` — but it leaves every
