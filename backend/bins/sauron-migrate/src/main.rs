@@ -18,11 +18,10 @@ async fn main() -> anyhow::Result<()> {
     // not-yet-shipped) subcommand became a no-op indistinguishable from
     // success. Bit an operator live: `backfill-rollups` against an older
     // binary "ran" instantly and did nothing.
-    const KNOWN_ARGS: [&str; 4] = [
+    const KNOWN_ARGS: [&str; 3] = [
         "backfill-person-envs",
         "backfill-device-envs",
         "backfill-rollups",
-        "finish-sessions-partitioning",
     ];
     for a in std::env::args().skip(1) {
         if !KNOWN_ARGS.contains(&a.as_str()) {
@@ -98,26 +97,5 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("rollup backfill complete");
     }
 
-    // The deferred half of migration 0073 (which is schema-only; see its
-    // header for why the copy cannot live inside the migration transaction).
-    // One day per transaction, resumable, drops the old table only when
-    // verifiably empty. Run BEFORE opening traffic; until it completes,
-    // session-scoped reads see only post-migration rows.
-    if std::env::args().any(|a| a == "finish-sessions-partitioning") {
-        let pool = sauron_db::build_pool(&url, 1)?;
-        let mut conn = sauron_db::conn(&pool).await?;
-        match sauron_db::sessions_cutover::finish_sessions_partitioning(&mut conn, |day, rows| {
-            tracing::info!(%day, rows, "sessions cutover: day moved");
-        })
-        .await?
-        {
-            sauron_db::sessions_cutover::FinishOutcome::AlreadyDone => {
-                tracing::info!("sessions cutover already complete; nothing to do");
-            }
-            sauron_db::sessions_cutover::FinishOutcome::Finished { days, rows } => {
-                tracing::info!(days, rows, "sessions cutover complete; old table dropped");
-            }
-        }
-    }
     Ok(())
 }

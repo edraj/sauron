@@ -2,7 +2,7 @@
 # Sauron post-upgrade runbook, as a script. Run ONCE after installing a new
 # version, INSIDE tmux/screen (the first rollup backfill on a large history
 # can run an hour or more, and interrupting it mid-run is the one thing this
-# script cannot make safe — see step 4).
+# script cannot make safe — see step 2).
 #
 #   sudo bash /usr/share/doc/sauron-server/post-upgrade.sh
 #
@@ -30,7 +30,7 @@ run_sql() {
 [[ -r $ENV_FILE ]]  || die "missing $ENV_FILE"
 [[ -x $MIGRATE ]]   || die "missing $MIGRATE — is sauron-server installed?"
 
-banner "0/6 preflight: this binary must be new enough for this script"
+banner "0/5 preflight: this binary must be new enough for this script"
 # Older sauron-migrate builds SILENTLY IGNORED unknown subcommands — a typo'd
 # or not-yet-shipped command "ran" instantly and did nothing, which cost a
 # production upgrade a full day of confusion. New builds reject unknown args,
@@ -38,33 +38,30 @@ banner "0/6 preflight: this binary must be new enough for this script"
 # binary predates every subcommand this script is about to rely on.
 if as_sauron "$MIGRATE" sauron-post-upgrade-probe >/dev/null 2>&1; then
   die "installed sauron-migrate silently accepts unknown arguments — it predates \
-finish-sessions-partitioning and strict argument checking. Install the current \
-release before running this script."
+strict argument checking (and so the subcommand behavior this script relies \
+on). Install the current release before running this script."
 fi
 echo "binary rejects unknown arguments: OK"
 
-banner "1/6 apply pending migrations"
-# Idempotent; fail-closed. Migration 0073 is schema-only and finishes in
-# seconds regardless of history size or max_locks_per_transaction.
+banner "1/5 apply pending migrations"
+# Idempotent; fail-closed. NOTE for hosts upgrading from v1.7.3 or older with
+# a LONG session history: migration 0073 rewrites the sessions table in one
+# transaction and can need more lock slots than a default Postgres provides —
+# see SETUP.md's 0073 section (ALTER SYSTEM SET max_locks_per_transaction)
+# BEFORE running this on such a host. Hosts already at v1.7.4+ are past it.
 as_sauron "$MIGRATE"
 
-banner "2/6 finish sessions partitioning (deferred half of migration 0073)"
-# One day per transaction, resumable, drops the side table only when it is
-# verifiably empty. Prints 'already complete' when there is nothing to do
-# (fresh installs, and deployments migrated by an earlier all-in-one build).
-as_sauron "$MIGRATE" finish-sessions-partitioning
-
-banner "3/6 rollup backfill (skipped automatically if already done)"
+banner "2/5 rollup backfill (skipped automatically if already done)"
 echo "NOTE: first run replays all pre-existing history day by day — budget"
 echo "roughly an hour per 100M events. Do NOT interrupt it: a partial backfill"
 echo "must not be blindly re-run (the aggregates are additive); see SETUP.md."
 as_sauron "$MIGRATE" backfill-rollups
 
-banner "4/6 environment-scope backfills (per-app markers make re-runs no-ops)"
+banner "3/5 environment-scope backfills (per-app markers make re-runs no-ops)"
 as_sauron "$MIGRATE" backfill-device-envs
 as_sauron "$MIGRATE" backfill-person-envs
 
-banner "5/6 start daemons and check health"
+banner "4/5 start daemons and check health"
 systemctl start sauron-api sauron-ingest
 for unit in sauron-api sauron-ingest; do
   systemctl is-active --quiet "$unit" || die "$unit did not start — journalctl -u $unit"
@@ -77,13 +74,13 @@ curl -sf "http://localhost:${API_PORT}/health"    >/dev/null || die "api /health
 curl -sf "http://localhost:${INGEST_PORT}/health" >/dev/null || die "ingest /health failed on :${INGEST_PORT}"
 echo "api :${API_PORT}/health OK, ingest :${INGEST_PORT}/health OK"
 
-banner "6/6 database verification"
+banner "5/5 database verification"
 fail=0
-side=$(run_sql "SELECT COALESCE(to_regclass('sessions_old_73')::text, '')")
-if [[ -n "$side" ]]; then
-  echo "FAIL: sessions_old_73 still exists — the cutover did not complete"; fail=1
+part=$(run_sql "SELECT COALESCE(to_regclass('sessions_default')::text, '')")
+if [[ -z "$part" ]]; then
+  echo "FAIL: sessions is not partitioned — migration 0073 did not apply"; fail=1
 else
-  echo "PASS: no sessions side table (cutover complete)"
+  echo "PASS: sessions is partitioned"
 fi
 dupes=$(run_sql "SELECT count(*) FROM (SELECT 1 FROM sessions GROUP BY app_id, session_id HAVING count(*) > 1) d")
 if [[ "$dupes" != "0" ]]; then

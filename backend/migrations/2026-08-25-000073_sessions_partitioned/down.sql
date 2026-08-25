@@ -1,18 +1,6 @@
 -- Reverse: rebuild the plain table with the original constraints. The global
 -- UNIQUE (app_id, session_id) is restorable because the write path's advisory
 -- locks kept sessions one-row-per-key while partitioned.
--- If the deferred copy (finish-sessions-partitioning) never ran to completion,
--- fold the remainder back in first so the rebuild below loses nothing. The
--- rows land in DEFAULT (their day partitions may not exist) — irrelevant, the
--- whole partition set is flattened two statements later.
-DO $abs$
-BEGIN
-  IF to_regclass('sessions_old_73') IS NOT NULL THEN
-    INSERT INTO sessions SELECT * FROM sessions_old_73 ON CONFLICT DO NOTHING;
-    DROP TABLE sessions_old_73;
-  END IF;
-END $abs$;
-
 ALTER TABLE sessions RENAME TO sessions_part_old;
 
 CREATE TABLE sessions (
