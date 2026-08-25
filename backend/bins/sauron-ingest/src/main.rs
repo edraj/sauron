@@ -555,6 +555,22 @@ async fn main() -> anyhow::Result<()> {
     // doc comments) rather than once here at boot.
     let _merge = sauron_pipeline::merge::spawn_merge_worker(pool.clone(), cfg.tier_hot_days);
 
+    // Rollup fold: dashboard aggregates stay ≤ ~1 min behind live. Lives here
+    // and not in sauron-api because this is the stateful consumer — an API
+    // scaled to N replicas would run N folds for nothing (they'd serialize on
+    // the advisory lock and N-1 would fold zero rows).
+    let _rollups = sauron_pipeline::rollup_task::spawn_rollup_task(
+        pool.clone(),
+        redis.clone(),
+        sauron_pipeline::rollup_task::RollupCfg {
+            fold_secs: cfg.rollup_fold_secs,
+            lag_secs: cfg.rollup_lag_secs,
+            kick_lag_secs: cfg.rollup_kick_lag_secs,
+            name_cap: cfg.rollup_name_cap,
+            session_retention_days: cfg.session_retention_days,
+        },
+    );
+
     let port = cfg.ingest_port;
     let max_body = cfg.ingest_max_body_bytes;
     let uds_path = cfg.ingest_uds_path.clone();

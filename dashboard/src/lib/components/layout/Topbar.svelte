@@ -4,6 +4,7 @@
   import { authStore } from '../../stores/auth.svelte';
   import { sessionStore } from '../../stores/session.svelte';
   import { lockedBy } from '../../models/page-access';
+  import type { Permission } from '../../models';
   import { themeStore } from '../../stores/theme.svelte';
   import { initials, appTypeIcon } from '../../utils/format';
   import Icon from '../ui/Icon.svelte';
@@ -16,7 +17,19 @@
   }
 
   // Menu items for each breadcrumb segment.
-  const orgItems = $derived(sessionStore.orgs.map((o) => ({ id: o.id, name: o.name })));
+  // An org with nothing readable AND nothing creatable is a dead end: switching
+  // into it can only ever show an empty shell. Lock the row in place rather than
+  // hiding it — the member should be able to see the org exists and read why it
+  // is unavailable. Both facts come from the server (`/v1/orgs`), because
+  // `/access` is only ever fetched for the org currently loaded.
+  const orgItems = $derived(
+    sessionStore.orgs.map((o) => ({
+      id: o.id,
+      name: o.name,
+      locked:
+        o.project_count === 0 && !o.can_create_project ? ('project:read' as Permission) : null,
+    })),
+  );
   const projectItems = $derived(sessionStore.projects.map((p) => ({ id: p.id, name: p.name })));
   const appItems = $derived(
     sessionStore.apps.map((a) => ({ id: a.id, name: a.name, icon: appTypeIcon(a.app_type) })),

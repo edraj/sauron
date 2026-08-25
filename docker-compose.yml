@@ -16,7 +16,22 @@ services:
     # (50 + 8) + inspector 4 = 98, against a stock max_connections of 100 with
     # 3 reserved for superusers. Exhaustion surfaces as API 500s and ingest
     # 202-then-drop, not as an inspector error, so give it real headroom.
-    command: postgres -c max_connections=200
+    #
+    # Memory settings sized for the 62 GB host; the image defaults
+    # (shared_buffers=128MB, work_mem=4MB) force every multi-million-row
+    # aggregate through disk. shm_size lifts Docker's 64 MB /dev/shm, which
+    # parallel query and parallel vacuum allocate DSM segments from — at the
+    # default they die with "could not resize shared memory segment ... No
+    # space left on device" long before the disk is actually full.
+    shm_size: 2gb
+    command: >-
+      postgres
+      -c max_connections=200
+      -c shared_buffers=8GB
+      -c effective_cache_size=24GB
+      -c work_mem=32MB
+      -c maintenance_work_mem=1GB
+      -c max_wal_size=4GB
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

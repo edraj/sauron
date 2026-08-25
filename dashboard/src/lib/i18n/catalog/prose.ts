@@ -126,6 +126,10 @@ export const prose = {
     en: 'Data older than this moves out of Postgres into Parquet. It stays readable — queries span both tiers — but it no longer occupies database storage.',
     ar: 'تنتقل البيانات الأقدم من ذلك من Postgres إلى Parquet. وتبقى قابلة للقراءة — إذ تشمل الاستعلامات الطبقتين — لكنها لم تعد تشغل مساحة في قاعدة البيانات.',
   },
+  'prose.storage.sessionRetention': {
+    en: 'Raw sessions older than this are deleted outright — they have no cold copy. Their daily aggregates (counts, crash-free rate, durations) are already in the rollups and keep answering every chart; only per-session drill-down stops at the window.',
+    ar: 'تُحذف الجلسات الخام الأقدم من ذلك نهائيًا — فليس لها نسخة باردة. أما تجميعاتها اليومية (الأعداد، معدل الخلو من الأعطال، المدد) فمحفوظة مسبقًا في التجميعات وتظل تجيب عن كل المخططات؛ وحده التفصيل على مستوى الجلسة يتوقف عند النافذة.',
+  },
   'prose.storage.pins': {
     en: 'Each pin keeps a restored range from being re-tiered. Without one, a restore is undone on the next cycle.',
     ar: 'يمنع كل تثبيت إعادةَ ترحيل نطاق مستعاد. وبدونه تُلغى الاستعادة في الدورة التالية.',

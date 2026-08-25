@@ -157,6 +157,14 @@ pub struct TierPolicy {
     /// deserves to know that from the UI instead of from a support ticket.
     pub follows_on_restart: Vec<String>,
     pub pins: Vec<TierPinView>,
+    /// From `SESSION_RETENTION_DAYS` (or its default, `0` = keep forever).
+    pub configured_session_retention_days: i64,
+    /// What the daily retention pass will use next; `0` means retention is
+    /// off. Non-zero values are already clamped to the minimum.
+    pub effective_session_retention_days: i64,
+    pub session_retention_overridden: bool,
+    pub min_session_retention_days: i64,
+    pub session_retention_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Current rotation policy plus the pins protecting restored ranges.
@@ -169,6 +177,9 @@ pub async fn get_tier_policy(
     let row = repo::get_runtime_setting_row(&mut conn, repo::TIER_HOT_DAYS_KEY).await?;
     let effective = repo::effective_tier_hot_days(&mut conn, state.cfg.tier_hot_days).await?;
     let pins = repo::list_tier_pins(&mut conn).await?;
+    let sr_row = repo::get_runtime_setting_row(&mut conn, repo::SESSION_RETENTION_KEY).await?;
+    let sr_effective =
+        repo::effective_session_retention_days(&mut conn, state.cfg.session_retention_days).await?;
     drop(conn);
 
     let now = chrono::Utc::now();
@@ -199,6 +210,11 @@ pub async fn get_tier_policy(
             .into_iter()
             .map(|p| TierPinView::from_pin(p, now))
             .collect(),
+        configured_session_retention_days: state.cfg.session_retention_days,
+        effective_session_retention_days: sr_effective,
+        session_retention_overridden: sr_row.is_some(),
+        min_session_retention_days: repo::SESSION_RETENTION_MIN_DAYS,
+        session_retention_updated_at: sr_row.map(|(_, at)| at),
     }))
 }
 
@@ -258,6 +274,69 @@ pub async fn set_tier_policy(
         .changes(crate::audit::created(
             crate::audit::entity::TIER,
             &[("hot_days", serde_json::json!(body.hot_days))],
+        )),
+    )
+    .await;
+
+    drop(conn);
+    get_tier_policy(auth, State(state)).await
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetSessionRetention {
+    /// `null` clears the override (reverting to the process configuration);
+    /// `0` disables retention outright; any other value is days and must be at
+    /// least `min_session_retention_days`.
+    pub retention_days: Option<i64>,
+}
+
+/// Set or clear the session-retention override.
+///
+/// Unlike the rotation age, LOWERING this deletes data with no way back at
+/// all: sessions have no cold copy, so once the daily pass drops a partition
+/// the session-day rollups are everything that remains of those days. The UI
+/// carries the same warning; this is it in the place that enforces it.
+pub async fn set_session_retention(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<SetSessionRetention>,
+) -> Result<Json<TierPolicy>, ApiError> {
+    require_deployment_admin(&state, &auth).await?;
+    let mut conn = crate::routes::db(&state).await?;
+    match body.retention_days {
+        Some(v) => {
+            if v != 0 && v < repo::SESSION_RETENTION_MIN_DAYS {
+                return Err(ApiError::BadRequest(format!(
+                    "retention_days must be 0 (off) or at least {}",
+                    repo::SESSION_RETENTION_MIN_DAYS
+                )));
+            }
+            repo::set_runtime_setting(
+                &mut conn,
+                repo::SESSION_RETENTION_KEY,
+                &v.to_string(),
+                Some(auth.user_id),
+            )
+            .await?;
+        }
+        None => {
+            repo::delete_runtime_setting(&mut conn, repo::SESSION_RETENTION_KEY).await?;
+        }
+    }
+
+    // Same deployment-wide blast radius as the rotation age, same trail.
+    crate::audit::record_all_orgs(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            uuid::Uuid::nil(),
+            crate::audit::action::TIER_POLICY_UPDATE,
+            crate::audit::entity::TIER,
+        )
+        .target_named("session retention age")
+        .changes(crate::audit::created(
+            crate::audit::entity::TIER,
+            &[("retention_days", serde_json::json!(body.retention_days))],
         )),
     )
     .await;

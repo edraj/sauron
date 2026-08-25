@@ -55,4 +55,10 @@ export const time = {
     ar: 'النطاق المخصص يغطي {days} يومًا كحد أقصى',
   },
   'dateRange.future': { en: 'Dates after today hold no data yet', ar: 'التواريخ بعد اليوم لا تحتوي على بيانات بعد' },
+  // Rollup freshness chip + the ≈ approximation disclosure (docs/approximate-analytics.md).
+  'time.asOf': { en: 'as of {time}', ar: 'حتى {time}' },
+  'time.approxNote': {
+    en: 'Figures marked ≈ are approximate (±~2%), computed from sketches for speed at scale. Unmarked figures are exact.',
+    ar: 'الأرقام المميزة بعلامة ≈ تقريبية (±~2%) وتُحسب من ملخصات إحصائية للسرعة على نطاق واسع. الأرقام غير المميزة دقيقة.',
+  },
 } as const satisfies Record<string, Message>;

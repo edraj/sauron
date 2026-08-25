@@ -16,7 +16,7 @@ use sauron_auth::guard::{
     generate_temp_password, role_permissions, scope_parts, union_permissions, ResolvedScope,
 };
 use sauron_auth::hash_password_async;
-use sauron_auth::rbac::{grants_from_rows, Scope};
+use sauron_auth::rbac::{grants_from_rows, reach_for, Scope};
 use sauron_auth::{authorize_org, perm, AuthError, AuthUser};
 use sauron_db::models::{NewRoleGrant, Organization, Role};
 use sauron_db::repo;
@@ -33,13 +33,123 @@ use crate::AppState;
 
 // --- orgs -------------------------------------------------------------------
 
+/// An org plus how many of its projects the caller can actually reach.
+///
+/// `project_count` is flattened alongside the org's own fields so existing
+/// consumers of this endpoint keep reading the same shape.
+#[derive(Serialize)]
+pub struct OrgView {
+    #[serde(flatten)]
+    pub org: Organization,
+    /// Projects in this org visible to the caller under `project:read`.
+    ///
+    /// Counted with the SAME reachability rule `list_projects` renders with
+    /// (`reach_for` + app-grant ancestry), not a simpler "projects in org"
+    /// count. A count that disagreed with the list would be worse than no
+    /// count: the dashboard decides whether to show onboarding from this
+    /// number, so an org reporting 1 project that lists 0 would send a member
+    /// to a page with nothing on it.
+    pub project_count: i64,
+    /// Whether the caller may create a project here.
+    ///
+    /// Sent because the dashboard cannot work it out for any org but the one
+    /// it currently has loaded — `/access` is fetched per org — and the org
+    /// picker has to decide, for EVERY row, whether the org is a dead end
+    /// (`project_count == 0` and nothing creatable) or somewhere the member can
+    /// legitimately start work. Without it the picker would lock a brand-new
+    /// member out of their own empty org.
+    pub can_create_project: bool,
+}
+
 pub async fn list_orgs(
     auth: AuthUser,
     State(state): State<AppState>,
-) -> Result<Json<Vec<Organization>>, ApiError> {
+) -> Result<Json<Vec<OrgView>>, ApiError> {
     let mut conn = db(&state).await?;
+    let orgs = repo::list_orgs_for_user(&mut conn, auth.user_id).await?;
+    if orgs.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    // Three queries total, not three per org: an account granted across many
+    // orgs would otherwise pay a round trip each just to render a picker.
+    let grant_rows = repo::user_grants_all_orgs(&mut conn, auth.user_id).await?;
+    let mut by_org: HashMap<Uuid, Vec<(String, Uuid, Value)>> = HashMap::new();
+    for (org_id, scope_type, scope_id, perms) in grant_rows {
+        by_org
+            .entry(org_id)
+            .or_default()
+            .push((scope_type, scope_id, perms));
+    }
+
+    // `reach_for` is documented as requiring grants from a single org, which is
+    // what the grouping above produces.
+    let mut creatable: HashMap<Uuid, bool> = HashMap::new();
+    let reaches: HashMap<Uuid, _> = orgs
+        .iter()
+        .map(|o| {
+            let grants = grants_from_rows(by_org.remove(&o.id).unwrap_or_default());
+            // `project:create` is an org-scoped capability, so only an org-level
+            // grant confers it — a project- or app-scoped grant carrying the
+            // permission still cannot create a SIBLING project.
+            creatable.insert(o.id, reach_for(&grants, perm::PROJECT_CREATE).org);
+            (o.id, reach_for(&grants, perm::PROJECT_READ))
+        })
+        .collect();
+
+    // Orgs reachable at org scope need every project counted; the rest need
+    // only the specific projects their grants name.
+    let org_scoped: Vec<Uuid> = orgs
+        .iter()
+        .filter(|o| reaches.get(&o.id).is_some_and(|r| r.org))
+        .map(|o| o.id)
+        .collect();
+    let mut counts: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+    for (org_id, project_id) in repo::project_ids_for_orgs(&mut conn, &org_scoped).await? {
+        counts.entry(org_id).or_default().insert(project_id);
+    }
+
+    // An app-scoped grant reaches the app's project, so resolve every such app
+    // in one lookup and credit it to the org that actually owns it.
+    let all_apps: Vec<Uuid> = reaches
+        .values()
+        .flat_map(|r| r.apps.iter().copied())
+        .collect();
+    let ancestries = if all_apps.is_empty() {
+        Vec::new()
+    } else {
+        repo::app_ancestries(&mut conn, &all_apps).await?
+    };
+    drop(conn);
+
+    for o in &orgs {
+        let Some(reach) = reaches.get(&o.id) else {
+            continue;
+        };
+        if reach.org {
+            continue;
+        }
+        let entry = counts.entry(o.id).or_default();
+        entry.extend(reach.projects.iter().copied());
+        for (app_id, project_id, ancestor_org) in &ancestries {
+            if *ancestor_org == o.id && reach.apps.contains(app_id) {
+                entry.insert(*project_id);
+            }
+        }
+    }
+
     Ok(Json(
-        repo::list_orgs_for_user(&mut conn, auth.user_id).await?,
+        orgs.into_iter()
+            .map(|org| {
+                let project_count = counts.get(&org.id).map_or(0, |s| s.len()) as i64;
+                let can_create_project = creatable.get(&org.id).copied().unwrap_or(false);
+                OrgView {
+                    org,
+                    project_count,
+                    can_create_project,
+                }
+            })
+            .collect(),
     ))
 }
 

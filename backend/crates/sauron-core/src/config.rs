@@ -33,6 +33,15 @@ pub struct Config {
     /// field.
     pub dev_mode: bool,
     pub worker_concurrency: usize,
+    /// Cadence of the rollup fold task (seconds between scheduled folds).
+    pub rollup_fold_secs: u64,
+    /// Safety lag behind now() for scheduled folds: rows committing with an
+    /// already-stamped received_at must land before the watermark passes them.
+    pub rollup_lag_secs: i64,
+    /// The much shorter lag used for operator-kicked folds (Refresh button).
+    pub rollup_kick_lag_secs: i64,
+    /// Per-(app, bucket) distinct-name soft cap; tail folds into '~other'.
+    pub rollup_name_cap: usize,
     pub cors_allowed_origins: Vec<String>,
     pub ingest_rate_limit_per_min: u32,
     pub ingest_max_body_bytes: usize,
@@ -71,6 +80,11 @@ pub struct Config {
     pub tier_drop_lag_hours: i64,
     pub tier_tick_secs: u64,
     pub tier_partition_ahead: i64,
+    /// Days of raw `sessions` rows to keep; `0` (the default) keeps them
+    /// forever. Enforced by dropping whole day partitions — sessions have no
+    /// cold copy, the session-day rollups are the surviving record. Non-zero
+    /// values below 7 are clamped up (`SESSION_RETENTION_MIN_DAYS`).
+    pub session_retention_days: i64,
     /// How often `sauron-tier` looks for a queued restore job.
     ///
     /// Separate from `tier_tick_secs` (default 3600) on purpose: a restore is
@@ -276,6 +290,7 @@ impl std::fmt::Debug for Config {
             .field("jwt_refresh_ttl_secs", &self.jwt_refresh_ttl_secs)
             .field("dev_mode", &self.dev_mode)
             .field("worker_concurrency", &self.worker_concurrency)
+            .field("rollup_fold_secs", &self.rollup_fold_secs)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("ingest_rate_limit_per_min", &self.ingest_rate_limit_per_min)
             .field("ingest_max_body_bytes", &self.ingest_max_body_bytes)
@@ -314,6 +329,7 @@ impl std::fmt::Debug for Config {
             .field("restore_poll_secs", &self.restore_poll_secs)
             .field("restore_lease_secs", &self.restore_lease_secs)
             .field("tier_partition_ahead", &self.tier_partition_ahead)
+            .field("session_retention_days", &self.session_retention_days)
             .field("search_scan_clamp_days", &self.search_scan_clamp_days)
             .field("symbols_cache_mb", &self.symbols_cache_mb)
             .field(
@@ -792,6 +808,10 @@ impl Config {
             // workers at a batch of 200 more than doubled the write rate.
             // `INGEST_DB_POOL` must stay >= this.
             worker_concurrency: parse("WORKER_CONCURRENCY", 8),
+            rollup_fold_secs: parse("ROLLUP_FOLD_SECS", 60),
+            rollup_lag_secs: parse("ROLLUP_LAG_SECS", 60),
+            rollup_kick_lag_secs: parse("ROLLUP_KICK_LAG_SECS", 2),
+            rollup_name_cap: parse("ROLLUP_NAME_CAP", 2000),
             cors_allowed_origins,
             ingest_rate_limit_per_min: parse("INGEST_RATE_LIMIT_PER_MIN", 6000),
             ingest_max_body_bytes: parse("INGEST_MAX_BODY_BYTES", 1_048_576),
@@ -820,6 +840,7 @@ impl Config {
             tier_drop_lag_hours: parse("TIER_DROP_LAG_HOURS", 24),
             tier_tick_secs: parse("TIER_TICK_SECS", 3600),
             tier_partition_ahead: parse("TIER_PARTITION_AHEAD", 7),
+            session_retention_days: parse("SESSION_RETENTION_DAYS", 0),
             restore_poll_secs: parse("RESTORE_POLL_SECS", 5),
             restore_lease_secs: parse("RESTORE_LEASE_SECS", 300),
             search_scan_clamp_days,
@@ -1349,6 +1370,10 @@ mod tests {
             auth_revocation_poll_secs: 5,
             dev_mode: false,
             worker_concurrency: 4,
+            rollup_fold_secs: 60,
+            rollup_lag_secs: 60,
+            rollup_kick_lag_secs: 2,
+            rollup_name_cap: 2000,
             cors_allowed_origins: vec![],
             ingest_rate_limit_per_min: 6000,
             ingest_max_body_bytes: 1_048_576,
@@ -1370,6 +1395,7 @@ mod tests {
             tier_drop_lag_hours: 24,
             tier_tick_secs: 3600,
             tier_partition_ahead: 7,
+            session_retention_days: 0,
             restore_poll_secs: 5,
             restore_lease_secs: 300,
             search_scan_clamp_days: 30,

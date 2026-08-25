@@ -12,6 +12,8 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import SankeyChart from '../lib/components/SankeyChart.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import RollupChip from '../lib/components/ui/RollupChip.svelte';
+  import { refreshRollups } from '../lib/api/rollups';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { rangeStore } from '../lib/stores/range.svelte';
   import { rangeKey, toParams, type DateRangeValue } from '../lib/models/date-range';
@@ -132,6 +134,10 @@
     if (!aid) return;
     refreshing = true;
     try {
+      // Kick an immediate rollup fold first (bounded server-side wait), so
+      // the reloads below fetch aggregates that include the newest events.
+      // Older APIs 404 this — then the reload alone is the refresh.
+      await refreshRollups(aid).catch(() => {});
       // force: an explicit click must reach the network regardless of freshness.
       await load(aid, range, depth, true);
     } finally {
@@ -179,6 +185,7 @@
         spinner IS the "showing cached data, fetching fresh" hint, and without it
         the instant paint is indistinguishable from live data.
       -->
+      <RollupChip />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>

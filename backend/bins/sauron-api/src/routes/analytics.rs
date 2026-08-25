@@ -1087,6 +1087,102 @@ pub async fn overview_refresh(
 }
 
 // ---------------------------------------------------------------------------
+// Rollup freshness — GET /rollups/status, POST /rollups/refresh.
+// ---------------------------------------------------------------------------
+
+/// What the dashboard's "as of" chip reads. `ready` false means the app still
+/// serves every aggregate from the legacy raw queries (backfill pending) and
+/// nothing on the page is approximate.
+#[derive(Serialize)]
+pub struct RollupStatus {
+    pub ready: bool,
+    /// Oldest event-source watermark — data newer than this is not yet folded.
+    pub as_of: Option<chrono::DateTime<Utc>>,
+    pub sessions_as_of: Option<chrono::DateTime<Utc>>,
+}
+
+pub async fn rollups_status(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<RollupStatus>, ApiError> {
+    let mut conn = db(&state).await?;
+    super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let ready = sauron_db::rollups::is_ready(&mut conn, app_id).await?;
+    let as_of = sauron_db::rollups::as_of(&mut conn, &sauron_db::rollups::EVENT_SOURCES).await?;
+    let sessions_as_of =
+        sauron_db::rollups::as_of(&mut conn, &[sauron_db::rollups::SRC_SESSIONS]).await?;
+    Ok(Json(RollupStatus {
+        ready,
+        as_of,
+        sessions_as_of,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct RollupRefreshOut {
+    pub as_of: Option<chrono::DateTime<Utc>>,
+    /// True when the fold demonstrably caught up past this request's arrival;
+    /// false means the kick was sent but the wait budget elapsed first — the
+    /// page should still refetch (data may be only seconds behind).
+    pub caught_up: bool,
+}
+
+/// `POST /v1/apps/{app_id}/rollups/refresh` — the aggregate pages' Refresh.
+///
+/// Sets the shared kick key, then polls the watermarks briefly so the caller
+/// can refetch fresh data in the same interaction. Unlike `overview_refresh`
+/// this waits (bounded): rollup reads are milliseconds, so "refetch after
+/// 200" would otherwise race the fold and show the same stale numbers.
+pub async fn rollups_refresh(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<RollupRefreshOut>, ApiError> {
+    let mut conn = db(&state).await?;
+    super::scope::authorized_read_scope(
+        &mut conn,
+        auth.user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let t_req = Utc::now();
+    // Best-effort with a hard budget: sauron-redis hangs rather than errors
+    // against a dead Redis (see overview_cache::CACHE_OP_TIMEOUT), and this
+    // is a user-facing click.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        state.redis.set_ex(sauron_db::rollups::KICK_KEY, "1", 60),
+    )
+    .await;
+    // A kicked fold runs with the short lag (default 2 s); waiting for the
+    // watermark to pass t_req minus that lag proves this click's fold landed.
+    let target = t_req - Duration::seconds(3);
+    let mut as_of = None;
+    let mut caught_up = false;
+    for _ in 0..16 {
+        as_of = sauron_db::rollups::as_of(&mut conn, &sauron_db::rollups::EVENT_SOURCES).await?;
+        if as_of.is_some_and(|a| a >= target) {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    Ok(Json(RollupRefreshOut { as_of, caught_up }))
+}
+
+// ---------------------------------------------------------------------------
 // Audience analytics — GET /users/summary.
 // ---------------------------------------------------------------------------
 

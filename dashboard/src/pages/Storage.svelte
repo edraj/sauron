@@ -6,6 +6,7 @@
     getAdminStorage,
     getTierPolicy,
     setTierPolicy,
+    setSessionRetention,
     createRestore,
     listRestores,
     releasePin,
@@ -34,6 +35,10 @@
     isHotDaysDirty,
     revertWouldLower,
     describeRevert,
+    isRetentionValid,
+    retentionWouldDelete,
+    retentionRevertWouldDelete,
+    describeRetentionRevert,
     RESTORE_MIN_DAYS,
     RESTORE_MAX_DAYS,
   } from '../lib/models/tier-policy';
@@ -117,6 +122,15 @@
   let seededHotDays = $state('');
   let policySaved = $state(false);
   const hotDaysDirty = $derived(isHotDaysDirty(hotDaysInput, seededHotDays));
+  // Session retention: its own draft/busy/error state, so a failed retention
+  // save never disables or blanks the rotation-age controls beside it.
+  let retentionInput = $state('');
+  /** Last value written into the retention field from the server. */
+  let seededRetention = $state('');
+  let retentionSaved = $state(false);
+  let retentionBusy = $state(false);
+  let retentionActionError = $state<string | null>(null);
+  const retentionDirty = $derived(isHotDaysDirty(retentionInput, seededRetention));
 
   // Which app rows are expanded to show their cold Parquet file inventory.
   let openApp = $state<Record<string, boolean>>({});
@@ -147,6 +161,11 @@
         const seeded = String(policy.effective_hot_days);
         hotDaysInput = seeded;
         seededHotDays = seeded;
+      }
+      if (!retentionDirty) {
+        const seeded = String(policy.effective_session_retention_days);
+        retentionInput = seeded;
+        seededRetention = seeded;
       }
     } catch (e) {
       policy = null;
@@ -211,6 +230,48 @@
     }
   }
 
+  async function saveRetention(next: number) {
+    await putRetention(next);
+  }
+
+  /**
+   * Same one-click trap as the rotation age's revert, sharpened: clearing the
+   * retention override can itself be the destructive change (configured
+   * tighter than the override, or retention off only by override) — and here
+   * there is no restore path at all.
+   */
+  let confirmRetentionRevert = $state(false);
+
+  function askRetentionRevert() {
+    if (policy !== null && retentionRevertWouldDelete(policy)) {
+      confirmRetentionRevert = true;
+      return;
+    }
+    void revertRetention();
+  }
+
+  async function revertRetention() {
+    await putRetention(null);
+    confirmRetentionRevert = false;
+  }
+
+  async function putRetention(next: number | null) {
+    retentionBusy = true;
+    retentionActionError = null;
+    retentionSaved = false;
+    try {
+      policy = await setSessionRetention(next);
+      const seeded = String(policy.effective_session_retention_days);
+      retentionInput = seeded;
+      seededRetention = seeded;
+      retentionSaved = true;
+    } catch (e) {
+      retentionActionError = (e as Error).message;
+    } finally {
+      retentionBusy = false;
+    }
+  }
+
   // Parsed once so the button's disabled state and the submit path can never
   // disagree about whether the input is valid. The field is a TEXT input on
   // purpose — see lib/models/tier-policy.ts for why a number input made this
@@ -221,6 +282,19 @@
   );
   const wouldLower = $derived(
     policy !== null && parsedHotDays !== null && parsedHotDays < policy.effective_hot_days,
+  );
+  const parsedRetention = $derived(parseWholeDays(retentionInput));
+  const retentionValid = $derived(
+    policy !== null && isRetentionValid(parsedRetention, policy.min_session_retention_days),
+  );
+  // Any change that deletes data on the next daily pass: enabling retention
+  // while off, or lowering it while on. No cold copy backs sessions, so
+  // unlike the rotation age there is no restore path.
+  const retentionDeletes = $derived(
+    policy !== null &&
+      parsedRetention !== null &&
+      retentionValid &&
+      retentionWouldDelete(policy.effective_session_retention_days, parsedRetention),
   );
 
   // -------------------------------------------------------------------------
@@ -509,6 +583,95 @@
                 <dd>{pol.configured_hot_days} days (TIER_HOT_DAYS)</dd>
               </div>
             </dl>
+
+            <div class="policy-sub">
+              <h4 class="policy-subtitle">{t('storage.sessionRetention')}</h4>
+              <p class="muted policy-lede">{t('prose.storage.sessionRetention')}</p>
+              <div class="policy-row">
+                <label class="policy-field">
+                  <span class="policy-label">{t('storage.retentionAge')}</span>
+                  <!-- Text, not type="number", for the rotation field's reasons —
+                       and a silently rounded value here DELETES data with no
+                       restore path at all. -->
+                  <input
+                    class="policy-input"
+                    type="text"
+                    inputmode="numeric"
+                    bind:value={retentionInput}
+                    disabled={retentionBusy}
+                  />
+                </label>
+                <Button
+                  variant="primary"
+                  disabled={!retentionValid || retentionBusy}
+                  onclick={() => {
+                    if (parsedRetention !== null) saveRetention(parsedRetention);
+                  }}
+                >
+                  {retentionBusy ? 'Saving…' : 'Apply'}
+                </Button>
+                {#if pol.session_retention_overridden}
+                  <Button
+                    variant="secondary"
+                    disabled={retentionBusy}
+                    onclick={askRetentionRevert}
+                  >
+                    Revert to default ({pol.configured_session_retention_days === 0
+                      ? 'off'
+                      : `${pol.configured_session_retention_days}d`})
+                  </Button>
+                {/if}
+              </div>
+
+              {#if parsedRetention !== null && !retentionValid}
+                <p class="policy-warn" role="alert">
+                  Must be 0 (off) or a whole number of days, at least
+                  {pol.min_session_retention_days}. Sessions younger than that are never
+                  retention-dropped.
+                </p>
+              {:else if retentionDeletes}
+                <p class="policy-warn" role="alert">
+                  <Icon name="triangle-alert" size={14} />
+                  This deletes raw sessions older than {parsedRetention} days on the next
+                  daily pass — permanently. Sessions have no cold copy: past-retention
+                  days survive only as aggregates, so session lists and drill-downs stop
+                  at the retention window. Raising the number afterwards does not bring
+                  them back.
+                </p>
+              {/if}
+
+              {#if retentionActionError}
+                <p class="policy-err" role="alert">
+                  <Icon name="triangle-alert" size={14} />
+                  {retentionActionError}
+                </p>
+              {/if}
+
+              {#if retentionSaved && !retentionDirty}
+                <p class="policy-ok">{t('storage.saved')}</p>
+              {/if}
+
+              <dl class="policy-facts">
+                <div>
+                  <dt>{t('storage.inForce')}</dt>
+                  <dd>
+                    {pol.effective_session_retention_days === 0
+                      ? t('storage.retentionOff')
+                      : `${pol.effective_session_retention_days} days`}{pol.session_retention_overridden
+                      ? ''
+                      : ' (default)'}
+                  </dd>
+                </div>
+                <div>
+                  <dt>{t('storage.configured')}</dt>
+                  <dd>
+                    {pol.configured_session_retention_days === 0
+                      ? t('storage.retentionOff')
+                      : `${pol.configured_session_retention_days} days`} (SESSION_RETENTION_DAYS)
+                  </dd>
+                </div>
+              </dl>
+            </div>
 
             {#if pol.follows_on_restart.length > 0}
               <details class="policy-detail">
@@ -822,8 +985,21 @@
   oncancel={() => (confirmRevert = false)}
 />
 
+<ConfirmDialog
+  bind:open={confirmRetentionRevert}
+  title={t('storage.confirmRetention')}
+  message={policy && retentionRevertWouldDelete(policy) ? describeRetentionRevert(policy) : ''}
+  confirmLabel={t('storage.revert')}
+  danger
+  loading={retentionBusy}
+  onconfirm={revertRetention}
+  oncancel={() => (confirmRetentionRevert = false)}
+/>
+
 <style>
   .policy-lede { margin: 0 0 14px; }
+  .policy-sub { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .policy-subtitle { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
   .policy-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
   .policy-field { display: flex; flex-direction: column; gap: 5px; }
   .policy-label { font-size: 12px; color: var(--text-muted); }

@@ -8,6 +8,10 @@ import {
   describeRevert,
   RESTORE_MIN_DAYS,
   RESTORE_MAX_DAYS,
+  isRetentionValid,
+  retentionWouldDelete,
+  retentionRevertWouldDelete,
+  describeRetentionRevert,
 } from './tier-policy';
 
 describe('parseWholeDays', () => {
@@ -181,5 +185,59 @@ describe('isHotDaysDirty', () => {
     // Guards the first load: were this true, the initial seed would be skipped
     // and the field would stay empty forever.
     expect(isHotDaysDirty('', '')).toBe(false);
+  });
+});
+
+describe('isRetentionValid', () => {
+  it('accepts 0 as an explicit off', () => {
+    expect(isRetentionValid(0, 7)).toBe(true);
+  });
+
+  it('accepts values at or above the floor', () => {
+    expect(isRetentionValid(7, 7)).toBe(true);
+    expect(isRetentionValid(365, 7)).toBe(true);
+  });
+
+  // 1..6 is the band where a typo would over-delete; the server refuses it
+  // and the button must too.
+  it('rejects null and the below-floor band', () => {
+    expect(isRetentionValid(null, 7)).toBe(false);
+    expect(isRetentionValid(1, 7)).toBe(false);
+    expect(isRetentionValid(6, 7)).toBe(false);
+  });
+});
+
+describe('retentionWouldDelete', () => {
+  it('enabling retention while off deletes', () => {
+    expect(retentionWouldDelete(0, 30)).toBe(true);
+  });
+
+  it('lowering while on deletes', () => {
+    expect(retentionWouldDelete(90, 30)).toBe(true);
+  });
+
+  it('raising, keeping, or turning off deletes nothing', () => {
+    expect(retentionWouldDelete(30, 90)).toBe(false);
+    expect(retentionWouldDelete(30, 30)).toBe(false);
+    expect(retentionWouldDelete(30, 0)).toBe(false);
+    expect(retentionWouldDelete(0, 0)).toBe(false);
+  });
+});
+
+describe('retention revert', () => {
+  it('flags a revert to a tighter configured value and names both ages', () => {
+    const p = { configured_session_retention_days: 30, effective_session_retention_days: 90 };
+    expect(retentionRevertWouldDelete(p)).toBe(true);
+    expect(describeRetentionRevert(p)).toContain('30 days');
+    expect(describeRetentionRevert(p)).toContain('90 days');
+  });
+
+  it('a revert back to off is safe', () => {
+    expect(
+      retentionRevertWouldDelete({
+        configured_session_retention_days: 0,
+        effective_session_retention_days: 30,
+      }),
+    ).toBe(false);
   });
 });

@@ -181,6 +181,23 @@ async fn tier_table(
         if range.end > cutoff {
             continue; // still hot
         }
+        // Rollup interlock: never export a partition the fold has not fully
+        // passed. The rollups are what keep aggregates answerable after the
+        // raw rows leave Postgres, so exporting ahead of the watermark would
+        // tier out rows that never reached them. Trivially satisfied in
+        // steady state (fold lag ~1 min vs day-old exports) — enforced, not
+        // assumed, because a stopped ingest process is exactly the state in
+        // which both "fold is behind" and "partitions keep aging" hold.
+        match sauron_db::rollups::as_of(&mut c, &sauron_db::rollups::EVENT_SOURCES).await? {
+            Some(ro_wm) if range.end <= ro_wm => {}
+            ro => {
+                tracing::info!(
+                    table = t.name, partition = %child, rollup_watermark = ?ro,
+                    "tier: partition retained until the rollup fold passes it"
+                );
+                continue;
+            }
+        }
         let wm = repo::get_watermark(&mut c, t.name).await?;
         if let Some(w) = wm {
             if range.start < w {

@@ -242,6 +242,17 @@ pub async fn active_users_by_day(
     to: DateTime<Utc>,
 ) -> anyhow::Result<(Vec<DayCount>, Vec<PartialDay>)> {
     let app_id = scope.app_id;
+    // Rollup gate: the migration-71 rollups never tier out, so for a ready
+    // app one small read covers ANY window and the whole hot/cold seam
+    // machinery below is unnecessary — including partial-day exclusions.
+    {
+        let mut c = conn(&state.pool).await?;
+        if sauron_db::rollups::is_ready(&mut c, app_id).await? {
+            let rows =
+                sauron_db::rollups::read::active_users_by_day(&mut c, &scope, from, to).await?;
+            return Ok((to_dc(rows), Vec::new()));
+        }
+    }
     let (wm, restored) = {
         let mut c = conn(&state.pool).await?;
         let wm = repo::get_watermark(&mut c, "analytics_events").await?;

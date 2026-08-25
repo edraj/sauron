@@ -132,6 +132,67 @@ export function describeRevert(p: RotationAges): string {
   );
 }
 
+/**
+ * Whether a parsed session-retention value may be submitted. `0` is an
+ * explicit OFF; anything else must be at least the server's floor — below it
+ * the server refuses rather than rounding, because retention deletes data
+ * with no cold copy.
+ */
+export function isRetentionValid(parsed: number | null, minRetentionDays: number): boolean {
+  return parsed !== null && (parsed === 0 || parsed >= minRetentionDays);
+}
+
+/**
+ * Whether moving session retention from `effective` to `next` deletes data on
+ * the next daily pass: enabling it while off, or lowering it while on.
+ * Turning it OFF (`next === 0`) or raising it deletes nothing. Unlike the
+ * rotation age there is no restore path — sessions have no cold copy — so
+ * every true here deserves the strongest warning the page has.
+ */
+export function retentionWouldDelete(effective: number, next: number): boolean {
+  return next !== 0 && (effective === 0 || next < effective);
+}
+
+/** The two retention ages the revert guard compares. Structurally satisfied by `TierPolicy`. */
+export interface RetentionAges {
+  /** SESSION_RETENTION_DAYS in the API process — what clearing falls back to. */
+  configured_session_retention_days: number;
+  /** What the daily pass will use next; 0 = off. */
+  effective_session_retention_days: number;
+}
+
+/**
+ * Whether clearing the retention override would delete data — the same trap
+ * as `revertWouldLower`: "Revert to default" reads like an undo, but when the
+ * configured value is tighter (or retention was off only by override) the
+ * revert IS the destructive change, reached from one click.
+ */
+export function retentionRevertWouldDelete(p: RetentionAges): boolean {
+  return retentionWouldDelete(
+    p.effective_session_retention_days,
+    p.configured_session_retention_days,
+  );
+}
+
+/**
+ * Confirmation text for a retention revert that deletes data. Names both
+ * values and says plainly that there is no restore path; only meaningful when
+ * `retentionRevertWouldDelete` is true, callers guard on it.
+ */
+export function describeRetentionRevert(p: RetentionAges): string {
+  const from =
+    p.effective_session_retention_days === 0
+      ? 'off'
+      : `${p.effective_session_retention_days} days`;
+  return (
+    `Reverting drops the override (currently ${from}) and puts ` +
+    `${p.configured_session_retention_days} days in force. On the next daily pass, ` +
+    `raw sessions older than ${p.configured_session_retention_days} days are deleted ` +
+    `permanently — sessions have no cold copy, so past-retention days survive only ` +
+    `as aggregates. Raising the number afterwards does not bring them back.`
+  );
+}
+
 /** A restore pin lifetime within the server's bounds, or null. */
 export function parseRestoreDays(raw: string | number | null | undefined): number | null {
   const n = parseWholeDays(raw);

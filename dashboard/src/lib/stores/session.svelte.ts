@@ -112,6 +112,18 @@ class SessionStore {
     return this.orgs.find((o) => o.id === this.currentOrgId) ?? null;
   }
 
+  /**
+   * Projects this user can reach across EVERY org, not just the current one.
+   *
+   * The shell asks this before offering onboarding. Asking "does the current
+   * org have projects" instead is what stranded a member who holds a grant in
+   * one org and lands on another: the empty org answered "no projects", and
+   * onboarding is a page with no org switcher on it, so there was no way back.
+   */
+  get reachableProjectCount(): number {
+    return this.orgs.reduce((n, o) => n + (o.project_count ?? 0), 0);
+  }
+
   get currentProject(): Project | null {
     return this.projects.find((p) => p.id === this.currentProjectId) ?? null;
   }
@@ -275,7 +287,15 @@ class SessionStore {
         return;
       }
       const stored = readStored(ORG_KEY);
-      this.currentOrgId = stored && orgs.some((o) => o.id === stored) ? stored : orgs[0].id;
+      // A stored org still wins — switching orgs is an explicit choice and
+      // landing somewhere else would undo it. Without one, prefer the first org
+      // that actually HAS a reachable project: `orgs[0]` is creation-ordered,
+      // so blindly taking it drops a member onto an empty org while their
+      // projects sit one org over.
+      this.currentOrgId =
+        stored && orgs.some((o) => o.id === stored)
+          ? stored
+          : (orgs.find((o) => o.project_count > 0) ?? orgs[0]).id;
       writeStored(ORG_KEY, this.currentOrgId);
       await this.loadOrgScope(this.currentOrgId);
       this.loaded = true;

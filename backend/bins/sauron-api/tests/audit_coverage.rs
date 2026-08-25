@@ -24,6 +24,7 @@ const AUDITED: &[&str] = &[
     "routes::admin::extend_pin",
     "routes::admin::release_pin",
     "routes::admin::set_tier_policy",
+    "routes::admin::set_session_retention",
     // All three purge transitions are audited. `preview` destroys nothing but
     // is where the scope is chosen and frozen, so it is the only record of
     // what was ASKED for as distinct from what confirm executed.
@@ -125,6 +126,12 @@ const EXEMPT: &[(&str, &str)] = &[
     (
         "routes::funnels::compute",
         "read-only analysis; POST only because the query is a body",
+    ),
+    (
+        "routes::analytics::rollups_refresh",
+        "same class as overview_refresh directly below: kicks a recompute of \
+      derived rollup aggregates the caller can already read, writes no domain \
+      data, and POST only because it triggers server-side work",
     ),
     (
         "routes::analytics::overview_refresh",

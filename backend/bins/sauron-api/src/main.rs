@@ -675,6 +675,14 @@ async fn main() -> anyhow::Result<()> {
             post(routes::analytics::overview_refresh),
         )
         .route(
+            "/v1/apps/{app_id}/rollups/status",
+            get(routes::analytics::rollups_status),
+        )
+        .route(
+            "/v1/apps/{app_id}/rollups/refresh",
+            post(routes::analytics::rollups_refresh),
+        )
+        .route(
             "/v1/apps/{app_id}/users/summary",
             get(routes::analytics::users_summary),
         )
@@ -971,6 +979,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/tier-policy",
             get(routes::admin::get_tier_policy).put(routes::admin::set_tier_policy),
+        )
+        .route(
+            "/v1/admin/session-retention",
+            put(routes::admin::set_session_retention),
         )
         .route(
             "/v1/admin/restore",

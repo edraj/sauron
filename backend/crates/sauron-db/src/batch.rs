@@ -49,7 +49,7 @@ use chrono::{DateTime, Utc};
 use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::sql_types::{
-    Array, BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+    Array, BigInt, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
 };
 use diesel::upsert::excluded;
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -243,22 +243,6 @@ pub struct SessionBump {
     pub unhandled_delta: i64,
 }
 
-/// One row of [`bump_sessions`]' `RETURNING`.
-#[derive(QueryableByName)]
-struct BumpedSession {
-    #[diesel(sql_type = SqlUuid)]
-    app_id: Uuid,
-    #[diesel(sql_type = Text)]
-    session_id: String,
-    /// `xmax = 0` is true for exactly the rows this statement INSERTED. An
-    /// upsert that took the `DO UPDATE` arm stamps the updating transaction's
-    /// id into the row's `xmax`, so a non-zero value means "this already
-    /// existed". It is the only way to tell the two arms apart from a single
-    /// statement — `RETURNING` alone reports both identically.
-    #[diesel(sql_type = Bool)]
-    inserted: bool,
-}
-
 /// Fold N session bumps into `sessions`, one statement.
 ///
 /// The conflict arm is copied from [`crate::repo::bump_session`] unchanged, so
@@ -278,63 +262,162 @@ pub async fn bump_sessions(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    // Sorted by `(app_id, session_id)` so every concurrent batch takes these row locks in
-    // the same order — see the module's ordering rule.
+    // Sorted by `(app_id, session_id)` so every concurrent batch takes the
+    // advisory locks below in the same order — see the module's ordering rule.
     let mut ix: Vec<usize> = (0..rows.len()).collect();
     ix.sort_unstable_by(|&a, &b| {
         (rows[a].app_id, &rows[a].session_id).cmp(&(rows[b].app_id, &rows[b].session_id))
     });
+
+    // Since migration 73 `sessions` is RANGE-partitioned on `started_at`, and a
+    // partitioned table cannot carry the global UNIQUE (app_id, session_id)
+    // the old single-statement ON CONFLICT upsert targeted (a partitioned
+    // unique index must include the partition key, and `started_at` is
+    // batch-derived and LEAST-movable — in the conflict key it would split one
+    // session into a row per batch). The upsert therefore becomes three
+    // statements inside the caller's transaction (`write_rows_once` — this MUST
+    // run inside one):
+    //
+    //   1. xact-scoped advisory locks on every (app, session) key, in sorted
+    //      order. This is what serializes two batches CREATING the same brand
+    //      new session — without a table-wide unique index nothing else can.
+    //   2. UPDATE the keys that exist. Fresh read-committed snapshot per
+    //      statement is load-bearing: after the lock wait in step 1, this
+    //      statement SEES a concurrent creator's committed row. (A
+    //      single-statement CTE version is wrong for exactly that reason —
+    //      it keeps its pre-wait snapshot.)
+    //   3. INSERT the complement, RETURNING the new keys — the same contract
+    //      the old `RETURNING (xmax = 0)` filter produced.
+    //
+    // Every SET arm below is copied verbatim from the old conflict arm; the
+    // per-item `repo::bump_session` carries the identical arms and the same
+    // lock key derivation, and the pipeline equivalence test diffs the two.
+    // `LEAST(started_at, …)` can move a row across partitions; Postgres
+    // handles that as delete+insert under the row lock we hold.
     diesel::sql_query(
-        "INSERT INTO sessions \
-           (app_id, session_id, distinct_id, device_key, started_at, last_event_at, \
-            events_count, errors_count, unhandled_errors_count, context, release, \
-            environment_id, ip_address) \
-         SELECT app_id, session_id, distinct_id, device_key, first_at, last_at, \
-                events_delta, errors_delta, unhandled_delta, context, release, \
-                environment_id, ip_address \
-         FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::timestamptz[], \
+        "SELECT pg_advisory_xact_lock(hashtextextended(k.app_id::text || '|' || k.session_id, 8642)) \
+         FROM (SELECT app_id, session_id \
+               FROM unnest($1::uuid[], $2::text[]) AS u(app_id, session_id) \
+               ORDER BY app_id, session_id) k",
+    )
+    .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
+    .bind::<Array<Text>, _>(ix.iter().map(|&i| rows[i].session_id.clone()).collect::<Vec<_>>())
+    .execute(conn)
+    .await?;
+
+    let bind_all = |q: diesel::query_builder::BoxedSqlQuery<
+        'static,
+        diesel::pg::Pg,
+        diesel::query_builder::SqlQuery,
+    >| {
+        q.bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
+            .bind::<Array<Text>, _>(
+                ix.iter()
+                    .map(|&i| rows[i].session_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Nullable<Text>>, _>(
+                ix.iter()
+                    .map(|&i| rows[i].distinct_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Nullable<Text>>, _>(
+                ix.iter()
+                    .map(|&i| rows[i].device_key.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].first_at).collect::<Vec<_>>())
+            .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].last_at).collect::<Vec<_>>())
+            .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].events_delta).collect::<Vec<_>>())
+            .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].errors_delta).collect::<Vec<_>>())
+            .bind::<Array<Jsonb>, _>(
+                ix.iter()
+                    .map(|&i| rows[i].context.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Nullable<Text>>, _>(
+                ix.iter()
+                    .map(|&i| rows[i].release.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Nullable<SqlUuid>>, _>(
+                ix.iter()
+                    .map(|&i| rows[i].environment_id)
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Nullable<Text>>, _>(
+                ix.iter().map(|&i| rows[i].ip.clone()).collect::<Vec<_>>(),
+            )
+            .bind::<Array<BigInt>, _>(
+                ix.iter()
+                    .map(|&i| rows[i].unhandled_delta)
+                    .collect::<Vec<_>>(),
+            )
+    };
+
+    const UNNEST: &str =
+        "unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::timestamptz[], \
                      $6::timestamptz[], $7::bigint[], $8::bigint[], $9::jsonb[], $10::text[], \
                      $11::uuid[], $12::text[], $13::bigint[]) \
               AS t(app_id, session_id, distinct_id, device_key, first_at, last_at, \
                    events_delta, errors_delta, context, release, environment_id, ip_address, \
-                   unhandled_delta) \
-         ON CONFLICT (app_id, session_id) DO UPDATE SET \
-            last_event_at = GREATEST(sessions.last_event_at, EXCLUDED.last_event_at), \
-            started_at = LEAST(sessions.started_at, EXCLUDED.started_at), \
-            events_count = sessions.events_count + EXCLUDED.events_count, \
-            errors_count = sessions.errors_count + EXCLUDED.errors_count, \
-            unhandled_errors_count = sessions.unhandled_errors_count \
-                                   + EXCLUDED.unhandled_errors_count, \
-            distinct_id = COALESCE(EXCLUDED.distinct_id, sessions.distinct_id), \
-            device_key = COALESCE(EXCLUDED.device_key, sessions.device_key), \
-            context = CASE WHEN EXCLUDED.context <> '{}'::jsonb THEN EXCLUDED.context ELSE sessions.context END, \
-            release = COALESCE(EXCLUDED.release, sessions.release), \
-            environment_id = COALESCE(EXCLUDED.environment_id, sessions.environment_id), \
-            ip_address = COALESCE(EXCLUDED.ip_address, sessions.ip_address), \
-            updated_at = now() \
-         RETURNING app_id, session_id, (xmax = 0) AS inserted",
+                   unhandled_delta)";
+
+    bind_all(
+        diesel::sql_query(format!(
+            "UPDATE sessions s SET \
+                last_event_at = GREATEST(s.last_event_at, t.last_at), \
+                started_at = LEAST(s.started_at, t.first_at), \
+                events_count = s.events_count + t.events_delta, \
+                errors_count = s.errors_count + t.errors_delta, \
+                unhandled_errors_count = s.unhandled_errors_count + t.unhandled_delta, \
+                distinct_id = COALESCE(t.distinct_id, s.distinct_id), \
+                device_key = COALESCE(t.device_key, s.device_key), \
+                context = CASE WHEN t.context <> '{{}}'::jsonb THEN t.context ELSE s.context END, \
+                release = COALESCE(t.release, s.release), \
+                environment_id = COALESCE(t.environment_id, s.environment_id), \
+                ip_address = COALESCE(t.ip_address, s.ip_address), \
+                updated_at = now() \
+             FROM {UNNEST} \
+             WHERE s.app_id = t.app_id AND s.session_id = t.session_id"
+        ))
+        .into_boxed(),
     )
-    .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
-    .bind::<Array<Text>, _>(ix.iter().map(|&i| rows[i].session_id.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].distinct_id.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].device_key.clone()).collect::<Vec<_>>())
-    .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].first_at).collect::<Vec<_>>())
-    .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].last_at).collect::<Vec<_>>())
-    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].events_delta).collect::<Vec<_>>())
-    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].errors_delta).collect::<Vec<_>>())
-    .bind::<Array<Jsonb>, _>(ix.iter().map(|&i| rows[i].context.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].release.clone()).collect::<Vec<_>>())
-    .bind::<Array<Nullable<SqlUuid>>, _>(ix.iter().map(|&i| rows[i].environment_id).collect::<Vec<_>>())
-    .bind::<Array<Nullable<Text>>, _>(ix.iter().map(|&i| rows[i].ip.clone()).collect::<Vec<_>>())
-    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].unhandled_delta).collect::<Vec<_>>())
-    .get_results::<BumpedSession>(conn)
-    .await
-    .map(|rows| {
-        rows.into_iter()
-            .filter(|r| r.inserted)
-            .map(|r| (r.app_id, r.session_id))
-            .collect()
-    })
+    .execute(conn)
+    .await?;
+
+    let inserted: Vec<SessionKeyRow> = bind_all(
+        diesel::sql_query(format!(
+            "INSERT INTO sessions \
+               (app_id, session_id, distinct_id, device_key, started_at, last_event_at, \
+                events_count, errors_count, unhandled_errors_count, context, release, \
+                environment_id, ip_address) \
+             SELECT t.app_id, t.session_id, t.distinct_id, t.device_key, t.first_at, t.last_at, \
+                    t.events_delta, t.errors_delta, t.unhandled_delta, t.context, t.release, \
+                    t.environment_id, t.ip_address \
+             FROM {UNNEST} \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM sessions s \
+                 WHERE s.app_id = t.app_id AND s.session_id = t.session_id) \
+             RETURNING app_id, session_id"
+        ))
+        .into_boxed(),
+    )
+    .get_results(conn)
+    .await?;
+
+    Ok(inserted
+        .into_iter()
+        .map(|r| (r.app_id, r.session_id))
+        .collect())
+}
+
+#[derive(QueryableByName)]
+struct SessionKeyRow {
+    #[diesel(sql_type = SqlUuid)]
+    app_id: Uuid,
+    #[diesel(sql_type = Text)]
+    session_id: String,
 }
 
 /// One device's folded contribution from a batch.

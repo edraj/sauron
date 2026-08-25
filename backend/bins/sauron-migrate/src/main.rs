@@ -64,5 +64,21 @@ async fn main() -> anyhow::Result<()> {
         let pool = sauron_db::build_pool(&url, 4)?;
         sauron_db::device_env_backfill::backfill_all(&pool).await?;
     }
+
+    // Opt-in like its two siblings above, and heavier than both: this replays
+    // every pre-epoch day of all three firehose tables into the dashboard
+    // rollups (migration 71). Until it runs, every analytics read takes the
+    // pre-rollup query — a performance decision, never a correctness one.
+    // Refuses (with a warning) when marker rows already exist: the aggregates
+    // are additive and a second run would double-count.
+    if std::env::args().any(|a| a == "backfill-rollups") {
+        let pool = sauron_db::build_pool(&url, 4)?;
+        let mut conn = sauron_db::conn(&pool).await?;
+        sauron_db::rollups::fold::backfill_all(&mut conn, 2000, |day| {
+            tracing::info!(%day, "rollup backfill: day complete");
+        })
+        .await?;
+        tracing::info!("rollup backfill complete");
+    }
     Ok(())
 }

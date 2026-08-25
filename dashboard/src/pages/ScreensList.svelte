@@ -14,6 +14,10 @@
   import { rangeStore } from '../lib/stores/range.svelte';
   import { rangeKey, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import RollupChip from '../lib/components/ui/RollupChip.svelte';
+  import { refreshRollups } from '../lib/api/rollups';
+  import { approx } from '../lib/models/freshness';
+  import { rollupState } from '../lib/stores/rollups.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -126,6 +130,10 @@
     if (!aid) return;
     refreshing = true;
     try {
+      // Kick an immediate rollup fold first (bounded server-side wait), so
+      // the reloads below fetch aggregates that include the newest events.
+      // Older APIs 404 this — then the reload alone is the refresh.
+      await refreshRollups(aid).catch(() => {});
       await Promise.all([
         load(aid, range, search, sortParam(list.sort), list.offset, true),
       ]);
@@ -156,6 +164,7 @@
     <div class="controls">
       <DateRange value={range} onchange={onRange} />
       <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('screens.search')} width="240px" />
+      <RollupChip />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>
@@ -218,7 +227,7 @@
             <td class="num">{compactNumber(r.views)}</td>
             <td class="num">{compactNumber(r.events)}</td>
             <td class="num"><span class:err={r.exceptions > 0}>{compactNumber(r.exceptions)}</span></td>
-            <td class="num">{compactNumber(r.users)}</td>
+            <td class="num">{approx(compactNumber(r.users), rollupState.ready)}</td>
             <td class="num">{formatDuration(r.avg_dwell_ms)}</td>
           </tr>
         {/each}

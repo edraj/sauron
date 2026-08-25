@@ -63,6 +63,16 @@ export const nav = {
     en: "You don't have access to any app in this organization yet. Ask an administrator to grant you access.",
     ar: 'ليس لديك صلاحية الوصول إلى أي تطبيق في هذه المؤسسة بعد. اطلب من أحد المسؤولين منحك الصلاحية.',
   },
+  'shell.emptyOrg.title': {
+    en: 'No projects in this organization',
+    ar: 'لا توجد مشاريع في هذه المؤسسة',
+  },
+  'shell.emptyOrg.body': {
+    en: 'This organization has no projects you can see. Switch organizations from the picker above, or create a project here.',
+    ar: 'لا توجد مشاريع يمكنك رؤيتها في هذه المؤسسة. بدّل المؤسسة من القائمة أعلاه، أو أنشئ مشروعًا هنا.',
+  },
+  'shell.emptyOrg.create': { en: 'Create a project', ar: 'إنشاء مشروع' },
+  'nav.orgLocked': { en: 'No access', ar: 'لا صلاحية' },
   'shell.adminSections': { en: 'Admin sections', ar: 'أقسام الإدارة' },
 
   // --- top bar pickers -----------------------------------------------------
