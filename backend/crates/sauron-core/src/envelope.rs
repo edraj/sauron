@@ -438,7 +438,7 @@ impl IngestBatch {
         self.into_jobs_counting_skew().0
     }
 
-    /// [`Self::into_jobs`], plus how many timestamps [`EnvelopeItem::clamp_future`]
+    /// [`Self::into_jobs`], plus how many timestamps [`EnvelopeItem::clamp_clock`]
     /// had to rewrite — so the worker can meter clock skew instead of correcting
     /// it invisibly.
     pub fn into_jobs_counting_skew(mut self) -> (Vec<IngestJob>, usize) {
@@ -451,10 +451,7 @@ impl IngestBatch {
         // `occurred_at` derived from them. Clamping at those call sites instead
         // would be six places to keep in agreement forever.
         let received_at = self.received_at;
-        let skewed = items
-            .iter_mut()
-            .map(|it| it.clamp_future(received_at))
-            .sum();
+        let skewed = items.iter_mut().map(|it| it.clamp_clock(received_at)).sum();
         let n = items.len();
         let mut out = Vec::with_capacity(n);
         for (i, item) in items.into_iter().enumerate() {
@@ -549,14 +546,31 @@ impl EventUser {
 /// because the cost of clamping honest drift is silently reordered timelines.
 pub const MAX_CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(15);
 
+/// How far in the PAST a device timestamp may claim to be before it is pinned
+/// to `received_at`. Three orders wider than [`MAX_CLOCK_SKEW`] on purpose:
+/// events legitimately arrive hours or even days late (offline SDK buffers),
+/// and rewriting those would corrupt exactly the ordering the future clamp
+/// protects. Thirty days is also the platform's own usefulness horizon — the
+/// rollup consistency sweep repairs only the trailing 35 days and the cold
+/// tier's hot window defaults to 30 — so an event older than this AT ARRIVAL
+/// could never be aggregated or tiered correctly anyway. What such a
+/// timestamp is in practice is a device that booted with its clock at the
+/// epoch and fired before NTP sync (production sample, 2026-08-26: an event
+/// claiming 1970-01-01 00:09:45 — nine minutes of uptime — arriving in 2026;
+/// twenty of those cost a 20,000-day rollup-backfill walk).
+pub const MAX_CLOCK_LAG: chrono::Duration = chrono::Duration::days(30);
+
 /// Pin `ts` to `received_at` when it claims to be more than [`MAX_CLOCK_SKEW`]
-/// in the future. Returns whether it was rewritten, so callers can count.
+/// in the future or more than [`MAX_CLOCK_LAG`] in the past. Returns whether
+/// it was rewritten, so callers can count.
 ///
 /// Pinned to `received_at` rather than to the tolerance edge: a clamped value
 /// then reads as "arrived now", which is the one thing about it we actually
-/// know to be true.
+/// know to be true — and for the dominant past-direction failure (clock still
+/// at the epoch until NTP sync, then a quick flush) it is also very nearly
+/// the event's real time.
 fn clamp_one(ts: &mut DateTime<Utc>, received_at: DateTime<Utc>) -> bool {
-    if *ts > received_at + MAX_CLOCK_SKEW {
+    if *ts > received_at + MAX_CLOCK_SKEW || *ts < received_at - MAX_CLOCK_LAG {
         *ts = received_at;
         return true;
     }
@@ -564,16 +578,17 @@ fn clamp_one(ts: &mut DateTime<Utc>, received_at: DateTime<Utc>) -> bool {
 }
 
 impl EnvelopeItem {
-    /// Clamp every device-clock timestamp this item carries, returning how
-    /// many were rewritten (for the skew counter — a clamp that happens
-    /// silently is a clamp nobody ever fixes at the source).
+    /// Clamp every device-clock timestamp this item carries — in BOTH
+    /// directions, [`MAX_CLOCK_SKEW`] ahead and [`MAX_CLOCK_LAG`] behind —
+    /// returning how many were rewritten (for the skew counter — a clamp that
+    /// happens silently is a clamp nobody ever fixes at the source).
     ///
     /// Deliberately covers nested breadcrumbs and a transaction's
     /// `finished_at` as well as the top-level `timestamp`: they all come off
     /// the same broken clock, and clamping only the outer one would leave a
     /// breadcrumb trail dated after the crash it belongs to, or a span whose
     /// end precedes its start.
-    pub fn clamp_future(&mut self, received_at: DateTime<Utc>) -> usize {
+    pub fn clamp_clock(&mut self, received_at: DateTime<Utc>) -> usize {
         let mut n = 0;
         match self {
             EnvelopeItem::Error(e) => {
@@ -696,17 +711,67 @@ mod clock_skew_tests {
 
     /// The overwhelmingly common case: the device clock is BEHIND or equal,
     /// because the event genuinely happened before it was received. Nothing
-    /// may be rewritten here — this is the 96% of real traffic.
+    /// inside [`MAX_CLOCK_LAG`] may be rewritten — this is the 96% of real
+    /// traffic, and it includes offline SDK buffers flushing days later.
     #[test]
-    fn past_timestamps_are_never_touched() {
+    fn recent_past_is_never_touched() {
         let ts = recv() - Duration::hours(3);
         let mut item = event_at(ts);
-        assert_eq!(item.clamp_future(recv()), 0);
+        assert_eq!(item.clamp_clock(recv()), 0);
         assert_eq!(
             timestamp_of(&item),
             ts,
             "a past event must survive verbatim"
         );
+    }
+
+    /// The past-direction failure the future clamp missed: a device boots
+    /// with its clock at the epoch and fires before NTP sync. Production
+    /// sample 2026-08-26: `occurred_at = 1970-01-01 00:09:45` arriving in
+    /// 2026 — twenty such events cost a 20,000-day rollup-backfill walk and
+    /// DEFAULT-partition strays nothing ever reclaims.
+    #[test]
+    fn epoch_era_timestamps_are_pinned_to_receipt() {
+        let ts = at("1970-01-01T00:09:45Z");
+        let mut item = event_at(ts);
+        assert_eq!(item.clamp_clock(recv()), 1);
+        assert_eq!(
+            timestamp_of(&item),
+            recv(),
+            "an epoch-era timestamp must read as \"arrived now\""
+        );
+    }
+
+    /// Offline buffers flush DAYS late with correct timestamps; the lag
+    /// window exists so those survive verbatim while epoch garbage cannot.
+    /// Both sides of the boundary, since an off-by-one here silently rewrites
+    /// a month of legitimate history.
+    #[test]
+    fn the_lag_boundary_splits_buffered_from_broken() {
+        let fine = recv() - MAX_CLOCK_LAG + Duration::seconds(1);
+        let mut item = event_at(fine);
+        assert_eq!(item.clamp_clock(recv()), 0);
+        assert_eq!(timestamp_of(&item), fine, "inside the window: untouched");
+
+        let broken = recv() - MAX_CLOCK_LAG - Duration::seconds(1);
+        let mut item = event_at(broken);
+        assert_eq!(item.clamp_clock(recv()), 1);
+        assert_eq!(timestamp_of(&item), recv(), "outside the window: pinned");
+    }
+
+    /// Nested timestamps ride the same broken boot clock as the outer one:
+    /// a 1970 error carries 1970 breadcrumbs, a 1970 transaction a 1970
+    /// `finished_at`. Clamping only the outer timestamp would date a trail
+    /// before the epoch of the crash it explains.
+    #[test]
+    fn past_clamp_covers_nested_timestamps() {
+        let ancient = at("1970-01-01T00:05:00Z");
+        let mut err = error_at(ancient, vec![crumb_at("tap", ancient)]);
+        assert_eq!(err.clamp_clock(recv()), 2, "error timestamp + breadcrumb");
+
+        let mut txn = txn_at(ancient, Some(ancient));
+        assert_eq!(txn.clamp_clock(recv()), 2, "transaction + finished_at");
+        assert_eq!(timestamp_of(&txn), recv());
     }
 
     /// Measured 2026-08-12 against the live `sessions` table: positive skew
@@ -718,7 +783,7 @@ mod clock_skew_tests {
         for minutes in [0, 1, 5, 14] {
             let ts = recv() + Duration::minutes(minutes);
             let mut item = event_at(ts);
-            assert_eq!(item.clamp_future(recv()), 0, "{minutes}m must not clamp");
+            assert_eq!(item.clamp_clock(recv()), 0, "{minutes}m must not clamp");
             assert_eq!(timestamp_of(&item), ts, "{minutes}m must survive verbatim");
         }
     }
@@ -734,7 +799,7 @@ mod clock_skew_tests {
             Duration::days(31),
         ] {
             let mut item = event_at(recv() + skew);
-            assert_eq!(item.clamp_future(recv()), 1, "{skew} must clamp");
+            assert_eq!(item.clamp_clock(recv()), 1, "{skew} must clamp");
             assert_eq!(
                 timestamp_of(&item),
                 recv(),
@@ -765,7 +830,7 @@ mod clock_skew_tests {
             }),
         ];
         for item in &mut items {
-            assert!(item.clamp_future(recv()) > 0, "variant left unclamped");
+            assert!(item.clamp_clock(recv()) > 0, "variant left unclamped");
             assert_eq!(timestamp_of(item), recv(), "variant not pinned");
         }
     }
@@ -782,7 +847,7 @@ mod clock_skew_tests {
                 crumb_at("skewed", recv() + Duration::days(31)),
             ],
         );
-        assert_eq!(item.clamp_future(recv()), 1, "only the skewed crumb counts");
+        assert_eq!(item.clamp_clock(recv()), 1, "only the skewed crumb counts");
         let EnvelopeItem::Error(e) = &item else {
             unreachable!()
         };
@@ -801,7 +866,7 @@ mod clock_skew_tests {
     fn transaction_finished_at_clamps_too() {
         let far = recv() + Duration::days(31);
         let mut item = txn_at(far, Some(far));
-        assert_eq!(item.clamp_future(recv()), 2, "timestamp and finished_at");
+        assert_eq!(item.clamp_clock(recv()), 2, "timestamp and finished_at");
         let EnvelopeItem::Transaction(t) = &item else {
             unreachable!()
         };

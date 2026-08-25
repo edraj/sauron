@@ -343,6 +343,22 @@ journalctl -u sauron-migrate --no-pager | tail
 if `systemctl is-failed sauron-migrate` says `failed`, no daemon will start until
 the database is fixed.
 
+**Upgrading across the sessions partitioning (migration 0073) has one extra,
+mandatory step.** The migration itself is schema-only and finishes in seconds
+whatever your history size or `max_locks_per_transaction` — but it leaves every
+pre-existing session row in a renamed side table. Move them BEFORE opening
+traffic (and before `backfill-rollups`, which reads sessions):
+
+```bash
+sudo -u sauron bash -c 'set -a; . /etc/sauron/sauron.env; exec /usr/bin/sauron-migrate finish-sessions-partitioning'
+```
+
+One day per transaction (~15 lock slots — fits any Postgres, managed included),
+resumable: interrupt it at any point and re-run, it continues where it stopped
+and drops the side table only once it is verifiably empty. Until it completes,
+session lists and drill-downs see only rows written after the upgrade. A second
+run prints "already complete" and does nothing.
+
 ### Manual fallback
 
 Still valid, and what to use when the daemons are down and you want the migration

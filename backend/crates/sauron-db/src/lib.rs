@@ -17,6 +17,7 @@ pub mod repo;
 pub mod rollups;
 pub mod schema;
 pub mod scope;
+pub mod sessions_cutover;
 pub mod sketch;
 pub mod stack_pool;
 
