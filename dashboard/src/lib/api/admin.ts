@@ -107,6 +107,13 @@ export interface TierPolicy {
    */
   follows_on_restart: string[];
   pins: TierPin[];
+  /** From SESSION_RETENTION_DAYS (or its default); 0 = keep forever. */
+  configured_session_retention_days: number;
+  /** What the daily retention pass will use next; 0 means retention is off. */
+  effective_session_retention_days: number;
+  session_retention_overridden: boolean;
+  min_session_retention_days: number;
+  session_retention_updated_at: string | null;
 }
 
 /**
@@ -128,6 +135,20 @@ export async function getTierPolicy(): Promise<TierPolicy> {
  */
 export async function setTierPolicy(hotDays: number | null): Promise<TierPolicy> {
   const { data } = await api.put<TierPolicy>('/v1/admin/tier-policy', { hot_days: hotDays });
+  return data;
+}
+
+/**
+ * `retentionDays: null` clears the override; `0` turns retention off.
+ *
+ * ENABLING OR LOWERING DELETES DATA WITH NO WAY BACK. Sessions have no cold
+ * copy: on the next daily pass, whole day-partitions past the window are
+ * dropped and only the session-day rollups remain of them.
+ */
+export async function setSessionRetention(retentionDays: number | null): Promise<TierPolicy> {
+  const { data } = await api.put<TierPolicy>('/v1/admin/session-retention', {
+    retention_days: retentionDays,
+  });
   return data;
 }
 

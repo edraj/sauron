@@ -38,6 +38,10 @@ impl ObfuscationMap {
     /// the pairs before it are still usable, and refusing the whole map would
     /// turn a truncated upload into "no de-obfuscation at all" instead of
     /// "de-obfuscation for everything that arrived".
+    // clippy suggests `as_chunks`, which is Rust 1.88+; workspace MSRV is 1.82.
+    // The lint itself is clippy 1.98+, so older toolchains need unknown_lints.
+    #[allow(unknown_lints)]
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn parse(bytes: &[u8]) -> Result<Self, SymbolError> {
         let raw: Vec<String> = serde_json::from_slice(bytes)
             .map_err(|_| SymbolError::Corrupt("obfuscation map".to_string()))?;

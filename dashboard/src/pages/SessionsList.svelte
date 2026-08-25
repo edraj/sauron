@@ -29,6 +29,10 @@
   } from '../lib/components/filters/filters';
   import Pagination from '../lib/components/Pagination.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import RollupChip from '../lib/components/ui/RollupChip.svelte';
+  import { refreshRollups } from '../lib/api/rollups';
+  import { approx } from '../lib/models/freshness';
+  import { rollupState } from '../lib/stores/rollups.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
@@ -258,6 +262,10 @@
     if (!aid) return;
     refreshing = true;
     try {
+      // Kick an immediate rollup fold first (bounded server-side wait), so
+      // the reloads below fetch aggregates that include the newest events.
+      // Older APIs 404 this — then the reload alone is the refresh.
+      await refreshRollups(aid).catch(() => {});
       // force: an explicit click must reach the network regardless of freshness.
       await Promise.all([
         load(aid, timeFilter, sortParam(list.sort), list.offset, appliedSearch, filters, true),
@@ -387,7 +395,7 @@
       <StatTile label={t('explore.column.sessions')} value={compactNumber(analytics.stats.sessions)} tone="primary" sub={rangeCaption} />
       <StatTile label={t('sessions.stat.crashed')} value={compactNumber(analytics.stats.crashed)} tone={analytics.stats.crashed > 0 ? 'warning' : 'neutral'} />
       <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
-      <StatTile label={t('sessions.stat.median')} value={formatDuration(analytics.stats.median_session_ms)} />
+      <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), rollupState.ready)} />
     </StatTiles>
 
     <div class="session-charts">
@@ -433,7 +441,8 @@
     >
       {#snippet actions()}
         <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
-        <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
+        <RollupChip />
+      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
         <Button
           variant="secondary"
           disabled={sessions.length === 0}

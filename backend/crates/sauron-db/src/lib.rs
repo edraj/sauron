@@ -14,8 +14,10 @@ pub mod pool;
 pub mod purge;
 pub mod query_plan;
 pub mod repo;
+pub mod rollups;
 pub mod schema;
 pub mod scope;
+pub mod sketch;
 pub mod stack_pool;
 
 pub use pool::{build_pool, conn, PgConn, PgPool};
@@ -635,7 +637,9 @@ static TEST_TEMPLATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock:
 pub async fn create_test_database(maintenance_url: &str, db_name: &str) -> anyhow::Result<()> {
     if let Some(template) = ensure_migrated_template(maintenance_url).await {
         match create_database_from_template(maintenance_url, db_name, &template).await {
-            Ok(()) => return Ok(()),
+            // The copy inherits the template's epoch stamp too, so the gate
+            // close must run on this path as well, not only the fallback.
+            Ok(()) => return close_rollup_gate(&swap_database_url(maintenance_url, db_name)).await,
             Err(e) => {
                 eprintln!(
                     "create_test_database: copying {template} -> {db_name} failed, \
@@ -647,7 +651,25 @@ pub async fn create_test_database(maintenance_url: &str, db_name: &str) -> anyho
         }
     }
     create_database(maintenance_url, db_name).await?;
-    run_pending_migrations(&swap_database_url(maintenance_url, db_name)).await
+    run_pending_migrations(&swap_database_url(maintenance_url, db_name)).await?;
+    close_rollup_gate(&swap_database_url(maintenance_url, db_name)).await
+}
+
+/// Push `rollup_epoch` a decade out so every app a test creates predates it.
+///
+/// Without this, `rollups::is_ready` is TRUE for every test-created app (they
+/// are younger than the template's epoch stamp) while no fold task runs in
+/// tests — so every gated aggregate would read EMPTY rollup tables and return
+/// zeros that look like a query bug. Tests therefore exercise the legacy
+/// paths by default; `tests/rollup_equivalence.rs` re-pins the epoch in both
+/// directions on purpose to compare the two.
+async fn close_rollup_gate(db_url: &str) -> anyhow::Result<()> {
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+    let mut conn = AsyncPgConnection::establish(db_url).await?;
+    diesel::sql_query("UPDATE rollup_epoch SET started_at = now() + interval '10 years'")
+        .execute(&mut conn)
+        .await?;
+    Ok(())
 }
 
 /// Name and advisory-lock key of the template matching the migrations compiled

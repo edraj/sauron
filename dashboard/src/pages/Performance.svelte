@@ -11,6 +11,10 @@
   import { rangeStore } from '../lib/stores/range.svelte';
   import { rangeKey, toParams, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import RollupChip from '../lib/components/ui/RollupChip.svelte';
+  import { refreshRollups } from '../lib/api/rollups';
+  import { approx } from '../lib/models/freshness';
+  import { rollupState } from '../lib/stores/rollups.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
@@ -194,6 +198,10 @@
     if (!aid) return;
     refreshing = true;
     try {
+      // Kick an immediate rollup fold first (bounded server-side wait), so
+      // the reloads below fetch aggregates that include the newest events.
+      // Older APIs 404 this — then the reload alone is the refresh.
+      await refreshRollups(aid).catch(() => {});
       // force: an explicit click must reach the network regardless of freshness.
       await load(aid, range, op, true);
     } finally {
@@ -236,6 +244,7 @@
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached data, fetching fresh" hint.
       -->
+      <RollupChip />
       <RefreshButton
         onclick={refresh}
         loading={refreshing || revalidating}
@@ -275,7 +284,7 @@
         <StatTile label={t('perf.card.operations')} value={rows.length} sub="tracked" />
         <StatTile
           label={t('perf.stat.p95')}
-          value={formatMs(maxP95)}
+          value={approx(formatMs(maxP95), rollupState.ready)}
           sub="slowest operation"
           tone={latencyTone(maxP95)}
         />
@@ -340,10 +349,10 @@
                   <Badge tone={opTone(r.op)} size="sm">{opLabel(r.op)}</Badge>
                 </td>
                 <td class="num">{formatNumber(r.count)}</td>
-                <td class="num"><LatencyBadge ms={r.p50} size="sm" /></td>
-                <td class="num"><LatencyBadge ms={r.p95} size="sm" /></td>
-                <td class="num"><LatencyBadge ms={r.p99} size="sm" /></td>
-                <td class="num"><LatencyBadge ms={r.avg} size="sm" /></td>
+                <td class="num">{#if rollupState.ready}<span class="approx-mark">≈</span>{/if}<LatencyBadge ms={r.p50} size="sm" /></td>
+                <td class="num">{#if rollupState.ready}<span class="approx-mark">≈</span>{/if}<LatencyBadge ms={r.p95} size="sm" /></td>
+                <td class="num">{#if rollupState.ready}<span class="approx-mark">≈</span>{/if}<LatencyBadge ms={r.p99} size="sm" /></td>
+                <td class="num">{#if rollupState.ready}<span class="approx-mark">≈</span>{/if}<LatencyBadge ms={r.avg} size="sm" /></td>
                 <td class="num">
                   <span class="err-rate" class:err={r.error_rate > 0.01}>
                     {formatPercent(r.error_rate)}

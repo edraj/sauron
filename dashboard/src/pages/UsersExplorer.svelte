@@ -19,6 +19,10 @@
   import { formatAbsolute, spanDays, type DateRangeValue } from '../lib/models/date-range';
   import TimeFilter from '../lib/components/TimeFilter.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import RollupChip from '../lib/components/ui/RollupChip.svelte';
+  import { refreshRollups } from '../lib/api/rollups';
+  import { approx } from '../lib/models/freshness';
+  import { rollupState } from '../lib/stores/rollups.svelte';
   import UserActivityChart from '../lib/components/UserActivityChart.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -131,6 +135,10 @@
     if (!aid) return;
     refreshing = true;
     try {
+      // Kick an immediate rollup fold first (bounded server-side wait), so
+      // the reloads below fetch aggregates that include the newest events.
+      // Older APIs 404 this — then the reload alone is the refresh.
+      await refreshRollups(aid).catch(() => {});
       await Promise.all([
         load(aid, query, sortParam(list.sort), list.offset, timeFilter, true),
         loadAnalytics(aid, range),
@@ -312,12 +320,12 @@
         <!-- `stats.dau` has always been in the payload and in the `UserStats`
              model; the tile was simply never rendered, which is why this page
              shows a stickiness ratio whose numerator is invisible. -->
-        <StatTile label="DAU" value={compactNumber(analytics.stats.dau)} sub="24h" />
-        <StatTile label="WAU" value={compactNumber(analytics.stats.wau)} sub="7-day" />
-        <StatTile label="MAU" value={compactNumber(analytics.stats.mau)} sub="30-day" />
+        <StatTile label="DAU" value={approx(compactNumber(analytics.stats.dau), rollupState.ready)} sub="24h" />
+        <StatTile label="WAU" value={approx(compactNumber(analytics.stats.wau), rollupState.ready)} sub="7-day" />
+        <StatTile label="MAU" value={approx(compactNumber(analytics.stats.mau), rollupState.ready)} sub="30-day" />
         <StatTile label={t('users.stat.stickiness')} value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
         <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
-        <StatTile label={t('sessions.stat.median')} value={formatDuration(analytics.stats.median_session_ms)} />
+        <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), rollupState.ready)} />
       </StatTiles>
 
       <Card title={t('users.card.activePerDay')}>
@@ -369,6 +377,7 @@
           list = setOffsetPage(list, 0);
         }}
       />
+      <RollupChip />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>

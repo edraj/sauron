@@ -18,6 +18,13 @@
     id: string;
     name: string;
     icon?: IconName;
+    /**
+     * The permission the user is missing for this entry, or `null`/omitted if
+     * they may select it. Non-null keeps the row visible but inert with a lock
+     * — the same rule `createLocked` follows below, so an org the member
+     * cannot use is never silently missing from the picker.
+     */
+    locked?: Permission | null;
   }
 
   interface Props {
@@ -192,10 +199,16 @@
             type="button"
             class="item"
             class:active={item.id === currentId}
+            class:locked={item.locked}
             role="menuitem"
+            use:lockTip={item.locked ?? null}
             onclick={() => choose(item.id)}
           >
-            {#if item.icon}<span class="i-icon" aria-hidden="true"><Icon name={item.icon} size={15} /></span>{/if}
+            {#if item.locked}
+              <span class="i-icon" aria-hidden="true"><Icon name="lock" size={13} /></span>
+            {:else if item.icon}
+              <span class="i-icon" aria-hidden="true"><Icon name={item.icon} size={15} /></span>
+            {/if}
             <span class="i-name">{item.name}</span>
             {#if item.id === currentId}<span class="i-check" aria-hidden="true"><Icon name="check" size={14} /></span>{/if}
           </button>
@@ -312,6 +325,24 @@
   }
   .item.active {
     color: var(--text);
+  }
+  /* Declared AFTER `.item:hover`/`:focus-visible` on purpose. `.item.locked` and
+     `.item:focus-visible` have equal specificity (0,2,0), so source order is
+     what decides — moving this block above them would let the hover colour win
+     and a locked row would light up as if it were selectable. */
+  .item.locked {
+    color: var(--text-faint);
+    cursor: not-allowed;
+  }
+  .item.locked:hover {
+    background: none;
+    color: var(--text-faint);
+  }
+  /* Locked rows keep their place in the tab order (see `lockTip`), so the focus
+     ring has to survive — it is what tells a keyboard user where they are, and
+     what triggers the tooltip explaining the lock. */
+  .item.locked:focus-visible {
+    background: var(--surface-2);
   }
   .i-icon {
     display: inline-flex;

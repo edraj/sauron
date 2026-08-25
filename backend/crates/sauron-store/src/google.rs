@@ -76,6 +76,10 @@ pub fn decode_utf16le(bytes: &[u8]) -> anyhow::Result<String> {
         "UTF-16LE body has an odd byte length ({}); the file is truncated or not UTF-16",
         body.len()
     );
+    // clippy suggests `as_chunks`, which is Rust 1.88+; workspace MSRV is 1.82.
+    // The lint itself is clippy 1.98+, so older toolchains need unknown_lints.
+    #[allow(unknown_lints)]
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     let units: Vec<u16> = body
         .chunks_exact(2)
         .map(|p| u16::from_le_bytes([p[0], p[1]]))

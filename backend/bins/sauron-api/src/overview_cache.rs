@@ -72,7 +72,14 @@ use crate::AppState;
 ///
 /// Serving continues from the stale entry meanwhile — this is the "revalidate"
 /// half of stale-while-revalidate, not an expiry. See the module docs.
-const FRESH_FOR: Duration = Duration::hours(1);
+///
+/// Was 1 hour when every recompute was a multi-second raw aggregate. The
+/// migration-71 rollup gates make a ready app's recompute a few milliseconds,
+/// so revalidation can afford the dashboard's ~minute-fresh contract. For a
+/// NOT-yet-backfilled app the old expensive query still runs — at worst 30×
+/// more often than before, on access only, still bounded by single-flight,
+/// the 3-permit ceiling and the failure backoff.
+const FRESH_FOR: Duration = Duration::minutes(2);
 
 /// How long an entry survives in Redis. Deliberately far longer than
 /// [`FRESH_FOR`] so there is always something to serve instantly.

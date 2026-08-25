@@ -1411,6 +1411,33 @@ pub async fn user_grants_in_org(
         .await
 }
 
+/// Every grant the user holds, across every org, tagged with its org.
+///
+/// The same rows [`user_grants_in_org`] returns, unfiltered by org and carrying
+/// `org_id` so the caller can group them back. One query rather than one per
+/// org: `/v1/orgs` needs a per-org reachable-project count, and an account
+/// granted across many orgs would otherwise pay a round trip each.
+///
+/// `rbac::reach_for` requires grants pre-filtered to a SINGLE org, so callers
+/// must group by the returned `org_id` before handing rows to it — the org tag
+/// exists precisely to make that grouping possible.
+pub async fn user_grants_all_orgs(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> QueryResult<Vec<(Uuid, String, Uuid, Value)>> {
+    role_grants::table
+        .inner_join(roles::table.on(roles::id.eq(role_grants::role_id)))
+        .filter(role_grants::user_id.eq(user_id))
+        .select((
+            role_grants::org_id,
+            role_grants::scope_type,
+            role_grants::scope_id,
+            roles::permissions,
+        ))
+        .load(conn)
+        .await
+}
+
 // ===========================================================================
 // Projects (grouping)
 // ===========================================================================
@@ -1436,6 +1463,25 @@ pub async fn list_projects_for_org(
         .filter(projects::org_id.eq(org_id))
         .select(Project::as_select())
         .order(projects::created_at.asc())
+        .load(conn)
+        .await
+}
+
+/// `(org_id, project_id)` for every project in the given orgs.
+///
+/// Ids only, and one query for all orgs: the caller counts what the user can
+/// reach and never renders these rows, so loading whole `Project` records per
+/// org would be strictly more work for the same answer.
+pub async fn project_ids_for_orgs(
+    conn: &mut AsyncPgConnection,
+    org_ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid)>> {
+    if org_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    projects::table
+        .filter(projects::org_id.eq_any(org_ids))
+        .select((projects::org_id, projects::id))
         .load(conn)
         .await
 }
@@ -6040,6 +6086,11 @@ pub async fn top_events(
     range: Range,
     limit: i64,
 ) -> QueryResult<Vec<EventCount>> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::top_events(conn, &scope, range, limit).await;
+    }
     // The env fragment takes $3 when it needs a bind; `limit` therefore lands on
     // $4 in that case and $3 otherwise. Deriving both from the same `EnvFilter`
     // is what keeps the string and the bind sequence in agreement — see
@@ -6078,6 +6129,11 @@ pub async fn event_series(
     name: Option<&str>,
     range: Range,
 ) -> QueryResult<Vec<SeriesPoint>> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::event_series(conn, &scope, name, range).await;
+    }
     match name {
         Some(n) => {
             // $1 app_id, $2 since, $3 name — env takes $4 when it needs a bind,
@@ -6205,51 +6261,91 @@ pub async fn bump_session(
     errors_delta: i64,
     unhandled_delta: i64,
 ) -> QueryResult<bool> {
-    diesel::sql_query(
-        "INSERT INTO sessions \
-           (app_id, session_id, distinct_id, device_key, started_at, last_event_at, \
-            events_count, errors_count, unhandled_errors_count, context, release, \
-            environment_id, ip_address) \
-         VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $12, $8, $9, $10, $11) \
-         ON CONFLICT (app_id, session_id) DO UPDATE SET \
-            last_event_at = GREATEST(sessions.last_event_at, EXCLUDED.last_event_at), \
-            started_at = LEAST(sessions.started_at, EXCLUDED.started_at), \
-            events_count = sessions.events_count + EXCLUDED.events_count, \
-            errors_count = sessions.errors_count + EXCLUDED.errors_count, \
-            unhandled_errors_count = sessions.unhandled_errors_count \
-                                   + EXCLUDED.unhandled_errors_count, \
-            distinct_id = COALESCE(EXCLUDED.distinct_id, sessions.distinct_id), \
-            device_key = COALESCE(EXCLUDED.device_key, sessions.device_key), \
-            context = CASE WHEN EXCLUDED.context <> '{}'::jsonb THEN EXCLUDED.context ELSE sessions.context END, \
-            release = COALESCE(EXCLUDED.release, sessions.release), \
-            environment_id = COALESCE(EXCLUDED.environment_id, sessions.environment_id), \
-            ip_address = COALESCE(EXCLUDED.ip_address, sessions.ip_address), \
-            updated_at = now() \
-         RETURNING (xmax = 0) AS inserted",
-    )
-    .bind::<SqlUuid, _>(app_id)
-    .bind::<Text, _>(session_id)
-    .bind::<Nullable<Text>, _>(distinct_id)
-    .bind::<Nullable<Text>, _>(device_key)
-    .bind::<Timestamptz, _>(at)
-    .bind::<BigInt, _>(events_delta)
-    .bind::<BigInt, _>(errors_delta)
-    .bind::<Jsonb, _>(context.clone())
-    .bind::<Nullable<Text>, _>(release)
-    .bind::<Nullable<SqlUuid>, _>(environment_id)
-    .bind::<Nullable<Text>, _>(ip)
-    .bind::<BigInt, _>(unhandled_delta)
-    .get_result::<InsertedFlag>(conn)
-    .await
-    .map(|r| r.inserted)
-}
-
-/// `RETURNING (xmax = 0)` — see [`crate::batch::bump_sessions`]' `BumpedSession`
-/// for why `xmax` is what distinguishes an insert from an update.
-#[derive(QueryableByName)]
-struct InsertedFlag {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    inserted: bool,
+    // Since migration 73 `sessions` is partitioned and cannot carry the global
+    // unique the old ON CONFLICT targeted — see `batch::bump_sessions` for the
+    // full account. This is its single-row twin: SAME advisory key derivation
+    // (so the two ingest paths serialize against each other), same SET arms,
+    // and it owns a transaction because the xact-scoped lock must span all
+    // three statements — its one production caller (`process::rollup`) runs in
+    // autocommit. Do not call this from inside an open transaction: the COMMIT
+    // below would commit the caller's.
+    use diesel_async::SimpleAsyncConnection;
+    conn.batch_execute("BEGIN").await?;
+    let out: QueryResult<bool> = async {
+        diesel::sql_query(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text || '|' || $2, 8642))",
+        )
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Text, _>(session_id)
+        .execute(conn)
+        .await?;
+        let updated = diesel::sql_query(
+            "UPDATE sessions SET \
+                last_event_at = GREATEST(sessions.last_event_at, $3), \
+                started_at = LEAST(sessions.started_at, $3), \
+                events_count = events_count + $4, \
+                errors_count = errors_count + $5, \
+                unhandled_errors_count = unhandled_errors_count + $6, \
+                distinct_id = COALESCE($7, sessions.distinct_id), \
+                device_key = COALESCE($8, sessions.device_key), \
+                context = CASE WHEN $9::jsonb <> '{}'::jsonb THEN $9 ELSE sessions.context END, \
+                release = COALESCE($10, sessions.release), \
+                environment_id = COALESCE($11, sessions.environment_id), \
+                ip_address = COALESCE($12, sessions.ip_address), \
+                updated_at = now() \
+             WHERE app_id = $1 AND session_id = $2",
+        )
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Text, _>(session_id)
+        .bind::<Timestamptz, _>(at)
+        .bind::<BigInt, _>(events_delta)
+        .bind::<BigInt, _>(errors_delta)
+        .bind::<BigInt, _>(unhandled_delta)
+        .bind::<Nullable<Text>, _>(distinct_id)
+        .bind::<Nullable<Text>, _>(device_key)
+        .bind::<Jsonb, _>(context.clone())
+        .bind::<Nullable<Text>, _>(release)
+        .bind::<Nullable<SqlUuid>, _>(environment_id)
+        .bind::<Nullable<Text>, _>(ip)
+        .execute(conn)
+        .await?;
+        if updated > 0 {
+            return Ok(false);
+        }
+        diesel::sql_query(
+            "INSERT INTO sessions \
+               (app_id, session_id, distinct_id, device_key, started_at, last_event_at, \
+                events_count, errors_count, unhandled_errors_count, context, release, \
+                environment_id, ip_address) \
+             VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $12, $8, $9, $10, $11)",
+        )
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Text, _>(session_id)
+        .bind::<Nullable<Text>, _>(distinct_id)
+        .bind::<Nullable<Text>, _>(device_key)
+        .bind::<Timestamptz, _>(at)
+        .bind::<BigInt, _>(events_delta)
+        .bind::<BigInt, _>(errors_delta)
+        .bind::<Jsonb, _>(context.clone())
+        .bind::<Nullable<Text>, _>(release)
+        .bind::<Nullable<SqlUuid>, _>(environment_id)
+        .bind::<Nullable<Text>, _>(ip)
+        .bind::<BigInt, _>(unhandled_delta)
+        .execute(conn)
+        .await?;
+        Ok(true)
+    }
+    .await;
+    match out {
+        Ok(v) => {
+            conn.batch_execute("COMMIT").await?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.batch_execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
 }
 
 /// Single-row twin of [`crate::batch::bump_person_envs`], for the unbatched
@@ -7258,6 +7354,11 @@ pub async fn error_series(
     scope: ReadScope,
     range: Range,
 ) -> QueryResult<Vec<SeriesPoint>> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::error_series(conn, &scope, range).await;
+    }
     let env_sql = scope.env.sql_fragment(3);
     let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let upper_sql = range.upper_sql("occurred_at", upper_idx);
@@ -8076,8 +8177,15 @@ pub async fn list_device_groups(
     // since, `$3` pattern, `$4` limit, `$5` offset, `$6` env — which is what
     // lets one `bind` chain serve both. Change a bind in either shape and this
     // is the other place to change.
+    // Second, independent gate: once the migration-71 session-day rollups are
+    // ready, the rollup shape's windowed `sessions_count` comes from
+    // `device_sessions_daily` instead of a live LATERAL over `sessions` —
+    // measured 856 ms at 5M sessions, cost tracking that table. The live
+    // shape keeps its LATERAL unconditionally (it also feeds first/last_seen
+    // from the same probe under a scoped filter).
+    let sessions_from_rollup = crate::rollups::is_ready(conn, scope.app_id).await?;
     let q = if crate::device_env_backfill::is_backfilled(conn, scope.app_id).await? {
-        list_device_groups_rollup_sql(&scope.env, &sort, window.column)
+        list_device_groups_rollup_sql(&scope.env, &sort, window.column, sessions_from_rollup)
     } else {
         list_device_groups_live_sql(&scope.env, &sort, window.column)
     };
@@ -8108,7 +8216,7 @@ pub fn list_device_groups_sql_for_test(env: EnvFilter) -> String {
 
 /// Companion to [`list_device_groups_sql_for_test`] for the rollup shape.
 pub fn list_device_groups_rollup_sql_for_test(env: EnvFilter) -> String {
-    list_device_groups_rollup_sql(&env, &group_sort_for_test(), "last_seen")
+    list_device_groups_rollup_sql(&env, &group_sort_for_test(), "last_seen", false)
 }
 
 /// The default group sort — `last_seen DESC` with the four `GROUP BY` columns as
@@ -8268,16 +8376,17 @@ fn list_device_groups_live_sql(
 ///
 /// THREE things must not drift from [`list_device_groups_live_sql`]:
 ///
-/// 1. **`sessions_count` stays live.** It is the one count this endpoint
-///    WINDOWS (`count(*) FILTER (WHERE started_at >= $2)`) while `events_count`
-///    and `errors_count` are lifetime — an inconsistency that predates this
-///    work and is preserved deliberately rather than quietly fixed. Sourcing it
-///    from the rollup measured 36ms instead of 105ms and changed the number on
-///    40 of 40 rows. `sessions` is not partitioned, so the surviving LATERAL is
-///    one index probe per device against the old 45. The pre-aggregating
-///    subquery below therefore does not even select `sessions_count`: the
-///    column cannot leak into this shape by a later `sum(de.…)` edit because it
-///    is not in scope to be summed.
+/// 1. **`sessions_count` stays WINDOWED, never lifetime.** It is the one count
+///    this endpoint windows (`started_at >= $2`) while `events_count`/
+///    `errors_count` are lifetime — preserved deliberately. It must never come
+///    from `device_environments.sessions_count` (lifetime; measured changing
+///    the number on 40 of 40 rows). Since migration 72 the windowed count has
+///    two sources behind `rollups::is_ready`: `device_sessions_daily` (a
+///    per-(device, day) REPLACE rollup maintained by `recompute_sessions`,
+///    read as one (app, day)-led range scan — the per-device LATERAL had grown
+///    to 856 ms once `sessions` reached 5M rows) with the live LATERAL as the
+///    not-yet-ready fallback. Whole-day lower-edge semantics are the same
+///    disclosed bucket class as every other rollup read.
 /// 2. **`first_seen`/`last_seen` keep the `All`-vs-scoped split.** Under `All`
 ///    they read the durable `devices` columns exactly as the live shape does.
 ///    Deriving them from the rollup under `All` too would be defensible in
@@ -8300,6 +8409,7 @@ fn list_device_groups_rollup_sql(
     env: &EnvFilter,
     sort: &SortSpec,
     window_column: &'static str,
+    sessions_from_rollup: bool,
 ) -> String {
     // Same trailing slot as the live shape, and it must stay the same: one
     // `bind` chain in `list_device_groups` serves BOTH shapes, so a bind that
@@ -8363,6 +8473,30 @@ fn list_device_groups_rollup_sql(
     // applies verbatim, because these two shapes deliberately emit the same
     // output aliases.
     let order_by = sort.order_by();
+    // Both `de` and `se` reference bind `$6`: `bind_env!` binds it once and
+    // Postgres allows a parameter to appear any number of times. The rollup
+    // variant derives its day bound IN SQL from the existing `$2` timestamp
+    // (whole-day lower edge, the disclosed bucket semantics), so the bind
+    // chain stays byte-identical across all four shape combinations.
+    let se_env = env.sql_fragment(6);
+    let se_join = if sessions_from_rollup {
+        format!(
+            " LEFT JOIN ( \
+                 SELECT device_key, sum(sessions)::bigint AS cnt \
+                 FROM device_sessions_daily \
+                 WHERE app_id = $1 AND day >= ($2 AT TIME ZONE 'UTC')::date{se_env} \
+                 GROUP BY device_key \
+             ) se ON se.device_key = d.device_key"
+        )
+    } else {
+        format!(
+            " LEFT JOIN LATERAL ( \
+                 SELECT count(*) FILTER (WHERE started_at >= $2) AS cnt \
+                 FROM sessions \
+                 WHERE app_id = $1 AND device_key = d.device_key{se_env} \
+             ) se ON TRUE"
+        )
+    };
     format!(
         "SELECT d.family, d.model, d.os_name, d.os_version, \
                 count(*)::bigint AS device_count, \
@@ -8373,18 +8507,10 @@ fn list_device_groups_rollup_sql(
              WHERE app_id = $1 AND {window_sql} \
                AND (COALESCE(family,'') || ' ' || COALESCE(model,'') || ' ' || \
                     COALESCE(os_name,'') || ' ' || COALESCE(device_key,'')) ILIKE $3 \
-         ) d{scoped_join} \
-         LEFT JOIN LATERAL ( \
-             SELECT count(*) FILTER (WHERE started_at >= $2) AS cnt \
-             FROM sessions \
-             WHERE app_id = $1 AND device_key = d.device_key{se_env} \
-         ) se ON TRUE \
+         ) d{scoped_join}{se_join} \
          GROUP BY d.family, d.model, d.os_name, d.os_version \
          ORDER BY {order_by} \
-         LIMIT $4 OFFSET $5",
-        // Both `de` and `se` reference bind `$6`: `bind_env!` binds it once and
-        // Postgres allows a parameter to appear any number of times.
-        se_env = env.sql_fragment(6),
+         LIMIT $4 OFFSET $5"
     )
 }
 
@@ -9095,7 +9221,7 @@ pub struct OverviewTotals {
 /// (thousands of rows, not hundreds of thousands), where the correlated `EXISTS` short-
 /// circuits per row and beats the uncorrelated form — measured 2.5s vs 3.6s on the same
 /// fixture. The right shape follows from the outer table's cardinality, not from a rule.
-fn event_user_membership_exists(env: EnvFilter, bind_index: usize) -> String {
+pub(crate) fn event_user_membership_exists(env: EnvFilter, bind_index: usize) -> String {
     if matches!(env, EnvFilter::All) {
         return String::new();
     }
@@ -9116,6 +9242,11 @@ pub async fn overview_totals(
     scope: ReadScope,
     range: Range,
 ) -> QueryResult<OverviewTotals> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::overview_totals(conn, &scope, range).await;
+    }
     // $1 app_id, $2 since, reused across all six sub-selects (as before). Env takes $3 when
     // it needs a bind, reused across the four sub-selects whose table actually carries
     // `environment_id` (analytics_events, error_events, sessions x2) AND, as of this fix,
@@ -9759,6 +9890,11 @@ pub async fn journey_graph(
     range: Range,
     depth: i64,
 ) -> QueryResult<(Vec<JourneyNode>, Vec<JourneyLink>)> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::journey(conn, &scope, range, depth).await;
+    }
     // $1 app_id, $2 since — env takes $3 when it needs a bind, which pushes depth/max_rows
     // from $3/$4 to $4/$5. Both indices are derived from the same `env_bind`/`env_sql` pair
     // so the string and the bind chain can't drift apart.
@@ -9845,6 +9981,11 @@ pub async fn performance_summary(
     op: Option<&str>,
     device_key: Option<&str>,
 ) -> QueryResult<Vec<PerfSummaryRow>> {
+    // Rollup gate, only for the shape the rollup carries: a device_key filter
+    // has no rollup dimension and falls through to the raw scan.
+    if device_key.is_none() && crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::perf_summary(conn, &scope, range, op).await;
+    }
     // $1 app_id, $2 since, $3 op, $4 device_key (the pre-existing `(...::text IS NULL OR
     // ...)` optional-filter idiom — left untouched). Env is appended AFTER those, at the
     // next free index ($5), rather than interleaved among them, so $3/$4 never renumber and
@@ -9894,6 +10035,11 @@ pub async fn performance_series(
     name: Option<&str>,
     op: Option<&str>,
 ) -> QueryResult<Vec<PerfSeriesPoint>> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::perf_series(conn, &scope, range, name, op).await;
+    }
     // Same shape as `performance_summary`: env appended after the pre-existing $3/$4
     // optional-filter idiom, at the next free index ($5), so those two never renumber.
     let env_sql = scope.env.sql_fragment(5);
@@ -9980,6 +10126,11 @@ pub async fn user_stats(
     range: Range,
     now: DateTime<Utc>,
 ) -> QueryResult<UserStats> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::user_stats(conn, &scope, range, now).await;
+    }
     let env_sql = scope.env.sql_fragment(3);
     // `.clone()`, not a move — the final `bind_env!` call below still needs
     // `scope.env`; see `overview_totals`'s identical call for why.
@@ -10077,6 +10228,11 @@ pub async fn active_user_series(
     scope: ReadScope,
     range: Range,
 ) -> QueryResult<Vec<UserSeriesPoint>> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::active_user_series(conn, &scope, range).await;
+    }
     let env_sql = scope.env.sql_fragment(3);
     let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let up_occurred = range.upper_sql("occurred_at", upper_idx);
@@ -10193,6 +10349,11 @@ pub async fn session_stats(
     scope: ReadScope,
     range: Range,
 ) -> QueryResult<SessionStats> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::session_stats(conn, &scope, range).await;
+    }
     // $1 app_id, $2 since, reused across all four sub-selects, all against `sessions` — env
     // takes $3 when it needs a bind, reused the same way.
     //
@@ -10227,6 +10388,11 @@ pub async fn session_duration_series(
     scope: ReadScope,
     range: Range,
 ) -> QueryResult<Vec<SeriesAvgPoint>> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::session_duration_series(conn, &scope, range).await;
+    }
     let env_sql = scope.env.sql_fragment(3);
     let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     // `started_at`, matching this query's own lower bound — the bucket column.
@@ -10252,6 +10418,11 @@ pub async fn session_duration_histogram(
     scope: ReadScope,
     range: Range,
 ) -> QueryResult<Vec<HistoBucket>> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::session_duration_histogram(conn, &scope, range).await;
+    }
     let env_sql = scope.env.sql_fragment(3);
     let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let up = range.upper_sql("last_event_at", upper_idx);
@@ -10610,6 +10781,12 @@ pub async fn screen_list(
     offset: i64,
     sort: SortSpec,
 ) -> QueryResult<Vec<ScreenRow>> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::screens(conn, &scope, range, q_pattern, limit, offset, &sort)
+            .await;
+    }
     // $1 app_id, $2 since, $3 q_pattern (SCREEN_PRED_LIKE's own bind) — env
     // takes $4 when it needs a bind, which pushes limit/offset from $4/$5 to
     // $5/$6. Both indices derive from the same `env_bind`/`env_sql` pair, the
@@ -11499,6 +11676,38 @@ pub async fn effective_tier_hot_days(
     Ok(match raw.as_deref().map(str::trim).map(str::parse::<i64>) {
         Some(Ok(v)) if v >= TIER_HOT_DAYS_MIN => v,
         _ => configured,
+    })
+}
+
+/// `runtime_settings` key for the session-retention override. Same contract
+/// as [`TIER_HOT_DAYS_KEY`]: absence means "use the process configuration".
+pub const SESSION_RETENTION_KEY: &str = "sessions.retention_days";
+
+/// Sessions younger than this are never retention-dropped, whatever the knob
+/// says. A floor rather than a validation error at read time: retention
+/// deletes data with NO cold copy, so the safe direction for a nonsense value
+/// is keeping more, never less. 7 days comfortably clears every consumer of
+/// recent raw sessions — the fold's 36h recompute window, the
+/// duplicate-session probe, and late `bump_sessions` inserts.
+pub const SESSION_RETENTION_MIN_DAYS: i64 = 7;
+
+/// Effective session retention in days; `0` means retention is off (rows are
+/// kept forever). The runtime override wins when present and sane (`0` is an
+/// explicit off); otherwise the configured value. Any non-zero result is
+/// clamped UP to [`SESSION_RETENTION_MIN_DAYS`].
+pub async fn effective_session_retention_days(
+    conn: &mut AsyncPgConnection,
+    configured: i64,
+) -> QueryResult<i64> {
+    let raw = get_runtime_setting(conn, SESSION_RETENTION_KEY).await?;
+    let v = match raw.as_deref().map(str::trim).map(str::parse::<i64>) {
+        Some(Ok(v)) if v == 0 || v >= SESSION_RETENTION_MIN_DAYS => v,
+        _ => configured,
+    };
+    Ok(if v <= 0 {
+        0
+    } else {
+        v.max(SESSION_RETENTION_MIN_DAYS)
     })
 }
 
@@ -19229,6 +19438,11 @@ pub async fn count_screens(
     q_pattern: &str,
     cap: i64,
 ) -> QueryResult<(i64, bool)> {
+    // Rollup gate — the device-groups `is_backfilled` pattern (see
+    // crate::rollups): ready apps read the migration-71 aggregates.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::count_screens(conn, &scope, range, q_pattern, cap).await;
+    }
     let candidates = screen_candidates(conn, scope.app_id, q_pattern, cap + 1).await?;
     if candidates.len() as i64 > cap {
         return count_screens_by_aggregate(conn, scope, range, q_pattern, cap).await;
@@ -19425,8 +19639,10 @@ pub async fn count_device_groups(
     cap: i64,
 ) -> QueryResult<(i64, bool)> {
     let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+    // Same two gates as `list_device_groups` — this wraps its exact SQL.
+    let sessions_from_rollup = crate::rollups::is_ready(conn, scope.app_id).await?;
     let inner = if crate::device_env_backfill::is_backfilled(conn, scope.app_id).await? {
-        list_device_groups_rollup_sql(&scope.env, &sort, window.column)
+        list_device_groups_rollup_sql(&scope.env, &sort, window.column, sessions_from_rollup)
     } else {
         list_device_groups_live_sql(&scope.env, &sort, window.column)
     };

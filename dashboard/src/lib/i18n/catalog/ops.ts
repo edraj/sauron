@@ -175,6 +175,19 @@ export const ops = {
   'storage.column.org': { en: 'Org', ar: 'المؤسسة' },
   'storage.column.project': { en: 'Project', ar: 'المشروع' },
   'storage.rotationAge': { en: 'Rotation age (days)', ar: 'عمر التدوير (بالأيام)' },
+  'storage.sessionRetention': { en: 'Session retention', ar: 'مدة الاحتفاظ بالجلسات' },
+  'storage.retentionAge': {
+    en: 'Retention (days, 0 = off)',
+    ar: 'مدة الاحتفاظ (بالأيام، 0 = معطّل)',
+  },
+  'storage.retentionOff': {
+    en: 'Off — sessions kept forever',
+    ar: 'معطّل — تُحفظ الجلسات للأبد',
+  },
+  'storage.confirmRetention': {
+    en: 'Delete sessions past retention?',
+    ar: 'حذف الجلسات الأقدم من مدة الاحتفاظ؟',
+  },
   'storage.configured': { en: 'Configured', ar: 'المضبوط' },
   'storage.inForce': { en: 'In force', ar: 'النافذ' },
   'storage.saved': {

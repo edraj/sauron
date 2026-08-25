@@ -57,6 +57,16 @@
 
   onMount(async () => {
     await sessionStore.load();
+    // This page renders no Topbar, so it has no org switcher and its only exit
+    // is signing out — which restores the same stored org and lands right back
+    // here. That makes arriving in error unrecoverable, so refuse to stay:
+    // anyone with a reachable project anywhere belongs in the app, not in
+    // first-run setup. `AppShell` already avoids sending them, and this closes
+    // the same door from the other side for a stale bookmark or deep link.
+    if (sessionStore.reachableProjectCount > 0) {
+      push('/overview');
+      return;
+    }
     // Revisiting with an existing project/app? Pick it up and skip ahead.
     if (sessionStore.currentProject) project = sessionStore.currentProject;
     if (sessionStore.currentApp) {

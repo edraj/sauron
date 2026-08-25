@@ -53,6 +53,25 @@ export interface Organization {
   slug: string;
   created_at: string;
   updated_at: string;
+  /**
+   * Projects in this org the current user can reach, counted server-side with
+   * the same rule `/v1/orgs/{id}/projects` lists by.
+   *
+   * Carried on the org rather than fetched per org because the shell needs it
+   * for EVERY org at once: onboarding is only correct when the user has no
+   * reachable project anywhere, and answering that from per-org calls costs one
+   * request per org on every cold load.
+   */
+  project_count: number;
+  /**
+   * Whether this user may create a project in this org.
+   *
+   * Server-sent because `/access` is fetched for the current org only, so the
+   * org picker has no way to evaluate it for the other rows. Together with
+   * `project_count` it distinguishes a dead-end org (nothing to see, nothing
+   * to create — lock it) from an empty org the member can start work in.
+   */
+  can_create_project: boolean;
 }
 
 // A project is now a pure grouping container within an org. It no longer holds
@@ -1489,4 +1508,11 @@ export interface MaskPreviewStart {
   preview_ttl_secs: number;
   mask_max_rows: number;
   enforcement_latency_secs: number;
+}
+
+/** GET /v1/apps/{id}/rollups/status — the freshness chip's source. */
+export interface RollupStatus {
+  ready: boolean;
+  as_of: string | null;
+  sessions_as_of: string | null;
 }

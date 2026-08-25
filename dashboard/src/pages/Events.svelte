@@ -15,6 +15,8 @@
   import JsonTree from '../lib/components/JsonTree.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import RollupChip from '../lib/components/ui/RollupChip.svelte';
+  import { refreshRollups } from '../lib/api/rollups';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import { rangeStore } from '../lib/stores/range.svelte';
@@ -535,6 +537,10 @@
     if (!aid) return;
     refreshing = true;
     try {
+      // Kick an immediate rollup fold first (bounded server-side wait), so
+      // the reloads below fetch aggregates that include the newest events.
+      // Older APIs 404 this — then the reload alone is the refresh.
+      await refreshRollups(aid).catch(() => {});
       await Promise.all([
         loadTop(aid, range),
         loadSeries(aid, range, selectedTopEvent),
@@ -670,6 +676,7 @@
       <p class="muted sub">{t('events.subtitle')}</p>
     </div>
     <div class="controls">
+      <RollupChip />
       <RefreshButton onclick={refresh} loading={refreshing} />
     </div>
   </div>

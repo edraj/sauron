@@ -47,10 +47,21 @@
   // Onboarding asks the member to create a project, so only offer it to someone who
   // can actually create one — otherwise it is a dead end they cannot exit.
   const canOnboard = $derived(sessionStore.can('project:create'));
-  // Set when the member has zero reachable projects AND can't create one —
-  // onboarding would just ask them to create a project they have no
-  // permission for, so show a dead-end state instead of redirecting there.
-  const noAccess = $derived(needsScope && !canOnboard);
+  // ...and only to someone with no reachable project ANYWHERE. `needsScope` looks
+  // at the current org alone, so an account holding a grant in one org while
+  // sitting on another empty one used to be redirected here — and `/onboarding`
+  // renders no Topbar, so there was no org switcher to get back with and the
+  // only exit was signing out, which restored the same stored org and bounced
+  // them straight back in.
+  const hasProjectSomewhere = $derived(sessionStore.reachableProjectCount > 0);
+  const shouldOnboard = $derived(needsScope && canOnboard && !hasProjectSomewhere);
+  // The current org is empty but the user has projects elsewhere. That is a
+  // navigation problem, not a first-run one: render inside the normal shell so
+  // the org switcher stays reachable rather than routing away.
+  const emptyOrg = $derived(needsScope && hasProjectSomewhere);
+  // Zero reachable projects AND can't create one — onboarding would just ask for
+  // a project they have no permission to make, so show a dead end instead.
+  const noAccess = $derived(needsScope && !canOnboard && !hasProjectSomewhere);
 
   // The page-level permission gate. Deliberately resolved here rather than as a
   // router condition: a failed condition fires `conditionsFailed`, which
@@ -63,7 +74,7 @@
   const pageDenied = $derived(sessionStore.loaded && !canAccessPage(pageAccess));
 
   $effect(() => {
-    if (needsScope && canOnboard) push('/onboarding');
+    if (shouldOnboard) push('/onboarding');
   });
 
   // Mirrors the onboarding effect above: only steer a requireApp page to /projects
@@ -101,6 +112,24 @@
         >
           {#snippet action()}
             <Button variant="primary" onclick={() => location.reload()}>{t('common.retry')}</Button>
+          {/snippet}
+        </EmptyState>
+      {:else if emptyOrg}
+        <!-- Ranked above `noAccess`: this member DOES have projects, just not
+             in the org they are standing in. Rendered here rather than routed
+             to onboarding so the Topbar — and with it the org switcher — stays
+             on screen; that is the only thing that makes this state escapable. -->
+        <EmptyState
+          title={t('shell.emptyOrg.title')}
+          description={t('shell.emptyOrg.body')}
+          icon="folders"
+        >
+          {#snippet action()}
+            {#if canOnboard}
+              <Button variant="primary" onclick={() => push('/onboarding')}>
+                {t('shell.emptyOrg.create')}
+              </Button>
+            {/if}
           {/snippet}
         </EmptyState>
       {:else if noAccess}

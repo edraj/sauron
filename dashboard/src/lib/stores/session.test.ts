@@ -160,7 +160,7 @@ describe('resolveCurrentEnvironment (via setApp)', () => {
     window.localStorage.setItem(ENV_KEY, 'env-b');
 
     mockListOrgs.mockResolvedValue([
-      { id: 'org-1', name: 'Org 1', slug: 'org-1', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' },
+      { id: 'org-1', name: 'Org 1', slug: 'org-1', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', project_count: 1, can_create_project: true },
     ]);
     mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
     mockListProjects.mockResolvedValue([
@@ -553,6 +553,8 @@ describe('load() in-flight idempotency (fresh-login double bootstrap)', () => {
         slug: 'org-1',
         created_at: '2026-01-01T00:00:00Z',
         updated_at: '2026-01-01T00:00:00Z',
+        project_count: 1,
+        can_create_project: true,
       },
     ]);
     mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
@@ -829,6 +831,8 @@ describe('accessError', () => {
         slug: 'org-1',
         created_at: '2026-01-01T00:00:00Z',
         updated_at: '2026-01-01T00:00:00Z',
+        project_count: 0,
+        can_create_project: true,
       },
     ]);
     mockListProjects.mockResolvedValue([]);
@@ -922,5 +926,78 @@ describe('canAtAnyEnv()', () => {
   it('is false while access has not loaded', () => {
     sessionStore.access = null;
     expect(sessionStore.canAtAnyEnv('event:read')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reachable projects across orgs.
+//
+// The bug these cover: `AppShell` decided whether to show onboarding from the
+// CURRENT org's project list. A member holding a grant in one org while sitting
+// on another empty one was redirected to `/onboarding` — a page that renders no
+// Topbar, so it has no org switcher, and whose only exit is signing out, which
+// restores the same stored org and lands straight back there.
+// ---------------------------------------------------------------------------
+describe('reachableProjectCount', () => {
+  function org(id: string, project_count: number, can_create_project = true) {
+    return {
+      id,
+      name: id,
+      slug: id,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      project_count,
+      can_create_project,
+    };
+  }
+
+  it('sums across every org, not just the current one', () => {
+    sessionStore.orgs = [org('empty', 0), org('full', 3)];
+    expect(sessionStore.reachableProjectCount).toBe(3);
+  });
+
+  it('is zero only when no org has a reachable project', () => {
+    sessionStore.orgs = [org('a', 0), org('b', 0)];
+    expect(sessionStore.reachableProjectCount).toBe(0);
+  });
+
+  it('prefers an org that HAS projects over the creation-ordered first one', async () => {
+    // `list_orgs_for_user` orders by created_at, so the empty org legitimately
+    // comes first. Taking orgs[0] blindly is what stranded the member.
+    mockListOrgs.mockResolvedValue([org('empty', 0), org('full', 1)]);
+    mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
+    mockListProjects.mockResolvedValue([
+      {
+        id: 'proj-1',
+        org_id: 'full',
+        name: 'P1',
+        slug: 'p1',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      },
+    ]);
+    mockListApps.mockResolvedValue([]);
+
+    await sessionStore.load();
+
+    expect(sessionStore.currentOrgId).toBe('full');
+  });
+
+  it('still honours a stored org even when it is empty', async () => {
+    // Switching orgs is an explicit choice; overriding it would be its own bug.
+    // Safe now only because the empty org renders inside the shell (org switcher
+    // present) rather than redirecting to onboarding.
+    window.localStorage.setItem(ORG_KEY, 'empty');
+    mockListOrgs.mockResolvedValue([org('empty', 0), org('full', 1)]);
+    mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
+    mockListProjects.mockResolvedValue([]);
+    mockListApps.mockResolvedValue([]);
+
+    await sessionStore.load();
+
+    expect(sessionStore.currentOrgId).toBe('empty');
+    // ...and the shell can still tell that projects exist elsewhere, which is
+    // what keeps it out of onboarding.
+    expect(sessionStore.reachableProjectCount).toBe(1);
   });
 });
