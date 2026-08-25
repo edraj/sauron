@@ -264,7 +264,7 @@ fn cap_names(top: &mut BTreeMap<(DayKey, String), i64>, cap: usize) {
         return;
     }
     let mut per_key: HashMap<DayKey, usize> = HashMap::new();
-    for (k, _) in top.iter() {
+    for k in top.keys() {
         *per_key.entry(k.0).or_insert(0) += 1;
     }
     let over: Vec<DayKey> = per_key
@@ -344,7 +344,7 @@ pub(crate) fn fold_transaction_rows(
     // (name, op) pairs, fold the tail into (~other, ~other).
     if name_cap > 0 {
         let mut per_key: HashMap<(Uuid, Option<Uuid>, DateTime<Utc>), usize> = HashMap::new();
-        for (k, _) in out.iter() {
+        for k in out.keys() {
             *per_key.entry(k.0).or_insert(0) += 1;
         }
         for (hour_key, n) in per_key {
