@@ -343,6 +343,43 @@ journalctl -u sauron-migrate --no-pager | tail
 if `systemctl is-failed sauron-migrate` says `failed`, no daemon will start until
 the database is fixed.
 
+**The whole post-upgrade sequence below is also available as a script** —
+migrations, all three backfills, daemon start, health checks and a database
+verification pass, each step idempotent:
+
+```bash
+sudo bash /usr/share/doc/sauron-server/post-upgrade.sh
+```
+
+Run it inside tmux/screen (the first rollup backfill can take an hour+). It
+refuses to run against a sauron-migrate binary that silently ignores unknown
+arguments (releases before strict argument checking), so it cannot no-op the
+way a hand-typed command against a stale binary once did.
+
+**Upgrading from v1.7.3 or older across the sessions partitioning (migration
+0073): read this first.** 0073 rewrites the whole `sessions` table — rename,
+one partition per calendar day back to `min(started_at)`, full row copy and
+11 index builds — in ONE transaction. Hosts already at v1.7.4+ have run it
+and never will again. On a host that has not, two things decide whether it
+applies cleanly:
+
+- **Lock budget.** Each daily partition costs ~12 locked relations, against a
+  cluster capacity of `max_locks_per_transaction × max_connections`. A long
+  history can exceed it, failing with a cryptic `out of shared memory`. Fix
+  BEFORE upgrading: `ALTER SYSTEM SET max_locks_per_transaction = 1024;`
+  then restart Postgres. Keep the setting.
+- **Timestamp hygiene.** The partition span starts at `min(started_at)`, so a
+  single clock-skewed 1970 row would demand ~20,000 partitions. Check
+  `SELECT min(started_at) FROM sessions;` first and repair garbage rows
+  (`UPDATE sessions SET started_at = created_at, last_event_at =
+  GREATEST(last_event_at, created_at) WHERE started_at < DATE 'your-launch-date';`)
+  before the upgrade. Ingest now clamps such timestamps at arrival, but rows
+  written by older releases predate the clamp.
+
+The migration runs for minutes on a large table (it copies every row); the
+shipped `sauron-migrate.service` no longer applies a start timeout, so let it
+finish. Budget the maintenance window by sessions row count.
+
 ### Manual fallback
 
 Still valid, and what to use when the daemons are down and you want the migration

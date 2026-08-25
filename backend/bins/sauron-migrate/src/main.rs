@@ -13,6 +13,22 @@
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
 
+    // Unknown arguments are FATAL, before the database is touched. They used
+    // to fall through to the plain migrate path and exit 0 — and a typo'd (or
+    // not-yet-shipped) subcommand became a no-op indistinguishable from
+    // success. Bit an operator live: `backfill-rollups` against an older
+    // binary "ran" instantly and did nothing.
+    const KNOWN_ARGS: [&str; 3] = [
+        "backfill-person-envs",
+        "backfill-device-envs",
+        "backfill-rollups",
+    ];
+    for a in std::env::args().skip(1) {
+        if !KNOWN_ARGS.contains(&a.as_str()) {
+            anyhow::bail!("unknown argument {a:?}; known: {}", KNOWN_ARGS.join(", "));
+        }
+    }
+
     let url =
         std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?;
 
@@ -80,5 +96,6 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         tracing::info!("rollup backfill complete");
     }
+
     Ok(())
 }

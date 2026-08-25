@@ -442,7 +442,8 @@ async fn process_entries(
                 %app_id,
                 skewed,
                 tolerance_min = sauron_core::envelope::MAX_CLOCK_SKEW.num_minutes(),
-                "clamped future device timestamps to receive time"
+                max_lag_days = sauron_core::envelope::MAX_CLOCK_LAG.num_days(),
+                "clamped out-of-range device timestamps to receive time"
             );
         }
         let last = jobs.len() - 1;

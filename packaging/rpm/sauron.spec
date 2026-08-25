@@ -318,7 +318,7 @@ fi
 %attr(0750,sauron,sauron) %dir %{_sharedstatedir}/sauron/cold
 
 %files server
-%doc packaging/rpm/INSTALL.md packaging/rpm/SETUP.md
+%doc packaging/rpm/INSTALL.md packaging/rpm/SETUP.md packaging/rpm/post-upgrade.sh
 %{_bindir}/sauron-api
 %{_bindir}/sauron-ingest
 %{_bindir}/sauron-monitor

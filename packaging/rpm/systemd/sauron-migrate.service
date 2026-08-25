@@ -29,12 +29,22 @@ ExecStart=/usr/bin/sauron-migrate
 # 252/256 recorded the RemainAfterExit=no case as a harmless no-op — do not rely
 # on that. To stop Sauron, stop the daemons by name, never this unit.
 #
-# Type=oneshot defaults to TimeoutStartSec=infinity. Without an explicit bound,
-# an unreachable remote Postgres (SYN blackholed, no connect timeout in the
-# migrator) blocks every dependent daemon's start job forever and multi-user
-# .target never completes. Keep this comfortably above MIGRATE_WAIT_SECS
-# (/etc/sauron/sauron.env, default 120).
-TimeoutStartSec=300
+# Infinity is deliberate, and it REPLACED an earlier TimeoutStartSec=300.
+#
+# The two phases of this unit want opposite bounds, and the cap can only be
+# placed on the wrong one. The CONNECT phase is already hard-bounded inside
+# the binary (5s per probe attempt against a MIGRATE_WAIT_SECS deadline,
+# default 120s — see run_pending_migrations_waiting), so an unreachable
+# Postgres fails this unit, and every dependent start job with it, in about
+# two minutes with no help from systemd. The EXECUTION phase is unbounded on
+# purpose: schema rewrites legitimately run for tens of minutes (migration
+# 0073 copies the whole sessions table and rebuilds 11 indexes), and a
+# timeout here kills them mid-transaction — safe but wasted, and the unit can
+# then NEVER succeed on a real dataset. Hit live: a production upgrade looped
+# on "start operation timed out" at exactly 300s until this line changed.
+# A migration that is genuinely stuck shows up in pg_stat_activity as a lock
+# wait; that is the operator's signal, not a timer's guess.
+TimeoutStartSec=infinity
 
 NoNewPrivileges=true
 ProtectSystem=strict
