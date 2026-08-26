@@ -2,7 +2,6 @@
   import { t } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -171,7 +170,6 @@
   }
 </script>
 
-<AppShell requireApp>
   <button class="back" onclick={() => push('/events')}><Icon name="arrow-left" size={14} /> {t('person.backToEvents')}</button>
 
   {#if loading}
@@ -348,7 +346,6 @@
       </aside>
     </div>
   {/if}
-</AppShell>
 
 <style>
   .back {

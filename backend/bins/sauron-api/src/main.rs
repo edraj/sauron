@@ -36,7 +36,15 @@ use tracing::{info, warn};
 const API_JSON_BODY_LIMIT: usize = 1024 * 1024;
 /// Wall-clock budget for a single request. Bounds how long one expensive query
 /// can hold a connection and a worker.
-const REQUEST_TIMEOUT_SECS: u64 = 30;
+///
+/// 30 → 60 on 2026-08-26, by request: on large deployments the legacy
+/// (pre-rollup-backfill) analytics shapes routinely sat just past 30s and were
+/// shed as 503s the user could do nothing about. The trade is explicit — the
+/// layer sheds the HTTP response, not the Postgres query, so this doubles how
+/// long a pathological query can pin one of the 16 pool connections. The
+/// concurrency bounds (`MAX_INFLIGHT_REQUESTS`, the active-users semaphore)
+/// are what keep that from compounding.
+const REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Requests admitted concurrently before the service starts shedding load.
 const MAX_INFLIGHT_REQUESTS: usize = 512;
 /// How often the outbox is expired, scrubbed and pruned. A compile-time constant
@@ -1003,8 +1011,8 @@ async fn main() -> anyhow::Result<()> {
         //
         // `preview` returns 202 and a job the client polls — counting three
         // partitioned tables on a badly-polluted app is exactly the workload
-        // that would sit past the 30s TimeoutLayer, and that app is the one
-        // that most needs purging.
+        // that would sit past the TimeoutLayer's request budget, and that app
+        // is the one that most needs purging.
         .route(
             "/v1/admin/purge",
             get(routes::purge::list_jobs).post(routes::purge::preview),

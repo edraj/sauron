@@ -186,7 +186,7 @@
   }
 </script>
 
-<AdminShell requireProject={false}>
+<AdminShell>
   <div class="head">
     <div>
       <h1 class="page-title">{t('projects.title')}</h1>

@@ -51,6 +51,18 @@ banner "1/5 apply pending migrations"
 # BEFORE running this on such a host. Hosts already at v1.7.4+ are past it.
 as_sauron "$MIGRATE"
 
+banner "post-migration: refresh sessions statistics"
+# Migration 0073 rebuilds `sessions` into per-day partitions and runs no
+# ANALYZE of its own, so every new child starts with empty planner statistics.
+# Autovacuum does get there (the children carry threshold-5000 overrides), but
+# on a long history that is hundreds of tables against a few cost-limited
+# workers — and until it finishes, any plan touching sessions can misestimate
+# badly enough to ride the request timeout into a 503. One explicit
+# ANALYZE closes that window now; on a parent, Postgres analyzes every child.
+# Idempotent, and cheap next to the backfill below.
+run_sql "ANALYZE sessions" >/dev/null || die "ANALYZE sessions failed"
+echo "sessions statistics refreshed"
+
 banner "2/5 rollup backfill (skipped automatically if already done)"
 echo "NOTE: first run replays all pre-existing history day by day — budget"
 echo "roughly an hour per 100M events. Do NOT interrupt it: a partial backfill"

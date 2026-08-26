@@ -244,7 +244,7 @@
   });
 </script>
 
-<AdminShell requireProject>
+<AdminShell>
   <div class="page">
     <header class="head">
       <div>

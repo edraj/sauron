@@ -1,7 +1,6 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { onMount } from 'svelte';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import CodeBlock from '../lib/components/ui/CodeBlock.svelte';
   import CopyButton from '../lib/components/ui/CopyButton.svelte';
@@ -871,7 +870,6 @@ GROUP BY name, op`;
   </div>
 {/snippet}
 
-<AppShell requireProject={false}>
   <div class="docs-page">
     <div class="head">
       <div>
@@ -1640,7 +1638,6 @@ GROUP BY name, op`;
       </div>
     </div>
   </div>
-</AppShell>
 
 <style>
   .head {

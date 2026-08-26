@@ -4,6 +4,8 @@
   import Router, { location, push } from 'svelte-spa-router';
   import { routes, prefetchLandingRoute } from './routes';
   import { authStore } from './lib/stores/auth.svelte';
+  import AppShell from './lib/components/layout/AppShell.svelte';
+  import { resolveShell } from './lib/models/shell';
   import Toast from './lib/components/ui/Toast.svelte';
   import Spinner from './lib/components/ui/Spinner.svelte';
 
@@ -62,6 +64,17 @@
       push('/login');
     }
   }
+
+  // The ONE AppShell for the whole session — see `models/shell.ts`. Pages no
+  // longer wrap themselves, so between two shelled routes only the routed
+  // component swaps and the sidebar/topbar DOM persists; a lazy chunk's
+  // loading state now renders inside the shell's content pane instead of
+  // replacing the whole viewport. Gated on `isAuthenticated`: an anonymous
+  // visitor parked on a guarded path is mid-redirect to /login, and mounting
+  // the shell for that one tick would fire the whole session bootstrap.
+  const shell = $derived(
+    booted && authStore.isAuthenticated ? resolveShell($location) : null,
+  );
 </script>
 
 {#if !booted}
@@ -70,6 +83,10 @@
     <Spinner size={22} />
     <span class="boot-text">{t('prose.boot.loading')}</span>
   </div>
+{:else if shell}
+  <AppShell requireProject={shell.requireProject} requireApp={shell.requireApp}>
+    <Router {routes} on:conditionsFailed={onConditionsFailed} />
+  </AppShell>
 {:else}
   <Router {routes} on:conditionsFailed={onConditionsFailed} />
 {/if}

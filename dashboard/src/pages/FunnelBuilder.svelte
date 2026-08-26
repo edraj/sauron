@@ -2,7 +2,6 @@
   import { t } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
   import { untrack } from 'svelte';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -294,7 +293,6 @@
   const overallConv = $derived(result ? (result.steps.at(-1)?.conv_from_start ?? 0) : 0);
 </script>
 
-<AppShell requireApp>
   <div class="head">
     <div>
       <h1 class="page-title">{t('funnels.title')}</h1>
@@ -491,7 +489,6 @@
     onconfirm={confirmDelete}
     oncancel={cancelDelete}
   />
-</AppShell>
 
 <style>
   .head {

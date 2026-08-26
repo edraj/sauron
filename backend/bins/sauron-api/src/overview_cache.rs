@@ -7,8 +7,9 @@
 //! tables, so their cost scales with retained data rather than with the
 //! caller's window. Measured on the reporting app that motivated this module:
 //! top-issues ~5.7 s, top-events ~6.1 s, series ~7.0 s, active-users ~13.4 s
-//! and totals past 30 s — where `main`'s `TimeoutLayer` maps a 30 s request
-//! onto `SERVICE_UNAVAILABLE`. The KPI tiles therefore did not render at all:
+//! and totals past the request budget (30 s then; see `REQUEST_TIMEOUT_SECS`)
+//! — where `main`'s `TimeoutLayer` maps a timed-out request onto
+//! `SERVICE_UNAVAILABLE`. The KPI tiles therefore did not render at all:
 //! not slowly, not partially, but as a 503 with nothing behind it.
 //!
 //! Splitting `/overview` into five sections (see `routes::analytics`) already

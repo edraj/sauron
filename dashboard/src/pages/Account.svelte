@@ -1,5 +1,4 @@
 <script lang="ts">
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
@@ -219,7 +218,6 @@
   });
 </script>
 
-<AppShell requireProject={false}>
   <div class="head">
     <div>
       <h1 class="page-title">{t('account.title')}</h1>
@@ -385,7 +383,6 @@
 
     <NotificationSubscriptions />
   </div>
-</AppShell>
 
 <ConfirmDialog
   danger

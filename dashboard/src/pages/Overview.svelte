@@ -1,6 +1,5 @@
 <script lang="ts">
   import { t, localeStore, intlTag } from '../lib/i18n';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -315,23 +314,34 @@
     if (aid) void load(aid, range, true);
   }
 
+  // Mirror of `overview_refresh`'s server-side gate (org:manage over this
+  // app): the force-recompute of all five aggregates is an admin action now —
+  // on a large deployment it is exactly the query class the cache keeps off
+  // the request path, so it 403s for everyone else. Same default-'app' cascade
+  // as the server's `authorize_app`.
+  const canForce = $derived(sessionStore.can('org:manage'));
+
   async function refresh() {
     const aid = sessionStore.currentAppId;
     if (!aid) return;
     refreshing = true;
     try {
-      // Two calls, and both are needed.
+      // For an admin, two calls, and both are needed.
       //
       // `refreshOverview` tells the SERVER to recompute all five sections
-      // ignoring its 1h freshness window; it returns 202 as soon as the work is
+      // ignoring its freshness window; it returns 202 as soon as the work is
       // enqueued, because the aggregates take seconds to tens of seconds and
       // waiting for them is the failure this design removes. The results arrive
-      // on the stream.
+      // on the stream. Admin-only — see `canForce` above.
       //
       // `load(force)` then re-reads the sections so the page immediately
       // reflects the new `stale`/`computing` states — without it, clicking
       // Refresh would appear to do nothing at all until the first push landed.
-      await refreshOverview(aid, range);
+      // For a non-admin this re-read is the whole action, and it is not
+      // nothing: any section older than the server's freshness window
+      // self-enqueues a recompute on read, so the button still surfaces the
+      // newest data the server will compute for them.
+      if (canForce) await refreshOverview(aid, range);
       await load(aid, range, true);
     } finally {
       refreshing = false;
@@ -380,7 +390,6 @@
   });
 </script>
 
-<AppShell requireApp>
   <div class="head">
     <div>
       <h1 class="page-title">{t('overview.title')}</h1>
@@ -422,7 +431,7 @@
       <RefreshButton
         onclick={refresh}
         loading={refreshing || revalidating}
-        title={revalidating ? 'Refreshing…' : 'Refresh'}
+        title={revalidating ? 'Refreshing…' : canForce ? 'Recompute now' : 'Refresh'}
       />
     </div>
   </div>
@@ -606,7 +615,6 @@
       </div>
     {/if}
   </div>
-</AppShell>
 
 <style>
   /* Reason text under the active-users chart. Muted: it explains an absence, it

@@ -1235,6 +1235,53 @@ async fn every_overview_section_is_env_scoped_independently() {
     srv.shutdown().await;
 }
 
+/// `POST /overview/refresh` — the force-recompute — is an ADMIN action:
+/// `overview_refresh` requires `org:manage` reach over the app on top of the
+/// read scope, because a force ignores the freshness window and recomputes all
+/// five aggregates at once. Everyone else still gets fresh-enough data from
+/// the read path's own stale-triggered recompute; what they must not hold is
+/// the trigger. Asserted over HTTP because the gate is one `authorize_app`
+/// call inside the handler — only the real router can see whether it is
+/// actually wired.
+#[tokio::test]
+async fn overview_refresh_is_admin_only() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+
+    // App-wide read reach, no org:manage: the read scope resolves, the admin
+    // gate refuses. 403, not 404 — the app is visible to this member.
+    let denied = srv
+        .post_status(
+            &format!("/v1/apps/{app}/overview/refresh"),
+            &f.owner_token,
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        denied, 403,
+        "event:read alone must not trigger a force recompute"
+    );
+
+    // The Owner preset at org scope carries org:manage → accepted, and 202
+    // specifically: the work is enqueued, never run on the request path.
+    let accepted = srv
+        .post_status(
+            &format!("/v1/apps/{app}/overview/refresh"),
+            &f.org_owner_token,
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        accepted, 202,
+        "an org admin must be able to force a recompute"
+    );
+
+    srv.shutdown().await;
+}
+
 #[tokio::test]
 async fn empty_environment_id_returns_400_over_http_not_all_environments() {
     let Some(mut h) = TestServer::start().await else {

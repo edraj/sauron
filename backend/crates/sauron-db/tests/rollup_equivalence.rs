@@ -544,15 +544,27 @@ async fn rollup_reads_match_legacy_reads() {
     let l_errseries = repo::error_series(&mut conn, scope(), range)
         .await
         .expect("legacy errseries");
-    // `+ 1h`, not `+ 1s`: seed_two_envs pins a few rows seconds into the
-    // FUTURE, and the rollup's whole-day bucket includes them while a tight
-    // point-bound excludes them — the disclosed upper-edge semantic. A wide
-    // bound puts the pinned rows inside BOTH windows so the day counts are
-    // comparable exactly.
-    let l_days =
-        repo::active_users_by_day_hot(&mut conn, scope(), range.from, now + Duration::hours(1))
-            .await
-            .expect("legacy days");
+    // The day-count comparison is the ONE read here with an explicit upper
+    // bound, and the bucket it compares is fed by TWO different clocks: this
+    // test's own rows are anchored to the real `now` above, while
+    // `seed_two_envs` pins its rows to TODAY AT 12:00 UTC — a fixed instant
+    // that sits in the FUTURE for any run before ~noon. The rollup's
+    // whole-day bucket includes a future-noon row regardless (the disclosed
+    // upper-edge semantic; the fold admits it by `received_at`), but the
+    // legacy point-bound excludes it, so a bound derived from the wall clock
+    // alone made the two sides disagree on today's bucket for every run in
+    // the first half of the UTC day — which is exactly when CI runs. (`now +
+    // 1h` was written for an older seed that pinned rows only seconds ahead;
+    // the seed moved, the slack silently stopped covering it, and this test
+    // became green-after-lunch.) Anchoring to BOTH clocks puts every seeded
+    // row inside both windows at any time of day: the fixture's largest
+    // offset past its anchor is +5 s, this test seeds nothing after `now`,
+    // and nothing occupies the gap up to the bound, so the extra width
+    // admits no row asymmetrically.
+    let day_upper = now.max(ids.pinned_now) + Duration::hours(1);
+    let l_days = repo::active_users_by_day_hot(&mut conn, scope(), range.from, day_upper)
+        .await
+        .expect("legacy days");
 
     // ------------------------------------------------------------------
     // Open the gate: epoch behind the data's received_at, watermarks reset,
@@ -633,14 +645,12 @@ async fn rollup_reads_match_legacy_reads() {
     let r_errseries = repo::error_series(&mut conn, scope(), range)
         .await
         .expect("rollup errseries");
-    let r_days = rollups::read::active_users_by_day(
-        &mut conn,
-        &scope(),
-        range.from,
-        now + Duration::hours(1),
-    )
-    .await
-    .expect("rollup days");
+    // Same `day_upper` as the legacy call above, by construction — two
+    // hand-computed bounds here would eventually disagree the same way the
+    // two clocks did.
+    let r_days = rollups::read::active_users_by_day(&mut conn, &scope(), range.from, day_upper)
+        .await
+        .expect("rollup days");
 
     // ------------------------------------------------------------------
     // Exact comparisons.

@@ -9221,6 +9221,15 @@ pub struct OverviewTotals {
 /// (thousands of rows, not hundreds of thousands), where the correlated `EXISTS` short-
 /// circuits per row and beats the uncorrelated form — measured 2.5s vs 3.6s on the same
 /// fixture. The right shape follows from the outer table's cardinality, not from a rule.
+///
+/// # This is the FALLBACK shape — new callers want [`event_user_membership_sql`]
+///
+/// Even uncorrelated, these legs scan the full retained history of three tables (the
+/// sessions leg probes every daily partition since migration 73, with nothing to prune
+/// on), so cost still grows with retention. Apps whose person-env backfill has run get
+/// the same set from the `event_user_environments` rollup in O(members); the async
+/// chooser owns that gate. Direct calls to this function are correct only where the
+/// marker is already known absent (the persons LIVE shape) or a sync context forces it.
 pub(crate) fn event_user_membership_exists(env: EnvFilter, bind_index: usize) -> String {
     if matches!(env, EnvFilter::All) {
         return String::new();
@@ -9234,6 +9243,69 @@ pub(crate) fn event_user_membership_exists(env: EnvFilter, bind_index: usize) ->
             UNION SELECT ee.distinct_id FROM error_events ee WHERE ee.app_id=$1{ee_env} \
             UNION SELECT se.distinct_id FROM sessions se WHERE se.app_id=$1{se_env} \
           )"
+    )
+}
+
+/// The rollup twin of [`event_user_membership_exists`]: the same "member of
+/// this environment, all-time" set, read from `event_user_environments`
+/// instead of the three signal tables.
+///
+/// Same semantics BY CONSTRUCTION, not by coincidence:
+/// `person_env_backfill::backfill_app`'s aggregate and `batch`'s live bumps
+/// each mirror the raw fragment's three legs exactly (their own doc comments
+/// carry the warning), so a `distinct_id` appears in the rollup for an
+/// environment iff it has at least one analytics event, error event or session
+/// there — all-time. What changes is the COST: the raw legs scan the full
+/// retained history of three tables (the sessions leg is one probe per daily
+/// partition since migration 73, with no time bound to prune on), while this
+/// reads O(members) rows from one small table. On the fixture that motivated
+/// the persons rollup that was 2,752 ms → 37 ms for the same answer.
+///
+/// Only valid for apps whose `event_user_env_backfill` marker is present —
+/// before that the rollup is incomplete (pre-epoch history missing) and reads
+/// from it would be quiet-wrong. Callers therefore never pick this directly;
+/// [`event_user_membership_sql`] owns that decision. Same aliasing rule as the
+/// raw fragment: the subquery column is qualified (`r.distinct_id`) so it can
+/// never silently resolve against the outer `event_users`.
+fn event_user_membership_rollup(env: &EnvFilter, bind_index: usize) -> String {
+    if matches!(env, EnvFilter::All) {
+        return String::new();
+    }
+    let r_env = env.sql_fragment_for("r", bind_index);
+    format!(
+        " AND event_users.distinct_id IN ( \
+            SELECT r.distinct_id FROM event_user_environments r WHERE r.app_id=$1{r_env} \
+          )"
+    )
+}
+
+/// The membership fragment for this app, choosing rollup vs raw on the
+/// person-env marker — the `person_env_backfill::is_backfilled` gate
+/// `list_persons` already uses (the device-groups `is_ready` pattern).
+///
+/// `All` short-circuits to the empty fragment WITHOUT probing the marker:
+/// no filter is emitted for it by either shape, so the probe would be a
+/// wasted round trip on the most common selection.
+///
+/// The contract callers rely on is unchanged from
+/// [`event_user_membership_exists`]: `app_id` bound at `$1`, `bind_index`
+/// reusing the caller's own environment bind, and no bind of this fragment's
+/// own — so swapping shapes can never shift a caller's positional bind chain.
+pub(crate) async fn event_user_membership_sql(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    env: &EnvFilter,
+    bind_index: usize,
+) -> QueryResult<String> {
+    if matches!(env, EnvFilter::All) {
+        return Ok(String::new());
+    }
+    Ok(
+        if crate::person_env_backfill::is_backfilled(conn, app_id).await? {
+            event_user_membership_rollup(env, bind_index)
+        } else {
+            event_user_membership_exists(env.clone(), bind_index)
+        },
     )
 }
 
@@ -9285,11 +9357,10 @@ pub async fn overview_totals(
     // today counts as "new" in *neither* environment's window under this reading — their
     // global `first_seen` predates `since` regardless of which environment's membership is
     // checked.
-    // `.clone()`, not a move: the final `bind_env!` call below still needs
-    // `scope.env` — `event_user_membership_exists` keeps its pre-existing
-    // owned-`EnvFilter` signature (not reshaped to take `&`), per the rule of
-    // adding a clone at the call site instead.
-    let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
+    // Chooses rollup vs raw membership on the person-env marker — see
+    // `event_user_membership_sql`. Same fragment contract either way (app at
+    // `$1`, env bind reused), so nothing else in this bind chain moves.
+    let membership_sql = event_user_membership_sql(conn, scope.app_id, &scope.env, 3).await?;
 
     // `crashed_sessions` counts `unhandled_errors_count`, NOT `errors_count`:
     // `errors_count` counts every row in `error_events` at any level, so one
@@ -10132,9 +10203,9 @@ pub async fn user_stats(
         return crate::rollups::read::user_stats(conn, &scope, range, now).await;
     }
     let env_sql = scope.env.sql_fragment(3);
-    // `.clone()`, not a move — the final `bind_env!` call below still needs
-    // `scope.env`; see `overview_totals`'s identical call for why.
-    let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
+    // Rollup-vs-raw membership on the person-env marker — see
+    // `event_user_membership_sql`; `overview_totals` makes the identical call.
+    let membership_sql = event_user_membership_sql(conn, scope.app_id, &scope.env, 3).await?;
     // Derived from `consumes_bind()`, never assumed: `All` and `Unattributed`
     // reserve no bind, so the three cutoffs start at $3 for them and $4 for
     // `One`/`Subset`. Hardcoding either shifts every cutoff by one and silently
@@ -10255,11 +10326,9 @@ pub async fn active_user_series(
     let active_stmt = crate::bind_range!(active_stmt, range);
     let active: Vec<SeriesPoint> = active_stmt.get_results(conn).await?;
 
-    // `.clone()`, not a move: the second `bind_env!` call below (for
-    // `new_stmt`) still needs `scope.env` — see `overview_totals`'s identical
-    // call for why `event_user_membership_exists` itself is not reshaped to
-    // take `&EnvFilter` instead.
-    let membership_sql = event_user_membership_exists(scope.env.clone(), 3);
+    // Rollup-vs-raw membership on the person-env marker — see
+    // `event_user_membership_sql`; `overview_totals` makes the identical call.
+    let membership_sql = event_user_membership_sql(conn, scope.app_id, &scope.env, 3).await?;
     let up_first_seen = range.upper_sql("first_seen", upper_idx);
     let new_q = format!(
         "SELECT date_trunc('day', first_seen) AS bucket, count(*)::bigint AS count \

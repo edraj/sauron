@@ -716,3 +716,244 @@ async fn person_backfill_all_sources_its_cutoff_from_the_epoch_not_now() {
     drop(conn);
     db.cleanup().await;
 }
+
+// ===========================================================================
+// Membership-fragment equivalence: rollup vs raw three-table UNION
+// ===========================================================================
+
+/// The env-membership swap (`repo::event_user_membership_sql`): for a
+/// person-env-backfilled app, `user_stats` and `active_user_series` must
+/// return IDENTICAL answers through the `event_user_environments` rollup as
+/// through the raw analytics∪errors∪sessions UNION — for every `EnvFilter`
+/// variant that emits a filter, at several windows, on BOTH the legacy path
+/// and the migration-71 rollup read path.
+///
+/// The fixture is extended with the two identities a leg-dropping regression
+/// would silently lose:
+/// - a SESSIONS-ONLY member of `env_a` (no analytics, no errors) — drop the
+///   sessions leg from either shape and this person vanishes from `One(a)`;
+/// - an UNATTRIBUTED-only member (one NULL-environment analytics row) — lose
+///   the rollup's NULL-env rows and `Unattributed` goes empty.
+///
+/// Method: snapshot every (variant × window) result while the app has NO
+/// person-env marker (the chooser emits the raw UNION), run `backfill_app`,
+/// snapshot again (the chooser emits the rollup shape), require equality.
+/// Then open the migration-71 gate (`rollups::mark_all_backfilled`) and run
+/// the same comparison through `rollups::read::*` — marker deleted for the
+/// raw snapshot, restored for the rollup one. The read-path sketch legs are
+/// empty-but-deterministic either way, so full-value equality stays a valid
+/// oracle there too; the membership-carrying legs (`total_users`,
+/// `active_in_range`, `new_in_range`, the series' `new_users`) are exact.
+///
+/// `create_test_database` pins the migration-71 epoch +10 years out, so the
+/// first phase genuinely exercises the LEGACY callers — see
+/// `rollup_gate_closed_in_tests` for why that is the default.
+#[tokio::test]
+async fn membership_via_rollup_agrees_with_raw_union_for_all_env_variants() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // --- corner identities ------------------------------------------------
+    // Same anchoring rule as `backfill_adds_to_rows_the_write_path_already_
+    // created`: timestamps derive from the fixture's pinned clock, and the
+    // backfill cutoff clears them by an hour, or the aggregate excludes the
+    // very rows this test is about.
+    let at = ids.pinned_now - chrono::Duration::seconds(90);
+    let cutoff = ids.pinned_now + chrono::Duration::hours(1);
+
+    let sessions_only = format!("{}-sessions-only", ids.shared_distinct_id);
+    sauron_db::repo::touch_event_user(&mut conn, ids.app_id, &sessions_only)
+        .await
+        .expect("register sessions-only member");
+    sauron_db::batch::bump_sessions(
+        &mut conn,
+        &[sauron_db::batch::SessionBump {
+            app_id: ids.app_id,
+            session_id: "membership-sessions-only".to_string(),
+            distinct_id: Some(sessions_only.clone()),
+            device_key: None,
+            first_at: at,
+            last_at: at,
+            context: serde_json::json!({}),
+            release: None,
+            environment_id: Some(ids.env_a),
+            ip: None,
+            events_delta: 0,
+            errors_delta: 0,
+            unhandled_delta: 0,
+        }],
+    )
+    .await
+    .expect("insert sessions-only session");
+
+    let unattributed_only = format!("{}-unattributed", ids.shared_distinct_id);
+    sauron_db::repo::touch_event_user(&mut conn, ids.app_id, &unattributed_only)
+        .await
+        .expect("register unattributed member");
+    common::seed_signal_event(&mut conn, ids.app_id, None, &unattributed_only, at).await;
+
+    // --- the comparison harness -------------------------------------------
+    let variants: Vec<(&str, EnvFilter)> = vec![
+        ("One(env_a)", EnvFilter::One(ids.env_a)),
+        ("One(env_b)", EnvFilter::One(ids.env_b)),
+        (
+            "Subset([a,b])",
+            EnvFilter::Subset(vec![ids.env_a, ids.env_b]),
+        ),
+        ("Unattributed", EnvFilter::Unattributed),
+    ];
+    let windows_days: [i64; 3] = [1, 30, 3650];
+
+    // Every (variant × window) answer from both endpoints, as one comparable
+    // value. `UserStats` has no `PartialEq`; JSON is the equality oracle.
+    async fn snapshot(
+        conn: &mut sauron_db::PgConn,
+        app_id: uuid::Uuid,
+        variants: &[(&str, EnvFilter)],
+        windows_days: &[i64],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(String, serde_json::Value)> {
+        let mut out = Vec::new();
+        for (label, env) in variants {
+            for days in windows_days {
+                let scope = ReadScope {
+                    app_id,
+                    env: env.clone(),
+                };
+                let range = sauron_db::scope::Range::since(now - chrono::Duration::days(*days));
+                let stats = sauron_db::repo::user_stats(conn, scope.clone(), range, now)
+                    .await
+                    .unwrap_or_else(|e| panic!("user_stats {label}/{days}d: {e}"));
+                let series = sauron_db::repo::active_user_series(conn, scope, range)
+                    .await
+                    .unwrap_or_else(|e| panic!("active_user_series {label}/{days}d: {e}"));
+                out.push((
+                    format!("user_stats {label} {days}d"),
+                    serde_json::to_value(&stats).expect("stats to json"),
+                ));
+                out.push((
+                    format!("active_user_series {label} {days}d"),
+                    serde_json::to_value(&series).expect("series to json"),
+                ));
+            }
+        }
+        out
+    }
+
+    // --- phase 1: LEGACY callers, raw UNION vs rollup ----------------------
+    assert!(
+        !sauron_db::person_env_backfill::is_backfilled(&mut conn, ids.app_id)
+            .await
+            .expect("marker probe"),
+        "fixture precondition: no person-env marker yet, so the raw shape runs"
+    );
+    let raw = snapshot(
+        &mut conn,
+        ids.app_id,
+        &variants,
+        &windows_days,
+        ids.pinned_now,
+    )
+    .await;
+
+    // Vacuity guards: a test comparing empty answers to empty answers proves
+    // nothing. Every variant must admit someone, and the corner identities
+    // must be visible in the variants built to catch their loss.
+    let total_of = |snaps: &[(String, serde_json::Value)], label: &str| -> i64 {
+        let key = format!("user_stats {label} 3650d");
+        snaps
+            .iter()
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("missing snapshot {key}"))
+            .1["total_users"]
+            .as_i64()
+            .expect("total_users")
+    };
+    for (label, _) in &variants {
+        assert!(
+            total_of(&raw, label) > 0,
+            "vacuity guard: {label} must admit at least one member"
+        );
+    }
+    assert!(
+        total_of(&raw, "Subset([a,b])") >= total_of(&raw, "One(env_a)")
+            && total_of(&raw, "Subset([a,b])") >= total_of(&raw, "One(env_b)"),
+        "subset admits the union of its environments"
+    );
+
+    sauron_db::person_env_backfill::backfill_app(&mut conn, ids.app_id, cutoff)
+        .await
+        .expect("person-env backfill");
+
+    let rolled = snapshot(
+        &mut conn,
+        ids.app_id,
+        &variants,
+        &windows_days,
+        ids.pinned_now,
+    )
+    .await;
+    for ((k, raw_v), (k2, rolled_v)) in raw.iter().zip(rolled.iter()) {
+        assert_eq!(k, k2, "snapshot ordering must be stable");
+        assert_eq!(
+            raw_v, rolled_v,
+            "legacy path: {k} must be identical through the rollup membership \
+             and the raw three-table UNION"
+        );
+    }
+
+    // --- phase 2: the migration-71 read path (rollups::read twins) ---------
+    sauron_db::rollups::mark_all_backfilled(&mut conn)
+        .await
+        .expect("open the rollup read gate");
+
+    // Marker OFF: read-path callers emit the raw UNION.
+    diesel::sql_query("DELETE FROM event_user_env_backfill WHERE app_id = $1")
+        .bind::<SqlUuid, _>(ids.app_id)
+        .execute(&mut conn)
+        .await
+        .expect("clear person-env marker");
+    let read_raw = snapshot(
+        &mut conn,
+        ids.app_id,
+        &variants,
+        &windows_days,
+        ids.pinned_now,
+    )
+    .await;
+
+    // Marker ON: same callers, rollup membership. The rollup table itself was
+    // fully populated by phase 1's backfill and the marker re-insert claims
+    // exactly that data, so this restore is not a second backfill.
+    diesel::sql_query(
+        "INSERT INTO event_user_env_backfill (app_id, completed_at) VALUES ($1, now())",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .execute(&mut conn)
+    .await
+    .expect("restore person-env marker");
+    let read_rolled = snapshot(
+        &mut conn,
+        ids.app_id,
+        &variants,
+        &windows_days,
+        ids.pinned_now,
+    )
+    .await;
+
+    for ((k, raw_v), (k2, rolled_v)) in read_raw.iter().zip(read_rolled.iter()) {
+        assert_eq!(k, k2, "snapshot ordering must be stable");
+        assert_eq!(
+            raw_v, rolled_v,
+            "rollup read path: {k} must be identical through the rollup \
+             membership and the raw three-table UNION"
+        );
+    }
+
+    drop(conn);
+    db.cleanup().await;
+}

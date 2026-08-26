@@ -1,7 +1,6 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import { getMonitor, getMonitorChecks, updateMonitor, deleteMonitor } from '../lib/api/monitors';
   import { viewCache } from '../lib/stores/view-cache';
   import { MONITOR_INTERVALS, formatInterval } from '../lib/constants/monitorIntervals';
@@ -238,7 +237,6 @@
   });
 </script>
 
-<AppShell>
   <button class="back" onclick={() => push('/monitors')}>
     <Icon name="arrow-left" size={14} />
     {t('monitors.column.uptime')}
@@ -443,7 +441,6 @@
       </Card>
     </div>
   {/if}
-</AppShell>
 
 <ConfirmDialog
   bind:open={confirmOpen}

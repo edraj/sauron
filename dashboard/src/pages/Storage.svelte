@@ -440,7 +440,7 @@
   });
 </script>
 
-<AdminShell requireProject={false}>
+<AdminShell>
   <div class="storage">
     <header class="head">
       <div>

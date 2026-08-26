@@ -2,20 +2,18 @@
   import { t } from '../../i18n';
   import type { Snippet } from 'svelte';
   import { location } from 'svelte-spa-router';
-  import AppShell from './AppShell.svelte';
   import Icon from '../ui/Icon.svelte';
   import { adminNavLocks } from '../../models/admin-nav';
   import { lockTip } from '../../actions/lock-tip';
 
   interface Props {
-    requireProject?: boolean;
-    requireApp?: boolean;
     children: Snippet;
   }
 
-  // Forwarded to AppShell unchanged — each admin page keeps the scope
-  // requirements it had as a top-level route.
-  let { requireProject = false, requireApp = false, children }: Props = $props();
+  // No AppShell here any more, and no requireProject/requireApp props: the
+  // one shell lives in App.svelte and reads each admin route's flags from
+  // `models/shell.ts`. This component is only the admin rail + body grid.
+  let { children }: Props = $props();
 
   // Every child renders, locked ones included — see `adminNavLocks`. The rail
   // and the sidebar read the same helper, so they cannot disagree about which
@@ -23,8 +21,7 @@
   const items = $derived(adminNavLocks());
 </script>
 
-<AppShell {requireProject} {requireApp}>
-  <div class="admin">
+<div class="admin">
     <nav class="rail" aria-label={t('shell.adminSections')}>
       {#each items as item (item.href)}
         {#if item.locked}
@@ -47,8 +44,7 @@
       {/each}
     </nav>
     <div class="body">{@render children()}</div>
-  </div>
-</AppShell>
+</div>
 
 <style>
   .admin {

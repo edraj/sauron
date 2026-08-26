@@ -1,7 +1,6 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import AppEnvPicker from '../lib/components/AppEnvPicker.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -234,7 +233,6 @@
   }
 </script>
 
-<AppShell requireProject requireApp={false}>
   <div class="active-users">
     <header class="head">
       <div>
@@ -393,7 +391,6 @@
       </Card>
     {/if}
   </div>
-</AppShell>
 
 <style>
   .active-users {

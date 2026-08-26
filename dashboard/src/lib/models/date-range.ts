@@ -206,6 +206,22 @@ export function toParams(v: DateRangeValue): Record<string, string> {
 }
 
 /**
+ * The same window, shaped for a JSON request BODY.
+ *
+ * Separate from [`toParams`] because the two wires type values differently. A
+ * query string carries only text, so `since_days=30` arrives as a string and
+ * the server's query deserializer parses it. A JSON body preserves types, and
+ * the server deserializes `since_days` there as an `i64` — so the string
+ * `toParams` emits is a 422 ("invalid type: string \"30\", expected i64"), not
+ * a number. Spreading `toParams` into a POST body is exactly the mistake that
+ * shipped: the funnel page sent `{"since_days":"30"}` and every relative
+ * window — including the default — failed while the absolute ones worked.
+ */
+export function toBody(v: DateRangeValue): { since_days: number } | { from: string; to: string } {
+  return v.kind === 'last' ? { since_days: v.days } : { from: v.from, to: v.to };
+}
+
+/**
  * Decode a window from query parameters, falling back to `fallbackDays` for
  * anything this app cannot honour.
  *
