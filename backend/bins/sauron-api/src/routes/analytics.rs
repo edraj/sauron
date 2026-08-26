@@ -1076,6 +1076,18 @@ pub async fn overview_refresh(
     RawQuery(raw_query): RawQuery,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let (scope, perms) = overview_scope(&state, &auth, app_id, raw_query.as_deref()).await?;
+    // Admin-only, unlike every read beside it. A force ignores the freshness
+    // window and recomputes all five aggregates — on a large deployment that
+    // is the exact query class the cache exists to keep off the request path,
+    // so handing the trigger to every `event:read` holder is a self-DoS
+    // button. Plain section reads still self-enqueue a recompute whenever the
+    // cached entry is older than `FRESH_FOR`, so non-admins lose only the
+    // sub-2-minute force, not freshness. The dashboard mirrors this gate with
+    // `can('org:manage')` and simply re-reads for everyone else.
+    {
+        let mut conn = db(&state).await?;
+        authorize_app(&mut conn, auth.user_id, app_id, perm::ORG_MANAGE).await?;
+    }
     let window = overview_cache::Window::from_query(q.since_days, q.from, q.to);
     for section in Section::ALL {
         if section == Section::TopIssues && !perms.contains(perm::ISSUE_READ) {

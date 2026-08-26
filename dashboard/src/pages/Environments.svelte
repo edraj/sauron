@@ -508,7 +508,7 @@
   }
 </script>
 
-<AdminShell requireProject>
+<AdminShell>
   <div class="head">
     <div>
       <h1 class="page-title">{t('environments.title')}</h1>

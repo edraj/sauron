@@ -1,7 +1,6 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { replace } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import { firstAccessibleAdminPath } from '../lib/models/admin-nav';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -25,7 +24,6 @@
   });
 </script>
 
-<AppShell requireProject={false}>
   {#if denied}
     <!--
       A plain EmptyState rather than PermissionDenied, for the same reason
@@ -41,4 +39,3 @@
       icon="lock"
     />
   {/if}
-</AppShell>

@@ -10,6 +10,7 @@ import {
   monthRange,
   rangeKey,
   spanDays,
+  toBody,
   toParams,
   toPredicate,
   formatAbsolute,
@@ -293,6 +294,41 @@ describe('labels', () => {
     // Not asserting the exact Arabic string — the point is that the formatter
     // is reached at all, so a label cannot be frozen in English.
     expect(formatAbsolute(monthRange(localDay(2026, 7, 17)), 'ar-u-nu-latn')).not.toBe('July 2026');
+  });
+});
+
+describe('the body encoder', () => {
+  /**
+   * NUMBER, not string — the one way `toBody` may differ from `toParams`. The
+   * server deserializes a JSON body's `since_days` as an `i64`, so the string
+   * that is correct in a query string is a 422 in a body. The funnel page
+   * shipped that exact request once: `{"since_days":"30"}`, every relative
+   * window broken including the default.
+   */
+  it('sends since_days as a number for a relative window', () => {
+    expect(toBody(lastDays(30))).toEqual({ since_days: 30 });
+  });
+
+  it('sends only the bounds for an absolute window', () => {
+    const r = dayRange(localDay(2026, 8, 12));
+    if (r.kind !== 'absolute') throw new Error('absolute');
+    expect(toBody(r)).toEqual({ from: r.from, to: r.to });
+  });
+
+  /**
+   * Field-for-field, `toBody` must stay `toParams` with the types repaired —
+   * same names, same precedence rule — so the two encodings can never
+   * describe different windows for the same value.
+   */
+  it('agrees with toParams on names and precedence for both shapes', () => {
+    for (const v of [lastDays(7), monthRange(localDay(2026, 7, 3))]) {
+      const params = toParams(v);
+      const body = toBody(v);
+      expect(Object.keys(body).sort()).toEqual(Object.keys(params).sort());
+      for (const [k, sv] of Object.entries(params)) {
+        expect(String((body as Record<string, unknown>)[k])).toBe(sv);
+      }
+    }
   });
 });
 

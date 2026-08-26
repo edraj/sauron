@@ -1,7 +1,6 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -123,7 +122,6 @@
   }
 </script>
 
-<AppShell requireApp>
   <button class="back" onclick={() => push('/screens')}>
     <Icon name="arrow-left" size={14} />
     {t('screens.title')}
@@ -318,7 +316,6 @@
       icon="layout-panel-top"
     />
   {/if}
-</AppShell>
 
 <style>
   .back {

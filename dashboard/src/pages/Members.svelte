@@ -409,7 +409,7 @@
   }
 </script>
 
-<AdminShell requireProject={false}>
+<AdminShell>
   <div class="head">
     <div>
       <h1 class="page-title">{t('members.title')}</h1>
@@ -417,7 +417,7 @@
     </div>
   </div>
 
-  <!-- The `member:read` gate is AdminShell's now (which wraps AppShell): it
+  <!-- The `member:read` gate is the hoisted AppShell's now (App.svelte): it
        resolves /admin/members through PAGE_ACCESS and renders PermissionDenied
        instead of this page, so the bespoke "No access" card that used to live
        here would be unreachable. -->

@@ -233,7 +233,7 @@
   }
 </script>
 
-<AdminShell requireProject={false}>
+<AdminShell>
   <div class="head">
     <div>
       <h1>{t('audit.title')}</h1>

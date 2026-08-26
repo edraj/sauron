@@ -229,7 +229,7 @@
   });
 </script>
 
-<AdminShell requireProject={false} requireApp={true}>
+<AdminShell>
   <div class="head">
     <div>
       <h1>{t('prose.purge.title')}</h1>

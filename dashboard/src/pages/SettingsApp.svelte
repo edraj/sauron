@@ -120,7 +120,7 @@
   }
 </script>
 
-<AdminShell requireProject={false}>
+<AdminShell>
   <div class="head">
     <h1 class="page-title">{t('settings.title')}</h1>
     {#if app}

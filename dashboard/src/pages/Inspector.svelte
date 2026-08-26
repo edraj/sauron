@@ -314,7 +314,7 @@
   });
 </script>
 
-<AdminShell requireApp>
+<AdminShell>
   <div class="head">
     <h1 class="page-title">{t('inspector.title')}</h1>
     {#if effective}

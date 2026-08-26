@@ -2,7 +2,6 @@
   import { t } from '../lib/i18n';
   import { untrack } from 'svelte';
   import { querystring, replace } from 'svelte-spa-router';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -300,7 +299,6 @@
   });
 </script>
 
-<AppShell requireApp>
   <div class="head">
     <div>
       <h1>{t('transactions.title')}</h1>
@@ -466,7 +464,6 @@
       />
     {/if}
   </Card>
-</AppShell>
 
 <style>
   .head {

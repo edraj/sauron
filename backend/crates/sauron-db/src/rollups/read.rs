@@ -463,15 +463,19 @@ async fn session_sums(
 }
 
 /// Rollup twin of `repo::user_stats`. The three `event_users` legs stay live
-/// (small table); dau/wau/mau become calendar-day sketch merges; the session
-/// duration legs read the sessions rollup.
+/// (small table) — but their env-membership filter rides the person-env
+/// rollup once that marker is present (`event_user_membership_sql`): the raw
+/// membership UNION scans the full history of three tables and was the one
+/// full-scan this twin still carried under `environment_id=`. dau/wau/mau
+/// become calendar-day sketch merges; the session duration legs read the
+/// sessions rollup.
 pub async fn user_stats(
     conn: &mut AsyncPgConnection,
     scope: &ReadScope,
     range: Range,
     now: DateTime<Utc>,
 ) -> QueryResult<UserStats> {
-    let membership_sql = repo::event_user_membership_exists(scope.env.clone(), 3);
+    let membership_sql = repo::event_user_membership_sql(conn, scope.app_id, &scope.env, 3).await?;
     let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let up_last_seen = range.upper_sql("last_seen", upper_idx);
     let up_first_seen = range.upper_sql("first_seen", upper_idx);
@@ -532,7 +536,7 @@ pub async fn active_user_series(
         })
         .collect();
 
-    let membership_sql = repo::event_user_membership_exists(scope.env.clone(), 3);
+    let membership_sql = repo::event_user_membership_sql(conn, scope.app_id, &scope.env, 3).await?;
     let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let up = range.upper_sql("first_seen", upper_idx);
     let q = format!(
@@ -766,7 +770,7 @@ pub async fn overview_totals(
     let counts: TwoCounts = stmt.get_result(conn).await?;
     let s = session_sums(conn, scope, range).await?;
 
-    let membership_sql = repo::event_user_membership_exists(scope.env.clone(), 3);
+    let membership_sql = repo::event_user_membership_sql(conn, scope.app_id, &scope.env, 3).await?;
     let env_sql_errors = scope.env.sql_fragment_for("error_events", 3);
     let upper_idx = if scope.env.consumes_bind() { 4 } else { 3 };
     let up_last_seen = range.upper_sql("last_seen", upper_idx);

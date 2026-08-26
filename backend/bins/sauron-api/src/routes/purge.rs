@@ -10,8 +10,8 @@
 //! a `purge_jobs` row with `status = 'previewing'`, and returns 202; the worker
 //! counts and moves the row to `previewed`, which the client polls for. A
 //! count over three partitioned tables on a badly-polluted app is exactly the
-//! workload that would sit past the 30s `TimeoutLayer`, and the app that most
-//! needs purging is the one where counting is slowest.
+//! workload that would sit past the `TimeoutLayer`'s request budget, and the
+//! app that most needs purging is the one where counting is slowest.
 //!
 //! ## Why confirm cannot widen anything
 //!

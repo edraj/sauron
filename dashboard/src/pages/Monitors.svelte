@@ -2,7 +2,6 @@
   import { t } from '../lib/i18n';
   import { formatTime } from '../lib/utils/format';
   import { rowHref, rowNav } from '../lib/utils/row-link';
-  import AppShell from '../lib/components/layout/AppShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -166,7 +165,6 @@
   });
 </script>
 
-<AppShell>
   <div class="mons">
     <header class="head">
       <div>
@@ -344,7 +342,6 @@
       />
     {/if}
   </div>
-</AppShell>
 
 <style>
   .mons {

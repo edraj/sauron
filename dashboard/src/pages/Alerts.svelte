@@ -684,7 +684,7 @@
   });
 </script>
 
-<AdminShell requireProject>
+<AdminShell>
   <div class="alerts">
     <header class="head">
       <div>

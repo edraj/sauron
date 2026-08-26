@@ -219,7 +219,7 @@
   });
 </script>
 
-<AdminShell requireProject={false}>
+<AdminShell>
   <div class="head">
     <div>
       <h1 class="page-title">{t('roles.title')}</h1>
