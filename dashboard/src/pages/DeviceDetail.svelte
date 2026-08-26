@@ -4,7 +4,7 @@
   import { push } from 'svelte-spa-router';
   import { rowHref, rowNav } from '../lib/utils/row-link';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -134,7 +134,7 @@
   </button>
 
   {#if loading}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if error}
     <EmptyState title={t('device.notFound')} description={error} icon="triangle-alert">
       {#snippet action()}
@@ -318,11 +318,6 @@
   }
   .back:hover {
     color: var(--text);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   .detail-head {
     margin-bottom: 20px;

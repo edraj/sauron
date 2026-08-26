@@ -18,7 +18,7 @@
   import Badge from './ui/Badge.svelte';
   import Button from './ui/Button.svelte';
   import Icon from './ui/Icon.svelte';
-  import Spinner from './ui/Spinner.svelte';
+  import Skeleton from './ui/Skeleton.svelte';
   import EmptyState from './ui/EmptyState.svelte';
   import DataTable from './DataTable.svelte';
   import TimeValue from './TimeValue.svelte';
@@ -194,7 +194,7 @@
     </div>
 
     {#if loading && rows.length === 0}
-      <div class="center"><Spinner size={22} /></div>
+      <Skeleton rows={5} />
     {:else if error}
       <EmptyState title={t('ui.opModal.loadError')} description={error} icon="triangle-alert">
         {#snippet action()}
@@ -344,11 +344,6 @@
     background: var(--surface);
     color: var(--text);
     box-shadow: var(--shadow-sm);
-  }
-  .center {
-    display: flex;
-    justify-content: center;
-    padding: 40px 0;
   }
   .chev {
     width: 28px;

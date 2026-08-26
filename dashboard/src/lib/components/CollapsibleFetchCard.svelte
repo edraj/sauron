@@ -17,7 +17,7 @@
   import Card from './ui/Card.svelte';
   import Button from './ui/Button.svelte';
   import Icon, { type IconName } from './ui/Icon.svelte';
-  import Spinner from './ui/Spinner.svelte';
+  import Skeleton from './ui/Skeleton.svelte';
   import Pagination from './Pagination.svelte';
   import { SectionPage } from '../stores/section-page.svelte';
   import type { ListPage } from '../models/list-state';
@@ -112,7 +112,7 @@
         </Button>
       </div>
     {:else if section.loading && !section.loaded}
-      <div class="center"><Spinner size={20} /></div>
+      <Skeleton rows={4} />
     {:else if section.error}
       <div class="prompt">
         <p class="error-note">{section.error}</p>
@@ -194,11 +194,6 @@
     justify-content: space-between;
     gap: 12px;
     flex-wrap: wrap;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 24px;
   }
   .muted {
     color: var(--text-muted);

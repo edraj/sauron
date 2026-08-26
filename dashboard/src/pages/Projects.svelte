@@ -3,7 +3,7 @@
   import { push } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
@@ -311,7 +311,7 @@
           {#if openProject[project.id]}
             <div class="apps">
               {#if loadingApps[project.id]}
-                <div class="apps-loading"><Spinner size={18} /></div>
+                <div class="apps-loading"><Skeleton rows={2} /></div>
               {:else}
                 {#each appsByProject[project.id] ?? [] as app (app.id)}
                   <div class="app-row">

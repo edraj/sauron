@@ -3,7 +3,7 @@
   import Card from '../ui/Card.svelte';
   import Button from '../ui/Button.svelte';
   import Badge from '../ui/Badge.svelte';
-  import Spinner from '../ui/Spinner.svelte';
+  import Skeleton from '../ui/Skeleton.svelte';
   import EmptyState from '../ui/EmptyState.svelte';
   import ConfirmDialog from '../ui/ConfirmDialog.svelte';
   import DataTable from '../DataTable.svelte';
@@ -199,7 +199,7 @@
   {/snippet}
 
   {#if loading}
-    <Spinner />
+    <Skeleton rows={4} />
   {:else if loadError}
     <p class="err">{loadError}</p>
   {:else if subs.length === 0}

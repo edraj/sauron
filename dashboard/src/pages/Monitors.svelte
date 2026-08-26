@@ -17,7 +17,7 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import ClientPager from '../lib/components/ClientPager.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
@@ -264,7 +264,7 @@
     {/if}
 
     {#if loading}
-      <div class="center"><Spinner size={24} /></div>
+      <Skeleton rows={6} />
     {:else if monitors.length === 0}
       <EmptyState
         title={t('monitors.empty.title')}
@@ -449,11 +449,6 @@
   }
 
   /* --- table cells ---------------------------------------------------------- */
-  .center {
-    display: grid;
-    place-items: center;
-    min-height: 180px;
-  }
   .name-cell {
     display: inline-flex;
     align-items: center;

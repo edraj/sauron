@@ -2,7 +2,7 @@
   import { t } from '../lib/i18n';
   import { rowHref, rowNav } from '../lib/utils/row-link';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
@@ -200,7 +200,7 @@
       </EmptyState>
     </Card>
   {:else if loading && rows.length === 0}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if rows.length === 0}
     <Card>
       <EmptyState
@@ -318,11 +318,6 @@
     align-items: center;
     gap: 10px;
     flex-wrap: wrap;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   .num {
     text-align: end;

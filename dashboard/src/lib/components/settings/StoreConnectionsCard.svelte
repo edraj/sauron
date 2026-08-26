@@ -2,7 +2,7 @@
   import { t } from '../../i18n';
   import Card from '../ui/Card.svelte';
   import Button from '../ui/Button.svelte';
-  import Spinner from '../ui/Spinner.svelte';
+  import Skeleton from '../ui/Skeleton.svelte';
   import { lockedBy } from '../../models/page-access';
   import { errorMessage } from '../../api/client';
   import { toastStore } from '../../stores/toast.svelte';
@@ -226,7 +226,7 @@
   </p>
 
   {#if loading}
-    <div class="center"><Spinner size={22} /></div>
+    <Skeleton rows={4} />
   {:else if loadError}
     <p class="err">{loadError}</p>
   {:else}

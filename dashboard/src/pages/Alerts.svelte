@@ -37,7 +37,7 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import ClientPager from '../lib/components/ClientPager.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -724,7 +724,7 @@
     {/if}
 
     {#if loading}
-      <div class="center"><Spinner size={24} /></div>
+      <Skeleton rows={6} />
     {:else if tab === 'channels'}
       <!-- ---------------- Channels ---------------- -->
       <div class="section-head">
@@ -1563,11 +1563,6 @@
   .ok-banner {
     background: color-mix(in srgb, var(--success) 12%, transparent);
     color: var(--success);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 48px 0;
   }
 
   @media (max-width: 720px) {

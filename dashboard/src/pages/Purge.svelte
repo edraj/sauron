@@ -5,6 +5,7 @@
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -248,7 +249,7 @@
     {/if}
 
     {#if loading}
-      <Spinner />
+      <Card><Skeleton rows={5} /></Card>
     {:else if !app}
       <EmptyState title={t('purge.selectApp')} description={t('purge.selectAppBody')} icon="package" />
     {:else if !job}

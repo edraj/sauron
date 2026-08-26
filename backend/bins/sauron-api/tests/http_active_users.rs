@@ -431,6 +431,48 @@ fn url(f: &ActiveUsersFixture, extra: &str) -> String {
     )
 }
 
+/// The serve-stale cache contract, at its deterministic edge: a cold GET
+/// computes and STAMPS the report (`computed_at`), and an immediate second
+/// GET returns the same stamp byte-for-byte — served from the cache, nothing
+/// recomputed on the request path. A moving stamp here would mean every
+/// visit still pays the aggregate, which is the 25 s production symptom this
+/// cache exists to remove.
+///
+/// The stale arm (serve old + background refresh) is deliberately NOT driven
+/// here: aging an entry to the 1 h horizon through the public surface would
+/// mean sleeping, and the cache key is an opaque hash this test cannot
+/// reconstruct to rewrite the entry directly. `is_fresh`'s unit tests pin
+/// the decision (including `None` = stale, the pre-upgrade-entry case), and
+/// the change's live drive exercised the full stale cycle end-to-end.
+#[tokio::test]
+async fn report_is_cached_and_serves_the_same_computed_at() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_active_users");
+        return;
+    };
+    let f = h.seed_active_users_fixture().await;
+    let path = url(&f, &format!("selection={}", f.app_a));
+
+    let cold: Value = h.get_json(&path, &f.owner_token).await;
+    let stamp = cold["computed_at"]
+        .as_str()
+        .expect("a cold report must carry computed_at")
+        .to_string();
+
+    let warm: Value = h.get_json(&path, &f.owner_token).await;
+    assert_eq!(
+        warm["computed_at"].as_str(),
+        Some(stamp.as_str()),
+        "an immediate re-read must serve the cached report, not recompute"
+    );
+    assert_eq!(
+        cold["series"], warm["series"],
+        "the cached payload must be the computed one"
+    );
+
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn active_users_http_contract() {
     let Some(mut h) = TestServer::start().await else {

@@ -5,7 +5,7 @@
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
@@ -19,7 +19,7 @@
   import { listEnvironments } from '../lib/api/environments';
   import { downloadActiveUsersCsv, getActiveUsers } from '../lib/api/activeUsers';
   import { errorMessage } from '../lib/api/client';
-  import { compactNumber } from '../lib/utils/format';
+  import { compactNumber, formatTime, relativeTime } from '../lib/utils/format';
   import {
     decodeSelection,
     defaultWindow,
@@ -242,6 +242,17 @@
              gets read after the figure has already been believed. -->
         <p class="sub muted">
           {t('activeUsers.subtitle')}
+          <!-- When the numbers were computed, not when they were fetched: the
+               server serves this report from a ~1h serve-stale cache, so an
+               instant paint can carry hour-old numbers — the stamp is the
+               disclosure, same contract as the Overview header's. Absent on
+               reports cached by older server builds, hence the guard. -->
+          {#if report?.computed_at}
+            {@const stamp = new Date(report.computed_at)}
+            <span class="stamp" title={stamp.toISOString()}>
+              · Updated {formatTime(stamp)} <span class="muted">({relativeTime(stamp)})</span>
+            </span>
+          {/if}
         </p>
       </div>
       <div class="controls">
@@ -311,7 +322,7 @@
     {/if}
 
     {#if loading && !report}
-      <div class="center"><Spinner size={24} /></div>
+      <Skeleton rows={6} />
     {:else if !selectionValid.ok}
       <Card>
         <EmptyState
@@ -410,6 +421,11 @@
     margin-top: 3px;
     max-width: 62ch;
   }
+  /* Same rule as Overview's stamp: the time and its relative qualifier stay
+     on one line; the subtitle still wraps at the space before the "·". */
+  .stamp {
+    white-space: nowrap;
+  }
   .controls {
     display: inline-flex;
     align-items: center;
@@ -453,11 +469,6 @@
     color: var(--error);
     background: var(--error-soft);
     border: 1px solid color-mix(in srgb, var(--error) 38%, transparent);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    min-height: 180px;
   }
   .hint {
     margin-top: 8px;

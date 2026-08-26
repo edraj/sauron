@@ -3,7 +3,7 @@
   import { untrack } from 'svelte';
   import { querystring, replace } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
@@ -732,7 +732,7 @@
       -->
       <Card title={t('overview.card.eventVolume')}>
         {#if loadingSeries}
-          <div class="center"><Spinner size={22} /></div>
+          <Skeleton rows={6} />
         {:else}
           <TimeSeriesChart data={series} height={220} color="var(--primary)" />
         {/if}
@@ -741,7 +741,7 @@
 
       <Card title={t('overview.card.topEvents')}>
         {#if loadingTop}
-          <div class="center"><Spinner size={22} /></div>
+          <Skeleton rows={6} />
         {:else if top.length === 0}
           <EmptyState title={t('events.empty.title')} description={t('events.empty.body')} icon="chart-column" />
         {:else}
@@ -787,7 +787,7 @@
         </p>
       {/if}
       {#if loadingStream && streamEvents.length === 0}
-        <div class="center"><Spinner size={22} /></div>
+        <Skeleton rows={6} />
       {:else if fatalStreamError}
         <EmptyState title={t('events.error.load')} description={streamError ?? undefined} icon="triangle-alert">
           {#snippet action()}
@@ -966,11 +966,6 @@
     /* Deliberately NOT `align-items: start`: the volume chart has a fixed 220px
        plot and the top-events list is as tall as its rows, so sizing each to its
        own content leaves the pair ragged. Stretching keeps the row square. */
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    min-height: 200px;
   }
   .hint {
     font-size: 12px;

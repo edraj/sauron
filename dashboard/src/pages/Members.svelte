@@ -3,7 +3,7 @@
   import { untrack } from 'svelte';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
@@ -422,7 +422,7 @@
        instead of this page, so the bespoke "No access" card that used to live
        here would be unreachable. -->
   {#if loading}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if error}
     <Card><p class="err-msg">{error}</p></Card>
   {:else}
@@ -576,11 +576,6 @@
   .sub {
     font-size: 13.5px;
     margin-top: 3px;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   /* Owns the vertical rhythm for the page's cards. Previously each card carried
      its own margin-bottom via :global(), which silently skipped the members

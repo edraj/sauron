@@ -1351,6 +1351,14 @@ export interface ActiveUsersReport {
   series: ActiveUserPoint[];
   /** The last COMPLETE UTC day, or null when the window contains only today. */
   latest: ActiveUserPoint | null;
+  /**
+   * When the numbers were computed. The server serves this report from a
+   * ~1h serve-stale cache, so a page that painted instantly can be showing
+   * hour-old numbers — the stamp is the disclosure, same contract as the
+   * overview's `computed_at`. Optional: absent from reports cached by older
+   * server builds.
+   */
+  computed_at?: string | null;
 }
 
 // ---------------------------------------------------------------------------

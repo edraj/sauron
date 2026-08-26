@@ -3,7 +3,7 @@
   import { untrack } from 'svelte';
   import { querystring, replace } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
@@ -342,7 +342,7 @@
     {/if}
 
     {#if loading && rows.length === 0}
-      <div class="center"><Spinner size={22} /></div>
+      <Skeleton rows={6} />
     {:else if fatalError}
       <EmptyState title={t('transactions.error.load')} description={error ?? undefined} icon="triangle-alert">
         {#snippet action()}
@@ -477,11 +477,6 @@
   .sub {
     font-size: 13.5px;
     margin-top: 3px;
-  }
-  .center {
-    display: flex;
-    justify-content: center;
-    padding: 40px 0;
   }
   .stale-banner {
     display: flex;
