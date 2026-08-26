@@ -4,7 +4,7 @@
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
   import Badge from '../ui/Badge.svelte';
-  import Spinner from '../ui/Spinner.svelte';
+  import Skeleton from '../ui/Skeleton.svelte';
   import ScopeTree from './ScopeTree.svelte';
   import { createGrant, deleteGrant } from '../../api/orgs';
   import { isNormalizedError } from '../../api/client';
@@ -440,7 +440,7 @@
   {#if !member}
     <p class="lede">{t('members.edit.noMember')}</p>
   {:else if !ready}
-    <div class="center"><Spinner size={24} /></div>
+    <Skeleton rows={5} />
   {:else if results}
     <p class="err-msg head-msg">{t('members.edit.partialFailure')}</p>
     <ul class="results">
@@ -605,11 +605,6 @@
 </Modal>
 
 <style>
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 40px;
-  }
   .identity {
     display: flex;
     flex-direction: column;

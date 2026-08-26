@@ -2,7 +2,7 @@
   import { t } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -526,7 +526,7 @@
   </div>
 
   {#if loading}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if error}
     <Card><p class="err-msg">{error}</p></Card>
   {:else if catalogueReadable && catalogue.length === 0}
@@ -822,11 +822,6 @@
     margin-top: 4px;
     max-width: 64ch;
     line-height: 1.55;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   .err-msg {
     color: var(--error);

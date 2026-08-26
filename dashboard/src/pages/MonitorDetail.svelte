@@ -15,6 +15,7 @@
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import CopyButton from '../lib/components/ui/CopyButton.svelte';
@@ -34,6 +35,11 @@
 
   let detail = $state<MonitorDetail | null>(null);
   let checks = $state<MonitorCheck[]>([]);
+  // The checks half loads independently of `detail` — see load(). Its own
+  // flag and error keep a slow or failed 24 h check read inside the Recent
+  // checks card instead of holding up (or blanking) the whole page.
+  let checksLoading = $state(false);
+  let checksError = $state<string | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let confirmOpen = $state(false);
@@ -136,24 +142,42 @@
   }
 
   async function load() {
-    loading = true; error = null;
+    loading = true;
+    error = null;
+    checksError = null;
+    checksLoading = true;
+    // Both issued together as before (neither feeds the other), but no longer
+    // JOINED: the header, config and actions need only `detail`, so they
+    // render the moment it lands instead of waiting on 24 h of check rows —
+    // and a failed checks read degrades to a message inside its own card
+    // rather than blanking a page whose monitor half arrived fine.
+    const checksDone = getMonitorChecks(params.id, 24)
+      .then(
+        (c) => {
+          checks = c;
+        },
+        (e) => {
+          checksError = (e as Error).message;
+        },
+      )
+      .finally(() => {
+        checksLoading = false;
+      });
     try {
-      // Issued together: neither call feeds the other, so awaiting them in
-      // sequence just added a serial round trip to every load and every refresh
-      // after a pause/interval change. `all`, not `allSettled` — the page cannot
-      // render without either half, so a rejection should surface as the error
-      // it is.
-      [detail, checks] = await Promise.all([
-        getMonitor(params.id),
-        getMonitorChecks(params.id, 24),
-      ]);
+      detail = await getMonitor(params.id);
       // Reseeded here, not at mount: the router reuses this component across
       // `#/monitors/A` -> `#/monitors/B`, so a mount-time seed would leave the
       // control showing the interval of the monitor we navigated away from.
       selectedInterval = detail.monitor.interval_seconds;
       pendingInterval = null;
-    } catch (e) { error = (e as Error).message; }
-    finally { loading = false; }
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      loading = false;
+    }
+    // Callers (the pause/interval/delete refreshes) await the WHOLE load, so
+    // their "refresh finished" contract still covers both halves.
+    await checksDone;
   }
 
   async function togglePause() {
@@ -243,7 +267,7 @@
   </button>
 
   {#if loading}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if error && !detail}
     <EmptyState title={t('monitor.notFound')} description={error} icon="triangle-alert">
       {#snippet action()}
@@ -324,7 +348,11 @@
 
     <div class="section">
       <Card title={t('monitor.card.recentChecks')} padding="none">
-        {#if checks.length === 0}
+        {#if checksLoading}
+          <Skeleton rows={5} />
+        {:else if checksError}
+          <div class="err-banner in-card" role="alert">{checksError}</div>
+        {:else if checks.length === 0}
           <EmptyState
             title={t('monitor.empty.checks')}
             description={t('monitor.empty.checksBody')}
@@ -537,11 +565,6 @@
   }
   .back:hover {
     color: var(--text);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
 
   /* --- header --------------------------------------------------------------- */

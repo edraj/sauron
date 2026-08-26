@@ -14,6 +14,7 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Input from '../lib/components/ui/Input.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -363,7 +364,7 @@
   {#if error}
     <Card><p class="err">{error}</p></Card>
   {:else if loading}
-    <div class="loading-pane"><Spinner /><span class="muted">{t('inspector.loading')}</span></div>
+    <Card><Skeleton rows={6} label={t('inspector.loading')} /></Card>
   {:else if tab === 'findings'}
     <Card>
       <!-- Non-dismissible, always. Detection is best-effort: the prefilter
@@ -1117,13 +1118,6 @@
     outline: 2px solid var(--primary);
     outline-offset: -2px;
     border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  }
-  .loading-pane {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 10px;
-    padding: 48px 0;
   }
   .tab.active {
     color: var(--primary);

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -128,7 +128,7 @@
   </button>
 
   {#if loading && !detail}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if error}
     <EmptyState title={t('screen.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
@@ -331,11 +331,6 @@
   }
   .back:hover {
     color: var(--text);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   .screen-title {
     word-break: break-word;

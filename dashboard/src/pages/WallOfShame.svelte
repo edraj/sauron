@@ -5,7 +5,7 @@
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import Modal from '../lib/components/ui/Modal.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -339,7 +339,7 @@
   {/if}
 
   {#if loading}
-    <div class="centered"><Spinner /></div>
+    <Skeleton rows={8} />
   {:else if error}
     <EmptyState
       title={t('audit.error.load')}

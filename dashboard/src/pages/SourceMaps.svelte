@@ -9,7 +9,7 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import ClientPager from '../lib/components/ClientPager.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -390,7 +390,7 @@
     {/if}
 
     {#if loading}
-      <div class="center"><Spinner /></div>
+      <Skeleton rows={6} />
     {:else if artifacts.length === 0}
       <EmptyState
         title={t('sourcemaps.empty.title')}
@@ -606,11 +606,6 @@
     background: var(--surface-2);
     padding: 2px 6px;
     border-radius: var(--radius);
-  }
-  .center {
-    display: flex;
-    justify-content: center;
-    padding: 40px;
   }
   .err-banner {
     display: flex;

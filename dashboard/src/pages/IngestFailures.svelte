@@ -4,7 +4,7 @@
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import Modal from '../lib/components/ui/Modal.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -209,7 +209,7 @@
   {/if}
 
   {#if loading}
-    <div class="centered"><Spinner /></div>
+    <Skeleton rows={6} />
   {:else if error}
     <EmptyState title={t('failures.error.load')} description={error} icon="triangle-alert" />
   {:else if failures.length === 0}
@@ -321,7 +321,7 @@
 
       <h3>{t('failures.retainedPayloads')}</h3>
       {#if payloadsLoading}
-        <Spinner />
+        <Skeleton rows={3} />
       {:else if payloads.length === 0}
         <p class="muted">{t('failures.noPayloads')}</p>
       {:else}

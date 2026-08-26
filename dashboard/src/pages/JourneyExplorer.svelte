@@ -2,6 +2,7 @@
   import { t } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
   import Card from '../lib/components/ui/Card.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -198,7 +199,7 @@
     </Card>
   {:else if loading && !journey}
     <Card>
-      <div class="center"><Spinner size={24} /></div>
+      <Skeleton rows={6} />
     </Card>
   {:else if journey && journey.nodes.length === 0}
     <Card>
@@ -339,11 +340,6 @@
     background: var(--surface);
     color: var(--text);
     box-shadow: var(--shadow-sm);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    min-height: 260px;
   }
   .journey-card {
     position: relative;

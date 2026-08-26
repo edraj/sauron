@@ -7,7 +7,7 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
@@ -281,7 +281,7 @@
       {/if}
 
       {#if loading}
-        <div class="center"><Spinner size={24} /></div>
+        <Skeleton rows={6} />
       {:else if live.length === 0}
         <div class="pad">
           <EmptyState
@@ -446,11 +446,6 @@
   }
   tr.dim td {
     opacity: 0.55;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 36px 0;
   }
   .pad {
     padding: 18px;

@@ -4,6 +4,7 @@
   import { untrack } from 'svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -311,7 +312,7 @@
   </div>
 
   {#if loadingEvents}
-    <Card><div class="center"><Spinner size={22} /></div></Card>
+    <Card><Skeleton rows={4} /></Card>
   {:else if error && available.length === 0}
     <Card>
       <EmptyState title={t('funnels.error.events')} description={error} icon="triangle-alert">
@@ -412,7 +413,7 @@
 
       <Card title={t('funnels.card.results')}>
         {#if computing && !result}
-          <div class="center"><Spinner size={22} /></div>
+          <Skeleton rows={6} />
         {:else if error && !result}
           <EmptyState title={t('funnels.error.compute')} description={error} icon="triangle-alert">
             {#snippet action()}
@@ -509,11 +510,6 @@
     font-size: 13.5px;
     margin-top: 3px;
     max-width: 620px;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    min-height: 200px;
   }
   .grid {
     display: grid;

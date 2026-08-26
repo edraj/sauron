@@ -4,7 +4,7 @@
   import { untrack } from 'svelte';
   import { push } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -588,7 +588,7 @@
   </button>
 
   {#if loading}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if error}
     <EmptyState title={t('issue.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
@@ -751,7 +751,7 @@
             payloadSearched={occStats?.payload_searched ?? null}
           />
           {#if occLoading}
-            <div class="center"><Spinner size={20} /></div>
+            <Skeleton rows={6} />
           {:else if occEmptyPastFirstPage}
             <!--
               Deliberately not the copy below. That one answers "does anything
@@ -957,11 +957,6 @@
   }
   .back:hover {
     color: var(--text);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   /* `.scope-note` lived here for the `payload_searched` line, which now comes
      from `SearchDisclosure` along with the clamp notice — the styling moved

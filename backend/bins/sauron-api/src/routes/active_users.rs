@@ -38,10 +38,32 @@ const MAX_SELECTED_APPS: usize = 20;
 /// 20 apps × 92 days is 1840 partition-day scans, and bounding the two
 /// dimensions independently does not bound their product.
 const MAX_SCAN_BUDGET: i64 = 1200;
-/// How long an assembled report stays warm. A latency optimization, NOT a DoS
+/// How long an assembled report is served WITHOUT triggering any recompute.
+///
+/// Raised from the original 60 s read-through cache by request (2026-08-26):
+/// the aggregate takes ~25 s on the reporting deployment, so recomputing it
+/// once a minute on the request path made nearly every visit pay full price.
+/// ~1 h of staleness was accepted explicitly — the overview's trade, applied
+/// to this report. `computed_at` on the response is what keeps the age
+/// honest.
+const ACTIVE_USERS_FRESH_FOR_SECS: i64 = 3600;
+/// How long an assembled report stays SERVABLE at all.
+///
+/// Between [`ACTIVE_USERS_FRESH_FOR_SECS`] and this, a hit is served as-is
+/// and a background recompute is kicked (stale-while-revalidate) — the next
+/// visitor sees current numbers. Past it, the entry is gone and the next
+/// request pays the cold compute on-path. A latency optimization, NOT a DoS
 /// control: the rate limiter, the scan budget and the semaphore are the
 /// control.
-const ACTIVE_USERS_CACHE_TTL_SECS: u64 = 60;
+const ACTIVE_USERS_CACHE_TTL_SECS: u64 = 3 * 3600;
+/// Single-flight TTL for the background-refresh lock.
+///
+/// Must outlive one full compute (the request budget is 60 s) or a second
+/// refresh piles onto a still-running first; must expire at all or a crashed
+/// refresher wedges every future refresh of that key. When the semaphore is
+/// busy the lock is released explicitly instead, so the next stale hit can
+/// retry without waiting this out.
+const ACTIVE_USERS_REFRESH_LOCK_SECS: u64 = 120;
 
 /// The four values `SelectionView::resolved` can take. Named constants so the
 /// handler, the tests and the dashboard cannot drift on a string literal.
@@ -118,6 +140,14 @@ pub struct ActiveUsersReport {
     pub truncation_reason: Option<String>,
     pub selections: Vec<SelectionView>,
     pub series: Vec<ActiveUserPoint>,
+    /// When these numbers were computed — the staleness disclosure the ~1 h
+    /// serve-stale window depends on (the UI stamps it, the same contract as
+    /// the overview's `computed_at`). `#[serde(default)]` per this struct's
+    /// own rule above; an entry cached by a build predating this field reads
+    /// as `None`, which [`is_fresh`] treats as stale: served instantly,
+    /// refreshed in the background.
+    #[serde(default)]
+    pub computed_at: Option<DateTime<Utc>>,
     pub latest: Option<ActiveUserPoint>,
 }
 
@@ -445,23 +475,11 @@ async fn gated_report(
     )
     .await?;
 
-    // `try_acquire`, not `acquire`: 503 ahead of the pool rather than queueing
-    // behind it. The pool is 16 connections for the WHOLE process and
-    // `POOL_WAIT_TIMEOUT` is 5 s, so sixteen people hitting Refresh — or one
-    // person with the shareable URL open in a few tabs — would starve
-    // /v1/auth/login and /health with "db pool checkout failed" 500s.
-    // `ConcurrencyLimitLayer` and `TimeoutLayer` shed the HTTP request but
-    // cancel neither the Postgres query nor the pool slot.
-    //
-    // `let _permit`, never `let _`: the latter drops the permit immediately and
-    // the gate becomes a no-op that still compiles.
-    let _permit = state.active_users_gate.try_acquire().map_err(|_| {
-        ApiError::Unavailable(
-            "busy",
-            "too many active-user reports are already running; retry shortly".into(),
-        )
-    })?;
-
+    // The semaphore is no longer taken here: a cache HIT costs no permit (and
+    // can no longer be shed 503-busy while three computes run). The permit
+    // moved to where the expensive query actually runs — `build_report`'s
+    // cold-miss branch and the background refresh — which are the only things
+    // it ever needed to bound.
     build_report(state, user_id, project_id, q).await
 }
 
@@ -687,17 +705,96 @@ async fn build_report(
     // for the whole process and Redis is a different host.
     drop(conn);
 
-    if let Some(hit) = cache_get(state, &key).await {
+    // Everything the expensive assembly needs, captured ONCE — the on-path
+    // cold miss and the background refresh must build byte-identical reports
+    // for the same key, and two argument lists would eventually disagree.
+    // Reusing the request's RESOLVED scopes off-path is sound because they
+    // are exactly what the key hashes: the refresh only ever overwrites an
+    // entry with a recomputation of itself.
+    let inputs = RefreshInputs {
+        key,
+        scopes,
+        requested: requested_window,
+        effective: effective_window,
+        truncated,
+        truncation_reason,
+        selections: selection_views,
+    };
+
+    if let Some(hit) = cache_get(state, &inputs.key).await {
+        // Serve whatever is cached, instantly — that is the whole point. A
+        // stale hit (or one cached by a build predating `computed_at`)
+        // additionally kicks a background recompute so the NEXT visitor sees
+        // current numbers; this visitor keeps the ~1 h-old ones, which is the
+        // accepted trade.
+        if !is_fresh(hit.computed_at, Utc::now()) {
+            spawn_refresh(state, inputs);
+        }
         return Ok(hit);
     }
 
-    let rows = if effective_from >= to {
+    // Cold miss — the one path that still computes on the request clock.
+    //
+    // `try_acquire`, not `acquire`: 503 ahead of the pool rather than queueing
+    // behind it. The pool is 16 connections for the WHOLE process and
+    // `POOL_WAIT_TIMEOUT` is 5 s, so sixteen people hitting a cold report — or
+    // one person with the shareable URL open in a few tabs — would starve
+    // /v1/auth/login and /health with "db pool checkout failed" 500s.
+    // `ConcurrencyLimitLayer` and `TimeoutLayer` shed the HTTP request but
+    // cancel neither the Postgres query nor the pool slot.
+    //
+    // `let _permit`, never `let _`: the latter drops the permit immediately and
+    // the gate becomes a no-op that still compiles.
+    let _permit = state.active_users_gate.try_acquire().map_err(|_| {
+        ApiError::Unavailable(
+            "busy",
+            "too many active-user reports are already running; retry shortly".into(),
+        )
+    })?;
+    assemble_report(state, &inputs).await
+}
+
+/// The resolved, authorized ingredients of one cache entry — see the comment
+/// at its construction in [`build_report`].
+struct RefreshInputs {
+    key: String,
+    scopes: Vec<AppEnvScope>,
+    requested: ReportWindow,
+    effective: ReportWindow,
+    truncated: bool,
+    truncation_reason: Option<String>,
+    selections: Vec<SelectionView>,
+}
+
+/// Whether a cached report is young enough to serve without any recompute.
+///
+/// `None` — an entry cached before `computed_at` existed — is STALE, not
+/// fresh: age unknown means "refresh it", never "trust it forever".
+fn is_fresh(computed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    computed_at
+        .is_some_and(|t| now.signed_duration_since(t).num_seconds() < ACTIVE_USERS_FRESH_FOR_SECS)
+}
+
+/// Run the aggregate, assemble the report, cache it. The ONE producer of
+/// cache entries — called on-path for a cold miss and off-path by
+/// [`spawn_refresh`].
+async fn assemble_report(
+    state: &AppState,
+    inputs: &RefreshInputs,
+) -> Result<ActiveUsersReport, ApiError> {
+    let rows = if inputs.effective.from >= inputs.effective.to {
         // The clamp swallowed the whole window. Skip the scan entirely rather
         // than paying for a query that can only return an empty grid.
         Vec::new()
     } else {
         let mut conn = crate::routes::db(state).await?;
-        let rows = repo::active_users_combined(&mut conn, &scopes, effective_from, to).await?;
+        let rows = repo::active_users_combined(
+            &mut conn,
+            &inputs.scopes,
+            inputs.effective.from,
+            inputs.effective.to,
+        )
+        .await?;
         drop(conn);
         rows
     };
@@ -714,16 +811,66 @@ async fn build_report(
     let latest = latest_full_day(&series, Utc::now().date_naive()).cloned();
 
     let report = ActiveUsersReport {
-        requested: requested_window,
-        effective: effective_window,
-        truncated,
-        truncation_reason,
-        selections: selection_views,
+        requested: inputs.requested.clone(),
+        effective: inputs.effective.clone(),
+        truncated: inputs.truncated,
+        truncation_reason: inputs.truncation_reason.clone(),
+        selections: inputs.selections.clone(),
         series,
         latest,
+        computed_at: Some(Utc::now()),
     };
-    cache_put(state, &key, &report).await;
+    cache_put(state, &inputs.key, &report).await;
     Ok(report)
+}
+
+/// Recompute a stale entry off the request path, at most once at a time per
+/// key across every replica.
+///
+/// Two gates, both mandatory: the Redis `SET NX` single-flight (a popular
+/// stale report would otherwise spawn one refresh per visitor — thundering
+/// herd on the heaviest query in the product), and the SAME semaphore the
+/// on-path compute holds (a refresh IS that query; exempting it would let
+/// background work bypass the one bound that protects the pool). When the
+/// semaphore is full the lock is released so the next stale hit retries
+/// promptly; when the lock survives to its TTL it doubles as a cooldown
+/// against a failing refresh being re-kicked every request.
+fn spawn_refresh(state: &AppState, inputs: RefreshInputs) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let lock_key = format!("{}:refresh", inputs.key);
+        match tokio::time::timeout(
+            CACHE_OP_TIMEOUT,
+            state
+                .redis
+                .set_nx_ex(&lock_key, "1", ACTIVE_USERS_REFRESH_LOCK_SECS),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            // Someone (possibly another replica) is already on it.
+            Ok(Ok(false)) => return,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "active-users refresh lock failed");
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::warn!("active-users refresh lock timed out");
+                return;
+            }
+        }
+        let Ok(_permit) = state.active_users_gate.try_acquire() else {
+            // Best-effort: an expired lock self-heals in 120 s anyway.
+            let _ = tokio::time::timeout(CACHE_OP_TIMEOUT, state.redis.del(&lock_key)).await;
+            return;
+        };
+        // `?e`, not `%e`: `ApiError` is a response type and deliberately has
+        // no `Display`; its `Debug` names the variant, which is what a log
+        // line needs.
+        if let Err(e) = assemble_report(&state, &inputs).await {
+            tracing::warn!(error = ?e, "active-users background refresh failed");
+        }
+    });
 }
 
 /// Human names for a resolved environment id list.
@@ -1042,5 +1189,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ab, ba);
+    }
+
+    /// The serve-stale decision. The `None` arm is the one worth pinning: a
+    /// report cached by a build that predates `computed_at` must read as
+    /// STALE (served, but refreshed) — treating unknown age as fresh would
+    /// freeze pre-upgrade numbers in place for the whole TTL.
+    #[test]
+    fn freshness_boundary_and_unknown_age() {
+        let now = Utc::now();
+        assert!(is_fresh(Some(now), now), "just computed is fresh");
+        assert!(
+            is_fresh(
+                Some(now - chrono::Duration::seconds(ACTIVE_USERS_FRESH_FOR_SECS - 1)),
+                now
+            ),
+            "one second inside the horizon is fresh"
+        );
+        assert!(
+            !is_fresh(
+                Some(now - chrono::Duration::seconds(ACTIVE_USERS_FRESH_FOR_SECS)),
+                now
+            ),
+            "exactly at the horizon is stale"
+        );
+        assert!(!is_fresh(None, now), "unknown age is stale, never fresh");
     }
 }

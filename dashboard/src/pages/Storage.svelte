@@ -24,7 +24,7 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
@@ -472,7 +472,15 @@
     {/if}
 
     {#if loading}
-      <div class="center"><Spinner size={24} /></div>
+      <!-- Skeletons rather than a spinner (requested 2026-08-26): the page
+           has a fixed shape — a stat-tile strip, the rotation card, the
+           tables card — so show that shape filling in. The admin storage
+           aggregate walks pg_partition_tree over every partitioned table and
+           is legitimately slow on a big deployment; a lone spinner reads as
+           a hang exactly when the page is working hardest. -->
+      <Card><Skeleton rows={2} height="34px" /></Card>
+      <div class="section"><Card><Skeleton rows={4} /></Card></div>
+      <div class="section"><Card><Skeleton rows={7} /></Card></div>
     {:else if report}
       {@const rep = report}
       {@const dbBytes = rep.database.physical_bytes ?? rep.database.total_bytes}
@@ -740,7 +748,7 @@
               </div>
             {/if}
           {:else}
-            <div class="center"><Spinner size={20} /></div>
+            <Skeleton rows={6} />
           {/if}
         </Card>
       </div>

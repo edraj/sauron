@@ -3,7 +3,7 @@
   import { querystring, replace } from 'svelte-spa-router';
   import { rowHref, rowNav } from '../lib/utils/row-link';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
@@ -460,7 +460,7 @@
 
   <Card padding="none">
     {#if loading}
-      <div class="center"><Spinner size={24} /></div>
+      <Skeleton rows={6} />
     {:else if error}
       <EmptyState title={t('sessions.error.load')} description={error} icon="triangle-alert">
         {#snippet action()}
@@ -631,11 +631,6 @@
     font-size: 15px;
     font-weight: 640;
     margin: 0;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 60px;
   }
   .sid {
     display: inline-block;

@@ -3,7 +3,7 @@
   import { push } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -132,7 +132,7 @@
   </div>
 
   {#if loading}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if error}
     <Card><p class="err-msg">{error}</p></Card>
   {:else if !app}
@@ -216,11 +216,6 @@
     gap: 6px;
     font-weight: 600;
     color: var(--text);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   .settings-stack {
     display: flex;

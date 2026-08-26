@@ -8,7 +8,7 @@
   import { push, location as routePath } from 'svelte-spa-router';
   import Sidebar from './Sidebar.svelte';
   import Topbar from './Topbar.svelte';
-  import Spinner from '../ui/Spinner.svelte';
+  import Skeleton from '../ui/Skeleton.svelte';
   import EmptyState from '../ui/EmptyState.svelte';
   import Button from '../ui/Button.svelte';
   import PermissionDenied from '../PermissionDenied.svelte';
@@ -99,7 +99,7 @@
           {/snippet}
         </EmptyState>
       {:else if !sessionStore.loaded}
-        <div class="shell-loading"><Spinner size={26} /></div>
+        <Skeleton rows={6} />
       {:else if sessionStore.accessError}
         <!-- Ranked above every permission-derived state below. When the access
              fetch fails, `can()` answers false for everything, so the nav
@@ -185,11 +185,6 @@
     margin: 0 auto;
     padding: 28px 28px 64px;
     animation: fade-in 0.22s ease;
-  }
-  .shell-loading {
-    display: grid;
-    place-items: center;
-    min-height: 50vh;
   }
 
   @media (max-width: 860px) {

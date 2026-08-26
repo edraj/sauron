@@ -2,7 +2,7 @@
   import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -449,7 +449,7 @@
       </EmptyState>
     </Card>
   {:else if loading && rowCount === 0}
-    <div class="center"><Spinner size={26} /></div>
+    <Skeleton rows={6} />
   {:else if rowCount === 0}
     <Card>
       <EmptyState
@@ -501,11 +501,6 @@
     align-items: center;
     gap: 10px;
     flex-wrap: wrap;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
   }
   .crumb {
     display: flex;

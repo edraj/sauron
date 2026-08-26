@@ -4,7 +4,7 @@
   import { querystring, replace } from 'svelte-spa-router';
   import { rowHref, rowNav } from '../lib/utils/row-link';
   import Card from '../lib/components/ui/Card.svelte';
-  import Spinner from '../lib/components/ui/Spinner.svelte';
+  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -562,7 +562,7 @@
       </Card>
     </div>
   {:else if loadingStats}
-    <div class="center-sm"><Spinner size={22} /></div>
+    <div class="stats-grid"><Card><Skeleton rows={2} height="28px" /></Card><Card><Skeleton rows={1} height="200px" /></Card></div>
   {/if}
 
   <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:range ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" error={searchError} {onSearch} />
@@ -592,7 +592,7 @@
       </p>
     {/if}
     {#if loading}
-      <div class="center"><Spinner size={24} /></div>
+      <Skeleton rows={6} />
     {:else if fatalError}
       <EmptyState
         title={blockedFilterFields.length > 0
@@ -769,17 +769,6 @@
      used to get from this margin alone. */
   .occ {
     margin: 6px 0 18px;
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 60px;
-  }
-  .center-sm {
-    display: grid;
-    place-items: center;
-    padding: 32px;
-    margin-bottom: 18px;
   }
   .col-title {
     min-width: 280px;
