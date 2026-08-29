@@ -1,15 +1,34 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
-  # dry run: builds the RPMs as workflow artifacts, creates no release
+  # Manual only. Previously every push to main built both distros and published
+  # a release — ~24 runner-minutes, over half the CI budget for the repo, on
+  # every merge regardless of whether anyone wanted to ship. #53 stopped the
+  # merges that could not change a shipped byte; this stops the rest.
+  #
+  # Matches edraj/csdmart, which triggers its Release on workflow_dispatch and
+  # `release: [created]` rather than on merges.
+  #
+  # The version scheme is unchanged and still works here: major.minor comes
+  # from backend/Cargo.toml and the patch is (highest existing v<maj>.<min>.*
+  # tag + 1). Releases simply become deliberate rather than automatic, and the
+  # patch advances once per release instead of once per merge.
   workflow_dispatch:
+    inputs:
+      publish:
+        # Default false, deliberately. Publishing creates a public release AND
+        # a tag, which is not something to do by accident on a run someone
+        # started to check that the RPMs still build. Ticking this box is the
+        # whole act of releasing, so it should be an explicit act.
+        description: 'Publish a real GitHub release (default: dry run, build artifacts only)'
+        type: boolean
+        default: false
 
 concurrency:
-  # Serialize releases so two quick merges can't compute the same version.
-  # A newer push replaces the queued run; the in-flight one finishes first,
-  # so the queued run sees its tag and bumps the patch off it.
+  # Serialize releases so two runs started close together can't compute the
+  # same version. Far less likely now that releases are manual, but two people
+  # dispatching at once is exactly the case this still covers: the in-flight
+  # run finishes first, so the queued one sees its tag and bumps off it.
   group: release-main
   cancel-in-progress: false
 
@@ -275,8 +294,10 @@ jobs:
 
   release:
     name: publish GitHub release
-    # Real merges to main publish; workflow_dispatch is a build-only dry run.
-    if: github.event_name == 'push'
+    # A dispatch is a build-only dry run unless `publish` was ticked. There is
+    # no automatic path to here any more: nothing publishes without someone
+    # asking for it.
+    if: inputs.publish
     needs: [version, package, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 10

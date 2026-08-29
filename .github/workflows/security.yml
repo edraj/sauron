@@ -10,10 +10,24 @@ name: Security Gate
 
 on:
   workflow_dispatch:
+  # `dev`, `develop` and `development` are here because the default branch is
+  # NOT where several of these repos actually build and deploy from, and for a
+  # long time this list said [main, master] only -- so the gate had never once
+  # run on a branch that ships.
+  #
+  # Measured across the fleet before this changed: 7 of 26 repos build from a
+  # non-default branch, and those branches carried 83 secrets, 55 CVEs and 8
+  # SAST findings between them -- largely the same findings that had already
+  # been fixed on the default branch and therefore looked resolved.
+  #
+  # Naming a branch that does not exist in a given repo is harmless, so this
+  # stays one list for all repos rather than 26 bespoke ones. If a repo ships
+  # from a branch not named here, add it here -- do not edit the copy in the
+  # repo, which the deploy script will overwrite.
   pull_request:
-    branches: [main, master]
+    branches: [main, master, dev, develop, development]
   push:
-    branches: [main, master]
+    branches: [main, master, dev, develop, development]
 
 jobs:
   security-gate:
@@ -26,7 +40,27 @@ jobs:
       TRIVY_SCANNERS: "vuln"
       SEMGREP_CONFIG: "p/ci"
       IGNORE_UNFIXED: "true"
-      GITLEAKS_VERSION: "8.21.2"
+      # Pinned like the other two scanners. An unpinned `pip install --upgrade`
+      # is what jumped semgrep 1.38 -> 1.174 and broke the gate everywhere.
+      SEMGREP_VERSION: "1.174.0"
+      # .cigate/bin holds the gitleaks/trivy binaries this job just downloaded;
+      # trivy's gobinary analyzer would otherwise report their embedded Go
+      # stdlib CVEs (fixable, so --ignore-unfixed will not hide them) and fail
+      # the gate on vulnerabilities that are not in the repository.
+      TRIVY_SKIP_DIRS: ".cigate"
+      # Bumped from 8.21.2 (2024-10-28) — nearly two years stale for a secret
+      # scanner. Still PINNED: an unpinned upgrade jumping semgrep 1.38 -> 1.174
+      # is what broke this gate originally. The pin is not the problem; a stale
+      # pin is, and it gets bumped deliberately.
+      #
+      # 8.30.1 also supports allowlist targetRules, which 8.21.2 silently ignores.
+      # That lets a repo allowlist one rule in one file (a Firebase client key,
+      # say) without blinding that file to every other rule.
+      #
+      # Measured on a real repository before bumping: 8.21.2 reported 4 findings,
+      # 8.30.1 reported 3 — the one it drops is a fake Apple P8 key in a unit test
+      # that the repo already allowlists by hand. No findings were lost.
+      GITLEAKS_VERSION: "8.30.1"
       TRIVY_VERSION: "0.74.0"
     steps:
       - uses: actions/checkout@v4
@@ -42,46 +76,100 @@ jobs:
         run: |
           GLT=$(mktemp)   # unique path: the self-hosted runner shares /tmp across users
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o "$GLT" \
-            || { echo "::error::gitleaks download failed"; exit 1; }
-          tar xzf "$GLT" -C .cigate/bin gitleaks || { echo "::error::gitleaks extract failed"; exit 1; }
+            || { echo "::error::gitleaks download failed"; echo 1 > .cigate/rc; exit 1; }
+          tar xzf "$GLT" -C .cigate/bin gitleaks \
+            || { echo "::error::gitleaks extract failed"; echo 1 > .cigate/rc; exit 1; }
           echo "::group::gitleaks detect"
+          # `|| rc=$?`: steps run under `bash -e`, so a bare non-zero exit
+          # aborted the step HERE. Everything below was dead code: the
+          # remaining scanners were skipped and Gate result never reported.
+          rc=0
           .cigate/bin/gitleaks detect --source . --no-git --redact \
-            --report-format json --report-path .cigate/out/gitleaks.json
-          rc=$?
+            --report-format json --report-path .cigate/out/gitleaks.json || rc=$?
           echo "::endgroup::"
+          # gitleaks writes its detail to the JSON report and prints only a
+          # count, so a failing gate said "leaks found: 42" and nothing about
+          # WHICH rule or file — the same gap semgrep had. Render it.
+          #
+          # Rule, file and line ONLY. Never Secret or Match: --redact blanks
+          # both today, but this printer must not become the leak if that flag
+          # is ever dropped.
+          python3 - <<'PYEOF' || true
+          import json
+          try:
+              res = json.load(open(".cigate/out/gitleaks.json")) or []
+          except Exception:
+              res = []
+          for r in res:
+              print("::error file=%s,line=%s::[%s] %s" % (
+                  r.get("File", "?"), r.get("StartLine", 0), r.get("RuleID", "?"),
+                  (r.get("Description") or "").strip()))
+          PYEOF
           if [ "$rc" -ne 0 ]; then echo "::error::Gitleaks found committed secrets"; echo 1 > .cigate/rc; fi
           exit 0
 
-      - name: Trivy (dependencies + misconfig)
+      - name: Trivy (dependency CVEs)
         run: |
           TVT=$(mktemp)   # unique path: the self-hosted runner shares /tmp across users
           curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o "$TVT" \
-            || { echo "::error::trivy download failed"; exit 1; }
-          tar xzf "$TVT" -C .cigate/bin trivy || { echo "::error::trivy extract failed"; exit 1; }
+            || { echo "::error::trivy download failed"; echo 1 > .cigate/rc; exit 1; }
+          tar xzf "$TVT" -C .cigate/bin trivy \
+            || { echo "::error::trivy extract failed"; echo 1 > .cigate/rc; exit 1; }
           UNFIXED=""
           if [ "$IGNORE_UNFIXED" = "true" ]; then UNFIXED="--ignore-unfixed"; fi
           echo "::group::trivy fs"
+          rc=0
           .cigate/bin/trivy fs --scanners "$TRIVY_SCANNERS" --severity "$SEVERITY" $UNFIXED \
-            --format json --output .cigate/out/trivy.json --exit-code 1 --no-progress .
-          rc=$?
+            --skip-dirs "$TRIVY_SKIP_DIRS" \
+            --format json --output .cigate/out/trivy.json --exit-code 1 --no-progress . || rc=$?
           .cigate/bin/trivy fs --scanners "$TRIVY_SCANNERS" --severity "$SEVERITY" $UNFIXED \
+            --skip-dirs "$TRIVY_SKIP_DIRS" \
             --no-progress --skip-db-update . 2>/dev/null || true
           echo "::endgroup::"
-          if [ "$rc" -ne 0 ]; then echo "::error::Trivy found ${SEVERITY} dependency/misconfig issues"; echo 1 > .cigate/rc; fi
+          if [ "$rc" -ne 0 ]; then echo "::error::Trivy found ${SEVERITY} dependency vulnerabilities"; echo 1 > .cigate/rc; fi
           exit 0
 
       - name: Semgrep (SAST)
         run: |
-          python3 -m pip install --quiet --upgrade --user semgrep || { echo "::error::semgrep install failed"; exit 1; }
+          python3 -m pip install --quiet --user "semgrep==${SEMGREP_VERSION}" \
+            || { echo "::error::semgrep install failed"; echo 1 > .cigate/rc; exit 1; }
           # Use the semgrep binary: `python -m semgrep` hard-fails (exit 2) as of semgrep 1.38+.
-          export PATH="$HOME/.local/bin:$PATH"
+          # Ask pip where its user bin dir is rather than assuming ~/.local/bin,
+          # which is wrong when PYTHONUSERBASE is set.
+          export PATH="$(python3 -m site --user-base)/bin:$PATH"
+          command -v semgrep >/dev/null \
+            || { echo "::error::semgrep installed but not on PATH"; echo 1 > .cigate/rc; exit 1; }
           echo "::group::semgrep scan"
+          rc=0
           semgrep scan --config "$SEMGREP_CONFIG" \
             --error --severity ERROR --disable-version-check --metrics off \
-            --json --output .cigate/out/semgrep.json .
-          rc=$?
+            --json --output .cigate/out/semgrep.json . || rc=$?
           echo "::endgroup::"
-          if [ "$rc" -ne 0 ]; then echo "::error::Semgrep found security issues (ERROR severity)"; echo 1 > .cigate/rc; fi
+          # `--json --output` suppresses the console findings, so a failing gate
+          # used to say "sast:1" and nothing about WHICH rule or file. Render
+          # them from the JSON instead of making everyone reproduce locally.
+          python3 - <<'PYEOF' || true
+          import json
+          try:
+              res = json.load(open(".cigate/out/semgrep.json")).get("results", [])
+          except Exception:
+              res = []
+          for r in res:
+              s = r.get("start", {})
+              print("::error file=%s,line=%s::[%s] %s" % (
+                  r.get("path", "?"), s.get("line", 0),
+                  r.get("check_id", "?"),
+                  (r.get("extra", {}).get("message") or "").strip().splitlines()[:1] and
+                  (r.get("extra", {}).get("message") or "").strip().splitlines()[0] or ""))
+          PYEOF
+          # semgrep exits 1 for findings, >=2 for its own errors. Both fail the
+          # gate, but do not report a crashed scanner as "found security issues".
+          if [ "$rc" -eq 1 ]; then
+            echo "::error::Semgrep found security issues (ERROR severity)"; echo 1 > .cigate/rc
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::Semgrep failed to run (exit ${rc}) — tool error, not a finding"
+            echo 1 > .cigate/rc
+          fi
           exit 0
 
       - name: Summary
@@ -91,23 +179,24 @@ jobs:
           GL=$(py "import json;print(len(json.load(open('.cigate/out/gitleaks.json'))))")
           TV=$(py "import json;d=json.load(open('.cigate/out/trivy.json'));print(sum(len(r.get('Vulnerabilities') or [])+len(r.get('Misconfigurations') or []) for r in (d.get('Results') or [])))")
           SG=$(py "import json;print(len(json.load(open('.cigate/out/semgrep.json')).get('results',[])))")
-          echo "Findings — secrets:${GL} deps/misconfig:${TV} sast:${SG}"
+          echo "Findings — secrets:${GL} deps:${TV} sast:${SG}"
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             {
               echo "## Security Gate"
               echo "| Gate | Tool | Findings |"
               echo "|------|------|----------|"
               echo "| Secrets | Gitleaks | ${GL} |"
-              echo "| Deps + misconfig (${SEVERITY}) | Trivy | ${TV} |"
+              echo "| Dependencies (${SEVERITY}) | Trivy | ${TV} |"
               echo "| SAST (ERROR) | Semgrep | ${SG} |"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Gate result
+        if: ${{ always() }}
         run: |
           rc=$(cat .cigate/rc 2>/dev/null || echo 1)
           if [ "$rc" != "0" ]; then
-            echo "❌ Security gate FAILED — expand the grouped logs above (secrets / deps+misconfig / SAST)."
+            echo "❌ Security gate FAILED — expand the grouped logs above (secrets / deps / SAST)."
             exit 1
           fi
           echo "✅ Security gate passed."

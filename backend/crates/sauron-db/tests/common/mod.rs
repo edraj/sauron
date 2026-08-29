@@ -417,6 +417,19 @@ async fn reap_stale_test_databases(admin_url: &str) {
     // the first call. `compare_exchange` guarantees exactly one winner even with
     // the whole suite starting at once; a loser skipping the reap is harmless,
     // since this was always best-effort.
+    //
+    // Skipped entirely in CI: the postgres service container is created fresh
+    // for each job, so there has never been anything there to reap. The saving
+    // is small today (~34 binaries x one connect-and-scan) but the guard above
+    // is process-scoped, so under a process-per-test runner like nextest this
+    // would run once per `setup()` call — ~398 times — instead of once per
+    // binary. Databases leaked by a panicking test still accumulate for the
+    // rest of the job; that is harmless because the container is discarded
+    // with it.
+    if std::env::var_os("CI").is_some() {
+        return;
+    }
+
     static REAPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     use std::sync::atomic::Ordering;
     if REAPED
