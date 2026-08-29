@@ -123,7 +123,7 @@ const BUS_CAPACITY: usize = 256;
 ///
 /// The wire name is also the cache-key component and the SSE event name, so the
 /// three cannot drift apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Section {
     Totals,
@@ -154,7 +154,7 @@ impl Section {
 }
 
 /// Freshness of what is being returned, as the dashboard sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Freshness {
     /// Computed within [`FRESH_FOR`]. No recompute triggered.
@@ -172,7 +172,7 @@ pub enum Freshness {
 /// state — the whole point is that a cold read answers immediately instead of
 /// occupying a request for 30 s. A caller that treats a missing `data` as an
 /// error has misread the contract; the dashboard renders a skeleton.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct Envelope {
     pub state: Freshness,
     /// When the query behind `data` actually ran. `None` iff `data` is `None`.
@@ -189,14 +189,14 @@ pub struct Envelope {
 /// The cached document. `computed_at` travels with the payload rather than
 /// being inferred from a Redis TTL, because the TTL is 24 h and says nothing
 /// about the 1 h freshness question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 struct CacheEntry {
     data: Value,
     computed_at: DateTime<Utc>,
 }
 
 /// One recompute result, fanned out to every SSE subscriber.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct SectionUpdate {
     /// `{app}:{env}:{days}` — see [`scope_token`]. SSE subscribers filter on
     /// an EXACT match of this, so a stream opened for app A / env X / 30 days

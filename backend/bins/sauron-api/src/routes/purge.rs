@@ -34,11 +34,12 @@ use uuid::Uuid;
 
 use crate::audit;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 use super::admin::require_deployment_admin;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PreviewReq {
     pub app_id: Uuid,
     /// Absent or `null` = every environment, including unattributed rows.
@@ -57,7 +58,7 @@ pub struct PreviewReq {
     pub all_time: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PurgeJobView {
     #[serde(flatten)]
     pub job: Value,
@@ -92,6 +93,31 @@ fn parse_kinds(raw: &[String]) -> Result<Vec<PurgeKind>, ApiError> {
 /// stricter than the app-scoped alternative on purpose — in a multi-tenant
 /// deployment a single tenant's admin cannot purge, only a global operator
 /// can. In the common single-tenant self-hosted case it is simply "the admin".
+#[utoipa::path(
+    post, path = "/v1/admin/purge", tag = "Admin",
+    summary = "Preview a data purge (step 1 of 2)",
+    description = "\
+Creates a purge job in **preview** state and reports what it would delete. \
+Nothing is destroyed by this call.
+
+Deletion happens only when the job is confirmed via \
+`POST /v1/admin/purge/{id}/confirm`, which requires echoing back a token from \
+this response. A preview left unconfirmed expires on its own.",
+    security(("bearerAuth" = [])),
+    request_body(content = PreviewReq, description = "What to purge. Read `GET /v1/admin/purge` first for the kinds this deployment supports.",
+        example = json!({
+            "kinds": ["error_events", "analytics_events"],
+            "app_id": "6f1c9a70-2f4b-4d1e-9a2f-0b3c5d7e9f11",
+            "before": "2026-01-01T00:00:00Z"
+        })),
+    responses(
+        (status = 200, description = "An existing matching preview.", body = PurgeJobView),
+        (status = 201, description = "A new preview job with its impact estimate.", body = PurgeJobView),
+        (status = 400, description = "Unknown purge kind, or a malformed selector.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse),
+        (status = 422, description = "The selector resolved to nothing purgeable.", body = ErrorResponse),
+    ),
+)]
 pub async fn preview(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -214,7 +240,7 @@ pub async fn preview(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ConfirmReq {
     /// Must equal the app's slug.
     pub confirm_text: String,
@@ -227,6 +253,27 @@ pub struct ConfirmReq {
 /// it is purging the WRONG APP, because the operator saw a problem and forgot
 /// which app was selected. A typed literal like `PURGE` proves intent and
 /// proves nothing about scope; the slug proves scope.
+#[utoipa::path(
+    post, path = "/v1/admin/purge/{id}/confirm", tag = "Admin",
+    summary = "Confirm a purge (step 2 of 2) — destructive",
+    description = "\
+**Irreversible.** Executes the purge previewed by step 1. The body must echo \
+the confirmation token from the preview, so a confirm cannot be issued from the \
+job id alone.
+
+The set actually deleted is recomputed at execution time and may differ from \
+the preview if data arrived or aged out in between.",
+    params(("id" = Uuid, Path, description = "Purge job identifier.")), security(("bearerAuth" = [])),
+    request_body(content = ConfirmReq, description = "Must echo the confirmation token returned by the preview.",
+        example = json!({ "confirm_token": "pct_1f8c4b2e9d7a" })),
+    responses(
+        (status = 200, description = "The executed job.", body = PurgeJobView),
+        (status = 400, description = "Missing or mismatched confirmation token.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse),
+        (status = 404, description = "No such job.", body = ErrorResponse),
+        (status = 409, description = "Job is not in a confirmable state (already run, cancelled, or expired).", body = ErrorResponse),
+    ),
+)]
 pub async fn confirm(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -303,6 +350,17 @@ pub async fn confirm(
 /// `cancelling`; the worker observes that on a write it was making anyway and
 /// stops after the current batch. **Rows already deleted are not restored** —
 /// the report shows how far it got.
+#[utoipa::path(
+    post, path = "/v1/admin/purge/{id}/cancel", tag = "Admin",
+    summary = "Cancel an unconfirmed purge",
+    params(("id" = Uuid, Path, description = "Purge job identifier.")), security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The cancelled job.", body = PurgeJobView),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse),
+        (status = 404, description = "No such job.", body = ErrorResponse),
+        (status = 409, description = "Job already ran and cannot be cancelled.", body = ErrorResponse),
+    ),
+)]
 pub async fn cancel(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -346,6 +404,13 @@ pub async fn cancel(
     Ok(Json(view(&fresh, state.cfg.purge_preview_ttl_secs)?))
 }
 
+#[utoipa::path(
+    get, path = "/v1/admin/purge/{id}", tag = "Admin",
+    summary = "Fetch a purge job",
+    params(("id" = Uuid, Path, description = "Purge job identifier.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The job.", body = PurgeJobView), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse),
+              (status = 404, description = "No such job.", body = ErrorResponse)),
+)]
 pub async fn get_job(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -359,13 +424,13 @@ pub async fn get_job(
     Ok(Json(view(&job, state.cfg.purge_preview_ttl_secs)?))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PurgeCatalog {
     pub kinds: Vec<KindView>,
     pub jobs: Vec<Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct KindView {
     pub slug: &'static str,
     /// `raw` rows are deleted; `rollup` rows are recomputed and deleted only
@@ -382,6 +447,13 @@ pub struct KindView {
 /// The vocabulary is served rather than hardcoded in the client so the two
 /// cannot drift: a kind added to `sauron-purge` appears in the UI, and one
 /// removed disappears, without a matching frontend change.
+#[utoipa::path(
+    get, path = "/v1/admin/purge", tag = "Admin",
+    summary = "Purge catalogue and recent jobs",
+    description = "The purge kinds this deployment supports, plus recent jobs. Read this before building a `POST /v1/admin/purge` body — the kinds are what its selector accepts.",
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Supported kinds and recent jobs.", body = PurgeCatalog), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse)),
+)]
 pub async fn list_jobs(
     auth: AuthUser,
     State(state): State<AppState>,

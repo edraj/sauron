@@ -23,10 +23,11 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
 use super::{
-    add_event_top, add_journey_links, add_journey_nodes, add_perf_agg, add_screen_stats,
-    add_user_activity, begin_locked, env_key, replace_session_days, rollback_quietly,
-    set_watermark, watermark, DayKey, PerfDelta, ScreenDelta, SessionDayRow, UserActivityDelta,
-    OTHER_NAME, SRC_ANALYTICS, SRC_ERRORS, SRC_SESSIONS, SRC_TRANSACTIONS,
+    add_event_top, add_journey_links, add_journey_nodes, add_perf_agg, add_person_days,
+    add_screen_stats, add_user_activity, begin_locked, env_key, replace_session_days,
+    rollback_quietly, set_watermark, watermark, DayKey, PerfDelta, PersonDayDelta, PersonKey,
+    ScreenDelta, SessionDayRow, UserActivityDelta, OTHER_NAME, SRC_ANALYTICS, SRC_ERRORS,
+    SRC_SESSIONS, SRC_TRANSACTIONS,
 };
 use crate::sketch::LatencyHistogram;
 
@@ -135,6 +136,7 @@ pub(crate) struct AnalyticsDeltas {
     pub links: BTreeMap<(DayKey, i16, String, String), i64>,
     pub top: BTreeMap<(DayKey, String), i64>,
     pub activity: BTreeMap<DayKey, UserActivityDelta>,
+    pub person_days: BTreeMap<PersonKey, PersonDayDelta>,
 }
 
 fn day_of(t: DateTime<Utc>) -> NaiveDate {
@@ -167,6 +169,13 @@ pub(crate) fn fold_analytics_rows(
         if !r.distinct_id.is_empty() {
             a.hll_all.insert(&r.distinct_id);
             a.hll_analytics.insert(&r.distinct_id);
+            // Same non-empty guard as the journey walk below, for the same
+            // reason: '' is not a person, and admitting it would make one
+            // shared pseudo-user whose retention curve is meaningless.
+            d.person_days
+                .entry((key, r.distinct_id.clone()))
+                .or_default()
+                .events += 1;
         }
         if let Some(scr) = &r.screen {
             let s = d.screens.entry((key, scr.clone())).or_default();
@@ -296,6 +305,7 @@ fn cap_names(top: &mut BTreeMap<(DayKey, String), i64>, cap: usize) {
 pub(crate) struct ErrorDeltas {
     pub screens: BTreeMap<(DayKey, String), ScreenDelta>,
     pub activity: BTreeMap<DayKey, UserActivityDelta>,
+    pub person_days: BTreeMap<PersonKey, PersonDayDelta>,
 }
 
 pub(crate) fn fold_error_rows(rows: &[ERow]) -> ErrorDeltas {
@@ -307,6 +317,10 @@ pub(crate) fn fold_error_rows(rows: &[ERow]) -> ErrorDeltas {
         let did = r.distinct_id.as_deref().filter(|s| !s.is_empty());
         if let Some(did) = did {
             a.hll_all.insert(did);
+            d.person_days
+                .entry((key, did.to_string()))
+                .or_default()
+                .errors += 1;
         }
         if let Some(scr) = &r.screen {
             let s = d.screens.entry((key, scr.clone())).or_default();
@@ -695,6 +709,7 @@ pub async fn fold_analytics(
         add_journey_nodes(conn, &d.nodes).await?;
         add_journey_links(conn, &d.links).await?;
         add_user_activity(conn, &mut d.activity).await?;
+        add_person_days(conn, &d.person_days).await?;
         add_screen_stats(conn, &mut d.screens).await?;
         save_session_state(conn, &sess).await?;
         save_journey_state(conn, &jour).await?;
@@ -723,6 +738,7 @@ pub async fn fold_errors(
         let n = rows.len();
         let mut d = fold_error_rows(&rows);
         add_user_activity(conn, &mut d.activity).await?;
+        add_person_days(conn, &d.person_days).await?;
         add_screen_stats(conn, &mut d.screens).await?;
         set_watermark(conn, SRC_ERRORS, new_wm).await?;
         Ok(Some(FoldOutcome {
@@ -1448,6 +1464,81 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().expect("ts")
+    }
+
+    fn erow(app: Uuid, distinct: Option<&str>, at: DateTime<Utc>) -> ERow {
+        ERow {
+            app_id: app,
+            environment_id: None,
+            occurred_at: at,
+            received_at: at,
+            screen: None,
+            distinct_id: distinct.map(|s| s.to_string()),
+        }
+    }
+
+    /// One row per (person, day), counting every event that person emitted --
+    /// and NOTHING for the anonymous ones. '' would otherwise become a single
+    /// giant shared "person" whose retention is meaningless, exactly as the
+    /// journey walk above already guards against.
+    #[test]
+    fn person_days_counts_events_per_person_day_and_skips_anonymous() {
+        let app = Uuid::new_v4();
+        let mut sess = HashMap::new();
+        let mut jour = HashMap::new();
+        let rows = vec![
+            arow(app, "s1", "u1", "view", None, ts("2026-08-28T09:00:00Z")),
+            arow(app, "s1", "u1", "click", None, ts("2026-08-28T10:00:00Z")),
+            arow(app, "s2", "u2", "view", None, ts("2026-08-28T09:00:00Z")),
+            arow(app, "s3", "", "view", None, ts("2026-08-28T09:00:00Z")),
+        ];
+        let d = fold_analytics_rows(&rows, &mut sess, &mut jour, 100);
+
+        assert_eq!(
+            d.person_days.len(),
+            2,
+            "one row per person-day, and the anonymous row is dropped"
+        );
+        let day = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        let k = ((app, None, day), "u1".to_string());
+        assert_eq!(
+            d.person_days[&k].events, 2,
+            "both of u1's events fold onto the one day row"
+        );
+        assert_eq!(d.person_days[&k].errors, 0);
+    }
+
+    /// Two events a day apart are two person-days, not one. The bucket is
+    /// occurred_at's DATE, so a late-arriving event lands in its own history.
+    #[test]
+    fn person_days_separate_by_day() {
+        let app = Uuid::new_v4();
+        let mut sess = HashMap::new();
+        let mut jour = HashMap::new();
+        let rows = vec![
+            arow(app, "s1", "u1", "view", None, ts("2026-08-27T23:59:00Z")),
+            arow(app, "s1", "u1", "view", None, ts("2026-08-28T00:01:00Z")),
+        ];
+        let d = fold_analytics_rows(&rows, &mut sess, &mut jour, 100);
+        assert_eq!(d.person_days.len(), 2, "a day boundary splits the rows");
+    }
+
+    /// The error firehose contributes to `errors`, never to `events`. The
+    /// error-impact split reads that column, so crossing them would silently
+    /// reclassify every crashing user as merely active.
+    #[test]
+    fn person_days_from_errors_sets_errors_not_events() {
+        let app = Uuid::new_v4();
+        let d = fold_error_rows(&[
+            erow(app, Some("u1"), ts("2026-08-28T09:00:00Z")),
+            erow(app, None, ts("2026-08-28T09:00:00Z")),
+        ]);
+
+        let day = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        let k = ((app, None, day), "u1".to_string());
+        assert_eq!(d.person_days.len(), 1, "the anonymous error is dropped");
+        assert_eq!(d.person_days[&k].errors, 1, "error firehose sets errors");
+        assert_eq!(d.person_days[&k].events, 0, "and never events");
     }
 
     #[test]

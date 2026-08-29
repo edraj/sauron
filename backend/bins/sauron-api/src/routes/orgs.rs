@@ -29,6 +29,7 @@ use super::auth::{
 };
 use super::{db, slugify};
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
 
 // --- orgs -------------------------------------------------------------------
@@ -37,7 +38,7 @@ use crate::AppState;
 ///
 /// `project_count` is flattened alongside the org's own fields so existing
 /// consumers of this endpoint keep reading the same shape.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct OrgView {
     #[serde(flatten)]
     pub org: Organization,
@@ -61,6 +62,13 @@ pub struct OrgView {
     pub can_create_project: bool,
 }
 
+#[utoipa::path(
+    get, path = "/v1/orgs", tag = "Organizations",
+    summary = "List organizations you can reach",
+    description = "Organizations the caller holds any grant in. Returns an empty list rather than 403 when there are none.",
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Reachable organizations.", body = Vec<OrgView>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse)),
+)]
 pub async fn list_orgs(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -153,11 +161,20 @@ pub async fn list_orgs(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateOrgReq {
     pub name: String,
 }
 
+#[utoipa::path(
+    post, path = "/v1/orgs", tag = "Organizations",
+    summary = "Create an organization",
+    description = "The caller becomes its owner.",
+    security(("bearerAuth" = [])),
+    request_body(content = CreateOrgReq, example = json!({ "name": "Analytical Engines" })),
+    responses((status = 200, description = "The created organization.", body = Organization),
+              (status = 400, description = "Missing or malformed name.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse)),
+)]
 pub async fn create_org(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -205,14 +222,14 @@ pub async fn create_org(
 
 // --- access (UI gating) -----------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct GrantView {
     pub scope_type: String,
     pub scope_id: Uuid,
     pub permissions: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct AccessResponse {
     /// Org-level effective permissions.
     pub permissions: Vec<String>,
@@ -220,6 +237,17 @@ pub struct AccessResponse {
     pub grants: Vec<GrantView>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/access", tag = "Organizations",
+    summary = "What the caller may do in this organization",
+    description = "\
+The caller's effective permissions and reachable scopes. The dashboard drives \
+its navigation gating from this, which is why it answers for the *caller* \
+rather than describing the org.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Effective access.", body = AccessResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "No grant in this organization.", body = ErrorResponse)),
+)]
 pub async fn access(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -258,7 +286,7 @@ pub async fn access(
 
 // --- members / grants -------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct MemberGrant {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -279,6 +307,14 @@ pub struct MemberGrant {
     pub credentials_invalidated_at: Option<DateTime<Utc>>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/members", tag = "Organizations",
+    summary = "List members and their grants",
+    description = "Each member with every grant they hold, including grants scoped below the org (project- or app-level).",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Members with their grants.", body = Vec<MemberGrant>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "Requires member-management permission.", body = ErrorResponse)),
+)]
 pub async fn list_members(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -308,7 +344,7 @@ pub async fn list_members(
 }
 
 /// One scope target in a grant request.
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, utoipa::ToSchema)]
 pub struct ScopeRef {
     pub scope_type: String,
     pub scope_id: Uuid,
@@ -317,7 +353,7 @@ pub struct ScopeRef {
 /// Largest batch one grant request may carry.
 const MAX_SCOPES: usize = 200;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateGrantReq {
     pub email: String,
     pub role_id: Uuid,
@@ -567,6 +603,21 @@ async fn validate_scope_in_org(
     }
 }
 
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/grants", tag = "Organizations",
+    summary = "Grant a role at a scope",
+    description = "\
+Binds a user to a role at an org, project, app or environment scope. A member \
+may hold several grants; their effective permission at any point is the union.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body(content = CreateGrantReq),
+    responses(
+        (status = 200, description = "The created grant.", body = serde_json::Value),
+        (status = 400, description = "Malformed scope or unknown role.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires member-management permission, or the scope is outside the caller's own reach.", body = ErrorResponse),
+        (status = 422, description = "The scope resolved to nothing grantable.", body = ErrorResponse),
+    ),
+)]
 pub async fn create_grant(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -732,7 +783,7 @@ pub async fn create_grant(
     Ok(Json(serde_json::json!({ "ids": ids, "id": ids.first() })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateMemberReq {
     pub email: String,
     #[serde(default)]
@@ -752,6 +803,26 @@ pub struct CreateMemberReq {
 /// choose it would hold a working durable credential for somebody else's
 /// account. It is returned exactly once, here, and `must_change_password`
 /// makes it useless for anything but being replaced.
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/members", tag = "Organizations",
+    summary = "Add a member",
+    description = "\
+Creates the user if the address is new, then grants them a role at the \
+requested scope. The invitee does not choose an organization name — that \
+is what distinguishes this from `POST /v1/auth/register`.
+
+When SMTP is configured an invitation is mailed; when it is not, the member is \
+still created and an administrator must deliver credentials out of band.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body(content = CreateMemberReq),
+    responses(
+        (status = 200, description = "The member and their initial grant.", body = serde_json::Value),
+        (status = 400, description = "Malformed address, role, or scope.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires member-management permission.", body = ErrorResponse),
+        (status = 409, description = "Already a member of this organization.", body = ErrorResponse),
+        (status = 422, description = "The scope resolved to nothing grantable.", body = ErrorResponse),
+    ),
+)]
 pub async fn create_member(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -873,6 +944,16 @@ pub async fn create_member(
     })))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/grants/{grant_id}", tag = "Organizations",
+    summary = "Revoke a grant",
+    description = "Removes one grant. A member holding others keeps whatever those still cover.",
+    params(("grant_id" = Uuid, Path, description = "The grant.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Grant revoked.", body = OkResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "Requires member-management permission.", body = ErrorResponse),
+              (status = 404, description = "No such grant.", body = ErrorResponse),
+              (status = 409, description = "Removing it would leave the organization without an owner.", body = ErrorResponse)),
+)]
 pub async fn delete_grant(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -987,7 +1068,7 @@ pub async fn delete_grant(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SetMemberActiveReq {
     pub is_active: bool,
 }
@@ -1084,6 +1165,19 @@ async fn guard_member_admin_action(
 /// Deliberately leaves `role_grants` untouched. This is not a delete: the
 /// member stays in the list, badged and reversible. Removing access to one
 /// scope is what `DELETE /v1/grants/{id}` is for.
+#[utoipa::path(
+    patch, path = "/v1/orgs/{org_id}/members/{user_id}", tag = "Organizations",
+    summary = "Activate or deactivate a member",
+    description = "\
+Deactivating blocks sign-in and revokes live sessions, but preserves the \
+member's grants so reactivating restores their access exactly. Prefer this over \
+deleting grants when someone leaves temporarily.",
+    params(("org_id" = Uuid, Path, description = "The organization."), ("user_id" = Uuid, Path, description = "The member.")), security(("bearerAuth" = [])),
+    request_body(content = SetMemberActiveReq, example = json!({ "is_active": false })),
+    responses((status = 200, description = "Updated.", body = OkResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "Requires member-management permission.", body = ErrorResponse),
+              (status = 404, description = "Not a member of this organization.", body = ErrorResponse)),
+)]
 pub async fn set_member_active(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1229,6 +1323,16 @@ pub async fn set_member_active(
 /// self-target would log the admin out of the page they are standing on. "Sign
 /// out my other devices" is a different verb, lives on `/account`, and spares
 /// the current session.
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/members/{user_id}/revoke-sessions", tag = "Organizations",
+    summary = "Revoke all of a member's sessions",
+    description = "Signs the member out everywhere without changing their password or grants. Propagates to other replicas on their next revocation poll.",
+    params(("org_id" = Uuid, Path, description = "The organization."), ("user_id" = Uuid, Path, description = "The member.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Sessions revoked; `revoked` counts them.", body = OkResponse,
+               example = json!({ "ok": true, "revoked": 2 })),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires member-management permission.", body = ErrorResponse),
+              (status = 404, description = "Not a member of this organization.", body = ErrorResponse)),
+)]
 pub async fn revoke_member_sessions(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1286,7 +1390,7 @@ pub async fn revoke_member_sessions(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ResetMemberPasswordReq {
     /// `"reset"` or `"cancel"`. The default is the forward action; an
     /// unrecognised value is a 400, never a silent reset.
@@ -1328,6 +1432,26 @@ impl Default for ResetMemberPasswordReq {
 /// There is deliberately no last-`org:manage` guard: a forced reset removes
 /// nobody's permission — the target regains their account by using the link —
 /// so an org can never be orphaned by it.
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/members/{user_id}/password-reset", tag = "Organizations",
+    summary = "Force a member's password reset",
+    description = "\
+Locks the account until the member completes `POST /v1/auth/reset-password`, \
+and mails them a link valid for 24 hours — longer than a self-service \
+link, because the account cannot be used at all until it is consumed.
+
+Refused for a member holding grants outside this organization: an admin here \
+must not be able to lock an account that reaches elsewhere.",
+    params(("org_id" = Uuid, Path, description = "The organization."), ("user_id" = Uuid, Path, description = "The member.")), security(("bearerAuth" = [])),
+    request_body(content = ResetMemberPasswordReq),
+    responses(
+        (status = 200, description = "Reset forced and mail queued.", body = OkResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires member-management permission, or the member holds grants outside this org.", body = ErrorResponse),
+        (status = 404, description = "Not a member of this organization.", body = ErrorResponse),
+        (status = 429, description = "Per-caller or per-target reset limit exhausted.", body = ErrorResponse),
+        (status = 503, description = "SMTP is not configured on this deployment.", body = ErrorResponse),
+    ),
+)]
 pub async fn reset_member_password(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1606,7 +1730,7 @@ pub async fn reset_member_password(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateGrantReq {
     pub role_id: Option<Uuid>,
     pub scope_type: Option<String>,
@@ -1619,6 +1743,22 @@ pub struct UpdateGrantReq {
 /// that failed would silently strand the member with no access, and the
 /// last-owner guard has to judge the final state, not the intermediate one
 /// where the grant is already gone.
+#[utoipa::path(
+    patch, path = "/v1/grants/{grant_id}", tag = "Organizations",
+    summary = "Change a grant's role or scope",
+    description = "\
+Applied as add-before-remove, so a member editing their own coverage never \
+passes through a moment of holding nothing — an ordering that has caused \
+real lockouts elsewhere.",
+    params(("grant_id" = Uuid, Path, description = "The grant.")), security(("bearerAuth" = [])),
+    request_body(content = UpdateGrantReq),
+    responses(
+        (status = 200, description = "The updated grant.", body = serde_json::Value),
+        (status = 400, description = "Malformed scope or unknown role.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires member-management permission, or the new scope exceeds the caller's reach.", body = ErrorResponse),
+        (status = 404, description = "No such grant.", body = ErrorResponse),
+    ),
+)]
 pub async fn update_grant_handler(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1790,6 +1930,13 @@ pub async fn update_grant_handler(
 
 // --- roles ------------------------------------------------------------------
 
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/roles", tag = "Organizations",
+    summary = "List roles",
+    description = "Both the seeded preset roles and any custom roles defined in this organization.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Roles.", body = Vec<Role>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant in this organization.", body = ErrorResponse)),
+)]
 pub async fn list_roles(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1800,7 +1947,7 @@ pub async fn list_roles(
     Ok(Json(repo::list_roles(&mut conn, org_id).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateRoleReq {
     pub name: String,
     #[serde(default)]
@@ -1808,6 +1955,19 @@ pub struct CreateRoleReq {
     pub permissions: Vec<String>,
 }
 
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/roles", tag = "Organizations",
+    summary = "Create a custom role",
+    description = "A role is a named permission set. A caller cannot grant a role more permissions than they themselves hold.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body(content = CreateRoleReq),
+    responses(
+        (status = 200, description = "The created role.", body = Role),
+        (status = 400, description = "Unknown permission, or a malformed name.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires role-management permission, or the role exceeds the caller's own permissions.", body = ErrorResponse),
+        (status = 409, description = "A role of that name already exists here.", body = ErrorResponse),
+    ),
+)]
 pub async fn create_role(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1870,7 +2030,7 @@ pub async fn create_role(
     Ok(Json(role))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateRoleReq {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -1882,6 +2042,20 @@ pub struct UpdateRoleReq {
 /// Presets are refused: `ensure_preset_roles` re-syncs them from rbac.rs at
 /// every API boot, so an edit would silently revert on the next restart —
 /// worse than not offering it.
+#[utoipa::path(
+    patch, path = "/v1/orgs/{org_id}/roles/{role_id}", tag = "Organizations",
+    summary = "Update a role",
+    description = "Takes effect immediately for every member holding it. Preset roles cannot be edited.",
+    params(("org_id" = Uuid, Path, description = "The organization."), ("role_id" = Uuid, Path, description = "The role.")), security(("bearerAuth" = [])),
+    request_body(content = UpdateRoleReq),
+    responses(
+        (status = 200, description = "The updated role.", body = Role),
+        (status = 400, description = "Unknown permission, or a malformed name.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires role-management permission, or the change exceeds the caller's own permissions.", body = ErrorResponse),
+        (status = 404, description = "No such role.", body = ErrorResponse),
+        (status = 409, description = "Preset roles cannot be modified, or the name is taken.", body = ErrorResponse),
+    ),
+)]
 pub async fn update_role_handler(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1998,6 +2172,16 @@ pub async fn update_role_handler(
 /// every holder at once. The response reports how many grants went with it —
 /// the rows are gone by the time the delete returns, so the count is taken
 /// first.
+#[utoipa::path(
+    delete, path = "/v1/orgs/{org_id}/roles/{role_id}", tag = "Organizations",
+    summary = "Delete a custom role",
+    description = "Refused while any grant still references the role — revoke or move those grants first.",
+    params(("org_id" = Uuid, Path, description = "The organization."), ("role_id" = Uuid, Path, description = "The role.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Role deleted.", body = OkResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "Requires role-management permission.", body = ErrorResponse),
+              (status = 404, description = "No such role.", body = ErrorResponse),
+              (status = 409, description = "The role is still granted to someone, or is a preset.", body = ErrorResponse)),
+)]
 pub async fn delete_role_handler(
     auth: AuthUser,
     State(state): State<AppState>,

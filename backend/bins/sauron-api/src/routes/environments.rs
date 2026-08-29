@@ -90,9 +90,10 @@ use sauron_redis::keys;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub struct ListEnvQuery {
     #[serde(default)]
     pub include_retired: bool,
@@ -173,6 +174,17 @@ pub async fn enroll_new_app(
 // Catalogue: environments as a project defines them
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get, path = "/v1/projects/{project_id}/environments", tag = "Environments",
+    summary = "List a project's environment catalogue",
+    description = "\
+The **catalogue** entries (production, staging, ...), not the per-app \
+enrollments. Telemetry is posted against an enrollment; see \
+`GET /v1/apps/{app_id}/environments` for those.",
+    params(("project_id" = Uuid, Path, description = "The project."), ListEnvQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Catalogue environments.", body = Vec<Environment>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "No grant covers this project.", body = ErrorResponse)),
+)]
 pub async fn list_project_environments(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -198,11 +210,24 @@ pub async fn list_project_environments(
     Ok(Json(envs))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateEnvReq {
     pub name: String,
 }
 
+#[utoipa::path(
+    post, path = "/v1/projects/{project_id}/environments", tag = "Environments",
+    summary = "Add an environment to the catalogue",
+    description = "Creates the catalogue entry and enrolls every app in the project, so each app gains a fresh ingest key for it.",
+    params(("project_id" = Uuid, Path, description = "The project.")), security(("bearerAuth" = [])),
+    request_body(content = CreateEnvReq, example = json!({ "name": "staging" })),
+    responses(
+        (status = 200, description = "The created environment.", body = Environment),
+        (status = 400, description = "Name empty, too long, or not in the accepted character set.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this project.", body = ErrorResponse),
+        (status = 409, description = "An environment of that name already exists here.", body = ErrorResponse),
+    ),
+)]
 pub async fn create_project_environment(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -290,11 +315,27 @@ pub async fn create_project_environment(
     Ok(Json(env))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateProjectEnvReq {
     pub name: Option<String>,
 }
 
+#[utoipa::path(
+    patch, path = "/v1/environments/{env_id}", tag = "Environments",
+    summary = "Rename a catalogue environment",
+    description = "\
+A rename keeps the same identity, so existing enrollments and their keys keep \
+working and historical telemetry stays attributed to it.",
+    params(("env_id" = Uuid, Path, description = "Catalogue environment id (NOT an enrollment id).")), security(("bearerAuth" = [])),
+    request_body(content = UpdateProjectEnvReq),
+    responses(
+        (status = 200, description = "The updated environment.", body = Environment),
+        (status = 400, description = "Invalid name.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this environment.", body = ErrorResponse),
+        (status = 404, description = "No such environment.", body = ErrorResponse),
+        (status = 409, description = "That name is taken in this project.", body = ErrorResponse),
+    ),
+)]
 pub async fn update_project_environment(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -358,6 +399,20 @@ pub async fn update_project_environment(
     }
 }
 
+#[utoipa::path(
+    delete, path = "/v1/environments/{env_id}", tag = "Environments",
+    summary = "Retire a catalogue environment",
+    description = "\
+Retires rather than deletes: its enrollments stop accepting telemetry, and \
+already-ingested data stays queryable and attributed. Use the admin purge \
+endpoints to actually remove data.",
+    params(("env_id" = Uuid, Path, description = "Catalogue environment id (NOT an enrollment id).")), security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The retired environment.", body = Environment),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this environment.", body = ErrorResponse),
+        (status = 404, description = "No such environment.", body = ErrorResponse),
+    ),
+)]
 pub async fn retire_project_environment(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -444,6 +499,19 @@ pub async fn retire_project_environment(
 // Enrollment: one app's membership in one environment
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/environments", tag = "Environments",
+    summary = "List an app's environment enrollments",
+    description = "\
+The enrollments telemetry is actually posted against. Each carries the public \
+ingest key for one (app, environment) pair.
+
+**These ids are what `?environment_id=` takes** on the analytics routes — \
+passing a catalogue id there is refused.",
+    params(("app_id" = Uuid, Path, description = "The app."), ListEnvQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Enrollments with their public keys.", body = Vec<AppEnvironmentView>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "No grant covers this app.", body = ErrorResponse)),
+)]
 pub async fn list_app_environments(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -496,12 +564,25 @@ pub async fn list_app_environments(
     Ok(Json(mine))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateAppEnvReq {
     pub ingest_enabled: Option<bool>,
     pub is_default: Option<bool>,
 }
 
+#[utoipa::path(
+    patch, path = "/v1/app-environments/{id}", tag = "Environments",
+    summary = "Update an enrollment",
+    description = "Enable or disable an enrollment. A disabled enrollment rejects telemetry without deleting its key.",
+    params(("id" = Uuid, Path, description = "App-environment *enrollment* id — the id an SDK DSN carries.")), security(("bearerAuth" = [])),
+    request_body(content = UpdateAppEnvReq),
+    responses(
+        (status = 200, description = "The updated enrollment.", body = AppEnvironment),
+        (status = 400, description = "Malformed field.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this enrollment.", body = ErrorResponse),
+        (status = 404, description = "No such enrollment.", body = ErrorResponse),
+    ),
+)]
 pub async fn update_app_environment(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -632,6 +713,23 @@ pub async fn update_app_environment(
     Ok(Json(current))
 }
 
+#[utoipa::path(
+    post, path = "/v1/app-environments/{id}/rotate-key", tag = "Environments",
+    summary = "Rotate an enrollment's ingest key",
+    description = "\
+Issues a new public key and **invalidates the old one immediately**. Every \
+deployed SDK still carrying the previous DSN stops being accepted at once, so \
+ship the new key before rotating.
+
+The key is write-only and non-secret by design — it can identify an \
+environment and accept telemetry, and can read nothing.",
+    params(("id" = Uuid, Path, description = "App-environment *enrollment* id — the id an SDK DSN carries.")), security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The enrollment with its new key.", body = AppEnvironment),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this enrollment.", body = ErrorResponse),
+        (status = 404, description = "No such enrollment.", body = ErrorResponse),
+    ),
+)]
 pub async fn rotate_app_environment_key(
     auth: AuthUser,
     State(state): State<AppState>,

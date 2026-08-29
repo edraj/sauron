@@ -27,6 +27,7 @@ use sauron_db::repo::SortSpec;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 fn days30() -> i32 {
@@ -117,7 +118,8 @@ pub(crate) fn workflow_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError
 /// though it never appears as a stored value.
 const WORKFLOW_STATUSES: &[&str] = &["active", "completed", "cancelled", "abandoned"];
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct WorkflowListQuery {
     #[serde(default = "days30")]
     pub since_days: i32,
@@ -143,6 +145,14 @@ pub struct WorkflowListQuery {
 /// One row per workflow name: started/completed/cancelled/abandoned/active
 /// counts, unique users, median/p95 duration and last seen — paginated,
 /// optionally substring-filtered by name.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/workflows", tag = "Analytics",
+    summary = "Workflows observed in this app",
+    description = "Named multi-step flows, with completion and failure counts.",
+    params(("app_id" = Uuid, Path, description = "The app."), WorkflowListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Workflows.", body = Vec<repo::WorkflowRow>),
+              (status = 400, description = "Malformed query or sort.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -198,6 +208,12 @@ pub async fn list(
 /// That is a disclosure property, not a consistency nicety: a count resolved
 /// over a wider scope than the list would leak the SIZE of data the caller
 /// cannot read.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/counts/workflows", tag = "Analytics",
+    summary = "Count matching workflows",
+    params(("app_id" = Uuid, Path, description = "The app."), WorkflowListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The count.", body = super::search::CountEnvelope), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn count(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -235,7 +251,8 @@ pub async fn count(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct WorkflowDetailQuery {
     #[serde(default = "days30")]
     pub since_days: i32,
@@ -263,6 +280,14 @@ pub struct WorkflowDetailQuery {
 /// coarse error gate — is what entitles a caller to. It comes back empty for a
 /// caller holding only `event:read`, the same carve-out `analytics::overview`
 /// makes for its own `top_issues`.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/workflows/{name}", tag = "Analytics",
+    summary = "One workflow's aggregate shape",
+    params(("app_id" = Uuid, Path, description = "The app."), ("name" = String, Path, description = "Workflow name as reported by the SDK."), WorkflowDetailQuery, super::search::TimeFilterQuery),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The workflow.", body = repo::WorkflowDetail), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 404, description = "No such workflow.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -301,7 +326,8 @@ pub async fn detail(
     Ok(Json(detail))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct WorkflowRunsQuery {
     #[serde(default = "days30")]
     pub since_days: i32,
@@ -321,6 +347,13 @@ pub struct WorkflowRunsQuery {
 
 /// Individual runs of one workflow name, newest first, optionally filtered by
 /// effective status.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/workflows/{name}/runs", tag = "Analytics",
+    summary = "Individual runs of one workflow",
+    params(("app_id" = Uuid, Path, description = "The app."), ("name" = String, Path, description = "Workflow name."), WorkflowRunsQuery, super::search::TimeFilterQuery),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Runs.", body = Vec<repo::WorkflowRun>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn runs(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -378,6 +411,15 @@ pub async fn runs(
 /// timeline lane. Lives here (grouped with the other `repo::workflow_*`
 /// consumers) rather than in `sessions.rs`, even though the route sits under
 /// `/sessions/{session_id}/workflows`.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/sessions/{session_id}/workflows", tag = "Analytics",
+    summary = "Workflow spans within one session",
+    description = "The workflow activity belonging to a single session, for the session timeline view.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("session_id" = String, Path, description = "The session id.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Spans.", body = Vec<repo::WorkflowSpan>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 410, description = "The session's partition has been tiered or dropped.", body = ErrorResponse)),
+)]
 pub async fn session_spans(
     auth: AuthUser,
     State(state): State<AppState>,

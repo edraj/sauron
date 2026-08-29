@@ -4,6 +4,8 @@
 //! envelope, and enqueues each item onto the Redis ingest stream. Worker tasks
 //! (spawned here, co-located) drain the stream and write durable rows.
 
+mod openapi;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -604,6 +606,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
         .route("/api/{project_id}/envelope", post(ingest))
+        // The document only — no UI assets. `sauron-api`'s /docs lists this
+        // URL in its selector.
+        .route(
+            "/openapi.json",
+            get(|| async { axum::Json(<openapi::IngestDoc as utoipa::OpenApi>::openapi()) }),
+        )
         // Layer order matters. `Router::layer` makes the LAST-added layer the
         // outermost, so the limit must be added AFTER decompression to sit
         // outside it... which would only bound the compressed bytes. Instead we

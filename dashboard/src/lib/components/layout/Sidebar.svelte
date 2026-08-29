@@ -72,6 +72,7 @@
         { href: '#/active-users', label: t('nav.activeUsers'), icon: 'users', match: (p) => p.startsWith('/active-users') },
         { href: '#/funnels', label: t('nav.funnels'), icon: 'funnel', match: (p) => p.startsWith('/funnels') },
         { href: '#/journeys', label: t('nav.journeys'), icon: 'waypoints', match: (p) => p.startsWith('/journeys') },
+        { href: '#/retention', label: t('nav.retention'), icon: 'repeat', match: (p) => p.startsWith('/retention') },
       ],
     },
     {

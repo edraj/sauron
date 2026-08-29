@@ -21,6 +21,7 @@ use sauron_mail::MailKind;
 
 use super::{db, issue_tokens, sanitize_ip, sanitize_ua, slugify, SessionContext, TokenPair};
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
 
 /// Upper bound on an accepted password. Argon2 cost grows with input length, so
@@ -393,7 +394,7 @@ pub(crate) fn render_password_reset_mail(
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct RegisterReq {
     pub email: String,
     pub password: String,
@@ -402,13 +403,40 @@ pub struct RegisterReq {
     pub org_name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct AuthResponse {
     #[serde(flatten)]
     pub tokens: TokenPair,
     pub user: User,
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/auth/register",
+    tag = "Auth",
+    summary = "Register a user and create their organization",
+    description = "\
+Creates a user, an organization, and an owner grant binding them, in one \
+transaction. Intended for standing up a new deployment or a new tenant — \
+existing organizations add people through `POST /v1/orgs/{org_id}/members` \
+instead, which does not require the invitee to choose an org name.
+
+Rate limited per IP (10/hour): the route is unauthenticated and each call runs \
+a memory-hard Argon2 hash plus three inserts.",
+    security(),
+    request_body(content = RegisterReq, description = "Credentials and the organization to create.", example = json!({
+        "email": "ada@example.com",
+        "password": "correct horse battery staple",
+        "name": "Ada Lovelace",
+        "org_name": "Analytical Engines"
+    })),
+    responses(
+        (status = 200, description = "The user, the organization, and a fresh token pair.", body = AuthResponse),
+        (status = 400, description = "Malformed email, or a password outside the accepted length.", body = ErrorResponse),
+        (status = 409, description = "That email is already registered.", body = ErrorResponse),
+        (status = 429, description = "Per-IP registration limit exhausted.", body = ErrorResponse),
+    ),
+)]
 pub async fn register(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -492,7 +520,7 @@ pub async fn register(
     Ok(Json(AuthResponse { tokens, user }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct LoginReq {
     pub email: String,
     pub password: String,
@@ -537,6 +565,32 @@ fn record_auth(state: &AppState, actor_id: uuid::Uuid, action: &'static str, rea
     });
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/auth/login",
+    tag = "Auth",
+    summary = "Exchange credentials for a token pair",
+    description = "\
+Rate limited per account (10/min) and per IP. A wrong password and an unknown \
+address take the same constant-time path and return the same 401, so this \
+endpoint cannot be used to enumerate registered addresses.
+
+An account with a pending forced password reset authenticates successfully and \
+is then refused: the response is a 403 whose message names the reset, and the \
+caller must complete `POST /v1/auth/reset-password` before any other route \
+will accept its token.",
+    security(),
+    request_body(content = LoginReq, example = json!({
+        "email": "ada@example.com",
+        "password": "correct horse battery staple"
+    })),
+    responses(
+        (status = 200, description = "Authenticated. Tokens and the user record.", body = AuthResponse),
+        (status = 401, description = "Unknown address or wrong password — deliberately indistinguishable.", body = ErrorResponse),
+        (status = 403, description = "A password change is required before this account can be used.", body = ErrorResponse),
+        (status = 429, description = "Too many attempts for this account or address.", body = ErrorResponse),
+    ),
+)]
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -654,11 +708,33 @@ pub async fn login(
     Ok(Json(AuthResponse { tokens, user }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct RefreshReq {
     pub refresh_token: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/auth/refresh",
+    tag = "Auth",
+    summary = "Rotate a refresh token",
+    description = "\
+Returns a new pair and invalidates the presented refresh token. Rotation is \
+strict: presenting an already-rotated token is treated as a replay and revokes \
+the whole session family.
+
+The one exception is a short grace window (10 seconds) in which a second \
+presentation of the same token is read as two tabs racing on one timer rather \
+than theft. Clients should still serialise refreshes; the grace exists so an \
+honest race does not sign the user out.",
+    security(),
+    request_body(content = RefreshReq, example = json!({ "refresh_token": "rt_9f2c..." })),
+    responses(
+        (status = 200, description = "A new access/refresh pair. The old refresh token is now dead.", body = TokenPair),
+        (status = 401, description = "Unknown, expired, or replayed token. On replay the session family is revoked.", body = ErrorResponse),
+        (status = 429, description = "Per-IP refresh limit exhausted.", body = ErrorResponse),
+    ),
+)]
 pub async fn refresh(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -841,11 +917,30 @@ pub async fn refresh(
     Ok(Json(tokens))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct LogoutReq {
     pub refresh_token: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/auth/logout",
+    tag = "Auth",
+    summary = "Revoke the presented refresh token",
+    description = "\
+Ends one session. Other sessions belonging to the same user are untouched — \
+use `POST /v1/me/sessions/revoke-others` to end the rest, or \
+`DELETE /v1/me/sessions/{session_id}` for a specific one.
+
+Answers 200 for an unknown or already-revoked token: logout is idempotent, and \
+distinguishing the cases would let an unauthenticated caller test whether a \
+token is live.",
+    security(),
+    request_body(content = LogoutReq, example = json!({ "refresh_token": "rt_9f2c..." })),
+    responses(
+        (status = 200, description = "The session is revoked, or was already.", body = OkResponse),
+    ),
+)]
 pub async fn logout(
     State(state): State<AppState>,
     Json(req): Json<LogoutReq>,
@@ -876,7 +971,7 @@ pub async fn logout(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ForgotPasswordReq {
     pub email: String,
 }
@@ -898,6 +993,28 @@ pub struct ForgotPasswordReq {
 /// hashes — sub-millisecond against network jitter orders of magnitude larger.
 /// If instrumentation ever shows a signal, the fix is a fixed-cost pad, not a
 /// dummy INSERT, which would be visible in the table.
+#[utoipa::path(
+    post,
+    path = "/v1/auth/forgot-password",
+    tag = "Auth",
+    summary = "Request a password reset link",
+    description = "\
+**Always answers 200**, whether or not the address is registered and whether or \
+not SMTP is configured on this deployment. A response that distinguished those \
+cases would be an account-enumeration oracle, and a config oracle, handed to \
+anyone on the internet.
+
+Mail sending is capped per address per hour. Past the cap the request still \
+succeeds and still mints a link unless a live one already exists — the cap \
+suppresses redundant mail rather than locking anyone out, so an attacker cannot \
+deny someone their own reset.",
+    security(),
+    request_body(content = ForgotPasswordReq, example = json!({ "email": "ada@example.com" })),
+    responses(
+        (status = 200, description = "Request accepted. Reveals nothing about the address.", body = OkResponse),
+        (status = 429, description = "Per-IP burst limit exhausted.", body = ErrorResponse),
+    ),
+)]
 pub async fn forgot_password(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1083,7 +1200,7 @@ pub async fn forgot_password(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ResetPasswordReq {
     pub token: String,
     pub new_password: String,
@@ -1106,6 +1223,30 @@ pub struct ResetPasswordReq {
 /// No preflight is needed here, unlike `forgot_password`: every input path
 /// touches `password_reset_tokens` unconditionally, so an unmigrated schema
 /// 500s uniformly.
+#[utoipa::path(
+    post,
+    path = "/v1/auth/reset-password",
+    tag = "Auth",
+    summary = "Complete a password reset",
+    description = "\
+Consumes a token from a reset mail and sets the new password. Also clears a \
+forced-reset flag, so this is the route that unlocks an account an \
+administrator has locked.
+
+Every session belonging to the user is revoked on success — a reset is the \
+remedy for a suspected compromise, and leaving existing sessions alive would \
+defeat it.",
+    security(),
+    request_body(content = ResetPasswordReq, example = json!({
+        "token": "prt_4b81...",
+        "password": "a new and different passphrase"
+    })),
+    responses(
+        (status = 200, description = "Password replaced; all sessions revoked.", body = OkResponse),
+        (status = 400, description = "Unknown, expired or already-used token, or a password identical to the current one.", body = ErrorResponse),
+        (status = 429, description = "Per-IP or per-link submission limit exhausted.", body = ErrorResponse),
+    ),
+)]
 pub async fn reset_password(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1236,7 +1377,7 @@ pub async fn reset_password(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ChangePasswordReq {
     pub current_password: String,
     pub new_password: String,
@@ -1244,6 +1385,33 @@ pub struct ChangePasswordReq {
 
 /// Self-service password change. The only endpoint a temp-password holder can
 /// reach.
+#[utoipa::path(
+    post,
+    path = "/v1/auth/password",
+    tag = "Auth",
+    summary = "Change your own password",
+    description = "\
+Requires the current password as well as the new one, so a stolen access token \
+alone cannot take over the account.
+
+Returns a **fresh token pair**: the change revokes every other session, \
+including the one that made the request, and the returned pair is the \
+replacement. A client that ignores the response body will find its next call \
+answered with 401.
+
+This is one of only two routes reachable while an account is in the \
+forced-password-change state.",
+    security(("bearerAuth" = [])),
+    request_body(content = ChangePasswordReq, example = json!({
+        "current_password": "correct horse battery staple",
+        "password": "an entirely different passphrase"
+    })),
+    responses(
+        (status = 200, description = "Password changed. Contains the replacement token pair.", body = AuthResponse),
+        (status = 400, description = "New password rejected, or identical to the current one.", body = ErrorResponse),
+        (status = 401, description = "Missing/invalid access token, or the current password is wrong.", body = ErrorResponse),
+    ),
+)]
 pub async fn change_password(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1359,6 +1527,25 @@ pub async fn change_password(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/me",
+    tag = "Auth",
+    summary = "The authenticated user",
+    description = "\
+Returns the caller's own user record. Fields that are never serialized \
+(`password_hash`, `credentials_invalidated_at`) are absent by construction, not \
+by filtering.
+
+This route reflects the token, not the database session: it answers from the \
+access token's claims plus a lookup, so it is the cheapest way for a client to \
+check that its token is still valid.",
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The calling user.", body = User),
+        (status = 401, description = "Missing, expired or revoked access token.", body = ErrorResponse),
+    ),
+)]
 pub async fn me(auth: AuthUser, State(state): State<AppState>) -> Result<Json<User>, ApiError> {
     let mut conn = db(&state).await?;
     let user = repo::find_user_by_id(&mut conn, auth.user_id)

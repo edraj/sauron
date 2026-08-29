@@ -9,7 +9,12 @@ mod audit;
 mod csv;
 mod error;
 mod mail;
+mod openapi;
 mod overview_cache;
+/// Test-only: parses this file's own route table so `openapi`'s parity test can
+/// compare the document against the routes actually served.
+#[cfg(test)]
+mod route_table;
 mod routes;
 mod symbolicate;
 mod tasks;
@@ -30,6 +35,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+use utoipa::OpenApi;
 
 /// Hard ceiling on a JSON request body. Large binary uploads go through the
 /// separately-merged artifact routes, which carry their own raised limit.
@@ -435,6 +441,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(DefaultBodyLimit::max(artifact_body_limit));
 
+    let docs_routes = docs_router(cfg.api_docs_enabled, cfg.api_docs_ingest_url.as_deref());
+
     let cors = CorsLayer::new()
         .allow_origin(origins)
         // Every method any route actually uses. Omitting one does NOT surface
@@ -693,6 +701,15 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/apps/{app_id}/users/summary",
             get(routes::analytics::users_summary),
+        )
+        .route("/v1/apps/{app_id}/retention", get(routes::retention::grid))
+        .route(
+            "/v1/apps/{app_id}/retention/lifecycle",
+            get(routes::retention::lifecycle),
+        )
+        .route(
+            "/v1/apps/{app_id}/retention/churn",
+            get(routes::retention::churn),
         )
         .route(
             "/v1/apps/{app_id}/errors/timeseries",
@@ -1040,6 +1057,7 @@ async fn main() -> anyhow::Result<()> {
         // routes below are merged separately with their own raised limit.
         .layer(DefaultBodyLimit::max(API_JSON_BODY_LIMIT))
         .merge(artifact_routes)
+        .merge(docs_routes)
         .layer(cors)
         // Shed load before it reaches a handler: an unbounded queue of slow
         // requests otherwise pins connections and pool slots indefinitely.
@@ -1054,25 +1072,12 @@ async fn main() -> anyhow::Result<()> {
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::X_FRAME_OPTIONS,
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        ))
-        // The API only ever returns JSON, so a maximally restrictive CSP is
-        // safe and stops a sniffed response from executing as a document.
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
-        ))
+        ));
+
+    // Security headers, then tracing outermost — the same order as before this
+    // was extracted. `apply_security_headers` is shared with the tests at the
+    // bottom of this file so what they exercise is this exact composition.
+    let app = apply_security_headers(app)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -1089,13 +1094,335 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The OpenAPI document + Swagger UI router, or an empty one when disabled.
+///
+/// Takes the two settings it needs rather than `&Config` so it can be built in
+/// a unit test with no database, no Redis and no environment — see the tests at
+/// the bottom of this file, which exist because the failure this router can
+/// suffer is invisible to every other kind of test here.
+///
+/// Generic over state for the same reason: the docs router touches no state, so
+/// a test can instantiate it at `()` instead of constructing an `AppState`
+/// (which would require live connections).
+fn docs_router<S>(docs_enabled: bool, ingest_doc_url: Option<&str>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if !docs_enabled {
+        // Not registered at all, so the paths answer 404 rather than 403 — a
+        // 403 would confirm to an unauthenticated caller that docs exist.
+        return Router::new();
+    }
+
+    // Swagger UI is HTML + CSS + JS, which the API-wide `default-src 'none'`
+    // blocks outright: every asset returns 200 and the browser then refuses to
+    // execute it, so the page renders blank. This shipped once; the header that
+    // actually goes out is now pinned by
+    // `docs_serving_tests::docs_csp_allows_swagger_ui_to_load_its_own_assets`.
+    //
+    // Still tight: same-origin scripts only (the shipped `index.html` has no
+    // inline `<script>`), `unsafe-inline` for STYLES only, which Swagger UI
+    // injects at runtime, and `frame-ancestors 'none'` preserved.
+    let docs_csp = {
+        let mut policy = String::from(
+            "default-src 'none'; \
+             script-src 'self'; \
+             style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; \
+             font-src 'self'; \
+             frame-ancestors 'none'; \
+             connect-src 'self'",
+        );
+        // The ingest document is fetched cross-origin by the browser, so its
+        // ORIGIN (not the full URL — a path is not a valid CSP source) has to
+        // be allowed or the second selector entry fails to load.
+        if let Some(origin) = ingest_doc_url.and_then(origin_of) {
+            policy.push(' ');
+            policy.push_str(&origin);
+        }
+        policy.push(';');
+        HeaderValue::from_str(&policy).expect("docs CSP is header-safe")
+    };
+
+    let ui =
+        utoipa_swagger_ui::SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi());
+
+    // The ingest gateway is a separate service on a separate origin, so its
+    // document is listed only when an operator says where it is. Guessing would
+    // produce a selector entry that fails to load with a console-only error.
+    //
+    // Listed through `Config` rather than `external_url_unchecked`: that method
+    // embeds a document this process would have to hold, whereas these URLs are
+    // fetched by the browser from the gateway itself, which is what keeps the
+    // two documents independently deployable.
+    let ui = match ingest_doc_url.map(|u| &*Box::leak(u.to_string().into_boxed_str())) {
+        Some(ingest) => {
+            info!(url = %ingest, "listing the ingest document in the docs selector");
+            // Named, not bare URLs: the name is what the selector shows, and a
+            // dropdown reading "http://host:8081/openapi.json" tells a reader
+            // nothing about which API they are looking at.
+            ui.config(utoipa_swagger_ui::Config::new([
+                utoipa_swagger_ui::Url::new("Sauron API", "/openapi.json"),
+                utoipa_swagger_ui::Url::new("Sauron Ingest", ingest),
+            ]))
+        }
+        None => ui,
+    };
+
+    // Convert to a Router first: `SwaggerUi` is not itself a `Router`.
+    //
+    // This also covers `/openapi.json`, which `SwaggerUi` serves, so that
+    // response carries the docs policy rather than the strict JSON one.
+    // Accepted rather than worked around: it is `application/json` under
+    // `nosniff`, so it cannot execute as a document under either policy, and
+    // splitting it into its own `.route()` would put it in this file's literal
+    // route table, where `openapi::tests::router_parity` would then demand the
+    // document describe itself.
+    Router::from(ui).layer(SetResponseHeaderLayer::overriding(
+        header::CONTENT_SECURITY_POLICY,
+        docs_csp,
+    ))
+}
+
+/// The response headers applied to every route, outermost.
+///
+/// Extracted so the tests can compose it over [`docs_router`] exactly as `main`
+/// does. Testing the two separately would miss the thing that actually broke:
+/// the CSP here is outermost, and an `overriding` layer would silently replace
+/// the policy the docs router sets for itself.
+fn apply_security_headers<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        // Every route except `/docs` returns JSON, so a maximally restrictive
+        // CSP is safe there and stops a sniffed response executing as a
+        // document.
+        //
+        // `if_not_present`, NOT `overriding`: this layer is outermost, so
+        // overriding would replace the policy `docs_router` sets for itself and
+        // blank the UI. Nothing else in the API sets this header, so every JSON
+        // response still gets the strict policy.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        ))
+}
+
+/// The `scheme://host[:port]` of an absolute URL, for use as a CSP source.
+///
+/// A CSP source expression may not carry a path, so the configured document URL
+/// cannot be dropped into the policy verbatim.
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
+}
+
 /// ALWAYS 200. `packaging/rpm/SETUP.md` documents `curl -fsS .../health` and
 /// `tests/http_env_scoping.rs` polls it for readiness; both read a non-2xx as
 /// "the API is down", which a stalled reaper is not. The task list is the signal;
 /// the status code is not.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "Health",
+    summary = "Liveness probe",
+    description = "\
+Always answers `200`, by design. `packaging/rpm/SETUP.md` documents \
+`curl -fsS .../health` as the liveness check, and a non-2xx here is read as \
+\"the API is down\" — which a stalled background task is not. Inspect the \
+`tasks` object to judge worker health; do not infer it from the status code.",
+    security(),
+    responses(
+        (status = 200, description = "The API is serving.", body = serde_json::Value,
+         example = json!({
+             "status": "ok",
+             "tasks": {
+                 "revocation-poll": { "last_ok_at": "2026-08-28T10:15:00Z", "consecutive_failures": 0 }
+             }
+         })),
+    ),
+)]
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "status": "ok",
         "tasks": tasks::snapshot(),
     }))
+}
+
+#[cfg(test)]
+mod docs_serving_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    const INGEST: &str = "http://localhost:8081/openapi.json";
+
+    /// The router `main` actually serves, minus the state-carrying API routes.
+    ///
+    /// Composed through the same [`docs_router`] and [`apply_security_headers`]
+    /// the binary uses, so a change to either is exercised here. `()` state
+    /// because the docs router needs none — which is what lets these tests run
+    /// with no Postgres and no Redis, and therefore never skip.
+    fn app(docs_enabled: bool, ingest: Option<&str>) -> Router {
+        let router = Router::new()
+            // Stands in for the JSON API: any route that is not the docs.
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .merge(docs_router::<()>(docs_enabled, ingest));
+        apply_security_headers(router).with_state(())
+    }
+
+    async fn get(docs_enabled: bool, ingest: Option<&str>, path: &str) -> (StatusCode, String) {
+        let res = app(docs_enabled, ingest)
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .expect("router responds");
+        let status = res.status();
+        let csp = res
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (status, csp)
+    }
+
+    /// **The blank-page regression test.**
+    ///
+    /// Swagger UI is HTML that loads its own CSS and JS. Under the API-wide
+    /// `default-src 'none'` every one of those assets is delivered with a 200
+    /// and then refused by the browser, so `/docs` renders as an empty page.
+    ///
+    /// This cannot be caught by asserting status codes — they were all 200 when
+    /// the bug shipped — nor by unit-testing the policy string, which was
+    /// already correct: the defect was that the outermost `SetResponseHeaderLayer`
+    /// *overrode* it. Only composing the real layers and reading the header that
+    /// actually goes out catches it.
+    #[tokio::test]
+    async fn docs_csp_allows_swagger_ui_to_load_its_own_assets() {
+        for path in [
+            "/docs/",
+            "/docs/swagger-ui-bundle.js",
+            "/docs/swagger-ui.css",
+        ] {
+            let (status, csp) = get(true, Some(INGEST), path).await;
+            assert_eq!(status, StatusCode::OK, "{path} should be served");
+
+            assert!(
+                csp.contains("script-src 'self'"),
+                "{path} is served with a CSP that blocks its own scripts, so the \
+                 docs page renders blank in a browser while every request still \
+                 returns 200. Check that the outermost CSP layer in \
+                 `apply_security_headers` is `if_not_present`, not `overriding`. \
+                 CSP was: {csp:?}"
+            );
+            assert!(
+                csp.contains("style-src 'self'"),
+                "{path} is served with a CSP that blocks its own stylesheets. \
+                 CSP was: {csp:?}"
+            );
+            assert!(
+                csp.contains("img-src 'self' data:"),
+                "Swagger UI renders inline `data:` images; this CSP blocks them. \
+                 CSP was: {csp:?}"
+            );
+        }
+    }
+
+    /// The strict policy must survive for everything that is not the docs —
+    /// the fix must not have relaxed the whole API.
+    #[tokio::test]
+    async fn non_docs_routes_keep_the_strict_json_policy() {
+        let (status, csp) = get(true, Some(INGEST), "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            csp, "default-src 'none'; frame-ancestors 'none'",
+            "a JSON route must keep the maximally restrictive policy; relaxing \
+             it API-wide would be the wrong fix for the docs page"
+        );
+    }
+
+    /// The selector's second entry is fetched cross-origin, so the ingest
+    /// origin has to be in `connect-src` or it fails to load with an error
+    /// visible only in a browser console.
+    #[tokio::test]
+    async fn the_ingest_origin_is_allowed_when_configured() {
+        let (_, csp) = get(true, Some(INGEST), "/docs/").await;
+        assert!(
+            csp.contains("connect-src 'self' http://localhost:8081"),
+            "the configured ingest document's origin must be allowed by \
+             `connect-src`, and as an ORIGIN — a CSP source may not carry a \
+             path. CSP was: {csp:?}"
+        );
+        assert!(
+            !csp.contains("openapi.json"),
+            "the full URL leaked into the policy; a path is not a valid CSP \
+             source and browsers ignore the whole source expression. CSP was: {csp:?}"
+        );
+
+        // Without the setting there is nothing to allow, and the policy must
+        // not widen speculatively.
+        let (_, csp) = get(true, None, "/docs/").await;
+        assert!(
+            csp.contains("connect-src 'self';"),
+            "with no ingest URL configured, `connect-src` should be 'self' \
+             alone. CSP was: {csp:?}"
+        );
+    }
+
+    /// The gate answers 404, not 403: a 403 confirms to an unauthenticated
+    /// caller that the deployment has docs to find.
+    #[tokio::test]
+    async fn disabled_docs_are_absent_rather_than_forbidden() {
+        for path in ["/docs/", "/docs/index.html", "/openapi.json"] {
+            let (status, _) = get(false, Some(INGEST), path).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{path} must 404 when API_DOCS_ENABLED is off, not 403"
+            );
+        }
+        // ...and the rest of the API is unaffected by the gate.
+        let (status, _) = get(false, Some(INGEST), "/health").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn origin_of_strips_paths_and_refuses_non_http_schemes() {
+        assert_eq!(
+            origin_of("http://localhost:8081/openapi.json").as_deref(),
+            Some("http://localhost:8081")
+        );
+        assert_eq!(
+            origin_of("https://sauron.example.com/openapi.json?v=1").as_deref(),
+            Some("https://sauron.example.com")
+        );
+        assert_eq!(
+            origin_of("https://sauron.example.com").as_deref(),
+            Some("https://sauron.example.com")
+        );
+        // A `javascript:` or `data:` source in a CSP would be a real hole.
+        assert_eq!(origin_of("javascript:alert(1)"), None);
+        assert_eq!(origin_of("not-a-url"), None);
+        assert_eq!(origin_of("http://"), None);
+    }
 }

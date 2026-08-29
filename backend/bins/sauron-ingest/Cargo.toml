@@ -22,6 +22,10 @@ tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Serves its own OpenAPI document at /openapi.json. No `utoipa-swagger-ui`:
+# the UI assets live only in `sauron-api`, keeping megabytes of static files
+# out of this write-hot-path binary.
+utoipa.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 tracing.workspace = true

@@ -15,6 +15,7 @@ use sauron_db::repo::SortSpec;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// `sessions.id` is the table's primary key, so it is unique across any result
@@ -82,7 +83,8 @@ pub(crate) fn session_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError>
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     pub query: Option<String>,
     #[serde(default)]
@@ -90,7 +92,13 @@ pub struct ListQuery {
     pub q: Option<String>,
     /// `time_field` / `from` / `to` / `since_days`. Flattened so the
     /// precedence between them is decided once, in `resolve_time_filter`.
+    // `#[param(ignore)]` because the wire format is FOUR scalar query
+    // parameters, not one object. `IntoParams` would otherwise document a
+    // parameter literally named `window` taking an object, which the extractor
+    // does not accept — a document that lies. The four real parameters are
+    // documented by listing `TimeFilterQuery` in each route's `params(...)`.
     #[serde(flatten)]
+    #[param(ignore = true)]
     pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_limit")]
     pub limit: i64,
@@ -121,6 +129,14 @@ fn default_limit() -> i64 {
     50
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/sessions", tag = "Sessions",
+    summary = "Search sessions",
+    description = "User sessions reconstructed from telemetry. Windows 30 days by default — pass `since_days`, or an explicit `from`/`to`, to change that.",
+    params(("app_id" = Uuid, Path, description = "The app."), ListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Matching sessions.", body = super::search::SearchEnvelope<Session>),
+              (status = 400, description = "Malformed query, sort, or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -211,7 +227,7 @@ pub async fn list(
 
 /// One entry on the session timeline. Tagged by `kind` so the frontend can
 /// render events, errors and transactions with distinct treatments.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TimelineItem {
     Event {
@@ -240,7 +256,7 @@ impl TimelineItem {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct SessionDetail {
     pub session: Session,
     pub timeline: Vec<TimelineItem>,
@@ -250,6 +266,16 @@ pub struct SessionDetail {
 // `environment_id` comes from `RawQuery` (see `ListQuery`'s comment above),
 // not a `Query<T>` extractor.
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/sessions/{session_id}", tag = "Sessions",
+    summary = "Fetch one session",
+    description = "The session with its device, person and event timeline.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("session_id" = String, Path, description = "The session id as reported by the SDK.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The session.", body = SessionDetail), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 404, description = "No such session.", body = ErrorResponse),
+              (status = 410, description = "The session's partition has been tiered to cold storage or dropped.", body = ErrorResponse)),
+)]
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,

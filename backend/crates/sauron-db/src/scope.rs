@@ -23,7 +23,7 @@ use uuid::Uuid;
 /// inside a variable-length list, and a naive join lets two distinct
 /// selections flatten to the same bytes. A collision there is a cross-tenant
 /// data leak, not a staleness bug.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub enum EnvFilter {
     /// Every environment, including rows with none. The picker's default, and
     /// what an absent `environment_id` query parameter means.

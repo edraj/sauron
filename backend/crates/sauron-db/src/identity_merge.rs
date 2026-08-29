@@ -937,6 +937,42 @@ pub async fn fold_rollups(
         .execute(conn)
         .await?;
 
+    // Person-days move with the identity, and they UNION rather than sum.
+    //
+    // Same `DELETE … RETURNING` + `INSERT … ON CONFLICT` shape as `env_fold`
+    // above, and the union falls out of `person_days_key`: the alias and the
+    // person having both been active on one day is a conflict, so their two
+    // rows collapse into one with the counters added.
+    //
+    // A plain `UPDATE person_days SET distinct_id = person` would not merely
+    // miscount — it would raise a unique violation on exactly that overlapping
+    // day, which is the COMMON case rather than the rare one: an identify()
+    // typically fires on a day the guest was already active.
+    //
+    // Untouched deliberately: the person's cohort. It is derived from
+    // `event_user_environments.first_seen`, which `env_fold` above has just
+    // widened with `LEAST`, so a guest who identifies moves to the EARLIER
+    // cohort automatically. That is correct — they were always that person —
+    // and it does mean historical cohorts shift under a merge, which the
+    // dashboard footnotes.
+    diesel::sql_query(format!(
+        "WITH moved AS ( \
+             DELETE FROM person_days \
+              WHERE app_id = $1 AND distinct_id = $2 \
+             RETURNING environment_id, day, events, errors) \
+         INSERT INTO person_days (app_id, environment_id, distinct_id, day, events, errors) \
+         SELECT $1, environment_id, $3, day, events, errors FROM moved \
+         ON CONFLICT (app_id, COALESCE(environment_id, {NIL}), distinct_id, day) \
+         DO UPDATE SET events = person_days.events + EXCLUDED.events, \
+                       errors = person_days.errors + EXCLUDED.errors, \
+                       updated_at = now()"
+    ))
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(alias)
+    .bind::<Text, _>(person)
+    .execute(conn)
+    .await?;
+
     // `properties` is concatenated ANON-FIRST so the person's identify() traits
     // win: jsonb `||` lets the right-hand side override. identified_at and
     // identified_source are left untouched — the surviving row is already

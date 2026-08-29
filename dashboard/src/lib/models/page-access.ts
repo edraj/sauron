@@ -79,6 +79,9 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // request 403s.
   '/funnels': { perm: 'event:read', level: 'app', title: 'Funnels' },
   '/journeys': { perm: 'event:read', level: 'app', title: 'Journeys', envAware: true },
+  // `routes/retention.rs` authorizes through `scope::authorized_read_scope`
+  // on `event:read` — the ENV-AWARE read path, hence `envAware`.
+  '/retention': { perm: 'event:read', level: 'app', title: 'Retention', envAware: true },
 
   // --- Uptime --------------------------------------------------------------
   // monitors.rs:67 authorizes at the project.

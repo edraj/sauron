@@ -71,7 +71,7 @@ impl TaskHealth {
 }
 
 /// One row of `/health`'s `tasks` array.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct TaskStatus {
     pub name: &'static str,
     /// `null` before the first success. It NEVER changes the status code:

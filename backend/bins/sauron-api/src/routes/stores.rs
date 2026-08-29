@@ -24,13 +24,14 @@ use sauron_store::{apple::AppleIdentifiers, google::GoogleIdentifiers, StoreKind
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct StoreConnectionOut {
     pub store: String,
     pub enabled: bool,
@@ -118,6 +119,13 @@ fn reject_env(raw_query: Option<&str>) -> Result<(), ApiError> {
     )
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/store-connections", tag = "Stores",
+    summary = "List app-store connections",
+    description = "Configured App Store / Play Console connections. Credentials are never returned.",
+    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Connections.", body = Vec<StoreConnectionOut>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -131,7 +139,7 @@ pub async fn list(
     Ok(Json(rows.into_iter().map(to_out).collect()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpsertReq {
     pub identifiers: serde_json::Value,
     /// Absent = leave the stored credential alone. `null` = clear it. Present
@@ -209,6 +217,17 @@ fn validate_identifiers(
     }
 }
 
+#[utoipa::path(
+    put, path = "/v1/apps/{app_id}/store-connections/{store}", tag = "Stores",
+    summary = "Create or replace a store connection",
+    description = "\
+Idempotent by `(app, store)`. Credentials are stored encrypted and never read \
+back — the response describes the connection, not its secret.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("store" = String, Path, description = "Store identifier, e.g. `apple` or `google`.")), security(("bearerAuth" = [])),
+    request_body(content = UpsertReq),
+    responses((status = 200, description = "The stored connection.", body = StoreConnectionOut),
+              (status = 400, description = "Unknown store, or malformed credentials.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn upsert(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -271,6 +290,13 @@ pub async fn upsert(
     Ok(Json(to_out(row)))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/apps/{app_id}/store-connections/{store}", tag = "Stores",
+    summary = "Remove a store connection",
+    description = "Deletes the connection and its credentials. Metrics already synced are retained.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("store" = String, Path, description = "Store identifier, e.g. `apple` or `google`.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Removed.", body = OkResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such connection.", body = ErrorResponse)),
+)]
 pub async fn delete(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -301,6 +327,13 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    post, path = "/v1/apps/{app_id}/store-connections/{store}/sync", tag = "Stores",
+    summary = "Queue a store metrics sync",
+    description = "Asynchronous — queues work for `sauron-storesync` and returns immediately. Store APIs publish with a lag of a day or more, so a sync will not surface same-day numbers.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("store" = String, Path, description = "Store identifier, e.g. `apple` or `google`.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Sync queued.", body = OkResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such connection.", body = ErrorResponse)),
+)]
 pub async fn queue_sync(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -336,7 +369,7 @@ pub async fn queue_sync(
 // Chart feed
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct StoreCounts {
     pub installs: i64,
     pub uninstalls: i64,
@@ -345,7 +378,7 @@ pub struct StoreCounts {
 /// One day. A store key is ABSENT when that store published nothing for the
 /// day — deliberately not `{installs: 0}`, because zero is a real value that
 /// means something different.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct StoreDayOut {
     pub day: NaiveDate,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -354,21 +387,22 @@ pub struct StoreDayOut {
     pub app_store: Option<StoreCounts>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PendingDay {
     pub day: NaiveDate,
     /// Rendered verbatim by the dashboard.
     pub reason: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct StoreMetricsOut {
     pub series: Vec<StoreDayOut>,
     pub pending_days: Vec<PendingDay>,
     pub stores: Vec<StoreConnectionOut>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct MetricsQuery {
     #[serde(default = "default_since_days")]
     pub since_days: i64,
@@ -382,6 +416,13 @@ fn default_since_days() -> i64 {
 /// `pending_days` because listing them would flag the normal case forever.
 const REPORTING_LAG_DAYS: i64 = 2;
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/store-metrics", tag = "Stores",
+    summary = "Installs and store metrics",
+    description = "Synced install/uninstall figures by day. Days the store has not yet published appear as pending rather than zero — a zero would misread as \"nobody installed it\".",
+    params(("app_id" = Uuid, Path, description = "The app."), MetricsQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Store metrics with pending days marked.", body = StoreMetricsOut), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn metrics(
     auth: AuthUser,
     State(state): State<AppState>,

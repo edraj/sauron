@@ -13,9 +13,11 @@ use sauron_db::repo::{PerfSeriesPoint, PerfSummaryRow};
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SummaryQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
@@ -31,7 +33,8 @@ pub struct SummaryQuery {
     // for the extractor trap this avoids.
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SeriesQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
@@ -57,6 +60,16 @@ fn default_days() -> i64 {
 /// weeks. 365 days let one request sort an app's entire transaction history.
 const MAX_PERF_WINDOW_DAYS: i64 = 90;
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/performance/summary", tag = "Performance",
+    summary = "Performance summary by operation",
+    description = "\
+Aggregates per `(name, op)` **pair** — the pair is the identity, so two \
+operations sharing a name but differing in op are distinct rows and must be \
+filtered on both.",
+    params(("app_id" = Uuid, Path, description = "The app."), SummaryQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Rows per operation.", body = Vec<PerfSummaryRow>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn summary(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -87,6 +100,13 @@ pub async fn summary(
     ))
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/performance/series", tag = "Performance",
+    summary = "Performance over time",
+    description = "A time series for one operation or the whole app. Durations are milliseconds.",
+    params(("app_id" = Uuid, Path, description = "The app."), SeriesQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Time series points.", body = Vec<PerfSeriesPoint>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn series(
     auth: AuthUser,
     State(state): State<AppState>,

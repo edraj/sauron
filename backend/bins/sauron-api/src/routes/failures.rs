@@ -17,6 +17,7 @@ use sauron_db::models::{IngestFailurePayload, IngestFailureRow};
 use sauron_db::repo;
 
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
 
 /// Page size ceiling. Groups are cheap to render but each carries a message and
@@ -28,7 +29,7 @@ const DEFAULT_LIMIT: i64 = 50;
 /// Retained payloads returned in one page of the drill-down.
 const MAX_PAYLOAD_LIMIT: i64 = 100;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct ListQuery {
     pub status: Option<String>,
     pub error_kind: Option<String>,
@@ -37,7 +38,7 @@ pub struct ListQuery {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ListResponse {
     pub failures: Vec<IngestFailureRow>,
     /// Absent on the last page. Opaque to the client by contract — it encodes
@@ -58,6 +59,19 @@ fn parse_cursor(raw: &str) -> Result<(chrono::DateTime<chrono::Utc>, Uuid), ApiE
 }
 
 /// One page of failure groups, newest activity first.
+#[utoipa::path(
+    get, path = "/v1/admin/ingest-failures", tag = "Admin",
+    summary = "List ingest failure groups",
+    description = "\
+Envelopes the pipeline could not process, grouped by cause. This is the only \
+place a silently-dropped event becomes visible — an SDK that is being \
+rejected still reports success locally.
+
+Keyset-paginated through an opaque `cursor`.",
+    params(ListQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Failure groups and the next cursor.", body = ListResponse),
+              (status = 400, description = "Malformed cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: sauron_auth::AuthUser,
     State(state): State<AppState>,
@@ -98,13 +112,25 @@ pub async fn list(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct PayloadQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
 /// The retained payloads behind one group.
+#[utoipa::path(
+    get, path = "/v1/admin/ingest-failures/{id}/payloads", tag = "Admin",
+    summary = "Sample the raw payloads behind a failure group",
+    description = "\
+Returns retained raw envelopes so an operator can see what an SDK actually \
+sent. These are **unredacted customer payloads** — the response can \
+contain whatever the SDK was configured to send, including PII the privacy \
+inspector would otherwise mask.",
+    params(("id" = Uuid, Path, description = "Failure-group identifier."), PayloadQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Retained raw payloads.", body = Vec<IngestFailurePayload>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse),
+              (status = 404, description = "No such failure group.", body = ErrorResponse)),
+)]
 pub async fn payloads(
     auth: sauron_auth::AuthUser,
     State(state): State<AppState>,
@@ -120,7 +146,7 @@ pub async fn payloads(
     Ok(Json(rows))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RetryResponse {
     /// Payloads actually put back on the ingest stream.
     pub requeued: usize,
@@ -140,6 +166,17 @@ pub struct RetryResponse {
 /// exercises the same path production ingest takes. Processing inline would
 /// test a subtly different one, and would hold an HTTP request open for the
 /// duration of a database write storm.
+#[utoipa::path(
+    post, path = "/v1/admin/ingest-failures/{id}/retry", tag = "Admin",
+    summary = "Replay a failure group through the pipeline",
+    description = "\
+Re-enqueues the retained payloads. Only useful once the cause is fixed — \
+replaying into an unchanged pipeline reproduces the same failure and consumes \
+the retained copies' retry budget.",
+    params(("id" = Uuid, Path, description = "Failure-group identifier.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "How many payloads were re-enqueued.", body = RetryResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse),
+              (status = 404, description = "No such failure group.", body = ErrorResponse)),
+)]
 pub async fn retry(
     auth: sauron_auth::AuthUser,
     State(state): State<AppState>,
@@ -225,6 +262,14 @@ pub async fn retry(
 /// survivor — writing it afterwards would lose the record entirely if the
 /// delete succeeded and the process died, which is the one ordering that leaves
 /// no trace of an irreversible action.
+#[utoipa::path(
+    delete, path = "/v1/admin/ingest-failures/{id}", tag = "Admin",
+    summary = "Discard a failure group",
+    description = "Permanently drops the group and its retained payloads. The events are not recoverable afterwards.",
+    params(("id" = Uuid, Path, description = "Failure-group identifier.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Group discarded.", body = OkResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse),
+              (status = 404, description = "No such failure group.", body = ErrorResponse)),
+)]
 pub async fn drop_group(
     auth: sauron_auth::AuthUser,
     State(state): State<AppState>,

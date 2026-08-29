@@ -16,10 +16,12 @@ use sauron_db::scope::Range;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::overview_cache::{self, Envelope, Section};
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct RangeQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
@@ -56,6 +58,12 @@ fn default_top() -> i64 {
     20
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/events/top", tag = "Analytics",
+    summary = "Most frequent events",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Events by count.", body = Vec<EventCount>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn top_events(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -78,6 +86,12 @@ pub async fn top_events(
     Ok(Json(repo::top_events(&mut conn, scope, win, limit).await?))
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/events/series", tag = "Analytics",
+    summary = "Event counts over time",
+    params(("app_id" = Uuid, Path, description = "The app."), TimeseriesQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Series points.", body = Vec<DayCountOut>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn event_series(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -101,7 +115,8 @@ pub async fn event_series(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PersonQuery {
     #[serde(default = "default_person_limit")]
     pub limit: i64,
@@ -113,7 +128,7 @@ fn default_person_limit() -> i64 {
     50
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PersonProfile {
     pub distinct_id: String,
     // `PersonRow`, not the raw `EventUser` model — see `repo::get_event_user`'s
@@ -124,6 +139,18 @@ pub struct PersonProfile {
     pub errors: Vec<ErrorEvent>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/persons/{distinct_id}", tag = "Analytics",
+    summary = "One person's profile and timeline",
+    description = "\
+A person is keyed by `distinct_id`. When a guest is later identified, their \
+anonymous history is merged into the identified person, so a `distinct_id` \
+that previously resolved may afterwards point at the merged record.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("distinct_id" = String, Path, description = "The person's distinct id."), PersonQuery),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The profile.", body = PersonProfile), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 404, description = "No such person.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn person(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -236,7 +263,8 @@ pub(crate) fn person_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> 
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PersonsQuery {
     pub search: Option<String>,
     /// `time_field` / `from` / `to` / `since_days`, flattened so the precedence
@@ -247,6 +275,7 @@ pub struct PersonsQuery {
     /// every person regardless, so the control claimed a filter it did not
     /// apply.
     #[serde(flatten)]
+    #[param(ignore = true)]
     pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_persons_list_limit")]
     pub limit: i64,
@@ -279,6 +308,18 @@ fn default_persons_since_days() -> i64 {
     super::search::MAX_WINDOW_DAYS
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/persons", tag = "Analytics",
+    summary = "Search persons",
+    description = "Identified and anonymous users.\
+\
+Adding `?environment_id=` narrows this to one environment **enrollment** id \
+(not a catalogue id). Env-scoped variants run a different query shape, which is \
+why they can time out where the unscoped call does not.",
+    params(("app_id" = Uuid, Path, description = "The app."), PersonsQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Matching persons.", body = serde_json::Value),
+              (status = 400, description = "Malformed query, sort, or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn persons_list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -341,6 +382,12 @@ pub async fn persons_list(
 /// exists, axum resolves a static segment ahead of a `{param}` capture, and
 /// distinct IDs are arbitrary strings from SDK `identify()` calls — so a person
 /// literally named `count` would lose their profile page.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/counts/persons", tag = "Analytics",
+    summary = "Count matching persons",
+    params(("app_id" = Uuid, Path, description = "The app."), PersonsQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The count.", body = super::search::CountEnvelope), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn persons_count(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -392,7 +439,8 @@ pub async fn persons_count(
 // Event Explorer — the raw analytics event stream with filters.
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct EventsListQuery {
     #[serde(default)]
     pub filter: Vec<String>,
@@ -407,6 +455,7 @@ pub struct EventsListQuery {
     /// `time_field` / `from` / `to` / `since_days`, flattened so the
     /// precedence between them is decided once, in `resolve_time_filter`.
     #[serde(flatten)]
+    #[param(ignore = true)]
     pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_events_list_limit")]
     pub limit: i64,
@@ -472,6 +521,18 @@ pub const EVENT_TIME_FIELDS: &[&str] = &["occurred_at"];
 /// Three input spellings, one execution path: `query=` (the language),
 /// `filter=`+`q=` (the pre-language wire format, bridged through
 /// `from_legacy`), or nothing.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/events/list", tag = "Analytics",
+    summary = "Search analytics events",
+    description = "Individual product-analytics events.\
+\
+Adding `?environment_id=` narrows this to one environment **enrollment** id \
+(not a catalogue id). Env-scoped variants run a different query shape, which is \
+why they can time out where the unscoped call does not.",
+    params(("app_id" = Uuid, Path, description = "The app."), EventsListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Matching events.", body = super::search::SearchEnvelope<AnalyticsEvent>),
+              (status = 400, description = "Malformed query, sort, or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn events_list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -661,7 +722,7 @@ pub async fn events_list(
 // Overview — a single composite health + activity snapshot for the app.
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct Overview {
     pub totals: repo::OverviewTotals,
     pub error_rate: f64,
@@ -711,6 +772,13 @@ pub(crate) fn crash_free_rate(totals: &sauron_db::repo::OverviewTotals) -> Optio
     Some(1.0 - (totals.crashed_sessions as f64 / totals.sessions as f64))
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/overview", tag = "Analytics",
+    summary = "Composite overview",
+    description = "Headline numbers for the app's landing page, assembled from the cached sections below.",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The overview.", body = Overview), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn overview(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -808,7 +876,7 @@ pub async fn overview(
 /// arithmetic over `totals`, so serving them separately would mean either
 /// re-running that query or making the client duplicate the formulas — and a
 /// crash-free rate computed two ways eventually disagrees.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct OverviewTotalsSection {
     pub totals: repo::OverviewTotals,
     pub error_rate: f64,
@@ -823,7 +891,7 @@ pub struct OverviewTotalsSection {
     pub crash_free_sessions: Option<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct OverviewSeriesSection {
     pub events_series: Vec<SeriesPoint>,
     pub errors_series: Vec<SeriesPoint>,
@@ -874,7 +942,8 @@ async fn overview_scope(
 /// button its own permanently-cold cache — a bug whose only symptom is that
 /// refreshing is always slow, which reads as "refresh does more work", i.e.
 /// correct behaviour.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ForceQuery {
     #[serde(default)]
     pub force: bool,
@@ -887,6 +956,20 @@ pub struct ForceQuery {
 /// background recompute and returns immediately, with the answer arriving over
 /// `/overview/stream`. That is what makes the 30s+ totals query survivable: the
 /// request path never waits on it, so the `TimeoutLayer` cannot fire.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/overview/totals", tag = "Analytics",
+    summary = "Overview totals (cached)",
+    description = "\
+Served from a cache that is recomputed **off the request path**: these \
+aggregates outgrew the request timeout, so the route never runs them inline.
+
+The envelope's `data` is therefore **nullable**. A null means \"not computed \
+yet\", not \"zero\" — render a pending state, and either poll or subscribe to \
+`/overview/stream`.",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Totals, or a null `data` while the first computation is pending.", body = OverviewTotalsSection),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn overview_totals(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -908,6 +991,13 @@ pub async fn overview_totals(
 /// request that delivered events without errors would render a graph that is
 /// wrong rather than incomplete, and the two queries are comparable in cost so
 /// there is no fast half to show early.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/overview/series", tag = "Analytics",
+    summary = "Overview time series (cached)",
+    description = "Same cache and same nullable-`data` contract as `/overview/totals`.",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Series, or a null `data` while pending.", body = OverviewSeriesSection), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn overview_series(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -934,6 +1024,12 @@ pub async fn overview_series(
 /// a section addressed on its own has no such constraint, and an empty array is
 /// indistinguishable from "this app has no issues" — which would leave the UI
 /// showing a reassuring blank card instead of saying the caller cannot see it.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/overview/top-issues", tag = "Analytics",
+    summary = "Overview top issues (cached)",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Top issues, or null while pending.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn overview_top_issues(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -958,6 +1054,12 @@ pub async fn overview_top_issues(
 }
 
 /// Top analytics events by count.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/overview/top-events", tag = "Analytics",
+    summary = "Overview top events (cached)",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Top events, or null while pending.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn overview_top_events(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -990,6 +1092,20 @@ pub async fn overview_top_events(
 /// stream with `fetch()` + `ReadableStream` and parses the frames itself — a
 /// few dozen lines in `sse.ts`, and it reuses the existing 401-refresh
 /// interceptor for free.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/overview/stream", tag = "Analytics",
+    summary = "Overview updates as server-sent events",
+    description = "\
+An SSE stream that pushes each section as its recompute lands, so the page \
+fills in without polling.
+
+**`EventSource` cannot send an `Authorization` header.** Browser clients must \
+either use a fetch-based SSE implementation or fall back to polling the cached \
+section endpoints.",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "An SSE stream of section updates.", content_type = "text/event-stream", body = String),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn overview_stream(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1068,6 +1184,13 @@ pub async fn overview_stream(
 ///
 /// Still bounded by single-flight and the permit count, so holding the button
 /// down cannot multiply DB load.
+#[utoipa::path(
+    post, path = "/v1/apps/{app_id}/overview/refresh", tag = "Analytics",
+    summary = "Force an overview recompute",
+    description = "Requests an immediate recompute. Single-flighted — concurrent callers join the one in progress rather than each starting another.",
+    params(("app_id" = Uuid, Path, description = "The app."), ForceQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Recompute requested.", body = OkResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn overview_refresh(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1105,7 +1228,7 @@ pub async fn overview_refresh(
 /// What the dashboard's "as of" chip reads. `ready` false means the app still
 /// serves every aggregate from the legacy raw queries (backfill pending) and
 /// nothing on the page is approximate.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct RollupStatus {
     pub ready: bool,
     /// Oldest event-source watermark — data newer than this is not yet folded.
@@ -1113,6 +1236,16 @@ pub struct RollupStatus {
     pub sessions_as_of: Option<chrono::DateTime<Utc>>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/rollups/status", tag = "Analytics",
+    summary = "Rollup freshness",
+    description = "\
+How far each rollup has folded. Several analytics routes answer 503 when a \
+rollup they need has never been backfilled — this is where to look first, \
+because backfills are run by an operator (`sauron-migrate`), not automatically.",
+    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Per-rollup freshness and backfill markers.", body = RollupStatus), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn rollups_status(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1139,7 +1272,7 @@ pub async fn rollups_status(
     }))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct RollupRefreshOut {
     pub as_of: Option<chrono::DateTime<Utc>>,
     /// True when the fold demonstrably caught up past this request's arrival;
@@ -1154,6 +1287,13 @@ pub struct RollupRefreshOut {
 /// can refetch fresh data in the same interaction. Unlike `overview_refresh`
 /// this waits (bounded): rollup reads are milliseconds, so "refetch after
 /// 200" would otherwise race the fold and show the same stale numbers.
+#[utoipa::path(
+    post, path = "/v1/apps/{app_id}/rollups/refresh", tag = "Analytics",
+    summary = "Fold rollups now",
+    description = "Runs a fold immediately instead of waiting for the scheduled one. Does **not** perform a historical backfill — that remains an operator-run migration.",
+    params(("app_id" = Uuid, Path, description = "The app."), ForceQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "What was folded.", body = RollupRefreshOut), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn rollups_refresh(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1207,13 +1347,24 @@ pub fn stickiness(dau: i64, mau: i64) -> f64 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct UsersAnalytics {
     pub stats: repo::UserStats,
     pub stickiness: f64,
     pub series: Vec<repo::UserSeriesPoint>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/users/summary", tag = "Analytics",
+    summary = "User totals",
+    description = "Served from rollups where available.\
+\
+Adding `?environment_id=` narrows this to one environment **enrollment** id \
+(not a catalogue id). Env-scoped variants run a different query shape, which is \
+why they can time out where the unscoped call does not.",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "User totals.", body = UsersAnalytics), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn users_summary(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1248,13 +1399,19 @@ pub async fn users_summary(
 // Session-engagement analytics — GET /sessions/summary.
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct SessionsAnalytics {
     pub stats: repo::SessionStats,
     pub duration_series: Vec<repo::SeriesAvgPoint>,
     pub duration_histogram: Vec<repo::HistoBucket>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/sessions/summary", tag = "Analytics",
+    summary = "Session totals",
+    params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Session totals.", body = SessionsAnalytics), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn sessions_summary(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1290,7 +1447,8 @@ pub async fn sessions_summary(
 // Cross-tier errors timeseries — GET /errors/timeseries.
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct TimeseriesQuery {
     pub from: chrono::DateTime<chrono::Utc>,
     pub to: chrono::DateTime<chrono::Utc>,
@@ -1340,7 +1498,7 @@ impl TimeseriesQuery {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct DayCountOut {
     pub day: chrono::NaiveDate,
     pub count: i64,
@@ -1355,6 +1513,12 @@ impl From<sauron_tier::DayCount> for DayCountOut {
     }
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/errors/timeseries", tag = "Analytics",
+    summary = "Error volume time series",
+    params(("app_id" = Uuid, Path, description = "The app."), TimeseriesQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Series points.", body = Vec<DayCountOut>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn error_timeseries(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1386,6 +1550,16 @@ pub async fn error_timeseries(
 // Cross-tier analytics-events timeseries — GET /events/timeseries.
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/events/timeseries", tag = "Analytics",
+    summary = "Event volume time series",
+    description = "\
+Timestamps are clamped in both directions before bucketing: up to 15 minutes \
+into the future, and 30 days into the past. An SDK with a badly-set clock \
+therefore lands in a bucket rather than distorting the axis.",
+    params(("app_id" = Uuid, Path, description = "The app."), TimeseriesQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Series points.", body = Vec<DayCountOut>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn event_timeseries(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1419,6 +1593,12 @@ pub async fn event_timeseries(
 // hot-only (Postgres) — see repo::transaction_counts_by_day_hot.
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/transactions/timeseries", tag = "Performance",
+    summary = "Transaction volume time series",
+    params(("app_id" = Uuid, Path, description = "The app."), TimeseriesQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Series points.", body = Vec<DayCountOut>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn transaction_timeseries(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1465,7 +1645,7 @@ mod stickiness_tests {
 // Active Users — distinct people per UTC day
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ActiveUsersSeries {
     /// `DayCountOut`, not `sauron_tier::DayCount`: the tier crate's type is
     /// deliberately serde-free (it is shared with the worker, which has no HTTP
@@ -1482,6 +1662,13 @@ pub struct ActiveUsersSeries {
 /// An AGGREGATE, so under the D4 ruling it needs only the `event:read` that
 /// authorizes the call: it exposes no event body and no issue metadata, just a
 /// count per day.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/analytics/active-users", tag = "Analytics",
+    summary = "Active users over time",
+    description = "Computed from raw events by design, so it reflects late-arriving data that a rollup would not yet include.",
+    params(("app_id" = Uuid, Path, description = "The app."), TimeseriesQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Active-user series.", body = ActiveUsersSeries), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn active_users_series(
     auth: AuthUser,
     State(state): State<AppState>,

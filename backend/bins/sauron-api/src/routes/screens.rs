@@ -13,6 +13,7 @@ use sauron_db::scope::Range;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// The list's `keys` CTE is `SELECT screen FROM ev UNION SELECT screen FROM
@@ -67,7 +68,8 @@ pub(crate) fn screen_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> 
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ScreenListQuery {
     #[serde(default = "days30")]
     pub since_days: i64,
@@ -96,6 +98,13 @@ fn lim50() -> i64 {
     50
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/screens", tag = "Analytics",
+    summary = "Screens seen in this app",
+    params(("app_id" = Uuid, Path, description = "The app."), ScreenListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Screens with their view counts.", body = Vec<repo::ScreenRow>),
+              (status = 400, description = "Malformed query or sort.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -144,6 +153,12 @@ pub async fn list(
 /// That is a disclosure property, not a consistency nicety: a count resolved
 /// over a wider scope than the list would leak the SIZE of data the caller
 /// cannot read.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/counts/screens", tag = "Analytics",
+    summary = "Count matching screens",
+    params(("app_id" = Uuid, Path, description = "The app."), ScreenListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The count.", body = super::search::CountEnvelope), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn count(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -174,7 +189,8 @@ pub async fn count(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ScreenDetailQuery {
     pub name: String,
     #[serde(default = "days30")]
@@ -200,11 +216,25 @@ pub struct ScreenDetailQuery {
 ///
 /// The rows now come from `/v1/apps/{app_id}/screens/{events,exceptions}`,
 /// which page properly instead of truncating at 20.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ScreenDetail {
     pub stats: repo::ScreenStats,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/screens/detail", tag = "Analytics",
+    summary = "Headline metrics for one screen",
+    description = "\
+The screen is named by a query parameter, not a path segment, because screen \
+names are arbitrary caller-supplied text.
+
+The four breakdown cards (events, exceptions, devices, users) are **separate \
+fetch-on-demand endpoints** rather than part of this response, so opening a \
+screen does not pay for panels nobody expands.",
+    params(("app_id" = Uuid, Path, description = "The app."), ScreenDetailQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Headline metrics.", body = ScreenDetail),
+              (status = 400, description = "Missing screen name.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -257,7 +287,8 @@ pub async fn detail(
 /// `flatten` routes every field through `serde`'s untyped content buffer,
 /// where a query-string `limit=25` arrives as the STRING `"25"` and fails to
 /// deserialize into `i64` — a 422 on a request that looks correct.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ScreenSectionQuery {
     pub name: String,
     #[serde(default = "days30")]
@@ -300,6 +331,13 @@ fn section_bounds(q: &ScreenSectionQuery) -> Result<(Range, i64, i64), ApiError>
 }
 
 /// `GET /v1/apps/{app_id}/screens/events` — a screen's analytics events, paged.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/screens/events", tag = "Analytics",
+    summary = "Events recorded on one screen",
+    params(("app_id" = Uuid, Path, description = "The app."), ScreenSectionQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Events for the screen.", body = Vec<AnalyticsEvent>),
+              (status = 400, description = "Missing screen name.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn section_events(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -331,6 +369,13 @@ pub async fn section_events(
 /// dashboard hides the card outright for a role without `issue:read`, so a
 /// 403 here would only turn a hidden card into a broken one for anyone
 /// calling the API directly.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/screens/exceptions", tag = "Analytics",
+    summary = "Exceptions raised on one screen",
+    params(("app_id" = Uuid, Path, description = "The app."), ScreenSectionQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Error events for the screen.", body = Vec<ErrorEvent>),
+              (status = 400, description = "Missing screen name.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn section_exceptions(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -359,6 +404,13 @@ pub async fn section_exceptions(
 ///
 /// `perm::EVENT_READ`, matching `devices::list`: this exposes no device a
 /// caller could not already page from the inventory.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/screens/devices", tag = "Analytics",
+    summary = "Devices that reached one screen",
+    params(("app_id" = Uuid, Path, description = "The app."), ScreenSectionQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Devices for the screen.", body = Vec<repo::ScreenDeviceRow>),
+              (status = 400, description = "Missing screen name.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn section_devices(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -383,6 +435,13 @@ pub async fn section_devices(
 /// `GET /v1/apps/{app_id}/screens/users` — the users seen on a screen.
 ///
 /// `perm::EVENT_READ`, matching `analytics::persons_list`.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/screens/users", tag = "Analytics",
+    summary = "Users who reached one screen",
+    params(("app_id" = Uuid, Path, description = "The app."), ScreenSectionQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Users for the screen.", body = Vec<repo::ScreenUserRow>),
+              (status = 400, description = "Missing screen name.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse)),
+)]
 pub async fn section_users(
     auth: AuthUser,
     State(state): State<AppState>,

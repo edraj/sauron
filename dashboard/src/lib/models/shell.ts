@@ -59,6 +59,7 @@ export const SHELL_FLAGS: Record<string, ShellFlags | null> = {
   '/active-users': PROJECT,
   '/funnels': APP,
   '/journeys': APP,
+  '/retention': APP,
   // --- Uptime ---
   '/monitors': PROJECT,
   // --- Admin (the rail itself is AdminShell's, rendered by each page) ---

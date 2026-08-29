@@ -13,9 +13,10 @@ use sauron_db::repo;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct FunnelReq {
     pub steps: Vec<String>,
     #[serde(default = "default_days")]
@@ -37,7 +38,7 @@ fn default_days() -> i64 {
     30
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct FunnelStep {
     pub name: String,
     pub count: i64,
@@ -47,12 +48,41 @@ pub struct FunnelStep {
     pub conv_from_prev: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct FunnelResult {
     pub total_entered: i64,
     pub steps: Vec<FunnelStep>,
 }
 
+#[utoipa::path(
+    post, path = "/v1/apps/{app_id}/funnel", tag = "Analytics",
+    summary = "Compute a funnel",
+    description = "\
+Conversion through an ordered list of steps.
+
+The step definitions go in the **JSON body**, not the query string. Encoding \
+them as query parameters is the documented cause of a 422 here.
+
+Cost grows sharply with step count, and a deep funnel over a wide window can \
+exceed the request budget — the guard inspects the query plan and refuses \
+rather than running something that would time out.",
+    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    request_body(content = FunnelReq, description = "Ordered steps and the window.", example = json!({
+        "steps": [
+            { "event": "app_open" },
+            { "event": "product_viewed" },
+            { "event": "checkout_completed" }
+        ],
+        "since_days": 30
+    })),
+    responses(
+        (status = 200, description = "Per-step counts and conversion rates.", body = FunnelResult),
+        (status = 400, description = "Fewer than two steps, or a malformed step.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+        (status = 422, description = "Steps were not supplied in the request body.", body = ErrorResponse),
+        (status = 503, description = "Query exceeded its time budget, or a required rollup is missing.", body = ErrorResponse),
+    ),
+)]
 pub async fn compute(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -176,7 +206,7 @@ pub fn validate_metadata(name: &str, description: Option<&str>) -> Result<(), St
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SaveFunnelReq {
     pub name: String,
     #[serde(default)]
@@ -188,6 +218,12 @@ pub struct SaveFunnelReq {
 /// funnel's steps are app-wide; only `compute`'s live counts are scoped) —
 /// `environment_id` is rejected rather than silently accepted-and-ignored,
 /// same reasoning as monitors/alert config/artifacts/admin storage.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/funnels", tag = "Analytics",
+    summary = "List saved funnels",
+    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Saved funnels.", body = Vec<repo::SavedFunnelRow>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list_saved(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -200,6 +236,15 @@ pub async fn list_saved(
     Ok(Json(repo::list_saved_funnels(&mut conn, app_id).await?))
 }
 
+#[utoipa::path(
+    post, path = "/v1/apps/{app_id}/funnels", tag = "Analytics",
+    summary = "Save a funnel definition",
+    description = "Stores the step definition for reuse. Saving does not compute it — POST to `/v1/apps/{app_id}/funnel` for that.",
+    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    request_body(content = SaveFunnelReq),
+    responses((status = 200, description = "The saved funnel.", body = repo::SavedFunnelRow),
+              (status = 400, description = "Malformed definition.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn create_saved(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -228,6 +273,14 @@ pub async fn create_saved(
     Ok(Json(row))
 }
 
+#[utoipa::path(
+    patch, path = "/v1/apps/{app_id}/funnels/{funnel_id}", tag = "Analytics",
+    summary = "Update a saved funnel",
+    params(("app_id" = Uuid, Path, description = "The app."), ("funnel_id" = Uuid, Path, description = "The saved funnel.")),
+    security(("bearerAuth" = [])), request_body(content = SaveFunnelReq),
+    responses((status = 200, description = "Updated.", body = serde_json::Value),
+              (status = 400, description = "Malformed definition.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such saved funnel.", body = ErrorResponse)),
+)]
 pub async fn update_saved(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -259,6 +312,13 @@ pub async fn update_saved(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/apps/{app_id}/funnels/{funnel_id}", tag = "Analytics",
+    summary = "Delete a saved funnel",
+    params(("app_id" = Uuid, Path, description = "The app."), ("funnel_id" = Uuid, Path, description = "The saved funnel.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Deleted.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such saved funnel.", body = ErrorResponse)),
+)]
 pub async fn delete_saved(
     auth: AuthUser,
     State(state): State<AppState>,

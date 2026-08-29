@@ -38,6 +38,8 @@ axum-extra.workspace = true
 form_urlencoded.workspace = true
 tower.workspace = true
 tower-http.workspace = true
+utoipa.workspace = true
+utoipa-swagger-ui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -48,6 +50,9 @@ tracing.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
+# `ServiceExt::oneshot` drives the real router in `main.rs`'s CSP tests without
+# binding a port or touching a database.
+tower = { workspace = true, features = ["util"] }
 # Pins the extractor contract for `#[serde(flatten)]` — see
 # `routes::search::tests::flattened_window_params_survive_the_query_extractor`.
 serde_urlencoded = "0.7"

@@ -15,6 +15,7 @@ use sauron_auth::{authorize_org, perm, AuthUser};
 use sauron_db::repo::{self, AuditFilter};
 
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// Page size. The default keeps the first paint small; the cap stops a client
@@ -22,7 +23,8 @@ use crate::AppState;
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct AuditQuery {
     /// Required: the org whose history to read.
     pub org_id: Uuid,
@@ -43,7 +45,7 @@ pub struct AuditQuery {
     pub include_auth: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AuditEntryView {
     pub id: Uuid,
     pub actor_id: Option<Uuid>,
@@ -65,13 +67,13 @@ pub struct AuditEntryView {
     pub source: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct FacetView {
     pub id: Option<Uuid>,
     pub label: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct Facets {
     pub actors: Vec<FacetView>,
     pub actions: Vec<FacetView>,
@@ -80,7 +82,7 @@ pub struct Facets {
     pub environments: Vec<FacetView>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AuditResponse {
     pub entries: Vec<AuditEntryView>,
     /// `None` on the last page.
@@ -131,6 +133,20 @@ fn validate_entity_type(entity_type: Option<&str>) -> Result<(), ApiError> {
 /// permission was introduced: the people who may read who did what are the
 /// people who administer the org, which is the same line `/v1/admin/storage`
 /// already draws.
+#[utoipa::path(
+    get, path = "/v1/admin/audit", tag = "Admin",
+    summary = "Search the audit log",
+    description = "\
+Administrative actions with actor, target and outcome, plus facet counts for \
+building filters.
+
+Audit rows carry **no foreign keys** to the entities they reference, so an \
+entry survives the deletion of whatever it describes — which is the point of \
+an audit trail, but means a referenced id may no longer resolve.",
+    params(AuditQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Audit entries and facets.", body = AuditResponse),
+              (status = 400, description = "Malformed filter or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -230,6 +246,17 @@ const MAX_EXPORT_ROWS: i64 = 10_000;
 /// Exports EVERY matching row up to the cap, not the page the browser happens
 /// to be showing. An export that silently covered only the first fifty rows
 /// would be worse than no export: it looks complete.
+#[utoipa::path(
+    get, path = "/v1/admin/audit.csv", tag = "Admin",
+    summary = "Export the audit log as CSV",
+    description = "\
+Same filters as `GET /v1/admin/audit`, streamed as `text/csv` with a \
+`Content-Disposition` filename. Browsers need that header exposed by CORS to \
+honour the filename; the shipped configuration does so.",
+    params(AuditQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "CSV export.", content_type = "text/csv", body = String),
+              (status = 400, description = "Malformed filter.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires a deployment-admin (org-owner) grant.", body = ErrorResponse)),
+)]
 pub async fn export_csv(
     auth: AuthUser,
     State(state): State<AppState>,

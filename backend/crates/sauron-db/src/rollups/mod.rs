@@ -42,7 +42,10 @@ use uuid::Uuid;
 use crate::sketch::{Hll, LatencyHistogram};
 
 pub mod fold;
+pub mod person_days;
 pub mod read;
+
+pub use person_days::{add_person_days, PersonDayDelta, PersonKey};
 
 pub const SRC_ANALYTICS: &str = "analytics_events";
 pub const SRC_ERRORS: &str = "error_events";

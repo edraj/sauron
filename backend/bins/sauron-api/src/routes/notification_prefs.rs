@@ -24,6 +24,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::routes::db;
 use crate::AppState;
 
@@ -210,7 +211,7 @@ async fn enrollments_for(
         .collect())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpsertSubscriptionReq {
     pub scope_type: String,
     pub scope_id: Uuid,
@@ -243,7 +244,7 @@ fn default_tz() -> String {
 
 /// The row plus everything the card needs, joined on read. The environment list
 /// and the best-effort scope name live here rather than on the row struct.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SubscriptionView {
     pub id: Uuid,
     pub scope_type: String,
@@ -337,6 +338,13 @@ async fn views_for(
         .collect())
 }
 
+#[utoipa::path(
+    get, path = "/v1/me/notification-subscriptions", tag = "Notifications",
+    summary = "Your notification subscriptions",
+    description = "What the calling user has chosen to be notified about, and through which channels.",
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Subscriptions.", body = Vec<SubscriptionView>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse)),
+)]
 pub async fn list_subscriptions(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -354,6 +362,15 @@ pub async fn list_subscriptions(
     Ok(Json(views))
 }
 
+#[utoipa::path(
+    post, path = "/v1/me/notification-subscriptions", tag = "Notifications",
+    summary = "Subscribe to a notification kind",
+    security(("bearerAuth" = [])),
+    request_body(content = UpsertSubscriptionReq),
+    responses((status = 200, description = "The created subscription.", body = SubscriptionView),
+              (status = 400, description = "Unknown notification kind or scope.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn create_subscription(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -468,7 +485,7 @@ pub async fn create_subscription(
 /// attribute serde drops them on the floor and the handler answers 200 with the
 /// row untouched, so a client re-pointing a subscription at another app is told
 /// it succeeded. A 422 naming the field is the honest answer.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PatchSubscriptionReq {
     pub enabled: Option<bool>,
@@ -514,6 +531,15 @@ fn parse_delivery(raw: &str) -> Result<&'static str, ApiError> {
     }
 }
 
+#[utoipa::path(
+    patch, path = "/v1/me/notification-subscriptions/{id}", tag = "Notifications",
+    summary = "Update a subscription",
+    params(("id" = Uuid, Path, description = "The subscription.")), security(("bearerAuth" = [])),
+    request_body(content = PatchSubscriptionReq),
+    responses((status = 200, description = "The updated subscription.", body = SubscriptionView),
+              (status = 400, description = "Malformed field.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 404, description = "No such subscription.", body = ErrorResponse)),
+)]
 pub async fn patch_subscription(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -631,6 +657,12 @@ pub async fn patch_subscription(
     Ok(Json(views.remove(0)))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/me/notification-subscriptions/{id}", tag = "Notifications",
+    summary = "Unsubscribe",
+    params(("id" = Uuid, Path, description = "The subscription.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Deleted.", body = OkResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 404, description = "No such subscription.", body = ErrorResponse)),
+)]
 pub async fn delete_subscription_route(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -647,7 +679,8 @@ pub async fn delete_subscription_route(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryQuery {
     pub limit: Option<i64>,
     pub environment_id: Option<String>,
@@ -657,7 +690,7 @@ fn history_limit(raw: Option<i64>) -> i64 {
     raw.unwrap_or(50).clamp(1, 200)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct NotificationView {
     pub id: Uuid,
     pub kind: String,
@@ -678,6 +711,12 @@ pub struct NotificationView {
 /// counts the drain refused to mail them. Blanking on `dropped_no_access`
 /// covers the rows the drain caught; this filter covers the rows whose access
 /// changed after they were already sent.
+#[utoipa::path(
+    get, path = "/v1/me/notifications", tag = "Notifications",
+    summary = "Your in-app notifications",
+    params(HistoryQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Notifications, newest first.", body = Vec<NotificationView>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse)),
+)]
 pub async fn list_notifications(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -758,7 +797,7 @@ pub async fn list_notifications(
     Ok(Json(out))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UnsubscribeReq {
     pub token: String,
 }
@@ -806,6 +845,21 @@ pub(crate) fn unsub_signing_key(state: &AppState) -> String {
 /// response body, a structured `info!` line, and a confirmation email to the
 /// owner. This repo has no audit table, so those last two are the only
 /// repudiation control there is.
+#[utoipa::path(
+    post, path = "/v1/notifications/unsubscribe", tag = "Notifications",
+    summary = "Unsubscribe from an emailed link",
+    description = "\
+Unauthenticated by design: it is reached from the unsubscribe link in a \
+notification email, where the recipient has no session and should not need one.
+
+Authorisation is the unguessable token in the body. Always answers 200, whether \
+or not the token matched — a distinguishing response would let anyone test \
+tokens.",
+    security(),
+    request_body(content = UnsubscribeReq),
+    responses((status = 200, description = "Processed. Reveals nothing about the token.", body = OkResponse),
+              (status = 429, description = "Too many attempts.", body = ErrorResponse)),
+)]
 pub async fn unsubscribe(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,

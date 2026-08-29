@@ -62,6 +62,29 @@ tower-http = { version = "0.7", features = [
 ] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 
+# --- openapi / swagger ---
+# `chrono` and `uuid` are not optional niceties: without them `DateTime<Utc>`
+# and `Uuid` render in the document as opaque objects rather than
+# `string/date-time` and `string/uuid`. Those two types appear in the majority
+# of the API's DTOs, so omitting the features produces a document that looks
+# complete and describes almost nothing.
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+# `default-features = false` + `vendored` is load-bearing, NOT tidiness.
+#
+# `utoipa-swagger-ui`'s build script downloads the Swagger UI release archive
+# from GitHub at BUILD time under its default features. `cargo build --release
+# --workspace` runs inside the RPM `%build` section, so the default would put a
+# network fetch on the packaging critical path and inside CI — and would break
+# any air-gapped rebuild of a shipped release.
+#
+# `vendored` swaps that for bytes compiled into `utoipa-swagger-ui-vendored`.
+# Verified, not assumed: the build script prints "using vendored Swagger UI",
+# and a clean recompile of the crate succeeds with CARGO_NET_OFFLINE=true and
+# both proxies pointed at a closed port. If you change these features, re-run
+# that check — the failure mode is a build that works on a developer laptop and
+# fails in the package builder.
+utoipa-swagger-ui = { version = "9", default-features = false, features = ["axum", "vendored"] }
+
 # --- cli / benchmarking (crebain) ---
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"

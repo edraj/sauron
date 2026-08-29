@@ -223,7 +223,7 @@ pub async fn transaction_counts_by_day(
 // halved or double-counted.
 
 /// A day whose count could not be computed exactly, and why.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct PartialDay {
     pub day: chrono::NaiveDate,
     pub reason: &'static str,
