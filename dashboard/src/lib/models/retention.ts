@@ -47,7 +47,10 @@ export interface LifecyclePoint {
 export interface ChurnPerson {
   distinct_id: string;
   last_seen: string;
+  first_seen: string;
   events_count: number;
+  errors_count: number;
+  sessions_count: number;
 }
 
 export type Granularity = 'day' | 'week';
@@ -174,4 +177,93 @@ export function gridToCsv(cohorts: Cohort[], granularity: Granularity): string {
     }),
   ]);
   return [head, ...rows].map((r) => r.join(',')).join('\n');
+}
+
+/** How grid cells render their numbers: share of cohort, or absolute people. */
+export type GridMode = 'rate' | 'count';
+
+/**
+ * The text for one grid cell, given the display mode.
+ *
+ * Period-0 cells render `100%` in rate mode — NOT the cohort size. The size
+ * already has its own column, and rendering it twice side by side was the
+ * "what does Day 0 even mean" confusion in the 2026-08-29 feedback: two
+ * identical numbers with different headers explain neither. In count mode
+ * period 0 is the size, which there reads as "everyone", consistently with
+ * the other cells being people-counts.
+ *
+ * `fmt` is injectable so the component can pass the locale-aware
+ * `formatNumber` (Arabic pins Latin digits) while tests use the default.
+ */
+export function cellLabel(
+  kind: CellKind,
+  mode: GridMode,
+  users: number | null,
+  size: number,
+  fmt: (n: number) => string = (n) => n.toLocaleString('en-US'),
+): string {
+  if (kind === 'empty') return '';
+  if (kind === 'size') return mode === 'rate' ? '100%' : fmt(size);
+  const rate = retentionRate(users, size);
+  if (rate === null || users === null) return '';
+  return mode === 'rate' ? `${Math.round(rate * 100)}%` : fmt(users);
+}
+
+/**
+ * The smallest "nice" number (1, 2 or 5 times a power of ten) at or above
+ * `x` — the top tick of an axis. `x <= 0` maps to 1 so a scale always exists.
+ */
+export function niceCeil(x: number): number {
+  if (x <= 1) return 1;
+  const pow = 10 ** Math.floor(Math.log10(x));
+  for (const m of [1, 2, 5, 10]) {
+    if (m * pow >= x) return m * pow;
+  }
+  return 10 * pow;
+}
+
+/**
+ * The vertical geometry of the lifecycle chart, computed from data alone.
+ *
+ * The old chart split its height 50/50 between the active stack and the
+ * dormant strip. With dormant a few percent of actives — the normal case —
+ * that rendered half the plot as dead space and pushed the date axis far
+ * below the bars (the 2026-08-29 screenshot feedback). The two regions now
+ * share height in proportion to their scales, with a floor so a nonzero
+ * dormant strip stays visible and a cap so a churn catastrophe cannot
+ * flatten the actives into a sliver.
+ *
+ * Everything is fractions and data — no element measurement — so the chart
+ * still renders correctly inside a hidden pane (the rAF trap this component
+ * has always avoided).
+ */
+export interface LifecycleLayout {
+  /** Axis top value for the positive region — a nice ceiling of the peak. */
+  posTop: number;
+  /** Axis value for the dormant region's outer edge; 0 when no dormancy. */
+  negTop: number;
+  /** Fraction of plot height the positive region occupies, 0..1. */
+  posShare: number;
+  negShare: number;
+  /** Ascending tick values for the positive region: [0, posTop/2, posTop]. */
+  posTicks: number[];
+}
+
+export function lifecycleLayout(bars: LifecycleBar[]): LifecycleLayout {
+  const posMax = bars.reduce((m, b) => Math.max(m, b.active), 0);
+  const negMax = bars.reduce((m, b) => Math.max(m, -b.dormant), 0);
+  const posTop = niceCeil(posMax);
+  if (negMax === 0) {
+    return { posTop, negTop: 0, posShare: 1, negShare: 0, posTicks: [0, posTop / 2, posTop] };
+  }
+  const negTop = niceCeil(negMax);
+  const raw = negTop / (posTop + negTop);
+  const negShare = Math.min(0.5, Math.max(0.08, raw));
+  return {
+    posTop,
+    negTop,
+    posShare: 1 - negShare,
+    negShare,
+    posTicks: [0, posTop / 2, posTop],
+  };
 }

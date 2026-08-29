@@ -28,7 +28,10 @@ export interface ChurnParams {
   silent_periods?: number;
   limit?: number;
   /** Keyset cursor: the `last_seen` of the previous page's final row. */
-  before?: string;
+  /** `column` = descending, `-column` = ascending (the house convention). */
+  sort?: string;
+  /** Verbatim `next_cursor` from the previous page. */
+  cursor?: string;
 }
 
 export interface LifecycleOut {
@@ -44,7 +47,8 @@ export interface ChurnOut {
   ready: boolean;
   silent_days: number;
   people: ChurnPerson[];
-  next_before: string | null;
+  /** Opaque row-value cursor, bound to the `sort` it was minted under. */
+  next_cursor: string | null;
 }
 
 /**

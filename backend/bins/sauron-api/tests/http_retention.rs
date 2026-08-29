@@ -680,3 +680,110 @@ async fn cache_is_keyed_by_the_resolved_env_filter_not_the_request() {
 
     ts.shutdown().await;
 }
+
+/// Sorting and row-value paging on the at-risk list: order respects `sort`
+/// (bare = descending, `-` = ascending), and a page walk under a counter sort
+/// neither repeats nor skips rows — the composite (value, id) cursor is what
+/// makes that hold when every row ties on the sort column.
+#[tokio::test]
+async fn churn_sorts_and_pages_by_row_value_cursor() {
+    let Some(mut ts) = TestServer::start().await else {
+        return;
+    };
+    let f = ts.seed_fixture().await;
+    // Three silent people; give them distinct event counters.
+    for (who, events) in [("rt_a", 10i64), ("rt_b", 30), ("rt_c", 20)] {
+        ts.seed_person(&f, who, f.env_id, 40, &[0]).await;
+        let mut conn = ts.conn().await;
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query(
+            "UPDATE event_user_environments SET events_count = $2 \
+              WHERE app_id = $1 AND distinct_id = $3",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(f.app_id)
+        .bind::<diesel::sql_types::BigInt, _>(events)
+        .bind::<diesel::sql_types::Text, _>(who)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let base = format!(
+        "/v1/apps/{}/retention/churn?granularity=day&silent_periods=4",
+        f.app_id
+    );
+
+    let by_events = ts
+        .get_json(&format!("{base}&sort=events"), &f.owner_token)
+        .await;
+    let order: Vec<i64> = by_events["people"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["events_count"].as_i64().unwrap())
+        .collect();
+    assert_eq!(order, vec![30, 20, 10], "bare sort=events is DESCENDING");
+
+    let ascending = ts
+        .get_json(&format!("{base}&sort=-events"), &f.owner_token)
+        .await;
+    let order: Vec<i64> = ascending["people"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["events_count"].as_i64().unwrap())
+        .collect();
+    assert_eq!(order, vec![10, 20, 30], "-events is ASCENDING");
+
+    // Page at limit=2: probe row proves a next page; following the cursor
+    // yields the remaining row exactly once, then no further cursor.
+    let page1 = ts
+        .get_json(&format!("{base}&sort=events&limit=2"), &f.owner_token)
+        .await;
+    assert_eq!(page1["people"].as_array().unwrap().len(), 2);
+    let cursor = page1["next_cursor"]
+        .as_str()
+        .expect("a full page with more rows behind it must mint a cursor");
+    let page2 = ts
+        .get_json(
+            &format!("{base}&sort=events&limit=2&cursor={}", urlencode(cursor)),
+            &f.owner_token,
+        )
+        .await;
+    let rest: Vec<i64> = page2["people"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["events_count"].as_i64().unwrap())
+        .collect();
+    assert_eq!(rest, vec![10], "page 2 is the remaining row, once");
+    assert!(page2["next_cursor"].is_null(), "no phantom third page");
+
+    // Enriched aggregates ride every row.
+    let p0 = &page1["people"][0];
+    assert!(p0["first_seen"].is_string());
+    assert!(p0["errors_count"].is_i64() || p0["errors_count"].is_u64());
+    assert!(p0["sessions_count"].is_i64() || p0["sessions_count"].is_u64());
+
+    // An unknown sort column is a named 400, not a silent default.
+    assert_eq!(
+        ts.get_status(&format!("{base}&sort=bogus"), &f.owner_token)
+            .await,
+        400
+    );
+
+    ts.shutdown().await;
+}
+
+/// Percent-encode a cursor for a query string.
+fn urlencode(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+                vec![c]
+            } else {
+                format!("%{:02X}", c as u32).chars().collect()
+            }
+        })
+        .collect()
+}

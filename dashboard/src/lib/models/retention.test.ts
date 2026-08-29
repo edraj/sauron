@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
+  cellLabel,
+  lifecycleLayout,
+  niceCeil,
   gridToCsv,
   retentionRate,
   cellKind,
@@ -164,5 +167,71 @@ describe('gridToCsv', () => {
     const lines = gridToCsv(cohorts, 'week').split('\n');
     expect(lines[2]).toBe('2026-08-23,4,4,,');
     expect(lines[0].split(',').length).toBe(lines[2].split(',').length);
+  });
+});
+
+describe('cellLabel', () => {
+  it('renders period 0 as 100% in rate mode, never as a duplicate of size', () => {
+    // The Users column already shows the cohort size; rendering size AGAIN in
+    // the first period column is the two-identical-numbers confusion the
+    // 2026-08-29 screenshot feedback was about.
+    expect(cellLabel('size', 'rate', null, 43367)).toBe('100%');
+  });
+
+  it('renders period 0 as the count in count mode', () => {
+    expect(cellLabel('size', 'count', null, 43367)).toBe('43,367');
+  });
+
+  it('renders rate cells as a percentage or a count by mode', () => {
+    expect(cellLabel('rate', 'rate', 1735, 43367)).toBe('4%');
+    expect(cellLabel('rate', 'count', 1735, 43367)).toBe('1,735');
+  });
+
+  it('renders empty cells as empty in BOTH modes', () => {
+    // An unelapsed period has no answer in any unit.
+    expect(cellLabel('empty', 'rate', null, 10)).toBe('');
+    expect(cellLabel('empty', 'count', null, 10)).toBe('');
+  });
+});
+
+describe('lifecycle layout', () => {
+  const bar = (active: number, dormant: number) =>
+    ({
+      start: '2026-08-20',
+      positive: [{ key: 'new' as const, value: active }],
+      dormant: -dormant,
+      active,
+    }) as import('./retention').LifecycleBar;
+
+  it('rounds the axis top to a nice number', () => {
+    expect(niceCeil(94858)).toBe(100000);
+    expect(niceCeil(1735)).toBe(2000);
+    expect(niceCeil(43)).toBe(50);
+    expect(niceCeil(0)).toBe(1);
+  });
+
+  it('gives the whole plot to actives when nothing is dormant', () => {
+    const l = lifecycleLayout([bar(100, 0)]);
+    expect(l.posShare).toBe(1);
+    expect(l.negShare).toBe(0);
+    expect(l.negTop).toBe(0);
+  });
+
+  it('keeps a small dormant strip visible but proportional', () => {
+    // 100k actives vs 2k dormant: proportionally ~2% — floored at 8% so the
+    // strip is visible, which is the whole complaint the 50/50 split solved
+    // by wasting half the chart.
+    const l = lifecycleLayout([bar(94858, 1735)]);
+    expect(l.negShare).toBe(0.08);
+    expect(l.posShare).toBeCloseTo(0.92);
+  });
+
+  it('caps the dormant region at half even in a churn catastrophe', () => {
+    const l = lifecycleLayout([bar(10, 100000)]);
+    expect(l.negShare).toBe(0.5);
+  });
+
+  it('ticks the positive axis at 0, half, top', () => {
+    expect(lifecycleLayout([bar(94858, 0)]).posTicks).toEqual([0, 50000, 100000]);
   });
 });

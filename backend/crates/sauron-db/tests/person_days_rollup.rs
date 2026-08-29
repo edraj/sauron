@@ -791,6 +791,8 @@ async fn churn_lists_only_the_silent() {
         &mut conn,
         sauron_db::scope::ReadScope::all(ids.app_id),
         30,
+        sauron_db::retention::ChurnSort::LastSeen,
+        true,
         None,
         50,
     )
@@ -891,14 +893,46 @@ async fn every_query_works_environment_scoped() {
         .await
         .unwrap_or_else(|e| panic!("lifecycle failed for EnvFilter::{name}: {e}"));
 
-        sauron_db::retention::churn(&mut conn, sc.clone(), 1, None, 10)
-            .await
-            .unwrap_or_else(|e| panic!("churn failed for EnvFilter::{name}: {e}"));
+        sauron_db::retention::churn(
+            &mut conn,
+            sc.clone(),
+            1,
+            sauron_db::retention::ChurnSort::LastSeen,
+            true,
+            None,
+            10,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("churn failed for EnvFilter::{name}: {e}"));
 
-        // And with a cursor, which shifts every later bind index by one.
-        sauron_db::retention::churn(&mut conn, sc, 1, Some(chrono::Utc::now()), 10)
-            .await
-            .unwrap_or_else(|e| panic!("churn+cursor failed for EnvFilter::{name}: {e}"));
+        // With a TIME cursor, which shifts every later bind index by one —
+        // and with a COUNT cursor on an ascending counter sort, so both
+        // cursor bind types and both directions execute under every filter.
+        sauron_db::retention::churn(
+            &mut conn,
+            sc.clone(),
+            1,
+            sauron_db::retention::ChurnSort::LastSeen,
+            true,
+            Some(sauron_db::retention::ChurnCursor::Time(
+                chrono::Utc::now(),
+                "zzz".into(),
+            )),
+            10,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("churn+time-cursor failed for EnvFilter::{name}: {e}"));
+        sauron_db::retention::churn(
+            &mut conn,
+            sc,
+            1,
+            sauron_db::retention::ChurnSort::Events,
+            false,
+            Some(sauron_db::retention::ChurnCursor::Count(0, String::new())),
+            10,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("churn+count-cursor failed for EnvFilter::{name}: {e}"));
     }
 
     // Scoping must actually FILTER, not merely execute.
@@ -916,6 +950,81 @@ async fn every_query_works_environment_scoped() {
     assert!(
         rows.iter().all(|r| r.cohort != d0 || r.users == 0),
         "env_b holds none of scoped_u's activity, so it must not appear there"
+    );
+
+    db.cleanup().await;
+}
+
+/// The coverage floor: the earliest day for which person-days exist at all.
+///
+/// This is the denominator of honesty for the grid. Cohorts are assigned from
+/// `event_user_environments.first_seen`, which is never pruned; activity comes
+/// from `person_days`, which begins whenever ingest or the backfill began. A
+/// person whose `first_seen` predates the person-day history has periods with
+/// NO data behind them, and the API must render those as unknown rather than
+/// as 0% — the difference between "nobody came back" and "we cannot say".
+#[tokio::test]
+async fn coverage_floor_reports_the_earliest_person_day() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mut conn = db.conn().await;
+    let ids = db.seed_two_envs().await;
+    let scope = sauron_db::scope::ReadScope::all(ids.app_id);
+
+    // Empty table: nothing is knowable, and the caller must get None rather
+    // than a date that would silently un-blank every period.
+    let empty = sauron_db::rollups::person_days::coverage_floor(&mut conn, &scope)
+        .await
+        .unwrap();
+    assert_eq!(empty, None, "an app with no person-days has no floor");
+
+    let d = |off: i64| (chrono::Utc::now() - chrono::Duration::days(off)).date_naive();
+    for (who, off) in [("cf_a", 5i64), ("cf_b", 12), ("cf_c", 2)] {
+        diesel::sql_query(
+            "INSERT INTO person_days (app_id, environment_id, distinct_id, day, events) \
+             VALUES ($1, NULL, $2, $3, 1)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+        .bind::<diesel::sql_types::Text, _>(who)
+        .bind::<diesel::sql_types::Date, _>(d(off))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let floor = sauron_db::rollups::person_days::coverage_floor(&mut conn, &scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        floor,
+        Some(d(12)),
+        "the floor is the EARLIEST person-day, not the latest"
+    );
+
+    // Environment-scoped: the floor must follow the scope, or an env whose
+    // history starts later would have its early periods reported as 0%.
+    diesel::sql_query(
+        "INSERT INTO person_days (app_id, environment_id, distinct_id, day, events) \
+         VALUES ($1, $2, 'cf_env', $3, 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+    .bind::<diesel::sql_types::Uuid, _>(ids.env_a)
+    .bind::<diesel::sql_types::Date, _>(d(3))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let scoped = sauron_db::rollups::person_days::coverage_floor(
+        &mut conn,
+        &sauron_db::scope::ReadScope::new(ids.app_id, sauron_db::scope::EnvFilter::One(ids.env_a)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scoped,
+        Some(d(3)),
+        "an environment-scoped floor must reflect THAT environment's history"
     );
 
     db.cleanup().await;

@@ -22,6 +22,7 @@
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
+  import ChevronsUpDown from '@lucide/svelte/icons/chevrons-up-down';
   import CircleCheck from '@lucide/svelte/icons/circle-check';
   import CircleX from '@lucide/svelte/icons/circle-x';
   import Clock from '@lucide/svelte/icons/clock';
@@ -81,6 +82,7 @@
     'chevron-left': ChevronLeft,
     'chevron-right': ChevronRight,
     'chevron-up': ChevronUp,
+    'chevrons-up-down': ChevronsUpDown,
     'circle-check': CircleCheck,
     'circle-x': CircleX,
     clock: Clock,

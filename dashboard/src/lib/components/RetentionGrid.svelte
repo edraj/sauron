@@ -1,20 +1,29 @@
 <script lang="ts">
   import { t, formatNumber } from '../i18n';
-  import { cellKind, columnCount, rampStep, retentionRate } from '../models/retention';
-  import type { Cohort, Granularity } from '../models/retention';
+  import { cellKind, cellLabel, columnCount, rampStep, retentionRate } from '../models/retention';
+  import type { Cohort, Granularity, GridMode } from '../models/retention';
 
   interface Props {
     cohorts: Cohort[];
     granularity: Granularity;
+    /** Percentages or absolute people — owned by the PAGE, because the error
+     *  split renders two of these grids and they must flip together. */
+    mode: GridMode;
+    /** Clicking any data cell is a shortcut for the header toggle. */
+    onmodetoggle?: () => void;
   }
 
-  let { cohorts, granularity }: Props = $props();
+  let { cohorts, granularity, mode, onmodetoggle }: Props = $props();
 
   const cols = $derived(columnCount(cohorts));
   const columns = $derived(Array.from({ length: cols }, (_, i) => i));
 
-  function pct(rate: number): string {
-    return `${Math.round(rate * 100)}%`;
+  /** "N days/weeks after each user's first day" — the Day-N header tooltip. */
+  function headerTitle(n: number): string {
+    if (n === 0) return t('retention.day0Title');
+    return granularity === 'week'
+      ? t('retention.weekNTitle', { n })
+      : t('retention.dayNTitle', { n });
   }
 </script>
 
@@ -41,7 +50,7 @@
         <th scope="col" class="cohort-col">{t('retention.cohort')}</th>
         <th scope="col" class="size-col">{t('retention.users')}</th>
         {#each columns as n (n)}
-          <th scope="col" class="period-col">
+          <th scope="col" class="period-col" title={headerTitle(n)}>
             {granularity === 'week' ? t('retention.weekN', { n }) : t('retention.dayN', { n })}
           </th>
         {/each}
@@ -56,20 +65,22 @@
             {@const users = c.periods[n] ?? null}
             {@const kind = cellKind(n, users, c.size)}
             {@const rate = retentionRate(users, c.size)}
+            <!-- Clickable as a convenience; the accessible control is the
+                 %/# toggle in the card header, so no per-cell tab stops. -->
             <td
               class="cell"
+              class:clickable={kind !== 'empty'}
               data-period={n}
               data-empty={kind === 'empty' ? 'true' : 'false'}
               data-step={kind === 'rate' && rate !== null ? rampStep(rate) : undefined}
               title={kind === 'rate' && users !== null
                 ? t('retention.cellTitle', { users: formatNumber(users), size: formatNumber(c.size) })
-                : undefined}
+                : kind === 'size'
+                  ? t('retention.day0Title')
+                  : undefined}
+              onclick={kind !== 'empty' ? onmodetoggle : undefined}
             >
-              {#if kind === 'size'}
-                {formatNumber(c.size)}
-              {:else if kind === 'rate' && rate !== null}
-                {pct(rate)}
-              {/if}
+              {cellLabel(kind, mode, users, c.size, formatNumber)}
             </td>
           {/each}
         </tr>
@@ -78,7 +89,7 @@
   </table>
 </div>
 
-<p class="legend">{t('retention.legend.empty')}</p>
+<p class="legend">{t('retention.legend.periods')} {t('retention.legend.empty')}</p>
 
 <style>
   /* The grid scrolls itself; the page body never scrolls sideways. */
@@ -129,6 +140,10 @@
   .cell {
     font-variant-numeric: tabular-nums;
     color: var(--fg);
+  }
+
+  .cell.clickable {
+    cursor: pointer;
   }
 
   /*

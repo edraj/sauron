@@ -7,6 +7,7 @@
   import Button from '../lib/components/ui/Button.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import RetentionGrid from '../lib/components/RetentionGrid.svelte';
   import LifecycleChart from '../lib/components/LifecycleChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -14,13 +15,29 @@
   import { viewKey } from '../lib/stores/view-cache';
   import { getRetention, getLifecycle, getChurn } from '../lib/api/retention';
   import { gridToCsv } from '../lib/models/retention';
-  import type { RetentionGrid as Grid, Granularity, ChurnPerson } from '../lib/models/retention';
+  import { insightLink, retentionInsights } from '../lib/models/retention-insights';
+  import { canAccessPage, resolvePageAccess } from '../lib/models/page-access';
+  import { sortParam, toggleSort, type SortDir, type SortState } from '../lib/models/sort';
+  import type {
+    RetentionGrid as Grid,
+    Granularity,
+    GridMode,
+    ChurnPerson,
+  } from '../lib/models/retention';
   import type { LifecycleOut } from '../lib/api/retention';
 
   const BACKFILL_COMMAND = 'sauron-migrate backfill-person-days';
 
   let granularity = $state<Granularity>('day');
   let split = $state(false);
+  // Percentages or absolute people. Page-owned so the error split's two grids
+  // flip together; the header control is the accessible toggle, clicking any
+  // cell is the shortcut.
+  let gridMode = $state<GridMode>('rate');
+
+  function toggleGridMode() {
+    gridMode = gridMode === 'rate' ? 'count' : 'rate';
+  }
 
   // Grid and lifecycle ride the house SWR view cache: at 51k persons the grid
   // is ~0.9 s and lifecycle ~1.8 s server-side, so returning to this page
@@ -46,6 +63,39 @@
   let churnCursor = $state<string | null>(null);
   let churnLoading = $state(true);
   let churnMoreLoading = $state(false);
+  // Server-side sort — the silent population is far larger than one page, so
+  // sorting only the loaded rows would silently lie. State change refetches
+  // from the top; the cursor is bound to the sort that minted it.
+  let churnSort = $state<SortState>({ key: 'last_seen', dir: 'desc' });
+  /** The one expanded row's person id, or null. */
+  let expandedPerson = $state<string | null>(null);
+
+  function onChurnSort(key: string, columnDefault: SortDir) {
+    churnSort = toggleSort(churnSort, key, columnDefault);
+  }
+
+  /**
+   * Row click toggles the detail panel — EXCEPT clicks on the person link,
+   * which navigate. `closest('a')` rather than target identity so a click on
+   * the link's text node still counts as the link.
+   */
+  function toggleExpanded(e: MouseEvent, id: string) {
+    if ((e.target as Element | null)?.closest('a')) return;
+    expandedPerson = expandedPerson === id ? null : id;
+  }
+
+  /** Whole days between an ISO instant and now, for the detail panel. */
+  function daysSince(iso: string): number {
+    return Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000));
+  }
+
+  /** Whole days between two ISO instants — the person's active tenure. */
+  function daysBetween(fromIso: string, toIso: string): number {
+    return Math.max(
+      0,
+      Math.round((new Date(toIso).getTime() - new Date(fromIso).getTime()) / 86_400_000),
+    );
+  }
 
   const appId = $derived(sessionStore.currentAppId);
 
@@ -87,16 +137,18 @@
   $effect(() => {
     const id = appId;
     const g = granularity;
+    const sort = sortParam(churnSort);
     sessionStore.scopeKey;
     if (!id) return;
     churnLoading = true;
     churnPeople = [];
     churnCursor = null;
-    getChurn(id, { granularity: g, silent_periods: 4, limit: 25 })
+    expandedPerson = null;
+    getChurn(id, { granularity: g, silent_periods: 4, limit: 25, sort })
       .then((r) => {
         churnPeople = r.people;
         churnSilentDays = r.silent_days;
-        churnCursor = r.next_before;
+        churnCursor = r.next_cursor;
       })
       .catch(() => {
         churnPeople = [];
@@ -117,10 +169,11 @@
         granularity,
         silent_periods: 4,
         limit: 25,
-        before: cursor,
+        sort: sortParam(churnSort),
+        cursor,
       });
       churnPeople = [...churnPeople, ...r.people];
-      churnCursor = r.next_before;
+      churnCursor = r.next_cursor;
     } catch {
       // Keep what we have; the button stays for a retry.
     } finally {
@@ -141,11 +194,17 @@
     URL.revokeObjectURL(url);
   }
 
-  const CHURN_COLUMNS = [
-    { key: 'distinct_id', label: 'retention.churn.person' },
-    { key: 'last_seen', label: 'retention.churn.lastSeen' },
-    { key: 'events_count', label: 'retention.churn.events' },
-  ];
+  /**
+   * The computed reading of what is on screen. Derived from the SAME loaded
+   * responses the two charts render, so the sentences and the pixels cannot
+   * disagree; empty until both cards have data.
+   */
+  const insights = $derived(
+    grid && grid.ready && life && life.ready
+      ? retentionInsights(grid.cohorts, life.points)
+      : [],
+  );
+
 </script>
 
 <div class="page">
@@ -189,6 +248,27 @@
   {:else}
     <Card title={t('retention.title')}>
       {#snippet actions()}
+        <div class="seg-group grid-mode" role="group" aria-label={t('retention.mode.label')}>
+          <button
+            type="button"
+            class="seg"
+            class:active={gridMode === 'rate'}
+            aria-pressed={gridMode === 'rate'}
+            onclick={() => (gridMode = 'rate')}
+          >
+            %
+          </button>
+          <button
+            type="button"
+            class="seg"
+            class:active={gridMode === 'count'}
+            aria-pressed={gridMode === 'count'}
+            title={t('retention.mode.countTitle')}
+            onclick={() => (gridMode = 'count')}
+          >
+            #
+          </button>
+        </div>
         <Button
           size="sm"
           variant="ghost"
@@ -208,14 +288,46 @@
         {#if split}
           <h3 class="split-head">{t('retention.errorSplit.exposed')}</h3>
         {/if}
-        <RetentionGrid cohorts={grid.cohorts} {granularity} />
+        <RetentionGrid
+          cohorts={grid.cohorts}
+          {granularity}
+          mode={gridMode}
+          onmodetoggle={toggleGridMode}
+        />
         {#if split && grid.clean}
           <h3 class="split-head">{t('retention.errorSplit.clean')}</h3>
-          <RetentionGrid cohorts={grid.clean} {granularity} />
+          <RetentionGrid
+            cohorts={grid.clean}
+            {granularity}
+            mode={gridMode}
+            onmodetoggle={toggleGridMode}
+          />
           <p class="caveat">{t('retention.errorSplit.caveat')}</p>
         {/if}
       {/if}
     </Card>
+
+    {#if insights.length > 0}
+      <Card title={t('retention.insights.title')}>
+        <ul class="insights">
+          {#each insights as ins (ins.key)}
+            {@const link = insightLink(ins, (r) => canAccessPage(resolvePageAccess(r)))}
+            <li data-tone={ins.tone}>
+              <span class="dot" aria-hidden="true"></span>
+              <div class="insight-body">
+                <p class="finding">{t(ins.key as never, ins.params)}</p>
+                <p class="action">
+                  {t(ins.actionKey as never)}
+                  {#if link}
+                    <a href={`#${link.route}`}>{t(link.labelKey as never)} &rarr;</a>
+                  {/if}
+                </p>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      </Card>
+    {/if}
 
     <Card title={t('retention.lifecycle.title')}>
       {#if lifeLoading}
@@ -240,20 +352,82 @@
         <DataTable>
           {#snippet head()}
             <tr>
-              {#each CHURN_COLUMNS as c (c.key)}
-                <th scope="col">{t(c.label as never)}</th>
-              {/each}
+              <th scope="col">{t('retention.churn.person')}</th>
+              <SortableTh key="last_seen" sort={churnSort} onsort={onChurnSort}>
+                {t('retention.churn.lastSeen')}
+              </SortableTh>
+              <SortableTh key="events" sort={churnSort} onsort={onChurnSort}>
+                {t('retention.churn.events')}
+              </SortableTh>
+              <SortableTh key="errors" sort={churnSort} onsort={onChurnSort}>
+                {t('retention.churn.errors')}
+              </SortableTh>
+              <SortableTh key="sessions" sort={churnSort} onsort={onChurnSort}>
+                {t('retention.churn.sessions')}
+              </SortableTh>
             </tr>
           {/snippet}
           {#snippet children()}
             {#each churnPeople as p (p.distinct_id)}
-              <tr>
+              {@const open = expandedPerson === p.distinct_id}
+              <!-- The row toggles the detail panel; the person link inside it
+                   navigates (toggleExpanded ignores clicks landing on the
+                   anchor, and middle-click stays native to the <a>). -->
+              <tr
+                class="churn-row"
+                class:open
+                aria-expanded={open}
+                onclick={(e) => toggleExpanded(e, p.distinct_id)}
+              >
                 <td>
-                  <a href={`#/persons/${encodeURIComponent(p.distinct_id)}`}>{p.distinct_id}</a>
+                  <a class="person-link" href={`#/persons/${encodeURIComponent(p.distinct_id)}`}>
+                    {p.distinct_id}
+                  </a>
                 </td>
                 <td>{p.last_seen}</td>
                 <td>{formatNumber(p.events_count)}</td>
+                <td>{formatNumber(p.errors_count)}</td>
+                <td>{formatNumber(p.sessions_count)}</td>
               </tr>
+              {#if open}
+                <tr class="churn-detail">
+                  <td colspan="5">
+                    <div class="detail-grid">
+                      <div>
+                        <span class="detail-label">{t('retention.churn.silentFor')}</span>
+                        <span class="detail-value" data-tone="bad">
+                          {t('retention.churn.nDays', { n: formatNumber(daysSince(p.last_seen)) })}
+                        </span>
+                      </div>
+                      <div>
+                        <span class="detail-label">{t('retention.churn.tenure')}</span>
+                        <span class="detail-value">
+                          {t('retention.churn.nDays', {
+                            n: formatNumber(daysBetween(p.first_seen, p.last_seen)),
+                          })}
+                        </span>
+                      </div>
+                      <div>
+                        <span class="detail-label">{t('retention.churn.firstSeen')}</span>
+                        <span class="detail-value">{p.first_seen.slice(0, 10)}</span>
+                      </div>
+                      <div>
+                        <span class="detail-label">{t('retention.churn.errors')}</span>
+                        <span class="detail-value" data-tone={p.errors_count > 0 ? 'bad' : undefined}>
+                          {formatNumber(p.errors_count)}
+                        </span>
+                      </div>
+                      <div>
+                        <span class="detail-label">{t('retention.churn.sessions')}</span>
+                        <span class="detail-value">{formatNumber(p.sessions_count)}</span>
+                      </div>
+                      <a class="person-link" href={`#/persons/${encodeURIComponent(p.distinct_id)}`}>
+                        {t('retention.churn.viewProfile')}
+                      </a>
+                    </div>
+                  </td>
+                </tr>
+              {/if}
             {/each}
           {/snippet}
         </DataTable>
@@ -359,5 +533,108 @@
     display: flex;
     justify-content: center;
     margin-top: 10px;
+  }
+
+  .insights {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 0.875rem;
+  }
+
+  .insights li {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  .insight-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .finding {
+    margin: 0;
+  }
+
+  /* The recommendation reads as a subordinate clause of the finding above it,
+     never as a second finding — muted and one step down in size. */
+  .action {
+    margin: 0;
+    font-size: 0.8125rem;
+    color: var(--muted-fg);
+  }
+
+  .action a {
+    color: var(--primary);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .action a:hover {
+    text-decoration: underline;
+  }
+
+  .insights .dot {
+    flex: 0 0 8px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted-fg);
+  }
+
+  .insights li[data-tone='bad'] .dot {
+    background: var(--danger);
+  }
+
+  .insights li[data-tone='warn'] .dot {
+    background: var(--warning);
+  }
+
+  .insights li[data-tone='good'] .dot {
+    background: var(--success);
+  }
+
+  .churn-row {
+    cursor: pointer;
+  }
+
+  .person-link {
+    color: var(--primary);
+    text-decoration: none;
+  }
+
+  .person-link:hover {
+    text-decoration: underline;
+  }
+
+  .churn-detail td {
+    background: var(--muted);
+  }
+
+  .detail-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 28px;
+    align-items: baseline;
+    padding: 4px 0;
+    font-size: 0.8125rem;
+  }
+
+  .detail-label {
+    color: var(--muted-fg);
+    margin-inline-end: 6px;
+  }
+
+  .detail-value {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .detail-value[data-tone='bad'] {
+    color: var(--danger);
   }
 </style>

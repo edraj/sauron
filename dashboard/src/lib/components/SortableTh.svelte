@@ -56,9 +56,23 @@
 <th class="sortable {klass}" aria-sort={ariaSort}>
   <button type="button" class="sort-btn" class:active onclick={() => onsort(key, columnDefault)}>
     {@render children()}
-    <span class="caret" aria-hidden="true">
+    <!--
+      The caret is ALWAYS rendered, in one of two states:
+
+      * active   — a single chevron naming the current direction;
+      * inactive — a faint up/down pair meaning "sortable, not sorting now".
+
+      The inactive glyph is deliberately the PAIR rather than a dimmed
+      `chevron-down`. In this app a bare `sort=` column is DESCENDING, so a
+      faint down-chevron on an unsorted column reads as "sorted descending,
+      faintly" — the one misreading a sort affordance must not invite. It is
+      also why the state is carried by the glyph and not by opacity alone.
+    -->
+    <span class="caret" class:inactive={!active} aria-hidden="true">
       {#if active}
         <Icon name={sort.dir === 'asc' ? 'chevron-up' : 'chevron-down'} size={12} />
+      {:else}
+        <Icon name="chevrons-up-down" size={12} />
       {/if}
     </span>
   </button>
@@ -100,6 +114,22 @@
     display: inline-flex;
     width: 12px;
     flex: none;
+  }
+  /*
+   * Faint until hovered, and it must stay faint: this glyph now appears on
+   * EVERY sortable header (23 files, 28 tables), so at full strength it would
+   * add a column of hard marks across every table header in the product and
+   * compete with the one caret that actually says something. `--text-faint` is
+   * the same ink the axis labels and empty-state text use.
+   */
+  .caret.inactive {
+    color: var(--text-faint);
+    opacity: 0.65;
+    transition: opacity 0.12s ease;
+  }
+  .sort-btn:hover .caret.inactive,
+  .sort-btn:focus-visible .caret.inactive {
+    opacity: 1;
   }
   /* A right-aligned numeric column reads wrong with the label pushed left. */
   :global(th.num) .sort-btn {

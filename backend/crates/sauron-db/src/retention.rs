@@ -311,50 +311,91 @@ pub async fn lifecycle(
     }
 }
 
-/// One at-risk person.
+/// One at-risk person, with the whole per-person aggregate the risk detail
+/// panel shows — first/last seen plus the three counters. All from the same
+/// `event_user_environments` scan the original three-column row cost.
 #[derive(QueryableByName, Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ChurnRow {
     #[diesel(sql_type = Text)]
     pub distinct_id: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     pub last_seen: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    pub first_seen: chrono::DateTime<chrono::Utc>,
     #[diesel(sql_type = BigInt)]
     pub events_count: i64,
+    #[diesel(sql_type = BigInt)]
+    pub errors_count: i64,
+    #[diesel(sql_type = BigInt)]
+    pub sessions_count: i64,
 }
 
-/// People whose last signal is older than `silent_days`, newest-silent first.
+/// The columns churn may be ordered by. A closed enum rather than a pass-through
+/// string because the column name is interpolated into SQL — the whitelist IS
+/// the injection guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChurnSort {
+    LastSeen,
+    FirstSeen,
+    Events,
+    Errors,
+    Sessions,
+}
+
+impl ChurnSort {
+    /// Wire name → column, `None` for anything not whitelisted.
+    pub fn parse(name: &str) -> Option<ChurnSort> {
+        match name {
+            "last_seen" => Some(ChurnSort::LastSeen),
+            "first_seen" => Some(ChurnSort::FirstSeen),
+            "events" => Some(ChurnSort::Events),
+            "errors" => Some(ChurnSort::Errors),
+            "sessions" => Some(ChurnSort::Sessions),
+            _ => None,
+        }
+    }
+
+    fn col(self) -> &'static str {
+        match self {
+            ChurnSort::LastSeen => "last_seen",
+            ChurnSort::FirstSeen => "first_seen",
+            ChurnSort::Events => "events_count",
+            ChurnSort::Errors => "errors_count",
+            ChurnSort::Sessions => "sessions_count",
+        }
+    }
+
+    /// Whether the keyset cursor value for this column is a timestamp.
+    pub fn is_time(self) -> bool {
+        matches!(self, ChurnSort::LastSeen | ChurnSort::FirstSeen)
+    }
+}
+
+/// The keyset cursor: the ACTIVE sort column's value on the last row of the
+/// previous page, plus that row's `distinct_id` as the tiebreak. Two variants
+/// because the two column families bind different SQL types — the same
+/// scalar-vs-array lesson as `EnvFilter`, one layer down.
+#[derive(Debug, Clone)]
+pub enum ChurnCursor {
+    Time(chrono::DateTime<chrono::Utc>, String),
+    Count(i64, String),
+}
+
+/// The silent: last seen before the horizon, ordered by any [`ChurnSort`].
 ///
-/// Reads `event_user_environments`, not `person_days`: the question is "when
-/// did this person last do anything", which that table already answers in one
-/// indexed row per person, where `person_days` would need an aggregate over
-/// every day they were ever active.
-///
-/// Keyset-paginated on `last_seen` with a hard limit, like every other list
-/// endpoint here.
-///
-/// # The `::bigint` cast is load-bearing
-///
-/// Postgres `sum(bigint)` returns NUMERIC, not bigint, and Diesel decodes this
-/// column as `BigInt`. Without the cast the endpoint 500s with "Received more
-/// than 8 bytes while decoding an i64" — but only once some person has a
-/// non-zero `events_count`, because a numeric zero happens to fit in eight
-/// bytes and decodes without complaint. A fixture whose counters are all zero
-/// therefore passes while the real endpoint fails.
-///
-/// # Bind numbering
-///
-/// `sql_query` has no boxed builder, so placeholders are numbered by hand and
-/// the environment filter is OPTIONAL — `EnvFilter::All` and `Unattributed`
-/// reserve no bind at all. The cursor's index therefore depends on whether the
-/// environment one exists, which is precisely the "a caller that assumes an
-/// index is always consumed shifts every subsequent bind by one" trap
-/// `EnvFilter::sql_fragment` warns about. `next` below is the single place that
-/// decides, so the two cannot drift.
+/// Pagination is a ROW-VALUE keyset — `(col, distinct_id) < ($v, $id)` — with
+/// the tiebreak in the same direction as the sort, so ties on the sort column
+/// (common for counters) page deterministically instead of repeating or
+/// skipping rows. The caller fetches `limit + 1` and peels the probe row; a
+/// bare `len == limit` check would advertise a next page exactly when the
+/// result set ends on a page boundary.
 pub async fn churn(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
     silent_days: i64,
-    before: Option<chrono::DateTime<chrono::Utc>>,
+    sort: ChurnSort,
+    descending: bool,
+    cursor: Option<ChurnCursor>,
     limit: i64,
 ) -> diesel::QueryResult<Vec<ChurnRow>> {
     // See `retention_grid` for why the bind type differs per variant rather
@@ -363,34 +404,55 @@ pub async fn churn(
     // $1 app, $2 silent_days, $3 limit, then whichever optionals apply.
     let env_e = scope.env.sql_fragment_for("e", 4);
     let next = if consumes { 5 } else { 4 };
-    let cursor = if before.is_some() {
-        format!(" AND agg.last_seen < ${next}")
+    let col = sort.col();
+    let (op, dir) = if descending {
+        ("<", "DESC")
+    } else {
+        (">", "ASC")
+    };
+    let keyset = if cursor.is_some() {
+        format!(
+            " AND (agg.{col}, agg.distinct_id) {op} (${next}, ${})",
+            next + 1
+        )
     } else {
         String::new()
     };
 
     let sql = format!(
         "WITH agg AS ( \
-             SELECT e.distinct_id, max(e.last_seen) AS last_seen, \
-                    COALESCE(sum(e.events_count), 0)::bigint AS events_count \
+             SELECT e.distinct_id, \
+                    max(e.last_seen) AS last_seen, \
+                    min(e.first_seen) AS first_seen, \
+                    COALESCE(sum(e.events_count), 0)::bigint AS events_count, \
+                    COALESCE(sum(e.errors_count), 0)::bigint AS errors_count, \
+                    COALESCE(sum(e.sessions_count), 0)::bigint AS sessions_count \
                FROM event_user_environments e \
               WHERE e.app_id = $1{env_e} \
               GROUP BY e.distinct_id) \
-         SELECT agg.distinct_id, agg.last_seen, agg.events_count \
+         SELECT agg.distinct_id, agg.last_seen, agg.first_seen, \
+                agg.events_count, agg.errors_count, agg.sessions_count \
            FROM agg \
-          WHERE agg.last_seen < now() - make_interval(days => $2::int){cursor} \
-          ORDER BY agg.last_seen DESC \
+          WHERE agg.last_seen < now() - make_interval(days => $2::int){keyset} \
+          ORDER BY agg.{col} {dir}, agg.distinct_id {dir} \
           LIMIT $3"
     );
 
     let days = silent_days.clamp(1, 3650) as i32;
-    let lim = limit.clamp(1, 500);
+    let lim = limit.clamp(1, 501);
 
     macro_rules! finish {
         ($q:expr) => {
-            match before {
-                Some(cur) => {
-                    $q.bind::<diesel::sql_types::Timestamptz, _>(cur)
+            match &cursor {
+                Some(ChurnCursor::Time(v, id)) => {
+                    $q.bind::<diesel::sql_types::Timestamptz, _>(*v)
+                        .bind::<Text, _>(id.clone())
+                        .get_results(conn)
+                        .await
+                }
+                Some(ChurnCursor::Count(v, id)) => {
+                    $q.bind::<BigInt, _>(*v)
+                        .bind::<Text, _>(id.clone())
                         .get_results(conn)
                         .await
                 }
