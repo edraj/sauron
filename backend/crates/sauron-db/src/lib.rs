@@ -711,6 +711,21 @@ async fn build_migrated_template(maintenance_url: &str) -> Option<String> {
         }
     };
 
+    // Lock-free fast path for the overwhelmingly common case: the template is
+    // already built. `build_template_locked` migrates under a scratch name and
+    // renames onto the canonical one only on success, so the canonical name
+    // existing is itself proof that the schema is complete — there is no
+    // half-built state to observe here, which is what makes skipping the lock
+    // safe rather than merely fast.
+    //
+    // Worth ~one round trip per binary today. It matters under a
+    // process-per-test runner, where every test process would otherwise
+    // serialize through this one global advisory lock just to be told the
+    // template already exists.
+    if database_exists(&mut conn, &name).await {
+        return Some(name);
+    }
+
     // Serializes every builder pointed at this server, across threads AND
     // processes — which is what keeps this correct under a process-per-test
     // runner as well as under `cargo test`. Session-scoped, so a builder that
