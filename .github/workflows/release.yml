@@ -3,8 +3,33 @@ name: Release
 on:
   push:
     branches: [main]
-  # dry run: builds the RPMs as workflow artifacts, creates no release
+    # Every merge to main publishes a release (the patch auto-advances off the
+    # highest existing tag), so a merge that cannot change a shipped byte still
+    # spent ~20 runner-minutes rebuilding both distros and cut a release whose
+    # binaries were identical to the previous one.
+    #
+    # Observed 2026-08-29: v1.7.9 came from a merge that touched only
+    # .github/workflows/security.yml, and v1.7.10 from one that touched only
+    # .github/workflows/*. Same application code, two full RPM builds.
+    #
+    # Only paths that CANNOT reach an artifact belong here. Deliberately absent:
+    # `**/*.md` (the spec ships README.md via %doc) and `packaging/**` (it is
+    # the spec itself). A wrong entry here means a real change silently never
+    # ships, which is far worse than a wasted build -- keep this list narrow.
+    paths-ignore:
+      - '.github/**'
+      - '.gitleaks.toml'
+      - 'wiki/**'
+      - 'docs/**'
+  # dry run: builds the RPMs as workflow artifacts, creates no release.
+  # `publish: true` forces a real release -- the escape hatch for paths-ignore
+  # above, since a skipped push cannot be re-triggered by pushing again.
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a real GitHub release (default: dry run, artifacts only)'
+        type: boolean
+        default: false
 
 concurrency:
   # Serialize releases so two quick merges can't compute the same version.
@@ -276,7 +301,7 @@ jobs:
   release:
     name: publish GitHub release
     # Real merges to main publish; workflow_dispatch is a build-only dry run.
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.publish
     needs: [version, package, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 10
