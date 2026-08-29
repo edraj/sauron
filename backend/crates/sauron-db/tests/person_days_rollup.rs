@@ -607,6 +607,7 @@ async fn retention_grid_counts_returners_by_period() {
         d0 + chrono::Duration::days(1),
         7,
         sauron_db::retention::ErrorSplit::All,
+        sauron_db::retention::Audience::Everyone,
     )
     .await
     .unwrap();
@@ -667,6 +668,7 @@ async fn retention_grid_does_not_double_count_across_environments() {
         d0 + chrono::Duration::days(1),
         3,
         sauron_db::retention::ErrorSplit::All,
+        sauron_db::retention::Audience::Everyone,
     )
     .await
     .unwrap();
@@ -708,6 +710,7 @@ async fn lifecycle_classifies_each_person_exactly_once() {
         sauron_db::retention::Granularity::Day,
         d(-4),
         d(1),
+        sauron_db::retention::Audience::Everyone,
     )
     .await
     .unwrap();
@@ -795,6 +798,7 @@ async fn churn_lists_only_the_silent() {
         true,
         None,
         50,
+        sauron_db::retention::Audience::Everyone,
     )
     .await
     .unwrap();
@@ -879,6 +883,7 @@ async fn every_query_works_environment_scoped() {
             d0 + chrono::Duration::days(1),
             5,
             sauron_db::retention::ErrorSplit::All,
+            sauron_db::retention::Audience::Everyone,
         )
         .await
         .unwrap_or_else(|e| panic!("retention_grid failed for EnvFilter::{name}: {e}"));
@@ -889,6 +894,7 @@ async fn every_query_works_environment_scoped() {
             sauron_db::retention::Granularity::Day,
             d0 - chrono::Duration::days(2),
             d0 + chrono::Duration::days(2),
+            sauron_db::retention::Audience::Everyone,
         )
         .await
         .unwrap_or_else(|e| panic!("lifecycle failed for EnvFilter::{name}: {e}"));
@@ -901,6 +907,7 @@ async fn every_query_works_environment_scoped() {
             true,
             None,
             10,
+            sauron_db::retention::Audience::Everyone,
         )
         .await
         .unwrap_or_else(|e| panic!("churn failed for EnvFilter::{name}: {e}"));
@@ -919,6 +926,7 @@ async fn every_query_works_environment_scoped() {
                 "zzz".into(),
             )),
             10,
+            sauron_db::retention::Audience::Everyone,
         )
         .await
         .unwrap_or_else(|e| panic!("churn+time-cursor failed for EnvFilter::{name}: {e}"));
@@ -930,6 +938,7 @@ async fn every_query_works_environment_scoped() {
             false,
             Some(sauron_db::retention::ChurnCursor::Count(0, String::new())),
             10,
+            sauron_db::retention::Audience::Everyone,
         )
         .await
         .unwrap_or_else(|e| panic!("churn+count-cursor failed for EnvFilter::{name}: {e}"));
@@ -944,6 +953,7 @@ async fn every_query_works_environment_scoped() {
         d0 + chrono::Duration::days(1),
         5,
         sauron_db::retention::ErrorSplit::All,
+        sauron_db::retention::Audience::Everyone,
     )
     .await
     .unwrap();

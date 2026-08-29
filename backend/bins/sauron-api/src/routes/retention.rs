@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use sauron_auth::{hash_token, perm, AuthUser};
-use sauron_db::retention::{self, ErrorSplit, Granularity};
+use sauron_db::retention::{self, Audience, ErrorSplit, Granularity};
 use sauron_db::rollups::person_days;
 use sauron_db::scope::{EnvFilter, ReadScope};
 
@@ -71,6 +71,29 @@ const RETENTION_REFRESH_LOCK_SECS: u64 = 120;
 /// a dead Redis — twice per request here would stall the API, not degrade it.
 const CACHE_OP_TIMEOUT: StdDuration = StdDuration::from_millis(500);
 
+/// Resolve the audience, refusing rather than silently answering the wrong
+/// question when the schema cannot support the filter.
+///
+/// `event_users.identified_at` arrives in migration 38, and an RPM upgrade can
+/// leave a new binary on an old schema. Falling back to `Everyone` there would
+/// return an all-users grid under an identified-only label — the failure this
+/// whole page exists to avoid. `active_users.rs` refuses on the same probe with
+/// the same message.
+fn resolve_audience(state: &AppState, identified_only: bool) -> Result<Audience, ApiError> {
+    if !identified_only {
+        return Ok(Audience::Everyone);
+    }
+    if !state.event_users_identified {
+        return Err(ApiError::Unavailable(
+            "schema_migration_required",
+            "event_users.identified_at is missing; run sauron-migrate, then restart \
+             sauron-api (see packaging/rpm/SETUP.md §11)"
+                .into(),
+        ));
+    }
+    Ok(Audience::IdentifiedOnly)
+}
+
 fn parse_granularity(s: &str) -> Result<Granularity, ApiError> {
     match s {
         "day" => Ok(Granularity::Day),
@@ -92,6 +115,12 @@ pub struct GridQuery {
     pub periods: i64,
     #[serde(default)]
     pub split: Option<String>,
+    /// Restrict to people the app has named (`event_users.identified_at`).
+    /// Defaults to false: "did the people who arrived come back?" is a
+    /// question about everyone, and hiding guests by default would quietly
+    /// change what this page claims to measure.
+    #[serde(default)]
+    pub identified_only: bool,
     // `environment_id` is deliberately NOT a field here — see the module docs.
 }
 
@@ -237,6 +266,7 @@ fn retention_cache_key(
     cohorts: i64,
     periods: i64,
     split: bool,
+    identified_only: bool,
     day: NaiveDate,
 ) -> Result<String, ApiError> {
     #[derive(Serialize)]
@@ -248,6 +278,11 @@ fn retention_cache_key(
         cohorts: i64,
         periods: i64,
         split: bool,
+        // Without this an identified-only request and an all-users request
+        // with the same shape share ONE entry, so whichever computed first
+        // is served under both labels — the same class of leak the resolved
+        // env filter is keyed on.
+        identified_only: bool,
         day: NaiveDate,
     }
     let json = serde_json::to_string(&Fingerprint {
@@ -258,6 +293,7 @@ fn retention_cache_key(
         cohorts,
         periods,
         split,
+        identified_only,
         day,
     })
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -317,6 +353,7 @@ struct GridInputs {
     cohorts: i64,
     periods: i64,
     split: bool,
+    audience: Audience,
 }
 
 #[derive(Clone)]
@@ -327,6 +364,7 @@ struct LifecycleInputs {
     g: Granularity,
     granularity: String,
     periods: i64,
+    audience: Audience,
 }
 
 async fn compute_grid(state: &AppState, inputs: &GridInputs) -> Result<GridOut, ApiError> {
@@ -354,6 +392,7 @@ async fn compute_grid(state: &AppState, inputs: &GridInputs) -> Result<GridOut, 
         } else {
             ErrorSplit::All
         },
+        inputs.audience,
     )
     .await?;
 
@@ -366,6 +405,7 @@ async fn compute_grid(state: &AppState, inputs: &GridInputs) -> Result<GridOut, 
             to,
             inputs.periods as i32,
             ErrorSplit::Clean,
+            inputs.audience,
         )
         .await?;
         Some(densify(
@@ -403,7 +443,27 @@ async fn compute_lifecycle(
     let from = to - Duration::days((inputs.periods + 1) * g.step_days());
     let scope = ReadScope::new(inputs.app_id, inputs.env.clone());
 
-    let points = retention::lifecycle(&mut conn, scope, g, from, to).await?;
+    // Clamp the window to where person-days actually begin — the same
+    // source asymmetry the grid's coverage floor handles, but here it
+    // MISCLASSIFIES rather than merely zeroing.
+    //
+    // `new` is decided by `first_seen` (complete history), while
+    // returning-vs-resurrected is decided by the presence of a person-day in
+    // the PREVIOUS bucket. Before the floor there are no person-days, so every
+    // person carried over from earlier looks "not new, and absent last period"
+    // — i.e. RESURRECTED — producing a spurious resurrection spike on the first
+    // bucket with data, plus a run of empty buckets before it that reads as
+    // "nobody was here" when the truth is "nothing was recorded".
+    //
+    // Clamping makes the floor bucket the primer, which `lifecycle` already
+    // drops for exactly this reason: it cannot classify itself. The first
+    // EMITTED bucket then has a real predecessor behind it.
+    let from = match person_days::coverage_floor(&mut conn, &scope).await? {
+        Some(floor) if floor > from => floor,
+        _ => from,
+    };
+
+    let points = retention::lifecycle(&mut conn, scope, g, from, to, inputs.audience).await?;
     Ok(LifecycleOut {
         granularity: inputs.granularity.clone(),
         as_of,
@@ -532,6 +592,7 @@ pub async fn grid(
         }
     };
 
+    let audience = resolve_audience(&state, q.identified_only)?;
     let ready = person_days::is_ready(&mut conn, app_id).await?;
 
     // A not-ready app ships NO cohort rows — and the response is NOT cached.
@@ -563,6 +624,7 @@ pub async fn grid(
             cohorts,
             periods,
             split,
+            q.identified_only,
             Utc::now().date_naive(),
         )?,
         app_id,
@@ -572,6 +634,7 @@ pub async fn grid(
         cohorts,
         periods,
         split,
+        audience,
     };
 
     if let Some(hit) = cache_get::<GridOut>(&state, &inputs.key).await {
@@ -593,6 +656,9 @@ pub struct LifecycleQuery {
     pub granularity: String,
     #[serde(default = "default_dim")]
     pub periods: i64,
+    /// See [`GridQuery::identified_only`].
+    #[serde(default)]
+    pub identified_only: bool,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -634,6 +700,7 @@ pub async fn lifecycle(
 
     let g = parse_granularity(&q.granularity)?;
     let periods = q.periods.clamp(1, MAX_DIM);
+    let audience = resolve_audience(&state, q.identified_only)?;
     let ready = person_days::is_ready(&mut conn, app_id).await?;
     if !ready {
         // Uncached, same reasoning as the grid's not-ready branch.
@@ -658,6 +725,7 @@ pub async fn lifecycle(
             0,
             periods,
             false,
+            q.identified_only,
             Utc::now().date_naive(),
         )?,
         app_id,
@@ -665,6 +733,7 @@ pub async fn lifecycle(
         g,
         granularity: q.granularity,
         periods,
+        audience,
     };
 
     if let Some(hit) = cache_get::<LifecycleOut>(&state, &inputs.key).await {
@@ -696,6 +765,9 @@ pub struct ChurnQuery {
     /// Opaque token from the previous page's `next_cursor`. Only valid for the
     /// same `sort` it was minted under.
     pub cursor: Option<String>,
+    /// See [`GridQuery::identified_only`].
+    #[serde(default)]
+    pub identified_only: bool,
 }
 
 fn default_silent() -> i64 {
@@ -802,6 +874,7 @@ pub async fn churn(
     // "Churned" is expressed in the SAME unit the grid is drawn in, so the two
     // cards cannot disagree about what a period means.
     let silent_days = q.silent_periods.clamp(1, MAX_DIM) * g.step_days();
+    let audience = resolve_audience(&state, q.identified_only)?;
     let (sort, descending) = parse_churn_sort(q.sort.as_deref())?;
     let cursor = q
         .cursor
@@ -826,6 +899,7 @@ pub async fn churn(
         descending,
         cursor,
         limit + 1,
+        audience,
     )
     .await?;
     let next_cursor = if people.len() as i64 > limit {

@@ -99,6 +99,51 @@ impl ErrorSplit {
     }
 }
 
+/// Restrict a query to people your app has named, or leave it open to everyone.
+///
+/// "Identified" is NOT a `distinct_id LIKE 'anon\_%'` string test. That heuristic
+/// breaks for the server-side SDKs and for any app with its own id scheme, and it
+/// would let this page and Active Users disagree about who counts as a person.
+/// The authority is `event_users.identified_at`, written first-write-wins by
+/// `mark_event_user_identified` from three sources — an `identify()` call, an
+/// event whose `context.user.id` equals the `distinct_id` it rode with, or the
+/// migration-38 backfill — and it is the same column
+/// `repo::active_users_series` joins on.
+///
+/// Rendered as a STATIC fragment carrying no bind of its own: the surrounding
+/// SQL numbers its parameters by hand and threads `EnvFilter`'s bind through
+/// them, so introducing one here would shift every later index. The value is a
+/// Rust `bool`, never user text, so there is nothing to inject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    /// Everyone seen, guests included — the honest denominator for "did the
+    /// people who arrived come back?".
+    Everyone,
+    /// Only people with `identified_at` set.
+    ///
+    /// Note this selects PEOPLE, not periods: someone who browsed anonymously
+    /// and signed up later is identified for their whole history, including the
+    /// guest-era days that precede the identify(). Their cohort is still their
+    /// first sighting, so period 0 of that cohort can contain people who were
+    /// guests at the time.
+    IdentifiedOnly,
+}
+
+impl Audience {
+    /// A predicate on `<alias>.distinct_id`, or empty for [`Audience::Everyone`].
+    /// `$1` is the app id in every query this is spliced into.
+    fn predicate(self, alias: &str) -> String {
+        match self {
+            Audience::Everyone => String::new(),
+            Audience::IdentifiedOnly => format!(
+                " AND EXISTS (SELECT 1 FROM event_users eu \
+                   WHERE eu.app_id = $1 AND eu.distinct_id = {alias}.distinct_id \
+                     AND eu.identified_at IS NOT NULL)"
+            ),
+        }
+    }
+}
+
 /// The cohort x period grid.
 ///
 /// `from`/`to` bound which COHORTS are returned (half-open on the cohort's
@@ -106,6 +151,7 @@ impl ErrorSplit {
 /// emitted only for (cohort, period) pairs that had at least one returner; the
 /// caller fills the gaps, because it — not this layer — knows which of those
 /// gaps are true zeroes and which are periods that have not elapsed.
+#[allow(clippy::too_many_arguments)]
 pub async fn retention_grid(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
@@ -114,6 +160,7 @@ pub async fn retention_grid(
     to: NaiveDate,
     periods: i32,
     split: ErrorSplit,
+    audience: Audience,
 ) -> diesel::QueryResult<Vec<CohortRow>> {
     // $1 app, $2 from, $3 to, $4 periods, then the env binds.
     let env_e = scope.env.sql_fragment_for("e", 5);
@@ -122,12 +169,17 @@ pub async fn retention_grid(
     let env_d = scope.env.sql_fragment_for("d", 5);
     let trunc = g.trunc();
     let step = g.step_days();
+    // Applied to the COHORT set only. `person_days` rows are reached solely
+    // through a join to that set, so filtering the source filters the activity
+    // with it — and doing it once keeps the `event_users` probe off the
+    // per-day rows, which outnumber people many times over.
+    let aud = audience.predicate("e");
 
     let sql = format!(
         "WITH cohort AS ( \
              SELECT e.distinct_id, (date_trunc('{trunc}', MIN(e.first_seen)))::date AS c \
                FROM event_user_environments e \
-              WHERE e.app_id = $1{env_e} \
+              WHERE e.app_id = $1{env_e}{aud} \
               GROUP BY e.distinct_id), \
          windowed AS ( \
              SELECT * FROM cohort WHERE c >= $2 AND c < $3), \
@@ -241,11 +293,17 @@ pub async fn lifecycle(
     g: Granularity,
     from: NaiveDate,
     to: NaiveDate,
+    audience: Audience,
 ) -> diesel::QueryResult<Vec<LifecyclePoint>> {
     let env_p = scope.env.sql_fragment_for("p", 4);
     let env_e = scope.env.sql_fragment_for("e", 4);
     let trunc = g.trunc();
     let step = g.step_days();
+    // Both legs, unlike the grid: `w` (activity) and `fb` (first bucket) are
+    // independent scans here, so filtering only one would classify people the
+    // other leg never saw.
+    let aud_p = audience.predicate("p");
+    let aud_e = audience.predicate("e");
 
     let sql = format!(
         "WITH buckets AS ( \
@@ -261,11 +319,11 @@ pub async fn lifecycle(
                FROM (SELECT DISTINCT p.distinct_id, \
                             (date_trunc('{trunc}', p.day::timestamp))::date AS b \
                        FROM person_days p \
-                      WHERE p.app_id = $1 AND p.day >= $2 AND p.day < $3{env_p}) ab), \
+                      WHERE p.app_id = $1 AND p.day >= $2 AND p.day < $3{env_p}{aud_p}) ab), \
          fb AS ( \
              SELECT e.distinct_id, (date_trunc('{trunc}', MIN(e.first_seen)))::date AS b \
                FROM event_user_environments e \
-              WHERE e.app_id = $1{env_e} \
+              WHERE e.app_id = $1{env_e}{aud_e} \
               GROUP BY e.distinct_id), \
          active AS ( \
              SELECT w.b, \
@@ -389,6 +447,7 @@ pub enum ChurnCursor {
 /// skipping rows. The caller fetches `limit + 1` and peels the probe row; a
 /// bare `len == limit` check would advertise a next page exactly when the
 /// result set ends on a page boundary.
+#[allow(clippy::too_many_arguments)]
 pub async fn churn(
     conn: &mut AsyncPgConnection,
     scope: ReadScope,
@@ -397,6 +456,7 @@ pub async fn churn(
     descending: bool,
     cursor: Option<ChurnCursor>,
     limit: i64,
+    audience: Audience,
 ) -> diesel::QueryResult<Vec<ChurnRow>> {
     // See `retention_grid` for why the bind type differs per variant rather
     // than going through `bind_uuids()`.
@@ -404,6 +464,7 @@ pub async fn churn(
     // $1 app, $2 silent_days, $3 limit, then whichever optionals apply.
     let env_e = scope.env.sql_fragment_for("e", 4);
     let next = if consumes { 5 } else { 4 };
+    let aud = audience.predicate("e");
     let col = sort.col();
     let (op, dir) = if descending {
         ("<", "DESC")
@@ -428,7 +489,7 @@ pub async fn churn(
                     COALESCE(sum(e.errors_count), 0)::bigint AS errors_count, \
                     COALESCE(sum(e.sessions_count), 0)::bigint AS sessions_count \
                FROM event_user_environments e \
-              WHERE e.app_id = $1{env_e} \
+              WHERE e.app_id = $1{env_e}{aud} \
               GROUP BY e.distinct_id) \
          SELECT agg.distinct_id, agg.last_seen, agg.first_seen, \
                 agg.events_count, agg.errors_count, agg.sessions_count \

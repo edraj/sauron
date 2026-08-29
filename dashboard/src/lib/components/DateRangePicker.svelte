@@ -40,6 +40,10 @@
   let { anchor, value, onpick, onclose }: Props = $props();
 
   type Mode = AbsolutePreset;
+  // svelte-ignore state_referenced_locally
+  // Seeding only. Once open, the picker OWNS these — they must not follow
+  // `value`, or choosing a mode would be undone the moment the parent
+  // re-rendered with the still-unchanged filter.
   let mode = $state<Mode>(value.kind === 'absolute' ? value.preset : 'day');
   /** First endpoint of an in-progress `range` selection. */
   let pendingStart = $state<Date | null>(null);
@@ -49,6 +53,9 @@
   let pos = $state({ top: 0, left: 0 });
 
   /** The month on screen. Day 1 so month arithmetic never overflows. */
+  // svelte-ignore state_referenced_locally
+  // Seeding only, as with `mode`: paging to another month is the user's, and
+  // must survive a parent re-render.
   let cursor = $state(startOfMonth(value.kind === 'absolute' ? new Date(value.from) : new Date()));
 
   const tag = $derived(intlTag(localeStore.locale));
@@ -190,6 +197,9 @@
   // -------------------------------------------------------------------------
 
   /** The cell that owns `tabindex="0"`. Roving, as `role="grid"` requires. */
+  // svelte-ignore state_referenced_locally
+  // Seeding only. Roving focus belongs to the keyboard user from here on;
+  // rebinding it to `value` would yank the cursor back on every parent render.
   let focusDay = $state(
     midnight(value.kind === 'absolute' ? new Date(value.from) : new Date()),
   );

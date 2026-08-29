@@ -787,3 +787,189 @@ fn urlencode(s: &str) -> String {
         })
         .collect()
 }
+
+/// Lifecycle must not invent a resurrection spike at the edge of its data.
+///
+/// `new` is decided by `first_seen` (complete history); returning-vs-resurrected
+/// is decided by a person-day in the PREVIOUS bucket. A person whose history
+/// predates the person-day floor has no such row, so before the window was
+/// clamped they surfaced as RESURRECTED on the first bucket with data — a spike
+/// that is an artifact of where recording started, not of user behaviour — with
+/// a run of empty buckets before it reading as "nobody was here".
+#[tokio::test]
+async fn lifecycle_does_not_fake_resurrections_at_the_data_floor() {
+    let Some(mut ts) = TestServer::start().await else {
+        return;
+    };
+    let f = ts.seed_fixture().await;
+
+    // Seen long ago (first_seen 40 days back), but person-days exist only for
+    // the last three days — exactly the shape of an app whose retention
+    // backfill covers less history than its event_user_environments.
+    ts.seed_person(&f, "old_hand", f.env_id, 40, &[38, 37])
+        .await;
+
+    let out = ts
+        .get_json(
+            &format!(
+                "/v1/apps/{}/retention/lifecycle?granularity=day&periods=12",
+                f.app_id
+            ),
+            &f.owner_token,
+        )
+        .await;
+    assert_eq!(out["ready"], json!(true));
+    let points = out["points"].as_array().expect("points array");
+
+    // No bucket may predate the person-day floor: those carry no data and
+    // would render as a stretch of "nobody was active".
+    let floor = (Utc::now() - chrono::Duration::days(3)).date_naive();
+    for p in points {
+        let start: chrono::NaiveDate = p["start"].as_str().unwrap().parse().unwrap();
+        assert!(
+            start >= floor,
+            "bucket {start} precedes the person-day floor {floor}: {p}"
+        );
+    }
+
+    // And the surviving buckets must not report a resurrection that is really
+    // just "this is the oldest day we recorded".
+    let resurrected: i64 = points
+        .iter()
+        .map(|p| p["resurrected_users"].as_i64().unwrap_or(0))
+        .sum();
+    assert_eq!(
+        resurrected, 0,
+        "a person whose history predates the data floor was counted as \
+         resurrected: {points:?}"
+    );
+
+    ts.shutdown().await;
+}
+
+/// `identified_only` must filter, must default to OFF, and must not share a
+/// cache entry with the all-users view.
+///
+/// The cache-key half is the one that bites silently: both requests are the
+/// same shape and differ only in this flag, so a key that omits it serves
+/// whichever computed first under BOTH labels — an all-users grid presented as
+/// identified-only, which is precisely the misreading the toggle exists to
+/// prevent.
+#[tokio::test]
+async fn identified_only_filters_and_is_cached_separately() {
+    let Some(mut ts) = TestServer::start().await else {
+        return;
+    };
+    let f = ts.seed_fixture().await;
+    // Three people in one cohort; only one of them is ever named by the app.
+    for who in ["id_known", "id_guest_a", "id_guest_b"] {
+        ts.seed_person(&f, who, f.env_id, 3, &[0, 1]).await;
+    }
+    {
+        let mut conn = ts.conn().await;
+        use diesel_async::RunQueryDsl;
+        // `identified_at` is the authority — the same column Active Users
+        // joins on — not a `distinct_id LIKE 'anon_%'` guess.
+        diesel::sql_query(
+            "INSERT INTO event_users (id, app_id, distinct_id, properties, identified_at, \
+                                      identified_source) \
+             VALUES (gen_random_uuid(), $1, 'id_known', '{}'::jsonb, now(), 'identify')",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(f.app_id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let base = format!(
+        "/v1/apps/{}/retention?granularity=day&cohorts=12&periods=12",
+        f.app_id
+    );
+
+    // Default is everyone — guests included.
+    let all = ts.get_json(&base, &f.owner_token).await;
+    assert_eq!(
+        all["cohorts"][0]["size"],
+        json!(3),
+        "the default must include guests: {all}"
+    );
+
+    // Filtered keeps only the named person — and is NOT the cached all-users
+    // answer, which is what a key missing the flag would hand back.
+    let only = ts
+        .get_json(&format!("{base}&identified_only=true"), &f.owner_token)
+        .await;
+    assert_eq!(
+        only["cohorts"][0]["size"],
+        json!(1),
+        "identified_only must exclude guests, and must not be served the \
+         cached all-users entry: {only}"
+    );
+
+    // Both directions: the all-users view is still 3 after the filtered one
+    // has been computed and cached.
+    let all_again = ts.get_json(&base, &f.owner_token).await;
+    assert_eq!(all_again["cohorts"][0]["size"], json!(3));
+
+    // Lifecycle and churn honour it too, so the page cannot end up with one
+    // card counting a different population than its neighbours.
+    // Compared against the unfiltered run rather than asserted absolutely:
+    // these people's `new` bucket is the primer the lifecycle query drops (it
+    // cannot classify itself), so they surface as `returning`. The population
+    // size is the thing the filter changes, and it is what this measures.
+    let peak_active = |v: &Value| -> i64 {
+        v["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p["new_users"].as_i64().unwrap_or(0)
+                    + p["returning_users"].as_i64().unwrap_or(0)
+                    + p["resurrected_users"].as_i64().unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let life_all = ts
+        .get_json(
+            &format!("/v1/apps/{}/retention/lifecycle?granularity=day", f.app_id),
+            &f.owner_token,
+        )
+        .await;
+    let life_only = ts
+        .get_json(
+            &format!(
+                "/v1/apps/{}/retention/lifecycle?granularity=day&identified_only=true",
+                f.app_id
+            ),
+            &f.owner_token,
+        )
+        .await;
+    assert_eq!(
+        peak_active(&life_all),
+        3,
+        "unfiltered lifecycle sees all three: {life_all}"
+    );
+    assert_eq!(
+        peak_active(&life_only),
+        1,
+        "lifecycle must filter too, and must not reuse the unfiltered cache          entry: {life_only}"
+    );
+
+    let churn = ts
+        .get_json(
+            &format!(
+                "/v1/apps/{}/retention/churn?granularity=day&silent_periods=1&identified_only=true",
+                f.app_id
+            ),
+            &f.owner_token,
+        )
+        .await;
+    let people = churn["people"].as_array().unwrap();
+    assert!(
+        people.iter().all(|p| p["distinct_id"] == "id_known"),
+        "churn must filter too: {churn}"
+    );
+
+    ts.shutdown().await;
+}
