@@ -10,6 +10,10 @@ regexes = [
   # WorkflowsList.svelte: a <SortableTh key="p95_duration_ms"> UI attribute the
   # generic-api-key rule mis-flags. Narrow, so real secrets in that file still gate.
   '''p95_duration_ms''',
+  # purge.rs: the `confirm_token` value in the utoipa `example = json!(...)`
+  # for POST /v1/admin/purge/{id}/confirm. Documentation example data, not a
+  # credential. Narrow, so real secrets in that file still gate.
+  '''pct_1f8c4b2e9d7a''',
 ]
 paths = [
   '''backend/bins/sauron-api/tests/http_monitors\.rs$''',   # test probe body
