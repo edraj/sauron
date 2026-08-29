@@ -182,6 +182,103 @@ export const analyze = {
   },
   'retention.cohort': { en: 'Cohort', ar: 'المجموعة' },
   'retention.users': { en: 'Users', ar: 'المستخدمون' },
+  'retention.action.day1Down': {
+    en: 'Turn on the error split and compare day-1 for error-exposed versus error-free period-0 users.',
+    ar: 'فعّل تقسيم الأخطاء وقارن اليوم الأول بين من واجهوا خطأ ومن لم يواجهوه في الفترة صفر.',
+  },
+  'retention.action.day1Up': {
+    en: 'Turn on the error split and check whether the gain holds for error-free users too.',
+    ar: 'فعّل تقسيم الأخطاء وتحقّق مما إذا كان التحسّن يشمل من لم يواجهوا أخطاءً أيضًا.',
+  },
+  'retention.action.day1Flat': {
+    en: 'Turn on the error split and check whether the flat average hides a gap between grids.',
+    ar: 'فعّل تقسيم الأخطاء وتحقّق مما إذا كان المتوسط المستقر يخفي فجوة بين الشبكتين.',
+  },
+  'retention.action.churnReplace': {
+    en: 'Open Users, sort by session count, and check whether returning people are being counted as new.',
+    ar: 'افتح المستخدمين، ورتّب حسب عدد الجلسات، وتحقّق مما إذا كان العائدون يُحتسبون كجدد.',
+  },
+  'retention.action.quickGood': {
+    en: 'Open Users and check whether the active-per-day bars grow, not just the new-user bars.',
+    ar: 'افتح المستخدمين وتحقّق من نمو أعمدة النشطين يوميًا، لا أعمدة الجدد وحدها.',
+  },
+  'retention.action.quickBad': {
+    en: 'Sort the churn-risk table by errors to see whether those silent users hit errors before leaving.',
+    ar: 'رتّب جدول المعرّضين للخطر حسب الأخطاء لترى هل واجه الصامتون أخطاءً قبل مغادرتهم.',
+  },
+  'retention.action.cliff': {
+    en: 'Filter Events to that date and check whether any events at all were received.',
+    ar: 'صفِّ الأحداث على ذلك التاريخ وتحقّق مما إذا وصلت أي أحداث على الإطلاق.',
+  },
+  'retention.action.bestCohort': {
+    en: "Open Journeys, set the range to that period, and compare its top paths with a weaker period's.",
+    ar: 'افتح الرحلات، واضبط النطاق على تلك الفترة، وقارن أبرز مساراتها بفترة أضعف.',
+  },
+  'retention.actionLink.churnReplace': { en: 'Users list', ar: 'قائمة المستخدمين' },
+  'retention.actionLink.quickGood': { en: 'Users list', ar: 'قائمة المستخدمين' },
+  'retention.actionLink.cliff': { en: 'Events explorer', ar: 'مستكشف الأحداث' },
+  'retention.actionLink.bestCohort': { en: 'Journeys explorer', ar: 'مستكشف الرحلات' },
+  'retention.insights.title': { en: 'Insights', ar: 'الرؤى' },
+  'retention.insight.day1Up': {
+    en: 'Day-1 retention averages {pct} and is improving — up {delta} between the older and newer half of these cohorts.',
+    ar: 'متوسط الاحتفاظ في اليوم الأول {pct} وهو في تحسّن — ارتفع {delta} بين النصف الأقدم والأحدث من هذه الأفواج.',
+  },
+  'retention.insight.day1Down': {
+    en: 'Day-1 retention averages {pct} and is declining — down {delta} between the older and newer half of these cohorts.',
+    ar: 'متوسط الاحتفاظ في اليوم الأول {pct} وهو في تراجع — انخفض {delta} بين النصف الأقدم والأحدث من هذه الأفواج.',
+  },
+  'retention.insight.day1Flat': {
+    en: 'Day-1 retention averages {pct}, roughly flat across these cohorts.',
+    ar: 'متوسط الاحتفاظ في اليوم الأول {pct}، مستقر تقريبًا عبر هذه الأفواج.',
+  },
+  'retention.insight.churnReplace': {
+    en: '{pct} of each period\u2019s active users are first-timers — activity depends on continuous acquisition rather than a returning base.',
+    ar: '{pct} من المستخدمين النشطين في كل فترة هم جدد — يعتمد النشاط على الاستقطاب المستمر لا على قاعدة عائدة.',
+  },
+  'retention.insight.quickGood': {
+    en: 'Gaining {ratio} users (new + resurrected) for every one going dormant.',
+    ar: 'مقابل كل مستخدم يخمل، يُكتسب {ratio} مستخدم (جديد + عائد من الخمول).',
+  },
+  'retention.insight.quickBad': {
+    en: 'Only {ratio} users gained (new + resurrected) for every one going dormant — the base is shrinking.',
+    ar: 'يُكتسب {ratio} مستخدم فقط (جديد + عائد) مقابل كل مستخدم يخمل — القاعدة تتقلص.',
+  },
+  'retention.insight.cliff': {
+    en: 'On {date} nobody was active while previously-active users went dormant — investigate what happened that period.',
+    ar: 'في {date} لم يكن أحد نشطًا بينما خمل مستخدمون كانوا نشطين — راجع ما حدث في تلك الفترة.',
+  },
+  'retention.insight.bestCohort': {
+    en: 'Best cohort: {date}, with {pct} returning the next period — worth comparing what that group experienced.',
+    ar: 'أفضل فوج: {date} بعودة {pct} في الفترة التالية — يستحق مقارنة ما مرّ به هذا الفوج.',
+  },
+  'retention.churn.errors': { en: 'Errors', ar: 'الأخطاء' },
+  'retention.churn.sessions': { en: 'Sessions', ar: 'الجلسات' },
+  'retention.churn.silentFor': { en: 'Silent for', ar: 'صامت منذ' },
+  'retention.churn.tenure': { en: 'Active tenure', ar: 'مدة النشاط' },
+  'retention.churn.firstSeen': { en: 'First seen', ar: 'أول ظهور' },
+  'retention.churn.nDays': { en: '{n} days', ar: '{n} يومًا' },
+  'retention.churn.viewProfile': { en: 'View profile \u2192', ar: '\u2190 عرض الملف الشخصي' },
+  'retention.day0Title': {
+    en: "Day 0 is each user's first day — the day they were first seen. 100% by definition.",
+    ar: 'اليوم 0 هو أول يوم لكل مستخدم — يوم ظهوره لأول مرة. \u200e100% بحكم التعريف.',
+  },
+  'retention.dayNTitle': {
+    en: "{n} days after each user's own first day",
+    ar: 'بعد {n} أيام من أول يوم لكل مستخدم',
+  },
+  'retention.weekNTitle': {
+    en: "{n} weeks after each user's own first week",
+    ar: 'بعد {n} أسابيع من أول أسبوع لكل مستخدم',
+  },
+  'retention.legend.periods': {
+    en: "Day N counts from each user's own first day, not the calendar. Click any cell to switch between % and user counts.",
+    ar: 'يُحسب اليوم N من أول يوم لكل مستخدم، لا من التقويم. انقر أي خلية للتبديل بين النسبة وعدد المستخدمين.',
+  },
+  'retention.mode.label': { en: 'Cell values', ar: 'قيم الخلايا' },
+  'retention.mode.countTitle': {
+    en: 'Show absolute user counts instead of percentages',
+    ar: 'عرض أعداد المستخدمين بدلاً من النسب المئوية',
+  },
   'retention.dayN': { en: 'Day {n}', ar: 'اليوم {n}' },
   'retention.weekN': { en: 'Week {n}', ar: 'الأسبوع {n}' },
   'retention.cellTitle': {
@@ -212,6 +309,7 @@ export const analyze = {
   'retention.lifecycle.new': { en: 'New', ar: 'جديد' },
   'retention.lifecycle.returning': { en: 'Returning', ar: 'عائد' },
   'retention.lifecycle.resurrected': { en: 'Resurrected', ar: 'مستعاد' },
+  'retention.lifecycle.active': { en: 'Active', ar: 'النشطون' },
   'retention.lifecycle.dormant': { en: 'Dormant', ar: 'خامل' },
   'retention.churn.title': { en: 'At risk', ar: 'معرّضون للفقد' },
   'retention.churn.subtitle': {

@@ -249,4 +249,14 @@ async fn maintenance(pool: &PgPool, cfg: RollupCfg) {
         Ok(_) => {}
         Err(e) => warn!(error = %e, "rollup state prune failed"),
     }
+    // The one rollup whose row count scales with USERS rather than with
+    // keys × envs × days (the documented migration-74 exception) — which is
+    // exactly why it is also the one that must actually be pruned. The horizon
+    // matches the longest window any endpoint can answer over, so this can
+    // never drop a day a query could still ask about.
+    match rollups::person_days::prune(&mut conn, rollups::person_days::MAX_KEEP_DAYS).await {
+        Ok(n) if n > 0 => info!(pruned = n, "person-days past the horizon pruned"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "person-days prune failed"),
+    }
 }

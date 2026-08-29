@@ -1,6 +1,6 @@
 import { localeStore } from './locale.svelte';
 import { MESSAGES, PLURALS, type MessageKey, type PluralKey } from './catalog';
-import { decimalFormat, pluralRules } from './formatters';
+import { compactFormat, decimalFormat, pluralRules } from './formatters';
 import type { Locale } from './types';
 
 export { localeStore } from './locale.svelte';
@@ -67,6 +67,11 @@ export function tn(
  */
 export function formatNumber(value: number): string {
   return decimalFormat(localeStore.locale).format(value);
+}
+
+/** "94.9K" — chart-annotation form of [`formatNumber`]; same digit pinning. */
+export function formatCompact(value: number): string {
+  return compactFormat(localeStore.locale).format(value);
 }
 
 /**

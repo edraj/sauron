@@ -143,6 +143,7 @@ fn densify(
     periods: usize,
     step: i64,
     as_of_day: NaiveDate,
+    floor: Option<NaiveDate>,
 ) -> Vec<Cohort> {
     let mut out: Vec<Cohort> = Vec::new();
     for row in rows {
@@ -166,6 +167,18 @@ fn densify(
         for (n, slot) in c.periods.iter_mut().enumerate() {
             let ends = c.start + Duration::days((n as i64 + 1) * step);
             if ends > as_of_day {
+                *slot = None;
+                continue;
+            }
+            // ...and blank the other end too. Cohorts come from
+            // `event_user_environments.first_seen`, which is never pruned and
+            // reaches back as far as ingest ever ran; activity comes from
+            // `person_days`, which begins when the fold or the backfill began.
+            // A period that ends at or before that floor has NO activity data
+            // behind it, so reporting the 0 rows found as "0% returned" states
+            // a fact the data cannot support — and does it exactly where the
+            // grid looks worst. `None` says "not knowable", which is true.
+            if floor.is_some_and(|f| ends <= f) {
                 *slot = None;
             }
         }
@@ -327,6 +340,8 @@ async fn compute_grid(state: &AppState, inputs: &GridInputs) -> Result<GridOut, 
     let as_of_day = as_of.map(|t| t.date_naive()).unwrap_or(today);
     let scope = ReadScope::new(inputs.app_id, inputs.env.clone());
 
+    let floor = person_days::coverage_floor(&mut conn, &scope).await?;
+
     let primary = retention::retention_grid(
         &mut conn,
         scope.clone(),
@@ -353,7 +368,13 @@ async fn compute_grid(state: &AppState, inputs: &GridInputs) -> Result<GridOut, 
             ErrorSplit::Clean,
         )
         .await?;
-        Some(densify(&rows, inputs.periods as usize, step, as_of_day))
+        Some(densify(
+            &rows,
+            inputs.periods as usize,
+            step,
+            as_of_day,
+            floor,
+        ))
     } else {
         None
     };
@@ -362,7 +383,7 @@ async fn compute_grid(state: &AppState, inputs: &GridInputs) -> Result<GridOut, 
         granularity: inputs.granularity.clone(),
         as_of,
         ready: true,
-        cohorts: densify(&primary, inputs.periods as usize, step, as_of_day),
+        cohorts: densify(&primary, inputs.periods as usize, step, as_of_day, floor),
         clean,
         computed_at: Some(Utc::now()),
     })
@@ -667,8 +688,14 @@ pub struct ChurnQuery {
     pub silent_periods: i64,
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// Keyset cursor: the `last_seen` of the previous page's final row.
-    pub before: Option<DateTime<Utc>>,
+    /// `column` for descending, `-column` for ascending — the bare form is
+    /// DESC, matching `sortParam` in the dashboard and `parse_sort` in
+    /// `routes/search.rs`. Columns: `last_seen`, `first_seen`, `events`,
+    /// `errors`, `sessions`.
+    pub sort: Option<String>,
+    /// Opaque token from the previous page's `next_cursor`. Only valid for the
+    /// same `sort` it was minted under.
+    pub cursor: Option<String>,
 }
 
 fn default_silent() -> i64 {
@@ -678,22 +705,80 @@ fn default_limit() -> i64 {
     50
 }
 
+/// `sort=` → (column, descending). Bare = descending, `-` = ascending.
+fn parse_churn_sort(sort: Option<&str>) -> Result<(retention::ChurnSort, bool), ApiError> {
+    let Some(raw) = sort else {
+        return Ok((retention::ChurnSort::LastSeen, true));
+    };
+    let (name, descending) = match raw.strip_prefix('-') {
+        Some(rest) => (rest, false),
+        None => (raw, true),
+    };
+    match retention::ChurnSort::parse(name) {
+        Some(col) => Ok((col, descending)),
+        None => Err(ApiError::BadRequest(format!(
+            "sort must be one of last_seen, first_seen, events, errors, sessions \
+             (with optional '-' prefix for ascending), got '{raw}'"
+        ))),
+    }
+}
+
+/// Cursor wire format: `{value}|{distinct_id}`, value typed by the ACTIVE sort
+/// column. The distinct_id half is taken verbatim (ids may themselves contain
+/// any character except our separator's first occurrence — `splitn` keeps
+/// everything after the first `|` intact).
+fn parse_churn_cursor(
+    cursor: &str,
+    sort: retention::ChurnSort,
+) -> Result<retention::ChurnCursor, ApiError> {
+    let mut halves = cursor.splitn(2, '|');
+    let (Some(v), Some(id)) = (halves.next(), halves.next()) else {
+        return Err(ApiError::BadRequest("malformed cursor".into()));
+    };
+    if sort.is_time() {
+        let t = DateTime::parse_from_rfc3339(v)
+            .map_err(|_| ApiError::BadRequest("malformed cursor timestamp".into()))?
+            .with_timezone(&Utc);
+        Ok(retention::ChurnCursor::Time(t, id.to_string()))
+    } else {
+        let n: i64 = v
+            .parse()
+            .map_err(|_| ApiError::BadRequest("malformed cursor value".into()))?;
+        Ok(retention::ChurnCursor::Count(n, id.to_string()))
+    }
+}
+
+/// The `next_cursor` for a page ending on `row`, under `sort`.
+fn churn_cursor_for(row: &retention::ChurnRow, sort: retention::ChurnSort) -> String {
+    let v = match sort {
+        retention::ChurnSort::LastSeen => row.last_seen.to_rfc3339(),
+        retention::ChurnSort::FirstSeen => row.first_seen.to_rfc3339(),
+        retention::ChurnSort::Events => row.events_count.to_string(),
+        retention::ChurnSort::Errors => row.errors_count.to_string(),
+        retention::ChurnSort::Sessions => row.sessions_count.to_string(),
+    };
+    format!("{v}|{}", row.distinct_id)
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ChurnOut {
     pub ready: bool,
     pub silent_days: i64,
     pub people: Vec<retention::ChurnRow>,
-    /// Cursor for the next page, or `None` at the end.
-    pub next_before: Option<DateTime<Utc>>,
+    /// Opaque cursor for the next page, or `None` at the end. Bound to the
+    /// `sort` it was minted under.
+    pub next_cursor: Option<String>,
 }
 
 #[utoipa::path(
     get, path = "/v1/apps/{app_id}/retention/churn", tag = "Analytics",
-    summary = "Churn over time",
-    description = "Users who stopped appearing, per period.",
+    summary = "At-risk users",
+    description = "Users who stopped appearing: silent for the given number of periods, with their \
+lifetime aggregates. Sortable via `sort` (bare column = descending, `-column` = ascending) and \
+paged by row-value keyset via `cursor`.",
     params(("app_id" = Uuid, Path, description = "The app."), ChurnQuery), security(("bearerAuth" = [])),
-    responses((status = 200, description = "Churn series.", body = ChurnOut),
-              (status = 400, description = "Malformed window or period.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing. The message names which.", body = ErrorResponse)),
+    responses((status = 200, description = "The at-risk page.", body = ChurnOut),
+              (status = 400, description = "Malformed window, sort or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup is missing. The message names which.", body = ErrorResponse)),
 )]
 pub async fn churn(
     auth: AuthUser,
@@ -717,6 +802,12 @@ pub async fn churn(
     // "Churned" is expressed in the SAME unit the grid is drawn in, so the two
     // cards cannot disagree about what a period means.
     let silent_days = q.silent_periods.clamp(1, MAX_DIM) * g.step_days();
+    let (sort, descending) = parse_churn_sort(q.sort.as_deref())?;
+    let cursor = q
+        .cursor
+        .as_deref()
+        .map(|c| parse_churn_cursor(c, sort))
+        .transpose()?;
 
     // Churn reads `event_user_environments`, which is maintained by the write
     // path rather than by this feature's fold, so it does NOT need the
@@ -724,9 +815,22 @@ pub async fn churn(
     // telling one story.
     let ready = person_days::is_ready(&mut conn, app_id).await?;
 
-    let people = retention::churn(&mut conn, scope, silent_days, q.before, limit).await?;
-    let next_before = if people.len() as i64 == limit {
-        people.last().map(|p| p.last_seen)
+    // limit + 1: the probe row proves a next page exists. A bare
+    // `len == limit` check advertises one exactly when the set ends on a page
+    // boundary.
+    let mut people = retention::churn(
+        &mut conn,
+        scope,
+        silent_days,
+        sort,
+        descending,
+        cursor,
+        limit + 1,
+    )
+    .await?;
+    let next_cursor = if people.len() as i64 > limit {
+        people.truncate(limit as usize);
+        people.last().map(|p| churn_cursor_for(p, sort))
     } else {
         None
     };
@@ -735,6 +839,6 @@ pub async fn churn(
         ready,
         silent_days,
         people,
-        next_before,
+        next_cursor,
     }))
 }

@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use diesel::sql_types::{
     Array, BigInt, Date, Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid,
 };
+use diesel::QueryableByName;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
@@ -126,6 +127,48 @@ pub async fn epoch(conn: &mut AsyncPgConnection) -> diesel::QueryResult<DateTime
         .get_result(conn)
         .await?;
     Ok(r.t)
+}
+
+/// The earliest day this app has ANY person-day for, under `scope`.
+///
+/// Retention takes its cohorts from `event_user_environments.first_seen` and
+/// its activity from `person_days` — two different sources with two different
+/// horizons. `first_seen` survives everything (it is a single row per person,
+/// never pruned), while person-days start at whenever ingest or the backfill
+/// began and are pruned at the retention horizon. So a cohort whose start
+/// predates the person-day history has periods for which NO activity data
+/// exists, and counting those as "nobody returned" reports 0% where the honest
+/// answer is "not knowable" — understating retention exactly where the grid
+/// looks worst.
+///
+/// `None` means the table is empty for this scope, so nothing is knowable.
+pub async fn coverage_floor(
+    conn: &mut AsyncPgConnection,
+    scope: &crate::scope::ReadScope,
+) -> diesel::QueryResult<Option<chrono::NaiveDate>> {
+    use diesel::sql_types::{Array, Nullable, Uuid as SqlUuid};
+
+    #[derive(QueryableByName)]
+    struct FloorRow {
+        #[diesel(sql_type = Nullable<diesel::sql_types::Date>)]
+        floor: Option<chrono::NaiveDate>,
+    }
+
+    let env = scope.env.sql_fragment_for("p", 2);
+    let sql = format!("SELECT min(p.day) AS floor FROM person_days p WHERE p.app_id = $1{env}");
+    let q = diesel::sql_query(sql).bind::<SqlUuid, _>(scope.app_id);
+    let row: FloorRow = match &scope.env {
+        crate::scope::EnvFilter::One(id) => q.bind::<SqlUuid, _>(*id).get_result(conn).await?,
+        crate::scope::EnvFilter::Subset(ids) => {
+            q.bind::<Array<SqlUuid>, _>(ids.clone())
+                .get_result(conn)
+                .await?
+        }
+        crate::scope::EnvFilter::All | crate::scope::EnvFilter::Unattributed => {
+            q.get_result(conn).await?
+        }
+    };
+    Ok(row.floor)
 }
 
 /// Longest horizon this table is kept for.

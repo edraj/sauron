@@ -2247,3 +2247,205 @@ Wire change: `computed_at: Option<DateTime<Utc>>` on `GridOut`/`LifecycleOut`
 
 http_retention.rs is now 6 tests; the fixture gained a second environment and
 an env-scoped member persona.
+
+---
+
+## Grid clarity + %/# toggle — 2026-08-29 (screenshot feedback)
+
+Feedback on the grid at production scale: "what does Day 0 even mean" — because
+Day 0 rendered the cohort SIZE beside a Users column showing the same number,
+two identical figures under different headers. And a request to click-toggle
+between percentages and absolute counts.
+
+- Day 0 now renders **100%** in rate mode (the size keeps its own column) and
+  the count in count mode. `cellLabel()` in `models/retention.ts` owns the
+  decision, unit-tested; the formatter is injected so Arabic keeps pinned
+  Latin digits.
+- Every period header and Day-0 cell carries a tooltip ("N days after each
+  user's OWN first day"), and the legend now states the day semantics and the
+  click affordance.
+- `%` / `#` segmented control in the card header; clicking any non-empty cell
+  toggles too. Mode is PAGE state so the error split's two grids flip
+  together — verified in the browser (both grids flipped on one click; split
+  showed 3 exposed / 7 clean).
+- Also wired `person_days::prune` into the nightly maintenance
+  (`rollup_task.rs`) — it was implemented and tested but had NO call site (the
+  unreachable-feature class): the table would have grown unboundedly.
+
+Dashboard: 1,227 tests, check clean, build clean. Backend: clippy+fmt clean.
+
+---
+
+## Chart readability, churn drill-down, insights — 2026-08-29 (second screenshot round)
+
+**Lifecycle chart** (the "no Y axis, huge gap" feedback): the 50/50 plot split
+was the gap — dormancy is a few percent of actives, so half the plot was dead
+space between bars and dates. `lifecycleLayout` (pure, tested) now shares the
+plot proportionally between the two regions (8% floor / 50% cap on the dormant
+strip), adds a real Y axis (nice 1-2-5 ticks at 0/half/top + a dormant tick,
+gridlines, solid zero line), and every bar carries its values at all times:
+compact total above, dormant count below, per-segment values inline when the
+segment is ≥14% of the plot. Labels clamp inside the plot via CSS min() so a
+full-scale bar cannot summon a scrollbar. `formatCompact` added to i18n (the
+concurrent session added an identical one mid-flight; deduplicated, theirs
+kept). Date labels offset by the axis gutter so columns and dates align.
+
+**At-risk table**: server-side sort (`sort=` bare-desc/`-`-asc; whitelist
+last_seen/first_seen/events/errors/sessions — the enum IS the injection guard)
+with row-value keyset cursors `(col, distinct_id)` so counter ties page
+without repeats; limit+1 probe replaces the ==limit heuristic. Rows enriched
+with first_seen/errors/sessions from the same aggregate scan. Row click
+expands a detail panel (silent-for, tenure, first seen, counters, profile
+link); clicks landing on the person anchor navigate instead (closest('a')
+guard) — verified in-browser, including the navigation to #/persons/{id}.
+
+**Insights card**: `retentionInsights` (pure, 7 tests) computes day-1 average
++ direction (older vs newer cohort halves, 1.5pt noise floor), the
+churn-and-replace share, the quick ratio, the all-dormant cliff (it named
+2026-08-25 on the drive data — the exact bar the generate_series fix made
+visible), and the best cohort ≥5 users. Severity-ordered, en+ar.
+
+Backend http_retention: 7 tests (sort order both directions, cursor walk with
+no phantom page, enrichment, named 400 on unknown sort). Dashboard: 1,239
+tests, check 0 errors, build clean.
+
+---
+
+## Insight recommendations — 2026-08-29 (user: "provide solutions")
+
+Every finding now carries a recommended next step, and 4 of 8 carry a
+permission-gated deep link. Copy was produced by an 8-agent workflow (3
+independent lenses -> synthesis -> 3 adversarial auditors on separate
+dimensions -> reconcile), which **overrode 5 of the 8 routes I had planned**
+by verifying each against the actual code:
+
+- `day1Up` was going to link Issues sorted by affected users. `Issues.svelte`
+  renders plain `<th>` — no `SortableTh` anywhere — and `api/issues.ts:33`
+  documents that the list sort accepts only last_seen/first_seen. The control
+  does not exist. Deeper objection accepted: the Exceptions list is app-wide,
+  not scoped to these cohorts, so attribution would be coincidence.
+- All three day-1 branches now point at the ON-PAGE error split instead of
+  leaving. Only one of the three is ever emitted, so they never collide, and
+  the split is the only control that redraws these exact cohorts by period-0
+  error exposure.
+- `quickBad` says "hit errors", not "crashed": `retention.rs` sums
+  `errors_count`, which counts every error row including handled ones —
+  migration 69 exists because reading that column as a crash was a defect.
+- `cliff` links Events, not Exceptions: "nobody active" already means no
+  person-attributed events, so the discriminating check is whether ANY traffic
+  arrived (ingest gap) or none did.
+- `bestCohort` wording avoids promising cohort segmentation `JourneyExplorer`
+  cannot do (it has DateRange + depth only).
+
+Structure: `actionKey` is REQUIRED on `Insight` and derived from the finding's
+own name, so advice cannot be misattached; links are gated through
+`canAccessPage` — a user without the grant keeps the advice and loses only the
+shortcut. A cross-source parity test asserts every derived key exists in both
+locales: the keys are built by concatenation, `t()` prints the raw key on a
+miss, and the page's `as never` casts erase the type check — that combination
+did render `retention.action.cliff` literally on screen before the copy landed.
+
+Verified by headless-Chromium capture (CDP over Node 22's built-in WebSocket,
+no new dependency) at production scale on the 51k-person app. Temporary read
+grant used for the capture was removed afterward. Dashboard: 1,247 tests,
+check clean.
+
+---
+
+## Lifecycle: hover tooltip replaces always-on labels — 2026-08-29
+
+Feedback on the zoomed chart: the always-on values collided — the total sat on
+top of the thin New segment, and a dormant label overlapped the date axis. Asked
+for the DAU chart's hover behaviour instead.
+
+`LifecycleChart` now mirrors `UserActivityChart` exactly: CSS-only `:hover`
+opacity tip (NOT JS hover state — this chart can render in a `display: none`
+pane, and a rule that only fires on :hover has no mount-time failure mode),
+`--surface-3` / `--border-strong` / `--shadow` tokens, plus the same
+`brightness(1.18)` on the hovered bar. The native `title` stays alongside it,
+as in the DAU chart: CSS :hover never fires for keyboard or screen-reader
+users, so it is the only version of the data they get. The tip lists all four
+series with swatches and a rule-separated Active total.
+
+Two overflow bugs found by CAPTURING it rather than trusting it:
+- Anchored above the bar, a full-scale bar pushed the tip out through the top
+  of the chart, over the card header, where it was clipped. It now flips to
+  hang inside the plot once the bar's top passes 62%.
+- `.cols` had `overflow-x: auto`, which clipped the tip vertically. Removed —
+  at most 52 buckets with a min-width, there was nothing to scroll worth
+  sacrificing the tip for.
+- Edge columns pin the tip to the near edge instead of centring, so it cannot
+  spill past the card.
+
+Removed: `fitsInline`, the `.inline` / `.value` / `.dormant-value` labels.
+Y axis retained (magnitude at a glance) + tip (precision on demand).
+1,247 tests, check clean.
+
+### Screenshot harness (scratchpad, not committed)
+
+`shot.mjs` drives headless Chromium over CDP using Node 22's built-in
+WebSocket — no puppeteer/playwright dependency. Notes worth keeping:
+- Seed `sauron.refresh_token` then **reload**; a hash change alone keeps the
+  already-booted unauthenticated SPA instance and renders the login form.
+- `:hover` requires `Input.dispatchMouseEvent`; a MouseEvent dispatched from
+  page JS does not trigger CSS :hover.
+- Port 9222 is taken by the user's own Brave, so Chromium falls back to IPv6
+  only — probe both `127.0.0.1` and `[::1]`.
+
+---
+
+## Sortable-header affordance — 2026-08-29 (approved)
+
+`SortableTh` rendered the caret ONLY on the active column, so the other
+sortable headers looked like plain labels — the reason the At-risk table's
+Events/Errors/Sessions read as non-sortable even though they always were.
+
+Inactive headers now render `chevrons-up-down` (added to the Icon registry from
+Lucide) at `--text-faint` / 0.65, going full opacity on hover and focus. The
+PAIR rather than a dimmed `chevron-down` is deliberate: in this app a bare
+`sort=` column is DESCENDING, so a faint down-chevron on an unsorted column
+reads as "sorted descending, faintly" — precisely the misreading a sort
+affordance must not invite. The `.caret` box already reserved its width, so
+nothing shifts.
+
+Blast radius is every sortable table (23 files). Verified in the browser rather
+than by inspection: a DOM probe confirms `Last seen` active/bright and
+Events/Errors/Sessions inactive/faint, all four carrying a glyph and `Person`
+(a plain `<th>`) carrying none; captured in dark AND light, since
+`--text-faint` is a different colour in each (light: rgb(139,147,161) @ .65).
+1,247 tests, check clean.
+
+---
+
+## Coverage floor: 0% vs unknown — 2026-08-29 (defect found while answering "retention seems off")
+
+The grid draws its two halves from DIFFERENT sources with different horizons:
+
+* cohort membership from `event_user_environments.first_seen` — one row per
+  person, never pruned, reaching back as far as ingest ever ran;
+* activity from `person_days` — which begins when the fold or the one-time
+  backfill began, and is pruned at the 400-day horizon.
+
+So a cohort whose start predates the person-day history has periods with NO
+activity data behind them, and the grid reported the zero rows it found as
+**0% retention** — stating a fact the data cannot support, in the direction
+that makes retention look worst.
+
+Caught on the benchmark app: `first_seen` reaches back to 2026-05-27 while
+`person_days`/`analytics_events` both start 2026-07-26, so the 2026-06-08
+cohort showed `0%, 0%, 0%, 0%, 0%` for every week before the data began. I had
+previously seen that row and misattributed it to the seed's event distribution.
+
+`person_days::coverage_floor(conn, scope)` returns the earliest person-day
+under the read scope (env-aware — an environment whose history starts later
+must blank more, not less), and `densify` now returns `None` for any period
+that ENDS at or before it, exactly as it already did for periods that have not
+elapsed. Both ends of the timeline now say "not knowable" instead of "zero".
+
+Also verified while investigating, and worth recording as the reason to trust
+the rest: `person_days` reproduces raw `analytics_events` EXACTLY for an
+in-range cohort — 1431/1431 on day 0, then 75/75, 136/136, 136/136, 166/166,
+130/130, 128/128. The rollup loses nothing; where retention is genuinely low,
+it is low in the source data.
+
+14 db tests, 7 http tests, clippy clean.
