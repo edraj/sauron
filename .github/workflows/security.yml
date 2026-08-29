@@ -45,9 +45,12 @@ jobs:
             || { echo "::error::gitleaks download failed"; exit 1; }
           tar xzf "$GLT" -C .cigate/bin gitleaks || { echo "::error::gitleaks extract failed"; exit 1; }
           echo "::group::gitleaks detect"
+          # `|| rc=$?`, not a bare call: steps run under `bash -e`, so a bare
+          # non-zero exit kills the step before `rc=$?` and skips every scanner
+          # below it. A command on the left of `||` is exempt from `set -e`.
+          rc=0
           .cigate/bin/gitleaks detect --source . --no-git --redact \
-            --report-format json --report-path .cigate/out/gitleaks.json
-          rc=$?
+            --report-format json --report-path .cigate/out/gitleaks.json || rc=$?
           echo "::endgroup::"
           if [ "$rc" -ne 0 ]; then echo "::error::Gitleaks found committed secrets"; echo 1 > .cigate/rc; fi
           exit 0
@@ -61,9 +64,9 @@ jobs:
           UNFIXED=""
           if [ "$IGNORE_UNFIXED" = "true" ]; then UNFIXED="--ignore-unfixed"; fi
           echo "::group::trivy fs"
+          rc=0
           .cigate/bin/trivy fs --scanners "$TRIVY_SCANNERS" --severity "$SEVERITY" $UNFIXED \
-            --format json --output .cigate/out/trivy.json --exit-code 1 --no-progress .
-          rc=$?
+            --format json --output .cigate/out/trivy.json --exit-code 1 --no-progress . || rc=$?
           .cigate/bin/trivy fs --scanners "$TRIVY_SCANNERS" --severity "$SEVERITY" $UNFIXED \
             --no-progress --skip-db-update . 2>/dev/null || true
           echo "::endgroup::"
@@ -76,10 +79,10 @@ jobs:
           # Use the semgrep binary: `python -m semgrep` hard-fails (exit 2) as of semgrep 1.38+.
           export PATH="$HOME/.local/bin:$PATH"
           echo "::group::semgrep scan"
+          rc=0
           semgrep scan --config "$SEMGREP_CONFIG" \
             --error --severity ERROR --disable-version-check --metrics off \
-            --json --output .cigate/out/semgrep.json .
-          rc=$?
+            --json --output .cigate/out/semgrep.json . || rc=$?
           echo "::endgroup::"
           if [ "$rc" -ne 0 ]; then echo "::error::Semgrep found security issues (ERROR severity)"; echo 1 > .cigate/rc; fi
           exit 0
