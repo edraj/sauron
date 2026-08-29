@@ -16,18 +16,23 @@ export interface RetentionParams {
   cohorts?: number;
   periods?: number;
   split?: 'none' | 'errors';
+  /** Restrict to people the app has named (event_users.identified_at). */
+  identified_only?: boolean;
 }
 
 export interface LifecycleParams {
   granularity?: Granularity;
   periods?: number;
+  /** Restrict to people the app has named (event_users.identified_at). */
+  identified_only?: boolean;
 }
 
 export interface ChurnParams {
   granularity?: Granularity;
   silent_periods?: number;
+  /** Restrict to people the app has named (event_users.identified_at). */
+  identified_only?: boolean;
   limit?: number;
-  /** Keyset cursor: the `last_seen` of the previous page's final row. */
   /** `column` = descending, `-column` = ascending (the house convention). */
   sort?: string;
   /** Verbatim `next_cursor` from the previous page. */

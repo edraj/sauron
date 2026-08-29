@@ -21,6 +21,7 @@
 - [Best Practices](Best-Practices.md)
 - [Notifications](Notifications.md)
 - [Privacy Inspector](Privacy-Inspector.md)
+- [Admin: purge & ingest failures](Admin.md)
 - [Troubleshooting](Troubleshooting.md)
 
 **Reference**
@@ -28,4 +29,5 @@
 - [Examples](Examples.md)
 - [Dashboard](Dashboard.md)
 - [Active Users](Active-Users.md)
+- [Retention](Retention.md)
 - [Search & Filtering](Search.md)

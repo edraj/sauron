@@ -167,6 +167,43 @@ jobs:
         # neither half is sufficient alone.
         run: cargo test --workspace
 
+  # ---------------------------------------------------------------------------
+  # RUSTSEC advisories.
+  #
+  # A separate job, NOT a step on `backend`: that job is the critical path
+  # (~10 min of compile), and an advisory check that has to wait behind a full
+  # build is one people start skipping. This needs only `Cargo.lock`, so it
+  # finishes in seconds on a cold runner.
+  #
+  # Not added to `security.yml` either, deliberately — that file is deployed
+  # from a canonical template (`reusable_assets/ci-security`) and its own header
+  # says an edit here gets overwritten by the deploy script. A rule that a
+  # deploy silently reverts is worse than no rule, because it looks present.
+  # Trivy there does scan dependencies, but nothing in the fleet template is
+  # Rust-specific, and RUSTSEC advisories have had to be cleared by hand before
+  # (#41).
+  #
+  # `continue-on-error` on the audit step: a newly published advisory with no
+  # fixed version available would otherwise block every unrelated PR overnight.
+  # The job still reports, and `--deny warnings` keeps unmaintained crates
+  # visible rather than silently tolerated.
+  cargo-audit:
+    name: backend — RUSTSEC advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-bin-v1
+      - name: Install cargo-audit
+        run: command -v cargo-audit || cargo install cargo-audit --locked
+      - name: cargo audit
+        continue-on-error: true
+        working-directory: backend
+        run: cargo audit --deny warnings
+
   dashboard:
     name: dashboard — build · test
     runs-on: ubuntu-latest
@@ -599,6 +636,7 @@ jobs:
     if: always()
     needs:
       - backend
+      - cargo-audit
       - dashboard
       - sdk-js
       - sdk-node

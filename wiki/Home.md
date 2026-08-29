@@ -83,10 +83,15 @@ scope and resolved as a union down the tree.
   copy-paste run commands.
 - **[Dashboard](Dashboard.md)** — a tour of the dashboard sections: Overview,
   Exceptions, Performance, Events, Sessions, Users, Devices, Screens, Funnels,
-  Journeys, and the Manage section.
+  Journeys, Retention, and the Manage section.
 - **[Active Users](Active-Users.md)** — combined daily active users across
   several apps, the identified/guest split and what it can and cannot merge,
   and the CSV export.
+- **[Admin](Admin.md)** — data purge (preview → confirm, permanent) and the
+  ingest-failure dead-letter queue.
+- **[Retention](Retention.md)** — the cohort grid and how to read it, the
+  lifecycle split, the error-exposure comparison, the at-risk list, and the
+  one-time backfill an existing app needs before any of it works.
 - **[Search & Filtering](Search.md)** — the free-text search boxes and the
   structured `field · op · value` filters on each list, which columns each one
   matches, and how it works (case-insensitive `ILIKE`, no full-text engine).

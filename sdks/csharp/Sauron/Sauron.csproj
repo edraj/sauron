@@ -10,7 +10,23 @@
     <Version>1.5.0</Version>
     <PackageId>Sauron</PackageId>
     <Description>Server-side .NET SDK for the Sauron observability + analytics ingest gateway.</Description>
+    <!--
+      Packaging metadata, added so `dotnet pack` produces something publishable
+      rather than something that merely builds. The readme was the only warning
+      `dotnet pack` emitted; the rest is what NuGet shows on the listing page
+      and what consumers need to judge the package.
+    -->
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
+    <Authors>edraj</Authors>
+    <PackageTags>observability;analytics;error-tracking;telemetry;sauron</PackageTags>
+    <RepositoryUrl>https://github.com/edraj/sauron</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Sauron.Tests" />

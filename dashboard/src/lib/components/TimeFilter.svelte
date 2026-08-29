@@ -65,7 +65,12 @@
   // `between` while only `from` is set produces a transiently INVALID filter
   // that must still render so the user can fill in the other bound. Emitting it
   // would put a request on the wire the server answers with a 400.
+  // svelte-ignore state_referenced_locally
+  // Seeding only, and the divergence is the entire point — see the comment
+  // above. The `$effect` below is what re-syncs on a genuine OUTSIDE change,
+  // deliberately and not on every read.
   let draft = $state<TimeFilterState>({ ...value });
+  // svelte-ignore state_referenced_locally
   let syncedKey = $state(keyOf(value));
 
   // Re-sync only when `value` genuinely changed from OUTSIDE — a URL restore,

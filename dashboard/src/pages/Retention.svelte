@@ -30,6 +30,17 @@
 
   let granularity = $state<Granularity>('day');
   let split = $state(false);
+  /**
+   * Restrict every card to people the app has named.
+   *
+   * Defaults OFF deliberately: "did the people who arrived come back?" is a
+   * question about everyone, and guests are most of the arrivals. Filtering
+   * them out by default would quietly change what this page claims to measure
+   * — and it selects for people who already converted, which flatters the
+   * number. It is offered because an identified id comes from the app and is
+   * stable even where an anonymous one is not.
+   */
+  let identifiedOnly = $state(false);
   // Percentages or absolute people. Page-owned so the error split's two grids
   // flip together; the header control is the accessible toggle, clicking any
   // cell is the shortcut.
@@ -112,6 +123,7 @@
     const id = appId;
     const g = granularity;
     const sp = split;
+    const idOnly = identifiedOnly;
     // Touch scopeKey so the effect re-runs when the environment picker
     // changes. The axios client injects `environment_id` itself, so nothing
     // below reads this value — without the touch the request would simply
@@ -119,18 +131,28 @@
     // environment's numbers.
     const scope = sessionStore.scopeKey;
     if (!id) return;
-    void gridView.load(viewKey('retention.grid', id, scope, g, sp), () =>
-      getRetention(id, { granularity: g, cohorts: 12, periods: 12, split: sp ? 'errors' : 'none' }),
+    // `idOnly` is part of the KEY, not just the request: two entries whose
+    // only difference is the audience must not share one slot, or a cached
+    // all-users grid gets shown under the identified-only label.
+    void gridView.load(viewKey('retention.grid', id, scope, g, sp, idOnly), () =>
+      getRetention(id, {
+        granularity: g,
+        cohorts: 12,
+        periods: 12,
+        split: sp ? 'errors' : 'none',
+        identified_only: idOnly,
+      }),
     );
   });
 
   $effect(() => {
     const id = appId;
     const g = granularity;
+    const idOnly = identifiedOnly;
     const scope = sessionStore.scopeKey;
     if (!id) return;
-    void lifeView.load(viewKey('retention.lifecycle', id, scope, g), () =>
-      getLifecycle(id, { granularity: g, periods: 12 }),
+    void lifeView.load(viewKey('retention.lifecycle', id, scope, g, idOnly), () =>
+      getLifecycle(id, { granularity: g, periods: 12, identified_only: idOnly }),
     );
   });
 
@@ -138,13 +160,14 @@
     const id = appId;
     const g = granularity;
     const sort = sortParam(churnSort);
+    const idOnly = identifiedOnly;
     sessionStore.scopeKey;
     if (!id) return;
     churnLoading = true;
     churnPeople = [];
     churnCursor = null;
     expandedPerson = null;
-    getChurn(id, { granularity: g, silent_periods: 4, limit: 25, sort })
+    getChurn(id, { granularity: g, silent_periods: 4, limit: 25, sort, identified_only: idOnly })
       .then((r) => {
         churnPeople = r.people;
         churnSilentDays = r.silent_days;
@@ -171,6 +194,7 @@
         limit: 25,
         sort: sortParam(churnSort),
         cursor,
+        identified_only: identifiedOnly,
       });
       churnPeople = [...churnPeople, ...r.people];
       churnCursor = r.next_cursor;
@@ -236,6 +260,10 @@
         <input type="checkbox" bind:checked={split} />
         {t('retention.errorSplit.toggle')}
       </label>
+      <label class="split-toggle" title={t('retention.identifiedOnly.hint')}>
+        <input type="checkbox" bind:checked={identifiedOnly} />
+        {t('retention.identifiedOnly.toggle')}
+      </label>
     </div>
   </header>
 
@@ -243,6 +271,7 @@
     <Card>
       <h2 class="not-ready-title">{t('retention.notReady.title')}</h2>
       <p>{t('retention.notReady.body')}</p>
+      <p class="sub">{t('retention.notReady.allApps')}</p>
       <CodeBlock code={BACKFILL_COMMAND} language="bash" />
     </Card>
   {:else}

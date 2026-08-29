@@ -2449,3 +2449,133 @@ in-range cohort — 1431/1431 on day 0, then 75/75, 136/136, 136/136, 166/166,
 it is low in the source data.
 
 14 db tests, 7 http tests, clippy clean.
+
+---
+
+## Closing sweep — 2026-08-29
+
+Two real gaps found and closed; everything else verified rather than assumed.
+
+**1. Lifecycle had the same source asymmetry as the grid, and worse.** The grid
+merely reported 0% for periods with no data; lifecycle MISCLASSIFIED them.
+`new` is decided by `first_seen` (complete history) while
+returning-vs-resurrected needs a person-day in the PREVIOUS bucket — so anyone
+carried over from before the person-day floor read as "not new, absent last
+period" = RESURRECTED, producing a fake resurrection spike on the first bucket
+with data, preceded by empty buckets that read as "nobody was here".
+`compute_lifecycle` now clamps its window to `coverage_floor`, which makes the
+floor bucket the primer that `lifecycle` already drops.
+
+The test was verified to FAIL without the fix (`bucket 2026-08-18 precedes the
+person-day floor 2026-08-26`) rather than assumed to cover it.
+
+**2. The feature was undocumented.** Its sibling Active Users has a wiki page,
+a sidebar entry and a Home listing; Retention had none — including no mention
+anywhere of `sauron-migrate backfill-person-days`, without which an existing
+app shows nothing. Added `wiki/Retention.md` (how to read the grid, why hatched
+is never zero, lifecycle, the error split's period-0 rule, at-risk, insights,
+freshness/limits, and an "if the numbers look impossibly low" section pointing
+at the SDK 1.4.0 anon-id boundary), linked from `_Sidebar.md`, `Dashboard.md`
+(Analyze list) and `Home.md`. No broken wiki links; the wiki parity test passes.
+
+**Environment note:** the project's `sauron-postgres-1`/`sauron-redis-1` had
+exited and the scratchpad was wiped, so the suite was failing for want of a
+database rather than for any code reason. On restart the two containers SWAPPED
+IPs (postgres .3, redis .2). Derive them with `docker inspect` — do not
+hardcode. Host :5432 remains the unrelated Postgres that rejects the `sauron`
+user.
+
+Final: backend 2,060 passed / 0 failed (incl. `router_parity`, which the
+concurrent OpenAPI session has since completed), clippy `-D warnings` clean,
+fmt clean; dashboard 1,247 tests, check 0 errors, build clean.
+
+---
+
+## Identified-users-only toggle — 2026-08-29 (approved: toggle, default off)
+
+Guests can now be excluded from all three cards. Default OFF, because "did the
+people who arrived come back?" is a question about everyone and guests are most
+of the arrivals — making it the default would quietly change what the page
+claims to measure, and it selects for people who already converted.
+
+- `retention::Audience` (`Everyone` | `IdentifiedOnly`) renders a STATIC SQL
+  fragment with no bind of its own: these queries number their parameters by
+  hand and thread `EnvFilter`'s bind through them, so a new bind would shift
+  every later index.
+- The authority is `event_users.identified_at` — the same column
+  `active_users_series` joins on — NOT a `distinct_id LIKE 'anon\_%'` test,
+  which breaks for server-side SDKs and would let the two pages disagree about
+  who is a person.
+- Grid filters the COHORT set only (person-days are reached solely through a
+  join to it, so one filter covers both and keeps the probe off the per-day
+  rows); lifecycle filters BOTH legs, since `w` and `fb` are independent scans.
+- `identified_only` is in the CACHE KEY. Without it two same-shape requests
+  share one entry and an all-users grid is served under the identified-only
+  label — the same leak class as the resolved env filter.
+- `resolve_audience` refuses with 503 `schema_migration_required` when the
+  column is absent, reusing `active_users.rs`'s probe and message rather than
+  falling back to `Everyone` under an identified-only label.
+
+Verified live end to end, not just wired: drive app reads 10 users / day-1 60%
+by default and 2 users / day-1 100% filtered — which is itself the survivorship
+bias the docs now warn about. Browser check confirmed the checkbox flips the
+cohort 10 → 2, so the UI call site is real (the unreachable-feature class).
+
+Clippy `too_many_arguments` on the two 8-arg queries is silenced with
+`#[allow]`, matching 70 existing uses in this workspace (incl.
+`sauron-db/src/purge.rs`); a params-struct refactor here would be the
+inconsistent choice.
+
+Backend 2,061 tests + 9 http_retention; dashboard 1,247, check 0 errors.
+`wiki/Retention.md` gained an "Identified users only" section.
+
+---
+
+## Audit remediation + `sauron-migrate --help` — 2026-08-29
+
+**`sauron-migrate`** gained `--help`/`-h`/`help` and `--version`/`-V`, and its
+bad-argument path now suggests the near miss. `COMMANDS` is ONE array feeding
+both the help text and validation — they were never allowed to become two
+lists, because a list only the error path reads is one nobody notices going
+stale. Args are parsed before the tracing subscriber and before the database is
+touched, so `--help` works on a box with no `DATABASE_URL` and prints to stdout
+un-interleaved. Repeating a backfill in one invocation now runs it once (they
+are additive; twice would double-count). 7 unit tests.
+
+Audit items, all resolved except the one that needs a credential:
+
+1. **a11y (Timeline)** — the slice control was a bare `<span>` behind two
+   `svelte-ignore` comments in the OLD dash syntax that Svelte 5 no longer
+   honours: the suppressions were dead AND the defect live. Converting it to a
+   `<button>` surfaced the real reason it was a span — the whole row is already
+   a button, and nesting is invalid HTML. Fixed as `role="button"` +
+   `tabindex="0"` + `onkeydown` (Enter/Space, with `preventDefault` so Space
+   does not scroll and neither key toggles the row behind it).
+2. **Dependencies** — `vitest` 2 -> 4.1.11 clears all 7 advisories (1 critical,
+   2 high). Verified rather than assumed: 1,247 tests, check and build all pass
+   on v4. `svelte-check`'s file count dropped 590 -> 558, so a deliberate type
+   error was planted to prove source coverage was intact (it failed correctly)
+   and then removed — the drop is dependency `.d.ts`, not lost scanning.
+3. **C# SDK** — NOT published: that is an outward-facing action needing a NuGet
+   credential and explicit approval. Made publish-READY instead: added
+   `PackageReadmeFile`, licence, authors, tags and repo URL, so `dotnet pack`
+   is now warning-free. 132 C# tests pass.
+4. **8 `state_referenced_locally` warnings** — all intentional seeding
+   snapshots; annotated with `svelte-ignore` + a line saying why divergence is
+   the point. Dashboard is now 0 errors / 0 warnings / 0 files with problems.
+5. **RUSTSEC** — added a `cargo-audit` job to `ci.yml`, NOT to `security.yml`:
+   that file is deployed from a canonical template whose header says an edit
+   here is overwritten by the deploy script, and a rule a deploy silently
+   reverts is worse than none. Separate job, not a `backend` step, so a ~10-min
+   compile cannot discourage running it. `ci-complete`'s self-coverage gate
+   caught that the new job was missing from its `needs:` — registered, and the
+   gate's own check was run locally to confirm.
+6. **Undocumented admin surfaces** — added `wiki/Admin.md` covering the purge
+   preview -> confirm flow (and why `confirm` takes no scope fields, so it
+   cannot widen what was reviewed) and the ingest-failure dead-letter queue.
+   Linked from `_Sidebar.md`, `Dashboard.md` and `Home.md`; no broken links.
+7. **Backfill discoverability** — the not-ready card now says the command
+   covers every predating app, not just the one being viewed.
+
+Final: backend 2,068 passed / 0 failed, workspace clippy + fmt clean;
+dashboard 1,247 tests, 0 errors, 0 warnings, 0 vulnerabilities; C# 132 tests.

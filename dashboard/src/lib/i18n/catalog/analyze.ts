@@ -218,6 +218,11 @@ export const analyze = {
   'retention.actionLink.quickGood': { en: 'Users list', ar: 'قائمة المستخدمين' },
   'retention.actionLink.cliff': { en: 'Events explorer', ar: 'مستكشف الأحداث' },
   'retention.actionLink.bestCohort': { en: 'Journeys explorer', ar: 'مستكشف الرحلات' },
+  'retention.identifiedOnly.toggle': { en: 'Identified users only', ar: 'المستخدمون المعرّفون فقط' },
+  'retention.identifiedOnly.hint': {
+    en: 'Exclude guests: count only people your app named via identify() or context.user.id. Note this selects people who already signed up, so retention will read higher.',
+    ar: 'استبعاد الضيوف: احتساب من عرّفهم تطبيقك عبر identify() أو context.user.id فقط. لاحظ أن هذا يختار من سجّلوا بالفعل، لذا سيبدو الاحتفاظ أعلى.',
+  },
   'retention.insights.title': { en: 'Insights', ar: 'الرؤى' },
   'retention.insight.day1Up': {
     en: 'Day-1 retention averages {pct} and is improving — up {delta} between the older and newer half of these cohorts.',
@@ -300,6 +305,13 @@ export const analyze = {
   'retention.notReady.body': {
     en: 'Run this on the server to cover data from before this feature was installed. Until then this page has nothing to show for this app.',
     ar: 'شغّل هذا على الخادم لتغطية البيانات السابقة لتثبيت هذه الميزة. حتى ذلك الحين لا يوجد ما يُعرض هنا لهذا التطبيق.',
+  },
+  // The command covers EVERY app in one run, and an operator who reads this
+  // card on one app has no way to know that from here — so they fix the app in
+  // front of them and leave the rest quietly blank.
+  'retention.notReady.allApps': {
+    en: 'It runs once and covers every app that predates the feature — not just this one.',
+    ar: 'يُشغَّل مرة واحدة ويغطي كل التطبيقات السابقة للميزة، وليس هذا التطبيق فقط.',
   },
   'retention.lifecycle.title': { en: 'Lifecycle', ar: 'دورة الحياة' },
   'retention.lifecycle.subtitle': {

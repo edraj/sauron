@@ -284,6 +284,10 @@ their tables, because that one also picks the timestamp column.
   store a funnel, then search, load, duplicate, or remove saved funnels later.
 - **Journeys** — a journey/path graph that shows how users move between events and
   screens (branches, common paths).
+- **Retention** — did the people who arrived come back? A cohort grid, a
+  new/returning/resurrected/dormant lifecycle split, an at-risk list and computed
+  insights. Needs a one-time `sauron-migrate backfill-person-days` for apps that
+  predate the feature. See [Retention](Retention.md).
 
 ## Manage
 
@@ -293,6 +297,9 @@ their tables, because that one also picks the timestamp column.
 - **Members** — org/project/app members and role grants (shown only to users with
   `member:read`). RBAC is enforced per request; the UI hides actions the caller can't
   perform.
+- **Data purge / Ingest failures** — deployment-admin surfaces: permanent
+  erasure (preview → confirm, no undo) and the dead-letter queue for envelopes
+  that failed validation. See [Admin](Admin.md).
 - **App settings** — per-app configuration, including **Settings → Environments**:
   create/rename/retire environments and copy, rotate, or mute each one's **DSN**.
 

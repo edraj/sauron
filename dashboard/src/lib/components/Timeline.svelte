@@ -201,11 +201,33 @@
               {/if}
               <LatencyBadge ms={item.transaction.duration_ms} size="sm" />
               {#if onslice && item.transaction.finished_at}
-                <!-- svelte-ignore a11y-click-events-have-key-events -->
-                <!-- svelte-ignore a11y-no-static-element-interactions -->
+                <!--
+                  Keyboard-operable, but NOT a <button>: the whole row is
+                  already one (the expand toggle), and a button inside a button
+                  is invalid HTML the browser silently restructures.
+                  `role`+`tabindex`+`onkeydown` give focus and Enter/Space
+                  without the nesting.
+
+                  It was previously a bare span behind two `svelte-ignore`
+                  comments in the old dash syntax, which Svelte 5 no longer
+                  honours — so the suppressions were dead AND the defect was
+                  real: the only way to slice the timeline could not be reached
+                  without a mouse.
+                -->
                 <span
                   class="in-between-btn"
+                  role="button"
+                  tabindex="0"
                   onclick={(e) => {
+                    e.stopPropagation();
+                    onslice(item.transaction);
+                  }}
+                  onkeydown={(e) => {
+                    if (e.key !== 'Enter' && e.key !== ' ') return;
+                    // Space would scroll the timeline, and either key would
+                    // otherwise also reach the row button behind this and
+                    // toggle the row open as a side effect.
+                    e.preventDefault();
                     e.stopPropagation();
                     onslice(item.transaction);
                   }}
@@ -549,6 +571,10 @@
     font-size: 13px;
   }
   .in-between-btn {
+    /* A button does not inherit the surrounding font, so say so explicitly —
+       without this the element changes appearance purely from being made
+       keyboard-reachable. */
+    font-family: inherit;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -563,6 +589,13 @@
     cursor: pointer;
     transition: background 0.12s, color 0.12s;
   }
+  /* The reason this became a button: keyboard users need to see where they
+     are. `:focus-visible` keeps it off mouse clicks. */
+  .in-between-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
   .in-between-btn:hover {
     background: var(--surface-3);
     color: var(--text);
