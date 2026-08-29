@@ -69,9 +69,28 @@ jobs:
           POSTGRES_USER: sauron
           POSTGRES_PASSWORD: sauron
           POSTGRES_DB: sauron
+          # PGDATA is a SUBDIRECTORY of the tmpfs mount, not the mount itself.
+          # Docker creates the mountpoint root-owned, and initdb refuses a data
+          # directory it does not own; the entrypoint creates and chowns a
+          # subdirectory itself, which sidesteps that entirely.
+          PGDATA: /var/lib/postgresql/data/pgdata
         ports:
           - 5432:5432
+        # Postgres on a RAM disk. The measured bottleneck of the backend job is
+        # not scheduling — the nextest trial (#55) proved that by improving
+        # scheduling and getting 6s SLOWER. It is ~398 CREATE DATABASE /
+        # DROP DATABASE pairs, each copying the migrated template, on a disk
+        # shared with the 4 vCPUs running the tests. 249s of the 380s test step.
+        #
+        # Nothing here needs to survive the job: every database is created and
+        # dropped inside it, and the container is discarded at the end. Durability
+        # is being paid for and thrown away.
+        #
+        # 1g is generous — the template plus the handful of ephemeral copies
+        # alive at once are megabytes — but the runner has 16 GB and running out
+        # would present as confusing postgres errors rather than a clean failure.
         options: >-
+          --tmpfs=/var/lib/postgresql/data:rw,size=1g
           --health-cmd="pg_isready -U sauron"
           --health-interval=5s
           --health-timeout=3s
