@@ -1,40 +1,34 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
-    # Every merge to main publishes a release (the patch auto-advances off the
-    # highest existing tag), so a merge that cannot change a shipped byte still
-    # spent ~20 runner-minutes rebuilding both distros and cut a release whose
-    # binaries were identical to the previous one.
-    #
-    # Observed 2026-08-29: v1.7.9 came from a merge that touched only
-    # .github/workflows/security.yml, and v1.7.10 from one that touched only
-    # .github/workflows/*. Same application code, two full RPM builds.
-    #
-    # Only paths that CANNOT reach an artifact belong here. Deliberately absent:
-    # `**/*.md` (the spec ships README.md via %doc) and `packaging/**` (it is
-    # the spec itself). A wrong entry here means a real change silently never
-    # ships, which is far worse than a wasted build -- keep this list narrow.
-    paths-ignore:
-      - '.github/**'
-      - '.gitleaks.toml'
-      - 'wiki/**'
-      - 'docs/**'
-  # dry run: builds the RPMs as workflow artifacts, creates no release.
-  # `publish: true` forces a real release -- the escape hatch for paths-ignore
-  # above, since a skipped push cannot be re-triggered by pushing again.
+  # Manual only. Previously every push to main built both distros and published
+  # a release — ~24 runner-minutes, over half the CI budget for the repo, on
+  # every merge regardless of whether anyone wanted to ship. #53 stopped the
+  # merges that could not change a shipped byte; this stops the rest.
+  #
+  # Matches edraj/csdmart, which triggers its Release on workflow_dispatch and
+  # `release: [created]` rather than on merges.
+  #
+  # The version scheme is unchanged and still works here: major.minor comes
+  # from backend/Cargo.toml and the patch is (highest existing v<maj>.<min>.*
+  # tag + 1). Releases simply become deliberate rather than automatic, and the
+  # patch advances once per release instead of once per merge.
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Publish a real GitHub release (default: dry run, artifacts only)'
+        # Default false, deliberately. Publishing creates a public release AND
+        # a tag, which is not something to do by accident on a run someone
+        # started to check that the RPMs still build. Ticking this box is the
+        # whole act of releasing, so it should be an explicit act.
+        description: 'Publish a real GitHub release (default: dry run, build artifacts only)'
         type: boolean
         default: false
 
 concurrency:
-  # Serialize releases so two quick merges can't compute the same version.
-  # A newer push replaces the queued run; the in-flight one finishes first,
-  # so the queued run sees its tag and bumps the patch off it.
+  # Serialize releases so two runs started close together can't compute the
+  # same version. Far less likely now that releases are manual, but two people
+  # dispatching at once is exactly the case this still covers: the in-flight
+  # run finishes first, so the queued one sees its tag and bumps off it.
   group: release-main
   cancel-in-progress: false
 
@@ -300,8 +294,10 @@ jobs:
 
   release:
     name: publish GitHub release
-    # Real merges to main publish; workflow_dispatch is a build-only dry run.
-    if: github.event_name == 'push' || inputs.publish
+    # A dispatch is a build-only dry run unless `publish` was ticked. There is
+    # no automatic path to here any more: nothing publishes without someone
+    # asking for it.
+    if: inputs.publish
     needs: [version, package, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 10

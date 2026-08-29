@@ -19,6 +19,21 @@ name: cache warm
 on:
   push:
     branches: [main]
+    # An allowlist, not paths-ignore: this job exists only to write the Rust
+    # dependency cache, so it is worth running only when something that feeds
+    # that cache moved. It ran for 5 minutes on dce2dbe0, a merge that touched
+    # nothing but .github/**, warming a cache that could not have changed.
+    #
+    # ci.yml and cache-warm.yml are listed because they carry RUSTFLAGS and
+    # CARGO_PROFILE_TEST_DEBUG, which are part of the cache key — editing
+    # either MUST rewarm or every later PR restores nothing. fetch-libduckdb.sh
+    # is listed because it decides which libduckdb the test binaries link
+    # against.
+    paths:
+      - 'backend/**'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/cache-warm.yml'
+      - 'packaging/rpm/fetch-libduckdb.sh'
   workflow_dispatch:
 
 concurrency:
