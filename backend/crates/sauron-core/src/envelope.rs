@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Severity level, shared by errors and breadcrumbs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     Debug,
@@ -37,7 +37,7 @@ impl Level {
 }
 
 /// Top-level envelope posted by an SDK.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Envelope {
     pub header: EnvelopeHeader,
     #[serde(default)]
@@ -46,7 +46,7 @@ pub struct Envelope {
     pub items: Vec<EnvelopeItem>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EnvelopeHeader {
     /// Full DSN — optional; the public key normally travels in `X-Sauron-Key`.
     #[serde(default)]
@@ -59,7 +59,7 @@ pub struct EnvelopeHeader {
     pub release: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SdkInfo {
     pub name: String,
     pub version: String,
@@ -68,7 +68,7 @@ pub struct SdkInfo {
 /// Envelope-wide context. Free-form JSON blocks keep the SDKs unopinionated
 /// about platform-specific fields; only `user` is typed because the backend
 /// resolves it to an identity.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EnvelopeContext {
     #[serde(default)]
     pub device: serde_json::Value,
@@ -83,7 +83,7 @@ pub struct EnvelopeContext {
 }
 
 /// A single item in the envelope, tagged by `type`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EnvelopeItem {
     Error(Box<ErrorItem>),
@@ -93,7 +93,7 @@ pub enum EnvelopeItem {
     Transaction(TransactionItem),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ErrorItem {
     #[serde(default = "Uuid::new_v4")]
     pub event_id: Uuid,
@@ -150,7 +150,7 @@ pub struct ErrorItem {
 }
 
 /// Symbol-matching metadata shipped alongside a `raw_stacktrace`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DebugMeta {
     #[serde(default)]
     pub build_id: Option<String>,
@@ -162,7 +162,7 @@ pub struct DebugMeta {
     pub os: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ExceptionInfo {
     #[serde(rename = "type")]
     pub ty: String,
@@ -174,7 +174,7 @@ pub struct ExceptionInfo {
     pub stacktrace: Vec<Frame>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Mechanism {
     #[serde(rename = "type")]
     pub ty: String,
@@ -185,7 +185,7 @@ pub struct Mechanism {
 /// A platform-neutral stack frame. Frames are ordered with the crashing frame
 /// **last** (call site → crash). Symbolication happens server-side later; the
 /// SDK only ships raw frames plus the release.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Frame {
     #[serde(default)]
     pub function: Option<String>,
@@ -203,7 +203,7 @@ pub struct Frame {
     pub in_app: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Breadcrumb {
     #[serde(rename = "type", default)]
     pub ty: String,
@@ -220,7 +220,7 @@ pub struct Breadcrumb {
 }
 
 /// A `track()` product-analytics event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AnalyticsItem {
     pub name: String,
     pub distinct_id: String,
@@ -256,7 +256,7 @@ pub struct AnalyticsItem {
 
 /// A performance transaction: one timed operation (page/screen load, HTTP call,
 /// resource fetch, or a custom span). Aggregated server-side into p50/p95/etc.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TransactionItem {
     /// Route / screen / operation label (the grouping key on the dashboard).
     pub name: String,
@@ -311,7 +311,7 @@ pub struct TransactionItem {
 
 /// An `identify()` call: attach traits to a person, optionally aliasing an
 /// anonymous id to a known one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct IdentifyItem {
     pub distinct_id: String,
     #[serde(default)]
@@ -324,7 +324,7 @@ pub struct IdentifyItem {
 
 /// A batch of breadcrumbs uploaded ahead of (or alongside) an error so the
 /// backend can attach recent activity to a later crash for the same person.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BreadcrumbBatch {
     #[serde(default)]
     pub distinct_id: Option<String>,
@@ -335,7 +335,7 @@ pub struct BreadcrumbBatch {
 }
 
 /// The person a signal is attributed to.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EventUser {
     #[serde(default)]
     pub id: Option<String>,
@@ -353,7 +353,7 @@ pub struct EventUser {
 /// envelope item plus the edge-resolved tenancy + request context. The worker
 /// consumes these. Signals are written keyed by `app_id`; `project_id`/`org_id`
 /// are carried for context and future roll-ups.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct IngestJob {
     pub app_id: Uuid,
     pub project_id: Uuid,
@@ -400,7 +400,7 @@ pub struct IngestJob {
 ///
 /// Expanded back into per-item [`IngestJob`]s by the worker, so everything
 /// downstream of the decode is untouched.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct IngestBatch {
     pub app_id: Uuid,
     pub project_id: Uuid,
@@ -903,13 +903,17 @@ mod clock_skew_tests {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The golden envelope both SDKs must emit. Kept in sync with
-    /// `sdks/js/test/envelope.test.ts` and `sdks/flutter/test/envelope_test.dart`.
-    const GOLDEN: &str = r#"{
+/// The golden envelope every SDK must emit, and the worked example published
+/// in the ingest OpenAPI document.
+///
+/// Public and non-test so the documentation example and the parity test are the
+/// **same bytes**. A hand-copied example in the OpenAPI module would be free to
+/// drift from the contract this constant defines, which is exactly the failure
+/// this crate's golden-fixture discipline exists to prevent.
+///
+/// Kept in sync with `sdks/js/test/envelope.test.ts` and
+/// `sdks/flutter/test/envelope_test.dart`.
+pub const GOLDEN_ENVELOPE: &str = r#"{
       "header": {
         "dsn": "https://pk_test@localhost:8081/1",
         "sdk": { "name": "sauron.javascript", "version": "0.1.0" },
@@ -934,6 +938,14 @@ mod tests {
         { "type": "identify", "distinct_id": "u_123", "anonymous_id": null, "traits": { "plan": "pro" } }
       ]
     }"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same bytes as [`super::GOLDEN_ENVELOPE`], which the ingest
+    /// OpenAPI document publishes as its worked example.
+    const GOLDEN: &str = super::GOLDEN_ENVELOPE;
 
     #[test]
     fn deserializes_golden_envelope() {

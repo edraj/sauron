@@ -22,6 +22,7 @@ pub mod orgs;
 pub mod performance;
 pub mod projects;
 pub mod purge;
+pub mod retention;
 pub mod scope;
 pub mod screens;
 pub mod search;
@@ -40,7 +41,7 @@ use crate::error::ApiError;
 use crate::AppState;
 
 /// Access + refresh token pair returned by auth endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct TokenPair {
     pub access_token: String,
     pub refresh_token: String,

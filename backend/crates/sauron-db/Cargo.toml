@@ -17,6 +17,9 @@ scoped-futures.workspace = true
 tokio = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+# `models` structs ARE the API's response bodies, so their OpenAPI schemas have
+# to be derived here rather than mirrored by hand in `sauron-api`.
+utoipa.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 percent-encoding.workspace = true

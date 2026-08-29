@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::walk::Leaf;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyScope {
     /// Any depth. The default: a policy whose entry omits `scope` must widen,
@@ -27,7 +27,7 @@ pub enum KeyScope {
     Top,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TrackedKey {
     pub key: String,
     #[serde(default)]

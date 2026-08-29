@@ -13,9 +13,11 @@ use sauron_db::repo::{JourneyLink, JourneyNode};
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct JourneyQuery {
     #[serde(default = "default_days")]
     pub since_days: i64,
@@ -39,13 +41,21 @@ fn default_depth() -> i64 {
     5
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct Journey {
     pub depth: i64,
     pub nodes: Vec<JourneyNode>,
     pub links: Vec<JourneyLink>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/journeys", tag = "Analytics",
+    summary = "Explore user journeys",
+    description = "Common paths users take through the app, as a tree of steps rooted at a chosen starting event.",
+    params(("app_id" = Uuid, Path, description = "The app."), JourneyQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The journey tree.", body = Journey),
+              (status = 400, description = "Malformed step selection.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn explore(
     auth: AuthUser,
     State(state): State<AppState>,

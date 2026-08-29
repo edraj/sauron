@@ -62,6 +62,25 @@ pub struct Config {
     /// whole deployment at once rather than per client. Same trust caveat as
     /// the ingest flag: only enable when a proxy you control sets the header.
     pub api_trust_forwarded_headers: bool,
+    /// Whether `sauron-api` serves its OpenAPI document and Swagger UI.
+    ///
+    /// On by default: the API is the integration surface for SDK authors and
+    /// operators, and docs that ship dark are docs nobody reads. Set
+    /// `API_DOCS_ENABLED=0` on a hardened deployment to withdraw them.
+    ///
+    /// When off the routes are not registered at all, so they answer 404 rather
+    /// than 403. A 403 would confirm the endpoint exists and merely refuse it,
+    /// which tells an unauthenticated caller the deployment has docs to find.
+    pub api_docs_enabled: bool,
+    /// Absolute URL of `sauron-ingest`'s OpenAPI document, listed alongside the
+    /// API's own in the Swagger UI document selector.
+    ///
+    /// `None` when unset, and the selector then lists only the API document.
+    /// Deliberately not guessed: the gateway is a different service on a
+    /// different origin, and in the shipped topology it sits at a proxy's host
+    /// root rather than on `ingest_port`. A wrong default would render as a
+    /// selector entry that silently fails to load.
+    pub api_docs_ingest_url: Option<String>,
     pub monitor_tick_ms: u64,
     pub monitor_batch: i64,
     pub monitor_max_concurrency: usize,
@@ -304,6 +323,8 @@ impl std::fmt::Debug for Config {
                 "api_trust_forwarded_headers",
                 &self.api_trust_forwarded_headers,
             )
+            .field("api_docs_enabled", &self.api_docs_enabled)
+            .field("api_docs_ingest_url", &self.api_docs_ingest_url)
             .field("monitor_tick_ms", &self.monitor_tick_ms)
             .field("monitor_batch", &self.monitor_batch)
             .field("monitor_max_concurrency", &self.monitor_max_concurrency)
@@ -823,6 +844,12 @@ impl Config {
             api_trust_forwarded_headers: var("API_TRUST_FORWARDED_HEADERS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            // Inverted sense compared to its neighbours — this one defaults ON,
+            // so it tests for the OFF values rather than the ON ones.
+            api_docs_enabled: var("API_DOCS_ENABLED")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true),
+            api_docs_ingest_url: var("API_DOCS_INGEST_URL").filter(|v| !v.trim().is_empty()),
             monitor_tick_ms: parse("MONITOR_TICK_MS", 1000),
             monitor_batch: parse("MONITOR_BATCH", 100),
             monitor_max_concurrency: parse("MONITOR_MAX_CONCURRENCY", 50),
@@ -1381,6 +1408,8 @@ mod tests {
             ingest_backlog: 4096,
             ingest_trust_forwarded_headers: false,
             api_trust_forwarded_headers: false,
+            api_docs_enabled: true,
+            api_docs_ingest_url: None,
             monitor_tick_ms: 1000,
             monitor_batch: 100,
             monitor_max_concurrency: 50,

@@ -30,6 +30,7 @@ use sauron_db::scope::Range;
 use sauron_query::{from_legacy, parse, resolve, Node, ResolvedNode, ResolvedPredicate, Store};
 
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// Counting stops here when the plan degrades to a scan.
@@ -38,7 +39,7 @@ use crate::AppState;
 /// never becomes the expensive part of the request.
 pub const COUNT_CAP: i64 = 10_000;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ClampInfo {
     pub field: String,
     pub to: String,
@@ -52,13 +53,13 @@ pub struct ClampInfo {
 /// its rows or on its own request. The `+` for a capped total stays a display
 /// concern — see `SearchEnvelope`'s note on why this is a number and a boolean
 /// rather than the string `"1204+"`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CountEnvelope {
     pub total: i64,
     pub total_is_capped: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SearchEnvelope<T> {
     pub data: Vec<T>,
     pub total: i64,
@@ -147,12 +148,20 @@ pub fn resolve_window(
 /// Flattened into each route's `Query<T>` with `#[serde(flatten)]`. Note this
 /// does NOT go through `RawQuery` the way `environment_id` does — these three
 /// are ordinary typed parameters with no extractor trap attached.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct TimeFilterQuery {
     /// Validated by equality against the route's whitelist; the RESOLVED value
     /// is the whitelist's own `&'static str`. This `String` never reaches SQL.
+    #[param(example = "last_seen")]
     pub time_field: Option<String>,
+    /// Inclusive lower bound, RFC 3339. Sent together with `to`; sending only
+    /// one of the pair is accepted and the other end stays open.
+    #[param(example = "2026-08-01T00:00:00Z")]
     pub from: Option<DateTime<Utc>>,
+    /// Exclusive upper bound, RFC 3339. The server refuses a window wider than
+    /// its configured ceiling rather than silently narrowing it.
+    #[param(example = "2026-08-28T00:00:00Z")]
     pub to: Option<DateTime<Utc>>,
     /// `None` means the caller sent no `since_days`, and the route's own
     /// default applies.
@@ -164,6 +173,7 @@ pub struct TimeFilterQuery {
     /// query string, which is the extractor trap `routes::scope` exists to warn
     /// about; passing the default in as an argument avoids the question.
     #[serde(default, deserialize_with = "opt_i64_from_str_or_int")]
+    #[param(example = 30)]
     pub since_days: Option<i64>,
 }
 
@@ -190,7 +200,7 @@ where
 {
     use serde::de::{Error, Unexpected};
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, utoipa::ToSchema)]
     #[serde(untagged)]
     enum StrOrInt<'a> {
         Int(i64),
@@ -787,14 +797,14 @@ fn reject_withheld_body(p: &ResolvedPredicate, reach: TextSearchReach) -> Result
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SchemaVariable {
     pub prefix: String,
     pub description: String,
     pub chainable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SchemaDimension {
     pub name: String,
     #[serde(rename = "type")]
@@ -806,21 +816,21 @@ pub struct SchemaDimension {
     pub aliases: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TagInfo {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_values: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LabelInfo {
     pub key: String,
     #[serde(rename = "type")]
     pub ty: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SchemaResponse {
     pub resource: String,
     pub variables: Vec<SchemaVariable>,
@@ -829,7 +839,8 @@ pub struct SchemaResponse {
     pub available_labels: Vec<LabelInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SchemaQuery {
     pub context: Option<String>,
 }
@@ -982,6 +993,20 @@ pub fn build_schema_response(
     }
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/search/schema", tag = "Search",
+    summary = "Queryable fields for this app",
+    description = "\
+The dimensions, variables, tags and labels the query DSL will accept for this \
+app, discovered from its own data. Build autocomplete from this rather than \
+hardcoding field names.
+
+DSL semantics worth knowing: a bare `@tag` matches **any** key; a bare `sort=` \
+is descending; and time units resolve longest-suffix-first, so `m` means \
+**minutes**, not months.",
+    params(("app_id" = Uuid, Path, description = "The app."), SchemaQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Queryable schema.", body = SchemaResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn schema(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1139,6 +1164,9 @@ mod tests {
     /// pinned once here rather than discovered per route in the browser.
     #[test]
     fn flattened_window_params_survive_the_query_extractor() {
+        // NOT `ToSchema`: this probe exists to pin the *extractor* contract,
+        // and flattening a type that only implements `IntoParams` is exactly
+        // the shape the derive cannot describe. See `sessions::ListQuery`.
         #[derive(Debug, Deserialize)]
         struct Probe {
             #[serde(flatten)]

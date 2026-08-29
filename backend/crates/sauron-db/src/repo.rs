@@ -5739,7 +5739,7 @@ fn error_events_for_issue_query<'a>(
 
 /// Counts behind the occurrences stat strip. Raw-shape row, so it lives here
 /// beside `IssueStatsRow` rather than in `models.rs`.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct IssueEventStatsRow {
     pub events: i64,
     pub users: i64,
@@ -6072,7 +6072,7 @@ pub async fn events_for_person(
         .await
 }
 
-#[derive(Debug, PartialEq, QueryableByName, serde::Serialize)]
+#[derive(Debug, PartialEq, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct EventCount {
     #[diesel(sql_type = Text)]
     pub name: String,
@@ -6115,7 +6115,7 @@ pub async fn top_events(
     crate::bind_range!(stmt, range).get_results(conn).await
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct SeriesPoint {
     #[diesel(sql_type = Timestamptz)]
     pub bucket: DateTime<Utc>,
@@ -6839,7 +6839,7 @@ fn workflow_outcome_subquery(env_sql: &str, name_pred: &str, up: &str) -> String
 /// `workflow_list` and `workflow_detail` both produce (`workflow_detail`
 /// reuses this exact shape for its own single-name aggregate before folding
 /// in the other three pieces).
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct WorkflowRow {
     #[diesel(sql_type = Text)]
     pub name: String,
@@ -6964,7 +6964,7 @@ pub async fn workflow_list(
 
 /// One contained event name and its count within a workflow — `top_events`'
 /// row shape.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct NameCount {
     #[diesel(sql_type = Text)]
     pub name: String,
@@ -6974,7 +6974,7 @@ pub struct NameCount {
 
 /// One contained issue and its occurrence count within a workflow —
 /// `top_issues`' row shape.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct WorkflowIssue {
     #[diesel(sql_type = SqlUuid)]
     pub issue_id: Uuid,
@@ -6987,7 +6987,7 @@ pub struct WorkflowIssue {
 /// A single workflow name's full detail: the same outcome/duration aggregate
 /// as `workflow_list` (one name's worth), a duration histogram, the top
 /// contained (non-lifecycle) event names, and the top contained issues.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct WorkflowDetail {
     pub name: String,
     pub started: i64,
@@ -7182,7 +7182,7 @@ pub async fn workflow_detail(
 
 /// One individual workflow run — `workflow_runs`' row shape, linking to
 /// session detail via `session_id`.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct WorkflowRun {
     #[diesel(sql_type = Text)]
     pub workflow_id: String,
@@ -7261,7 +7261,7 @@ pub async fn workflow_runs(
 }
 
 /// One workflow span within a session — for the session timeline lane.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct WorkflowSpan {
     #[diesel(sql_type = Text)]
     pub workflow_id: String,
@@ -7567,7 +7567,7 @@ pub async fn transactions_for_session(
 /// it happens to report telemetry from, so there is no per-environment
 /// reading to derive these from any more than there is for a person's
 /// property bag.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct DeviceRow {
     #[diesel(sql_type = SqlUuid)]
     pub id: Uuid,
@@ -8092,7 +8092,7 @@ pub async fn list_devices(
 /// (a locked decision — every browser on Windows 11 folds into one row), so
 /// they have no single value per group. Both survive on the drill-down, which
 /// returns [`DeviceRow`].
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct DeviceGroupRow {
     #[diesel(sql_type = Nullable<Text>)]
     pub family: Option<String>,
@@ -8708,7 +8708,7 @@ pub async fn errors_for_device(
 /// choice explicitly — does a property bag stay visible to a caller scoped to
 /// an environment the person merely also happens to appear in, or should
 /// `properties` require broader access? — rather than inherit it silently.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct PersonRow {
     #[diesel(sql_type = Text)]
     pub distinct_id: String,
@@ -9134,7 +9134,7 @@ pub async fn list_persons(
 // Overview (composite health snapshot)
 // ===========================================================================
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct OverviewTotals {
     #[diesel(sql_type = BigInt)]
     pub events: i64,
@@ -9512,7 +9512,7 @@ pub async fn top_issues(
 // Issue stats (Exceptions dashboard header)
 // ===========================================================================
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct IssueStatsRow {
     #[diesel(sql_type = BigInt)]
     pub total: i64,
@@ -9806,7 +9806,7 @@ pub async fn list_analytics_events(
 // Funnel (ordered multi-step conversion)
 // ===========================================================================
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct FunnelStepCount {
     #[diesel(sql_type = BigInt)]
     pub step: i64,
@@ -9912,7 +9912,7 @@ pub async fn funnel(
 // Journeys (step-indexed transition graph for a Sankey)
 // ===========================================================================
 
-#[derive(Debug, QueryableByName, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct JourneyLink {
     #[diesel(sql_type = BigInt)]
     pub from_step: i64,
@@ -9924,7 +9924,7 @@ pub struct JourneyLink {
     pub count: i64,
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct JourneyNode {
     #[diesel(sql_type = BigInt)]
     pub step: i64,
@@ -10023,7 +10023,7 @@ pub async fn journey_graph(
 // Performance (percentile aggregates over transactions)
 // ===========================================================================
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct PerfSummaryRow {
     #[diesel(sql_type = Text)]
     pub name: String,
@@ -10087,7 +10087,7 @@ pub async fn performance_summary(
     crate::bind_range!(stmt, range).get_results(conn).await
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct PerfSeriesPoint {
     #[diesel(sql_type = Timestamptz)]
     pub bucket: DateTime<Utc>,
@@ -10139,7 +10139,7 @@ pub async fn performance_series(
 // Audience & session-engagement analytics (feature A).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct UserStats {
     #[diesel(sql_type = BigInt)]
     pub total_users: i64,
@@ -10258,7 +10258,7 @@ pub async fn user_stats(
     crate::bind_range!(stmt, range).get_result(conn).await
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct UserSeriesPoint {
     pub bucket: DateTime<Utc>,
     pub active: i64,
@@ -10346,7 +10346,7 @@ pub async fn active_user_series(
     Ok(merge_user_series(active, new))
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct SessionStats {
     #[diesel(sql_type = BigInt)]
     pub sessions: i64,
@@ -10358,7 +10358,7 @@ pub struct SessionStats {
     pub median_session_ms: f64,
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct SeriesAvgPoint {
     #[diesel(sql_type = Timestamptz)]
     pub bucket: DateTime<Utc>,
@@ -10366,7 +10366,7 @@ pub struct SeriesAvgPoint {
     pub avg_ms: f64,
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct HistoBucket {
     #[diesel(sql_type = Text)]
     pub bucket: String,
@@ -10613,7 +10613,7 @@ mod histogram_tests {
 // Saved funnels (persisted, app-scoped funnel templates)
 // ===========================================================================
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct SavedFunnelRow {
     #[diesel(sql_type = SqlUuid)]
     pub id: Uuid,
@@ -10714,7 +10714,7 @@ pub async fn delete_saved_funnel(
 // Screens (on-read per-screen metrics + capped dwell, app-scoped)
 // ===========================================================================
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct ScreenRow {
     #[diesel(sql_type = Text)]
     pub screen: String,
@@ -10730,7 +10730,7 @@ pub struct ScreenRow {
     pub avg_dwell_ms: f64,
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct ScreenStats {
     #[diesel(sql_type = Text)]
     pub screen: String,
@@ -11060,7 +11060,7 @@ const SCREEN_ACTOR_AGG: &str = "SELECT k, \
 
 /// One user who produced signal on a given screen, with their activity ON THAT
 /// SCREEN. See [`SCREEN_ACTOR_AGG`] for why the counts are screen-scoped.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct ScreenUserRow {
     #[diesel(sql_type = Text)]
     pub distinct_id: String,
@@ -11087,7 +11087,7 @@ pub struct ScreenUserRow {
 /// per-environment counters, so there is nothing to roll up and no fan-out to
 /// get wrong. Every counter in this row is computed here, from the screen's
 /// own signal.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct ScreenDeviceRow {
     #[diesel(sql_type = Text)]
     pub device_key: String,
@@ -11230,7 +11230,7 @@ mod avg_dwell_tests {
 // Monitors (uptime checks, keyed by project_id)
 // ===========================================================================
 
-#[derive(QueryableByName, serde::Serialize)]
+#[derive(QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct MonitorListRow {
     #[diesel(sql_type = SqlUuid)]
     pub id: Uuid,
@@ -11252,7 +11252,7 @@ pub struct MonitorListRow {
     pub uptime_24h: Option<f64>,
 }
 
-#[derive(QueryableByName, serde::Serialize)]
+#[derive(QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct CheckPoint {
     #[diesel(sql_type = Timestamptz)]
     pub checked_at: DateTime<Utc>,
@@ -14081,7 +14081,7 @@ pub async fn alert_latency_metric(
     Ok(row.v)
 }
 
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct AlertIssueBrief {
     #[diesel(sql_type = SqlUuid)]
     pub id: Uuid,
@@ -15537,7 +15537,7 @@ pub async fn enabled_subscriptions_all(
 /// read functions take it, so adding a plural variant of it would let a caller
 /// hand a multi-app scope to a single-app query and get a silently wrong
 /// number back.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AppEnvScope {
     pub app_id: Uuid,
     pub env: EnvFilter,
@@ -15545,7 +15545,7 @@ pub struct AppEnvScope {
 
 /// One UTC calendar day of the combined report. The three counts are exact:
 /// `active_total == active_identified + active_guest` always.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct ActiveUserDay {
     #[diesel(sql_type = diesel::sql_types::Date)]
     pub day: chrono::NaiveDate,
@@ -18563,7 +18563,7 @@ pub async fn insert_audit_log(
 
 /// One row of the unified trail: `audit_log` plus the two pre-existing
 /// inspector audit tables projected into the same shape.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditFeedRow {
     #[diesel(sql_type = SqlUuid)]
     pub id: Uuid,
@@ -18733,7 +18733,7 @@ LIMIT $12
 }
 
 /// A distinct value offered by a filter dropdown.
-#[derive(Debug, QueryableByName, serde::Serialize)]
+#[derive(Debug, QueryableByName, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditFacet {
     #[diesel(sql_type = Nullable<SqlUuid>)]
     pub id: Option<Uuid>,

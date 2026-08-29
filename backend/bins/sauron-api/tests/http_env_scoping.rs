@@ -43,6 +43,17 @@
 //! start at all (auth-adjacent bookkeeping these tests never themselves
 //! touch).
 
+/// The router scanner, shared with the binary's own OpenAPI parity test rather
+/// than copied. An integration test cannot `use` a binary crate, so the module
+/// is included by path — see its docs for why one parser matters here.
+///
+/// Including the file also brings its five parser unit tests into this test
+/// binary, so they run here as well as in the binary's own suite. They need no
+/// services, so unlike everything else in this file they cannot skip — which
+/// makes this the one place the parser is still checked when Postgres and Redis
+/// are absent.
+#[path = "../src/route_table.rs"]
+mod route_table;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::process::Stdio;
@@ -2093,69 +2104,13 @@ async fn env_scoped_member_does_not_see_another_orgs_project_over_http() {
 /// Every `.route("...", ...)` path in `main.rs`'s literal source that (a)
 /// sits under `/v1/apps/{app_id}` (the bare app route counts too) and (b)
 /// attaches a `get(...)` handler — read straight out of the exact router the
-/// spawned server above is actually built from, not a hand-maintained copy
-/// of it. No `regex` dependency: the balanced-paren scan below is exactly as
-/// much parsing as `main.rs`'s `.route(path, method(handler)...)` shape
-/// needs, and a parse of the real file is the accepted alternative here to a
-/// hand-written list, which is the thing this test exists to eliminate.
+/// spawned server above is actually built from, not a hand-maintained copy of
+/// it, which is the thing this test exists to eliminate.
+///
+/// The parse itself lives in [`route_table`], shared with the binary's OpenAPI
+/// parity test so the two cannot disagree about what the router contains.
 fn app_scoped_get_route_templates() -> Vec<String> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs");
-    let src = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("app_scoped_get_route_templates: could not read {path}: {e}"));
-    let bytes = src.as_bytes();
-
-    let marker = ".route(";
-    let mut templates = Vec::new();
-    let mut search_from = 0usize;
-    while let Some(rel) = src[search_from..].find(marker) {
-        let open_paren = search_from + rel + marker.len() - 1;
-        let mut depth = 0i32;
-        let mut i = open_paren;
-        let mut close_paren = None;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close_paren = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        let close_paren = close_paren.unwrap_or_else(|| {
-            panic!(
-                "app_scoped_get_route_templates: unbalanced parens in a .route(...) call in \
-                 {path} starting at byte {open_paren}"
-            )
-        });
-        let args = &src[open_paren + 1..close_paren];
-        if let Some(q1) = args.find('"') {
-            if let Some(q2_rel) = args[q1 + 1..].find('"') {
-                let route_path = &args[q1 + 1..q1 + 1 + q2_rel];
-                let is_app_scoped = route_path == "/v1/apps/{app_id}"
-                    || route_path.starts_with("/v1/apps/{app_id}/");
-                let has_get = {
-                    let a = args.as_bytes();
-                    (0..a.len().saturating_sub(3)).any(|idx| {
-                        &a[idx..idx + 4] == b"get(" && (idx == 0 || !is_ident_byte(a[idx - 1]))
-                    })
-                };
-                if is_app_scoped && has_get {
-                    templates.push(route_path.to_string());
-                }
-            }
-        }
-        search_from = close_paren + 1;
-    }
-    templates
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+    route_table::app_scoped_get_paths()
 }
 
 /// Turn a route template from [`app_scoped_get_route_templates`] into a
@@ -2437,57 +2392,7 @@ async fn the_backend_rejection_set_matches_the_dashboard_exclusion_list() {
 /// project-scoped twin of [`app_scoped_get_route_templates`], parsed out of
 /// the same real router for the same reason.
 fn project_scoped_get_route_templates() -> Vec<String> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs");
-    let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        panic!("project_scoped_get_route_templates: could not read {path}: {e}")
-    });
-    let bytes = src.as_bytes();
-
-    let marker = ".route(";
-    let mut templates = Vec::new();
-    let mut search_from = 0usize;
-    while let Some(rel) = src[search_from..].find(marker) {
-        let open_paren = search_from + rel + marker.len() - 1;
-        let mut depth = 0i32;
-        let mut i = open_paren;
-        let mut close_paren = None;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close_paren = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        let close_paren = close_paren.unwrap_or_else(|| {
-            panic!("project_scoped_get_route_templates: unbalanced parens in {path}")
-        });
-        let args = &src[open_paren + 1..close_paren];
-        if let Some(q1) = args.find('"') {
-            if let Some(q2_rel) = args[q1 + 1..].find('"') {
-                let route_path = &args[q1 + 1..q1 + 1 + q2_rel];
-                let is_project_scoped = route_path == "/v1/projects/{project_id}"
-                    || route_path.starts_with("/v1/projects/{project_id}/");
-                let has_get = {
-                    let a = args.as_bytes();
-                    (0..a.len().saturating_sub(3)).any(|idx| {
-                        &a[idx..idx + 4] == b"get(" && (idx == 0 || !is_ident_byte(a[idx - 1]))
-                    })
-                };
-                if is_project_scoped && has_get {
-                    templates.push(route_path.to_string());
-                }
-            }
-        }
-        search_from = close_paren + 1;
-    }
-    templates
+    route_table::project_scoped_get_paths()
 }
 
 /// `dashboard/src/lib/api/scope.ts`'s `PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID`,

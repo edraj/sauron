@@ -16,3 +16,9 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# Schema derives only. Consistent with the purity note above: `utoipa` is a
+# proc-macro plus type definitions — no database, no runtime, no I/O — so it
+# does not affect this crate's ability to unit-test without services. It is
+# here because these types are returned verbatim in `sauron-api` responses,
+# and a schema mirrored by hand in the API would drift from them.
+utoipa = { workspace = true }

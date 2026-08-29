@@ -15,6 +15,7 @@ use sauron_db::repo;
 
 use super::{db, slugify};
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
 
 const APP_TYPES: [&str; 8] = [
@@ -28,6 +29,13 @@ const APP_TYPES: [&str; 8] = [
     "csharp",
 ];
 
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/projects", tag = "Projects",
+    summary = "List projects in an organization",
+    description = "Only projects the caller's grants reach. An org-wide grant returns all of them; a project-scoped grant returns just that one.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Visible projects.", body = Vec<Project>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this organization.", body = ErrorResponse)),
+)]
 pub async fn list_projects(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -84,11 +92,22 @@ pub async fn list_projects(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateProjectReq {
     pub name: String,
 }
 
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/projects", tag = "Projects",
+    summary = "Create a project",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body(content = CreateProjectReq, example = json!({ "name": "Mobile" })),
+    responses(
+        (status = 200, description = "The created project.", body = Project),
+        (status = 400, description = "Missing or malformed name.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this organization.", body = ErrorResponse),
+    ),
+)]
 pub async fn create_project(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -140,6 +159,12 @@ pub async fn create_project(
     Ok(Json(project))
 }
 
+#[utoipa::path(
+    get, path = "/v1/projects/{project_id}", tag = "Projects",
+    summary = "Fetch a project",
+    params(("project_id" = Uuid, Path, description = "The project.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The project.", body = Project), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this project.", body = ErrorResponse), (status = 404, description = "No such project.", body = ErrorResponse)),
+)]
 pub async fn get_project(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -151,11 +176,23 @@ pub async fn get_project(
     Ok(Json(project))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateProjectReq {
     pub name: String,
 }
 
+#[utoipa::path(
+    patch, path = "/v1/projects/{project_id}", tag = "Projects",
+    summary = "Update a project",
+    description = "Partial update; omitted fields are left alone.",
+    params(("project_id" = Uuid, Path, description = "The project.")), security(("bearerAuth" = [])),
+    request_body(content = UpdateProjectReq),
+    responses(
+        (status = 200, description = "The updated project.", body = Project),
+        (status = 400, description = "Malformed field.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this project.", body = ErrorResponse), (status = 404, description = "No such project.", body = ErrorResponse),
+    ),
+)]
 pub async fn update_project(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -202,6 +239,20 @@ pub async fn update_project(
     Ok(Json(project))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/projects/{project_id}", tag = "Projects",
+    summary = "Delete a project",
+    description = "\
+Refused while the project still has apps — delete or move those first. \
+Telemetry is not purged synchronously; use the admin purge endpoints, which are \
+auditable and reversible up to the confirm step.",
+    params(("project_id" = Uuid, Path, description = "The project.")), security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "Deleted.", body = OkResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this project.", body = ErrorResponse), (status = 404, description = "No such project.", body = ErrorResponse),
+        (status = 409, description = "The project still contains apps.", body = ErrorResponse),
+    ),
+)]
 pub async fn delete_project(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -233,6 +284,13 @@ pub async fn delete_project(
 
 // --- apps under a project ---------------------------------------------------
 
+#[utoipa::path(
+    get, path = "/v1/projects/{project_id}/apps", tag = "Projects",
+    summary = "List apps in a project",
+    description = "Only apps the caller's grants reach, so this can return fewer apps than the project contains.",
+    params(("project_id" = Uuid, Path, description = "The project.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Visible apps.", body = Vec<App>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this project.", body = ErrorResponse)),
+)]
 pub async fn list_apps(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -281,12 +339,27 @@ pub async fn list_apps(
     Ok(Json(apps))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateAppReq {
     pub name: String,
     pub app_type: String,
 }
 
+#[utoipa::path(
+    post, path = "/v1/projects/{project_id}/apps", tag = "Projects",
+    summary = "Create an app in a project",
+    description = "\
+Creating an app does not by itself make it able to receive telemetry: an SDK \
+posts to an **environment enrollment**, so create one with \
+`POST /v1/projects/{project_id}/environments` and take its key.",
+    params(("project_id" = Uuid, Path, description = "The project.")), security(("bearerAuth" = [])),
+    request_body(content = CreateAppReq, example = json!({ "name": "Checkout (iOS)", "platform": "ios" })),
+    responses(
+        (status = 200, description = "The created app.", body = App),
+        (status = 400, description = "Missing or malformed field.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this project.", body = ErrorResponse),
+    ),
+)]
 pub async fn create_app(
     auth: AuthUser,
     State(state): State<AppState>,

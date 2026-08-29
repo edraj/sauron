@@ -146,6 +146,7 @@ export const routes = {
   '/active-users': guarded(() => import('./pages/ActiveUsers.svelte')),
   '/funnels': guarded(() => import('./pages/FunnelBuilder.svelte')),
   '/journeys': guarded(() => import('./pages/JourneyExplorer.svelte')),
+  '/retention': guarded(() => import('./pages/Retention.svelte')),
 
   // Uptime
   '/monitors': guarded(() => import('./pages/Monitors.svelte')),

@@ -8,6 +8,7 @@ use sauron_db::repo;
 
 use crate::admin_storage::{collect_storage_cached, StorageReport};
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// Storage & record report for the orgs the caller administers.
@@ -17,6 +18,23 @@ use crate::AppState;
 /// information about a tenant rather than ordinary product data. Callers see
 /// only the orgs they hold that permission in — there is no deployment-wide
 /// view, so one tenant can never observe another's existence or scale.
+#[utoipa::path(
+    get, path = "/v1/admin/storage", tag = "Admin",
+    summary = "Storage report",
+    description = "\
+Per-table and per-app on-disk sizes, including partitioned tables measured \
+through `pg_partition_tree` (a plain `pg_total_relation_size` on a partitioned \
+parent reports only the parent's own — near-zero — size).
+
+Rejects `?environment_id=`: storage is a deployment-wide question and \
+environment-scoping it would silently answer something else.",
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "Database, table and per-app sizes.", body = StorageReport),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
+        (status = 400, description = "`environment_id` is not supported here.", body = ErrorResponse),
+    ),
+)]
 pub async fn storage(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -97,7 +115,7 @@ pub(crate) async fn require_deployment_admin(
     Ok(())
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct TierPinView {
     pub id: uuid::Uuid,
     pub table_name: String,
@@ -140,7 +158,7 @@ impl TierPinView {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct TierPolicy {
     /// From `TIER_HOT_DAYS` (or its built-in default) in this API process.
     pub configured_hot_days: i64,
@@ -168,6 +186,13 @@ pub struct TierPolicy {
 }
 
 /// Current rotation policy plus the pins protecting restored ranges.
+#[utoipa::path(
+    get, path = "/v1/admin/tier-policy", tag = "Admin",
+    summary = "Read the cold-storage tiering policy",
+    description = "Current retention thresholds governing when partitions are tiered to Parquet and when they are dropped.",
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The active policy.", body = TierPolicy), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse)),
+)]
 pub async fn get_tier_policy(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -218,7 +243,7 @@ pub async fn get_tier_policy(
     }))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct SetTierPolicy {
     /// `None` clears the override, reverting to the process's configured value.
     /// Distinguished from "absent" by `Option<Option<i64>>` at the call site being
@@ -232,6 +257,21 @@ pub struct SetTierPolicy {
 /// next tier cycle exports and then drops the newly-eligible partitions, and
 /// raising the number back does NOT return them to Postgres — that needs a
 /// restore. The UI says so; this is the same warning in the place that enforces it.
+#[utoipa::path(
+    put, path = "/v1/admin/tier-policy", tag = "Admin",
+    summary = "Update the cold-storage tiering policy",
+    description = "\
+Changes when data is moved to Parquet and when it is dropped. **Lowering a drop \
+threshold destroys data on the next tier run** and cannot be undone from the \
+API; restoring means a `POST /v1/admin/restore` against surviving cold files.",
+    security(("bearerAuth" = [])),
+    request_body(content = SetTierPolicy),
+    responses(
+        (status = 200, description = "The policy after the change.", body = TierPolicy),
+        (status = 400, description = "Threshold outside the accepted range, or inconsistent with another.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
+    ),
+)]
 pub async fn set_tier_policy(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -282,7 +322,7 @@ pub async fn set_tier_policy(
     get_tier_policy(auth, State(state)).await
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct SetSessionRetention {
     /// `null` clears the override (reverting to the process configuration);
     /// `0` disables retention outright; any other value is days and must be at
@@ -296,6 +336,18 @@ pub struct SetSessionRetention {
 /// all: sessions have no cold copy, so once the daily pass drops a partition
 /// the session-day rollups are everything that remains of those days. The UI
 /// carries the same warning; this is it in the place that enforces it.
+#[utoipa::path(
+    put, path = "/v1/admin/session-retention", tag = "Admin",
+    summary = "Set how long sessions are retained",
+    description = "Session retention is stored alongside the tier policy, so the whole policy is returned.",
+    security(("bearerAuth" = [])),
+    request_body(content = SetSessionRetention),
+    responses(
+        (status = 200, description = "The policy after the change.", body = TierPolicy),
+        (status = 400, description = "Retention outside the accepted range.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
+    ),
+)]
 pub async fn set_session_retention(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -359,7 +411,7 @@ pub const RESTORE_MAX_DAYS: i64 = 365;
 /// the one input where a typo is silent and expensive.
 pub const RESTORE_MAX_RANGE_DAYS: i64 = 400;
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RestoreJobView {
     pub id: uuid::Uuid,
     pub table_name: String,
@@ -400,7 +452,7 @@ impl From<sauron_db::models::RestoreJob> for RestoreJobView {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct CreateRestore {
     pub table_name: String,
     /// `None` restores every app in the range.
@@ -416,6 +468,24 @@ pub struct CreateRestore {
 /// `RESTORE_POLL_SECS` and the client polls `GET /v1/admin/restore/{id}`. The
 /// copy itself can take minutes on a wide range, which is far past any sensible
 /// request timeout.
+#[utoipa::path(
+    post, path = "/v1/admin/restore", tag = "Admin",
+    summary = "Restore tiered data from cold storage",
+    description = "\
+Queues a restore of Parquet files back into Postgres. Asynchronous — the \
+response is the job, not the result; poll `GET /v1/admin/restore/{id}`.
+
+A restore can only reach data that was tiered, not data that was **dropped**. \
+If the drop threshold has already passed the window you are asking for, the job \
+succeeds having restored nothing.",
+    security(("bearerAuth" = [])),
+    request_body(content = CreateRestore),
+    responses(
+        (status = 200, description = "The queued restore job.", body = RestoreJobView),
+        (status = 400, description = "Malformed or impossible window.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
+    ),
+)]
 pub async fn create_restore(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -496,6 +566,12 @@ pub async fn create_restore(
     Ok(Json(job.into()))
 }
 
+#[utoipa::path(
+    get, path = "/v1/admin/restore", tag = "Admin",
+    summary = "List restore jobs",
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Restore jobs, newest first.", body = Vec<RestoreJobView>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse)),
+)]
 pub async fn list_restores(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -506,6 +582,18 @@ pub async fn list_restores(
     Ok(Json(jobs.into_iter().map(Into::into).collect()))
 }
 
+#[utoipa::path(
+    get, path = "/v1/admin/restore/{id}", tag = "Admin",
+    summary = "Fetch one restore job",
+    description = "Poll this to follow an asynchronous restore to completion.",
+    params(("id" = Uuid, Path, description = "Job or pin identifier.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The job.", body = RestoreJobView),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
+        (status = 404, description = "No such job.", body = ErrorResponse),
+    ),
+)]
 pub async fn get_restore(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -519,7 +607,7 @@ pub async fn get_restore(
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct ReleasedPin {
     pub id: uuid::Uuid,
     pub table_name: String,
@@ -531,6 +619,20 @@ pub struct ReleasedPin {
 /// Release a pin now: delete the rows it restored and drop the pin.
 ///
 /// Deliberately NOT a bare delete of the pin row. See `repo::release_tier_pin`.
+#[utoipa::path(
+    delete, path = "/v1/admin/tier-pins/{id}", tag = "Admin",
+    summary = "Release a tier pin",
+    description = "\
+A pin holds a partition in hot storage past its normal tiering date. Releasing \
+one makes that partition eligible for tiering again on the next run.",
+    params(("id" = Uuid, Path, description = "Job or pin identifier.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The released pin.", body = ReleasedPin),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
+        (status = 404, description = "No such pin.", body = ErrorResponse),
+    ),
+)]
 pub async fn release_pin(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -571,7 +673,7 @@ pub async fn release_pin(
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct ExtendPin {
     pub days: i64,
 }
@@ -580,6 +682,20 @@ pub struct ExtendPin {
 /// investigation is not finished. Measured from now, not from the current
 /// expiry, so extending a nearly-lapsed pin and a fresh one give the same
 /// predictable result.
+#[utoipa::path(
+    post, path = "/v1/admin/tier-pins/{id}/extend", tag = "Admin",
+    summary = "Extend a tier pin",
+    description = "Pushes a pin's expiry further out, keeping its partition in hot storage for longer.",
+    params(("id" = Uuid, Path, description = "Job or pin identifier.")),
+    security(("bearerAuth" = [])),
+    request_body(content = ExtendPin),
+    responses(
+        (status = 200, description = "The extended pin.", body = TierPinView),
+        (status = 400, description = "Expiry outside the accepted range.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
+        (status = 404, description = "No such pin.", body = ErrorResponse),
+    ),
+)]
 pub async fn extend_pin(
     auth: AuthUser,
     State(state): State<AppState>,

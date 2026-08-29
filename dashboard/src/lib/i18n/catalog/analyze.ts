@@ -172,4 +172,71 @@ export const analyze = {
     en: 'No downtime has been recorded for this monitor.',
     ar: 'لم يُسجَّل أي انقطاع لهذا المراقب.',
   },
+
+  // --- retention ------------------------------------------------------------
+  'nav.retention': { en: 'Retention', ar: 'الاحتفاظ' },
+  'retention.title': { en: 'Retention', ar: 'الاحتفاظ' },
+  'retention.subtitle': {
+    en: 'Whether the people who arrived came back.',
+    ar: 'ما إذا كان الأشخاص الذين وصلوا قد عادوا.',
+  },
+  'retention.cohort': { en: 'Cohort', ar: 'المجموعة' },
+  'retention.users': { en: 'Users', ar: 'المستخدمون' },
+  'retention.dayN': { en: 'Day {n}', ar: 'اليوم {n}' },
+  'retention.weekN': { en: 'Week {n}', ar: 'الأسبوع {n}' },
+  'retention.cellTitle': {
+    en: '{users} of {size} returned',
+    ar: 'عاد {users} من {size}',
+  },
+  'retention.legend.empty': {
+    en: 'Empty cells are periods that have not elapsed yet — not zero retention.',
+    ar: 'الخلايا الفارغة هي فترات لم تنقضِ بعد، وليست احتفاظًا صفريًا.',
+  },
+  'retention.granularity.day': { en: 'Daily', ar: 'يومي' },
+  'retention.granularity.week': { en: 'Weekly', ar: 'أسبوعي' },
+  'retention.notReady.title': {
+    en: 'Historical retention needs a one-time backfill',
+    ar: 'يحتاج الاحتفاظ التاريخي إلى تعبئة أولية لمرة واحدة',
+  },
+  // No {command} placeholder: the command itself is rendered below in a
+  // copyable CodeBlock, so interpolating it here produced "Run  on the server".
+  'retention.notReady.body': {
+    en: 'Run this on the server to cover data from before this feature was installed. Until then this page has nothing to show for this app.',
+    ar: 'شغّل هذا على الخادم لتغطية البيانات السابقة لتثبيت هذه الميزة. حتى ذلك الحين لا يوجد ما يُعرض هنا لهذا التطبيق.',
+  },
+  'retention.lifecycle.title': { en: 'Lifecycle', ar: 'دورة الحياة' },
+  'retention.lifecycle.subtitle': {
+    en: 'Is growth real, or churn and replace?',
+    ar: 'هل النمو حقيقي أم فقدان واستبدال؟',
+  },
+  'retention.lifecycle.new': { en: 'New', ar: 'جديد' },
+  'retention.lifecycle.returning': { en: 'Returning', ar: 'عائد' },
+  'retention.lifecycle.resurrected': { en: 'Resurrected', ar: 'مستعاد' },
+  'retention.lifecycle.dormant': { en: 'Dormant', ar: 'خامل' },
+  'retention.churn.title': { en: 'At risk', ar: 'معرّضون للفقد' },
+  'retention.churn.subtitle': {
+    en: 'Active before, silent for {days} days.',
+    ar: 'كانوا نشطين سابقًا، وصامتون منذ {days} يومًا.',
+  },
+  'retention.churn.person': { en: 'Person', ar: 'الشخص' },
+  'retention.churn.lastSeen': { en: 'Last seen', ar: 'آخر ظهور' },
+  'retention.churn.events': { en: 'Events', ar: 'الأحداث' },
+  'retention.errorSplit.toggle': {
+    en: 'Compare users who hit an error',
+    ar: 'قارن المستخدمين الذين واجهوا خطأ',
+  },
+  'retention.errorSplit.exposed': { en: 'Hit an error', ar: 'واجهوا خطأ' },
+  'retention.errorSplit.clean': { en: 'No error', ar: 'بلا خطأ' },
+  'retention.errorSplit.caveat': {
+    en: 'An association, not a cause. Exposure is measured in the first period only.',
+    ar: 'ارتباط وليس سببًا. يُقاس التعرض في الفترة الأولى فقط.',
+  },
+  'retention.export': { en: 'Export CSV', ar: 'تصدير CSV' },
+  'retention.updating': { en: 'Updating…', ar: 'جارٍ التحديث…' },
+  'retention.churn.loadMore': { en: 'Load more', ar: 'تحميل المزيد' },
+  'retention.empty.title': { en: 'No cohorts yet', ar: 'لا توجد مجموعات بعد' },
+  'retention.empty.body': {
+    en: 'Nobody has been first seen inside this window yet.',
+    ar: 'لم يظهر أي شخص لأول مرة ضمن هذه النافذة بعد.',
+  },
 } as const satisfies Record<string, Message>;

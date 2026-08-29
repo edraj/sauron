@@ -15,6 +15,7 @@ use sauron_db::scope::Range;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// Unique per device within an app, which `id` is not for the grouped query —
@@ -175,11 +176,13 @@ pub(crate) fn group_sort_spec(raw: Option<&str>) -> Result<SortSpec, ApiError> {
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     /// `time_field` / `from` / `to` / `since_days`, flattened so the
     /// precedence between them is decided once, in `resolve_time_filter`.
     #[serde(flatten)]
+    #[param(ignore = true)]
     pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_limit")]
     pub limit: i64,
@@ -232,6 +235,13 @@ fn default_limit() -> i64 {
     50
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/devices", tag = "Devices",
+    summary = "Search devices",
+    params(("app_id" = Uuid, Path, description = "The app."), ListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Matching devices.", body = Vec<DeviceRow>),
+              (status = 400, description = "Malformed query, sort, or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -295,6 +305,13 @@ pub async fn list(
 /// The Devices inventory's default read: one row per
 /// `(family, model, os_name, os_version)`. Same scope handling as [`list`] —
 /// `environment_id` comes from the raw query string, never from `ListQuery`.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/device-groups", tag = "Devices",
+    summary = "Devices grouped by model and OS",
+    description = "Served from a rollup. On a deployment where that rollup has never been backfilled this answers 503 naming the backfill to run, rather than timing out.",
+    params(("app_id" = Uuid, Path, description = "The app."), ListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Device groups.", body = Vec<DeviceGroupRow>), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn groups(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -363,6 +380,13 @@ pub async fn groups(
 /// Same permission and `RawQuery` environment handling as both lists: a count
 /// resolved over a wider scope than the list leaks the SIZE of data the caller
 /// cannot read.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/counts/devices", tag = "Devices",
+    summary = "Count matching devices",
+    description = "The same `(total, total_is_capped)` pair the search envelope carries, on its own request. `total_is_capped` means the count stopped at the cap, not that it is exact.",
+    params(("app_id" = Uuid, Path, description = "The app."), ListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The count.", body = super::search::CountEnvelope), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn count(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -435,7 +459,8 @@ pub async fn count(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DetailQuery {
     /// The device key (passed as a query param — keys can contain `/` and spaces).
     pub key: String,
@@ -443,7 +468,7 @@ pub struct DetailQuery {
     // comment above.
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct DeviceDetail {
     /// Environment-scoped, not the raw `devices` row — see `get_device`'s doc
     /// comment. `events_count`/`errors_count` read the durable `devices`
@@ -456,6 +481,15 @@ pub struct DeviceDetail {
     pub perf: Vec<PerfSummaryRow>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/device", tag = "Devices",
+    summary = "Fetch one device",
+    description = "Identified by `device_key` as a query parameter rather than a path segment, because the key is caller-supplied text and not a UUID.",
+    params(("app_id" = Uuid, Path, description = "The app."), DetailQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The device.", body = DeviceDetail),
+              (status = 400, description = "Missing `device_key`.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such device.", body = ErrorResponse)),
+)]
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,

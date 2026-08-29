@@ -60,6 +60,7 @@
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import User from '@lucide/svelte/icons/user';
   import Users from '@lucide/svelte/icons/users';
+  import Repeat from '@lucide/svelte/icons/repeat';
   import Waypoints from '@lucide/svelte/icons/waypoints';
   import Workflow from '@lucide/svelte/icons/workflow';
   import X from '@lucide/svelte/icons/x';
@@ -90,6 +91,7 @@
     'eye-off': EyeOff,
     folders: Folders,
     funnel: Funnel,
+    repeat: Repeat,
     globe: Globe,
     hash: Hash,
     inbox: Inbox,

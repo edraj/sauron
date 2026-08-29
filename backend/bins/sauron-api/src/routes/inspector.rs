@@ -33,6 +33,7 @@ use sauron_inspector::{detect, matching};
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// The one message every `/v1/apps/{app_id}/inspector/*` route rejects
@@ -86,7 +87,7 @@ async fn authorize_policy(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreatePolicyReq {
     pub target_type: String,
     pub target_id: Uuid,
@@ -141,6 +142,20 @@ fn parse_hhmm(raw: &str) -> Result<chrono::NaiveTime, ApiError> {
         .map_err(|_| ApiError::BadRequest("schedule_time must be HH:MM".into()))
 }
 
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/inspector/policies", tag = "Inspector",
+    summary = "Create a privacy-inspector policy",
+    description = "\
+A policy declares which payload keys count as sensitive and where to look.
+
+**A policy with no matchers is refused.** A matcher-less policy would scan \
+successfully, report `coverage: full` and zero findings — a confident false \
+negative, and the worst thing this feature can emit.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body(content = CreatePolicyReq),
+    responses((status = 200, description = "The created policy.", body = serde_json::Value),
+              (status = 400, description = "No matchers, or a malformed matcher.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn create_policy(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -248,6 +263,12 @@ pub async fn create_policy(
 /// historical 403-for-scoped-members bug. This is the house discovery pattern:
 /// load the caller's grants, 403 on empty, compute their reach for `pii:read`,
 /// and filter, lifting env grants to their app.
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/inspector/policies", tag = "Inspector",
+    summary = "List privacy-inspector policies",
+    params(("org_id" = Uuid, Path, description = "The organization."), ListLimit), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Policies.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list_policies(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -353,6 +374,12 @@ pub async fn list_policies(
     Ok(Json(json!(visible)))
 }
 
+#[utoipa::path(
+    get, path = "/v1/inspector/policies/{policy_id}", tag = "Inspector",
+    summary = "Fetch a policy",
+    params(("policy_id" = Uuid, Path, description = "The inspector policy.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The policy.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such policy.", body = ErrorResponse)),
+)]
 pub async fn get_policy(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -373,7 +400,7 @@ pub async fn get_policy(
     Ok(Json(json!(p)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PatchPolicyReq {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -397,6 +424,16 @@ pub struct PatchPolicyReq {
     pub schedule_tz: Option<String>,
 }
 
+#[utoipa::path(
+    patch, path = "/v1/inspector/policies/{policy_id}", tag = "Inspector",
+    summary = "Update a policy",
+    description = "Same matcher validation as creation: an edit that would leave the policy with no matchers is refused.",
+    params(("policy_id" = Uuid, Path, description = "The inspector policy.")), security(("bearerAuth" = [])),
+    request_body(content = PatchPolicyReq),
+    responses((status = 200, description = "The updated policy.", body = serde_json::Value),
+              (status = 400, description = "The edit would leave no matchers, or a matcher is malformed.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such policy.", body = ErrorResponse)),
+)]
 pub async fn patch_policy(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -515,6 +552,12 @@ pub async fn patch_policy(
 /// is the same permission the normal path demands, only checked at the org the
 /// policy row itself names. It cannot widen anything — a policy whose target
 /// still resolves never reaches this branch.
+#[utoipa::path(
+    delete, path = "/v1/inspector/policies/{policy_id}", tag = "Inspector",
+    summary = "Delete a policy",
+    params(("policy_id" = Uuid, Path, description = "The inspector policy.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Deleted.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such policy.", body = ErrorResponse)),
+)]
 pub async fn delete_policy(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -563,6 +606,13 @@ pub async fn delete_policy(
 /// Also reports the enforcement latency the pipeline really uses, so the UI
 /// states a number rather than hardcoding "30 seconds" — the key lives in
 /// `sauron.env` precisely so the API and the enforcer cannot diverge.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/inspector/policy", tag = "Inspector",
+    summary = "Effective policy for an app",
+    description = "The policy that actually applies to this app after org-level inheritance is resolved.",
+    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The effective policy.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn effective_policy(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -585,12 +635,19 @@ pub async fn effective_policy(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListLimit {
     #[serde(default)]
     pub limit: Option<i64>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/inspector/policies/{policy_id}/scans", tag = "Inspector",
+    summary = "List a policy's scans",
+    params(("policy_id" = Uuid, Path, description = "The inspector policy."), ListLimit), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Scans, newest first.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such policy.", body = ErrorResponse)),
+)]
 pub async fn list_scans(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -618,6 +675,14 @@ pub async fn list_scans(
 /// The 409 comes from the partial unique index `inspector_scans_active_key`,
 /// not from a handler pre-check: two clients racing must produce one scan, and
 /// a check-then-insert cannot promise that.
+#[utoipa::path(
+    post, path = "/v1/inspector/policies/{policy_id}/scans", tag = "Inspector",
+    summary = "Start a scan",
+    description = "Asynchronous — returns the queued scan. Poll `GET /v1/inspector/scans/{scan_id}` for progress and `coverage`, which states whether the scan saw everything it intended to.",
+    params(("policy_id" = Uuid, Path, description = "The inspector policy.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The queued scan.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such policy.", body = ErrorResponse),
+              (status = 409, description = "A scan for this policy is already running.", body = ErrorResponse)),
+)]
 pub async fn start_scan(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -670,6 +735,13 @@ pub async fn start_scan(
     }
 }
 
+#[utoipa::path(
+    get, path = "/v1/inspector/scans/{scan_id}", tag = "Inspector",
+    summary = "Fetch a scan",
+    description = "Read `coverage` before trusting a zero-finding result: a partial scan with no findings is not the same claim as a full one.",
+    params(("scan_id" = Uuid, Path, description = "The scan.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The scan with its state and coverage.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such scan.", body = ErrorResponse)),
+)]
 pub async fn get_scan(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -693,6 +765,14 @@ pub async fn get_scan(
     Ok(Json(json!(s)))
 }
 
+#[utoipa::path(
+    post, path = "/v1/inspector/scans/{scan_id}/cancel", tag = "Inspector",
+    summary = "Cancel a running scan",
+    description = "Findings already recorded are kept, and coverage reflects that the scan stopped early.",
+    params(("scan_id" = Uuid, Path, description = "The scan.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Cancelled.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such scan.", body = ErrorResponse),
+              (status = 409, description = "The scan has already finished.", body = ErrorResponse)),
+)]
 pub async fn cancel_scan(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -722,7 +802,8 @@ pub async fn cancel_scan(
     Ok(Json(json!({ "ok": true })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct FindingsQuery {
     #[serde(default)]
     pub limit: Option<i64>,
@@ -764,6 +845,13 @@ fn csv_response(filename: &str, body: String) -> Response {
         .into_response()
 }
 
+#[utoipa::path(
+    get, path = "/v1/inspector/scans/{scan_id}/findings", tag = "Inspector",
+    summary = "List a scan's findings",
+    description = "Findings are **redacted by default** — the matched value is not included. Use the reveal endpoint, which is audited, to see one.",
+    params(("scan_id" = Uuid, Path, description = "The scan."), FindingsQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Findings, values redacted.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such scan.", body = ErrorResponse)),
+)]
 pub async fn list_findings(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -890,6 +978,20 @@ pub async fn list_findings(
 /// POST rather than GET so the identifier does not land in access logs and so
 /// the audit row has a request body to record. The audit row is written BEFORE
 /// the value is returned, so a failure to audit is a failure to reveal.
+#[utoipa::path(
+    post, path = "/v1/inspector/findings/{finding_id}/reveal", tag = "Inspector",
+    summary = "Reveal a finding's matched value — audited",
+    description = "\
+Returns the actual matched text, which is by definition suspected personal \
+data. **Every reveal writes an audit record** naming the caller.
+
+Answers 410 rather than 404 when the underlying partition has since been tiered \
+or dropped, so a caller can tell \"aged out\" from \"no such finding\".",
+    params(("finding_id" = Uuid, Path, description = "The finding.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The revealed value.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such finding.", body = ErrorResponse),
+              (status = 410, description = "The data has aged out of hot storage.", body = ErrorResponse)),
+)]
 pub async fn reveal_finding(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -990,7 +1092,7 @@ pub async fn reveal_finding(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct MaskPreviewReq {
     /// Preferred form: derive the targets from a finding, so the paths the
     /// scanner actually saw are the paths the mask writes.
@@ -1008,6 +1110,15 @@ pub struct MaskPreviewReq {
 /// no index that can serve it, since the tags GIN is `jsonb_path_ops` and
 /// answers `@>` only. Running that on the API's 16-connection pool is how the
 /// whole dashboard goes down.
+#[utoipa::path(
+    post, path = "/v1/apps/{app_id}/inspector/mask-preview", tag = "Inspector",
+    summary = "Preview what a mask would change",
+    description = "Counts what a mask action would rewrite, without changing anything. Masking is irreversible, so preview first.",
+    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    request_body(content = MaskPreviewReq),
+    responses((status = 200, description = "Estimated impact.", body = serde_json::Value),
+              (status = 400, description = "Malformed target.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn mask_preview(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1128,7 +1239,7 @@ pub async fn mask_preview(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ConfirmReq {
     /// Must equal the app's slug.
     pub confirm_text: String,
@@ -1141,6 +1252,20 @@ pub struct ConfirmReq {
 /// it is masking the WRONG APP, because the operator saw a finding and forgot
 /// which app was selected. A typed literal like `MASK` proves intent and
 /// proves nothing about scope, and `ConfirmDialog` has no text input at all.
+#[utoipa::path(
+    post, path = "/v1/inspector/mask-actions/{action_id}/confirm", tag = "Inspector",
+    summary = "Confirm a mask action — irreversible",
+    description = "\
+**Rewrites stored payloads in place. The original values are gone.** Confirm \
+requires echoing the token from the preview, so it cannot be issued from the \
+action id alone.",
+    params(("action_id" = Uuid, Path, description = "The mask action.")), security(("bearerAuth" = [])),
+    request_body(content = ConfirmReq),
+    responses((status = 200, description = "The executed mask action.", body = serde_json::Value),
+              (status = 400, description = "Missing or mismatched confirmation token.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such mask action.", body = ErrorResponse),
+              (status = 409, description = "Already confirmed or cancelled.", body = ErrorResponse)),
+)]
 pub async fn confirm_mask(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1219,6 +1344,13 @@ pub async fn confirm_mask(
 /// because in an audit table whose whole justification is "who did it", the
 /// one adversarial action the design permits must not be the one it cannot
 /// attribute.
+#[utoipa::path(
+    post, path = "/v1/inspector/mask-actions/{action_id}/cancel", tag = "Inspector",
+    summary = "Cancel an unconfirmed mask action",
+    params(("action_id" = Uuid, Path, description = "The mask action.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Cancelled.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such mask action.", body = ErrorResponse),
+              (status = 409, description = "Already confirmed.", body = ErrorResponse)),
+)]
 pub async fn cancel_mask(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1240,6 +1372,12 @@ pub async fn cancel_mask(
     Ok(Json(json!(fresh)))
 }
 
+#[utoipa::path(
+    get, path = "/v1/inspector/mask-actions/{action_id}", tag = "Inspector",
+    summary = "Fetch a mask action",
+    params(("action_id" = Uuid, Path, description = "The mask action.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The mask action.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such mask action.", body = ErrorResponse)),
+)]
 pub async fn get_mask_action_handler(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1327,7 +1465,8 @@ fn audit_csv(rows: &[sauron_db::models::InspectorMaskAction], label: &str) -> Re
 /// The findings query struct has no `environment_id` field, and passing
 /// `None` to the rejection helper is a call that can never reject — so this
 /// route needs its own struct that actually carries the parameter.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct AuditQuery {
     #[serde(default)]
     pub limit: Option<i64>,
@@ -1337,6 +1476,12 @@ pub struct AuditQuery {
     pub environment_id: Option<String>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/inspector/mask-actions", tag = "Inspector",
+    summary = "Mask actions for an app",
+    params(("app_id" = Uuid, Path, description = "The app."), ListLimit), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Mask actions.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list_app_mask_actions(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1372,6 +1517,12 @@ pub async fn list_app_mask_actions(
 /// downloadable STAFF-EMAIL ROSTER available to any org-scoped pii:read
 /// holder. That is a deliberate trade for an audit trail, it is bounded by the
 /// pseudonymization reaper, and it is stated in the wiki.
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/inspector/mask-actions", tag = "Inspector",
+    summary = "Mask actions across an organization",
+    params(("org_id" = Uuid, Path, description = "The organization."), ListLimit), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Mask actions.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list_org_mask_actions(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1397,6 +1548,12 @@ pub async fn list_org_mask_actions(
     Ok(Json(json!(rows)).into_response())
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/inspector/masked-keys", tag = "Inspector",
+    summary = "Keys currently masked for an app",
+    params(("app_id" = Uuid, Path, description = "The app."), ListLimit), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Masked keys.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list_app_masked_keys(
     auth: AuthUser,
     State(state): State<AppState>,

@@ -25,6 +25,7 @@ use sauron_db::repo;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// The window columns this list accepts.
@@ -53,7 +54,8 @@ fn default_limit() -> i64 {
 /// window stays bounded rather than defaulting to effectively all history.
 const MAX_SINCE_DAYS: i64 = 365;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     #[serde(default)]
     pub filter: Vec<String>,
@@ -67,6 +69,7 @@ pub struct ListQuery {
     /// `time_field` / `from` / `to` / `since_days`, flattened so the precedence
     /// between them is decided once, in `resolve_time_filter`.
     #[serde(flatten)]
+    #[param(ignore = true)]
     pub window: super::search::TimeFilterQuery,
     #[serde(default = "default_limit")]
     pub limit: i64,
@@ -92,6 +95,16 @@ pub struct ListQuery {
 }
 
 /// `GET /v1/apps/{app_id}/transactions`
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/transactions", tag = "Performance",
+    summary = "Search transactions",
+    description = "\
+Traced operations with their spans. Durations are milliseconds — not \
+seconds — throughout this API.",
+    params(("app_id" = Uuid, Path, description = "The app."), ListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Matching transactions.", body = super::search::SearchEnvelope<Transaction>),
+              (status = 400, description = "Malformed query, sort, or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::columns::{find, ColumnKind};
 use crate::path::{parse_mask_path, PathError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetTable {
     ErrorEvents,
@@ -67,7 +67,7 @@ impl TargetTable {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetColumn {
     Tags,
@@ -139,7 +139,7 @@ impl TargetColumn {
 
 /// One fully resolved mask target. `path` is `""` for a TEXT column (the whole
 /// value is replaced) and a wire-form mask path for a jsonb column.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MaskTarget {
     pub table: TargetTable,
     pub column: TargetColumn,

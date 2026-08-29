@@ -16,14 +16,20 @@ use sauron_db::scope::Range;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     #[serde(default)]
     pub filter: Vec<String>,
     pub q: Option<String>,
     /// The query language. Wins over `filter`/`q` when non-empty.
+    ///
+    /// A bare `@tag` matches ANY key; a bare `sort=` is descending; time units
+    /// resolve longest-suffix-first, so `m` means minutes.
+    #[param(example = "level:error @release:1.4.2 last_seen:>7d sort=-last_seen")]
     pub query: Option<String>,
     /// `column` or `-column`. Restricted to keyset-backed orderings — see
     /// `search::parse_sort`.
@@ -173,6 +179,20 @@ async fn repair_blank_culprits(
 /// heal on the next page view, and each row only ever pays once.
 const CULPRIT_REPAIR_MAX: usize = 25;
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/issues", tag = "Issues",
+    summary = "Search issues",
+    description = "\
+Grouped errors, newest-affected first by default. Accepts either the structured \
+`filter`/`q` parameters or the `query` DSL — `query` wins when non-empty.
+
+Paging is keyset via `cursor`; `offset` exists only for jumping to a numbered \
+page nobody has walked to, and is ignored when a cursor is present. `total` is \
+capped for cost, which `total_is_capped` discloses.",
+    params(("app_id" = Uuid, Path, description = "The app."), ListQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Matching issues.", body = super::search::SearchEnvelope<Issue>),
+              (status = 400, description = "Malformed query, sort, or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -394,7 +414,7 @@ pub async fn list(
     }))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct IssueDetail {
     #[serde(flatten)]
     pub issue: Issue,
@@ -405,6 +425,14 @@ pub struct IssueDetail {
 // No bespoke query struct: `detail` takes only `environment_id`, which comes
 // from `RawQuery` (see `list`'s comment above), not a `Query<T>` extractor.
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/issues/{issue_id}", tag = "Issues",
+    summary = "Fetch one issue",
+    params(("app_id" = Uuid, Path, description = "The app."), ("issue_id" = Uuid, Path, description = "The issue.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The issue with its latest event and aggregates.", body = IssueDetail),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such issue.", body = ErrorResponse)),
+)]
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -463,11 +491,22 @@ pub async fn detail(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateReq {
     pub status: String,
 }
 
+#[utoipa::path(
+    patch, path = "/v1/apps/{app_id}/issues/{issue_id}", tag = "Issues",
+    summary = "Update an issue's triage state",
+    description = "Resolve, ignore or reopen. Triage state is per-issue and does not alter the underlying events.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("issue_id" = Uuid, Path, description = "The issue.")),
+    security(("bearerAuth" = [])),
+    request_body(content = UpdateReq, example = json!({ "status": "resolved" })),
+    responses((status = 200, description = "The updated issue.", body = Issue),
+              (status = 400, description = "Unknown status value.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such issue.", body = ErrorResponse)),
+)]
 pub async fn update(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -487,7 +526,8 @@ pub async fn update(
     Ok(Json(issue))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct EventsQuery {
     #[serde(default)]
     pub filter: Vec<String>,
@@ -555,6 +595,18 @@ fn default_events_since_days() -> i64 {
 /// Three input spellings, one execution path: `query=` (the language),
 /// `filter=`+`q=` (the pre-language wire format, bridged through
 /// `from_legacy`), or nothing.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/issues/{issue_id}/events", tag = "Issues",
+    summary = "Events belonging to an issue",
+    description = "\
+Individual occurrences. There is **one row per occurrence** — events are \
+not de-duplicated — so a loop that throws thousands of times produces \
+thousands of rows under one issue.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("issue_id" = Uuid, Path, description = "The issue."), EventsQuery, super::search::TimeFilterQuery),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Matching events.", body = super::search::SearchEnvelope<ErrorEvent>),
+              (status = 400, description = "Malformed query or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn events(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -761,7 +813,7 @@ pub async fn events(
 /// `#[serde(flatten)]`, so the counts stay top-level keys and the existing
 /// `IssueEventStats` type in `dashboard/src/lib/api/issues.ts` keeps parsing
 /// unchanged — same shape as [`IssueStats`] below.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct IssueEventStats {
     #[serde(flatten)]
     pub counts: repo::IssueEventStatsRow,
@@ -785,6 +837,14 @@ pub struct IssueEventStats {
     pub payload_searched: Option<bool>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/issues/{issue_id}/events/stats", tag = "Issues",
+    summary = "Aggregates over one issue's events",
+    description = "Breakdowns (platform, version, device) computed over the same filtered set the events list would return.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("issue_id" = Uuid, Path, description = "The issue."), EventsQuery, super::search::TimeFilterQuery),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Aggregates.", body = IssueEventStats), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn event_stats(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -905,7 +965,8 @@ pub async fn event_stats(
 // Exceptions dashboard header — status/level breakdown + occurrence series.
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct StatsQuery {
     #[serde(default = "default_stats_days")]
     pub since_days: i64,
@@ -922,13 +983,20 @@ fn default_stats_days() -> i64 {
     30
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct IssueStats {
     #[serde(flatten)]
     pub counts: repo::IssueStatsRow,
     pub series: Vec<SeriesPoint>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/issues/stats", tag = "Issues",
+    summary = "Issue counts by triage state",
+    description = "Counts for the badge row above the issue list, over the same window and filters the list uses.",
+    params(("app_id" = Uuid, Path, description = "The app."), StatsQuery, super::search::TimeFilterQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Counts per state.", body = IssueStats), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "The query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
 pub async fn stats(
     auth: AuthUser,
     State(state): State<AppState>,

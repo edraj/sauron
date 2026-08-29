@@ -12,6 +12,7 @@ use sauron_db::repo;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
 
 const KINDS: [&str; 2] = ["http", "tcp"];
@@ -73,7 +74,8 @@ fn invalid_interval_msg() -> String {
     format!("interval_seconds must be one of (seconds): {allowed}")
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct RangeQuery {
     pub hours: Option<i64>,
     /// Monitors are project-scoped with no app/environment link at all;
@@ -82,7 +84,7 @@ pub struct RangeQuery {
     pub environment_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateMonitorReq {
     pub name: String,
     pub kind: String,
@@ -103,6 +105,12 @@ pub struct CreateMonitorReq {
     pub webhook_url: Option<String>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/projects/{project_id}/monitors", tag = "Monitors",
+    summary = "List uptime monitors",
+    params(("project_id" = Uuid, Path, description = "The project.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Monitors.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -116,6 +124,19 @@ pub async fn list(
     Ok(Json(json!(rows)))
 }
 
+#[utoipa::path(
+    post, path = "/v1/projects/{project_id}/monitors", tag = "Monitors",
+    summary = "Create an uptime monitor",
+    description = "\
+The target URL is validated against SSRF: addresses resolving to private or \
+link-local ranges are refused unless the deployment explicitly opts in with \
+`MONITOR_SSRF_ALLOW_PRIVATE`.",
+    params(("project_id" = Uuid, Path, description = "The project.")), security(("bearerAuth" = [])),
+    request_body(content = CreateMonitorReq),
+    responses((status = 200, description = "The created monitor.", body = serde_json::Value),
+              (status = 400, description = "Malformed URL, interval, or a target refused by the SSRF guard.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn create(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -217,6 +238,12 @@ async fn load_authorized(
     Ok((conn, m))
 }
 
+#[utoipa::path(
+    get, path = "/v1/monitors/{monitor_id}", tag = "Monitors",
+    summary = "Fetch a monitor",
+    params(("monitor_id" = Uuid, Path, description = "The monitor.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The monitor.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such monitor.", body = ErrorResponse)),
+)]
 pub async fn detail(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -242,7 +269,7 @@ pub async fn detail(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateMonitorReq {
     pub name: Option<String>,
     pub enabled: Option<bool>,
@@ -281,6 +308,16 @@ where
     Option::deserialize(de).map(Some)
 }
 
+#[utoipa::path(
+    patch, path = "/v1/monitors/{monitor_id}", tag = "Monitors",
+    summary = "Update a monitor",
+    description = "Same SSRF validation as creation applies to a changed URL.",
+    params(("monitor_id" = Uuid, Path, description = "The monitor.")), security(("bearerAuth" = [])),
+    request_body(content = UpdateMonitorReq),
+    responses((status = 200, description = "The updated monitor.", body = serde_json::Value),
+              (status = 400, description = "Malformed field, or a target refused by the SSRF guard.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such monitor.", body = ErrorResponse)),
+)]
 pub async fn update(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -348,6 +385,19 @@ pub async fn update(
     Ok(Json(monitor_view(&m)))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/monitors/{monitor_id}", tag = "Monitors",
+    summary = "Delete a monitor",
+    description = "\
+Alert rules attached to this monitor are **cascaded**, and the response \
+discloses how many were removed. That disclosure is deliberate: a silent \
+cascade would leave an operator believing alerting still covered something it \
+no longer does.",
+    params(("monitor_id" = Uuid, Path, description = "The monitor.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Deleted; `cascaded_alert_rules` counts the rules removed with it.",
+               body = OkResponse, example = json!({ "ok": true, "cascaded_alert_rules": 2 })),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such monitor.", body = ErrorResponse)),
+)]
 pub async fn delete(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -397,6 +447,13 @@ pub async fn delete(
     ))
 }
 
+#[utoipa::path(
+    get, path = "/v1/monitors/{monitor_id}/checks", tag = "Monitors",
+    summary = "Recent check results",
+    description = "Individual probe results. Retained for `MONITOR_CHECK_RETENTION_DAYS` (30 by default), so an older window returns nothing rather than failing.",
+    params(("monitor_id" = Uuid, Path, description = "The monitor."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Check results.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such monitor.", body = ErrorResponse)),
+)]
 pub async fn checks(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -411,6 +468,13 @@ pub async fn checks(
     Ok(Json(json!(series)))
 }
 
+#[utoipa::path(
+    get, path = "/v1/monitors/{monitor_id}/incidents", tag = "Monitors",
+    summary = "Downtime incidents",
+    description = "Contiguous runs of failed checks, grouped into incidents with start, end and duration.",
+    params(("monitor_id" = Uuid, Path, description = "The monitor."), RangeQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Incidents.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such monitor.", body = ErrorResponse)),
+)]
 pub async fn incidents(
     auth: AuthUser,
     State(state): State<AppState>,

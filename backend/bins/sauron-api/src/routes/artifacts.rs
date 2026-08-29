@@ -20,12 +20,13 @@ use sauron_db::repo;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 const KINDS: [&str; 3] = ["js_sourcemap", "dart_symbols", "dart_obfuscation_map"];
 const PLATFORMS: [&str; 3] = ["web", "android", "ios"];
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct UploadParams {
     pub kind: String,
     pub platform: String,
@@ -123,6 +124,26 @@ fn warn_on_content_mismatch(art: &SymbolArtifact, uploaded_sha: &[u8]) {
     }
 }
 
+#[utoipa::path(
+    post, path = "/v1/apps/{app_id}/artifacts", tag = "Artifacts",
+    summary = "Upload a source map or debug artifact",
+    description = "\
+Raw binary body, not multipart. Carries its own raised body limit, well above \
+the 1 MB ceiling the rest of the JSON API enforces.
+
+Artifacts are what turn minified stack frames into source locations. Note that \
+`exception_type` cannot be de-obfuscated from a Dart/Flutter map — only \
+frames can.",
+    params(("app_id" = Uuid, Path, description = "The app."), UploadParams), security(("bearerAuth" = [])),
+    request_body(content = String, description = "The artifact bytes.", content_type = "application/octet-stream"),
+    responses(
+        (status = 201, description = "Stored. Returns the artifact record.", body = serde_json::Value),
+        (status = 400, description = "Missing required upload parameters, or an unreadable artifact.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+        (status = 403, description = "No grant covers this app, or it lacks artifact-write.", body = ErrorResponse),
+        (status = 413, description = "Artifact exceeds the configured maximum size.", body = ErrorResponse),
+    ),
+)]
 pub async fn upload(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -382,6 +403,13 @@ pub async fn upload(
     ))
 }
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/artifacts", tag = "Artifacts",
+    summary = "List an app's artifacts",
+    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Artifacts for the app.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "No grant covers this app.", body = ErrorResponse)),
+)]
 pub async fn list(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -418,6 +446,22 @@ pub async fn list(
     Ok(Json(json!(out)))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/apps/{app_id}/artifacts/{artifact_id}", tag = "Artifacts",
+    summary = "Delete an artifact",
+    description = "\
+Removes the artifact and its cached parse. Errors already symbolicated keep \
+their resolved frames; errors arriving afterwards will not be symbolicated \
+against it.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("artifact_id" = Uuid, Path, description = "The artifact.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 204, description = "Deleted. No body."),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+        (status = 403, description = "No grant covers this app, or it lacks artifact-write.", body = ErrorResponse),
+        (status = 404, description = "No such artifact.", body = ErrorResponse),
+    ),
+)]
 pub async fn delete(
     auth: AuthUser,
     State(state): State<AppState>,

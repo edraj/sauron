@@ -17,6 +17,7 @@ use sauron_db::repo;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 const SEVERITIES: [&str; 3] = ["info", "warning", "critical"];
@@ -141,6 +142,13 @@ fn parse_secret(secret: &Value) -> Result<Option<String>, ApiError> {
 
 // --- channels ---------------------------------------------------------------
 
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/notification-channels", tag = "Notifications",
+    summary = "List notification channels",
+    description = "Channel secrets (webhook URLs, tokens) are stored encrypted and never returned.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Channels.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list_channels(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -157,7 +165,7 @@ pub async fn list_channels(
         .collect::<Vec<_>>())))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateChannelReq {
     pub name: String,
     pub kind: String,
@@ -168,6 +176,16 @@ pub struct CreateChannelReq {
     pub secret: Value,
 }
 
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/notification-channels", tag = "Notifications",
+    summary = "Create a notification channel",
+    description = "Webhook targets are validated against SSRF — an address resolving to a private range is refused unless the deployment opts in.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body(content = CreateChannelReq),
+    responses((status = 200, description = "The created channel.", body = serde_json::Value),
+              (status = 400, description = "Unknown channel kind, malformed configuration, or a target refused by the SSRF guard.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn create_channel(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -268,6 +286,12 @@ async fn load_channel_authorized(
     Ok((conn, ch))
 }
 
+#[utoipa::path(
+    get, path = "/v1/notification-channels/{channel_id}", tag = "Notifications",
+    summary = "Fetch a channel",
+    params(("channel_id" = Uuid, Path, description = "The notification channel.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The channel, without its secret.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such channel.", body = ErrorResponse)),
+)]
 pub async fn get_channel(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -280,7 +304,7 @@ pub async fn get_channel(
     Ok(Json(channel_view(&state.alerts.cipher, &ch)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateChannelReq {
     pub name: Option<String>,
     pub config: Option<Value>,
@@ -291,6 +315,16 @@ pub struct UpdateChannelReq {
     pub enabled: Option<bool>,
 }
 
+#[utoipa::path(
+    patch, path = "/v1/notification-channels/{channel_id}", tag = "Notifications",
+    summary = "Update a channel",
+    description = "Omitting the secret leaves the stored one intact, so a channel can be renamed without re-entering its credential.",
+    params(("channel_id" = Uuid, Path, description = "The notification channel.")), security(("bearerAuth" = [])),
+    request_body(content = UpdateChannelReq),
+    responses((status = 200, description = "The updated channel.", body = serde_json::Value),
+              (status = 400, description = "Malformed configuration, or a target refused by the SSRF guard.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such channel.", body = ErrorResponse)),
+)]
 pub async fn update_channel(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -474,6 +508,17 @@ pub async fn update_channel(
     Ok(Json(channel_view(&state.alerts.cipher, &updated)))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/notification-channels/{channel_id}", tag = "Notifications",
+    summary = "Delete a channel",
+    description = "\
+Alert rules that deliver only through this channel are **cascaded**, and the \
+response says how many. Disclosed rather than silent: an operator must not be \
+left believing a rule still alerts when its only delivery path is gone.",
+    params(("channel_id" = Uuid, Path, description = "The notification channel.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Deleted; `cascaded_alert_rules` counts the rules removed with it.", body = serde_json::Value),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such channel.", body = ErrorResponse)),
+)]
 pub async fn delete_channel(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -504,6 +549,14 @@ pub async fn delete_channel(
 }
 
 /// Send a test message through a channel so the admin can verify wiring.
+#[utoipa::path(
+    post, path = "/v1/notification-channels/{channel_id}/test", tag = "Notifications",
+    summary = "Send a test notification",
+    description = "Delivers a sample message through the channel and reports the outcome, so a misconfigured webhook is found now rather than during an incident.",
+    params(("channel_id" = Uuid, Path, description = "The notification channel.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Delivery result, including the provider's response on failure.", body = serde_json::Value),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such channel.", body = ErrorResponse)),
+)]
 pub async fn test_channel(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -560,6 +613,12 @@ async fn rule_view(
     Ok(v)
 }
 
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/alert-rules", tag = "Notifications",
+    summary = "List alert rules",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Alert rules.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list_rules(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -588,7 +647,7 @@ pub async fn list_rules(
     Ok(Json(json!(out)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateRuleReq {
     pub name: String,
     pub trigger_type: String,
@@ -855,6 +914,16 @@ async fn check_channels_in_org(
     Ok(())
 }
 
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/alert-rules", tag = "Notifications",
+    summary = "Create an alert rule",
+    description = "Quiet hours are evaluated in the rule's own timezone, and a window crossing midnight is handled as one interval rather than two.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body(content = CreateRuleReq),
+    responses((status = 200, description = "The created rule.", body = serde_json::Value),
+              (status = 400, description = "Unknown trigger, malformed threshold, or an invalid quiet-hours window.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn create_rule(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -973,6 +1042,12 @@ async fn load_rule_authorized(
     Ok((conn, rule))
 }
 
+#[utoipa::path(
+    get, path = "/v1/alert-rules/{rule_id}", tag = "Notifications",
+    summary = "Fetch an alert rule",
+    params(("rule_id" = Uuid, Path, description = "The alert rule.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The rule.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such rule.", body = ErrorResponse)),
+)]
 pub async fn get_rule(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -985,7 +1060,7 @@ pub async fn get_rule(
     Ok(Json(rule_view(&mut conn, &rule).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateRuleReq {
     pub name: Option<String>,
     pub enabled: Option<bool>,
@@ -999,6 +1074,15 @@ pub struct UpdateRuleReq {
     pub channel_ids: Option<Vec<Uuid>>,
 }
 
+#[utoipa::path(
+    patch, path = "/v1/alert-rules/{rule_id}", tag = "Notifications",
+    summary = "Update an alert rule",
+    params(("rule_id" = Uuid, Path, description = "The alert rule.")), security(("bearerAuth" = [])),
+    request_body(content = UpdateRuleReq),
+    responses((status = 200, description = "The updated rule.", body = serde_json::Value),
+              (status = 400, description = "Unknown trigger, malformed threshold, or an invalid quiet-hours window.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such rule.", body = ErrorResponse)),
+)]
 pub async fn update_rule(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1113,6 +1197,12 @@ pub async fn update_rule(
 /// rule discloses nothing — it only stops future notifications. Requiring read
 /// on the target to delete would leave an alerting operator unable to clean up
 /// rules for projects they do not read, which is what `alert:write` is for.
+#[utoipa::path(
+    delete, path = "/v1/alert-rules/{rule_id}", tag = "Notifications",
+    summary = "Delete an alert rule",
+    params(("rule_id" = Uuid, Path, description = "The alert rule.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Deleted.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such rule.", body = ErrorResponse)),
+)]
 pub async fn delete_rule(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1144,7 +1234,8 @@ pub async fn delete_rule(
 
 // --- history + metadata -----------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -1153,6 +1244,14 @@ pub struct HistoryQuery {
     pub environment_id: Option<String>,
 }
 
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/alert-events", tag = "Notifications",
+    summary = "Alert delivery history",
+    description = "Which alerts fired, when, and whether delivery succeeded — the record to check when someone says they never got paged.",
+    params(("org_id" = Uuid, Path, description = "The organization."), HistoryQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Alert events.", body = serde_json::Value),
+              (status = 400, description = "Malformed filter or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
+)]
 pub async fn list_history(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -1330,6 +1429,13 @@ fn subscription_kinds_meta() -> serde_json::Value {
 /// silently ignore, but a caller passing the parameter here and having it
 /// vanish without complaint — while every sibling endpoint 400s — is the same
 /// "did my filter apply?" trap as the scoping bug itself.
+#[utoipa::path(
+    get, path = "/v1/alert-meta", tag = "Notifications",
+    summary = "Alerting capabilities of this deployment",
+    description = "The channel kinds, trigger types and comparators this build supports. Read it before constructing a rule rather than hardcoding the vocabulary.",
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Supported channel kinds and trigger vocabulary.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse)),
+)]
 pub async fn meta(
     _auth: AuthUser,
     Query(env): Query<super::scope::RejectEnvQuery>,

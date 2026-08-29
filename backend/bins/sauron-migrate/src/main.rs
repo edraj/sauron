@@ -18,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
     // not-yet-shipped) subcommand became a no-op indistinguishable from
     // success. Bit an operator live: `backfill-rollups` against an older
     // binary "ran" instantly and did nothing.
-    const KNOWN_ARGS: [&str; 3] = [
+    const KNOWN_ARGS: [&str; 4] = [
+        "backfill-person-days",
         "backfill-person-envs",
         "backfill-device-envs",
         "backfill-rollups",
@@ -66,6 +67,20 @@ async fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "backfill-person-envs") {
         let pool = sauron_db::build_pool(&url, 4)?;
         sauron_db::person_env_backfill::backfill_all(&pool).await?;
+    }
+
+    // Opt-in like its siblings, and for the same reason: proportional to
+    // retained data, inside the oneshot every daemon `Requires=`.
+    //
+    // Unlike them, skipping this IS a correctness decision, not merely a
+    // performance one. `person_days` has no pre-rollup fallback query to read
+    // through — retention simply has no legacy path — so until this runs, the
+    // retention endpoints report `ready: false` for every app that predates
+    // migration 74 and the dashboard names this command. That is deliberate:
+    // the alternative is a 0% grid that looks like an answer.
+    if std::env::args().any(|a| a == "backfill-person-days") {
+        let pool = sauron_db::build_pool(&url, 4)?;
+        sauron_db::person_days_backfill::backfill_all(&pool).await?;
     }
 
     // Opt-in for exactly the same reason as `backfill-person-envs` above: this

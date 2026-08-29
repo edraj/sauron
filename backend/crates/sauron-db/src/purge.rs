@@ -177,7 +177,13 @@ struct RollupTable {
 /// deliberately leaves to its own worker).
 fn rollup_companions(kind: PurgeKind) -> &'static [&'static str] {
     match kind {
-        PurgeKind::Persons => &["event_user_environments", "identities"],
+        // `person_days` is keyed by distinct_id, so it is personal data in its
+        // own right: a surviving row still says which days an erased person was
+        // active. It rides in the SAME statement as the rest for the reason the
+        // call site documents — nothing here runs in an explicit transaction, so
+        // a separate statement is a window in which the person is gone and their
+        // daily activity is not.
+        PurgeKind::Persons => &["event_user_environments", "identities", "person_days"],
         _ => &[],
     }
 }
@@ -975,6 +981,40 @@ async fn recompute_person(
     key: &str,
     counts: sauron_purge::recompute::Counts,
 ) -> QueryResult<bool> {
+    // Person-days, re-derived from whatever raw rows survived.
+    //
+    // A blanket delete would be wrong here: this branch runs when the person
+    // still HAS rows (a time-ranged purge), so their remaining days must
+    // survive. Leaving the old rows alone would be wrong the other way — a
+    // person-day whose raw rows were purged still claims the person was active
+    // that day, the same misleading residue the environment recompute below
+    // rejects, one row down.
+    //
+    // Two statements rather than one `DELETE … RETURNING` + `INSERT`: both
+    // would target `person_days` within a single snapshot, so the insert's
+    // uniqueness check would still see the rows the CTE is deleting and could
+    // raise a spurious conflict. Nothing here runs in an explicit transaction
+    // anyway, so the pair is no weaker than the statements around it.
+    diesel::sql_query("DELETE FROM person_days WHERE app_id = $1 AND distinct_id = $2")
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Text, _>(key)
+        .execute(conn)
+        .await?;
+    diesel::sql_query(
+        "INSERT INTO person_days (app_id, environment_id, distinct_id, day, events, errors) \
+         SELECT $1, environment_id, $2, day, sum(ev), sum(er) FROM ( \
+             SELECT environment_id, occurred_at::date AS day, 1 AS ev, 0 AS er \
+               FROM analytics_events WHERE app_id = $1 AND distinct_id = $2 \
+             UNION ALL \
+             SELECT environment_id, occurred_at::date, 0, 1 \
+               FROM error_events WHERE app_id = $1 AND distinct_id = $2 \
+         ) u GROUP BY environment_id, day",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(key)
+    .execute(conn)
+    .await?;
+
     // The person's own row: span only, no counters.
     diesel::sql_query(
         "UPDATE event_users SET \

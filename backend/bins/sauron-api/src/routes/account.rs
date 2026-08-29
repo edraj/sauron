@@ -17,6 +17,7 @@ use sauron_db::repo;
 use super::auth::rate_limit;
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
 
 /// Session actions allowed per user per window. Generous enough for a user
@@ -31,7 +32,7 @@ const SESSION_ACTIONS_PER_MIN: u32 = 20;
 /// Surfacing `revoked_at` and `revoked_reason` is what makes the destructive
 /// action observable to the person it happened to, which is the whole point of
 /// writing those columns.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SessionView {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
@@ -53,7 +54,8 @@ pub struct SessionView {
     pub revoked_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListSessionsQuery {
     /// Accepts `1` or `true`. Deliberately a `String` and not an `Option<bool>`:
     /// axum's `Query` deserializes through `serde_urlencoded`, which rejects `1`
@@ -113,6 +115,26 @@ fn to_view(row: AuthSession, current_sid: Option<Uuid>) -> SessionView {
 }
 
 /// `GET /v1/me/sessions`
+#[utoipa::path(
+    get,
+    path = "/v1/me/sessions",
+    tag = "Account",
+    summary = "List your own sign-in sessions",
+    description = "\
+Every live session for the calling user, newest first. The session the request \
+was made with is flagged `current`, so a client never has to decode the JWT to \
+identify it.
+
+`ip` is returned **unmasked** here, unlike telemetry IPs elsewhere in the API. \
+This is the caller's own data, and a masked address defeats the only question \
+the list exists to answer — \"was that login me?\"",
+    params(ListSessionsQuery),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The caller's sessions.", body = Vec<SessionView>),
+        (status = 401, description = "Missing, expired or revoked access token.", body = ErrorResponse),
+    ),
+)]
 pub async fn list_sessions(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -127,6 +149,27 @@ pub async fn list_sessions(
 }
 
 /// `DELETE /v1/me/sessions/{session_id}`
+#[utoipa::path(
+    delete,
+    path = "/v1/me/sessions/{session_id}",
+    tag = "Account",
+    summary = "Revoke one of your own sessions",
+    description = "\
+Ends a single session immediately. Revoking the current session is allowed and \
+signs the caller out.
+
+Revocation propagates to other API replicas on their next revocation poll \
+rather than instantly, so a token may survive for a few seconds on a replica \
+that has not yet refreshed.",
+    params(("session_id" = Uuid, Path, description = "Session to revoke, from `GET /v1/me/sessions`.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "Session revoked.", body = OkResponse),
+        (status = 401, description = "Missing, expired or revoked access token.", body = ErrorResponse),
+        (status = 404, description = "No such session, or it belongs to another user.", body = ErrorResponse),
+        (status = 429, description = "Too many revocations in a short window.", body = ErrorResponse),
+    ),
+)]
 pub async fn revoke_session(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -177,6 +220,24 @@ pub async fn revoke_session(
 ///
 /// No request body — the dashboard sends `{}` and axum needs no `Json`
 /// extractor to ignore it.
+#[utoipa::path(
+    post,
+    path = "/v1/me/sessions/revoke-others",
+    tag = "Account",
+    summary = "Revoke every session except this one",
+    description = "\
+The \"sign out everywhere else\" action. Keeps the session that made the \
+request alive, so the caller is not signed out by their own cleanup.
+
+Returns how many sessions were ended, which is what lets a client show \
+\"3 other devices signed out\" rather than a bare acknowledgement.",
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "Other sessions revoked; `revoked` counts them.",
+         body = OkResponse, example = json!({ "ok": true, "revoked": 3 })),
+        (status = 401, description = "Missing, expired or revoked access token.", body = ErrorResponse),
+    ),
+)]
 pub async fn revoke_other_sessions(
     auth: AuthUser,
     State(state): State<AppState>,

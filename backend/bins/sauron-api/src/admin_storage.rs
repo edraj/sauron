@@ -34,13 +34,13 @@ const CACHE_TTL_SECS: u64 = 60;
 /// unbounded response size and memory for no added insight.
 const MAX_COLD_FILES_PER_APP: usize = 200;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StorageReport {
     pub database: DatabaseInfo,
     pub apps: Vec<AppStorage>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DatabaseInfo {
     /// Postgres bytes attributable to the caller's visible apps. For a
     /// full-scope caller this *is* `pg_database_size`; otherwise it is the
@@ -63,7 +63,7 @@ pub struct DatabaseInfo {
     pub tables: Vec<TableSize>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TableSize {
     pub name: String,
     /// Physical bytes attributed to the caller's visible apps.
@@ -76,7 +76,7 @@ pub struct TableSize {
     pub tiered: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AppStorage {
     pub app_id: Uuid,
     pub app_name: String,
@@ -97,7 +97,7 @@ pub struct AppStorage {
     pub cold_files_total: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AppTableStorage {
     pub name: String,
     pub hot_rows: i64,
@@ -109,7 +109,7 @@ pub struct AppTableStorage {
     pub estimated_hot_bytes: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ColdFile {
     pub path: String,
     pub bytes: i64,

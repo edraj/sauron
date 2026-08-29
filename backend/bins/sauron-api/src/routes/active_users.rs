@@ -28,6 +28,7 @@ use sauron_db::repo::AppEnvScope;
 use sauron_db::scope::EnvFilter;
 
 use crate::error::ApiError;
+use crate::openapi::ErrorResponse;
 use crate::AppState;
 
 /// Longest window a single request may cover.
@@ -76,7 +77,8 @@ const RESOLVED_UNATTRIBUTED: &str = "unattributed";
 /// `selection` is a repeated key. `environment_id` is deliberately NOT a field:
 /// the dimension is per selection, and accepting a global one and ignoring it
 /// is exactly the bug `routes::scope`'s module docs exist to prevent.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ActiveUsersQuery {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
@@ -84,13 +86,13 @@ pub struct ActiveUsersQuery {
     pub selection: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReportWindow {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ActiveUserPoint {
     pub day: NaiveDate,
     pub active_total: i64,
@@ -115,7 +117,7 @@ pub struct ActiveUserPoint {
 /// `resolved` is a `String`, not the `&'static str` it wants to be, because
 /// this report round-trips through the Redis cache and must therefore derive
 /// `Deserialize`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SelectionView {
     pub app_id: Uuid,
     pub app_name: String,
@@ -130,7 +132,7 @@ pub struct SelectionView {
 /// Derives `Deserialize` as well as `Serialize`, and every field added after
 /// v1 must carry `#[serde(default)]`: a report cached by an older build has to
 /// keep deserializing rather than missing the cache for a whole TTL.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ActiveUsersReport {
     pub requested: ReportWindow,
     pub effective: ReportWindow,
@@ -289,7 +291,7 @@ fn resolved_label(env: &EnvFilter) -> &'static str {
 }
 
 /// The canonical, injective document the cache key hashes.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct CacheFingerprint<'a> {
     project_id: Uuid,
     from: DateTime<Utc>,
@@ -375,6 +377,24 @@ const ACTIVE_USERS_RATE_WINDOW_SECS: u64 = 60;
 const CACHE_OP_TIMEOUT: StdDuration = StdDuration::from_millis(500);
 
 /// `GET /v1/projects/{project_id}/active-users`
+#[utoipa::path(
+    get, path = "/v1/projects/{project_id}/active-users", tag = "Analytics",
+    summary = "Active-users report",
+    description = "\
+The heaviest query in the product, and runnable by the lowest-privileged role — \
+so it is admitted through a small semaphore and answers **503 rather than \
+queueing** when saturated. Queueing here would surface as connection-pool \
+failures on unrelated endpoints, including login and health.
+
+Results are served stale-while-revalidate: under an hour old they are returned \
+as-is; between one and three hours they are returned immediately and refreshed \
+in the background. `computed_at` states which. A cache hit costs no admission \
+permit.",
+    params(("project_id" = Uuid, Path, description = "The project."), ActiveUsersQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The report, with `computed_at` disclosing its freshness.", body = ActiveUsersReport),
+              (status = 400, description = "Malformed selection or window.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 503, description = "Report admission is saturated, or `event_users.identified_at` is missing because migrations have not been run. Retry, or run sauron-migrate.", body = ErrorResponse)),
+)]
 pub async fn active_users(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -393,6 +413,15 @@ pub async fn active_users(
 /// negotiation via a query param is easy to mis-validate. Both routes call one
 /// `build_report`, so they can never disagree about the numbers — the only
 /// thing `?format=csv` really bought.
+#[utoipa::path(
+    get, path = "/v1/projects/{project_id}/active-users.csv", tag = "Analytics",
+    summary = "Active-users report as CSV",
+    description = "Same computation and same admission gate as the JSON report, streamed as `text/csv`.",
+    params(("project_id" = Uuid, Path, description = "The project."), ActiveUsersQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "CSV export.", content_type = "text/csv", body = String),
+              (status = 400, description = "Malformed selection or window.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 503, description = "Report admission is saturated, or a required column is missing.", body = ErrorResponse)),
+)]
 pub async fn active_users_csv(
     auth: AuthUser,
     State(state): State<AppState>,

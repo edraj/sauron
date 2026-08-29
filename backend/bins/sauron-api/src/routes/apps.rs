@@ -15,6 +15,7 @@ use sauron_redis::keys;
 
 use super::db;
 use crate::error::ApiError;
+use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
 
 /// Uses `authorize_app_reachable`, not `authorize_app`: an env-scoped member
@@ -31,6 +32,19 @@ use crate::AppState;
 /// feature has already had. This handler used to accept no query extractor
 /// at all, which meant a bogus value was silently dropped instead of
 /// refused.
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}", tag = "Apps",
+    summary = "Fetch an app",
+    description = "Returns the app record. Refused before the id is looked up when the caller holds no covering grant, so a 403 does not confirm the app exists.",
+    params(("app_id" = Uuid, Path, description = "The app. The caller must hold a grant covering it.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The app.", body = App),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+        (status = 403, description = "No grant covers this app.", body = ErrorResponse),
+        (status = 404, description = "No such app.", body = ErrorResponse),
+    ),
+)]
 pub async fn get_app(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -45,7 +59,7 @@ pub async fn get_app(
     Ok(Json(app))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateAppReq {
     pub name: String,
     #[serde(default = "default_true")]
@@ -71,6 +85,25 @@ where
     Ok(Some(Option::deserialize(d)?))
 }
 
+#[utoipa::path(
+    patch, path = "/v1/apps/{app_id}", tag = "Apps",
+    summary = "Update an app",
+    description = "\
+Partial update: omitted fields are left alone. `project_id` is a *nullable* \
+field with three states — absent (leave as-is), `null` (detach from its \
+project), or an id (move it) — which is why the request body distinguishes \
+missing from null.",
+    params(("app_id" = Uuid, Path, description = "The app. The caller must hold a grant covering it.")),
+    security(("bearerAuth" = [])),
+    request_body(content = UpdateAppReq, example = json!({ "name": "Checkout (iOS)" })),
+    responses(
+        (status = 200, description = "The updated app.", body = App),
+        (status = 400, description = "Malformed field.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+        (status = 403, description = "No grant covers this app, or the target project.", body = ErrorResponse),
+        (status = 404, description = "No such app.", body = ErrorResponse),
+    ),
+)]
 pub async fn update_app(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -162,6 +195,22 @@ pub async fn update_app(
     Ok(Json(app))
 }
 
+#[utoipa::path(
+    delete, path = "/v1/apps/{app_id}", tag = "Apps",
+    summary = "Delete an app",
+    description = "\
+Removes the app and its enrollments. Telemetry already ingested is **not** \
+deleted synchronously — use the admin purge endpoints for that, which are \
+auditable and support a confirm/cancel handshake.",
+    params(("app_id" = Uuid, Path, description = "The app. The caller must hold a grant covering it.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "Deleted.", body = OkResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+        (status = 403, description = "No grant covers this app.", body = ErrorResponse),
+        (status = 404, description = "No such app.", body = ErrorResponse),
+    ),
+)]
 pub async fn delete_app(
     auth: AuthUser,
     State(state): State<AppState>,
@@ -204,7 +253,7 @@ pub async fn delete_app(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct FirstEventResp {
     pub received: bool,
     /// Presence flags, not counts — the onboarding poll only needs "yet?".
@@ -225,6 +274,21 @@ pub struct FirstEventResp {
 // same way it does for `issues::list`. This handler was never on the gap
 // this task closes.
 
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/first-event", tag = "Apps",
+    summary = "When this app first sent telemetry",
+    description = "\
+Powers the onboarding \"waiting for your first event\" state. Answers 200 with \
+a null timestamp when nothing has arrived yet — not a 404, because \
+\"no data yet\" is a normal state for a correctly-configured new app.",
+    params(("app_id" = Uuid, Path, description = "The app. The caller must hold a grant covering it.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The first event's timestamp, or null if none has arrived.", body = FirstEventResp),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+        (status = 403, description = "No grant covers this app.", body = ErrorResponse),
+    ),
+)]
 pub async fn first_event(
     auth: AuthUser,
     State(state): State<AppState>,

@@ -50,7 +50,7 @@ fn mask_ip(raw: &str) -> String {
 // Organizations & users
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = organizations)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Organization {
@@ -68,7 +68,7 @@ pub struct NewOrganization<'a> {
     pub slug: &'a str,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = users)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct User {
@@ -106,7 +106,7 @@ pub struct NewUser<'a> {
 // Projects (grouping) & apps (ingest unit)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = projects)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Project {
@@ -126,7 +126,7 @@ pub struct NewProject<'a> {
     pub slug: &'a str,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = apps)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct App {
@@ -163,7 +163,7 @@ pub struct NewApp<'a> {
 /// key and no ingest switch — those belong to the per-app enrollment below,
 /// because a key that did not name an app could not prove which app an incoming
 /// event belonged to.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = environments)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Environment {
@@ -189,7 +189,7 @@ pub struct NewEnvironment<'a> {
 /// environment does this app report to by default" is a property of the app,
 /// and a second `is_default` one level up would give two rows the authority to
 /// answer the same question.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = app_environments)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AppEnvironment {
@@ -217,7 +217,7 @@ pub struct NewAppEnvironment<'a> {
 /// environment list and DSN table actually render. The name is not stored on
 /// the enrollment (that is exactly the drift this feature removed), so any
 /// caller that needs to *display* an enrollment needs this join.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct AppEnvironmentView {
     #[serde(flatten)]
     pub enrollment: AppEnvironment,
@@ -226,7 +226,7 @@ pub struct AppEnvironmentView {
 
 /// Everything the ingest edge needs after presenting a key: the environment it
 /// belongs to, its ancestry, and both ingest switches. Cached in Redis as JSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EnvRef {
     pub env_id: Uuid,
     pub app_id: Uuid,
@@ -240,7 +240,7 @@ pub struct EnvRef {
 // RBAC: roles & grants
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = roles)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Role {
@@ -263,7 +263,7 @@ pub struct NewRole<'a> {
     pub permissions: Value,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = role_grants)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct RoleGrant {
@@ -290,7 +290,7 @@ pub struct NewRoleGrant {
 // Issues & error events (keyed by app_id)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = issues)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Issue {
@@ -353,7 +353,7 @@ pub struct IssueLatestFrames {
     pub stacktrace_symbolicated: Option<Value>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = error_events)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct ErrorEvent {
@@ -482,7 +482,7 @@ pub struct NewErrorEvent {
 // Analytics events & people (keyed by app_id)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = analytics_events)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AnalyticsEvent {
@@ -535,7 +535,7 @@ pub struct NewAnalyticsEvent {
     pub extra: Value,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = event_users)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct EventUser {
@@ -648,7 +648,7 @@ pub struct NewPasswordResetToken {
 // Sessions & devices (roll-ups materialized by the pipeline, keyed by app_id)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = sessions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Session {
@@ -674,7 +674,7 @@ pub struct Session {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = devices)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Device {
@@ -706,7 +706,7 @@ pub struct Device {
 // return garbage.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = workflows)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Workflow {
@@ -734,7 +734,7 @@ pub struct Workflow {
 // Transactions (performance signal, keyed by app_id)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = transactions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Transaction {
@@ -890,7 +890,7 @@ where
 /// `bins/sauron-monitor` reads the columns straight from Postgres and never
 /// deserializes this struct, so redacting the API serializer costs the prober
 /// nothing.
-#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = monitors)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Monitor {
@@ -937,7 +937,7 @@ pub struct NewMonitor<'a> {
     pub created_by: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = monitor_incidents)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct MonitorIncidentRow {
@@ -1017,7 +1017,7 @@ pub struct NewSymbolArtifact {
 /// `{}` the first time the row is written. Reach the real value through
 /// `sauron_alerts::crypto::open_channel_config`, never this field — reading
 /// `config` directly is how a caller silently gets `{}` on a converted row.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = notification_channels)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct NotificationChannel {
@@ -1054,7 +1054,7 @@ pub struct NewNotificationChannel<'a> {
 
 /// An admin-defined trigger. `conditions` is a free-form bag interpreted per
 /// `trigger_type` (threshold / comparator / window / filters / spike factor…).
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = alert_rules)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AlertRule {
@@ -1093,7 +1093,7 @@ pub struct NewAlertRule<'a> {
     pub created_by: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = alert_events)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AlertEventRow {
@@ -1204,7 +1204,7 @@ pub struct NewMailOutbox<'a> {
 /// [`NotificationQueueItem`] carries it: `upsert_subscription` is one
 /// data-modifying CTE ending in `SELECT * FROM up`, and `diesel::sql_query`
 /// decodes by column NAME, which plain `Queryable` cannot do.
-#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = notification_subscriptions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct NotificationSubscription {
@@ -1249,7 +1249,7 @@ pub struct NewNotificationSubscription<'a> {
 
 /// `environment_id` here is a **catalogue** `environments.id`, never an
 /// `app_environments` enrollment id.
-#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = notification_subscription_envs)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct NotificationSubscriptionEnv {
@@ -1259,7 +1259,7 @@ pub struct NotificationSubscriptionEnv {
 
 /// `QueryableByName` as well as `Queryable`, because the drain's claim is a
 /// `sql_query ... RETURNING *`.
-#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, QueryableByName, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = notification_queue)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct NotificationQueueItem {
@@ -1309,7 +1309,7 @@ pub struct NewNotificationQueueItem<'a> {
 }
 
 /// `environment_id` here is an **enrollment** `app_environments.id`.
-#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = notification_queue_envs)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct NotificationQueueEnv {
@@ -1323,7 +1323,7 @@ pub struct NotificationQueueEnv {
 /// `effective_policy_for_app` are raw `sql_query`s (the scheduling arithmetic
 /// and the precedence `ORDER BY CASE` have no diesel DSL equivalent), and
 /// `sql_query` loads by column NAME, which `Queryable` cannot do.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName, utoipa::ToSchema)]
 #[diesel(table_name = inspector_policies)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct InspectorPolicy {
@@ -1397,7 +1397,7 @@ pub struct InspectorPolicyPatch<'a> {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName, utoipa::ToSchema)]
 #[diesel(table_name = inspector_scans)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct InspectorScan {
@@ -1443,7 +1443,7 @@ pub struct NewInspectorScan<'a> {
     pub units_total: i32,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = inspector_findings)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct InspectorFinding {
@@ -1470,7 +1470,7 @@ pub struct InspectorFinding {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName, utoipa::ToSchema)]
 #[diesel(table_name = inspector_mask_actions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct InspectorMaskAction {
@@ -1521,7 +1521,7 @@ pub struct NewInspectorMaskAction<'a> {
     pub requested_by_email: &'a str,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = inspector_masked_keys)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct InspectorMaskedKey {
@@ -1546,7 +1546,7 @@ pub struct NewInspectorMaskedKey<'a> {
     pub source_action_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = inspector_reveal_audit)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct InspectorRevealAudit {
@@ -1581,7 +1581,7 @@ pub struct NewInspectorRevealAudit<'a> {
 /// export watermark and durable in Parquet. Created by a cold-data restore; see
 /// the `tier_pins` migration for why a restore without one is undone on the very
 /// next tier cycle.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = tier_pins)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct TierPin {
@@ -1604,7 +1604,7 @@ pub struct TierPin {
 /// `QueryableByName` as well as `Queryable`: the claim goes through
 /// `sql_query(... RETURNING *)`, which loads by column name rather than by
 /// position. Same reason `InspectorScan` carries both.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName, utoipa::ToSchema)]
 #[diesel(table_name = restore_jobs)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct RestoreJob {
@@ -1666,7 +1666,7 @@ pub struct AppStoreConnection {
 ///
 /// No `environment_id`: the stores key their data to a package name or bundle
 /// id and have no environment dimension to report. See migration 49.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = store_daily_metrics)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct StoreDailyMetric {
@@ -1685,7 +1685,7 @@ pub struct StoreDailyMetric {
 /// `ON DELETE SET NULL` (or, for `environment_id`, unconstrained), so the
 /// names are the only thing that keeps an entry readable once the thing it
 /// describes has been deleted — which is exactly when the trail is consulted.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = audit_log)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AuditLogEntry {
@@ -1745,7 +1745,7 @@ pub struct NewAuditLogEntry<'a> {
 /// for the same reasons as [`AuditLogEntry`]: the row is an inert snapshot that
 /// must outlive the app it describes, and the dominant failure mode is a
 /// payload that never decoded, so there is no app to point at.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = ingest_failures)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct IngestFailure {
@@ -1784,7 +1784,7 @@ pub struct IngestFailure {
 /// `dropped` is rendered wherever it is non-zero. Silent truncation that reads
 /// as full coverage is the specific bug class this page exists to expose, so
 /// the number is never hidden behind a tooltip or an expander.
-#[derive(Debug, Clone, QueryableByName, Serialize)]
+#[derive(Debug, Clone, QueryableByName, Serialize, utoipa::ToSchema)]
 pub struct IngestFailureRow {
     #[diesel(sql_type = diesel::sql_types::Uuid)]
     pub id: Uuid,
@@ -1844,7 +1844,7 @@ pub struct NewIngestFailure<'a> {
 /// `mask::apply_wire` runs in the worker before anything is persisted or
 /// re-queued, so this is never the raw wire payload. It is still a copy of a
 /// real user event, which is why the retention reaper exists.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
 #[diesel(table_name = ingest_failure_payloads)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct IngestFailurePayload {
@@ -1874,7 +1874,7 @@ pub struct NewIngestFailurePayload {
 /// Field order MUST match `schema::purge_jobs` exactly — `Queryable` decodes
 /// POSITIONALLY, so a field inserted in the middle silently binds every later
 /// column to the wrong one. Append only.
-#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName)]
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, QueryableByName, utoipa::ToSchema)]
 #[diesel(table_name = purge_jobs)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct PurgeJob {
@@ -1954,5 +1954,48 @@ mod tests {
         // Never reflect arbitrary stored text into the response.
         assert_eq!(mask_ip("not-an-ip"), "invalid");
         assert_eq!(mask_ip("<script>"), "invalid");
+    }
+}
+
+#[cfg(test)]
+mod openapi_schema_tests {
+    use utoipa::PartialSchema;
+
+    /// `User::password_hash` and `User::credentials_invalidated_at` carry
+    /// `#[serde(skip_serializing)]`, so they are never present in a response
+    /// body. The OpenAPI schema is derived by a *different* macro than the one
+    /// that honours those attributes at runtime, and a schema that advertises
+    /// `password_hash` on the object returned by `/v1/me` would be a published
+    /// claim that Sauron hands out password hashes.
+    ///
+    /// Serde-attribute handling is exactly the kind of thing a dependency bump
+    /// changes quietly, so this asserts the property rather than trusting it.
+    #[test]
+    fn user_schema_omits_fields_that_are_never_serialized() {
+        let schema =
+            serde_json::to_string(&super::User::schema()).expect("User schema should serialize");
+
+        assert!(
+            !schema.contains("password_hash"),
+            "the derived OpenAPI schema for `User` advertises `password_hash`, \
+             which `#[serde(skip_serializing)]` guarantees is never in a \
+             response. Fix the derive (e.g. `#[schema(ignore)]`) — do not \
+             delete this test. Schema was: {schema}"
+        );
+        assert!(
+            !schema.contains("credentials_invalidated_at"),
+            "the derived OpenAPI schema for `User` advertises \
+             `credentials_invalidated_at`, which is never serialized. \
+             Schema was: {schema}"
+        );
+
+        // Guards the assertions above against passing vacuously: if the schema
+        // ever stopped containing any fields at all, the two `!contains`
+        // checks would still succeed while documenting nothing.
+        assert!(
+            schema.contains("email") && schema.contains("is_active"),
+            "expected the `User` schema to describe its serialized fields; \
+             got: {schema}"
+        );
     }
 }
