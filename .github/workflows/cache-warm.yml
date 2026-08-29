@@ -38,6 +38,22 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: "0"
+      # `ci.yml` installed lld and never told rustc to use it, so the backend
+      # job linked dozens of test binaries with GNU ld anyway. This mirrors the
+      # pattern packaging/rpm/build-rpm.sh already uses for the release build,
+      # where lld is proven against this workspace's DuckDB link.
+      #
+      # Deliberately job env, not backend/.cargo/config.toml: a config file
+      # would also apply to developer machines that may not have lld, and to
+      # rpmbuild, where sauron.spec exports its own RUSTFLAGS that would
+      # override it regardless.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+      # [profile.test] is empty, so it inherited [profile.dev] debug = 1.
+      # `cargo test` spends ~7 minutes compiling and ~2 seconds running (every
+      # test result line reads 0.00s), so codegen and link cost is the whole
+      # bill. Set here rather than in Cargo.toml so local `cargo test` keeps
+      # its debuginfo for actual debugging.
+      CARGO_PROFILE_TEST_DEBUG: "0"
     defaults:
       run:
         working-directory: backend
@@ -48,7 +64,7 @@ jobs:
       # steps are copies on purpose — divergence shows up as a silent cache miss
       # (a slow PR), never as a failure here.
       - name: Toolchain deps (pkg-config + libzstd for the system-zstd link)
-        run: sudo apt-get update -q && sudo apt-get install -y -q pkg-config libzstd-dev
+        run: sudo apt-get update -q && sudo apt-get install -y -q pkg-config libzstd-dev lld
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
