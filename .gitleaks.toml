@@ -14,6 +14,16 @@ regexes = [
   # for POST /v1/admin/purge/{id}/confirm. Documentation example data, not a
   # credential. Narrow, so real secrets in that file still gate.
   '''pct_1f8c4b2e9d7a''',
+  # dashboard i18n message keys. `key: 'retention.insight.day1Down'` trips the
+  # generic-api-key rule, which fires on the word `key` beside a quoted
+  # high-entropy string. These are translation identifiers rendered into the
+  # UI, never credentials.
+  #
+  # Scoped to the namespace rather than the two values that happen to trip
+  # today: 2 of the 9 existing retention.insight.* keys cross the entropy
+  # threshold, so pinning the two would let a tenth key re-break the gate.
+  # This is the only `key: '<dotted>'` namespace in the dashboard.
+  '''retention\.insight\.[A-Za-z0-9_]+''',
 ]
 paths = [
   '''backend/bins/sauron-api/tests/http_monitors\.rs$''',   # test probe body
