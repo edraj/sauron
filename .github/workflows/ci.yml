@@ -127,7 +127,12 @@ jobs:
         # No --all-features: it would enable sauron-tier's `bundled` feature and
         # recompile DuckDB from source (needs the C++ toolchain we no longer install).
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test
+      - name: Install cargo-nextest
+        # Official installer, not a marketplace action: this repo already
+        # prefers fetching a pinned binary directly (see security.yml), and it
+        # keeps the supply-chain surface to one URL we can read.
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+      - name: cargo nextest + doctests
         # TEST_DATABASE_URL/TEST_REDIS_URL opt the harness in — without them
         # `TestDb::setup()` returns `None` and every env-scoping test reports
         # "passed" in 0.00s without running (see the module doc on
@@ -146,7 +151,21 @@ jobs:
         # the stale committed file and passing. That half is the
         # `check-wire-fixture.sh` step in each of the five sdk-* jobs below;
         # neither half is sufficient alone.
-        run: cargo test --workspace
+        #
+        # nextest runs each test in its own process, which is what buys the
+        # cross-binary parallelism `cargo test` cannot do — it runs binaries
+        # strictly one at a time, so a binary with fewer tests than threads
+        # leaves the machine idle. Measured before this change: 100 binaries,
+        # 2057 tests, 249s of execution against 126s of compile+link.
+        #
+        # `--doc` is a SEPARATE command and not optional: nextest does not run
+        # doctests at all, so `cargo nextest run` alone would silently drop
+        # every doctest in the workspace. `cargo test` was running them (the
+        # Doc-tests phase of the previous log), and dropping coverage to save
+        # time would not be a speedup.
+        run: |
+          cargo nextest run --workspace
+          cargo test --doc --workspace
 
   dashboard:
     name: dashboard — build · test
