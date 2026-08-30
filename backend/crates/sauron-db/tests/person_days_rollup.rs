@@ -1039,3 +1039,184 @@ async fn coverage_floor_reports_the_earliest_person_day() {
 
     db.cleanup().await;
 }
+
+/// One human logging out and back in all day stays ONE person.
+///
+/// Each `reset()` mints a fresh anonymous id, so a day of logout/login cycles
+/// creates a *transient* anonymous person per cycle — the question is whether
+/// they accumulate. They must not: each `identify()` aliases that cycle's
+/// anonymous id onto the same named user, and the merge folds the rows over
+/// and deletes the alias's own `event_users` row.
+///
+/// The failure this pins is unbounded person growth for a single human, which
+/// would inflate cohort sizes, crush retention, and bill by the login.
+#[tokio::test]
+async fn repeated_logout_login_collapses_to_one_person() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mut conn = db.conn().await;
+    let ids = db.seed_two_envs().await;
+    const PERSON: &str = "user-42";
+    const CYCLES: usize = 8;
+
+    // The named user exists from the first login.
+    sauron_db::repo::upsert_event_user(&mut conn, ids.app_id, PERSON, &serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let today = chrono::Utc::now().date_naive();
+    for cycle in 0..CYCLES {
+        // Logged out: a fresh anon id, and the user browses under it — which
+        // is what makes it a real alias rather than an unused id.
+        let anon = format!("anon_cycle_{cycle}");
+        sauron_db::repo::upsert_event_user(&mut conn, ids.app_id, &anon, &serde_json::json!({}))
+            .await
+            .unwrap();
+        diesel::sql_query(
+            "INSERT INTO person_days (app_id, environment_id, distinct_id, day, events) \
+             VALUES ($1, NULL, $2, $3, 1) \
+             ON CONFLICT (app_id, COALESCE(environment_id, \
+               '00000000-0000-0000-0000-000000000000'::uuid), distinct_id, day) \
+             DO UPDATE SET events = person_days.events + 1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+        .bind::<diesel::sql_types::Text, _>(anon.clone())
+        .bind::<diesel::sql_types::Date, _>(today)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // Logs back in: identify() aliases this cycle's anon id onto the same
+        // person, and the merge runs.
+        sauron_db::identity_merge::rewrite_hot_rows(&mut conn, ids.app_id, &anon, PERSON)
+            .await
+            .unwrap();
+        sauron_db::identity_merge::fold_rollups(&mut conn, ids.app_id, &anon, PERSON, 7)
+            .await
+            .unwrap();
+    }
+
+    let people: CountRow = diesel::sql_query(
+        "SELECT count(*) AS n FROM event_users WHERE app_id = $1 AND distinct_id LIKE 'anon\\_cycle%'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+    .get_result(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        people.n, 0,
+        "every cycle's anonymous person must be folded away, not left behind"
+    );
+
+    // And the day is ONE person-day for the named user, not one per login:
+    // the union means eight logins on one day are one active day.
+    let days: CountRow = diesel::sql_query(
+        "SELECT count(*) AS n FROM person_days WHERE app_id = $1 AND distinct_id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+    .bind::<diesel::sql_types::Text, _>(PERSON)
+    .get_result(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(days.n, 1, "eight logins in one day are one active day");
+
+    db.cleanup().await;
+}
+
+/// One human on many devices is ONE person — but still many devices.
+///
+/// After `identify()`, every device writes under the SAME app-supplied
+/// `distinct_id`, and each device's own anonymous id is aliased onto it. So the
+/// person count must not scale with devices, and neither must the person-DAY
+/// count: three devices active on one day is one active day for that human, or
+/// retention would read three returns where there was one.
+///
+/// The device dimension is deliberately NOT collapsed — `devices` stays one row
+/// per device, which is what the Devices inventory is for.
+#[tokio::test]
+async fn one_user_on_many_devices_is_one_person_with_many_devices() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mut conn = db.conn().await;
+    let ids = db.seed_two_envs().await;
+    const PERSON: &str = "user-42";
+    const DEVICES: usize = 3;
+
+    sauron_db::repo::upsert_event_user(&mut conn, ids.app_id, PERSON, &serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let today = chrono::Utc::now().date_naive();
+    for d in 0..DEVICES {
+        // Each device carries its OWN anonymous id (device-local storage), used
+        // before the user logs in on that device.
+        let anon = format!("anon_device_{d}");
+        sauron_db::repo::upsert_event_user(&mut conn, ids.app_id, &anon, &serde_json::json!({}))
+            .await
+            .unwrap();
+        diesel::sql_query(
+            "INSERT INTO person_days (app_id, environment_id, distinct_id, day, events) \
+             VALUES ($1, NULL, $2, $3, 1) \
+             ON CONFLICT (app_id, COALESCE(environment_id, \
+               '00000000-0000-0000-0000-000000000000'::uuid), distinct_id, day) \
+             DO UPDATE SET events = person_days.events + 1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+        .bind::<diesel::sql_types::Text, _>(anon.clone())
+        .bind::<diesel::sql_types::Date, _>(today)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // Logging in on that device aliases its anonymous id onto the same
+        // person. Different alias each time, same target — no conflict, because
+        // an anonymous id binds to a person once and these are distinct ids.
+        sauron_db::identity_merge::rewrite_hot_rows(&mut conn, ids.app_id, &anon, PERSON)
+            .await
+            .unwrap();
+        sauron_db::identity_merge::fold_rollups(&mut conn, ids.app_id, &anon, PERSON, 7)
+            .await
+            .unwrap();
+    }
+
+    let leftover: CountRow = diesel::sql_query(
+        "SELECT count(*) AS n FROM event_users \
+          WHERE app_id = $1 AND distinct_id LIKE 'anon\\_device%'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+    .get_result(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(leftover.n, 0, "each device's guest identity must fold away");
+
+    let days: CountRow = diesel::sql_query(
+        "SELECT count(*) AS n FROM person_days WHERE app_id = $1 AND distinct_id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+    .bind::<diesel::sql_types::Text, _>(PERSON)
+    .get_result(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        days.n, 1,
+        "three devices on one day is ONE active day, not three"
+    );
+
+    // The counters still add up: the day carries all three devices' events.
+    let events: CountRow = diesel::sql_query(
+        "SELECT events AS n FROM person_days WHERE app_id = $1 AND distinct_id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ids.app_id)
+    .bind::<diesel::sql_types::Text, _>(PERSON)
+    .get_result(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        events.n, DEVICES as i64,
+        "activity is summed, days are unioned"
+    );
+
+    db.cleanup().await;
+}

@@ -674,6 +674,9 @@ TIER_TICK_SECS=3600
 # Postgres partition". Late-arriving rows land inside this lag.
 TIER_DROP_LAG_HOURS=24`;
 
+  /** The one operator step retention needs; covers every predating app at once. */
+  const retentionBackfillSnippet = 'sauron-migrate backfill-person-days\n\n# then, so the planner has statistics for the new rows:\npsql -c \'ANALYZE person_days;\'';
+
   // --- in-page navigation --------------------------------------------------
   const sdkNav: { key: Platform; label: string; icon: IconName }[] = [
     { key: 'web', label: 'Web', icon: 'globe' },
@@ -688,6 +691,7 @@ TIER_DROP_LAG_HOURS=24`;
   ]);
   const guideNav: { id: string; label: string; icon: IconName }[] = $derived([
     { id: 'funnels', label: t('docs.nav.item.funnels'), icon: 'funnel' },
+    { id: 'retention', label: t('docs.nav.item.retention'), icon: 'repeat' },
     { id: 'verify', label: t('docs.nav.item.verify'), icon: 'circle-check' },
     { id: 'search', label: t('docs.nav.item.search'), icon: 'search' },
     { id: 'privacy-inspector', label: t('docs.nav.item.privacy'), icon: 'shield-alert' },
@@ -706,7 +710,7 @@ TIER_DROP_LAG_HOURS=24`;
   ]);
   // Section anchors in document order — drives scroll-spy highlighting.
   const sectionIds = [
-    'dsn', 'concepts', 'quickstart', 'funnels', 'verify', 'search', 'privacy-inspector',
+    'dsn', 'concepts', 'quickstart', 'funnels', 'retention', 'verify', 'search', 'privacy-inspector',
     'troubleshooting', 'architecture', 'grouping', 'analytics-internals', 'queries', 'tiering',
     'uptime', 'rbac', 'sdk-internals',
   ];
@@ -1231,6 +1235,67 @@ GROUP BY name, op`;
         {t('docs.analytics.stepOrder.a')} <code class="ic">identify()</code>
         {t('docs.analytics.stepOrder.b')}
       </p>
+    </Card>
+
+        </section>
+
+        <!-- Retention -->
+        <section id="retention" class="doc-sec">
+    <Card>
+      {#snippet header()}
+        <div class="card-h"><Icon name="repeat" size={16} /><h3>{t('docs.ret.title')}</h3></div>
+      {/snippet}
+      <p class="muted verify-lead">{t('docs.ret.lead')}</p>
+
+      <h4 class="doc-h4">{t('docs.ret.readingTheGrid')}</h4>
+      <p>{t('docs.ret.rowIs')}</p>
+      <ul class="mini-steps">
+        <li>{t('docs.ret.dayNIsRelative')}</li>
+        <li>{t('docs.ret.day0')}</li>
+        <li>{t('docs.ret.readDirections')}</li>
+        <li>{t('docs.ret.units')}</li>
+      </ul>
+
+      <!-- The two misreadings that actually happen, called out as their own
+           blocks rather than buried in a list: both make the grid look like it
+           says something worse than it does. -->
+      <div class="ret-note">
+        <h4 class="doc-h4">{t('docs.ret.independent.h')}</h4>
+        <p class="fine">{t('docs.ret.independent.b')}</p>
+      </div>
+      <div class="ret-note">
+        <h4 class="doc-h4">{t('docs.ret.hatched.h')}</h4>
+        <p class="fine">{t('docs.ret.hatched.b')}</p>
+      </div>
+
+      <h4 class="doc-h4">{t('docs.ret.lifecycle.h')}</h4>
+      <p class="fine">{t('docs.ret.lifecycle.b')}</p>
+
+      <h4 class="doc-h4">{t('docs.ret.errorSplit.h')}</h4>
+      <p class="fine">{t('docs.ret.errorSplit.b')}</p>
+
+      <h4 class="doc-h4">{t('docs.ret.identified.h')}</h4>
+      <p class="fine">{t('docs.ret.identified.b')}</p>
+
+      <h4 class="doc-h4">{t('docs.ret.atRisk.h')}</h4>
+      <p class="fine">{t('docs.ret.atRisk.b')}</p>
+
+      <h4 class="doc-h4">{t('docs.ret.insights.h')}</h4>
+      <p class="fine">{t('docs.ret.insights.b')}</p>
+
+      <h4 class="doc-h4">{t('docs.ret.backfill.h')}</h4>
+      <p class="fine">{t('docs.ret.backfill.b')}</p>
+      <CodeBlock code={retentionBackfillSnippet} language="bash" />
+
+      <div class="ret-note">
+        <h4 class="doc-h4">{t('docs.ret.identity.h')}</h4>
+        <p class="fine">{t('docs.ret.identity.b')}</p>
+      </div>
+
+      <p class="faint fine">{t('docs.ret.freshness')}</p>
+      <ol class="mini-steps">
+        <li>{t('projects.open')} <a href="#/retention">{t('nav.retention')}</a></li>
+      </ol>
     </Card>
 
         </section>
@@ -1991,6 +2056,34 @@ GROUP BY name, op`;
   }
 
   /* funnel mini-guide */
+  /* Sub-headings inside a long doc card. The page had no h4 style because no
+     section had needed one; retention has eight sub-topics and reads as a wall
+     without them. */
+  .doc-h4 {
+    margin: 18px 0 6px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .doc-h4:first-of-type {
+    margin-top: 8px;
+  }
+
+  /* The traps and the identity caveat: set apart because each one is a thing
+     the grid will otherwise be misread as saying. */
+  .ret-note {
+    margin: 14px 0;
+    padding: 10px 12px;
+    border-inline-start: 3px solid var(--warning);
+    background: var(--surface-2);
+    border-radius: var(--radius-sm);
+  }
+
+  .ret-note .doc-h4 {
+    margin-top: 0;
+  }
+
   .mini-steps {
     margin: 14px 0 0;
     padding-inline-start: 20px;

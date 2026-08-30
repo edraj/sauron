@@ -53,6 +53,24 @@ Click any cell to switch the whole grid between percentages and user counts, or
 **Export CSV** for raw counts (unelapsed periods export as empty fields, never
 `0`, so a spreadsheet average is not poisoned by them).
 
+### Each cell is independent — not a streak
+
+**`Day 10 = 5%` means 5% were active on day 10. It says nothing about days
+1–9.**
+
+Every cell is counted on its own: the query buckets each cohort's activity by
+period and counts distinct people per bucket, with no requirement that they
+appeared in any earlier one. So:
+
+- someone who came on day 1, vanished, and reappeared on day 10 is counted in
+  **both**;
+- the 5% on day 9 and the 5% on day 10 need **not** be the same people.
+
+"Used it every day for ten days" is a different — and much smaller — number,
+and this grid does not show it. A curve that drops and then **flattens** is the
+normal healthy shape: you lose most arrivals early, and the survivors settle
+into a returning core.
+
 ### Hatched is never zero
 
 Two different things are unknowable, and both render hatched rather than `0%`:
