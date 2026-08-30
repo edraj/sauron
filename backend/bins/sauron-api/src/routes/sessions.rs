@@ -2,8 +2,16 @@
 //! per-session timeline that merges analytics events, errors, and performance
 //! transactions into one chronological stream.
 
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
+// `axum_extra`'s Query, NOT `axum`'s: this struct has a `Vec<String>`
+// `filter` fed by REPEATED query params, and `axum::extract::Query` is
+// `serde_urlencoded`, which cannot build a sequence from repeated keys —
+// it fails the whole request with `invalid type: string, expected a
+// sequence`, even for a single `?filter=`. Every filter chip on this page
+// 400d. `issues.rs` had this right; see its note about `environment_id`
+// deliberately NOT being a field on such a struct, which applies here too.
 use axum::Json;
+use axum_extra::extract::Query;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

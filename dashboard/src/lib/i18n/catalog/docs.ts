@@ -297,6 +297,83 @@ export const docs = {
   },
   'docs.nav.item.dsn': { en: 'Your DSN', ar: 'عنوان DSN الخاص بك' },
   'docs.nav.item.concepts': { en: 'How it works', ar: 'كيف يعمل' },
+  // --- Retention guide -------------------------------------------------------
+  'docs.nav.item.retention': { en: 'Retention', ar: 'الاحتفاظ' },
+  'docs.ret.title': { en: 'Retention & cohorts', ar: 'الاحتفاظ والأفواج' },
+  'docs.ret.lead': {
+    en: 'Retention answers the one question a rising active-user count cannot: did the people who arrived come back? Acquisition can refill a bucket that is draining just as fast, and only a cohort view shows the difference.',
+    ar: 'يجيب الاحتفاظ عن السؤال الذي لا يجيب عنه ارتفاع عدد المستخدمين النشطين: هل عاد من وصلوا؟ فالاستقطاب قد يملأ دلوًا يفرغ بالسرعة نفسها، ولا يُظهر الفرق إلا عرض الأفواج.',
+  },
+  'docs.ret.readingTheGrid': { en: 'Reading the grid', ar: 'قراءة الشبكة' },
+  'docs.ret.rowIs': {
+    en: 'Each row is one cohort: everyone whose first-ever activity in this app fell on that day (or ISO week). Each column then follows that same group forward through THEIR own calendar, not yours.',
+    ar: 'كل صف فوج واحد: كل من كان أول نشاط له في هذا التطبيق في ذلك اليوم (أو الأسبوع). ثم تتابع كل خانة المجموعة نفسها عبر تقويمها هي، لا تقويمك.',
+  },
+  'docs.ret.dayNIsRelative': {
+    en: '"Day 5" is a different date on every row — the 6th for a cohort that started on the 1st, the 15th for one that started on the 10th. That alignment is the whole point.',
+    ar: '"اليوم 5" تاريخ مختلف في كل صف — السادس لفوج بدأ في الأول، والخامس عشر لفوج بدأ في العاشر. وهذه المحاذاة هي جوهر الأمر.',
+  },
+  'docs.ret.day0': {
+    en: 'Day 0 is always 100%: they were active in the period they arrived, by definition.',
+    ar: 'اليوم 0 دائمًا 100%: فقد كانوا نشطين في الفترة التي وصلوا فيها، بحكم التعريف.',
+  },
+  'docs.ret.independent.h': { en: 'Each cell is independent — not a streak', ar: 'كل خانة مستقلة — وليست سلسلة متصلة' },
+  'docs.ret.independent.b': {
+    en: 'Day 10 = 5% means 5% were active on day 10. It says nothing about days 1-9. Someone who came on day 1, vanished, and reappeared on day 10 counts in both, and the 5% on day 9 need not be the same people as the 5% on day 10. "Used it every day for ten days" is a different, much smaller number that this grid does not show.',
+    ar: 'اليوم 10 = 5% يعني أن 5% كانوا نشطين في اليوم العاشر. ولا يقول شيئًا عن الأيام 1-9. فمن جاء في اليوم الأول ثم اختفى وعاد في اليوم العاشر يُحتسب في الاثنين، وليس بالضرورة أن يكون 5% اليوم التاسع هم أنفسهم 5% اليوم العاشر. أما "استخدمه كل يوم لعشرة أيام" فرقم مختلف وأصغر بكثير لا تعرضه هذه الشبكة.',
+  },
+  'docs.ret.hatched.h': { en: 'Hatched is never zero', ar: 'الخانة المخطّطة ليست صفرًا أبدًا' },
+  'docs.ret.hatched.b': {
+    en: 'Two different things are unknowable and both render hatched: the period has not elapsed yet (which is why the hatching forms a staircase — newer cohorts have had less time), or it predates the recorded data. An elapsed period with data behind it and nobody returning is a true 0%, and is shown as one.',
+    ar: 'أمران مختلفان لا يمكن معرفتهما وكلاهما يظهر مخطّطًا: فترة لم تنقضِ بعد (ولهذا يتخذ التخطيط شكل السلّم — فالأفواج الأحدث أمامها وقت أقل)، أو فترة تسبق البيانات المسجّلة. أما فترة انقضت ولها بيانات ولم يعد فيها أحد فهي 0% حقيقية وتُعرض كذلك.',
+  },
+  'docs.ret.readDirections': {
+    en: 'Read across a row to see whether that group sticks. Read DOWN a column to compare cohorts at the same age — that is where a product change shows up first.',
+    ar: 'اقرأ الصف أفقيًا لترى هل تستمر تلك المجموعة. واقرأ العمود رأسيًا لمقارنة الأفواج في العمر نفسه — وهناك يظهر أثر أي تغيير في المنتج أولًا.',
+  },
+  'docs.ret.units': {
+    en: 'Click any cell to switch the whole grid between percentages and user counts, or export CSV for raw counts (unelapsed periods export as empty fields, never 0, so a spreadsheet average is not poisoned).',
+    ar: 'انقر أي خلية لتبديل الشبكة كلها بين النسب وأعداد المستخدمين، أو صدّر CSV للأعداد الخام (تُصدَّر الفترات غير المنقضية كحقول فارغة لا كصفر، حتى لا يفسد متوسط جدول البيانات).',
+  },
+  'docs.ret.lifecycle.h': { en: 'Lifecycle', ar: 'دورة الحياة' },
+  'docs.ret.lifecycle.b': {
+    en: 'New, returning and resurrected partition each period\u2019s active people exactly; dormant (active last period, silent this one) is drawn below the axis. This is the chart that catches churn-and-replace: a flat active-user line made entirely of "new" is a treadmill, not growth.',
+    ar: 'ينقسم النشطون في كل فترة انقسامًا تامًا إلى جدد وعائدين ومستعادين؛ أما الخاملون (نشطون في الفترة السابقة وصامتون في هذه) فيُرسمون تحت المحور. وهذا هو الرسم الذي يكشف الفقدان والاستبدال: فخط نشاط ثابت مكوّن كله من "جدد" هو دوران في المكان لا نمو.',
+  },
+  'docs.ret.errorSplit.h': { en: 'Compare users who hit an error', ar: 'مقارنة من واجهوا خطأ' },
+  'docs.ret.errorSplit.b': {
+    en: 'Redraws the grid twice: once for people who hit an error in their FIRST period, once for everyone else. Exposure is measured in the first period only, and that is what keeps it honest rather than circular \u2014 a user who churns immediately cannot accumulate later errors, so splitting over the whole window would sort short-lived users into the clean half by construction. It remains an association, not a cause.',
+    ar: 'يعيد رسم الشبكة مرتين: مرة لمن واجهوا خطأً في فترتهم الأولى، ومرة لبقية المستخدمين. ويُقاس التعرّض في الفترة الأولى فقط، وهذا ما يبقي المقارنة نزيهة لا دائرية — فمن ينقطع فورًا لا يمكن أن يراكم أخطاءً لاحقة، ولذا فإن التقسيم على النافذة كلها يضع قصيري البقاء في النصف "السليم" بحكم البناء. وتبقى العلاقة اقترانًا لا سببية.',
+  },
+  'docs.ret.identified.h': { en: 'Identified users only', ar: 'المستخدمون المعرّفون فقط' },
+  'docs.ret.identified.b': {
+    en: 'Restricts every card to people your app named via identify(), an event whose context.user.id equals its distinct_id, or the backfill \u2014 the same column Active Users splits on. It defaults to OFF on purpose: guests are most of the arrivals, and the filter selects for people who already converted, so retention reads higher. It filters people, not periods: someone who browsed anonymously and signed up later is identified for their whole history, so their cohort is still their first anonymous sighting.',
+    ar: 'يقصر كل البطاقات على من عرّفهم تطبيقك عبر identify()، أو حدث يتطابق فيه context.user.id مع distinct_id، أو التعبئة الأولية — وهو العمود نفسه الذي تنقسم عليه صفحة المستخدمين النشطين. وهو معطّل افتراضيًا عن قصد: فالضيوف هم غالبية الوافدين، والمرشّح يختار من تحوّلوا بالفعل، فيبدو الاحتفاظ أعلى. وهو يرشّح الأشخاص لا الفترات: فمن تصفّح كضيف ثم سجّل يُعدّ معرّفًا طوال تاريخه، ويبقى فوجه أول ظهور مجهول له.',
+  },
+  'docs.ret.insights.h': { en: 'Insights', ar: 'الرؤى' },
+  'docs.ret.insights.b': {
+    en: 'A computed reading of what is on screen \u2014 day-1 level and direction, the first-timer share, the ratio of people gained to people going dormant, any period where everyone went silent, and the best cohort. Each finding carries a recommended next step, and several link to the page that answers it. Every statement is derived from the data on the page; nothing is estimated.',
+    ar: 'قراءة محسوبة لما يظهر على الشاشة — مستوى اليوم الأول واتجاهه، ونسبة الوافدين لأول مرة، ونسبة المكتسبين إلى الخاملين، وأي فترة صمت فيها الجميع، وأفضل فوج. وتحمل كل نتيجة خطوة تالية مقترحة، ويربط بعضها بالصفحة التي تجيب عنها. وكل عبارة مشتقة من بيانات الصفحة؛ ولا شيء مُقدَّر تقديرًا.',
+  },
+  'docs.ret.atRisk.h': { en: 'At risk', ar: 'المعرّضون للخطر' },
+  'docs.ret.atRisk.b': {
+    en: 'People active before and silent since, with their lifetime events, errors and sessions. Every column sorts server-side, each row expands for tenure and silence detail, and the person id opens their profile.',
+    ar: 'أشخاص كانوا نشطين ثم صمتوا، مع أحداثهم وأخطائهم وجلساتهم طوال المدة. كل عمود يُرتَّب من الخادم، وكل صف يتوسّع لعرض تفاصيل المدة والصمت، ومعرّف الشخص يفتح ملفه.',
+  },
+  'docs.ret.backfill.h': { en: 'One-time backfill', ar: 'تعبئة أولية لمرة واحدة' },
+  'docs.ret.backfill.b': {
+    en: 'Retention reads a rollup that starts recording the day the feature is deployed, so apps older than that need one run of the command below \u2014 it covers every predating app at once. Until then those apps show a card naming it rather than a grid: an empty grid is indistinguishable from "nobody came back", and answering 0% confidently is worse than declining to answer. Run ANALYZE afterwards; a backfill ships no statistics.',
+    ar: 'يقرأ الاحتفاظ تجميعة تبدأ التسجيل يوم تثبيت الميزة، لذا تحتاج التطبيقات الأقدم إلى تشغيل الأمر أدناه مرة واحدة — وهو يغطي كل التطبيقات السابقة دفعة واحدة. وحتى ذلك الحين تعرض تلك التطبيقات بطاقة تسمّي الأمر بدل الشبكة: فالشبكة الفارغة لا تُميَّز عن "لم يعد أحد"، والإجابة بثقة بـ 0% أسوأ من الامتناع عن الإجابة. وشغّل ANALYZE بعدها؛ فالتعبئة لا تأتي بإحصاءات.',
+  },
+  'docs.ret.identity.h': { en: 'If the numbers look impossibly low', ar: 'إذا بدت الأرقام منخفضة على نحو غير معقول' },
+  'docs.ret.identity.b': {
+    en: 'Retention is only as meaningful as the identity behind it. If a returning visitor arrives carrying a NEW distinct_id, they are counted as a brand-new person in a brand-new cohort and can never appear as retained \u2014 daily cohorts balloon toward your page-load count and retention collapses toward zero. Check that your anonymous id persists across page loads, and that identify() is called on login with your canonical user id, the same string in every app: matching is exact string equality, and there is no server-side repair.',
+    ar: 'لا يكون الاحتفاظ ذا معنى إلا بقدر الهوية التي خلفه. فإذا عاد زائر حاملًا معرّفًا جديدًا، احتُسب شخصًا جديدًا تمامًا في فوج جديد ولا يمكن أن يظهر أبدًا كمُحتفَظ به — فتتضخم الأفواج اليومية نحو عدد مرات تحميل الصفحة وينهار الاحتفاظ نحو الصفر. تأكّد أن المعرّف المجهول يبقى عبر تحميلات الصفحة، وأن identify() يُستدعى عند تسجيل الدخول بمعرّف المستخدم المعتمد لديك، وبالسلسلة نفسها في كل التطبيقات: فالمطابقة تساوٍ نصّي تام، ولا إصلاح من جانب الخادم.',
+  },
+  'docs.ret.freshness': {
+    en: 'The grid and lifecycle are served stale-while-revalidate \u2014 under an hour old as-is, between one and three hours as-is while a single background refresh recomputes. The "as of" chip states the age.',
+    ar: 'تُقدَّم الشبكة ودورة الحياة وفق مبدأ "قديم أثناء التحديث" — أقل من ساعة كما هي، وبين ساعة وثلاث ساعات كما هي مع إعادة حساب واحدة في الخلفية. وتوضّح شارة "حتى" العمر.',
+  },
   'docs.nav.item.funnels': { en: 'Funnels', ar: 'مسارات التحويل' },
   'docs.nav.item.verify': { en: 'Verify setup', ar: 'التحقق من الإعداد' },
   'docs.nav.item.search': { en: 'Search & filtering', ar: 'البحث والتصفية' },

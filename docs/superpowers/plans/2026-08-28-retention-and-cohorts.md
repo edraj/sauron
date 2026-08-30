@@ -2579,3 +2579,147 @@ Audit items, all resolved except the one that needs a credential:
 
 Final: backend 2,068 passed / 0 failed, workspace clippy + fmt clean;
 dashboard 1,247 tests, 0 errors, 0 warnings, 0 vulnerabilities; C# 132 tests.
+
+---
+
+## In-app Docs section — 2026-08-30
+
+`/docs` had no retention entry at all. Added one under **Guides**, beside
+Funnels (its sibling analytics feature), reusing the `repeat` icon the sidebar
+already uses for Retention so the two read as the same thing. Registered in
+`guideNav` AND in `sectionIds` — the latter drives scroll-spy, and a section
+missing from it highlights the wrong nav item.
+
+Content is ordered by what people actually get wrong, not by feature list. The
+two misreadings that came up in review are pulled out as their own accented
+blocks rather than buried in prose:
+
+* **"Each cell is independent — not a streak."** Day 10 = 5% says nothing about
+  days 1-9; the 5% on day 9 need not be the same people. "Used it every day for
+  ten days" is a different, much smaller number this grid does not show.
+* **"Hatched is never zero."** Not-yet-elapsed and predates-recorded-data both
+  render hatched; an elapsed period with data and nobody returning is a true 0%.
+
+Then lifecycle, the error split (with the period-0-only reasoning), the
+identified-only toggle (with the survivorship caveat and the people-not-periods
+subtlety), at-risk, the one-time backfill with a copyable command, and an
+"if the numbers look impossibly low" block pointing at identity stability.
+
+25 strings, English and Arabic. Verified in a real browser rather than assumed:
+the section renders with the nav item active (scroll-spy correct), and under
+`ar` the layout mirrors, `border-inline-start` resolves to `border-right` on
+all three accent blocks, and a DOM probe found **0 elements showing a raw
+`docs.ret.*` key** — the exact silent failure that shipped once already, when
+concatenated keys plus `t()`'s raw-key fallback rendered `retention.action.cliff`
+on screen. A script also checks all 27 `t()` keys in the section resolve against
+the catalogs, since `as never` casts erase the type check.
+
+Dashboard: 1,247 tests, check 0 errors / 0 warnings, build clean.
+
+### Wiki/docs parity — 2026-08-30
+
+`wiki/Retention.md` already existed (written during the audit sweep), so this
+was a gap-closing pass rather than a second write-up. Comparing it against the
+new in-app section found one gap in EACH direction:
+
+* the wiki lacked **"Each cell is independent — not a streak"**, which is the
+  misreading that actually came up in review — day-10 5% says nothing about
+  days 1-9, and the 5% on day 9 need not be the same people;
+* `/docs` lacked the **Insights** card, which the wiki documented.
+
+Both added. A script now checks topic parity across all 11 sections
+(backfill, grid, streak, hatched, lifecycle, error split, identified-only,
+at-risk, insights, identity, freshness) — all present in both. Wiki links
+resolve, and Retention is reachable from `_Sidebar.md`, `Home.md` and
+`Dashboard.md`.
+
+Dashboard: 1,247 tests, 0 errors, 0 warnings, build clean.
+
+---
+
+## Repeated `filter=` 400 on Transactions and Sessions — 2026-08-30
+
+Reported against Transactions; the same defect was live on Sessions.
+
+`filter` is a `Vec<String>` fed by repeated query params, which needs
+`axum_extra::extract::Query`. Both routes used plain `axum::extract::Query` —
+that is `serde_urlencoded`, which cannot build a sequence from repeated keys and
+fails the whole request with `invalid type: string "...", expected a sequence`.
+It fails on a SINGLE `?filter=` too, so every filter chip on both pages 400d.
+
+`issues.rs` already had the right extractor AND the only test that sends two
+filters (`http_search.rs`), which is exactly why it was fine and the other two
+were not. New `http_list_filters.rs` therefore tests the CLASS — one filter and
+two, across transactions, sessions, and issues as a control — rather than the
+one endpoint that was reported. Verified to fail before the fix.
+
+NOT a bug, though it looks like one: the `%2520` in the reported URL. The value
+is percent-encoded once by `encodeFilters` so a `:` inside it cannot break the
+`field:op:value` split, then again by the transport. `legacy.rs:48` documents
+the matching extra decode server-side. Leaving it alone.
+
+**"Fetch by id instead of name" is not implementable as asked**: a Performance
+row is an AGGREGATE over `(name, op)` — `PerfSummaryRow` has no id on either
+side of the wire (`repo.rs:10027`, `models/index.ts:843`), because one row
+stands for many transactions. The `(name, op)` pair IS the group key, and the
+modal already filters on both halves rather than name alone.
+
+sauron-api: 464 tests, clippy `-D warnings` clean, fmt clean.
+
+### Option 2 was already built — the filter bug was hiding it (2026-08-30)
+
+"Open transaction detail by id" from the Performance drill-down needed no new
+code: `OperationTransactionsModal` already keys expansion by transaction id
+(`expanded: Set<string>`, `toggle(tx.id)`) and renders `TransactionDetailPanel`
+inline. It needs no fetch either — `listTransactions` returns
+`SearchEnvelope<Transaction>`, the exact type the panel takes, so the rows in
+hand are already complete. There is no `GET /transactions/{id}` endpoint and
+none is required.
+
+It was invisible because the modal's own request carries two `filter=` params,
+so the extractor bug 400d it before a single row could render. Verified after
+the fix by driving the real UI: Performance -> 30d -> click `GET /api/report`
+-> modal lists its transactions -> clicking one flips `aria-expanded` to true,
+`.meta-row` count 0 -> 1, and the panel renders with **Transaction id
+90743981-122e-42ff-901a-01f8266a9c9b**, span fields, tags and the 16 KB payload
+cap notice.
+
+Temporary read grant used for the drive was removed afterwards.
+
+### Sweep: does the filter bug affect other list pages? (2026-08-30)
+
+No — and the sweep was made repeatable rather than done by eye.
+
+Six endpoints carry a sequence field in a query struct; all now use
+`axum_extra::extract::Query`:
+
+| endpoint | field | was |
+|---|---|---|
+| transactions | `ListQuery.filter` | BROKEN, fixed |
+| sessions | `ListQuery.filter` | BROKEN, fixed |
+| issues (list + events) | `ListQuery/EventsQuery.filter` | correct |
+| events/list (analytics) | `EventsListQuery.filter` | correct |
+| active-users | `ActiveUsersQuery.selection` | correct |
+
+Blind spots closed rather than assumed away:
+
+* **`#[serde(flatten)]` sub-structs** — a flattened type holding a `Vec` would
+  not appear in a scan of the outer struct. Checked all 11 flatten sites; none
+  contains one.
+* **Alternate `Query<T>` spellings** — enumerated every `Query<T>` in the route
+  tree, not just the `Query(x): Query<T>` shape the first pass matched.
+* **The client half** — only two call sites `append` a repeated param
+  (`api/search.ts:140`, `api/sessions.ts:59`), and both target endpoints on the
+  correct extractor. Alerts' `filters` is a JSON body field, and `audit.ts`
+  uses `params.set` (single-valued), so neither is affected.
+
+`http_list_filters.rs` now covers four endpoints × {one filter, two filters}.
+`active-users` is left to `http_active_users.rs`, which already sends repeated
+`selection=` params.
+
+**Trap worth remembering: an invalid FIELD NAME 400s exactly like the extractor
+bug.** It cost two false alarms here — `device`/`country` on sessions and
+`screen` on events are not in `sauron-query`'s catalog. Check the field against
+the catalog before concluding the extractor is at fault.
+
+sauron-api: 464 tests, clippy clean, fmt clean.
