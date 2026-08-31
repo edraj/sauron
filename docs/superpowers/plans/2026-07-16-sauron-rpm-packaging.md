@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Design spec: [docs/superpowers/specs/2026-07-16-sauron-rpm-packaging-design.md](../specs/2026-07-16-sauron-rpm-packaging-design.md). Every task's requirements implicitly include it.
-- **Version:** `0.1.0` — must match `[workspace.package] version` in `backend/Cargo.toml`. License: `LGPL-3.0-only`.
+- **Version:** `0.1.0` — must match `[workspace.package] version` in `backend/Cargo.toml`. License: `AGPL-3.0-only`.
 - **Binary names produced by `cargo build --release --workspace`:** `sauron-api`, `sauron-ingest`, `sauron-monitor`, `sauron-tier`, `sauron-migrate`, `sauron-symcli`, `crebain` (all land in `backend/target/release/`).
 - **Config paths:** shared env `/etc/sauron/sauron.env`; per-service `/etc/sauron/{api,ingest,monitor,tier,dashboard}.env`; generated `/etc/sauron/secret.env`. Data under `/var/lib/sauron` (+ `/cold`). Dashboard webroot `/usr/share/sauron/dashboard`.
 - **Only `DATABASE_URL` is strictly required by the binaries**; everything else defaults (see `sauron-core/src/config.rs`). Migrations are compiled into `sauron-migrate` (`embed_migrations!`) — no migration files ship.
@@ -524,7 +524,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
-License:        LGPL-3.0-only
+License:        AGPL-3.0-only
 URL:            https://github.com/splimter/sauron
 Source0:        %{name}-%{version}.tar.gz
 

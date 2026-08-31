@@ -567,5 +567,19 @@ An end-to-end check — register → create project → POST an envelope to `:80
 
 ## License
 
-[LGPL-3.0-only](LICENSE) — GNU Lesser General Public License v3.0. LGPLv3 applies
-on top of the GNU GPL v3, whose text is in [COPYING](COPYING).
+Sauron is split across two licences, by component.
+
+**Server** — the `backend/` workspace and the `dashboard/`, and the `sauron` RPM built
+from them: [AGPL-3.0-only](LICENSE), GNU Affero General Public License v3.0. The Affero
+network-use clause applies: offering a modified Sauron to users over a network obliges
+you to offer them the corresponding source.
+
+**Client SDKs** — everything under [`sdks/`](sdks) (Flutter, JS, Node, Python, C#):
+LGPL-3.0-only, GNU Lesser General Public License v3.0, each with its own `LICENSE` and
+the GPLv3 base text it extends in `COPYING`. Linking an SDK into your application does
+not place your application under copyleft — which is the point of licensing them apart
+from the server.
+
+1.8.0 briefly applied LGPL-3.0-only to the server as well. That was broader than
+intended and is corrected in 1.8.1; 1.8.0 itself remains available under the terms it
+was published with.

@@ -12,7 +12,7 @@ Design spec: `docs/superpowers/specs/2026-07-15-admin-storage-view-design.md`.
 
 ## Global Constraints
 
-- **Workspace conventions (verbatim):** edition `2021`, rust-version `1.82` (crates omit it; workspace sets it), license `LGPL-3.0-only`, `version = "0.1.0"`. Enum-like columns are `TEXT`. All DB I/O goes through `&mut AsyncPgConnection`; repo fns return `QueryResult`. Config is hand-rolled in `sauron-core::config`.
+- **Workspace conventions (verbatim):** edition `2021`, rust-version `1.82` (crates omit it; workspace sets it), license `AGPL-3.0-only`, `version = "0.1.0"`. Enum-like columns are `TEXT`. All DB I/O goes through `&mut AsyncPgConnection`; repo fns return `QueryResult`. Config is hand-rolled in `sauron-core::config`.
 - **No DB/handler integration-test harness** (by design). Pure logic (Task 3: `parse_cold_path`, `DuckEngine::counts_by_app`) gets real `cargo test`. Everything touching Postgres/handlers (Tasks 1, 2, 4, 5) is verified by the **controller's docker-compose e2e** at the checkpoint after Task 5. The dashboard (Task 6) is verified via the preview server. Reviewers get this constraint — do not false-flag missing unit tests for DB/handler code.
 - **Diesel Queryable is positional:** a new column added to a `table!` block and its model struct must be appended in the SAME position as the physical DB column (which `ALTER TABLE ADD COLUMN` puts LAST). `is_admin` goes LAST in the `users` `table!` block AND LAST in the `User` struct.
 - **Migration numbering** continues the sequence; next free id is `2026-07-15-000014`.
