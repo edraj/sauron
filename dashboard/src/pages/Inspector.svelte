@@ -25,6 +25,9 @@
   import JsonTree from '../lib/components/JsonTree.svelte';
   import MaskDialog from '../lib/components/inspector/MaskDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { lockedBy } from '../lib/models/page-access';
   import { lockTip } from '../lib/actions/lock-tip';
   import { toastStore } from '../lib/stores/toast.svelte';
@@ -78,17 +81,52 @@
   const goTab = (next: InspectorTab) => replace(inspectorTabRoute(next, $querystring));
 
 
-  let loading = $state(true);
-  let error = $state('');
   // $state.raw, not $state: these are replaced wholesale on every reload and
   // deep-proxying them makes `===` never match a raw row, which breaks the
   // "is this the row I opened?" check in the expand map below.
-  let effective = $state.raw<EffectivePolicy | null>(null);
-  let scans = $state.raw<InspectorScan[]>([]);
-  let findings = $state.raw<InspectorFinding[]>([]);
-  let actions = $state.raw<InspectorMaskAction[]>([]);
-  let coverageNote = $state('');
-  let detectionCaveat = $state('');
+  /**
+   * One payload, because these six are ONE read.
+   *
+   * `loadAll` is a dependent chain — the policy decides whether scans are
+   * fetched, and the newest succeeded scan decides which findings are. Caching
+   * them separately would let a cache hit on one pair with a miss on another
+   * and paint a policy beside findings from a different scan. As one entry
+   * they are always mutually consistent.
+   */
+  interface InspectorPayload {
+    effective: EffectivePolicy | null;
+    scans: InspectorScan[];
+    findings: InspectorFinding[];
+    actions: InspectorMaskAction[];
+    coverageNote: string;
+    detectionCaveat: string;
+  }
+  const EMPTY_PAYLOAD: InspectorPayload = {
+    effective: null,
+    scans: [],
+    findings: [],
+    actions: [],
+    coverageNote: '',
+    detectionCaveat: '',
+  };
+
+  const view = new CachedView<InspectorPayload>();
+  const payload = $derived(view.data ?? EMPTY_PAYLOAD);
+  const effective = $derived(payload.effective);
+  const scans = $derived(payload.scans);
+  const findings = $derived(payload.findings);
+  const actions = $derived(payload.actions);
+  const coverageNote = $derived(payload.coverageNote);
+  const detectionCaveat = $derived(payload.detectionCaveat);
+  const revalidating = $derived(view.revalidating);
+  const loading = $derived(view.loading);
+  /**
+   * `errorMessage`, not `e.message`: every rejection from `api` is a
+   * NormalizedError PLAIN OBJECT, so `e instanceof Error` is false and the
+   * banner would read "[object Object]" for the 403 that is this page's real
+   * gate. `CachedView` already normalises, which is why this is now derived.
+   */
+  const error = $derived(view.error ?? '');
   let expanded = $state<Record<string, boolean>>({});
   let revealed = $state<Record<string, unknown>>({});
   let maskTargetFinding = $state.raw<InspectorFinding | null>(null);
@@ -251,36 +289,36 @@
   // spends most of its time showing nothing.
   async function loadAll(quiet = false) {
     if (!appId) return;
-    if (!quiet) loading = true;
-    error = '';
-    try {
-      effective = await inspectorApi.effectivePolicy(appId);
-      actions = await inspectorApi.listAppMaskActions(appId);
-      if (effective.policy) {
-        scans = await inspectorApi.listScans(effective.policy.id);
-        const latest = scans.find((s) => s.status === 'succeeded') ?? scans[0];
-        if (latest) {
-          const page = await inspectorApi.listFindings(latest.id);
-          findings = page.findings;
-          coverageNote = page.coverage === 'partial' ? page.coverage_note : '';
-          detectionCaveat = page.detection_caveat;
-        } else {
-          findings = [];
+    const aid = appId;
+    // `quiet` used to mean "do not raise the skeleton". Under the cached view
+    // that is the default for anything already on screen — a reload with rows
+    // up is a revalidate, never a `loading` — so it only decides whether the
+    // network is forced.
+    await view.load(
+      viewKey('inspector.page', aid, sessionStore.scopeKey),
+      async () => {
+        const effective = await inspectorApi.effectivePolicy(aid);
+        const actions = await inspectorApi.listAppMaskActions(aid);
+        if (!effective.policy) {
+          return { ...EMPTY_PAYLOAD, effective, actions };
         }
-      } else {
-        scans = [];
-        findings = [];
-      }
-    } catch (e) {
-      // `errorMessage`, not `e.message`: every rejection from `api` is a
-      // NormalizedError PLAIN OBJECT (client.ts rejects with
-      // `normalizeError(error)`), so `e instanceof Error` is false and the
-      // banner would read "[object Object]" for the 403 that is this page's
-      // real gate.
-      error = errorMessage(e);
-    } finally {
-      loading = false;
-    }
+        const scans = await inspectorApi.listScans(effective.policy.id);
+        const latest = scans.find((s) => s.status === 'succeeded') ?? scans[0];
+        if (!latest) {
+          return { ...EMPTY_PAYLOAD, effective, actions, scans };
+        }
+        const page = await inspectorApi.listFindings(latest.id);
+        return {
+          effective,
+          actions,
+          scans,
+          findings: page.findings,
+          coverageNote: page.coverage === 'partial' ? page.coverage_note : '',
+          detectionCaveat: page.detection_caveat,
+        };
+      },
+      !quiet,
+    );
   }
 
   // Every write and every download goes through here. A bare `await` inside an
@@ -317,7 +355,10 @@
 
 <AdminShell>
   <div class="head">
-    <h1 class="page-title">{t('inspector.title')}</h1>
+    <h1 class="page-title">
+      {t('inspector.title')}
+      <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+    </h1>
     {#if effective}
       <span class="muted">
         New events are masked within about {effective.enforcement_latency_secs} seconds of a change.

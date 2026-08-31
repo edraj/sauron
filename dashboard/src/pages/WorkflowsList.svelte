@@ -16,6 +16,7 @@
   import { rangeStore } from '../lib/stores/range.svelte';
   import { rangeKey, toParams, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -179,6 +180,7 @@
         spinner IS the "showing cached rows, fetching fresh" hint, and without it
         the instant paint is indistinguishable from live data.
       -->
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>

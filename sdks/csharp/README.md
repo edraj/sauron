@@ -1362,8 +1362,9 @@ SDK below the floor, the error names both the version wanted and this file.
 
 ## License
 
-AGPL-3.0-only — GNU Affero General Public License v3.0. See
-[LICENSE](../../LICENSE).
+LGPL-3.0-only — GNU Lesser General Public License v3.0. See
+[LICENSE](../../LICENSE); LGPLv3 applies on top of the GNU GPL v3 in
+[COPYING](../../COPYING).
 
 Repo: <https://github.com/edraj/sauron> · Wiki:
 <https://github.com/edraj/sauron/wiki>

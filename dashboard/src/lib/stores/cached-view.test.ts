@@ -496,3 +496,69 @@ describe('errorStatus', () => {
     expect(v.errorStatus).toBeNull();
   });
 });
+
+/**
+ * `fetchedAt` is what lets a page say "as of 14:32" instead of implying the
+ * numbers on screen are current. Without it the cache is silent about age, and
+ * a stale-while-revalidate render is indistinguishable from a fresh one.
+ */
+describe('fetchedAt', () => {
+  it('is null before anything has ever been shown', () => {
+    const v = new CachedView<string[]>();
+    expect(v.fetchedAt).toBeNull();
+  });
+
+  it('is stamped when a cold load lands', async () => {
+    const v = new CachedView<string[]>();
+    const before = Date.now();
+    await v.load('k', async () => ['a']);
+    expect(v.fetchedAt).not.toBeNull();
+    expect(v.fetchedAt!).toBeGreaterThanOrEqual(before);
+    expect(v.fetchedAt!).toBeLessThanOrEqual(Date.now());
+  });
+
+  /**
+   * The case the feature exists for: a second view mounting on an existing
+   * entry must report when that entry was CAPTURED, not when this view read
+   * it. Reporting the read time would restate "just now" on every navigation
+   * and make the age meaningless.
+   */
+  it('reports when the cached entry was captured, not when it was read', async () => {
+    const first = new CachedView<string[]>();
+    await first.load('k', async () => ['a']);
+    const captured = first.fetchedAt!;
+
+    await new Promise((r) => setTimeout(r, 12));
+
+    const second = new CachedView<string[]>();
+    await second.load('k', async () => ['b']);
+    expect(second.fetchedAt).toBe(captured);
+  });
+
+  it('advances when a revalidate replaces the payload', async () => {
+    const v = new CachedView<string[]>(0); // never fresh: every load revalidates
+    await v.load('k', async () => ['a']);
+    const first = v.fetchedAt!;
+    await new Promise((r) => setTimeout(r, 12));
+    await v.load('k', async () => ['b']);
+    expect(v.data).toEqual(['b']);
+    expect(v.fetchedAt!).toBeGreaterThan(first);
+  });
+
+  /**
+   * A failed background refresh keeps the old rows on screen, so the stamp must
+   * keep describing those rows. Advancing it would date stale data to now —
+   * the exact lie this field exists to prevent.
+   */
+  it('does not advance when a refresh fails over existing data', async () => {
+    const v = new CachedView<string[]>(0);
+    await v.load('k', async () => ['a']);
+    const first = v.fetchedAt!;
+    await new Promise((r) => setTimeout(r, 12));
+    await v.load('k', async () => {
+      throw new Error('network');
+    });
+    expect(v.data).toEqual(['a']);
+    expect(v.fetchedAt).toBe(first);
+  });
+});

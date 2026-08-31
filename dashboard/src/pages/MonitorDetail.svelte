@@ -2,7 +2,10 @@
   import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import { getMonitor, getMonitorChecks, updateMonitor, deleteMonitor } from '../lib/api/monitors';
-  import { viewCache } from '../lib/stores/view-cache';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { sessionStore } from '../lib/stores/session.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { MONITOR_INTERVALS, formatInterval } from '../lib/constants/monitorIntervals';
   import type { MonitorDetail, MonitorCheck } from '../lib/models';
   import { lockedBy } from '../lib/models/page-access';
@@ -33,15 +36,28 @@
 
   let { params }: { params: { id: string } } = $props();
 
-  let detail = $state<MonitorDetail | null>(null);
-  let checks = $state<MonitorCheck[]>([]);
+  // Two cached views, not one: the split is deliberate (see `load`) — the
+  // header renders the moment `detail` lands rather than waiting on 24 h of
+  // check rows, and a failed checks read degrades inside its own card.
+  const detailView = new CachedView<MonitorDetail>();
+  const checksView = new CachedView<MonitorCheck[]>();
+  const detail = $derived(detailView.data ?? null);
+  const checks = $derived(checksView.data ?? []);
   // The checks half loads independently of `detail` — see load(). Its own
   // flag and error keep a slow or failed 24 h check read inside the Recent
   // checks card instead of holding up (or blanking) the whole page.
-  let checksLoading = $state(false);
-  let checksError = $state<string | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  const checksLoading = $derived(checksView.loading);
+  const checksError = $derived(checksView.error);
+  const loading = $derived(detailView.loading);
+  const revalidating = $derived(detailView.revalidating || checksView.revalidating);
+  /**
+   * The monitor read failing, or an action (pause / interval / delete) failing.
+   * Kept apart because they have different lifetimes — an action's message must
+   * survive a background revalidate, and a load error must not be cleared by
+   * starting an unrelated action.
+   */
+  let actionError = $state<string | null>(null);
+  const error = $derived(actionError ?? detailView.error);
   let confirmOpen = $state(false);
   let deleting = $state(false);
   let pausing = $state(false);
@@ -141,48 +157,49 @@
     incidentSort = toggleSort(incidentSort, key, columnDefault);
   }
 
-  async function load() {
-    loading = true;
-    error = null;
-    checksError = null;
-    checksLoading = true;
+  async function load(force = false) {
     // Both issued together as before (neither feeds the other), but no longer
     // JOINED: the header, config and actions need only `detail`, so they
     // render the moment it lands instead of waiting on 24 h of check rows —
     // and a failed checks read degrades to a message inside its own card
     // rather than blanking a page whose monitor half arrived fine.
-    const checksDone = getMonitorChecks(params.id, 24)
-      .then(
-        (c) => {
-          checks = c;
-        },
-        (e) => {
-          checksError = (e as Error).message;
-        },
-      )
-      .finally(() => {
-        checksLoading = false;
-      });
-    try {
-      detail = await getMonitor(params.id);
-      // Reseeded here, not at mount: the router reuses this component across
-      // `#/monitors/A` -> `#/monitors/B`, so a mount-time seed would leave the
-      // control showing the interval of the monitor we navigated away from.
-      selectedInterval = detail.monitor.interval_seconds;
-      pendingInterval = null;
-    } catch (e) {
-      error = (e as Error).message;
-    } finally {
-      loading = false;
-    }
+    //
+    // `params.id` is in both keys: the router REUSES this component across
+    // `#/monitors/A` -> `#/monitors/B`, so a key without it would repaint the
+    // previous monitor's rows under the new id.
+    const checksDone = checksView.load(
+      viewKey('monitor.checks', params.id, sessionStore.scopeKey),
+      () => getMonitorChecks(params.id, 24),
+      force,
+    );
+    await detailView.load(
+      viewKey('monitor.detail', params.id, sessionStore.scopeKey),
+      () => getMonitor(params.id),
+      force,
+    );
     // Callers (the pause/interval/delete refreshes) await the WHOLE load, so
     // their "refresh finished" contract still covers both halves.
     await checksDone;
   }
 
+  /**
+   * Reseed the interval control from whatever monitor is on screen.
+   *
+   * Was an inline assignment after the fetch, which a cache HIT never runs —
+   * and this page is reused across `#/monitors/A` -> `#/monitors/B`, so the
+   * control would show the interval of the monitor navigated away from. Driven
+   * off the payload it is correct for a hit and a fetch alike.
+   */
+  $effect(() => {
+    const d = detail;
+    if (!d) return;
+    selectedInterval = d.monitor.interval_seconds;
+    pendingInterval = null;
+  });
+
   async function togglePause() {
     if (!detail) return;
-    pausing = true; error = null;
+    pausing = true; actionError = null;
     try {
       await updateMonitor(params.id, { enabled: detail.monitor.status === 'paused' });
       // Monitors.svelte serves its list from the view cache, so the status column
@@ -191,7 +208,7 @@
       // "Back to Uptime" refetch.
       viewCache.invalidate('monitors.list');
       await load();
-    } catch (e) { error = (e as Error).message; }
+    } catch (e) { actionError = (e as Error).message; }
     finally { pausing = false; }
   }
 
@@ -216,7 +233,7 @@
   async function confirmIntervalChange() {
     if (!detail || pendingInterval === null) return;
     const seconds = pendingInterval;
-    savingInterval = true; error = null;
+    savingInterval = true; actionError = null;
     try {
       await updateMonitor(params.id, { interval_seconds: seconds });
       viewCache.invalidate('monitors.list');
@@ -224,7 +241,7 @@
       // Clears `pendingInterval` and reseeds the control from the saved value.
       await load();
     } catch (err) {
-      error = (err as Error).message;
+      actionError = (err as Error).message;
       // The change did not take, so the control must not keep showing it.
       cancelIntervalChange();
     } finally {
@@ -233,7 +250,7 @@
   }
 
   async function remove() {
-    deleting = true; error = null;
+    deleting = true; actionError = null;
     try {
       await deleteMonitor(params.id);
       // Must happen before the navigation: Monitors.svelte's effect runs on mount
@@ -242,7 +259,7 @@
       viewCache.invalidate('monitors.list');
       push('/monitors');
     } catch (e) {
-      error = (e as Error).message;
+      actionError = (e as Error).message;
       deleting = false;
       confirmOpen = false;
     }
@@ -277,7 +294,11 @@
   {:else if detail}
     <header class="detail-head">
       <div class="head-main">
-        <h1 class="mon-title">{detail.monitor.name} <StatusPill status={detail.monitor.status} /></h1>
+        <h1 class="mon-title">
+          {detail.monitor.name}
+          <StatusPill status={detail.monitor.status} />
+          <Freshness fetchedAt={detailView.fetchedAt} {revalidating} />
+        </h1>
         <div class="key-row">
           <span class="kindtag">{detail.monitor.kind}</span>
           <span class="key mono">{detail.monitor.target}</span>

@@ -17,7 +17,7 @@
       and what consumers need to judge the package.
     -->
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
+    <PackageLicenseExpression>LGPL-3.0-only</PackageLicenseExpression>
     <Authors>edraj</Authors>
     <PackageTags>observability;analytics;error-tracking;telemetry;sauron</PackageTags>
     <RepositoryUrl>https://github.com/edraj/sauron</RepositoryUrl>

@@ -19,6 +19,7 @@ mod routes;
 mod symbolicate;
 mod tasks;
 mod tier_read;
+mod view_cache;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

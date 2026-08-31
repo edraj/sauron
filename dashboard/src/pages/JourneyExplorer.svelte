@@ -12,6 +12,7 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import SankeyChart from '../lib/components/SankeyChart.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
   import { refreshRollups } from '../lib/api/rollups';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -185,6 +186,7 @@
         the instant paint is indistinguishable from live data.
       -->
       <RollupChip />
+      <Freshness fetchedAt={journeyView.fetchedAt} revalidating={journeyView.revalidating} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>

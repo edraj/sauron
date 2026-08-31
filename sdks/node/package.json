@@ -25,7 +25,8 @@
     "dist",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "COPYING"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -52,7 +53,7 @@
     "node",
     "server"
   ],
-  "license": "AGPL-3.0-only",
+  "license": "LGPL-3.0-only",
   "publishConfig": {
     "access": "public"
   }

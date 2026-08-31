@@ -40,6 +40,7 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
@@ -694,6 +695,7 @@
         </p>
       </div>
       <div class="controls">
+        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
         <RefreshButton onclick={refresh} loading={refreshing} />
       </div>
     </header>

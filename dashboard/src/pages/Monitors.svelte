@@ -20,6 +20,7 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
   import { MONITOR_DEFAULT_SORT, monitorAccessor } from '../lib/models/monitor-sort';
   import { pageSlice } from '../lib/models/paginate';
@@ -180,6 +181,7 @@
           spinner IS the "showing cached rows, fetching fresh" hint, and without it
           the instant paint is indistinguishable from live data.
         -->
+        <Freshness fetchedAt={monitorsView.fetchedAt} revalidating={monitorsView.revalidating} />
         <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
       </div>
     </header>

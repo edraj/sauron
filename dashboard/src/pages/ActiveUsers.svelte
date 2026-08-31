@@ -8,6 +8,7 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import Sparkline from '../lib/components/Sparkline.svelte';
@@ -15,6 +16,7 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
+  import type { ViewEnvelope } from '../lib/api/overview';
   import { viewKey } from '../lib/stores/view-cache';
   import { listEnvironments } from '../lib/api/environments';
   import { downloadActiveUsersCsv, getActiveUsers } from '../lib/api/activeUsers';
@@ -50,9 +52,20 @@
   // Cached view (lib/stores/cached-view.svelte.ts): the cached report paints
   // instantly on return, then refreshes behind it. Re-exposed under the names the
   // template already used, so the markup is unchanged apart from the spinner prop.
-  const view = new CachedView<ActiveUsersReport>();
+  const view = new CachedView<ViewEnvelope<ActiveUsersReport>>();
 
-  const report = $derived(view.data ?? null);
+  // Two unwraps: the CachedView holds the ENVELOPE, and the envelope holds the
+  // report — which is null while the server is still computing it.
+  const envelope = $derived(view.data ?? null);
+  const report = $derived(envelope?.data ?? null);
+  /**
+   * The server is building the report and has answered immediately to say so.
+   *
+   * Not an error and not an empty result: `computing` is a normal 200. It is
+   * what stops a cold read occupying a request until the timeout turns it into
+   * a 503, which is what this page was reported for.
+   */
+  const computing = $derived(envelope?.state === 'computing');
   const revalidating = $derived(view.revalidating);
   const error = $derived(view.error);
 
@@ -80,7 +93,9 @@
   // an empty selection renders a spinner that never resolves instead of the
   // "Pick an app to begin" empty state below it.
   const hasSelection = $derived(selectionCount(selection) > 0);
-  const loading = $derived(hasSelection && view.loading);
+  // `computing` counts as loading: the request succeeded, but there is still
+  // nothing to render, and the skeleton is the honest thing to show.
+  const loading = $derived(hasSelection && (view.loading || (computing && !report)));
 
   const rangeDays = $derived(
     Math.max(1, Math.round((Date.parse(to) - Date.parse(from)) / 86_400_000)),
@@ -138,6 +153,23 @@
       force,
     );
   }
+
+  /**
+   * Poll while the server computes.
+   *
+   * Overview gets its recomputes pushed over SSE; this route has none, so the
+   * page asks again until the report lands. `force` is required — without it
+   * the client cache would answer from its own fresh window and the page would
+   * sit on `computing` forever, having stopped asking.
+   */
+  $effect(() => {
+    if (!computing) return;
+    const pid = sessionStore.currentProjectId;
+    if (!pid) return;
+    const params = { from, to, selection: encodeSelection(selection) };
+    const id = setTimeout(() => void load(pid, params, true), 1500);
+    return () => clearTimeout(id);
+  });
 
   async function refresh() {
     const pid = sessionStore.currentProjectId;
@@ -271,6 +303,11 @@
           Spins for a background revalidate too, not just an explicit click: that
           spinner IS the "showing cached numbers, fetching fresh" hint.
         -->
+        <Freshness
+            computedAt={envelope?.computed_at ?? null}
+            fetchedAt={view.fetchedAt}
+            revalidating={view.revalidating || computing}
+          />
         <RefreshButton
           onclick={refresh}
           loading={refreshing || revalidating}

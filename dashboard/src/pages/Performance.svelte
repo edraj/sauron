@@ -10,6 +10,7 @@
   import { rangeStore } from '../lib/stores/range.svelte';
   import { rangeKey, toParams, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
   import { refreshRollups } from '../lib/api/rollups';
   import { approx } from '../lib/models/freshness';
@@ -270,6 +271,7 @@
         spinner IS the "showing cached data, fetching fresh" hint.
       -->
       <RollupChip />
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton
         onclick={refresh}
         loading={refreshing || revalidating}

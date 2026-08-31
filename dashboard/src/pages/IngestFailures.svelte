@@ -11,6 +11,7 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { lockedBy } from '../lib/models/page-access';
   import {
     listIngestFailures,
@@ -185,6 +186,7 @@
         {t('prose.failures.lede')}
       </p>
     </div>
+    <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
     <RefreshButton onclick={refresh} loading={loading || revalidating} />
   </div>
 

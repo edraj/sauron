@@ -179,6 +179,8 @@ const TRANSACTION_SCHEMA = {
   available_labels: [],
 };
 
+let activeUsersCalls = 0;
+
 function stubApi() {
   const root = fileURLToPath(new URL('./daymodal-harness', import.meta.url));
   return {
@@ -215,7 +217,82 @@ function stubApi() {
           return json(res, TRANSACTION_SCHEMA);
         }
 
+        // Deliberate latency so a revalidate is OBSERVABLE: without it the
+        // stub answers in microseconds and `revalidating` flips back before a
+        // frame renders, which is indistinguishable from the indicator being
+        // broken.
+
+        // --- project active-users: `computing` first, then the report -------
+        // The sequence is the point. A stub that answered with data straight
+        // away would pass whether or not the page ever polls, which is the one
+        // thing worth checking here.
+        if (path === '/v1/projects/proj1/active-users') {
+          activeUsersCalls += 1;
+          console.log(`[daymodal] active-users call #${activeUsersCalls}`);
+          if (activeUsersCalls === 1) {
+            return json(res, { state: 'computing', computed_at: null, data: null });
+          }
+          return json(res, {
+            state: 'fresh',
+            computed_at: '2026-08-31T09:00:00Z',
+            data: {
+              requested: { from: '2026-08-25T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+              effective: { from: '2026-08-25T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+              truncated: false,
+              truncation_reason: null,
+              selections: [
+                { app_id: 'app1', app_name: 'Harness App', environment_ids: [], environment_labels: [], resolved: 'all' },
+              ],
+              series: Array.from({ length: 7 }, (_, i) => ({
+                day: `2026-08-${25 + i}`,
+                active_total: 100 + i * 10,
+                active_identified: 60 + i * 6,
+                active_guest: 40 + i * 4,
+              })),
+              latest: { day: '2026-08-30', active_total: 150, active_identified: 90, active_guest: 60 },
+              computed_at: '2026-08-31T09:00:00Z',
+            },
+          });
+        }
+
+
+        // Shaped stubs for the two detail pages: the catch-all below returns
+        // `[]`, and an array where the page expects an object blows up inside
+        // TimeSeriesChart / StatusPill for reasons that have nothing to do
+        // with the page under test.
+        if (path === '/v1/apps/app1/issues/abc') {
+          // `IssueDetail` EXTENDS `Issue` — flat, not nested under `issue`.
+          return json(res, {
+            id: 'abc', app_id: 'app1', fingerprint: 'fp1', type: 'TypeError',
+            title: 'TypeError: undefined is not a function', culprit: 'main.dart',
+            level: 'error', status: 'unresolved',
+            first_seen: '2026-08-20T00:00:00Z', last_seen: '2026-08-30T00:00:00Z',
+            times_seen: 42, users_seen: 7, assignee_id: null,
+            created_at: '2026-08-20T00:00:00Z', updated_at: '2026-08-30T00:00:00Z',
+            latest_event: null,
+            series: [{ bucket: '2026-08-29T00:00:00Z', count: 5 }],
+          });
+        }
+        if (path === '/v1/monitors/abc') {
+          return json(res, {
+            monitor: {
+              id: 'abc', project_id: 'proj1', name: 'API health', kind: 'http',
+              target: 'https://api.example.com/health', status: 'up',
+              interval_seconds: 60, enabled: true, timeout_ms: 5000,
+            },
+            uptime: { h24: 0.999, d7: 0.997, d30: 0.995 },
+            incidents: [],
+            pinned_alert_rules: 0,
+          });
+        }
+        if (path === '/v1/monitors/abc/checks') return json(res, []);
+
         if (path === '/v1/apps/app1/performance/summary') {
+          const op0 = params.get('op');
+          setTimeout(() => json(res, op0 ? OPERATIONS.filter((o) => o.op === op0) : OPERATIONS), 1500);
+          return;
+        }
+        if (false) {
           const op = params.get('op');
           return json(res, op ? OPERATIONS.filter((o) => o.op === op) : OPERATIONS);
         }

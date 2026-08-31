@@ -102,7 +102,7 @@ resource is looked up, so a 403 does not confirm that the id exists.
 The ingest gateway that SDKs post telemetry to is a **separate service** with \
 its own document — select \"Sauron Ingest\" above.",
         version = env!("CARGO_PKG_VERSION"),
-        license(name = "AGPL-3.0"),
+        license(name = "LGPL-3.0-only"),
     ),
     modifiers(&SecurityAddon),
     tags(

@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::process::Stdio;
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -453,60 +453,62 @@ async fn report_is_cached_and_serves_the_same_computed_at() {
     let f = h.seed_active_users_fixture().await;
     let path = url(&f, &format!("selection={}", f.app_a));
 
-    let cold: Value = h.get_json(&path, &f.owner_token).await;
-    let stamp = cold["computed_at"]
-        .as_str()
-        .expect("a cold report must carry computed_at")
-        .to_string();
+    // A cold read no longer carries the report: the aggregate moved off the
+    // request path, so the first call answers `computing` and the work starts
+    // behind it. Poll until it lands.
+    let first = h.get_section(&path, &f.owner_token).await;
 
     let warm: Value = h.get_json(&path, &f.owner_token).await;
+    let stamp = warm["computed_at"]
+        .as_str()
+        .expect("a served report must carry computed_at")
+        .to_string();
     assert_eq!(
-        warm["computed_at"].as_str(),
+        warm["state"].as_str(),
+        Some("fresh"),
+        "an entry computed seconds ago must read as fresh"
+    );
+
+    let again: Value = h.get_json(&path, &f.owner_token).await;
+    assert_eq!(
+        again["computed_at"].as_str(),
         Some(stamp.as_str()),
         "an immediate re-read must serve the cached report, not recompute"
     );
     assert_eq!(
-        cold["series"], warm["series"],
+        first, again["data"],
         "the cached payload must be the computed one"
     );
 
     h.shutdown().await;
 }
 
-/// A cold request cancelled mid-computation must still leave the report in
-/// the cache.
+/// The property this whole move exists for: the request path never awaits the
+/// aggregate.
 ///
-/// This is the production failure this test exists to stop coming back. The
-/// 60 s `TimeoutLayer` answers 503 by DROPPING the handler future, and
-/// `cache_put` is the last statement of `assemble_report` — so a report that
-/// misses the budget is computed, thrown away, and never cached. The next
-/// visitor is another cold miss that times out identically, and the endpoint
-/// never recovers on its own; it stays 503 until the load that caused it
-/// disappears. Retries make it worse rather than better, because a shed
-/// request cancels neither the Postgres query nor its pool slot.
+/// Supersedes an earlier test that pinned "a cancelled cold request still
+/// caches its report". That guarded a real bug — the cold miss computed on the
+/// request path, so a timeout dropped the future and threw the result away,
+/// leaving the next visitor to time out identically. There is now nothing to
+/// cancel: the aggregate runs only in a detached recompute, so the defect is
+/// structurally impossible rather than merely tested against.
 ///
-/// The stall is an `ACCESS EXCLUSIVE` lock rather than a sleep so the
-/// cancellation lands mid-computation DETERMINISTICALLY: the aggregate
-/// `LEFT JOIN`s `event_users`, so it cannot proceed past that lock until this
-/// test commits, no matter how fast the fixture's query would otherwise be.
-///
-/// `computed_at` is the observable. The cache key is an opaque hash this test
-/// cannot reconstruct, but a stamp that PREDATES the final read proves that
-/// read was served from cache — i.e. that the cancelled request's work
-/// survived. A stamp after it means the result was discarded and this
-/// visitor paid the aggregate again, which is the bug.
+/// `event_users` is locked ACCESS EXCLUSIVE, so the report's query cannot make
+/// progress at all — the worst case the production 503 represented. The read
+/// must still answer at once, say `computing`, and converge on real numbers
+/// once the lock clears.
 #[tokio::test]
-async fn a_cancelled_cold_request_still_caches_its_report() {
+async fn a_cold_read_answers_at_once_even_when_the_aggregate_cannot_run() {
+    use diesel_async::RunQueryDsl;
+
     let Some(mut h) = TestServer::start().await else {
         eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_active_users");
         return;
     };
-    use diesel_async::RunQueryDsl;
-
     let f = h.seed_active_users_fixture().await;
     let path = url(&f, &format!("selection={}", f.app_a));
 
-    // Hold the aggregate off its data until we say so.
+    // Block the aggregate outright: it LEFT JOINs `event_users`.
     let mut lock = h.conn().await;
     diesel::sql_query("BEGIN")
         .execute(&mut lock)
@@ -517,40 +519,114 @@ async fn a_cancelled_cold_request_still_caches_its_report() {
         .await
         .expect("lock event_users");
 
-    // Fire the cold request and cancel it while it is blocked on that lock —
-    // the same future-drop the TimeoutLayer performs at 60 s in production.
-    let cancelled =
-        tokio::time::timeout(StdDuration::from_secs(2), h.get(&path, &f.owner_token)).await;
+    let started = std::time::Instant::now();
+    let cold: Value = h.get_json(&path, &f.owner_token).await;
+    let waited = started.elapsed();
+
+    assert_eq!(
+        cold["state"].as_str(),
+        Some("computing"),
+        "a cold read with the aggregate blocked must report `computing`: {cold}"
+    );
     assert!(
-        cancelled.is_err(),
-        "the request answered while event_users was locked — the lock did not \
-         stall the aggregate, so this test would not be cancelling anything"
+        cold["data"].is_null(),
+        "`computing` carries no data by contract: {cold}"
+    );
+    assert!(
+        waited < StdDuration::from_secs(2),
+        "the read waited {waited:?} while the aggregate was blocked — it is \
+         still awaiting the query on the request path, which is what turns a \
+         slow report into a 503"
     );
 
-    // Let the now-clientless computation proceed.
     diesel::sql_query("COMMIT")
         .execute(&mut lock)
         .await
         .expect("commit lock txn");
 
-    // Room for that computation to finish and write the cache. The fixture's
-    // aggregate is milliseconds; this is slack, not a race.
-    tokio::time::sleep(StdDuration::from_secs(3)).await;
-
-    let before_read = Utc::now();
-    let after: Value = h.get_json(&path, &f.owner_token).await;
-    let stamp: DateTime<Utc> = after["computed_at"]
-        .as_str()
-        .expect("a served report must carry computed_at")
-        .parse()
-        .expect("computed_at must be RFC3339");
-
+    // With the aggregate free, the detached recompute lands and the next reads
+    // converge on it.
+    let data = h.get_section(&path, &f.owner_token).await;
     assert!(
-        stamp < before_read,
-        "the cancelled request's report was not cached: this read was stamped \
-         {stamp}, at or after the moment it started ({before_read}), so it paid \
-         the aggregate itself. A cancelled cold request must still populate the \
-         cache, or every retry recomputes and the endpoint stays 503."
+        data["series"].is_array(),
+        "the report must arrive once the aggregate can run: {data}"
+    );
+
+    h.shutdown().await;
+}
+
+/// A refresh poll must not sit on a pooled connection while it sleeps.
+///
+/// `rollups_refresh` polls the fold watermark 16 times at 300 ms — up to 4.8 s
+/// — and the query it runs each round is a scan of a four-row table, measured
+/// at 0.02 ms. Holding the checkout across those sleeps pins one of the
+/// process's SIXTEEN connections for five seconds to perform a fraction of a
+/// millisecond of work, so a handful of dashboard tabs clicking Refresh starves
+/// every other endpoint. `active_users.rs` states the rule this route broke:
+/// "Never hold a pooled connection across network I/O — the API pool is 16 for
+/// the WHOLE process."
+///
+/// Saturation is the only honest way to observe it. A checked-out-but-idle
+/// connection and a pooled-idle one are indistinguishable in `pg_stat_activity`,
+/// so the property is only visible through its consequence: whether anything
+/// else can still get a connection while the polls are sleeping.
+///
+/// Lives in this file because it needs exactly this harness — a real binary, a
+/// migrated ephemeral database and a Redis for the kick — and duplicating ~200
+/// lines of `TestServer` for one test is the worse trade.
+#[tokio::test]
+async fn a_rollup_refresh_does_not_hold_a_pool_connection_while_it_sleeps() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_active_users");
+        return;
+    };
+    let f = h.seed_active_users_fixture().await;
+
+    /// `sauron-api` builds its pool with this many connections (`main.rs`).
+    const POOL_SIZE: usize = 16;
+
+    // One refresh per pool slot. Each runs its full 4.8 s budget: this
+    // ephemeral database has no fold task, so the watermark never advances past
+    // the request and `caught_up` never becomes true.
+    let mut inflight = Vec::with_capacity(POOL_SIZE);
+    for _ in 0..POOL_SIZE {
+        let client = h.client.clone();
+        let url = format!("{}/v1/apps/{}/rollups/refresh", h.base, f.app_a);
+        let token = f.owner_token.clone();
+        inflight.push(tokio::spawn(async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .map(|r| r.status())
+        }));
+    }
+
+    // Long enough for every one of them to clear auth and reach the poll loop,
+    // short enough to land well inside the 4.8 s budget.
+    tokio::time::sleep(StdDuration::from_millis(700)).await;
+
+    // The probe: a cheap authorized read that needs one connection. With the
+    // pool held it waits on `POOL_WAIT_TIMEOUT` (5 s) and then fails.
+    let probe = format!("/v1/apps/{}/rollups/status", f.app_a);
+    let started = std::time::Instant::now();
+    let status = h.get_status(&probe, &f.owner_token).await;
+    let waited = started.elapsed();
+
+    for job in inflight {
+        let _ = job.await;
+    }
+
+    assert_eq!(
+        status, 200,
+        "a cheap read was refused while {POOL_SIZE} refreshes were polling — \
+         they are holding the connection pool across their sleeps"
+    );
+    assert!(
+        waited < StdDuration::from_secs(2),
+        "a cheap read waited {waited:?} for a pool connection while {POOL_SIZE} \
+         refresh polls slept on theirs; it should never have queued at all"
     );
 
     h.shutdown().await;
@@ -608,7 +684,7 @@ async fn active_users_http_contract() {
     // `subset`, never `all`. With `Option<Uuid>` this would render as "All
     // environments" over a number computed from one environment.
     let body: Value = h
-        .get_json(
+        .get_section(
             &url(&f, &format!("selection={}", f.app_a)),
             &f.env_member_token,
         )
@@ -684,7 +760,7 @@ async fn active_users_csv_matches_the_json_route() {
         f.app_a, f.env_a1, f.app_b, f.env_b1
     );
 
-    let json: Value = h.get_json(&url(&f, &query), &f.owner_token).await;
+    let json: Value = h.get_section(&url(&f, &query), &f.owner_token).await;
     let series_len = json["series"].as_array().expect("series").len();
 
     let resp = h

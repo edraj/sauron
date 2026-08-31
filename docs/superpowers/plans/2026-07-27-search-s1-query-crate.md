@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Spec: `docs/superpowers/specs/2026-07-27-pro-search-and-saved-views-design.md`. Read §5 (grammar), §6 (catalog), §7 (architecture) before starting.
-- Rust edition `2021`, `rust-version = "1.82"`, license `AGPL-3.0-only` — all inherited via `version.workspace = true` / `edition.workspace = true` / `license.workspace = true`.
+- Rust edition `2021`, `rust-version = "1.82"`, license `LGPL-3.0-only` — all inherited via `version.workspace = true` / `edition.workspace = true` / `license.workspace = true`.
 - Every dependency is declared `foo.workspace = true`. Never pin a version in a crate manifest.
 - Tests are inline `#[cfg(test)] mod tests { use super::*; ... }` in the same file as the code. This repo has **no test DB and no integration-test directory**; that is why this crate is pure.
 - Hard gates, run from `backend/`: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.

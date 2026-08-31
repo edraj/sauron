@@ -7,8 +7,23 @@
    */
   import Router from 'svelte-spa-router';
   import Performance from '../src/pages/Performance.svelte';
+  import ActiveUsers from '../src/pages/ActiveUsers.svelte';
+  import Transactions from '../src/pages/Transactions.svelte';
+  import IssueDetail from '../src/pages/IssueDetail.svelte';
+  import MonitorDetail from '../src/pages/MonitorDetail.svelte';
+  import Environments from '../src/pages/Environments.svelte';
+  import FunnelBuilder from '../src/pages/FunnelBuilder.svelte';
+  import Inspector from '../src/pages/Inspector.svelte';
+  import Purge from '../src/pages/Purge.svelte';
 
-  const routes = { '/performance': Performance, '*': Performance };
+  const routes = { '/performance': Performance, '/active-users': ActiveUsers,
+    '/transactions': Transactions,
+    '/issues/:id': IssueDetail,
+    '/monitors/:id': MonitorDetail,
+    '/environments': Environments,
+    '/funnels': FunnelBuilder,
+    '/inspector': Inspector,
+    '/purge': Purge, '*': Performance };
 </script>
 
 <Router {routes} />

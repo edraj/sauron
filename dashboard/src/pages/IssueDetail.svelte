@@ -49,7 +49,9 @@
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import { fetchSchema, type SchemaDefinition } from '../lib/api/schema';
   import { preflight, queryErrorFor } from '../lib/utils/query-error';
-  import { viewCache } from '../lib/stores/view-cache';
+  import { viewCache, viewKey } from '../lib/stores/view-cache';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { toastStore } from '../lib/stores/toast.svelte';
   import {
     relativeTime,
@@ -63,9 +65,19 @@
   }
   let { params }: Props = $props();
 
-  let issue = $state<IssueDetail | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): returning to an issue
+  // repaints it instantly instead of blanking while the same read runs again.
+  const view = new CachedView<IssueDetail>();
+  const issue = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  const revalidating = $derived(view.revalidating);
+  /**
+   * The issue read failing, or a mutation (resolve / ignore / assign) failing.
+   * Separate lifetimes: an action's message must survive a background
+   * revalidate, and a load error must not be cleared by starting an action.
+   */
+  let actionError = $state<string | null>(null);
+  const error = $derived(actionError ?? view.error);
   let updating = $state(false);
 
   const issueId = $derived(params?.id ?? '');
@@ -75,17 +87,15 @@
     lockedBy('issue:write', { app: sessionStore.currentAppId, level: 'app' }),
   );
 
-  async function load(appId: string, id: string) {
-    loading = true;
-    error = null;
-    try {
-      issue = await getIssue(appId, id);
-    } catch (err) {
-      error = errorMessage(err);
-      issue = null;
-    } finally {
-      loading = false;
-    }
+  async function load(appId: string, id: string, force = false) {
+    // `id` AND `scopeKey`: the router reuses this component across
+    // `#/issues/A` -> `#/issues/B`, and `scopeKey` carries the environment the
+    // interceptor adds to the request but which appears in no argument here.
+    await view.load(
+      viewKey('issue.detail', appId, id, sessionStore.scopeKey),
+      () => getIssue(appId, id),
+      force,
+    );
   }
 
   $effect(() => {
@@ -601,7 +611,10 @@
         <div class="badges">
           <span class="type-tag mono">{issue.type}</span>
         </div>
-        <h1 class="issue-title">{issue.title}</h1>
+        <h1 class="issue-title">
+          {issue.title}
+          <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+        </h1>
         {#if issue.culprit}<p class="culprit mono">{issue.culprit}</p>{/if}
       </div>
         <div class="actions">

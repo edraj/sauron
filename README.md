@@ -567,4 +567,5 @@ An end-to-end check — register → create project → POST an envelope to `:80
 
 ## License
 
-[AGPL-3.0-only](LICENSE) — GNU Affero General Public License v3.0.
+[LGPL-3.0-only](LICENSE) — GNU Lesser General Public License v3.0. LGPLv3 applies
+on top of the GNU GPL v3, whose text is in [COPYING](COPYING).

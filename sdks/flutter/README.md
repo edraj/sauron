@@ -1437,7 +1437,8 @@ alongside the wire contract.
 
 ## License
 
-AGPL-3.0-only — GNU Affero General Public License v3.0.
+LGPL-3.0-only — GNU Lesser General Public License v3.0. LGPLv3 applies on top of
+the GNU GPL v3, whose text ships alongside it in `COPYING`.
 
 Repo: https://github.com/edraj/sauron — wiki:
 https://github.com/edraj/sauron/wiki

@@ -56,6 +56,9 @@ export const time = {
   },
   'dateRange.future': { en: 'Dates after today hold no data yet', ar: 'التواريخ بعد اليوم لا تحتوي على بيانات بعد' },
   // Rollup freshness chip + the ≈ approximation disclosure (docs/approximate-analytics.md).
+  // Shared by every cached view's freshness chip. `funnels.updating` and
+  // `retention.updating` predate this and say the same thing per page.
+  'time.updating': { en: 'Updating…', ar: 'جارٍ التحديث…' },
   'time.asOf': { en: 'as of {time}', ar: 'حتى {time}' },
   'time.approxNote': {
     en: 'Figures marked ≈ are approximate (±~2%), computed from sketches for speed at scale. Unmarked figures are exact.',
