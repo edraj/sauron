@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::process::Stdio;
 use std::time::Duration as StdDuration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -468,6 +468,89 @@ async fn report_is_cached_and_serves_the_same_computed_at() {
     assert_eq!(
         cold["series"], warm["series"],
         "the cached payload must be the computed one"
+    );
+
+    h.shutdown().await;
+}
+
+/// A cold request cancelled mid-computation must still leave the report in
+/// the cache.
+///
+/// This is the production failure this test exists to stop coming back. The
+/// 60 s `TimeoutLayer` answers 503 by DROPPING the handler future, and
+/// `cache_put` is the last statement of `assemble_report` — so a report that
+/// misses the budget is computed, thrown away, and never cached. The next
+/// visitor is another cold miss that times out identically, and the endpoint
+/// never recovers on its own; it stays 503 until the load that caused it
+/// disappears. Retries make it worse rather than better, because a shed
+/// request cancels neither the Postgres query nor its pool slot.
+///
+/// The stall is an `ACCESS EXCLUSIVE` lock rather than a sleep so the
+/// cancellation lands mid-computation DETERMINISTICALLY: the aggregate
+/// `LEFT JOIN`s `event_users`, so it cannot proceed past that lock until this
+/// test commits, no matter how fast the fixture's query would otherwise be.
+///
+/// `computed_at` is the observable. The cache key is an opaque hash this test
+/// cannot reconstruct, but a stamp that PREDATES the final read proves that
+/// read was served from cache — i.e. that the cancelled request's work
+/// survived. A stamp after it means the result was discarded and this
+/// visitor paid the aggregate again, which is the bug.
+#[tokio::test]
+async fn a_cancelled_cold_request_still_caches_its_report() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_active_users");
+        return;
+    };
+    use diesel_async::RunQueryDsl;
+
+    let f = h.seed_active_users_fixture().await;
+    let path = url(&f, &format!("selection={}", f.app_a));
+
+    // Hold the aggregate off its data until we say so.
+    let mut lock = h.conn().await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut lock)
+        .await
+        .expect("begin lock txn");
+    diesel::sql_query("LOCK TABLE event_users IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut lock)
+        .await
+        .expect("lock event_users");
+
+    // Fire the cold request and cancel it while it is blocked on that lock —
+    // the same future-drop the TimeoutLayer performs at 60 s in production.
+    let cancelled =
+        tokio::time::timeout(StdDuration::from_secs(2), h.get(&path, &f.owner_token)).await;
+    assert!(
+        cancelled.is_err(),
+        "the request answered while event_users was locked — the lock did not \
+         stall the aggregate, so this test would not be cancelling anything"
+    );
+
+    // Let the now-clientless computation proceed.
+    diesel::sql_query("COMMIT")
+        .execute(&mut lock)
+        .await
+        .expect("commit lock txn");
+
+    // Room for that computation to finish and write the cache. The fixture's
+    // aggregate is milliseconds; this is slack, not a race.
+    tokio::time::sleep(StdDuration::from_secs(3)).await;
+
+    let before_read = Utc::now();
+    let after: Value = h.get_json(&path, &f.owner_token).await;
+    let stamp: DateTime<Utc> = after["computed_at"]
+        .as_str()
+        .expect("a served report must carry computed_at")
+        .parse()
+        .expect("computed_at must be RFC3339");
+
+    assert!(
+        stamp < before_read,
+        "the cancelled request's report was not cached: this read was stamped \
+         {stamp}, at or after the moment it started ({before_read}), so it paid \
+         the aggregate itself. A cancelled cold request must still populate the \
+         cache, or every retry recomputes and the endpoint stays 503."
     );
 
     h.shutdown().await;

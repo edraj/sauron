@@ -24,6 +24,17 @@
      * disagree about which day a number belongs to.
      */
     label?: (bucket: string) => string;
+    /**
+     * Make each bar activate this with its point.
+     *
+     * Opt-in, and the reason the markup below branches: with no handler every
+     * column renders exactly the `div` it always did, so the six other callers
+     * are untouched and no bar advertises an interaction it does not have.
+     * With one, a column becomes a real `button` — focusable, Enter/Space
+     * activated — rather than a `div` with a click listener, which is
+     * unreachable for anyone not using a mouse.
+     */
+    onselect?: (point: SeriesPoint) => void;
   }
 
   let {
@@ -34,6 +45,7 @@
     format = (n: number) => formatNumber(n),
     showTotal = true,
     label: labelProp,
+    onselect,
   }: Props = $props();
 
   const max = $derived(data.length ? Math.max(...data.map((d) => d.count), 1) : 1);
@@ -80,8 +92,7 @@
            hover (the bar read "10 · Jul 29" above and "Jul 29 · 10" below at
            the same time). `aria-label` keeps the same text as the accessible
            name without drawing a second box. -->
-      {#each data as point (point.bucket)}
-        <div class="col" role="img" aria-label={tooltip(point)}>
+      {#snippet column(point: SeriesPoint)}
           <div class="bar" class:has-segments={point.segments && point.segments.length > 0} style="height:{barHeight(point.count)}%">
             <div class="bar-fill">
               {#if point.segments && point.segments.length > 0}
@@ -106,7 +117,23 @@
             </div>
           </div>
           <span class="tip tip-date">{label(point.bucket)}</span>
-        </div>
+      {/snippet}
+
+      {#each data as point (point.bucket)}
+        {#if onselect}
+          <button
+            type="button"
+            class="col col-btn"
+            aria-label={tooltip(point)}
+            onclick={() => onselect(point)}
+          >
+            {@render column(point)}
+          </button>
+        {:else}
+          <div class="col" role="img" aria-label={tooltip(point)}>
+            {@render column(point)}
+          </div>
+        {/if}
       {/each}
     </div>
     <div class="axis">
@@ -148,6 +175,22 @@
     display: flex;
     align-items: flex-end;
     justify-content: center;
+  }
+  /* A button, but it must measure and paint exactly like the div it replaces —
+     only the affordances are added. */
+  .col-btn {
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+  .col-btn:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
   .bar {
     position: relative;

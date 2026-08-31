@@ -21,6 +21,7 @@
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import OperationTransactionsModal from '../lib/components/OperationTransactionsModal.svelte';
+  import PerfDayModal from '../lib/components/PerfDayModal.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -187,6 +188,32 @@
     selected = null;
   }
 
+  // --- day detail ------------------------------------------------------------
+  //
+  // A bar on either chart above is an HOUR, while the axis beneath it is
+  // labelled by day — so the charts answer "how was this hour" under a legend
+  // that invites "how was this day". This opens that second question: the
+  // clicked bar's local day, hour by hour.
+  //
+  // The bucket, not the whole point: the modal slices `series` itself, and
+  // handing it a `{bucket, count}` pair from the mapped chart data would give
+  // it the one metric that chart happens to plot, when the day it draws needs
+  // both.
+  let dayBucket = $state<string | null>(null);
+  let dayMetric = $state<'latency' | 'throughput'>('latency');
+  let dayOpen = $state(false);
+
+  function openDay(bucket: string, metric: 'latency' | 'throughput') {
+    dayBucket = bucket;
+    dayMetric = metric;
+    dayOpen = true;
+  }
+
+  function closeDay() {
+    dayOpen = false;
+    dayBucket = null;
+  }
+
   function retry() {
     const aid = sessionStore.currentAppId;
     if (aid) void load(aid, range, op, true);
@@ -302,7 +329,12 @@
               <span class="caption">p95 latency (ms)</span>
             </div>
           {/snippet}
-          <TimeSeriesChart data={latencyData} height={200} color="var(--warning)" />
+          <TimeSeriesChart
+            data={latencyData}
+            height={200}
+            color="var(--warning)"
+            onselect={(p) => openDay(p.bucket, 'latency')}
+          />
         </Card>
 
         <Card>
@@ -312,7 +344,12 @@
               <span class="caption">{t('prose.perf.perBucket')}</span>
             </div>
           {/snippet}
-          <TimeSeriesChart data={throughputData} height={200} color="var(--primary)" />
+          <TimeSeriesChart
+            data={throughputData}
+            height={200}
+            color="var(--primary)"
+            onselect={(p) => openDay(p.bucket, 'throughput')}
+          />
         </Card>
       </div>
 
@@ -375,6 +412,17 @@
     appId={sessionStore.currentAppId}
     {range}
     onclose={closeDrill}
+  />
+
+  <!-- Mounted alongside the drill-down and for the same reason: inside the
+       `{:else}` branch a background refresh that emptied `rows` would unmount
+       it mid-read. -->
+  <PerfDayModal
+    bind:open={dayOpen}
+    bucket={dayBucket}
+    metric={dayMetric}
+    {series}
+    onclose={closeDay}
   />
 
 <style>

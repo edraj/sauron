@@ -762,25 +762,50 @@ async fn build_report(
         return Ok(hit);
     }
 
-    // Cold miss — the one path that still computes on the request clock.
+    // Cold miss — the one path that still computes while a request is waiting.
     //
-    // `try_acquire`, not `acquire`: 503 ahead of the pool rather than queueing
-    // behind it. The pool is 16 connections for the WHOLE process and
+    // `try_acquire_owned`, not `acquire`: 503 ahead of the pool rather than
+    // queueing behind it. The pool is 16 connections for the WHOLE process and
     // `POOL_WAIT_TIMEOUT` is 5 s, so sixteen people hitting a cold report — or
     // one person with the shareable URL open in a few tabs — would starve
     // /v1/auth/login and /health with "db pool checkout failed" 500s.
-    // `ConcurrencyLimitLayer` and `TimeoutLayer` shed the HTTP request but
-    // cancel neither the Postgres query nor the pool slot.
+    let permit = state
+        .active_users_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::Unavailable(
+                "busy",
+                "too many active-user reports are already running; retry shortly".into(),
+            )
+        })?;
+
+    // Detached, NOT computed inline on the request future.
     //
-    // `let _permit`, never `let _`: the latter drops the permit immediately and
-    // the gate becomes a no-op that still compiles.
-    let _permit = state.active_users_gate.try_acquire().map_err(|_| {
-        ApiError::Unavailable(
-            "busy",
-            "too many active-user reports are already running; retry shortly".into(),
-        )
-    })?;
-    assemble_report(state, &inputs).await
+    // `ConcurrencyLimitLayer` and `TimeoutLayer` shed a slow request by
+    // DROPPING this future, and `cache_put` is the last statement of
+    // `assemble_report`. Inline, a report that misses the 60 s budget is
+    // therefore computed, thrown away, and never cached — so the next visitor
+    // is another cold miss that times out identically and the endpoint never
+    // recovers on its own. Retries only deepen it, because shedding the
+    // request cancels neither the Postgres query nor its pool slot. Spawning
+    // outlives the request: the work finishes and populates the cache even
+    // when nobody is left to read the response, so the retry after it is a hit.
+    //
+    // The permit moves INTO the task for the same reason. Owned by the
+    // request, it was released the instant that future was dropped while the
+    // query it exists to bound kept running — so under exactly the timeout
+    // storm it is meant to contain, the gate bounded nothing. Held by the task,
+    // it now covers the actual work, and a retry arriving mid-computation gets
+    // an honest `busy` instead of starting a second copy of the same scan.
+    let task_state = state.clone();
+    let handle = tokio::spawn(async move {
+        let _permit = permit;
+        assemble_report(&task_state, &inputs).await
+    });
+    handle.await.map_err(|e| {
+        ApiError::Internal(format!("active-users computation did not complete: {e}"))
+    })?
 }
 
 /// The resolved, authorized ingredients of one cache entry — see the comment

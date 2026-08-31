@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Performance day-detail modal — render harness</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <!-- Before the app module: `config/env.ts` reads `window.__SAURON_CONFIG__`
+         at module scope and otherwise falls back to the :8090 pin in the
+         committed static/config.js. The dev middleware answers this path. -->
+    <script src="/config.js"></script>
+    <script>
+      const t = new URLSearchParams(location.search).get('theme');
+      if (t === 'light' || t === 'dark') localStorage.setItem('sauron.theme', t);
+    </script>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
