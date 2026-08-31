@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Edition 2021, `rust-version = 1.82`, license `AGPL-3.0-only` (copy `license.workspace = true`).
+- Edition 2021, `rust-version = 1.82`, license `LGPL-3.0-only` (copy `license.workspace = true`).
 - diesel uses `postgres_backend` (no libpq); all I/O via diesel-async/deadpool.
 - Never auto-commit — user runs on local `main` only and commits manually. The `git commit` steps below are written for completeness; **skip them unless the user explicitly asks to commit** (leave changes in the working tree).
 - No DB/handler integration-test harness exists — pure logic gets Rust unit tests; DB/API/CLI get `docker compose` e2e verification.

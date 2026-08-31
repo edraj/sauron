@@ -13,7 +13,9 @@
     spanDays,
     type DateRangeValue,
   } from '../lib/models/date-range';
+  import { combineFreshness } from '../lib/models/freshness';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import BarList from '../lib/components/BarList.svelte';
   import StoreSection from '../lib/components/StoreSection.svelte';
@@ -103,6 +105,12 @@
   const issuesView = new CachedView<OverviewEnvelope<Issue[]>>();
   const eventsView = new CachedView<OverviewEnvelope<TopEvent[]>>();
   const activeUsersView = new CachedView<OverviewEnvelope<ActiveUsersSeries>>();
+
+  // The page is only as fresh as its stalest section — see
+  // `combineFreshness`. Overview loads these independently.
+  const pageFreshness = $derived(
+    combineFreshness([totalsView, seriesView, issuesView, eventsView, activeUsersView]) ?? { fetchedAt: null, revalidating: false },
+  );
 
   // `?? null` on the INNER data too: an envelope in the `computing` state has a
   // null payload, and every card below already renders its skeleton for a null.
@@ -428,6 +436,7 @@
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached data, fetching fresh" hint.
       -->
+      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
       <RefreshButton
         onclick={refresh}
         loading={refreshing || revalidating}

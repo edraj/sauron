@@ -12,7 +12,7 @@ use std::time::Duration as StdDuration;
 use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 use axum_extra::extract::Query;
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -29,6 +29,7 @@ use sauron_db::scope::EnvFilter;
 
 use crate::error::ApiError;
 use crate::openapi::ErrorResponse;
+use crate::view_cache::Envelope;
 use crate::AppState;
 
 /// Longest window a single request may cover.
@@ -57,6 +58,15 @@ const ACTIVE_USERS_FRESH_FOR_SECS: i64 = 3600;
 /// control: the rate limiter, the scan budget and the semaphore are the
 /// control.
 const ACTIVE_USERS_CACHE_TTL_SECS: u64 = 3 * 3600;
+
+/// This route's cache timings, in the shared vocabulary.
+const POLICY: crate::view_cache::CachePolicy = crate::view_cache::CachePolicy {
+    fresh_for: Duration::seconds(ACTIVE_USERS_FRESH_FOR_SECS),
+    ttl_secs: ACTIVE_USERS_CACHE_TTL_SECS,
+    // Short, because a failed recompute here is cheap to retry and the page
+    // shows the previous numbers meanwhile.
+    fail_backoff_secs: 60,
+};
 /// Single-flight TTL for the background-refresh lock.
 ///
 /// Must outlive one full compute (the request budget is 60 s) or a second
@@ -352,7 +362,10 @@ fn cache_key(
     let json =
         serde_json::to_string(&fingerprint).map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(format!(
-        "sauron:activeusers:{}",
+        // `v2`: the stored document is now a `view_cache::CacheEntry`
+        // wrapper rather than a bare report, so a v1 entry would deserialize
+        // to nothing and be silently recomputed under the same key forever.
+        "sauron:activeusers:v2:{}",
         sauron_auth::hash_token(&json)
     ))
 }
@@ -391,7 +404,7 @@ as-is; between one and three hours they are returned immediately and refreshed \
 in the background. `computed_at` states which. A cache hit costs no admission \
 permit.",
     params(("project_id" = Uuid, Path, description = "The project."), ActiveUsersQuery), security(("bearerAuth" = [])),
-    responses((status = 200, description = "The report, with `computed_at` disclosing its freshness.", body = ActiveUsersReport),
+    responses((status = 200, description = "The report, with `computed_at` disclosing its freshness.", body = Envelope),
               (status = 400, description = "Malformed selection or window.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
               (status = 503, description = "Report admission is saturated, or `event_users.identified_at` is missing because migrations have not been run. Retry, or run sauron-migrate.", body = ErrorResponse)),
 )]
@@ -401,9 +414,19 @@ pub async fn active_users(
     Path(project_id): Path<Uuid>,
     Query(q): Query<ActiveUsersQuery>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<ActiveUsersReport>, ApiError> {
-    let report = gated_report(&state, auth.user_id, project_id, &q, raw_query.as_deref()).await?;
-    Ok(Json(report))
+) -> Result<Json<Envelope>, ApiError> {
+    let inputs = gated_inputs(&state, auth.user_id, project_id, &q, raw_query.as_deref()).await?;
+    // Never awaits the aggregate. A miss answers `computing` with a null
+    // `data` and starts the work in the background, so this handler's latency
+    // is a Redis round trip plus the authorization above — it cannot reach the
+    // request timeout however slow the report is. That timeout, mapped onto
+    // 503, is what this route was reported for.
+    let (envelope, should_recompute) =
+        crate::view_cache::read(&state.redis, &inputs.key, &POLICY, false).await;
+    if should_recompute {
+        spawn_refresh(&state, inputs);
+    }
+    Ok(Json(envelope))
 }
 
 /// `GET /v1/projects/{project_id}/active-users.csv`
@@ -429,7 +452,31 @@ pub async fn active_users_csv(
     Query(q): Query<ActiveUsersQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<axum::response::Response, ApiError> {
-    let report = gated_report(&state, auth.user_id, project_id, &q, raw_query.as_deref()).await?;
+    let inputs = gated_inputs(&state, auth.user_id, project_id, &q, raw_query.as_deref()).await?;
+    // The CSV route cannot answer `computing`: a downloaded file has nowhere to
+    // put "not ready, try again", and handing the user an empty spreadsheet
+    // would be worse than making them wait. So it serves the cache when there
+    // is one and otherwise computes on the request path behind the permit —
+    // the behaviour both routes had before the JSON side moved off it. A
+    // download is a deliberate, rare action; a page load is neither.
+    let (envelope, _) = crate::view_cache::read(&state.redis, &inputs.key, &POLICY, false).await;
+    let report: ActiveUsersReport = match envelope.data {
+        Some(v) => serde_json::from_value(v).map_err(|e| ApiError::Internal(e.to_string()))?,
+        None => {
+            let permit = state
+                .active_users_gate
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    ApiError::Unavailable(
+                        "busy",
+                        "too many active-user reports are already running; retry shortly".into(),
+                    )
+                })?;
+            let _permit = permit;
+            assemble_report(&state, &inputs).await?
+        }
+    };
 
     let mut out = String::new();
     crate::csv::write_row(
@@ -474,13 +521,13 @@ pub async fn active_users_csv(
 
 /// The guard stack both routes share, in the order the failures must be
 /// reported: parameter shape, schema readiness, per-user rate, then admission.
-async fn gated_report(
+async fn gated_inputs(
     state: &AppState,
     user_id: Uuid,
     project_id: Uuid,
     q: &ActiveUsersQuery,
     raw_query: Option<&str>,
-) -> Result<ActiveUsersReport, ApiError> {
+) -> Result<RefreshInputs, ApiError> {
     // The environment dimension is expressed PER SELECTION. Accepting a global
     // one and ignoring it is the bug `routes::scope` exists to prevent.
     crate::routes::scope::reject_environment_id(
@@ -504,53 +551,25 @@ async fn gated_report(
     )
     .await?;
 
-    // The semaphore is no longer taken here: a cache HIT costs no permit (and
-    // can no longer be shed 503-busy while three computes run). The permit
-    // moved to where the expensive query actually runs — `build_report`'s
-    // cold-miss branch and the background refresh — which are the only things
-    // it ever needed to bound.
-    build_report(state, user_id, project_id, q).await
+    // No semaphore here: this function does only bounded work. The permit
+    // lives with the recompute, which is the only thing it ever needed to
+    // bound.
+    resolve_inputs(state, user_id, project_id, q).await
 }
 
-async fn cache_get(state: &AppState, key: &str) -> Option<ActiveUsersReport> {
-    match tokio::time::timeout(CACHE_OP_TIMEOUT, state.redis.get(key)).await {
-        Ok(Ok(Some(json))) => serde_json::from_str(&json).ok(),
-        Ok(Ok(None)) => None,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "active-users cache read failed");
-            None
-        }
-        Err(_elapsed) => {
-            tracing::warn!("active-users cache read timed out");
-            None
-        }
-    }
-}
-
-async fn cache_put(state: &AppState, key: &str, report: &ActiveUsersReport) {
-    let Ok(json) = serde_json::to_string(report) else {
-        return;
-    };
-    match tokio::time::timeout(
-        CACHE_OP_TIMEOUT,
-        state.redis.set_ex(key, &json, ACTIVE_USERS_CACHE_TTL_SECS),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "active-users cache write failed"),
-        Err(_elapsed) => tracing::warn!("active-users cache write timed out"),
-    }
-}
-
-/// Resolve, authorize, clamp, cache and query. The single source of both the
-/// JSON body and the CSV body.
-async fn build_report(
+/// Resolve, authorize and clamp — the CHEAP half, shared by both routes.
+///
+/// Everything here is bounded work: parsing, a handful of small reads and the
+/// cache-key fingerprint. Deliberately does NOT touch the aggregate or the
+/// cache, so both handlers can decide for themselves what to do about a miss —
+/// the JSON route answers `computing` and enqueues, while the CSV route, which
+/// has no way to express "not ready" in a downloaded file, still computes.
+async fn resolve_inputs(
     state: &AppState,
     user_id: Uuid,
     project_id: Uuid,
     q: &ActiveUsersQuery,
-) -> Result<ActiveUsersReport, ApiError> {
+) -> Result<RefreshInputs, ApiError> {
     let selections = parse_selection(&q.selection)?;
     let (from, to) = validate_window(q.from, q.to, selections.len())?;
     let requested_app_ids: Vec<Uuid> = selections.iter().map(|(a, _)| *a).collect();
@@ -750,37 +769,7 @@ async fn build_report(
         selections: selection_views,
     };
 
-    if let Some(hit) = cache_get(state, &inputs.key).await {
-        // Serve whatever is cached, instantly — that is the whole point. A
-        // stale hit (or one cached by a build predating `computed_at`)
-        // additionally kicks a background recompute so the NEXT visitor sees
-        // current numbers; this visitor keeps the ~1 h-old ones, which is the
-        // accepted trade.
-        if !is_fresh(hit.computed_at, Utc::now()) {
-            spawn_refresh(state, inputs);
-        }
-        return Ok(hit);
-    }
-
-    // Cold miss — the one path that still computes on the request clock.
-    //
-    // `try_acquire`, not `acquire`: 503 ahead of the pool rather than queueing
-    // behind it. The pool is 16 connections for the WHOLE process and
-    // `POOL_WAIT_TIMEOUT` is 5 s, so sixteen people hitting a cold report — or
-    // one person with the shareable URL open in a few tabs — would starve
-    // /v1/auth/login and /health with "db pool checkout failed" 500s.
-    // `ConcurrencyLimitLayer` and `TimeoutLayer` shed the HTTP request but
-    // cancel neither the Postgres query nor the pool slot.
-    //
-    // `let _permit`, never `let _`: the latter drops the permit immediately and
-    // the gate becomes a no-op that still compiles.
-    let _permit = state.active_users_gate.try_acquire().map_err(|_| {
-        ApiError::Unavailable(
-            "busy",
-            "too many active-user reports are already running; retry shortly".into(),
-        )
-    })?;
-    assemble_report(state, &inputs).await
+    Ok(inputs)
 }
 
 /// The resolved, authorized ingredients of one cache entry — see the comment
@@ -793,15 +782,6 @@ struct RefreshInputs {
     truncated: bool,
     truncation_reason: Option<String>,
     selections: Vec<SelectionView>,
-}
-
-/// Whether a cached report is young enough to serve without any recompute.
-///
-/// `None` — an entry cached before `computed_at` existed — is STALE, not
-/// fresh: age unknown means "refresh it", never "trust it forever".
-fn is_fresh(computed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    computed_at
-        .is_some_and(|t| now.signed_duration_since(t).num_seconds() < ACTIVE_USERS_FRESH_FOR_SECS)
 }
 
 /// Run the aggregate, assemble the report, cache it. The ONE producer of
@@ -849,7 +829,14 @@ async fn assemble_report(
         latest,
         computed_at: Some(Utc::now()),
     };
-    cache_put(state, &inputs.key, &report).await;
+    // Written as a `view_cache::CacheEntry`, so `computed_at` travels beside
+    // the payload instead of being inferred from a TTL that says nothing about
+    // freshness.
+    let entry = crate::view_cache::CacheEntry {
+        data: serde_json::to_value(&report).map_err(|e| ApiError::Internal(e.to_string()))?,
+        computed_at: report.computed_at.unwrap_or_else(Utc::now),
+    };
+    crate::view_cache::cache_put(&state.redis, &inputs.key, &entry, POLICY.ttl_secs).await;
     Ok(report)
 }
 
@@ -1220,28 +1207,27 @@ mod tests {
         assert_eq!(ab, ba);
     }
 
-    /// The serve-stale decision. The `None` arm is the one worth pinning: a
-    /// report cached by a build that predates `computed_at` must read as
-    /// STALE (served, but refreshed) — treating unknown age as fresh would
-    /// freeze pre-upgrade numbers in place for the whole TTL.
+    /// The serve-stale decision moved to `view_cache::is_fresh`, which is
+    /// tested there. What is specific to THIS route is the migration: the
+    /// stored document changed from a bare report to a `CacheEntry` wrapper,
+    /// and the key gained a `v2` so no v1 entry is ever read under it.
+    ///
+    /// This pins the second half of that guarantee. The old shape carried no
+    /// `computed_at` of its own in early builds, so if one were ever read as
+    /// the new shape it would have to invent an age — and a fabricated
+    /// timestamp on a cached report is exactly the lie the freshness stamp
+    /// exists to prevent. It does not parse, so it reads as a miss and is
+    /// recomputed.
     #[test]
-    fn freshness_boundary_and_unknown_age() {
-        let now = Utc::now();
-        assert!(is_fresh(Some(now), now), "just computed is fresh");
+    fn a_v1_cache_document_does_not_parse_as_the_v2_entry() {
+        let v1 = serde_json::json!({
+            "series": [],
+            "truncated": false,
+            "selections": [],
+        });
         assert!(
-            is_fresh(
-                Some(now - chrono::Duration::seconds(ACTIVE_USERS_FRESH_FOR_SECS - 1)),
-                now
-            ),
-            "one second inside the horizon is fresh"
+            serde_json::from_value::<crate::view_cache::CacheEntry>(v1).is_err(),
+            "a v1 document must not deserialize into a v2 entry"
         );
-        assert!(
-            !is_fresh(
-                Some(now - chrono::Duration::seconds(ACTIVE_USERS_FRESH_FOR_SECS)),
-                now
-            ),
-            "exactly at the horizon is stale"
-        );
-        assert!(!is_fresh(None, now), "unknown age is stale, never fresh");
     }
 }

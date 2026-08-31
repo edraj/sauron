@@ -8,8 +8,8 @@ version = "1.5.0"
 description = "Server-side Python SDK for the Sauron observability + analytics gateway"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "AGPL-3.0-only"
-license-files = ["LICENSE"]
+license = "LGPL-3.0-only"
+license-files = ["LICENSE", "COPYING"]
 authors = [{ name = "Sauron" }]
 keywords = ["observability", "analytics", "error-tracking", "sauron"]
 classifiers = [

@@ -1309,6 +1309,17 @@ pub async fn rollups_refresh(
         raw_query.as_deref(),
     )
     .await?;
+    // Authorization is the last thing this checkout is needed for. Everything
+    // below is a poll with a sleep between rounds, and `active_users.rs` states
+    // the rule: never hold a pooled connection across waiting — the pool is 16
+    // for the WHOLE process. Held across the loop, one Refresh pins a
+    // sixteenth of the process's database capacity for up to 4.8 s in order to
+    // run about 0.3 ms of query, so a handful of open dashboard tabs clicking
+    // Refresh starves every other endpoint. Measured before this drop: with 16
+    // concurrent refreshes, an unrelated cheap read waited 4.2 s for a
+    // connection.
+    drop(conn);
+
     let t_req = Utc::now();
     // Best-effort with a hard budget: sauron-redis hangs rather than errors
     // against a dead Redis (see overview_cache::CACHE_OP_TIMEOUT), and this
@@ -1324,7 +1335,19 @@ pub async fn rollups_refresh(
     let mut as_of = None;
     let mut caught_up = false;
     for _ in 0..16 {
+        // Re-checked out per round and released before the sleep. The query is
+        // a scan of a four-row table (measured 0.02 ms), so the connection is
+        // held for microseconds instead of seconds.
+        //
+        // A checkout that cannot be had does NOT fail the request: the kick has
+        // already been sent, and `caught_up: false` is a documented answer the
+        // page handles by refetching anyway. Turning a busy moment into a 500
+        // would be a worse outcome than the honest "not yet".
+        let Ok(mut conn) = db(&state).await else {
+            break;
+        };
         as_of = sauron_db::rollups::as_of(&mut conn, &sauron_db::rollups::EVENT_SOURCES).await?;
+        drop(conn);
         if as_of.is_some_and(|a| a >= target) {
             caught_up = true;
             break;

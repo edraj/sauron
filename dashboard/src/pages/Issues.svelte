@@ -17,7 +17,9 @@
   import StatusBadge from '../lib/components/StatusBadge.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
+  import { combineFreshness } from '../lib/models/freshness';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import { rangeStore } from '../lib/stores/range.svelte';
   import {
@@ -127,6 +129,12 @@
   // follow them.
   const issuesView = new CachedView<SearchEnvelope<Issue>>();
   const statsView = new CachedView<IssueStats>();
+
+  // The page is only as fresh as its stalest section — see
+  // `combineFreshness`. Overview loads these independently.
+  const pageFreshness = $derived(
+    combineFreshness([issuesView, statsView]) ?? { fetchedAt: null, revalidating: false },
+  );
 
   const issues = $derived(issuesView.data?.data ?? []);
   const loading = $derived(issuesView.loading);
@@ -528,6 +536,7 @@
         spinner IS the "showing cached data, fetching fresh" hint, and without it
         the instant paint is indistinguishable from live data.
       -->
+      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
       <RefreshButton
         onclick={refresh}
         loading={refreshing || revalidating || revalidatingStats}

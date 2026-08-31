@@ -57,7 +57,13 @@ export type OverviewSectionName =
   | 'top-events'
   | 'active-users';
 
-export interface OverviewEnvelope<T> {
+/**
+ * The server-side cache envelope, shared by every route that answers from
+ * `view_cache` — no longer Overview's alone since `/active-users` moved onto
+ * the same mechanism. `OverviewEnvelope` remains as an alias so the existing
+ * call sites in this file keep reading naturally.
+ */
+export interface ViewEnvelope<T> {
   /**
    * - `fresh` — computed within the server's freshness window (1h). Nothing running.
    * - `stale` — older than that. Shown as-is while a recompute runs.
@@ -223,3 +229,6 @@ export async function refreshOverview(
     params: toParams(win),
   });
 }
+
+/** @deprecated name — the envelope is not Overview-specific. Use `ViewEnvelope`. */
+export type OverviewEnvelope<T> = ViewEnvelope<T>;

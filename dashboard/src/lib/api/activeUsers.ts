@@ -1,6 +1,7 @@
 import { api } from './client';
 import { downloadCsv } from './download';
 import type { ActiveUsersReport } from '../models';
+import type { ViewEnvelope } from './overview';
 
 /**
  * Request parameters. Lives here rather than in `models/`, per the
@@ -24,11 +25,17 @@ export interface ActiveUsersParams {
  */
 const REPEATED_KEYS = { indexes: null } as const;
 
+/**
+ * The report now arrives inside a cache envelope: the aggregate moved off the
+ * request path, so a cold read answers `computing` with a null `data` instead
+ * of occupying the request until it times out. That timeout, mapped onto 503,
+ * is what this endpoint was reported for.
+ */
 export async function getActiveUsers(
   projectId: string,
   params: ActiveUsersParams,
-): Promise<ActiveUsersReport> {
-  const { data } = await api.get<ActiveUsersReport>(
+): Promise<ViewEnvelope<ActiveUsersReport>> {
+  const { data } = await api.get<ViewEnvelope<ActiveUsersReport>>(
     `/v1/projects/${projectId}/active-users`,
     { params, paramsSerializer: REPEATED_KEYS },
   );

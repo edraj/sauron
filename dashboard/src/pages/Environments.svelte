@@ -13,6 +13,8 @@
   import Modal from '../lib/components/ui/Modal.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
   import { toastStore } from '../lib/stores/toast.svelte';
@@ -55,8 +57,22 @@
   // Enrollment rows for EVERY app in the project, flattened into one list.
   // One entry per (app, environment) pair.
   let enrollments = $state<AppEnvironment[]>([]);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  /**
+   * `CachedView` over the same entry the hand-rolled loader used, for the two
+   * things it did not have: a generation guard (a slow response for a project
+   * the user has left can no longer overwrite the current one) and a
+   * `revalidating` flag to disclose the background refresh.
+   *
+   * The rows stay in local `$state` rather than becoming `$derived` — see
+   * `apply`. This page edits them optimistically after a rename or a mute, and
+   * writing through a derived value would reach into the cached payload and
+   * corrupt it for every later reader.
+   */
+  const view = new CachedView<EnvironmentsPayload>();
+  const loading = $derived(view.loading);
+  const revalidating = $derived(view.revalidating);
+  let actionError = $state<string | null>(null);
+  const error = $derived(actionError ?? view.error);
   let showRetired = $state(false);
   // Holds either a catalogue id (rename/retire in flight) or an enrollment id
   // (mute/promote/rotate in flight) — the two id spaces never collide, so one
@@ -301,31 +317,19 @@
   }
 
   async function load(pid: string, force = false) {
-    const key = pageKey(pid);
-    const cached = viewCache.get<EnvironmentsPayload>(key);
-    if (cached !== undefined) {
-      apply(cached);
-      error = null;
-      loading = false;
-    } else {
-      loading = true;
-      error = null;
-    }
-    if (!force && viewCache.isFresh(key)) return;
-    try {
-      const fresh = await viewCache.dedupe(key, () => fetchAll(pid), force);
-      viewCache.set(key, fresh);
-      apply(fresh);
-      error = null;
-    } catch (err) {
-      // A failed refresh over rows that are already on screen leaves them up —
-      // they are still a true answer, merely older. Only a failure with nothing
-      // to show becomes the page's error state.
-      if (cached === undefined) error = errorMessage(err);
-    } finally {
-      loading = false;
-    }
+    await view.load(pageKey(pid), () => fetchAll(pid), force);
   }
+
+  /**
+   * Copy each payload into the page's own rows.
+   *
+   * Driven off `view.data` rather than done inline on a successful fetch, so a
+   * cache HIT — which runs no fetch at all — seeds the page too.
+   */
+  $effect(() => {
+    const payload = view.data;
+    if (payload) apply(payload);
+  });
 
   $effect(() => {
     const pid = sessionStore.currentProjectId;
@@ -511,7 +515,10 @@
 <AdminShell>
   <div class="head">
     <div>
-      <h1 class="page-title">{t('environments.title')}</h1>
+      <h1 class="page-title">
+        {t('environments.title')}
+        <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+      </h1>
       <p class="muted sub">
         Defined by {sessionStore.currentProject?.name ?? 'this project'} and shared by every app in
         it — creating, renaming or retiring one below changes it for all of them. Each app's ingest

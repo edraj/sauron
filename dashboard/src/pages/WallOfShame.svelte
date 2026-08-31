@@ -12,6 +12,7 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
@@ -251,6 +252,7 @@
       >
         {exporting ? 'Preparing…' : 'Export CSV'}
       </Button>
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton onclick={refresh} loading={loading || revalidating} />
     </div>
   </div>

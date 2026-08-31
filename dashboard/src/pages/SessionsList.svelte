@@ -28,9 +28,10 @@
   } from '../lib/components/filters/filters';
   import Pagination from '../lib/components/Pagination.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
   import { refreshRollups } from '../lib/api/rollups';
-  import { approx } from '../lib/models/freshness';
+  import { approx, combineFreshness } from '../lib/models/freshness';
   import { rollupState } from '../lib/stores/rollups.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
@@ -156,6 +157,12 @@
   // names, so the markup is unchanged.
   const sessionsView = new CachedView<SearchEnvelope<Session>>();
   const analyticsView = new CachedView<SessionsAnalytics>();
+
+  // The page is only as fresh as its stalest section — see
+  // `combineFreshness`. Overview loads these independently.
+  const pageFreshness = $derived(
+    combineFreshness([sessionsView, analyticsView]) ?? { fetchedAt: null, revalidating: false },
+  );
 
   const sessions = $derived(sessionsView.data?.data ?? []);
   const total = $derived(sessionsView.data?.total ?? 0);
@@ -440,6 +447,7 @@
       {#snippet actions()}
         <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
         <RollupChip />
+      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
         <Button
           variant="secondary"

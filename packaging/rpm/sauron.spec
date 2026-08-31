@@ -8,11 +8,11 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.7.0
+Version:        1.8.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
-License:        AGPL-3.0-only
+License:        LGPL-3.0-only
 URL:            https://github.com/splimter/sauron
 Source0:        %{name}-%{version}.tar.gz
 
@@ -308,7 +308,7 @@ fi
 %{_libexecdir}/sauron/sauron-dashboard-config || :
 
 %files
-%license LICENSE
+%license LICENSE COPYING
 %doc README.md
 %dir %{_sysconfdir}/sauron
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/sauron.env
@@ -364,6 +364,12 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Mon Aug 31 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.8.0-1
+- Relicensed from AGPL-3.0-only to LGPL-3.0-only. LGPLv3 is a set of additional
+  permissions on top of GPLv3, so the package now ships both texts: LICENSE
+  (LGPLv3) and COPYING (GPLv3). The AGPL network-use clause no longer applies —
+  running a modified Sauron as a hosted service does not by itself oblige an
+  operator to offer users the corresponding source.
 * Wed Aug 19 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.7.0-1
 - "Crash-free sessions" is renamed "Unhandled-exception-free sessions" and now
   means what the new name says: it counts only errors the SDK

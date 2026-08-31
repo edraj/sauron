@@ -12,6 +12,9 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import {
     purgeApi,
     blockedByEnvFilter,
@@ -22,9 +25,23 @@
     type PurgeKind,
   } from '../lib/api/purge';
 
-  let catalog = $state<PurgeCatalog | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts): the catalogue paints
+  // instantly on return instead of blanking while the same request runs again.
+  const view = new CachedView<PurgeCatalog>();
+  const catalog = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  /**
+   * Two error sources, deliberately not merged into one variable.
+   *
+   * `view.error` is the catalogue read failing; `actionError` is a preview,
+   * confirm or cancel failing. They have different lifetimes — an action error
+   * must survive a background revalidate, and a load error must not be cleared
+   * by starting an unrelated action — so the page keeps both and renders
+   * whichever is live, the action first because it is what the user just did.
+   */
+  const revalidating = $derived(view.revalidating);
+  let actionError = $state<string | null>(null);
+  const error = $derived(actionError ?? view.error);
 
   // --- the form ------------------------------------------------------------
   let selectedKinds = $state<Set<string>>(new Set());
@@ -70,17 +87,15 @@
 
   const slugMatches = $derived(!!job && confirmText.trim() === job.app_slug);
 
-  async function load() {
-    loading = true;
-    error = null;
-    try {
-      const { data } = await purgeApi.catalog();
-      catalog = data;
-    } catch (e) {
-      error = describe(e);
-    } finally {
-      loading = false;
-    }
+  async function load(force = false) {
+    // `scopeKey` carries the selected environment, which the axios interceptor
+    // adds to the request but which appears in no argument here. Omit it and
+    // one environment's catalogue keys the same as another's.
+    await view.load(
+      viewKey('purge.catalog', sessionStore.scopeKey),
+      async () => (await purgeApi.catalog()).data,
+      force,
+    );
   }
 
   function describe(e: unknown): string {
@@ -95,7 +110,7 @@
   async function startPreview() {
     if (!app || !canPreview) return;
     busy = true;
-    error = null;
+    actionError = null;
     confirmText = '';
     try {
       const { data } = await purgeApi.preview({
@@ -115,7 +130,7 @@
       job = data;
       poll();
     } catch (e) {
-      error = describe(e);
+      actionError = describe(e);
     } finally {
       busy = false;
     }
@@ -138,7 +153,7 @@
         job = data;
         poll();
       } catch (e) {
-        error = describe(e);
+        actionError = describe(e);
       }
     }, 1500);
   }
@@ -146,13 +161,13 @@
   async function doConfirm() {
     if (!job || !slugMatches) return;
     busy = true;
-    error = null;
+    actionError = null;
     try {
       const { data } = await purgeApi.confirm(job.id, confirmText.trim());
       job = data;
       poll();
     } catch (e) {
-      error = describe(e);
+      actionError = describe(e);
     } finally {
       busy = false;
     }
@@ -166,7 +181,7 @@
       job = data;
       poll();
     } catch (e) {
-      error = describe(e);
+      actionError = describe(e);
     } finally {
       busy = false;
     }
@@ -238,9 +253,12 @@
         {t('prose.purge.lede')} <strong>{t('purge.noUndo')}</strong>
       </p>
     </div>
-    <Button variant="ghost" onclick={reset} disabled={busy}>
-      <Icon name="refresh" /> {t('common.reset')}
-    </Button>
+    <div class="head-actions">
+      <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+      <Button variant="ghost" onclick={reset} disabled={busy}>
+        <Icon name="refresh" /> {t('common.reset')}
+      </Button>
+    </div>
   </div>
 
   <div class="content">

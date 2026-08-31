@@ -57,6 +57,26 @@ export class CachedView<T> {
    */
   errorStatus = $state<number | null>(null);
 
+  /**
+   * `Date.now()` at the moment the payload ON SCREEN was captured, or `null`
+   * when there is nothing to show.
+   *
+   * Read from the cache entry's `storedAt`, NOT stamped when this view reads
+   * it. The difference is the whole point: a page mounting on an entry another
+   * page filled must report when that data was *captured*, or every navigation
+   * would restate "just now" and the age would mean nothing.
+   *
+   * It deliberately does not advance when a refresh fails over existing data —
+   * those rows are still the old rows, and re-dating them to now is precisely
+   * the lie this field exists to prevent.
+   *
+   * This is the LOCAL stamp. Where an endpoint discloses its own `computed_at`
+   * (the server may have served an answer Redis has held for hours), that is
+   * the honest number and pages should prefer it — see
+   * `docs/superpowers/specs/2026-08-31-server-view-cache-design.md`.
+   */
+  fetchedAt = $state<number | null>(null);
+
   #gen = 0;
   #freshMs: number;
 
@@ -108,6 +128,7 @@ export class CachedView<T> {
     const cached = viewCache.get<T>(key);
     if (cached !== undefined) {
       this.data = cached;
+      this.fetchedAt = viewCache.peek<T>(key)?.storedAt ?? null;
       this.#clearError();
       this.loading = false;
     } else {
@@ -118,6 +139,7 @@ export class CachedView<T> {
       // result. `loading` alone is not enough to prevent that.
       this.loading = true;
       this.data = undefined;
+      this.fetchedAt = null;
       this.#clearError();
     }
     if (!force && viewCache.isFresh(key, this.#freshMs)) return;
@@ -132,6 +154,7 @@ export class CachedView<T> {
       // it since. Kept out deliberately rather than left in as defensive noise —
       // an assignment no test can falsify is a line nobody can safely change.
       this.data = viewCache.set(key, fresh);
+      this.fetchedAt = viewCache.peek<T>(key)?.storedAt ?? null;
     } catch (err) {
       if (gen !== this.#gen) return;
       // Not cached on the failure path on purpose: caching it would make the
@@ -139,6 +162,7 @@ export class CachedView<T> {
       if (cached === undefined) {
         this.#setError(err);
         this.data = undefined;
+        this.fetchedAt = null;
       } else if (force) {
         // Keep the stale data, but SAY SO. A background revalidate may fail
         // quietly — the user did not ask for it and the screen is still

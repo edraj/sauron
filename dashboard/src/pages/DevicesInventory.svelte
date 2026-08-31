@@ -11,7 +11,9 @@
   import TimeFilter from '../lib/components/TimeFilter.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
+  import { combineFreshness } from '../lib/models/freshness';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -107,6 +109,12 @@
   // modes repaints from cache instead of re-fetching.
   const groupView = new CachedView<ListPage<DeviceGroupRow>>();
   const flatView = new CachedView<ListPage<DeviceRow>>();
+
+  // The page is only as fresh as its stalest section — see
+  // `combineFreshness`. Overview loads these independently.
+  const pageFreshness = $derived(
+    combineFreshness([groupView, flatView]) ?? { fetchedAt: null, revalidating: false },
+  );
 
   const groups = $derived(groupView.data?.rows ?? []);
   const devices = $derived(flatView.data?.rows ?? []);
@@ -396,6 +404,7 @@
         width="240px"
       />
       <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
+      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
       <Button
         variant="secondary"

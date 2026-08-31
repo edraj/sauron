@@ -18,6 +18,8 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import FunnelChart from '../lib/components/FunnelChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
   import { lockTip } from '../lib/actions/lock-tip';
   import { toastStore } from '../lib/stores/toast.svelte';
@@ -36,12 +38,22 @@
   // The shared selection, falling back to this page's own 30 days.
   let range = $state<DateRangeValue>(rangeStore.effective(30));
 
-  let available = $state<TopEvent[]>([]);
+  /**
+   * Only the CATALOGUE is cached, not the builder.
+   *
+   * `loadEvents` seeds mutable state the user then edits — `steps`, `picked`,
+   * `result`. Caching those would either clobber an edited funnel on return or
+   * leave the builder empty on a hit, so the seeding below stays imperative
+   * and runs after `load` resolves, which it does for a cache hit and a fetch
+   * alike. What is cached is the pure server read: a 90-day top-events list.
+   */
+  const catalogView = new CachedView<TopEvent[]>();
+  const available = $derived(catalogView.data ?? []);
   let steps = $state<string[]>([]);
   let picked = $state('');
   let result = $state<FunnelResult | null>(null);
 
-  let loadingEvents = $state(true);
+  const loadingEvents = $derived(catalogView.loading);
   let computing = $state(false);
   let error = $state<string | null>(null);
   let refreshing = $state(false);
@@ -197,27 +209,26 @@
   }
 
   async function loadEvents(aid: string) {
-    loadingEvents = true;
     error = null;
     steps = [];
     result = null;
-    try {
-      // A fixed 90 days, NOT the picker's window: this list is the CATALOGUE
-      // of event names to build a funnel from, and narrowing it to the
-      // reporting window would hide steps the user wants to measure.
-      available = await topEvents(aid, { since_days: '90', limit: 50 });
-      picked = available[0]?.name ?? '';
-      if (available.length >= 2) {
-        // Prefill the first 3 (or 2) events and compute so the page isn't empty.
-        const n = Math.min(3, available.length);
-        steps = available.slice(0, n).map((e) => e.name);
-        void compute(aid, range);
-      }
-    } catch (err) {
-      error = errorMessage(err);
-      available = [];
-    } finally {
-      loadingEvents = false;
+    // A fixed 90 days, NOT the picker's window: this list is the CATALOGUE
+    // of event names to build a funnel from, and narrowing it to the
+    // reporting window would hide steps the user wants to measure.
+    await catalogView.load(
+      viewKey('funnel.catalogue', aid, sessionStore.scopeKey),
+      () => topEvents(aid, { since_days: '90', limit: 50 }),
+    );
+    if (catalogView.error) {
+      error = catalogView.error;
+      return;
+    }
+    picked = available[0]?.name ?? '';
+    if (available.length >= 2) {
+      // Prefill the first 3 (or 2) events and compute so the page isn't empty.
+      const n = Math.min(3, available.length);
+      steps = available.slice(0, n).map((e) => e.name);
+      void compute(aid, range);
     }
   }
 

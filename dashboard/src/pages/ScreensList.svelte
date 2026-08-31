@@ -13,6 +13,7 @@
   import { rangeStore } from '../lib/stores/range.svelte';
   import { rangeKey, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
   import { refreshRollups } from '../lib/api/rollups';
   import { approx } from '../lib/models/freshness';
@@ -163,6 +164,7 @@
       <DateRange value={range} onchange={onRange} />
       <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('screens.search')} width="240px" />
       <RollupChip />
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
     </div>
   </div>

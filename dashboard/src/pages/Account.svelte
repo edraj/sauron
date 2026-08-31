@@ -10,6 +10,7 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import NotificationSubscriptions from '../lib/components/account/NotificationSubscriptions.svelte';
   import LanguagePicker from '../lib/components/account/LanguagePicker.svelte';
@@ -229,6 +230,7 @@
       the instant paint is indistinguishable from live data. The click forces,
       because this button is also the only retry affordance on this page.
     -->
+    <Freshness fetchedAt={sessionsView.fetchedAt} revalidating={sessionsView.revalidating} />
     <RefreshButton onclick={() => void load(true)} loading={loading || revalidating} />
   </div>
 

@@ -14,6 +14,7 @@
   import TransactionDetailPanel from '../lib/components/TransactionDetailPanel.svelte';
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
   // Aliased: this page already imports `fromParams` from `time-filter` for
@@ -33,11 +34,11 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { listTransactions } from '../lib/api/transactions';
   import type { SearchEnvelope } from '../lib/api/search';
-  import { errorMessage, errorStatus } from '../lib/api/client';
   import { cursorOf, emptyPage, offsetOf, pageKey, pageNumber } from '../lib/models/cursor-page';
   import { cursorGoTo, setCursorSort, type CursorListState } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
   import { fromParams, toParams, type TimeField, type TimeFilterState } from '../lib/models/time-filter';
+  import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { httpStatusTone } from '../lib/models/timeline-row';
   import type { Transaction } from '../lib/models';
@@ -81,10 +82,17 @@
     sort: { key: initial.get('sort')?.replace(/^-/, '') ?? 'occurred_at', dir: initial.get('sort')?.startsWith('-') ? 'asc' : 'desc' },
   });
 
-  let page = $state.raw<SearchEnvelope<Transaction> | null>(null);
-  let loading = $state(false);
-  let error = $state<string | null>(null);
-  let errorStatusCode = $state<number | null>(null);
+  // Cached view (lib/stores/cached-view.svelte.ts). This page already hand-rolled
+  // the generation guard, the key discipline and the keep-rows-on-failure rule
+  // that primitive exists to own; using it means the rows also survive a
+  // navigation away and back, which is the part it could not do alone.
+  const view = new CachedView<SearchEnvelope<Transaction>>();
+
+  const page = $derived(view.data ?? null);
+  const loading = $derived(view.loading);
+  const revalidating = $derived(view.revalidating);
+  const error = $derived(view.error);
+  const errorStatusCode = $derived(view.errorStatus);
   let refreshing = $state(false);
   /** Row ids whose extras panel is open. */
   let expanded = $state(new Set<string>());
@@ -102,18 +110,14 @@
     expanded = next;
   }
 
-  /** The inputs that produced `page`, as a `viewKey` string. See `load`'s catch. */
-  let key = $state<string | null>(null);
-  let gen = 0;
-
   async function load(
     appId: string,
     filterList: string[],
     q: string,
     tf: TimeFilterState,
     l: CursorListState,
+    force = false,
   ) {
-    const myGen = ++gen;
     const k = viewKey(
       'transactions.list',
       appId,
@@ -134,61 +138,49 @@
       // page straight out of the cache, with no request on the wire to notice.
       pageKey(l.page),
     );
-    loading = true;
-    error = null;
-    errorStatusCode = null;
-    try {
-      const envelope = await listTransactions(appId, {
-        filters: filterList,
-        // `query`, NOT `q`. The FilterBar's box is a query-LANGUAGE input —
-        // its placeholder is generated from this resource's schema and reads
-        // `extra:…, @tag.key:value…`. Sent as `q` it goes through the legacy
-        // bridge, where `@tag.tier:premium` is one free-text term rather than
-        // a predicate: the box would offer a syntax it then matched literally
-        // and returned nothing for. `query` still accepts bare free text
-        // (verified: `query=order_id` and `q=order_id` return the same row),
-        // so nothing is lost by preferring it.
-        query: q.trim() || undefined,
-        // Sent only in `last` mode; `predicateParams` drops it whenever a
-        // bound is present, so the two can never both reach the wire.
-        sinceDays: tf.mode === 'last' ? tf.lastDays : undefined,
-        timeField: tf.field === DEFAULT_TIME_FIELD ? undefined : tf.field,
-        from: tf.from,
-        to: tf.to,
-        limit: LIMIT,
-        sort: sortParam(l.sort),
-        cursor: cursorOf(l.page),
-        offset: offsetOf(l.page),
-      });
-      if (myGen !== gen) return;
-      page = envelope;
-      key = k;
-      // A row's expansion is keyed on its id, and the ids on screen have just
-      // been replaced. Left alone, an id reappearing on a later page would come
-      // back already open — state from a view the reader has left.
-      expanded = new Set();
-    } catch (err) {
-      if (myGen !== gen) return;
-      error = errorMessage(err);
-      errorStatusCode = errorStatus(err);
-      // Keep the rows ONLY when the request that failed asked for exactly what
-      // is on screen (a Refresh or a Retry). Then they are still a true answer,
-      // merely older than asked for, and the banner says so. For any other key
-      // they answer a DIFFERENT question, and leaving them under the new chips
-      // would present them as the new result.
-      if (key !== k) {
-        page = null;
-        key = null;
-      }
-    } finally {
-      // Left to the newest call: a superseded one clearing this would drop the
-      // spinner while its replacement is still in flight.
-      if (myGen === gen) {
-        loading = false;
-        refreshing = false;
-      }
-    }
+    await view.load(
+      k,
+      () =>
+          listTransactions(appId, {
+          filters: filterList,
+          // `query`, NOT `q`. The FilterBar's box is a query-LANGUAGE input —
+          // its placeholder is generated from this resource's schema and reads
+          // `extra:…, @tag.key:value…`. Sent as `q` it goes through the legacy
+          // bridge, where `@tag.tier:premium` is one free-text term rather than
+          // a predicate: the box would offer a syntax it then matched literally
+          // and returned nothing for. `query` still accepts bare free text
+          // (verified: `query=order_id` and `q=order_id` return the same row),
+          // so nothing is lost by preferring it.
+          query: q.trim() || undefined,
+          // Sent only in `last` mode; `predicateParams` drops it whenever a
+          // bound is present, so the two can never both reach the wire.
+          sinceDays: tf.mode === 'last' ? tf.lastDays : undefined,
+          timeField: tf.field === DEFAULT_TIME_FIELD ? undefined : tf.field,
+          from: tf.from,
+          to: tf.to,
+          limit: LIMIT,
+          sort: sortParam(l.sort),
+          cursor: cursorOf(l.page),
+          offset: offsetOf(l.page),
+          }),
+      force,
+    );
   }
+
+  /**
+   * Collapse every expanded row whenever the payload changes.
+   *
+   * Expansion is keyed on row id and the ids on screen have just been
+   * replaced, so an id reappearing on a later page would come back already
+   * open — carrying state from a view the reader has left. This used to be an
+   * inline assignment on each successful load; driving it off the payload
+   * keeps it correct for a cache HIT too, which arrives without running the
+   * fetch at all.
+   */
+  $effect(() => {
+    page;
+    expanded = new Set();
+  });
 
   const staleError = $derived(error !== null && rows.length > 0);
   const fatalError = $derived(error !== null && rows.length === 0);
@@ -201,7 +193,9 @@
   function toPage(next: CursorListState) {
     const aid = sessionStore.currentAppId;
     list = next;
-    page = null;
+    // No `page = null` any more: a new key is a cache miss, and `CachedView`
+    // clears `data` on a miss for exactly this reason — leaving one page's
+    // rows under another's chips would present them as the new result.
     if (aid) void load(aid, encodeFilters(filters), appliedSearch, window_, next);
   }
 
@@ -234,7 +228,7 @@
     const aid = sessionStore.currentAppId;
     if (!aid) return;
     refreshing = true;
-    void load(aid, encodeFilters(filters), appliedSearch, window_, list);
+    void load(aid, encodeFilters(filters), appliedSearch, window_, list, true);
   }
 
   /**
@@ -283,7 +277,6 @@
     // which is why this effect never needs to *observe* it.
     const fresh: CursorListState = { page: emptyPage(), sort: untrack(() => list.sort) };
     list = fresh;
-    page = null;
     void load(aid, f, q, w, fresh);
   });
 
@@ -307,7 +300,8 @@
         <a href="#/performance">{t('perf.title')}</a> {t('transactions.aggregatedBy')}
       </p>
     </div>
-    <RefreshButton onclick={refresh} loading={refreshing} />
+    <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
   </div>
 
   <FilterBar
