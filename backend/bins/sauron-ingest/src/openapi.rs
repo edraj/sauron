@@ -157,7 +157,7 @@ accept telemetry for exactly one environment and can read nothing, so it is safe
 to embed in client code. The dashboard and administration API is a separate \
 service with its own document.",
         version = env!("CARGO_PKG_VERSION"),
-        license(name = "LGPL-3.0-only"),
+        license(name = "AGPL-3.0-only"),
     ),
     modifiers(&SecurityAddon),
     tags((name = "Ingest", description = "The telemetry write path, plus its liveness and readiness probes.")),
