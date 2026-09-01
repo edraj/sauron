@@ -1,6 +1,6 @@
 # Flutter SDK — `sauron_flutter`
 
-Error reporting **+** product analytics for Flutter, from one SDK (**v1.8.0**). It binds
+Error reporting **+** product analytics for Flutter, from one SDK (**v1.9.0**). It binds
 four uncaught-error capture layers (`FlutterError.onError`, `PlatformDispatcher.onError`,
 `Isolate.addErrorListener`, and a guarding zone) plus manual capture, analytics,
 screens, and breadcrumbs. Source: [`sdks/flutter`](../sdks/flutter).
