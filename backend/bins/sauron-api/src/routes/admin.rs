@@ -6,9 +6,9 @@ use axum::Json;
 use sauron_auth::{perm, AuthError, AuthUser};
 use sauron_db::repo;
 
-use crate::admin_storage::{collect_storage_cached, StorageReport};
 use crate::error::ApiError;
 use crate::openapi::ErrorResponse;
+use crate::view_cache::Envelope;
 use crate::AppState;
 
 /// Storage & record report for the orgs the caller administers.
@@ -30,7 +30,7 @@ Rejects `?environment_id=`: storage is a deployment-wide question and \
 environment-scoping it would silently answer something else.",
     security(("bearerAuth" = [])),
     responses(
-        (status = 200, description = "Database, table and per-app sizes.", body = StorageReport),
+        (status = 200, description = "Database, table and per-app sizes, in a cache envelope: a cold read answers `computing` with a null `data` and the report follows.", body = Envelope),
         (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
         (status = 400, description = "`environment_id` is not supported here.", body = ErrorResponse),
     ),
@@ -39,7 +39,7 @@ pub async fn storage(
     auth: AuthUser,
     State(state): State<AppState>,
     Query(env): Query<super::scope::RejectEnvQuery>,
-) -> Result<Json<StorageReport>, ApiError> {
+) -> Result<Json<Envelope>, ApiError> {
     // The report is a per-org rollup across every app; there is no single
     // environment to scope it to, so the parameter is rejected rather than
     // silently accepted-and-ignored.
@@ -79,8 +79,71 @@ pub async fn storage(
         )
     );
 
-    let report = collect_storage_cached(&state, &org_ids, &key).await?;
-    Ok(Json(report))
+    // Never awaits the report. `collect_storage` counts rows per app per tiered
+    // table — measured at 8.6 s for ONE app on a 63M/16M/34M-row dataset, and it
+    // scales with both apps in scope and retained rows. Run on the request path
+    // behind a read-through cache, one unlucky caller per TTL paid all of it and
+    // crossed the 60 s budget, which is a 503 with nothing behind it.
+    let (envelope, should_recompute) =
+        crate::view_cache::read(&state.redis, &key, &STORAGE_POLICY, false).await;
+    if should_recompute {
+        enqueue_storage(&state, org_ids, key);
+    }
+    Ok(Json(envelope))
+}
+
+/// Storage sizes move slowly, so the freshness window is generous; the TTL is
+/// far longer still so there is always something to paint. See
+/// `view_cache`'s module docs for why these are two different numbers.
+const STORAGE_POLICY: crate::view_cache::CachePolicy = crate::view_cache::CachePolicy {
+    fresh_for: chrono::Duration::minutes(5),
+    ttl_secs: 24 * 60 * 60,
+    fail_backoff_secs: 60,
+};
+
+/// Recompute one storage report off the request path.
+fn enqueue_storage(state: &AppState, org_ids: Vec<uuid::Uuid>, key: String) {
+    let Some(guard) = state.view_cache.claim(&key) else {
+        return; // already running; both callers read the same entry when it lands
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        // Held for the whole recompute, including the permit wait, so a
+        // panicking pass cannot wedge the key until the process restarts.
+        let _guard = guard;
+        let Ok(_permit) = state.view_cache.permits().acquire_owned().await else {
+            return; // semaphore closed — shutting down
+        };
+        let started = chrono::Utc::now();
+        match crate::admin_storage::collect_storage(&state, &org_ids).await {
+            Ok(report) => match serde_json::to_value(&report) {
+                Ok(data) => {
+                    let entry = crate::view_cache::CacheEntry {
+                        data,
+                        computed_at: started,
+                    };
+                    crate::view_cache::cache_put(
+                        &state.redis,
+                        &key,
+                        &entry,
+                        STORAGE_POLICY.ttl_secs,
+                    )
+                    .await;
+                }
+                Err(e) => tracing::warn!(error = %e, "storage report did not serialize"),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "storage report recompute failed");
+                crate::view_cache::fail_put(
+                    &state.redis,
+                    &key,
+                    &e.to_string(),
+                    STORAGE_POLICY.fail_backoff_secs,
+                )
+                .await;
+            }
+        }
+    });
 }
 
 // ===========================================================================

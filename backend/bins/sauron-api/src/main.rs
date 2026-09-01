@@ -107,6 +107,10 @@ pub struct AppState {
     /// page. Its aggregates outgrew the 30s request timeout, so they no longer
     /// run on the request path at all — see `overview_cache`'s module docs.
     pub overview_cache: crate::overview_cache::OverviewCache,
+    /// Single-flight + the recompute ceiling for every OTHER cached route.
+    /// Separate from `overview_cache` only because that one also owns an SSE
+    /// bus; the caching half is the same mechanism (`crate::view_cache`).
+    pub view_cache: crate::view_cache::ViewCache,
     /// Whether `event_users.identified_at` exists, probed once at boot.
     ///
     /// Probed rather than assumed because RPM upgrades do not re-run
@@ -298,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
         mail,
         active_users_gate: Arc::new(tokio::sync::Semaphore::new(3)),
         overview_cache: crate::overview_cache::OverviewCache::new(),
+        view_cache: crate::view_cache::ViewCache::new(3),
         event_users_identified,
     };
 

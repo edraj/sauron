@@ -16,6 +16,7 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
+  import { envelopeStatus } from '../lib/models/freshness';
   import type { ViewEnvelope } from '../lib/api/overview';
   import { viewKey } from '../lib/stores/view-cache';
   import { listEnvironments } from '../lib/api/environments';
@@ -65,9 +66,26 @@
    * what stops a cold read occupying a request until the timeout turns it into
    * a 503, which is what this page was reported for.
    */
-  const computing = $derived(envelope?.state === 'computing');
+  /**
+   * How to read the envelope — see `envelopeStatus`, which is where the rule
+   * lives and is tested.
+   *
+   * A failed server-side recompute arrives as HTTP 200 with
+   * `{state:"computing", data:null, error:"…"}`. Read through `view.error`
+   * alone that is a success with nothing in it, and this page polls forever on
+   * a skeleton while the reason sits unread in the payload.
+   */
+  const status = $derived(
+    envelopeStatus({
+      state: envelope?.state,
+      error: envelope?.error,
+      hasData: report !== null,
+      viewError: view.error,
+    }),
+  );
+  const computing = $derived(status.computing);
   const revalidating = $derived(view.revalidating);
-  const error = $derived(view.error);
+  const error = $derived(status.error);
 
   let refreshing = $state(false);
   let exporting = $state(false);
@@ -163,7 +181,7 @@
    * sit on `computing` forever, having stopped asking.
    */
   $effect(() => {
-    if (!computing) return;
+    if (!status.shouldPoll) return;
     const pid = sessionStore.currentProjectId;
     if (!pid) return;
     const params = { from, to, selection: encodeSelection(selection) };

@@ -180,6 +180,7 @@ const TRANSACTION_SCHEMA = {
 };
 
 let activeUsersCalls = 0;
+let storageCalls = 0;
 
 function stubApi() {
   const root = fileURLToPath(new URL('./daymodal-harness', import.meta.url));
@@ -231,6 +232,16 @@ function stubApi() {
           console.log(`[daymodal] active-users call #${activeUsersCalls}`);
           if (activeUsersCalls === 1) {
             return json(res, { state: 'computing', computed_at: null, data: null });
+          }
+          // Call #2 is a FAILED recompute: HTTP 200, still `computing`, with the
+          // reason in `error`. The page must show it and stop polling.
+          if (activeUsersCalls === 2) {
+            return json(res, {
+              state: 'computing',
+              computed_at: null,
+              data: null,
+              error: 'canceling statement due to statement timeout',
+            });
           }
           return json(res, {
             state: 'fresh',
@@ -286,6 +297,66 @@ function stubApi() {
           });
         }
         if (path === '/v1/monitors/abc/checks') return json(res, []);
+
+
+        // Wall of Shame. The facets matter: the selects are built from them, and
+        // the reported symptom is that picking one does not stick.
+
+        // Admin storage: `computing` first, then the report — so the page's
+        // poll-and-converge is what is actually being checked.
+        if (path === '/v1/admin/storage') {
+          storageCalls += 1;
+          console.log(`[daymodal] storage call #${storageCalls}`);
+          if (storageCalls === 1) {
+            return json(res, { state: 'computing', computed_at: null, data: null });
+          }
+          return json(res, {
+            state: 'fresh',
+            computed_at: '2026-08-31T21:00:00Z',
+            data: {
+              database: {
+                total_bytes: 66571993088,
+                physical_bytes: 90194313216,
+                cold_bytes: 0,
+                full_scope: true,
+                tables: [
+                  { name: 'analytics_events', total_bytes: 66571993088, hot_rows: 63064258, tiered: true },
+                  { name: 'error_events', total_bytes: 23622320128, hot_rows: 15923552, tiered: true },
+                ],
+              },
+              apps: [
+                {
+                  app_id: 'app1',
+                  app_name: 'Harness App',
+                  project_name: 'Harness Project',
+                  org_name: 'Harness Org',
+                  tables: [],
+                  hot_rows_total: 63064258,
+                  cold_rows_total: 0,
+                  cold_bytes_total: 0,
+                  estimated_hot_bytes_total: 66571993088,
+                  cold_files: [],
+                  cold_files_total: 0,
+                },
+              ],
+            },
+          });
+        }
+
+        if (path === '/v1/admin/audit') {
+          console.log(`[daymodal] audit ${req.url}`);
+          return json(res, {
+            entries: [],
+            next_cursor: null,
+            facets: {
+              actors: [{ id: 'u1', label: 'ada@example.com', count: 3 }],
+              actions: [{ id: 'app.create', label: 'app.create', count: 2 }],
+              projects: [{ id: 'proj1', label: 'Harness Project', count: 5 }],
+              apps: [{ id: 'app1', label: 'Harness App', count: 5 }],
+              environments: [{ id: 'env1', label: 'production', count: 4 }],
+            },
+          });
+        }
 
         if (path === '/v1/apps/app1/performance/summary') {
           const op0 = params.get('op');

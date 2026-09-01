@@ -24,11 +24,6 @@ use sauron_tier::{parse_cold_path, TIERED_TABLES};
 
 use crate::AppState;
 
-/// How long an assembled report stays warm. Storage figures move slowly; a
-/// minute of staleness is invisible to a human reading the page but collapses
-/// repeated loads (and refresh-spamming) onto one computation.
-const CACHE_TTL_SECS: u64 = 60;
-
 /// Cap on the per-app cold-file inventory returned to the client. A long-lived
 /// app can accumulate tens of thousands of Parquet files; the full list is
 /// unbounded response size and memory for no added insight.
@@ -121,25 +116,6 @@ struct WalkedFile {
     app_id: Uuid,
     path: String,
     bytes: i64,
-}
-
-/// Assemble the report for the apps in `org_ids`, serving a cached copy when one
-/// is warm. `cache_key` distinguishes callers with different visible scopes.
-pub async fn collect_storage_cached(
-    state: &AppState,
-    org_ids: &[Uuid],
-    cache_key: &str,
-) -> anyhow::Result<StorageReport> {
-    if let Ok(Some(hit)) = state.redis.get(cache_key).await {
-        if let Ok(report) = serde_json::from_str::<StorageReport>(&hit) {
-            return Ok(report);
-        }
-    }
-    let report = collect_storage(state, org_ids).await?;
-    if let Ok(json) = serde_json::to_string(&report) {
-        let _ = state.redis.set_ex(cache_key, &json, CACHE_TTL_SECS).await;
-    }
-    Ok(report)
 }
 
 pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Result<StorageReport> {

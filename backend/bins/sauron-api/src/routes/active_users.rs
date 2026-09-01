@@ -379,7 +379,9 @@ const ACTIVE_USERS_RATE_WINDOW_SECS: u64 = 60;
 
 /// Budget for one Redis command.
 ///
-/// Do NOT copy `collect_storage_cached`'s untimed `get`/`set_ex`.
+/// Every cache read and write goes through `view_cache`, which wraps each in
+/// a timeout: sauron-redis HANGS rather than errors against a dead Redis, so an
+/// untimed `get`/`set_ex` on a request path is an unbounded wait.
 /// `sauron-redis` builds its connection with `set_response_timeout(None)`, and
 /// `routes/auth.rs` records the measurement: 9-19 s per command against a dead
 /// Redis, "long enough that the in-flight cap fills and the whole API stalls".
