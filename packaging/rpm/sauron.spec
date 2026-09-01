@@ -8,11 +8,11 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.8.0
+Version:        1.8.1
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
-License:        LGPL-3.0-only
+License:        AGPL-3.0-only
 URL:            https://github.com/splimter/sauron
 Source0:        %{name}-%{version}.tar.gz
 
@@ -308,7 +308,7 @@ fi
 %{_libexecdir}/sauron/sauron-dashboard-config || :
 
 %files
-%license LICENSE COPYING
+%license LICENSE
 %doc README.md
 %dir %{_sysconfdir}/sauron
 %attr(0640,root,sauron) %config(noreplace) %{_sysconfdir}/sauron/sauron.env
@@ -364,6 +364,21 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Tue Sep 01 2026 Kefah Issa <kefah@oodi.iq> - 1.8.1-1
+- Licence scope corrected. 1.8.0 relicensed the whole tree LGPL-3.0-only; only the
+  client SDKs under sdks/ were meant to move. The server -- the backend workspace and
+  the dashboard, i.e. everything this package ships -- returns to AGPL-3.0-only, and
+  the Affero network-use clause applies to it again: running a modified Sauron as a
+  hosted service does oblige the operator to offer users the corresponding source.
+- The SDKs stay LGPL-3.0-only and are unchanged, so an application linking one is
+  still not pulled into copyleft. That separation was the aim of the 1.8.0 change and
+  it survives intact.
+- This package ships LICENSE (AGPLv3) only. The GPLv3 COPYING text added at the repo
+  root in 1.8.0 was there as the base LGPLv3 extends; AGPL-3.0 is standalone and needs
+  no companion text, so root COPYING is removed. Each SDK keeps its own pair.
+- Agreed with the author of the 1.8.0 change before this was made. Note that 1.8.0 was
+  tagged and public: anyone who took the server under LGPL from that tag keeps those
+  terms for that version. This corrects 1.8.1 onward, it does not retract 1.8.0.
 * Mon Aug 31 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.8.0-1
 - Relicensed from AGPL-3.0-only to LGPL-3.0-only. LGPLv3 is a set of additional
   permissions on top of GPLv3, so the package now ships both texts: LICENSE

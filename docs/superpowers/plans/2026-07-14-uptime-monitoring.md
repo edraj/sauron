@@ -12,7 +12,7 @@
 
 Copied verbatim from the spec and the repo's existing conventions — every task implicitly includes these:
 
-- **Rust:** `edition = "2021"`, `rust-version = "1.82"`, `license = "LGPL-3.0-only"` (inherited via `*.workspace = true`).
+- **Rust:** `edition = "2021"`, `rust-version = "1.82"`, `license = "AGPL-3.0-only"` (inherited via `*.workspace = true`).
 - **DB access:** diesel-async over `AsyncPgConnection`; typed diesel for CRUD, `diesel::sql_query(...).bind::<SqlType, _>(...)` for aggregates (mirror `repo::create_saved_funnel`). All timestamps `chrono::Utc::now()`.
 - **Migrations:** `backend/migrations/YYYY-MM-DD-NNNNNN_name/{up,down}.sql`; this feature uses **`2026-07-14-000009_monitors`** (next after `000008`). `schema.rs` is hand-maintained to match.
 - **RBAC:** permission strings live in `sauron-auth::rbac::perm`; `perm::ALL` array length must equal the const count; preset roles are re-synced at API startup by `ensure_preset_roles`.
