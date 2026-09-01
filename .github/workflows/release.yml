@@ -286,6 +286,47 @@ jobs:
           n=$(grep -c '"purl"' "sauron-${VER}.cdx.json" || true)
           echo "SBOM components: $n"
           [ "${n:-0}" -ge 1 ]
+
+      # syft enumerates the crate graph from Cargo.lock, and a lockfile has no
+      # licence field -- so every component it emits arrives with no licence at
+      # all. Measured before this step existed: 487 components, 487 unlicensed.
+      # In Dependency-Track that is indistinguishable from 487 genuinely
+      # unlicensed dependencies, and it buries any real finding.
+      #
+      # The licence is not missing, only unread: each crate declares it in its
+      # own Cargo.toml, which is exactly what `cargo metadata` reports. Reading
+      # it there rather than from the crates.io API is deliberate -- it is the
+      # manifest the crate was published with, it has no rate limit, and it
+      # covers this workspace's own 25 crates, which are unpublished and so
+      # cannot be looked up in any registry at all.
+      - name: Install Rust (for cargo metadata)
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Fill licences from cargo metadata
+        env:
+          VER: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo metadata --manifest-path backend/Cargo.toml \
+            --format-version 1 --locked > cargo-meta.json
+          python3 packaging/sbom/fill-cargo-licences.py \
+            "sauron-${VER}.cdx.json" cargo-meta.json | tee fill.log
+
+          # Gate the result. Without this the step can silently go back to
+          # emitting a licence-free SBOM -- a rustup or cargo change that makes
+          # the metadata call fail open would look identical to success in the
+          # artifact, which is how this regressed unnoticed in the first place.
+          still=$(sed -n 's/^ *still unlicensed *: *//p' fill.log)
+          echo "unlicensed after fill: ${still}"
+          if [ "${still:-999}" -gt 25 ]; then
+            echo "::error::${still} components still have no licence (limit 25)."
+            echo "A handful is expected -- crates that ship license-file instead"
+            echo "of a license field. Hundreds means the fill did not run."
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: sbom
