@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.8.1 - 2026-09-01
+## 1.9.0 - 2026-09-01
 
 ### Changed
 
@@ -13,10 +13,10 @@
 - The relicence landed in the repository on 2026-08-31, *after* 1.8.0 had been
   published on 2026-08-16. pub.dev versions are immutable, so 1.8.0 remains
   available under the terms it was published with and cannot be changed.
-  **1.8.1 is the first release carrying LGPL-3.0-only**; anyone relying on the
+  **1.9.0 is the first release carrying LGPL-3.0-only**; anyone relying on the
   new terms must move off 1.8.0.
 - No functional change. The SDK version reported in envelope headers
-  (`kSauronSdkVersion`) advances to 1.8.1 with the release.
+  (`kSauronSdkVersion`) advances to 1.9.0 with the release.
 
 
 ## 1.8.0 - 2026-08-16
