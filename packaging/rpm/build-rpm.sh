@@ -104,7 +104,7 @@ tar czf "$topdir/SOURCES/${name}-${version}.tar.gz" \
     --exclude='.cache' \
     --exclude='tmp' \
     --transform "s,^,${name}-${version}/," \
-    backend dashboard packaging LICENSE COPYING README.md
+    backend dashboard packaging LICENSE README.md
 
 echo ">> Copying auxiliary SourceN files into SOURCES"
 install -m0644 packaging/rpm/systemd/sauron-api.service      "$topdir/SOURCES/"
