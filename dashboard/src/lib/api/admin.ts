@@ -1,3 +1,4 @@
+import type { ViewEnvelope } from './overview';
 import { api } from './client';
 
 // ---------------------------------------------------------------------------
@@ -62,8 +63,13 @@ export interface StorageReport {
   apps: AppStorage[];
 }
 
-export async function getAdminStorage(): Promise<StorageReport> {
-  const { data } = await api.get<StorageReport>('/v1/admin/storage');
+/**
+ * The report arrives inside a cache envelope: counting rows per app per tiered
+ * table is measured in seconds and scales with retained data, so it moved off
+ * the request path. A cold read answers `computing` with a null `data`.
+ */
+export async function getAdminStorage(): Promise<ViewEnvelope<StorageReport>> {
+  const { data } = await api.get<ViewEnvelope<StorageReport>>('/v1/admin/storage');
   return data;
 }
 

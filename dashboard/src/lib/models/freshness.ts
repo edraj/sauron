@@ -2,6 +2,7 @@
 // the RollupChip component is only wiring around this (house rule: no
 // component-render harness; logic lives here with a co-located test).
 import { t } from '../i18n';
+import { localeStore } from '../i18n/locale.svelte';
 import { formatTime } from '../utils/format';
 import type { RollupStatus } from './index';
 
@@ -36,14 +37,15 @@ export function approx(formatted: string, active: boolean): string {
   return active ? `≈${formatted}` : formatted;
 }
 
-/// Past this, the "as of" chip turns warning-toned.
+/// Past this, the "as of" stamp is emphasised.
 ///
-/// Three times the rollup chip's threshold, deliberately. A view cache is
-/// ALLOWED to be old — the contract is "numbers may be up to an hour old and
-/// the page says how old" — so warning at five minutes would be permanently on
-/// for an endpoint behaving exactly as designed, and a warning that is always
-/// lit conveys nothing.
-export const DEFAULT_STALE_AFTER_MS = 15 * 60 * 1000;
+/// SIX HOURS, not the fifteen minutes this started at. A view cache is ALLOWED
+/// to be old — `/active-users` serves up to three hours by design — so a
+/// threshold inside the normal range lit the warning permanently on pages
+/// behaving exactly as intended, which is both wrong and, once it is always
+/// on, meaningless. The stamp is passive metadata; it should read as an alert
+/// only when the age is genuinely surprising.
+export const DEFAULT_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
 
 export interface ViewFreshnessInput {
   /** The server's own stamp, where the endpoint discloses one. */
@@ -72,6 +74,16 @@ export interface ViewFreshnessView {
 /// wrong, in the one place the reader is looking to find out how old it is.
 /// The local stamp is the fallback for endpoints computed per request, where it
 /// is the only clock there is and an accurate one.
+/// Hours and minutes, never seconds.
+///
+/// `formatTime` includes seconds, which is precision nobody reads on a
+/// staleness stamp and which made the chip wide enough to compete with the
+/// buttons beside it. Local rather than a change to `formatTime`, which the
+/// rollup chip and other callers share.
+function hhmm(d: Date): string {
+  return d.toLocaleTimeString(localeStore.tag, { hour: '2-digit', minute: '2-digit' });
+}
+
 export function viewFreshness(
   input: ViewFreshnessInput,
   now: Date = new Date(),
@@ -101,7 +113,7 @@ export function viewFreshness(
   if (at === null) return null;
 
   return {
-    label: t('time.asOf', { time: formatTime(at) }),
+    label: t('time.asOf', { time: hhmm(at) }),
     title: at.toISOString(),
     updating: revalidating,
     tone: now.getTime() - at.getTime() > staleAfterMs ? 'warning' : 'neutral',
@@ -133,5 +145,50 @@ export function combineFreshness(sources: FreshnessSource[]): FreshnessSource | 
   return {
     fetchedAt: Math.min(...stamped.map((s) => s.fetchedAt)),
     revalidating: sources.some((s) => s.revalidating === true),
+  };
+}
+
+/// What a page should do with a cache envelope.
+export interface EnvelopeStatusInput {
+  /** `ViewEnvelope.state`; absent for endpoints that return no envelope. */
+  state?: 'fresh' | 'stale' | 'computing';
+  /** `ViewEnvelope.error` — the server's last RECOMPUTE failed. */
+  error?: string | null;
+  /** Whether the page currently has a payload to render. */
+  hasData: boolean;
+  /** `CachedView.error` — the request itself failed. */
+  viewError?: string | null;
+}
+
+export interface EnvelopeStatus {
+  error: string | null;
+  /** Waiting on the server's first compute, with nothing to show meanwhile. */
+  computing: boolean;
+  /** Ask again shortly. */
+  shouldPoll: boolean;
+}
+
+/// Read a cache envelope the way a page has to.
+///
+/// The subtlety, and the reason this is tested rather than inlined: a failed
+/// server-side recompute is an HTTP **200** carrying
+/// `{state:"computing", data:null, error:"…"}`. A page that reads only the
+/// transport error sees a success with nothing in it, renders a skeleton and
+/// polls forever — while the reason sits unread in the payload and the server's
+/// failure backoff means nothing is retrying either. That is a perpetual
+/// spinner with a diagnosable cause one field away, and it shipped once.
+///
+/// `viewError` wins when both are present: it means the read never landed, so
+/// the envelope beside it is from an older response or absent entirely.
+export function envelopeStatus(input: EnvelopeStatusInput): EnvelopeStatus {
+  const { state, error = null, hasData, viewError = null } = input;
+  const combined = viewError ?? error ?? null;
+  const computing = state === 'computing' && !hasData && combined === null;
+  return {
+    error: combined,
+    computing,
+    // Never poll through a failure: the server is backing off, so asking again
+    // returns the same failure and only adds load.
+    shouldPoll: computing,
   };
 }

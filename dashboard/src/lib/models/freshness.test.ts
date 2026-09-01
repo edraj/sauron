@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { approx, combineFreshness, rollupChip, viewFreshness } from './freshness';
+import { approx, combineFreshness, envelopeStatus, rollupChip, viewFreshness } from './freshness';
 
 const NOW = new Date('2026-08-25T12:00:00Z');
 
@@ -62,7 +62,10 @@ describe('viewFreshness', () => {
       now,
     );
     expect(v!.source).toBe('server');
-    expect(v!.tone).toBe('warning');
+    // Three hours is NOT a warning: `/active-users` serves up to that by
+    // design, and a threshold inside the normal range lights permanently on a
+    // page behaving exactly as intended. See `DEFAULT_STALE_AFTER_MS`.
+    expect(v!.tone).toBe('neutral');
   });
 
   it('falls back to the local stamp when the endpoint discloses none', () => {
@@ -133,5 +136,56 @@ describe('combineFreshness', () => {
     expect(
       combineFreshness([{ fetchedAt: 1, revalidating: false }])!.revalidating,
     ).toBe(false);
+  });
+});
+
+describe('envelopeStatus', () => {
+  it('is computing with nothing to show on a cold read', () => {
+    const s = envelopeStatus({ state: 'computing', hasData: false });
+    expect(s).toEqual({ error: null, computing: true, shouldPoll: true });
+  });
+
+  /**
+   * The bug this exists to stop coming back. A failed server-side recompute
+   * returns HTTP 200 with `{state:"computing", data:null, error:"…"}`. Read
+   * only through the transport error, that is a success with nothing in it —
+   * so the page renders a skeleton and polls forever while the reason sits
+   * unread in the payload. The server also suppresses re-enqueue behind a
+   * failure backoff, so nothing is even retrying.
+   */
+  it('surfaces a failed recompute and stops polling', () => {
+    const s = envelopeStatus({
+      state: 'computing',
+      hasData: false,
+      error: 'relation "event_users" does not exist',
+    });
+    expect(s.error).toBe('relation "event_users" does not exist');
+    expect(s.shouldPoll).toBe(false);
+  });
+
+  it('keeps stale data on screen when a refresh fails', () => {
+    const s = envelopeStatus({ state: 'stale', hasData: true, error: 'timed out' });
+    expect(s.error).toBe('timed out');
+    expect(s.computing).toBe(false);
+    expect(s.shouldPoll).toBe(false);
+  });
+
+  it('prefers the transport error, which means the read never landed', () => {
+    const s = envelopeStatus({ state: 'computing', hasData: false, viewError: '503' });
+    expect(s.error).toBe('503');
+    expect(s.shouldPoll).toBe(false);
+  });
+
+  it('does not poll once the data has arrived', () => {
+    expect(envelopeStatus({ state: 'fresh', hasData: true }).shouldPoll).toBe(false);
+  });
+
+  /** An endpoint that returns no envelope at all is not "computing". */
+  it('treats a missing envelope as nothing to wait for', () => {
+    expect(envelopeStatus({ hasData: true })).toEqual({
+      error: null,
+      computing: false,
+      shouldPoll: false,
+    });
   });
 });

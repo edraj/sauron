@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
@@ -166,7 +167,15 @@
   // and reload the page in a loop.
   $effect(() => {
     const fromUrl = filtersFromQuery($querystring ?? '');
-    if (!sameFilters(fromUrl, filters)) filters = fromUrl;
+    // `untrack` on `filters` is load-bearing: this is the URL -> state
+    // direction ONLY. Read reactively, this effect also re-runs when the USER
+    // changes a filter — and at that moment the URL has not been rewritten yet
+    // (that is the effect below), so it compares the new selection against the
+    // stale URL, finds them different, and writes the URL's value back. Every
+    // dropdown on the page then snaps to its previous value the instant it is
+    // changed. Measured before this fix: Range 7d -> 24h reverted to 7d within
+    // 600 ms, with the address bar never updating.
+    if (!sameFilters(fromUrl, untrack(() => filters))) filters = fromUrl;
   });
 
   // Keep the address bar in step so a filtered view is linkable. `replace`,

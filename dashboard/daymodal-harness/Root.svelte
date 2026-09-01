@@ -15,6 +15,8 @@
   import FunnelBuilder from '../src/pages/FunnelBuilder.svelte';
   import Inspector from '../src/pages/Inspector.svelte';
   import Purge from '../src/pages/Purge.svelte';
+  import WallOfShame from '../src/pages/WallOfShame.svelte';
+  import Storage from '../src/pages/Storage.svelte';
 
   const routes = { '/performance': Performance, '/active-users': ActiveUsers,
     '/transactions': Transactions,
@@ -23,7 +25,9 @@
     '/environments': Environments,
     '/funnels': FunnelBuilder,
     '/inspector': Inspector,
-    '/purge': Purge, '*': Performance };
+    '/purge': Purge,
+    '/admin/wall-of-shame': WallOfShame,
+    '/admin/storage': Storage, '*': Performance };
 </script>
 
 <Router {routes} />

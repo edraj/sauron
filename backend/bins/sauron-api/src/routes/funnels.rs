@@ -89,7 +89,7 @@ pub async fn compute(
     Path(app_id): Path<Uuid>,
     RawQuery(raw_query): RawQuery,
     Json(req): Json<FunnelReq>,
-) -> Result<Json<FunnelResult>, ApiError> {
+) -> Result<Json<crate::view_cache::Envelope>, ApiError> {
     if req.steps.len() < 2 {
         return Err(ApiError::BadRequest(
             "a funnel needs at least 2 steps".into(),
@@ -117,18 +117,141 @@ pub async fn compute(
         365,
     )?;
 
-    let rows = repo::funnel(&mut conn, scope, &req.steps, win).await?;
+    drop(conn);
+
+    // Never awaits the funnel. Measured on a 34M-event / 7-day window, WITH the
+    // per-step `occurred_at` bound already in place: a THREE-step funnel takes
+    // 12.97 s, and each additional step is another pass. Run on the request path
+    // that is most of the 60 s budget spent before anything can be rendered, and
+    // past it a 503 with nothing behind it.
+    let key = funnel_cache_key(app_id, &scope, &win, &req.steps)?;
+    let (envelope, should_recompute) =
+        crate::view_cache::read(&state.redis, &key, &FUNNEL_POLICY, false).await;
+    if should_recompute {
+        enqueue_funnel(&state, scope, win, req.steps.clone(), key);
+    }
+    Ok(Json(envelope))
+}
+
+/// A funnel is re-run from the builder as the user edits it, so the freshness
+/// window is short — a stale answer to a funnel someone is actively editing is
+/// worth less than for a dashboard tile. The TTL is long so returning to a
+/// funnel already computed is instant.
+const FUNNEL_POLICY: crate::view_cache::CachePolicy = crate::view_cache::CachePolicy {
+    fresh_for: chrono::Duration::minutes(10),
+    ttl_secs: 24 * 60 * 60,
+    fail_backoff_secs: 60,
+};
+
+/// The document the funnel cache key hashes.
+///
+/// JSON, never a join: `steps` is a variable-length list of free-form event
+/// names, so any flattening lets two different funnels collide — and an entry
+/// holds one app's counts, which makes a collision a cross-tenant data leak
+/// rather than a staleness bug. Same rule as `active_users::cache_key`; treat
+/// deviation as Critical in review.
+#[derive(serde::Serialize)]
+struct FunnelFingerprint<'a> {
+    app_id: Uuid,
+    /// The RESOLVED environment filter, never the requested token — that is
+    /// what stops a caller with app-wide reach sharing an entry with one that
+    /// can only see a single environment.
+    env: String,
+    from: chrono::DateTime<Utc>,
+    to: Option<chrono::DateTime<Utc>>,
+    steps: &'a [String],
+}
+
+fn funnel_cache_key(
+    app_id: Uuid,
+    scope: &sauron_db::scope::ReadScope,
+    win: &sauron_db::scope::Range,
+    steps: &[String],
+) -> Result<String, ApiError> {
+    let fingerprint = FunnelFingerprint {
+        app_id,
+        env: crate::view_cache::env_token(&scope.env),
+        from: win.from,
+        to: win.to,
+        steps,
+    };
+    let json =
+        serde_json::to_string(&fingerprint).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(format!(
+        "sauron:funnel:v1:{}",
+        sauron_auth::hash_token(&json)
+    ))
+}
+
+/// Recompute one funnel off the request path.
+fn enqueue_funnel(
+    state: &AppState,
+    scope: sauron_db::scope::ReadScope,
+    win: sauron_db::scope::Range,
+    steps: Vec<String>,
+    key: String,
+) {
+    let Some(guard) = state.view_cache.claim(&key) else {
+        return; // already running; both callers read the entry when it lands
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let Ok(_permit) = state.view_cache.permits().acquire_owned().await else {
+            return; // semaphore closed — shutting down
+        };
+        let started = Utc::now();
+        let outcome = async {
+            let mut conn = crate::routes::db(&state).await?;
+            let rows = repo::funnel(&mut conn, scope, &steps, win)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok::<_, ApiError>(assemble_funnel(&steps, rows))
+        }
+        .await;
+        match outcome {
+            Ok(result) => match serde_json::to_value(&result) {
+                Ok(data) => {
+                    let entry = crate::view_cache::CacheEntry {
+                        data,
+                        computed_at: started,
+                    };
+                    crate::view_cache::cache_put(
+                        &state.redis,
+                        &key,
+                        &entry,
+                        FUNNEL_POLICY.ttl_secs,
+                    )
+                    .await;
+                }
+                Err(e) => tracing::warn!(error = %e, "funnel result did not serialize"),
+            },
+            Err(e) => {
+                tracing::warn!(error = ?e, "funnel recompute failed");
+                crate::view_cache::fail_put(
+                    &state.redis,
+                    &key,
+                    &format!("{e:?}"),
+                    FUNNEL_POLICY.fail_backoff_secs,
+                )
+                .await;
+            }
+        }
+    });
+}
+
+/// Turn the per-step rows into the response. Extracted so the request path and
+/// the background recompute cannot drift into computing conversions differently.
+fn assemble_funnel(steps: &[String], rows: Vec<repo::FunnelStepCount>) -> FunnelResult {
     // rows come back ordered by step; index defensively by step id.
-    let mut counts = vec![0i64; req.steps.len()];
+    let mut counts = vec![0i64; steps.len()];
     for r in rows {
         if let Some(slot) = counts.get_mut(r.step as usize) {
             *slot = r.count;
         }
     }
-
     let total = counts.first().copied().unwrap_or(0);
-    let steps = req
-        .steps
+    let out_steps = steps
         .iter()
         .enumerate()
         .map(|(i, name)| {
@@ -142,11 +265,10 @@ pub async fn compute(
             }
         })
         .collect();
-
-    Ok(Json(FunnelResult {
+    FunnelResult {
         total_entered: total,
-        steps,
-    }))
+        steps: out_steps,
+    }
 }
 
 fn ratio(num: i64, den: i64) -> f64 {

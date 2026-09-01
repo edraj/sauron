@@ -1,7 +1,7 @@
 # Server-side view cache + honest freshness — design
 
-**Status:** slices 2, 3, 4, 6 built and verified. Slice 5 MEASURED AND NOT
-JUSTIFIED (see below). Slice 1 outstanding (operator change on the deployment).
+**Status:** slices 2–6 built and verified. Slice 1 outstanding (operator change
+on the deployment).
 **Date:** 2026-08-31
 **Supersedes:** nothing. Generalises the pattern proven in
 `bins/sauron-api/src/overview_cache.rs` (Overview only) and
@@ -133,6 +133,13 @@ One component, `<Freshness>`, rendering two independent facts:
 - **whether a refresh is in flight** — `CachedView.revalidating`, or
   `state == "computing"`.
 
+Rendered as QUIET TEXT, not a `Badge`. Shipped first as a bordered badge with a
+tone, which gave passive metadata the same visual weight as the Export and
+Refresh buttons beside it, and lit amber at 15 minutes — permanently on for
+endpoints behaving exactly as designed. Now plain `--text-faint` text, no
+seconds, and the staleness threshold is SIX HOURS (`/active-users` serves up to
+three by design, so anything shorter alarms on correct behaviour).
+
 They must stay visually distinct. "Updating…" next to a timestamp must not
 imply the figure is nearly current: `/active-users` can serve an answer Redis
 has held for hours, and a browser-fetch timestamp would report that as seconds
@@ -169,19 +176,32 @@ required is modest; the risk is the policy, not the volume.
 4. **`CachedView.fetchedAt` + `<Freshness>`** — DONE for the 15 pages that have
    a `RefreshButton` to anchor the chip to. 10 more hold a `CachedView` but have
    no header control; they need a slot deciding.
-5. **Remaining slow analytics routes** — MEASURED, and the answer is *almost
-   none*. Fifteen of the heaviest repo functions already have a rollup fast
-   path (`overview_totals`, `user_stats`, `performance_summary`/`_series`,
-   `session_stats`, `event_series`, `error_series`, `screen_list`,
-   `journey_graph`, `top_events`, …), and Overview and `/active-users` are now
-   on the server cache. The only genuinely slow routes left are the three
-   cross-tier timeseries endpoints, measured on the 84 GB dev set over a 7-day
-   window: **transactions 21.9 s, events 7.6 s, errors 4.0 s**. But **no
-   dashboard page and no SDK calls any of them** — they are referenced only by
-   the env-scoping allowlist and two design docs. Caching them would be a
-   breaking wire change on public API surface, for endpoints nothing we ship
-   calls, so it is not worth doing now. Revisit if a caller appears; the 21.9 s
-   is a real liability for any external consumer.
+5. **Remaining slow routes** — DONE, after a CORRECTED measurement.
+
+   The first pass surveyed only `routes/analytics.rs` and concluded "almost
+   nothing qualifies". That was wrong twice over, and both misses were found by
+   production reports rather than by the survey:
+
+   - **`/v1/admin/storage`** counts rows per app per tiered table. Measured for
+     ONE app on 63M/16M/34M rows: 4.79 s + 1.64 s + 2.18 s = **8.6 s**, in a
+     loop, behind a 60 s READ-THROUGH cache — so one caller per minute paid all
+     of it on the request path. Now on `view_cache`.
+   - **`/v1/apps/{id}/funnel`** takes **12.97 s for a THREE-step funnel** on a
+     34M-event window, *with* the per-step `occurred_at` bound already in place
+     (that older fix is real and shipped in v1.5.1; it is not the cause here).
+     Each further step is another pass, and the route allows ten. Now on
+     `view_cache`, keyed on a JSON fingerprint of app + resolved env + window +
+     the step list — steps are variable-length free text, so any flattening
+     would collide two different funnels into one tenant's counts.
+
+   The three cross-tier timeseries routes (transactions 21.9 s, events 7.6 s,
+   errors 4.0 s) remain UNCACHED on purpose: no dashboard page and no SDK calls
+   them, so caching them is a breaking wire change on public API surface for
+   endpoints nothing we ship uses. Revisit if a caller appears.
+
+   **Lesson for the next survey: grep the whole `routes/` directory, not the
+   file whose name matches the feature.**
+
 6. **The pages lacking `CachedView`** — DONE. All seven converted and driven
    in the browser: Transactions, Purge, MonitorDetail, IssueDetail, Inspector,
    FunnelBuilder, Environments. Every data page in the app now caches; the only

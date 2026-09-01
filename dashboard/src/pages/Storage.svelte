@@ -52,6 +52,9 @@
   import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
+  import { envelopeStatus } from '../lib/models/freshness';
+  import type { ViewEnvelope } from '../lib/api/overview';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
 
   // Cached view (lib/stores/cached-view.svelte.ts): the report paints instantly
@@ -63,10 +66,36 @@
   // exactly the orgs you manage, so the caller has no id to vary it by. The
   // whole cache is dropped on logout, which is what keeps a second user on the
   // same tab from being served the first one's report.
-  const view = new CachedView<StorageReport>();
-  const report = $derived(view.data ?? null);
-  const loading = $derived(view.loading);
-  const error = $derived(view.error);
+  const view = new CachedView<ViewEnvelope<StorageReport>>();
+  // Two unwraps: the CachedView holds the ENVELOPE, the envelope holds the
+  // report — which is null while the server is still counting.
+  const envelope = $derived(view.data ?? null);
+  const report = $derived(envelope?.data ?? null);
+  /**
+   * See `envelopeStatus`. A failed recompute arrives as HTTP 200 with
+   * `{state:"computing", data:null, error:"…"}`; read through `view.error`
+   * alone that is a success with nothing in it, and the page spins forever
+   * with the reason unread in the payload.
+   */
+  const status = $derived(
+    envelopeStatus({
+      state: envelope?.state,
+      error: envelope?.error,
+      hasData: report !== null,
+      viewError: view.error,
+    }),
+  );
+  const loading = $derived(view.loading || status.computing);
+  const error = $derived(status.error);
+
+  // This route has no SSE of its own, so the page asks again until the report
+  // lands. `force` is required or the client cache answers from its own fresh
+  // window and the page stops asking while still showing `computing`.
+  $effect(() => {
+    if (!status.shouldPoll) return;
+    const id = setTimeout(() => void load(true), 2000);
+    return () => clearTimeout(id);
+  });
 
   // Both tables arrive whole in the one `/v1/admin/storage` response — one row
   // per tiered table, one per visible app — so each sort runs over the ENTIRE
@@ -444,7 +473,14 @@
   <div class="storage">
     <header class="head">
       <div>
-        <h1 class="page-title">{t('storage.title')}</h1>
+        <h1 class="page-title">
+          {t('storage.title')}
+          <Freshness
+            computedAt={envelope?.computed_at ?? null}
+            fetchedAt={view.fetchedAt}
+            revalidating={view.revalidating || status.computing}
+          />
+        </h1>
         <!-- Wording tracks `full_scope`. When the caller manages every org there
              is no other tenant to leak, so the figures are real physical bytes
              (pg_database_size / pg_total_relation_size) and must NOT be called
