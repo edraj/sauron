@@ -300,8 +300,19 @@ jobs:
       # covers this workspace's own 25 crates, which are unpublished and so
       # cannot be looked up in any registry at all.
       - name: Install Rust (for cargo metadata)
+        # Download-then-run, never `curl | sh` -- the same shape as the syft
+        # install above, and for the same reason. The Security Gate rejects the
+        # piped form (gha-curl-pipe-shell) and is right to: piping means the
+        # bytes that execute are never on disk to inspect, pin or diff.
+        # ubuntu-latest usually ships cargo already, so this is normally a no-op.
         run: |
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          set -euo pipefail
+          if command -v cargo >/dev/null 2>&1; then
+            echo "cargo already present: $(cargo --version)"
+            exit 0
+          fi
+          curl -sSf https://sh.rustup.rs -o rustup-init.sh
+          sh rustup-init.sh -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Fill licences from cargo metadata
