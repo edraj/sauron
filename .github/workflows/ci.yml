@@ -610,6 +610,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     container: fedora:44
+    # GitHub's default `run:` shell inside a `container:` is sh, NOT bash, and
+    # on Debian-family images sh is dash. Fedora hides it (/bin/sh is bash), so
+    # a bash-ism written here would pass on this job and fail on packaging-deb
+    # below with `set: Illegal option -o pipefail` -- which is how the first
+    # .deb release run died. Declare the shell rather than inherit the image's.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install rpm tooling
         run: dnf install -y --allowerasing rpm-build rpmlint systemd-rpm-macros git tar gzip gawk curl unzip findutils
@@ -655,6 +663,11 @@ jobs:
       matrix:
         image: ["debian:12", "ubuntu:22.04"]
     container: ${{ matrix.image }}
+    # Both images are Debian-family, where the container default shell (sh) is
+    # dash. See the `packaging` job above.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install packaging + test tooling
         env:
@@ -748,6 +761,43 @@ jobs:
               print(f"::error::ci-complete needs a job that does not exist: {' '.join(unknown)}")
           sys.exit(1 if (missing or unknown) else 0)
           EOF
+
+      # ---- every container job declares its shell ------------------------
+      # The default `run:` shell inside a `container:` is sh, NOT bash. On
+      # Fedora that is bash wearing a different name, so bash-isms pass; on
+      # Debian-family images sh is dash and the first one dies with
+      # `set: Illegal option -o pipefail`. release.yml is checked here too
+      # because it NEVER runs in CI: the first release with .deb legs failed
+      # exactly this way -- both deb legs red, both rpm legs green, identical
+      # YAML -- and no PR check could have seen it.
+      - name: Container jobs declare their shell
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          fail = False
+          for path in ('.github/workflows/ci.yml', '.github/workflows/release.yml'):
+              body = open(path).read().split('\njobs:\n', 1)[1]
+              starts = [(m.start(), m.group(1))
+                        for m in re.finditer(r'^  ([A-Za-z0-9_-]+):[ \t]*$', body, re.M)]
+              for i, (pos, job) in enumerate(starts):
+                  end = starts[i + 1][0] if i + 1 < len(starts) else len(body)
+                  block = body[pos:end]
+                  if not re.search(r'^    container:', block, re.M):
+                      continue
+                  ok = bool(re.search(r'^    defaults:\n      run:\n        shell: bash$',
+                                      block, re.M))
+                  print(f'{path} :: {job} :: container :: shell '
+                        f'{"declared" if ok else "MISSING"}')
+                  if not ok:
+                      print(f'::error file={path}::job `{job}` runs in a container but does '
+                            'not declare `defaults: {run: {shell: bash}}`. A container job '
+                            "inherits the image's /bin/sh -- dash on Debian-family images -- "
+                            'so set -o pipefail, arrays and process substitution fail there '
+                            'while passing on Fedora, where /bin/sh is bash.')
+                      fail = True
+          sys.exit(1 if fail else 0)
+          EOF
+
 
       - name: Report every job's result
         env:
