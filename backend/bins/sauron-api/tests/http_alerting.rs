@@ -996,6 +996,174 @@ async fn alert_write_alone_cannot_target_an_app_it_cannot_read() {
     server.shutdown().await;
 }
 
+/// A rule's `filters.query` reaches the same withheld columns the search
+/// routes gate on, so it needs the same permission.
+///
+/// **Why it is an oracle rather than merely a filter.** `error_threshold`
+/// authorizes on `issue:read`, and an `issue:read`-only caller has the event
+/// body nulled out of every response by `strip_event_body`. A rule carrying
+/// `extra.token:~sk_live_` never shows them a body — it just fires, or does
+/// not, and `list_history` persists the answer. Walk a wordlist through
+/// rule-edits and the withheld column is readable one prefix at a time.
+#[tokio::test]
+async fn a_rule_query_over_the_event_body_needs_event_read_not_just_issue_read() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let fx = seed(&server, "rulequery").await;
+    let before = rule_count(&server, fx.org_id).await;
+
+    // Reads issues across the whole org, but NOT event bodies.
+    let issue_only = user_with_read_at(
+        &server,
+        fx.org_id,
+        "issueonly",
+        &[perm::ISSUE_READ],
+        "org",
+        fx.org_id,
+    )
+    .await;
+
+    // Baseline: a rule with no query at all is fine for her — this test must
+    // fail on the QUERY, not on the scope check that runs before it.
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            Some(&issue_only),
+            json!({
+                "name": "plain",
+                "trigger_type": "error_threshold",
+                "conditions": { "threshold": 5, "window_seconds": 60 }
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "an unfiltered rule is hers to make: {text}");
+
+    // …and the same rule with a body predicate is refused.
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            Some(&issue_only),
+            json!({
+                "name": "probe",
+                "trigger_type": "error_threshold",
+                "conditions": {
+                    "threshold": 1,
+                    "window_seconds": 60,
+                    "filters": { "query": "extra.token:~sk_live_" }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 403, "a body predicate needs event:read: {text}");
+    assert!(
+        text.contains("event:read"),
+        "the refusal must name the permission that lifts it: {text}"
+    );
+    assert_eq!(
+        rule_count(&server, fx.org_id).await,
+        before + 1,
+        "only the allowed rule was inserted"
+    );
+
+    // The owner, who holds event:read, may save exactly that rule.
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+            Some(&fx.owner_token),
+            json!({
+                "name": "probe",
+                "trigger_type": "error_threshold",
+                "conditions": {
+                    "threshold": 1,
+                    "window_seconds": 60,
+                    "filters": { "query": "extra.title=noInternetConnectionTitle" }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "event:read lifts it: {text}");
+
+    server.shutdown().await;
+}
+
+/// The edit route is the same door. A caller who could not CREATE the rule
+/// must not be able to reach it by PATCHing a harmless one.
+#[tokio::test]
+async fn a_rule_query_cannot_be_smuggled_in_through_an_edit() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let fx = seed(&server, "ruleedit").await;
+    let issue_only = user_with_read_at(
+        &server,
+        fx.org_id,
+        "editonly",
+        &[perm::ISSUE_READ],
+        "org",
+        fx.org_id,
+    )
+    .await;
+
+    let rule_id = create_rule_as_owner(
+        &server,
+        &fx,
+        json!({
+            "name": "harmless",
+            "trigger_type": "error_threshold",
+            "conditions": { "threshold": 5, "window_seconds": 60 }
+        }),
+    )
+    .await;
+
+    let (status, text, _) = server
+        .patch_raw(
+            &format!("/v1/alert-rules/{rule_id}"),
+            &issue_only,
+            json!({ "conditions": {
+                "threshold": 1,
+                "window_seconds": 60,
+                "filters": { "query": "extra.token:~sk_live_" }
+            }}),
+        )
+        .await;
+    assert_eq!(status, 403, "the edit door is gated too: {text}");
+
+    server.shutdown().await;
+}
+
+/// A query that cannot resolve is refused when the rule is SAVED. Left to the
+/// evaluator it becomes a rule that counts zero every tick — silence that
+/// reads exactly like "nothing is wrong".
+#[tokio::test]
+async fn a_rule_query_that_cannot_resolve_is_refused_at_write_time() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let fx = seed(&server, "rulebad").await;
+
+    for (q, why) in [
+        ("extar.title=x", "an unknown field"),
+        ("(level:error", "a parse failure"),
+        ("environment:staging", "an environment predicate"),
+    ] {
+        let (status, text, _) = server
+            .post_raw(
+                &format!("/v1/orgs/{}/alert-rules", fx.org_id),
+                Some(&fx.owner_token),
+                json!({
+                    "name": "bad",
+                    "trigger_type": "error_threshold",
+                    "conditions": { "filters": { "query": q } }
+                }),
+            )
+            .await;
+        assert_eq!(status, 400, "`{q}` — {why}: {text}");
+    }
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_unnarrowed_rule_needs_org_wide_read_not_merely_alert_write() {
     let Some(mut server) = TestServer::start().await else {

@@ -53,7 +53,7 @@ syntax.
 
 | Page | Query language | Free-text box matches | Runs |
 |------|----------------|-----------------------|------|
-| **Exceptions** (Issues) | ✅ | issue `title`, `type`, `culprit`, plus event `tags`/`contexts`/`extra` payload | server |
+| **Exceptions** (Issues) | ✅ | issue `title`, `type`, `culprit`, plus the whole event payload — `tags`/`contexts`/`extra`/`context`/`user`/`sdk`/`stack` | server |
 | **Issue → Occurrences** | ✅ | `message`, `exception_type`, `exception_value`, plus `tags`/`contexts`/`extra` payload | server |
 | **Events** | ✅ | event `name`, `distinct_id`, plus `tags`/`contexts`/`extra`/`properties` payload | server |
 | **Users** (People) | — | `distinct_id` **and any trait** | server |
@@ -66,6 +66,15 @@ Performance (transactions), Journeys, Overview, and the Manage pages have no
 free-text search. Sessions, Devices, Users and Transactions are scheduled to
 join the query language later; until then their boxes are plain substring
 matches.
+
+**One place off this list also speaks the language: an alert rule's Search
+filter.** An `Error count crosses threshold` or `Error spike` rule narrows what
+it counts with the same vocabulary the Occurrences page accepts, so a rule can
+watch for one specific exception rather than for "any error". Two differences
+from a search box, both covered in [Dashboard → Alert
+rules](Dashboard.md#alert-rules): `environment:` is refused there (the rule has
+its own environment filter), and a query that does not resolve is rejected when
+you save the rule rather than returning an empty page.
 
 ## The query language
 
@@ -268,7 +277,7 @@ using `filter=culprit:contains:checkout` translate straight onto it.
 ### `has:field` — is this key present at all?
 
 ```
-has:extra.cartValue         rows that carry that key            (Occurrences, Events)
+has:extra.cartValue         rows that carry that key            (Exceptions, Occurrences, Events)
 has:handled                 rows where "handled" is known       (Occurrences)
 has:tag.checkout_step       rows carrying that tag key          (Exceptions, Occurrences, Events)
 ```
@@ -330,13 +339,13 @@ spelling that would match nothing.
 Where a field holds JSON, address inside it with dots:
 
 ```
-user.email:*@acme.com               (Occurrences)
-os.name:Windows                     (Occurrences)
-browser.version:~12                 (Occurrences)
-extra.cartValue:1200                (Occurrences, Events)
-has:extra.cartValue                 (Occurrences, Events)
-contexts.checkout.step:payment      (Occurrences, Events)
-stack.function:handleRequest        (Occurrences)
+user.email:*@acme.com               (Exceptions, Occurrences)
+os.name:Windows                     (Exceptions, Occurrences)
+browser.version:~12                 (Exceptions, Occurrences)
+extra.cartValue:1200                (Exceptions, Occurrences, Events)
+has:extra.cartValue                 (Exceptions, Occurrences, Events)
+contexts.checkout.step:payment      (Exceptions, Occurrences, Events)
+stack.function:handleRequest        (Exceptions, Occurrences)
 properties.plan:pro                 (Events)
 traits.company:"Acme Inc"           (Users — not on the query language yet)
 ```
@@ -391,20 +400,48 @@ The canonical name is on the left; anything in brackets is an accepted alias
 | `distinctId` (`distinct_id`) | text | matches an issue that affected that user |
 | `deviceKey` (`device_key`) | text | matches an issue seen on that device — exact match only, no `~` substring |
 | `workflow` | text | needs `event:read` |
+| `contexts` | JSON root | matches an issue with an occurrence whose `contexts` matches — needs `event:read` |
+| `extra` | JSON root | matches an issue with an occurrence whose `extra` matches — needs `event:read` |
+| `user` | JSON root | `user.email`, `user.id`, … — needs `event:read` |
+| `sdk` | JSON root | `sdk.name`, `sdk.version`, … — needs `event:read` |
+| `os` | JSON root | `os.name`, `os.version`, … — needs `event:read` |
+| `browser` (`runtime`) | JSON root | `browser.name`, … — needs `event:read` |
+| `device` | JSON root | `device.model`, … — needs `event:read` |
+| `app` | JSON root | `app.version`, … — needs `event:read` |
+| `context` | JSON root | `context.app_version`, `context.os.name`, … — also `@context.<path>`. Needs `event:read` |
+| `stack` | JSON root | unindexed — a scan. Needs `event:read` |
 | `tag.<key>` | text | needs `event:read` |
 | `environment` `release` `handled` | — | **declared but not searchable yet on this page** — they need the issue-dimension rollup, and asking for one returns a 400 saying exactly that. `environment` and `release` *are* searchable on Occurrences and Events, and `handled` on Occurrences. |
 
-`screen`, `distinctId` and `deviceKey` are not columns of an issue — they belong
-to its individual occurrences — so on this page they ask **"does this issue have
-an occurrence that matches?"**, evaluated inside the time range and environment
-the page is already scoped to. Two consequences worth knowing:
+`screen`, `distinctId`, `deviceKey` and every JSON root are not columns
+of an issue — they belong to its individual occurrences — so on this page they
+ask **"does this issue have an occurrence that matches?"**, evaluated inside the
+time range and environment the page is already scoped to. Two consequences worth
+knowing:
 
 - Narrowing the range can drop an issue that still appears without the filter:
   the issue is in range because it was *seen* in range, but its `/checkout`
   occurrence may be older than that.
 - Negation reads as "no matching occurrence". `!screen:/checkout` keeps an issue
   that has never been seen on `/checkout`, including one whose occurrences
-  recorded no screen at all — it does not mean "seen on some other screen".
+  recorded no screen at all — it does not mean "seen on some other screen". The
+  same reading applies to `!extra.title:x`, which keeps an issue whose
+  occurrences carry no `extra` object at all.
+
+Every JSON root an occurrence carries is reachable here: the developer-supplied
+`contexts.*` and `extra.*`, the enriched `os.*` / `browser.*` / `device.*` /
+`app.*` / `user.*` / `sdk.*` / `context.*`, and `stack.*`.
+
+`os`, `browser`, `device` and `app` are shorthands for namespaces inside
+`context`, not separate columns, so `os.name:Linux` and `context.os.name:Linux`
+are the same query written two ways. Use whichever reads better; there is no
+performance difference between them.
+
+`stack.*` is worth its own note. It searches the effective trace, whether the
+event stored it inline or in the shared trace pool, so a pooled event is never
+invisible to it. `stack.filename:~x` matches the substring anywhere in the
+rendered trace rather than scoped to the named key, and it is a scan in both
+cases — expect it to be the slowest field on the page.
 
 ### Issue → Occurrences
 

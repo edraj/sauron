@@ -1224,6 +1224,15 @@ export interface AlertConditions {
     tag_key?: string;
     tag_value?: string;
     op?: string;
+    /**
+     * A search-language string in the Exceptions page's vocabulary, narrowing
+     * the counted metric to the events it matches — e.g.
+     * `extra.title=noInternetConnectionTitle`.
+     *
+     * Server-validated on write: an unresolvable query is a 400, and one
+     * probing the event body needs `event:read` at the rule's scope.
+     */
+    query?: string;
   };
 }
 

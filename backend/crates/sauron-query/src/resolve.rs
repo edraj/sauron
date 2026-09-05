@@ -681,6 +681,59 @@ mod tests {
         assert_eq!(p.path, None);
     }
 
+    /// Every bridged root, in the spelling a user types. `browser` carries a
+    /// non-empty storage prefix (`runtime`), so this also pins that the
+    /// prefix-folding branch runs on this resource, not just the empty-prefix
+    /// one `extra` exercises.
+    #[test]
+    fn every_bridged_json_root_resolves_on_issues() {
+        for (q, column) in [
+            ("user.email:a@b.com", "event_user"),
+            ("sdk.name:sauron", "sdk"),
+            ("os.name:Linux", "context"),
+            ("browser.version:12", "context"),
+            ("device.model:Pixel", "context"),
+            ("app.build:100", "context"),
+            ("stack.function:handleRequest", "stacktrace"),
+        ] {
+            let p = one(q, Resource::Issues);
+            match p.dim.store {
+                Store::JsonRoot { column: c, .. } => {
+                    assert_eq!(c, column, "`{q}` must address the {column} column")
+                }
+                other => panic!("`{q}` must be a JSON root, got {other:?}"),
+            }
+        }
+    }
+
+    /// `os.name` folds the storage prefix into the path, so the containment
+    /// object nests `{"os": {"name": …}}` — the same shape Occurrences builds.
+    #[test]
+    fn a_prefixed_root_folds_its_prefix_into_the_path_on_issues() {
+        let p = one("os.name:Linux", Resource::Issues);
+        assert_eq!(p.path.as_deref(), Some("os.name"));
+    }
+
+    #[test]
+    fn a_json_root_path_resolves_on_issues() {
+        // `extra.title` on the Exceptions list: the root is the `extra` COLUMN
+        // of `error_events`, and `title` is the JSON path under it — not the
+        // `title` dimension of `issues`, which is a different field entirely.
+        let p = one("extra.title:noInternetConnectionTitle", Resource::Issues);
+        assert!(
+            matches!(
+                p.dim.store,
+                Store::JsonRoot {
+                    column: "extra",
+                    prefix: ""
+                }
+            ),
+            "{:?}",
+            p.dim.store
+        );
+        assert_eq!(p.path.as_deref(), Some("title"));
+    }
+
     #[test]
     fn unknown_field_is_rejected_rather_than_read_as_a_tag() {
         // **The ruling this test exists to pin.** An unrecognised name used to

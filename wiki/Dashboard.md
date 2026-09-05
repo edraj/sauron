@@ -300,8 +300,62 @@ their tables, because that one also picks the timestamp column.
 - **Data purge / Ingest failures** — deployment-admin surfaces: permanent
   erasure (preview → confirm, no undo) and the dead-letter queue for envelopes
   that failed validation. See [Admin](Admin.md).
+- **Alerts** — org-wide alert rules and the channels they deliver to. Distinct
+  from [Notifications](Notifications.md), which are personal, go to your own
+  address, and are configured by you rather than by an admin.
 - **App settings** — per-app configuration, including **Settings → Environments**:
   create/rename/retire environments and copy, rotate, or mute each one's **DSN**.
+
+### Alert rules
+
+A rule is a **trigger**, a **threshold**, a **window**, and optional **filters**.
+The evaluator runs every 30 seconds, so the shortest useful window is one minute.
+
+The **Environment filter** is offered on every rule. A **Level filter** appears
+on the four issue and error triggers, and a **Search filter** on the two that
+count error events — `Error count crosses threshold` and `Error spike`.
+
+#### The search filter
+
+The Search filter is the same query language as the Exceptions page — see
+[Search](Search.md) for the full vocabulary. It narrows *which* events the rule
+counts, so a rule can watch for one specific exception instead of "any error":
+
+```
+Trigger:  Error count crosses threshold
+Window:   1 minute        Threshold: >= 1
+Filter:   extra.title=noInternetConnectionTitle
+```
+
+That rule fires when at least one error carrying that `extra.title` arrives in a
+one-minute window, and stays quiet through any number of unrelated errors. The
+alert body names the query, so a narrowed rule is distinguishable from the
+unfiltered one beside it:
+
+```
+3 error event(s) matching `extra.title=noInternetConnectionTitle` in the last
+1 minute(s) (threshold 1).
+```
+
+Four things worth knowing before you rely on one:
+
+- **It needs `event:read`.** The filter reaches the event body — `extra`,
+  `contexts`, `tags`, `user`, `sdk`, `os`, `stack` — which is withheld from a
+  caller holding only `issue:read`. Saving such a rule without `event:read` is a
+  403 naming the permission, because whether the rule fires would disclose the
+  contents it is not allowed to read. A rule with no search filter, or one over
+  ordinary columns like `level`, needs nothing extra.
+- **`environment:` is not accepted in the query.** Use the rule's own
+  Environment filter, which resolves the name across every app the rule covers;
+  the query language resolves it against a single app, so allowing both would
+  give one rule two environment filters that mean different things.
+- **A query that does not resolve is refused when you save the rule**, naming
+  the field. That is deliberate: accepted and left to the evaluator, a typo
+  becomes a rule that counts zero every 30 seconds forever, and silence from an
+  alert is indistinguishable from "nothing is wrong".
+- **Substring matches are the expensive shape.** `extra.title:~foo` scans, where
+  `extra.title=foo` uses containment. At a one- or five-minute window that
+  difference is not worth thinking about; on a 24-hour window it is.
 
 ### Resetting a member's password
 

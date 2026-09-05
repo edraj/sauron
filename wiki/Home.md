@@ -83,7 +83,8 @@ scope and resolved as a union down the tree.
   copy-paste run commands.
 - **[Dashboard](Dashboard.md)** — a tour of the dashboard sections: Overview,
   Exceptions, Performance, Events, Sessions, Users, Devices, Screens, Funnels,
-  Journeys, Retention, and the Manage section.
+  Journeys, Retention, and the Manage section — including admin alert rules and
+  their search filter.
 - **[Active Users](Active-Users.md)** — combined daily active users across
   several apps, the identified/guest split and what it can and cannot merge,
   and the CSV export.

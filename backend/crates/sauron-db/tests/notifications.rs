@@ -76,6 +76,140 @@ async fn subscription_row_round_trips_in_declared_column_order() {
     db.cleanup().await;
 }
 
+/// An alert rule's `filters.query` narrows the counted metric.
+///
+/// The whole point of the feature: a rule that fires on one specific exception
+/// rather than on "any error". The predicate is resolved against
+/// `Resource::Occurrences` and lowered by `OccurrencesLower`, so this also
+/// pins that the alert path and the Exceptions search agree on what
+/// `extra.title=…` means.
+#[tokio::test]
+async fn alert_count_errors_narrows_by_a_search_query() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    let from = chrono::Utc::now() - chrono::Duration::days(2);
+    let to = chrono::Utc::now() + chrono::Duration::days(1);
+
+    // One extra event carrying the payload the rule is meant to catch. The
+    // seven `seed_two_envs` rows carry an empty `extra`, so they are the
+    // control group.
+    let issue = sauron_db::repo::upsert_issue(
+        &mut conn,
+        sauron_db::models::NewIssue {
+            app_id: ids.app_id,
+            fingerprint: "alertq-fp",
+            type_: "Error",
+            title: "no internet",
+            culprit: "alertq::seed",
+            level: "error",
+            first_seen: chrono::Utc::now(),
+            last_seen: chrono::Utc::now(),
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("upsert issue");
+    sauron_db::repo::insert_error_event(&mut conn, new_error_event(ids.app_id, issue))
+        .await
+        .expect("insert error event");
+
+    for (q, want, why) in [
+        (None, 8, "seven seeded rows plus the one above"),
+        (
+            Some("extra.title=noInternetConnectionTitle"),
+            1,
+            "only the row carrying that `extra` matches",
+        ),
+        (
+            Some("extra.title=somethingElse"),
+            0,
+            "a non-matching value counts nothing — not everything",
+        ),
+        (
+            Some("os.name:Linux"),
+            1,
+            "a prefixed `context` root narrows the same way",
+        ),
+        (
+            Some("extra.title=noInternetConnectionTitle level:fatal"),
+            0,
+            "the query composes with the rest of the tree as AND",
+        ),
+    ] {
+        let parsed = q.map(|q| {
+            let ast = sauron_query::parse(q).expect("parse");
+            sauron_query::resolve(&ast, sauron_query::Resource::Occurrences).expect("resolve")
+        });
+        let ctx = sauron_db::query_plan::PrepCtx {
+            environments: std::collections::HashMap::new(),
+            now: chrono::Utc::now(),
+        };
+        let filter = parsed
+            .as_ref()
+            .map(|node| sauron_db::repo::AlertQuery { node, ctx: &ctx });
+        let got = sauron_db::repo::alert_count_errors(
+            &mut conn,
+            sauron_db::repo::AlertErrorCount {
+                app_ids: &[ids.app_id],
+                from,
+                to,
+                level: None,
+                env_ids: None,
+                tag: None,
+                query: filter.as_ref(),
+            },
+        )
+        .await
+        .expect("count");
+        assert_eq!(got, want, "`{q:?}` — {why}");
+    }
+
+    db.cleanup().await;
+}
+
+fn new_error_event(app_id: uuid::Uuid, issue_id: uuid::Uuid) -> sauron_db::models::NewErrorEvent {
+    sauron_db::models::NewErrorEvent {
+        id: uuid::Uuid::new_v4(),
+        app_id,
+        environment_id: None,
+        issue_id,
+        fingerprint: "alertq-fp".into(),
+        level: "error".into(),
+        message: "no internet".into(),
+        exception_type: "SocketException".into(),
+        exception_value: "no internet".into(),
+        stacktrace: json!([]),
+        breadcrumbs: json!([]),
+        context: json!({"os": {"name": "Linux"}}),
+        tags: json!({}),
+        release: None,
+        distinct_id: None,
+        event_user: None,
+        sdk: None,
+        ip_address: None,
+        occurred_at: chrono::Utc::now(),
+        session_id: None,
+        device_key: None,
+        screen: None,
+        workflow_id: None,
+        workflow_name: None,
+        stacktrace_symbolicated: None,
+        symbolication_status: "not_applicable".into(),
+        debug_meta: None,
+        contexts: json!({}),
+        extra: json!({"title": "noInternetConnectionTitle"}),
+        handled: Some(false),
+        title: None,
+        culprit: None,
+        stacktrace_sha256: None,
+    }
+}
+
 /// The live bug this slice fixes. Since migration 33, `environments` is the
 /// project-level catalogue and `error_events.environment_id` holds an
 /// `app_environments` ENROLLMENT id, so `alert_count_errors`'s old subquery
@@ -94,10 +228,20 @@ async fn alert_count_errors_narrows_by_enrollment_id_not_catalogue_id() {
     let from = chrono::Utc::now() - chrono::Duration::days(2);
     let to = chrono::Utc::now() + chrono::Duration::days(1);
 
-    let all =
-        sauron_db::repo::alert_count_errors(&mut conn, &[ids.app_id], from, to, None, None, None)
-            .await
-            .expect("unfiltered count");
+    let all = sauron_db::repo::alert_count_errors(
+        &mut conn,
+        sauron_db::repo::AlertErrorCount {
+            app_ids: &[ids.app_id],
+            from,
+            to,
+            level: None,
+            env_ids: None,
+            tag: None,
+            query: None,
+        },
+    )
+    .await
+    .expect("unfiltered count");
     assert_eq!(all, 7, "seed_two_envs inserts 7 error_events");
 
     let enrollments =
@@ -112,12 +256,15 @@ async fn alert_count_errors_narrows_by_enrollment_id_not_catalogue_id() {
 
     let narrowed = sauron_db::repo::alert_count_errors(
         &mut conn,
-        &[ids.app_id],
-        from,
-        to,
-        None,
-        Some(&enrollments),
-        None,
+        sauron_db::repo::AlertErrorCount {
+            app_ids: &[ids.app_id],
+            from,
+            to,
+            level: None,
+            env_ids: Some(&enrollments),
+            tag: None,
+            query: None,
+        },
     )
     .await
     .expect("narrowed count");
@@ -136,12 +283,15 @@ async fn alert_count_errors_narrows_by_enrollment_id_not_catalogue_id() {
     assert_eq!(catalogue.len(), 1);
     let wrong = sauron_db::repo::alert_count_errors(
         &mut conn,
-        &[ids.app_id],
-        from,
-        to,
-        None,
-        Some(&catalogue),
-        None,
+        sauron_db::repo::AlertErrorCount {
+            app_ids: &[ids.app_id],
+            from,
+            to,
+            level: None,
+            env_ids: Some(&catalogue),
+            tag: None,
+            query: None,
+        },
     )
     .await
     .expect("catalogue-id count");

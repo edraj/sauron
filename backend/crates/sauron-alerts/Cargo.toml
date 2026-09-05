@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 sauron-core = { workspace = true }
 sauron-db = { workspace = true }
+sauron-query = { workspace = true }
 sauron-redis = { workspace = true }
 sauron-monitor-core = { workspace = true }
 sauron-auth = { workspace = true }

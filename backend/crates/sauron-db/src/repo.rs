@@ -13908,42 +13908,102 @@ pub async fn enrollment_ids_for_env_name(
         .await
 }
 
+/// The search-language narrowing an alert rule may carry, already resolved.
+///
+/// Two references rather than the rule's raw string: parsing belongs to the
+/// caller (the evaluator parses once per rule per tick and reports a bad query
+/// against that rule), and `lower` needs the `PrepCtx` for the clock any
+/// relative time bound in the predicate resolves against.
+pub struct AlertQuery<'a> {
+    pub node: &'a sauron_query::ResolvedNode,
+    pub ctx: &'a crate::query_plan::PrepCtx,
+}
+
 /// Count error events across `app_ids` in `(from, to]`, with optional
-/// level/environment/tag filters. All values are bound parameters.
+/// level/environment/tag filters and an optional search-language predicate.
+/// All values are bound parameters.
 ///
 /// `env_ids` are **enrollment** ids (`app_environments.id`), because that is
 /// what `error_events.environment_id` holds. Callers that start from an
 /// environment *name* resolve it through [`enrollment_ids_for_env_name`]
 /// first. `Some(&[])` short-circuits to zero explicitly rather than by
 /// accident through an empty `ANY()`.
+///
+/// Takes a struct rather than eight positional parameters, for the reason
+/// [`IssueSearch`] does: three `Option`s in a row are trivially transposed at
+/// a call site and every one of them changes what is counted, silently.
+///
+/// **Boxed rather than `sql_query`**, and that is what `query` costs: a
+/// lowered predicate is a diesel expression over `error_events::table`, which
+/// only a query builder can accept. The three legacy filters keep their exact
+/// previous meaning — each is applied only when present, which is what
+/// `($n IS NULL OR …)` said.
+pub struct AlertErrorCount<'a> {
+    pub app_ids: &'a [Uuid],
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub level: Option<&'a str>,
+    pub env_ids: Option<&'a [Uuid]>,
+    pub tag: Option<&'a Value>,
+    pub query: Option<&'a AlertQuery<'a>>,
+}
+
 pub async fn alert_count_errors(
     conn: &mut AsyncPgConnection,
-    app_ids: &[Uuid],
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-    level: Option<&str>,
-    env_ids: Option<&[Uuid]>,
-    tag: Option<&Value>,
+    params: AlertErrorCount<'_>,
 ) -> QueryResult<i64> {
+    let AlertErrorCount {
+        app_ids,
+        from,
+        to,
+        level,
+        env_ids,
+        tag,
+        query,
+    } = params;
     if env_ids.is_some_and(|e| e.is_empty()) {
         return Ok(0);
     }
-    let row: AlertCountRow = diesel::sql_query(
-        "SELECT count(*) AS n FROM error_events \
-         WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
-           AND ($4::text IS NULL OR level = $4) \
-           AND ($5::uuid[] IS NULL OR environment_id = ANY($5)) \
-           AND ($6::jsonb IS NULL OR tags @> $6)",
-    )
-    .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
-    .bind::<Timestamptz, _>(from)
-    .bind::<Timestamptz, _>(to)
-    .bind::<Nullable<Text>, _>(level)
-    .bind::<Nullable<diesel::sql_types::Array<SqlUuid>>, _>(env_ids.map(|e| e.to_vec()))
-    .bind::<Nullable<Jsonb>, _>(tag)
-    .get_result(conn)
-    .await?;
-    Ok(row.n)
+    let mut q = error_events::table
+        .filter(error_events::app_id.eq_any(app_ids.to_vec()))
+        .filter(error_events::occurred_at.gt(from))
+        .filter(error_events::occurred_at.le(to))
+        .into_boxed();
+    if let Some(level) = level {
+        q = q.filter(error_events::level.eq(level.to_string()));
+    }
+    if let Some(ids) = env_ids {
+        q = q.filter(error_events::environment_id.eq_any(ids.to_vec()));
+    }
+    if let Some(tag) = tag {
+        q = q.filter(error_events::tags.contains(tag.clone()));
+    }
+    if let Some(query) = query {
+        // `IncludingBody`: a rule's query was authorized when the rule was
+        // WRITTEN (`reject_withheld_dimensions` on the create/update route),
+        // and the evaluator runs as no user at all. Narrowing here instead
+        // would silently drop a predicate an admin had been allowed to save,
+        // which for an alert means firing on more events than the rule asks
+        // for — the failure `reject_withheld_dimensions` refuses rather than
+        // widens for.
+        //
+        // `issue_id` is unused by every leaf on this resource (see
+        // `OccurrencesLower`'s field docs) — the field exists so per-issue
+        // callers have somewhere to put it, and this caller counts across
+        // issues by design.
+        let predicate = crate::query_plan::lower(
+            query.node,
+            &crate::query_plan::occurrences::OccurrencesLower {
+                app_id: Uuid::nil(),
+                issue_id: Uuid::nil(),
+                text_reach: TextSearchReach::IncludingBody,
+            },
+            query.ctx,
+        )
+        .map_err(|e| diesel::result::Error::QueryBuilderError(e.to_string().into()))?;
+        q = q.filter(predicate);
+    }
+    q.count().get_result(conn).await
 }
 
 /// Count analytics events across `app_ids` in `(from, to]`, with optional

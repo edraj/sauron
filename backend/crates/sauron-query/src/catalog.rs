@@ -157,20 +157,21 @@ const R_ISSUES: &[Resource] = &[Resource::Issues];
 const R_OCC: &[Resource] = &[Resource::Occurrences];
 const R_ISSUE_OCC: &[Resource] = &[Resource::Issues, Resource::Occurrences];
 const R_EVENTS: &[Resource] = &[Resource::Events];
-const R_OCC_EVENTS: &[Resource] = &[Resource::Occurrences, Resource::Events];
-/// The `extra` set: the two event resources plus Transactions, which gained a
-/// dev-supplied `extra` column in migration 0063. Kept separate from
-/// [`R_OCC_EVENTS`] because `contexts` deliberately did NOT follow it there.
-const R_OCC_EVENTS_TX: &[Resource] = &[
+/// All three list resources S2c bridges onto the language. `workflow` was the
+/// only member for a while — the one field every one of the three pre-language
+/// registries (`ISSUE_FILTERS`/`ERROR_EVENT_FILTERS`/`EVENT_FILTERS`) accepts —
+/// and `contexts` joined it when Issues gained the JSON-root bridge.
+const R_ISSUE_OCC_EVENTS: &[Resource] =
+    &[Resource::Issues, Resource::Occurrences, Resource::Events];
+/// The `extra` set: [`R_ISSUE_OCC_EVENTS`] plus Transactions, which gained a
+/// dev-supplied `extra` column in migration 0063. Kept separate because
+/// `contexts` deliberately did NOT follow it there.
+const R_ISSUE_OCC_EVENTS_TX: &[Resource] = &[
+    Resource::Issues,
     Resource::Occurrences,
     Resource::Events,
     Resource::Transactions,
 ];
-/// All three list resources S2c bridges onto the language. Only `workflow`
-/// uses it — the one field every one of the three pre-language registries
-/// (`ISSUE_FILTERS`/`ERROR_EVENT_FILTERS`/`EVENT_FILTERS`) accepts.
-const R_ISSUE_OCC_EVENTS: &[Resource] =
-    &[Resource::Issues, Resource::Occurrences, Resource::Events];
 const R_TX: &[Resource] = &[Resource::Transactions];
 const R_DEVICES: &[Resource] = &[Resource::Devices];
 const R_PERSONS: &[Resource] = &[Resource::Persons];
@@ -515,7 +516,12 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "",
         },
         ops: OPS_TEXT,
-        resources: &[Resource::Occurrences, Resource::Events, Resource::Sessions],
+        resources: &[
+            Resource::Issues,
+            Resource::Occurrences,
+            Resource::Events,
+            Resource::Sessions,
+        ],
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -527,7 +533,7 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "",
         },
         ops: OPS_TEXT,
-        resources: R_OCC,
+        resources: R_ISSUE_OCC,
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -539,7 +545,7 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "",
         },
         ops: OPS_TEXT,
-        resources: R_OCC,
+        resources: R_ISSUE_OCC,
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -551,7 +557,7 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "os",
         },
         ops: OPS_TEXT,
-        resources: R_OCC,
+        resources: R_ISSUE_OCC,
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -569,7 +575,7 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "runtime",
         },
         ops: OPS_TEXT,
-        resources: R_OCC,
+        resources: R_ISSUE_OCC,
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -581,7 +587,7 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "device",
         },
         ops: OPS_TEXT,
-        resources: R_OCC,
+        resources: R_ISSUE_OCC,
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -593,9 +599,19 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "app",
         },
         ops: OPS_TEXT,
-        resources: R_OCC,
+        resources: R_ISSUE_OCC,
         index: IndexClass::Bounded,
     },
+    // On Issues none of the JSON roots is a column at all:
+    // `IssuesLower::json_root_leaf` answers them with a correlated EXISTS into
+    // `error_events`, the same bridge `screen`/`distinctId`/`deviceKey` take.
+    // `stack` is the exception to the SHAPE rather than to the reach — an
+    // ARRAY column with a blob pool behind it, so it has its own `stack_leaf`.
+    //
+    // `context` and `os`/`browser`/`device`/`app` all address one column, and
+    // all five are reachable: the prefixed dimensions are shorthands, not
+    // replacements, so `context.os.name` and `os.name` both resolve and build
+    // the identical containment bind.
     Dimension {
         name: "contexts",
         aliases: NO_ALIAS,
@@ -605,11 +621,12 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "",
         },
         ops: OPS_TEXT,
-        resources: R_OCC_EVENTS,
+        resources: R_ISSUE_OCC_EVENTS,
         index: IndexClass::Bounded,
     },
     // Transactions carry `extra` too (migration 0063), which is what makes
-    // `extra.order_id:123` resolve on the transactions list. Still
+    // `extra.order_id:123` resolve on the transactions list — the one resource
+    // `contexts` above does not reach. Still
     // `IndexClass::Bounded` there and deliberately unindexed in Postgres: the
     // probe is containment/ILIKE over freeform JSON of unbounded shape, and a
     // GIN on the highest-volume table would cost more write throughput than the
@@ -623,7 +640,7 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "",
         },
         ops: OPS_TEXT,
-        resources: R_OCC_EVENTS_TX,
+        resources: R_ISSUE_OCC_EVENTS_TX,
         index: IndexClass::Bounded,
     },
     Dimension {
@@ -659,7 +676,7 @@ pub const CATALOG: &[Dimension] = &[
             prefix: "",
         },
         ops: OPS_TEXT,
-        resources: R_OCC,
+        resources: R_ISSUE_OCC,
         index: IndexClass::Scan,
     },
     // ---- analytics events ----
@@ -1033,6 +1050,32 @@ mod tests {
         // The event resources keep both.
         assert!(lookup("extra", Resource::Events).is_some());
         assert!(lookup("contexts", Resource::Occurrences).is_some());
+    }
+
+    #[test]
+    fn json_roots_reach_issues_through_the_occurrence_bridge() {
+        // The Exceptions list owns no JSON column at all; every root below is
+        // answered by a correlated EXISTS over `error_events`, the same bridge
+        // `screen`/`distinctId`/`deviceKey` already take on this resource.
+        for name in [
+            "extra", "contexts", "context", "user", "sdk", "os", "browser", "device", "app",
+            "stack",
+        ] {
+            assert!(
+                lookup(name, Resource::Issues).is_some(),
+                "`{name}` must be searchable on Issues"
+            );
+        }
+        // `context` reaches the same column as `os`/`browser`/`device`/`app`,
+        // so `context.os.name` and `os.name` are two spellings of one query.
+        // Both resolve — the shorthand does not replace the root.
+        assert!(matches!(
+            lookup("context", Resource::Issues).unwrap().store,
+            Store::JsonRoot {
+                column: "context",
+                prefix: ""
+            }
+        ));
     }
 
     #[test]

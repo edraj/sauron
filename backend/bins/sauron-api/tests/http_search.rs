@@ -3926,6 +3926,507 @@ async fn seed_issue_with_occurrence_columns(
     issue_id
 }
 
+/// Seeds one issue with a single occurrence carrying the given `contexts` and
+/// `extra` objects. The sibling of [`seed_issue_with_occurrence_columns`], for
+/// the two JSON roots rather than the three scalar columns.
+#[allow(clippy::too_many_arguments)]
+async fn seed_issue_with_event_json(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    title: &str,
+    contexts: serde_json::Value,
+    extra: serde_json::Value,
+    issue_last_seen: DateTime<Utc>,
+    occurred_at: DateTime<Utc>,
+) -> Uuid {
+    let fingerprint = format!("jsonroot-fp-{}", Uuid::new_v4().simple());
+    let issue_id = repo::upsert_issue(
+        conn,
+        NewIssue {
+            app_id,
+            fingerprint: &fingerprint,
+            type_: "Error",
+            title,
+            culprit: "jsonroot::seed",
+            level: "error",
+            first_seen: occurred_at,
+            last_seen: issue_last_seen,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("upsert issue");
+    repo::insert_error_event(
+        conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: None,
+            issue_id,
+            fingerprint: fingerprint.clone(),
+            level: "error".into(),
+            message: "json-root fixture".into(),
+            exception_type: "Error".into(),
+            exception_value: "json-root fixture".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: None,
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            workflow_id: None,
+            workflow_name: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts,
+            extra,
+            handled: Some(false),
+            title: None,
+            culprit: None,
+            stacktrace_sha256: None,
+        },
+    )
+    .await
+    .expect("insert error event");
+    issue_id
+}
+
+/// `extra.*` and `contexts.*` narrow the issues list.
+///
+/// Neither is an `issues` column — each lowers to a correlated `EXISTS` into
+/// `error_events` — so this is the test that the plumbing actually selects
+/// rows rather than merely compiling. The third issue carries empty objects in
+/// both columns, which is what makes the negation and `has:` cases mean
+/// something.
+#[tokio::test]
+async fn json_roots_narrow_the_issues_list() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let (app_id, token) = srv.seed_app("json-roots").await;
+    let at = Utc::now() - ChronoDuration::hours(1);
+    let (alpha, beta, bare) = {
+        let mut conn = srv.conn().await;
+        let alpha = seed_issue_with_event_json(
+            &mut conn,
+            app_id,
+            "alpha issue",
+            json!({"checkout": {"step": "payment"}}),
+            json!({"title": "noInternetConnectionTitle"}),
+            at,
+            at,
+        )
+        .await;
+        let beta = seed_issue_with_event_json(
+            &mut conn,
+            app_id,
+            "beta issue",
+            json!({"checkout": {"step": "shipping"}}),
+            json!({"title": "timeoutTitle"}),
+            at,
+            at,
+        )
+        .await;
+        let bare = seed_issue_with_event_json(
+            &mut conn,
+            app_id,
+            "bare issue",
+            json!({}),
+            json!({}),
+            at,
+            at,
+        )
+        .await;
+        (alpha, beta, bare)
+    };
+    let list = format!("/v1/apps/{app_id}/issues");
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    let expect = |ids: &[Uuid]| sorted(ids.iter().map(|i| i.to_string()).collect());
+
+    // Sanity: without a filter all three are present. An equivalence between
+    // two empty lists proves nothing.
+    let all = srv.get_json(&list, &token).await;
+    assert_eq!(all["total"], 3, "fixture did not land: {all}");
+
+    for (params, want, why) in [
+        (
+            "query=extra.title:noInternetConnectionTitle",
+            vec![alpha],
+            "an exact `extra` value — the case this feature was asked for",
+        ),
+        (
+            "query=contexts.checkout.step:payment",
+            vec![alpha],
+            "a NESTED path into `contexts`",
+        ),
+        (
+            "query=extra.title:[noInternetConnectionTitle,timeoutTitle]",
+            vec![alpha, beta],
+            "`In` over a bracketed list",
+        ),
+        (
+            "query=extra.title:~noInternet",
+            vec![alpha],
+            "a literal substring, which `timeoutTitle` must not satisfy",
+        ),
+        (
+            "query=has:extra.title",
+            vec![alpha, beta],
+            "presence excludes only the issue whose `extra` is empty",
+        ),
+        (
+            "query=has:contexts.checkout.step",
+            vec![alpha, beta],
+            "nested presence, which takes the jsonpath branch",
+        ),
+        // The one that would be wrong under `EXISTS(… <> …)`: `bare` carries
+        // no `extra` keys at all, and "no occurrence with that title" is true
+        // of it.
+        (
+            "query=!extra.title:noInternetConnectionTitle",
+            vec![beta, bare],
+            "negation keeps the issue whose occurrences carry no `extra` key",
+        ),
+        (
+            "query=!has:extra.title",
+            vec![bare],
+            "the complement of the `has:` case",
+        ),
+        (
+            "query=extra.title:noInternetConnectionTitle contexts.checkout.step:payment",
+            vec![alpha],
+            "the two roots compose",
+        ),
+        (
+            "query=extra.title:noInternetConnectionTitle contexts.checkout.step:shipping",
+            vec![],
+            "…and compose as AND, not as OR",
+        ),
+    ] {
+        let got = srv.get_json(&format!("{list}?{params}"), &token).await;
+        assert_eq!(
+            sorted(ids(&got)),
+            expect(&want),
+            "`{params}` — {why}: {got}"
+        );
+        assert_eq!(
+            got["total"],
+            want.len(),
+            "`{params}` — `total` must agree with `data`: {got}"
+        );
+    }
+
+    srv.shutdown().await;
+}
+
+/// Seeds one issue whose single occurrence carries the enriched `context`
+/// namespaces, `event_user`, `sdk` and a stacktrace — inline when `pooled` is
+/// false, or as a POOLED row (placeholder `[]` inline, real trace in
+/// `error_stack_blobs`) when it is true.
+///
+/// The pooled row is written with raw SQL rather than through `stack_pool`
+/// deliberately: pooling is latched in a `OnceLock` off `INGEST_STACK_POOLING`
+/// and `stack_pool.rs` owns that latch for the whole binary. Writing the two
+/// rows directly reproduces the on-disk shape without touching it.
+#[allow(clippy::too_many_arguments)]
+async fn seed_issue_with_event_body(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    title: &str,
+    context: serde_json::Value,
+    event_user: Option<serde_json::Value>,
+    sdk: Option<serde_json::Value>,
+    stack: serde_json::Value,
+    pooled: bool,
+    at: DateTime<Utc>,
+) -> Uuid {
+    use diesel::sql_types::{Binary, Jsonb};
+    use diesel_async::RunQueryDsl;
+    let fingerprint = format!("body-fp-{}", Uuid::new_v4().simple());
+    let issue_id = repo::upsert_issue(
+        conn,
+        NewIssue {
+            app_id,
+            fingerprint: &fingerprint,
+            type_: "Error",
+            title,
+            culprit: "body::seed",
+            level: "error",
+            first_seen: at,
+            last_seen: at,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("upsert issue");
+
+    // A content address that is stable per fixture but distinct per row.
+    let sha: Vec<u8> = Uuid::new_v4().as_bytes().to_vec();
+    let _ = &sha;
+    if pooled {
+        diesel::sql_query(
+            "INSERT INTO error_stack_blobs (sha256, content, created_at) \
+             VALUES ($1, $2, now()) ON CONFLICT (sha256) DO NOTHING",
+        )
+        .bind::<Binary, _>(sha.clone())
+        .bind::<Jsonb, _>(stack.clone())
+        .execute(conn)
+        .await
+        .expect("insert stack blob");
+    }
+
+    repo::insert_error_event(
+        conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: None,
+            issue_id,
+            fingerprint: fingerprint.clone(),
+            level: "error".into(),
+            message: "event-body fixture".into(),
+            exception_type: "Error".into(),
+            exception_value: "event-body fixture".into(),
+            // A pooled row holds the placeholder inline; the trace lives in
+            // the blob written above.
+            stacktrace: if pooled { json!([]) } else { stack },
+            breadcrumbs: json!([]),
+            context,
+            tags: json!({}),
+            release: None,
+            distinct_id: None,
+            event_user,
+            sdk,
+            ip_address: None,
+            occurred_at: at,
+            session_id: None,
+            device_key: None,
+            screen: None,
+            workflow_id: None,
+            workflow_name: None,
+            stacktrace_symbolicated: None,
+            symbolication_status: "not_applicable".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(false),
+            title: None,
+            culprit: None,
+            stacktrace_sha256: pooled.then_some(sha),
+        },
+    )
+    .await
+    .expect("insert error event");
+    issue_id
+}
+
+/// The rest of the event body — `user`, `sdk`, `os`, `browser`, `device`,
+/// `app` and `stack` — narrows the issues list.
+///
+/// `os`/`browser`/`device`/`app` are four views onto the one `context` column
+/// distinguished by a storage prefix, so this is also the test that the prefix
+/// is folded into the containment bind rather than lost.
+///
+/// **The `stack` fixture is the point of the third issue.** It is written as a
+/// POOLED row — placeholder `[]` inline, real trace in `error_stack_blobs` —
+/// so a `stack.*` predicate that only probed the inline column would miss it
+/// while every other assertion here still passed.
+#[tokio::test]
+async fn the_event_body_narrows_the_issues_list() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let (app_id, token) = srv.seed_app("event-body").await;
+    let at = Utc::now() - ChronoDuration::hours(1);
+    let (linux, android, pooled) = {
+        let mut conn = srv.conn().await;
+        let linux = seed_issue_with_event_body(
+            &mut conn,
+            app_id,
+            "linux issue",
+            json!({
+                "os": {"name": "Linux", "version": "6.1"},
+                "runtime": {"name": "Chrome", "version": "12"},
+                "device": {"model": "Pixel"},
+                "app": {"build": "100"}
+            }),
+            Some(json!({"email": "a@b.com"})),
+            Some(json!({"name": "sauron", "version": "1.3.0"})),
+            json!([{"filename": "app.js", "function": "handleRequest"}]),
+            false,
+            at,
+        )
+        .await;
+        let android = seed_issue_with_event_body(
+            &mut conn,
+            app_id,
+            "android issue",
+            json!({"os": {"name": "Android"}}),
+            Some(json!({"email": "c@d.com"})),
+            Some(json!({"name": "sauron-flutter"})),
+            json!([{"filename": "main.dart", "function": "runApp"}]),
+            false,
+            at,
+        )
+        .await;
+        let pooled = seed_issue_with_event_body(
+            &mut conn,
+            app_id,
+            "pooled issue",
+            json!({}),
+            None,
+            None,
+            json!([{"filename": "app.js", "function": "pooledFrame"}]),
+            true,
+            at,
+        )
+        .await;
+        (linux, android, pooled)
+    };
+    let list = format!("/v1/apps/{app_id}/issues");
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    let expect = |ids: &[Uuid]| sorted(ids.iter().map(|i| i.to_string()).collect());
+
+    let all = srv.get_json(&list, &token).await;
+    assert_eq!(all["total"], 3, "fixture did not land: {all}");
+
+    for (params, want, why) in [
+        (
+            "query=os.name:Linux",
+            vec![linux],
+            "a prefixed root folds `os` into the containment object",
+        ),
+        (
+            "query=browser.version:12",
+            vec![linux],
+            "`browser` is stored under `runtime`, and the ALIAS must resolve",
+        ),
+        (
+            "query=device.model:Pixel",
+            vec![linux],
+            "a third view onto the same `context` column",
+        ),
+        ("query=app.build:100", vec![linux], "and a fourth"),
+        (
+            "query=user.email:c@d.com",
+            vec![android],
+            "`user` addresses the `event_user` column",
+        ),
+        (
+            "query=sdk.name:sauron",
+            vec![linux],
+            "`sdk` is exact, so `sauron-flutter` must not match",
+        ),
+        (
+            "query=sdk.name:~sauron",
+            vec![linux, android],
+            "…and the substring form catches both",
+        ),
+        (
+            "query=has:os",
+            vec![linux, android],
+            "a bare prefixed root asks whether the namespace is present at all",
+        ),
+        (
+            "query=context.os.name:Linux",
+            vec![linux],
+            "the long spelling of `os.name:Linux` — same column, same answer",
+        ),
+        (
+            "query=context.runtime.version:12",
+            vec![linux],
+            "…and it reaches namespaces the shorthands spell differently",
+        ),
+        // `has:<bare root>` is column presence, a branch `has:os` does not
+        // reach: with an empty storage prefix there are no path segments to
+        // probe, and this used to be a 400 on this page while working on the
+        // occurrences drill-down.
+        (
+            "query=has:context",
+            vec![linux, android, pooled],
+            "root presence is IS NOT NULL, and an EMPTY object is still \
+             present — `pooled` carries `{}` and must match",
+        ),
+        (
+            "query=has:user",
+            vec![linux, android],
+            "root presence on a different column",
+        ),
+        ("query=!has:user", vec![pooled], "and its complement"),
+        (
+            "query=os.name:[Linux,Android]",
+            vec![linux, android],
+            "`In` over a prefixed root",
+        ),
+        (
+            "query=!os.name:Linux",
+            vec![android, pooled],
+            "negation keeps the issue carrying no `context` at all",
+        ),
+        // The three that would fail if `stack` only probed the inline column.
+        (
+            "query=stack.filename:app.js",
+            vec![linux, pooled],
+            "the trace pool: `pooled` holds `[]` inline and the real frame in a blob",
+        ),
+        (
+            "query=stack.function:pooledFrame",
+            vec![pooled],
+            "a pooled-only frame is reachable at all",
+        ),
+        (
+            "query=has:stack.filename",
+            vec![linux, android, pooled],
+            "array-wildcard presence, inline and pooled alike",
+        ),
+        (
+            "query=stack.function:~pooled",
+            vec![pooled],
+            "the rendered-text scan also reads through the pool",
+        ),
+        (
+            "query=os.name:Linux user.email:a@b.com",
+            vec![linux],
+            "two roots over two different columns compose",
+        ),
+        (
+            "query=os.name:Linux user.email:c@d.com",
+            vec![],
+            "…and compose as AND, not as OR",
+        ),
+    ] {
+        let got = srv.get_json(&format!("{list}?{params}"), &token).await;
+        assert_eq!(
+            sorted(ids(&got)),
+            expect(&want),
+            "`{params}` — {why}: {got}"
+        );
+        assert_eq!(
+            got["total"],
+            want.len(),
+            "`{params}` — `total` must agree with `data`: {got}"
+        );
+    }
+
+    srv.shutdown().await;
+}
+
 /// `screen`, `distinctId` and `deviceKey` narrow the issues list, in both the
 /// `query=` and the `filter=` spelling.
 ///
