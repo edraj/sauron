@@ -80,8 +80,11 @@ docs/             design specs + the RBAC security/performance audit
 
 ## Quick start (Docker Compose)
 
+> Deploying rather than evaluating? **[INSTALL.md](INSTALL.md)** covers all three install
+> paths — Docker, Fedora/RHEL, Debian/Ubuntu — and the environment variables that matter.
+
 ```bash
-cp .env.example .env        # then set JWT_SECRET
+cp .env.example .env        # then set JWT_SECRET and NOTIFY_SECRET_KEY
 docker compose up --build
 ```
 
@@ -99,20 +102,37 @@ Register in the dashboard, create a project → an app (it starts with one envir
 
 > First build compiles the Rust workspace three times (one per service image); subsequent builds are cached.
 
-## Install via RPM (Fedora / RHEL)
+## Install without Docker (Fedora / RHEL · Debian / Ubuntu)
 
-For a Docker-less deployment on Fedora/RHEL-family systems, Sauron ships as four
-RPMs (`sauron`, `sauron-server`, `sauron-dashboard`, `sauron-cli`) driven by
-systemd. Postgres and Redis/Valkey are external.
+For a Docker-less deployment Sauron ships as four native packages — `sauron`,
+`sauron-server`, `sauron-dashboard`, `sauron-cli` — driven by systemd. Postgres and
+Redis/Valkey are external and are neither installed nor configured for you.
+
+**Fedora / RHEL family** (RPM):
 
 ```bash
-./packaging/rpm/build-rpm.sh                 # build the RPMs (needs rust, cargo, node, rpm-build)
+./packaging/rpm/build-rpm.sh                 # needs rust, cargo, node, rpm-build
 sudo dnf install ~/rpmbuild/RPMS/$(uname -m)/sauron-*.rpm
 ```
 
-Full instructions: **[packaging/rpm/INSTALL.md](packaging/rpm/INSTALL.md)** (build & install)
-and **[packaging/rpm/SETUP.md](packaging/rpm/SETUP.md)** (configure DB/Redis, migrate,
-enable services, dashboard).
+**Debian / Ubuntu** (`.deb`, built for Debian 12 and Ubuntu 22.04 separately — glibc 2.36 vs
+2.35, so the two are not interchangeable):
+
+```bash
+./packaging/deb/build-deb.sh                 # needs rustup + NodeSource; distro rustc/node are too old
+cd build/deb && sudo apt-get install ./sauron_*.deb ./sauron-server_*.deb ./sauron-dashboard_*.deb ./sauron-cli_*.deb
+```
+
+> The two differ in one operator-visible way: the RPM enables the daemons but starts nothing,
+> while the `.deb` follows Debian policy and starts them on install — so a fresh, unconfigured
+> Debian host shows failed units until you set `DATABASE_URL`. The install itself still succeeds.
+
+Full instructions: **[INSTALL.md](INSTALL.md)** — all three install paths plus the environment
+variables that matter and where each one lives. Per-format detail in
+**[packaging/rpm/INSTALL.md](packaging/rpm/INSTALL.md)** and
+**[packaging/deb/INSTALL.md](packaging/deb/INSTALL.md)**; day-two operations in
+**[packaging/rpm/SETUP.md](packaging/rpm/SETUP.md)** (provision DB/Redis, migrate, enable
+services, dashboard).
 
 Migrations run automatically on an RPM host: every `sauron-*` daemon unit carries
 `Requires=sauron-migrate.service`, so starting or restarting one applies pending

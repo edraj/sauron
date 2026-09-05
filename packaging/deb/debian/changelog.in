@@ -1,0 +1,6 @@
+sauron (@VERSION@) @DISTRO@; urgency=medium
+
+  * Release @VERSION_UPSTREAM@. See the GitHub release notes for the full
+    changelog: https://github.com/edraj/sauron/releases
+
+ -- @MAINTAINER@  @DATE@

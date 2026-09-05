@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    # Generate config.js from config.template.js and /etc/sauron/dashboard.env.
+    # Non-fatal, as in the RPM's %post dashboard: a dashboard whose runtime config
+    # could not be written is a broken page, not a reason to fail the install and
+    # leave the operator with no package at all.
+    /usr/libexec/sauron/sauron-dashboard-config || :
+fi
+
+#DEBHELPER#

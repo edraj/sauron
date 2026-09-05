@@ -1,0 +1,60 @@
+#!/bin/sh
+# Base package configure hook.
+#
+# The debhelper token below is placed FIRST here, unlike in
+# sauron-server.postinst. The block it expands to is what creates the `sauron`
+# system account (dh_installsysusers, called explicitly from debian/rules -- it is
+# not in the compat-13 sequence) and what runs systemd-tmpfiles. Everything after
+# it needs that account to exist, and this package ships no systemd units, so
+# there is nothing whose start could be raced by expanding it early.
+#
+# NEVER write the debhelper token in prose anywhere in this file. debhelper
+# substitutes it by literal string match with no regard for shell comments, so a
+# mention inside a comment is replaced too: the autoscripts get emitted a second
+# time (systemd-sysusers and systemd-tmpfiles run twice) and the remainder of the
+# comment line is left dangling as a command. Both packages did exactly that
+# before this note was written, and both still built without a single warning.
+set -e
+
+#DEBHELPER#
+
+CONFDIR=/etc/sauron
+
+if [ "$1" = "configure" ]; then
+    # The RPM declares this with %attr(0640,root,sauron) in %files. dpkg has no
+    # equivalent: it unpacks conffiles BEFORE any maintainer script runs, so the
+    # `sauron` group does not exist at unpack time, and Rules-Requires-Root: no
+    # means the build could not have set the owner anyway.
+    #
+    # Applied on EVERY configure, not just first install -- as a REPAIR, not
+    # because dpkg would undo it. Measured on both target distributions: when
+    # dpkg replaces an unmodified conffile on upgrade it keeps the existing
+    # owner and mode and rewrites only the content, so a correct ownership set
+    # here survives on its own.
+    #
+    # What it repairs is the case where this ran and FAILED: if the base package
+    # had not been configured yet, the `sauron` group did not exist, chgrp fell
+    # to the warning branch, and the file is left root:root 0644 -- which dpkg
+    # then faithfully preserves forever, because preserving is what it does.
+    # Without the unconditional re-run there is no second chance, and the
+    # daemons (User=sauron) never regain read access to their own config.
+    if [ -e "$CONFDIR/sauron.env" ]; then
+        if chgrp sauron "$CONFDIR/sauron.env" 2>/dev/null; then
+            chmod 0640 "$CONFDIR/sauron.env"
+        else
+            echo "sauron: WARNING could not set group 'sauron' on $CONFDIR/sauron.env." >&2
+            echo "sauron: The daemons run as User=sauron and will not be able to read it." >&2
+        fi
+    fi
+
+    # Belt and braces alongside the tmpfiles fragment: tmpfiles only applies when
+    # systemd is actually running, which is not the case in a container or a
+    # chroot install. StateDirectory=sauron in the units covers it at runtime too,
+    # but an operator inspecting the tree before first start should still see the
+    # right ownership.
+    for d in /var/lib/sauron /var/lib/sauron/cold; do
+        [ -d "$d" ] || continue
+        chown sauron:sauron "$d" 2>/dev/null || :
+        chmod 0750 "$d"
+    done
+fi
