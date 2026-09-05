@@ -267,13 +267,17 @@ async fn test_http_search_schema_issues_200_ok() {
     // Check variable prefixes presence
     let vars = json_body["variables"].as_array().unwrap();
     let prefixes: Vec<&str> = vars.iter().map(|v| v["prefix"].as_str().unwrap()).collect();
-    // Only what this resource can actually resolve. Issues carry tags (via
-    // their occurrences) but have no `context`/`extra` column, so offering
-    // those prefixes would advertise a filter that every query using it gets a
-    // 400 for — see `build_schema_response`.
+    // Only what this resource can actually resolve — offering a prefix that
+    // every query using it gets a 400 for is the failure this pins; see
+    // `build_schema_response`.
+    //
+    // Issues own none of these columns. All three are advertised anyway
+    // because `IssuesLower` answers each with a correlated EXISTS into
+    // `error_events`, so the autocomplete is offering something that works.
+    // `@$label` is the one absentee, and it belongs to a different mechanism.
     assert!(prefixes.contains(&"@tag"));
-    assert!(!prefixes.contains(&"@context"));
-    assert!(!prefixes.contains(&"@extra"));
+    assert!(prefixes.contains(&"@extra"));
+    assert!(prefixes.contains(&"@context"));
 
     server.shutdown().await;
 }

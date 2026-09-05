@@ -27,7 +27,7 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use sauron_alerts::rule::{Conditions, TriggerType};
+use sauron_alerts::rule::{self, Conditions, TriggerType};
 use sauron_alerts::{AlertContext, AlertEngine, SecretCipher, Severity};
 use sauron_core::Config;
 use sauron_db::models::AlertRule;
@@ -237,6 +237,44 @@ async fn evaluate_rule(
         _ => None,
     };
 
+    // The rule's search-language narrowing, parsed once per tick. `rule::
+    // parse_query` is the same call the write path validates with, so the two
+    // cannot disagree about what resolves.
+    //
+    // An unparseable query **skips the rule** rather than counting unfiltered.
+    // Both outcomes are bad — a rule that never fires, or a rule that fires on
+    // events it was never asked about — and the second is worse: it pages
+    // someone with a wrong answer, whereas this one is loud in the log and
+    // cannot be reached by any rule the API accepted.
+    let query_node = match cond.filters.query.as_deref() {
+        Some(q) => match rule::parse_query(q) {
+            Ok(node) => Some(node),
+            Err(e) => {
+                warn!(
+                    rule_id = %rule.id,
+                    query = q,
+                    error = %e,
+                    "alert rule carries an unusable query — rule skipped this tick"
+                );
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+    // No environment map: `parse_query` refuses an `environment` predicate, so
+    // there is never a name here to resolve. Were one to arrive anyway it
+    // would lower to `Uuid::nil()` and match nothing — a rule that does not
+    // fire, never a rule that fires wrongly.
+    let prep_ctx = sauron_db::query_plan::PrepCtx {
+        environments: std::collections::HashMap::new(),
+        now,
+    };
+    let alert_query = query_node.as_ref().map(|node| repo::AlertQuery {
+        node,
+        ctx: &prep_ctx,
+    });
+    let alert_query = alert_query.as_ref();
+
     // The admin-facing input is an environment NAME, which is the right thing
     // to type into a rule dialog — but `error_events.environment_id` holds an
     // `app_environments` ENROLLMENT id, and before this the count compared it
@@ -301,12 +339,15 @@ async fn evaluate_rule(
             let from = now - window;
             let count = repo::alert_count_errors(
                 &mut conn,
-                &app_ids,
-                from,
-                now,
-                cond.filters.level.as_deref(),
-                env_ids_ref,
-                tag.as_ref(),
+                repo::AlertErrorCount {
+                    app_ids: &app_ids,
+                    from,
+                    to: now,
+                    level: cond.filters.level.as_deref(),
+                    env_ids: env_ids_ref,
+                    tag: tag.as_ref(),
+                    query: alert_query,
+                },
             )
             .await?;
             if cond.fires(count as f64) {
@@ -314,10 +355,12 @@ async fn evaluate_rule(
                 let mut ctx = AlertContext::new(severity, trigger.as_str())
                     .var("count", count.to_string())
                     .var("threshold", fmt_num(cond.threshold))
-                    .var("window_minutes", mins.to_string());
+                    .var("window_minutes", mins.to_string())
+                    .var("query", cond.filters.query.clone().unwrap_or_default());
                 ctx.title = format!("Error threshold crossed ({count} in {mins}m)");
                 ctx.summary = format!(
-                    "{count} error event(s) in the last {mins} minute(s) (threshold {}).",
+                    "{count} error event(s){} in the last {mins} minute(s) (threshold {}).",
+                    match_clause(cond.filters.query.as_deref()),
                     fmt_num(cond.threshold)
                 );
                 let dedup = format!("rule:{}:error_threshold", rule.id);
@@ -331,22 +374,28 @@ async fn evaluate_rule(
             let prev_from = from - window;
             let current = repo::alert_count_errors(
                 &mut conn,
-                &app_ids,
-                from,
-                now,
-                cond.filters.level.as_deref(),
-                env_ids_ref,
-                tag.as_ref(),
+                repo::AlertErrorCount {
+                    app_ids: &app_ids,
+                    from,
+                    to: now,
+                    level: cond.filters.level.as_deref(),
+                    env_ids: env_ids_ref,
+                    tag: tag.as_ref(),
+                    query: alert_query,
+                },
             )
             .await?;
             let previous = repo::alert_count_errors(
                 &mut conn,
-                &app_ids,
-                prev_from,
-                from,
-                cond.filters.level.as_deref(),
-                env_ids_ref,
-                tag.as_ref(),
+                repo::AlertErrorCount {
+                    app_ids: &app_ids,
+                    from: prev_from,
+                    to: from,
+                    level: cond.filters.level.as_deref(),
+                    env_ids: env_ids_ref,
+                    tag: tag.as_ref(),
+                    query: alert_query,
+                },
             )
             .await?;
             // Require a real baseline and a real current volume, so 0→2 events
@@ -361,11 +410,13 @@ async fn evaluate_rule(
                     .var("count", current.to_string())
                     .var("previous_count", previous.to_string())
                     .var("factor", format!("{factor:.1}"))
-                    .var("window_minutes", mins.to_string());
+                    .var("window_minutes", mins.to_string())
+                    .var("query", cond.filters.query.clone().unwrap_or_default());
                 ctx.title = format!("Error spike: {factor:.1}× in {mins}m");
                 ctx.summary = format!(
-                    "{current} error event(s) in the last {mins} minute(s) vs {previous} in the \
-                     previous {mins} — a {factor:.1}× increase."
+                    "{current} error event(s){} in the last {mins} minute(s) vs {previous} in \
+                     the previous {mins} — a {factor:.1}× increase.",
+                    match_clause(cond.filters.query.as_deref())
                 );
                 let dedup = format!("rule:{}:error_spike", rule.id);
                 engine
@@ -464,6 +515,20 @@ fn percentile_of(metric: &str) -> Option<f64> {
 }
 
 /// Render a threshold without a trailing `.0` when it is a whole number.
+/// The " matching `<query>`" clause an alert body carries when its rule is
+/// narrowed, and nothing at all when it is not.
+///
+/// A rule that fires on one specific exception must SAY which, or the
+/// notification is indistinguishable from the unfiltered rule beside it — the
+/// recipient sees "3 error events in the last minute" either way and cannot
+/// tell which alarm went off.
+fn match_clause(query: Option<&str>) -> String {
+    match query {
+        Some(q) => format!(" matching `{q}`"),
+        None => String::new(),
+    }
+}
+
 fn fmt_num(v: f64) -> String {
     if (v.fract()).abs() < f64::EPSILON {
         format!("{v:.0}")
@@ -494,5 +559,391 @@ mod tests {
     fn fmt_num_drops_trailing_zero() {
         assert_eq!(fmt_num(10.0), "10");
         assert_eq!(fmt_num(2.5), "2.5");
+    }
+
+    // =======================================================================
+    // `evaluate_rule` against a real database.
+    //
+    // The two tests above are the whole of this binary's previous coverage,
+    // and both are pure helpers — the evaluation path itself had never
+    // executed under test. Everything AROUND it was proven separately (the
+    // count query in `sauron-db`'s `notifications.rs`, the write-time
+    // validation in `sauron-alerts`' `rule.rs`, the authorization in
+    // `sauron-api`'s `http_alerting.rs`) and nothing had ever connected them
+    // and watched an alert appear.
+    //
+    // A rule with NO channels still writes its `alert_events` row — status
+    // `skipped`, title and body intact (`AlertEngine::fire`) — so the whole
+    // decision is observable without a delivery destination, a network stub,
+    // or a webhook that could fail for its own reasons.
+    // =======================================================================
+
+    use sauron_db::models::{NewAlertRule, NewErrorEvent, NewIssue};
+    use serde_json::json as j;
+
+    struct Rig {
+        /// `Option` so [`Rig::cleanup`] can take it and drop every connection
+        /// before asking the server to drop the database — and so `Drop` can
+        /// tell a cleaned rig from a leaked one without a second flag.
+        pool: Option<sauron_db::PgPool>,
+        redis: RedisStore,
+        engine: AlertEngine,
+        org_id: uuid::Uuid,
+        app_id: uuid::Uuid,
+        admin_url: String,
+        db_name: String,
+    }
+
+    impl Rig {
+        /// Seeds three error events: two carrying
+        /// `extra.title = noInternetConnectionTitle`, one carrying a different
+        /// title. Three, not two, so "narrowed" and "unfiltered" produce
+        /// DIFFERENT counts — with an all-matching fixture a predicate that
+        /// silently dropped would still look right.
+        async fn setup() -> Option<Rig> {
+            let admin_url = std::env::var("TEST_DATABASE_URL").ok()?;
+            let redis_url = std::env::var("TEST_REDIS_URL").ok()?;
+            let db_name = format!("sauron_test_eval_{}", uuid::Uuid::new_v4().simple());
+            sauron_db::create_test_database(&admin_url, &db_name)
+                .await
+                .expect("create migrated ephemeral database");
+            let db_url = {
+                let (base, _) = admin_url.rsplit_once('/').expect("database url has a path");
+                format!("{base}/{db_name}")
+            };
+            let pool = sauron_db::build_pool(&db_url, 4).expect("build pool");
+            let redis = RedisStore::connect(&redis_url).await.expect("redis");
+            let engine = AlertEngine::new(SecretCipher::new("evaluator-test-key"), false, 1000);
+
+            let mut conn = sauron_db::conn(&pool).await.expect("checkout");
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let org = repo::create_org(&mut conn, "eval org", &format!("eval-org-{suffix}"))
+                .await
+                .expect("org");
+            let project = repo::create_project(
+                &mut conn,
+                org.id,
+                "eval project",
+                &format!("eval-p-{suffix}"),
+            )
+            .await
+            .expect("project");
+            let app = repo::create_app(
+                &mut conn,
+                project.id,
+                "eval app",
+                &format!("eval-a-{suffix}"),
+                "flutter",
+            )
+            .await
+            .expect("app");
+            let issue = repo::upsert_issue(
+                &mut conn,
+                NewIssue {
+                    app_id: app.id,
+                    fingerprint: &format!("eval-fp-{suffix}"),
+                    type_: "SocketException",
+                    title: "no internet",
+                    culprit: "eval::seed",
+                    level: "error",
+                    first_seen: Utc::now(),
+                    last_seen: Utc::now(),
+                    times_seen: 3,
+                },
+            )
+            .await
+            .expect("issue");
+
+            for title in [
+                "noInternetConnectionTitle",
+                "noInternetConnectionTitle",
+                "someOtherTitle",
+            ] {
+                repo::insert_error_event(
+                    &mut conn,
+                    NewErrorEvent {
+                        id: uuid::Uuid::new_v4(),
+                        app_id: app.id,
+                        environment_id: None,
+                        issue_id: issue,
+                        fingerprint: format!("eval-fp-{suffix}"),
+                        level: "error".into(),
+                        message: "boom".into(),
+                        exception_type: "SocketException".into(),
+                        exception_value: "boom".into(),
+                        stacktrace: j!([]),
+                        breadcrumbs: j!([]),
+                        context: j!({}),
+                        tags: j!({}),
+                        release: None,
+                        distinct_id: None,
+                        event_user: None,
+                        sdk: None,
+                        ip_address: None,
+                        // Inside every window under test, and safely clear of
+                        // the `(from, to]` upper bound.
+                        occurred_at: Utc::now() - chrono::Duration::seconds(5),
+                        session_id: None,
+                        device_key: None,
+                        screen: None,
+                        workflow_id: None,
+                        workflow_name: None,
+                        stacktrace_symbolicated: None,
+                        symbolication_status: "not_applicable".into(),
+                        debug_meta: None,
+                        contexts: j!({}),
+                        extra: j!({ "title": title }),
+                        handled: Some(false),
+                        title: None,
+                        culprit: None,
+                        stacktrace_sha256: None,
+                    },
+                )
+                .await
+                .expect("insert error event");
+            }
+            drop(conn);
+
+            Some(Rig {
+                pool: Some(pool),
+                redis,
+                engine,
+                org_id: org.id,
+                app_id: app.id,
+                admin_url,
+                db_name,
+            })
+        }
+
+        /// A channel-less `error_threshold` rule over this app, carrying
+        /// `conditions` verbatim — including a query the API would have
+        /// refused, which is how the "stored rule is unusable" branch is
+        /// reachable at all.
+        async fn rule(&self, name: &str, conditions: serde_json::Value) -> AlertRule {
+            let mut conn = sauron_db::conn(self.pool.as_ref().expect("pool taken"))
+                .await
+                .expect("checkout");
+            repo::create_alert_rule(
+                &mut conn,
+                NewAlertRule {
+                    org_id: self.org_id,
+                    project_id: None,
+                    app_id: Some(self.app_id),
+                    monitor_id: None,
+                    name,
+                    trigger_type: "error_threshold",
+                    conditions: &conditions,
+                    severity: "warning",
+                    // No throttle: two rules in one test must not suppress
+                    // each other, and a throttled row would be a THIRD status
+                    // to disambiguate for no benefit.
+                    throttle_seconds: 0,
+                    message_template: None,
+                    last_evaluated_at: None,
+                    created_by: None,
+                },
+            )
+            .await
+            .expect("create rule")
+        }
+
+        /// Every `alert_events` body written for one rule.
+        ///
+        /// Read through the same repo function `list_history` serves, rather
+        /// than a hand-written query: this binary depends on `sauron-db`, not
+        /// on diesel, and the shipped reader is the honest thing to assert on
+        /// anyway — an event this cannot see is one an operator cannot see.
+        async fn bodies(&self, rule_id: uuid::Uuid) -> Vec<String> {
+            let mut conn = sauron_db::conn(self.pool.as_ref().expect("pool taken"))
+                .await
+                .expect("checkout");
+            repo::list_alert_events_visible(&mut conn, self.org_id, &[rule_id], &[], 200, 0)
+                .await
+                .expect("load alert events")
+                .into_iter()
+                .map(|e| e.body)
+                .collect()
+        }
+
+        /// Explicit, not `Drop`: async work cannot run there, and a leaked
+        /// ephemeral database is the failure this project has already been
+        /// bitten by once.
+        async fn cleanup(mut self) {
+            // Every connection must be back before the server will drop the
+            // database out from under them.
+            drop(self.pool.take());
+            sauron_db::drop_database(&self.admin_url, &self.db_name)
+                .await
+                .expect("drop ephemeral test database");
+        }
+    }
+
+    impl Drop for Rig {
+        /// Async work cannot run in `Drop`, so a test that panicked before
+        /// reaching `cleanup()` leaks its database. Say so loudly rather than
+        /// attempt a runtime-in-`Drop` workaround — the same ruling
+        /// `sauron-db`'s `TestDb` makes, and for the same reason: this project
+        /// has already had a silent leak sit unnoticed for a whole session.
+        fn drop(&mut self) {
+            // A taken pool means `cleanup` ran and the database is gone.
+            if self.pool.is_none() {
+                return;
+            }
+            eprintln!(
+                "WARNING: ephemeral test database {} leaked (the test panicked before \
+                 cleanup). Drop it with: DROP DATABASE \"{}\" WITH (FORCE);",
+                self.db_name, self.db_name
+            );
+        }
+    }
+
+    /// **The test this feature was missing.** Three events are in the window,
+    /// two of which match the query, and the narrowed rule must count two.
+    ///
+    /// Counting THREE would mean the predicate never reached the query —
+    /// exactly what a mis-wired `AlertQuery` produces, and exactly what every
+    /// other test in the stack would have kept passing through.
+    #[tokio::test]
+    async fn a_query_narrowed_rule_counts_only_matching_events() {
+        let Some(rig) = Rig::setup().await else {
+            eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping");
+            return;
+        };
+
+        let narrowed = rig
+            .rule(
+                "narrowed",
+                j!({
+                    "threshold": 1,
+                    "window_seconds": 60,
+                    "filters": { "query": "extra.title=noInternetConnectionTitle" }
+                }),
+            )
+            .await;
+        let unfiltered = rig
+            .rule("unfiltered", j!({ "threshold": 1, "window_seconds": 60 }))
+            .await;
+
+        evaluate_rule(
+            rig.pool.as_ref().expect("pool"),
+            &rig.redis,
+            &rig.engine,
+            narrowed.clone(),
+        )
+        .await
+        .expect("evaluate narrowed");
+        evaluate_rule(
+            rig.pool.as_ref().expect("pool"),
+            &rig.redis,
+            &rig.engine,
+            unfiltered.clone(),
+        )
+        .await
+        .expect("evaluate unfiltered");
+
+        let narrowed_bodies = rig.bodies(narrowed.id).await;
+        assert_eq!(narrowed_bodies.len(), 1, "the narrowed rule must fire once");
+        assert!(
+            narrowed_bodies[0].contains("2 error event(s)"),
+            "must count only the two matching rows: {}",
+            narrowed_bodies[0]
+        );
+        assert!(
+            narrowed_bodies[0].contains("matching `extra.title=noInternetConnectionTitle`"),
+            "the body must name the query, or it reads like the unfiltered rule: {}",
+            narrowed_bodies[0]
+        );
+
+        // The control, and the reason the number above means something.
+        let all = rig.bodies(unfiltered.id).await;
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].contains("3 error event(s)"),
+            "the unfiltered rule sees all three: {}",
+            all[0]
+        );
+        assert!(
+            !all[0].contains("matching"),
+            "and carries no match clause: {}",
+            all[0]
+        );
+
+        rig.cleanup().await;
+    }
+
+    /// A query that matches nothing must leave the rule SILENT — not fire with
+    /// a zero count, and not fire on the unfiltered population.
+    #[tokio::test]
+    async fn a_query_matching_nothing_fires_no_alert() {
+        let Some(rig) = Rig::setup().await else {
+            eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let rule = rig
+            .rule(
+                "no match",
+                j!({
+                    "threshold": 1,
+                    "window_seconds": 60,
+                    "filters": { "query": "extra.title=neverHappens" }
+                }),
+            )
+            .await;
+
+        evaluate_rule(
+            rig.pool.as_ref().expect("pool"),
+            &rig.redis,
+            &rig.engine,
+            rule.clone(),
+        )
+        .await
+        .expect("evaluate");
+
+        assert!(
+            rig.bodies(rule.id).await.is_empty(),
+            "a rule whose query matches nothing must not fire"
+        );
+        rig.cleanup().await;
+    }
+
+    /// A stored rule whose query cannot resolve is SKIPPED, not counted
+    /// unfiltered.
+    ///
+    /// Unreachable through the API — `validate_conditions` refuses it on write
+    /// — so the row is inserted directly, which is also how it could arrive in
+    /// production: a rule saved before the grammar changed under it. The
+    /// failure this pins is the tempting one: falling back to an unfiltered
+    /// count would page someone about events the rule never asked about.
+    #[tokio::test]
+    async fn a_rule_whose_stored_query_is_unusable_is_skipped_not_widened() {
+        let Some(rig) = Rig::setup().await else {
+            eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping");
+            return;
+        };
+        let rule = rig
+            .rule(
+                "unusable",
+                j!({
+                    "threshold": 1,
+                    "window_seconds": 60,
+                    "filters": { "query": "nonsenseField=1" }
+                }),
+            )
+            .await;
+
+        evaluate_rule(
+            rig.pool.as_ref().expect("pool"),
+            &rig.redis,
+            &rig.engine,
+            rule.clone(),
+        )
+        .await
+        .expect("an unusable query is a skip, never an Err that kills the tick");
+
+        assert!(
+            rig.bodies(rule.id).await.is_empty(),
+            "an unusable query must not fall back to an unfiltered count"
+        );
+        rig.cleanup().await;
     }
 }

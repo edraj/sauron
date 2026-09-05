@@ -3137,6 +3137,7 @@ dependencies = [
  "sauron-db",
  "sauron-mail",
  "sauron-monitor-core",
+ "sauron-query",
  "sauron-redis",
  "serde",
  "serde_json",

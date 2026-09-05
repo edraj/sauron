@@ -148,6 +148,7 @@
   let rLevel = $state('');
   let rEnvironment = $state('');
   let rEventName = $state('');
+  let rQuery = $state('');
   let rTemplate = $state('');
   let rChannels = $state<string[]>([]);
   let savingRule = $state(false);
@@ -247,6 +248,7 @@
     rLevel = '';
     rEnvironment = '';
     rEventName = '';
+    rQuery = '';
     rTemplate = '';
     rChannels = [];
     rMonitor = '';
@@ -301,6 +303,7 @@
     rLevel = c.filters?.level ?? '';
     rEnvironment = c.filters?.environment ?? '';
     rEventName = c.filters?.event_name ?? '';
+    rQuery = c.filters?.query ?? '';
     showRuleForm = true;
   }
 
@@ -320,6 +323,7 @@
     metric: t === 'perf_degradation',
     level: t === 'issue_new' || t === 'issue_regression' || t === 'error_threshold' || t === 'error_spike',
     eventName: t === 'event_threshold',
+    query: t === 'error_threshold' || t === 'error_spike',
   });
 
   const needs = $derived(triggerNeeds(rTrigger));
@@ -523,6 +527,7 @@
     if (needs.level && rLevel) filters.level = rLevel;
     if (rEnvironment) filters.environment = rEnvironment;
     if (needs.eventName && rEventName) filters.event_name = rEventName;
+    if (needs.query && rQuery.trim()) filters.query = rQuery.trim();
     if (Object.keys(filters).length) conditions.filters = filters;
     return conditions;
   }
@@ -1120,6 +1125,15 @@
 
             {#if needs.eventName}
               <Input label={t('alerts.field.eventName')} bind:value={rEventName} placeholder="checkout_completed" />
+            {/if}
+
+            {#if needs.query}
+              <Input
+                label={t('alerts.field.queryFilter')}
+                bind:value={rQuery}
+                placeholder="extra.title=noInternetConnectionTitle"
+                hint={t('alerts.field.queryHint')}
+              />
             {/if}
 
             <Input

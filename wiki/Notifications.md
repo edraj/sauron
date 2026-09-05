@@ -1,9 +1,10 @@
 # Notifications
 
 Sauron sends two kinds of email. **Alerts** are configured by an organization
-admin and go to org-wide channels. **Personal notifications** — this page — are
-configured by you, go to your own address, and nobody else can see or change
-them.
+admin and go to org-wide channels — see [Dashboard → Alert
+rules](Dashboard.md#alert-rules), which is also where the per-rule search filter
+is documented. **Personal notifications** — this page — are configured by you, go
+to your own address, and nobody else can see or change them.
 
 ## What you can subscribe to
 

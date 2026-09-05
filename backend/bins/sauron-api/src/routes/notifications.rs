@@ -832,6 +832,70 @@ async fn authorize_rule_target(
     Ok(())
 }
 
+/// A rule's `filters.query` probes the same columns the search routes gate on,
+/// so it needs the same permission — at the rule's own scope.
+///
+/// **Why the trigger's own permission is not enough.** `error_threshold`
+/// authorizes on `issue:read`, and a caller holding that alone has every event
+/// body nulled by `symbolicate::strip_event_body`. A rule carrying
+/// `extra.token:~sk_live_` never shows them a body; it simply fires or does
+/// not, and `AlertEngine::log_event` persists that answer where `list_history`
+/// serves it. That is the same oracle `search::reject_withheld_dimensions`
+/// refuses on the read routes, reached by a different door.
+///
+/// An unusable query is a 400 here rather than a silent skip, for the reason
+/// `rule::validate_conditions` gives: an alert that never fires is
+/// indistinguishable from an alert that has nothing to say.
+async fn authorize_rule_query(
+    conn: &mut sauron_db::AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+    project_id: Option<Uuid>,
+    app_id: Option<Uuid>,
+    trigger: TriggerType,
+    conditions: &Value,
+) -> Result<(), ApiError> {
+    let Some(q) = rule::Conditions::from_value(trigger, conditions)
+        .filters
+        .query
+    else {
+        return Ok(());
+    };
+    let node = rule::parse_query(&q).map_err(ApiError::BadRequest)?;
+    if !super::search::touches_withheld_body(&node) {
+        return Ok(());
+    }
+    // Same scope arms as `authorize_rule_target`, one permission up. Monitor
+    // triggers keep their app-narrowing dropped there; they carry no query at
+    // all (`is_metric` is false), so this never runs for one.
+    let outcome = match (app_id, project_id) {
+        (Some(a), _) => authorize_app(conn, user_id, a, perm::EVENT_READ)
+            .await
+            .map(|_| ()),
+        (None, Some(p)) => authorize_project(conn, user_id, p, perm::EVENT_READ)
+            .await
+            .map(|_| ()),
+        (None, None) => authorize_org(conn, user_id, org_id, perm::EVENT_READ)
+            .await
+            .map(|_| ()),
+    };
+    // The generic "you do not have access" is the wrong answer HERE, and
+    // uniquely so: the caller was just allowed to create this very rule
+    // without the query, so a bare denial reads as a bug in the product. Name
+    // the field and the permission, the way `search::reject_withheld_body`
+    // does for the same probe on the read routes. Only the authorization
+    // verdict is rewritten; a NotFound or a database error travels unchanged.
+    match outcome {
+        Err(sauron_auth::AuthError::Forbidden) => Err(ApiError::Forbidden(
+            "filtering an alert rule by the event body requires event:read: the query \
+             probes columns withheld from a caller holding only issue:read, and whether \
+             the rule fires would disclose their contents"
+                .into(),
+        )),
+        other => Ok(other?),
+    }
+}
+
 /// [`authorize_rule_target`] as a question instead of an assertion.
 ///
 /// A denial is a legitimate answer here, not an error: both callers below have to
@@ -979,6 +1043,16 @@ pub async fn create_rule(
     )
     .await?;
     authorize_rule_target(&mut conn, auth.user_id, org_id, project_id, app_id, trigger).await?;
+    authorize_rule_query(
+        &mut conn,
+        auth.user_id,
+        org_id,
+        project_id,
+        app_id,
+        trigger,
+        &conditions,
+    )
+    .await?;
     check_channels_in_org(&mut conn, org_id, &req.channel_ids).await?;
 
     let rule = repo::create_alert_rule(
@@ -1131,6 +1205,20 @@ pub async fn update_rule(
             return Err(ApiError::BadRequest("conditions must be an object".into()));
         }
         rule::validate_conditions(trigger, c).map_err(ApiError::BadRequest)?;
+        // The edit door is the same door: a caller who could not CREATE this
+        // rule must not arrive at it by editing a harmless one. Checked
+        // against the SUBMITTED conditions, and against the rule's stored
+        // scope, which this route does not let them move.
+        authorize_rule_query(
+            &mut conn,
+            auth.user_id,
+            rule.org_id,
+            rule.project_id,
+            rule.app_id,
+            trigger,
+            c,
+        )
+        .await?;
     }
     if let Some(s) = &req.severity {
         if !SEVERITIES.contains(&s.as_str()) {

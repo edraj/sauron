@@ -114,6 +114,18 @@ pub struct Filters {
     pub tag_key: Option<String>,
     pub tag_value: Option<String>,
     pub op: Option<String>,
+    /// A search-language string, narrowing the metric to the events it
+    /// matches — `extra.title=noInternetConnectionTitle`, `os.name:Android`,
+    /// anything the Occurrences vocabulary accepts.
+    ///
+    /// Stored as the TEXT the admin typed rather than a serialized AST: it is
+    /// what the rule dialog shows back, what a shared link carries, and the
+    /// only form that survives a grammar gaining new spellings. It is parsed
+    /// on write (see [`validate_conditions`]) so a rule that cannot resolve is
+    /// refused rather than silently counting zero forever, and parsed again
+    /// per evaluation, which costs nothing measurable against one aggregate
+    /// query.
+    pub query: Option<String>,
 }
 
 impl Filters {
@@ -132,6 +144,7 @@ impl Filters {
             tag_key: get("tag_key"),
             tag_value: get("tag_value"),
             op: get("op"),
+            query: get("query"),
         }
     }
 }
@@ -220,8 +233,63 @@ pub fn validate_conditions(trigger: TriggerType, v: &Value) -> Result<(), String
         if c.threshold < 0.0 {
             return Err("threshold must be non-negative".into());
         }
+        if let Some(q) = c.filters.query.as_deref() {
+            validate_query(q)?;
+        }
     }
     Ok(())
+}
+
+/// Parse and resolve a `filters.query` string, so an unusable one is a 400 on
+/// the rule rather than a rule that counts zero.
+///
+/// Resolved against [`sauron_query::Resource::Occurrences`] because that is the
+/// resource whose lowering runs over `error_events` — the table every
+/// metric-driven error trigger counts. A rule on a different metric that names
+/// an occurrence-only field is still refused here, which is the honest answer:
+/// the predicate could not have narrowed that metric anyway.
+pub fn validate_query(q: &str) -> Result<(), String> {
+    parse_query(q).map(|_| ())
+}
+
+/// Parse, resolve and vet a `filters.query`, returning the tree the evaluator
+/// lowers.
+///
+/// **The single place the resource is chosen**, and it has to stay that way:
+/// validating against one resource and evaluating against another would accept
+/// rules at write time that can never match, which is the failure mode this
+/// whole path exists to avoid.
+pub fn parse_query(q: &str) -> Result<sauron_query::ResolvedNode, String> {
+    let ast = sauron_query::parse(q).map_err(|e| format!("query is not valid: {e}"))?;
+    let node = sauron_query::resolve(&ast, sauron_query::Resource::Occurrences)
+        .map_err(|e| format!("query is not valid: {e}"))?;
+    if names_an_environment(&node) {
+        return Err(
+            "query may not filter on `environment` — use the rule's own \
+                    environment filter, which resolves the name across every app \
+                    the rule covers"
+                .into(),
+        );
+    }
+    Ok(node)
+}
+
+/// Whether any leaf addresses the environment column.
+///
+/// Matched on the STORE rather than the dimension name, exactly as
+/// `sauron-api`'s `reject_withheld_environment` is: a name test would miss an
+/// alias and would also catch a same-named dimension over a different column.
+fn names_an_environment(node: &sauron_query::ResolvedNode) -> bool {
+    match node {
+        sauron_query::ResolvedNode::Pred(p) => {
+            matches!(p.dim.store, sauron_query::Store::Column("environment_id"))
+        }
+        sauron_query::ResolvedNode::Text(_) => false,
+        sauron_query::ResolvedNode::Not(inner) => names_an_environment(inner),
+        sauron_query::ResolvedNode::And(v) | sauron_query::ResolvedNode::Or(v) => {
+            v.iter().any(names_an_environment)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +342,87 @@ mod tests {
         assert_eq!(c.filters.level.as_deref(), Some("error"));
         assert_eq!(c.filters.environment.as_deref(), Some("prod"));
         assert_eq!(c.filters.tag_key.as_deref(), Some("region"));
+    }
+
+    #[test]
+    fn a_query_filter_is_parsed_and_blank_is_treated_as_absent() {
+        let c = Conditions::from_value(
+            TriggerType::ErrorThreshold,
+            &json!({ "filters": { "query": "extra.title=noInternetConnectionTitle" } }),
+        );
+        assert_eq!(
+            c.filters.query.as_deref(),
+            Some("extra.title=noInternetConnectionTitle")
+        );
+
+        // An empty string is a cleared input, not a query that matches
+        // nothing — the same rule every other filter here follows.
+        let blank = Conditions::from_value(
+            TriggerType::ErrorThreshold,
+            &json!({ "filters": { "query": "" } }),
+        );
+        assert_eq!(blank.filters.query, None);
+    }
+
+    /// A rule whose query does not parse must be refused at WRITE time. Left
+    /// to evaluation it becomes a rule that quietly counts zero every 30s
+    /// forever — indistinguishable from "nothing is wrong", which is the worst
+    /// possible failure for an alert.
+    /// Note the example: `extra.title:` with an EMPTY value is not an error —
+    /// the lexer reads it as free text, deliberately. An unmatched paren is a
+    /// real parse failure, and is what this asserts on.
+    #[test]
+    fn an_unparseable_query_is_rejected_on_write() {
+        let err = validate_conditions(
+            TriggerType::ErrorThreshold,
+            &json!({ "filters": { "query": "(level:error" } }),
+        )
+        .unwrap_err();
+        assert!(err.contains("query"), "{err}");
+
+        // …and the empty-value form really does pass, so the line above is
+        // not accidentally asserting on the wrong failure.
+        assert!(validate_conditions(
+            TriggerType::ErrorThreshold,
+            &json!({ "filters": { "query": "extra.title:" } }),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_query_naming_an_unknown_field_is_rejected_on_write() {
+        let err = validate_conditions(
+            TriggerType::ErrorThreshold,
+            &json!({ "filters": { "query": "extar.title=x" } }),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("extar"),
+            "the message must name the field: {err}"
+        );
+    }
+
+    /// `environment` is already a first-class rule filter, and that one
+    /// resolves enrollment ids across every app the rule covers. The query
+    /// language's version resolves against a SINGLE app, so allowing both
+    /// would give one rule two environment filters with different meanings.
+    #[test]
+    fn an_environment_predicate_in_the_query_is_rejected_with_a_pointer() {
+        let err = validate_conditions(
+            TriggerType::ErrorThreshold,
+            &json!({ "filters": { "query": "environment:staging" } }),
+        )
+        .unwrap_err();
+        assert!(err.contains("environment"), "{err}");
+    }
+
+    #[test]
+    fn a_valid_query_passes_validation() {
+        assert!(validate_conditions(
+            TriggerType::ErrorThreshold,
+            &json!({ "filters": { "query": "extra.title=noInternetConnectionTitle level:error" } }),
+        )
+        .is_ok());
     }
 
     #[test]

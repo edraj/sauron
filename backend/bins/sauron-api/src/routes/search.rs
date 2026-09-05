@@ -637,11 +637,13 @@ impl EnvNameReach {
 ///   into exactly that withheld blob, and a *sharper* one than a tag filter
 ///   because it addresses a single nested key.
 ///
-///   This has **no effect on Issues** — `R_ISSUES` declares no JSON root —
-///   and is here because Tasks 5 and 6 bridge `issues::events` and
-///   `issues::event_stats` onto Occurrences/Events, which authorize on
-///   `issue:read` ALONE and where those roots are live. Adding the arm in the
-///   linchpin is what stops the hole propagating into both.
+///   This arm went in for `issues::events` and `issues::event_stats`, which
+///   Tasks 5 and 6 bridged onto Occurrences/Events — routes authorizing on
+///   `issue:read` ALONE, where those roots are live. Adding it in the linchpin
+///   is what stopped the hole propagating into both, and it is also why the
+///   Issues LIST needed no new gate when `extra` and `contexts` were bridged
+///   onto that resource: the arm was already here, keyed on the store, and it
+///   started refusing the moment the catalog made those two reachable.
 ///
 ///   The default is REFUSE and the exceptions are listed by column, not the
 ///   other way round: an opt-out list fails open for whatever a later slice
@@ -764,6 +766,27 @@ fn reject_withheld_environment(
 
 /// The three storage kinds withheld from a caller without `event:read` — see
 /// [`reject_withheld_dimensions`]' doc for the reasoning behind each.
+/// Whether any leaf of `node` probes something only `event:read` entitles a
+/// caller to — the boolean form of [`reject_withheld_body`]'s decision.
+///
+/// Exists for a caller that is not a search route and so has no
+/// [`TextSearchReach`] to hand: `routes::notifications`, which must decide
+/// whether an alert rule's stored query demands `event:read` at the rule's
+/// scope. Kept beside the refusal, and pinned to agree with it by
+/// `the_boolean_and_the_refusal_agree_leaf_for_leaf`, because two independent
+/// readings of "withheld" is exactly how one of them ends up more permissive.
+pub fn touches_withheld_body(node: &ResolvedNode) -> bool {
+    match node {
+        ResolvedNode::Pred(p) => reject_withheld_body(p, TextSearchReach::ShellOnly).is_err(),
+        // Free text is narrowed rather than refused on a search route, and an
+        // alert rule's `query` cannot carry a bare text term into the event
+        // body either: `OccurrencesLower::text` applies the same narrowing.
+        ResolvedNode::Text(_) => false,
+        ResolvedNode::Not(inner) => touches_withheld_body(inner),
+        ResolvedNode::And(v) | ResolvedNode::Or(v) => v.iter().any(touches_withheld_body),
+    }
+}
+
 fn reject_withheld_body(p: &ResolvedPredicate, reach: TextSearchReach) -> Result<(), ApiError> {
     if reach.includes_body() {
         return Ok(());
@@ -1723,6 +1746,52 @@ mod tests {
         }
     }
 
+    /// The Exceptions list authorizes on `issue:read` ALONE, and its two JSON
+    /// roots reach `error_events.extra` / `.contexts` through a correlated
+    /// EXISTS — the same columns `strip_event_body` nulls for that caller. So
+    /// the fail-closed arm has to bite here too, and this is the resource
+    /// where it matters most: before the bridge, `Resource::Issues` declared
+    /// no JSON root and could not reach that arm at all.
+    #[test]
+    fn a_json_root_on_issues_is_refused_without_event_read() {
+        use sauron_query::Resource;
+        for q in [
+            "extra.title:noInternetConnectionTitle",
+            "contexts.checkout.step:payment",
+            "has:extra.title",
+            "!extra.title:noInternetConnectionTitle",
+            // The rest of the event body, bridged in the same way and over
+            // exactly the columns `strip_event_body` nulls: `event_user`,
+            // `sdk`, `context` (behind `os`/`browser`/`device`/`app`) and
+            // `stacktrace`.
+            "user.email:a@b.com",
+            "sdk.name:sauron",
+            "os.name:Linux",
+            "browser.version:~12",
+            "device.model:Pixel",
+            "app.build:100",
+            "stack.filename:app.js",
+            "has:stack.filename",
+            // The bare roots, whose `has:` form is column presence rather than
+            // a key probe — a different branch of the lowerer, same gate.
+            "context.os.name:Linux",
+            "has:context",
+            "has:extra",
+            "has:user",
+        ] {
+            let node = resolve_query(Some(q), &[], None, Resource::Issues).unwrap();
+            match reject(&node, ShellOnly) {
+                Err(ApiError::Forbidden(m)) => assert!(
+                    m.contains("event:read"),
+                    "`{q}`: the refusal must name the permission that lifts it: {m}"
+                ),
+                other => panic!("`{q}` must be refused with a 403, got {other:?}"),
+            }
+            // …and allowed once the caller may read the body it probes.
+            assert!(reject(&node, IncludingBody).is_ok());
+        }
+    }
+
     #[test]
     fn a_json_root_over_a_non_withheld_column_is_allowed() {
         use sauron_query::Resource;
@@ -1739,6 +1808,56 @@ mod tests {
                 "`{q}` must NOT be refused — it is not a withheld column"
             );
         }
+    }
+
+    /// `touches_withheld_body` and `reject_withheld_body` must give the same
+    /// answer for every dimension the catalog declares. Two readings of
+    /// "withheld" is how the alert-rule gate ends up more permissive than the
+    /// search gate without anyone editing either.
+    #[test]
+    fn the_boolean_and_the_refusal_agree_leaf_for_leaf() {
+        use sauron_query::{dimensions_for, Resource};
+        let mut checked = 0;
+        for resource in [
+            Resource::Issues,
+            Resource::Occurrences,
+            Resource::Events,
+            Resource::Sessions,
+        ] {
+            for dim in dimensions_for(resource) {
+                // One syntactically valid probe per dimension; JSON roots need
+                // a dotted remainder to produce a path at all.
+                let q = match dim.store {
+                    sauron_query::Store::JsonRoot { .. } => format!("{}.k:v", dim.name),
+                    _ => continue,
+                };
+                let Ok(node) = resolve_query(Some(&q), &[], None, resource) else {
+                    continue;
+                };
+                let refused = reject(&node, ShellOnly).is_err();
+                assert_eq!(
+                    touches_withheld_body(&node),
+                    refused,
+                    "`{q}` on {resource:?}: the boolean and the refusal disagree"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10, "the sweep must actually cover something");
+
+        // And the two non-leaf shapes, which the walk handles separately.
+        let nested = resolve_query(
+            Some("level:error OR extra.k:v"),
+            &[],
+            None,
+            Resource::Issues,
+        )
+        .unwrap();
+        assert!(touches_withheld_body(&nested), "an OR branch still counts");
+        let negated = resolve_query(Some("!extra.k:v"), &[], None, Resource::Issues).unwrap();
+        assert!(touches_withheld_body(&negated), "so does a negated one");
+        let clean = resolve_query(Some("level:error"), &[], None, Resource::Issues).unwrap();
+        assert!(!touches_withheld_body(&clean), "and a clean query does not");
     }
 
     /// The list is fail-closed, and this is what pins that: it must name
@@ -2058,9 +2177,25 @@ mod tests {
         assert!(resp.variables.iter().any(|v| v.prefix == "@context"));
 
         // ...and the converse, so this cannot be "fixed" by dropping every
-        // variable: Issues have tags but no `context`/`extra` column.
+        // variable: Transactions carry tags and `extra` (both since migration
+        // 0063) but no `context`, so exactly two of the three are offered.
+        //
+        // This assertion used to be made with Issues, which was the resource
+        // with tags and no JSON roots at all. Issues now declares every root,
+        // so it can no longer play the counter-example — Transactions is the
+        // resource that still splits the two, and the property under test (a
+        // per-resource filter, not an all-or-nothing list) is unchanged.
+        let tx =
+            build_schema_response("transactions", sauron_query::Resource::Transactions, vec![]);
+        assert!(tx.variables.iter().any(|v| v.prefix == "@tag"));
+        assert!(tx.variables.iter().any(|v| v.prefix == "@extra"));
+        assert!(!tx.variables.iter().any(|v| v.prefix == "@context"));
+
+        // Issues, the resource this changed for: every root reachable, so
+        // every prefix offered.
         let issues = build_schema_response("issues", sauron_query::Resource::Issues, vec![]);
         assert!(issues.variables.iter().any(|v| v.prefix == "@tag"));
-        assert!(!issues.variables.iter().any(|v| v.prefix == "@context"));
+        assert!(issues.variables.iter().any(|v| v.prefix == "@extra"));
+        assert!(issues.variables.iter().any(|v| v.prefix == "@context"));
     }
 }

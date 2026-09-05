@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use sauron_query::{MatchOp, ResolvedPredicate, Store, TimeSpec, TypedValue};
 
-use crate::query_plan::{Frag, PlanError, PrepCtx, ResourceLower};
+use crate::query_plan::{
+    json_path_segments, nest_json_object, Frag, PlanError, PrepCtx, ResourceLower,
+};
 use crate::repo::{like_contains, TextSearchReach};
 use crate::schema::issues;
 use crate::scope::EnvFilter;
@@ -440,8 +442,44 @@ impl ResourceLower for IssuesLower<'_> {
             Store::Column("device_key") => {
                 occurrence_column_leaf(" AND e.device_key", p, negate, self.env, self.since)
             }
-            // Issues has no JSON-root dimensions in the catalog; kept for
-            // exhaustiveness in case the catalog ever grows one.
+            // `extra` and `contexts` are the two DEV-SUPPLIED JSONB columns,
+            // and they live on `error_events` like the three columns above —
+            // so they take the same correlated-EXISTS bridge. The column SQL
+            // is a literal from this arm for the reason it is one there.
+            Store::JsonRoot {
+                column: "extra",
+                prefix,
+            } => json_root_leaf(" AND e.extra", prefix, p, negate, self.env, self.since),
+            Store::JsonRoot {
+                column: "contexts",
+                prefix,
+            } => json_root_leaf(" AND e.contexts", prefix, p, negate, self.env, self.since),
+            Store::JsonRoot {
+                column: "event_user",
+                prefix,
+            } => json_root_leaf(" AND e.event_user", prefix, p, negate, self.env, self.since),
+            Store::JsonRoot {
+                column: "sdk",
+                prefix,
+            } => json_root_leaf(" AND e.sdk", prefix, p, negate, self.env, self.since),
+            // One arm for four dimensions: `os`, `browser`, `device` and `app`
+            // are all views onto the single `context` column, told apart by
+            // the storage `prefix` the resolver already folded into the path.
+            Store::JsonRoot {
+                column: "context",
+                prefix,
+            } => json_root_leaf(" AND e.context", prefix, p, negate, self.env, self.since),
+            // `stacktrace` is an ARRAY and has a blob pool behind it, so it
+            // cannot share `json_root_leaf` — see `stack_leaf`.
+            Store::JsonRoot {
+                column: "stacktrace",
+                ..
+            } => stack_leaf(p, negate, self.env, self.since),
+            // Any FUTURE JSON root stays refused, and the default is refusal
+            // rather than a generic bridge on purpose: a catch-all would
+            // silently light a new column up on this page the moment the
+            // catalog listed one. Each needs its own arm, and the decision to
+            // add it needs to be someone's.
             Store::JsonRoot { .. } => Err(PlanError::UnsupportedOnResource {
                 field: p.dim.name.to_string(),
             }),
@@ -890,6 +928,299 @@ fn tag_ilike(key: &str, pattern: &str, env: &EnvFilter) -> Frag<issues::table> {
     )
 }
 
+// ===========================================================================
+// JSON roots — `extra` and `contexts`, asked of an issue.
+// ===========================================================================
+
+/// A predicate over one of `error_events`' dev-supplied JSONB columns, asked
+/// of an issue.
+///
+/// The same correlated-EXISTS bridge as [`occurrence_column_leaf`], and it
+/// inherits the same three properties from it: the tenant key re-asserted
+/// inside the subquery, the environment scope ANDed in by
+/// [`exists_close_env`], and negation as `NOT EXISTS` rather than
+/// `EXISTS(… <> …)` — an issue none of whose occurrences carry an `extra`
+/// object at all DOES match `!extra.title:x`.
+///
+/// The JSONB rules themselves are `occurrences.rs`' `json_object_leaf!`,
+/// measured against a live database and restated here over raw SQL because
+/// the subquery is text, not a diesel DSL expression over `error_events`:
+/// `Eq`/`In` are `@>` containment, single-segment `Has` is `?`, nested `Has`
+/// is `@? …::jsonpath`, and `Like`/`Contains` is `#>> … ILIKE`.
+///
+/// **The caller-supplied path never reaches SQL text.** It is nested into one
+/// `Jsonb` bind by [`nest_json_object`], or bound as `Array<Text>` for the
+/// `#>>` extraction, or as `Text` for the key/jsonpath probes — the same
+/// injection story `occurrences.rs` documents, on a path that gets there by a
+/// different route.
+///
+/// Unlike the occurrence COLUMNS, there is no index behind any of this: the
+/// `jsonb_ops` GINs were measured and dropped (see migration 25's `up.sql`),
+/// which is why the catalog classes both roots `Bounded` and why the `since`
+/// bound below is doing real work rather than tidying.
+fn json_root_leaf(
+    col_sql: &'static str,
+    prefix: &str,
+    p: &ResolvedPredicate,
+    negate: bool,
+    env: &EnvFilter,
+    since: DateTime<Utc>,
+) -> Result<Frag<issues::table>, PlanError> {
+    let field = p.dim.name;
+    // `has:extra` — the object itself, with no key named. On a root whose
+    // storage prefix is empty this yields no segments at all, so it must be
+    // answered here rather than through `json_path_segments`. Negation stays
+    // `NOT EXISTS` over the positive form, which on this resource reads "no
+    // occurrence carries one"; the occurrences macro's `col IS NULL` is a
+    // statement about a single row and would be the wrong question here.
+    if p.path.is_none() && prefix.is_empty() && matches!(p.op, MatchOp::Has) {
+        let positive = exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" IS NOT NULL"),
+            env
+        );
+        return Ok(if negate {
+            Box::new(diesel::dsl::not(positive))
+        } else {
+            positive
+        });
+    }
+    // A bare `extra:x` with no dotted remainder is still a `BadValue`, the same
+    // answer `occurrences.rs` gives it: there is no key to compare against.
+    let segments =
+        json_path_segments(prefix, p.path.as_deref()).ok_or_else(|| PlanError::BadValue {
+            field: field.to_string(),
+        })?;
+
+    let contains = |value: &str| -> Frag<issues::table> {
+        let obj = nest_json_object(&segments, serde_json::Value::String(value.to_string()));
+        exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" @> ")
+                .bind::<Jsonb, _>(obj),
+            env
+        )
+    };
+
+    let positive: Frag<issues::table> = match p.op {
+        MatchOp::Eq => contains(as_str(&p.value, field)?),
+        // Reachable only through the serialized-`Node` spelling of `query=`;
+        // `!extra.title:x` arrives as `Eq` with `negate`. It must emit exactly
+        // what that emits — "no occurrence matches", not "some occurrence
+        // holds a different value" — so it flips the flag and returns.
+        MatchOp::Ne => {
+            let eq = contains(as_str(&p.value, field)?);
+            return Ok(if negate {
+                eq
+            } else {
+                Box::new(diesel::dsl::not(eq))
+            });
+        }
+        MatchOp::In => {
+            let values = as_str_list(&p.value, field)?;
+            let mut values = values.into_iter();
+            let first = values.next().ok_or_else(|| PlanError::BadValue {
+                field: field.to_string(),
+            })?;
+            let mut acc: Frag<issues::table> = contains(&first);
+            for v in values {
+                acc = Box::new(acc.or(contains(&v)));
+            }
+            acc
+        }
+        // `has:extra.title` — one segment, so top-level key existence, which
+        // `?` answers directly.
+        MatchOp::Has if segments.len() == 1 => exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" ? ")
+                .bind::<Text, _>(segments[0].clone()),
+            env
+        ),
+        // `has:contexts.checkout.step` — nested key existence has no `?`-style
+        // operator; a jsonpath probe is the closest correct primitive.
+        MatchOp::Has => exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" @? ")
+                .bind::<Text, _>(format!("$.{}", segments.join(".")))
+                .sql("::jsonpath"),
+            env
+        ),
+        // `resolve` has already escaped the pattern and wrapped it in `%`.
+        MatchOp::Like | MatchOp::Contains => exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(col_sql)
+                .sql(" #>> ")
+                .bind::<Array<Text>, _>(segments.clone())
+                .sql(" ILIKE ")
+                .bind::<Text, _>(as_pattern(&p.value, field)?.to_string()),
+            env
+        ),
+        // No ordering comparison is declared for either root — `OPS_TEXT`
+        // grants none — so these are unreachable through `resolve`, kept for
+        // match exhaustiveness. Values inside JSON compare as text anyway.
+        MatchOp::Gt | MatchOp::Gte | MatchOp::Lt | MatchOp::Lte => {
+            return Err(PlanError::UnsupportedOnResource {
+                field: field.to_string(),
+            })
+        }
+    };
+
+    // `EXISTS` is never SQL NULL, so wrapping it is always correct — the same
+    // reason `tag_leaf` and `occurrence_column_leaf` negate this way.
+    Ok(if negate {
+        Box::new(diesel::dsl::not(positive))
+    } else {
+        positive
+    })
+}
+
+// ===========================================================================
+// `stack` — an ARRAY column with a blob pool behind it, asked of an issue.
+// ===========================================================================
+
+/// `EXISTS (SELECT 1 FROM error_stack_blobs __esb WHERE __esb.sha256 =
+/// e.stacktrace_sha256 AND __esb.content <op> …`, left OPEN for the caller to
+/// bind a value and close.
+///
+/// The correlation is to `e`, the aliased `error_events` row of the enclosing
+/// bridge — `occurrences.rs`' twin of this names `"error_events"` directly,
+/// which inside this subquery would reference a table that is not in scope.
+macro_rules! pooled_stack_head {
+    ($op:literal) => {
+        concat!(
+            " OR EXISTS (SELECT 1 FROM error_stack_blobs __esb \
+             WHERE __esb.sha256 = e.stacktrace_sha256 AND __esb.content",
+            $op
+        )
+    };
+}
+
+/// A predicate over `error_events.stacktrace`, asked of an issue.
+///
+/// Separate from [`json_root_leaf`] for the two reasons `occurrences.rs`'
+/// `stack_leaf` is separate from its `json_object_leaf!`:
+///
+/// - **`stacktrace` holds a JSON ARRAY** (`[{filename, function, …}, …]`), so
+///   a matched value is wrapped in a one-element array before containment can
+///   ever be true, and `has:` is an `$[*].…` wildcard jsonpath rather than a
+///   top-level key probe.
+/// - **The stack pool (migration 0068).** A row written with pooling on holds
+///   the placeholder `[]` inline and its real trace in `error_stack_blobs`, so
+///   every positive predicate is `inline-match OR pooled-match` — which IS the
+///   effective-value predicate for both populations, because an inline row's
+///   NULL `stacktrace_sha256` makes the EXISTS false and a pooled row's
+///   placeholder makes the inline arm false.
+///
+/// **The disjunction is parenthesised**, and that is load-bearing rather than
+/// cosmetic: this fragment is one link in the subquery's `AND` chain, and
+/// [`exists_close_env`] appends the environment predicate after it. Unbracketed,
+/// `… AND a OR b AND env` binds as `(… AND a) OR (b AND env)` and any row
+/// matching the inline arm escapes the environment scope entirely.
+fn stack_leaf(
+    p: &ResolvedPredicate,
+    negate: bool,
+    env: &EnvFilter,
+    since: DateTime<Utc>,
+) -> Result<Frag<issues::table>, PlanError> {
+    let field = p.dim.name;
+    // `stack`'s prefix is always empty — the whole path is the dotted
+    // remainder (`stack.filename` -> "filename").
+    let segments =
+        json_path_segments("", p.path.as_deref()).ok_or_else(|| PlanError::BadValue {
+            field: field.to_string(),
+        })?;
+    let array_of = |v: &str| {
+        serde_json::Value::Array(vec![nest_json_object(
+            &segments,
+            serde_json::Value::String(v.to_string()),
+        )])
+    };
+    let contains = |value: &str| -> Frag<issues::table> {
+        let arr = array_of(value);
+        exists_close_env!(
+            occurrence_exists_head!(since)
+                .sql(" AND (e.stacktrace @> ")
+                .bind::<Jsonb, _>(arr.clone())
+                .sql(pooled_stack_head!(" @> "))
+                .bind::<Jsonb, _>(arr)
+                .sql("))"),
+            env
+        )
+    };
+
+    let positive: Frag<issues::table> = match p.op {
+        MatchOp::Eq => contains(as_str(&p.value, field)?),
+        MatchOp::Ne => {
+            let eq = contains(as_str(&p.value, field)?);
+            return Ok(if negate {
+                eq
+            } else {
+                Box::new(diesel::dsl::not(eq))
+            });
+        }
+        MatchOp::In => {
+            let values = as_str_list(&p.value, field)?;
+            let mut values = values.into_iter();
+            let first = values.next().ok_or_else(|| PlanError::BadValue {
+                field: field.to_string(),
+            })?;
+            let mut acc: Frag<issues::table> = contains(&first);
+            for v in values {
+                acc = Box::new(acc.or(contains(&v)));
+            }
+            acc
+        }
+        // An array has no meaningful top-level key, so EVERY `has:stack.*` is
+        // "some element carries this key" — unlike the object roots, this does
+        // not distinguish single- from multi-segment.
+        MatchOp::Has => {
+            let jsonpath = format!("$[*].{}", segments.join("."));
+            exists_close_env!(
+                occurrence_exists_head!(since)
+                    .sql(" AND (e.stacktrace @? ")
+                    .bind::<Text, _>(jsonpath.clone())
+                    .sql("::jsonpath")
+                    .sql(pooled_stack_head!(" @? "))
+                    .bind::<Text, _>(jsonpath)
+                    .sql("::jsonpath))"),
+                env
+            )
+        }
+        // Cast the whole array to text and scan it, exactly as the occurrences
+        // lowerer does: a per-element `#>>` would need an index this query has
+        // no way to use, and scoping the match to the named key would need a
+        // jsonpath `like_regex` and its own escaping surface — for a dimension
+        // the catalog already prices `Cost::Scan` either way.
+        MatchOp::Like | MatchOp::Contains => {
+            let pattern = as_pattern(&p.value, field)?.to_string();
+            exists_close_env!(
+                occurrence_exists_head!(since)
+                    .sql(" AND (e.stacktrace::text ILIKE ")
+                    .bind::<Text, _>(pattern.clone())
+                    .sql(pooled_stack_head!("::text ILIKE "))
+                    .bind::<Text, _>(pattern)
+                    .sql("))"),
+                env
+            )
+        }
+        MatchOp::Gt | MatchOp::Gte | MatchOp::Lt | MatchOp::Lte => {
+            return Err(PlanError::UnsupportedOnResource {
+                field: field.to_string(),
+            })
+        }
+    };
+
+    Ok(if negate {
+        Box::new(diesel::dsl::not(positive))
+    } else {
+        positive
+    })
+}
+
 /// A single-key JSONB object `{key: value}` for a `tags @> …` containment
 /// bind. Local to this module: `repo::tag_object` is private to `repo.rs`.
 fn tag_bind_object(key: &str, value: &str) -> serde_json::Value {
@@ -1300,6 +1631,363 @@ mod tests {
             assert!(
                 !sql.contains(&format!(r#""issues"."{}""#, col.trim_start_matches("e."))),
                 "`{q}` must not reference an `issues` column: {sql}"
+            );
+        }
+    }
+
+    // -- JSON roots on Issues (extra / contexts) ----------------------------
+    //
+    // Same bridge as the three occurrence COLUMNS above, over the two
+    // dev-supplied JSONB columns. The bind assertions below match
+    // `debug_query`'s `{:?}` rendering of `serde_json::Value`, exactly as
+    // `occurrences.rs`'s own JSONB tests do.
+
+    fn lower_issues(q: &str) -> (String, String) {
+        let full = lower_issues_sql(q);
+        let mut parts = full.splitn(2, "-- binds:");
+        let sql = parts.next().unwrap_or_default().to_string();
+        let binds = parts.next().unwrap_or_default().to_string();
+        (sql, binds)
+    }
+
+    /// Just the WHERE clause. The "path never reaches SQL text" assertions
+    /// below have to look here and not at the whole statement: `issues` has a
+    /// `title` COLUMN, so the SELECT list contains `"issues"."title"` no
+    /// matter what the predicate does, and a whole-statement check would fail
+    /// on correct SQL for a path named after any selected column.
+    fn lower_issues_predicate(q: &str) -> String {
+        let (sql, _) = lower_issues(q);
+        sql.split_once(" WHERE ").unwrap().1.to_string()
+    }
+
+    /// The point of the feature: `extra` is not an `issues` column, so an
+    /// `extra.title` predicate must become a correlated subquery carrying the
+    /// tenant key — never a comparison against a column that is not there.
+    #[test]
+    fn a_json_root_lowers_to_a_correlated_exists_over_the_event_column() {
+        let (sql, _) = lower_issues("extra.title:noInternet");
+        assert!(
+            sql.contains("EXISTS (SELECT 1 FROM error_events e"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("e.issue_id = issues.id") && sql.contains("e.app_id = issues.app_id"),
+            "must carry the correlation AND the tenant key: {sql}"
+        );
+        assert!(sql.contains("e.extra @> "), "{sql}");
+    }
+
+    /// The injection property `occurrences.rs` documents, restated on this
+    /// resource: the caller-supplied path is nested into ONE `Jsonb` bind and
+    /// never reaches SQL text.
+    #[test]
+    fn a_json_root_equality_binds_the_path_rather_than_writing_it_into_sql() {
+        let (_sql, binds) = lower_issues("extra.title:noInternet");
+        let predicate = lower_issues_predicate("extra.title:noInternet");
+        assert!(
+            !predicate.contains("title"),
+            "the path must NOT appear in SQL text: {predicate}"
+        );
+        assert!(
+            binds.contains(r#"Object {"title": String("noInternet")}"#),
+            "{binds}"
+        );
+    }
+
+    #[test]
+    fn a_nested_json_root_path_nests_the_containment_object() {
+        let (_sql, binds) = lower_issues("contexts.checkout.step:payment");
+        assert!(
+            binds.contains(r#"Object {"checkout": Object {"step": String("payment")}}"#),
+            "{binds}"
+        );
+    }
+
+    #[test]
+    fn single_segment_has_on_a_json_root_uses_the_question_operator() {
+        let (sql, binds) = lower_issues("has:extra.title");
+        assert!(sql.contains("e.extra ? "), "{sql}");
+        let predicate = lower_issues_predicate("has:extra.title");
+        assert!(
+            !predicate.contains("title"),
+            "the key must NOT appear in SQL text: {predicate}"
+        );
+        assert!(binds.contains(r#""title""#), "{binds}");
+    }
+
+    #[test]
+    fn multi_segment_has_on_a_json_root_uses_the_jsonpath_operator() {
+        let (sql, binds) = lower_issues("has:contexts.checkout.step");
+        assert!(sql.contains("e.contexts @? "), "{sql}");
+        assert!(sql.contains("::jsonpath"), "{sql}");
+        assert!(binds.contains("$.checkout.step"), "{binds}");
+    }
+
+    #[test]
+    fn a_json_root_substring_uses_path_extraction_and_ilike() {
+        let (sql, binds) = lower_issues("extra.title:~noInternet");
+        assert!(sql.contains("e.extra #>> "), "{sql}");
+        assert!(sql.contains("ILIKE"), "{sql}");
+        let predicate = lower_issues_predicate("extra.title:~noInternet");
+        assert!(
+            !predicate.contains("title"),
+            "the path must NOT appear in SQL text: {predicate}"
+        );
+        assert!(binds.contains("%noInternet%"), "{binds}");
+    }
+
+    #[test]
+    fn a_json_root_in_ors_the_per_value_exists_clauses() {
+        let (sql, _) = lower_issues("extra.title:[noInternet,timeout]");
+        assert_eq!(
+            sql.matches("EXISTS (SELECT 1 FROM error_events e").count(),
+            2,
+            "{sql}"
+        );
+        assert!(sql.contains(" OR "), "{sql}");
+    }
+
+    /// `NOT EXISTS`, never `EXISTS(… <> …)`: an issue none of whose
+    /// occurrences carry an `extra` object at all DOES match
+    /// `!extra.title:noInternet`. The environment scope stays INSIDE the
+    /// negated subquery for the reason `occurrence_column_leaf` documents — a
+    /// staging-scoped member must not read a production answer off the count.
+    #[test]
+    fn a_negated_json_root_is_not_exists_and_keeps_its_scope_inside() {
+        let env = EnvFilter::One(Uuid::from_u128(7));
+        let sql = lower_issues_sql_env("!extra.title:noInternet", &env);
+        assert!(sql.contains("NOT (EXISTS"), "{sql}");
+        let subquery = sql.split("NOT (EXISTS").nth(1).unwrap();
+        assert!(
+            subquery.contains("e.environment_id = $"),
+            "the env predicate must be INSIDE the negated EXISTS: {sql}"
+        );
+    }
+
+    /// The six OBJECT-shaped roots beyond `extra`/`contexts`. `os`, `browser`,
+    /// `device` and `app` are all views onto the one `context` column with a
+    /// storage prefix, so this also pins that the prefix reaches the bind
+    /// rather than the SQL.
+    #[test]
+    fn every_object_root_lowers_to_its_own_event_column() {
+        for (q, col, want_bind) in [
+            (
+                "user.email:a@b.com",
+                "e.event_user @> ",
+                r#"Object {"email": String("a@b.com")}"#,
+            ),
+            (
+                "sdk.name:sauron",
+                "e.sdk @> ",
+                r#"Object {"name": String("sauron")}"#,
+            ),
+            (
+                "os.name:Linux",
+                "e.context @> ",
+                r#"Object {"os": Object {"name": String("Linux")}}"#,
+            ),
+            // The long spelling of the line above: `context` is the bare root
+            // over the same column, so both must build the same bind.
+            (
+                "context.os.name:Linux",
+                "e.context @> ",
+                r#"Object {"os": Object {"name": String("Linux")}}"#,
+            ),
+            (
+                "browser.version:12",
+                "e.context @> ",
+                r#"Object {"runtime": Object {"version": String("12")}}"#,
+            ),
+            (
+                "device.model:Pixel",
+                "e.context @> ",
+                r#"Object {"device": Object {"model": String("Pixel")}}"#,
+            ),
+            (
+                "app.build:100",
+                "e.context @> ",
+                r#"Object {"app": Object {"build": String("100")}}"#,
+            ),
+        ] {
+            let (sql, binds) = lower_issues(q);
+            assert!(
+                sql.contains("EXISTS (SELECT 1 FROM error_events e"),
+                "`{q}` must lower to a correlated EXISTS: {sql}"
+            );
+            assert!(sql.contains(col), "`{q}` must name {col}: {sql}");
+            assert!(binds.contains(want_bind), "`{q}`: {binds}");
+        }
+    }
+
+    /// `has:os` has no dotted remainder, so the storage prefix IS the sole
+    /// segment — the single-segment `?` branch, not a `$.os.os` jsonpath.
+    #[test]
+    fn a_bare_prefixed_root_has_does_not_double_count_the_prefix() {
+        let (sql, binds) = lower_issues("has:os");
+        assert!(sql.contains("e.context ? "), "{sql}");
+        assert!(binds.contains(r#""os""#), "{binds}");
+    }
+
+    /// `has:<root>` with NO dotted path asks whether the occurrence carries the
+    /// object at all — column presence, not a path lookup. `json_path_segments`
+    /// cannot express it (no path and an empty prefix yields no segments), so
+    /// it has to be answered before segments exist, exactly as the occurrences
+    /// and sessions copies of `json_object_leaf!` do.
+    ///
+    /// Without this branch the query is a `BadValue` 400 on THIS page while
+    /// working on the occurrences drill-down — one vocabulary, two answers.
+    #[test]
+    fn a_bare_root_presence_probe_asks_whether_the_column_is_populated() {
+        for (q, col) in [
+            ("has:extra", "e.extra IS NOT NULL"),
+            ("has:context", "e.context IS NOT NULL"),
+            ("has:contexts", "e.contexts IS NOT NULL"),
+            ("has:user", "e.event_user IS NOT NULL"),
+            ("has:sdk", "e.sdk IS NOT NULL"),
+        ] {
+            let sql = lower_issues_sql(q);
+            assert!(
+                sql.contains("EXISTS (SELECT 1 FROM error_events e"),
+                "`{q}` must still take the bridge: {sql}"
+            );
+            assert!(sql.contains(col), "`{q}` must ask for {col}: {sql}");
+        }
+    }
+
+    /// Negation reads as "no occurrence carries one", so it stays `NOT EXISTS`
+    /// over the same positive predicate — NOT the `col IS NULL` the occurrences
+    /// macro emits, which is a statement about one row rather than about an
+    /// issue's whole occurrence set.
+    #[test]
+    fn a_negated_bare_root_presence_probe_is_not_exists() {
+        let sql = lower_issues_sql("!has:extra");
+        assert!(sql.contains("NOT (EXISTS"), "{sql}");
+        assert!(sql.contains("e.extra IS NOT NULL"), "{sql}");
+    }
+
+    // -- `stack` on Issues: an ARRAY column, plus the blob pool -------------
+
+    /// `stacktrace` holds a JSON ARRAY, so a matched value is wrapped in a
+    /// one-element array — object containment would never match.
+    #[test]
+    fn stack_on_issues_uses_array_containment() {
+        let (sql, binds) = lower_issues("stack.filename:app.js");
+        assert!(sql.contains("e.stacktrace @> "), "{sql}");
+        assert!(
+            binds.contains(r#"Array [Object {"filename": String("app.js")}]"#),
+            "array shape required: {binds}"
+        );
+    }
+
+    /// **The trap this test exists for.** Pooled rows (migration 0068) hold a
+    /// placeholder `[]` inline and the real trace in `error_stack_blobs`, so
+    /// every positive stack predicate must be `inline OR pooled` — and inside
+    /// the issues bridge the pool has to correlate to `e.stacktrace_sha256`,
+    /// the aliased row, never to a bare `error_events` that is not in scope.
+    #[test]
+    fn stack_on_issues_also_probes_the_blob_pool_through_the_aliased_row() {
+        let (sql, _) = lower_issues("stack.filename:app.js");
+        assert!(
+            sql.contains("FROM error_stack_blobs __esb"),
+            "the pooled arm must be present: {sql}"
+        );
+        assert!(
+            sql.contains("__esb.sha256 = e.stacktrace_sha256"),
+            "the pool must correlate to the ALIASED event row: {sql}"
+        );
+        assert!(
+            !sql.contains(r#"__esb.sha256 = "error_events""#),
+            "must not reference an unaliased error_events inside the bridge: {sql}"
+        );
+    }
+
+    /// An array column has no meaningful top-level key, so every `has:stack.*`
+    /// is "some element carries this key" — a jsonpath with an array wildcard,
+    /// against both the inline column and the pool.
+    #[test]
+    fn stack_has_on_issues_uses_an_array_wildcard_jsonpath() {
+        let (sql, binds) = lower_issues("has:stack.filename");
+        assert!(sql.contains("::jsonpath"), "{sql}");
+        assert!(binds.contains("$[*].filename"), "{binds}");
+        assert!(sql.contains("FROM error_stack_blobs __esb"), "{sql}");
+    }
+
+    /// Substring on `stack` scans the array's rendered text, matching the
+    /// occurrences lowerer rather than inventing a per-element `#>>`.
+    #[test]
+    fn stack_substring_on_issues_scans_the_rendered_array_text() {
+        let (sql, binds) = lower_issues("stack.filename:~app");
+        assert!(sql.contains("e.stacktrace::text ILIKE "), "{sql}");
+        assert!(binds.contains("%app%"), "{binds}");
+        assert!(sql.contains("FROM error_stack_blobs __esb"), "{sql}");
+    }
+
+    /// The inline-or-pooled disjunction must be PARENTHESISED inside the
+    /// subquery's AND chain. Without the parens the trailing environment
+    /// predicate binds to the `OR`, and the whole scope check evaporates for
+    /// any row matching the inline arm.
+    #[test]
+    fn the_stack_disjunction_is_parenthesised_inside_the_bridge() {
+        let env = EnvFilter::One(Uuid::from_u128(7));
+        let sql = lower_issues_sql_env("stack.filename:app.js", &env);
+        let subquery = sql
+            .split("EXISTS (SELECT 1 FROM error_events e")
+            .nth(1)
+            .unwrap();
+        let opened = subquery
+            .find(" AND (")
+            .expect("disjunction must open a group");
+        let env_at = subquery
+            .find("e.environment_id = $")
+            .expect("env predicate must be present");
+        assert!(
+            opened < env_at,
+            "the env predicate must follow the closed group: {sql}"
+        );
+        assert!(
+            subquery.contains(") AND e.environment_id = $"),
+            "the group must CLOSE before the env predicate: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_negated_stack_predicate_on_issues_is_not_exists() {
+        let sql = lower_issues_sql("!stack.filename:app.js");
+        assert!(sql.contains("NOT (EXISTS"), "{sql}");
+    }
+
+    /// Same argument as `every_occurrence_column_predicate_is_bounded_by_since`:
+    /// `error_events` is RANGE partitioned on `occurred_at`, and these two
+    /// columns carry no index at all, so an unbounded subquery scans every live
+    /// partition for every candidate issue.
+    #[test]
+    fn every_json_root_predicate_is_bounded_by_since() {
+        for q in [
+            "extra.title:noInternet",
+            "!extra.title:noInternet",
+            "extra.title:[noInternet,timeout]",
+            "has:extra.title",
+            "has:contexts.checkout.step",
+            "extra.title:~noInternet",
+            "contexts.checkout.step:payment",
+            "user.email:a@b.com",
+            "sdk.name:sauron",
+            "os.name:Linux",
+            "browser.version:12",
+            "device.model:Pixel",
+            "app.build:100",
+            "has:os",
+            "has:extra",
+            "!has:extra",
+            "stack.filename:app.js",
+            "!stack.filename:app.js",
+            "has:stack.filename",
+            "stack.filename:~app",
+        ] {
+            let sql = lower_issues_sql(q);
+            assert!(
+                sql.contains("e.occurred_at >= "),
+                "`{q}` must bind a partition bound: {sql}"
             );
         }
     }

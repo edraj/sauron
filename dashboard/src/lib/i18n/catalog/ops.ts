@@ -96,6 +96,11 @@ export const ops = {
     en: 'Optional — debug, info, warning, error, fatal.',
     ar: 'اختياري — debug أو info أو warning أو error أو fatal.',
   },
+  'alerts.field.queryFilter': { en: 'Search filter', ar: 'مرشّح البحث' },
+  'alerts.field.queryHint': {
+    en: 'Optional — the same search language as the Exceptions page, e.g. extra.title=noInternetConnectionTitle. Needs event:read.',
+    ar: 'اختياري — نفس لغة البحث في صفحة الاستثناءات، مثل extra.title=noInternetConnectionTitle. يتطلّب صلاحية event:read.',
+  },
   'alerts.field.window': { en: 'Window (minutes)', ar: 'النافذة (بالدقائق)' },
   'alerts.field.spikeFactor': { en: 'Spike factor (×)', ar: 'معامل الارتفاع (×)' },
   'alerts.field.spikeHint': {

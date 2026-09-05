@@ -118,6 +118,10 @@ const ALLOWED = new Set<string>([
   'production',
   'error',
   'checkout_completed',
+  // The shape IS the instruction here more than anywhere else in this list:
+  // it demonstrates the search grammar (`field.path=value`), and translating
+  // either half would demonstrate a query that does not resolve.
+  'extra.title=noInternetConnectionTitle',
   'web@1.4.2',
   'app@1.4.2+12',
   'arm64',

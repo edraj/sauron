@@ -145,6 +145,20 @@ const UNCHIPPED: Record<string, Record<string, string>> = {
     // the page until the reader worked out which chip to remove.
     release: 'Store::Rollup — 400s until the issue_dimensions rollup exists',
     handled: 'Store::Rollup — 400s until the issue_dimensions rollup exists',
+    // The JSON roots, bridged onto Issues as correlated EXISTS subqueries.
+    // Same ruling Sessions and Transactions already make below: a chip has one
+    // value slot and these need a PATH as well (`extra.title`, `os.name`), so
+    // they are typed into the query box, which the Exceptions page has.
+    contexts: 'a JSON root, addressed as the chainable @contexts.<key> in the query box',
+    extra: 'a JSON root, addressed as the chainable @extra.<key> in the query box',
+    context: 'a JSON root, addressed as the chainable @context.<path> in the query box',
+    user: 'a JSON root, addressed as user.<key> in the query box',
+    sdk: 'a JSON root, addressed as sdk.<key> in the query box',
+    os: 'a JSON root, addressed as os.<key> in the query box',
+    browser: 'a JSON root, addressed as browser.<key> in the query box',
+    device: 'a JSON root, addressed as device.<key> in the query box',
+    app: 'a JSON root, addressed as app.<key> in the query box',
+    stack: 'a JSON root over an array column, addressed as stack.<key> in the query box',
   },
   Sessions: {
     environment: 'scoped by the topbar environment switcher, not a per-page chip',
