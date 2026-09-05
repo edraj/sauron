@@ -108,6 +108,17 @@ jobs:
             image: ubuntu:22.04
             family: deb
     container: ${{ matrix.image }}
+    # GitHub's default `run:` shell inside a `container:` is sh, NOT bash.
+    # On fedora/almalinux /bin/sh is bash, so `set -euo pipefail`, arrays and
+    # process substitution all work by accident. On debian/ubuntu /bin/sh is
+    # dash and the first bash-ism dies with `set: Illegal option -o pipefail`.
+    # That is exactly how the first release carrying .deb legs failed: both deb
+    # legs red at "Assemble prebuilt artifacts" below, both rpm legs green, on
+    # byte-identical YAML. Declaring the shell makes it a property of this
+    # workflow instead of a property of whichever image the leg happens to use.
+    defaults:
+      run:
+        shell: bash
     env:
       # sccache-backed compilation cache, shared across matrix legs and runs.
       CARGO_INCREMENTAL: "0"
@@ -260,6 +271,12 @@ jobs:
           - target: el9
             image: almalinux:9
     container: ${{ matrix.image }}
+    # sh in a container is dash on Debian-family images; see `build` above.
+    # Not load-bearing for fedora/el9 (their /bin/sh is bash) but the same trap,
+    # and this job is one matrix entry away from having a Debian-family leg.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install rpm tooling (no compiler toolchain)
         # el9 minimal base ships coreutils-single, which conflicts with the full
@@ -328,6 +345,11 @@ jobs:
           - target: ubuntu2204
             image: ubuntu:22.04
     container: ${{ matrix.image }}
+    # sh in a container is dash on Debian-family images; see `build` above.
+    # Load-bearing here: both of this job's images are Debian-family.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install deb tooling (no compiler toolchain)
         # debian/rules overrides every dh_auto_* to a no-op, so debhelper and
