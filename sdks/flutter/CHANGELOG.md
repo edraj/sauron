@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.9.0 - 2026-09-01
+
+### Changed
+
+- **Licence: AGPL-3.0-only -> LGPL-3.0-only.** LGPLv3 is a set of additional
+  permissions on top of GPLv3, so the package ships both texts: `LICENSE`
+  (LGPLv3) and `COPYING` (GPLv3). Linking `sauron_flutter` into an application
+  no longer places that application under copyleft, which is the point of
+  licensing the client SDKs apart from the Sauron server -- the server itself
+  remains AGPL-3.0-only.
+- The relicence landed in the repository on 2026-08-31, *after* 1.8.0 had been
+  published on 2026-08-16. pub.dev versions are immutable, so 1.8.0 remains
+  available under the terms it was published with and cannot be changed.
+  **1.9.0 is the first release carrying LGPL-3.0-only**; anyone relying on the
+  new terms must move off 1.8.0.
+- No functional change. The SDK version reported in envelope headers
+  (`kSauronSdkVersion`) advances to 1.9.0 with the release.
+
+
 ## 1.8.0 - 2026-08-16
 
 ### Added
