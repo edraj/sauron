@@ -1,0 +1,74 @@
+-- 0075: GIN indexes on the `context` JSONB root of the three tables whose
+-- resources expose it by dynamic path -- `sessions` (Resource::Sessions),
+-- `analytics_events` (Resource::Events) and `error_events`
+-- (Resource::Occurrences). The catalog declares ONE `context` dimension shared
+-- by all three (`Store::JsonRoot { column: "context", prefix: "" }`), so a
+-- query spelled `@context.extra.title=X` lowers to the same
+-- `context @> '{"extra":{"title":"X"}}'` containment on whichever table the
+-- route reads. Nothing indexed that column on any of them.
+--
+-- jsonb_path_ops for the reason 0018 and 0063 give: the smaller and faster GIN
+-- opclass, and it serves exactly the `@>` containment that the `MatchOp::Eq`
+-- lowering emits. It does NOT serve `@?` key-existence (`MatchOp::Has`), which
+-- cost.rs already prices as a scan -- `has:` on a context path is unaffected by
+-- this migration, deliberately.
+--
+-- ALL THREE ON THE PARTITIONED PARENT, so they propagate to every existing
+-- partition, the default partition, and every partition `sauron-tier` creates
+-- later. That is the rule 0018 followed for the `tags` GINs on these same two
+-- event tables, and the rule 0073's own eleven `sessions` indexes follow.
+--
+-- ---------------------------------------------------------------------------
+-- THE THREE ARE NOT THE SAME BUY. Recorded because a future reader weighing
+-- whether to keep them should not have to re-derive it.
+--
+-- `sessions` is the severe case, and the one this migration was written for.
+-- Its list windows on `last_event_at` (routes::sessions::TIME_FIELDS, and
+-- `resolve_time_filter` is called with that column deliberately) while the
+-- table is PARTITION BY RANGE (started_at) since 0073. Postgres cannot infer
+-- `last_event_at >= started_at`, so NO partition is pruned and every daily
+-- child is read whatever the window says. Two amplifiers on top: the default
+-- `sort=started_at` is DESC across that unpruned Append, so `LIMIT 51` cannot
+-- stop early; and `count_sessions` re-runs the identical predicate for up to
+-- COUNT_CAP + 1 (10_001) ids, which a specific `extra` value never reaches, so
+-- the scan runs twice per request. Measured on a 3-partition, 50k-row fixture:
+-- Seq Scan on every partition + Sort, 7.487 ms -> Bitmap Index Scan, 0.122 ms.
+--
+-- `analytics_events` and `error_events` are the milder case. Both are
+-- PARTITION BY RANGE (occurred_at) (0011, 0012) and both search bases window on
+-- `occurred_at` itself (`occurrence_search_base`, `event_search_base`), so
+-- pruning already works and the window genuinely bounds the scan. What the
+-- index removes there is the per-row cost INSIDE the window, which is not
+-- small on `error_events`: 0065 lists `context` among the fat columns it moved
+-- to LZ4, so an unindexed containment detoasts and decompresses every row in
+-- range before it can reject it.
+--
+-- WRITE COST, honestly. These two are the highest-volume tables in the system,
+-- and 0063 declined a GIN on `transactions.extra` citing exactly that. The
+-- difference is that `tags` on both of these tables has carried a GIN since
+-- 0018 -- this adds a second, it does not introduce the cost class. If ingest
+-- throughput regresses after this ships, THESE TWO are the indexes to drop
+-- first (`DROP INDEX analytics_events_context_gin, error_events_context_gin`);
+-- the `sessions` one is cheap by comparison, since `bump_session` already
+-- updates the indexed `last_event_at` on every event, so those rows are already
+-- HOT-disqualified and already write fresh tuples into all eleven of their
+-- existing indexes on every bump. This adds a twelfth.
+--
+-- STILL DELIBERATELY UNINDEXED: `extra`, `contexts`, `properties`,
+-- `event_user`, `sdk`, `stacktrace`. Same reasoning as 0063 -- freeform JSON of
+-- unbounded shape, probed by containment AND ILIKE, where a GIN buys little.
+-- Only `context` is promoted here, because only `context` is what the
+-- structured device/os/browser/app dimensions resolve against.
+--
+-- OPERATORS WITH LARGE EXISTING TABLES: each statement takes ACCESS EXCLUSIVE
+-- on its parent and builds on every partition before returning, and
+-- sauron-migrate is the oneshot every daemon's `Requires=` waits on. To avoid
+-- that window, build each CONCURRENTLY per partition BEFORE upgrading (parent
+-- `ON ONLY`, children CONCURRENTLY, then `ALTER INDEX ... ATTACH PARTITION`);
+-- `IF NOT EXISTS` then makes the matching statement here a no-op. See SETUP.md.
+CREATE INDEX IF NOT EXISTS sessions_context_gin
+    ON sessions USING gin (context jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS analytics_events_context_gin
+    ON analytics_events USING gin (context jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS error_events_context_gin
+    ON error_events USING gin (context jsonb_path_ops);
