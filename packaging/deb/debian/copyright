@@ -1,0 +1,23 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: sauron
+Upstream-Contact: https://github.com/edraj/sauron
+Source: https://github.com/edraj/sauron
+
+Files: *
+Copyright: Sauron contributors
+License: AGPL-3.0-only
+
+License: AGPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU Affero General Public License as published by the Free
+ Software Foundation, version 3.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+ .
+ The full licence text is shipped with this package at
+ /usr/share/doc/sauron/LICENSE. It is NOT referenced from
+ /usr/share/common-licenses/: base-files on Debian 12 and Ubuntu 22.04 ships
+ GPL/LGPL/GFDL and friends but no AGPL-3, so a pointer there would dangle on both
+ target distributions.

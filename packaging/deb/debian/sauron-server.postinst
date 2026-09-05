@@ -1,0 +1,97 @@
+#!/bin/sh
+# Server package configure hook. Ported from %post server in
+# packaging/rpm/sauron.spec -- keep the two in step.
+#
+# Everything below sits BEFORE the debhelper token at the end of this file,
+# deliberately. The block it expands to is what runs deb-systemd-invoke, so the
+# secrets and the config-file ownership must already be in place by the time it
+# executes; otherwise the daemons are started against a half-configured
+# /etc/sauron and land in `failed` on a host that was actually fine.
+#
+# NEVER write that token in prose here -- see the note in debian/sauron.postinst.
+# It is substituted by literal string match, comments included, which silently
+# emits the autoscripts twice.
+#
+# The `sauron` group is created by the base package's postinst, and
+# `Depends: sauron (= ${binary:Version})` makes dpkg configure that package
+# first, so the group exists by the time this script runs.
+set -e
+
+CONFDIR=/etc/sauron
+SECRET="$CONFDIR/secret.env"
+
+if [ "$1" = "configure" ]; then
+    # --- conffile ownership -------------------------------------------------
+    # Set here rather than declared in the package, and re-run on every
+    # configure as a REPAIR rather than because dpkg would undo it -- dpkg
+    # preserves a conffile's owner and mode across upgrades. See
+    # debian/sauron.postinst for the measurement and the failure it repairs.
+    warned=0
+    for f in api ingest monitor tier alerts inspector storesync; do
+        [ -e "$CONFDIR/$f.env" ] || continue
+        if chgrp sauron "$CONFDIR/$f.env" 2>/dev/null; then
+            chmod 0640 "$CONFDIR/$f.env"
+        elif [ "$warned" -eq 0 ]; then
+            warned=1
+            echo "sauron: WARNING could not set group 'sauron' on $CONFDIR/*.env." >&2
+            echo "sauron: The daemons run as User=sauron and will not be able to read them." >&2
+        fi
+    done
+
+    # --- vendored libduckdb -------------------------------------------------
+    # Refresh the linker cache so sauron-tier resolves
+    # /usr/lib/sauron/libduckdb.so through the ld.so.conf.d drop-in. Must happen
+    # before the debhelper block starts the units.
+    ldconfig || :
+
+    # --- first install: generate secrets ------------------------------------
+    # "$2" is the previously configured version; empty means first install.
+    if [ -z "$2" ] && [ ! -s "$SECRET" ]; then
+        umask 027
+        printf 'JWT_SECRET=%s\n' \
+            "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$SECRET"
+        printf 'NOTIFY_SECRET_KEY=%s\n' \
+            "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$SECRET"
+        chgrp sauron "$SECRET" 2>/dev/null || :
+        chmod 0640 "$SECRET"
+    fi
+
+    # --- UPGRADES from a build predating the fail-closed notification key ----
+    #
+    # api, monitor and alerts refuse to start without NOTIFY_SECRET_KEY, so an
+    # upgraded host would come back with three dead units. Backfill it with the
+    # EXISTING JWT_SECRET, not a fresh random value: older builds derived the
+    # channel cipher from JWT_SECRET when the dedicated key was unset, so that is
+    # the key every stored channel secret was actually encrypted under.
+    # Generating a new one here would boot cleanly and then fail every delivery
+    # with "secret decrypt failed" -- silent, total loss of every configured
+    # channel.
+    #
+    # The value is captured and TESTED before anything is written. An operator
+    # who moved JWT_SECRET into api.env leaves this file with no JWT_SECRET=
+    # line, and an unguarded version would append a literal `NOTIFY_SECRET_KEY=`
+    # with an empty right-hand side. sauron-core's var() filters empty strings,
+    # so require_notify_secret_key() then takes the None branch and api, monitor
+    # and alerts all refuse to start -- the exact three-dead-units outcome this
+    # backfill exists to prevent. It is also self-masking: the `! grep -q` guard
+    # below matches an empty assignment, so re-running would never repair it.
+    if [ -s "$SECRET" ] && ! grep -q '^NOTIFY_SECRET_KEY=' "$SECRET"; then
+        sauron_jwt=$(sed -n 's/^JWT_SECRET=//p' "$SECRET" | head -n 1)
+        if [ -n "$sauron_jwt" ]; then
+            umask 027
+            printf 'NOTIFY_SECRET_KEY=%s\n' "$sauron_jwt" >> "$SECRET"
+            chgrp sauron "$SECRET" 2>/dev/null || :
+            chmod 0640 "$SECRET"
+        else
+            echo "sauron: WARNING no JWT_SECRET= in $SECRET, so NOTIFY_SECRET_KEY could" >&2
+            echo "sauron: not be backfilled. sauron-api, sauron-monitor and sauron-alerts" >&2
+            echo "sauron: will refuse to start until you add it. Use the SAME value older" >&2
+            echo "sauron: builds encrypted channel secrets under (your previous JWT_SECRET)" >&2
+            echo "sauron: - a fresh random key makes every stored channel secret" >&2
+            echo "sauron: permanently unreadable. See SETUP.md section 6." >&2
+        fi
+        unset sauron_jwt
+    fi
+fi
+
+#DEBHELPER#

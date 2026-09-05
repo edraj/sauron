@@ -93,8 +93,20 @@ jobs:
         include:
           - target: fedora
             image: fedora:44
+            family: rpm
           - target: el9
             image: almalinux:9
+            family: rpm
+          # Two Debian-family legs, not one. This is a glibc floor, not a
+          # preference: Debian 12 is glibc 2.36 and Ubuntu 22.04 is 2.35, so
+          # neither build runs on the other's target. A single deb12 artifact
+          # would simply fail to start on 22.04.
+          - target: deb12
+            image: debian:12
+            family: deb
+          - target: ubuntu2204
+            image: ubuntu:22.04
+            family: deb
     container: ${{ matrix.image }}
     env:
       # sccache-backed compilation cache, shared across matrix legs and runs.
@@ -102,7 +114,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
     steps:
-      - name: Install build toolchain
+      - name: Install build toolchain (rpm)
+        if: matrix.family == 'rpm'
         # Native code left after the build optimizations is just ring's C/asm, so
         # only a C compiler + perl are needed — no gcc-c++/cmake/clang (DuckDB is
         # prebuilt, TLS is the ring backend, zstd links the system library). zstd
@@ -126,6 +139,20 @@ jobs:
               dnf install -y libzstd-devel ;;
           esac
 
+      - name: Install build toolchain (deb)
+        if: matrix.family == 'deb'
+        # The Debian-family mirror of the step above, same reasoning: only a C
+        # compiler + perl are needed (DuckDB is prebuilt, TLS is ring, zstd links
+        # the system library). libc6-dev is explicit because Debian's gcc package
+        # does not pull the headers in the way Fedora's does.
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            gcc libc6-dev perl lld pkg-config libzstd-dev \
+            git tar gzip gawk findutils curl unzip ca-certificates
+
       - name: Install Rust (rustup — uniform across distros)
         run: |
           # Download then run (not curl|sh): the script hits disk before it runs.
@@ -133,7 +160,8 @@ jobs:
           sh rustup-init.sh -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install Node 22
+      - name: Install Node 22 (rpm)
+        if: matrix.family == 'rpm'
         run: |
           . /etc/os-release
           case "$ID" in
@@ -142,6 +170,19 @@ jobs:
                     bash nodesource_setup.sh
                     dnf install -y nodejs ;;
           esac
+          node --version && npm --version
+
+      - name: Install Node 22 (deb)
+        if: matrix.family == 'deb'
+        # Neither target ships Node 22: Debian 12 has 18, Ubuntu 22.04 has 12.
+        # Both therefore go through NodeSource, downloaded to disk before it runs
+        # rather than piped into a shell.
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          curl -fsSL https://deb.nodesource.com/setup_22.x -o nodesource_setup.sh
+          bash nodesource_setup.sh
+          apt-get install -y nodejs
           node --version && npm --version
 
       - uses: actions/checkout@v4
@@ -261,6 +302,83 @@ jobs:
             rpmbuild/SRPMS/*.rpm
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # The Debian-family counterpart of `package`. Same shape: no toolchain, just
+  # debhelper + dpkg-dev over the precompiled artifacts, so it runs in seconds.
+  # Native per distro so the version suffix and dh_shlibdeps' derived Depends:
+  # are computed against the distribution the package is actually for.
+  #
+  # Kept separate from `package` rather than folded in behind a matrix `family`
+  # field: only two of its six steps would be shared, and the version stamping
+  # and artifact upload differ in both target and content.
+  # ---------------------------------------------------------------------------
+  package-deb:
+    name: package (${{ matrix.target }})
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: deb12
+            image: debian:12
+          - target: ubuntu2204
+            image: ubuntu:22.04
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install deb tooling (no compiler toolchain)
+        # debian/rules overrides every dh_auto_* to a no-op, so debhelper and
+        # dpkg-dev are genuinely all that is needed here.
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            debhelper dpkg-dev git ca-certificates
+
+      - uses: actions/checkout@v4
+
+      - name: Trust the workspace (container git)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.target }}
+          path: prebuilt
+
+      - name: Stamp computed version into Cargo.toml + spec
+        env:
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # build-deb.sh reads the version from backend/Cargo.toml and asserts it
+          # matches packaging/rpm/sauron.spec, so BOTH have to be stamped here --
+          # the .deb and the .rpm must not ship different versions from one
+          # commit. Checkout only; never committed.
+          sed -i '0,/^version = ".*"/s//version = "'"$V"'"/' backend/Cargo.toml
+          sed -i -E 's/^(Version:[[:space:]]*).*/\1'"$V"'/'    packaging/rpm/sauron.spec
+          echo ">> stamped:"
+          grep -E '^version = ' backend/Cargo.toml | head -n1
+          grep -E '^Version:'   packaging/rpm/sauron.spec
+
+      - name: Package prebuilt .debs
+        env:
+          DEB_BUILD_TOPDIR: ${{ github.workspace }}/debbuild
+        # The distro suffix (~deb12 / ~ubuntu22.04) is derived from the
+        # container's own /etc/os-release. It is mandatory: without it both legs
+        # emit sauron-server_<version>_amd64.deb and silently overwrite each
+        # other when the release job merges them into one directory.
+        run: ./packaging/deb/build-deb.sh --prebuilt "$PWD/prebuilt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.target }}
+          path: debbuild/*.deb
+          if-no-files-found: error
+
   sbom:
     # CycloneDX SBOM of the Rust workspace, read from backend/Cargo.lock. The
     # server ships as a self-contained binary, so its crate graph cannot be
@@ -350,7 +468,7 @@ jobs:
     # no automatic path to here any more: nothing publishes without someone
     # asking for it.
     if: inputs.publish
-    needs: [version, package, sbom]
+    needs: [version, package, package-deb, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -364,10 +482,16 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: debs-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
           name: sbom
           path: dist
 
-      - name: Create release and attach RPMs
+      - name: Create release and attach packages
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
@@ -375,8 +499,22 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mapfile -t FILES < <(find dist \( -name '*.rpm' -o -name '*.cdx.json'  \) | sort)
-          [ "${#FILES[@]}" -gt 0 ] || { echo "::error::no RPMs found to release"; exit 1; }
+          mapfile -t FILES < <(find dist \( -name '*.rpm' -o -name '*.deb' -o -name '*.cdx.json'  \) | sort)
+          [ "${#FILES[@]}" -gt 0 ] || { echo "::error::no packages found to release"; exit 1; }
+
+          # Each format is counted SEPARATELY. A bare "did we get any files?"
+          # check passes on a release that shipped RPMs and no .debs at all --
+          # the deb legs are fail-fast:false, so both can go red without failing
+          # this job, and merge-multiple hides the gap by flattening whatever did
+          # arrive into one directory. The only signal that half the artifacts
+          # vanished would be someone noticing on the releases page.
+          n_rpm=$(printf '%s\n' "${FILES[@]}" | grep -c '\.rpm$' || true)
+          n_deb=$(printf '%s\n' "${FILES[@]}" | grep -c '\.deb$' || true)
+          echo "rpm=$n_rpm deb=$n_deb"
+          # 2 distros x 4 subpackages, plus the source RPMs on the rpm side.
+          [ "$n_rpm" -ge 8 ] || { echo "::error::only $n_rpm RPMs present, expected at least 8"; exit 1; }
+          [ "$n_deb" -eq 8 ] || { echo "::error::$n_deb .debs present, expected exactly 8 (2 distros x 4 packages)"; exit 1; }
+
           printf 'asset: %s\n' "${FILES[@]}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             # Re-run against an existing release/tag: refresh the assets.

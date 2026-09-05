@@ -1,0 +1,79 @@
+Source: sauron
+Section: web
+Priority: optional
+Maintainer: Kefah Issa <kefah@oodi.iq>
+# No cargo/nodejs here on purpose. packaging/deb/build-deb.sh owns compilation and
+# debian/rules never invokes a compiler (every dh_auto_* is overridden to a no-op),
+# exactly as packaging/rpm/build-rpm.sh --prebuilt does for the RPM path. Adding a
+# toolchain here would not make `dh` build anything; it would only slow the
+# package job down and make the two formats diverge.
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/edraj/sauron
+# Nothing is chowned at build time — see debian/sauron-server.postinst for why
+# ownership is applied at configure time instead — so the build needs no fakeroot.
+Rules-Requires-Root: no
+
+# Every binary package is Architecture: any, including the two that hold no ELF
+# (sauron and sauron-dashboard). Marking those `all` would be more correct, but it
+# forces the arch:any -> arch:all dependencies to use `(= ${source:Version})`
+# instead of `(= ${binary:Version})`, and getting that wrong produces packages
+# that simply cannot be co-installed. The RPM makes all four subpackages
+# arch-specific too. Uniform `any` keeps one dependency idiom across the set;
+# revisit only if these are ever published to a real multi-arch archive.
+
+Package: sauron
+Architecture: any
+Depends: ${misc:Depends}
+Description: Unified error reporting and product analytics platform (common files)
+ Sauron collects crashes, errors and product analytics from applications through
+ SDKs, and serves them through a web dashboard.
+ .
+ This package holds the pieces every other sauron package needs: the shared
+ /etc/sauron configuration directory, the service account definition and the
+ state directories under /var/lib/sauron.
+
+Package: sauron-server
+Architecture: any
+Depends: sauron (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+# postgresql and redis-server are Recommends, not Depends: both are routinely run
+# on a different host from the one Sauron is installed on, so hard-requiring them
+# would drag a local database onto every deployment that already has one.
+# The RPM says `Recommends: valkey`; neither Debian 12 nor Ubuntu 22.04 ships a
+# valkey package, so the Debian-family equivalent is redis-server.
+Recommends: postgresql, redis-server
+Description: Sauron backend services (API, ingest, monitor, tier, migrate)
+ The long-running Sauron daemons, their systemd units and per-service
+ configuration:
+ .
+  * sauron-api       - dashboard API
+  * sauron-ingest    - SDK ingest edge and worker pool
+  * sauron-monitor   - uptime prober
+  * sauron-alerts    - alert rule evaluator
+  * sauron-tier      - hot/cold Parquet tiering
+  * sauron-storesync - app store metrics syncer
+  * sauron-inspector - PII inspector (opt-in, not enabled on install)
+  * sauron-migrate   - one-shot schema migrator
+ .
+ Postgres and Redis are treated as external services; see
+ /usr/share/doc/sauron-server/SETUP.md.
+
+Package: sauron-dashboard
+Architecture: any
+Depends: sauron (= ${binary:Version}), nginx, ${misc:Depends}
+Description: Sauron web dashboard (static SPA served by nginx)
+ The Sauron single-page dashboard, served as static files by the system nginx
+ through a drop-in at /etc/nginx/conf.d/sauron-dashboard.conf.
+ .
+ The browser-facing API URLs are runtime configuration, not build-time: edit
+ /etc/sauron/dashboard.env and run /usr/libexec/sauron/sauron-dashboard-config
+ to regenerate config.js, then reload nginx.
+
+Package: sauron-cli
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Sauron command-line tools
+ Standalone Sauron command-line tools, installable without the server:
+ .
+  * crebain       - load and benchmark generator
+  * sauron-symcli - symbolication CLI

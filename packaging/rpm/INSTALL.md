@@ -1,17 +1,28 @@
 # Sauron — Installing from RPM (Fedora / RHEL)
 
+> Installing for the first time? Start at the top-level **[INSTALL.md](../../INSTALL.md)** — it covers Docker, Fedora/RHEL and Debian/Ubuntu side by side, plus the environment variables that matter and where
+> each one lives. This document is the Fedora / RHEL detail underneath it.
+
 Sauron ships four RPMs from one spec:
 
 | Package | Contents |
 |---|---|
 | `sauron` | shared `sauron` user, `/var/lib/sauron`, `/etc/sauron/sauron.env` (pulled in automatically) |
-| `sauron-server` | API, ingest, monitor, tier, migrate binaries + systemd units |
+| `sauron-server` | API, ingest, monitor, alerts, tier, inspector, storesync, migrate binaries + systemd units |
 | `sauron-dashboard` | static web UI + nginx vhost (requires `nginx`) |
 | `sauron-cli` | `crebain` load generator, `sauron-symcli` |
 
 ## 1. Build the RPMs
 
-Requires the build toolchain (`sudo dnf install rust cargo gcc gcc-c++ cmake clang perl-interpreter nodejs npm rpm-build systemd-rpm-macros curl unzip`):
+Requires the build toolchain:
+
+```bash
+sudo dnf install rust cargo gcc perl-interpreter libzstd-devel nodejs npm rpm-build systemd-rpm-macros curl unzip
+```
+
+No `gcc-c++`, `cmake` or `clang`: they were needed only to compile DuckDB's C++ amalgamation,
+and the build now links a prebuilt `libduckdb` instead (see below). `libzstd-devel` satisfies
+the spec's `BuildRequires: pkgconfig(libzstd)`.
 
 ```bash
 git clone <repo> sauron && cd sauron
@@ -63,15 +74,15 @@ sudo dnf install ./sauron-1.0.0-*.rpm ./sauron-server-1.0.0-*.rpm
 ## What gets installed
 
 ```
-/usr/bin/sauron-{api,ingest,monitor,alerts,tier,inspector,migrate,symcli}   /usr/bin/crebain
-/usr/lib/systemd/system/sauron-{api,ingest,monitor,alerts,tier,inspector,migrate}.service
+/usr/bin/sauron-{api,ingest,monitor,alerts,tier,inspector,storesync,migrate,symcli}   /usr/bin/crebain
+/usr/lib/systemd/system/sauron-{api,ingest,monitor,alerts,tier,inspector,storesync,migrate}.service
 /usr/lib64/sauron/libduckdb.so  vendored DuckDB library (sauron-tier links it)
 /etc/ld.so.conf.d/sauron.conf   puts /usr/lib64/sauron on the loader path (ldconfig runs on install)
 /etc/sauron/sauron.env          shared by every unit: DATABASE_URL, REDIS_URL, RUST_LOG,
                                 and the settings MORE THAN ONE binary reads —
                                 TIER_HOT_DAYS, INSPECTOR_POLICY_CACHE_SECS,
                                 INSPECTOR_TAIL_SWEEP_SECS
-/etc/sauron/{api,ingest,monitor,alerts,tier,inspector,dashboard}.env
+/etc/sauron/{api,ingest,monitor,alerts,tier,inspector,storesync,dashboard}.env
 /etc/sauron/secret.env          JWT_SECRET + NOTIFY_SECRET_KEY, auto-generated on first install (0640 root:sauron). BACK THIS UP: NOTIFY_SECRET_KEY is the only key that decrypts stored notification channels.
 /var/lib/sauron/  /var/lib/sauron/cold        owned by the sauron user
 /usr/share/sauron/dashboard/    static SPA

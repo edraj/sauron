@@ -1,0 +1,4 @@
+usr/share/sauron/dashboard
+usr/libexec/sauron/sauron-dashboard-config
+etc/nginx/conf.d/sauron-dashboard.conf
+etc/sauron/dashboard.env

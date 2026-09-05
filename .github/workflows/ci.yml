@@ -535,7 +535,7 @@ jobs:
             done
           fi
 
-          # ---- 5. every path the RPM spec references actually EXISTS --------
+          # ---- 5. every path the PACKAGING references actually EXISTS -------
           #
           # Checks 1-3 cannot catch this class, and neither can any `git status`
           # check, because CI only ever sees TRACKED files: an untracked file is
@@ -550,26 +550,53 @@ jobs:
           #   install: cannot stat 'packaging/rpm/systemd/50-sauron.preset'
           # in %install, taking every RPM with it. Same shape as the untracked
           # migration above, one directory over.
-          spec=packaging/rpm/sauron.spec
-          if [ ! -f "$spec" ]; then
-            die "packaging/rpm/sauron.spec is missing"
-          else
-            note "check 5: resolving repo paths referenced by $spec"
-            missing=0
-            # Every bare packaging/... token in the spec: Source lines, install
-            # arguments, anything. Deliberately greedy — a false positive here is
-            # a one-line fix, a false negative is a dead release.
+          # The .deb path has exactly the same exposure and reads the SAME
+          # packaging/rpm/ assets (units, sysusers, tmpfiles, config, nginx,
+          # scripts) — deliberately, so the two formats cannot drift — which means
+          # one untracked file there now kills both releases at once.
+          missing=0
+          for src in packaging/rpm/sauron.spec \
+                     packaging/deb/debian/rules \
+                     packaging/deb/build-deb.sh; do
+            if [ ! -f "$src" ]; then
+              die "$src is missing"
+              continue
+            fi
+            note "check 5: resolving repo paths referenced by $src"
+            # Every bare packaging/... token: Source lines, install arguments,
+            # anything. Deliberately greedy — a false positive here is a one-line
+            # fix, a false negative is a dead release.
             # sed, not `tr -d '[:space:]'`: tr would also delete the NEWLINES
             # between matches and collapse every path into one unopenable token.
             # The first version of this guard did exactly that and "passed".
-            for ref in $(grep -oE '(^|[[:space:]])packaging/[A-Za-z0-9._/-]+' "$spec" \
-                          | sed 's/^[[:space:]]*//' | sort -u); do
+            # Two normalisations, both needed once prose comments (not just
+            # install arguments) mention packaging paths:
+            #   * strip trailing sentence punctuation — "see packaging/deb/rules."
+            #     otherwise reports a missing file called 'rules.'
+            #   * skip tokens containing '..' — an elided path in prose such as
+            #     "reads packaging/rpm/..." is not a path claim at all
+            # Still greedy about everything else: a false positive is a one-line
+            # fix, a false negative is a dead release.
+            for ref in $(grep -oE '(^|[[:space:]])packaging/[A-Za-z0-9._/-]+' "$src" \
+                          | sed -e 's/^[[:space:]]*//' -e 's/[.,;:)]*$//' \
+                          | grep -v '\.\.' | sort -u); do
               if [ ! -e "$ref" ]; then
-                die "$spec references '$ref' but it does not exist in this checkout. If it exists on your machine it is UNTRACKED — run 'git add $ref'. rpmbuild will fail in %install and every RPM with it."
+                die "$src references '$ref' but it does not exist in this checkout. If it exists on your machine it is UNTRACKED — run 'git add $ref'. The build will fail while installing files, taking every package with it."
                 missing=1
               fi
             done
-            [ "$missing" -eq 0 ] && note "  all spec-referenced packaging paths present"
+          done
+          [ "$missing" -eq 0 ] && note "  all referenced packaging paths present"
+
+          # ---- 6. the RPM and the .deb ship the same binaries ---------------
+          # Each format's build catches only its OWN drift, so a binary can reach
+          # one and not the other with both builds green. Shell-only, so it
+          # belongs in this job rather than behind a container.
+          if [ -x packaging/tests/manifest-parity.sh ]; then
+            note "check 6: rpm/deb binary manifest parity"
+            packaging/tests/manifest-parity.sh || fail=1
+          else
+            die "packaging/tests/manifest-parity.sh is missing or not executable"
           fi
 
           if [ "$fail" -ne 0 ]; then
@@ -601,6 +628,49 @@ jobs:
           key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
       - name: Source RPM builds (validates SourceN staging + tarball)
         run: ./packaging/rpm/build-rpm.sh --srpm
+
+  # ---------------------------------------------------------------------------
+  # The .deb counterpart. Goes further than the RPM job above because it can:
+  # dpkg install/upgrade/purge needs no database and no real binaries, so the
+  # whole lifecycle is exercised here rather than only the build.
+  #
+  # Built from STUB binaries (packaging/deb/tests/make-stub-prebuilt.sh), which is
+  # what makes that affordable — compiling the workspace to find out whether a
+  # postinst chgrps the right file would cost ~40 minutes per PR. The stubs are
+  # real ELF and sauron-tier really links a libduckdb.so with the real SONAME, so
+  # everything the packaging depends on is still under test; only Sauron's own
+  # behaviour is not, and no gate here is about that.
+  #
+  # Both distros, because they are two different debhelper versions (13.11.4 vs
+  # 13.6) with different sequences — dh_installsysusers is in neither at compat
+  # 13, but bookworm has an add-on for it that jammy lacks, so "works on Debian"
+  # genuinely does not imply "works on Ubuntu" here.
+  # ---------------------------------------------------------------------------
+  packaging-deb:
+    name: packaging deb — build · install · upgrade · purge (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "ubuntu:22.04"]
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install packaging + test tooling
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            debhelper dpkg-dev gcc libc6-dev git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Trust the workspace (container git)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Build, install, upgrade and purge the packages
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          DEB_BUILD_TOPDIR: ${{ github.workspace }}/debbuild
+        run: ./packaging/deb/tests/install-test.sh
 
   # ---------------------------------------------------------------------------
   # The single job branch protection should require.
@@ -645,6 +715,7 @@ jobs:
       - sdk-flutter
       - migrations
       - packaging
+      - packaging-deb
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -690,6 +761,7 @@ jobs:
             sdk-flutter ${{ needs.sdk-flutter.result }}
             migrations  ${{ needs.migrations.result }}
             packaging   ${{ needs.packaging.result }}
+            packaging-deb ${{ needs.packaging-deb.result }}
         run: printf '%s\n' "$RESULTS"
 
       # 'skipped' counts as failure too. No job here has a path filter or a

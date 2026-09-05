@@ -1,0 +1,3 @@
+packaging/deb/INSTALL.md
+packaging/rpm/SETUP.md
+packaging/rpm/post-upgrade.sh

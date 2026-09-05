@@ -1,0 +1,190 @@
+#!/usr/bin/make -f
+#
+# Sauron .deb rules.
+#
+# THIS FILE NEVER COMPILES ANYTHING. packaging/deb/build-deb.sh owns compilation
+# (or consumes CI's prebuilt artifacts), stages the result, and only then calls
+# dpkg-buildpackage. Every dh_auto_* below is overridden to a no-op to enforce
+# that: if `dh` were allowed to run its default sequence it would find
+# backend/Cargo.toml and start a 40-minute cargo build inside the package job.
+#
+# Layout build-deb.sh guarantees before dh runs (see that script's "stage" step):
+#   prebuilt/bin/<name>     one per line of packaging/rpm/binaries.txt
+#   prebuilt/dist/          dashboard build output
+#   prebuilt/libduckdb.so   the DuckDB C library the binaries were linked against
+#   packaging/rpm/...       units, sysusers, tmpfiles, config, nginx, scripts
+#   LICENSE  README.md
+#
+# Assets are read out of packaging/rpm/ deliberately. The systemd units, sysusers,
+# tmpfiles, the nine .env files, the nginx vhost and sauron-dashboard-config are
+# format-independent, so there is exactly ONE copy of each in the repo and the two
+# packaging formats cannot drift apart.
+
+RPMDIR := packaging/rpm
+TMP    := debian/tmp
+
+# Where the vendored DuckDB library lands. NOT multiarch: the path is resolved
+# through the ld.so.conf.d drop-in below, never by the linker's multiarch search,
+# so $(DEB_HOST_MULTIARCH) templating would buy nothing and only make every path
+# in this file longer. (The RPM uses %{_libdir}/sauron = /usr/lib64/sauron; this
+# path is loader-internal and appears in no operator-facing documentation.)
+SAURONLIB := usr/lib/sauron
+
+%:
+	dh $@
+
+# --- compilation is not dh's job -------------------------------------------
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+override_dh_auto_clean:
+
+override_dh_auto_install:
+	# --- binaries ---
+	# packaging/rpm/binaries.txt is the single source of truth for what ships.
+	# release.yml's assemble step, build-rpm.sh, sauron.spec's %install loop and
+	# this loop all read it, so a binary added for one packaging format cannot go
+	# missing from the other. Which package owns each one is declared in
+	# debian/*.install, and dh_missing --fail-missing (below) errors on anything
+	# installed here but claimed by no package -- the same safety net rpmbuild
+	# gives the spec with its installed-but-unpackaged check.
+	set -e; for b in $$(grep -vE '^[[:space:]]*(#|$$)' $(RPMDIR)/binaries.txt); do \
+	    install -Dm0755 prebuilt/bin/$$b $(TMP)/usr/bin/$$b; \
+	done
+
+	# --- systemd units ---
+	# /lib/systemd/system, not /usr/lib: correct on both targets (on merged-usr
+	# Debian 12 and Ubuntu 22.04 /lib is a symlink to /usr/lib), and it is the
+	# path dh_installsystemd scans on the older debhelper in jammy.
+	set -e; for u in api ingest monitor tier migrate alerts inspector storesync; do \
+	    install -Dm0644 $(RPMDIR)/systemd/sauron-$$u.service \
+	        $(TMP)/lib/systemd/system/sauron-$$u.service; \
+	done
+	# packaging/rpm/systemd/50-sauron.preset is deliberately NOT installed. It is
+	# the RPM's answer to `systemctl preset`; on Debian the equivalent policy is
+	# expressed by dh_installsystemd's enable/--no-enable split in
+	# override_dh_installsystemd below. Shipping both would give two sources of
+	# truth for which daemons start.
+
+	# --- sysusers / tmpfiles ---
+	install -Dm0644 $(RPMDIR)/sysusers/sauron.conf $(TMP)/usr/lib/sysusers.d/sauron.conf
+	install -Dm0644 $(RPMDIR)/tmpfiles/sauron.conf $(TMP)/usr/lib/tmpfiles.d/sauron.conf
+
+	# --- config ---
+	# Mode 0644 root:root here, NOT 0640 root:sauron as the RPM's %attr sets.
+	# dpkg unpacks conffiles before any maintainer script runs, so the `sauron`
+	# group does not exist yet -- and Rules-Requires-Root: no means the build
+	# cannot set arbitrary owners anyway. Ownership and the 0640 mode are applied
+	# at configure time; see debian/sauron-server.postinst.
+	set -e; for c in sauron api ingest monitor tier alerts inspector storesync dashboard; do \
+	    install -Dm0644 $(RPMDIR)/config/$$c.env $(TMP)/etc/sauron/$$c.env; \
+	done
+
+	# The state dirs under /var/lib/sauron are NOT staged here: dh_install skips
+	# empty directories, so they would silently never reach the package. They come
+	# from debian/sauron.dirs instead, and are chowned by debian/sauron.postinst
+	# (and again at runtime by the tmpfiles fragment).
+
+	# --- vendored libduckdb (dynamically linked by sauron-tier) ---
+	# Private lib dir plus an ld.so.conf.d drop-in so the loader resolves it; no
+	# rpath is baked into the binary. ldconfig is run from the postinst.
+	install -Dm0755 prebuilt/libduckdb.so $(TMP)/$(SAURONLIB)/libduckdb.so
+	install -dm0755 $(TMP)/etc/ld.so.conf.d
+	printf '/%s\n' '$(SAURONLIB)' > $(TMP)/etc/ld.so.conf.d/sauron.conf
+
+	# --- dashboard static + generator + nginx vhost ---
+	install -dm0755 $(TMP)/usr/share/sauron/dashboard
+	cp -a prebuilt/dist/. $(TMP)/usr/share/sauron/dashboard/
+	# config.js is generated per-host by sauron-dashboard.postinst from
+	# config.template.js; ship only the template.
+	rm -f $(TMP)/usr/share/sauron/dashboard/config.js
+	install -Dm0644 $(RPMDIR)/nginx/sauron-dashboard.conf \
+	    $(TMP)/etc/nginx/conf.d/sauron-dashboard.conf
+	install -Dm0755 $(RPMDIR)/scripts/sauron-dashboard-config \
+	    $(TMP)/usr/libexec/sauron/sauron-dashboard-config
+
+# --- dh_installsysusers is not in the compat-13 sequence -------------------
+# It joins the default `dh` sequence only at compat 14, and compat 14 is
+# available on neither target (bookworm ships debhelper 13.11.4, jammy 13.6).
+# `dh --with installsysusers` is not portable either: bookworm has
+# Sequence/installsysusers.pm, jammy does NOT. The program itself exists on both,
+# so call it directly. Without this the sauron user is never created and every
+# daemon fails with a User=sauron lookup error.
+override_dh_install:
+	dh_install
+	dh_installsysusers
+
+override_dh_missing:
+	dh_missing --fail-missing
+
+# --- the vendored DuckDB library has no dependency information -------------
+# libduckdb.so is private to this package: it is not in any shlibs database, so
+# dpkg-shlibdeps aborts sauron-server's build with "no dependency information
+# found for .../libduckdb.so". -l puts the staged package dir on its search path
+# so it can resolve the SONAME sauron-tier links against, and
+# --ignore-missing-info downgrades the unresolvable-to-a-package part to a
+# warning. The libraries that DO have dependency info (libc, libzstd, ...) are
+# still resolved normally, which is the whole reason for using dh_shlibdeps
+# rather than a hand-written Depends: line.
+override_dh_shlibdeps:
+	dh_shlibdeps -psauron-server \
+	    -l$(CURDIR)/debian/sauron-server/$(SAURONLIB) \
+	    -- --ignore-missing-info
+	dh_shlibdeps -psauron-cli
+
+# libduckdb.so is a PRIVATE library, not a public one this package offers to
+# others. Left to itself dh_makeshlibs would treat it as public: emit a shlibs
+# entry advertising its SONAME as provided by sauron-server, and add an ldconfig
+# trigger for it. The first is wrong (nothing outside this package may link it)
+# and the second is redundant -- the postinst runs ldconfig itself, and has to,
+# because it must happen before the units are started.
+override_dh_makeshlibs:
+	dh_makeshlibs -X$(SAURONLIB)
+
+# --- unit enablement -------------------------------------------------------
+# sauron-inspector gets --no-enable ONLY, never --no-start.
+#
+# deb-systemd-invoke gates on `systemctl is-enabled` and prints "<unit> is a
+# disabled or a static unit, not starting it", so --no-enable alone already means
+# "not started on install". What --no-start would additionally throw away is the
+# restart on upgrade -- and because that restart runs through the same gate, it
+# fires only for an operator who deliberately enabled and started the inspector.
+# Adding --no-start would leave exactly that operator running old code after an
+# upgrade. --no-enable alone reproduces the RPM's preset-disable plus
+# %systemd_postun_with_restart try-restart semantics precisely.
+#
+# Why the inspector is excluded at all is a technical constraint, not a
+# distribution policy: its extra 4-connection pool pushes a stock Postgres past
+# max_connections, and the failures then surface as sauron-api 500s rather than
+# as inspector errors. See packaging/rpm/systemd/50-sauron.preset.
+#
+# sauron-migrate.service is in the enabled group for symmetry with the RPM's
+# %post/%preun lists, and costs nothing: it is static (no [Install]), so
+# deb-systemd-helper creates no symlinks for it and the same is-enabled gate
+# keeps deb-systemd-invoke from ever starting or restarting it. It is pulled in
+# instead by every daemon's Requires=sauron-migrate.service.
+override_dh_installsystemd:
+	dh_installsystemd -psauron-server --no-enable sauron-inspector.service
+	dh_installsystemd -psauron-server \
+	    sauron-api.service sauron-ingest.service sauron-monitor.service \
+	    sauron-alerts.service sauron-tier.service sauron-storesync.service \
+	    sauron-migrate.service
+
+# --- no debug packages -----------------------------------------------------
+# backend/Cargo.toml's release profile sets strip = true, so the binaries arrive
+# already stripped and dh_strip would produce empty -dbgsym packages. Passing
+# --no-automatic-dbgsym keeps that true if the profile ever changes, rather than
+# silently adding four unannounced artifacts to the release.
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
+override_dh_dwz:
+
+# --- keep the shipped docs readable at the paths that reference them --------
+# dh_compress gzips anything in /usr/share/doc over 4k, which silently breaks
+# every unit's `Documentation=file:///usr/share/doc/sauron-server/SETUP.md`:
+# the file is there as SETUP.md.gz and `systemctl status` points at nothing.
+# packaging/deb/INSTALL.md links SETUP.md by the same path, and the RPM ships
+# both uncompressed, so exclude them and keep one set of documented paths.
+override_dh_compress:
+	dh_compress -X.md -X.sh
