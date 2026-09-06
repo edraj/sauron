@@ -26,6 +26,12 @@ User=sauron
 Group=sauron
 EnvironmentFile=/etc/sauron/sauron.env
 EnvironmentFile=-/etc/sauron/tier.env
+# DuckDB spills large exports to a `.tmp` directory relative to the process's
+# working directory. Without this it resolves to `/`, which ProtectSystem=strict
+# makes read-only, and every export of a partition bigger than DUCKDB_MEMORY_MB
+# dies with `IO Error: Failed to create directory ".tmp": Read-only file system`.
+# Must stay inside ReadWritePaths below.
+WorkingDirectory=/var/lib/sauron
 ExecStart=/usr/bin/sauron-tier
 Restart=on-failure
 RestartSec=2

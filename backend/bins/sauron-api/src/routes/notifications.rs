@@ -1520,12 +1520,12 @@ fn template_vars() -> Value {
     json!({
         "monitor_down": ["monitor", "target", "status", "previous_status", "cause", "project_id"],
         "monitor_up": ["monitor", "target", "status", "previous_status", "project_id"],
-        "issue_new": ["issue_title", "issue_level", "app_id", "times_seen"],
-        "issue_regression": ["issue_title", "issue_level", "app_id", "times_seen"],
+        "issue_new": ["issue_title", "issue_level", "app_id", "times_seen", "environment"],
+        "issue_regression": ["issue_title", "issue_level", "app_id", "times_seen", "environment"],
         "error_threshold": ["count", "threshold", "window_minutes", "query"],
         "error_spike": ["count", "previous_count", "factor", "window_minutes", "query"],
         "event_threshold": ["count", "threshold", "window_minutes", "event_name"],
-        "perf_degradation": ["value_ms", "threshold_ms", "metric", "window_minutes"],
+        "perf_degradation": ["value_ms", "threshold_ms", "metric", "window_minutes", "environment", "op"],
     })
 }
 

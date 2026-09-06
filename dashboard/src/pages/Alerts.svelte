@@ -29,6 +29,7 @@
   } from '../lib/models';
   import { errorMessage } from '../lib/api/client';
   import { listMonitors } from '../lib/api/monitors';
+  import { listProjectEnvironments } from '../lib/api/environments';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import Card from '../lib/components/ui/Card.svelte';
@@ -56,6 +57,14 @@
   import { pageSlice } from '../lib/models/paginate';
   import { sortRows } from '../lib/models/sort-rows';
   import type { SortDir } from '../lib/models/sort';
+  import {
+    withPinnedChoice,
+    mergeEnvironmentNames,
+    mergeStoredFilters,
+    triggerNeeds,
+    TRANSACTION_OPS,
+    opLabel,
+  } from '../lib/models/alert-filters';
 
   /** Rows per page, for all three tables. Each list arrives whole, so this is a
       rendering budget only — no request is issued by a sort or a page click. */
@@ -147,6 +156,20 @@
   let rMetric = $state('p95');
   let rLevel = $state('');
   let rEnvironment = $state('');
+  // Environment NAMES, not ids: `conditions.filters.environment` stores the
+  // name and the evaluator resolves it to this app's enrollment ids per tick
+  // (`enrollment_ids_for_env_name`). Storing an id here would pin the rule to
+  // one app's enrollment and stop matching the moment the rule's scope widened.
+  let environmentOptions = $state<string[]>([]);
+  // The `conditions.filters` the rule being edited arrived with, verbatim.
+  //
+  // Kept because the dialog cannot express all of them: `tag_key`/`tag_value`
+  // have no field at all, and a hidden field's key (`environment` on a monitor
+  // rule) must survive an edit that never showed it. See `mergeStoredFilters`.
+  let storedFilters = $state<Record<string, string>>({});
+  // The transaction `op` a latency rule aggregates over. Empty = every op,
+  // which is what `alert_latency_metric` does with a null `op` bind.
+  let rOp = $state('');
   let rEventName = $state('');
   let rQuery = $state('');
   let rTemplate = $state('');
@@ -234,6 +257,44 @@
     }
   }
 
+  /**
+   * The environment names the picker offers.
+   *
+   * Two sources, because neither alone covers every reader. The project
+   * CATALOGUE is the right list — it names every environment any app in the
+   * project defines, and a rule may span several apps — but
+   * `GET /v1/projects/{id}/environments` takes a project-scoped `env:read`
+   * (`routes/environments.rs::list_project_environments`), which an org-scoped
+   * `alert:write` grant does not imply. So a member who can write the rule can
+   * still be 403'd on the list. `sessionStore.environments` is the fallback
+   * that endpoint's own comment points at: the current app's enrollments,
+   * already loaded, already reach-filtered, no extra permission.
+   *
+   * Union rather than either/or, deduped by name: the fallback is narrower
+   * (one app) and would otherwise hide a sibling app's environment from a
+   * reader who can see both.
+   */
+  async function loadEnvironmentOptions() {
+    const pid = projectId;
+    let catalogue: string[] = [];
+    if (pid) {
+      try {
+        catalogue = (await listProjectEnvironments(pid)).map((e) => e.name);
+      } catch {
+        // 403 or offline — the session list still gives a usable picker.
+      }
+    }
+    // Cheap and idempotent: returns immediately with no app selected, with
+    // environments already in hand, or with a load already attempted for this
+    // app. Without it the fallback reads `[]` on a hard load of /alerts, where
+    // nothing has needed the app's environments yet.
+    await sessionStore.ensureEnvironmentsLoaded();
+    environmentOptions = mergeEnvironmentNames(
+      catalogue,
+      sessionStore.environments.map((e) => e.name),
+    );
+  }
+
   function openNewRule() {
     editingRuleId = null;
     rName = '';
@@ -247,12 +308,17 @@
     rMetric = 'p95';
     rLevel = '';
     rEnvironment = '';
+    rOp = '';
     rEventName = '';
     rQuery = '';
-    rTemplate = '';
+    // A new rule has nothing stored to preserve. Not resetting this is how a
+    // value carried over from the previously-edited rule would ride along.
+    storedFilters = {};
+    rTemplate = TRIGGER_TEMPLATES[rTrigger];
     rChannels = [];
     rMonitor = '';
     void loadMonitorOptions();
+    void loadEnvironmentOptions();
     showRuleForm = true;
   }
 
@@ -270,6 +336,7 @@
     // moving on, as `openNewRule` does) lets us detect that and splice in a
     // synthetic option carrying the real id — never inventing a name we
     // don't have.
+    void loadEnvironmentOptions();
     await loadMonitorOptions();
     if (r.monitor_id && !monitorOptions.some((m) => m.id === r.monitor_id)) {
       monitorOptions = [
@@ -302,6 +369,8 @@
     rMetric = c.metric ?? 'p95';
     rLevel = c.filters?.level ?? '';
     rEnvironment = c.filters?.environment ?? '';
+    rOp = c.filters?.op ?? '';
+    storedFilters = { ...((c.filters ?? {}) as Record<string, string>) };
     rEventName = c.filters?.event_name ?? '';
     rQuery = c.filters?.query ?? '';
     showRuleForm = true;
@@ -314,19 +383,69 @@
 
   let confirmDelete = $state<{ kind: 'channel' | 'rule'; id: string; name: string } | null>(null);
 
-  /** Which extra condition inputs a trigger actually uses. */
-  const triggerNeeds = (t: TriggerType) => ({
-    threshold: t === 'error_threshold' || t === 'event_threshold' || t === 'perf_degradation',
-    window: t !== 'monitor_down' && t !== 'monitor_up',
-    monitor: t === 'monitor_down' || t === 'monitor_up',
-    spike: t === 'error_spike',
-    metric: t === 'perf_degradation',
-    level: t === 'issue_new' || t === 'issue_regression' || t === 'error_threshold' || t === 'error_spike',
-    eventName: t === 'event_threshold',
-    query: t === 'error_threshold' || t === 'error_spike',
-  });
-
   const needs = $derived(triggerNeeds(rTrigger));
+
+  /**
+   * The picker's options, with the rule's saved environment spliced in when the
+   * fetched list does not contain it — a retired environment, one belonging to
+   * a project the session no longer has selected, or a name typed before this
+   * field became a picker. Same reason `openEditRule` splices a synthetic
+   * monitor option; see `models/alert-env.ts` for what goes wrong without it.
+   */
+  const environmentChoices = $derived(withPinnedChoice(environmentOptions, rEnvironment));
+
+  /**
+   * The op picker's options. The vocabulary is a constant rather than a fetch
+   * (see `models/alert-filters.ts`), so the only moving part is the pin — which
+   * this field needs more than the environment one does, because `op` is
+   * free-form on the wire and a rule may legitimately name an op no SDK in the
+   * documented set emits.
+   */
+  const opChoices = $derived(withPinnedChoice([...TRANSACTION_OPS], rOp));
+
+  /**
+   * A starting message for each trigger, prefilled when the trigger is picked
+   * and freely editable afterwards.
+   *
+   * Every `{{name}}` here MUST appear in that trigger's `template_vars` list
+   * (see `template_vars()` in the API's notifications route): an unknown name
+   * is dropped silently by the substituter, so a wrong one renders as a hole in
+   * the message with nothing to explain it. `{{query}}` is deliberately left
+   * out of the two triggers that offer it — it is empty unless a search filter
+   * was typed, which would read as a dangling clause for most rules.
+   */
+  const TRIGGER_TEMPLATES: Record<TriggerType, string> = {
+    monitor_down:
+      '{{monitor}} is DOWN — {{target}} ({{cause}}). Was {{previous_status}}.',
+    monitor_up: '{{monitor}} is back UP — {{target}} is responding again (was {{previous_status}}).',
+    issue_new: 'New {{issue_level}} issue: {{issue_title}} — seen {{times_seen}}x (app {{app_id}}).',
+    issue_regression:
+      'Regression: {{issue_title}} ({{issue_level}}) is back — seen {{times_seen}}x (app {{app_id}}).',
+    error_threshold:
+      '{{count}} errors in the last {{window_minutes}} min, over the threshold of {{threshold}}.',
+    error_spike:
+      'Error spike: {{count}} errors in the last {{window_minutes}} min — {{factor}}x the previous {{previous_count}}.',
+    event_threshold:
+      '{{event_name}}: {{count}} events in the last {{window_minutes}} min, over the threshold of {{threshold}}.',
+    perf_degradation:
+      'Latency degraded: {{metric}} is {{value_ms}} ms over the last {{window_minutes}} min (threshold {{threshold_ms}} ms).',
+  };
+
+  /**
+   * Swap in the new trigger's starter message, unless the operator has written
+   * their own. "Their own" is anything that is neither blank nor one of the
+   * other triggers' starters, so flipping between triggers keeps re-seeding but
+   * a customised message is never silently rewritten. Editing is exempt
+   * outright — an existing rule's message is the operator's, and the trigger
+   * selector is locked there anyway.
+   */
+  function selectTrigger(next: TriggerType) {
+    rTrigger = next;
+    if (editingRuleId) return;
+    const untouched =
+      rTemplate.trim() === '' || Object.values(TRIGGER_TEMPLATES).includes(rTemplate);
+    if (untouched) rTemplate = TRIGGER_TEMPLATES[next];
+  }
 
   const TRIGGER_LABELS: Record<TriggerType, string> = {
     monitor_down: 'Monitor goes down',
@@ -525,10 +644,12 @@
     if (needs.metric) conditions.metric = rMetric;
     const filters: Record<string, string> = {};
     if (needs.level && rLevel) filters.level = rLevel;
-    if (rEnvironment) filters.environment = rEnvironment;
+    if (needs.env && rEnvironment) filters.environment = rEnvironment;
     if (needs.eventName && rEventName) filters.event_name = rEventName;
+    if (needs.op && rOp) filters.op = rOp;
     if (needs.query && rQuery.trim()) filters.query = rQuery.trim();
-    if (Object.keys(filters).length) conditions.filters = filters;
+    const merged = mergeStoredFilters(filters, storedFilters, needs);
+    if (Object.keys(merged).length) conditions.filters = merged;
     return conditions;
   }
 
@@ -687,6 +808,15 @@
   // break the page.
   $effect(() => {
     if (projectId) void loadMonitorOptions();
+  });
+
+  // Same reasoning, one dependency wider: the environment picker's fallback
+  // source is the SESSION's app, so this re-runs on an app switch too. Reading
+  // both ids here is what registers them as dependencies.
+  $effect(() => {
+    void projectId;
+    void sessionStore.currentAppId;
+    void loadEnvironmentOptions();
   });
 </script>
 
@@ -888,7 +1018,7 @@
               lockedReason={writeLock}
               onclick={submitChannel}
             >
-              {t('alerts.createChannel')}
+              {editingChannelId ? t('alerts.updateChannel') : t('alerts.createChannel')}
             </Button>
           </div>
         </Card>
@@ -1033,7 +1163,12 @@
             <div class="field">
               <label class="lbl" for="r-trigger">{t('alerts.column.trigger')}</label>
               <div class="control select">
-                <select id="r-trigger" bind:value={rTrigger} disabled={editingRuleId !== null}>
+                <select
+                  id="r-trigger"
+                  value={rTrigger}
+                  onchange={(e) => selectTrigger(e.currentTarget.value as TriggerType)}
+                  disabled={editingRuleId !== null}
+                >
                   {#each Object.entries(TRIGGER_LABELS) as [k, label] (k)}
                     <option value={k}>{label}</option>
                   {/each}
@@ -1098,6 +1233,22 @@
               </div>
             {/if}
 
+            {#if needs.op}
+              <div class="field">
+                <label class="lbl" for="r-op">{t('alerts.field.opFilter')}</label>
+                <div class="control select">
+                  <select id="r-op" bind:value={rOp}>
+                    <option value="">{t('alerts.field.opAny')}</option>
+                    {#each opChoices as o (o)}
+                      <option value={o}>{opLabel(o)}</option>
+                    {/each}
+                  </select>
+                  <span class="affix"><Icon name="chevron-down" size={15} /></span>
+                </div>
+                <p class="hint">{t('alerts.field.opHint')}</p>
+              </div>
+            {/if}
+
             {#if needs.spike}
               <Input
                 label={t('alerts.field.spikeFactor')}
@@ -1136,12 +1287,25 @@
               />
             {/if}
 
-            <Input
-              label={t('alerts.field.envFilter')}
-              bind:value={rEnvironment}
-              placeholder="production"
-              hint={t('alerts.field.optional')}
-            />
+            {#if needs.env}
+              <div class="field">
+                <label class="lbl" for="r-env">{t('alerts.field.envFilter')}</label>
+                <div class="control select">
+                  <select id="r-env" bind:value={rEnvironment}>
+                    <option value="">{t('alerts.field.envAny')}</option>
+                    {#each environmentChoices as e (e)}
+                      <option value={e}>{e}</option>
+                    {/each}
+                  </select>
+                  <span class="affix"><Icon name="chevron-down" size={15} /></span>
+                </div>
+                <p class="hint">
+                  {environmentOptions.length === 0
+                    ? t('alerts.field.envNone')
+                    : t('alerts.field.optional')}
+                </p>
+              </div>
+            {/if}
 
             <div class="field">
               <label class="lbl" for="r-sev">{t('alerts.column.severity')}</label>
@@ -1168,7 +1332,7 @@
                 class="textarea"
                 bind:value={rTemplate}
                 rows="3"
-                placeholder="{'{{monitor}}'} is {'{{status}}'} — {'{{cause}}'}"
+                placeholder={TRIGGER_TEMPLATES[rTrigger]}
               ></textarea>
               <p class="hint">
                 {t('alerts.optionalUse')} <code>{'{{variable}}'}</code> placeholders.
@@ -1205,7 +1369,7 @@
               lockedReason={writeLock}
               onclick={submitRule}
             >
-              {t('alerts.createRule')}
+              {editingRuleId ? t('alerts.updateRule') : t('alerts.createRule')}
             </Button>
           </div>
         </Card>
