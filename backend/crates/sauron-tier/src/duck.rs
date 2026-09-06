@@ -22,15 +22,62 @@ pub struct DuckEngine {
     alias_map: std::cell::RefCell<Option<Vec<(String, String)>>>,
 }
 
+/// Environment variable naming this process's DuckDB memory ceiling, in MB.
+///
+/// Read from the environment rather than `Config` because `open()` is a static
+/// constructor with call sites across two binaries, and threading config through
+/// all of them would buy nothing: the right ceiling is a property of the PROCESS,
+/// not of the call. `sauron-api` opens an engine per concurrent cold read, so it
+/// wants a low ceiling to bound the worst case across many readers; `sauron-tier`
+/// opens one at a time and streams a whole partition through it, so it wants a
+/// high one. One variable, set per systemd unit, expresses both.
+const DUCK_MEMORY_MB_ENV: &str = "DUCKDB_MEMORY_MB";
+
+/// Ceiling when the variable is unset or unusable. Matches the value this was
+/// hard-coded to before the knob existed, so an untouched deployment is
+/// bit-identical to the old behaviour.
+const DUCK_MEMORY_MB_DEFAULT: u32 = 512;
+
+/// Parse a memory ceiling, falling back to [`DUCK_MEMORY_MB_DEFAULT`].
+///
+/// Split from the env read so it is testable without mutating process-global
+/// state, which is unsound under a parallel test runner. Zero and negative
+/// values fall back rather than erroring: a mis-typed ceiling must not be able
+/// to stop tiering deployment-wide, and DuckDB rejects `0MB` outright.
+fn parse_memory_mb(raw: Option<&str>) -> u32 {
+    raw.map(str::trim)
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DUCK_MEMORY_MB_DEFAULT)
+}
+
+fn duck_memory_mb() -> u32 {
+    parse_memory_mb(std::env::var(DUCK_MEMORY_MB_ENV).ok().as_deref())
+}
+
 impl DuckEngine {
     /// Open an in-memory DuckDB. Parquet is read directly from the filesystem;
     /// no persistent DuckDB database file is used.
     pub fn open() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory().context("open duckdb")?;
-        // Bound memory so many concurrent cold reads can't OOM the process.
+        // Bound memory so many concurrent cold reads can't OOM the process; see
+        // `DUCK_MEMORY_MB_ENV` for why the ceiling is per-process.
         // Pin UTC so `CAST(occurred_at AS DATE)` day-bucketing matches the hot side's
         // `(occurred_at AT TIME ZONE 'UTC')::date`.
-        conn.execute_batch("SET memory_limit='512MB'; SET threads=4; SET TimeZone='UTC';")?;
+        //
+        // `preserve_insertion_order=false` lets DuckDB stream an export instead of
+        // buffering it to reproduce input order. Without it, exporting a wide table
+        // (`error_events` carries stack traces and payloads) exhausts the ceiling
+        // above and fails with "failed to pin block" long before the spill path can
+        // help. Nothing downstream depends on row order within the Parquet: every
+        // reader either counts, aggregates under an explicit `ORDER BY`, or inserts
+        // into Postgres, which has no inherent order either. The setting does not
+        // affect queries that name an `ORDER BY` of their own.
+        conn.execute_batch(&format!(
+            "SET memory_limit='{}MB'; SET threads=4; SET TimeZone='UTC'; \
+             SET preserve_insertion_order=false;",
+            duck_memory_mb()
+        ))?;
         Ok(Self {
             conn,
             alias_map: std::cell::RefCell::new(None),
@@ -604,6 +651,66 @@ pub struct ColdKeyCount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_ceiling_falls_back_on_anything_unusable() {
+        // Unset is the common case: an untouched deployment keeps the value this
+        // was hard-coded to before the knob existed.
+        assert_eq!(parse_memory_mb(None), DUCK_MEMORY_MB_DEFAULT);
+        assert_eq!(parse_memory_mb(Some("2048")), 2048);
+        assert_eq!(parse_memory_mb(Some("  2048  ")), 2048);
+        // Garbage must not be able to stop tiering deployment-wide, and DuckDB
+        // rejects a zero ceiling outright, so both fall back rather than error.
+        assert_eq!(parse_memory_mb(Some("")), DUCK_MEMORY_MB_DEFAULT);
+        assert_eq!(parse_memory_mb(Some("2048MB")), DUCK_MEMORY_MB_DEFAULT);
+        assert_eq!(parse_memory_mb(Some("0")), DUCK_MEMORY_MB_DEFAULT);
+        assert_eq!(parse_memory_mb(Some("-1")), DUCK_MEMORY_MB_DEFAULT);
+    }
+
+    /// The export path's actual fix. A wide table exhausts the memory ceiling
+    /// while DuckDB buffers rows to reproduce input order; streaming instead is
+    /// what lets `error_events` export at all. Asserted by reading the setting
+    /// back, because a typo in the `SET` batch would otherwise fail silently --
+    /// `execute_batch` succeeds and the OOM only reappears under a real export.
+    #[test]
+    fn open_streams_instead_of_preserving_insertion_order() {
+        let eng = DuckEngine::open().unwrap();
+        let mut stmt = eng
+            .conn
+            .prepare("SELECT current_setting('preserve_insertion_order')")
+            .unwrap();
+        // DuckDB hands this back as a BOOLEAN, not the string a `SET` takes.
+        let v: bool = stmt.query_row([], |r| r.get(0)).unwrap();
+        assert!(
+            !v,
+            "exports must stream, not buffer to preserve input order"
+        );
+    }
+
+    #[test]
+    fn open_applies_a_bounded_memory_ceiling() {
+        let eng = DuckEngine::open().unwrap();
+        let mut stmt = eng
+            .conn
+            .prepare("SELECT current_setting('memory_limit')")
+            .unwrap();
+        let raw: String = stmt.query_row([], |r| r.get(0)).unwrap();
+        // DuckDB reports the ceiling back in MiB (it reads `MB` as 10^6), so the
+        // number it echoes is smaller than the one we set but must still be a
+        // real bound -- not the unset default, which is a large share of host RAM.
+        let n: f64 = raw
+            .split_whitespace()
+            .next()
+            .expect("a numeric prefix")
+            .parse()
+            .expect("a number");
+        assert!(n > 0.0, "ceiling must be positive, got {raw}");
+        assert!(
+            n <= duck_memory_mb() as f64,
+            "ceiling {raw} exceeds the configured {} MB",
+            duck_memory_mb()
+        );
+    }
 
     #[test]
     fn write_then_read_counts_by_day() {
