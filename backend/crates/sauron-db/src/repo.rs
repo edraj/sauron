@@ -10900,6 +10900,26 @@ pub async fn screen_stats(
     range: Range,
     name: &str,
 ) -> QueryResult<ScreenStats> {
+    // Rollup gate, the same one `screen_list` opens with — this function is
+    // the `#/screens/:name` page header, so it runs on every screen-detail
+    // load.
+    //
+    // The raw path below is far more expensive here than the row-per-screen
+    // shape suggests, and the cost does NOT scale with the screen: `dw`
+    // inside `screen_ctes` is deliberately not narrowed by `pred` (see its
+    // doc comment — dwell is measured to the session's next event whatever
+    // screen that is on), so it runs `LEAD` over EVERY event in the app and
+    // window, sorts that to disk, and only then filters to the one screen
+    // asked for. Measured on 2M events with 1.33M in the requested
+    // environment: 1834ms total, of which `dw` was 1370ms discarding
+    // 1,171,429 of 1,333,334 windowed rows. That is linear in total app
+    // traffic, which is how a single-screen header ends up timing out at the
+    // gateway. The rollup answers the same question in ~1.4ms because
+    // `screen_stats_daily` already carries per-screen per-day
+    // views/events/exceptions/dwell.
+    if crate::rollups::is_ready(conn, scope.app_id).await? {
+        return crate::rollups::read::screen_stats(conn, &scope, range, name).await;
+    }
     // $1 app_id, $2 since, $3 name (SCREEN_PRED_EXACT's own bind) — env takes
     // $4 when it needs a bind. No trailing binds after it, so unlike
     // `screen_list` nothing needs to shift.

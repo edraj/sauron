@@ -173,6 +173,59 @@ pub async fn screens(
         .collect())
 }
 
+/// Rollup twin of `repo::screen_stats`: the single-screen header behind
+/// `GET /v1/apps/{app_id}/screens/detail`.
+///
+/// Shares `ScreenAggRow` and the `screen_stats_daily` grain with
+/// [`screens`], but matches `screen` with `=` rather than the list's
+/// `ILIKE` — the name is an exact caller-supplied string, and an `ILIKE`
+/// would let a literal `%` or `_` in a screen name silently widen the match
+/// into other screens' rows.
+///
+/// Preserves the legacy `Err(NotFound)` contract for a screen never seen in
+/// scope: `repo::screen_stats`' `keys` CTE (`ev UNION ex`) yields no row, and
+/// `get_result` turns that into `NotFound`, which the route maps to a 404.
+/// The rollup's equivalent of "no `keys` row" is "no day-rows", so the empty
+/// result maps to the same error rather than to a zero-filled row.
+pub async fn screen_stats(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    range: Range,
+    name: &str,
+) -> QueryResult<repo::ScreenStats> {
+    let (lo, hi) = day_bounds(&range);
+    let env_sql = scope.env.sql_fragment(5);
+    let q = format!(
+        "SELECT screen, sum(views)::bigint AS views, sum(events)::bigint AS events, \
+                sum(exceptions)::bigint AS exceptions, sum(dwell_ms_sum)::float8 AS dwell, \
+                array_agg(users_hll) AS hlls \
+         FROM screen_stats_daily \
+         WHERE app_id=$1 AND day>=$2 AND day<=$3 AND screen=$4{env_sql} \
+         GROUP BY screen"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Date, _>(lo)
+        .bind::<Date, _>(hi)
+        .bind::<Text, _>(name.to_string());
+    stmt = crate::bind_env!(stmt, &scope.env);
+    let rows: Vec<ScreenAggRow> = stmt.get_results(conn).await?;
+    let r = rows
+        .into_iter()
+        .next()
+        .ok_or(diesel::result::Error::NotFound)?;
+    Ok(repo::ScreenStats {
+        avg_dwell_ms: repo::avg_dwell(r.dwell, r.views),
+        users: merged_hll(&r.hlls).estimate(),
+        screen: r.screen,
+        views: r.views,
+        events: r.events,
+        exceptions: r.exceptions,
+        total_dwell_ms: r.dwell,
+    })
+}
+
 #[derive(QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = BigInt)]
