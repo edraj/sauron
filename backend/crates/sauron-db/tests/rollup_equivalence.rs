@@ -511,6 +511,15 @@ async fn rollup_reads_match_legacy_reads() {
     let l_count = repo::count_screens(&mut conn, scope(), range, "%", 10_000)
         .await
         .expect("legacy count");
+    // The `#/screens/:name` header. Captured under BOTH scopes: the env-scoped
+    // read is the one that 504'd in production, and it exercises the rollup
+    // twin's `$5` env bind, which the all-env read leaves unbound.
+    let l_stats = repo::screen_stats(&mut conn, scope(), range, "Home")
+        .await
+        .expect("legacy screen_stats");
+    let l_stats_a = repo::screen_stats(&mut conn, scope_a(), range, "Home")
+        .await
+        .expect("legacy screen_stats env");
     let l_perf = repo::performance_summary(&mut conn, scope(), range, None, None)
         .await
         .expect("legacy perf");
@@ -612,6 +621,12 @@ async fn rollup_reads_match_legacy_reads() {
     let r_count = repo::count_screens(&mut conn, scope(), range, "%", 10_000)
         .await
         .expect("rollup count");
+    let r_stats = repo::screen_stats(&mut conn, scope(), range, "Home")
+        .await
+        .expect("rollup screen_stats");
+    let r_stats_a = repo::screen_stats(&mut conn, scope_a(), range, "Home")
+        .await
+        .expect("rollup screen_stats env");
     let r_perf = repo::performance_summary(&mut conn, scope(), range, None, None)
         .await
         .expect("rollup perf");
@@ -689,6 +704,38 @@ async fn rollup_reads_match_legacy_reads() {
         );
         assert_close(
             &format!("avg_dwell {}", l.screen),
+            l.avg_dwell_ms,
+            r.avg_dwell_ms,
+            1e-6,
+        );
+    }
+
+    // `screen_stats` must agree with `screen_list` on the same screen AND
+    // across the two paths. `users` is exact on the legacy path and an HLL
+    // estimate on the rollup, so it carries `screen_list`'s ±2 tolerance;
+    // every counter is exact on both.
+    for (label, l, r) in [
+        ("screen_stats all-env", &l_stats, &r_stats),
+        ("screen_stats One(env_a)", &l_stats_a, &r_stats_a),
+    ] {
+        assert_eq!(l.screen, r.screen, "{label} screen");
+        assert_eq!(l.views, r.views, "{label} views");
+        assert_eq!(l.events, r.events, "{label} events");
+        assert_eq!(l.exceptions, r.exceptions, "{label} exceptions");
+        assert!(
+            (l.users - r.users).abs() <= 2,
+            "{label} users: {} vs {}",
+            l.users,
+            r.users
+        );
+        assert_close(
+            &format!("{label} total_dwell_ms"),
+            l.total_dwell_ms,
+            r.total_dwell_ms,
+            1e-6,
+        );
+        assert_close(
+            &format!("{label} avg_dwell_ms"),
             l.avg_dwell_ms,
             r.avg_dwell_ms,
             1e-6,
@@ -931,6 +978,106 @@ async fn rollup_reads_match_legacy_reads() {
             l.screen
         );
     }
+
+    drop(conn);
+    db.cleanup().await;
+}
+
+/// `repo::screen_stats` must read the migration-71 rollup once the gate is
+/// open, exactly as its sibling `repo::screen_list` does.
+///
+/// It did not. `screen_list` opens with a `rollups::is_ready` gate and
+/// delegates to `rollups::read::screens`; `screen_stats` had no gate at all
+/// and always ran the raw `screen_ctes` query — which the
+/// `#/screens/:name` header calls on every page load. That query's `dw`
+/// (dwell) CTE is deliberately NOT narrowed by screen: it runs `LEAD` over
+/// **every** event in the app/environment for the window and only filters to
+/// the requested screen after the window has been computed. So a
+/// single-screen request sorted the whole app's window to disk, its cost
+/// scaling with total app traffic rather than with the screen's own — the
+/// 504 that motivated this test.
+///
+/// **Why this is a mutation test and not an equivalence one.** With no gate,
+/// the legacy and rollup reads are the *same query*, so comparing them passes
+/// no matter what — the vacuous-guard trap. The only oracle that can tell the
+/// two paths apart is data that exists in one source and not the other: fold,
+/// open the gate, then move the rollup out from under the raw tables and
+/// require the read to follow the rollup.
+#[tokio::test]
+async fn screen_stats_reads_the_rollup_when_the_gate_is_open() {
+    let Some(db) = TestDb::setup().await else {
+        panic!("TEST_DATABASE_URL unset — this test must not silently skip");
+    };
+    let mut conn = db.conn().await;
+    let ids = db.seed_two_envs().await;
+    let app = ids.app_id;
+    let env_a = ids.env_a;
+    let now = Utc::now();
+    let range = Range::since(now - Duration::days(30));
+    let scope = || ReadScope::new(app, EnvFilter::One(env_a));
+
+    // One session on one screen, two days back so the day bucket is settled.
+    let at = now - Duration::days(2);
+    for (i, name) in ["$screen", "tap", "tap"].iter().enumerate() {
+        insert_event(
+            &mut conn,
+            app,
+            Some(env_a),
+            Some("ss-s1"),
+            "ss-u1",
+            name,
+            Some("Gated"),
+            at + Duration::seconds(i as i64 * 5),
+        )
+        .await;
+    }
+
+    // Fold with the gate open, the `rollup_equivalence` recipe.
+    exec(
+        &mut conn,
+        "UPDATE rollup_epoch SET started_at = now() - interval '1 day'",
+    )
+    .await;
+    exec(
+        &mut conn,
+        "UPDATE rollup_watermarks SET watermark = (SELECT started_at FROM rollup_epoch)",
+    )
+    .await;
+    drain_folds(&mut conn, Utc::now() + Duration::seconds(1)).await;
+    assert!(
+        rollups::is_ready(&mut conn, app).await.expect("is_ready"),
+        "gate must be open"
+    );
+
+    let folded = repo::screen_stats(&mut conn, scope(), range, "Gated")
+        .await
+        .expect("screen_stats after fold");
+    assert_eq!(folded.views, 1, "seeded one $screen view");
+    assert_eq!(folded.events, 2, "seeded two non-view events");
+
+    // The oracle: bump the rollup only. A read that reaches the raw tables
+    // cannot see this; a read that goes through `screen_stats_daily` must.
+    let bumped: usize = diesel::sql_query(
+        "UPDATE screen_stats_daily SET views = views + 1000, events = events + 1000 \
+         WHERE app_id = $1 AND screen = 'Gated'",
+    )
+    .bind::<SqlUuid, _>(app)
+    .execute(&mut conn)
+    .await
+    .expect("bump rollup");
+    assert_eq!(bumped, 1, "exactly one rollup day-row to bump");
+
+    let after = repo::screen_stats(&mut conn, scope(), range, "Gated")
+        .await
+        .expect("screen_stats after bump");
+    assert_eq!(
+        after.views, 1001,
+        "screen_stats must source `views` from screen_stats_daily, not analytics_events"
+    );
+    assert_eq!(
+        after.events, 1002,
+        "screen_stats must source `events` from screen_stats_daily, not analytics_events"
+    );
 
     drop(conn);
     db.cleanup().await;
