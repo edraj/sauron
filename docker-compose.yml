@@ -246,6 +246,10 @@ services:
       TIER_DROP_LAG_HOURS: ${TIER_DROP_LAG_HOURS:-24}
       TIER_TICK_SECS: ${TIER_TICK_SECS:-3600}
       TIER_PARTITION_AHEAD: ${TIER_PARTITION_AHEAD:-7}
+      # Higher than the 512 MB default on purpose: this unit streams whole
+      # partitions through DuckDB, unlike `api` which opens an engine per
+      # concurrent cold read. Wide tables fail at the default.
+      DUCKDB_MEMORY_MB: ${DUCKDB_MEMORY_MB:-2048}
       RUST_LOG: ${RUST_LOG:-info,sauron=debug}
     volumes:
       - colddata:/cold

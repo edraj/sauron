@@ -1508,6 +1508,27 @@ fn subscription_kinds_meta() -> serde_json::Value {
     )
 }
 
+/// The `{{variable}}` names each trigger makes available to an admin's message
+/// template.
+///
+/// A function rather than a literal inside [`meta`] so a test can read it
+/// without standing up an authenticated request — see
+/// `every_advertised_template_var_is_one_the_evaluator_actually_sets`, which is
+/// what keeps this list honest against the `.var(…)` calls that produce the
+/// values.
+fn template_vars() -> Value {
+    json!({
+        "monitor_down": ["monitor", "target", "status", "previous_status", "cause", "project_id"],
+        "monitor_up": ["monitor", "target", "status", "previous_status", "project_id"],
+        "issue_new": ["issue_title", "issue_level", "app_id", "times_seen"],
+        "issue_regression": ["issue_title", "issue_level", "app_id", "times_seen"],
+        "error_threshold": ["count", "threshold", "window_minutes", "query"],
+        "error_spike": ["count", "previous_count", "factor", "window_minutes", "query"],
+        "event_threshold": ["count", "threshold", "window_minutes", "event_name"],
+        "perf_degradation": ["value_ms", "threshold_ms", "metric", "window_minutes"],
+    })
+}
+
 /// Static metadata the rule-builder UI needs: trigger types, channel kinds,
 /// comparators, and the template variables each trigger exposes.
 ///
@@ -1538,16 +1559,7 @@ pub async fn meta(
         "comparators": ["gte", "gt", "lte", "lt", "eq"],
         "severities": SEVERITIES,
         "metrics": ["p50", "p75", "p90", "p95", "p99", "avg", "max"],
-        "template_vars": {
-            "monitor_down": ["monitor", "target", "status", "previous_status", "cause", "project_id"],
-            "monitor_up": ["monitor", "target", "status", "previous_status", "project_id"],
-            "issue_new": ["issue_title", "issue_level", "app_id", "times_seen"],
-            "issue_regression": ["issue_title", "issue_level", "app_id", "times_seen"],
-            "error_threshold": ["count", "threshold", "window_minutes"],
-            "error_spike": ["count", "previous_count", "factor", "window_minutes"],
-            "event_threshold": ["count", "threshold", "window_minutes", "event_name"],
-            "perf_degradation": ["value_ms", "threshold_ms", "metric", "window_minutes"],
-        },
+        "template_vars": template_vars(),
         "subscription_kinds": subscription_kinds_meta(),
     })))
 }
@@ -1555,6 +1567,78 @@ pub async fn meta(
 #[cfg(test)]
 mod meta_tests {
     use super::*;
+
+    /// `template_vars` is hand-written while the variables themselves come from
+    /// `.var(…)` calls in the evaluator binary, and nothing kept the two
+    /// together — which is exactly how `query` came to work while the rule
+    /// dialog never offered it.
+    ///
+    /// Both directions, because they fail differently. An unadvertised variable
+    /// is a feature nobody can find; an advertised one no trigger sets renders
+    /// as an EMPTY STRING (`sauron_mail::text::substitute` drops unknown names
+    /// silently), so the admin gets a message with a hole in it and no clue why.
+    #[test]
+    fn every_advertised_template_var_is_one_the_evaluator_actually_sets() {
+        // BOTH producers. The metric triggers are filled by the evaluator loop;
+        // the two monitor triggers are event-driven and filled by the prober,
+        // in a different binary entirely. Scraping only the first reports every
+        // monitor variable as unset, which is what the first draft of this test
+        // did.
+        const EVALUATOR: &str = include_str!("../../../sauron-alerts/src/main.rs");
+        const PROBER: &str = include_str!("../../../sauron-monitor/src/main.rs");
+
+        let scrape = |src: &'static str| -> Vec<&'static str> {
+            src.match_indices(".var(\"")
+                .filter_map(|(i, _)| {
+                    let rest = &src[i + 6..];
+                    rest.find('"').map(|end| &rest[..end])
+                })
+                .collect()
+        };
+        let set_by_evaluator: std::collections::BTreeSet<&str> = scrape(EVALUATOR)
+            .into_iter()
+            .chain(scrape(PROBER))
+            .collect();
+        assert!(
+            set_by_evaluator.len() > 10,
+            "the scrape found almost nothing — the `.var(` spelling must have \
+             changed in one of the two binaries, and this test is now vacuous: \
+             {set_by_evaluator:?}"
+        );
+
+        let vars = template_vars();
+        let advertised = vars.as_object().expect("template_vars is an object");
+        for (trigger, names) in advertised {
+            for v in names.as_array().expect("array of names") {
+                let name = v.as_str().expect("name is a string");
+                assert!(
+                    set_by_evaluator.contains(name),
+                    "`{trigger}` advertises `{name}`, which no `.var(` call sets — \
+                     it would render as an empty string"
+                );
+            }
+        }
+
+        // …and the other way, for the metric triggers an admin actually
+        // templates: a variable the evaluator sets must be offered somewhere,
+        // or nobody can use it.
+        for name in [
+            "count",
+            "threshold",
+            "window_minutes",
+            "query",
+            "factor",
+            "previous_count",
+            "event_name",
+        ] {
+            assert!(
+                advertised
+                    .values()
+                    .any(|vs| vs.as_array().unwrap().iter().any(|v| v == name)),
+                "`{name}` is set by the evaluator but advertised for no trigger"
+            );
+        }
+    }
 
     /// The house convention is to publish enum/option metadata from
     /// `/v1/alert-meta` rather than hardcode lists in Svelte, so the dialog's
