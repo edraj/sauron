@@ -14087,6 +14087,16 @@ pub async fn alert_count_errors_by_app(
 /// A latency metric over transactions in the window. `percentile` is the
 /// fraction for percentile_cont; `None` means avg, `Some(-1.0)` means max
 /// (the caller maps the whitelisted metric string).
+///
+/// `env_ids` are **enrollment** ids (`app_environments.id`), the same shape
+/// `transactions.environment_id` holds and the same shape
+/// [`alert_count_errors`] takes — resolved from the rule's environment NAME by
+/// [`enrollment_ids_for_env_name`] before the call.
+///
+/// `Some(&[])` (a name that resolves to no enrollment) returns `None`, not
+/// `Some(0.0)`: an unresolvable environment measured nothing, and zero is a
+/// *value* that a `lte`/`lt` rule would happily fire on. `None` takes the same
+/// "no data, no decision" path as an empty window.
 pub async fn alert_latency_metric(
     conn: &mut AsyncPgConnection,
     app_ids: &[Uuid],
@@ -14094,20 +14104,27 @@ pub async fn alert_latency_metric(
     to: DateTime<Utc>,
     percentile: Option<f64>,
     op: Option<&str>,
+    env_ids: Option<&[Uuid]>,
 ) -> QueryResult<Option<f64>> {
+    if env_ids.is_some_and(|e| e.is_empty()) {
+        return Ok(None);
+    }
+    let env_ids = env_ids.map(|e| e.to_vec());
     let row: AlertValueRow = match percentile {
         Some(p) if p >= 0.0 => {
             diesel::sql_query(
                 "SELECT percentile_cont($4) WITHIN GROUP (ORDER BY duration_ms)::double precision AS v \
                  FROM transactions \
                  WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
-                   AND ($5::text IS NULL OR op = $5)",
+                   AND ($5::text IS NULL OR op = $5) \
+                   AND ($6::uuid[] IS NULL OR environment_id = ANY($6))",
             )
             .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
             .bind::<Timestamptz, _>(from)
             .bind::<Timestamptz, _>(to)
             .bind::<Double, _>(p)
             .bind::<Nullable<Text>, _>(op)
+            .bind::<Nullable<diesel::sql_types::Array<SqlUuid>>, _>(env_ids)
             .get_result(conn)
             .await?
         }
@@ -14115,12 +14132,14 @@ pub async fn alert_latency_metric(
             diesel::sql_query(
                 "SELECT max(duration_ms)::double precision AS v FROM transactions \
                  WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
-                   AND ($4::text IS NULL OR op = $4)",
+                   AND ($4::text IS NULL OR op = $4) \
+                   AND ($5::uuid[] IS NULL OR environment_id = ANY($5))",
             )
             .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
             .bind::<Timestamptz, _>(from)
             .bind::<Timestamptz, _>(to)
             .bind::<Nullable<Text>, _>(op)
+            .bind::<Nullable<diesel::sql_types::Array<SqlUuid>>, _>(env_ids)
             .get_result(conn)
             .await?
         }
@@ -14128,12 +14147,14 @@ pub async fn alert_latency_metric(
             diesel::sql_query(
                 "SELECT avg(duration_ms)::double precision AS v FROM transactions \
                  WHERE app_id = ANY($1) AND occurred_at > $2 AND occurred_at <= $3 \
-                   AND ($4::text IS NULL OR op = $4)",
+                   AND ($4::text IS NULL OR op = $4) \
+                   AND ($5::uuid[] IS NULL OR environment_id = ANY($5))",
             )
             .bind::<diesel::sql_types::Array<SqlUuid>, _>(app_ids)
             .bind::<Timestamptz, _>(from)
             .bind::<Timestamptz, _>(to)
             .bind::<Nullable<Text>, _>(op)
+            .bind::<Nullable<diesel::sql_types::Array<SqlUuid>>, _>(env_ids)
             .get_result(conn)
             .await?
         }

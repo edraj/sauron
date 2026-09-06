@@ -300,6 +300,109 @@ async fn alert_count_errors_narrows_by_enrollment_id_not_catalogue_id() {
     db.cleanup().await;
 }
 
+/// The same defect as `alert_count_errors_narrows_by_enrollment_id_not_catalogue_id`,
+/// one table over and found later: `alert_latency_metric` took no `env_ids` at
+/// all, so the rule dialog's environment field — which it renders for EVERY
+/// trigger — was accepted, stored, resolved by the evaluator, and then dropped
+/// on the floor. A `perf_degradation` rule narrowed to `env_a` measured every
+/// environment and fired on `env_b`'s latency.
+///
+/// Asserted through all three metric shapes because they are three separate
+/// SQL strings with three separate bind orders, and only the percentile branch
+/// numbers the environment parameter `$6`.
+#[tokio::test]
+async fn alert_latency_metric_narrows_by_environment() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+
+    // Wide enough to clear both the real clock and the harness's pinned one.
+    let from = chrono::Utc::now() - chrono::Duration::days(2);
+    let to = chrono::Utc::now() + chrono::Duration::days(1);
+
+    // seed_two_envs: env_a = 10/20/30/40/50ms, env_b = 100/200ms, one
+    // unattributed 5ms row.
+    let all_max = sauron_db::repo::alert_latency_metric(
+        &mut conn,
+        &[ids.app_id],
+        from,
+        to,
+        Some(-1.0),
+        None,
+        None,
+    )
+    .await
+    .expect("unfiltered max");
+    assert_eq!(all_max, Some(200.0), "env_b's 200ms is the app-wide max");
+
+    let enrollments =
+        sauron_db::repo::enrollment_ids_for_env_name(&mut conn, &[ids.app_id], "env_a")
+            .await
+            .expect("resolve env_a");
+    assert_eq!(enrollments, vec![ids.env_a]);
+
+    // THE regression: before the fix this returned 200.0 — env_b's latency
+    // reported under an env_a rule.
+    let narrowed_max = sauron_db::repo::alert_latency_metric(
+        &mut conn,
+        &[ids.app_id],
+        from,
+        to,
+        Some(-1.0),
+        None,
+        Some(&enrollments),
+    )
+    .await
+    .expect("narrowed max");
+    assert_eq!(narrowed_max, Some(50.0), "env_a's slowest transaction");
+
+    let narrowed_avg = sauron_db::repo::alert_latency_metric(
+        &mut conn,
+        &[ids.app_id],
+        from,
+        to,
+        None,
+        None,
+        Some(&enrollments),
+    )
+    .await
+    .expect("narrowed avg");
+    assert_eq!(narrowed_avg, Some(30.0), "mean of 10/20/30/40/50");
+
+    let narrowed_p50 = sauron_db::repo::alert_latency_metric(
+        &mut conn,
+        &[ids.app_id],
+        from,
+        to,
+        Some(0.5),
+        None,
+        Some(&enrollments),
+    )
+    .await
+    .expect("narrowed p50");
+    assert_eq!(narrowed_p50, Some(30.0), "median of 10/20/30/40/50");
+
+    // An environment name that resolves to nothing must measure nothing, NOT
+    // zero: `Some(0.0)` fires every `lte`/`lt` rule in the product.
+    let unresolvable = sauron_db::repo::alert_latency_metric(
+        &mut conn,
+        &[ids.app_id],
+        from,
+        to,
+        Some(-1.0),
+        None,
+        Some(&[]),
+    )
+    .await
+    .expect("empty env set");
+    assert_eq!(unresolvable, None, "no environment, no measurement");
+
+    db.cleanup().await;
+}
+
 /// Both `retired_at IS NULL` filters are load-bearing and only a DB test can
 /// prove it: `(app_id, name)` is unique only among LIVE rows, so retiring
 /// `staging` and creating a fresh `staging` leaves two rows with that name.

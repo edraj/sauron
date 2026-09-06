@@ -21,8 +21,10 @@ export const ops = {
   },
   'alerts.newChannel': { en: 'New channel', ar: 'قناة جديدة' },
   'alerts.createChannel': { en: 'Create channel', ar: 'إنشاء القناة' },
+  'alerts.updateChannel': { en: 'Update channel', ar: 'تحديث القناة' },
   'alerts.newRule': { en: 'New rule', ar: 'قاعدة جديدة' },
   'alerts.createRule': { en: 'Create rule', ar: 'إنشاء القاعدة' },
+  'alerts.updateRule': { en: 'Update rule', ar: 'تحديث القاعدة' },
   'alerts.column.channel': { en: 'Channel', ar: 'القناة' },
   'alerts.column.trigger': { en: 'Trigger', ar: 'المُطلِق' },
   'alerts.column.condition': { en: 'Condition', ar: 'الشرط' },
@@ -91,6 +93,17 @@ export const ops = {
   // rule fields
   'alerts.field.eventName': { en: 'Event name', ar: 'اسم الحدث' },
   'alerts.field.envFilter': { en: 'Environment filter', ar: 'مرشّح البيئة' },
+  'alerts.field.envAny': { en: 'Any environment', ar: 'أي بيئة' },
+  'alerts.field.envNone': {
+    en: 'No environments visible for this project — the rule stays un-narrowed.',
+    ar: 'لا توجد بيئات مرئية لهذا المشروع — تبقى القاعدة دون تضييق.',
+  },
+  'alerts.field.opFilter': { en: 'Operation filter', ar: 'مرشّح العملية' },
+  'alerts.field.opAny': { en: 'All operations', ar: 'كل العمليات' },
+  'alerts.field.opHint': {
+    en: 'Optional — narrows the latency metric to one kind of transaction.',
+    ar: 'اختياري — يضيّق مقياس زمن الاستجابة إلى نوع واحد من المعاملات.',
+  },
   'alerts.field.levelFilter': { en: 'Level filter', ar: 'مرشّح المستوى' },
   'alerts.field.levelHint': {
     en: 'Optional — debug, info, warning, error, fatal.',

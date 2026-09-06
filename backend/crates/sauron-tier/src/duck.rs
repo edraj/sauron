@@ -55,6 +55,48 @@ fn duck_memory_mb() -> u32 {
     parse_memory_mb(std::env::var(DUCK_MEMORY_MB_ENV).ok().as_deref())
 }
 
+/// Every `*.parquet` path under `dir`, recursively. Missing directory ⇒ empty
+/// set, which is the correct answer before the very first export.
+fn parquet_files_under(dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            out.extend(parquet_files_under(&path));
+        } else if path.extension().is_some_and(|x| x == "parquet") {
+            out.insert(path);
+        }
+    }
+    out
+}
+
+/// Delete every `*.parquet` under `dir` that was not in `before`. Returns how
+/// many were removed.
+///
+/// Called only when a `COPY` failed, which makes the export all-or-nothing.
+/// Two distinct kinds of debris need this. A killed `COPY` leaves a TRUNCATED
+/// file (observed: 0 bytes), and DuckDB refuses to read the whole glob
+/// afterwards -- `Invalid Input Error: ... too small to be a Parquet file` --
+/// so one dead file poisons every cold read for that app, not just the failed
+/// range. It also leaves any files it had already finished for other
+/// `PARTITION_BY` keys; those are individually valid but uncommitted, since the
+/// watermark never advanced, and leaving them lands the next attempt in the
+/// `0 < already != pg_rows` branch that refuses to re-export and demands a
+/// manual clear. Removing both restores the exact pre-export state.
+fn remove_files_added_since(
+    dir: &std::path::Path,
+    before: &std::collections::HashSet<std::path::PathBuf>,
+) -> usize {
+    parquet_files_under(dir)
+        .into_iter()
+        .filter(|f| !before.contains(f))
+        .filter(|f| std::fs::remove_file(f).is_ok())
+        .count()
+}
+
 impl DuckEngine {
     /// Open an in-memory DuckDB. Parquet is read directly from the filesystem;
     /// no persistent DuckDB database file is used.
@@ -198,7 +240,16 @@ impl DuckEngine {
             end = end.to_rfc3339(),
             cold_dir = cold_dir,
         );
-        self.conn.execute_batch(&sql)?;
+        // All-or-nothing: a failed COPY must leave no trace. See
+        // `remove_files_added_since` for the two kinds of debris and why either
+        // one breaks the NEXT run rather than just this one.
+        let cold = std::path::Path::new(cold_dir);
+        let before = parquet_files_under(cold);
+        if let Err(e) = self.conn.execute_batch(&sql) {
+            let removed = remove_files_added_since(cold, &before);
+            return Err(anyhow::Error::new(e)
+                .context(format!("export failed; removed {removed} partial file(s)")));
+        }
         Ok(())
     }
 
@@ -651,6 +702,44 @@ pub struct ColdKeyCount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed export must leave the cold tier byte-identical to how it found
+    /// it -- including files it had already FINISHED for other partition keys,
+    /// which are valid Parquet but uncommitted (the watermark never advanced).
+    #[test]
+    fn a_failed_export_removes_only_what_it_added() {
+        let root = std::env::temp_dir().join(format!("sauron-tier-cleanup-{}", Uuid::new_v4()));
+        let keep = root.join("app_id=a/year=2026/month=8");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::write(keep.join("committed.parquet"), b"PAR1old").unwrap();
+        std::fs::write(keep.join("notes.txt"), b"not parquet").unwrap();
+
+        let before = parquet_files_under(&root);
+        assert_eq!(before.len(), 1, "only the committed file exists yet");
+
+        // What a killed COPY leaves: a truncated file here, a finished-but-
+        // uncommitted one under a different partition key.
+        std::fs::write(keep.join("truncated.parquet"), b"").unwrap();
+        let other = root.join("app_id=b/year=2026/month=8");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("finished.parquet"), b"PAR1whole").unwrap();
+
+        assert_eq!(remove_files_added_since(&root, &before), 2);
+
+        let after = parquet_files_under(&root);
+        assert_eq!(after, before, "pre-export state restored exactly");
+        assert!(keep.join("committed.parquet").exists());
+        // Non-parquet files are none of this function's business.
+        assert!(keep.join("notes.txt").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scanning_a_cold_dir_that_does_not_exist_yet_is_empty_not_an_error() {
+        let missing = std::env::temp_dir().join(format!("sauron-tier-absent-{}", Uuid::new_v4()));
+        assert!(parquet_files_under(&missing).is_empty());
+    }
 
     #[test]
     fn memory_ceiling_falls_back_on_anything_unusable() {

@@ -291,26 +291,34 @@ async fn evaluate_rule(
 
     match trigger {
         TriggerType::IssueNew | TriggerType::IssueRegression => {
-            let issues = if trigger == TriggerType::IssueNew {
-                repo::alert_new_issues(
-                    &mut conn,
-                    &app_ids,
-                    since,
-                    now,
-                    cond.filters.level.as_deref(),
-                    20,
-                )
-                .await?
-            } else {
-                repo::alert_regressed_issues(
-                    &mut conn,
-                    &app_ids,
-                    since,
-                    now,
-                    cond.filters.level.as_deref(),
-                    20,
-                )
-                .await?
+            // The `_env` variants existed and were reachable only from
+            // `subs.rs` (personal subscriptions): the ORG rule path called the
+            // unnarrowed pair unconditionally, so an `issue_new` rule filtered
+            // to `staging` alerted on every environment. `issues` carries no
+            // `environment_id`, which is why narrowing needs a separate query
+            // rather than another bind — see `alert_new_issues_env` for how it
+            // reaches through `error_events` without mixing the two clocks.
+            //
+            // `Some(&[])` — a name that resolves to no enrollment — returns no
+            // issues, deliberately, matching every other trigger here.
+            let level = cond.filters.level.as_deref();
+            let issues = match (trigger, env_ids_ref) {
+                (TriggerType::IssueNew, Some(envs)) => {
+                    repo::alert_new_issues_env(&mut conn, &app_ids, since, now, level, envs, 20)
+                        .await?
+                }
+                (TriggerType::IssueNew, None) => {
+                    repo::alert_new_issues(&mut conn, &app_ids, since, now, level, 20).await?
+                }
+                (_, Some(envs)) => {
+                    repo::alert_regressed_issues_env(
+                        &mut conn, &app_ids, since, now, level, envs, 20,
+                    )
+                    .await?
+                }
+                (_, None) => {
+                    repo::alert_regressed_issues(&mut conn, &app_ids, since, now, level, 20).await?
+                }
             };
             for issue in issues {
                 let verb = if trigger == TriggerType::IssueNew {
@@ -318,14 +326,20 @@ async fn evaluate_rule(
                 } else {
                     "Issue regressed"
                 };
+                let env = cond.filters.environment.clone().unwrap_or_default();
                 let mut ctx = AlertContext::new(severity, trigger.as_str())
                     .var("issue_title", issue.title.clone())
                     .var("issue_level", issue.level.clone())
                     .var("app_id", issue.app_id.to_string())
-                    .var("times_seen", issue.times_seen.to_string());
+                    .var("times_seen", issue.times_seen.to_string())
+                    .var("environment", env);
+                // Named for the same reason the latency and error bodies name
+                // theirs: two rules differing only in environment otherwise
+                // send the same sentence.
+                let scope = scope_clause(None, cond.filters.environment.as_deref());
                 ctx.title = format!("{verb}: {}", issue.title);
                 ctx.summary = format!(
-                    "{verb} ({}) in app {} — seen {} time(s).",
+                    "{verb} ({}){scope}, app {} — seen {} time(s).",
                     issue.level, issue.app_id, issue.times_seen
                 );
                 // Per-issue dedup: each distinct issue alerts once per throttle.
@@ -469,19 +483,45 @@ async fn evaluate_rule(
                 now,
                 pct,
                 cond.filters.op.as_deref(),
+                // The rule dialog offers an environment on EVERY trigger, and
+                // this one used to be the only reader that dropped it on the
+                // floor: a rule narrowed to `staging` measured the whole app
+                // and fired on production latency. `transactions` carries the
+                // same enrollment-id `environment_id` `error_events` does, so
+                // the ids resolved above apply here unchanged.
+                env_ids_ref,
             )
             .await?;
             if let Some(v) = value {
                 if cond.fires(v) {
                     let mins = cond.window_seconds / 60;
+                    // Bound to locals so each `.var("name", …)` stays on ONE
+                    // line: `every_advertised_template_var_is_one_the_evaluator_actually_sets`
+                    // scrapes this file for the literal `.var("`, and a
+                    // rustfmt line break between the two would read to it as a
+                    // variable nothing sets.
+                    let env = cond.filters.environment.clone().unwrap_or_default();
+                    let op = cond.filters.op.clone().unwrap_or_default();
                     let mut ctx = AlertContext::new(severity, trigger.as_str())
                         .var("value_ms", format!("{v:.0}"))
                         .var("threshold_ms", fmt_num(cond.threshold))
                         .var("metric", cond.metric.clone())
-                        .var("window_minutes", mins.to_string());
-                    ctx.title = format!("Latency {} = {v:.0}ms", cond.metric);
+                        .var("window_minutes", mins.to_string())
+                        .var("environment", env)
+                        .var("op", op);
+                    // Same reason `match_clause` exists on the error triggers:
+                    // a staging rule and a production rule — or an `http` rule
+                    // and a `screen_load` one — are otherwise the same
+                    // sentence, and the recipient cannot tell which alarm went
+                    // off.
+                    let scope = scope_clause(
+                        cond.filters.op.as_deref(),
+                        cond.filters.environment.as_deref(),
+                    );
+                    ctx.title = format!("Latency {} = {v:.0}ms{scope}", cond.metric);
                     ctx.summary = format!(
-                        "{} latency is {v:.0}ms over the last {mins} minute(s) (threshold {}ms).",
+                        "{} latency is {v:.0}ms{scope} over the last {mins} minute(s) \
+                         (threshold {}ms).",
                         cond.metric,
                         fmt_num(cond.threshold)
                     );
@@ -527,6 +567,19 @@ fn match_clause(query: Option<&str>) -> String {
         Some(q) => format!(" matching `{q}`"),
         None => String::new(),
     }
+}
+
+/// The narrowing a latency alert names in its own title — " for `http`",
+/// " in `staging`", or both — and nothing at all for an unnarrowed rule.
+///
+/// One function rather than two adjacent clauses so the two halves cannot drift
+/// into " in `staging` for `http`" on one line and the reverse on the other.
+fn scope_clause(op: Option<&str>, environment: Option<&str>) -> String {
+    let part = |prefix: &str, v: Option<&str>| match v {
+        Some(x) if !x.is_empty() => format!("{prefix}`{x}`"),
+        _ => String::new(),
+    };
+    format!("{}{}", part(" for ", op), part(" in ", environment))
 }
 
 fn fmt_num(v: f64) -> String {
@@ -589,6 +642,9 @@ mod tests {
         redis: RedisStore,
         engine: AlertEngine,
         org_id: uuid::Uuid,
+        /// Needed only by the latency tests, which create their own
+        /// environments — the catalogue entry is project-scoped.
+        project_id: uuid::Uuid,
         app_id: uuid::Uuid,
         admin_url: String,
         db_name: String,
@@ -709,6 +765,7 @@ mod tests {
                 redis,
                 engine,
                 org_id: org.id,
+                project_id: project.id,
                 app_id: app.id,
                 admin_url,
                 db_name,
@@ -745,6 +802,188 @@ mod tests {
             )
             .await
             .expect("create rule")
+        }
+
+        /// A channel-less rule with an explicit trigger, for the paths
+        /// [`Rig::rule`]'s hardcoded `error_threshold` cannot reach.
+        ///
+        /// A separate constructor rather than a parameter on `rule` so the
+        /// three query tests above keep reading as one thing about queries.
+        async fn typed_rule(
+            &self,
+            name: &str,
+            trigger_type: &str,
+            conditions: serde_json::Value,
+        ) -> AlertRule {
+            let mut conn = sauron_db::conn(self.pool.as_ref().expect("pool taken"))
+                .await
+                .expect("checkout");
+            repo::create_alert_rule(
+                &mut conn,
+                NewAlertRule {
+                    org_id: self.org_id,
+                    project_id: None,
+                    app_id: Some(self.app_id),
+                    monitor_id: None,
+                    name,
+                    trigger_type,
+                    conditions: &conditions,
+                    severity: "warning",
+                    throttle_seconds: 0,
+                    message_template: None,
+                    last_evaluated_at: None,
+                    created_by: None,
+                },
+            )
+            .await
+            .expect("create rule")
+        }
+
+        /// Enroll this app in a new catalogue environment, returning the
+        /// ENROLLMENT id — the one `transactions.environment_id` holds.
+        async fn env(&self, name: &str) -> uuid::Uuid {
+            let mut conn = sauron_db::conn(self.pool.as_ref().expect("pool taken"))
+                .await
+                .expect("checkout");
+            let env = repo::create_project_environment(&mut conn, self.project_id, name)
+                .await
+                .expect("create catalogue environment");
+            repo::create_app_environments(
+                &mut conn,
+                &[sauron_db::models::NewAppEnvironment {
+                    app_id: self.app_id,
+                    environment_id: env.id,
+                    public_key: &format!("pk-{}", uuid::Uuid::new_v4().simple()),
+                    is_default: false,
+                }],
+            )
+            .await
+            .expect("enroll app")
+            .remove(0)
+            .id
+        }
+
+        /// One transaction, inside the evaluation window.
+        async fn tx(&self, env: uuid::Uuid, op: &str, duration_ms: f64) {
+            let mut conn = sauron_db::conn(self.pool.as_ref().expect("pool taken"))
+                .await
+                .expect("checkout");
+            repo::insert_transaction(
+                &mut conn,
+                sauron_db::models::NewTransaction {
+                    id: uuid::Uuid::new_v4(),
+                    app_id: self.app_id,
+                    environment_id: Some(env),
+                    name: "eval.transaction".into(),
+                    op: op.into(),
+                    duration_ms,
+                    status: Some("ok".into()),
+                    http_method: None,
+                    http_status: None,
+                    url: None,
+                    distinct_id: None,
+                    session_id: None,
+                    device_key: None,
+                    workflow_id: None,
+                    workflow_name: None,
+                    finished_at: None,
+                    release: None,
+                    ip_address: None,
+                    occurred_at: Utc::now(),
+                    tags: j!({}),
+                    extra: j!({}),
+                },
+            )
+            .await
+            .expect("insert transaction");
+        }
+
+        /// A fresh issue whose only error event sits in `env`.
+        ///
+        /// Two rows, not one: `issues` carries no `environment_id`, so
+        /// `alert_new_issues_env` reaches an environment only through the
+        /// issue's `error_events` — an issue with no event in the environment
+        /// is exactly the row the narrowing must exclude.
+        async fn issue_in_env(&self, slug: &str, env: uuid::Uuid) -> uuid::Uuid {
+            let mut conn = sauron_db::conn(self.pool.as_ref().expect("pool taken"))
+                .await
+                .expect("checkout");
+            let now = Utc::now();
+            let issue = repo::upsert_issue(
+                &mut conn,
+                NewIssue {
+                    app_id: self.app_id,
+                    fingerprint: &format!("fp-{slug}"),
+                    type_: "StateError",
+                    title: slug,
+                    culprit: "eval::seed",
+                    level: "error",
+                    first_seen: now,
+                    last_seen: now,
+                    times_seen: 1,
+                },
+            )
+            .await
+            .expect("issue");
+            repo::insert_error_event(
+                &mut conn,
+                NewErrorEvent {
+                    id: uuid::Uuid::new_v4(),
+                    app_id: self.app_id,
+                    environment_id: Some(env),
+                    issue_id: issue,
+                    fingerprint: format!("fp-{slug}"),
+                    level: "error".into(),
+                    message: slug.into(),
+                    exception_type: "StateError".into(),
+                    exception_value: slug.into(),
+                    stacktrace: j!([]),
+                    breadcrumbs: j!([]),
+                    context: j!({}),
+                    tags: j!({}),
+                    release: None,
+                    distinct_id: None,
+                    event_user: None,
+                    sdk: None,
+                    ip_address: None,
+                    occurred_at: now - chrono::Duration::seconds(5),
+                    session_id: None,
+                    device_key: None,
+                    screen: None,
+                    workflow_id: None,
+                    workflow_name: None,
+                    stacktrace_symbolicated: None,
+                    symbolication_status: "not_applicable".into(),
+                    debug_meta: None,
+                    contexts: j!({}),
+                    extra: j!({}),
+                    handled: Some(false),
+                    title: None,
+                    culprit: None,
+                    stacktrace_sha256: None,
+                },
+            )
+            .await
+            .expect("insert error event");
+            issue
+        }
+
+        /// Every `alert_events` TITLE written for one rule.
+        ///
+        /// A twin of [`Rig::bodies`] rather than a tuple, because the issue
+        /// triggers put the issue's own name in the title and everything else
+        /// in the body — asserting on the wrong column reads as "the alert did
+        /// not fire" when it fired perfectly.
+        async fn titles(&self, rule_id: uuid::Uuid) -> Vec<String> {
+            let mut conn = sauron_db::conn(self.pool.as_ref().expect("pool taken"))
+                .await
+                .expect("checkout");
+            repo::list_alert_events_visible(&mut conn, self.org_id, &[rule_id], &[], 200, 0)
+                .await
+                .expect("load alert events")
+                .into_iter()
+                .map(|e| e.title)
+                .collect()
         }
 
         /// Every `alert_events` body written for one rule.
@@ -865,6 +1104,193 @@ mod tests {
         assert!(
             !all[0].contains("matching"),
             "and carries no match clause: {}",
+            all[0]
+        );
+
+        rig.cleanup().await;
+    }
+
+    /// The ORG rule path called the unnarrowed `alert_new_issues` regardless
+    /// of `filters.environment`, while `subs.rs` — the personal-subscription
+    /// path over the same data — used the `_env` variant. So an `issue_new`
+    /// rule filtered to `staging` alerted on production issues, and the
+    /// repo-level coverage for the narrowing passed the whole time because
+    /// nothing in the org path was calling it.
+    #[tokio::test]
+    async fn issue_rules_narrow_by_environment() {
+        let Some(rig) = Rig::setup().await else {
+            eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping");
+            return;
+        };
+
+        let staging = rig.env("staging").await;
+        let production = rig.env("production").await;
+        rig.issue_in_env("only-in-staging", staging).await;
+        rig.issue_in_env("only-in-production", production).await;
+
+        let narrowed = rig
+            .typed_rule(
+                "staging issues",
+                "issue_new",
+                j!({ "window_seconds": 900, "filters": { "environment": "staging" } }),
+            )
+            .await;
+        let unfiltered = rig
+            .typed_rule("all issues", "issue_new", j!({ "window_seconds": 900 }))
+            .await;
+
+        for rule in [&narrowed, &unfiltered] {
+            evaluate_rule(
+                rig.pool.as_ref().expect("pool"),
+                &rig.redis,
+                &rig.engine,
+                rule.clone(),
+            )
+            .await
+            .expect("evaluate");
+        }
+
+        let named = rig.titles(narrowed.id).await.join("\n");
+        assert!(
+            named.contains("only-in-staging"),
+            "the staging issue must alert: {named}"
+        );
+        assert!(
+            !named.contains("only-in-production"),
+            "the production issue must NOT — that was the bug: {named}"
+        );
+        let scoped = rig.bodies(narrowed.id).await.join("\n");
+        assert!(
+            scoped.contains("in `staging`"),
+            "and the body must name the environment: {scoped}"
+        );
+
+        // The control. `Rig::setup` seeds a third issue with no environment at
+        // all, so the unfiltered rule sees strictly more than the narrowed one
+        // — which is what makes the exclusion above meaningful.
+        let all = rig.titles(unfiltered.id).await.join("\n");
+        assert!(
+            all.contains("only-in-staging") && all.contains("only-in-production"),
+            "the unfiltered rule sees both environments: {all}"
+        );
+        assert!(
+            all.contains("no internet"),
+            "including the environment-less issue `setup` seeds: {all}"
+        );
+        let unscoped = rig.bodies(unfiltered.id).await.join("\n");
+        assert!(
+            !unscoped.contains(" in `"),
+            "and carries no environment clause: {unscoped}"
+        );
+
+        rig.cleanup().await;
+    }
+
+    /// **The test the latency trigger was missing.** Both of its narrowing
+    /// filters — `environment` and `op` — were reachable from the rule dialog
+    /// (or, for `op`, from the API) and neither reached the query: `op` was
+    /// passed but had no UI, `environment` had a UI and was not passed at all.
+    ///
+    /// Three transactions with three different durations, one per
+    /// (environment, op) cell, so each filter combination produces a DIFFERENT
+    /// maximum. A filter that silently dropped would report another cell's
+    /// number, which is the failure that reads as "the alert fired on the
+    /// wrong environment" in production.
+    #[tokio::test]
+    async fn latency_rules_narrow_by_environment_and_op() {
+        let Some(rig) = Rig::setup().await else {
+            eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping");
+            return;
+        };
+
+        let staging = rig.env("staging").await;
+        let production = rig.env("production").await;
+        rig.tx(staging, "http", 100.0).await;
+        rig.tx(staging, "screen_load", 5000.0).await;
+        rig.tx(production, "http", 9000.0).await;
+
+        // `max` rather than a percentile: with one row per cell every
+        // percentile IS the max, and `max` says so without implying the
+        // interpolation matters here.
+        let base = |extra: serde_json::Value| {
+            let mut c = j!({
+                "threshold": 500,
+                "comparator": "gte",
+                "window_seconds": 900,
+                "metric": "max",
+            });
+            c.as_object_mut()
+                .expect("object")
+                .insert("filters".into(), extra);
+            c
+        };
+
+        let both = rig
+            .typed_rule(
+                "staging http",
+                "perf_degradation",
+                base(j!({ "environment": "staging", "op": "http" })),
+            )
+            .await;
+        let env_only = rig
+            .typed_rule(
+                "staging any op",
+                "perf_degradation",
+                base(j!({ "environment": "staging" })),
+            )
+            .await;
+        let unfiltered = rig
+            .typed_rule("everything", "perf_degradation", base(j!({})))
+            .await;
+
+        for rule in [&both, &env_only, &unfiltered] {
+            evaluate_rule(
+                rig.pool.as_ref().expect("pool"),
+                &rig.redis,
+                &rig.engine,
+                rule.clone(),
+            )
+            .await
+            .expect("evaluate");
+        }
+
+        // staging+http is the 100ms cell, under the 500ms threshold. Firing
+        // here means a filter leaked and it measured 5000 or 9000.
+        assert!(
+            rig.bodies(both.id).await.is_empty(),
+            "staging/http is 100ms — the rule must stay silent"
+        );
+
+        let env_bodies = rig.bodies(env_only.id).await;
+        assert_eq!(env_bodies.len(), 1, "staging alone crosses at 5000ms");
+        assert!(
+            env_bodies[0].contains("5000ms"),
+            "must measure staging's slowest, not production's 9000ms: {}",
+            env_bodies[0]
+        );
+        assert!(
+            env_bodies[0].contains("in `staging`"),
+            "and must name the environment, or it reads like the unfiltered \
+             rule beside it: {}",
+            env_bodies[0]
+        );
+        assert!(
+            !env_bodies[0].contains(" for `"),
+            "an op-less rule carries no op clause: {}",
+            env_bodies[0]
+        );
+
+        // The control, and the reason the numbers above mean something.
+        let all = rig.bodies(unfiltered.id).await;
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].contains("9000ms"),
+            "the unfiltered rule sees every environment: {}",
+            all[0]
+        );
+        assert!(
+            !all[0].contains(" in `") && !all[0].contains(" for `"),
+            "and carries neither clause: {}",
             all[0]
         );
 
