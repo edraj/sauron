@@ -235,6 +235,34 @@ class ViewCache {
    * that no longer references it, and the page that started it is being torn
    * down, so its result reaches nothing.
    */
+  /**
+   * Drop every entry EXCEPT the given keys.
+   *
+   * The global Refresh means "nothing cached is trusted", but a plain `clear()`
+   * before reloading is wrong: `CachedView.load` finds no cache, takes its
+   * `data = undefined` branch, and the page blanks to skeletons for the whole
+   * request — and shows a hard error state rather than stale data if it fails.
+   * That is the opposite of the stale-while-revalidate behaviour this cache
+   * exists to provide.
+   *
+   * So the refresh reloads the current page's views first and then drops
+   * everything else, keeping exactly the keys it just repopulated. In-flight
+   * bookkeeping is deliberately untouched: a request in flight for another view
+   * is either about to write a key we are dropping (harmless — it lands in a
+   * map nobody reads until that page is visited again, which refetches) or is
+   * one of the reloads we just awaited.
+   */
+  clearExcept(keep: ReadonlySet<string>): number {
+    let dropped = 0;
+    for (const key of [...this.entries.keys()]) {
+      if (!keep.has(key)) {
+        this.entries.delete(key);
+        dropped += 1;
+      }
+    }
+    return dropped;
+  }
+
   clear(): void {
     this.entries.clear();
     this.inflight.clear();

@@ -10,6 +10,9 @@ use std::time::Duration;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -32,6 +35,42 @@ pub enum OutcomeKind {
 pub struct SendOutcome {
     pub kind: OutcomeKind,
     pub status: Option<u16>,
+}
+
+/// One distinct failure body per status code, first-seen wins.
+///
+/// The response body used to be read and dropped on the floor, so a run that
+/// failed every request could report only "status codes 400x516" — true, and
+/// useless. The server almost always says exactly what is wrong ("Invalid URL:
+/// Cannot parse `project_id`...", "missing field `sdk`"), and throwing that
+/// away turns a one-line misconfiguration into an afternoon.
+///
+/// Bounded deliberately: one sample per status, truncated. A load generator
+/// failing at 10k req/s must not accumulate 10k copies of the same message, and
+/// the tenth identical body tells you nothing the first did not.
+static FAILURE_SAMPLES: Mutex<BTreeMap<u16, String>> = Mutex::new(BTreeMap::new());
+
+/// Longest failure body retained per status code.
+const FAILURE_SAMPLE_MAX: usize = 300;
+
+fn record_failure_sample(status: u16, body: &[u8]) {
+    let Ok(mut map) = FAILURE_SAMPLES.lock() else {
+        return; // a poisoned diagnostic map must never take the run down
+    };
+    map.entry(status).or_insert_with(|| {
+        let text = String::from_utf8_lossy(&body[..body.len().min(FAILURE_SAMPLE_MAX)]);
+        text.trim().to_string()
+    });
+}
+
+/// `(status, first body seen)` for every failing status code in this run.
+///
+/// Rendered by the report so the operator sees the REASON beside the tally.
+pub fn failure_samples() -> Vec<(u16, String)> {
+    FAILURE_SAMPLES
+        .lock()
+        .map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect())
+        .unwrap_or_default()
 }
 
 /// Classify an HTTP status code into an [`OutcomeKind`]. Shared by
@@ -130,8 +169,12 @@ impl ReqwestPool {
         match req.body(body.to_vec()).send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                // Fully read the body so the connection can be reused.
-                let _ = resp.bytes().await;
+                // Fully read the body so the connection can be reused — and, on
+                // a failure, KEEP it. See `record_failure_sample`.
+                let body = resp.bytes().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    record_failure_sample(status, &body);
+                }
                 SendOutcome {
                     kind: classify(status),
                     status: Some(status),

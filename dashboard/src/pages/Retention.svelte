@@ -6,6 +6,8 @@
   import CodeBlock from '../lib/components/ui/CodeBlock.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import RetentionGrid from '../lib/components/RetentionGrid.svelte';
@@ -59,6 +61,14 @@
   // green.
   const gridView = new CachedView<Grid>();
   const lifeView = new CachedView<LifecycleOut>();
+
+  // Both views. The grid and the lifecycle chart answer the same question at
+  // different resolutions, and refreshing one without the other would show two
+  // views of retention that disagree.
+  const refresher = pageRefresher(async () => {
+    await Promise.all([gridView.reload(), lifeView.reload()]);
+  });
+
 
   const grid = $derived(gridView.data ?? null);
   const gridLoading = $derived(gridView.loading);
@@ -238,6 +248,10 @@
       <p class="sub">{t('retention.subtitle')}</p>
     </div>
     <div class="controls">
+      <RefreshButton
+        onclick={refresher.run}
+        loading={refresher.busy || gridRevalidating || lifeView.revalidating}
+      />
       <RollupChip />
       {#if gridRevalidating}<span class="updating">{t('retention.updating')}</span>{/if}
       <div class="seg-group" role="group">

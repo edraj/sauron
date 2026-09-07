@@ -101,6 +101,26 @@ pub(crate) const ADMIN_RESET_PER_CALLER_PER_HOUR: u32 = 20;
 /// unbounded re-lock of an account somebody is trying to recover.
 pub(crate) const ADMIN_RESET_PER_TARGET_PER_HOUR: u32 = 5;
 
+/// Email-change requests per calling admin per hour. Bounds fan-out, exactly as
+/// [`ADMIN_RESET_PER_CALLER_PER_HOUR`] does and for the same reason:
+/// `member:credential` is in the Admin preset, not just Owner.
+pub(crate) const EMAIL_CHANGE_PER_CALLER_PER_HOUR: u32 = 20;
+/// Email-change requests per target per hour.
+///
+/// The one that matters, and the ONLY bound on the two mails that endpoint
+/// sends: both email-change `MailKind`s carry a ZERO dedup window on purpose
+/// (see `sauron-mail`'s `kind.rs`), so the per-recipient suppression that
+/// backstops password-reset mail does not apply here. Raise it and one member's
+/// inbox is the target; there is no second limiter behind this one.
+pub(crate) const EMAIL_CHANGE_PER_TARGET_PER_HOUR: u32 = 5;
+/// Public preview/confirm/cancel attempts per IP per minute. A burst limiter,
+/// sized like [`RESET_ATTEMPTS_PER_MIN_PER_IP`].
+pub(crate) const EMAIL_CHANGE_ATTEMPTS_PER_MIN_PER_IP: u32 = 60;
+/// Public attempts per token per hour. Bounds the branches that return WITHOUT
+/// burning the row — a stale fingerprint, or an address claimed since issue —
+/// which are the only ones a caller can retry.
+pub(crate) const EMAIL_CHANGE_ATTEMPTS_PER_TOKEN_PER_HOUR: u32 = 10;
+
 /// The address to attribute a request to for per-IP limiting.
 ///
 /// Falls back to the socket peer, so a limiter key always exists. `X-Forwarded-For`
@@ -391,6 +411,129 @@ pub(crate) fn render_password_reset_mail(
         // an origin that is not http(s) must never reach an anchor href.
         cta: Some(sauron_mail::Cta::new(cta_label, vars.reset_url)?),
         footnotes,
+    })
+}
+
+/// How long an email-change link lives.
+///
+/// 24 hours, matching [`ADMIN_RESET_TTL_SECS`]: both are admin-initiated acts
+/// aimed at someone who may not read their mail the same day, and a shorter
+/// window would mostly produce dead links an admin has to reissue.
+pub(crate) const EMAIL_CHANGE_TTL_SECS: i64 = 86_400;
+
+/// Fragment-based, for the reason [`reset_link`] documents in full: the token
+/// sits after the `#`, so it is never sent in a request line or a `Referer` and
+/// reaches no server log, proxy log, or analytics beacon.
+pub(crate) fn email_change_confirm_link(dashboard_url: &str, raw_token: &str) -> String {
+    format!(
+        "{}/#/confirm-email-change?token={}",
+        dashboard_url.trim_end_matches('/'),
+        raw_token
+    )
+}
+
+/// Sibling of [`email_change_confirm_link`], carrying the veto token instead.
+pub(crate) fn email_change_cancel_link(dashboard_url: &str, raw_token: &str) -> String {
+    format!(
+        "{}/#/cancel-email-change?token={}",
+        dashboard_url.trim_end_matches('/'),
+        raw_token
+    )
+}
+
+/// Everything both email-change messages interpolate.
+///
+/// There is deliberately no field for the acting admin, and — more importantly —
+/// no field for the new address.
+///
+/// The first matches the rule [`ResetMailVars`] documents: the org is what a
+/// recipient needs to judge legitimacy, and naming an individual invites a reply
+/// to a person rather than a route back into the account.
+///
+/// The second is the structural half of the non-disclosure rule. The mail sent
+/// to the address being *replaced* must never name the address replacing it, and
+/// a renderer cannot leak a value it was never given — so the rule survives an
+/// edit by someone who never read the spec.
+pub(crate) struct EmailChangeMailVars<'a> {
+    /// The recipient's display name, already falling back to their email.
+    pub display_name: &'a str,
+    pub org_name: &'a str,
+    /// The confirm link for the approval mail, the cancel link for the notice.
+    pub url: &'a str,
+}
+
+/// The mail sent to the address being replaced.
+///
+/// This is the veto, and it is the single thing standing between
+/// `member:credential` and an account-takeover primitive. It says a change was
+/// requested, never what to, and offers exactly one action: stop it.
+pub(crate) fn render_email_change_notice(
+    vars: EmailChangeMailVars<'_>,
+) -> Result<sauron_mail::MailContent, sauron_mail::TemplateError> {
+    let expiry = expiry_wording(EMAIL_CHANGE_TTL_SECS);
+    let name = vars.display_name;
+    let org = vars.org_name;
+
+    Ok(sauron_mail::MailContent {
+        subject: "A change to your Sauron email address was requested".to_string(),
+        heading: "Was this you?".to_string(),
+        paragraphs: vec![
+            format!("Hi {name},"),
+            format!("An administrator of {org} asked to change the email address on your account."),
+            "Nothing has changed yet. The change takes effect only when the new address confirms \
+             it, and you will keep signing in with your current address until then."
+                .to_string(),
+            format!(
+                "If you did not expect this, use the link below to stop it. Otherwise the request \
+                 lapses on its own in {expiry}."
+            ),
+        ],
+        cta: Some(sauron_mail::Cta::new("Stop this change", vars.url)?),
+        footnotes: vec![
+            PASTE_FALLBACK.to_string(),
+            vars.url.to_string(),
+            format!(
+                "If you were expecting this, no action is needed — you can ignore this email, or \
+                 contact an administrator of {org}."
+            ),
+        ],
+    })
+}
+
+/// The mail sent to the address being adopted.
+///
+/// The recipient already holds this mailbox, so naming the address would tell
+/// them nothing they do not know; it is omitted because the sentence reads
+/// better without it and the page behind the link states it plainly.
+pub(crate) fn render_email_change_approval(
+    vars: EmailChangeMailVars<'_>,
+) -> Result<sauron_mail::MailContent, sauron_mail::TemplateError> {
+    let expiry = expiry_wording(EMAIL_CHANGE_TTL_SECS);
+    let name = vars.display_name;
+    let org = vars.org_name;
+
+    Ok(sauron_mail::MailContent {
+        subject: "Confirm your new Sauron email address".to_string(),
+        heading: "Confirm this address".to_string(),
+        paragraphs: vec![
+            format!("Hi {name},"),
+            format!(
+                "An administrator of {org} set this address as the new sign-in email for your \
+                 account."
+            ),
+            "Until you confirm, the account keeps its current address and you keep signing in \
+             with it."
+                .to_string(),
+            format!("The link below expires in {expiry}."),
+        ],
+        cta: Some(sauron_mail::Cta::new("Confirm this address", vars.url)?),
+        footnotes: vec![
+            PASTE_FALLBACK.to_string(),
+            vars.url.to_string(),
+            "If you were not expecting this, ignore this email and the request will lapse. \
+             The address currently on the account has also been notified, and can cancel it."
+                .to_string(),
+        ],
     })
 }
 
@@ -1554,6 +1697,300 @@ pub async fn me(auth: AuthUser, State(state): State<AppState>) -> Result<Json<Us
     Ok(Json(user))
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct EmailChangeTokenReq {
+    pub token: String,
+}
+
+/// What a public email-change page may know before the visitor acts.
+///
+/// `new_email` is `Option` + `skip_serializing_if` — omitted, not nulled —
+/// because the cancel page is reached from the mail sent to the OLD address,
+/// and that address must never learn the new one. Enforcing it HERE rather than
+/// in the page is what makes the rule hold: a Svelte template can be edited by
+/// someone who never read the spec, but this endpoint is the only source the
+/// page has, so a leak would take a deliberate change to this struct.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct EmailChangePreview {
+    /// `"approve"` or `"cancel"` — which of the row's two tokens was presented.
+    pub role: String,
+    pub org_name: String,
+    pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_email: Option<String>,
+}
+
+/// Shared preamble for the three public email-change endpoints: shape check,
+/// per-IP limiter, per-token limiter. Returns the token's hash.
+///
+/// The shape check runs FIRST and on every path, so a spray of garbage never
+/// reaches Redis — otherwise the per-token limiter would mint one key per guess,
+/// turning a brute-force attempt into a memory-exhaustion one.
+async fn email_change_token_preamble(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    peer: &SocketAddr,
+    token: &str,
+) -> Result<String, ApiError> {
+    if !is_reset_token_shape(token) {
+        return Err(ApiError::Auth(AuthError::InvalidToken));
+    }
+    rate_limit(
+        state,
+        &format!(
+            "sauron:auth:emailchange:ip:{}",
+            client_addr(headers, peer, state)
+        ),
+        EMAIL_CHANGE_ATTEMPTS_PER_MIN_PER_IP,
+        60,
+    )
+    .await?;
+    let hash = hash_token(token);
+    // Keyed on the hash, so nothing sensitive lands in Redis.
+    rate_limit(
+        state,
+        &format!("sauron:auth:emailchange:tok:{hash}"),
+        EMAIL_CHANGE_ATTEMPTS_PER_TOKEN_PER_HOUR,
+        3600,
+    )
+    .await?;
+    Ok(hash)
+}
+
+/// Describe a pending change to whoever holds one of its two links.
+///
+/// Exists so the public pages can render what is about to happen *before* the
+/// visitor acts. That ordering is not cosmetic: it is what lets both pages put
+/// their mutation behind an explicit button press, which is what stops a mail
+/// link-scanner (Outlook Safe Links and friends fetch every mailed URL) from
+/// silently approving or cancelling changes nobody clicked.
+#[utoipa::path(
+    post, path = "/v1/auth/email-change/preview", tag = "Authentication",
+    summary = "Describe a pending email change",
+    description = "\
+The token travels in the BODY, never a query string, so it reaches no server \
+log, proxy log or `Referer`.
+
+`new_email` is present only for the confirmation token. The cancellation token \
+belongs to the address being replaced, which is never told what it is being \
+replaced with.",
+    request_body(content = EmailChangeTokenReq),
+    responses(
+        (status = 200, description = "The pending change.", body = EmailChangePreview),
+        (status = 401, description = "No live request matches this token.", body = ErrorResponse),
+        (status = 429, description = "Rate limited.", body = ErrorResponse),
+    ),
+)]
+pub async fn preview_email_change(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<EmailChangeTokenReq>,
+) -> Result<Json<EmailChangePreview>, ApiError> {
+    let hash = email_change_token_preamble(&state, &headers, &peer, &req.token).await?;
+    let mut conn = db(&state).await?;
+
+    // Approve first, then cancel. A token is one or the other: both columns are
+    // UNIQUE and independently random, so there is no ambiguity to resolve.
+    let (row, role) = match repo::find_live_email_change_by_approve_token(&mut conn, &hash).await? {
+        Some(r) => (r, "approve"),
+        None => match repo::find_live_email_change_by_cancel_token(&mut conn, &hash).await? {
+            Some(r) => (r, "cancel"),
+            // Expired, already used, cancelled, or never existed — one answer for
+            // all four. Which one it was belongs in the audit log, not in a
+            // response to whoever is holding the link.
+            None => return Err(ApiError::Auth(AuthError::InvalidToken)),
+        },
+    };
+
+    let org_name = repo::get_org(&mut conn, row.org_id)
+        .await?
+        .map(|o| o.name)
+        .unwrap_or_default();
+
+    Ok(Json(EmailChangePreview {
+        role: role.to_string(),
+        org_name,
+        expires_at: row.expires_at.to_rfc3339(),
+        // The one line the entire non-disclosure rule rests on.
+        new_email: if role == "approve" {
+            Some(row.new_email)
+        } else {
+            None
+        },
+    }))
+}
+
+/// Adopt the new address.
+#[utoipa::path(
+    post, path = "/v1/auth/email-change/confirm", tag = "Authentication",
+    summary = "Confirm a new email address",
+    description = "\
+Moves the account's sign-in address. Existing sessions are deliberately NOT \
+revoked — access and refresh tokens carry a user id, not an address, so nothing \
+breaks and nobody is signed out. Outstanding password-reset links ARE \
+invalidated: they were mailed to an address the account no longer owns.",
+    request_body(content = EmailChangeTokenReq),
+    responses(
+        (status = 200, description = "The address was changed.", body = OkResponse),
+        (status = 401, description = "No live request matches this token.", body = ErrorResponse),
+        (status = 409, description = "That address now belongs to another account.", body = ErrorResponse),
+        (status = 429, description = "Rate limited.", body = ErrorResponse),
+    ),
+)]
+pub async fn confirm_email_change(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<EmailChangeTokenReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hash = email_change_token_preamble(&state, &headers, &peer, &req.token).await?;
+    let mut conn = db(&state).await?;
+
+    let row = repo::find_live_email_change_by_approve_token(&mut conn, &hash)
+        .await?
+        .ok_or(ApiError::Auth(AuthError::InvalidToken))?;
+    let user = repo::get_user(&mut conn, row.user_id)
+        .await?
+        .ok_or(ApiError::Auth(AuthError::InvalidToken))?;
+    // The holder controls the mailbox, so telling them is honest rather than a
+    // leak — the same judgement `reset_password` makes.
+    if !user.is_active {
+        return Err(ApiError::Auth(AuthError::AccountDeactivated));
+    }
+
+    // Re-checked at the point of use, not merely when the request was opened:
+    // this link lives 24 hours and `create_member` can claim the address inside
+    // that window. Returns WITHOUT burning the row — the address may be freed
+    // again, and a spent link would strand a change that could still succeed.
+    // `EMAIL_CHANGE_ATTEMPTS_PER_TOKEN_PER_HOUR` is what bounds the retries.
+    if let Some(other) = repo::find_user_by_email(&mut conn, &row.new_email).await? {
+        if other.id != row.user_id {
+            return Err(ApiError::Conflict(
+                "that address now belongs to another account".into(),
+            ));
+        }
+    }
+
+    // The fingerprint is matched INSIDE this UPDATE, so "the address has not
+    // moved since the link was issued" and "the link is now spent" are one
+    // atomic fact rather than two statements with a window between them.
+    let Some((user_id, new_email)) =
+        repo::consume_email_change_approval(&mut conn, &hash, &user.email.to_lowercase()).await?
+    else {
+        return Err(ApiError::Auth(AuthError::InvalidToken));
+    };
+
+    // The residual race: another account claimed the address between the check
+    // above and here. Failing at this point is the acceptable direction — the
+    // link is correctly spent and the other account keeps the address.
+    match repo::set_user_email(&mut conn, user_id, &new_email).await {
+        Ok(_) => {}
+        Err(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        )) => {
+            return Err(ApiError::Conflict(
+                "that address now belongs to another account".into(),
+            ))
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Sessions are deliberately untouched, and `state.revocations` is not
+    // poked — see this endpoint's description. Tokens carry `user_id`, not an
+    // address, so nothing about them went stale.
+    //
+    // Reset links are NOT left alone. `password_reset_tokens.password_fingerprint`
+    // kills a link when the PASSWORD moves, never when the ADDRESS does, so
+    // without this a reset link mailed to the old address stays redeemable by
+    // whoever still reads that mailbox — a full account takeover, days later, by
+    // exactly the person the change was meant to move the account away from.
+    repo::invalidate_password_reset_tokens_for_user(
+        &mut conn,
+        user_id,
+        repo::RESET_INVALIDATED_SUPERSEDED,
+    )
+    .await?;
+
+    // `audit::record` takes a non-optional actor, and the target user is the
+    // honest one: this path is unauthenticated, and the only thing anybody
+    // proved is control of the mailbox. Naming the admin would record them as
+    // the actor of an act they did not perform, minutes or hours later.
+    crate::audit::record(
+        &mut conn,
+        user_id,
+        crate::audit::Entry::new(
+            row.org_id,
+            crate::audit::action::MEMBER_EMAIL_CHANGE_APPROVED,
+            crate::audit::entity::MEMBER,
+        )
+        .target(user_id, &new_email)
+        .changes(crate::audit::created(
+            crate::audit::entity::MEMBER,
+            &[("new_email", serde_json::json!(new_email))],
+        )),
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Veto a pending change, from the address being replaced.
+#[utoipa::path(
+    post, path = "/v1/auth/email-change/cancel", tag = "Authentication",
+    summary = "Cancel a pending email change",
+    description = "Invalidates the confirmation link. The response never names the address that was requested.",
+    request_body(content = EmailChangeTokenReq),
+    responses(
+        (status = 200, description = "The request was cancelled.", body = OkResponse),
+        (status = 401, description = "No live request matches this token.", body = ErrorResponse),
+        (status = 429, description = "Rate limited.", body = ErrorResponse),
+    ),
+)]
+pub async fn cancel_email_change(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<EmailChangeTokenReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hash = email_change_token_preamble(&state, &headers, &peer, &req.token).await?;
+    let mut conn = db(&state).await?;
+
+    // Single-use, like the approve token: without that, a second click would
+    // write a second audit entry claiming the member rejected the change twice.
+    let Some((user_id, org_id)) =
+        repo::cancel_email_change_by_cancel_token(&mut conn, &hash).await?
+    else {
+        return Err(ApiError::Auth(AuthError::InvalidToken));
+    };
+
+    let target_email = repo::user_email(&mut conn, user_id)
+        .await?
+        .unwrap_or_default();
+    // The signal worth investigating in a wall of two hundred rows: a member
+    // rejected an admin's attempt to move their login identity. Told apart from
+    // a routine admin withdrawal by `cancelled_reason`.
+    crate::audit::record(
+        &mut conn,
+        user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::MEMBER_EMAIL_CHANGE_CANCELLED,
+            crate::audit::entity::MEMBER,
+        )
+        .target(user_id, &target_email)
+        .changes(crate::audit::created(
+            crate::audit::entity::MEMBER,
+            &[("cancelled_reason", serde_json::json!("user"))],
+        )),
+    )
+    .await;
+
+    // Says nothing about what was requested.
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 #[cfg(test)]
 mod password_reset_render_tests {
     use super::*;
@@ -1712,5 +2149,160 @@ mod password_reset_render_tests {
             org_name: "",
         })
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod email_change_render_tests {
+    use super::*;
+
+    fn branding() -> sauron_mail::Branding {
+        sauron_mail::Branding {
+            product_name: "Sauron".to_string(),
+            dashboard_url: Some("https://s.example".to_string()),
+            footer: "Sent by Sauron.".to_string(),
+        }
+    }
+
+    /// Everything a recipient can actually see, subject and both bodies, after
+    /// branding is applied. Asserting on this rather than on `MailContent` is
+    /// what keeps the non-disclosure test honest: a leak into the HTML shell or
+    /// a footnote would pass a check against the struct's `paragraphs`.
+    fn wire(content: &sauron_mail::MailContent) -> String {
+        let m = sauron_mail::render(&branding(), content).expect("mail renders");
+        format!("{}\n{}\n{}", m.subject, m.text, m.html)
+    }
+
+    const CANCEL_URL: &str = "https://s.example/#/cancel-email-change?token=abc";
+    const CONFIRM_URL: &str = "https://s.example/#/confirm-email-change?token=abc";
+
+    #[test]
+    fn the_notice_never_names_the_new_address() {
+        // The rule the whole veto rests on: the address being replaced learns
+        // that a change was requested, never what it was requested to. If it
+        // learned the target, a hostile admin's chosen address would be handed
+        // to the person best placed to be socially engineered about it.
+        let content = render_email_change_notice(EmailChangeMailVars {
+            display_name: "Bob",
+            org_name: "Acme",
+            url: CANCEL_URL,
+        })
+        .expect("content renders");
+
+        let body = wire(&content);
+        assert!(
+            !body.contains("new@example.com"),
+            "the old-address mail must never name the new address:\n{body}"
+        );
+        // `EmailChangeMailVars` has no field for it, so this can only regress by
+        // someone adding one — which is the point.
+        assert!(body.contains("Acme"), "the org is what makes it judgeable");
+        assert!(body.contains(CANCEL_URL), "the veto must be reachable");
+    }
+
+    #[test]
+    fn the_notice_says_nothing_has_changed_yet() {
+        // A recipient who reads this as "my email HAS been changed" will not
+        // click the one button that stops it.
+        let content = render_email_change_notice(EmailChangeMailVars {
+            display_name: "Bob",
+            org_name: "Acme",
+            url: CANCEL_URL,
+        })
+        .expect("content renders");
+        assert!(content
+            .paragraphs
+            .iter()
+            .any(|p| p.contains("Nothing has changed yet")));
+    }
+
+    #[test]
+    fn the_approval_names_the_org_and_carries_the_confirm_link() {
+        let content = render_email_change_approval(EmailChangeMailVars {
+            display_name: "Bob",
+            org_name: "Acme",
+            url: CONFIRM_URL,
+        })
+        .expect("content renders");
+
+        let body = wire(&content);
+        assert!(body.contains("Acme"));
+        assert!(body.contains(CONFIRM_URL));
+    }
+
+    #[test]
+    fn both_mails_state_the_lifetime_from_the_constant() {
+        // Derived via `expiry_wording`, never typed, so changing the TTL cannot
+        // leave either message claiming the old number.
+        let expected = expiry_wording(EMAIL_CHANGE_TTL_SECS);
+        assert_eq!(expected, "24 hours");
+
+        for content in [
+            render_email_change_notice(EmailChangeMailVars {
+                display_name: "Bob",
+                org_name: "Acme",
+                url: CANCEL_URL,
+            })
+            .expect("notice"),
+            render_email_change_approval(EmailChangeMailVars {
+                display_name: "Bob",
+                org_name: "Acme",
+                url: CONFIRM_URL,
+            })
+            .expect("approval"),
+        ] {
+            assert!(
+                wire(&content).contains(&expected),
+                "every mail states its own lifetime"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_links_are_distinct_routes() {
+        // A copy-paste slip that pointed the notice at the confirm page would
+        // turn the veto button into an approve button.
+        assert_ne!(
+            email_change_cancel_link("https://s.example", "tok"),
+            email_change_confirm_link("https://s.example", "tok")
+        );
+        assert_eq!(
+            email_change_cancel_link("https://s.example/", "tok"),
+            "https://s.example/#/cancel-email-change?token=tok",
+            "a trailing slash on DASHBOARD_URL must not produce a double slash"
+        );
+    }
+
+    #[test]
+    fn the_token_rides_in_the_fragment_not_the_query() {
+        // The property that keeps it out of every server log, proxy log and
+        // Referer header: everything after `#` is never transmitted.
+        for url in [
+            email_change_confirm_link("https://s.example", "tok"),
+            email_change_cancel_link("https://s.example", "tok"),
+        ] {
+            let (before_fragment, _) = url.split_once('#').expect("a fragment link");
+            assert!(
+                !before_fragment.contains("tok"),
+                "the token must live after the '#': {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_that_is_not_http_never_becomes_an_href() {
+        // Same reasoning as the password-reset case: a `javascript:` origin
+        // reaching an anchor in an email is stored XSS in an inbox.
+        for render in [
+            render_email_change_notice as fn(EmailChangeMailVars<'_>) -> _,
+            render_email_change_approval,
+        ] {
+            assert!(render(EmailChangeMailVars {
+                display_name: "Bob",
+                org_name: "Acme",
+                url: "javascript:alert(1)",
+            })
+            .is_err());
+        }
     }
 }

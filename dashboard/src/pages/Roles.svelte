@@ -13,6 +13,8 @@
   import RoleEditorDialog from '../lib/components/members/RoleEditorDialog.svelte';
   import DeleteRoleDialog from '../lib/components/members/DeleteRoleDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
@@ -147,6 +149,11 @@
    * write would return the pre-write catalogue and `set` would then cache it —
    * the deleted role reappears and stays for the whole fresh window.
    */
+  const refresher = pageRefresher(async () => {
+    const org = sessionStore.currentOrgId;
+    if (org) await load(org, true);
+  });
+
   async function load(orgId: string, force = false) {
     await view.load(
       viewKey('roles.list', orgId),
@@ -227,9 +234,12 @@
         Permission sets that can be granted to members of {sessionStore.currentOrg?.name ?? 'this org'}.
       </p>
     </div>
-    <Button variant="primary" lockedReason={roleManageLock} onclick={openNewRole}>
-      {t('roles.new')}
-    </Button>
+    <div class="head-actions">
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+      <Button variant="primary" lockedReason={roleManageLock} onclick={openNewRole}>
+        {t('roles.new')}
+      </Button>
+    </div>
   </div>
 
   {#if loading}
@@ -366,6 +376,11 @@
 </AdminShell>
 
 <style>
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .head {
     display: flex;
     align-items: flex-start;

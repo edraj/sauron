@@ -15,6 +15,7 @@
   } from '../lib/models/date-range';
   import { combineFreshness } from '../lib/models/freshness';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import BarList from '../lib/components/BarList.svelte';
@@ -349,12 +350,32 @@
       // nothing: any section older than the server's freshness window
       // self-enqueues a recompute on read, so the button still surfaces the
       // newest data the server will compute for them.
-      if (canForce) await refreshOverview(aid, range);
+      // ORDER MATTERS, and it is the reverse of what it was.
+      //
+      // Since the refresh unification, `load(force)` sends `force=true` on the
+      // five section GETs — which reach the same `read_section(..., force)` the
+      // POST does. Running the POST first spent all five per-key force budgets,
+      // so every GET behind it was downgraded by the cooldown and answered
+      // `recomputing: false`; `pendingCount()` was then 0 and the spinner
+      // stopped instantly while the recompute was still running.
+      //
+      // With the GETs first they take the budgets, report `recomputing: true`,
+      // and the button waits properly. The POST is now a downgraded no-op on
+      // this path and is retained only so the admin-only endpoint keeps a
+      // caller — it is a genuine candidate for removal, but deleting a shipped
+      // endpoint's only caller is a separate decision from fixing this bug.
       await load(aid, range, true);
+      if (canForce) await refreshOverview(aid, range);
     } finally {
       refreshing = false;
     }
   }
+
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
 
   // A null rate means "not measurable", so the subtitle must say why rather
   // than print "0 crashed" — which reads as a real, perfect number and is the
@@ -438,8 +459,8 @@
       -->
       <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
       <RefreshButton
-        onclick={refresh}
-        loading={refreshing || revalidating}
+        onclick={refresher.run}
+        loading={refresher.busy || refreshing || revalidating}
         title={revalidating ? 'Refreshing…' : canForce ? 'Recompute now' : 'Refresh'}
       />
     </div>

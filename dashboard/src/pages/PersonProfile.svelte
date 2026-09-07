@@ -14,6 +14,8 @@
   import JsonTree from '../lib/components/JsonTree.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { getPerson } from '../lib/api/persons';
@@ -42,6 +44,15 @@
   // paints instantly on return and refreshes behind the render. Re-exposed under
   // the names the template already used, so the markup is unchanged.
   const view = new CachedView<PersonProfile>();
+
+  // `reload()` replays the view's most recent key and fetcher with force,
+  // which is exactly what Refresh means here — the page's loads are driven by
+  // effects, so there is no `load(force)` to call and reconstructing the key
+  // by hand would be a second definition of it, free to drift.
+  const refresher = pageRefresher(async () => {
+    await view.reload();
+  });
+
 
   const profile = $derived(view.data ?? null);
   const loading = $derived(view.loading);
@@ -182,6 +193,9 @@
     </EmptyState>
   {:else if profile}
     <header class="identity">
+      <div class="id-actions">
+        <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+      </div>
       <span class="avatar">{initials(distinctId)}</span>
       <div class="id-meta">
         <h1 class="id-title mono">{distinctId}</h1>
@@ -348,6 +362,12 @@
   {/if}
 
 <style>
+  .id-actions {
+    order: 99;
+    margin-inline-start: auto;
+    align-self: center;
+  }
+
   .back {
     display: inline-flex;
     align-items: center;

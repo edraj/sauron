@@ -10,9 +10,12 @@
   import CreateMemberDialog from '../lib/components/members/CreateMemberDialog.svelte';
   import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
   import ResetPasswordDialog from '../lib/components/members/ResetPasswordDialog.svelte';
+  import ChangeEmailDialog from '../lib/components/members/ChangeEmailDialog.svelte';
   import MembersTable from '../lib/components/members/MembersTable.svelte';
   import ScopeTree from '../lib/components/members/ScopeTree.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
@@ -24,6 +27,8 @@
     deleteGrant,
     setMemberActive,
     resetMemberPassword,
+    requestMemberEmailChange,
+    cancelMemberEmailChange,
   } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
   import { listEnvironments } from '../lib/api/environments';
@@ -133,6 +138,8 @@
   // the row that opened the dialog.
   let resetTarget = $state<{ member: Member; action: 'reset' | 'cancel' } | null>(null);
   let resetBusy = $state(false);
+  let emailTarget = $state<{ member: Member; action: 'request' | 'withdraw' } | null>(null);
+  let emailBusy = $state(false);
 
   // One row per person: this recomputes fresh Member/grant objects every time
   // `members` is reloaded, so anything derived from it (below) is never a
@@ -191,6 +198,11 @@
    * returns the pre-write roster, and `set` would then cache it — so the grant
    * just revoked reappears and stays for the whole fresh window.
    */
+  const refresher = pageRefresher(async () => {
+    const org = sessionStore.currentOrgId;
+    if (org) await load(org, true);
+  });
+
   async function load(orgId: string, force = false) {
     actionError = null;
     await view.load(
@@ -383,6 +395,42 @@
     }
   }
 
+  async function confirmEmailChange(newEmail: string) {
+    const org = sessionStore.currentOrg;
+    const target = emailTarget;
+    if (!org || !target) return;
+    emailBusy = true;
+    try {
+      if (target.action === 'request') {
+        await requestMemberEmailChange(org.id, target.member.user_id, newEmail);
+        // Says what actually happened, not "email changed". An admin who reads
+        // this as done will not understand why the member still signs in with
+        // the old address, and will ask again — mailing the member a second
+        // warning about a change they already approved.
+        //
+        // Names the DESTINATION as the address that must confirm. An earlier
+        // wording ("X must confirm the change from Y") read as though Y were
+        // the address being moved away from, which is the opposite of what
+        // happens.
+        toastStore.success(
+          `Nothing has changed yet. ${newEmail} must open the emailed link to confirm, and ${target.member.email} has been told a change was requested so they can stop it.`,
+        );
+      } else {
+        await cancelMemberEmailChange(org.id, target.member.user_id);
+        toastStore.success(`The pending email change for ${target.member.email} was withdrawn.`);
+      }
+      emailTarget = null;
+      await load(org.id, true);
+    } catch (err) {
+      // The backend's 409s carry the actionable text (address taken, unchanged,
+      // inactive, cross-org, a concurrent admin) and its 503 names the missing
+      // SMTP setting — surface both verbatim, as the reset path already does.
+      toastStore.error(errorMessage(err));
+    } finally {
+      emailBusy = false;
+    }
+  }
+
   function requestRevokeSessions(member: Member) {
     pendingRevoke = member;
   }
@@ -414,6 +462,9 @@
     <div>
       <h1 class="page-title">{t('members.title')}</h1>
       <p class="muted sub">People with access to {sessionStore.currentOrg?.name ?? 'this org'}.</p>
+    </div>
+    <div class="head-actions">
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
     </div>
   </div>
 
@@ -496,6 +547,7 @@
       currentUserId={authStore.user?.id ?? ''}
       {credentialLock}
       onresetpassword={(m, a) => (resetTarget = { member: m, action: a })}
+      onemailchange={(m, a) => (emailTarget = { member: m, action: a })}
       onremovegrant={removeGrant}
     />
     </div>
@@ -556,6 +608,16 @@
     />
   {/if}
 
+  {#if emailTarget}
+    <ChangeEmailDialog
+      member={emailTarget.member}
+      action={emailTarget.action}
+      busy={emailBusy}
+      onconfirm={confirmEmailChange}
+      oncancel={() => (emailTarget = null)}
+    />
+  {/if}
+
   {#if pendingRevoke}
     <ConfirmDialog
       open
@@ -570,7 +632,16 @@
 </AdminShell>
 
 <style>
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
     margin-bottom: 18px;
   }
   .sub {

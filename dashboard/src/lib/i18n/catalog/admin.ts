@@ -24,6 +24,32 @@ export const admin = {
   },
   'members.deactivated': { en: 'Deactivated', ar: 'معطَّل' },
   'members.resetPending': { en: 'Reset pending', ar: 'إعادة التعيين معلّقة' },
+  'members.emailChangePending': { en: 'Email change pending', ar: 'تغيير البريد معلّق' },
+  'members.changeEmail': { en: 'Change email', ar: 'تغيير البريد الإلكتروني' },
+  'members.changeEmail.title': {
+    en: 'Change this member’s email?',
+    ar: 'تغيير البريد الإلكتروني لهذا العضو؟',
+  },
+  'members.changeEmail.newAddress': {
+    en: 'New email address',
+    ar: 'عنوان البريد الإلكتروني الجديد',
+  },
+  'members.changeEmail.submit': { en: 'Send confirmation', ar: 'إرسال طلب التأكيد' },
+  'members.changeEmail.unchanged': {
+    en: 'That is already this member’s address.',
+    ar: 'هذا هو عنوان العضو الحالي بالفعل.',
+  },
+  'members.changeEmail.malformed': {
+    en: 'Enter a valid email address.',
+    ar: 'أدخل عنوان بريد إلكتروني صالحًا.',
+  },
+  'members.changeEmail.pendingTo': { en: 'A change is pending to', ar: 'هناك تغيير معلّق إلى' },
+  'members.withdrawEmailChange': { en: 'Withdraw email change', ar: 'سحب تغيير البريد' },
+  'members.withdrawEmailChange.title': {
+    en: 'Withdraw the pending email change?',
+    ar: 'سحب تغيير البريد المعلّق؟',
+  },
+  'members.withdrawEmailChange.submit': { en: 'Withdraw change', ar: 'سحب التغيير' },
   'members.deactivate': { en: 'Deactivate', ar: 'تعطيل' },
   'members.confirmDeactivate': { en: 'Deactivate member?', ar: 'تعطيل العضو؟' },
   'members.signOutAll': { en: 'Sign out all sessions', ar: 'إنهاء كل الجلسات' },

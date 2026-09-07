@@ -13,6 +13,7 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -138,6 +139,12 @@
     await load(true);
   }
 
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
+
   async function loadMore() {
     const cursor = nextCursor;
     if (!orgId || !cursor || loadingMore) return;
@@ -262,7 +269,7 @@
         {exporting ? 'Preparing…' : 'Export CSV'}
       </Button>
       <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-      <RefreshButton onclick={refresh} loading={loading || revalidating} />
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || loading || revalidating} />
     </div>
   </div>
 

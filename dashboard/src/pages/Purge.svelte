@@ -12,6 +12,8 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -28,6 +30,15 @@
   // Cached view (lib/stores/cached-view.svelte.ts): the catalogue paints
   // instantly on return instead of blanking while the same request runs again.
   const view = new CachedView<PurgeCatalog>();
+
+  // `reload()` replays the view's most recent key and fetcher with force,
+  // which is exactly what Refresh means here — the page's loads are driven by
+  // effects, so there is no `load(force)` to call and reconstructing the key
+  // by hand would be a second definition of it, free to drift.
+  const refresher = pageRefresher(async () => {
+    await view.reload();
+  });
+
   const catalog = $derived(view.data ?? null);
   const loading = $derived(view.loading);
   /**
@@ -255,6 +266,7 @@
     </div>
     <div class="head-actions">
       <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
       <Button variant="ghost" onclick={reset} disabled={busy}>
         <Icon name="refresh" /> {t('common.reset')}
       </Button>

@@ -6,6 +6,7 @@
   import { authStore } from './lib/stores/auth.svelte';
   import AppShell from './lib/components/layout/AppShell.svelte';
   import { resolveShell } from './lib/models/shell';
+  import { setCurrentRoute } from './lib/stores/current-route';
   import Toast from './lib/components/ui/Toast.svelte';
   import Spinner from './lib/components/ui/Spinner.svelte';
 
@@ -42,6 +43,17 @@
   // where the flag flips after boot.
   $effect(() => {
     if (booted && authStore.isAuthenticated) prefetchLandingRoute();
+  });
+
+  // Feeds `refreshRegistry`'s route tags. One writer, so nothing else in the
+  // app has to import the router — see `current-route.ts` for why the caching
+  // primitive must not depend on svelte-spa-router directly.
+  //
+  // Deliberately NOT gated on `booted`: a `CachedView` can load before boot
+  // settles, and a registration tagged '' would never match a real route and
+  // so would never refresh.
+  $effect(() => {
+    setCurrentRoute($location);
   });
 
   // Once booted, keep authenticated users out of the login/register pages.

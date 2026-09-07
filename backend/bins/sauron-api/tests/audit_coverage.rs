@@ -68,6 +68,14 @@ const AUDITED: &[&str] = &[
     "routes::orgs::delete_grant",
     "routes::orgs::delete_role_handler",
     "routes::orgs::reset_member_password",
+    "routes::orgs::request_member_email_change",
+    "routes::orgs::cancel_member_email_change",
+    // Unauthenticated, but they DO record — see their `audit::record` calls,
+    // which attribute the act to the target user themselves. That is the honest
+    // actor: the only thing proved is control of a mailbox, and naming the
+    // admin would file an act they did not perform under their name.
+    "routes::auth::confirm_email_change",
+    "routes::auth::cancel_email_change",
     "routes::orgs::revoke_member_sessions",
     "routes::orgs::set_member_active",
     "routes::orgs::update_grant_handler",
@@ -117,6 +125,12 @@ const EXEMPT: &[(&str, &str)] = &[
         "routes::auth::reset_password",
         "unauthenticated (bearer is the reset token); the ADMIN half of a reset is \
       recorded by orgs::reset_member_password",
+    ),
+    (
+        "routes::auth::preview_email_change",
+        "reads a pending change and mutates nothing; POST only because the token \
+      belongs in a body rather than a query string, where it would reach server \
+      logs. The two halves that DO mutate are in AUDITED",
     ),
     // --- Product data, not configuration (locked decision 1) ----------------
     (

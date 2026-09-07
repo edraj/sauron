@@ -5,6 +5,8 @@
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { MONITOR_INTERVALS, formatInterval } from '../lib/constants/monitorIntervals';
   import type { MonitorDetail, MonitorCheck } from '../lib/models';
@@ -41,6 +43,18 @@
   // check rows, and a failed checks read degrades inside its own card.
   const detailView = new CachedView<MonitorDetail>();
   const checksView = new CachedView<MonitorCheck[]>();
+
+  // `reload()` replays the view's most recent key and fetcher with force,
+  // which is exactly what Refresh means here — the page's loads are driven by
+  // effects, so there is no `load(force)` to call and reconstructing the key
+  // by hand would be a second definition of it, free to drift.
+  const refresher = pageRefresher(async () => {
+    // Both views: the page shows a monitor and its recent checks, and a
+    // refresh that updated only one of them would be misread as the other
+    // having stopped moving.
+    await Promise.all([detailView.reload(), checksView.reload()]);
+  });
+
   const detail = $derived(detailView.data ?? null);
   const checks = $derived(checksView.data ?? []);
   // The checks half loads independently of `detail` — see load(). Its own
@@ -322,6 +336,10 @@
         </div>
       </div>
         <div class="actions">
+          <RefreshButton
+            onclick={refresher.run}
+            loading={refresher.busy || detailView.revalidating || checksView.revalidating}
+          />
           <Button variant="secondary" loading={pausing} lockedReason={writeLock} onclick={togglePause}>
             {detail.monitor.status === 'paused' ? 'Resume' : 'Pause'}
           </Button>

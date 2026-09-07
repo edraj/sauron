@@ -3,6 +3,8 @@
 //! previous step's time), plus conversion ratios.
 
 use axum::extract::{Path, Query, RawQuery, State};
+
+use crate::routes::analytics::ForceQuery;
 use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -66,7 +68,7 @@ them as query parameters is the documented cause of a 422 here.
 Cost grows sharply with step count, and a deep funnel over a wide window can \
 exceed the request budget — the guard inspects the query plan and refuses \
 rather than running something that would time out.",
-    params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
+    params(("app_id" = Uuid, Path, description = "The app."), ForceQuery), security(("bearerAuth" = [])),
     request_body(content = FunnelReq, description = "Ordered steps and the window.", example = json!({
         "steps": [
             { "event": "app_open" },
@@ -87,6 +89,9 @@ pub async fn compute(
     auth: AuthUser,
     State(state): State<AppState>,
     Path(app_id): Path<Uuid>,
+    // Before the `Json` body, which must stay last — body-consuming extractors
+    // have to come after every other one.
+    Query(f): Query<ForceQuery>,
     RawQuery(raw_query): RawQuery,
     Json(req): Json<FunnelReq>,
 ) -> Result<Json<crate::view_cache::Envelope>, ApiError> {
@@ -125,8 +130,9 @@ pub async fn compute(
     // that is most of the 60 s budget spent before anything can be rendered, and
     // past it a 503 with nothing behind it.
     let key = funnel_cache_key(app_id, &scope, &win, &req.steps)?;
+    let force = crate::view_cache::honour_force(&state, f.force, &key).await;
     let (envelope, should_recompute) =
-        crate::view_cache::read(&state.redis, &key, &FUNNEL_POLICY, false).await;
+        crate::view_cache::read(&state.redis, &key, &FUNNEL_POLICY, force).await;
     if should_recompute {
         enqueue_funnel(&state, scope, win, req.steps.clone(), key);
     }

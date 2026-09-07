@@ -100,6 +100,39 @@ export async function resetMemberPassword(
   return data;
 }
 
+/**
+ * Open a pending change to a member's sign-in address.
+ *
+ * Returns with NOTHING changed: the address moves only when the new mailbox
+ * confirms. The member's current address is mailed a link that cancels it, and
+ * is deliberately never told what the new address is.
+ *
+ * Goes through `api`, not `bareClient` — it needs the bearer, and requires
+ * `member:credential` rather than plain `member:manage`.
+ */
+export async function requestMemberEmailChange(
+  orgId: string,
+  userId: string,
+  newEmail: string,
+): Promise<{ new_email: string; expires_at: string }> {
+  const { data } = await api.post<{ new_email: string; expires_at: string }>(
+    `/v1/orgs/${orgId}/members/${userId}/email-change`,
+    { new_email: newEmail },
+  );
+  return data;
+}
+
+/**
+ * Withdraw a pending change.
+ *
+ * Unlike the request, this works on a deployment with no SMTP configured:
+ * gating the undo on the configuration whose failure motivates it would make it
+ * unreachable in exactly the deployment that needs it.
+ */
+export async function cancelMemberEmailChange(orgId: string, userId: string): Promise<void> {
+  await api.delete(`/v1/orgs/${orgId}/members/${userId}/email-change`);
+}
+
 export async function updateGrant(
   grantId: string,
   body: UpdateGrantPayload,

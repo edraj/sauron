@@ -69,6 +69,19 @@ pub struct Envelope {
     /// "here are yesterday's numbers, and the refresh is currently broken".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether a recompute is being started as a result of THIS read.
+    ///
+    /// Separate from `state`, because they answer different questions that were
+    /// previously conflated: `state` is about how old `data` is, this is about
+    /// whether fresher data is on its way. They come apart precisely on a
+    /// forced read of an entry that is still inside its freshness window —
+    /// `state` is `Fresh` and correct, and a client watching only `state` would
+    /// conclude the Refresh it just requested had already finished.
+    ///
+    /// Added rather than folding the condition into `state`: making `state`
+    /// report `Stale` here would relabel by-policy-fresh data as stale for
+    /// every existing consumer, including the Overview freshness chip.
+    pub recomputing: bool,
 }
 
 /// The cached document. `computed_at` travels with the payload rather than
@@ -174,6 +187,69 @@ pub fn env_token(env: &EnvFilter) -> String {
     }
 }
 
+/// One honoured force per cache entry per this many seconds, shared across all
+/// users.
+pub const FORCE_COOLDOWN_SECS: u64 = 30;
+
+/// Decide whether a requested `force` is actually honoured, and prepare for it.
+///
+/// # Why the budget is keyed on the CACHE KEY
+///
+/// The obvious key is `{app_id}:{env}`, one budget per app-and-scope. It does
+/// not work: `active_users` is PROJECT-scoped and `admin::storage` is
+/// deployment-wide, so neither has an `app_id` to key on. The cache key already
+/// encodes whatever scope its route actually has, which makes it the only
+/// identifier every caller can supply.
+///
+/// It also produces the behaviour that was actually wanted. One user clicking
+/// Refresh on Overview spends five separate budgets and gets five recomputes —
+/// correct, because those are five different aggregates and all of them are
+/// stale. A second user clicking ten seconds later finds all five exhausted and
+/// is served the cached envelope — which is the "ten people clicking costs one
+/// recompute" property. A single budget per app would have let the first user's
+/// click block their own remaining four sections.
+///
+/// # Why `within_budget` and not `rate_limit`
+///
+/// An exhausted budget must DOWNGRADE the force to an ordinary cached read,
+/// never return 429. The recompute whose budget was spent is already running,
+/// so the correct answer is the cached envelope — and a 429 would break a page
+/// render over a control the user pressed hopefully. The response still reports
+/// `Stale`/`Computing`, so the client keeps polling and receives the fresh
+/// value when that in-flight recompute lands.
+///
+/// `within_budget` degrades to a per-process fallback when Redis is slow, which
+/// is the right direction here: a degraded cooldown allows more forces per
+/// replica, and the single-flight claim plus the concurrency semaphore are both
+/// still in front of the aggregate.
+///
+/// # The failure marker
+///
+/// [`read`] suppresses re-enqueue under a failure marker EVEN WHEN FORCED, so
+/// without clearing it a user clicking Refresh on a recently-failed section
+/// gets no attempt at all — and, with the spin-until-fresh button, a spinner
+/// that runs to its cap. An honoured force therefore deletes the marker.
+///
+/// A DOWNGRADED force must not: that is precisely what keeps the cooldown
+/// bounding retries of a permanently broken aggregate. The marker keeps its
+/// full effect for automatic background revalidation, which is its actual
+/// purpose — a person asking for data is a different question from a poll
+/// asking on its own initiative.
+pub async fn honour_force(state: &crate::AppState, requested: bool, key: &str) -> bool {
+    if !requested {
+        return false;
+    }
+    let budget_key = format!("sauron:cache:force:{key}");
+    if !crate::routes::auth::within_budget(state, &budget_key, 1, FORCE_COOLDOWN_SECS).await {
+        return false;
+    }
+    // Best-effort: a failed delete leaves the marker in place, which degrades
+    // to "this force behaves like an unforced read" rather than to anything
+    // unsafe.
+    let _ = tokio::time::timeout(CACHE_OP_TIMEOUT, state.redis.del(&fail_key(key))).await;
+    true
+}
+
 pub fn fail_key(key: &str) -> String {
     format!("{key}:fail")
 }
@@ -254,12 +330,14 @@ pub async fn read(
             computed_at: Some(e.computed_at),
             data: Some(e.data),
             error,
+            recomputing: should_recompute,
         },
         None => Envelope {
             state: Freshness::Computing,
             computed_at: None,
             data: None,
             error,
+            recomputing: should_recompute,
         },
     };
     (envelope, should_recompute)

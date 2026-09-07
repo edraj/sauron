@@ -869,6 +869,239 @@ pub async fn prune_password_reset_tokens(
     .await
 }
 
+// --- email change requests ---------------------------------------------------
+
+/// Written to `email_change_requests.cancelled_reason`. Stable wire strings: the
+/// CHECK in migration 000076 matches on them, and the audit trail reads them to
+/// tell "the member rejected an admin's attempt" — the signal worth
+/// investigating — from "the admin withdrew it", which is routine.
+pub const EMAIL_CHANGE_CANCELLED_USER: &str = "user";
+pub const EMAIL_CHANGE_CANCELLED_ADMIN: &str = "admin";
+pub const EMAIL_CHANGE_CANCELLED_SUPERSEDED: &str = "superseded";
+
+/// Open a pending change to a user's login address.
+///
+/// A `UniqueViolation` means either a concurrent admin won this user's single
+/// live slot (`email_change_one_live_per_user`) or a token hash collided.
+/// Callers map it to 409 rather than retrying: a silent retry would discard
+/// whichever admin's address lost the race.
+pub async fn insert_email_change_request(
+    conn: &mut AsyncPgConnection,
+    req: NewEmailChangeRequest,
+) -> QueryResult<EmailChangeRequest> {
+    diesel::insert_into(email_change_requests::table)
+        .values(req)
+        .returning(EmailChangeRequest::as_returning())
+        .get_result(conn)
+        .await
+}
+
+/// The approve link's row, if it still works.
+pub async fn find_live_email_change_by_approve_token(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+) -> QueryResult<Option<EmailChangeRequest>> {
+    email_change_requests::table
+        .filter(email_change_requests::approve_token_hash.eq(token_hash))
+        .filter(email_change_requests::approved_at.is_null())
+        .filter(email_change_requests::cancelled_at.is_null())
+        .filter(email_change_requests::expires_at.gt(Utc::now()))
+        .select(EmailChangeRequest::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// The veto link's row, if it still works.
+pub async fn find_live_email_change_by_cancel_token(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+) -> QueryResult<Option<EmailChangeRequest>> {
+    email_change_requests::table
+        .filter(email_change_requests::cancel_token_hash.eq(token_hash))
+        .filter(email_change_requests::approved_at.is_null())
+        .filter(email_change_requests::cancelled_at.is_null())
+        .filter(email_change_requests::expires_at.gt(Utc::now()))
+        .select(EmailChangeRequest::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+/// Whatever this user currently has outstanding.
+pub async fn find_live_email_change_for_user(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> QueryResult<Option<EmailChangeRequest>> {
+    email_change_requests::table
+        .filter(email_change_requests::user_id.eq(user_id))
+        .filter(email_change_requests::approved_at.is_null())
+        .filter(email_change_requests::cancelled_at.is_null())
+        .filter(email_change_requests::expires_at.gt(Utc::now()))
+        .select(EmailChangeRequest::as_select())
+        .first(conn)
+        .await
+        .optional()
+}
+
+#[derive(QueryableByName)]
+struct ConsumedEmailChangeRow {
+    #[diesel(sql_type = SqlUuid)]
+    user_id: Uuid,
+    #[diesel(sql_type = Text)]
+    new_email: String,
+}
+
+/// Burn an approve link, atomically. Returns `(user_id, new_email)`.
+///
+/// `expected_fingerprint` is `lower(users.email)` as the caller just read it,
+/// and it is matched INSIDE this statement rather than checked beforehand.
+/// That is one statement tighter than [`consume_password_reset_token`], which
+/// checks its fingerprint on a prior read: a read-then-burn leaves a window in
+/// which the address moves between the two, and the burn would then apply a
+/// change the fingerprint exists to stop.
+///
+/// Zero rows means the link was already burned, vetoed, expired, or is stale.
+/// One `UPDATE … RETURNING` rather than a SELECT then an UPDATE because
+/// single-use is the whole security property and `conn.transaction` is
+/// unavailable (async closures need Rust 1.85; workspace MSRV is 1.82 per
+/// `packaging/rpm/sauron.spec`).
+pub async fn consume_email_change_approval(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+    expected_fingerprint: &str,
+) -> QueryResult<Option<(Uuid, String)>> {
+    let row: Option<ConsumedEmailChangeRow> = diesel::sql_query(
+        "UPDATE email_change_requests SET approved_at = now() \
+         WHERE approve_token_hash = $1 AND approved_at IS NULL AND cancelled_at IS NULL \
+           AND expires_at > now() AND email_fingerprint = $2 \
+         RETURNING user_id, new_email",
+    )
+    .bind::<Text, _>(token_hash)
+    .bind::<Text, _>(expected_fingerprint)
+    .get_result(conn)
+    .await
+    .optional()?;
+    Ok(row.map(|r| (r.user_id, r.new_email)))
+}
+
+#[derive(QueryableByName)]
+struct CancelledEmailChangeRow {
+    #[diesel(sql_type = SqlUuid)]
+    user_id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    org_id: Uuid,
+}
+
+/// Burn a veto link, atomically. Returns `(user_id, org_id)`.
+///
+/// The org comes back because the caller is unauthenticated — the token is all
+/// it has, and the audit entry has to land somewhere.
+///
+/// Deliberately does NOT return `new_email`. This is the old address's path,
+/// and the whole point of the mail carrying this token is that it never learns
+/// the new address. A convenience return value here would be the one place that
+/// rule could leak from.
+pub async fn cancel_email_change_by_cancel_token(
+    conn: &mut AsyncPgConnection,
+    token_hash: &str,
+) -> QueryResult<Option<(Uuid, Uuid)>> {
+    let row: Option<CancelledEmailChangeRow> = diesel::sql_query(
+        "UPDATE email_change_requests SET cancelled_at = now(), cancelled_reason = 'user' \
+         WHERE cancel_token_hash = $1 AND approved_at IS NULL AND cancelled_at IS NULL \
+           AND expires_at > now() \
+         RETURNING user_id, org_id",
+    )
+    .bind::<Text, _>(token_hash)
+    .get_result(conn)
+    .await
+    .optional()?;
+    Ok(row.map(|r| (r.user_id, r.org_id)))
+}
+
+/// Kill whatever this user has outstanding. Serves both the admin withdrawal
+/// and the supersede step of a new request; the caller picks the reason.
+pub async fn cancel_live_email_change_for_user(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    reason: &str,
+) -> QueryResult<usize> {
+    diesel::update(
+        email_change_requests::table
+            .filter(email_change_requests::user_id.eq(user_id))
+            .filter(email_change_requests::approved_at.is_null())
+            .filter(email_change_requests::cancelled_at.is_null()),
+    )
+    .set((
+        email_change_requests::cancelled_at.eq(Utc::now()),
+        email_change_requests::cancelled_reason.eq(reason),
+    ))
+    .execute(conn)
+    .await
+}
+
+/// `(user_id, new_email, expires_at)` for every live request in the org — what
+/// the members list badges. Rides `email_change_live_by_org`, and is bounded by
+/// the org's member count because at most one row per user can be live.
+pub async fn live_email_changes_for_org(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+) -> QueryResult<Vec<(Uuid, String, DateTime<Utc>)>> {
+    email_change_requests::table
+        .filter(email_change_requests::org_id.eq(org_id))
+        .filter(email_change_requests::approved_at.is_null())
+        .filter(email_change_requests::cancelled_at.is_null())
+        .filter(email_change_requests::expires_at.gt(Utc::now()))
+        .select((
+            email_change_requests::user_id,
+            email_change_requests::new_email,
+            email_change_requests::expires_at,
+        ))
+        .load(conn)
+        .await
+}
+
+/// Move the login identity.
+///
+/// Lower-cases on the way in: `users_email_lower_key` is on `lower(email)` and
+/// [`find_user_by_email`] lower-cases its argument, so a mixed-case write would
+/// still be findable — but two rows differing only in case could then both
+/// exist, and which one authenticates would depend on insertion order.
+///
+/// A `UniqueViolation` means the address was claimed since the request was
+/// issued; the caller reports 409 rather than retrying. `updated_at` moves with
+/// it, because this is a change to the account and not bookkeeping.
+pub async fn set_user_email(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    email: &str,
+) -> QueryResult<usize> {
+    diesel::update(users::table.filter(users::id.eq(user_id)))
+        .set((
+            users::email.eq(email.to_lowercase()),
+            users::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
+}
+
+/// Deletes by `created_at`, not `expires_at`, so a resolved request's trace
+/// survives a fixed window regardless of its TTL. Same reasoning as
+/// [`prune_password_reset_tokens`], and the two run in the same reaper tick:
+/// this row is the only record that an admin tried to move someone's login
+/// identity.
+pub async fn prune_email_change_requests(
+    conn: &mut AsyncPgConnection,
+    older_than_days: i64,
+) -> QueryResult<usize> {
+    diesel::sql_query(
+        "DELETE FROM email_change_requests WHERE created_at < now() - ($1 || ' days')::interval",
+    )
+    .bind::<Text, _>(older_than_days.to_string())
+    .execute(conn)
+    .await
+}
+
 /// Set the forced-change flag and nothing else.
 ///
 /// Deliberately not routed through [`set_user_password`]: that one clears

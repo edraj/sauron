@@ -14,6 +14,8 @@ pub enum MailKind {
     NotificationDigest,
     PersonalNotification,
     SmtpTest,
+    EmailChangeNotice,
+    EmailChangeApproval,
 }
 
 impl MailKind {
@@ -25,6 +27,8 @@ impl MailKind {
             MailKind::NotificationDigest => "notification_digest",
             MailKind::PersonalNotification => "personal_notification",
             MailKind::SmtpTest => "smtp_test",
+            MailKind::EmailChangeNotice => "email_change_notice",
+            MailKind::EmailChangeApproval => "email_change_approval",
         }
     }
 
@@ -42,6 +46,8 @@ impl MailKind {
             MailKind::NotificationDigest => Duration::from_secs(900),
             MailKind::PersonalNotification => Duration::ZERO,
             MailKind::SmtpTest => Duration::ZERO,
+            MailKind::EmailChangeNotice => Duration::ZERO,
+            MailKind::EmailChangeApproval => Duration::ZERO,
         }
     }
 }
@@ -58,6 +64,8 @@ mod tests {
             MailKind::NotificationDigest,
             MailKind::PersonalNotification,
             MailKind::SmtpTest,
+            MailKind::EmailChangeNotice,
+            MailKind::EmailChangeApproval,
         ];
         let names: Vec<&str> = all.iter().map(|k| k.as_str()).collect();
         assert_eq!(
@@ -67,6 +75,8 @@ mod tests {
                 "notification_digest",
                 "personal_notification",
                 "smtp_test",
+                "email_change_notice",
+                "email_change_approval",
             ]
         );
         // These strings are written into `mail_outbox.kind`, which has no CHECK.
@@ -101,5 +111,19 @@ mod tests {
         );
         // An operator clicking "test" twice must get two mails.
         assert_eq!(MailKind::SmtpTest.dedup_window(), Duration::ZERO);
+        // ZERO, and it must stay zero. This is the veto signal: the mail whose
+        // link is a member's only way to stop an admin moving their login
+        // identity. A second request SUPERSEDES the first, so repeat notices to
+        // the SAME old address are a normal event -- and PasswordReset's
+        // 300-second window would swallow the second attempt's warning, which is
+        // exactly the case the veto exists for. Suppression is indistinguishable
+        // from success at the call site (both `Ok(None)`), so the failure would
+        // be silent. The bound is EMAIL_CHANGE_PER_TARGET_PER_HOUR on an
+        // authenticated, member:credential-gated endpoint, not this window.
+        assert_eq!(MailKind::EmailChangeNotice.dedup_window(), Duration::ZERO);
+        // ZERO for a plainer reason: an admin correcting a mistyped address
+        // mails a DIFFERENT recipient, and an admin resending after a bounce
+        // must actually resend.
+        assert_eq!(MailKind::EmailChangeApproval.dedup_window(), Duration::ZERO);
     }
 }

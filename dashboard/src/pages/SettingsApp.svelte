@@ -9,6 +9,8 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import StoreConnectionsCard from '../lib/components/settings/StoreConnectionsCard.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
@@ -53,6 +55,11 @@
    * the axios interceptor puts on the request but which appears in no argument
    * here. Omit it and one environment's response can be served as another's.
    */
+  const refresher = pageRefresher(async () => {
+    const aid = sessionStore.currentAppId;
+    if (aid) await load(aid, true);
+  });
+
   async function load(appId: string, force = false) {
     await view.load(
       viewKey('settings.app', appId, sessionStore.scopeKey),
@@ -122,6 +129,9 @@
 
 <AdminShell>
   <div class="head">
+    <div class="head-actions">
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+    </div>
     <h1 class="page-title">{t('settings.title')}</h1>
     {#if app}
       <p class="muted sub">
@@ -203,6 +213,12 @@
 </AdminShell>
 
 <style>
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    float: right;
+  }
   .head {
     margin-bottom: 20px;
   }

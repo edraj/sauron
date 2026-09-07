@@ -109,6 +109,13 @@ export const routes = {
   // to have; only the import became lazy.)
   '/forgot-password': open(() => import('./pages/ForgotPassword.svelte')),
   '/reset-password': open(() => import('./pages/ResetPassword.svelte')),
+  // Condition-free for exactly the same reasons as the two above, and
+  // deliberately absent from App.svelte's PUBLIC_ROUTES for the reason
+  // '/reset-password' is: that array drives an $effect pushing authenticated
+  // users to /issues, and a signed-in member clicking their own link would be
+  // bounced off the page before they could use it.
+  '/confirm-email-change': open(() => import('./pages/ConfirmEmailChange.svelte')),
+  '/cancel-email-change': open(() => import('./pages/CancelEmailChange.svelte')),
   // Ungated on passwordCurrent — otherwise a temp-password holder redirected
   // here would immediately redirect right back to itself.
   '/change-password': wrap({

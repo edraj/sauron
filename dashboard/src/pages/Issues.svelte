@@ -19,6 +19,7 @@
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import { combineFreshness } from '../lib/models/freshness';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import { rangeStore } from '../lib/stores/range.svelte';
@@ -469,6 +470,12 @@
     }
   }
 
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
+
   // The search box applies on submit only (button/Enter/clear). Filters and
   // the date range still reload immediately; a query, unlike a chip, spends
   // most of its typing life as an invalid fragment.
@@ -538,8 +545,8 @@
       -->
       <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
       <RefreshButton
-        onclick={refresh}
-        loading={refreshing || revalidating || revalidatingStats}
+        onclick={refresher.run}
+        loading={refresher.busy || refreshing || revalidating || revalidatingStats}
         title={revalidating || revalidatingStats ? 'Refreshing…' : 'Refresh'}
       />
     </div>

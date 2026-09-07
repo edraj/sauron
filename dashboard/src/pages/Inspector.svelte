@@ -25,6 +25,8 @@
   import JsonTree from '../lib/components/JsonTree.svelte';
   import MaskDialog from '../lib/components/inspector/MaskDialog.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import Freshness from '../lib/components/ui/Freshness.svelte';
@@ -111,6 +113,15 @@
   };
 
   const view = new CachedView<InspectorPayload>();
+
+  // `reload()` replays the view's most recent key and fetcher with force,
+  // which is exactly what Refresh means here — the page's loads are driven by
+  // effects, so there is no `load(force)` to call and reconstructing the key
+  // by hand would be a second definition of it, free to drift.
+  const refresher = pageRefresher(async () => {
+    await view.reload();
+  });
+
   const payload = $derived(view.data ?? EMPTY_PAYLOAD);
   const effective = $derived(payload.effective);
   const scans = $derived(payload.scans);
@@ -359,6 +370,7 @@
       {t('inspector.title')}
       <Freshness fetchedAt={view.fetchedAt} {revalidating} />
     </h1>
+    <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
     {#if effective}
       <span class="muted">
         New events are masked within about {effective.enforcement_latency_secs} seconds of a change.

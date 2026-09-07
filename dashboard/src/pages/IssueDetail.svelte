@@ -24,6 +24,8 @@
   import { lastDays, toPredicate, type DateRangeValue } from '../lib/models/date-range';
   import { OCCURRENCE_FIELDS, encodeFilters, type Filter } from '../lib/components/filters/filters';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { lockedBy } from '../lib/models/page-access';
   import {
     getIssue,
@@ -68,6 +70,15 @@
   // Cached view (lib/stores/cached-view.svelte.ts): returning to an issue
   // repaints it instantly instead of blanking while the same read runs again.
   const view = new CachedView<IssueDetail>();
+
+  // `reload()` replays the view's most recent key and fetcher with force,
+  // which is exactly what Refresh means here — the page's loads are driven by
+  // effects, so there is no `load(force)` to call and reconstructing the key
+  // by hand would be a second definition of it, free to drift.
+  const refresher = pageRefresher(async () => {
+    await view.reload();
+  });
+
   const issue = $derived(view.data ?? null);
   const loading = $derived(view.loading);
   const revalidating = $derived(view.revalidating);
@@ -618,6 +629,7 @@
         {#if issue.culprit}<p class="culprit mono">{issue.culprit}</p>{/if}
       </div>
         <div class="actions">
+          <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
           {#if issue.status !== 'resolved'}
             <Button
               variant="primary"

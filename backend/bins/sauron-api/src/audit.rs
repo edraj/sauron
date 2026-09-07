@@ -52,6 +52,12 @@ pub mod action {
     pub const MEMBER_ACTIVATE: &str = "member.activate";
     pub const MEMBER_DEACTIVATE: &str = "member.deactivate";
     pub const MEMBER_RESET_PASSWORD: &str = "member.reset_password";
+    pub const MEMBER_EMAIL_CHANGE_REQUEST: &str = "member.email_change_request";
+    pub const MEMBER_EMAIL_CHANGE_APPROVED: &str = "member.email_change_approved";
+    /// Carries `cancelled_reason`: "the member rejected an admin's attempt" is
+    /// the signal worth investigating, "the admin withdrew it" is routine, and
+    /// they must not read the same in a wall of two hundred rows.
+    pub const MEMBER_EMAIL_CHANGE_CANCELLED: &str = "member.email_change_cancelled";
     pub const MEMBER_REVOKE_SESSIONS: &str = "member.revoke_sessions";
 
     pub const ROLE_CREATE: &str = "role.create";
@@ -201,6 +207,17 @@ pub fn allowlist(entity_type: &str) -> &'static [&'static str] {
             "revoked_sessions",
             "reset_action",
             "expires_at",
+            // The address an admin asked to move the account TO. Recording it
+            // is the point of the entry: without it the trail says only that
+            // *some* change was requested, which cannot be reviewed. It is not
+            // a disclosure — the acting admin typed it, and the Wall is an
+            // admin surface. Neither email-change token is ever a candidate:
+            // no allowlist key could carry them.
+            "new_email",
+            // 'user' (the member refused an admin's attempt), 'admin' (the
+            // admin withdrew it), or 'superseded'. The first is the row worth
+            // spotting; without this key all three read identically.
+            "cancelled_reason",
         ],
         entity::ROLE => &["name", "permissions"],
         // `scopes` carries the whole batch: one API call grants a role at N

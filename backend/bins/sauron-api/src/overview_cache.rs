@@ -376,6 +376,11 @@ pub async fn read_section(
     force: bool,
 ) -> Envelope {
     let key = cache_key(section, scope.app_id, &scope.env, &window);
+    // Every Overview caller reaches the cache through here — the five section
+    // GETs and the admin `overview_refresh` alike — so the force cooldown is
+    // applied once, at the single chokepoint, rather than five times at the
+    // call sites where one could be forgotten.
+    let force = view_cache::honour_force(state, force, &key).await;
     // The freshness decision, the envelope and the failure-marker backoff are
     // identical for every cached route and live in `view_cache::read`; what is
     // Overview's own is only what happens on enqueue, below.

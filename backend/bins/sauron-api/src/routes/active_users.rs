@@ -29,6 +29,7 @@ use sauron_db::scope::EnvFilter;
 
 use crate::error::ApiError;
 use crate::openapi::ErrorResponse;
+use crate::routes::analytics::ForceQuery;
 use crate::view_cache::Envelope;
 use crate::AppState;
 
@@ -405,7 +406,7 @@ Results are served stale-while-revalidate: under an hour old they are returned \
 as-is; between one and three hours they are returned immediately and refreshed \
 in the background. `computed_at` states which. A cache hit costs no admission \
 permit.",
-    params(("project_id" = Uuid, Path, description = "The project."), ActiveUsersQuery), security(("bearerAuth" = [])),
+    params(("project_id" = Uuid, Path, description = "The project."), ActiveUsersQuery, ForceQuery), security(("bearerAuth" = [])),
     responses((status = 200, description = "The report, with `computed_at` disclosing its freshness.", body = Envelope),
               (status = 400, description = "Malformed selection or window.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
               (status = 503, description = "Report admission is saturated, or `event_users.identified_at` is missing because migrations have not been run. Retry, or run sauron-migrate.", body = ErrorResponse)),
@@ -415,6 +416,7 @@ pub async fn active_users(
     State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
     Query(q): Query<ActiveUsersQuery>,
+    Query(f): Query<ForceQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Envelope>, ApiError> {
     let inputs = gated_inputs(&state, auth.user_id, project_id, &q, raw_query.as_deref()).await?;
@@ -423,8 +425,9 @@ pub async fn active_users(
     // is a Redis round trip plus the authorization above — it cannot reach the
     // request timeout however slow the report is. That timeout, mapped onto
     // 503, is what this route was reported for.
+    let force = crate::view_cache::honour_force(&state, f.force, &inputs.key).await;
     let (envelope, should_recompute) =
-        crate::view_cache::read(&state.redis, &inputs.key, &POLICY, false).await;
+        crate::view_cache::read(&state.redis, &inputs.key, &POLICY, force).await;
     if should_recompute {
         spawn_refresh(&state, inputs);
     }

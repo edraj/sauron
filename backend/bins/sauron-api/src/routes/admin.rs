@@ -8,6 +8,7 @@ use sauron_db::repo;
 
 use crate::error::ApiError;
 use crate::openapi::ErrorResponse;
+use crate::routes::analytics::ForceQuery;
 use crate::view_cache::Envelope;
 use crate::AppState;
 
@@ -28,7 +29,7 @@ parent reports only the parent's own — near-zero — size).
 
 Rejects `?environment_id=`: storage is a deployment-wide question and \
 environment-scoping it would silently answer something else.",
-    security(("bearerAuth" = [])),
+    params(ForceQuery), security(("bearerAuth" = [])),
     responses(
         (status = 200, description = "Database, table and per-app sizes, in a cache envelope: a cold read answers `computing` with a null `data` and the report follows.", body = Envelope),
         (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "Requires an org-owner grant.", body = ErrorResponse),
@@ -39,6 +40,7 @@ pub async fn storage(
     auth: AuthUser,
     State(state): State<AppState>,
     Query(env): Query<super::scope::RejectEnvQuery>,
+    Query(f): Query<ForceQuery>,
 ) -> Result<Json<Envelope>, ApiError> {
     // The report is a per-org rollup across every app; there is no single
     // environment to scope it to, so the parameter is rejected rather than
@@ -84,8 +86,9 @@ pub async fn storage(
     // scales with both apps in scope and retained rows. Run on the request path
     // behind a read-through cache, one unlucky caller per TTL paid all of it and
     // crossed the 60 s budget, which is a 503 with nothing behind it.
+    let force = crate::view_cache::honour_force(&state, f.force, &key).await;
     let (envelope, should_recompute) =
-        crate::view_cache::read(&state.redis, &key, &STORAGE_POLICY, false).await;
+        crate::view_cache::read(&state.redis, &key, &STORAGE_POLICY, force).await;
     if should_recompute {
         enqueue_storage(&state, org_ids, key);
     }

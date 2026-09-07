@@ -24,8 +24,11 @@ use sauron_db::AsyncPgConnection;
 use sauron_mail::MailKind;
 
 use super::auth::{
-    client_addr, rate_limit, render_password_reset_mail, reset_link, ResetMailVars, ResetMode,
-    ADMIN_RESET_PER_CALLER_PER_HOUR, ADMIN_RESET_PER_TARGET_PER_HOUR, ADMIN_RESET_TTL_SECS,
+    client_addr, email_change_cancel_link, email_change_confirm_link, rate_limit,
+    render_email_change_approval, render_email_change_notice, render_password_reset_mail,
+    reset_link, EmailChangeMailVars, ResetMailVars, ResetMode, ADMIN_RESET_PER_CALLER_PER_HOUR,
+    ADMIN_RESET_PER_TARGET_PER_HOUR, ADMIN_RESET_TTL_SECS, EMAIL_CHANGE_PER_CALLER_PER_HOUR,
+    EMAIL_CHANGE_PER_TARGET_PER_HOUR, EMAIL_CHANGE_TTL_SECS,
 };
 use super::{db, slugify};
 use crate::error::ApiError;
@@ -286,6 +289,14 @@ pub async fn access(
 
 // --- members / grants -------------------------------------------------------
 
+/// A change to this member's sign-in address, awaiting the new address's
+/// confirmation.
+#[derive(Serialize, Clone, utoipa::ToSchema)]
+pub struct PendingEmailChange {
+    pub new_email: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct MemberGrant {
     pub id: Uuid,
@@ -305,6 +316,14 @@ pub struct MemberGrant {
     /// which is the same as not existing, since the admin who needs it is
     /// looking at a members table, not at `curl`.
     pub credentials_invalidated_at: Option<DateTime<Utc>>,
+    /// Non-null while a change to this member's email awaits confirmation.
+    ///
+    /// Same reasoning as the field above: `GET /v1/orgs/{org}/members` is the
+    /// only place the dashboard learns anything about a member's account state,
+    /// and without this the withdraw action exists on the server and is
+    /// unreachable from the UI — which is the same as not existing, since the
+    /// admin who needs it is looking at a members table, not at `curl`.
+    pub pending_email_change: Option<PendingEmailChange>,
 }
 
 #[utoipa::path(
@@ -323,10 +342,29 @@ pub async fn list_members(
     let mut conn = db(&state).await?;
     authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_READ).await?;
     let rows = repo::list_org_grants(&mut conn, org_id).await?;
+    // A second query rather than a seventh element on `list_org_grants`'s
+    // already-six-wide tuple, which several callers destructure positionally.
+    // Bounded by the org's member count — the partial unique index allows at
+    // most one live request per user — and rides `email_change_live_by_org`.
+    let pending: HashMap<Uuid, PendingEmailChange> =
+        repo::live_email_changes_for_org(&mut conn, org_id)
+            .await?
+            .into_iter()
+            .map(|(user_id, new_email, expires_at)| {
+                (
+                    user_id,
+                    PendingEmailChange {
+                        new_email,
+                        expires_at,
+                    },
+                )
+            })
+            .collect();
     let members = rows
         .into_iter()
         .map(
             |(g, email, name, role_name, is_active, credentials_invalidated_at)| MemberGrant {
+                pending_email_change: pending.get(&g.user_id).cloned(),
                 id: g.id,
                 user_id: g.user_id,
                 email,
@@ -1728,6 +1766,393 @@ pub async fn reset_member_password(
         "action": "reset",
         "expires_at": expires_at.to_rfc3339(),
     })))
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct RequestEmailChangeReq {
+    pub new_email: String,
+}
+
+/// Open a pending change to a member's sign-in address.
+///
+/// Nothing changes when this returns. `users.email` moves only when the holder
+/// of the NEW address confirms, and the holder of the OLD address is mailed a
+/// link that stops it. That veto is what keeps `member:credential` from being an
+/// account-takeover primitive: an admin who could move a login identity silently
+/// could park an account on an address they control and then walk in through the
+/// ordinary forgotten-password flow.
+///
+/// The old address is deliberately never told what the new one is — see
+/// `EmailChangeMailVars`, which has no field for it.
+///
+/// A second request supersedes the first. That is enforced by
+/// `email_change_one_live_per_user`, a partial unique index, and NOT by the
+/// supersede call below: two concurrent admins both pass the supersede step, and
+/// only the index stops both inserting. The difference is one live approve link
+/// versus two, and a second live link is a mistyped domain holding a standing
+/// claim on the account for 24 hours.
+///
+/// There is deliberately no last-`org:manage` guard: a pending email change
+/// removes nobody's permission, so an org can never be orphaned by it.
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/members/{user_id}/email-change", tag = "Organizations",
+    summary = "Request a change to a member's email",
+    description = "\
+Mails the new address a confirmation link valid for 24 hours, and the current \
+address a notice carrying a link that cancels the request. The current address \
+is never told what the new one is.
+
+Nothing changes until the new address confirms. Refused for a member holding \
+grants outside this organization.",
+    params(("org_id" = Uuid, Path, description = "The organization."), ("user_id" = Uuid, Path, description = "The member.")),
+    security(("bearerAuth" = [])),
+    request_body(content = RequestEmailChangeReq),
+    responses(
+        (status = 200, description = "Request opened and both mails queued.", body = OkResponse),
+        (status = 400, description = "The address is not usable.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+        (status = 403, description = "Requires member-credential permission, or the member outranks the caller.", body = ErrorResponse),
+        (status = 404, description = "Not a member of this organization.", body = ErrorResponse),
+        (status = 409, description = "Address already in use or unchanged, member inactive or in another org, or a concurrent request won.", body = ErrorResponse),
+        (status = 429, description = "Per-caller or per-target limit exhausted.", body = ErrorResponse),
+        (status = 503, description = "SMTP is not configured on this deployment.", body = ErrorResponse),
+    ),
+)]
+pub async fn request_member_email_change(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Path((org_id, user_id)): Path<(Uuid, Uuid)>,
+    // Body-consuming extractor, so it stays last.
+    Json(req): Json<RequestEmailChangeReq>,
+) -> Result<Json<Value>, ApiError> {
+    let mut conn = db(&state).await?;
+
+    // `member:credential` in ADDITION to the `member:manage` that
+    // `guard_member_admin_action` demands first. Moving someone's login identity
+    // is at least as severe as forcing their password reset, and an org that
+    // handed out routine grant administration has not agreed to it. The narrower
+    // permission narrows the broader one; it never stands in for it.
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_CREDENTIAL).await?;
+
+    // Resolved BEFORE anything is written, exactly as `reset_member_password`
+    // does: a pending change must never exist when the mail carrying its veto
+    // cannot be sent. Unlike that endpoint there is no cancel-style exemption
+    // here, because this handler has no non-mailing mode — the DELETE sibling is
+    // the undo, and it deliberately never touches mail config.
+    let mail = state.mail.as_ref().cloned().ok_or_else(|| {
+        ApiError::Unavailable(
+            "unavailable",
+            "SMTP is not configured on this server".into(),
+        )
+    })?;
+    let dashboard_url = state
+        .cfg
+        .require_dashboard_url()
+        .map_err(|e| ApiError::Unavailable("unavailable", e.to_string()))?
+        .to_string();
+
+    // Validated with the SAME normalizer the mail path uses, not a `contains('@')`
+    // approximation. `MailSender::enqueue` ends in `normalize_recipient`, which
+    // is lettre's `Address::from_str` and rejects plenty that a naive check
+    // accepts (`newuser@`, a bare domain, an embedded space). A looser check
+    // here is not merely permissive — by the time the strict one runs, the row
+    // is inserted and the veto notice already queued, so the request fails 500
+    // having warned the member about a change that can never complete, with the
+    // single live slot occupied for the next 24 hours.
+    let new_email = sauron_mail::normalize_recipient(&req.new_email)
+        .map_err(|_| ApiError::BadRequest("a valid email is required".into()))?;
+    if new_email.len() > 320 {
+        return Err(ApiError::BadRequest("a valid email is required".into()));
+    }
+
+    // Format is checked BEFORE the limiters, and that ordering is a usability
+    // decision rather than an accident: a malformed address is the admin's own
+    // typo, they will retype it immediately, and spending the per-target budget
+    // on it means five typos lock them out of that member for an hour. The
+    // checks that need the database (unchanged, already-taken) still sit after
+    // the guard stack — those cost a query and must not run for a caller with
+    // no standing to ask.
+    rate_limit(
+        &state,
+        &format!("sauron:auth:emailchange:{}", auth.user_id),
+        EMAIL_CHANGE_PER_CALLER_PER_HOUR,
+        3600,
+    )
+    .await?;
+    rate_limit(
+        &state,
+        &format!("sauron:auth:emailchange:target:{user_id}"),
+        EMAIL_CHANGE_PER_TARGET_PER_HOUR,
+        3600,
+    )
+    .await?;
+
+    // The whole shared stack: `member:manage`, user-exists 404, grant-in-this-org
+    // 404, self-target 409, no-escalation against the target's full union, and
+    // the unconditional cross-org refusal. `allow_self` is false — self-service
+    // is explicitly out of scope for this feature, and an admin editing their own
+    // address belongs on an account page where their password can be demanded.
+    let _target_grants =
+        guard_member_admin_action(&mut conn, auth.user_id, org_id, user_id, false).await?;
+
+    let user = repo::get_user(&mut conn, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Same spirit as `create_grant`'s refusal to grant to an inactive account: a
+    // deactivated user's reach never grows, and an address is reach.
+    if !user.is_active {
+        return Err(ApiError::Conflict(
+            "reactivate this member before changing their email".into(),
+        ));
+    }
+
+    // `users_email_lower_key` is on `lower(email)`, so the comparison is too.
+    if new_email == user.email.to_lowercase() {
+        return Err(ApiError::Conflict(
+            "that is already this member's address".into(),
+        ));
+    }
+    // Checked here for a usable error message, re-checked at confirm time
+    // because `create_member` can claim the address inside the link's 24-hour
+    // life, and enforced a third time by the unique index — neither check is a
+    // lock.
+    if repo::find_user_by_email(&mut conn, &new_email)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::Conflict(
+            "a user with that email already exists".into(),
+        ));
+    }
+
+    // Best-effort; the index below is the guarantee. This exists so the ordinary
+    // single-admin case reads as "supersede" rather than as a 409 the admin has
+    // to resolve by hand.
+    repo::cancel_live_email_change_for_user(
+        &mut conn,
+        user_id,
+        repo::EMAIL_CHANGE_CANCELLED_SUPERSEDED,
+    )
+    .await?;
+
+    let approve_raw = sauron_core::ids::opaque_token();
+    let cancel_raw = sauron_core::ids::opaque_token();
+    let expires_at = Utc::now() + chrono::Duration::seconds(EMAIL_CHANGE_TTL_SECS);
+
+    match repo::insert_email_change_request(
+        &mut conn,
+        sauron_db::models::NewEmailChangeRequest {
+            user_id,
+            org_id,
+            new_email: new_email.clone(),
+            approve_token_hash: sauron_auth::hash_token(&approve_raw),
+            cancel_token_hash: sauron_auth::hash_token(&cancel_raw),
+            // What the confirm path re-checks, inside the same UPDATE that burns
+            // the token. If the address has moved by then, this link is stale.
+            email_fingerprint: user.email.to_lowercase(),
+            initiated_by: Some(auth.user_id),
+            // Populated here and not on any anonymous path's behalf: an
+            // identified admin's address is the half of the trail that matters.
+            requested_from: Some(client_addr(&headers, &peer, &state)),
+            expires_at,
+        },
+    )
+    .await
+    {
+        Ok(_) => {}
+        // Another admin opened a request for this member between our supersede
+        // and our insert. Reporting it is right: a silent retry would mean
+        // whichever admin lost the race has their address quietly discarded
+        // while the response tells them it was accepted.
+        Err(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        )) => {
+            return Err(ApiError::Conflict(
+                "another administrator just opened a change for this member — reload and try again"
+                    .into(),
+            ))
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let org = repo::get_org(&mut conn, org_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let org_name = org.name.clone();
+    let display_name = if user.name.trim().is_empty() {
+        user.email.clone()
+    } else {
+        user.name.clone()
+    };
+    let old_email = user.email.clone();
+
+    // Recorded while the connection is held and BEFORE either enqueue: the
+    // pending row exists whether or not the mail goes out, and auditing
+    // afterwards would lose exactly the case worth investigating — a request
+    // opened but never announced. Neither raw token is recorded. The new address
+    // is: the acting admin typed it, and the audit log is an admin surface, so
+    // it discloses nothing the reader could not already see.
+    crate::audit::record(
+        &mut conn,
+        auth.user_id,
+        crate::audit::Entry::new(
+            org_id,
+            crate::audit::action::MEMBER_EMAIL_CHANGE_REQUEST,
+            crate::audit::entity::MEMBER,
+        )
+        .target(user_id, &old_email)
+        .changes(crate::audit::created(
+            crate::audit::entity::MEMBER,
+            &[
+                ("new_email", json!(new_email)),
+                ("expires_at", json!(expires_at)),
+            ],
+        )),
+    )
+    .await;
+
+    // `MailSender` checks out its own pooled connection; see the identical drop
+    // and its full reasoning in `routes::auth::forgot_password`.
+    drop(conn);
+
+    let ttl = std::time::Duration::from_secs(EMAIL_CHANGE_TTL_SECS as u64);
+
+    // THE NOTICE GOES FIRST, and the order is the point. If only one of these two
+    // enqueues survives, it must be the one carrying the veto: a member who is
+    // warned but never sees a confirm link loses nothing, because the request
+    // lapses in 24 hours — while a member whose new address can confirm but who
+    // was never warned has lost the only control they have.
+    let notice = render_email_change_notice(EmailChangeMailVars {
+        display_name: &display_name,
+        org_name: &org_name,
+        url: &email_change_cancel_link(&dashboard_url, &cancel_raw),
+    })
+    // Unreachable rather than merely unlikely: the only fallible step is
+    // `Cta::new` refusing a non-http(s) href, and `require_dashboard_url()`
+    // already returned Ok, which happens only for an http(s) origin. It must NOT
+    // become a 503 — by here the row exists, and a 503 claims nothing was applied.
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    mail.enqueue(
+        MailKind::EmailChangeNotice,
+        &old_email,
+        &notice,
+        Some(user_id),
+        ttl,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let approval = render_email_change_approval(EmailChangeMailVars {
+        display_name: &display_name,
+        org_name: &org_name,
+        url: &email_change_confirm_link(&dashboard_url, &approve_raw),
+    })
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // `user_id` is passed for the outbox's own bookkeeping, but note the
+    // recipient is an address the account does not own yet — which is exactly
+    // why the notice above went to the address it does own.
+    mail.enqueue(
+        MailKind::EmailChangeApproval,
+        &new_email,
+        &approval,
+        Some(user_id),
+        ttl,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Never returns either raw token under any condition: those links are an
+    // account-takeover primitive, and `member:credential` lets its holder
+    // disrupt a member's account, not sign in as them.
+    Ok(Json(json!({
+        "ok": true,
+        "new_email": new_email,
+        "expires_at": expires_at.to_rfc3339(),
+    })))
+}
+
+/// Withdraw a pending change to a member's email.
+///
+/// Deliberately does not require SMTP. Gating the undo on the configuration
+/// whose failure motivates it would make it unreachable in precisely the
+/// deployment that needs it — the same reasoning `reset_member_password`'s
+/// `cancel` arm records.
+///
+/// Spends the per-caller budget only. It sends no mail and can only ever
+/// withdraw, so charging it to the per-target bucket would mean an admin who
+/// opened five requests in an hour cannot withdraw the fifth: a limiter blocking
+/// the remedy for the thing it was limiting.
+#[utoipa::path(
+    delete, path = "/v1/orgs/{org_id}/members/{user_id}/email-change", tag = "Organizations",
+    summary = "Withdraw a pending email change",
+    description = "Invalidates the outstanding confirmation link. Safe to call when nothing is pending — it reports `withdrawn: false`.",
+    params(("org_id" = Uuid, Path, description = "The organization."), ("user_id" = Uuid, Path, description = "The member.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "Withdrawn, or nothing was pending.", body = OkResponse),
+        (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+        (status = 403, description = "Requires member-credential permission.", body = ErrorResponse),
+        (status = 404, description = "Not a member of this organization.", body = ErrorResponse),
+        (status = 429, description = "Per-caller limit exhausted.", body = ErrorResponse),
+    ),
+)]
+pub async fn cancel_member_email_change(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((org_id, user_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_CREDENTIAL).await?;
+    rate_limit(
+        &state,
+        &format!("sauron:auth:emailchange:{}", auth.user_id),
+        EMAIL_CHANGE_PER_CALLER_PER_HOUR,
+        3600,
+    )
+    .await?;
+    let _ = guard_member_admin_action(&mut conn, auth.user_id, org_id, user_id, false).await?;
+
+    // Read BEFORE cancelling, because `cancel_live_email_change_for_user`
+    // deliberately ignores `expires_at`: an expired-but-uncancelled row still
+    // occupies `email_change_one_live_per_user`, so supersede has to clear it
+    // too. That makes its row count "rows tidied", not "requests withdrawn" —
+    // and reporting `withdrawn: true` for a request that lapsed hours ago, plus
+    // filing a cancellation audit entry for it, would both be untrue.
+    let was_live = repo::find_live_email_change_for_user(&mut conn, user_id)
+        .await?
+        .is_some();
+    repo::cancel_live_email_change_for_user(&mut conn, user_id, repo::EMAIL_CHANGE_CANCELLED_ADMIN)
+        .await?;
+    let n = usize::from(was_live);
+
+    // No live request, no event. A DELETE against a member with nothing pending
+    // is a no-op an admin may issue by reflex, and auditing it would bury the
+    // entries that mean something.
+    if n > 0 {
+        let target_email = repo::user_email(&mut conn, user_id)
+            .await?
+            .unwrap_or_default();
+        crate::audit::record(
+            &mut conn,
+            auth.user_id,
+            crate::audit::Entry::new(
+                org_id,
+                crate::audit::action::MEMBER_EMAIL_CHANGE_CANCELLED,
+                crate::audit::entity::MEMBER,
+            )
+            .target(user_id, &target_email)
+            .changes(crate::audit::created(
+                crate::audit::entity::MEMBER,
+                &[("cancelled_reason", json!("admin"))],
+            )),
+        )
+        .await;
+    }
+
+    Ok(Json(json!({ "ok": true, "withdrawn": n > 0 })))
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

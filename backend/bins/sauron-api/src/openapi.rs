@@ -134,6 +134,9 @@ its own document — select \"Sauron Ingest\" above.",
         crate::routes::auth::logout,
         crate::routes::auth::forgot_password,
         crate::routes::auth::reset_password,
+        crate::routes::auth::preview_email_change,
+        crate::routes::auth::confirm_email_change,
+        crate::routes::auth::cancel_email_change,
         crate::routes::auth::change_password,
         crate::routes::auth::me,
         crate::routes::account::list_sessions,
@@ -186,6 +189,8 @@ its own document — select \"Sauron Ingest\" above.",
         crate::routes::orgs::set_member_active,
         crate::routes::orgs::revoke_member_sessions,
         crate::routes::orgs::reset_member_password,
+        crate::routes::orgs::request_member_email_change,
+        crate::routes::orgs::cancel_member_email_change,
         crate::routes::orgs::create_grant,
         crate::routes::orgs::update_grant_handler,
         crate::routes::orgs::delete_grant,
@@ -388,6 +393,14 @@ mod tests {
         ("POST", "/v1/auth/logout"),
         ("POST", "/v1/auth/forgot-password"),
         ("POST", "/v1/auth/reset-password"),
+        // Deliberate, and the same shape as the two reset endpoints above: the
+        // caller proves control of a mailbox by holding a 256-bit token, not by
+        // holding a bearer. Requiring authentication would break the case the
+        // feature exists for — the person confirming a new address is very often
+        // not signed in on the device that reads that mailbox.
+        ("POST", "/v1/auth/email-change/preview"),
+        ("POST", "/v1/auth/email-change/confirm"),
+        ("POST", "/v1/auth/email-change/cancel"),
         ("POST", "/v1/notifications/unsubscribe"),
     ];
 

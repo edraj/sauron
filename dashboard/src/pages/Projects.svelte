@@ -8,6 +8,10 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
+  import { refreshRegistry } from '../lib/stores/refresh-registry';
+  import { currentRoute } from '../lib/stores/current-route';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { lockedBy } from '../lib/models/page-access';
@@ -89,6 +93,42 @@
       loadingApps[projectId] = false;
     }
   }
+
+  /**
+   * Reload every project whose row is currently expanded.
+   *
+   * Collapsed rows are deliberately skipped: their list is not on screen, and
+   * fetching it would spend a request on something nobody is looking at —
+   * expanding the row already refreshes it.
+   */
+  async function reloadOpenProjects(): Promise<void> {
+    const open = Object.keys(openProject).filter((id) => openProject[id]);
+    await Promise.allSettled(open.map((id) => loadApps(id, true)));
+  }
+
+  const refresher = pageRefresher(reloadOpenProjects);
+
+  /**
+   * Make this page reachable by the GLOBAL refresh in the top bar.
+   *
+   * Every other page is registered automatically by `CachedView.load`, but this
+   * one drives `viewCache` directly — it holds N lists, one per expanded
+   * project — so it owns no `CachedView` and registered nothing. The top-bar
+   * button therefore did nothing at all here, silently, which is exactly the
+   * invisible failure the registry's route tagging was designed to avoid.
+   *
+   * `pending` is always false: none of these lists is server-cached, so there
+   * is never a recompute to wait for and the button must not poll.
+   */
+  $effect(() => {
+    // `lastKey: null` — this page drives `viewCache` under N keys rather than
+    // one, so it names none. Its entries are simply dropped by the global
+    // refresh's invalidation and refetched when a row is next expanded.
+    refreshRegistry.register(
+      { reload: reloadOpenProjects, pending: false, lastKey: null },
+      currentRoute(),
+    );
+  });
 
   async function submitNewProject(event: SubmitEvent) {
     event.preventDefault();
@@ -192,6 +232,8 @@
       <h1 class="page-title">{t('projects.title')}</h1>
       <p class="muted sub">{t('projects.subtitle')}</p>
     </div>
+    <div class="head-actions">
+      <RefreshButton onclick={refresher.run} loading={refresher.busy} />
     <Button
       variant="primary"
       lockedReason={createProjectLock}
@@ -199,6 +241,7 @@
     >
       {showNewProject ? 'Cancel' : 'New project'}
     </Button>
+    </div>
   </div>
 
   {#if showNewProject}
@@ -380,6 +423,11 @@
 </AdminShell>
 
 <style>
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .head {
     display: flex;
     align-items: flex-start;

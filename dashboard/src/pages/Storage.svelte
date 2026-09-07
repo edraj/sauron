@@ -53,6 +53,8 @@
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { envelopeStatus } from '../lib/models/freshness';
   import type { ViewEnvelope } from '../lib/api/overview';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
@@ -168,6 +170,12 @@
   }
 
   /** `force` bypasses the fresh window — an explicit Refresh means "go now". */
+  // `load(true)` forces the CLIENT cache; `pageRefresher` opens the SERVER
+  // force window around it, so the report is actually recomputed rather than
+  // re-served from Redis. Storage is one of the four server-cached pages where
+  // the difference is visible.
+  const refresher = pageRefresher(() => load(true));
+
   async function load(force = false) {
     await view.load(viewKey('admin.storage'), () => getAdminStorage(), force);
   }
@@ -497,6 +505,9 @@
             record counts.
           {/if}
         </p>
+      </div>
+      <div class="head-actions">
+        <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
       </div>
     </header>
 
@@ -1143,6 +1154,11 @@
   }
 
   /* --- header --------------------------------------------------------------- */
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .head {
     display: flex;
     align-items: flex-start;

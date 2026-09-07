@@ -12,6 +12,8 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
@@ -155,6 +157,11 @@
    * the axios interceptor puts on the request but which appears in no argument
    * here. Omit it and one environment's list can be served as another's.
    */
+  const refresher = pageRefresher(async () => {
+    const appId = sessionStore.currentAppId;
+    if (appId) await load(appId, true);
+  });
+
   async function load(appId: string, force = false) {
     await view.load(
       viewKey('sourcemaps.artifacts', appId, sessionStore.scopeKey),
@@ -252,6 +259,9 @@
         <p class="sub muted">
           {t('prose.sourcemaps.subtitle')}
         </p>
+      </div>
+      <div class="head-actions">
+        <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
       </div>
     </header>
 
@@ -502,6 +512,11 @@
     display: flex;
     flex-direction: column;
     gap: 18px;
+  }
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .head {
     display: flex;
