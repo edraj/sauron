@@ -530,10 +530,9 @@ pub(crate) fn render_email_change_approval(
         footnotes: vec![
             PASTE_FALLBACK.to_string(),
             vars.url.to_string(),
-            format!(
-                "If you were not expecting this, ignore this email and the request will lapse. \
-                 The address currently on the account has also been notified, and can cancel it."
-            ),
+            "If you were not expecting this, ignore this email and the request will lapse. \
+             The address currently on the account has also been notified, and can cancel it."
+                .to_string(),
         ],
     })
 }
