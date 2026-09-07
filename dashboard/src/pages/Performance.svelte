@@ -10,6 +10,7 @@
   import { rangeStore } from '../lib/stores/range.svelte';
   import { rangeKey, toParams, type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
   import { refreshRollups } from '../lib/api/rollups';
@@ -235,6 +236,12 @@
       refreshing = false;
     }
   }
+
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
 </script>
 
   <div class="head">
@@ -273,8 +280,8 @@
       <RollupChip />
       <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton
-        onclick={refresh}
-        loading={refreshing || revalidating}
+        onclick={refresher.run}
+        loading={refresher.busy || refreshing || revalidating}
         title={revalidating ? 'Refreshing…' : 'Refresh'}
       />
     </div>

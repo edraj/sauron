@@ -308,6 +308,25 @@ export interface MemberGrant {
       `GET /v1/orgs/{org}/members`, the only place the dashboard learns anything
       about a member's account state. */
   credentials_invalidated_at: string | null;
+  /** Non-null while a change to this member's email awaits confirmation from
+      the new address. Same source and same reasoning as the field above.
+      OPTIONAL because a server build older than this feature omits it
+      entirely — `groupMembers` normalizes it to `null`, so nothing downstream
+      has to think about the difference. */
+  pending_email_change?: PendingEmailChange | null;
+}
+
+/**
+ * A change to this member's sign-in address, awaiting the new address's
+ * confirmation.
+ *
+ * The member's *current* address has been mailed a link that cancels it, so a
+ * pending change is not a decision the admin has already made — it is one the
+ * member can still refuse.
+ */
+export interface PendingEmailChange {
+  new_email: string;
+  expires_at: string;
 }
 
 /**
@@ -326,6 +345,9 @@ export interface Member {
       `GET /v1/orgs/{org}/members`, the only place the dashboard learns anything
       about a member's account state. */
   credentials_invalidated_at: string | null;
+  /** Non-null while a change to this member's email awaits confirmation from
+      the new address. Same source and same reasoning as the field above. */
+  pending_email_change: PendingEmailChange | null;
   grants: MemberGrant[];
 }
 
@@ -403,6 +425,7 @@ export function groupMembers(grants: MemberGrant[]): Member[] {
         name: g.name,
         is_active: g.is_active,
         credentials_invalidated_at: g.credentials_invalidated_at,
+        pending_email_change: g.pending_email_change ?? null,
         grants: [g],
       });
     }

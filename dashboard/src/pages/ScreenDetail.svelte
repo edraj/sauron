@@ -1,5 +1,7 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { push } from 'svelte-spa-router';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
@@ -36,9 +38,12 @@
   // blanking to a spinner. Re-exposed under the names the template already used,
   // so the markup is unchanged.
   //
-  // `revalidating` is deliberately not surfaced: this page has no RefreshButton
-  // to spin, and the payload is replaced in place when the refresh lands.
+  // `revalidating` now IS surfaced: the page grew a RefreshButton, and a
+  // refresh that spun nothing while the payload swapped underneath read as the
+  // click having done nothing.
   const view = new CachedView<ScreenDetail>();
+
+  const refresher = pageRefresher(() => view.reload());
 
   const detail = $derived(view.data ?? null);
   const loading = $derived(view.loading);
@@ -136,7 +141,10 @@
       {/snippet}
     </EmptyState>
   {:else if detail}
-    <h1 class="page-title mono screen-title">{screenName}</h1>
+    <div class="screen-head">
+      <h1 class="page-title mono screen-title">{screenName}</h1>
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+    </div>
 
     <StatTiles min={150}>
       <StatTile label={t('screens.column.views')} value={compactNumber(detail.stats.views)} tone="primary" />
@@ -318,6 +326,13 @@
   {/if}
 
 <style>
+  .screen-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
   .back {
     display: inline-flex;
     align-items: center;

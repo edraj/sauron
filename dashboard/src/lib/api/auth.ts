@@ -98,3 +98,56 @@ export async function resetPassword(token: string, newPassword: string): Promise
     throw normalizeError(err);
   }
 }
+
+/**
+ * What a public email-change page may know before the visitor acts.
+ *
+ * `new_email` is optional because the SERVER omits it for the cancellation
+ * token: that link is reached from the mail sent to the address being
+ * *replaced*, which is never told what it is being replaced with. The optional
+ * marker here is a description of that rule, not a convenience — a page that
+ * renders this field is only ever rendering it for the confirm side.
+ */
+export interface EmailChangePreview {
+  role: 'approve' | 'cancel';
+  org_name: string;
+  expires_at: string;
+  new_email?: string;
+}
+
+/**
+ * Describe a pending change without applying it.
+ *
+ * All three of these post the token in the BODY rather than a query string, so
+ * it reaches no server log or `Referer` — the same property the fragment gives
+ * it on the way to the browser.
+ *
+ * `bareClient`, not `api`: these routes take no bearer, and the person holding
+ * the link is very often not signed in on the device that reads that mailbox.
+ */
+export async function previewEmailChange(token: string): Promise<EmailChangePreview> {
+  try {
+    const { data } = await bareClient.post<EmailChangePreview>('/v1/auth/email-change/preview', {
+      token,
+    });
+    return data;
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}
+
+export async function confirmEmailChange(token: string): Promise<void> {
+  try {
+    await bareClient.post('/v1/auth/email-change/confirm', { token });
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}
+
+export async function cancelEmailChange(token: string): Promise<void> {
+  try {
+    await bareClient.post('/v1/auth/email-change/cancel', { token });
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}

@@ -95,6 +95,8 @@ const UNAUTHENTICATED = [
   '/register',
   '/forgot-password',
   '/reset-password',
+  '/confirm-email-change',
+  '/cancel-email-change',
   '/change-password',
   '/unsubscribe',
   '/',

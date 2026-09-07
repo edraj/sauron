@@ -66,6 +66,10 @@ const MAIL_HYGIENE_INTERVAL: Duration = Duration::from_secs(900);
 /// rather than an env var: a handful of tiny short-lived rows do not justify
 /// three files of documentation.
 const PASSWORD_RESET_RETENTION_DAYS: i64 = 30;
+/// Matches `PASSWORD_RESET_RETENTION_DAYS`, and for the same reason: an
+/// `email_change_requests` row is the only record that an admin tried to move
+/// someone's login identity.
+const EMAIL_CHANGE_RETENTION_DAYS: i64 = 30;
 /// Footer line on every product email. Deliberately says nothing about why the
 /// recipient is receiving it — each sender's own footnotes do that.
 const MAIL_FOOTER: &str = "Sent by Sauron. This mailbox is not monitored.";
@@ -410,8 +414,12 @@ async fn main() -> anyhow::Result<()> {
         // revoked rows are load-bearing for replay detection, nothing reads a dead
         // reset row.
         let pool = state.pool.clone();
+        // One task, two tables. Both are reaped hourly, both are owned by this
+        // process because their write paths are here, and folding them together
+        // means one connection checkout per tick against a pool of 16 rather
+        // than two loops competing for it.
         tasks::supervise(
-            "password_reset_reaper",
+            "credential_token_reaper",
             Duration::from_secs(3600),
             move || {
                 let pool = pool.clone();
@@ -422,11 +430,20 @@ async fn main() -> anyhow::Result<()> {
                         PASSWORD_RESET_RETENTION_DAYS,
                     )
                     .await?;
+                    let removed_changes = sauron_db::repo::prune_email_change_requests(
+                        &mut conn,
+                        EMAIL_CHANGE_RETENTION_DAYS,
+                    )
+                    .await?;
                     // Checked out, worked, dropped — the API pool is 16 for the
                     // whole process and this loop must not hold one between ticks.
                     drop(conn);
-                    if removed > 0 {
-                        tracing::info!(removed, "pruned expired password reset tokens");
+                    if removed > 0 || removed_changes > 0 {
+                        tracing::info!(
+                            reset_tokens = removed,
+                            email_changes = removed_changes,
+                            "pruned expired credential tokens"
+                        );
                     }
                     Ok(())
                 }
@@ -491,6 +508,22 @@ async fn main() -> anyhow::Result<()> {
             "/v1/auth/reset-password",
             post(routes::auth::reset_password),
         )
+        // Unauthenticated for the same reason and in the same way: the token
+        // travels in the request BODY (never a query string, and it reaches the
+        // page in a URL fragment), so no bearer is involved and
+        // `password_change_gate` is never reached.
+        .route(
+            "/v1/auth/email-change/preview",
+            post(routes::auth::preview_email_change),
+        )
+        .route(
+            "/v1/auth/email-change/confirm",
+            post(routes::auth::confirm_email_change),
+        )
+        .route(
+            "/v1/auth/email-change/cancel",
+            post(routes::auth::cancel_email_change),
+        )
         // Path must match the extractor's forced-change allowlist exactly.
         .route("/v1/auth/password", post(routes::auth::change_password))
         .route("/v1/me", get(routes::auth::me))
@@ -525,6 +558,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/orgs/{org_id}/members/{user_id}/password-reset",
             post(routes::orgs::reset_member_password),
+        )
+        .route(
+            "/v1/orgs/{org_id}/members/{user_id}/email-change",
+            post(routes::orgs::request_member_email_change)
+                .delete(routes::orgs::cancel_member_email_change),
         )
         .route(
             "/v1/orgs/{org_id}/members/{user_id}/revoke-sessions",

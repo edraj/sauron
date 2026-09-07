@@ -13,6 +13,8 @@
   import Modal from '../lib/components/ui/Modal.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
@@ -316,6 +318,11 @@
     viewCache.invalidate('environments.page');
   }
 
+  const refresher = pageRefresher(async () => {
+    const pid = sessionStore.currentProjectId;
+    if (pid) await load(pid, true);
+  });
+
   async function load(pid: string, force = false) {
     await view.load(pageKey(pid), () => fetchAll(pid), force);
   }
@@ -524,6 +531,9 @@
         it — creating, renaming or retiring one below changes it for all of them. Each app's ingest
         key, mute switch and default stay its own, set per app below.
       </p>
+    </div>
+    <div class="head-actions">
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
     </div>
     {#if catalogueReadable}
       <Button variant="primary" lockedReason={createLock} onclick={() => (creating = true)}>
@@ -816,6 +826,11 @@
 </AdminShell>
 
 <style>
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .head {
     display: flex;
     align-items: flex-start;

@@ -230,9 +230,38 @@ export const prose = {
     en: 'They will still be asked to choose a new one when they do. Any reset link already sent stops working.',
     ar: 'سيُطلب منهم اختيار كلمة مرور جديدة عند دخولهم. ويتوقف أي رابط إعادة تعيين سبق إرساله.',
   },
+  'prose.members.changeEmailWarning': {
+    en: 'Nothing changes yet. We email the new address a link to confirm, and tell their current address that a change was requested — without naming the new one — so they can stop it. The request lapses in 24 hours.',
+    ar: 'لا يتغيّر شيء الآن. نرسل إلى العنوان الجديد رابطًا للتأكيد، ونُخطر عنوانه الحالي بأن تغييرًا قد طُلب — دون ذكر العنوان الجديد — كي يتمكّن من إيقافه. وينتهي الطلب خلال 24 ساعة.',
+  },
+  'prose.members.withdrawEmailChange': {
+    en: 'The confirmation link stops working and the member keeps their current address. You can request a different one afterwards.',
+    ar: 'يتوقّف رابط التأكيد عن العمل ويحتفظ العضو بعنوانه الحالي. ويمكنك طلب عنوان آخر بعد ذلك.',
+  },
   'prose.stores.lede': {
     en: "Pull daily install and uninstall counts from Google Play and the App Store. Reports are daily and arrive one to three days late — this is the stores' own cadence, not a delay Sauron adds.",
     ar: 'اجلب أعداد التثبيت وإلغاء التثبيت اليومية من Google Play وApp Store. التقارير يومية وتصل متأخرة من يوم إلى ثلاثة أيام — وهذه وتيرة المتاجر نفسها، لا تأخيرٌ يضيفه Sauron.',
+  },
+  'prose.auth.emailChangeIntro': {
+    en: 'An administrator asked to make this the sign-in address for your account. Confirming does not sign you out anywhere.',
+    ar: 'طلب أحد المسؤولين جعل هذا العنوان عنوان الدخول إلى حسابك. والتأكيد لن يُخرجك من أي جهاز.',
+  },
+  'prose.auth.emailChangeOrg': { en: 'Requested by', ar: 'الطلب من' },
+  'prose.auth.emailChangeConfirmed': {
+    en: 'Done. This is now the address you sign in with. You are still signed in everywhere you were.',
+    ar: 'تم. صار هذا هو العنوان الذي تسجّل الدخول به. ولا تزال مسجَّل الدخول في كل مكان كنت فيه.',
+  },
+  'prose.auth.emailChangeCancelIntro': {
+    en: 'An administrator asked to change the email address on your account. Nothing has changed yet, and you can stop it here.',
+    ar: 'طلب أحد المسؤولين تغيير عنوان البريد الإلكتروني لحسابك. لم يتغيّر شيء بعد، ويمكنك إيقافه من هنا.',
+  },
+  'prose.auth.emailChangeCancelIgnore': {
+    en: 'If you were expecting this, you can close this page — the change goes ahead only when the new address confirms it.',
+    ar: 'إن كنت تتوقّع هذا فأغلق الصفحة — لا يمضي التغيير إلا حين يؤكّده العنوان الجديد.',
+  },
+  'prose.auth.emailChangeCancelled': {
+    en: 'Stopped. Nothing was changed, and your account keeps its current email address.',
+    ar: 'تم الإيقاف. لم يتغيّر شيء، ويحتفظ حسابك بعنوان بريده الحالي.',
   },
   'prose.boot.loading': { en: 'Loading Sauron…', ar: 'جارٍ تحميل Sauron…' },
   // Descriptive placeholders — these tell the user what to type, so they are

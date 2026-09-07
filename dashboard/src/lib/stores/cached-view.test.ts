@@ -562,3 +562,89 @@ describe('fetchedAt', () => {
     expect(v.fetchedAt).toBe(first);
   });
 });
+
+describe('reload', () => {
+  it('is a no-op before any load', async () => {
+    const v = new CachedView<number>();
+    // Inventing a key here would be worse than doing nothing: it would fetch
+    // under a key no page ever reads.
+    await expect(v.reload()).resolves.toBeUndefined();
+    expect(v.hasLoaded).toBe(false);
+  });
+
+  it('re-invokes the last key and fetcher with force', async () => {
+    const fetcher = vi.fn().mockResolvedValue(1);
+    const v = new CachedView<number>();
+    await v.load('k1', fetcher);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(v.hasLoaded).toBe(true);
+
+    // Without `force` this short-circuits on the fresh window and never
+    // reaches the network — the bug that makes a Refresh button look broken.
+    await v.reload();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays the MOST RECENT key, not the first', async () => {
+    const f1 = vi.fn().mockResolvedValue(1);
+    const f2 = vi.fn().mockResolvedValue(2);
+    const v = new CachedView<number>();
+    await v.load('k1', f1);
+    await v.load('k2', f2);
+    await v.reload();
+    // A page whose filters moved must refresh what is on screen now, not what
+    // was on screen when it mounted.
+    expect(f2).toHaveBeenCalledTimes(2);
+    expect(f1).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('pending', () => {
+  it('is false for an ordinary list payload', async () => {
+    const v = new CachedView<number[]>();
+    await v.load('plain', async () => [1, 2, 3]);
+    // Their promise settling IS freshness. Treating them as pending would make
+    // the global Refresh poll for 30s on every page with no server cache.
+    expect(v.pending).toBe(false);
+  });
+
+  it('is false before any load', () => {
+    expect(new CachedView<unknown>().pending).toBe(false);
+  });
+
+  it('is false for an envelope that is already fresh', async () => {
+    const v = new CachedView<unknown>();
+    await v.load('fresh', async () => ({ state: 'fresh', data: 1 }));
+    expect(v.pending).toBe(false);
+  });
+
+  it('is true for a fresh envelope that is still recomputing', async () => {
+    // The forced-refresh case: the DATA is fresh, but the recompute the click
+    // started has not landed. Watching `state` alone stops the spinner here.
+    const v = new CachedView<unknown>();
+    await v.load('forced', async () => ({ state: 'fresh', data: 1, recomputing: true }));
+    expect(v.pending).toBe(true);
+  });
+
+  it('is false for a fresh envelope that is not recomputing', async () => {
+    const v = new CachedView<unknown>();
+    await v.load('settled', async () => ({ state: 'fresh', data: 1, recomputing: false }));
+    expect(v.pending).toBe(false);
+  });
+
+  it('is true while an envelope reports computing or stale', async () => {
+    const v = new CachedView<unknown>();
+    await v.load('computing', async () => ({ state: 'computing', data: null }));
+    expect(v.pending).toBe(true);
+
+    await v.load('stale', async () => ({ state: 'stale', data: 1 }));
+    expect(v.pending).toBe(true);
+  });
+
+  it('is false for a null payload', async () => {
+    // `typeof null === 'object'`, so a naive check throws here.
+    const v = new CachedView<unknown>();
+    await v.load('null', async () => null);
+    expect(v.pending).toBe(false);
+  });
+});

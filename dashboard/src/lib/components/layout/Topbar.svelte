@@ -9,6 +9,39 @@
   import { initials, appTypeIcon } from '../../utils/format';
   import Icon from '../ui/Icon.svelte';
   import SwitcherMenu from './SwitcherMenu.svelte';
+  import { viewCache } from '../../stores/view-cache';
+  import { refreshRegistry } from '../../stores/refresh-registry';
+  import { currentRoute } from '../../stores/current-route';
+  import { beginForcing, endForcing } from '../../api/force';
+  import { runGlobalRefresh } from '../../models/force-refresh';
+
+  let refreshing = $state(false);
+
+  /**
+   * Force every section on the current page to re-fetch, and the server to
+   * recompute the cached ones.
+   *
+   * Not gated on any permission: a user who cannot read a section has no
+   * `CachedView` registered for it, so there is nothing to refresh and nothing
+   * to refuse.
+   */
+  async function doRefresh() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      await runGlobalRefresh({
+        beginForcing,
+        endForcing,
+        clearCacheExcept: (keep) => viewCache.clearExcept(keep),
+        refreshAll: () => refreshRegistry.refreshAll(currentRoute()),
+        pendingCount: () => refreshRegistry.pendingCount(currentRoute()),
+        sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+        now: () => Date.now(),
+      });
+    } finally {
+      refreshing = false;
+    }
+  }
 
   async function logout() {
     await authStore.logout();
@@ -146,6 +179,16 @@
   </div>
 
   <div class="right">
+    <button
+      class="icon-btn"
+      title={t('nav.refreshAll')}
+      aria-label={t('nav.refreshAll')}
+      disabled={refreshing}
+      onclick={doRefresh}
+    >
+      <span class="ic" class:spinning={refreshing}><Icon name="refresh" size={16} /></span>
+    </button>
+
     <a class="icon-btn" href="#/docs" title={t('nav.docsTitle')} aria-label={t('nav.docs')}>
       <Icon name="life-buoy" size={16} />
     </a>
@@ -204,6 +247,26 @@
   .sep {
     color: var(--text-faint);
     font-size: 13px;
+  }
+  .ic {
+    display: inline-flex;
+    color: inherit;
+  }
+  /* Same animation as `RefreshButton`, duplicated rather than shared: Svelte
+     scopes component styles, and hoisting one keyframe into a global sheet for
+     two callers is the worse trade. */
+  .ic.spinning {
+    animation: topbar-refresh-spin 0.7s linear infinite;
+  }
+  @keyframes topbar-refresh-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ic.spinning {
+      animation-duration: 1.4s;
+    }
   }
   .icon-btn {
     width: 36px;

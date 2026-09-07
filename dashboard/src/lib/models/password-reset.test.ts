@@ -35,6 +35,7 @@ function member(overrides: Partial<Member> = {}): Member {
     name: 'Ada',
     is_active: true,
     credentials_invalidated_at: null,
+    pending_email_change: null,
     grants: [grant()],
     ...overrides,
   };

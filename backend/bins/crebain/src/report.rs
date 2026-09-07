@@ -93,6 +93,15 @@ pub fn print_summary(s: &Summary, expected: &Expected, shape: &Shape) {
             .collect::<Vec<_>>()
             .join("   ");
         println!("    status codes    {codes}");
+
+        // The REASON, beside the tally. A run that fails every request used to
+        // print only the status counts, which says that something is wrong but
+        // never what — and the server nearly always states the cause exactly.
+        for (status, body) in crate::transport::failure_samples() {
+            if !body.is_empty() {
+                println!("    {status} says       {body}");
+            }
+        }
     }
 
     let elapsed = s.elapsed.as_secs_f64().max(1e-9);

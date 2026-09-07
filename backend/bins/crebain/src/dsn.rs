@@ -1,10 +1,17 @@
 //! The DSN wire format shared with the SDKs, and the resolved [`Target`] both
 //! run modes converge on.
 //!
-//! DSN: `scheme://<public_key>@host:port/<environment_id>` (identical to what a
+//! DSN: `scheme://<public_key>@host:port/<project_id>` (identical to what a
 //! real SDK is configured with). The ingest edge authenticates by the key in the
-//! `X-Sauron-Key` header and ignores this path segment, but we keep it so the
-//! request is byte-for-byte what an SDK would send.
+//! `X-Sauron-Key` header and does not READ this path segment — its handler binds
+//! it to `_project_id` and resolves the app from the key instead.
+//!
+//! It must still be a valid UUID. The route is `/api/{project_id}/envelope` with
+//! a `Path<Uuid>` extractor, so axum rejects a non-UUID segment with 400 before
+//! the handler runs. "Ignored" and "may be anything" are NOT the same thing, and
+//! an earlier version of this comment said only the first — which cost a full
+//! run of 100% 400s whose cause was invisible, because `send` discarded the
+//! response body. Both halves are fixed; keep them together.
 
 /// Everything the load engine needs to talk to an ingest edge, however it was
 /// obtained (parsed from `--dsn`, or minted by the isolated harness).
@@ -58,7 +65,19 @@ pub fn parse_dsn(dsn: &str) -> anyhow::Result<Target> {
     let app_id = app_id.trim_end_matches('/');
     let app_id = app_id.split(['?', '#']).next().unwrap_or(app_id);
     if app_id.is_empty() {
-        anyhow::bail!("DSN app id is empty: {dsn:?}");
+        anyhow::bail!("DSN project id is empty: {dsn:?}");
+    }
+    // Checked HERE rather than left to the server, because the server's refusal
+    // is a bare 400 on every request for the whole run and crebain reports it
+    // only as a status-code tally. One line before any traffic is sent beats a
+    // 60-second run that transmits nothing and cannot say why.
+    if uuid::Uuid::parse_str(app_id).is_err() {
+        anyhow::bail!(
+            "DSN path segment must be the project id as a UUID — got {app_id:?}. \
+             The ingest route is /api/{{project_id}}/envelope with a Path<Uuid> \
+             extractor: it never reads the value, but a non-UUID is rejected \
+             with 400 before the handler runs."
+        );
     }
 
     Ok(Target {
@@ -86,9 +105,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_path_segment_that_is_not_a_uuid() {
+        // The ingest route is `/api/{project_id}/envelope` with a `Path<Uuid>`
+        // extractor. It binds the value to `_project_id` and never reads it —
+        // the app is resolved from the key — but axum still REJECTS the request
+        // with 400 before the handler runs if the segment is not a UUID.
+        //
+        // Caught this the expensive way: a DSN ending `/detail` produced 400 on
+        // every single request, and because `send` discarded the response body
+        // the only signal was "status codes 400xN". Failing here, at parse time,
+        // turns a silent full-run failure into one line before any traffic.
+        let err = parse_dsn("http://pk_abc@localhost:8081/detail").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("UUID") || msg.contains("uuid"),
+            "error should name the real requirement, got: {msg}"
+        );
+    }
+
+    #[test]
     fn round_trips_dsn_display() {
-        let t = parse_dsn("https://key@example.com/app123").unwrap();
-        assert_eq!(t.dsn(), "https://key@example.com/app123");
+        let t = parse_dsn("https://key@example.com/11111111-2222-3333-4444-555555555555").unwrap();
+        assert_eq!(
+            t.dsn(),
+            "https://key@example.com/11111111-2222-3333-4444-555555555555"
+        );
     }
 
     #[test]

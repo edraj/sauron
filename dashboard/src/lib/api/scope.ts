@@ -285,3 +285,46 @@ export const PROJECT_SCOPED_REJECTS_ENVIRONMENT_ID: RegExp[] = [
   /^\/v1\/projects\/[^/]+\/environments(?:[/?].*)?$/,
   /^\/v1\/projects\/[^/]+\/monitors(?:[/?].*)?$/,
 ];
+
+// ---------------------------------------------------------------------------
+// Server-cache force.
+// ---------------------------------------------------------------------------
+
+/**
+ * The endpoints backed by the SERVER-side Redis result cache
+ * (`bins/sauron-api/src/view_cache.rs`), and therefore the only ones for which
+ * `force=true` means anything. Everything else re-fetches for real on any
+ * request, so sending the parameter there would be noise at best.
+ *
+ * Matched on the URL alone, never on HTTP method: `/v1/apps/{id}/funnel` is a
+ * POST purely because its query is too large for a query string, and a
+ * method-based rule would silently skip the most expensive cached endpoint
+ * here. A query parameter rides a POST perfectly well.
+ *
+ * `/v1/projects/{id}/active-users.csv` is deliberately ABSENT — it is an export
+ * the user explicitly asked for, not a section rendered on screen, so it falls
+ * outside what the global Refresh reaches. Note the `\.csv` alternative is
+ * excluded by the anchors below rather than by omission alone: the plain
+ * `active-users` pattern must not also match it.
+ *
+ * Anchored, not prefix-matched. `/overview`, `/overview/stream` and
+ * `/overview/refresh` are siblings of forceable routes, and `stream` is an SSE
+ * endpoint where an unknown query parameter is least welcome.
+ */
+export const FORCEABLE_URLS: readonly RegExp[] = [
+  /^\/v1\/apps\/[^/]+\/overview\/totals$/,
+  /^\/v1\/apps\/[^/]+\/overview\/series$/,
+  /^\/v1\/apps\/[^/]+\/overview\/top-issues$/,
+  /^\/v1\/apps\/[^/]+\/overview\/top-events$/,
+  /^\/v1\/apps\/[^/]+\/analytics\/active-users$/,
+  /^\/v1\/projects\/[^/]+\/active-users$/,
+  /^\/v1\/apps\/[^/]+\/funnel$/,
+  /^\/v1\/admin\/storage$/,
+];
+
+/** True when `url` is one of the server-cached endpoints above. */
+export function isForceableUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  const path = url.split('?')[0];
+  return FORCEABLE_URLS.some((re) => re.test(path));
+}

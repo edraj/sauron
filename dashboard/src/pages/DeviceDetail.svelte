@@ -1,5 +1,7 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
+  import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { formatNumber } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import { rowHref, rowNav } from '../lib/utils/row-link';
@@ -45,9 +47,12 @@
   // blanking to a spinner. Re-exposed under the names the template already used,
   // so the markup is unchanged.
   //
-  // `revalidating` is deliberately not surfaced: this page has no RefreshButton
-  // to spin, and the payload is replaced in place when the refresh lands.
+  // `revalidating` now IS surfaced: the page grew a RefreshButton, and a
+  // refresh that spun nothing while the payload swapped underneath read as the
+  // click having done nothing.
   const view = new CachedView<DeviceDetail>();
+
+  const refresher = pageRefresher(() => view.reload());
 
   const detail = $derived(view.data ?? null);
   const loading = $derived(view.loading);
@@ -143,6 +148,9 @@
     </EmptyState>
   {:else if detail && device}
     <header class="detail-head">
+      <div class="refresh-slot">
+        <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+      </div>
       <div class="head-main">
         <h1 class="dev-title">{title}</h1>
         <div class="key-row">
@@ -305,6 +313,11 @@
   {/if}
 
 <style>
+  .refresh-slot {
+    float: right;
+    margin-inline-start: 12px;
+  }
+
   .back {
     display: inline-flex;
     align-items: center;

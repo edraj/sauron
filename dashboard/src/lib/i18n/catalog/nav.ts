@@ -83,6 +83,7 @@ export const nav = {
   'nav.unattributed': { en: 'Unattributed', ar: 'غير منسوب' },
   'nav.docs': { en: 'Docs', ar: 'الوثائق' },
   'nav.docsTitle': { en: 'Docs & integration guides', ar: 'الوثائق وأدلة التكامل' },
+  'nav.refreshAll': { en: 'Refresh all data', ar: 'تحديث كل البيانات' },
   'nav.switchToLight': { en: 'Switch to light', ar: 'التبديل إلى الفاتح' },
   'nav.switchToDark': { en: 'Switch to dark', ar: 'التبديل إلى الداكن' },
   'nav.logOut': { en: 'Log out', ar: 'تسجيل الخروج' },

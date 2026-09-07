@@ -644,6 +644,54 @@ pub struct NewPasswordResetToken {
     pub expires_at: DateTime<Utc>,
 }
 
+/// A pending change to a user's login address.
+///
+/// Derives no `Serialize`, exactly like [`PasswordResetToken`]: both token
+/// hashes must never leave the process, and no endpoint returns this row. The
+/// handlers project the two fields a caller may see (`new_email`, `expires_at`)
+/// into their own response types, which is also where the rule that the *old*
+/// address never learns the new one is enforced.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = email_change_requests)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct EmailChangeRequest {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub org_id: Uuid,
+    pub new_email: String,
+    pub approve_token_hash: String,
+    pub cancel_token_hash: String,
+    /// `lower(users.email)` when the request was opened. See migration 000076.
+    pub email_fingerprint: String,
+    pub initiated_by: Option<Uuid>,
+    pub requested_from: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    /// `"user"`, `"admin"` or `"superseded"` -- see the CHECK in migration 000076.
+    pub cancelled_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert-only. Must never gain `Queryable`: that derive decodes POSITIONALLY,
+/// so a struct whose field order differs from the `table!` block would bind
+/// `cancel_token_hash` to `approve_token_hash` and still compile -- which would
+/// mail the veto link to the new address and the approve link to the old one,
+/// inverting the entire security model without a type error.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = email_change_requests)]
+pub struct NewEmailChangeRequest {
+    pub user_id: Uuid,
+    pub org_id: Uuid,
+    pub new_email: String,
+    pub approve_token_hash: String,
+    pub cancel_token_hash: String,
+    pub email_fingerprint: String,
+    pub initiated_by: Option<Uuid>,
+    pub requested_from: Option<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
 // ---------------------------------------------------------------------------
 // Sessions & devices (roll-ups materialized by the pipeline, keyed by app_id)
 // ---------------------------------------------------------------------------

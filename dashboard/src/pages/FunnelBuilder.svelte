@@ -16,6 +16,7 @@
   import { rangeStore } from '../lib/stores/range.svelte';
   import { type DateRangeValue } from '../lib/models/date-range';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import FunnelChart from '../lib/components/FunnelChart.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
@@ -340,6 +341,12 @@
     }
   }
 
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
+
   const overallConv = $derived(result ? (result.steps.at(-1)?.conv_from_start ?? 0) : 0);
 </script>
 
@@ -356,7 +363,7 @@
           rangeStore.set(v);
         }}
       />
-      <RefreshButton onclick={refresh} loading={refreshing} />
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing} />
     </div>
   </div>
 

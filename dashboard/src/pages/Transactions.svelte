@@ -14,6 +14,7 @@
   import TransactionDetailPanel from '../lib/components/TransactionDetailPanel.svelte';
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
   import FilterBar from '../lib/components/filters/FilterBar.svelte';
@@ -93,7 +94,6 @@
   const revalidating = $derived(view.revalidating);
   const error = $derived(view.error);
   const errorStatusCode = $derived(view.errorStatus);
-  let refreshing = $state(false);
   /** Row ids whose extras panel is open. */
   let expanded = $state(new Set<string>());
 
@@ -224,12 +224,23 @@
     toPage(cursorGoTo(list, target, nextCursor, LIMIT));
   }
 
-  function refresh() {
+  // `async` + `await`, not the fire-and-forget `void load(...)` this used to
+  // be. Two reasons: `pageRefresher` closes the server force window when this
+  // resolves, so a synchronous return would close it before the request even
+  // went out; and the old shape set a `refreshing` flag that NOTHING ever
+  // cleared, so one click left the button spinning for the life of the page.
+  // That flag is gone — `refresher.busy` is the single source now.
+  async function refresh() {
     const aid = sessionStore.currentAppId;
     if (!aid) return;
-    refreshing = true;
-    void load(aid, encodeFilters(filters), appliedSearch, window_, list, true);
+    await load(aid, encodeFilters(filters), appliedSearch, window_, list, true);
   }
+
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
 
   /**
    * Commit the search box into `appliedSearch` on an explicit submit.
@@ -301,7 +312,7 @@
       </p>
     </div>
     <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-    <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
+    <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
   </div>
 
   <FilterBar
@@ -331,7 +342,7 @@
       <p class="stale-banner" role="status">
         <Icon name="triangle-alert" size={14} />
         <span>Showing the last results that loaded — refreshing failed: {error}</span>
-        <Button variant="ghost" size="sm" onclick={refresh}>{t('ui.tryAgain')}</Button>
+        <Button variant="ghost" size="sm" onclick={refresher.run}>{t('ui.tryAgain')}</Button>
       </p>
     {/if}
 
@@ -340,7 +351,7 @@
     {:else if fatalError}
       <EmptyState title={t('transactions.error.load')} description={error ?? undefined} icon="triangle-alert">
         {#snippet action()}
-          <Button onclick={refresh}>{t('ui.tryAgain')}</Button>
+          <Button onclick={refresher.run}>{t('ui.tryAgain')}</Button>
         {/snippet}
       </EmptyState>
     {:else if rows.length === 0}

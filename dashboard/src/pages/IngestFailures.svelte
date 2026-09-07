@@ -11,6 +11,7 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { lockedBy } from '../lib/models/page-access';
   import {
@@ -101,6 +102,12 @@
     await load(true);
   }
 
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
+
   async function loadMore() {
     const cursor = nextCursor;
     if (!cursor) return;
@@ -187,7 +194,7 @@
       </p>
     </div>
     <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-    <RefreshButton onclick={refresh} loading={loading || revalidating} />
+    <RefreshButton onclick={refresher.run} loading={refresher.busy || loading || revalidating} />
   </div>
 
   <Card>

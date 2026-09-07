@@ -5,7 +5,8 @@ import axios, {
 } from 'axios';
 import { apiBaseUrl } from '../config/env';
 import type { ApiErrorEnvelope, NormalizedError } from '../models';
-import { computeScopeParams, currentEnvironmentId } from './scope';
+import { computeScopeParams, isForceableUrl, currentEnvironmentId } from './scope';
+import { isForcing } from './force';
 
 // ---------------------------------------------------------------------------
 // Auth bridge
@@ -110,6 +111,26 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   const scopeParams = computeScopeParams(config.url, currentEnvironmentId());
   if (scopeParams) {
     config.params = { ...(config.params as Record<string, unknown> | undefined), ...scopeParams };
+  }
+  return config;
+});
+
+// ---------------------------------------------------------------------------
+// Request interceptor — mark a user-initiated global Refresh.
+//
+// Both conditions are load-bearing. The flag alone would attach `force=true`
+// to any unrelated request that happened to fire during the window; the URL
+// list alone would attach it to every ordinary page load and defeat the server
+// cache entirely. See `./force.ts` for why this is a module flag rather than a
+// parameter threaded through `CachedView.load`.
+//
+// Method is deliberately not part of the test: `/v1/apps/{id}/funnel` is a
+// cached POST, and a GET-only rule would skip it.
+// ---------------------------------------------------------------------------
+
+api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+  if (isForcing() && isForceableUrl(config.url)) {
+    config.params = { ...(config.params as Record<string, unknown> | undefined), force: true };
   }
   return config;
 });

@@ -41,6 +41,7 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
@@ -530,6 +531,12 @@
     }
   }
 
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
+
   function f(key: string): string {
     return chFields[key] ?? '';
   }
@@ -831,7 +838,7 @@
       </div>
       <div class="controls">
         <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-        <RefreshButton onclick={refresh} loading={refreshing} />
+        <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing} />
       </div>
     </header>
 

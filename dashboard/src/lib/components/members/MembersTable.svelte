@@ -6,6 +6,7 @@
   import { sessionStore } from '../../stores/session.svelte';
   import { initials } from '../../utils/format';
   import { canCancelPasswordReset, canResetMemberPassword } from '../../models/password-reset';
+  import { canRequestEmailChange, canWithdrawEmailChange } from '../../models/email-change';
     import { lockTip } from '../../actions/lock-tip';
   import Icon from '../ui/Icon.svelte';
   import type {
@@ -55,6 +56,9 @@
     /** ONE callback rather than two, so the table cannot offer a member both a
         reset and a cancel. */
     onresetpassword: (member: Member, action: 'reset' | 'cancel') => void;
+    /** Same shape and same reason as `onresetpassword`: at most one of the two
+        email-change actions is ever offered for a given row. */
+    onemailchange: (member: Member, action: 'request' | 'withdraw') => void;
     onremovegrant: (grantId: string) => void;
   }
 
@@ -74,6 +78,7 @@
     currentUserId,
     credentialLock,
     onresetpassword,
+    onemailchange,
     onremovegrant,
   }: Props = $props();
 
@@ -143,6 +148,17 @@
                            to show without being opened: the admin who forced it may
                            not be the one fielding "I can't log in". -->
                       <Badge tone="warning" size="sm">{t('members.resetPending')}</Badge>
+                    {/if}
+                    {#if member.pending_email_change}
+                      <!-- Shown with the address, because the admin typed it and
+                           the whole point of the badge is spotting a typo before
+                           the link expires. The member's CURRENT address has been
+                           mailed a link that cancels this, so it is not a
+                           settled decision. -->
+                      <Badge tone="info" size="sm"
+                        >{t('members.emailChangePending')}: {member.pending_email_change
+                          .new_email}</Badge
+                      >
                     {/if}
                   </span>
                   {#if member.name}<span class="m-email">{member.email}</span>{/if}
@@ -228,6 +244,41 @@
                         {#if credentialLock}<span class="ram-lock" aria-hidden="true"
                             ><Icon name="lock" size={12} /></span
                           >{/if}Cancel password reset
+                      </button>
+                    {/if}
+                    <!-- Same `true` + lock treatment as the pair above: the
+                         helper answers the member-state question, the lock
+                         explains a missing permission rather than hiding the
+                         item. -->
+                    {#if canRequestEmailChange(member, currentUserId, true)}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        class="ram-item"
+                        use:lockTip={credentialLock}
+                        onclick={() => {
+                          close();
+                          onemailchange(member, 'request');
+                        }}
+                      >
+                        {#if credentialLock}<span class="ram-lock" aria-hidden="true"
+                            ><Icon name="lock" size={12} /></span
+                          >{/if}{t('members.changeEmail')}
+                      </button>
+                    {:else if canWithdrawEmailChange(member, currentUserId, true)}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        class="ram-item"
+                        use:lockTip={credentialLock}
+                        onclick={() => {
+                          close();
+                          onemailchange(member, 'withdraw');
+                        }}
+                      >
+                        {#if credentialLock}<span class="ram-lock" aria-hidden="true"
+                            ><Icon name="lock" size={12} /></span
+                          >{/if}{t('members.withdrawEmailChange')}
                       </button>
                     {/if}
                     <!-- Signing yourself out of every device from the members

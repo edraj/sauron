@@ -57,6 +57,21 @@ export const auth = {
   'auth.reset.title': { en: 'Choose a new password', ar: 'اختر كلمة مرور جديدة' },
   'auth.reset.submit': { en: 'Set new password', ar: 'تعيين كلمة المرور' },
   'auth.reset.requestNew': { en: 'Email me a new link', ar: 'أرسل لي رابطًا جديدًا' },
+  'auth.emailChange.confirmTitle': {
+    en: 'Confirm your new email address',
+    ar: 'أكّد عنوان بريدك الإلكتروني الجديد',
+  },
+  'auth.emailChange.cancelTitle': {
+    en: 'Stop this email change?',
+    ar: 'إيقاف تغيير البريد الإلكتروني؟',
+  },
+  'auth.emailChange.checking': { en: 'Checking this link…', ar: 'جارٍ التحقّق من الرابط…' },
+  'auth.emailChange.invalidLink': {
+    en: 'This link is no longer valid. It may have expired, already been used, or been cancelled.',
+    ar: 'لم يعد هذا الرابط صالحًا. ربما انتهت صلاحيته أو استُخدم من قبل أو أُلغي.',
+  },
+  'auth.emailChange.confirm': { en: 'Confirm this address', ar: 'تأكيد هذا العنوان' },
+  'auth.emailChange.stop': { en: 'Stop this change', ar: 'إيقاف هذا التغيير' },
   'auth.reset.invalidLink': {
     en: 'This reset link is invalid or has expired — request a new one.',
     ar: 'رابط إعادة التعيين غير صالح أو منتهي الصلاحية — اطلب رابطًا جديدًا.',

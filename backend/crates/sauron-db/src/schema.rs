@@ -298,6 +298,25 @@ diesel::table! {
 }
 
 diesel::table! {
+    email_change_requests (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        org_id -> Uuid,
+        new_email -> Text,
+        approve_token_hash -> Text,
+        cancel_token_hash -> Text,
+        email_fingerprint -> Text,
+        initiated_by -> Nullable<Uuid>,
+        requested_from -> Nullable<Text>,
+        expires_at -> Timestamptz,
+        approved_at -> Nullable<Timestamptz>,
+        cancelled_at -> Nullable<Timestamptz>,
+        cancelled_reason -> Nullable<Text>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     organizations (id) {
         id -> Uuid,
         name -> Text,
@@ -884,6 +903,10 @@ diesel::joinable!(refresh_tokens -> users (user_id));
 // `joinable!` accepts one per table pair, so a future query for the initiating
 // admin's email needs an explicit `.on(...)` rather than a second line here.
 diesel::joinable!(password_reset_tokens -> users (user_id));
+// Same one-per-table-pair limit, same shape: `email_change_requests` also has
+// two FKs to `users` (`user_id` and `initiated_by`).
+diesel::joinable!(email_change_requests -> users (user_id));
+diesel::joinable!(email_change_requests -> organizations (org_id));
 diesel::joinable!(role_grants -> organizations (org_id));
 diesel::joinable!(role_grants -> roles (role_id));
 diesel::joinable!(role_grants -> users (user_id));
@@ -1086,6 +1109,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     projects,
     refresh_tokens,
     password_reset_tokens,
+    email_change_requests,
     role_grants,
     roles,
     users,

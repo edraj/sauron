@@ -28,6 +28,7 @@
   } from '../lib/components/filters/filters';
   import Pagination from '../lib/components/Pagination.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
   import { refreshRollups } from '../lib/api/rollups';
@@ -282,6 +283,12 @@
     }
   }
 
+  // Wraps this page's OWN refresh rather than replacing it: the body below
+  // does page-specific work a generic sweep would drop. `pageRefresher` adds
+  // the server force window and the wait for the recompute to land, so a page
+  // button and the one in the top bar now mean the same thing.
+  const refresher = pageRefresher(refresh);
+
   $effect(() => {
     const aid = sessionStore.currentAppId;
     // Touch scopeKey so the effect re-runs when the environment changes; the
@@ -448,7 +455,7 @@
         <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
         <RollupChip />
       <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
-      <RefreshButton onclick={refresh} loading={refreshing || revalidating} />
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
         <Button
           variant="secondary"
           disabled={sessions.length === 0}

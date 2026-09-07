@@ -1,4 +1,6 @@
 import { errorMessage, isNormalizedError } from '../api/client';
+import { currentRoute } from './current-route';
+import { refreshRegistry } from './refresh-registry';
 import { DEFAULT_FRESH_MS, viewCache } from './view-cache';
 
 /**
@@ -110,6 +112,71 @@ export class CachedView<T> {
   }
 
   /**
+   * The last `(key, fetcher)` [`load`] was called with.
+   *
+   * Retained so something OUTSIDE the page — the global Refresh in the
+   * Topbar — can repeat a section's fetch. `load` takes both per invocation
+   * because they depend on the page's reactive inputs, so without this the
+   * instance is the only thing that knows how to fetch itself and the only
+   * thing that cannot be asked to.
+   */
+  #lastKey: string | null = null;
+  #lastFetcher: (() => Promise<T>) | null = null;
+
+  /** True once [`load`] has run at least once. */
+  get hasLoaded(): boolean {
+    return this.#lastKey !== null;
+  }
+
+  /**
+   * The key this view most recently loaded, or `null` before any load.
+   *
+   * Read by the global Refresh so it can drop every OTHER cache entry without
+   * dropping the ones it just repopulated — see `ViewCache.clearExcept`.
+   */
+  get lastKey(): string | null {
+    return this.#lastKey;
+  }
+
+  /**
+   * Repeat the most recent [`load`] with `force = true`.
+   *
+   * A no-op before any `load`: an instance constructed but never loaded has
+   * nothing to repeat, and inventing a key would fetch under one no page reads.
+   */
+  async reload(): Promise<void> {
+    if (this.#lastKey === null || this.#lastFetcher === null) return;
+    await this.load(this.#lastKey, this.#lastFetcher, true);
+  }
+
+  /**
+   * True when this section's payload is a server-cache `Envelope` that has not
+   * finished recomputing (a `state` of `stale` or `computing`).
+   *
+   * Duck-typed on purpose. Only 8 of the ~95 `CachedView` instances hold an
+   * envelope, and expressing that in the type system would mean threading a
+   * type parameter through the other 87 — the per-page cost the global-refresh
+   * design exists to avoid. Anything that is not an object carrying one of
+   * those two literal states is simply not pending, so an ordinary list
+   * payload can never make the global Refresh poll.
+   *
+   * The `typeof` guard is load-bearing: `typeof null === 'object'`, so a plain
+   * truthiness check would throw on a legitimately null payload.
+   */
+  get pending(): boolean {
+    const d = this.data as { state?: unknown; recomputing?: unknown } | null | undefined;
+    if (d === null || d === undefined || typeof d !== 'object') return false;
+    // `recomputing` is checked FIRST and is the load-bearing half. A forced
+    // read of an entry still inside its freshness window comes back
+    // `state: "fresh"` — correctly, because the DATA is fresh — while the
+    // recompute it just started is still running. Watching only `state` there
+    // stops the spinner immediately and leaves the old numbers on screen, which
+    // is the whole failure this getter exists to prevent.
+    if (d.recomputing === true) return true;
+    return d.state === 'stale' || d.state === 'computing';
+  }
+
+  /**
    * Paint whatever is cached for `key`, then refresh behind it if stale.
    *
    * `force` skips the fresh-window short-circuit: an explicit Refresh click or a
@@ -120,6 +187,12 @@ export class CachedView<T> {
    * because both depend on the page's current inputs, which are reactive.
    */
   async load(key: string, fetcher: () => Promise<T>, force = false): Promise<void> {
+    this.#lastKey = key;
+    this.#lastFetcher = fetcher;
+    // Registers on every load rather than at construction: construction has no
+    // route yet, and re-registering is how a view that loads under a new route
+    // gets re-tagged. `register` keys on the instance, so repeats are free.
+    refreshRegistry.register(this, currentRoute());
     const gen = ++this.#gen;
     // `!== undefined` and not a truthiness test: `undefined` is the cache's only
     // "absent" signal, so a payload that is legitimately null, 0, '' or [] counts

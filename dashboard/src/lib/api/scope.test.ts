@@ -280,6 +280,12 @@ const NON_TELEMETRY_PAGES = new Set([
   // sessionStore.currentEnvId — see scope.ts's UI_ONLY_EXCLUSIONS comment.
   'Onboarding',
   'Projects', // org-scoped project list
+  // The two halves of an admin-initiated email change, reached from an emailed
+  // link. Same shape as ResetPassword: they must render for a signed-out
+  // visitor AND a signed-in one, POST a single opaque token, and have no app or
+  // environment dimension to scope to.
+  'CancelEmailChange',
+  'ConfirmEmailChange',
   'Register', // pre-auth
   // Reached from an emailed link, so it must render for a signed-out visitor
   // AND for a signed-in one; either way it reads no telemetry.

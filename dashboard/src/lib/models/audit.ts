@@ -20,6 +20,9 @@ const VERBS: Record<string, string> = {
   activate: 'Activated',
   deactivate: 'Deactivated',
   reset_password: 'Reset password for',
+  email_change_request: 'Requested an email change for',
+  email_change_approved: 'Confirmed a new email for',
+  email_change_cancelled: 'Cancelled an email change for',
   revoke_sessions: 'Revoked sessions for',
   rotate_key: 'Rotated ingest key for',
   enrollment_update: 'Updated enrollment for',
@@ -71,6 +74,14 @@ const NOUNS: Record<string, string> = {
 const DESTRUCTIVE = new Set(['delete', 'retire', 'release']);
 const CREDENTIAL = new Set([
   'reset_password',
+  // All three move, or try to move, a login identity — `users.email` is what a
+  // person signs in with. `email_change_cancelled` earns the emphasis most of
+  // the three: with `cancelled_reason: 'user'` it is a member refusing an
+  // admin's attempt, which is precisely the row worth spotting in a wall of two
+  // hundred.
+  'email_change_request',
+  'email_change_approved',
+  'email_change_cancelled',
   'revoke_sessions',
   'rotate_key',
   'reveal',
