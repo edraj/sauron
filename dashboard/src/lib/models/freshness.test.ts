@@ -6,7 +6,17 @@ const NOW = new Date('2026-08-25T12:00:00Z');
 describe('rollupChip', () => {
   it('is null while rollups are not serving the app', () => {
     expect(rollupChip(null, NOW)).toBeNull();
-    expect(rollupChip({ ready: false, as_of: NOW.toISOString(), sessions_as_of: null }, NOW)).toBeNull();
+    expect(rollupChip({ ready: false, as_of: NOW.toISOString(), sessions_as_of: null }, NOW)).toEqual({
+      label: 'Building history…',
+      title: expect.any(String),
+      tone: 'warning',
+    });
+    expect(
+      rollupChip(
+        { ready: false, as_of: null, sessions_as_of: null, backfill: { days_done: 40, days_total: 90 } },
+        NOW,
+      )?.label,
+    ).toBe('Building history · 40/90 days');
     expect(rollupChip({ ready: true, as_of: null, sessions_as_of: null }, NOW)).toBeNull();
     expect(rollupChip({ ready: true, as_of: 'garbage', sessions_as_of: null }, NOW)).toBeNull();
   });

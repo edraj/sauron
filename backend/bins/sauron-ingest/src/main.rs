@@ -570,6 +570,7 @@ async fn main() -> anyhow::Result<()> {
             kick_lag_secs: cfg.rollup_kick_lag_secs,
             name_cap: cfg.rollup_name_cap,
             session_retention_days: cfg.session_retention_days,
+            auto_backfill: cfg.rollup_auto_backfill,
         },
     );
 

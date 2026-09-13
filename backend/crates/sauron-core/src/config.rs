@@ -40,6 +40,9 @@ pub struct Config {
     pub rollup_lag_secs: i64,
     /// The much shorter lag used for operator-kicked folds (Refresh button).
     pub rollup_kick_lag_secs: i64,
+    /// Let `sauron-ingest` run the history backfills itself whenever a
+    /// rollup gate is still closed (default on). Off = the manual runbook.
+    pub rollup_auto_backfill: bool,
     /// Per-(app, bucket) distinct-name soft cap; tail folds into '~other'.
     pub rollup_name_cap: usize,
     pub cors_allowed_origins: Vec<String>,
@@ -310,6 +313,7 @@ impl std::fmt::Debug for Config {
             .field("dev_mode", &self.dev_mode)
             .field("worker_concurrency", &self.worker_concurrency)
             .field("rollup_fold_secs", &self.rollup_fold_secs)
+            .field("rollup_auto_backfill", &self.rollup_auto_backfill)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("ingest_rate_limit_per_min", &self.ingest_rate_limit_per_min)
             .field("ingest_max_body_bytes", &self.ingest_max_body_bytes)
@@ -832,6 +836,9 @@ impl Config {
             rollup_fold_secs: parse("ROLLUP_FOLD_SECS", 60),
             rollup_lag_secs: parse("ROLLUP_LAG_SECS", 60),
             rollup_kick_lag_secs: parse("ROLLUP_KICK_LAG_SECS", 2),
+            rollup_auto_backfill: var("ROLLUP_AUTO_BACKFILL")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true),
             rollup_name_cap: parse("ROLLUP_NAME_CAP", 2000),
             cors_allowed_origins,
             ingest_rate_limit_per_min: parse("INGEST_RATE_LIMIT_PER_MIN", 6000),
@@ -1400,6 +1407,7 @@ mod tests {
             rollup_fold_secs: 60,
             rollup_lag_secs: 60,
             rollup_kick_lag_secs: 2,
+            rollup_auto_backfill: true,
             rollup_name_cap: 2000,
             cors_allowed_origins: vec![],
             ingest_rate_limit_per_min: 6000,

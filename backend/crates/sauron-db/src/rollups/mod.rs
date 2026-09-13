@@ -104,6 +104,45 @@ pub(crate) async fn rollback_quietly(conn: &mut AsyncPgConnection) {
     let _ = conn.batch_execute("ROLLBACK").await;
 }
 
+/// Session-level lock fencing history-backfill RUNNERS (one per deployment).
+/// Distinct from [`ADVISORY_LOCK`], which is per-transaction and shared with
+/// the live fold. Held on the runner's own connection until
+/// [`release_backfill_run_lock`] (or the session ends).
+const BACKFILL_RUN_LOCK: &str =
+    "SELECT pg_try_advisory_lock(hashtext('sauron_rollup_backfill')) AS present";
+const BACKFILL_RUN_UNLOCK: &str =
+    "SELECT pg_advisory_unlock(hashtext('sauron_rollup_backfill')) AS present";
+
+/// Try to become THE backfill runner; `false` means another session holds it.
+pub async fn try_backfill_run_lock(conn: &mut AsyncPgConnection) -> diesel::QueryResult<bool> {
+    let r: BoolRow = diesel::sql_query(BACKFILL_RUN_LOCK)
+        .get_result(conn)
+        .await?;
+    Ok(r.present)
+}
+
+pub async fn release_backfill_run_lock(conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
+    diesel::sql_query(BACKFILL_RUN_UNLOCK)
+        .get_result::<BoolRow>(conn)
+        .await
+        .map(|_| ())
+}
+
+/// Every table a backfill fills, in one statement. A backfill ships no
+/// statistics; until ANALYZE runs the planner sizes these tables from the
+/// empty-table estimate it last saw.
+pub async fn analyze_rollup_tables(conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
+    diesel::sql_query(
+        "ANALYZE event_user_environments, device_environments, person_days, \
+                 screen_stats_daily, journey_nodes_daily, journey_links_daily, \
+                 perf_agg_hourly, session_stats_daily, user_activity_daily, \
+                 event_top_daily, device_sessions_daily",
+    )
+    .execute(conn)
+    .await
+    .map(|_| ())
+}
+
 pub async fn epoch(conn: &mut AsyncPgConnection) -> diesel::QueryResult<DateTime<Utc>> {
     let r: TsRow = diesel::sql_query("SELECT started_at AS t FROM rollup_epoch")
         .get_result(conn)

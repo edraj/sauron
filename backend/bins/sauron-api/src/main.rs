@@ -81,7 +81,11 @@ use sauron_redis::{RedisStore, SymbolBlobCache};
 
 #[derive(Clone)]
 pub struct AppState {
+    /// Request-scoped connections: `statement_timeout` = the request budget.
     pub pool: PgPool,
+    /// Unbounded connections for work that outlives a request — see
+    /// `routes::bg_db`.
+    pub bg_pool: PgPool,
     pub redis: RedisStore,
     pub keys: JwtKeys,
     pub cfg: Arc<Config>,
@@ -143,7 +147,22 @@ async fn main() -> anyhow::Result<()> {
     // out of it, and the state build would otherwise move it first.
     let cfg = Arc::new(Config::from_env()?);
 
-    let pool = sauron_db::build_pool(&cfg.database_url, 16)?;
+    // Request pool: every statement carries the request budget as a server-side
+    // `statement_timeout`, so a request the TimeoutLayer abandons does not leave
+    // its query running (measured: 182 s past a 60 s 503, pool slot held
+    // throughout — see `sauron_db::build_pool_with_statement_timeout`).
+    // One second inside the TimeoutLayer's budget so the cancellation reaches
+    // the handler first: the client then gets the `query_timeout` body
+    // instead of the layer's bare 503, and the dashboard can say what to do.
+    let pool = sauron_db::build_pool_with_statement_timeout(
+        &cfg.database_url,
+        16,
+        REQUEST_TIMEOUT_SECS * 1000 - 1000,
+    )?;
+    // Background pool: cache recomputes and reapers that legitimately outlive a
+    // request. Small on purpose — the view/overview caches already bound their
+    // own concurrency with semaphores.
+    let bg_pool = sauron_db::build_pool(&cfg.database_url, 4)?;
     let redis = RedisStore::connect(&cfg.redis_url).await?;
     let keys = JwtKeys::new(cfg.require_jwt_secret()?, cfg.jwt_access_ttl_secs);
     let symbols = SymbolBlobCache::connect(
@@ -296,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         pool,
+        bg_pool,
         redis,
         keys,
         cfg: cfg.clone(),
@@ -327,7 +347,7 @@ async fn main() -> anyhow::Result<()> {
     // start is strictly smaller than the 900-second window that exists today.
     {
         let revocations = state.revocations.clone();
-        let pool = state.pool.clone();
+        let pool = state.bg_pool.clone();
         tasks::supervise("revocation-poll", revocation_poll, move || {
             let revocations = revocations.clone();
             let pool = pool.clone();
@@ -344,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
         // lifetime logins, not to live sessions — nothing writes `revoked_at`
         // when a session merely expires. The reaper lives here because the rule
         // is that a table's reaper runs in the process that owns its write path.
-        let pool = state.pool.clone();
+        let pool = state.bg_pool.clone();
         tasks::supervise(
             "auth-session-reaper",
             Duration::from_secs(86_400),
@@ -377,7 +397,7 @@ async fn main() -> anyhow::Result<()> {
         // referring artifact row — behind a grace age covering in-flight
         // uploads. Lives here because artifact upload is this process's route,
         // per the same write-path-owner rule as the reapers above.
-        let pool = state.pool.clone();
+        let pool = state.bg_pool.clone();
         tasks::supervise(
             "symbol-blob-sweeper",
             Duration::from_secs(86_400),
@@ -413,7 +433,7 @@ async fn main() -> anyhow::Result<()> {
         // Deleting these rows disables nothing: unlike `refresh_tokens`, whose
         // revoked rows are load-bearing for replay detection, nothing reads a dead
         // reset row.
-        let pool = state.pool.clone();
+        let pool = state.bg_pool.clone();
         // One task, two tables. Both are reaped hourly, both are owned by this
         // process because their write paths are here, and folding them together
         // means one connection checkout per tick against a pool of 16 rather

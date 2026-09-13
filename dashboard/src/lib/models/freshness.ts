@@ -20,7 +20,19 @@ export function rollupChip(
   status: RollupStatus | null | undefined,
   now: Date = new Date(),
 ): RollupChipView | null {
-  if (!status?.ready || !status.as_of) return null;
+  if (!status) return null;
+  if (!status.ready) {
+    // The gate is closed: pages are served by the exact legacy queries while
+    // sauron-ingest backfills history in the background. Say so — before this
+    // chip existed the page was silently slow with no explanation.
+    const b = status.backfill;
+    const label =
+      b && b.days_total > 0
+        ? t('time.buildingHistory', { done: String(b.days_done), total: String(b.days_total) })
+        : t('time.buildingHistoryPending');
+    return { label, title: t('time.buildingHistoryNote'), tone: 'warning' };
+  }
+  if (!status.as_of) return null;
   const asOf = new Date(status.as_of);
   if (Number.isNaN(asOf.getTime())) return null;
   return {

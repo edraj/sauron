@@ -607,7 +607,9 @@ fn to_value<T: Serialize>(v: T) -> Result<Value, String> {
 /// `Display` — it renders as an HTTP response, which is exactly what a
 /// detached background task has no way to return.
 async fn conn(state: &AppState) -> Result<sauron_db::PgConn, String> {
-    sauron_db::conn(&state.pool)
+    // The background pool: this is the detached recompute the request path
+    // enqueued precisely because it may not fit the request budget.
+    sauron_db::conn(&state.bg_pool)
         .await
         .map_err(|e| e.to_string())
 }

@@ -351,7 +351,11 @@ verification pass, each step idempotent:
 sudo bash /usr/share/doc/sauron-server/post-upgrade.sh
 ```
 
-Run it inside tmux/screen (the first rollup backfill can take an hour+). It
+Run it inside tmux/screen (the first rollup backfill can take an hour+). Note
+that since v1.8.8 `sauron-ingest` runs every backfill by itself once it starts
+(resumable; `ROLLUP_AUTO_BACKFILL=0` opts out), so steps 2 and 3 are only a way
+to front-load that work before the daemons come up — skipping them no longer
+leaves the analytics pages on the slow legacy queries. It
 refuses to run against a sauron-migrate binary that silently ignores unknown
 arguments (releases before strict argument checking), so it cannot no-op the
 way a hand-typed command against a stale binary once did.

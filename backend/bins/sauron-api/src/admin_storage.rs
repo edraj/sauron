@@ -122,7 +122,8 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
     let cold_path = state.cfg.tier_cold_path.clone();
 
     // --- Postgres branch (async, one connection) ---
-    let pool = state.pool.clone();
+    // Detached recompute (see `routes::admin::enqueue_storage`): background pool.
+    let pool = state.bg_pool.clone();
     let scope_orgs = org_ids.to_vec();
     let pg = async move {
         let mut c = conn(&pool).await?;

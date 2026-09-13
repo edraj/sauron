@@ -560,6 +560,13 @@ impl TestDb {
         &self.pool
     }
 
+    /// The ephemeral database's own connection string — for tests that must
+    /// build a pool with different settings than the harness pool (a
+    /// statement timeout, say) against the same database.
+    pub fn database_url(&self) -> String {
+        swap_database(&self.admin_url, &self.db_name)
+    }
+
     /// A raw, unpooled connection to this test's ephemeral database — for the
     /// rare test that must hold more concurrent sessions open than the 2-slot
     /// pool above allows (a deterministic multi-connection race test, e.g. an

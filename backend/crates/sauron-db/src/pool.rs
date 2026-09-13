@@ -46,6 +46,52 @@ pub fn build_pool(database_url: &str, max_size: usize) -> anyhow::Result<PgPool>
 }
 
 /// Check out a connection, mapping pool errors into `anyhow`.
+/// [`build_pool`] with a server-side `statement_timeout` baked into every
+/// connection as its SESSION DEFAULT (via the connection string's `options`),
+/// so `RESET statement_timeout` lands back on the budget rather than on "off".
+///
+/// This is the pool for request-serving processes. A request layer that gives
+/// up after N seconds only stops *waiting*; the Postgres backend keeps
+/// executing the abandoned statement to completion, still holding its pool
+/// slot and its share of the server. Measured at 30M rows: a device-groups
+/// query answered 503 at 60 s and ran 182 s more; a handful of dashboard
+/// reloads then filled every slot with orphans and cheap endpoints failed
+/// too. A statement budget is what makes the timeout actually free resources.
+///
+/// Work that legitimately outlives a request (cache recomputes, retention
+/// sweeps) must not share this pool — give it a plain [`build_pool`].
+pub fn build_pool_with_statement_timeout(
+    database_url: &str,
+    max_size: usize,
+    timeout_ms: u64,
+) -> anyhow::Result<PgPool> {
+    build_pool(
+        &url_with_statement_timeout(database_url, timeout_ms),
+        max_size,
+    )
+}
+
+/// Append `options=-c statement_timeout=<ms>` to a Postgres URL, keeping any
+/// query string it already carries. Percent-encoded because the value holds a
+/// space and an `=`, both of which the URL query grammar would otherwise eat.
+pub fn url_with_statement_timeout(database_url: &str, timeout_ms: u64) -> String {
+    let sep = if database_url.contains('?') { '&' } else { '?' };
+    format!("{database_url}{sep}options=-c%20statement_timeout%3D{timeout_ms}")
+}
+
+/// Whether a diesel error is Postgres cancelling a statement for exceeding
+/// `statement_timeout` (SQLSTATE 57014, message "canceling statement due to
+/// statement timeout"). Callers map it to a "try a narrower window" response
+/// instead of a generic 500.
+pub fn is_statement_timeout(err: &diesel::result::Error) -> bool {
+    match err {
+        diesel::result::Error::DatabaseError(_, info) => {
+            info.message().contains("statement timeout")
+        }
+        _ => false,
+    }
+}
+
 pub async fn conn(pool: &PgPool) -> anyhow::Result<PgConn> {
     pool.get()
         .await

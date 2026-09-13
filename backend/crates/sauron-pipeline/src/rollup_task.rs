@@ -47,6 +47,9 @@ pub struct RollupCfg {
     /// Days of raw `sessions` rows to keep; `0` = keep forever. Resolved
     /// against the `sessions.retention_days` runtime override each pass.
     pub session_retention_days: i64,
+    /// Run the history backfills unattended whenever a gate is closed
+    /// (`ROLLUP_AUTO_BACKFILL`, default on) — see `auto_backfill`.
+    pub auto_backfill: bool,
 }
 
 pub fn spawn_rollup_task(pool: PgPool, redis: RedisStore, cfg: RollupCfg) -> JoinHandle<()> {
@@ -55,6 +58,9 @@ pub fn spawn_rollup_task(pool: PgPool, redis: RedisStore, cfg: RollupCfg) -> Joi
         let mut last_fold = Instant::now();
         let mut maintained_on: Option<NaiveDate> = None;
         info!(fold_secs = cfg.fold_secs, "rollup fold task running");
+        if cfg.auto_backfill {
+            crate::auto_backfill::spawn(pool.clone(), cfg.name_cap);
+        }
         loop {
             tokio::time::sleep(TICK).await;
             // Kicks are honored regardless of leadership: they are explicit,
@@ -179,7 +185,12 @@ async fn maintenance(pool: &PgPool, cfg: RollupCfg) {
     };
     match rollups::backfill_pending(&mut conn).await {
         Ok(true) => {
-            info!("rollup maintenance skipped: backfill pending (run `sauron-migrate backfill-rollups`)");
+            if cfg.auto_backfill {
+                info!("rollup maintenance skipped: backfill pending — (re)starting the unattended backfill");
+                crate::auto_backfill::spawn(pool.clone(), cfg.name_cap);
+            } else {
+                info!("rollup maintenance skipped: backfill pending (run `sauron-migrate backfill-rollups`)");
+            }
             return;
         }
         Ok(false) => {}

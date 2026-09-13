@@ -172,6 +172,25 @@ pub async fn is_backfilled(conn: &mut AsyncPgConnection, app_id: Uuid) -> QueryR
     Ok(r.present)
 }
 
+/// Whether any app still lacks its marker — i.e. whether [`backfill_all`] has
+/// work to do. Apps are never implicitly ready here: the person/environment rollup has
+/// no created-after-epoch escape hatch, every app needs the marker.
+pub async fn backfill_pending(conn: &mut AsyncPgConnection) -> QueryResult<bool> {
+    #[derive(QueryableByName)]
+    struct Present {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        present: bool,
+    }
+    let r: Present = diesel::sql_query(
+        "SELECT EXISTS (SELECT 1 FROM apps a \
+                        WHERE NOT EXISTS (SELECT 1 FROM event_user_env_backfill b WHERE b.app_id = a.id)) \
+                AS present",
+    )
+    .get_result(conn)
+    .await?;
+    Ok(r.present)
+}
+
 /// Backfill every app that has no marker yet, one app per transaction.
 ///
 /// One app at a time rather than one statement for everything: a single
