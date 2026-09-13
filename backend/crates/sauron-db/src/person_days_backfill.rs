@@ -40,32 +40,74 @@ use crate::rollups::person_days::mark_all_backfilled;
 /// `occurred_at`, so a late-arriving event still lands in its correct
 /// historical day.
 pub async fn backfill_all(pool: &crate::PgPool) -> anyhow::Result<()> {
+    use diesel_async::SimpleAsyncConnection;
     let mut conn = crate::conn(pool).await?;
-    let cutoff = crate::rollups::person_days::epoch(&mut conn).await?;
-
-    for (table, col) in [("analytics_events", "events"), ("error_events", "errors")] {
-        let sql = format!(
-            "INSERT INTO person_days (app_id, environment_id, distinct_id, day, {col}) \
-             SELECT app_id, environment_id, distinct_id, occurred_at::date, count(*) \
-               FROM {table} \
-              WHERE received_at < $1 AND distinct_id IS NOT NULL AND distinct_id <> '' \
-              GROUP BY app_id, environment_id, distinct_id, occurred_at::date \
-             ON CONFLICT (app_id, COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid), distinct_id, day) \
-             DO UPDATE SET {col} = person_days.{col} + EXCLUDED.{col}, updated_at = now()"
-        );
-        diesel::sql_query(sql)
-            .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
-            .execute(&mut conn)
-            .await?;
-        tracing::info!(%table, "person-days backfill: table complete");
+    if !backfill_pending(&mut conn).await? {
+        tracing::info!("person-days backfill: every app already marked; nothing to add");
+        return Ok(());
     }
+    let cutoff = crate::rollups::person_days::epoch(&mut conn).await?;
+    // ONE transaction for both tables and the marker: the additive upsert
+    // cannot be re-run safely, so a failure between the two INSERTs must roll
+    // both back rather than leave analytics counted and errors not — which a
+    // retry would then double. All-or-nothing is what makes an unattended
+    // re-run (the ingest service's automatic backfill) correct.
+    conn.batch_execute("BEGIN").await?;
+    let out: anyhow::Result<()> = async {
+        for (table, col) in [("analytics_events", "events"), ("error_events", "errors")] {
+            let sql = format!(
+                "INSERT INTO person_days (app_id, environment_id, distinct_id, day, {col}) \
+                 SELECT app_id, environment_id, distinct_id, occurred_at::date, count(*) \
+                   FROM {table} \
+                  WHERE received_at < $1 AND distinct_id IS NOT NULL AND distinct_id <> '' \
+                  GROUP BY app_id, environment_id, distinct_id, occurred_at::date \
+                 ON CONFLICT (app_id, COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid), distinct_id, day) \
+                 DO UPDATE SET {col} = person_days.{col} + EXCLUDED.{col}, updated_at = now()"
+            );
+            diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+                .execute(&mut conn)
+                .await?;
+            tracing::info!(%table, "person-days backfill: table complete");
+        }
+        // The marker LAST, and only once both tables have landed: it must
+        // never be visible before the rows it claims (the
+        // `device_env_backfill:88` rule). Until it exists the API reports
+        // `ready: false` and the dashboard says history is being built.
+        mark_all_backfilled(&mut conn).await?;
+        Ok(())
+    }
+    .await;
+    match out {
+        Ok(()) => {
+            conn.batch_execute("COMMIT").await?;
+            tracing::info!("person-days backfill complete");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.batch_execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
+}
 
-    // The marker LAST, and only once both tables have landed: it must never be
-    // visible before the rows it claims (the `device_env_backfill:88` rule).
-    // Until it exists the API reports `ready: false` and the dashboard names
-    // this command, which is strictly better than an empty grid that looks like
-    // an answer.
-    mark_all_backfilled(&mut conn).await?;
-    tracing::info!("person-days backfill complete");
-    Ok(())
+/// Whether any app still predates the `person_days` epoch without a marker —
+/// i.e. whether [`backfill_all`] has work to do.
+pub async fn backfill_pending(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> diesel::QueryResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        present: bool,
+    }
+    let r: Row = diesel::sql_query(
+        "SELECT EXISTS (SELECT 1 FROM apps a, person_days_epoch e \
+                        WHERE a.created_at < e.started_at \
+                          AND NOT EXISTS (SELECT 1 FROM person_days_backfill b WHERE b.app_id = a.id)) \
+                AS present",
+    )
+    .get_result(conn)
+    .await?;
+    Ok(r.present)
 }

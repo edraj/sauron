@@ -4,6 +4,7 @@
 //!
 //! [`IngestJob`]: sauron_core::envelope::IngestJob
 
+pub mod auto_backfill;
 pub mod batch;
 pub mod classify;
 pub mod enrich;

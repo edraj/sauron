@@ -1234,15 +1234,26 @@ pub struct RollupStatus {
     /// Oldest event-source watermark — data newer than this is not yet folded.
     pub as_of: Option<chrono::DateTime<Utc>>,
     pub sessions_as_of: Option<chrono::DateTime<Utc>>,
+    /// While `ready` is false: how far the unattended history backfill has
+    /// come, once it has started. `None` before the first day lands (or on
+    /// an app that became ready without one).
+    pub backfill: Option<BackfillProgress>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct BackfillProgress {
+    pub days_done: i64,
+    pub days_total: i64,
 }
 
 #[utoipa::path(
     get, path = "/v1/apps/{app_id}/rollups/status", tag = "Analytics",
     summary = "Rollup freshness",
     description = "\
-How far each rollup has folded. Several analytics routes answer 503 when a \
-rollup they need has never been backfilled — this is where to look first, \
-because backfills are run by an operator (`sauron-migrate`), not automatically.",
+How far each rollup has folded. While `ready` is false the analytics routes \
+serve the exact-but-slow legacy queries; `backfill` reports the unattended \
+history backfill `sauron-ingest` runs to open the gate (or an operator's \
+`sauron-migrate backfill-rollups`).",
     params(("app_id" = Uuid, Path, description = "The app.")), security(("bearerAuth" = [])),
     responses((status = 200, description = "Per-rollup freshness and backfill markers.", body = RollupStatus), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
 )]
@@ -1265,10 +1276,21 @@ pub async fn rollups_status(
     let as_of = sauron_db::rollups::as_of(&mut conn, &sauron_db::rollups::EVENT_SOURCES).await?;
     let sessions_as_of =
         sauron_db::rollups::as_of(&mut conn, &[sauron_db::rollups::SRC_SESSIONS]).await?;
+    let backfill = if ready {
+        None
+    } else {
+        sauron_db::rollups::fold::backfill_progress(&mut conn)
+            .await?
+            .map(|(days_done, days_total)| BackfillProgress {
+                days_done,
+                days_total,
+            })
+    };
     Ok(Json(RollupStatus {
         ready,
         as_of,
         sessions_as_of,
+        backfill,
     }))
 }
 

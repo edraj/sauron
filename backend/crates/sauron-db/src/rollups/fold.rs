@@ -981,12 +981,31 @@ pub async fn fold_day_from_raw(
     name_cap: usize,
 ) -> diesel::QueryResult<()> {
     begin_locked(conn).await?;
-    let out = async {
+    let out = fold_day_body(conn, day, received_upto, delete_first, name_cap).await;
+    finish(conn, out).await
+}
+
+/// The per-day aggregation itself, run INSIDE a caller-owned locked
+/// transaction. Shared by [`fold_day_from_raw`] and the resumable backfill,
+/// which must advance its progress cursor in the same transaction as the
+/// day's writes — a cursor that could commit without the day (or the day
+/// without the cursor) is exactly the double-count the cursor exists to stop.
+async fn fold_day_body(
+    conn: &mut AsyncPgConnection,
+    day: NaiveDate,
+    received_upto: Option<DateTime<Utc>>,
+    delete_first: bool,
+    name_cap: usize,
+) -> diesel::QueryResult<()> {
+    {
         let day_start = day.and_hms_opt(0, 0, 0).expect("valid").and_utc();
         // Year 9999, not chrono's MAX_UTC — same Postgres-range caution as the
         // UNIX_EPOCH note in recompute_sessions.
-        let received = received_upto
-            .unwrap_or_else(|| Utc.with_ymd_and_hms(9999, 1, 1, 0, 0, 0).single().expect("valid"));
+        let received = received_upto.unwrap_or_else(|| {
+            Utc.with_ymd_and_hms(9999, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid")
+        });
         if delete_first {
             for tbl in [
                 "screen_stats_daily",
@@ -1000,10 +1019,12 @@ pub async fn fold_day_from_raw(
                     .execute(conn)
                     .await?;
             }
-            diesel::sql_query("DELETE FROM perf_agg_hourly WHERE hour >= $1 AND hour < $1 + interval '1 day'")
-                .bind::<Timestamptz, _>(day_start)
-                .execute(conn)
-                .await?;
+            diesel::sql_query(
+                "DELETE FROM perf_agg_hourly WHERE hour >= $1 AND hour < $1 + interval '1 day'",
+            )
+            .bind::<Timestamptz, _>(day_start)
+            .execute(conn)
+            .await?;
         }
         let mut sess: HashMap<SessKey, SessState> = HashMap::new();
         let mut jour: HashMap<JourKey, JourState> = HashMap::new();
@@ -1064,8 +1085,6 @@ pub async fn fold_day_from_raw(
         }
         Ok(())
     }
-    .await;
-    finish(conn, out).await
 }
 
 fn merge_analytics(acc: &mut AnalyticsDeltas, d: AnalyticsDeltas) {
@@ -1384,57 +1403,160 @@ struct MinDayRow {
     t: Option<DateTime<Utc>>,
 }
 
-/// One-shot, operator-run (`sauron-migrate backfill-rollups`). Aggregates
-/// `received_at <= epoch` day by day, recomputes all session days, then marks
-/// every existing app ready in the same final transaction as the last write.
-/// Idempotent in effect only when rollups are empty for the covered range —
-/// re-running against already-backfilled tables double-adds, which is why the
-/// runner refuses when any marker row exists.
-pub async fn backfill_all(
+/// What a resumable backfill run ended with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillOutcome {
+    /// Every pre-epoch day landed and every app is marked ready.
+    Completed,
+    /// `on_day` asked to stop; the days folded so far are committed and
+    /// recorded, and a later run continues from the first unfinished day.
+    Interrupted,
+    /// Markers were already present: nothing was added (the session-day
+    /// rollups, which are REPLACE-semantics, were refreshed in place).
+    AlreadyDone,
+}
+
+#[derive(QueryableByName)]
+struct ProgressRow {
+    #[diesel(sql_type = Date)]
+    first_day: NaiveDate,
+    #[diesel(sql_type = Date)]
+    last_day: NaiveDate,
+    #[diesel(sql_type = Date)]
+    next_day: NaiveDate,
+}
+
+/// Where the backfill stands: `(days landed, days in total)`, or `None` when
+/// no run has started. Read by the rollup status endpoint so the dashboard can
+/// say "building history, 40 of 90 days" instead of nothing.
+pub async fn backfill_progress(
+    conn: &mut AsyncPgConnection,
+) -> diesel::QueryResult<Option<(i64, i64)>> {
+    let rows: Vec<ProgressRow> =
+        diesel::sql_query("SELECT first_day, last_day, next_day FROM rollup_backfill_progress")
+            .get_results(conn)
+            .await?;
+    Ok(rows.into_iter().next().map(|r| {
+        let total = (r.last_day - r.first_day).num_days() + 1;
+        let done = (r.next_day - r.first_day).num_days().clamp(0, total);
+        (done, total)
+    }))
+}
+
+/// Pre-epoch history, one UTC day per transaction, resumable.
+///
+/// Aggregates `received_at <= epoch` day by day, recomputes all session days,
+/// then marks every existing app ready in the same final transaction as the
+/// last write. Each day's fold and the advance of `rollup_backfill_progress.
+/// next_day` commit together, so a run cut short at any point — process
+/// stop, lost connection, `on_day` returning `false` — leaves the tables in a
+/// state the next call simply continues from. That property is what lets
+/// `sauron-ingest` run this unattended on every upgraded deployment instead
+/// of waiting for an operator who, in practice, never ran it.
+///
+/// `on_day` is called after each day commits and returns whether to go on.
+/// Re-running once markers exist adds nothing (`AlreadyDone`).
+pub async fn backfill_all_resumable(
     conn: &mut AsyncPgConnection,
     name_cap: usize,
-    mut progress: impl FnMut(NaiveDate),
-) -> diesel::QueryResult<()> {
+    mut on_day: impl FnMut(NaiveDate) -> bool,
+) -> diesel::QueryResult<BackfillOutcome> {
     let already: CountRow = diesel::sql_query("SELECT count(*)::bigint AS n FROM rollup_backfill")
         .get_result(conn)
         .await?;
     if already.n > 0 {
-        tracing::warn!(
+        tracing::info!(
             "rollup_backfill markers already present; skipping the ADDITIVE event backfill \
              (a second run would double-count) — refreshing the session-day rollups only, \
              which are REPLACE-semantics and safe to recompute in place"
         );
         recompute_sessions(conn, None).await?;
-        return Ok(());
+        return Ok(BackfillOutcome::AlreadyDone);
     }
     let epoch = super::epoch(conn).await?;
-    let mut min_day: Option<NaiveDate> = None;
-    for tbl in ["analytics_events", "error_events", "transactions"] {
-        let r: MinDayRow = diesel::sql_query(format!("SELECT min(occurred_at) AS t FROM {tbl}"))
-            .get_result(conn)
+    let existing: Vec<ProgressRow> =
+        diesel::sql_query("SELECT first_day, last_day, next_day FROM rollup_backfill_progress")
+            .get_results(conn)
             .await?;
-        if let Some(t) = r.t {
-            let d = t.date_naive();
-            min_day = Some(min_day.map_or(d, |m: NaiveDate| m.min(d)));
+    let (first, last, mut day) = match existing.into_iter().next() {
+        Some(p) => (p.first_day, p.last_day, p.next_day),
+        None => {
+            let mut min_day: Option<NaiveDate> = None;
+            for tbl in ["analytics_events", "error_events", "transactions"] {
+                let r: MinDayRow =
+                    diesel::sql_query(format!("SELECT min(occurred_at) AS t FROM {tbl}"))
+                        .get_result(conn)
+                        .await?;
+                if let Some(t) = r.t {
+                    let d = t.date_naive();
+                    min_day = Some(min_day.map_or(d, |m: NaiveDate| m.min(d)));
+                }
+            }
+            let Some(first) = min_day else {
+                // No events at all: nothing to aggregate, but the apps still
+                // need their markers so reads take the rollup path from here on.
+                begin_locked(conn).await?;
+                let out = super::mark_all_backfilled(conn).await.map(|_| ());
+                finish(conn, out).await?;
+                return Ok(BackfillOutcome::Completed);
+            };
+            // Days after today hold nothing to fold (ingest clamps future
+            // timestamps), and an epoch pinned into the future — the test
+            // harness does this to keep gates closed — must not turn into
+            // thousands of empty day transactions.
+            let last = epoch.date_naive().min(Utc::now().date_naive()).max(first);
+            diesel::sql_query(
+                "INSERT INTO rollup_backfill_progress (first_day, last_day, next_day) \
+                 VALUES ($1, $2, $1)",
+            )
+            .bind::<Date, _>(first)
+            .bind::<Date, _>(last)
+            .execute(conn)
+            .await?;
+            (first, last, first)
         }
-    }
-    let Some(mut day) = min_day else {
-        // No events at all: nothing to aggregate, but the apps still need
-        // their markers so reads take the rollup path from here on.
-        begin_locked(conn).await?;
-        let out = super::mark_all_backfilled(conn).await.map(|_| ());
-        return finish(conn, out).await;
     };
-    let last = epoch.date_naive();
+    let _ = first;
     while day <= last {
-        fold_day_from_raw(conn, day, Some(epoch), false, name_cap).await?;
-        progress(day);
+        begin_locked(conn).await?;
+        let out = async {
+            fold_day_body(conn, day, Some(epoch), false, name_cap).await?;
+            diesel::sql_query(
+                "UPDATE rollup_backfill_progress SET next_day = $1, updated_at = now()",
+            )
+            .bind::<Date, _>(day + Duration::days(1))
+            .execute(conn)
+            .await?;
+            Ok::<(), diesel::result::Error>(())
+        }
+        .await;
+        finish(conn, out).await?;
+        let go_on = on_day(day);
         day += Duration::days(1);
+        if !go_on && day <= last {
+            return Ok(BackfillOutcome::Interrupted);
+        }
     }
     recompute_sessions(conn, None).await?;
     begin_locked(conn).await?;
     let out = super::mark_all_backfilled(conn).await.map(|_| ());
-    finish(conn, out).await
+    finish(conn, out).await?;
+    Ok(BackfillOutcome::Completed)
+}
+
+/// Operator entry point (`sauron-migrate backfill-rollups`): the resumable
+/// backfill, run to completion, reporting each landed day.
+pub async fn backfill_all(
+    conn: &mut AsyncPgConnection,
+    name_cap: usize,
+    mut progress: impl FnMut(NaiveDate),
+) -> diesel::QueryResult<()> {
+    backfill_all_resumable(conn, name_cap, |day| {
+        progress(day);
+        true
+    })
+    .await
+    .map(|_| ())
 }
 
 #[cfg(test)]

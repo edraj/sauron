@@ -22,7 +22,9 @@ pub mod scope;
 pub mod sketch;
 pub mod stack_pool;
 
-pub use pool::{build_pool, conn, PgConn, PgPool};
+pub use pool::{
+    build_pool, build_pool_with_statement_timeout, conn, is_statement_timeout, PgConn, PgPool,
+};
 
 /// Re-exported so downstream crates can name the connection type without a
 /// direct diesel-async dependency.

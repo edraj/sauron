@@ -95,6 +95,16 @@ impl From<diesel::result::Error> for ApiError {
     fn from(e: diesel::result::Error) -> Self {
         match e {
             diesel::result::Error::NotFound => ApiError::NotFound,
+            // Postgres cancelled the statement at the request budget (the
+            // pool's `statement_timeout`). Same class as the TimeoutLayer's
+            // 503 — the window is too wide for this deployment right now —
+            // and unlike a 500 it tells the dashboard what to suggest.
+            other if sauron_db::is_statement_timeout(&other) => ApiError::Unavailable(
+                "query_timeout",
+                "the query exceeded the request budget; narrow the time window or wait for the \
+                 rollup backfill to finish"
+                    .to_string(),
+            ),
             other => ApiError::Internal(other.to_string()),
         }
     }

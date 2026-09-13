@@ -208,7 +208,7 @@ fn enqueue_funnel(
         };
         let started = Utc::now();
         let outcome = async {
-            let mut conn = crate::routes::db(&state).await?;
+            let mut conn = crate::routes::bg_db(&state).await?;
             let rows = repo::funnel(&mut conn, scope, &steps, win)
                 .await
                 .map_err(|e| ApiError::Internal(e.to_string()))?;

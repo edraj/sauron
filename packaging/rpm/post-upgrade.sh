@@ -63,6 +63,9 @@ banner "post-migration: refresh sessions statistics"
 run_sql "ANALYZE sessions" >/dev/null || die "ANALYZE sessions failed"
 echo "sessions statistics refreshed"
 
+# Since v1.8.8 sauron-ingest runs these backfills itself on start-up (resumable,
+# ROLLUP_AUTO_BACKFILL). Running them here first just means the dashboard is
+# fast the moment the daemons come up instead of minutes later.
 banner "2/5 rollup backfill (skipped automatically if already done)"
 echo "NOTE: first run replays all pre-existing history day by day — budget"
 echo "roughly an hour per 100M events. Do NOT interrupt it: a partial backfill"

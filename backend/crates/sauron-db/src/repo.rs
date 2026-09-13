@@ -7935,6 +7935,43 @@ fn device_last_distinct_id_join(env: EnvFilter, bind_index: usize) -> String {
 /// Takes `&EnvFilter`, unlike the older [`device_last_distinct_id_join`] next
 /// to it: that one keeps its pre-existing owned signature rather than being
 /// reshaped, but a new function has no such constraint.
+/// `device_last_distinct_id_join` for the rollup shape, where the outer row
+/// carries the device's environment-scoped `last_seen` (from
+/// `device_environments`). The newest signal in the environment occurred AT
+/// that instant, so each leg is bounded to the day around it and the
+/// executor prunes to one or two partitions per leg instead of opening every
+/// one — measured: 344 partition scans per device → ~6 (sessions are
+/// partitioned by `started_at`, so that leg keeps a 7-day tail: no session
+/// runs longer than that and its last event still lands at `last_seen`).
+fn device_last_distinct_id_join_bounded(env: EnvFilter, bind_index: usize) -> String {
+    let ae_env = env.sql_fragment_for("lae", bind_index);
+    let ee_env = env.sql_fragment_for("lee", bind_index);
+    let se_env = env.sql_fragment_for("lse", bind_index);
+    format!(
+        " LEFT JOIN LATERAL ( \
+             SELECT distinct_id FROM ( \
+                 SELECT distinct_id, occurred_at FROM analytics_events lae \
+                 WHERE lae.app_id = $1 AND lae.device_key = d.device_key{ae_env} \
+                   AND lae.occurred_at >= d.last_seen - interval '1 day' \
+                   AND lae.occurred_at < d.last_seen + interval '1 day' \
+                 UNION ALL \
+                 SELECT distinct_id, occurred_at FROM error_events lee \
+                 WHERE lee.app_id = $1 AND lee.device_key = d.device_key \
+                   AND lee.distinct_id IS NOT NULL{ee_env} \
+                   AND lee.occurred_at >= d.last_seen - interval '1 day' \
+                   AND lee.occurred_at < d.last_seen + interval '1 day' \
+                 UNION ALL \
+                 SELECT distinct_id, last_event_at AS occurred_at FROM sessions lse \
+                 WHERE lse.app_id = $1 AND lse.device_key = d.device_key \
+                   AND lse.distinct_id IS NOT NULL{se_env} \
+                   AND lse.started_at >= d.last_seen - interval '7 days' \
+                   AND lse.started_at < d.last_seen + interval '1 day' \
+             ) recent \
+             ORDER BY occurred_at DESC LIMIT 1 \
+         ) ld ON TRUE"
+    )
+}
+
 fn device_membership_sql(env: &EnvFilter, bind_index: usize) -> String {
     if matches!(env, EnvFilter::All) {
         return String::new();
@@ -8000,63 +8037,50 @@ fn device_qualifying_sql(window_sql: &str, membership_sql: &str, group_sql: &str
 /// index is added and none would help the scoped case; see the block comment
 /// over this function's ORDER BY for the measured plans and why the cost is
 /// accepted.
-#[allow(clippy::too_many_arguments)]
-pub async fn list_devices(
-    conn: &mut AsyncPgConnection,
-    scope: ReadScope,
-    window: TimeWindow,
-    limit: i64,
-    offset: i64,
-    sort: SortSpec,
-    search: Option<&str>,
-    group: Option<DeviceGroupKey<'_>>,
-) -> QueryResult<Vec<DeviceRow>> {
-    // Escape LIKE metacharacters: an unescaped `%`/`_` makes a literal search
-    // term match the wrong rows, and a pattern of many wildcards makes ILIKE
-    // matching super-linear per scanned row.
-    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+/// Membership on the rollup path: one indexed probe of `device_environments`
+/// per candidate instead of four unbounded `EXISTS` over the raw tables. Like
+/// `list_device_groups_rollup_sql` this reads lifetime membership (a device
+/// whose only in-environment signal is a session older than the window counts
+/// as a member here and not on the live shape) — the devices' own
+/// `last_seen >= $2` window still applies to both.
+fn device_membership_rollup_sql(env: &EnvFilter, bind_index: usize) -> String {
+    if matches!(env, EnvFilter::All) {
+        return String::new();
+    }
+    let de_env = env.sql_fragment_for("de0", bind_index);
+    format!(
+        " AND EXISTS (SELECT 1 FROM device_environments de0 \
+                     WHERE de0.app_id = $1 AND de0.device_key = devices.device_key{de_env})"
+    )
+}
 
-    // $1 app_id, $2 since, $3 pattern, $4 limit, $5 offset — env takes $6 when
-    // it needs a bind, reused across the count LATERALs that are actually
-    // emitted (see the `counts_select`/`counts_join` comment below — `events`/
-    // `errors` only under `One`/`Unattributed`, `sessions` always) and the
-    // membership `EXISTS` (only emitted when `scope.env != All`). Same idiom
-    // as `list_persons`.
-    let env_sql = scope.env.sql_fragment(6);
-
-    // The group binds follow env, not precede it, so env keeps index 6 and
-    // every fragment above is untouched. `consumes_bind()` is load-bearing:
-    // `sql_fragment` reserves its index only for `One`/`Subset` — `All` emits
-    // nothing and `Unattributed` emits a literal `IS NULL` — so assuming the
-    // index is always consumed would shift all four group binds by one.
-    let group_base = if scope.env.consumes_bind() { 7 } else { 6 };
-
-    // `IS NOT DISTINCT FROM`, not `=`: the all-NULL group is a real group, and
-    // `model = NULL` is NULL (never true), which would silently return zero
-    // rows for it. Applied inside the qualifying-devices subquery, alongside
-    // the search predicate, so the outer LIMIT still applies to the filtered
-    // set.
-    // `to` binds LAST — after env AND after the four group binds — so no
-    // existing index moves. Its position is therefore dynamic in two ways at
-    // once: `consumes_bind()` decides whether env took 6, and `group` decides
-    // whether four more follow. Getting this wrong does not fail loudly; it
-    // silently binds the timestamp into `family` and scopes the page to a
-    // group nobody asked for.
-    let to_idx = group_base + if group.is_some() { 4 } else { 0 };
-
-    // One SQL shape serves a bounded and an unbounded window: `to` is bound as
-    // `Nullable<Timestamptz>` and the predicate short-circuits on NULL. A
-    // second `format!` branch would be a second shape to keep in step.
-    //
-    // `window.column` is a `&'static str` copied out of the route's whitelist —
-    // see `TimeWindow`. No caller text reaches this string.
-    //
-    // Note the asymmetry with the `$2` in the sessions LATERAL below: that one
-    // stays, because `$2` means "the window's lower bound" whichever column the
-    // window is on, and the session count has always been bounded by it.
-    let window_sql = device_window_sql(window.column, to_idx);
-
-    let group_sql = if group.is_some() {
+/// The `list_devices` SQL. Two shapes under an environment scope:
+///
+/// * `backfilled = false` (live): membership by four `EXISTS`, counts and
+///   extrema by three LATERALs over the raw tables — per candidate device,
+///   before `LIMIT`. O(devices × partitions); at 50k devices / 30M rows this
+///   was a 60 s timeout for the dashboard's default (environment-selected)
+///   Devices page.
+/// * `backfilled = true`: membership and counts from `device_environments`
+///   (one aggregate join), the latest-distinct-id probe pushed BELOW the
+///   page (unless it is the sort key), and sessions from
+///   `device_sessions_daily` once the rollups are ready — the same three
+///   swaps `list_device_groups` makes.
+fn list_devices_sql(
+    env: &EnvFilter,
+    sort: &SortSpec,
+    window_column: &'static str,
+    has_group: bool,
+    backfilled: bool,
+    sessions_from_rollup: bool,
+) -> String {
+    let env_sql = env.sql_fragment(6);
+    // Four optional group binds follow the (optional) env bind, and `to` sits
+    // after those.
+    let group_base = if env.consumes_bind() { 7 } else { 6 };
+    let to_idx = group_base + if has_group { 4 } else { 0 };
+    let window_sql = device_window_sql(window_column, to_idx);
+    let group_sql = if has_group {
         format!(
             " AND family IS NOT DISTINCT FROM ${} \
               AND model IS NOT DISTINCT FROM ${} \
@@ -8070,69 +8094,24 @@ pub async fn list_devices(
     } else {
         String::new()
     };
-
-    // See `list_persons`' doc comment: this is a WHERE-clause predicate on the
-    // qualifying-devices subquery, not a join, so it narrows the set the outer
-    // LIMIT pages over rather than the page itself. Omitted entirely under
-    // `All` — same reasoning as `list_persons`.
-    // See [`device_membership_sql`] for the alias-qualification and
-    // `started_at >= $2` reasoning; shared verbatim with [`list_device_groups`].
-    let membership_sql = device_membership_sql(&scope.env, 6);
-
-    // `devices.events_count`/`errors_count` are lifetime counters that
-    // `bump_device` increments on every event regardless of environment —
-    // durable, because `devices` is never partitioned and never dropped.
-    // `analytics_events`/`error_events` ARE partitioned by `sauron-tier`
-    // (`bins/sauron-tier/src/main.rs`), which exports aged partitions (past
-    // `TIER_HOT_DAYS`, default 30 days) to Parquet and then drops them from
-    // Postgres. The `ae`/`ee` LATERALs below can only see rows still in
-    // Postgres, so for a device whose activity has aged out of the hot window
-    // they under-report — all the way down to 0 for a device with a real,
-    // large lifetime count. This is the same tiering blind spot the design
-    // doc records for per-environment issue counts (see "No new table" in
-    // `docs/superpowers/specs/2026-07-28-environment-scoped-reads-design.md`:
-    // `issues.times_seen` vs. a per-environment LATERAL over `error_events`)
-    // — the scoped count cannot see tiered data, and that is accepted rather
-    // than solved here.
-    //
-    // So `All` — "every environment, all time" — reads the durable columns
-    // directly, no join, no subquery, matching that design's precedent for
-    // `All`. `One`/`Unattributed` have no alternative but the LATERALs: they
-    // are the only thing that *can* be scoped to a single environment,
-    // tiering blind spot and all. `sessions_count` has no durable column to
-    // fall back to (`devices` was never denormalized for it, and `sessions`
-    // itself is not one of `sauron-tier`'s tiered tables), so it stays a
-    // LATERAL under every variant, exactly as it already was before this
-    // task — do not read this as an oversight; the two fields are computed
-    // differently on purpose.
-    //
-    // F4: `first_seen`/`last_seen`/`last_distinct_id` follow the identical
-    // `All`-vs-scoped split, folded into this same variable rather than a
-    // parallel one — under `All` they read straight off `d`; under
-    // `One`/`Unattributed` they extend the `ae`/`ee`/`tx` LATERALs this
-    // fixes' counts already join, adding `min`/`max(occurred_at)`, plus
-    // [`device_last_distinct_id_join`] for `last_distinct_id` (see its own
-    // doc comment). `LEAST`/`GREATEST` ignore `NULL` arguments (Postgres's
-    // documented behaviour), so a device that qualifies via only one of
-    // `ae`/`ee`/`se`/`tx` (e.g. `session_only_device_key`, sessions alone)
-    // still gets a real value from the others.
-    //
-    // FIX ROUND 1 (Task 11): `tx` is a fourth `LEFT JOIN LATERAL`, over
-    // `transactions`, added alongside `ae`/`ee`. It carries NO `cnt` — a
-    // transaction is neither an event nor an error, so it must never touch
-    // `events_count`/`errors_count`, only `first_seen`/`last_seen` via the
-    // `LEAST`/`GREATEST` below. It is NOT optional: `device_membership_sql`'s
-    // transactions leg (added earlier in Task 11) admits a device whose ONLY
-    // signal is a transaction into `d` — and such a device has no row in
-    // `analytics_events`/`error_events`/`sessions` at all, so `ae`/`ee`/`se`
-    // are ALL NULL for it. Postgres's `LEAST`/`GREATEST` return NULL only
-    // when EVERY argument is NULL — exactly this case — and `DeviceRow`
-    // declares `first_seen`/`last_seen` non-nullable `Timestamptz`, so that
-    // NULL does not render a wrong number, it fails to DESERIALIZE: widening
-    // membership without also widening these two LATERALs turned a
-    // transaction-only device into a 500, reproduced live. Same reasoning,
-    // same fix, applies verbatim to `list_device_groups_live_sql` below.
-    let (scoped_select, scoped_join) = if matches!(scope.env, EnvFilter::All) {
+    let membership_sql = if backfilled {
+        device_membership_rollup_sql(env, 6)
+    } else {
+        device_membership_sql(env, 6)
+    };
+    let scoped = !matches!(env, EnvFilter::All);
+    let ld_join = if !scoped {
+        String::new()
+    } else if backfilled {
+        device_last_distinct_id_join_bounded(env.clone(), 6)
+    } else {
+        device_last_distinct_id_join(env.clone(), 6)
+    };
+    // The latest-id probe is a per-device UNION over three tables ordered
+    // by time; on the rollup shape it runs on the PAGE, except when it is
+    // what the page is sorted by.
+    let ld_after_page = backfilled && scoped && sort.column != "last_distinct_id";
+    let (scoped_select, scoped_join) = if !scoped {
         (
             "d.events_count AS events_count, d.errors_count AS errors_count, \
              d.first_seen AS first_seen, d.last_seen AS last_seen, \
@@ -8140,12 +8119,40 @@ pub async fn list_devices(
                 .to_string(),
             String::new(),
         )
+    } else if backfilled {
+        let de_env = env.sql_fragment(6);
+        let ld_inline = if ld_after_page {
+            String::new()
+        } else {
+            ld_join.clone()
+        };
+        let ld_select = if ld_after_page {
+            "NULL::text AS last_distinct_id"
+        } else {
+            "ld.distinct_id AS last_distinct_id"
+        };
+        (
+            format!(
+                "COALESCE(de.events_count, 0)::bigint AS events_count, \
+                 COALESCE(de.errors_count, 0)::bigint AS errors_count, \
+                 de.first_seen AS first_seen, \
+                 de.last_seen AS last_seen, \
+                 {ld_select}"
+            ),
+            format!(
+                " JOIN ( \
+                     SELECT app_id, device_key, \
+                            sum(events_count)::bigint AS events_count, \
+                            sum(errors_count)::bigint AS errors_count, \
+                            min(first_seen) AS first_seen, \
+                            max(last_seen) AS last_seen \
+                     FROM device_environments \
+                     WHERE app_id = $1{de_env} \
+                     GROUP BY app_id, device_key \
+                 ) de ON de.app_id = d.app_id AND de.device_key = d.device_key{ld_inline}"
+            ),
+        )
     } else {
-        // `.clone()`, not a move: `env_sql`/the final `bind_env!` call below both
-        // still need `scope.env` after this — `device_last_distinct_id_join` keeps
-        // its pre-existing owned-`EnvFilter` signature (not reshaped to take `&`),
-        // per the rule of adding a clone at the call site instead.
-        let ld_join = device_last_distinct_id_join(scope.env.clone(), 6);
         (
             "COALESCE(ae.cnt, 0)::bigint AS events_count, \
              COALESCE(ee.cnt, 0)::bigint AS errors_count, \
@@ -8172,97 +8179,32 @@ pub async fn list_devices(
             ),
         )
     };
-
-    // ORDER BY and LIMIT/OFFSET both live on the OUTER query. They used to sit
-    // inside the subquery ("page first, then count per returned device"),
-    // which worked only while the sole ordering was `last_seen`, a column of
-    // `devices`. `sessions_count`, `events_count`, `errors_count` and
-    // `last_distinct_id` are produced by the LATERALs below and are not
-    // addressable in there at all, so a subquery-level ORDER BY cannot serve
-    // them. One code path for every column beats two that drift.
-    //
-    // THE COST. Measured with `EXPLAIN` over this exact SQL, not estimated,
-    // and it is not uniform: it turns on whether an index can presort the
-    // ORDER BY column, which depends on `scope.env` as well as on the column.
-    //
-    // - `All` + the default `last_seen`: NO regression. `Index Scan using
-    //   devices_app_last_seen_idx` already delivers `last_seen` order, so the
-    //   tiebreak only adds an `Incremental Sort` with `Presorted Key:
-    //   devices.last_seen`, and the `Limit` still stops early — the same
-    //   bounded work the old inner `LIMIT` did.
-    //
-    // - `One`/`Unattributed`, ANY column INCLUDING the default: the whole
-    //   window. This is the common path, not the exception — the dashboard
-    //   auto-selects an environment — so it is the regression that matters.
-    //   Scoped, the `last_seen` alias is `GREATEST(max(ae.occurred_at),
-    //   max(ee.occurred_at), max(se.last_event_at))`, which nothing can
-    //   presort, and the plan becomes a blocking `Sort` (observed
-    //   `Sort Key: (GREATEST(...)) DESC, devices.device_key`) sitting above
-    //   FOUR nested-loop LATERALs — `ae`, `ee`, `ld`, `se`, and `ld` is itself
-    //   a three-way `UNION ALL` with its own `Sort ... LIMIT 1`. A blocking
-    //   sort must consume every row, so all four run once per qualifying
-    //   device in the `since` window. The old inner `LIMIT` capped them at
-    //   `limit + offset` — i.e. at most 200 + offset, and 50 on the first
-    //   page. This is a real and potentially large regression on an app with
-    //   many devices in the window, stated plainly rather than softened.
-    //
-    //   THE NUMBERS, and why there is no ratio here the way there is over
-    //   `list_persons`. The measurement fixture was 40 devices with one
-    //   env-tagged `analytics_events` row each, and on it the planner
-    //   estimated **81.79 either way** — `rows=1` for both shapes, because a
-    //   40-row table with no statistics gives it nothing to work with. That
-    //   figure is recorded so nobody re-derives it and mistakes it for
-    //   evidence of no regression: it is not a cost comparison, it is the
-    //   absence of one. The falsifiable signal on this fixture is
-    //   STRUCTURAL — whether `Limit` sits above or below the four joins —
-    //   and that difference is unambiguous in the plans quoted above.
-    //   A future optimiser wanting a ratio to beat has to re-measure on a
-    //   fixture with enough devices to make the planner's estimate mean
-    //   something; `list_persons` used 2,000 rows and got 40.0x/35.0x out of
-    //   the same structural change.
-    //
-    // - `All` + any non-indexable column (`family`, `os_name`, `browser`, the
-    //   four computed ones): the same blocking `Sort`, same full-window cost.
-    //   Unavoidable, and the price of being able to sort by them at all — the
-    //   trade [`list_device_groups`] already documents and accepts.
-    //
-    // Accepted rather than overlooked, because the cheap plan was also WRONG
-    // under a scoped read: the old inner `ORDER BY last_seen ... LIMIT` paged
-    // on `devices.last_seen`, the app-wide column, while the page displayed
-    // the env-scoped `GREATEST(...)`. It chose which rows to show by a value
-    // the caller never sees, and `d.last_seen` can be newer than the scoped
-    // one because of activity this scope cannot see. Restoring the bounded
-    // plan for scoped reads means restoring that bug. Ordering on the OUTPUT
-    // alias — Postgres resolves a bare name in ORDER BY against the select
-    // list first — is what fixes it; see the same reasoning spelled out over
-    // `list_device_groups`' ORDER BY.
-    //
-    // No index can buy the scoped case back: the sort key is an aggregate over
-    // three other tables. If this becomes a measured problem in production the
-    // answer is a materialized per-(device, environment) rollup, not an index
-    // and not a second code path here.
-    //
-    // IT DID BECOME A MEASURED PROBLEM, and that rollup now exists —
-    // `device_environments`, read by [`list_device_groups_rollup_sql`]. It was
-    // `list_device_groups` that measured it (4,639ms under `One(env)` on a
-    // 13,333-qualifying-device fixture, versus 596ms unscoped), and that
-    // function is the only reader so far; THIS function has NOT been moved onto
-    // the rollup, so everything above still describes it exactly. The "second
-    // code path" the paragraph above rejects was accepted over there, with a
-    // per-app backfill marker bounding how long both shapes must coexist —
-    // whoever moves `list_devices` too inherits that trade, plus one this
-    // function alone has: `last_distinct_id` is not in the rollup and would
-    // still need [`device_last_distinct_id_join`].
-    //
-    // The `se` LATERAL's `since` bound moved from a `WHERE` clause to a
-    // `count(*) FILTER (...)` — F4 needs `min(started_at)`/`max(last_event_at)`
-    // over *all* of this device's env-scoped sessions, not just the ones
-    // after `since` (a device's true per-environment `first_seen` can predate
-    // the page's window; `since` only decides which devices are listed, via
-    // the `WHERE ... last_seen >= $2` in the subquery, unchanged). Filtering
-    // only the count aggregate is equivalent to the old `WHERE started_at >=
-    // $2` for `cnt` specifically (same rows excluded, same count), while
-    // leaving the two new aggregates unbounded.
+    // Sessions: `count(*) FILTER (WHERE started_at >= $2)` keeps `cnt`
+    // windowed exactly as before while `min_started`/`max_last_event` stay
+    // lifetime (they feed the live shape's first/last_seen). On the rollup
+    // path the two extrema are unused, so the day-granular
+    // `device_sessions_daily` sum replaces the per-device LATERAL — same
+    // trade `list_device_groups` documents (windowed by started-day).
+    let se_join = if backfilled && sessions_from_rollup {
+        let se_env = env.sql_fragment(6);
+        format!(
+            " LEFT JOIN ( \
+                 SELECT device_key, sum(sessions)::bigint AS cnt \
+                 FROM device_sessions_daily \
+                 WHERE app_id = $1 AND day >= ($2 AT TIME ZONE 'UTC')::date{se_env} \
+                 GROUP BY device_key \
+             ) se ON se.device_key = d.device_key"
+        )
+    } else {
+        format!(
+            " LEFT JOIN LATERAL ( \
+                 SELECT count(*) FILTER (WHERE started_at >= $2) AS cnt, \
+                        min(started_at) AS min_started, max(last_event_at) AS max_last_event \
+                 FROM sessions \
+                 WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
+             ) se ON TRUE"
+        )
+    };
     let order_by = sort.order_by();
     // The rows that QUALIFY, shared verbatim with `count_devices`. Extracted so
     // the count's predicate is the same string as the list's rather than a copy
@@ -8271,23 +8213,105 @@ pub async fn list_devices(
     // that drifted by one index would not error — it would count a different
     // set of devices and report the number with total confidence.
     let qualifying = device_qualifying_sql(&window_sql, &membership_sql, &group_sql);
-
-    let q = format!(
+    let page = format!(
         "SELECT d.id, d.device_key, d.family, d.model, d.os_name, d.os_version, d.arch, \
                 d.browser, \
                 {scoped_select}, \
                 COALESCE(se.cnt, 0)::bigint AS sessions_count \
          FROM ( \
              SELECT * FROM {qualifying} \
-         ) d{scoped_join} \
-         LEFT JOIN LATERAL ( \
-             SELECT count(*) FILTER (WHERE started_at >= $2) AS cnt, \
-                    min(started_at) AS min_started, max(last_event_at) AS max_last_event \
-             FROM sessions \
-             WHERE app_id = $1 AND device_key = d.device_key{env_sql} \
-         ) se ON TRUE \
+         ) d{scoped_join}{se_join} \
          ORDER BY {order_by} \
          LIMIT $4 OFFSET $5"
+    );
+    if ld_after_page {
+        // Re-select every column by name so the page's `NULL AS
+        // last_distinct_id` placeholder is replaced, not duplicated; the
+        // outer alias is `d` again so the sort tiebreak (`d.device_key`) and
+        // the probe's `d.device_key` correlation both resolve.
+        format!(
+            "SELECT d.id, d.device_key, d.family, d.model, d.os_name, d.os_version, d.arch, \
+                    d.browser, d.events_count, d.errors_count, d.first_seen, d.last_seen, \
+                    ld.distinct_id AS last_distinct_id, d.sessions_count \
+             FROM ({page}) d{ld_join} \
+             ORDER BY {order_by}"
+        )
+    } else {
+        page
+    }
+}
+
+/// The count's predicate: the same qualifying string `list_devices_sql`
+/// pages over, so the two can never disagree on who is in the list.
+fn count_devices_sql(
+    env: &EnvFilter,
+    window_column: &'static str,
+    has_group: bool,
+    backfilled: bool,
+) -> String {
+    let group_base = if env.consumes_bind() { 7 } else { 6 };
+    let to_idx = group_base + if has_group { 4 } else { 0 };
+    let window_sql = device_window_sql(window_column, to_idx);
+    let group_sql = if has_group {
+        format!(
+            " AND family IS NOT DISTINCT FROM ${} \
+              AND model IS NOT DISTINCT FROM ${} \
+              AND os_name IS NOT DISTINCT FROM ${} \
+              AND os_version IS NOT DISTINCT FROM ${}",
+            group_base,
+            group_base + 1,
+            group_base + 2,
+            group_base + 3,
+        )
+    } else {
+        String::new()
+    };
+    let membership_sql = if backfilled {
+        device_membership_rollup_sql(env, 6)
+    } else {
+        device_membership_sql(env, 6)
+    };
+    format!(
+        "SELECT count(*)::bigint AS total FROM ( \
+           SELECT 1 FROM {} LIMIT $4 OFFSET $5) c",
+        device_qualifying_sql(&window_sql, &membership_sql, &group_sql)
+    )
+}
+
+/// Shape probe for tests: the default sort, `last_seen` window, no group.
+pub fn list_devices_sql_for_test(env: EnvFilter, backfilled: bool) -> String {
+    let sort = SortSpec {
+        column: "last_seen",
+        descending: true,
+        tiebreak: "d.device_key",
+        nulls_last: false,
+    };
+    list_devices_sql(&env, &sort, "last_seen", false, backfilled, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn list_devices(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    window: TimeWindow,
+    limit: i64,
+    offset: i64,
+    sort: SortSpec,
+    search: Option<&str>,
+    group: Option<DeviceGroupKey<'_>>,
+) -> QueryResult<Vec<DeviceRow>> {
+    let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
+    // Same two gates as `list_device_groups`: the env rollup decides the
+    // shape, the event rollup decides the sessions source.
+    let backfilled = crate::device_env_backfill::is_backfilled(conn, scope.app_id).await?;
+    let sessions_from_rollup = backfilled && crate::rollups::is_ready(conn, scope.app_id).await?;
+    let q = list_devices_sql(
+        &scope.env,
+        &sort,
+        window.column,
+        group.is_some(),
+        backfilled,
+        sessions_from_rollup,
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -19972,34 +19996,8 @@ pub async fn count_devices(
     cap: i64,
 ) -> QueryResult<(i64, bool)> {
     let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
-    // Every index below is computed exactly as `list_devices` computes it, and
-    // for the same reason: the bind chain that follows is `list_devices`' own.
-    // Note `6` is passed as an INDEX here, matching `list_devices` — the env
-    // FRAGMENT it builds is only needed by the sessions LATERAL, which this
-    // query does not have.
-    let group_base = if scope.env.consumes_bind() { 7 } else { 6 };
-    let to_idx = group_base + if group.is_some() { 4 } else { 0 };
-    let window_sql = device_window_sql(window.column, to_idx);
-    let group_sql = if group.is_some() {
-        format!(
-            " AND family IS NOT DISTINCT FROM ${} \
-              AND model IS NOT DISTINCT FROM ${} \
-              AND os_name IS NOT DISTINCT FROM ${} \
-              AND os_version IS NOT DISTINCT FROM ${}",
-            group_base,
-            group_base + 1,
-            group_base + 2,
-            group_base + 3,
-        )
-    } else {
-        String::new()
-    };
-    let membership_sql = device_membership_sql(&scope.env, 6);
-    let q = format!(
-        "SELECT count(*)::bigint AS total FROM ( \
-           SELECT 1 FROM {} LIMIT $4 OFFSET $5) c",
-        device_qualifying_sql(&window_sql, &membership_sql, &group_sql)
-    );
+    let backfilled = crate::device_env_backfill::is_backfilled(conn, scope.app_id).await?;
+    let q = count_devices_sql(&scope.env, window.column, group.is_some(), backfilled);
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)

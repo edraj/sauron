@@ -48,9 +48,27 @@ pub struct TokenPair {
     pub expires_at: i64,
 }
 
-/// Check out a pooled connection, mapping errors to `ApiError`.
+/// Check out a request-scoped pooled connection, mapping errors to `ApiError`.
+///
+/// Every statement on it is bounded by the request budget (`statement_timeout`
+/// baked into the pool), so a handler the TimeoutLayer abandons cannot leave
+/// its query running on the server. Work that is *meant* to outlive a request
+/// — a cache recompute enqueued for later, an hourly reaper — must use
+/// [`bg_db`] instead or it inherits a budget it was created to escape.
 pub(crate) async fn db(state: &AppState) -> Result<PgConn, ApiError> {
     sauron_db::conn(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Check out an UNBOUNDED pooled connection for detached background work.
+///
+/// Only for futures that no client is waiting on: the overview/view cache
+/// recomputes and the supervised reapers. A handler must never use this — a
+/// request that could run for minutes is exactly what the request pool's
+/// statement budget exists to prevent.
+pub(crate) async fn bg_db(state: &AppState) -> Result<PgConn, ApiError> {
+    sauron_db::conn(&state.bg_pool)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))
 }

@@ -1555,4 +1555,6 @@ export interface RollupStatus {
   ready: boolean;
   as_of: string | null;
   sessions_as_of: string | null;
+  /** While not ready: progress of the server's unattended history backfill. */
+  backfill?: { days_done: number; days_total: number } | null;
 }

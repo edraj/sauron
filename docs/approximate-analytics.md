@@ -43,8 +43,14 @@ would only report false drift.
 ## Operator notes
 
 - New installs are rollup-served from the first event. Upgrades serve legacy
-  raw queries (exact, slow) until `sauron-migrate backfill-rollups` has
-  replayed history — run it once, at a time of your choosing.
+  raw queries (exact, slow) until history has been replayed into the rollups.
+  `sauron-ingest` does that by itself on start-up (and retries on its daily
+  maintenance pass) whenever an app's gate is still closed — resumable, one
+  runner per deployment, cheapest gates first, `ROLLUP_AUTO_BACKFILL=0` to
+  opt out. `sauron-migrate backfill-rollups` (and the `backfill-*-envs` /
+  `backfill-person-days` commands) remain for running it by hand; the two
+  are safe to combine. The dashboard's freshness chip reads "Building
+  history · n/N days" until the gate opens.
 - `ROLLUP_FOLD_SECS` (60), `ROLLUP_LAG_SECS` (60), `ROLLUP_KICK_LAG_SECS` (2)
   and `ROLLUP_NAME_CAP` (2000) tune the fold task on `sauron-ingest`.
 - The tier worker never exports a partition the fold has not fully passed,

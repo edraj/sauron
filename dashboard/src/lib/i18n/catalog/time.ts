@@ -60,6 +60,16 @@ export const time = {
   // `retention.updating` predate this and say the same thing per page.
   'time.updating': { en: 'Updating…', ar: 'جارٍ التحديث…' },
   'time.asOf': { en: 'as of {time}', ar: 'حتى {time}' },
+  // Rollup gate closed: the server is building history in the background.
+  'time.buildingHistory': {
+    en: 'Building history · {done}/{total} days',
+    ar: 'جارٍ بناء السجل · {done}/{total} يومًا',
+  },
+  'time.buildingHistoryPending': { en: 'Building history…', ar: 'جارٍ بناء السجل…' },
+  'time.buildingHistoryNote': {
+    en: 'Historical data is being aggregated on the server. Until it finishes, these pages use slower exact queries and wide time windows may time out.',
+    ar: 'يجري تجميع البيانات التاريخية على الخادم. حتى يكتمل ذلك تستخدم هذه الصفحات استعلامات دقيقة أبطأ وقد تنتهي مهلة النطاقات الزمنية الواسعة.',
+  },
   'time.approxNote': {
     en: 'Figures marked ≈ are approximate (±~2%), computed from sketches for speed at scale. Unmarked figures are exact.',
     ar: 'الأرقام المميزة بعلامة ≈ تقريبية (±~2%) وتُحسب من ملخصات إحصائية للسرعة على نطاق واسع. الأرقام غير المميزة دقيقة.',
