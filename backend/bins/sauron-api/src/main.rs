@@ -41,17 +41,12 @@ use utoipa::OpenApi;
 /// Hard ceiling on a JSON request body. Large binary uploads go through the
 /// separately-merged artifact routes, which carry their own raised limit.
 const API_JSON_BODY_LIMIT: usize = 1024 * 1024;
-/// Wall-clock budget for a single request. Bounds how long one expensive query
-/// can hold a connection and a worker.
-///
-/// 30 → 60 on 2026-08-26, by request: on large deployments the legacy
-/// (pre-rollup-backfill) analytics shapes routinely sat just past 30s and were
-/// shed as 503s the user could do nothing about. The trade is explicit — the
-/// layer sheds the HTTP response, not the Postgres query, so this doubles how
-/// long a pathological query can pin one of the 16 pool connections. The
-/// concurrency bounds (`MAX_INFLIGHT_REQUESTS`, the active-users semaphore)
-/// are what keep that from compounding.
-const REQUEST_TIMEOUT_SECS: u64 = 60;
+// The per-request wall-clock budget is `Config::api_request_timeout_secs`
+// (`API_REQUEST_TIMEOUT_SECS`, default 60). History: 30 → 60 on 2026-08-26 for
+// large deployments on the legacy analytics shapes; since 2026-09-13 the
+// request pool's `statement_timeout` follows it one second under, so a query
+// is cancelled with the response instead of running on and pinning its pool
+// connection.
 /// Requests admitted concurrently before the service starts shedding load.
 const MAX_INFLIGHT_REQUESTS: usize = 512;
 /// How often the outbox is expired, scrubbed and pruned. A compile-time constant
@@ -154,10 +149,11 @@ async fn main() -> anyhow::Result<()> {
     // One second inside the TimeoutLayer's budget so the cancellation reaches
     // the handler first: the client then gets the `query_timeout` body
     // instead of the layer's bare 503, and the dashboard can say what to do.
+    let request_timeout_secs = cfg.api_request_timeout_secs;
     let pool = sauron_db::build_pool_with_statement_timeout(
         &cfg.database_url,
         16,
-        REQUEST_TIMEOUT_SECS * 1000 - 1000,
+        request_timeout_secs * 1000 - 1000,
     )?;
     // Background pool: cache recomputes and reapers that legitimately outlive a
     // request. Small on purpose — the view/overview caches already bound their
@@ -1135,7 +1131,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(ConcurrencyLimitLayer::new(MAX_INFLIGHT_REQUESTS))
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(request_timeout_secs),
         ));
 
     // Security headers, then tracing outermost — the same order as before this

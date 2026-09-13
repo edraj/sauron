@@ -12,6 +12,11 @@ pub struct Config {
     pub redis_url: String,
     pub ingest_port: u16,
     pub api_port: u16,
+    /// Wall-clock budget for one API request, seconds (`API_REQUEST_TIMEOUT_SECS`,
+    /// default 60, clamped 5..=600). The request pool's server-side
+    /// `statement_timeout` is derived from it (one second under), so raising
+    /// this raises both — a reverse proxy in front must allow at least as much.
+    pub api_request_timeout_secs: u64,
     /// The validated JWT signing secret, or the reason it is unusable.
     ///
     /// Private on purpose: reach it through [`Config::require_jwt_secret`] so a
@@ -307,6 +312,7 @@ impl std::fmt::Debug for Config {
             .field("redis_url", &R)
             .field("ingest_port", &self.ingest_port)
             .field("api_port", &self.api_port)
+            .field("api_request_timeout_secs", &self.api_request_timeout_secs)
             .field("jwt_secret", &self.jwt_secret.as_ref().map(|_| R))
             .field("jwt_access_ttl_secs", &self.jwt_access_ttl_secs)
             .field("jwt_refresh_ttl_secs", &self.jwt_refresh_ttl_secs)
@@ -822,6 +828,7 @@ impl Config {
             redis_url: var("REDIS_URL").unwrap_or_else(|| "redis://127.0.0.1:6379".to_string()),
             ingest_port: parse("INGEST_PORT", 8081),
             api_port: parse("API_PORT", 8080),
+            api_request_timeout_secs: parse::<u64>("API_REQUEST_TIMEOUT_SECS", 60).clamp(5, 600),
             jwt_secret,
             jwt_access_ttl_secs: parse("JWT_ACCESS_TTL_SECS", 900),
             jwt_refresh_ttl_secs: parse("JWT_REFRESH_TTL_SECS", 2_592_000),
@@ -1398,6 +1405,7 @@ mod tests {
             redis_url: "redis://localhost:6379".to_string(),
             ingest_port: 8081,
             api_port: 8080,
+            api_request_timeout_secs: 60,
             jwt_secret: Err("unset".to_string()),
             jwt_access_ttl_secs: 900,
             jwt_refresh_ttl_secs: 2_592_000,
