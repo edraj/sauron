@@ -49,15 +49,14 @@ void main() {
     };
   });
 
-  // `flush()` returns early while a drain is already in flight, so a delivery
-  // can land a few turns later. Settle before asserting, and before handing the
-  // console back, so a straggler cannot print into the next test.
-  Future<void> settle() =>
-      Future<void>.delayed(const Duration(milliseconds: 50));
-
+  // No settling delay: `Sauron.flush()` and `Sauron.close()` complete only once
+  // every queued envelope has been attempted — including the eager flush that
+  // `captureException` starts — so everything the tests assert on has already
+  // been printed when the await returns. (A 50 ms delay used to hide that
+  // `flush()` returned early while that eager drain was in flight; on a slow CI
+  // disk the transaction was then "delivered" during the NEXT test.)
   tearDown(() async {
     await Sauron.close();
-    await settle();
     debugPrint = originalDebugPrint;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(pathProvider, null);
@@ -88,7 +87,6 @@ void main() {
       httpStatus: 200,
     );
     await Sauron.flush();
-    await settle();
 
     expect(joined(), contains('delivered'));
     expect(joined(), contains('identify u_123'));
@@ -110,7 +108,6 @@ void main() {
     Sauron.setUser(const SauronUser(id: 'u_123'));
     Sauron.track('checkout_completed');
     await Sauron.flush();
-    await settle();
 
     expect(logged, isEmpty);
   });
@@ -128,7 +125,6 @@ void main() {
 
     Sauron.track('checkout_completed');
     await Sauron.flush();
-    await settle();
 
     expect(Sauron.anonymousId, startsWith('anon_'));
     expect(logged, isEmpty);
@@ -153,7 +149,6 @@ void main() {
 
     client.track('checkout_completed');
     client.track('viewed_pricing');
-    await settle();
 
     expect(logged, hasLength(1));
     expect(logged.single, contains('dropped analytics item'));
@@ -171,7 +166,6 @@ void main() {
 
     Sauron.captureException(StateError('x' * 500));
     await Sauron.flush();
-    await settle();
 
     final String line = logged.firstWhere((String l) => l.contains('error '));
     expect(line, contains('...'));

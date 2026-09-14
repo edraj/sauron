@@ -68,7 +68,20 @@ class SauronTransport {
   bool _enabled = true;
   bool _closed = false;
   bool _started = false;
-  bool _draining = false;
+
+  /// The drain pass currently running, and the single follow-up pass shared by
+  /// every caller that arrives while it runs.
+  ///
+  /// `flush()` and `close()` promise that everything queued before the call has
+  /// been attempted once their future completes. A caller that finds a pass
+  /// already running cannot simply skip: the envelope it just persisted may sit
+  /// behind that pass's last `peek()` (an error's eager flush is in flight
+  /// whenever an app flushes right after `captureException`). Nor should every
+  /// such caller get a pass of its own — stacked timer flushes during one slow
+  /// send would become a burst of back-to-back retries. So they wait for the
+  /// running pass, then share exactly one more.
+  Future<void>? _drain;
+  Future<void>? _followUp;
 
   /// Whether the transport is still accepting/sending data.
   bool get isEnabled => _enabled && !_closed;
@@ -104,6 +117,9 @@ class SauronTransport {
   }
 
   /// Packs the current buffer into an envelope, persists it, and drains.
+  ///
+  /// Completes only once everything queued before the call has been attempted,
+  /// including when a drain was already in flight (see [_drain]).
   Future<void> flush() async {
     if (_closed) {
       return;
@@ -156,40 +172,65 @@ class SauronTransport {
     );
   }
 
-  Future<void> _drainQueue() async {
-    if (!_enabled || _closed || _draining) {
+  Future<void> _drainQueue() {
+    if (_drain == null) {
+      return _runPass();
+    }
+    return _followUp ??= _runPass();
+  }
+
+  /// Runs one drain pass once no other pass is running.
+  Future<void> _runPass() async {
+    while (_drain != null) {
+      try {
+        await _drain;
+      } on Object {
+        // That pass reports to the caller that started it; this caller still
+        // gets its own attempt below.
+      }
+    }
+    // From here on, callers need a pass after THIS one.
+    _followUp = null;
+    if (!_enabled || _closed) {
       return;
     }
-    _draining = true;
+    final Future<void> pass = _drainPass();
+    _drain = pass;
     try {
-      while (true) {
-        final String? json = await _queue.peek();
-        if (json == null) {
-          break;
-        }
-        final _Outcome outcome = await _send(json);
-        switch (outcome.kind) {
-          case _OutcomeKind.success:
-            _logDelivered(json);
-            await _queue.acknowledgeFirst();
-            _retryAttempt = 0;
-          case _OutcomeKind.dropNoRetry:
-            _log('dropping envelope (non-retryable).');
-            await _queue.acknowledgeFirst();
-          case _OutcomeKind.disable:
-            _log('disabling transport (auth rejected).');
-            _enabled = false;
-            await _queue.acknowledgeFirst();
-            return;
-          case _OutcomeKind.split:
-            await _splitHead(json);
-          case _OutcomeKind.retry:
-            _scheduleRetry(outcome.retryAfter);
-            return;
-        }
-      }
+      await pass;
     } finally {
-      _draining = false;
+      _drain = null;
+    }
+  }
+
+  /// Sends queued envelopes head-first until the queue is empty, the transport
+  /// is disabled, or a send must wait for a retry.
+  Future<void> _drainPass() async {
+    while (true) {
+      final String? json = await _queue.peek();
+      if (json == null) {
+        break;
+      }
+      final _Outcome outcome = await _send(json);
+      switch (outcome.kind) {
+        case _OutcomeKind.success:
+          _logDelivered(json);
+          await _queue.acknowledgeFirst();
+          _retryAttempt = 0;
+        case _OutcomeKind.dropNoRetry:
+          _log('dropping envelope (non-retryable).');
+          await _queue.acknowledgeFirst();
+        case _OutcomeKind.disable:
+          _log('disabling transport (auth rejected).');
+          _enabled = false;
+          await _queue.acknowledgeFirst();
+          return;
+        case _OutcomeKind.split:
+          await _splitHead(json);
+        case _OutcomeKind.retry:
+          _scheduleRetry(outcome.retryAfter);
+          return;
+      }
     }
   }
 

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -172,5 +173,100 @@ void main() {
     expect(await queue.peekAll(), isEmpty);
     expect(call, greaterThanOrEqualTo(3));
     transport.debugCancelTimers();
+  });
+
+  /// Polls [condition] every millisecond, failing after [timeout].
+  Future<void> untilTrue(
+    bool Function() condition, {
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    final Stopwatch clock = Stopwatch()..start();
+    while (!condition()) {
+      if (clock.elapsed > timeout) {
+        fail('condition not met within $timeout');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 1));
+    }
+  }
+
+  /// Whether [future] completes within a short grace period.
+  ///
+  /// Used to assert a future is still PENDING. A correct transport can never
+  /// resolve the futures under test while the held request is open, so the
+  /// grace period only bounds how long a regression takes to show up.
+  Future<bool> settles(Future<void> future) => Future.any(<Future<bool>>[
+        future.then((_) => true, onError: (Object _) => true),
+        Future<bool>.delayed(const Duration(milliseconds: 200), () => false),
+      ]);
+
+  /// Stubs `post` so the FIRST request stays open until the returned completer
+  /// is completed; every later request is accepted at once. [posts] counts
+  /// requests so a test can wait until the held one has actually been reached.
+  Completer<http.Response> holdFirstPost(List<int> posts) {
+    final Completer<http.Response> first = Completer<http.Response>();
+    when(() => client.post(
+          any(),
+          headers: any(named: 'headers'),
+          body: any(named: 'body'),
+        )).thenAnswer((_) {
+      posts.add(1);
+      return posts.length == 1
+          ? first.future
+          : Future<http.Response>.value(http.Response('', 202));
+    });
+    return first;
+  }
+
+  // `captureException` starts a flush it does not await. A `flush()` or
+  // `close()` that lands while that drain is mid-send used to return at once:
+  // the envelope it had just persisted was left for the running drain to find
+  // later, and `close()` shut the HTTP client under the send. CI caught it as a
+  // transaction captured right after an error being "delivered" during the
+  // NEXT test. The first request is held open so "in flight" is a fact here,
+  // not a race.
+  test(
+      'flush() waits for a drain already in flight, then attempts what was '
+      'queued behind it', () async {
+    final List<int> posts = <int>[];
+    final Completer<http.Response> firstPost = holdFirstPost(posts);
+    final SauronTransport transport = buildTransport();
+
+    transport.capture(EventItem(name: 'a', timestamp: DateTime.now().toUtc()));
+    final Future<void> eager = transport.flush();
+    await untilTrue(() => posts.length == 1);
+
+    transport.capture(EventItem(name: 'b', timestamp: DateTime.now().toUtc()));
+    final Future<void> awaited = transport.flush();
+    expect(await settles(awaited), isFalse,
+        reason:
+            'flush() resolved while the first envelope was still in flight');
+
+    firstPost.complete(http.Response('', 202));
+    await awaited;
+    await eager;
+    expect(posts, hasLength(2));
+    expect(await queue.peekAll(), isEmpty);
+    transport.debugCancelTimers();
+  });
+
+  test('close() waits for a drain already in flight before closing the client',
+      () async {
+    final List<int> posts = <int>[];
+    final Completer<http.Response> firstPost = holdFirstPost(posts);
+    final SauronTransport transport = buildTransport();
+
+    transport.capture(EventItem(name: 'a', timestamp: DateTime.now().toUtc()));
+    final Future<void> eager = transport.flush();
+    await untilTrue(() => posts.length == 1);
+
+    final Future<void> closing = transport.close();
+    expect(await settles(closing), isFalse,
+        reason: 'close() resolved with a request still in flight');
+
+    firstPost.complete(http.Response('', 202));
+    await closing;
+    await eager;
+    expect(posts, hasLength(1));
+    expect(await queue.peekAll(), isEmpty);
   });
 }
