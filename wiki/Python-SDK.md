@@ -1,6 +1,6 @@
 # Python SDK — `sauron-sdk`
 
-Server-side Python SDK (**v1.5.0**). Dispatches product-analytics events and exceptions
+Server-side Python SDK (**v1.6.0**). Dispatches product-analytics events and exceptions
 over a buffered background HTTP transport (a daemon thread draining an in-memory queue
 via `urllib`). **Stdlib only — no runtime dependencies.** Source:
 [`sdks/python`](../sdks/python). SDK header name: `sauron-python`.
@@ -26,7 +26,7 @@ Then `import sauron`.
 ```python
 import sauron
 
-sauron.init(dsn="https://<public_key>@<host>/<environment_id>")
+sauron.init(dsn="https://<public_key>@<host>/<environment_id>", release="svc@1.4.2")
 ```
 
 A **missing/empty** `dsn` puts the SDK into disabled no-op mode (it logs, does not
@@ -38,7 +38,7 @@ raise) so code can ship without a DSN. A **non-empty but malformed** DSN raises
 | Option | Default | Notes |
 | --- | --- | --- |
 | `dsn` | `None` | `https://<public_key>@<host>/<environment_id>`; empty ⇒ disabled |
-| `release` | `None` | |
+| `release` | _required_ | the app version this build reports as, e.g. `svc@1.4.2`; trimmed. A present `dsn` with a missing, empty or whitespace-only `release` raises `ValueError` (an empty `dsn` skips the check and stays disabled) |
 | `sample_rate` | `1.0` | error sample rate |
 | `flush_interval` | `5.0` | background flush interval, seconds |
 | `max_batch` | `30` | flush eagerly at this many buffered items |
@@ -157,7 +157,7 @@ default 100) and attaches to errors captured afterwards. A `before_breadcrumb` h
 first — return `None` to drop the crumb:
 
 ```python
-sauron.init(dsn=DSN, before_breadcrumb=lambda c: None if c["category"] == "noisy" else c)
+sauron.init(dsn=DSN, release=RELEASE, before_breadcrumb=lambda c: None if c["category"] == "noisy" else c)
 ```
 
 ## `before_send` (any item)
@@ -172,7 +172,7 @@ def scrub(item, hint=None):
         item.get("properties", {}).pop("email", None)
     return item  # return None to drop
 
-sauron.init(dsn=DSN, before_send=scrub)
+sauron.init(dsn=DSN, release=RELEASE, before_send=scrub)
 ```
 
 ## Performance transactions
@@ -222,7 +222,7 @@ sauron.track_transaction(
 behavior is preserved:
 
 ```python
-sauron.init(dsn=DSN, auto_capture_unhandled=True)
+sauron.init(dsn=DSN, release=RELEASE, auto_capture_unhandled=True)
 ```
 
 Shutdown is handled by the `atexit` flush registered in `init`. You can still flush/close

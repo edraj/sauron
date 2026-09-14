@@ -48,6 +48,12 @@ class Sauron {
     SauronOptions options, {
     FutureOr<void> Function()? appRunner,
   }) async {
+    if (options.isConfigured && (options.release ?? '').trim().isEmpty) {
+      throw ArgumentError.value(options.release, 'release',
+          'SauronOptions.release is required when a dsn is set (the app version this build reports as)');
+    }
+    options.release = options.release?.trim();
+
     final SauronClient client = SauronClient(options);
     _client = client;
 

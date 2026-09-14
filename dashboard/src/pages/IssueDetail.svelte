@@ -102,6 +102,9 @@
     // `id` AND `scopeKey`: the router reuses this component across
     // `#/issues/A` -> `#/issues/B`, and `scopeKey` carries the environment the
     // interceptor adds to the request but which appears in no argument here.
+    // Two segments only — `GET …/issues/{id}` takes no `release=`, so the
+    // record is the same under every release; the occurrences table below is
+    // the part that narrows, and it keys on `scopeKeyWithRelease`.
     await view.load(
       viewKey('issue.detail', appId, id, sessionStore.scopeKey),
       () => getIssue(appId, id),
@@ -437,9 +440,13 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    // Touch scopeKey so the effect re-runs when the environment changes; the
-    // interceptor supplies the value, but nothing would refetch without this.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease so the effect re-runs when the environment or
+    // the release changes; the interceptor supplies both values, but nothing
+    // would refetch without this. The RELEASE half belongs here and not on the
+    // issue load above: `…/issues/{id}/events` is in `RELEASE_SCOPED_URL`, so
+    // these occurrences narrow to the selected release — while the issue
+    // record itself (first/last seen, counts) is app-wide whatever is selected.
+    sessionStore.scopeKeyWithRelease;
     const id = issueId;
     const enc = encodeFilters(occFilters);
     // `occApplied`, never `occSearch`: reading the typed text here is what
@@ -451,9 +458,9 @@
     occTimer = setTimeout(() => {
       // Back to page one, current sort kept. A cursor addresses a position in
       // ONE result set, so it is meaningless against a different predicate —
-      // and equally meaningless against a different issue or a different
-      // environment, which is why `issueId` and `scopeKey` above have to
-      // reset this too and not merely refetch.
+      // and equally meaningless against a different issue, environment or
+      // release, which is why `issueId` and `scopeKeyWithRelease` above have
+      // to reset this too and not merely refetch.
       //
       // `occList.sort` is read through `untrack`, the same rule
       // Events.svelte's equivalent effect follows: this callback must not

@@ -65,3 +65,38 @@ would only report false drift.
   recorded boundary (`tiering_state`, `table_name = 'sessions'`), so a late
   stray can never rewrite a dropped day's aggregates. Non-zero values below 7
   days are clamped up.
+- `app_releases` (migration 78) is empty after an upgrade — the dashboard's
+  release switcher only lists releases the pipeline has seen since the
+  upgrade until `sauron-migrate backfill-releases` runs, then
+  `psql -c 'ANALYZE app_releases'`. The catalogue is SEEDED from `error_events`
+  and `analytics_events` only (they are the only release-bearing tables with a
+  `received_at` to date a release by); full scan of both, hours at 158M rows.
+  Safe to re-run, and nothing else depends on it.
+  **It also WRITES to the five telemetry tables that store `release`** — `error_events`,
+  `analytics_events`, `sessions`, `transactions` and `workflows` (`symbol_artifacts` is
+  excluded on purpose: uploads have always trimmed the value) —
+  which no other backfill does: before seeding, it rewrites blank and
+  whitespace-padded historical `release`
+  values — `''` and `'\t'` become NULL, `' 1.4.0 '` becomes `'1.4.0'` — so
+  that `?release=1.4.0`, which lowers to a plain column equality, stops
+  answering "no" for rows that are on that release. That filter is offered on
+  the Sessions and Transactions lists too, so repairing only the two event
+  tables would leave those lists silently short. The ingest edge has
+  applied the same trim since the release filter shipped, but only
+  forward. Both statements are scoped by `WHERE`, and both are still a full
+  scan: `release` is not the partition key, so nothing prunes. It rewrites
+  those rows **partition by partition** — one statement per child partition,
+  each committing on its own — so the locks are per partition rather than one
+  lock on every partition of a table held for the whole run. (`workflows` is
+  not partitioned; it takes one statement.) **Stop
+  `sauron-tier` for the run**: a partition being rewritten cannot be
+  `DETACH`ed, and the tier worker strands its dependents forever if its
+  `DETACH` times out (see the tier-worker runbook note) — and the partition
+  list is **snapshotted per table, just before that table is repaired**, so a
+  partition dropped after its snapshot makes the statement naming it fail and
+  aborts the whole command. The command is
+  re-runnable and resumable — an interrupted (or aborted) run keeps every
+  partition it finished, and a second run repairs only what is left. Their row
+  counts are printed ("normalised N rows") and are 0 on a re-run.
+  `first_seen_at`/`last_seen_at` are `MIN`/`MAX` of `received_at`, the same
+  clock the live pipeline stamps — not `occurred_at`.

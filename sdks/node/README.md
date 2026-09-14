@@ -56,13 +56,13 @@ adding `Content-Encoding: gzip` once the body crosses the gzip threshold.
 
 ## Configuration
 
-`init(options)` takes a single `InitOptions` object. Every field except `dsn` is
-optional.
+`init(options)` takes a single `InitOptions` object. Every field except `dsn`
+and `release` is optional.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `dsn` | `string` | — (**required**) | `https://<public_key>@<host>/<environment_id>`. A non-string throws `Error`; a malformed value throws `DsnError`. |
-| `release` | `string \| null` | `null` | Written to `header.release`. |
+| `dsn` | `string` | — (**required**) | `https://<public_key>@<host>/<environment_id>`. A non-string or empty value throws `Error`; a malformed value throws `DsnError`. |
+| `release` | `string` | — (**required**) | The app version this build reports as, written to `header.release`. Missing or whitespace-only throws `Error`. Trimmed before it is sent. |
 | `tags` | `Record<string, string>` | `{}` | Default tags seeded into the global scope at init. |
 | `contexts` | `Record<string, unknown>` | `{}` | Default named dev context blocks seeded into the global scope. Distinct from the machine `context` (device/os/app/runtime). |
 | `extra` | `Record<string, unknown>` | `{}` | Default free-form extra values seeded into the global scope. |
@@ -140,11 +140,12 @@ function init(options: InitOptions): SauronClient
 | `options` | `InitOptions` | — (required) | See [Configuration](#configuration). |
 
 Returns the `SauronClient` it created, and installs it as the active client.
-Throws `Error` when `options.dsn` is not a string, and `DsnError` when the DSN
-is malformed.
+Throws `Error` when `options.dsn` is missing/empty/not a string, when
+`options.release` is missing or blank (**required as of v1.6.0**), and
+`DsnError` when the DSN is malformed.
 
 ```ts
-const client = init({ dsn: 'https://pk@ingest.example.com/42' });
+const client = init({ dsn: 'https://pk@ingest.example.com/42', release: 'api@1.4.2' });
 ```
 
 ### `getClient()`
@@ -823,7 +824,7 @@ Re-entrancy is guarded, so a throw inside the capture path cannot loop. Prefer
 down on `close()`.
 
 ```ts
-const client = init({ dsn: DSN });
+const client = init({ dsn: DSN, release: 'api@1.4.2' });
 const uninstall = installAutoCapture(client);
 // later
 uninstall();
@@ -855,7 +856,7 @@ signal fires — if you need to drain HTTP connections first, leave `autoShutdow
 off and call `close()` yourself from your own handler.
 
 ```ts
-const client = init({ dsn: DSN });
+const client = init({ dsn: DSN, release: 'api@1.4.2' });
 const uninstall = installShutdownHooks(client);
 ```
 
@@ -1088,7 +1089,7 @@ Emit conventions on the wire:
   `distinct_id` fallback from the scope's user id.
 
 ```ts
-init({ dsn: DSN, tags: { service: 'checkout' } });   // layer 1
+init({ dsn: DSN, release: 'api@1.4.2', tags: { service: 'checkout' } });   // layer 1
 
 setTag('region', 'eu-west-1');                        // layer 2 (global)
 
@@ -1194,7 +1195,7 @@ import {
   init, withScope, addBreadcrumb, captureException, trackTransaction, close,
 } from '@edraj/sauron-node';
 
-init({ dsn: process.env.SAURON_DSN!, autoCaptureUnhandled: true });
+init({ dsn: process.env.SAURON_DSN!, release: process.env.GIT_SHA, autoCaptureUnhandled: true });
 
 const fastify = Fastify();
 const startedAt = new WeakMap<object, number>();

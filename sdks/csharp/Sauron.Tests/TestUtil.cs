@@ -11,6 +11,7 @@ internal static class TestUtil
     {
         opts ??= new SauronOptions();
         opts.Dsn = "https://pub123@example.com/42";
+        opts.Release ??= "1.0.0";
         opts.HttpMessageHandler = handler;
         opts.FlushInterval = TimeSpan.FromHours(1);
         opts.MaxBatch = 1000;

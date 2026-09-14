@@ -121,10 +121,12 @@
     const k = viewKey(
       'transactions.list',
       appId,
-      // Carries the selected environment, which the axios interceptor adds to
-      // the request but which appears in none of these other arguments. Omit
-      // it and one environment's spans key the same as another's.
-      sessionStore.scopeKey,
+      // Carries the selected environment AND release, both of which the axios
+      // interceptor adds to the request but which appear in none of these
+      // other arguments. Omit it and one environment's (or release's) spans
+      // key the same as another's — `…/transactions` is in
+      // `RELEASE_SCOPED_URL`, so both dimensions really do reach the wire.
+      sessionStore.scopeKeyWithRelease,
       filterList,
       q.trim(),
       // The window's DECLARATION, never the instant `last` resolves to: a
@@ -264,13 +266,13 @@
   // is not a position within another.
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    // Touch scopeKey so the effect re-runs when the environment changes; the
-    // axios interceptor supplies the value, but nothing would refetch without
-    // this — one environment's spans would sit on screen labelled as another's.
-    // It also has to RESET the walk, not merely refetch, which the `fresh`
-    // page below already does: a cursor minted in one environment is not a
-    // position within another.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease so the effect re-runs when the environment or
+    // the release changes; the axios interceptor supplies both values, but
+    // nothing would refetch without this — one environment's spans would sit
+    // on screen labelled as another's. It also has to RESET the walk, not
+    // merely refetch, which the `fresh` page below already does: a cursor
+    // minted in one environment (or release) is not a position within another.
+    sessionStore.scopeKeyWithRelease;
     const f = encodeFilters(filters);
     const q = appliedSearch;
     const w = window_;

@@ -208,6 +208,7 @@ describe('identity switch', () => {
 
     const client = Sauron.init({
       dsn: 'https://pub@example.test/1',
+      release: '1.0.0',
       transport: { flushIntervalMs: 0 },
     });
     client.getDistinctId();
@@ -235,6 +236,7 @@ describe('identity switch', () => {
   it('mints a fresh anon id and rotates the session when a different user identifies', () => {
     const client = Sauron.init({
       dsn: 'https://pub@example.test/1',
+      release: '1.0.0',
       transport: { flushIntervalMs: 0 },
     });
 
@@ -257,6 +259,7 @@ describe('identity switch', () => {
   it('treats a numeric id as stable across identify calls (Storage coerces it to a string)', () => {
     const client = Sauron.init({
       dsn: 'https://pub@example.test/1',
+      release: '1.0.0',
       transport: { flushIntervalMs: 0 },
     });
 
@@ -276,6 +279,7 @@ describe('identity switch', () => {
   it('detects a real switch away from an empty-string identity (not falsy-skipped)', () => {
     const client = Sauron.init({
       dsn: 'https://pub@example.test/1',
+      release: '1.0.0',
       transport: { flushIntervalMs: 0 },
     });
 
@@ -297,6 +301,7 @@ describe('identity switch', () => {
   it('reset() clears the last identified user and rotates the session id', () => {
     const client = Sauron.init({
       dsn: 'https://pub@example.test/1',
+      release: '1.0.0',
       transport: { flushIntervalMs: 0 },
     });
 
@@ -317,6 +322,7 @@ describe('identity switch', () => {
 
     Sauron.init({
       dsn: 'https://pub@example.test/1',
+      release: '1.0.0',
       transport: { flushIntervalMs: 0, maxBatch: 1000 },
     });
 
@@ -348,6 +354,7 @@ describe('identity switch', () => {
 
     Sauron.init({
       dsn: 'https://pub@example.test/1',
+      release: '1.0.0',
       transport: { flushIntervalMs: 0, maxBatch: 1000 },
     });
 

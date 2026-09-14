@@ -785,6 +785,24 @@ pub async fn process_batch(
         }
     }
 
+    // --- stage 8: the release catalogue, LAST.
+    //
+    // Deliberately after every stage that can return `Err`, not next to the
+    // connection checkout where it started. `app_releases` is what the
+    // dashboard's release switcher lists, so a row here is a claim that this
+    // app has telemetry on that release — and a batch that fails at stage 3
+    // writes no telemetry at all, but the worker still retries it item by
+    // item. Recorded up front, a release whose every write kept failing would
+    // sit in the switcher forever, selectable and answering with nothing.
+    // Recorded here, the claim is only ever made about data that landed.
+    //
+    // Still infallible for the batch: a release row is a convenience, the
+    // event is the data, so `note_releases` logs its own per-key failures and
+    // returns nothing for this function to propagate. This is the PRIMARY
+    // write path; `process::process_job` carries the equivalent call for the
+    // per-item fallback.
+    crate::releases::note_releases(&mut conn, decoded.iter().map(|d| &d.job)).await;
+
     Ok(())
 }
 

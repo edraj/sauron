@@ -44,7 +44,7 @@ Or build a local package and consume it from a local feed:
 cd sdks/csharp
 dotnet pack Sauron/Sauron.csproj -c Release -o ./nupkg
 dotnet nuget add source "$(pwd)/nupkg" --name sauron-local
-dotnet add <your-project>.csproj package Sauron --version 1.5.0
+dotnet add <your-project>.csproj package Sauron --version 1.6.0
 ```
 
 Once published, the install command will be:
@@ -62,6 +62,9 @@ net9/net10 without the net8 runtime installed should set
 ```csharp
 using Sauron;
 
+// `Release` is required as of 1.6.0 whenever `Dsn` is set — the constructor
+// throws `ArgumentException` if `Dsn` is non-blank and `Release` is missing or
+// blank. An empty `Dsn` skips the check and leaves the SDK disabled.
 SauronSdk.Init(new SauronOptions
 {
     Dsn = Environment.GetEnvironmentVariable("SAURON_DSN")!,
@@ -106,7 +109,7 @@ does not throw, `Enabled` is `false`, and every dispatch call silently returns.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `Dsn` | `string` | `""` (**required**) | Ingest DSN, `https://<public_key>@<host>/<environment_id>`. Empty or invalid puts the client in no-op mode. |
-| `Release` | `string?` | `null` | Release identifier, sent in `header.release`. |
+| `Release` | `string?` | `null` (**required when `Dsn` is set**) | Release identifier, sent in `header.release`. Required whenever `Dsn` is non-blank (even an invalid one) — the constructor throws `ArgumentException` otherwise. An empty `Dsn` skips the check and leaves the client disabled. |
 | `Tags` | `IReadOnlyDictionary<string, string>?` | `null` | Default tags seeded into the process-wide global scope at construction. |
 | `Contexts` | `IReadOnlyDictionary<string, object?>?` | `null` | Default context blocks (name → block) seeded into the global scope. Distinct from the machine `context` in the envelope. |
 | `Extra` | `IReadOnlyDictionary<string, object?>?` | `null` | Default extra values (key → any) seeded into the global scope. |

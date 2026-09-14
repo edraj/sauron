@@ -168,6 +168,9 @@ pub async fn list(
         q.q.as_deref().filter(|s| !s.is_empty()),
         sauron_query::Resource::Sessions,
     )?;
+    let release =
+        super::scope::parse_release(super::scope::raw_release(raw_query.as_deref()).as_deref())?;
+    let node = sauron_query::with_release(node, sauron_query::Resource::Sessions, &release);
 
     super::search::reject_withheld_dimensions(
         &node,

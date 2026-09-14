@@ -91,6 +91,7 @@ void main() {
   test('defaults apply when only a dsn is given', () async {
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
     ));
 
@@ -104,10 +105,10 @@ void main() {
   });
 
   test('fields stay mutable after construction', () async {
-    final SauronOptions options =
-        SauronOptions(dsn: 'https://pk_test@localhost:9/1')
-          ..debug = true
-          ..httpClient = httpClient;
+    final SauronOptions options = SauronOptions(
+        dsn: 'https://pk_test@localhost:9/1', release: 'app@1.4.2+1402')
+      ..debug = true
+      ..httpClient = httpClient;
     await Sauron.init(options);
 
     expect(Sauron.client!.options.debug, isTrue);
@@ -129,5 +130,29 @@ void main() {
     Sauron.track('ignored');
     await Sauron.flush();
     expect(envelopes, isEmpty);
+  });
+
+  test('a dsn without a release throws at init', () async {
+    expect(
+      () => Sauron.init(SauronOptions(
+          dsn: 'https://pk_test@localhost:8081/1', httpClient: httpClient)),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('a blank release throws at init', () async {
+    expect(
+      () => Sauron.init(SauronOptions(
+          dsn: 'https://pk_test@localhost:8081/1',
+          release: '  ',
+          httpClient: httpClient)),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('an empty dsn still leaves the SDK disabled without a release',
+      () async {
+    await Sauron.init(SauronOptions(httpClient: httpClient));
+    expect(Sauron.isEnabled, isFalse);
   });
 }

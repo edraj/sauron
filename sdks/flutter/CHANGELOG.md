@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.10.1 - 2026-09-14
+
+### Fixed
+
+- `Sauron.flush()` and `Sauron.close()` now wait for a delivery that was
+  already in flight — the eager flush `captureException` starts, or the
+  periodic timer's — and then attempt whatever was queued behind it. Both used
+  to return immediately whenever a drain was running, so `await Sauron.flush()`
+  could resolve with an envelope still unsent, and `close()` could shut the
+  HTTP client under a request. Callers that pile up during one slow send share
+  a single follow-up pass rather than each retrying.
+- The SDK version reported in envelope headers (`kSauronSdkVersion`) advances
+  to 1.10.1.
+
+## 1.10.0 - 2026-09-14
+
+### Changed
+
+- **Breaking: `SauronOptions.release` is now required whenever `dsn` is set.**
+  `Sauron.init` throws `ArgumentError` if `dsn` is non-empty and `release` is
+  null or blank — release powers release-scoped filtering, so it can no longer
+  ship unset. `release` is trimmed of surrounding whitespace. `Sauron.init`
+  with no `dsn` still leaves the SDK disabled without throwing.
+- The SDK version reported in envelope headers (`kSauronSdkVersion`) advances
+  to 1.10.0 with the release.
+
 ## 1.9.0 - 2026-09-01
 
 ### Changed

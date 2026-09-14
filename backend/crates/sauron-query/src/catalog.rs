@@ -348,7 +348,9 @@ pub const CATALOG: &[Dimension] = &[
         resources: R_ISSUE_OCC_EVENTS,
         index: IndexClass::Bounded,
     },
-    // ---- issue-level rollups (S3: issue_dimensions) ----
+    // ---- issue-level dimensions: `environment` and `handled` are rollups
+    // (S3: issue_dimensions); `release`, between them, is NOT — it bridges to
+    // `error_events`. Read each entry's `store`, not this banner. ----
     Dimension {
         name: "environment",
         aliases: NO_ALIAS,
@@ -358,14 +360,18 @@ pub const CATALOG: &[Dimension] = &[
         resources: R_ISSUES,
         index: IndexClass::Indexed,
     },
+    // NOT a rollup, unlike its neighbours above and below: `issues` carries no
+    // `release` column, so this bridges to `error_events` through a correlated
+    // EXISTS — the same shape `screen`/`distinctId`/`deviceKey` already use —
+    // rather than waiting on the `issue_dimensions` rollup table (S3).
     Dimension {
         name: "release",
         aliases: NO_ALIAS,
         ty: ValueType::Str,
-        store: Store::Rollup,
+        store: Store::Column("release"),
         ops: OPS_EQ,
         resources: R_ISSUES,
-        index: IndexClass::Indexed,
+        index: IndexClass::Bounded,
     },
     Dimension {
         name: "handled",
@@ -401,7 +407,12 @@ pub const CATALOG: &[Dimension] = &[
         ty: ValueType::Str,
         store: Store::Column("release"),
         ops: OPS_TEXT,
-        resources: &[Resource::Occurrences, Resource::Events, Resource::Sessions],
+        resources: &[
+            Resource::Occurrences,
+            Resource::Events,
+            Resource::Sessions,
+            Resource::Transactions,
+        ],
         index: IndexClass::Bounded,
     },
     Dimension {

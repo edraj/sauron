@@ -371,9 +371,12 @@
    * `force` bypasses the fresh-window short-circuit: the Refresh button and the
    * error-state Retry both mean "go to the network now".
    *
-   * `scopeKey` is in the key because it carries the selected environment, which
-   * the axios interceptor adds to the request but which appears in none of these
-   * arguments — omit it and one environment's issues would be served as another's.
+   * `scopeKeyWithRelease` is in the key because it carries the selected
+   * environment AND release, both of which the axios interceptor adds to the
+   * request but which appear in none of these arguments — omit it and one
+   * environment's (or release's) issues would be served as another's. The
+   * release belongs here and not in `issues.stats` below: `GET …/issues` is in
+   * `RELEASE_SCOPED_URL`, the stats endpoint is not.
    *
    * The CURSOR is in the key for a blunter reason: without it every page of a
    * walk shares one entry, so the first Next click inside the fresh window is
@@ -395,7 +398,15 @@
       // null cursor, which is what page 1 carries — keyed on the cursor alone,
       // page 7 would hash to page 1's entry and repaint the first page out of
       // the cache with no request on the wire to notice.
-      viewKey('issues.list', appId, sessionStore.scopeKey, enc, q, rangeKey(range), pageKey(p)),
+      viewKey(
+        'issues.list',
+        appId,
+        sessionStore.scopeKeyWithRelease,
+        enc,
+        q,
+        rangeKey(range),
+        pageKey(p),
+      ),
       () =>
         listIssues(appId, {
           filters: enc,
@@ -488,9 +499,10 @@
   // doesn't fire per keystroke.
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    // Touch scopeKey so the effect re-runs when the environment changes; the
-    // interceptor supplies the value, but nothing would refetch without this.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease so the effect re-runs when the environment or
+    // the release changes; the interceptor supplies both values, but nothing
+    // would refetch without this.
+    sessionStore.scopeKeyWithRelease;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
     const win = range;
@@ -504,8 +516,8 @@
     void replace(`/issues?${p.toString()}`);
     // Back to page one. A cursor addresses a position in ONE result set, so it
     // is meaningless against a different predicate — and equally meaningless
-    // against a different environment, which is why touching `scopeKey` above
-    // has to reset this too and not merely refetch.
+    // against a different environment or release, which is why touching
+    // `scopeKeyWithRelease` above has to reset this too and not merely refetch.
     //
     // Written but never READ here, and the load takes the fresh page as an
     // argument rather than reading the state back: an effect that read `page`
@@ -524,6 +536,10 @@
     const aid = sessionStore.currentAppId;
     // Touch scopeKey so the effect re-runs when the environment changes; the
     // interceptor supplies the value, but nothing would refetch without this.
+    // `scopeKey`, NOT `scopeKeyWithRelease`: these tiles are an app-wide
+    // aggregate (`…/issues/stats` accepts no `release=`), so re-running on a
+    // release switch would re-fetch identical numbers. See `RELEASE_AWARE` in
+    // `models/shell.ts` — a release-aware page's SIDE WIDGETS are aggregate.
     sessionStore.scopeKey;
     const win = range;
     if (aid) {

@@ -400,10 +400,13 @@ function resolveOptions(options: InitOptions): ResolvedOptions {
   if (!options || typeof options.dsn !== 'string' || options.dsn.length === 0) {
     throw new Error('[sauron] init() requires a `dsn`');
   }
+  if (typeof options.release !== 'string' || options.release.trim().length === 0) {
+    throw new Error('[sauron] init() requires a `release` (the app version this build reports as)');
+  }
   const t = options.transport ?? {};
   return {
     dsn: options.dsn,
-    release: options.release ?? null,
+    release: options.release.trim(),
     sampleRate: clamp(options.sampleRate ?? 1, 0, 1),
     maxBreadcrumbs: options.maxBreadcrumbs ?? 50,
     tags: options.tags ?? {},

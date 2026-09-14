@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.6.0
+
+### Added
+
+- **`SauronSdk.Init(string dsn, string release)`.** The one-line facade
+  initializer, now that a release is mandatory. `Init(string dsn)` is marked
+  `[Obsolete("release is required since 1.6.0; use Init(dsn, release)")]` — its
+  body is unchanged and it still throws for a non-blank DSN, but the compiler
+  now says why instead of leaving it to a startup crash.
+
+### Changed
+
+- **Breaking: `SauronOptions.Release` is now required whenever a DSN is set.**
+  The `SauronClient` constructor throws `ArgumentException` if `Dsn` is
+  non-blank and `Release` is null, empty or whitespace — this check runs
+  before the DSN is parsed, so it also fires for an invalid/unparseable DSN,
+  not just a valid one. `Release` is trimmed of surrounding whitespace when
+  present. An empty/blank DSN skips the check entirely and keeps the SDK
+  disabled without throwing, matching the Python and Flutter SDKs.
+- `Envelope.Version` and the package version bumped to **1.6.0**.
+
 ## 1.5.0
 
 ### Added

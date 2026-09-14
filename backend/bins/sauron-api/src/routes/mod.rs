@@ -22,6 +22,7 @@ pub mod orgs;
 pub mod performance;
 pub mod projects;
 pub mod purge;
+pub mod releases;
 pub mod retention;
 pub mod scope;
 pub mod screens;

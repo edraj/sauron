@@ -140,6 +140,9 @@ pub async fn list(
         q.q.as_deref().filter(|s| !s.is_empty()),
         sauron_query::Resource::Transactions,
     )?;
+    let release =
+        super::scope::parse_release(super::scope::raw_release(raw_query.as_deref()).as_deref())?;
+    let node = sauron_query::with_release(node, sauron_query::Resource::Transactions, &release);
 
     // The reach is DERIVED, not chosen here. `transaction_text_search_reach`
     // and `gate_transaction_body` read the same predicate, which is the only

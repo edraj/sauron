@@ -49,15 +49,14 @@ void main() {
     };
   });
 
-  // `flush()` returns early while a drain is already in flight, so a delivery
-  // can land a few turns later. Settle before asserting, and before handing the
-  // console back, so a straggler cannot print into the next test.
-  Future<void> settle() =>
-      Future<void>.delayed(const Duration(milliseconds: 50));
-
+  // No settling delay: `Sauron.flush()` and `Sauron.close()` complete only once
+  // every queued envelope has been attempted — including the eager flush that
+  // `captureException` starts — so everything the tests assert on has already
+  // been printed when the await returns. (A 50 ms delay used to hide that
+  // `flush()` returned early while that eager drain was in flight; on a slow CI
+  // disk the transaction was then "delivered" during the NEXT test.)
   tearDown(() async {
     await Sauron.close();
-    await settle();
     debugPrint = originalDebugPrint;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(pathProvider, null);
@@ -71,6 +70,7 @@ void main() {
   test('logs every delivered item when debug is on', () async {
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
       debug: true,
     ));
@@ -87,7 +87,6 @@ void main() {
       httpStatus: 200,
     );
     await Sauron.flush();
-    await settle();
 
     expect(joined(), contains('delivered'));
     expect(joined(), contains('identify u_123'));
@@ -102,13 +101,13 @@ void main() {
   test('stays silent when debug is off', () async {
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
     ));
 
     Sauron.setUser(const SauronUser(id: 'u_123'));
     Sauron.track('checkout_completed');
     await Sauron.flush();
-    await settle();
 
     expect(logged, isEmpty);
   });
@@ -120,12 +119,12 @@ void main() {
     // the SDK must not editorialize about it on every event.
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
     ));
 
     Sauron.track('checkout_completed');
     await Sauron.flush();
-    await settle();
 
     expect(Sauron.anonymousId, startsWith('anon_'));
     expect(logged, isEmpty);
@@ -144,12 +143,12 @@ void main() {
     // bootstrap there is always an anonymous id to fall back to.
     final SauronClient client = SauronClient(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
     ));
 
     client.track('checkout_completed');
     client.track('viewed_pricing');
-    await settle();
 
     expect(logged, hasLength(1));
     expect(logged.single, contains('dropped analytics item'));
@@ -160,13 +159,13 @@ void main() {
   test('a long value is truncated onto one line', () async {
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
       debug: true,
     ));
 
     Sauron.captureException(StateError('x' * 500));
     await Sauron.flush();
-    await settle();
 
     final String line = logged.firstWhere((String l) => l.contains('error '));
     expect(line, contains('...'));

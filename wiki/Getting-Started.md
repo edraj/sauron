@@ -93,7 +93,7 @@ Sauron.track('checkout_completed', properties: {'cart_value': 42.5});
 ```ts
 import { init, track } from '@edraj/sauron-node';
 
-init({ dsn: process.env.SAURON_DSN! });
+init({ dsn: process.env.SAURON_DSN!, release: process.env.SAURON_RELEASE ?? 'api@1.0.0' });
 track('order_completed', 'user-123', { total: 42.5, currency: 'USD' });
 ```
 
@@ -102,7 +102,7 @@ track('order_completed', 'user-123', { total: 42.5, currency: 'USD' });
 ```python
 import sauron
 
-sauron.init(dsn="https://<public_key>@<host>/<environment_id>")
+sauron.init(dsn="https://<public_key>@<host>/<environment_id>", release="api@1.0.0")
 sauron.track("checkout_completed", distinct_id="u_123", properties={"cart_value": 42.5})
 ```
 
@@ -111,7 +111,7 @@ sauron.track("checkout_completed", distinct_id="u_123", properties={"cart_value"
 ```csharp
 using Sauron;
 
-SauronSdk.Init("https://<public_key>@<host>/<environment_id>");
+SauronSdk.Init("https://<public_key>@<host>/<environment_id>", "api@1.0.0");
 SauronSdk.Track("order_completed", "user-42", new Dictionary<string, object?> { ["total"] = 42.5 });
 ```
 

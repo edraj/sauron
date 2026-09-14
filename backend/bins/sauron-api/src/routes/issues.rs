@@ -242,6 +242,9 @@ pub async fn list(
         q.q.as_deref().filter(|s| !s.is_empty()),
         sauron_query::Resource::Issues,
     )?;
+    let release =
+        super::scope::parse_release(super::scope::raw_release(raw_query.as_deref()).as_deref())?;
+    let node = sauron_query::with_release(node, sauron_query::Resource::Issues, &release);
     // Must run on the resolved AST, not on the raw `filter=` strings: the
     // `query=` spelling of a tag or workflow probe produces the identical
     // predicate, so a string-level check would be bypassed by rewriting the
@@ -660,6 +663,9 @@ pub async fn events(
         q.q.as_deref().filter(|s| !s.is_empty()),
         sauron_query::Resource::Occurrences,
     )?;
+    let release =
+        super::scope::parse_release(super::scope::raw_release(raw_query.as_deref()).as_deref())?;
+    let node = sauron_query::with_release(node, sauron_query::Resource::Occurrences, &release);
     // **The refusal that matters most on this route.** `reject_body_filters`
     // below only ever saw the raw `filter=` strings, and `filter=` could name
     // just `tag`/`workflow`. Now that `query=` reaches the same planner,
@@ -894,6 +900,12 @@ pub async fn event_stats(
         q.q.as_deref().filter(|s| !s.is_empty()),
         sauron_query::Resource::Occurrences,
     )?;
+    // Same `?release=` predicate as the sibling `events` list — see that
+    // route's identical two lines. Without this, the caption above the
+    // occurrence list could describe a wider set than the rows it captions.
+    let release =
+        super::scope::parse_release(super::scope::raw_release(raw_query.as_deref()).as_deref())?;
+    let node = sauron_query::with_release(node, sauron_query::Resource::Occurrences, &release);
     super::search::reject_withheld_dimensions(
         &node,
         reach,

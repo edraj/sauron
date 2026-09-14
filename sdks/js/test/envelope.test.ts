@@ -110,10 +110,10 @@ describe('buildEnvelope', () => {
     // bump to `package.json` — or vice versa — cannot go unnoticed the way a
     // stale hardcoded golden literal can. Mirrors the equivalent assertion in
     // the Python SDK (`test_envelope_header_and_context`).
-    init({ dsn: 'https://pk_test@localhost:9/1' });
+    init({ dsn: 'https://pk_test@localhost:9/1', release: '1.0.0' });
     const built = getClient()!.makeEnvelope([]);
     expect(built.header.sdk).toEqual({ name: SDK_NAME, version: SDK_VERSION });
-    expect(SDK_VERSION).toBe('1.6.0');
+    expect(SDK_VERSION).toBe('1.7.0');
   });
 
   it('never carries an environment key on the header (removed: environment is now proven by the ingest key)', () => {
@@ -210,6 +210,7 @@ describe('error item reconciliation (event_id/message/tags/user)', () => {
       items = [];
       init({
         dsn: 'https://pk_test@localhost:9/1',
+        release: '1.0.0',
         beforeSend: (i) => {
           if (i.type === 'error') items.push(i);
           return null;
@@ -246,6 +247,7 @@ describe('error item reconciliation (event_id/message/tags/user)', () => {
     it('seeds init-default contexts/extra into the scope and lifts them onto errors', () => {
       init({
         dsn: 'https://pk_test@localhost:9/1',
+        release: '1.0.0',
         tags: { app: 'web' },
         contexts: { release_ctx: { channel: 'beta' } },
         extra: { build: 'ci-42' },
@@ -390,6 +392,7 @@ describe('event item metadata (track tags/contexts/extra)', () => {
   it('attaches scope + per-call meta, per-call wins per top-level key', () => {
     init({
       dsn: 'https://pk_test@localhost:9/1',
+      release: '1.0.0',
       tags: { app: 'web' },
       contexts: { app_ctx: { version: '1.0' } },
       beforeSend: capture(),
@@ -410,7 +413,7 @@ describe('event item metadata (track tags/contexts/extra)', () => {
   });
 
   it('omits tags/contexts/extra when scope and call carry none', () => {
-    init({ dsn: 'https://pk_test@localhost:9/1', beforeSend: capture() });
+    init({ dsn: 'https://pk_test@localhost:9/1', release: '1.0.0', beforeSend: capture() });
     track('ping', {});
     const e = events[0];
     expect('tags' in e).toBe(false);

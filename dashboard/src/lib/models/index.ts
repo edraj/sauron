@@ -193,6 +193,18 @@ export interface AppEnvironment extends AppEnvironmentRow {
   name: string;
 }
 
+/**
+ * One row of `GET /v1/apps/{app_id}/releases` — a release name observed on
+ * ingested events, with the enrollment ids that have seen it.
+ */
+export interface AppRelease {
+  release: string;
+  /** Enrollment ids that have seen this release; `null` = unattributed. */
+  environment_ids: (string | null)[];
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
 export interface FirstEventStatus {
   received: boolean;
   /** Presence flags, not counts — the API does an existence check only. */

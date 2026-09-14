@@ -56,7 +56,7 @@ describe('shouldScopeUrl', () => {
         true,
       );
       expect(
-        computeScopeParams(`/v1/apps/app-1/screens/${section}`, 'env-9'),
+        computeScopeParams(`/v1/apps/app-1/screens/${section}`, 'env-9', null),
       ).toEqual({ environment_id: 'env-9' });
     }
     // The list and the pre-existing detail route scope too.
@@ -135,37 +135,37 @@ describe('shouldScopeUrl', () => {
 
 describe('computeScopeParams', () => {
   it('adds environment_id for a telemetry url when an environment is selected', () => {
-    expect(computeScopeParams('/v1/apps/app-1/events', 'env-1')).toEqual({
+    expect(computeScopeParams('/v1/apps/app-1/events', 'env-1', null)).toEqual({
       environment_id: 'env-1',
     });
   });
 
   it('passes the literal "none" (unattributed) straight through', () => {
-    expect(computeScopeParams('/v1/apps/app-1/events', 'none')).toEqual({
+    expect(computeScopeParams('/v1/apps/app-1/events', 'none', null)).toEqual({
       environment_id: 'none',
     });
   });
 
   it('adds nothing for an app-configuration exclusion, even with an environment selected', () => {
-    expect(computeScopeParams('/v1/apps/app-1/environments', 'env-1')).toBeUndefined();
-    expect(computeScopeParams('/v1/apps/app-1/funnels', 'env-1')).toBeUndefined();
-    expect(computeScopeParams('/v1/apps/app-1/artifacts', 'env-1')).toBeUndefined();
-    expect(computeScopeParams('/v1/apps/app-1/first-event', 'env-1')).toBeUndefined();
-    expect(computeScopeParams('/v1/apps/app-1', 'env-1')).toBeUndefined();
+    expect(computeScopeParams('/v1/apps/app-1/environments', 'env-1', null)).toBeUndefined();
+    expect(computeScopeParams('/v1/apps/app-1/funnels', 'env-1', null)).toBeUndefined();
+    expect(computeScopeParams('/v1/apps/app-1/artifacts', 'env-1', null)).toBeUndefined();
+    expect(computeScopeParams('/v1/apps/app-1/first-event', 'env-1', null)).toBeUndefined();
+    expect(computeScopeParams('/v1/apps/app-1', 'env-1', null)).toBeUndefined();
   });
 
   it('adds nothing for routes outside /v1/apps/{id}/..., even with an environment selected', () => {
     // These are the exact URLs that a 400 was reaching production users on:
     // the opt-out list had no entry for any of them, so the old rule scoped
     // them by default. The opt-in rule leaves them unscoped by default.
-    expect(computeScopeParams('/v1/monitors/mon-1/checks', 'env-1')).toBeUndefined();
-    expect(computeScopeParams('/v1/orgs/org-1/alert-rules', 'env-1')).toBeUndefined();
-    expect(computeScopeParams('/v1/alert-meta', 'env-1')).toBeUndefined();
-    expect(computeScopeParams('/v1/admin/storage', 'env-1')).toBeUndefined();
+    expect(computeScopeParams('/v1/monitors/mon-1/checks', 'env-1', null)).toBeUndefined();
+    expect(computeScopeParams('/v1/orgs/org-1/alert-rules', 'env-1', null)).toBeUndefined();
+    expect(computeScopeParams('/v1/alert-meta', 'env-1', null)).toBeUndefined();
+    expect(computeScopeParams('/v1/admin/storage', 'env-1', null)).toBeUndefined();
   });
 
   it('adds nothing — not an empty-string parameter — when currentEnvId is null ("all")', () => {
-    const result = computeScopeParams('/v1/apps/app-1/events', null);
+    const result = computeScopeParams('/v1/apps/app-1/events', null, null);
     expect(result).toBeUndefined();
     // Guard the exact failure mode Task 10's review caught: a present-but-empty
     // `environment_id` is a hard 400 on the backend, not a synonym for "all".
@@ -385,10 +385,65 @@ describe('non-GET backend rejections', () => {
   // environment selected.
   it('does not scope the inspector mask-preview POST', () => {
     expect(shouldScopeUrl('/v1/apps/app-1/inspector/mask-preview')).toBe(false);
-    expect(computeScopeParams('/v1/apps/app-1/inspector/mask-preview', 'env-1')).toBeUndefined();
+    expect(computeScopeParams('/v1/apps/app-1/inspector/mask-preview', 'env-1', null)).toBeUndefined();
   });
 
   it('still scopes ordinary app telemetry reads', () => {
     expect(shouldScopeUrl('/v1/apps/app-1/inspector')).toBe(true);
+  });
+});
+
+describe('release scoping', () => {
+  it('attaches release only on the six searched list routes', () => {
+    expect(computeScopeParams('/v1/apps/a/issues', null, '1.4.0')).toEqual({ release: '1.4.0' });
+    expect(computeScopeParams('/v1/apps/a/issues/i1/events', null, '1.4.0')).toEqual({ release: '1.4.0' });
+    expect(computeScopeParams('/v1/apps/a/issues/i1/events/stats', null, '1.4.0')).toEqual({
+      release: '1.4.0',
+    });
+    expect(computeScopeParams('/v1/apps/a/events/list', null, '1.4.0')).toEqual({ release: '1.4.0' });
+    expect(computeScopeParams('/v1/apps/a/sessions', null, '1.4.0')).toEqual({ release: '1.4.0' });
+    expect(computeScopeParams('/v1/apps/a/transactions', null, '1.4.0')).toEqual({ release: '1.4.0' });
+    expect(computeScopeParams('/v1/apps/a/overview', null, '1.4.0')).toBeUndefined();
+    expect(computeScopeParams('/v1/apps/a/issues/i1', null, '1.4.0')).toBeUndefined();
+  });
+
+  it('combines env and release, and omits release when null', () => {
+    expect(computeScopeParams('/v1/apps/a/issues', 'env-1', '1.4.0')).toEqual({
+      environment_id: 'env-1',
+      release: '1.4.0',
+    });
+    expect(computeScopeParams('/v1/apps/a/issues', 'env-1', null)).toEqual({
+      environment_id: 'env-1',
+    });
+    expect(computeScopeParams('/v1/apps/a/issues', null, null)).toBeUndefined();
+  });
+
+  it('passes the literal none through', () => {
+    expect(computeScopeParams('/v1/apps/a/sessions', null, 'none')).toEqual({ release: 'none' });
+  });
+});
+
+describe('the releases endpoint itself', () => {
+  // The release switcher's own list must stay APP-WIDE. It is the source of
+  // each release's `environment_ids`, which is what narrows the environment
+  // dropdown once a release is picked — narrowing the LIST by the currently
+  // selected environment would feed that logic a pre-filtered answer and hide
+  // every environment the current one is not.
+  //
+  // The backend does honour `?environment_id=` here (it is a real
+  // `authorized_read_scope` handler, used by the env sweep in
+  // `http_release_scoping.rs`), so this is a UI-only exclusion, not a
+  // backend rejection.
+  it('is never scoped by environment', () => {
+    expect(shouldScopeUrl('/v1/apps/a/releases')).toBe(false);
+    expect(computeScopeParams('/v1/apps/a/releases', 'env-1', null)).toBeUndefined();
+    expect(computeScopeParams('/v1/apps/a/releases', 'env-1', '1.4.0')).toBeUndefined();
+  });
+
+  // Belt and braces: `release` is opt-in, so this holds already — but a
+  // `?release=` on the list of releases would be circular in exactly the way
+  // `?environment_id=` on `/environments` is.
+  it('is never scoped by release either', () => {
+    expect(computeScopeParams('/v1/apps/a/releases', null, '1.4.0')).toBeUndefined();
   });
 });

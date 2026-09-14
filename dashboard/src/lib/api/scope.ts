@@ -18,10 +18,13 @@ export interface ScopeBridge {
    * as this module is concerned — it is passed straight through to the wire.
    */
   getCurrentEnvironmentId(): string | null;
+  /** `null` = all releases; the literal `'none'` = rows with no release. */
+  getCurrentRelease(): string | null;
 }
 
 const noopScopeBridge: ScopeBridge = {
   getCurrentEnvironmentId: () => null,
+  getCurrentRelease: () => null,
 };
 
 let bridge: ScopeBridge = noopScopeBridge;
@@ -33,6 +36,11 @@ export function configureScopeBridge(next: ScopeBridge): void {
 /** Reads the current environment id through the bridge. `null` = all environments. */
 export function currentEnvironmentId(): string | null {
   return bridge.getCurrentEnvironmentId();
+}
+
+/** Reads the current release through the bridge. `null` = all releases. */
+export function currentRelease(): string | null {
+  return bridge.getCurrentRelease();
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +214,29 @@ const BACKEND_REJECTS_ENVIRONMENT_ID: RegExp[] = [
 // `http_env_scoping.rs` (see the comment above it), and `first-event` is not
 // part of that correspondence — folding it in would make the Rust test
 // demand the backend reject a route it correctly narrows on.
-const UI_ONLY_EXCLUSIONS: RegExp[] = [/^\/v1\/apps\/[^/]+\/first-event(?:[/?].*)?$/];
+//
+// `/v1/apps/{id}/releases` (`releases::list_app_releases`) is the second
+// entry of that kind, and for a closely related reason. The backend honours
+// `environment_id` here for real — it is an ordinary `authorized_read_scope`
+// handler and narrowing works (`http_release_scoping.rs` drives exactly
+// that) — but the DASHBOARD must never ask it to. This is the list behind the
+// release switcher, and each entry carries the `environment_ids` that have
+// reported it; `AppEnvPicker` reads those to narrow the environment dropdown
+// once a release is chosen. Scoping the request to the currently selected
+// environment would pre-filter that answer to the one environment already
+// selected, so picking a release could never reveal that it also reports from
+// another — and worse, selecting a release seen only in staging while prod is
+// the current environment would return an empty list and blank the switcher.
+// So the list stays app-wide and the narrowing is done client-side from
+// `environment_ids`.
+//
+// Same reasoning as `first-event` for why it is HERE and not in
+// `BACKEND_REJECTS_ENVIRONMENT_ID`: that array is compared against the
+// backend's actual rejection set, and this route does not reject.
+const UI_ONLY_EXCLUSIONS: RegExp[] = [
+  /^\/v1\/apps\/[^/]+\/first-event(?:[/?].*)?$/,
+  /^\/v1\/apps\/[^/]+\/releases(?:[/?].*)?$/,
+];
 
 // App-scoped routes the backend rejects `environment_id` on that have NO `get(`
 // handler, so they cannot live in `BACKEND_REJECTS_ENVIRONMENT_ID` without
@@ -239,25 +269,53 @@ export function shouldScopeUrl(url: string | undefined): boolean {
   return !APP_CONFIG_SUBPATHS.some((re) => re.test(url));
 }
 
+// ---------------------------------------------------------------------------
+// Release scoping is OPT-IN, and narrower than environment scoping: only the
+// five searched list routes read `release`; the backend's `release_guard`
+// middleware answers 400 to it everywhere else. This list mirrors
+// `RELEASE_ACCEPTING_PATHS` in backend/bins/sauron-api/src/release_guard.rs
+// and `release-scope-parity.test.ts` fails if the two drift.
+export const RELEASE_SCOPED_URL: readonly RegExp[] = [
+  /^\/v1\/apps\/[^/]+\/issues(?:\?.*)?$/,
+  /^\/v1\/apps\/[^/]+\/issues\/[^/]+\/events(?:\?.*)?$/,
+  /^\/v1\/apps\/[^/]+\/issues\/[^/]+\/events\/stats(?:\?.*)?$/,
+  /^\/v1\/apps\/[^/]+\/events\/list(?:\?.*)?$/,
+  /^\/v1\/apps\/[^/]+\/sessions(?:\?.*)?$/,
+  /^\/v1\/apps\/[^/]+\/transactions(?:\?.*)?$/,
+];
+
+export function shouldScopeRelease(url: string | undefined): boolean {
+  if (!url) return false;
+  return RELEASE_SCOPED_URL.some((re) => re.test(url));
+}
+
 /**
  * The query params the interceptor should merge onto a request, or
  * `undefined` when it should add nothing at all.
  *
- * Two independent reasons to add nothing, both load-bearing:
- *  - `url` is not an app-scoped telemetry read (see above).
+ * Environment and release scoping are independent: a URL may accept one,
+ * both, or neither, and each parameter is added only when its own predicate
+ * matches AND the corresponding value is non-null.
+ *
+ *  - `url` is not an app-scoped telemetry read (see above) -> no `environment_id`.
  *  - `envId` is `null` ("all environments") — the parameter must be omitted
  *    entirely rather than sent empty. The backend treats a *present* but
  *    empty `?environment_id=` as a `400`, not "all" (that silent-widening
  *    bug was a Critical in an earlier review); sending nothing is the only
  *    correct way to ask for every environment.
+ *  - `url` is not one of the five release-searched list routes -> no `release`.
+ *  - `release` is `null` ("all releases") — omitted for the same reason as
+ *    `envId` above.
  */
 export function computeScopeParams(
   url: string | undefined,
   envId: string | null,
+  release: string | null,
 ): Record<string, string> | undefined {
-  if (!shouldScopeUrl(url)) return undefined;
-  if (envId === null) return undefined;
-  return { environment_id: envId };
+  const out: Record<string, string> = {};
+  if (shouldScopeUrl(url) && envId !== null) out.environment_id = envId;
+  if (shouldScopeRelease(url) && release !== null) out.release = release;
+  return Object.keys(out).length ? out : undefined;
 }
 
 // ---------------------------------------------------------------------------

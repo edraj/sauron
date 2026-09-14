@@ -11,6 +11,7 @@ public class RetryPolicyTests
         => new(new SauronOptions
         {
             Dsn = "https://pub123@example.com/42",
+            Release = "1.0.0",
             HttpMessageHandler = handler,
             FlushInterval = TimeSpan.FromHours(1),
             MaxBatch = 1000,

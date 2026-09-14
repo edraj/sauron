@@ -5,7 +5,7 @@ import axios, {
 } from 'axios';
 import { apiBaseUrl } from '../config/env';
 import type { ApiErrorEnvelope, NormalizedError } from '../models';
-import { computeScopeParams, isForceableUrl, currentEnvironmentId } from './scope';
+import { computeScopeParams, isForceableUrl, currentEnvironmentId, currentRelease } from './scope';
 import { isForcing } from './force';
 
 // ---------------------------------------------------------------------------
@@ -95,11 +95,12 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 
 // ---------------------------------------------------------------------------
 // Request interceptor — attach `environment_id` from the session store to
-// every environment-scoped read (see `./scope.ts` for the opt-out list and
-// the wire-contract rule that a `null` environment omits the parameter
-// entirely rather than sending it empty).
+// every environment-scoped read, and `release` to the five release-searched
+// list routes (see `./scope.ts` for both allowlists and the wire-contract
+// rule that a `null` value omits its parameter entirely rather than sending
+// it empty).
 //
-// Imports the predicate from `scope.ts` rather than the store directly —
+// Imports the predicates from `scope.ts` rather than the store directly —
 // same reasoning as the auth bridge above: a module-level `import
 // { sessionStore }` here would create a `store -> api -> client -> store`
 // cycle (the store's own load path imports `./orgs`, `./apps`, etc., which
@@ -108,7 +109,7 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 // ---------------------------------------------------------------------------
 
 api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
-  const scopeParams = computeScopeParams(config.url, currentEnvironmentId());
+  const scopeParams = computeScopeParams(config.url, currentEnvironmentId(), currentRelease());
   if (scopeParams) {
     config.params = { ...(config.params as Record<string, unknown> | undefined), ...scopeParams };
   }

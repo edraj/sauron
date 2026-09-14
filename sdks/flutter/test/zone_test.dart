@@ -65,7 +65,7 @@ void main() {
     final Completer<Zone> runnerZone = Completer<Zone>();
 
     await Sauron.init(
-      SauronOptions(dsn: dsn, httpClient: httpClient),
+      SauronOptions(dsn: dsn, release: 'app@1.4.2+1402', httpClient: httpClient),
       appRunner: () => runnerZone.complete(Zone.current),
     );
 
@@ -82,7 +82,7 @@ void main() {
     final Completer<void> ran = Completer<void>();
 
     await Sauron.init(
-      SauronOptions(dsn: dsn, httpClient: httpClient),
+      SauronOptions(dsn: dsn, release: 'app@1.4.2+1402', httpClient: httpClient),
       appRunner: () => ran.complete(),
     );
     await ran.future;

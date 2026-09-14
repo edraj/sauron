@@ -37,6 +37,7 @@ class TestAutoCapture(unittest.TestCase):
     def _init(self, **kwargs):
         return sauron.init(
             DSN,
+            release="1.0.0",
             flush_interval=3600,
             max_batch=1000,
             sender=self.sender,

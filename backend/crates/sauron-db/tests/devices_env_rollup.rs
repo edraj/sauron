@@ -15,6 +15,7 @@ mod common;
 
 use chrono::{DateTime, Duration, Utc};
 use common::TestDb;
+use diesel_async::RunQueryDsl;
 use sauron_db::repo::{self, DeviceRow, SortSpec, TimeWindow};
 use sauron_db::scope::{EnvFilter, ReadScope};
 
@@ -126,6 +127,24 @@ async fn scoped_rollup_and_live_shapes_agree_page_for_page() {
         live.iter().any(|(rows, _)| !rows.is_empty()),
         "fixture must have devices"
     );
+
+    // `backfill_all` aggregates only signals strictly BEFORE the device rollup
+    // epoch (migration 59's apply time — for a test database, the moment it
+    // was migrated): anything later belongs to the live write path, which this
+    // test never runs. `seed_two_envs` pins every signal to noon UTC today, so
+    // on any run before noon they land AFTER that epoch, the backfill rightly
+    // skips them, and the rollup shape comes back empty against a live shape
+    // that sees all five devices (CI failed at 10:52 and 11:21 UTC, passed
+    // after noon). Declare the seed as history: move the epoch past its newest
+    // signal (`pinned_now + 5 s`), anchored to whichever clock is later so the
+    // bound holds at any wall-clock time — the two-clock rule behind
+    // `rollup_equivalence.rs`'s `day_upper`.
+    let epoch_after_seed = Utc::now().max(ids.pinned_now) + Duration::hours(1);
+    diesel::sql_query("UPDATE device_env_rollup_epoch SET started_at = $1")
+        .bind::<diesel::sql_types::Timestamptz, _>(epoch_after_seed)
+        .execute(&mut conn)
+        .await
+        .expect("pin the device rollup epoch after the pinned-noon fixture");
 
     sauron_db::device_env_backfill::backfill_all(db.pool())
         .await

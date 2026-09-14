@@ -33,13 +33,23 @@
  *
  * ## The cache key must carry the scope
  *
- * `sessionStore.scopeKey` is `appId:envId`, and telemetry pages already key
- * their effects on it because an effect tracking only the app "will not re-run
- * when the environment changes, leaving the previous environment's data on
- * screen" (session.svelte.ts). A cache key has the same requirement but fails
+ * `sessionStore.scopeKey` is `appId:envId` — two segments, the second spelled
+ * `all` when nothing is selected — and telemetry pages already key their
+ * effects on it because an effect tracking only the app "will not re-run when
+ * the environment changes, leaving the previous environment's data on screen"
+ * (session.svelte.ts). A cache key has the same requirement but fails
  * worse: a missing scope component does not merely leave stale rows up, it
  * serves one environment's rows *as* another's. Include every id the request
  * varies on — `viewKey()` exists to make that a one-liner.
+ *
+ * Views whose request carries `?release=` — the five list routes in
+ * `api/scope.ts`'s `RELEASE_SCOPED_URL` — must key on
+ * `sessionStore.scopeKeyWithRelease` instead, which appends the selected
+ * release as a third segment. Everything else, including the aggregate widgets
+ * sitting on those same pages, stays on `scopeKey`: a release segment on a
+ * request that never sends one only mints a fresh entry per switch and
+ * re-fetches an identical payload. `models/release-scope-key-parity.test.ts`
+ * holds the line in both directions.
  *
  * Entries are also dropped wholesale on logout (`authStore.clearLocal`), so a
  * second user signing in on the same tab can never be served the first user's

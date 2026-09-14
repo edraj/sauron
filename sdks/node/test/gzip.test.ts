@@ -68,6 +68,7 @@ describe('transport gzip wiring', () => {
   it('gzips a large envelope and the ingest still decodes it', async () => {
     const client = new SauronClient({
       dsn: DSN,
+      release: '1.0.0',
       flushInterval: 0,
       fetchImpl: fake.fetchImpl,
       gzipThresholdBytes: 16,
@@ -84,7 +85,12 @@ describe('transport gzip wiring', () => {
   });
 
   it('leaves a small envelope uncompressed by default', async () => {
-    const client = new SauronClient({ dsn: DSN, flushInterval: 0, fetchImpl: fake.fetchImpl });
+    const client = new SauronClient({
+      dsn: DSN,
+      release: '1.0.0',
+      flushInterval: 0,
+      fetchImpl: fake.fetchImpl,
+    });
     client.track('small', 'u1');
     await client.flush();
 

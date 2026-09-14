@@ -352,7 +352,14 @@ SauronSdk.Track("signup_completed", "u_123");`;
   ];
 
   const pythonApi: { sig: string; desc: string }[] = [
-    { sig: 'init(dsn, release?, …)', desc: 'Initialize the SDK (no-op when the DSN is missing).' },
+    // `release` lost its `?` in SDK 1.6.0: a present DSN with a missing,
+    // empty or whitespace-only release raises ValueError. An empty DSN still
+    // skips the check and leaves the SDK disabled, which is what the
+    // parenthetical below still describes.
+    {
+      sig: 'init(dsn, release, …)',
+      desc: 'Initialize the SDK — release is required (no-op when the DSN is missing).',
+    },
     { sig: 'capture_exception(exc, *, level?)', desc: 'Report an exception with its traceback.' },
     { sig: 'capture_message(msg, level?)', desc: 'Report a plain message.' },
     { sig: 'track(event, distinct_id, properties?)', desc: 'Record a product-analytics event.' },

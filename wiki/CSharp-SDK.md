@@ -1,6 +1,6 @@
 # C# SDK — `Sauron`
 
-Server-side .NET SDK (**v1.5.0**, `net8.0`, namespace `Sauron`). Dispatches
+Server-side .NET SDK (**v1.6.0**, `net8.0`, namespace `Sauron`). Dispatches
 product-analytics events and captured exceptions over a buffered background HTTP
 transport (`HttpClient` + a timer flush), with JSON via `System.Text.Json`. **No
 auto-instrumentation** — a plain server-side dispatch API. Source:
@@ -28,7 +28,7 @@ Everything goes through the static `SauronSdk` facade over a single process-wide
 client. Initialize once at startup:
 
 ```csharp
-SauronSdk.Init("https://<public_key>@<host>/<environment_id>");
+SauronSdk.Init("https://<public_key>@<host>/<environment_id>", "svc@1.4.2");
 
 // or with options:
 SauronSdk.Init(new SauronOptions
@@ -48,7 +48,7 @@ previously-initialized client. `SauronSdk.Current` returns the current client (o
 | Property | Type | Default |
 | --- | --- | --- |
 | `Dsn` | `string` | `""` (required for dispatch) |
-| `Release` | `string?` | `null` |
+| `Release` | `string` | *(required when `Dsn` is set)* — `ArgumentException` otherwise; trimmed |
 | `SampleRate` | `double` | `1.0` (errors) |
 | `FlushInterval` | `TimeSpan` | `5 s` |
 | `MaxBatch` | `int` | `30` |
@@ -66,7 +66,7 @@ previously-initialized client. `SauronSdk.Current` returns the current client (o
 
 | Method | Signature |
 | --- | --- |
-| `Init` | `Init(string dsn)` / `Init(SauronOptions options)` |
+| `Init` | `Init(string dsn, string release)` / `Init(SauronOptions options)`. `Init(string dsn)` is `[Obsolete]` since 1.6.0 — a release is required whenever a DSN is set. |
 | `Track` | `Track(string @event, string distinctId, IReadOnlyDictionary<string, object?>? properties = null)` |
 | `CaptureException` | `CaptureException(Exception exception, SauronUser? user = null, string level = "error", IReadOnlyDictionary<string, object?>? tags = null, IReadOnlyList<string>? fingerprint = null)` |
 | `CaptureMessage` | `CaptureMessage(string message, string level = "info", IReadOnlyList<string>? fingerprint = null)` |
@@ -238,7 +238,7 @@ to `AppDomain.CurrentDomain.UnhandledException` and
 and preserving the runtime's default crash/exit behavior:
 
 ```csharp
-SauronSdk.Init(new SauronOptions { Dsn = dsn, AutoCaptureUnhandled = true });
+SauronSdk.Init(new SauronOptions { Dsn = dsn, Release = release, AutoCaptureUnhandled = true });
 ```
 
 `SauronClient` is `IDisposable`; `Close()`/`Dispose()` unsubscribes those handlers and

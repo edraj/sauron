@@ -36,7 +36,7 @@ import { init, close } from '@edraj/sauron-node';
 
 init({
   dsn: process.env.SAURON_DSN!,
-  release: process.env.RELEASE,
+  release: process.env.SAURON_RELEASE ?? 'api@1.0.0',
 });
 
 // Drain the buffer on shutdown (or pass `autoShutdown: true` to init).
@@ -180,7 +180,7 @@ across separate hook functions. Initialize once at startup:
 ```python
 import sauron
 
-sauron.init(dsn=os.environ["SAURON_DSN"])
+sauron.init(dsn=os.environ["SAURON_DSN"], release=os.environ["SAURON_RELEASE"])
 # `sauron.init` registers an atexit flush; call `sauron.close()` explicitly for a
 # hard shutdown.
 ```
@@ -333,6 +333,7 @@ var builder = WebApplication.CreateBuilder(args);
 SauronSdk.Init(new SauronOptions
 {
     Dsn = builder.Configuration["Sauron:Dsn"]!,
+    Release = builder.Configuration["Sauron:Release"]!,
 });
 
 var app = builder.Build();

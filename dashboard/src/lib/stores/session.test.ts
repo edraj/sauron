@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { App, AppEnvironment } from '../models';
+import type { App, AppEnvironment, AppRelease } from '../models';
 
 vi.mock('../api/orgs', () => ({
   getAccess: vi.fn(),
@@ -14,14 +14,19 @@ vi.mock('../api/apps', () => ({
 vi.mock('../api/environments', () => ({
   listEnvironments: vi.fn(),
 }));
+vi.mock('../api/releases', () => ({
+  listReleases: vi.fn(),
+}));
 
 import { listApps } from '../api/apps';
 import { listEnvironments } from '../api/environments';
+import { listReleases } from '../api/releases';
 import { listProjects } from '../api/projects';
 import { getAccess, listOrgs } from '../api/orgs';
 import { sessionStore } from './session.svelte';
 
 const mockListEnvironments = vi.mocked(listEnvironments);
+const mockListReleases = vi.mocked(listReleases);
 const mockListApps = vi.mocked(listApps);
 const mockListProjects = vi.mocked(listProjects);
 const mockGetAccess = vi.mocked(getAccess);
@@ -94,6 +99,16 @@ function makeEnv(id: string, overrides: Partial<AppEnvironment> = {}): AppEnviro
   };
 }
 
+function makeRelease(release: string, overrides: Partial<AppRelease> = {}): AppRelease {
+  return {
+    release,
+    environment_ids: [null],
+    first_seen_at: '2026-01-01T00:00:00Z',
+    last_seen_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
 /** Reset the singleton store back to a blank slate before every test. */
 function resetStore() {
   sessionStore.orgs = [];
@@ -101,10 +116,13 @@ function resetStore() {
   sessionStore.apps = [];
   sessionStore.environments = [];
   sessionStore.environmentsError = false;
+  sessionStore.releases = [];
+  sessionStore.releasesError = false;
   sessionStore.currentOrgId = null;
   sessionStore.currentProjectId = null;
   sessionStore.currentAppId = null;
   sessionStore.currentEnvId = null;
+  sessionStore.currentRelease = null;
   sessionStore.access = null;
   sessionStore.loaded = false;
   sessionStore.loading = false;
@@ -113,6 +131,8 @@ function resetStore() {
   // over between tests, unlike every other field reset above.
   (sessionStore as unknown as { environmentsLoadAttemptedFor: string | null }).environmentsLoadAttemptedFor =
     null;
+  // Same reasoning for the release equivalent.
+  (sessionStore as unknown as { releasesLoadAttemptedFor: string | null }).releasesLoadAttemptedFor = null;
   // Same reasoning for `loadPromise` (Task 15, Item 3) — every test that sets
   // it awaits `load()` to completion, which always resets it to `null` itself
   // (success or failure), but reset it here too rather than rely on that.
@@ -123,6 +143,11 @@ beforeEach(() => {
   vi.stubGlobal('window', { localStorage: new FakeStorage() } as unknown as Window & typeof globalThis);
   resetStore();
   vi.clearAllMocks();
+  // Default to no releases so every pre-existing test that reaches
+  // `loadAppReleases` via `setApp`/`setOrg`/`setProject`/`load()` without
+  // caring about releases doesn't have to mock it explicitly — mirrors the
+  // "genuinely empty" success path `loadAppEnvironments` already handles.
+  mockListReleases.mockResolvedValue([]);
 });
 
 describe('resolveCurrentEnvironment (via setApp)', () => {
@@ -327,6 +352,357 @@ describe('scopeKey', () => {
     expect(sessionStore.scopeKey).not.toBe(all);
     expect(sessionStore.scopeKey).toBe('app-1:none');
   });
+
+  // The whole point of the split: ~20 telemetry pages read rollups with no
+  // release dimension, and folding the release into `scopeKey` made every one
+  // of them re-fetch an identical payload on each switch of the Topbar's
+  // release picker.
+  it('does NOT change when only the release changes', () => {
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.currentEnvId = null;
+    sessionStore.currentRelease = null;
+    const base = sessionStore.scopeKey;
+
+    sessionStore.setRelease('1.4.0');
+
+    expect(sessionStore.scopeKey).toBe(base);
+  });
+});
+
+describe('scopeKeyWithRelease', () => {
+  it('changes when the release changes but the app and environment do not', () => {
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.currentEnvId = null;
+    sessionStore.currentRelease = null;
+    const base = sessionStore.scopeKeyWithRelease;
+    expect(base).toBe('app-1:all:all');
+
+    sessionStore.setRelease('1.4.0');
+
+    expect(sessionStore.scopeKeyWithRelease).not.toBe(base);
+    expect(sessionStore.scopeKeyWithRelease).toBe('app-1:all:1.4.0');
+  });
+
+  // Prefixed by `scopeKey`, so a release-aware page still re-fetches on an
+  // app or environment switch — it does not trade one dimension for another.
+  it('still changes when the environment or the app changes', () => {
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.currentEnvId = null;
+    sessionStore.currentRelease = '1.4.0';
+    expect(sessionStore.scopeKeyWithRelease).toBe('app-1:all:1.4.0');
+
+    sessionStore.setEnvironment('env-1');
+    expect(sessionStore.scopeKeyWithRelease).toBe('app-1:env-1:1.4.0');
+
+    sessionStore.currentAppId = 'app-2';
+    expect(sessionStore.scopeKeyWithRelease).toBe('app-2:env-1:1.4.0');
+  });
+
+  it('spells "all releases" as the `all` sentinel, distinct from a release named "none"', () => {
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.currentEnvId = 'env-1';
+    sessionStore.currentRelease = null;
+    expect(sessionStore.scopeKeyWithRelease).toBe('app-1:env-1:all');
+
+    sessionStore.currentRelease = 'none';
+    expect(sessionStore.scopeKeyWithRelease).toBe('app-1:env-1:none');
+  });
+});
+
+describe('releases', () => {
+  it('persists the release per app and clears it when the stored value is stale', async () => {
+    sessionStore.currentAppId = 'app-0';
+    mockListEnvironments.mockResolvedValue([]);
+    mockListReleases.mockResolvedValue([makeRelease('1.4.0')]);
+    window.localStorage.setItem('sauron.release:app-1', '1.4.0');
+
+    await sessionStore.setApp('app-1');
+
+    expect(sessionStore.currentRelease).toBe('1.4.0');
+    expect(mockListReleases).toHaveBeenCalledWith('app-1');
+
+    mockListReleases.mockResolvedValue([makeRelease('1.4.0')]);
+    window.localStorage.setItem('sauron.release:app-2', '9.9.9');
+
+    await sessionStore.setApp('app-2');
+
+    expect(sessionStore.currentRelease).toBeNull();
+    expect(window.localStorage.getItem('sauron.release:app-2')).toBeNull();
+  });
+
+  it('setApp clears releases and currentRelease — they belong to the previous app', async () => {
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.currentRelease = '1.4.0';
+    sessionStore.releases = [makeRelease('1.4.0')];
+    mockListEnvironments.mockResolvedValue([]);
+    mockListReleases.mockResolvedValue([]);
+
+    await sessionStore.setApp('app-2');
+
+    expect(sessionStore.currentRelease).toBeNull();
+    expect(sessionStore.releases).toEqual([]);
+  });
+
+  it('setOrg and setProject clear currentRelease along with currentEnvId', async () => {
+    sessionStore.currentOrgId = 'org-1';
+    sessionStore.currentRelease = '1.4.0';
+    mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
+    mockListProjects.mockResolvedValue([]);
+
+    await sessionStore.setOrg('org-2');
+
+    expect(sessionStore.currentRelease).toBeNull();
+
+    sessionStore.currentProjectId = 'proj-1';
+    sessionStore.currentRelease = '1.4.0';
+    mockListApps.mockResolvedValue([]);
+
+    await sessionStore.setProject('proj-2');
+
+    expect(sessionStore.currentRelease).toBeNull();
+  });
+
+  describe('setRelease', () => {
+    it('narrows the environment to "all" when the current env has not seen the selected release', () => {
+      sessionStore.currentAppId = 'app-1';
+      sessionStore.currentEnvId = 'env-1';
+      sessionStore.releases = [makeRelease('1.4.0', { environment_ids: ['env-2'] })];
+
+      sessionStore.setRelease('1.4.0');
+
+      expect(sessionStore.currentRelease).toBe('1.4.0');
+      expect(sessionStore.currentEnvId).toBeNull();
+    });
+
+    it('leaves the environment alone when it has seen the selected release', () => {
+      sessionStore.currentAppId = 'app-1';
+      sessionStore.currentEnvId = 'env-1';
+      sessionStore.releases = [makeRelease('1.4.0', { environment_ids: ['env-1'] })];
+
+      sessionStore.setRelease('1.4.0');
+
+      expect(sessionStore.currentEnvId).toBe('env-1');
+    });
+
+    it('leaves "none" (unattributed) untouched regardless of the release', () => {
+      sessionStore.currentAppId = 'app-1';
+      sessionStore.currentEnvId = 'none';
+      sessionStore.releases = [makeRelease('1.4.0', { environment_ids: ['env-2'] })];
+
+      sessionStore.setRelease('1.4.0');
+
+      expect(sessionStore.currentEnvId).toBe('none');
+    });
+
+    /**
+     * The switcher offers the TRIMMED name (`selectableReleases`), so a padded
+     * catalogue row must still be found by the env-fallback lookup. With a raw
+     * `x.release === id` compare the row is never found, the guard silently
+     * no-ops, and the app is left on an (env, release) pair the release was
+     * never seen in. Padded rows only predate the ingest-edge normalisation,
+     * but the lookup has to agree with the menu that produced the value.
+     */
+    it('matches a padded catalogue row by its trimmed name when falling back', () => {
+      sessionStore.currentAppId = 'app-1';
+      sessionStore.currentEnvId = 'env-a';
+      sessionStore.releases = [makeRelease(' 2.0.0', { environment_ids: ['env-b'] })];
+
+      sessionStore.setRelease('2.0.0');
+
+      expect(sessionStore.currentRelease).toBe('2.0.0');
+      expect(sessionStore.currentEnvId).toBeNull();
+    });
+
+    it('persists the selection per app and clears it via setRelease(null)', () => {
+      sessionStore.currentAppId = 'app-1';
+
+      sessionStore.setRelease('1.4.0');
+      expect(window.localStorage.getItem('sauron.release:app-1')).toBe('1.4.0');
+
+      sessionStore.setRelease(null);
+      expect(sessionStore.currentRelease).toBeNull();
+      expect(window.localStorage.getItem('sauron.release:app-1')).toBeNull();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stale continuations.
+//
+// `setApp` starts two fetches and awaits them; nothing cancels an in-flight
+// one. A user clicking through the app switcher faster than the network
+// answers therefore has two loads in flight for two DIFFERENT apps, and the
+// OLDER one can land last. Without a guard after each `await`, that older
+// continuation writes its app's environments/releases over the newer app's —
+// the picker then lists environments that belong to an app you are no longer
+// looking at, and every request the interceptor scopes goes out with an
+// `environment_id` the current app does not own (a 403, or worse, a silent
+// cross-app read if the id happens to be reachable).
+//
+// The guard is a generation counter (`loadGen`), not an app-id comparison,
+// because the two loads in flight need not be for two different apps: A→B→A
+// leaves two `app-1` loads racing while `currentAppId` reads `'app-1'` for
+// both. See the A→B→A test below.
+// ---------------------------------------------------------------------------
+describe('rapid app switching', () => {
+  /** A `listX` mock whose `app-1` answer is held open until the test releases it. */
+  function gated<T>(slow: T, fast: T) {
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const impl = async (appId: string): Promise<T> => {
+      if (appId === 'app-1') {
+        await gate;
+        return slow;
+      }
+      return fast;
+    };
+    return { impl, open };
+  }
+
+  it('a stale loadAppReleases continuation is discarded, not applied', async () => {
+    const oldReleases = [makeRelease('1.0.0')];
+    const newReleases = [makeRelease('2.0.0')];
+    const { impl, open } = gated(oldReleases, newReleases);
+    mockListEnvironments.mockResolvedValue([]);
+    mockListReleases.mockImplementation(impl);
+
+    const first = sessionStore.setApp('app-1');
+    const second = sessionStore.setApp('app-2');
+    await second;
+    expect(sessionStore.releases).toEqual(newReleases);
+
+    // app-1's fetch answers only now, long after the user moved on.
+    open();
+    await first;
+
+    expect(sessionStore.currentAppId).toBe('app-2');
+    expect(sessionStore.releases).toEqual(newReleases);
+  });
+
+  it('a stale loadAppEnvironments continuation is discarded, not applied', async () => {
+    const oldEnvs = [makeEnv('env-old', { is_default: true })];
+    const newEnvs = [makeEnv('env-new', { is_default: true })];
+    const { impl, open } = gated(oldEnvs, newEnvs);
+    mockListReleases.mockResolvedValue([]);
+    mockListEnvironments.mockImplementation(impl);
+
+    const first = sessionStore.setApp('app-1');
+    const second = sessionStore.setApp('app-2');
+    await second;
+    expect(sessionStore.currentEnvId).toBe('env-new');
+
+    open();
+    await first;
+
+    expect(sessionStore.environments).toEqual(newEnvs);
+    // The selection is the part that actually reaches the wire, so it matters
+    // more than the list: `resolveCurrentEnvironment` running for the stale
+    // app is what would put `env-old` into every scoped request.
+    expect(sessionStore.currentEnvId).toBe('env-new');
+  });
+
+  /**
+   * The case an `appId`-identity guard cannot see. Going A→B→A leaves TWO
+   * `app-1` loads in flight; when the first one finally answers,
+   * `currentAppId` is `'app-1'` again, so `this.currentAppId !== appId` is
+   * false and the oldest response is applied over the newest. Only a
+   * generation counter (`loadGen`, bumped by every `setApp`) distinguishes
+   * "this app" from "this load".
+   */
+  it('a same-app A→B→A first continuation does not overwrite the second A result', async () => {
+    const firstA = [makeRelease('1.0.0')];
+    const secondA = [makeRelease('3.0.0')];
+    const bList = [makeRelease('2.0.0')];
+
+    // Hold app-1's FIRST answer open; its second call resolves immediately.
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let aCalls = 0;
+    mockListEnvironments.mockResolvedValue([]);
+    mockListReleases.mockImplementation(async (appId: string) => {
+      if (appId !== 'app-1') return bList;
+      aCalls += 1;
+      if (aCalls === 1) {
+        await gate;
+        return firstA;
+      }
+      return secondA;
+    });
+
+    const first = sessionStore.setApp('app-1');
+    await sessionStore.setApp('app-2');
+    await sessionStore.setApp('app-1');
+
+    expect(aCalls).toBe(2);
+    expect(sessionStore.releases).toEqual(secondA);
+
+    // The very first app-1 fetch answers last.
+    open();
+    await first;
+
+    expect(sessionStore.currentAppId).toBe('app-1');
+    expect(sessionStore.releases).toEqual(secondA);
+  });
+
+  it('a stale FAILED load does not raise an error flag over the newer app', async () => {
+    // The failure path writes state too (`releasesError`, and it clears the
+    // attempted-for stamp so a retry is possible). Both belong to the app that
+    // failed — applied to the app now on screen they show an error banner for
+    // a load that succeeded, and re-open the door to a duplicate fetch.
+    let reject!: (err: Error) => void;
+    const failing = new Promise<AppRelease[]>((_, r) => {
+      reject = r;
+    });
+    mockListEnvironments.mockResolvedValue([]);
+    mockListReleases.mockImplementation(async (appId: string) =>
+      appId === 'app-1' ? failing : [makeRelease('2.0.0')],
+    );
+
+    const first = sessionStore.setApp('app-1');
+    const second = sessionStore.setApp('app-2');
+    await second;
+
+    reject(new Error('network'));
+    await first;
+
+    expect(sessionStore.releasesError).toBe(false);
+    expect(sessionStore.releases).toEqual([makeRelease('2.0.0')]);
+  });
+});
+
+describe('resolveCurrentRelease', () => {
+  it('does not touch localStorage when the app has no stored release', async () => {
+    // `writeStored(key, null)` is a `removeItem`, and the overwhelmingly
+    // common case — an app whose release was never pinned — hit it on every
+    // single app switch and every bootstrap.
+    const removeItem = vi.spyOn(window.localStorage, 'removeItem');
+    mockListEnvironments.mockResolvedValue([]);
+    mockListReleases.mockResolvedValue([makeRelease('1.4.0')]);
+
+    await sessionStore.setApp('app-9');
+
+    expect(sessionStore.currentRelease).toBeNull();
+    expect(
+      removeItem.mock.calls.filter(([k]) => k === 'sauron.release:app-9'),
+      'a release that was never stored has nothing to clear',
+    ).toEqual([]);
+    removeItem.mockRestore();
+  });
+
+  it('still clears a stored release that no longer exists', async () => {
+    window.localStorage.setItem('sauron.release:app-9', '0.0.1-gone');
+    mockListEnvironments.mockResolvedValue([]);
+    mockListReleases.mockResolvedValue([makeRelease('1.4.0')]);
+
+    await sessionStore.setApp('app-9');
+
+    expect(sessionStore.currentRelease).toBeNull();
+    expect(window.localStorage.getItem('sauron.release:app-9')).toBeNull();
+  });
 });
 
 describe('ensureEnvironmentsLoaded', () => {
@@ -488,6 +864,9 @@ describe('setApp vs. the Topbar self-heal effect (no duplicate concurrent fetch)
       if (sessionStore.currentAppId && sessionStore.environments.length === 0) {
         await sessionStore.ensureEnvironmentsLoaded();
       }
+      if (sessionStore.currentAppId && sessionStore.releases.length === 0) {
+        await sessionStore.ensureReleasesLoaded();
+      }
     });
   }
 
@@ -504,6 +883,33 @@ describe('setApp vs. the Topbar self-heal effect (no duplicate concurrent fetch)
     expect(mockListEnvironments).toHaveBeenCalledTimes(1);
     expect(mockListEnvironments).toHaveBeenCalledWith('app-2');
     expect(sessionStore.currentEnvId).toBe('env-2');
+  });
+
+  // Regression for the `setApp` sequential-await bug: `loadAppEnvironments`
+  // stamps `environmentsLoadAttemptedFor` synchronously, before its own
+  // network round trip, but `loadAppReleases` was only ever invoked (and so
+  // only ever stamped `releasesLoadAttemptedFor`) *after* that round trip
+  // completed. That left a window, for the whole `listEnvironments` await,
+  // where the Topbar effect's `ensureReleasesLoaded()` guard saw
+  // `releasesLoadAttemptedFor !== 'app-2'` and fired a second, concurrent
+  // `listReleases('app-2')` alongside `setApp`'s own. Fails against
+  // sequential `await loadAppEnvironments(id); await loadAppReleases(id);`
+  // and passes once both loads are started before either is awaited
+  // (`Promise.all`).
+  it('issues exactly one releases load for an ordinary app switch', async () => {
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.environments = [makeEnv('env-1', { app_id: 'app-1', is_default: true })];
+    sessionStore.releases = [makeRelease('1.0.0')];
+    const newDefault = makeEnv('env-2', { app_id: 'app-2', is_default: true });
+    mockListEnvironments.mockResolvedValue([newDefault]);
+    mockListReleases.mockResolvedValue([makeRelease('2.0.0')]);
+
+    const setAppDone = sessionStore.setApp('app-2');
+    const effectDone = simulateTopbarEffectFlush();
+    await Promise.all([setAppDone, effectDone]);
+
+    expect(mockListReleases).toHaveBeenCalledTimes(1);
+    expect(mockListReleases).toHaveBeenCalledWith('app-2');
   });
 
   it('still self-heals exactly once after removeApp switches away without loading', async () => {

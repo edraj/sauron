@@ -51,6 +51,7 @@ function newClient(options: { throwOnEvent?: string } = {}) {
   const fetchImpl: FetchLike = async () => ({ status: 200, ok: true });
   const client = new SauronClient({
     dsn: DSN,
+    release: '1.0.0',
     flushInterval: 0,
     fetchImpl,
     // Purely a capture role now (see the doc comment above) — every
@@ -175,7 +176,7 @@ describe('workflow', () => {
 
     it('returns disabled once the transport has auto-disabled itself, emitting nothing', async () => {
       const fetchImpl: FetchLike = async () => ({ status: 401, ok: false });
-      const client = new SauronClient({ dsn: DSN, flushInterval: 0, fetchImpl });
+      const client = new SauronClient({ dsn: DSN, release: '1.0.0', flushInterval: 0, fetchImpl });
       client.track('trigger', 'u1');
       await client.flush(); // 401 -> transport.disabled = true
 

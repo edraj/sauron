@@ -33,7 +33,7 @@ or, in `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  sauron_flutter: ^1.9.0
+  sauron_flutter: ^1.10.1
 ```
 
 Requires Dart SDK `>=3.4.0 <4.0.0` and Flutter `>=3.19.0`.
@@ -58,6 +58,9 @@ Future<void> main() async {
   );
 }
 ```
+
+As of 1.10.0, `release` is required whenever `dsn` is set — `Sauron.init` throws
+`ArgumentError` if it is missing or blank.
 
 `appRunner` runs `WidgetsFlutterBinding.ensureInitialized()`, installs the
 capture layers, awaits `bootstrap()` and then launches your app — all inside a

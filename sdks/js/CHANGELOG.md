@@ -2,6 +2,14 @@
 
 All notable changes to `@edraj/sauron-browser` are documented here.
 
+## 1.7.0
+
+### Changed
+
+- **`release` is required at init.** `Sauron.init()` now throws when `release`
+  is missing, not a string, or whitespace-only. `release` is trimmed before it
+  is sent. `InitOptions.release` is now a required `string` (was optional).
+
 ## 1.6.0
 
 ### Added

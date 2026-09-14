@@ -94,6 +94,43 @@ pub fn parse_env(raw: Option<&str>) -> Result<EnvFilter, ApiError> {
     }
 }
 
+/// The raw `release` query value, if present. Same shape as
+/// [`raw_environment_id`]: distinguishes "the key is absent" from "the key is
+/// present with an empty value", which a `Query<T>`-deserialized
+/// `Option<String>` field cannot be trusted to do consistently (see that
+/// function's doc comment for the extractor-codec discrepancy this routes
+/// around).
+pub fn raw_release(raw_query: Option<&str>) -> Option<String> {
+    let raw_query = raw_query?;
+    form_urlencoded::parse(raw_query.as_bytes())
+        .find(|(k, _)| k == "release")
+        .map(|(_, v)| v.into_owned())
+}
+
+/// Parse the `release` query parameter into a [`sauron_query::ReleaseFilter`].
+///
+/// `raw` is [`raw_release`]'s result, `.as_deref()`'d — never a
+/// `Query<T>`-deserialized field, for the same extractor-trap reason
+/// [`parse_env`] takes `raw_environment_id`'s output rather than a struct
+/// field.
+///
+/// | value | meaning |
+/// |---|---|
+/// | absent | every release (`ReleaseFilter::All`) |
+/// | `?release=none` | rows with no release attributed (`ReleaseFilter::Unknown`) |
+/// | anything else | exact match (`ReleaseFilter::One`) |
+/// | empty (`?release=`) | `400` — never a silent fallback to "all", the same
+///   rule [`parse_env`] applies to `environment_id` |
+pub fn parse_release(raw: Option<&str>) -> Result<sauron_query::ReleaseFilter, ApiError> {
+    use sauron_query::ReleaseFilter;
+    match raw.map(str::trim) {
+        None => Ok(ReleaseFilter::All),
+        Some("") => Err(ApiError::BadRequest("release must not be empty".into())),
+        Some("none") => Ok(ReleaseFilter::Unknown),
+        Some(s) => Ok(ReleaseFilter::One(s.to_string())),
+    }
+}
+
 /// Authorize an environment-scoped read and produce its `ReadScope` in one
 /// call, sourcing `environment_id` from the raw query string.
 ///
@@ -308,6 +345,67 @@ mod tests {
         assert_eq!(
             raw_environment_id(Some(&format!("environment_id={id}"))),
             Some(id.to_string())
+        );
+    }
+
+    // --- parse_release / raw_release ----------------------------------------
+
+    #[test]
+    fn release_absent_means_all() {
+        assert_eq!(
+            parse_release(None).unwrap(),
+            sauron_query::ReleaseFilter::All
+        );
+    }
+
+    #[test]
+    fn release_none_means_unknown() {
+        assert_eq!(
+            parse_release(Some("none")).unwrap(),
+            sauron_query::ReleaseFilter::Unknown
+        );
+    }
+
+    #[test]
+    fn release_a_value_selects_one() {
+        assert_eq!(
+            parse_release(Some("1.4.0")).unwrap(),
+            sauron_query::ReleaseFilter::One("1.4.0".to_string())
+        );
+    }
+
+    /// Empty and whitespace-only are both `400`, never a silent fallback to
+    /// `All` — the same rule `parse_env` applies to `environment_id`.
+    #[test]
+    fn release_empty_or_whitespace_is_rejected_not_widened() {
+        assert!(parse_release(Some("")).is_err());
+        assert!(parse_release(Some("   ")).is_err());
+    }
+
+    #[test]
+    fn raw_release_absent_query_string_is_none() {
+        assert_eq!(raw_release(None), None);
+    }
+
+    #[test]
+    fn raw_release_key_missing_from_query_string_is_none() {
+        assert_eq!(raw_release(Some("since_days=7&limit=20")), None);
+    }
+
+    #[test]
+    fn raw_release_present_but_empty_is_some_empty_string_not_none() {
+        assert_eq!(raw_release(Some("release=")), Some(String::new()));
+        assert_eq!(
+            raw_release(Some("since_days=7&release=&limit=20")),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn raw_release_present_with_value_is_decoded() {
+        assert_eq!(
+            raw_release(Some("release=1.4.0")),
+            Some("1.4.0".to_string())
         );
     }
 }

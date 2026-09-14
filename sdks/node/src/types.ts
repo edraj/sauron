@@ -356,7 +356,8 @@ export interface TransportOptions {
 export interface InitOptions {
   /** `https://<public_key>@<host>/<project_id>` */
   dsn: string;
-  release?: string | null;
+  /** Required. The app version every event is attributed to. */
+  release: string;
   /** Default tags seeded into the global scope at init. */
   tags?: Record<string, string>;
   /** Default named dev context blocks seeded into the global scope at init. Distinct from the machine `context`. */
@@ -402,7 +403,7 @@ export interface InitOptions {
 /** Fully-resolved options with all defaults applied. */
 export interface ResolvedOptions {
   dsn: string;
-  release: string | null;
+  release: string;
   tags: Record<string, string>;
   contexts: Record<string, unknown>;
   extra: Record<string, unknown>;

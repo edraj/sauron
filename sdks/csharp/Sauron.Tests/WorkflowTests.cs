@@ -480,6 +480,7 @@ public class WorkflowTests
         using var client = new SauronClient(new SauronOptions
         {
             Dsn = "not-a-valid-dsn",
+            Release = "1.0.0",
             HttpMessageHandler = handler,
         });
         Assert.False(client.Enabled);
@@ -508,6 +509,7 @@ public class WorkflowTests
         SauronSdk.Init(new SauronOptions
         {
             Dsn = "https://pub123@example.com/42",
+            Release = "1.0.0",
             HttpMessageHandler = handler,
             FlushInterval = TimeSpan.FromHours(1),
             MaxBatch = 1000,

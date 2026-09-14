@@ -14,8 +14,30 @@ public static class SauronSdk
     private static SauronClient? _client;
     private static readonly object _gate = new();
 
-    /// <summary>Initialize the SDK with a DSN string (uses defaults for everything else).</summary>
+    /// <summary>
+    /// Initialize the SDK with a DSN string (uses defaults for everything else).
+    /// </summary>
+    /// <remarks>
+    /// Obsolete since 1.6.0: <see cref="SauronOptions.Release"/> is required
+    /// whenever a DSN is set, so this overload can only succeed for a blank
+    /// DSN (which leaves the SDK disabled). The body is unchanged — it still
+    /// throws <see cref="ArgumentException"/> for a non-blank DSN — and the
+    /// attribute is what explains why, at compile time, instead of leaving a
+    /// caller to discover it as a startup crash.
+    /// </remarks>
+    [Obsolete("release is required since 1.6.0; use Init(dsn, release)")]
     public static void Init(string dsn) => Init(new SauronOptions { Dsn = dsn });
+
+    /// <summary>
+    /// Initialize the SDK with a DSN and a release (uses defaults for everything else).
+    /// </summary>
+    /// <param name="dsn">The project DSN. Blank leaves the SDK disabled.</param>
+    /// <param name="release">
+    /// The app version this build reports as, e.g. <c>svc@1.4.2</c>. Required
+    /// whenever <paramref name="dsn"/> is non-blank; trimmed before use.
+    /// </param>
+    public static void Init(string dsn, string release)
+        => Init(new SauronOptions { Dsn = dsn, Release = release });
 
     /// <summary>Initialize the SDK. Replaces (and closes) any previously-initialized client.</summary>
     public static void Init(SauronOptions options)

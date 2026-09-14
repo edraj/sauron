@@ -199,12 +199,17 @@ offline queue. Returns the live `SauronClient`.
 
 Idempotent: a second `init()` tears the previous client down first (restoring
 every patched global, clearing the current screen) before installing a fresh
-one. Throws `Error` when `dsn` is missing or not a string, and `DsnError` when
-the DSN itself is malformed.
+one. Throws `Error` when `dsn` is missing or not a string, when `release` is
+missing or blank, and `DsnError` when the DSN itself is malformed.
+
+`release` is required as of v1.7.0 — `init()` throws without one.
 
 ```ts
-const client = Sauron.init({ dsn: 'https://pk_test@localhost:8081/1' });
-client.options.release;     // null
+const client = Sauron.init({
+  dsn: 'https://pk_test@localhost:8081/1',
+  release: 'web@1.4.2',
+});
+client.options.release;     // 'web@1.4.2'
 client.dsn.projectId;       // '1'
 ```
 
@@ -985,7 +990,7 @@ const appFrames = frames.filter((f) => isInAppFrame(f.filename));
 
 ```ts
 const SDK_NAME: string  // 'sauron.javascript'
-const SDK_VERSION: string // '1.6.0'
+const SDK_VERSION: string // '1.7.0'
 ```
 
 The SDK identity embedded in `header.sdk` of every envelope.
@@ -1106,7 +1111,7 @@ Other scope data:
   is unavailable.
 
 ```ts
-Sauron.init({ dsn, tags: { tier: 'free' }, extra: { build: 'ci-42' } });
+Sauron.init({ dsn, release: 'web@1.4.2', tags: { tier: 'free' }, extra: { build: 'ci-42' } });
 Sauron.setTag('tier', 'pro');                       // scope beats init default
 Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 // -> event tags: { tier: 'trial' }, extra: { build: 'ci-42' }
@@ -1126,8 +1131,8 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.6.0';
-  Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42' });
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.7.0';
+  Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42', release: 'web@1.4.2' });
 </script>
 ```
 

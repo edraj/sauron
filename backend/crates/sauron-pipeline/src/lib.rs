@@ -12,6 +12,7 @@ pub mod failures;
 pub mod mask;
 pub mod merge;
 pub mod process;
+pub mod releases;
 pub mod retry;
 pub mod rollup_task;
 pub mod symbolize;

@@ -24,6 +24,7 @@ class TestInitDefaults(unittest.TestCase):
     def test_init_seeds_global_scope(self):
         sauron.init(
             DSN,
+            release="1.0.0",
             flush_interval=3600,
             max_batch=1000,
             tags={"service": "api"},
@@ -40,6 +41,7 @@ class TestInitDefaults(unittest.TestCase):
         fake = FakeSender(status=200)
         sauron.init(
             DSN,
+            release="1.0.0",
             flush_interval=3600,
             max_batch=1000,
             tags={"service": "api"},

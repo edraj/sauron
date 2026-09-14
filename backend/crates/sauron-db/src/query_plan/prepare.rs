@@ -4,11 +4,14 @@
 //!
 //! Three jobs, run in this order:
 //!
-//! 1. **Reject `Store::Rollup` dimensions** (`environment`/`release`/`handled`
-//!    on Issues — the `issue_dimensions` rollup table doesn't exist until S3)
+//! 1. **Reject `Store::Rollup` dimensions** (`environment`/`handled` on
+//!    Issues — the `issue_dimensions` rollup table doesn't exist until S3)
 //!    with `PlanError::NotYetSupported`, before any query runs. Failing fast
 //!    here avoids a pointless environment-lookup round-trip for a query that
-//!    can never succeed.
+//!    can never succeed. `release` on Issues is NOT one of these: it bridges
+//!    to `error_events` through a correlated EXISTS instead of waiting on the
+//!    rollup, so it is `Store::Column` and reaches `lower()` like any other
+//!    predicate.
 //! 2. **Batch-resolve every `environment` name** appearing anywhere in the
 //!    tree — inside `TypedValue::List`, inside `Or` branches, under `Not` —
 //!    with ONE query, rather than one lookup per predicate.
@@ -351,16 +354,24 @@ mod tests {
 
     #[test]
     fn every_rollup_dimension_on_issues_is_rejected() {
-        for q in ["release:1.0.0", "handled:true"] {
-            let node = resolve(&parse(q).unwrap(), Resource::Issues).unwrap();
-            assert!(
-                matches!(
-                    reject_rollups(&node),
-                    Err(PlanError::NotYetSupported { .. })
-                ),
-                "{q}"
-            );
-        }
+        let q = "handled:true";
+        let node = resolve(&parse(q).unwrap(), Resource::Issues).unwrap();
+        assert!(
+            matches!(
+                reject_rollups(&node),
+                Err(PlanError::NotYetSupported { .. })
+            ),
+            "{q}"
+        );
+    }
+
+    // `release` on Issues is `Store::Column`, not `Store::Rollup` (it bridges
+    // to `error_events` through a correlated EXISTS) — this job must let it
+    // through rather than rejecting it alongside `handled`.
+    #[test]
+    fn release_on_issues_is_not_rejected_as_a_rollup() {
+        let node = resolve(&parse("release:1.0.0").unwrap(), Resource::Issues).unwrap();
+        assert!(reject_rollups(&node).is_ok());
     }
 
     #[test]

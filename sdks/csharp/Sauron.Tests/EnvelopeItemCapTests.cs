@@ -52,6 +52,7 @@ public class EnvelopeItemCapTests
         var client = new SauronClient(new SauronOptions
         {
             Dsn = "https://pub123@example.com/42",
+            Release = "1.0.0",
             HttpMessageHandler = handler,
             FlushInterval = TimeSpan.FromHours(1),
             MaxBatch = 100_000,          // never auto-flushes during the loop

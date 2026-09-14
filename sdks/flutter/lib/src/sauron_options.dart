@@ -62,6 +62,10 @@ class SauronOptions {
   String? dsn;
 
   /// Release identifier, e.g. `app@1.4.2+1402`.
+  ///
+  /// Required whenever [dsn] is set — [Sauron.init] throws [ArgumentError] if
+  /// [dsn] is non-empty and this is null/blank. Trimmed of surrounding
+  /// whitespace by [Sauron.init].
   String? release;
 
   /// App version reported in the envelope's `context.app`, e.g. `1.4.2`.

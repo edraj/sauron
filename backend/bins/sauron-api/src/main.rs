@@ -11,6 +11,7 @@ mod error;
 mod mail;
 mod openapi;
 mod overview_cache;
+mod release_guard;
 /// Test-only: parses this file's own route table so `openapi`'s parity test can
 /// compare the document against the routes actually served.
 #[cfg(test)]
@@ -657,6 +658,13 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/environments",
             get(routes::environments::list_app_environments),
         )
+        // The release switcher's list: every `release` seen in this app's
+        // telemetry, folded across the caller's environment reach. Not on the
+        // `release_guard` allowlist — see `routes::releases`'s module docs.
+        .route(
+            "/v1/apps/{app_id}/releases",
+            get(routes::releases::list_app_releases),
+        )
         // No DELETE here on purpose. Withdrawing one app from an environment
         // would be a one-way door: enrollment happens only when an environment
         // or an app is created, so there is no path back short of retiring the
@@ -1118,6 +1126,19 @@ async fn main() -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(API_JSON_BODY_LIMIT))
         .merge(artifact_routes)
         .merge(docs_routes)
+        // Added BEFORE `cors`, not after: a layer added later is OUTERMOST
+        // (see the comment on the timeout/concurrency pair below), and this
+        // middleware can short-circuit with its own 400 before the request
+        // ever reaches an inner layer. If `cors` were inside this one, a
+        // `release=`-rejected response would skip it entirely and go out with
+        // no CORS headers — invisible to every Rust test here (none of them
+        // are subject to CORS; see the `cors` layer's own comment on that
+        // blind spot) and visible only as `net::ERR_FAILED` in a browser.
+        // Keeping `cors` outermost of the two means it post-processes this
+        // middleware's response the same as any handler's.
+        .layer(axum::middleware::from_fn(
+            release_guard::reject_release_outside_allowlist,
+        ))
         .layer(cors)
         // Shed load before it reaches a handler: an unbounded queue of slow
         // requests otherwise pins connections and pool slots indefinitely.

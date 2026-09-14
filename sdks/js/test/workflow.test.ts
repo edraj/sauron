@@ -32,6 +32,7 @@ describe('workflows', () => {
     items = [];
     init({
       dsn: 'https://pk_test@localhost:9/1',
+      release: '1.0.0',
       beforeSend: (i: EnvelopeItem) => {
         items.push(i);
         return null;
