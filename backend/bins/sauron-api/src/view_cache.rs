@@ -4,7 +4,7 @@
 //! largest caller. The property worth preserving is the one that removes a
 //! whole class of 503: a request that reads this cache does three cheap things
 //! — authorize, read Redis, maybe enqueue — and never awaits an aggregate, so
-//! its latency is bounded well under `REQUEST_TIMEOUT_SECS` no matter how
+//! its latency is bounded well under the request budget (`API_REQUEST_TIMEOUT_SECS`) no matter how
 //! expensive the underlying query is.
 //!
 //! What lives here is everything that is not about a particular page: the
