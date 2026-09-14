@@ -136,9 +136,14 @@
     const aid = appId;
     const days = rangeKey(range);
     const mode = sortMode;
-    // Touch scopeKey so a mid-view environment switch refetches; the axios
-    // interceptor supplies the value but nothing here would notice it changed.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease so a mid-view environment OR release switch
+    // refetches; the axios interceptor supplies both values but nothing here
+    // would notice they changed. The release half matters even though this
+    // modal opens over `/performance`, whose own `RELEASE_AWARE` entry is
+    // `false`: the page's rollups have no release dimension, but the spans
+    // this modal lists come from `…/transactions`, which is in
+    // `RELEASE_SCOPED_URL` and therefore IS narrowed.
+    sessionStore.scopeKeyWithRelease;
     if (!isOpen || !r || !aid) return;
     void days;
     void mode;

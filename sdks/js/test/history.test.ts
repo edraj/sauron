@@ -63,6 +63,7 @@ describe('history navigation breadcrumbs', () => {
     installGlobals();
     client = init({
       dsn: 'https://pk_test@localhost:9/1',
+      release: '1.0.0',
       beforeBreadcrumb: (b) => {
         crumbs.push(b);
         return b;

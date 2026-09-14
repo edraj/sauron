@@ -21,7 +21,7 @@ function makeFakeFetch() {
 const DSN = 'https://pub_key_abc@ingest.sauron.dev/99';
 
 function newClient(fetchImpl: FetchLike, overrides: Partial<InitOptions> = {}) {
-  return new SauronClient({ dsn: DSN, flushInterval: 0, fetchImpl, ...overrides });
+  return new SauronClient({ dsn: DSN, release: '1.0.0', flushInterval: 0, fetchImpl, ...overrides });
 }
 
 describe('breadcrumbs', () => {

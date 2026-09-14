@@ -1,7 +1,7 @@
 # Browser SDK — `@edraj/sauron-browser`
 
 Error reporting **+** product analytics **+** performance for the browser, from one
-SDK (**v1.6.0**). Source: [`sdks/js`](../sdks/js). SDK header name: `sauron.javascript`.
+SDK (**v1.7.0**). Source: [`sdks/js`](../sdks/js). SDK header name: `sauron.javascript`.
 
 See also: **[Ingest Wire Contract](Ingest-Wire-Contract.md)** ·
 **[Examples](Examples.md)** · the runnable demo:
@@ -41,7 +41,7 @@ functions.
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `dsn` | `string` | *(required)* | `https://<public_key>@<host>/<environment_id>` |
-| `release` | `string` | — | e.g. `web@1.4.2` |
+| `release` | `string` | *(required)* | the app version this build reports as, e.g. `web@1.4.2`; trimmed. `init` throws unless it is a non-empty string |
 | `tags` | `Record<string, string>` | — | default scope tags (see [Tags, contexts & extra](#tags-contexts--extra)) |
 | `contexts` | `Record<string, Record<string, unknown>>` | — | default scope context blocks |
 | `extra` | `Record<string, unknown>` | — | default freeform extra |
@@ -207,6 +207,7 @@ send it, or `null` to drop it:
 ```ts
 Sauron.init({
   dsn,
+  release,
   beforeSend: (item) => {
     if (item.type === 'event') delete item.properties.email;
     return item; // return null to drop

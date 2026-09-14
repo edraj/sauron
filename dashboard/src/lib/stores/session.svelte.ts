@@ -2,11 +2,14 @@ import { getAccess, listOrgs } from '../api/orgs';
 import { listProjects } from '../api/projects';
 import { listApps } from '../api/apps';
 import { listEnvironments } from '../api/environments';
+import { listReleases } from '../api/releases';
 import { configureScopeBridge } from '../api/scope';
+import { selectableReleases } from '../models/release-switcher';
 import type {
   AccessResponse,
   App,
   AppEnvironment,
+  AppRelease,
   Organization,
   Permission,
   Project,
@@ -16,6 +19,8 @@ const ORG_KEY = 'sauron.org_id';
 const PROJECT_KEY = 'sauron.project_id';
 const APP_KEY = 'sauron.app_id';
 const ENV_KEY = 'sauron.environment_id';
+const RELEASE_KEY_PREFIX = 'sauron.release:';
+const releaseKey = (appId: string) => RELEASE_KEY_PREFIX + appId;
 
 function readStored(key: string): string | null {
   if (typeof window === 'undefined') return null;
@@ -82,6 +87,13 @@ class SessionStore {
   // wire contract, so there is no translation layer anywhere above this.
   currentEnvId = $state<string | null>(null);
 
+  releases = $state<AppRelease[]>([]);
+  releasesError = $state(false);
+  // `null` = all releases; the literal `'none'` = rows with no release.
+  // Persisted PER APP (`sauron.release:{appId}`), unlike the environment,
+  // because a release name is meaningless across apps.
+  currentRelease = $state<string | null>(null);
+
   // Access grants for the current org — drives every permission check.
   access = $state<AccessResponse | null>(null);
   // True iff the most recent `getAccess` for the current org failed. Distinct
@@ -105,6 +117,7 @@ class SessionStore {
     // this callback instead, registered once here.
     configureScopeBridge({
       getCurrentEnvironmentId: () => this.currentEnvId,
+      getCurrentRelease: () => this.currentRelease,
     });
   }
 
@@ -141,8 +154,30 @@ class SessionStore {
   /// tracks only the app will not re-run when the environment changes, leaving
   /// the previous environment's data on screen. That exact bug shipped once in
   /// Docs.svelte and was caught in review; here there would be 24 chances for it.
+  ///
+  /// Two segments — app and environment — because those are the dimensions
+  /// EVERY telemetry read is narrowed by. The release is deliberately NOT here:
+  /// only five list routes accept `?release=` (`api/scope.ts`'s
+  /// `RELEASE_SCOPED_URL`), so folding it in made all 24 pages re-fetch on every
+  /// release switch, and ~20 of them re-rendered a byte-identical rollup.
+  /// Release-aware pages use `scopeKeyWithRelease` below instead.
   get scopeKey(): string {
     return `${this.currentAppId ?? ''}:${this.currentEnvId ?? 'all'}`;
+  }
+
+  /// `scopeKey` plus the selected release, for the pages whose LIST requests the
+  /// axios interceptor actually attaches `release=` to — Issues (and its
+  /// occurrences table), Events, Sessions and Transactions. Everything else,
+  /// including the aggregate side widgets ON those same pages, stays on
+  /// `scopeKey`; `models/release-scope-key-parity.test.ts` enforces both
+  /// directions off `RELEASE_AWARE`.
+  ///
+  /// The name contains `scopeKey` on purpose: `api/scope.test.ts`'s
+  /// "telemetry pages observe scopeKey" guard is a source scan for that
+  /// substring, and a page that swapped to a differently-named getter would
+  /// otherwise drop out of it silently.
+  get scopeKeyWithRelease(): string {
+    return `${this.scopeKey}:${this.currentRelease ?? 'all'}`;
   }
 
   // -------------------------------------------------------------------------
@@ -274,15 +309,18 @@ class SessionStore {
       const orgs = await listOrgs();
       this.orgs = orgs;
       if (orgs.length === 0) {
+        this.beginAppScopeChange();
         this.projects = [];
         this.apps = [];
         this.environments = [];
+        this.releases = [];
         this.access = null;
         this.accessError = false;
         this.currentOrgId = null;
         this.currentProjectId = null;
         this.currentAppId = null;
         this.currentEnvId = null;
+        this.currentRelease = null;
         this.loaded = true;
         return;
       }
@@ -323,11 +361,15 @@ class SessionStore {
     if (this.currentProjectId) {
       await this.loadProjectApps(this.currentProjectId);
     } else {
+      this.beginAppScopeChange();
       this.apps = [];
       this.currentAppId = null;
       this.environments = [];
       this.currentEnvId = null;
       this.environmentsError = false;
+      this.releases = [];
+      this.currentRelease = null;
+      this.releasesError = false;
     }
   }
 
@@ -345,14 +387,35 @@ class SessionStore {
   }
 
   private async loadProjectApps(projectId: string): Promise<void> {
+    // Unconditionally, not just on the empty branch below: this re-derives the
+    // whole app scope, so whatever was in flight for the previous one is void
+    // either way. `setProject`/`setOrg` already bumped before calling, but
+    // `load(force: true)` reaches here without one — and it can re-resolve to
+    // the SAME app, which is exactly the case an app-id comparison cannot
+    // catch (see `loadGen`).
+    this.beginAppScopeChange();
     this.apps = await listApps(projectId).catch(() => [] as App[]);
     this.resolveCurrentApp();
     if (this.currentAppId) {
-      await this.loadAppEnvironments(this.currentAppId);
+      // Start both loads before awaiting either, so both
+      // `environmentsLoadAttemptedFor` / `releasesLoadAttemptedFor` stamps
+      // land synchronously in the same tick — see `setApp`'s identical
+      // `Promise.all` for why a sequential `await`/`await` here would let
+      // the Topbar effect's `ensureReleasesLoaded()` guard see a released
+      // load as not-yet-attempted and fire a duplicate `listReleases`.
+      await Promise.all([
+        this.loadAppEnvironments(this.currentAppId),
+        this.loadAppReleases(this.currentAppId),
+      ]);
     } else {
+      // No second `beginAppScopeChange()` — the one at the top of this method
+      // already covers this branch.
       this.environments = [];
       this.currentEnvId = null;
       this.environmentsError = false;
+      this.releases = [];
+      this.currentRelease = null;
+      this.releasesError = false;
     }
   }
 
@@ -399,11 +462,24 @@ class SessionStore {
    * ("all environments") here would be exactly that wrong-direction fallback,
    * and worse: `resolveCurrentEnvironment` would then persist the `null` to
    * `localStorage`, destroying the selection permanently rather than just for
-   * this one failed load. So on failure: leave `environments` and
-   * `currentEnvId` exactly as they were (do not call
-   * `resolveCurrentEnvironment` at all — there is nothing new to reconcile
-   * against), set `environmentsError` so the UI can react, and clear
-   * `environmentsLoadAttemptedFor` so the failure is retryable.
+   * this one failed load. So on failure: do not touch `environments` or
+   * `currentEnvId` (do not call `resolveCurrentEnvironment` at all — there is
+   * nothing new to reconcile against), set `environmentsError` so the UI can
+   * react, and clear `environmentsLoadAttemptedFor` so the failure is
+   * retryable.
+   *
+   * Note what "do not touch" does and does not buy, per caller. On the
+   * `setApp` path it buys nothing observable: `setApp` has ALREADY cleared
+   * `currentEnvId` to `null` and `environments` to `[]` synchronously before
+   * calling here (the previous app's environment must not be sent for the new
+   * app), so a failed load lands the user on "all environments" regardless —
+   * what this code avoids is only the extra harm of `resolveCurrentEnvironment`
+   * writing that `null` through to `localStorage`. The claim that a selection
+   * SURVIVES a failed load holds on the self-heal path
+   * (`ensureEnvironmentsLoaded`, the Topbar's retry effect), where the app did
+   * not change and `currentEnvId` is whatever the user picked: there a failure
+   * leaves the picker empty but the scoping intact, and the next successful
+   * retry re-populates it.
    *
    * That last part is what keeps this from colliding with
    * `ensureEnvironmentsLoaded`'s guard: a genuinely-empty successful load
@@ -414,18 +490,109 @@ class SessionStore {
    * completed, a retry is still warranted."
    */
   private async loadAppEnvironments(appId: string): Promise<void> {
+    const gen = this.loadGen;
     this.environmentsLoadAttemptedFor = appId;
     this.environmentsError = false;
     let fetched: AppEnvironment[];
     try {
       fetched = await listEnvironments(appId);
     } catch {
+      if (this.isStale(gen)) return;
       this.environmentsError = true;
       this.environmentsLoadAttemptedFor = null;
       return;
     }
+    if (this.isStale(gen)) return;
     this.environments = fetched;
     this.resolveCurrentEnvironment();
+  }
+
+  /**
+   * Monotonic counter identifying the current app-scope "generation".
+   *
+   * Bumped by `beginAppScopeChange()` at the head of EVERY path that clears
+   * app-scoped state (`setApp`, `setOrg`, `setProject`, `removeApp`,
+   * `removeProject`, `reset`, and `performLoad`'s no-orgs branch). Each loader
+   * captures it synchronously before its first `await` and refuses to write
+   * anything if it has moved on by the time the fetch resolves.
+   *
+   * This replaces an earlier `isStale(appId)` that compared the load's `appId`
+   * against `currentAppId`. That check could not see a same-app A→B→A
+   * sequence: by the time the FIRST A load resolved, `currentAppId` was `'A'`
+   * again, so the check passed and the oldest response overwrote the newest
+   * one — exactly the bug the guard was there to prevent, and the easiest one
+   * to hit by double-clicking back to where you started. Identity of the app
+   * is not the question; "is this continuation still the one we are waiting
+   * for" is, and only a counter answers that.
+   */
+  private loadGen = 0;
+
+  /**
+   * Invalidate every in-flight app-scoped load. Call synchronously, BEFORE
+   * clearing state and before starting the replacement loads, so the new
+   * loaders capture the new generation and the old ones are already stale.
+   */
+  private beginAppScopeChange(): void {
+    this.loadGen += 1;
+  }
+
+  /**
+   * Whether an in-flight load still speaks for the app scope on screen.
+   *
+   * Nothing cancels a fetch when the user switches apps, so a rapid double
+   * `setApp` leaves two loads in flight and the OLDER one may land last. Every
+   * continuation past an `await` in this file checks this before writing
+   * anything — the result, the `…Error` flag, and the `…LoadAttemptedFor`
+   * stamp alike: applied to the newer scope they would list another app's
+   * environments in the picker (and then send that app's `environment_id` on
+   * every scoped request), or raise an error banner over a load that
+   * succeeded.
+   */
+  private isStale(gen: number): boolean {
+    return gen !== this.loadGen;
+  }
+
+  // Tracks which app id a releases load has *completed* for, mirroring
+  // `environmentsLoadAttemptedFor` above — same reasoning: a genuinely-empty
+  // result (an app with no releases yet) must not retrigger a fetch on every
+  // reactive read of `releases`, and a load already in flight must not be
+  // duplicated. Rolled back to `null` on failure so a retry is possible.
+  private releasesLoadAttemptedFor: string | null = null;
+
+  /**
+   * The releases the caller may see for `appId`, mirroring
+   * `loadAppEnvironments` in every particular: stamped synchronously before
+   * the fetch, `releasesError` cleared at the start of every attempt, and on
+   * failure neither `releases` nor `currentRelease` is written — in
+   * particular `resolveCurrentRelease` is not called, so a failed list fetch
+   * never widens a selection to "all" and never persists that widening (see
+   * `loadAppEnvironments`'s doc comment for why a failed list fetch must not
+   * behave like a fail-open scoping fallback).
+   *
+   * As there, "not written" is not the same as "preserved", and which one you
+   * get depends on the caller. `setApp` clears `releases` to `[]` and
+   * `currentRelease` to `null` up front (release names are per-app), so a
+   * failed load on that path lands on "all releases" no matter what this
+   * method does — only the persisted per-app selection under `releaseKey` is
+   * spared. The selection genuinely survives only on the self-heal path
+   * (`ensureReleasesLoaded`), where the app did not change.
+   */
+  private async loadAppReleases(appId: string): Promise<void> {
+    const gen = this.loadGen;
+    this.releasesLoadAttemptedFor = appId;
+    this.releasesError = false;
+    let fetched: AppRelease[];
+    try {
+      fetched = await listReleases(appId);
+    } catch {
+      if (this.isStale(gen)) return;
+      this.releasesError = true;
+      this.releasesLoadAttemptedFor = null;
+      return;
+    }
+    if (this.isStale(gen)) return;
+    this.releases = fetched;
+    this.resolveCurrentRelease(appId);
   }
 
   // Tracks which app id a load has *completed* for (see
@@ -460,6 +627,15 @@ class SessionStore {
     await this.loadAppEnvironments(appId);
   }
 
+  /** The release equivalent of `ensureEnvironmentsLoaded` — same guard shape. */
+  async ensureReleasesLoaded(): Promise<void> {
+    const appId = this.currentAppId;
+    if (!appId) return;
+    if (this.releases.length > 0) return;
+    if (this.releasesLoadAttemptedFor === appId) return;
+    await this.loadAppReleases(appId);
+  }
+
   private resolveCurrentEnvironment(): void {
     const stored = readStored(ENV_KEY);
     // `'none'` (Unattributed) is always a valid selection — it does not name
@@ -476,12 +652,39 @@ class SessionStore {
     writeStored(ENV_KEY, this.currentEnvId);
   }
 
+  /**
+   * The release equivalent of `resolveCurrentEnvironment`. There is no
+   * "default release" concept to fall back to (unlike environments, which
+   * always have exactly one live default) — an unresolvable stored value just
+   * falls back to `null` ("all releases").
+   *
+   * Validated through `selectableReleases`, the same function the topbar menu
+   * is built from, so "restorable" and "offerable" cannot drift: a stored
+   * value the switcher would refuse to render (blank, or padded differently
+   * from the catalogue row) must not survive a reload as an invisible active
+   * filter.
+   */
+  private resolveCurrentRelease(appId: string): void {
+    const stored = readStored(releaseKey(appId));
+    if (stored && (stored === 'none' || selectableReleases(this.releases).includes(stored))) {
+      this.currentRelease = stored;
+      return;
+    }
+    this.currentRelease = null;
+    // Only when there was actually something to clear. `writeStored(_, null)`
+    // is a `removeItem`, and the common case by far is an app whose release
+    // was never pinned — writing to `localStorage` on every app switch and
+    // every bootstrap to delete a key that does not exist.
+    if (stored !== null) writeStored(releaseKey(appId), null);
+  }
+
   // -------------------------------------------------------------------------
   // Switching
   // -------------------------------------------------------------------------
 
   async setOrg(id: string): Promise<void> {
     if (id === this.currentOrgId) return;
+    this.beginAppScopeChange();
     this.currentOrgId = id;
     writeStored(ORG_KEY, id);
     // Downstream selections belong to the previous org — clear them so the new
@@ -492,27 +695,36 @@ class SessionStore {
     this.currentProjectId = null;
     this.currentAppId = null;
     this.currentEnvId = null;
+    this.currentRelease = null;
     this.projects = [];
     this.apps = [];
     this.environments = [];
+    this.releases = [];
     await this.loadOrgScope(id);
   }
 
   async setProject(id: string): Promise<void> {
     if (id === this.currentProjectId) return;
+    this.beginAppScopeChange();
     this.currentProjectId = id;
     writeStored(PROJECT_KEY, id);
     writeStored(APP_KEY, null);
     writeStored(ENV_KEY, null);
     this.currentAppId = null;
     this.currentEnvId = null;
+    this.currentRelease = null;
     this.apps = [];
     this.environments = [];
+    this.releases = [];
     await this.loadProjectApps(id);
   }
 
   async setApp(id: string): Promise<void> {
     if (id === this.currentAppId) return;
+    // Before anything else: any load still in flight for the app we are
+    // leaving must not land on this one. Note this matters even when the user
+    // comes back to an app they just left (A→B→A) — see `loadGen`.
+    this.beginAppScopeChange();
     this.currentAppId = id;
     writeStored(APP_KEY, id);
     // The environment belongs to the previous app — carrying it over would
@@ -520,12 +732,52 @@ class SessionStore {
     writeStored(ENV_KEY, null);
     this.currentEnvId = null;
     this.environments = [];
-    await this.loadAppEnvironments(id);
+    // The release belongs to the previous app too — release names are
+    // per-app (`releaseKey`), so this only clears in-memory state; the old
+    // app's own persisted selection is left alone for when it becomes
+    // current again.
+    this.currentRelease = null;
+    this.releases = [];
+    // Start both loads before awaiting either (rather than
+    // `await loadAppEnvironments(id); await loadAppReleases(id);`), so both
+    // `environmentsLoadAttemptedFor` and `releasesLoadAttemptedFor` are
+    // stamped synchronously in the same tick. `loadAppEnvironments` stamps
+    // its marker before its own network round trip, so a sequential await
+    // here would let the Topbar effect's `ensureEnvironmentsLoaded()` guard
+    // close (satisfied) while `ensureReleasesLoaded()`'s guard was still open
+    // (not yet attempted) for the whole environments round trip — the effect
+    // would then fire a second, concurrent `listReleases` alongside this
+    // one's.
+    await Promise.all([this.loadAppEnvironments(id), this.loadAppReleases(id)]);
   }
 
   setEnvironment(id: string | null): void {
     this.currentEnvId = id;
     writeStored(ENV_KEY, id);
+  }
+
+  /**
+   * `null` = all releases; the literal `'none'` = rows with no release.
+   * Persisted per app, unlike the environment (see `currentRelease`'s field
+   * comment).
+   */
+  setRelease(id: string | null): void {
+    this.currentRelease = id;
+    if (this.currentAppId) writeStored(releaseKey(this.currentAppId), id);
+    // A release narrows the env list (Topbar); if the current env is not in
+    // it, fall back to "all" rather than sending an impossible pair. `'none'`
+    // (unattributed) is left untouched — it does not name a row in
+    // `environment_ids` the way a real environment id does, so it can never
+    // be "not in" a release's set in any meaningful sense.
+    if (id !== null && this.currentEnvId !== null && this.currentEnvId !== 'none') {
+      // `id` is whatever the switcher offered, i.e. a name already put through
+      // `selectableReleases`'s trim — so match the raw catalogue row on its
+      // trimmed name (same lookup as `Topbar`'s `visibleEnvs`). Padded rows can
+      // only predate the ingest-edge normalisation; a raw `===` would leave the
+      // env pointing at an environment the selected release was never seen in.
+      const r = this.releases.find((x) => x.release.trim() === id);
+      if (r && !r.environment_ids.includes(this.currentEnvId)) this.setEnvironment(null);
+    }
   }
 
   /** Select a project + app together (used when jumping from lists). */
@@ -554,12 +806,16 @@ class SessionStore {
   removeProject(projectId: string): void {
     this.projects = this.projects.filter((p) => p.id !== projectId);
     if (this.currentProjectId === projectId) {
+      this.beginAppScopeChange();
       this.resolveCurrentProject();
       this.apps = [];
       this.currentAppId = null;
       this.environments = [];
       this.currentEnvId = null;
       this.environmentsError = false;
+      this.releases = [];
+      this.currentRelease = null;
+      this.releasesError = false;
     }
   }
 
@@ -578,6 +834,7 @@ class SessionStore {
   removeApp(appId: string): void {
     this.apps = this.apps.filter((a) => a.id !== appId);
     if (this.currentAppId === appId) {
+      this.beginAppScopeChange();
       this.resolveCurrentApp();
       // The removed app's environments no longer apply. Whichever app
       // `resolveCurrentApp` landed on (or none) gets its own environments
@@ -586,21 +843,29 @@ class SessionStore {
       this.currentEnvId = null;
       this.environmentsError = false;
       writeStored(ENV_KEY, null);
+      // Same reasoning for releases — they belong to the removed app.
+      this.releases = [];
+      this.currentRelease = null;
+      this.releasesError = false;
     }
   }
 
   reset(): void {
+    this.beginAppScopeChange();
     this.orgs = [];
     this.projects = [];
     this.apps = [];
     this.environments = [];
     this.environmentsError = false;
+    this.releases = [];
+    this.releasesError = false;
     this.access = null;
     this.accessError = false;
     this.currentOrgId = null;
     this.currentProjectId = null;
     this.currentAppId = null;
     this.currentEnvId = null;
+    this.currentRelease = null;
     this.loaded = false;
     writeStored(ORG_KEY, null);
     writeStored(PROJECT_KEY, null);

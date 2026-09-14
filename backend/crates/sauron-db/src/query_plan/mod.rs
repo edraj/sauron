@@ -421,6 +421,7 @@ mod tests {
     use super::issues::IssuesLower;
     use super::occurrences::OccurrencesLower;
     use super::sessions::SessionsLower;
+    use super::transactions::TransactionsLower;
 
     fn ctx() -> PrepCtx {
         PrepCtx {
@@ -528,6 +529,7 @@ mod tests {
         assert_eq!(dimensions_for(Resource::Occurrences).count(), 21);
         assert_eq!(dimensions_for(Resource::Events).count(), 10);
         assert_eq!(dimensions_for(Resource::Sessions).count(), 10);
+        assert_eq!(dimensions_for(Resource::Transactions).count(), 10);
 
         let fixed = Uuid::nil();
         assert_full_coverage(
@@ -549,5 +551,21 @@ mod tests {
         );
         assert_full_coverage(Resource::Events, &EventsLower { app_id: fixed });
         assert_full_coverage(Resource::Sessions, &SessionsLower { app_id: fixed });
+        // Transactions was the one searched list resource this sweep never
+        // covered — it was added to the language after the sweep was written,
+        // and `release` (the switcher's predicate) is declared on it, so an
+        // unlowered `(Store, MatchOp)` pair here is reachable from the UI.
+        //
+        // No explicit-deferral list, unlike Issues: every one of its 10
+        // declared dimensions lowers, for every operator the catalog grants
+        // it. If that changes, name the deferred ones HERE with a reason each
+        // rather than widening the `NotYetSupported` arm in silence.
+        assert_full_coverage(
+            Resource::Transactions,
+            &TransactionsLower {
+                app_id: fixed,
+                text_reach: crate::repo::TextSearchReach::IncludingBody,
+            },
+        );
     }
 }

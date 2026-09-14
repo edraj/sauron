@@ -30,7 +30,7 @@ from ._workflow import (
 )
 
 SDK_NAME = "sauron-python"
-SDK_VERSION = "1.5.0"
+SDK_VERSION = "1.6.0"
 
 # Item types eligible for workflow stamping in ``_dispatch`` — the single
 # chokepoint every error/event/identify/transaction item passes through.

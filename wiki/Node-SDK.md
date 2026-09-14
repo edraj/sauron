@@ -1,6 +1,6 @@
 # Node SDK — `@edraj/sauron-node`
 
-Server-side Node/TypeScript SDK (**v1.5.0**). Dispatches product-analytics events and
+Server-side Node/TypeScript SDK (**v1.6.0**). Dispatches product-analytics events and
 captured exceptions from your Node backends over a buffered background HTTP transport
 (Node's global `fetch`). **No browser/DOM/auto-instrumentation** — for the browser use
 the **[Browser SDK](Browser-SDK.md)** (`@edraj/sauron-browser`). Source:
@@ -40,7 +40,7 @@ clearly-invalid DSN. `getClient()` returns the client created by the most recent
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `dsn` | `string` | *(required)* | `https://<public_key>@<host>/<environment_id>` |
-| `release` | `string \| null` | `null` | |
+| `release` | `string` | *(required)* | the app version this build reports as, e.g. `svc@1.4.2`; trimmed. `init` throws unless it is a non-empty string |
 | `sampleRate` | `number` | `1` | error sample rate in `[0,1]` |
 | `flushInterval` | `number` | `5000` | background flush interval, ms |
 | `maxBatch` | `number` | `30` | eager flush at this many buffered items |
@@ -166,6 +166,7 @@ and attaches to errors captured afterwards (ring-buffered at `maxBreadcrumbs`, d
 ```ts
 init({
   dsn,
+  release,
   beforeBreadcrumb: (crumb) => (crumb.category === 'noisy' ? null : crumb),
 });
 ```
@@ -179,6 +180,7 @@ at the single enqueue chokepoint — the place to scrub PII or drop items. Retur
 ```ts
 init({
   dsn,
+  release,
   beforeSend: (item) => {
     if (item.type === 'event' && item.properties?.email) {
       item.properties.email = '[redacted]';
@@ -230,7 +232,7 @@ user's id when omitted.
 Both are **opt-in** and OFF by default:
 
 ```ts
-init({ dsn, autoCaptureUnhandled: true, autoShutdown: true });
+init({ dsn, release, autoCaptureUnhandled: true, autoShutdown: true });
 ```
 
 > **Leaving this off also blanks the dashboard's

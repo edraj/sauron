@@ -8,6 +8,7 @@
   import { push, location as routePath } from 'svelte-spa-router';
   import Sidebar from './Sidebar.svelte';
   import Topbar from './Topbar.svelte';
+  import ReleaseScopeNote from './ReleaseScopeNote.svelte';
   import Skeleton from '../ui/Skeleton.svelte';
   import EmptyState from '../ui/EmptyState.svelte';
   import Button from '../ui/Button.svelte';
@@ -144,6 +145,7 @@
              technically-correct "requires event:read". -->
         <PermissionDenied access={pageAccess} />
       {:else}
+        <ReleaseScopeNote />
         {@render children()}
       {/if}
     </div>

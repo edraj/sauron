@@ -560,6 +560,9 @@ pub async fn events_list(
         q.q.as_deref().filter(|s| !s.is_empty()),
         sauron_query::Resource::Events,
     )?;
+    let release =
+        super::scope::parse_release(super::scope::raw_release(raw_query.as_deref()).as_deref())?;
+    let node = sauron_query::with_release(node, sauron_query::Resource::Events, &release);
     // **`IncludingBody`, unconditionally, and that is a decision rather than an
     // oversight — read this before "fixing" it to `text_search_reach(&perms)`.**
     //

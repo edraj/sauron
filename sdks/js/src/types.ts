@@ -330,7 +330,8 @@ export interface TransportOptions {
 export interface InitOptions {
   /** `https://<public_key>@<host>/<project_id>` */
   dsn: string;
-  release?: string;
+  /** Required. The app version every event is attributed to. */
+  release: string;
   /** Error sample rate in [0, 1]. Default 1 (send everything). */
   sampleRate?: number;
   /** Ring-buffer size for breadcrumbs. Default 50. */
@@ -363,7 +364,7 @@ export interface InitOptions {
 /** Fully-resolved options with all defaults applied. */
 export interface ResolvedOptions {
   dsn: string;
-  release: string | null;
+  release: string;
   sampleRate: number;
   maxBreadcrumbs: number;
   beforeSend?: BeforeSend;

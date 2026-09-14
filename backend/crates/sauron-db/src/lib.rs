@@ -14,6 +14,7 @@ pub mod person_env_backfill;
 pub mod pool;
 pub mod purge;
 pub mod query_plan;
+pub mod releases;
 pub mod repo;
 pub mod retention;
 pub mod rollups;

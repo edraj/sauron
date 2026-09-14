@@ -71,6 +71,7 @@ void main() {
   test('logs every delivered item when debug is on', () async {
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
       debug: true,
     ));
@@ -102,6 +103,7 @@ void main() {
   test('stays silent when debug is off', () async {
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
     ));
 
@@ -120,6 +122,7 @@ void main() {
     // the SDK must not editorialize about it on every event.
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
     ));
 
@@ -144,6 +147,7 @@ void main() {
     // bootstrap there is always an anonymous id to fall back to.
     final SauronClient client = SauronClient(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
     ));
 
@@ -160,6 +164,7 @@ void main() {
   test('a long value is truncated onto one line', () async {
     await Sauron.init(SauronOptions(
       dsn: 'https://pk_test@localhost:9/1',
+      release: 'app@1.4.2+1402',
       httpClient: httpClient,
       debug: true,
     ));

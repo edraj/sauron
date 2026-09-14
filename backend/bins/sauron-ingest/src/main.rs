@@ -817,7 +817,10 @@ async fn ingest(
         project_id: env.project_id,
         org_id: env.org_id,
         environment_id: env.env_id,
-        release: envelope.header.release,
+        // Normalised HERE, at the edge, so every consumer downstream — the
+        // stored column on all four event tables, `app_releases`, the
+        // dashboard's switcher — sees one spelling. See `normalize_release`.
+        release: normalize_release(envelope.header.release.as_deref()),
         received_at: Utc::now(),
         ip,
         user_agent,
@@ -965,6 +968,30 @@ fn client_ip(headers: &HeaderMap, cfg: &Config) -> Option<String> {
         })
 }
 
+/// Trim the envelope's `release`, and treat an all-whitespace one as absent.
+///
+/// Applied at the ingest edge rather than at any reader, because `release` is
+/// now a *selectable value* — it names an entry in the dashboard's release
+/// switcher and is compared verbatim by `?release=`. Two spellings of one
+/// build (`"1.4.0"` and `" 1.4.0"`) would be two entries in that list, each
+/// filtering to a disjoint slice of the same release's events, with nothing in
+/// the UI to explain the split. `" "` would be a third: a switcher row with a
+/// blank label that no one can identify.
+///
+/// Every current SDK already trims and rejects blanks at init (see the
+/// 2026-09-14 spec §2), so this catches only old SDKs and hand-rolled
+/// senders — which is exactly the population that will keep sending for years.
+///
+/// The write half of the same rule already exists for symbol artifacts
+/// (`sauron-api`'s `routes/artifacts.rs::blank_to_none`) and for the matcher
+/// (`sauron_symbols::normalize_release`); this is the event path's.
+fn normalize_release(release: Option<&str>) -> Option<String> {
+    release
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn error(status: StatusCode, code: &str, message: &str) -> axum::response::Response {
     (
         status,
@@ -1007,6 +1034,61 @@ mod tests {
         assert!(response.contains("ok"), "response was: {response}");
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod release_normalisation_tests {
+    use super::*;
+
+    /// The edge normalisation behind the release switcher: one build must not
+    /// be able to appear as several entries, and a blank one must not appear
+    /// at all. See [`normalize_release`].
+    #[test]
+    fn blank_and_padded_releases_are_normalised_at_the_edge() {
+        assert_eq!(normalize_release(None), None);
+        assert_eq!(normalize_release(Some("")), None, "empty is absent");
+        assert_eq!(
+            normalize_release(Some("   ")),
+            None,
+            "whitespace-only is absent — it would otherwise be an \
+             unidentifiable blank row in the release switcher"
+        );
+        assert_eq!(
+            normalize_release(Some("\t\n ")),
+            None,
+            "any whitespace, not just spaces"
+        );
+        assert_eq!(
+            normalize_release(Some(" 1.4.0 ")),
+            Some("1.4.0".to_string()),
+            "padding must not split one build into two switcher entries"
+        );
+        assert_eq!(
+            normalize_release(Some("1.4.0")),
+            Some("1.4.0".to_string()),
+            "an already-canonical value passes through unchanged"
+        );
+        // Interior whitespace is content, not padding: `release` is opaque and
+        // a build name may legitimately contain a space.
+        assert_eq!(
+            normalize_release(Some(" my app 1.4.0 ")),
+            Some("my app 1.4.0".to_string())
+        );
+    }
+
+    /// `none` is the wire literal `?release=` uses for "no release", so a
+    /// release literally named `none` is unreachable from the dashboard. It
+    /// is NOT rewritten here — the ingest edge must not silently discard a
+    /// value an SDK deliberately sent — only documented (spec §3,
+    /// `wiki/Ingest-Wire-Contract.md`) and skipped by the switcher.
+    #[test]
+    fn the_literal_none_is_stored_as_itself() {
+        assert_eq!(
+            normalize_release(Some("none")),
+            Some("none".to_string()),
+            "ingest stores what was sent; the collision is a UI-side rule"
+        );
     }
 }
 

@@ -61,6 +61,7 @@ auth headers, and anything else that must never leave the process.
 ```ts
 init({
   dsn,
+  release,
   beforeSend(item) {
     if (item.type === 'error' && item.user) item.user.email = null;      // redact
     if (item.type === 'event') delete item.properties.password;          // strip
@@ -80,7 +81,7 @@ def scrub(item, hint=None):
         item["user"]["email"] = None
     return item  # return None to drop
 
-sauron.init(dsn, before_send=scrub)
+sauron.init(dsn, release=release, before_send=scrub)
 ```
 
 **C#** — `BeforeSend` is `Func<object, object?>`. Note the item record types
@@ -93,6 +94,7 @@ to **not collect the PII in the first place** (scrub before you call `Track` /
 SauronSdk.Init(new SauronOptions
 {
     Dsn = dsn,
+    Release = release,
     // Example that works in-assembly; from app code prefer scrubbing at the call site.
     BeforeSend = item => item is IdentifyItem ? null : item, // drop all identify items
 });
@@ -108,6 +110,7 @@ items**, and scrub sensitive values at the call site rather than mutating in pla
 ```dart
 await Sauron.init(SauronOptions(
   dsn: dsn,
+  release: release,
   beforeSend: (item) {
     if (item is EventItem && item.name == r'$secret') return null; // drop
     return item; // guard the type if you only care about a subset

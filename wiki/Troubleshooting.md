@@ -14,11 +14,11 @@ failures, and retries. It's the fastest way to see what the transport is doing.
 
 | SDK | Enable debug |
 | --- | --- |
-| Browser | `Sauron.init({ dsn, debug: true })` |
-| Flutter | `Sauron.init(SauronOptions(dsn: dsn, debug: true))` |
-| Node | `init({ dsn, debug: true })` |
-| Python | `sauron.init(dsn, debug=True)` |
-| C# | `new SauronOptions { Dsn = dsn, Debug = true }` |
+| Browser | `Sauron.init({ dsn, release, debug: true })` |
+| Flutter | `Sauron.init(SauronOptions(dsn: dsn, release: release, debug: true))` |
+| Node | `init({ dsn, release, debug: true })` |
+| Python | `sauron.init(dsn, release=release, debug=True)` |
+| C# | `new SauronOptions { Dsn = dsn, Release = release, Debug = true }` |
 
 ---
 
@@ -86,7 +86,7 @@ Flush before exit:
 
 | SDK | On shutdown |
 | --- | --- |
-| Node | `await close();` — flush + stop the timer. Or set `init({ dsn, autoShutdown: true })` to wire `beforeExit`/`SIGTERM`/`SIGINT` to `close()`. |
+| Node | `await close();` — flush + stop the timer. Or set `init({ dsn, release, autoShutdown: true })` to wire `beforeExit`/`SIGTERM`/`SIGINT` to `close()`. |
 | Python | `sauron.flush()` then `sauron.close()`. `init` also registers an `atexit` flush automatically. |
 | C# | `SauronSdk.Flush();` then `SauronSdk.Close();` |
 | Browser | flushes on background/`visibilitychange`; call `await Sauron.flush()` before a hard teardown. |
@@ -153,7 +153,7 @@ be absent (e.g. local dev):
 // Node — opt out cleanly when no DSN is configured
 import { init } from '@edraj/sauron-node';
 if (process.env.SAURON_DSN) {
-  init({ dsn: process.env.SAURON_DSN });
+  init({ dsn: process.env.SAURON_DSN, release: process.env.SAURON_RELEASE ?? 'api@1.0.0' });
 }
 // dispatch calls are already no-ops while uninitialized — no other guard needed
 ```
@@ -198,6 +198,7 @@ Force the behavior to test it:
 import { init, track, flush } from '@edraj/sauron-node';
 init({
   dsn: 'https://pk@localhost/1',
+  release: 'probe@1.0.0',
   gzipThresholdBytes: 0,               // compress even tiny bodies
   fetchImpl: async (_url, init) => {
     console.log('encoding:', init.headers['Content-Encoding']); // -> "gzip"
@@ -214,7 +215,7 @@ await flush();
 def sender(url, headers, body):
     print("encoding:", headers.get("Content-Encoding"))  # -> "gzip"
     return 200
-sauron.init("https://pk@localhost/1", gzip_threshold_bytes=0, sender=sender)
+sauron.init("https://pk@localhost/1", release="probe@1.0.0", gzip_threshold_bytes=0, sender=sender)
 sauron.track("probe", distinct_id="u1"); sauron.flush()
 ```
 

@@ -83,6 +83,14 @@ default to now.
   release, and the five version **independently** — see
   [Capabilities](Capabilities.md#versioning). The `0.1.0` in the example above mirrors
   the golden parity fixture and is not any SDK's real version.
+- **`header.release`** — Optional on the wire (older SDKs may omit it; the server
+  stores NULL and the dashboard shows it as Unknown release). Required at init by
+  every SDK from JS 1.7.0 / Node 1.6.0 / Python 1.6.0 / Flutter 1.10.0 / C# 1.6.0.
+  Ingest **trims** the value and stores an all-whitespace one as NULL, so `"1.4.2"`
+  and `" 1.4.2"` are one release rather than two entries in the dashboard's release
+  switcher. A release literally named `none` is stored verbatim but **cannot be
+  selected in the dashboard**: `?release=none` is the wire literal for "no release",
+  so the switcher's "Unknown release" entry owns that value. Pick any other name.
 - **`context`** blocks (`device`, `os`, `app`, `runtime`) are free-form JSON so SDKs
   stay unopinionated about platform fields. Only `user` is typed (id / email /
   username / ip_address / traits) because the backend resolves it to an identity.

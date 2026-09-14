@@ -2,6 +2,17 @@
 
 All notable changes to `@edraj/sauron-node` are documented here.
 
+## 1.6.0
+
+### Changed
+
+- **`release` is required at init.** `init()`/`new SauronClient()` throws
+  `[sauron] init requires a release option` when `release` is missing, not a
+  string, or whitespace-only. `release` is trimmed before it is sent.
+  `InitOptions.release` is now a required `string` (was optional/nullable).
+- **`dsn` empty-string check.** `init()` now also throws when `dsn` is an
+  empty string, not just when it is missing or non-string.
+
 ## 1.5.0
 
 ### Added

@@ -140,10 +140,10 @@ const UNCHIPPED: Record<string, Record<string, string>> = {
     firstSeen: 'the page owns its window through the range control, which maps onto last_seen',
     lastSeen: 'the page owns its window through the range control, which maps onto last_seen',
     environment: 'scoped by the topbar environment switcher, not a per-page chip',
+    release: 'scoped by the topbar release switcher, not a per-page chip',
     // Not "unhelpful" — unanswerable. `IssuesLower` rejects `Store::Rollup`
-    // with `NotYetSupported`, so a chip for either would 400 every request on
+    // with `NotYetSupported`, so a chip for this would 400 every request on
     // the page until the reader worked out which chip to remove.
-    release: 'Store::Rollup — 400s until the issue_dimensions rollup exists',
     handled: 'Store::Rollup — 400s until the issue_dimensions rollup exists',
     // The JSON roots, bridged onto Issues as correlated EXISTS subqueries.
     // Same ruling Sessions and Transactions already make below: a chip has one
@@ -169,6 +169,7 @@ const UNCHIPPED: Record<string, Record<string, string>> = {
   Transactions: {
     duration: 'ValueType::Duration accepts 2s/500ms, which the i64 chip validator rejects',
     extra: 'a JSON root, addressed as the chainable @extra.<key> in the query box',
+    release: 'scoped by the topbar release switcher, not a per-page chip',
   },
 };
 

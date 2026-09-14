@@ -1,6 +1,6 @@
 # Flutter SDK — `sauron_flutter`
 
-Error reporting **+** product analytics for Flutter, from one SDK (**v1.9.0**). It binds
+Error reporting **+** product analytics for Flutter, from one SDK (**v1.10.0**). It binds
 four uncaught-error capture layers (`FlutterError.onError`, `PlatformDispatcher.onError`,
 `Isolate.addErrorListener`, and a guarding zone) plus manual capture, analytics,
 screens, and breadcrumbs. Source: [`sdks/flutter`](../sdks/flutter).
@@ -61,7 +61,7 @@ Uncaught errors are captured automatically via the four layers bound at init.
 | Field | Type | Default |
 | --- | --- | --- |
 | `dsn` | `String?` | — (null/empty ⇒ SDK disabled, all calls no-op) |
-| `release` | `String?` | — |
+| `release` | `String` | *(required when `dsn` is set)* — asserted non-empty; trimmed. A null/empty `dsn` still disables without asserting |
 | `screen` | `String?` | — (seed the initial screen) |
 | `tags` | `Map<String, String>` | `{}` — default scope tags |
 | `contexts` | `Map<String, Map<String, Object?>>` | `{}` — default scope context blocks |
@@ -196,6 +196,7 @@ change — see above). Return the item to send it, or `null` to drop it:
 ```dart
 await Sauron.init(SauronOptions(
   dsn: dsn,
+  release: release,
   beforeSend: (item) {
     if (item is EventItem) return null; // drop analytics events
     return item;                        // send everything else (incl. errors)

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.10.0 - 2026-09-14
+
+### Changed
+
+- **Breaking: `SauronOptions.release` is now required whenever `dsn` is set.**
+  `Sauron.init` throws `ArgumentError` if `dsn` is non-empty and `release` is
+  null or blank — release powers release-scoped filtering, so it can no longer
+  ship unset. `release` is trimmed of surrounding whitespace. `Sauron.init`
+  with no `dsn` still leaves the SDK disabled without throwing.
+- The SDK version reported in envelope headers (`kSauronSdkVersion`) advances
+  to 1.10.0 with the release.
+
 ## 1.9.0 - 2026-09-01
 
 ### Changed

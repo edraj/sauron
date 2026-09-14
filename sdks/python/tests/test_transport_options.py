@@ -24,6 +24,7 @@ class TestInitForwardsTransportOptions(unittest.TestCase):
     def test_gzip_threshold_is_honored(self):
         sauron.init(
             DSN,
+            release="1.0.0",
             flush_interval=3600,
             max_batch=1000,
             gzip_threshold_bytes=64,
@@ -45,6 +46,7 @@ class TestInitForwardsTransportOptions(unittest.TestCase):
         with self.assertTempDir() as d:
             sauron.init(
                 DSN,
+                release="1.0.0",
                 flush_interval=3600,
                 max_batch=1000,
                 offline_path=d,

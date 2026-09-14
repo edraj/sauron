@@ -34,7 +34,7 @@ public class AutoCaptureTests
     public void AutoCapture_NotInstalled_WhenDisabledDsn()
     {
         // A bad DSN puts the client in no-op mode: auto-capture must not wire itself.
-        using var client = new SauronClient(new SauronOptions { Dsn = "not-a-dsn", AutoCaptureUnhandled = true });
+        using var client = new SauronClient(new SauronOptions { Dsn = "not-a-dsn", Release = "1.0.0", AutoCaptureUnhandled = true });
         Assert.False(client.Enabled);
         Assert.Null(client.AutoCapture);
     }

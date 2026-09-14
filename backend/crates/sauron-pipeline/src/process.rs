@@ -58,7 +58,12 @@ pub async fn process_job(
     masks: &crate::mask::MaskSet,
     job: IngestJob,
 ) -> anyhow::Result<()> {
-    let mut conn = sauron_db::conn(pool).await?;
+    // Held in an `Option` so there is exactly ONE owner of the pool slot that
+    // every arm agrees on: the Error arm takes it (`process_error` needs it by
+    // value — see below), the others borrow it, and `drop(held)` after the
+    // match returns the slot on every path, taken or not. The release upsert
+    // below must not run while it is still checked out.
+    let mut held = Some(sauron_db::conn(pool).await?);
 
     // Resolved at the ingest edge from the presented key. The client no longer
     // has any say in which environment a signal lands in.
@@ -70,6 +75,8 @@ pub async fn process_job(
     // see it — the `woothee` ua block and `device_key` are derived right here.
     crate::mask::apply_context(masks, &mut context);
 
+    // `expect` rather than `?` on the borrows: nothing has taken `held` yet —
+    // it was filled immediately above and this match is its only consumer.
     match job.item.clone() {
         sauron_core::EnvelopeItem::Error(e) => {
             // Hand the connection over rather than dropping and re-acquiring:
@@ -77,17 +84,94 @@ pub async fn process_job(
             // releases it before symbolication — which checks out its OWN
             // connections, so holding one across it would let a handful of
             // concurrent errors exhaust the (small) ingest pool.
+            let conn = held.take().expect("dispatch connection");
             process_error(redis, pool, sym, conn, &job, environment_id, context, *e).await
         }
         sauron_core::EnvelopeItem::Event(ev) => {
-            process_event(&mut conn, &job, environment_id, context, ev).await
+            process_event(
+                held.as_mut().expect("dispatch connection"),
+                &job,
+                environment_id,
+                context,
+                ev,
+            )
+            .await
         }
-        sauron_core::EnvelopeItem::Identify(id) => process_identify(&mut conn, &job, id).await,
+        sauron_core::EnvelopeItem::Identify(id) => {
+            process_identify(held.as_mut().expect("dispatch connection"), &job, id).await
+        }
         sauron_core::EnvelopeItem::BreadcrumbBatch(b) => process_breadcrumbs(redis, &job, b).await,
         sauron_core::EnvelopeItem::Transaction(t) => {
-            process_transaction(&mut conn, &job, environment_id, context, t).await
+            process_transaction(
+                held.as_mut().expect("dispatch connection"),
+                &job,
+                environment_id,
+                context,
+                t,
+            )
+            .await
+        }
+    }?;
+
+    // The dispatch slot goes back to the pool HERE, before anything else asks
+    // for one. `process_error` already consumed it; on every other arm this is
+    // what actually frees it. Unconditional, and before the `if` below, so
+    // there is no path on which this function holds two slots at once.
+    drop(held);
+
+    // The release catalogue, LAST — after the `match`, not before it.
+    //
+    // `app_releases` is what the dashboard's release switcher lists, so a row
+    // here is a claim that this app has telemetry on that release. Recorded
+    // before the dispatch, a job whose write failed still left the claim
+    // behind: a release in the switcher that every filtered list answers
+    // empty for, permanently, because nothing ever deletes from this table.
+    // Recorded here, the claim is only ever made about data that landed.
+    // (`batch::process_batch` carries the equivalent call, for the same
+    // reason, as its own last stage.)
+    //
+    // Its own connection, taken only when there is something to record —
+    // `clean` is the gate rather than `is_some()` because a blank release is
+    // not a release; see its doc comment. The `drop(held)` above has already
+    // returned the dispatch slot, so this function holds ONE slot at a time,
+    // never two: the per-item path runs on the same small ingest pool as every
+    // other worker task (`INGEST_DB_POOL` ≈ `WORKER_CONCURRENCY`), and a
+    // second checkout taken while the first was still held would let every
+    // task sit on a slot waiting for one that no other task can release.
+    //
+    // NOTHING here propagates. By the time this runs the event is committed,
+    // so the job must not be failed (and therefore re-queued, and therefore
+    // duplicated) for a catalogue row — that includes the CHECKOUT, not just
+    // the upsert: a pool timeout is exactly the kind of transient failure that
+    // would re-drive a job that already succeeded. Both failures are logged
+    // and swallowed.
+    if crate::releases::clean(job.release.as_deref()).is_some() {
+        match sauron_db::conn(pool).await {
+            Ok(mut conn) => {
+                if let Err(e) = crate::releases::note_release(
+                    &mut conn,
+                    job.app_id,
+                    job.environment_id,
+                    job.release.as_deref(),
+                    job.received_at,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        app_id = %job.app_id,
+                        "app_releases upsert failed; continuing"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                app_id = %job.app_id,
+                "app_releases upsert skipped; no connection"
+            ),
         }
     }
+    Ok(())
 }
 
 /// Fold one signal into its `sessions` / `devices` roll-ups. `events_delta` /

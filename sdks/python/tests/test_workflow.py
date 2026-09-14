@@ -62,7 +62,7 @@ class WorkflowTests(unittest.TestCase):
 
     def _init(self, **kwargs):
         return sauron.init(
-            DSN, flush_interval=3600, max_batch=1000, sender=self.sender,
+            DSN, release="1.0.0", flush_interval=3600, max_batch=1000, sender=self.sender,
             **kwargs,
         )
 
@@ -691,7 +691,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
     def setUp(self):
         reset_scopes()
         self.sender = FakeSender(status=200)
-        sauron.init(DSN, flush_interval=3600, max_batch=1000, sender=self.sender)
+        sauron.init(DSN, release="1.0.0", flush_interval=3600, max_batch=1000, sender=self.sender)
 
     def tearDown(self):
         sauron.close(timeout=2)

@@ -9,8 +9,12 @@ use crate::ast::MatchOp;
 use crate::catalog::{IndexClass, Store};
 use crate::resolve::{ResolvedNode, ResolvedPredicate};
 
-/// Ordered cheapest to most expensive; `Ord` is what makes the `min`/`max`
-/// combination rules below read directly.
+/// Ordered cheapest to most expensive. `Ord` is what lets the combination
+/// rules below be written as comparisons: `Or` and `Not` take the `max` (the
+/// worst branch is what actually runs), and `and_cost` folds with `max` after
+/// short-circuiting on an `Indexed` child. Deliberately NOT a `min` anywhere —
+/// see `and_cost` for why a cheap sibling cannot make an expensive one
+/// cheaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cost {
     Indexed,
@@ -43,10 +47,38 @@ fn predicate_cost(p: &ResolvedPredicate) -> Cost {
     }
 }
 
+/// The `And` rule, spelled out because it is deliberately NOT `min`.
+///
+/// `Indexed` wins: an indexed child really does bound the candidate set its
+/// siblings are then checked against, one row at a time. That is the whole
+/// reason a clamp is unnecessary for `is:unresolved title:*boom*`.
+///
+/// `Bounded` does NOT. It names a predicate that is *cheap once something else
+/// has already bounded the set* — an unindexed column comparison, a correlated
+/// `EXISTS` on an `app_id`-led index — and it bounds nothing by itself. So it
+/// cannot make a free-text `Scan` sibling cheaper: `boom release:1.4.0` still
+/// reads every candidate row's payload, exactly as `boom` alone does, and the
+/// old `min` rule answered `Bounded` for it and skipped the window clamp.
+/// That property became reachable from the UI the day the release switcher
+/// shipped, because it ANDs `release:<x>` into every list query.
+///
+/// So: any `Indexed` child → `Indexed`; otherwise any `Scan` child → `Scan`;
+/// otherwise `Bounded`. An empty `And` is `Indexed` (it constrains nothing and
+/// costs nothing), as before.
+fn and_cost(children: &[ResolvedNode]) -> Cost {
+    let mut worst = Cost::Indexed;
+    for c in children {
+        match classify(c) {
+            Cost::Indexed => return Cost::Indexed,
+            cost => worst = worst.max(cost),
+        }
+    }
+    worst
+}
+
 pub fn classify(node: &ResolvedNode) -> Cost {
     match node {
-        // An indexed child bounds the candidate set for its siblings.
-        ResolvedNode::And(v) => v.iter().map(classify).min().unwrap_or(Cost::Indexed),
+        ResolvedNode::And(v) => and_cost(v),
         // Every branch must be evaluated, so the worst one dominates.
         ResolvedNode::Or(v) => v.iter().map(classify).max().unwrap_or(Cost::Indexed),
         // Negation can never seek, but it is no worse than the inner cost.
@@ -101,11 +133,48 @@ mod tests {
     }
 
     #[test]
-    fn and_takes_the_cheapest_child() {
+    fn an_indexed_child_bounds_its_siblings() {
         // The indexed status predicate bounds the set; `title` is then per-row.
         assert_eq!(
             cost("is:unresolved title:*boom*", Resource::Issues),
             Cost::Indexed
+        );
+        // Same for a free-text scan: with an indexed sibling the payload check
+        // runs over a bounded candidate set, which is the whole point of the
+        // rule and must NOT change.
+        assert_eq!(cost("is:unresolved boom", Resource::Issues), Cost::Indexed);
+    }
+
+    /// `Bounded` is not an index. It means "cheap once something else bounded
+    /// the set" — so ANDing one onto a free-text scan leaves the scan a scan.
+    ///
+    /// This is the release switcher's shape: it ANDs `release:<x>` into every
+    /// list query, so before this rule every `?q=` free-text search on a list
+    /// page silently lost its window clamp the moment a release was selected.
+    #[test]
+    fn a_bounded_sibling_cannot_un_clamp_a_free_text_scan() {
+        assert_eq!(cost("boom release:1.4.0", Resource::Events), Cost::Scan);
+        // Order must not matter.
+        assert_eq!(cost("release:1.4.0 boom", Resource::Events), Cost::Scan);
+        // And on Issues, where `release` bridges to `error_events` through a
+        // correlated EXISTS rather than reading a column.
+        assert_eq!(cost("boom release:1.4.0", Resource::Issues), Cost::Scan);
+    }
+
+    #[test]
+    fn a_bounded_predicate_alone_is_still_bounded() {
+        // The clamp is for `Scan` only; narrowing to one release is not a
+        // scan, and must not start being clamped because of the rule above.
+        assert_eq!(cost("release:1.4.0", Resource::Events), Cost::Bounded);
+        assert_eq!(cost("release:1.4.0", Resource::Issues), Cost::Bounded);
+    }
+
+    #[test]
+    fn an_and_of_bounded_children_stays_bounded() {
+        // No `Indexed` child to promote it, no `Scan` child to demote it.
+        assert_eq!(
+            cost("culprit:handler level:error", Resource::Issues),
+            Cost::Bounded
         );
     }
 

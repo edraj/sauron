@@ -4,6 +4,7 @@
   import { authStore } from '../../stores/auth.svelte';
   import { sessionStore } from '../../stores/session.svelte';
   import { lockedBy } from '../../models/page-access';
+  import { selectableReleases } from '../../models/release-switcher';
   import type { Permission } from '../../models';
   import { themeStore } from '../../stores/theme.svelte';
   import { initials, appTypeIcon } from '../../utils/format';
@@ -89,9 +90,36 @@
   // for a member who can only see some of them. Rewording would only be
   // warranted if this entry could show environments beyond what is listed
   // right below it, which by construction it cannot.
+  //
+  // `visibleEnvs` narrows that same reach-filtered list further by the
+  // selected release's `environment_ids` — a different, intended filter (by
+  // release, not by reach) layered on top of the one above, not a
+  // replacement for it.
+  // Which raw release rows can become menu items — blank and `none` dropped,
+  // duplicates collapsed — lives in `models/release-switcher.ts` with its
+  // reasoning and its tests. It is not a cosmetic filter: two items sharing
+  // `id === 'none'` (or one release listed twice) make the keyed `{#each}` in
+  // `SwitcherMenu` throw "keyed each duplicate key", which takes down the
+  // whole topbar rather than just this menu.
+  const releaseItems = $derived([
+    { id: '', name: t('nav.allReleases') },
+    ...selectableReleases(sessionStore.releases).map((r) => ({ id: r, name: r })),
+    { id: 'none', name: t('nav.unknownRelease') },
+  ]);
+  const visibleEnvs = $derived.by(() => {
+    const sel = sessionStore.currentRelease;
+    if (sel === null || sel === 'none') return sessionStore.environments;
+    // `sel` came out of `selectableReleases`, which emits the TRIMMED name, so
+    // match the raw catalogue row on its trimmed name too. A padded row can
+    // only predate the ingest-edge normalisation, but a raw `===` here would
+    // silently skip the narrowing for exactly the rows the menu can offer.
+    const r = sessionStore.releases.find((x) => x.release.trim() === sel);
+    if (!r) return sessionStore.environments;
+    return sessionStore.environments.filter((e) => r.environment_ids.includes(e.id));
+  });
   const envItems = $derived([
     { id: '', name: t('nav.allEnvironments') },
-    ...sessionStore.environments.map((e) => ({ id: e.id, name: e.name })),
+    ...visibleEnvs.map((e) => ({ id: e.id, name: e.name })),
     { id: 'none', name: t('nav.unattributed') },
   ]);
 
@@ -105,6 +133,9 @@
   $effect(() => {
     if (sessionStore.currentAppId && sessionStore.environments.length === 0) {
       void sessionStore.ensureEnvironmentsLoaded();
+    }
+    if (sessionStore.currentAppId && sessionStore.releases.length === 0) {
+      void sessionStore.ensureReleasesLoaded();
     }
   });
 
@@ -160,6 +191,19 @@
         onCreate={() => push('/admin/projects')}
         createLocked={createAppLock}
         ariaLabel={t('nav.switchApp')}
+      />
+    {/if}
+
+    <!-- Release switcher — narrows the environment list below to enrollments
+         that have seen the selected release. -->
+    {#if sessionStore.currentAppId}
+      <span class="sep" aria-hidden="true">/</span>
+      <SwitcherMenu
+        label={t('nav.release')}
+        items={releaseItems}
+        currentId={sessionStore.currentRelease ?? ''}
+        onSelect={(id) => sessionStore.setRelease(id === '' ? null : id)}
+        ariaLabel={t('nav.switchRelease')}
       />
     {/if}
 

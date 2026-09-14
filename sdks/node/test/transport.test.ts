@@ -31,6 +31,7 @@ const DSN = 'https://pub_key_abc@ingest.sauron.dev/99';
 function newClient(fetchImpl: FetchLike, overrides = {}) {
   return new SauronClient({
     dsn: DSN,
+    release: '1.0.0',
     // Timer disabled so tests are deterministic — we flush manually.
     flushInterval: 0,
     fetchImpl,
@@ -64,7 +65,7 @@ describe('transport POST', () => {
     await client.flush();
 
     const { header, context } = fake.calls[0].envelope;
-    expect(header.sdk).toEqual({ name: 'sauron-node', version: '1.5.0' });
+    expect(header.sdk).toEqual({ name: 'sauron-node', version: '1.6.0' });
     expect(header.dsn).toBe(DSN);
     expect(header.release).toBe('1.2.3');
     expect(typeof header.sent_at).toBe('string');

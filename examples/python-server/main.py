@@ -120,7 +120,15 @@ def handle_abandoned_checkout() -> None:
 
 def main() -> int:
     dsn = os.environ.get("SAURON_DSN")
-    sauron.init(dsn, debug=True)
+    # `release` is required whenever a DSN is present (SDK 1.6.0+): a
+    # missing or blank one raises ValueError. Env-driven so a real
+    # deployment reports its build, with a literal fallback so the
+    # example runs unconfigured.
+    sauron.init(
+        dsn,
+        release=os.environ.get("SAURON_RELEASE", "python-server@dev"),
+        debug=True,
+    )
 
     # Attach traits to the person behind this distinct_id (process-wide).
     sauron.identify(

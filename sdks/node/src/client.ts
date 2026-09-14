@@ -32,7 +32,6 @@ import type {
 } from './types.js';
 
 const DEFAULTS = {
-  release: null as string | null,
   sampleRate: 1,
   flushInterval: 5000,
   maxBatch: 30,
@@ -44,14 +43,19 @@ const DEFAULTS = {
 };
 
 function resolveOptions(options: InitOptions): ResolvedOptions {
-  if (!options || typeof options.dsn !== 'string') {
+  if (!options || typeof options.dsn !== 'string' || options.dsn.length === 0) {
     throw new Error('[sauron] init requires a { dsn } option');
+  }
+  if (typeof options.release !== 'string' || options.release.trim().length === 0) {
+    throw new Error(
+      '[sauron] init requires a { release } option (the app version this build reports as)',
+    );
   }
   const sampleRate =
     typeof options.sampleRate === 'number' ? options.sampleRate : DEFAULTS.sampleRate;
   return {
     dsn: options.dsn,
-    release: options.release ?? DEFAULTS.release,
+    release: options.release.trim(),
     tags: options.tags ?? {},
     contexts: options.contexts ?? {},
     extra: options.extra ?? {},

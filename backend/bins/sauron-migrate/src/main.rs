@@ -21,7 +21,7 @@ struct Command {
     summary: &'static str,
 }
 
-const COMMANDS: [Command; 4] = [
+const COMMANDS: [Command; 5] = [
     Command {
         name: "backfill-person-days",
         summary: "Retention cohorts for apps predating migration 74. \
@@ -43,6 +43,18 @@ const COMMANDS: [Command; 4] = [
         summary: "Replays every pre-epoch day of the three firehose tables into \
                   the dashboard rollups (migration 71). The heaviest of the \
                   four; refuses if marker rows already exist.",
+    },
+    Command {
+        name: "backfill-releases",
+        summary: "Seed app_releases (the dashboard's release switcher) from \
+                  error_events and analytics_events. Full scan of both tables; \
+                  run once after migration 78, at low traffic. Idempotent. \
+                  ALSO WRITES to the five telemetry tables that store `release` \
+                  (error_events, analytics_events, sessions, transactions, \
+                  workflows): it repairs blank and padded historical values, \
+                  partition by partition, from a partition list snapshotted \
+                  per table — a partition dropped mid-run aborts the command \
+                  (re-run to resume), so stop sauron-tier for the run.",
     },
 ];
 
@@ -78,6 +90,7 @@ EXAMPLES:
     sauron-migrate
     sauron-migrate backfill-person-days
     sauron-migrate backfill-rollups backfill-person-envs
+    sauron-migrate backfill-releases
 
 After a backfill, run `ANALYZE` on the tables it filled — a backfill ships no
 statistics and the planner misestimates the new rows until it has them.
@@ -242,13 +255,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Every backfill below is opt-in, and deliberately NOT part of the default
     // no-arg path — see `USAGE` for the reasoning, which is the same for all
-    // four: this is the oneshot every RPM daemon `Requires=`.
+    // five: this is the oneshot every RPM daemon `Requires=`.
     //
     // Skipping `backfill-person-envs`, `-device-envs` or `-rollups` is a
     // PERFORMANCE decision: those reads fall back to a pre-rollup query.
     // Skipping `backfill-person-days` is a CORRECTNESS one — retention has no
     // legacy path, so those apps report `ready: false` and the dashboard names
     // this command, rather than drawing a 0% grid that looks like an answer.
+    // Skipping `backfill-releases` is a COMPLETENESS gap, not an error path:
+    // the release switcher just starts empty and fills in from events seen
+    // after the upgrade, same as a brand-new app.
     if tasks.contains(&"backfill-person-envs") {
         let pool = sauron_db::build_pool(&url, 4)?;
         sauron_db::person_env_backfill::backfill_all(&pool).await?;
@@ -272,6 +288,23 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
         tracing::info!("rollup backfill complete");
+    }
+
+    if tasks.contains(&"backfill-releases") {
+        let pool = sauron_db::build_pool(&url, 4)?;
+        let out = sauron_db::releases::backfill_all(&pool).await?;
+        // Two numbers, because this command does two things: it seeds the
+        // catalogue from the two event tables AND repairs blank/padded
+        // `release` values left by senders that predate the ingest edge's
+        // trim on all five tables that store one (the event pair plus
+        // sessions, transactions and workflows). The second number is the one
+        // an operator would otherwise have no way to know happened; it is
+        // deliberately not "event rows", since it spans all five.
+        println!(
+            "backfill-releases: normalised {} rows; upserted {} rows; \
+             run ANALYZE app_releases",
+            out.normalised_event_rows, out.upserted
+        );
     }
 
     Ok(())

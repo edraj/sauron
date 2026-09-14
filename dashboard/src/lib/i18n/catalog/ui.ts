@@ -23,6 +23,19 @@ export const ui = {
   'ui.route.errorTitle': { en: 'This page didn’t load', ar: 'تعذّر تحميل هذه الصفحة' },
   'ui.route.reload': { en: 'Reload Sauron', ar: 'إعادة تحميل Sauron' },
 
+  // --- release scope note (models/shell.ts's showsReleaseNote) --------------
+  // Deliberately names BOTH halves — what ignores the switcher (charts and
+  // totals) and what honours it (lists) — because the note renders on every
+  // env-scoped telemetry page, release-aware or not. On a release-AWARE page
+  // the list beside the charts really does narrow, so a bare "this page does
+  // not filter by release" would be false there; on a release-BLIND page
+  // there is no list that narrows, and the sentence still reads true. See
+  // `showsReleaseNote` / `RELEASE_AWARE` in `models/shell.ts`.
+  'ui.release.showingAll': {
+    en: 'Charts and totals include all releases; only lists follow the release switcher.',
+    ar: 'الرسوم البيانية والإجماليات تشمل كل الإصدارات؛ القوائم فقط تتبع مبدّل الإصدار.',
+  },
+
   // --- search --------------------------------------------------------------
   'ui.search.clear': { en: 'Clear search', ar: 'مسح البحث' },
   'ui.search.submit': { en: 'Search (Enter)', ar: 'بحث (Enter)' },

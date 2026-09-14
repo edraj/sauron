@@ -14,6 +14,7 @@ public class TransportTests
         => new(new SauronOptions
         {
             Dsn = dsn,
+            Release = "1.0.0",
             HttpMessageHandler = handler,
             FlushInterval = TimeSpan.FromHours(1), // keep the background timer out of the way
             MaxBatch = 1000,
@@ -61,7 +62,7 @@ public class TransportTests
 
         var sdk = root.GetProperty("header").GetProperty("sdk");
         Assert.Equal("sauron-dotnet", sdk.GetProperty("name").GetString());
-        Assert.Equal("1.5.0", sdk.GetProperty("version").GetString());
+        Assert.Equal("1.6.0", sdk.GetProperty("version").GetString());
 
         // Removed: environment is now proven by the ingest key, not client-supplied.
         Assert.False(root.GetProperty("header").TryGetProperty("environment", out _));
@@ -178,6 +179,7 @@ public class TransportTests
         using var client = new SauronClient(new SauronOptions
         {
             Dsn = "https://pub123@example.com/42",
+            Release = "1.0.0",
             HttpMessageHandler = handler,
             FlushInterval = TimeSpan.FromHours(1),
             MaxBatch = 2,
@@ -208,6 +210,7 @@ public class TransportTests
         using var client = new SauronClient(new SauronOptions
         {
             Dsn = "not-a-valid-dsn",
+            Release = "1.0.0",
             HttpMessageHandler = handler,
         });
 

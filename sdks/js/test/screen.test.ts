@@ -28,7 +28,11 @@ describe('screen on items', () => {
   beforeEach(() => {
     resetScreen();
     items = [];
-    init({ dsn: 'https://pk_test@localhost:9/1', beforeSend: (i) => { items.push(i); return null; } });
+    init({
+      dsn: 'https://pk_test@localhost:9/1',
+      release: '1.0.0',
+      beforeSend: (i) => { items.push(i); return null; },
+    });
   });
 
   it('stamps the current screen on events', () => {

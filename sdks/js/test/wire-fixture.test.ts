@@ -133,6 +133,7 @@ describe('wire fixture (js)', () => {
 
     Sauron.init({
       dsn: 'https://pk_test@localhost:8081/1',
+      release: 'web@1.4.2',
       transport: { flushIntervalMs: 0, maxBatch: 1000 },
     });
     Sauron.captureMessage('soft decline from provider', 'warning');

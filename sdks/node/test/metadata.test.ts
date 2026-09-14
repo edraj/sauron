@@ -73,6 +73,7 @@ describe('init seeds the global scope with default metadata', () => {
     const fake = makeFakeFetch();
     const client = new SauronClient({
       dsn: DSN,
+      release: '1.0.0',
       flushInterval: 0,
       fetchImpl: fake.fetchImpl,
       tags: { env: 'prod' },
@@ -99,7 +100,12 @@ describe('init seeds the global scope with default metadata', () => {
 describe('per-call metadata overrides scope', () => {
   it('captureException per-call contexts/extra override same-named scope blocks', async () => {
     const fake = makeFakeFetch();
-    const client = new SauronClient({ dsn: DSN, flushInterval: 0, fetchImpl: fake.fetchImpl });
+    const client = new SauronClient({
+      dsn: DSN,
+      release: '1.0.0',
+      flushInterval: 0,
+      fetchImpl: fake.fetchImpl,
+    });
     getGlobalScope().setContext('order', { id: 1 });
     getGlobalScope().setExtra('trace_id', 'scope');
     client.captureException(new Error('boom'), {
@@ -115,7 +121,12 @@ describe('per-call metadata overrides scope', () => {
 
   it('captureMessage accepts per-call tags/contexts/extra', async () => {
     const fake = makeFakeFetch();
-    const client = new SauronClient({ dsn: DSN, flushInterval: 0, fetchImpl: fake.fetchImpl });
+    const client = new SauronClient({
+      dsn: DSN,
+      release: '1.0.0',
+      flushInterval: 0,
+      fetchImpl: fake.fetchImpl,
+    });
     client.captureMessage('note', 'warning', {
       tags: { a: '1' },
       contexts: { page: { route: '/x' } },
@@ -131,7 +142,12 @@ describe('per-call metadata overrides scope', () => {
 
   it('track merges per-call tags over scope and omits empty contexts/extra', async () => {
     const fake = makeFakeFetch();
-    const client = new SauronClient({ dsn: DSN, flushInterval: 0, fetchImpl: fake.fetchImpl });
+    const client = new SauronClient({
+      dsn: DSN,
+      release: '1.0.0',
+      flushInterval: 0,
+      fetchImpl: fake.fetchImpl,
+    });
     getGlobalScope().setTag('env', 'prod');
     client.track('viewed', 'u_1', {}, { tags: { plan: 'pro' } });
     await client.flush();

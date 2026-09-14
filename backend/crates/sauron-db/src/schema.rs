@@ -103,6 +103,17 @@ diesel::table! {
 }
 
 diesel::table! {
+    app_releases (id) {
+        id -> Int8,
+        app_id -> Uuid,
+        environment_id -> Nullable<Uuid>,
+        release -> Text,
+        first_seen_at -> Timestamptz,
+        last_seen_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     environments (id) {
         id -> Uuid,
         project_id -> Uuid,
@@ -880,6 +891,7 @@ diesel::joinable!(devices -> apps (app_id));
 diesel::joinable!(transactions -> apps (app_id));
 diesel::joinable!(apps -> projects (project_id));
 diesel::joinable!(app_environments -> apps (app_id));
+diesel::joinable!(app_releases -> apps (app_id));
 diesel::joinable!(app_store_connections -> apps (app_id));
 diesel::joinable!(store_daily_metrics -> apps (app_id));
 diesel::joinable!(app_environments -> environments (environment_id));
@@ -1094,6 +1106,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
     auth_sessions,
     app_environments,
+    app_releases,
     app_store_connections,
     apps,
     environments,

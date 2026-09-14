@@ -118,6 +118,7 @@ public class QueueTests
             var c1 = new SauronClient(new SauronOptions
             {
                 Dsn = "https://pub123@example.com/42",
+                Release = "1.0.0",
                 HttpMessageHandler = down,
                 FlushInterval = TimeSpan.FromHours(1),
                 MaxBatch = 1000,
@@ -135,6 +136,7 @@ public class QueueTests
             var c2 = new SauronClient(new SauronOptions
             {
                 Dsn = "https://pub123@example.com/42",
+                Release = "1.0.0",
                 HttpMessageHandler = up,
                 FlushInterval = TimeSpan.FromHours(1),
                 MaxBatch = 1000,

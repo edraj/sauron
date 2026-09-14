@@ -33,11 +33,11 @@ Current versions:
 
 | SDK | Directory | Registry | Package | Version | Wire `sdk.name` |
 | --- | --- | --- | --- | --- | --- |
-| Browser | `sdks/js` | npm | `@edraj/sauron-browser` | 1.4.1 | `sauron.javascript` |
-| Node | `sdks/node` | npm | `@edraj/sauron-node` | 1.4.0 | `sauron-node` |
-| Python | `sdks/python` | PyPI | `sauron-sdk` | 1.4.0 | `sauron-python` |
-| C# | `sdks/csharp` | NuGet | `Sauron` | 1.4.0 | `sauron-dotnet` |
-| Flutter | `sdks/flutter` | pub.dev | `sauron_flutter` | 1.7.0 | `sauron.flutter` |
+| Browser | `sdks/js` | npm | `@edraj/sauron-browser` | 1.7.0 | `sauron.javascript` |
+| Node | `sdks/node` | npm | `@edraj/sauron-node` | 1.6.0 | `sauron-node` |
+| Python | `sdks/python` | PyPI | `sauron-sdk` | 1.6.0 | `sauron-python` |
+| C# | `sdks/csharp` | NuGet | `Sauron` | 1.6.0 | `sauron-dotnet` |
+| Flutter | `sdks/flutter` | pub.dev | `sauron_flutter` | 1.10.0 | `sauron.flutter` |
 
 The registry package name and the **wire** SDK name are independent — the
 envelope header reports the wire name above no matter what the package is
@@ -242,3 +242,4 @@ that's the whole point of independent versioning.
 4. Re-run that SDK's pre-flight, commit, tag, publish. Leave the other four
    SDKs' manifests, constants, and CHANGELOG files untouched — they didn't
    change, so their versions don't move.
+5. Update this table too; nothing asserts it.

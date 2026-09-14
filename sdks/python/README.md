@@ -36,7 +36,9 @@ distribution name is `sauron-sdk`.
 ```python
 import sauron
 
-sauron.init(dsn="https://pk_live_xxx@ingest.sauron.example/1")
+# `release=` is required as of 1.6.0 whenever `dsn` is set — pass the app
+# version this build reports as.
+sauron.init(dsn="https://pk_live_xxx@ingest.sauron.example/1", release="1.4.2")
 
 # Product analytics — distinct_id is required by the wire contract.
 sauron.track("checkout_completed", distinct_id="u_123",
@@ -1028,11 +1030,11 @@ print(dsn.envelope_url)  # https://ingest.sauron.example:8443/api/7/envelope
 ### `SDK_NAME`, `SDK_VERSION`
 
 Module constants (`str`) reported in the envelope header's `sdk` block:
-`"sauron-python"` and `"1.5.0"`.
+`"sauron-python"` and `"1.6.0"`.
 
 ```python
 import sauron
-print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.5.0
+print(sauron.SDK_NAME, sauron.SDK_VERSION)  # sauron-python 1.6.0
 ```
 
 ## Scope & metadata

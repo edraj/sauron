@@ -65,6 +65,7 @@ void main() {
   Future<void> initSauron() async {
     final SauronOptions options = SauronOptions()
       ..dsn = 'https://pk_test@localhost:9/1'
+      ..release = 'app@1.4.2+1402'
       ..httpClient = httpClient
       ..gzipThresholdBytes = 1 << 30;
     

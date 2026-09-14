@@ -111,9 +111,14 @@ def init(
 
     A missing/empty ``dsn`` puts the SDK into a disabled no-op mode (logs, does
     not raise) so production code can ship without a DSN configured. A non-empty
-    but malformed DSN raises :class:`DsnError`.
+    but malformed DSN raises :class:`DsnError`. When a ``dsn`` is given,
+    ``release`` (the app version this build reports as) is required and must
+    not be blank; it is trimmed of surrounding whitespace. A missing/blank
+    ``release`` raises :class:`ValueError`.
 
     Args:
+        release: required whenever ``dsn`` is set — the app version this
+            build reports as. Trimmed of surrounding whitespace.
         gzip_threshold_bytes: compress the request body with gzip (and set
             ``Content-Encoding: gzip``) once it exceeds this size. Default 1024.
         max_queue_bytes: byte budget for the in-memory pending queue; once
@@ -129,6 +134,14 @@ def init(
 
     Returns:
         The created :class:`Client`, or ``None`` when disabled.
+
+    Raises:
+        ValueError: ``dsn`` is set but ``release`` is missing or blank. This
+            check runs BEFORE the DSN is parsed, so a call that gets both wrong
+            — a malformed DSN *and* no ``release`` — raises ``ValueError``, not
+            :class:`DsnError`. Fix the ``release`` first and the ``DsnError``
+            appears on the next call.
+        DsnError: ``dsn`` is non-empty but malformed (and ``release`` is set).
     """
     global _client, _atexit_registered
 
@@ -139,6 +152,12 @@ def init(
             print("[sauron] no DSN configured; SDK disabled", file=sys.stderr)
         _client = None
         return None
+
+    if release is None or not str(release).strip():
+        raise ValueError(
+            "sauron.init() requires release= (the app version this build reports as)"
+        )
+    release = str(release).strip()
 
     _client = Client(
         dsn,

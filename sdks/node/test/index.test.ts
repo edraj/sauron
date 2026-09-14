@@ -16,7 +16,7 @@ function makeFakeFetch() {
 describe('module facade', () => {
   it('delegates track/captureMessage to the active client and flushes', async () => {
     const fake = makeFakeFetch();
-    init({ dsn: 'https://k@host/1', flushInterval: 0, fetchImpl: fake.fetchImpl });
+    init({ dsn: 'https://k@host/1', release: '1.0.0', flushInterval: 0, fetchImpl: fake.fetchImpl });
     expect(getClient()).not.toBeNull();
 
     track('hello', 'user-1', { a: 1 });
@@ -38,6 +38,18 @@ describe('module facade', () => {
   });
 
   it('throws a typed DsnError on a clearly-invalid DSN', () => {
-    expect(() => init({ dsn: 'not-a-dsn', flushInterval: 0 })).toThrow(/invalid DSN/);
+    expect(() => init({ dsn: 'not-a-dsn', release: '1.0.0', flushInterval: 0 })).toThrow(
+      /invalid DSN/,
+    );
+  });
+
+  it('throws without a release', () => {
+    expect(() => init({ dsn: 'https://pk_test@localhost:8081/1', flushInterval: 0 } as never)).toThrow(
+      /requires a \{ release \}/,
+    );
+  });
+
+  it('throws on an empty dsn', () => {
+    expect(() => init({ dsn: '', release: '1.0.0', flushInterval: 0 })).toThrow();
   });
 });

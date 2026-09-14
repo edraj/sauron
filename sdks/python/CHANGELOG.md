@@ -2,6 +2,18 @@
 
 All notable changes to the Sauron Python SDK are documented here.
 
+## 1.6.0
+
+### Changed
+
+- **Breaking: `release=` is now required whenever `dsn` is set.** `sauron.init()`
+  raises `ValueError` if `release` is missing or blank when a non-empty `dsn` is
+  given — the release is the app version this build reports as, and it powers
+  release-scoped filtering. `release` is trimmed of surrounding whitespace.
+  Calling `sauron.init("")` (no DSN) still disables the SDK without raising, so
+  a `dsn`-less deployment is unaffected.
+- `SDK_VERSION` and the package version bumped to **1.6.0**.
+
 ## 1.5.0
 
 ### Added

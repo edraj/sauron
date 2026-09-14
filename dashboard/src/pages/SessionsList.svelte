@@ -207,9 +207,13 @@
     (analytics?.duration_series ?? []).map((p) => ({ bucket: p.bucket, count: p.avg_ms })),
   );
 
-  // `scopeKey` belongs in every key: it carries the selected environment, which
-  // the axios interceptor adds to the request but which appears in none of these
+  // A scope key belongs in every key: it carries the selection the axios
+  // interceptor adds to the request but which appears in none of these
   // arguments. Omit it and one environment's sessions are served as another's.
+  // Which key differs: the LIST takes `?release=` (`…/sessions` is in
+  // `RELEASE_SCOPED_URL`) so it uses `scopeKeyWithRelease`; the analytics
+  // summary below does not, so it stays on the two-segment `scopeKey` rather
+  // than re-fetching identical aggregates on every release switch.
   async function loadAnalytics(appId: string, win: DateRangeValue, force = false) {
     await analyticsView.load(
       viewKey('sessions.analytics', appId, sessionStore.scopeKey, rangeKey(win)),
@@ -244,7 +248,7 @@
       viewKey(
         'sessions.list',
         appId,
-        sessionStore.scopeKey,
+        sessionStore.scopeKeyWithRelease,
         windowKey,
         sort,
         off,
@@ -291,9 +295,10 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    // Touch scopeKey so the effect re-runs when the environment changes; the
-    // interceptor supplies the value, but nothing would refetch without this.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease so the effect re-runs when the environment or
+    // the release changes; the interceptor supplies both values, but nothing
+    // would refetch without this.
+    sessionStore.scopeKeyWithRelease;
     const tf = timeFilter;
     const sort = sortParam(list.sort);
     const off = list.offset;

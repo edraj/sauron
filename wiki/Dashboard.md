@@ -146,6 +146,7 @@ import { Sauron } from '@edraj/sauron-browser';
 
 Sauron.init({
   dsn: 'https://<public_key>@<host>/<environment_id>',
+  release: 'web@1.4.2',
   tags: { region: 'eu-central' },            // default tag on every signal
 });
 

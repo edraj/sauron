@@ -645,6 +645,7 @@ impl ResourceLower for TransactionsLower {
             Store::Column("session_id") => str_leaf!(transactions::session_id, p, negate),
             Store::Column("distinct_id") => str_leaf!(transactions::distinct_id, p, negate),
             Store::Column("url") => str_leaf!(transactions::url, p, negate),
+            Store::Column("release") => str_leaf!(transactions::release, p, negate),
             Store::Column("http_method") => str_leaf!(transactions::http_method, p, negate),
             Store::Column("http_status") => int_leaf!(transactions::http_status, p, negate),
             Store::Column("duration_ms") => duration_leaf(p, negate),
@@ -741,6 +742,12 @@ mod tests {
         let sql = lower_tx_sql("@tag.tier:premium");
         assert!(sql.contains("tags"), "{sql}");
         assert!(sql.contains("@>"), "{sql}");
+    }
+
+    #[test]
+    fn release_lowers_to_a_column_equality() {
+        let sql = lower_tx_sql("release:1.0.0");
+        assert!(sql.contains("\"transactions\".\"release\" = "), "{sql}");
     }
 
     /// The unit bug this module's `as_duration_ms` doc warns about: the column

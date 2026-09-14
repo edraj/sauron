@@ -11,7 +11,14 @@ public sealed class SauronOptions
     /// <summary>Ingest DSN (required): <c>https://&lt;public_key&gt;@&lt;host&gt;/&lt;project_id&gt;</c>.</summary>
     public string Dsn { get; set; } = string.Empty;
 
-    /// <summary>Optional release identifier.</summary>
+    /// <summary>
+    /// Release identifier, e.g. <c>svc@1.4.2</c>. Required whenever <see cref="Dsn"/> is set
+    /// (including an invalid/unparseable one) — <see cref="SauronClient"/>'s constructor throws
+    /// <see cref="ArgumentException"/> when <see cref="Dsn"/> is non-blank but this is
+    /// null/whitespace. An empty/blank <see cref="Dsn"/> skips this check entirely and leaves
+    /// the client disabled without throwing. When non-null, it is trimmed of surrounding
+    /// whitespace.
+    /// </summary>
     public string? Release { get; set; }
 
     /// <summary>Default tags seeded into the global scope at init (string -> string). Optional.</summary>
@@ -124,6 +131,14 @@ public sealed class SauronClient : IDisposable
     public SauronClient(SauronOptions options)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
+
+        if (!string.IsNullOrWhiteSpace(options.Dsn))
+        {
+            if (string.IsNullOrWhiteSpace(options.Release))
+                throw new ArgumentException("SauronOptions.Release is required when a DSN is set (the app version this build reports as).", nameof(options));
+        }
+        if (options.Release is not null)
+            options.Release = options.Release.Trim();
 
         Dsn dsn;
         try

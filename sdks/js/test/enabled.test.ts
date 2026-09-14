@@ -40,7 +40,7 @@ describe('isEnabled() propagation from a live 401/403', () => {
 
   it('flips isEnabled() to false after the transport classifies a 401 response', async () => {
     globalThis.fetch = fetchReturning(401);
-    const client = init({ dsn: 'https://pk_test@localhost:9/1' });
+    const client = init({ dsn: 'https://pk_test@localhost:9/1', release: '1.0.0' });
 
     expect(client.isEnabled()).toBe(true);
 
@@ -57,7 +57,7 @@ describe('isEnabled() propagation from a live 401/403', () => {
 
   it('flips isEnabled() to false after the transport classifies a 403 response', async () => {
     globalThis.fetch = fetchReturning(403);
-    const client = init({ dsn: 'https://pk_test@localhost:9/1' });
+    const client = init({ dsn: 'https://pk_test@localhost:9/1', release: '1.0.0' });
 
     track('ping');
     await client.flush(1000);
@@ -67,7 +67,7 @@ describe('isEnabled() propagation from a live 401/403', () => {
 
   it('stays enabled through an unrelated failure (e.g. a 500), unlike a 401/403', async () => {
     globalThis.fetch = fetchReturning(500);
-    const client = init({ dsn: 'https://pk_test@localhost:9/1' });
+    const client = init({ dsn: 'https://pk_test@localhost:9/1', release: '1.0.0' });
 
     track('ping');
     // Bound the wait: a 500 retries with backoff and would otherwise hang

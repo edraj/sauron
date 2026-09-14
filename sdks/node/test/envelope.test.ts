@@ -128,7 +128,7 @@ function makeFakeFetch() {
 }
 
 function newClient(fetchImpl: FetchLike, overrides: Partial<InitOptions> = {}) {
-  return new SauronClient({ dsn: DSN, flushInterval: 0, fetchImpl, ...overrides });
+  return new SauronClient({ dsn: DSN, release: '1.0.0', flushInterval: 0, fetchImpl, ...overrides });
 }
 
 /**
@@ -220,7 +220,7 @@ describe('client emits the reconciled golden shape', () => {
     client.captureMessage('hello');
     await client.flush();
 
-    expect(fake.envelopes[0].header.sdk).toEqual({ name: 'sauron-node', version: '1.5.0' });
+    expect(fake.envelopes[0].header.sdk).toEqual({ name: 'sauron-node', version: '1.6.0' });
   });
 
   it('never carries an environment key on the header (removed: environment is now proven by the ingest key)', async () => {

@@ -1,10 +1,12 @@
 //! `IssuesLower`: turns one `ResolvedPredicate` (or free-text term) resolved
 //! against `Resource::Issues` into a diesel boxed fragment over `issues::table`.
 //!
-//! `environment`, `release`, and `handled` on Issues are `Store::Rollup` — the
-//! `issue_dimensions` rollup table does not exist yet (S3), so those three are
+//! `environment` and `handled` on Issues are `Store::Rollup` — the
+//! `issue_dimensions` rollup table does not exist yet (S3), so those two are
 //! rejected with `PlanError::NotYetSupported` rather than silently matching
-//! nothing or panicking.
+//! nothing or panicking. `release` is NOT one of them: `issues` carries no
+//! `release` column, so it bridges to `error_events` through a correlated
+//! `EXISTS`, the same shape `screen`/`distinct_id`/`device_key` already use.
 //!
 //! `issues` has no `tags` column at all (16 columns, verified against
 //! `schema.rs`): a tag predicate becomes a correlated `EXISTS` into
@@ -428,11 +430,12 @@ impl ResourceLower for IssuesLower<'_> {
             Store::Tag => tag_leaf(p, negate, self.env),
             // Not an `issues` column at all — see `workflow_leaf`.
             Store::Column("workflow") => workflow_leaf(p, negate, self.env),
-            // Nor are these three: `screen`, `distinct_id` and `device_key`
-            // live on `error_events`, so on this resource they take the same
-            // correlated-EXISTS shape — see `occurrence_column_leaf`. The
-            // argument is the literal SQL fragment naming the column, because
-            // every byte of SQL this module emits is a compile-time constant.
+            // Nor are these four: `screen`, `distinct_id`, `device_key` and
+            // `release` live on `error_events`, so on this resource they take
+            // the same correlated-EXISTS shape — see `occurrence_column_leaf`.
+            // The argument is the literal SQL fragment naming the column,
+            // because every byte of SQL this module emits is a compile-time
+            // constant.
             Store::Column("screen") => {
                 occurrence_column_leaf(" AND e.screen", p, negate, self.env, self.since)
             }
@@ -441,6 +444,35 @@ impl ResourceLower for IssuesLower<'_> {
             }
             Store::Column("device_key") => {
                 occurrence_column_leaf(" AND e.device_key", p, negate, self.env, self.since)
+            }
+            // `release` bridges the same way, with ONE deliberate exception:
+            // negated `Has`.
+            //
+            // `occurrence_column_leaf`'s convention for `!has:x` is `NOT
+            // EXISTS(… x IS NOT NULL)` — "no occurrence recorded an x". That
+            // is right for `screen`/`device_key`, whose `!has:` reads as an
+            // absence. It is wrong for the release picker: the dashboard's
+            // "Unknown release" entry sends `?release=none`, which must mean
+            // the same thing on Issues that `?environment_id=none` already
+            // means — "this issue HAS an occurrence with no release", a
+            // POSITIVE `EXISTS(… IS NULL)` (the issues list spells the env
+            // twin exactly that way, `repo.rs`'s `member_env_sql` under
+            // `EnvFilter::Unattributed`). The two differ for an issue with
+            // both a `1.4.0` occurrence and a release-less one: the negated
+            // form hides it from Unknown, and it would then appear under no
+            // release selection at all while being visible under "All".
+            //
+            // Nothing relied on the old reading here: `release` on Issues was
+            // `NotYetSupported` before this branch, so no saved view or chip
+            // can carry a `!has:release` lowered the other way.
+            //
+            // Positive `has:release`, `Eq`, `In`, `Ne` and the pattern ops all
+            // keep the shared shape.
+            Store::Column("release") if negate && matches!(p.op, MatchOp::Has) => {
+                Ok(unknown_release_leaf(self.env, self.since))
+            }
+            Store::Column("release") => {
+                occurrence_column_leaf(" AND e.release", p, negate, self.env, self.since)
             }
             // `extra` and `contexts` are the two DEV-SUPPLIED JSONB columns,
             // and they live on `error_events` like the three columns above —
@@ -823,6 +855,28 @@ fn occurrence_column_leaf(
     } else {
         positive
     })
+}
+
+/// `!has:release` — the "Unknown release" selection.
+///
+/// A POSITIVE correlated `EXISTS` over `e.release IS NULL`, deliberately NOT
+/// the `NOT EXISTS(… IS NOT NULL)` shape [`occurrence_column_leaf`] emits for
+/// a negated `Has`. See the `Store::Column("release")` guard arm in
+/// [`IssuesLower::leaf`] for the full argument; in short it mirrors
+/// `?environment_id=none`, which the issues list already spells this way.
+///
+/// Lives here, below `occurrence_exists_head!`, because `macro_rules!` is
+/// textually scoped — the match arm sits above the macro's definition and
+/// cannot expand it.
+///
+/// Carries the environment scope through `exists_close_env!` for the same
+/// reason every other correlated subquery in this module does: it is a second
+/// access boundary, not a repeat of the outer one.
+fn unknown_release_leaf(env: &EnvFilter, since: DateTime<Utc>) -> Frag<issues::table> {
+    exists_close_env!(
+        occurrence_exists_head!(since).sql(" AND e.release IS NULL"),
+        env
+    )
 }
 
 /// `tag:<value>` with no key — the same predicate applied across every key of
@@ -1305,17 +1359,72 @@ mod tests {
         assert!(sql.contains("e.tags @>"), "{sql}");
     }
 
-    // -- Rollup: release/handled must reject the same way as environment ----
+    // -- Rollup: handled must reject the same way as environment ------------
 
     #[test]
     fn every_rollup_dimension_on_issues_is_rejected() {
-        for q in ["release:1.0.0", "handled:true"] {
-            let err = lower_issues_err(q);
-            assert!(
-                matches!(err, PlanError::NotYetSupported { .. }),
-                "{q} => {err:?}"
-            );
-        }
+        let q = "handled:true";
+        let err = lower_issues_err(q);
+        assert!(
+            matches!(err, PlanError::NotYetSupported { .. }),
+            "{q} => {err:?}"
+        );
+    }
+
+    // -- `release` bridges through `error_events`, like `screen` ------------
+
+    #[test]
+    fn release_on_issues_bridges_through_error_events() {
+        let sql = lower_issues_sql("release:1.0.0");
+        assert!(sql.contains("EXISTS"), "{sql}");
+        assert!(sql.contains("e.release = "), "{sql}");
+    }
+
+    /// `!has:release` is "Unknown release", not "not every occurrence has
+    /// one" — see the `Store::Column("release")` arm's comment for the full
+    /// argument. The shape must be a POSITIVE `EXISTS(… e.release IS NULL)`,
+    /// mirroring how the issues list expresses the env `Unattributed` case
+    /// (`repo.rs`'s `member_env_sql`), never the generic `NOT EXISTS(…
+    /// e.release IS NOT NULL)` the other occurrence columns emit.
+    #[test]
+    fn unknown_release_on_issues_is_a_positive_exists_over_null() {
+        let sql = lower_issues_sql("!has:release");
+        assert!(sql.contains("EXISTS"), "{sql}");
+        assert!(
+            sql.contains("e.release IS NULL"),
+            "must select issues that HAVE a release-less occurrence: {sql}"
+        );
+        assert!(
+            !sql.contains("NOT EXISTS"),
+            "must not be the generic negated form — an issue with both a \
+             1.4.0 occurrence and a NULL one belongs under Unknown: {sql}"
+        );
+        assert!(
+            !sql.contains("e.release IS NOT NULL"),
+            "the generic negated form leaked through: {sql}"
+        );
+    }
+
+    /// The asymmetry is confined to the negated `Has`: positive `has:release`
+    /// keeps the ordinary `EXISTS(… IS NOT NULL)` shape.
+    #[test]
+    fn positive_has_release_on_issues_is_unchanged() {
+        let sql = lower_issues_sql("has:release");
+        assert!(sql.contains("e.release IS NOT NULL"), "{sql}");
+        assert!(!sql.contains("NOT EXISTS"), "{sql}");
+    }
+
+    /// The rewritten arm must still carry the environment scope — it is a new
+    /// correlated subquery, and an un-fragmented one is the same live oracle
+    /// `every_correlated_subquery_carries_the_environment_scope` guards
+    /// against for the others.
+    #[test]
+    fn unknown_release_on_issues_carries_the_environment_scope() {
+        let one = EnvFilter::One(Uuid::from_u128(7));
+        let sql = lower_issues_sql_env("!has:release", &one);
+        assert!(sql.contains("e.environment_id = "), "{sql}");
+        let sql = lower_issues_sql_env("!has:release", &EnvFilter::Unattributed);
+        assert!(sql.contains("e.environment_id IS NULL"), "{sql}");
     }
 
     // -- Store::Column, Eq ---------------------------------------------------
@@ -1547,6 +1656,18 @@ mod tests {
             "deviceKey:d_1",
             "deviceKey:[d_1,d_2]",
             "has:deviceKey",
+            // `release` — a fourth borrowed occurrence column, and the one the
+            // `?release=` switcher ANDs into every Issues query, so its
+            // subquery is now on the hot path for every list read. All four
+            // shapes the Issues catalog entry's `OPS_EQ` grants are here:
+            // `Eq`, `In`, `Has`, and the negated `Has` the `Unknown` sentinel
+            // rewrites to. (`OPS_EQ` grants no ordering operators, so there is
+            // no range shape to drive — `release:[1.0.0,2.0.0]` is `In`, a
+            // two-value list, not a between.)
+            "release:1.0.0",
+            "release:[1.0.0,2.0.0]",
+            "has:release",
+            "!has:release",
         ];
         for q in queries {
             let sql = lower_issues_sql_env(q, &one);

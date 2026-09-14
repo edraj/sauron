@@ -589,9 +589,12 @@
   // per keystroke.
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    // Touch scopeKey so the effect re-runs when the environment changes; the
-    // interceptor supplies the value, but nothing would refetch without this.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease so the effect re-runs when the environment or
+    // the release changes; the interceptor supplies both values, but nothing
+    // would refetch without this. Both stream effects use it because
+    // `…/events/list` is in `RELEASE_SCOPED_URL`; the two card effects above
+    // stay on `scopeKey` — their endpoints take no `release=`.
+    sessionStore.scopeKeyWithRelease;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
     const win = range;
@@ -610,9 +613,9 @@
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    // Touch scopeKey so the effect re-runs when the environment changes; the
-    // interceptor supplies the value, but nothing would refetch without this.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease for the same reason as the effect above: the
+    // stream narrows by release, so a switch must reset the walk and refetch.
+    sessionStore.scopeKeyWithRelease;
     const enc = encodeFilters(filters);
     const s = appliedSearch;
     // The STREAM's window, not the cards' `range`: this effect exists to
@@ -623,8 +626,9 @@
     if (!aid) return;
     // Back to page one, current sort kept. A cursor addresses a position in
     // ONE result set, so it is meaningless against a different predicate —
-    // and equally meaningless against a different environment, which is why
-    // touching `scopeKey` above has to reset this too and not merely refetch.
+    // and equally meaningless against a different environment or release,
+    // which is why touching `scopeKeyWithRelease` above has to reset this too
+    // and not merely refetch.
     //
     // `list.sort` is read through `untrack`: this effect must depend ONLY on
     // the predicate inputs above, never on `list` itself. `toPage` and

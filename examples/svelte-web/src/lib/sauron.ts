@@ -9,6 +9,15 @@ import { activity, config, initStatus } from './store.svelte';
 import type { ShowcaseSink } from './showcase';
 import type { SeedingSink } from './seeding';
 
+/**
+ * The release reported when the header's release box is empty.
+ *
+ * Matches `store.svelte.ts`'s own default for `config.release`, so clearing
+ * the box and reconnecting reports the same value a fresh visitor does rather
+ * than a second, mysterious entry in the dashboard's release switcher.
+ */
+const DEFAULT_RELEASE = 'web-demo@0.1.0';
+
 /** True once the SDK has an active client. */
 export function isConnected(): boolean {
   return Sauron.getClient() !== null;
@@ -132,7 +141,11 @@ export async function connect(): Promise<void> {
 
     Sauron.init({
       dsn,
-      release: config.release.trim() || undefined,
+      // Never `undefined`: since browser SDK 1.7.0 `init` THROWS unless
+      // `release` is a non-empty string, so a user who clears the
+      // release box in the header would otherwise take the whole demo
+      // down instead of simply reporting no version.
+      release: config.release.trim() || DEFAULT_RELEASE,
       // Flush a little more eagerly than the 5s default so freshly-clicked
       // actions show up in the dashboard within a couple of seconds.
       transport: { flushIntervalMs: 3000 },
@@ -150,7 +163,9 @@ export async function connect(): Promise<void> {
     activity.push(
       'system',
       'Sauron.init()',
-      config.release.trim() ? `release=${config.release.trim()}` : 'no release set',
+      config.release.trim()
+        ? `release=${config.release.trim()}`
+        : `release=${DEFAULT_RELEASE} (default — the release box is empty)`,
     );
 
     // v0.2.0 screen API — declare the initial screen right after init. This
