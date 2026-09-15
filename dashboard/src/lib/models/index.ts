@@ -915,6 +915,10 @@ export interface UserStats {
   total_users: number;
   active_in_range: number;
   new_in_range: number;
+  /** Identified share of the three counts above; guests are the remainder. */
+  total_identified: number;
+  active_identified: number;
+  new_identified: number;
   dau: number;
   wau: number;
   mau: number;

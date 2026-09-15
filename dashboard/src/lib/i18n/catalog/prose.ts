@@ -295,8 +295,8 @@ export const prose = {
 
   // --- last trailing runs --------------------------------------------------
   'prose.users.combinedNoteTail': {
-    en: 'counts people across several apps at once.',
-    ar: 'يحتسب الأشخاص عبر عدة تطبيقات دفعةً واحدة.',
+    en: 'breaks the same scope down by day, identified versus guests.',
+    ar: 'يفصّل النطاق نفسه يومًا بيوم، معروفين مقابل ضيوف.',
   },
   'prose.scope.entireOrg': { en: 'entire org', ar: 'المؤسسة بأكملها' },
   'prose.members.tempPasswordTail': {

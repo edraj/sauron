@@ -1,7 +1,6 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
-  import AppEnvPicker from '../lib/components/AppEnvPicker.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -20,21 +19,18 @@
   import { envelopeStatus } from '../lib/models/freshness';
   import type { ViewEnvelope } from '../lib/api/overview';
   import { viewKey } from '../lib/stores/view-cache';
-  import { listEnvironments } from '../lib/api/environments';
   import { downloadActiveUsersCsv, getActiveUsers } from '../lib/api/activeUsers';
   import { errorMessage } from '../lib/api/client';
   import { compactNumber, formatTime, relativeTime } from '../lib/utils/format';
   import {
-    decodeSelection,
     defaultWindow,
-    describeSelection,
     encodeSelection,
     selectionCount,
     utcDayLabel,
     validateSelection,
     type AppEnvSelection,
   } from '../lib/models/active-users';
-  import type { ActiveUsersReport, AppEnvironment, SelectionView } from '../lib/models';
+  import type { ActiveUsersReport } from '../lib/models';
 
   const RANGES = [
     { days: 7, label: '7d' },
@@ -49,7 +45,22 @@
   const initialWindow = defaultWindow(30, new Date());
   let from = $state(initial.get('from') ?? initialWindow.from);
   let to = $state(initial.get('to') ?? initialWindow.to);
-  let selection = $state<AppEnvSelection>(decodeSelection(initial.getAll('selection')));
+
+  /**
+   * The app and environment come from the top bar, like every other telemetry
+   * page — this page used to carry its own multi-app picker, which duplicated
+   * the org/project/app/release/environment switcher and let the two disagree.
+   *
+   * Encoded in the wire's own vocabulary: `sessionStore.currentEnvId` is
+   * `null` for all environments and the literal `'none'` for unattributed,
+   * which are exactly the `EnvChoice` tokens `encodeSelection` emits. Empty
+   * while no app is selected, which the empty state below explains.
+   */
+  const selection = $derived<AppEnvSelection>(
+    sessionStore.currentAppId
+      ? { [sessionStore.currentAppId]: sessionStore.currentEnvId ?? 'all' }
+      : {},
+  );
 
   // Cached view (lib/stores/cached-view.svelte.ts): the cached report paints
   // instantly on return, then refreshes behind it. Re-exposed under the names the
@@ -91,18 +102,6 @@
   let refreshing = $state(false);
   let exporting = $state(false);
 
-  // Lazily-loaded per-app enrollments. Records and Sets in `$state` are
-  // REPLACED, never mutated in place — a mutation on the deep proxy is not a
-  // new value and dependent effects do not re-run.
-  let envsByApp = $state<Record<string, AppEnvironment[]>>({});
-  let loadingEnvApps = $state<Set<string>>(new Set());
-
-  const apps = $derived(sessionStore.apps);
-  const resolvedByApp = $derived.by(() => {
-    const out: Record<string, SelectionView> = {};
-    for (const s of report?.selections ?? []) out[s.app_id] = s;
-    return out;
-  });
   const selectionValid = $derived(validateSelection(selection));
 
   // `CachedView` starts out `loading: true`, but this page legitimately sits with
@@ -119,23 +118,6 @@
   const rangeDays = $derived(
     Math.max(1, Math.round((Date.parse(to) - Date.parse(from)) / 86_400_000)),
   );
-
-  // Copied from `Members.svelte`: guard on both the loaded map and the
-  // in-flight set, or a double click fires two identical requests.
-  async function ensureEnvsLoaded(appId: string) {
-    if (appId in envsByApp || loadingEnvApps.has(appId)) return;
-    loadingEnvApps = new Set(loadingEnvApps).add(appId);
-    try {
-      const envs = await listEnvironments(appId);
-      envsByApp = { ...envsByApp, [appId]: envs };
-    } catch {
-      envsByApp = { ...envsByApp, [appId]: [] };
-    } finally {
-      const next = new Set(loadingEnvApps);
-      next.delete(appId);
-      loadingEnvApps = next;
-    }
-  }
 
   function setRange(days: number) {
     const w = defaultWindow(days, new Date());
@@ -227,7 +209,10 @@
   }
 
   // One effect that both writes the URL and reloads, so the shareable link and
-  // the displayed numbers can never describe different requests.
+  // the displayed numbers can never describe different requests. Only the
+  // window is in the URL: the app and environment are the top bar's, which the
+  // session store already persists, so a shared link opens on the viewer's own
+  // scope like every other page.
   $effect(() => {
     const pid = sessionStore.currentProjectId;
     const encoded = encodeSelection(selection);
@@ -237,7 +222,6 @@
     const p = new URLSearchParams();
     p.set('from', f);
     p.set('to', end);
-    for (const s of encoded) p.append('selection', s);
     void replace(`/active-users?${p.toString()}`);
     if (encoded.length === 0) {
       // `reset()`, not just "show nothing": it also bumps the generation, so a
@@ -247,12 +231,6 @@
       return;
     }
     void load(pid, { from: f, to: end, selection: encoded });
-  });
-
-  // Pre-load environments for anything the URL already had ticked, so a shared
-  // link renders its environment names rather than raw ids.
-  $effect(() => {
-    for (const appId of Object.keys(selection)) void ensureEnvsLoaded(appId);
   });
 
   const chartData = $derived(
@@ -273,16 +251,6 @@
       : null,
   );
   const peak = $derived(peakDay?.active_total ?? null);
-
-  function appName(appId: string): string {
-    return apps.find((a) => a.id === appId)?.name ?? appId;
-  }
-
-  function envLabel(appId: string, choice: string): string {
-    if (choice === 'all') return 'All environments';
-    if (choice === 'none') return 'Unattributed';
-    return envsByApp[appId]?.find((e) => e.id === choice)?.name ?? choice;
-  }
 
   function rangeLabel(): string {
     if (!report) return '';
@@ -350,21 +318,6 @@
       </div>
     </header>
 
-    <Card title={t('activeUsers.card.apps')}>
-      <AppEnvPicker
-        {apps}
-        {envsByApp}
-        {loadingEnvApps}
-        {resolvedByApp}
-        value={selection}
-        onchange={(next) => (selection = next)}
-        onopenapp={(appId) => void ensureEnvsLoaded(appId)}
-      />
-      {#if !selectionValid.ok}
-        <p class="hint muted">{selectionValid.reason}</p>
-      {/if}
-    </Card>
-
     {#if report?.truncated && report.truncation_reason}
       <!-- A persistent property of the displayed data, not a transient event,
            so a banner rather than a toast. On shipped defaults (TIER_HOT_DAYS
@@ -405,9 +358,7 @@
         <StatTile
           label={t('activeUsers.stat.identified')}
           value={rep.latest ? compactNumber(rep.latest.active_identified) : '—'}
-          sub={selectionCount(selection) === 1
-            ? 'matched by distinct ID'
-            : 'matched across apps by raw distinct ID'}
+          sub="matched by distinct ID"
         >
           {#snippet visual()}
             <Sparkline data={identifiedSeries} />
@@ -416,7 +367,7 @@
         <StatTile
           label={t('activeUsers.stat.guests')}
           value={rep.latest ? compactNumber(rep.latest.active_guest) : '—'}
-          sub="never merged across apps"
+          sub="anonymous distinct IDs"
         >
           {#snippet visual()}
             <Sparkline data={guestSeries} />
@@ -427,24 +378,7 @@
           value={peak === null ? '—' : compactNumber(peak)}
           sub={peakDay ? `${rangeLabel()} · ${compactNumber(peakDay.active_identified)} identified / ${compactNumber(peakDay.active_guest)} guests` : rangeLabel()}
         />
-        <StatTile
-          label={t('activeUsers.stat.apps')}
-          value={selectionCount(selection)}
-          sub={describeSelection(selection, appName, envLabel)}
-        />
       </StatTiles>
-
-      {#if selectionCount(selection) > 1}
-        <!-- Beside the figure it qualifies, not only in the page subtitle and
-             the wiki. Exact arithmetic over a lossy join is still lossy: the
-             three tiles always add up, and the identified half can still
-             double-count one person. -->
-        <p class="caveat muted">
-          {t('activeUsers.doubleCount')}
-          <strong>{t('activeUsers.stat.identified')}</strong>. Guests are never merged across apps at all, so a large
-          guest share means most of the total was never a candidate for merging.
-        </p>
-      {/if}
 
       <Card title={t('activeUsers.card.perDay')}>
         {#if chartData.length === 0}
@@ -531,13 +465,5 @@
     color: var(--error);
     background: var(--error-soft);
     border: 1px solid color-mix(in srgb, var(--error) 38%, transparent);
-  }
-  .hint {
-    margin-top: 8px;
-    font-size: 12.5px;
-  }
-  .caveat {
-    font-size: 12.5px;
-    max-width: 78ch;
   }
 </style>

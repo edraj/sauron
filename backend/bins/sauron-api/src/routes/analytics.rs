@@ -371,8 +371,10 @@ pub async fn persons_list(
 ///
 /// Takes `PersonsQuery` verbatim so the count and the list are built from one
 /// predicate description. Page fields are ignored; `sort` is still resolved
-/// because `count_persons` wraps the list's own SQL, which embeds an ORDER BY
-/// that cannot change a count.
+/// because, under a scoped read, `count_persons` wraps the list's own SQL,
+/// which embeds an ORDER BY that cannot change a count. (Unscoped, the count
+/// reads `event_users` alone and the sort is unused — see
+/// `repo::persons_count_sql`.)
 ///
 /// Same permission and `RawQuery` environment handling as the list — a count
 /// resolved over a wider scope leaks the SIZE of data the caller cannot read.
