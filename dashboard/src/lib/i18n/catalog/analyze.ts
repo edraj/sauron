@@ -5,23 +5,18 @@ export const analyze = {
   // --- active users --------------------------------------------------------
   'activeUsers.title': { en: 'Active users', ar: 'المستخدمون النشطون' },
   'activeUsers.subtitle': {
-    en: 'Distinct people per UTC day, combined across the apps you pick. Users are matched across apps by the distinct ID your SDK sends — apps must use the same identifier.',
-    ar: 'الأشخاص المميزون لكل يوم بتوقيت UTC، مجمّعين عبر التطبيقات التي تختارها. تجري مطابقة المستخدمين بين التطبيقات عبر المعرّف المميز الذي ترسله حزمة التطوير — ويجب أن تستخدم التطبيقات المعرّف نفسه.',
-  },
-  'activeUsers.doubleCount': {
-    en: 'Two apps that name the same person differently count that person twice in',
-    ar: 'التطبيقان اللذان يسمّيان الشخص نفسه بطريقتين مختلفتين يحتسبانه مرتين في',
+    en: 'Distinct people per UTC day for the app and environment selected above, split into identified users and guests.',
+    ar: 'الأشخاص المميزون لكل يوم بتوقيت UTC للتطبيق والبيئة المحددين أعلاه، مقسّمين إلى مستخدمين معروفين وضيوف.',
   },
   'activeUsers.card.perDay': { en: 'Active users per day', ar: 'المستخدمون النشطون يوميًا' },
-  'activeUsers.card.apps': { en: 'Apps and environments', ar: 'التطبيقات والبيئات' },
   'activeUsers.stat.apps': { en: 'Apps', ar: 'التطبيقات' },
   'activeUsers.stat.peak': { en: 'Peak', ar: 'الذروة' },
   'activeUsers.stat.identified': { en: 'Identified', ar: 'معروفون' },
   'activeUsers.stat.guests': { en: 'Guests', ar: 'ضيوف' },
-  'activeUsers.empty.pickApp': { en: 'Pick an app to begin', ar: 'اختر تطبيقًا للبدء' },
+  'activeUsers.empty.pickApp': { en: 'Select an app to begin', ar: 'حدّد تطبيقًا للبدء' },
   'activeUsers.empty.pickAppBody': {
-    en: "Tick one or more apps above and choose which environment each one's numbers come from.",
-    ar: 'حدّد تطبيقًا أو أكثر أعلاه واختر البيئة التي تأتي منها أرقام كل تطبيق.',
+    en: 'Choose an app in the top bar; the environment switcher there scopes these numbers too.',
+    ar: 'اختر تطبيقًا من الشريط العلوي؛ ويحدّد مبدّل البيئة هناك نطاق هذه الأرقام أيضًا.',
   },
   'activeUsers.empty.noDays': { en: 'No days in range', ar: 'لا توجد أيام في النطاق' },
   'activeUsers.empty.noDaysBody': {

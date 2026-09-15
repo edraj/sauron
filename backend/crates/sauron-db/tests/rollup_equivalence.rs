@@ -772,6 +772,18 @@ async fn rollup_reads_match_legacy_reads() {
         "active_in_range"
     );
     assert_eq!(l_users.new_in_range, r_users.new_in_range, "new_in_range");
+    assert_eq!(
+        l_users.total_identified, r_users.total_identified,
+        "total_identified"
+    );
+    assert_eq!(
+        l_users.active_identified, r_users.active_identified,
+        "active_identified"
+    );
+    assert_eq!(
+        l_users.new_identified, r_users.new_identified,
+        "new_identified"
+    );
     assert!(
         (l_users.dau - r_users.dau).abs() <= 1,
         "dau {} vs {}",

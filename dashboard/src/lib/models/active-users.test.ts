@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   decodeSelection,
   defaultWindow,
-  describeSelection,
   encodeSelection,
   MAX_SELECTED_APPS,
   selectionCount,
@@ -57,29 +56,6 @@ describe('selectionCount / validateSelection', () => {
     const sel: AppEnvSelection = {};
     for (let i = 0; i < MAX_SELECTED_APPS; i += 1) sel[`app-${i}`] = 'all';
     expect(validateSelection(sel)).toEqual({ ok: true });
-  });
-});
-
-describe('describeSelection', () => {
-  const name = (id: string) => id.toUpperCase();
-  const env = (_appId: string, choice: string) => (choice === 'all' ? 'All environments' : choice);
-
-  it('names the environment when exactly one app is selected', () => {
-    expect(describeSelection({ web: 'prod' }, name, env)).toBe('WEB · prod');
-  });
-
-  it('lists both when two are selected', () => {
-    expect(describeSelection({ web: 'all', api: 'all' }, name, env)).toBe('API, WEB');
-  });
-
-  it('summarises the tail past two', () => {
-    expect(describeSelection({ a: 'all', b: 'all', c: 'all', d: 'all' }, name, env)).toBe(
-      'A, B +2 more',
-    );
-  });
-
-  it('says so when nothing is selected', () => {
-    expect(describeSelection({}, name, env)).toBe('No apps selected');
   });
 });
 

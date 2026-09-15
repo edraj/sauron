@@ -62,23 +62,6 @@ export function validateSelection(
 }
 
 /**
- * A one-line summary for the "Apps" tile. Names the environment only when a
- * single app is selected — with several, the per-app environments differ and a
- * concatenated list reads as one combined filter, which it is not.
- */
-export function describeSelection(
-  sel: AppEnvSelection,
-  appName: (appId: string) => string,
-  envLabel: (appId: string, choice: EnvChoice) => string,
-): string {
-  const ids = Object.keys(sel).sort();
-  if (ids.length === 0) return 'No apps selected';
-  if (ids.length === 1) return `${appName(ids[0])} · ${envLabel(ids[0], sel[ids[0]])}`;
-  const named = ids.slice(0, 2).map(appName).join(', ');
-  return ids.length === 2 ? named : `${named} +${ids.length - 2} more`;
-}
-
-/**
  * The default `[from, to)` window for a range of `rangeDays` whole UTC days
  * ending with today.
  *

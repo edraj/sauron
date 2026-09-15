@@ -9002,7 +9002,60 @@ pub fn list_persons_rollup_sql_for_test(env: EnvFilter) -> String {
             nulls_last: false,
         },
         "last_seen",
+        true,
     )
+}
+
+/// The exact list SQL `list_persons` runs for this scope, shape and sort —
+/// `backfilled` selects the rollup shape (`true`) or the live one. For tests
+/// that read the PLAN (`persons_page_first.rs`): the difference between "page
+/// first, then enrich" and "enrich everyone, then page" is invisible in the
+/// rows and decisive in the runtime.
+pub fn persons_list_sql(
+    env: &EnvFilter,
+    backfilled: bool,
+    sort: &SortSpec,
+    window_column: &'static str,
+    has_search: bool,
+) -> String {
+    if backfilled {
+        list_persons_rollup_sql(env, sort, window_column, has_search)
+    } else {
+        list_persons_live_sql(env, sort, window_column, has_search)
+    }
+}
+
+/// The exact count SQL `count_persons` runs — companion to [`persons_list_sql`].
+///
+/// Under [`EnvFilter::All`] the count reads `event_users` ALONE, in both
+/// shapes and for every sort: the admitted set is exactly the rows the search
+/// and window admit there (both shapes LEFT JOIN their enrichment 1:1), and a
+/// count depends on no ordering. Wrapping the list SQL — as the scoped shapes
+/// still do, because their membership and displayed extrema come from the
+/// enrichment — would run the enrichment for up to `cap + 1` persons to
+/// discard every column of it. Same binds, same positions, so
+/// `count_persons`' one bind chain serves both.
+pub fn persons_count_sql(
+    env: &EnvFilter,
+    backfilled: bool,
+    sort: &SortSpec,
+    window_column: &'static str,
+    has_search: bool,
+) -> String {
+    if matches!(env, EnvFilter::All) {
+        let window = person_window_sql(window_column, 5, 6);
+        let search_sql = person_search_sql(has_search);
+        return format!(
+            "SELECT count(*)::bigint AS total FROM ( \
+                 SELECT 1 FROM event_users \
+                 WHERE app_id=$1 AND {search_sql} \
+                   AND {window} \
+                 LIMIT $3 OFFSET $4 \
+             ) c"
+        );
+    }
+    let inner = persons_list_sql(env, backfilled, sort, window_column, has_search);
+    format!("SELECT count(*)::bigint AS total FROM ({inner}) c")
 }
 
 pub fn list_persons_sql_for_test(env: EnvFilter) -> String {
@@ -9015,6 +9068,7 @@ pub fn list_persons_sql_for_test(env: EnvFilter) -> String {
             nulls_last: false,
         },
         "last_seen",
+        true,
     )
 }
 
@@ -9037,6 +9091,22 @@ pub fn list_persons_sql_for_test(env: EnvFilter) -> String {
 /// questions wearing the same words.
 ///
 /// `column` is a `&'static str` from the route whitelist; see [`TimeWindow`].
+/// The search predicate for a persons query. `$2` is the LIKE pattern in
+/// every shape and is ALWAYS referenced, so the one bind chain in
+/// `list_persons`/`count_persons` never changes; what changes is whether the
+/// jsonb leg is emitted. With no search term the pattern is `%`, and
+/// `properties::text ILIKE '%'` serialises every candidate row's jsonb to
+/// match everything — at 3.5M persons that cast was most of the unscoped
+/// count's runtime (375 ms → see `persons_page_first.rs`). The `distinct_id`
+/// leg alone is a cheap text compare that admits the same rows.
+fn person_search_sql(has_search: bool) -> &'static str {
+    if has_search {
+        "(distinct_id ILIKE $2 OR properties::text ILIKE $2)"
+    } else {
+        "distinct_id ILIKE $2"
+    }
+}
+
 fn person_seen_expr(env: &EnvFilter, rollup: bool, column: &'static str) -> String {
     match (rollup, matches!(env, EnvFilter::All)) {
         // Under `All` BOTH shapes read the durable `event_users` columns — see
@@ -9059,7 +9129,12 @@ fn person_window_sql(expr: &str, from_idx: usize, to_idx: usize) -> String {
     format!("{expr} >= ${from_idx} AND (${to_idx}::timestamptz IS NULL OR {expr} < ${to_idx})")
 }
 
-fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec, window_column: &'static str) -> String {
+fn list_persons_live_sql(
+    env: &EnvFilter,
+    sort: &SortSpec,
+    window_column: &'static str,
+    has_search: bool,
+) -> String {
     // $1 app_id, $2 pattern, $3 limit, $4 offset — env takes $5 when it needs a
     // bind, reused across the three count LATERALs (always emitted, `""` under
     // `All`) and the membership `EXISTS` (only emitted when `scope.env != All`).
@@ -9161,16 +9236,20 @@ fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec, window_column: &'stat
          GREATEST(ae.max_occurred, ee.max_occurred, se.max_last_event) AS last_seen"
             .to_string()
     };
-    // ORDER BY and LIMIT/OFFSET both live on the OUTER query, matching
-    // [`list_devices`] — read that function's ORDER BY comment first, this is
-    // the same trade with a different (worse) window. They used to sit inside
-    // the `eu` subquery, which worked only while the sole ordering was
-    // `last_seen`, a column of `event_users`. `events_count`, `errors_count`
+    // ORDER BY and LIMIT/OFFSET live on the OUTER query for the count sorts
+    // and every scoped read, matching [`list_devices`] — read that function's
+    // ORDER BY comment first, this is the same trade with a different (worse)
+    // window. Under `All` with a durable sort column they go back INSIDE the
+    // `eu` subquery (`person_page_first`), which is exactly where they sat
+    // before Task 3 and exactly the case that regressed: the unscoped Users
+    // Explorer default. They had been moved out because a subquery-level
+    // ORDER BY cannot serve the count sorts at all — `events_count`, `errors_count`
     // and `sessions_count` are produced by the LATERALs below and are not
     // addressable in there at all, and under a scoped read neither are
-    // `first_seen`/`last_seen` — so a subquery-level ORDER BY cannot serve
-    // four of the six sortable columns. One code path for every column beats
-    // two that drift.
+    // `first_seen`/`last_seen`. "One code path for every column" was the
+    // rationale; the cost below is what it bought, and at 3.5M persons that
+    // cost is the request timeout, so the placement is now decided per
+    // (scope, sort) in one place rather than fixed.
     //
     // THE COST, measured with `EXPLAIN` over the exact string this `format!`
     // emits (captured from a running build, not transcribed by hand) against
@@ -9248,14 +9327,28 @@ fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec, window_column: &'stat
     // it. The "second code path" the paragraph above rejects was accepted, with
     // the per-app marker bounding how long both shapes must coexist.
     let order_by = sort.order_by();
+    // Page FIRST when the page can be cut from `event_users` alone — see
+    // `person_page_first`. The three LATERALs then run once per row on the
+    // page (51), not once per person the window admits (133K on a 3.5M-user
+    // app at `since_days=1`), and no blocking Sort consumes them. The outer
+    // ORDER BY stays: joins do not promise to preserve the subquery's order,
+    // and re-sorting ≤ `limit` rows is free.
+    let (inner_page_sql, outer_page_sql) = person_page_first(env, sort, &order_by);
+    // Aliased `eu` ONLY when the ORDER BY moves inside (its tiebreak is
+    // `eu.distinct_id`). Under a scoped read `membership_sql` addresses the
+    // table as `event_users.distinct_id`, which an alias would make
+    // unresolvable: "invalid reference to FROM-clause entry for table
+    // event_users". The two are never both non-empty.
+    let inner_alias = if inner_page_sql.is_empty() { "" } else { " eu" };
+    let search_sql = person_search_sql(has_search);
     format!(
         "SELECT eu.distinct_id, eu.properties, {seen_select}, \
                 COALESCE(ae.cnt,0)::bigint AS events_count, \
                 COALESCE(ee.cnt,0)::bigint AS errors_count, \
                 COALESCE(se.cnt,0)::bigint AS sessions_count \
          FROM ( \
-             SELECT distinct_id, properties, first_seen, last_seen FROM event_users \
-             WHERE app_id=$1 AND (distinct_id ILIKE $2 OR properties::text ILIKE $2){membership_sql}{inner_window_sql} \
+             SELECT distinct_id, properties, first_seen, last_seen FROM event_users{inner_alias} \
+             WHERE app_id=$1 AND {search_sql}{membership_sql}{inner_window_sql}{inner_page_sql} \
          ) eu \
          LEFT JOIN LATERAL (SELECT count(*) cnt, min(occurred_at) min_occurred, \
                     max(occurred_at) max_occurred FROM analytics_events \
@@ -9266,9 +9359,50 @@ fn list_persons_live_sql(env: &EnvFilter, sort: &SortSpec, window_column: &'stat
          LEFT JOIN LATERAL (SELECT count(*) cnt, min(started_at) min_started, \
                     max(last_event_at) max_last_event FROM sessions \
                     WHERE app_id=$1 AND distinct_id = eu.distinct_id{env_sql}) se ON TRUE{outer_window_sql} \
-         ORDER BY {order_by} \
-         LIMIT $3 OFFSET $4"
+         ORDER BY {order_by}{outer_page_sql}"
     )
+}
+
+/// True when `sort.column` is a durable, indexed `event_users` column — the
+/// three the Users Explorer offers besides the counts. Under
+/// [`EnvFilter::All`] the displayed `first_seen`/`last_seen` ARE those columns
+/// (both shapes, see `list_persons_rollup_sql`'s invariant 2), so ordering and
+/// paging can be decided on `event_users` alone.
+fn person_sort_is_durable(sort: &SortSpec) -> bool {
+    matches!(sort.column, "last_seen" | "first_seen" | "eu.distinct_id")
+}
+
+/// Where `ORDER BY … LIMIT $3 OFFSET $4` goes: INSIDE the `event_users`
+/// subquery when the page can be cut there (`All` + a durable sort column),
+/// OUTSIDE otherwise. Returns `(inner, outer)`; exactly one is non-empty.
+///
+/// This is the fix for the unscoped Users page timing out at 3.5M persons.
+/// Both query shapes used to order and page on the OUTER query, after the
+/// per-person enrichment — the three LATERALs in the live shape, the whole-app
+/// `GROUP BY` in the rollup shape — so every page did O(persons the window
+/// admits) work and then kept 51 rows. Measured on the 30M-row bench (50K
+/// persons, marker set): 97 ms and a GroupAggregate over all 140K rollup rows
+/// plus a Seq Scan of every person, per page; that is linear in the audience,
+/// and the production app has 70× the persons.
+///
+/// The inner subquery is aliased `eu` so `SortSpec`'s qualified tiebreak
+/// (`eu.distinct_id`) resolves there too; `first_seen`/`last_seen` resolve to
+/// the table's own columns. `event_users_app_last_seen_idx`,
+/// `event_users_app_first_seen_idx` and the `(app_id, distinct_id)` unique
+/// index each serve one of the three orderings directly.
+///
+/// The count sorts (`events_count`, `errors_count`, `sessions_count`) and
+/// every scoped read keep the outer placement: their sort key does not exist
+/// until after the enrichment.
+fn person_page_first(env: &EnvFilter, sort: &SortSpec, order_by: &str) -> (String, String) {
+    if matches!(env, EnvFilter::All) && person_sort_is_durable(sort) {
+        (
+            format!(" ORDER BY {order_by} LIMIT $3 OFFSET $4"),
+            String::new(),
+        )
+    } else {
+        (String::new(), " LIMIT $3 OFFSET $4".to_string())
+    }
 }
 
 /// The rollup shape, read for apps whose `event_user_environments` backfill has
@@ -9298,6 +9432,7 @@ fn list_persons_rollup_sql(
     env: &EnvFilter,
     sort: &SortSpec,
     window_column: &'static str,
+    has_search: bool,
 ) -> String {
     let env_sql = env.sql_fragment_for("r", 5);
     let order_by = sort.order_by();
@@ -9325,6 +9460,49 @@ fn list_persons_rollup_sql(
     } else {
         "r.first_seen AS first_seen, r.last_seen AS last_seen"
     };
+    let search_sql = person_search_sql(has_search);
+    // The grouped shape filters on the OUTER `eu`, so qualify.
+    let eu_search_sql = if has_search {
+        "(eu.distinct_id ILIKE $2 OR eu.properties::text ILIKE $2)"
+    } else {
+        "eu.distinct_id ILIKE $2"
+    };
+    if matches!(env, EnvFilter::All) {
+        // Unscoped: `event_users` decides membership, the window and (for a
+        // durable sort) the page; the rollup only supplies the three counts,
+        // summed per person by one probe of `event_user_env_key_idx`. LEFT
+        // JOIN + COALESCE, matching the live shape: a person whose every
+        // signal was tiered away before the backfill has no rollup row but is
+        // still a person, and the unscoped page must not lose them on the day
+        // the marker lands (invariant 2 above, applied to the row set).
+        //
+        // For the count sorts the page cannot be cut before the sums, so the
+        // LATERAL runs once per admitted person — the same O(persons) the
+        // pre-fix shape had, on the same index, now without the whole-app
+        // GroupAggregate + hash join. Not the hot path: the Explorer's
+        // default and its two other durable sorts take the paged branch.
+        let bare_window = person_window_sql(window_column, from_idx, from_idx + 1);
+        let (inner_page_sql, outer_page_sql) = person_page_first(env, sort, &order_by);
+        return format!(
+            "SELECT eu.distinct_id, eu.properties, {seen_select}, \
+                    COALESCE(r.events_count, 0)::bigint AS events_count, \
+                    COALESCE(r.errors_count, 0)::bigint AS errors_count, \
+                    COALESCE(r.sessions_count, 0)::bigint AS sessions_count \
+             FROM ( \
+                 SELECT distinct_id, properties, first_seen, last_seen FROM event_users eu \
+                 WHERE app_id=$1 AND {search_sql} \
+                   AND {bare_window}{inner_page_sql} \
+             ) eu \
+             LEFT JOIN LATERAL ( \
+                 SELECT sum(events_count)::bigint AS events_count, \
+                        sum(errors_count)::bigint AS errors_count, \
+                        sum(sessions_count)::bigint AS sessions_count \
+                 FROM event_user_environments r \
+                 WHERE r.app_id=$1 AND r.distinct_id = eu.distinct_id \
+             ) r ON TRUE \
+             ORDER BY {order_by}{outer_page_sql}"
+        );
+    }
     format!(
         "SELECT eu.distinct_id, eu.properties, {seen_select}, \
                 r.events_count AS events_count, \
@@ -9341,7 +9519,7 @@ fn list_persons_rollup_sql(
              GROUP BY app_id, distinct_id \
          ) r \
          JOIN event_users eu ON eu.app_id = r.app_id AND eu.distinct_id = r.distinct_id \
-         WHERE (eu.distinct_id ILIKE $2 OR eu.properties::text ILIKE $2) \
+         WHERE {eu_search_sql} \
            AND {window_pred} \
          ORDER BY {order_by} \
          LIMIT $3 OFFSET $4"
@@ -9367,9 +9545,9 @@ pub async fn list_persons(
     // can never be visible before the data it claims — a marker that ran ahead of
     // its data would make this page quiet-wrong rather than error.
     let q = if crate::person_env_backfill::is_backfilled(conn, scope.app_id).await? {
-        list_persons_rollup_sql(&scope.env, &sort, window.column)
+        list_persons_rollup_sql(&scope.env, &sort, window.column, search.is_some())
     } else {
-        list_persons_live_sql(&scope.env, &sort, window.column)
+        list_persons_live_sql(&scope.env, &sort, window.column, search.is_some())
     };
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -10404,6 +10582,18 @@ pub struct UserStats {
     pub active_in_range: i64,
     #[diesel(sql_type = BigInt)]
     pub new_in_range: i64,
+    /// How many of `total_users` / `active_in_range` / `new_in_range` carry
+    /// `event_users.identified_at` — a person named by `identify()` or a
+    /// matching `context.user.id` (migration 38), as opposed to an SDK-minted
+    /// anonymous id. Guests are the remainder, so the wire carries only this
+    /// side. Not offered for dau/wau/mau: those are distinct-id counts (raw)
+    /// or day sketches (rollup) with no per-person flag to filter on.
+    #[diesel(sql_type = BigInt)]
+    pub total_identified: i64,
+    #[diesel(sql_type = BigInt)]
+    pub active_identified: i64,
+    #[diesel(sql_type = BigInt)]
+    pub new_identified: i64,
     #[diesel(sql_type = BigInt)]
     pub dau: i64,
     #[diesel(sql_type = BigInt)]
@@ -10481,6 +10671,9 @@ pub async fn user_stats(
            (SELECT count(*) FROM event_users WHERE app_id=$1{membership_sql})::bigint AS total_users, \
            (SELECT count(*) FROM event_users WHERE app_id=$1 AND last_seen>=$2{membership_sql}{up_last_seen})::bigint AS active_in_range, \
            (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql}{up_first_seen})::bigint AS new_in_range, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND identified_at IS NOT NULL{membership_sql})::bigint AS total_identified, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND identified_at IS NOT NULL AND last_seen>=$2{membership_sql}{up_last_seen})::bigint AS active_identified, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND identified_at IS NOT NULL AND first_seen>=$2{membership_sql}{up_first_seen})::bigint AS new_identified, \
            (SELECT count(DISTINCT distinct_id) FROM ( \
               SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= ${b1}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
               UNION ALL \
@@ -20078,12 +20271,14 @@ pub async fn count_persons(
     cap: i64,
 ) -> QueryResult<(i64, bool)> {
     let pattern = search.map(like_contains).unwrap_or_else(|| "%".to_string());
-    let inner = if crate::person_env_backfill::is_backfilled(conn, scope.app_id).await? {
-        list_persons_rollup_sql(&scope.env, &sort, window.column)
-    } else {
-        list_persons_live_sql(&scope.env, &sort, window.column)
-    };
-    let q = format!("SELECT count(*)::bigint AS total FROM ({inner}) c");
+    let backfilled = crate::person_env_backfill::is_backfilled(conn, scope.app_id).await?;
+    let q = persons_count_sql(
+        &scope.env,
+        backfilled,
+        &sort,
+        window.column,
+        search.is_some(),
+    );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
         .bind::<SqlUuid, _>(scope.app_id)

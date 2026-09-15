@@ -121,6 +121,17 @@
 
   let range = $state<DateRangeValue>(rangeStore.effective(30));
   /** The window in words, under the tiles it applies to. */
+  /**
+   * "caption · N identified / M guests" for the three tiles that count
+   * `event_users` rows, which carry the identified flag. DAU/WAU/MAU do not
+   * get one: they are distinct-id counts or day sketches with no per-person
+   * flag, and inventing a split there would be a guess dressed as a number.
+   */
+  function split(caption: string, total: number, identified: number): string {
+    const guests = Math.max(0, total - identified);
+    return `${caption} · ${compactNumber(identified)} ${t('users.identifiedShort')} / ${compactNumber(guests)} ${t('users.guestsShort')}`;
+  }
+
   const rangeCaption = $derived(
     range.kind === 'last'
       ? `last ${spanDays(range)}d`
@@ -320,9 +331,9 @@
   <div class="audience">
     {#if analytics}
       <StatTiles min={150}>
-        <StatTile label={t('users.stat.total')} value={compactNumber(analytics.stats.total_users)} tone="primary" sub="all time" />
-        <StatTile label={t('users.stat.active')} value={compactNumber(analytics.stats.active_in_range)} sub={rangeCaption} />
-        <StatTile label={t('users.stat.new')} value={compactNumber(analytics.stats.new_in_range)} sub={rangeCaption} />
+        <StatTile label={t('users.stat.total')} value={compactNumber(analytics.stats.total_users)} tone="primary" sub={split('all time', analytics.stats.total_users, analytics.stats.total_identified)} />
+        <StatTile label={t('users.stat.active')} value={compactNumber(analytics.stats.active_in_range)} sub={split(rangeCaption, analytics.stats.active_in_range, analytics.stats.active_identified)} />
+        <StatTile label={t('users.stat.new')} value={compactNumber(analytics.stats.new_in_range)} sub={split(rangeCaption, analytics.stats.new_in_range, analytics.stats.new_identified)} />
         <!-- `stats.dau` has always been in the payload and in the `UserStats`
              model; the tile was simply never rendered, which is why this page
              shows a stickiness ratio whose numerator is invisible. -->

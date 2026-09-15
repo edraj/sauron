@@ -465,6 +465,12 @@ struct EventUserLegs {
     active_in_range: i64,
     #[diesel(sql_type = BigInt)]
     new_in_range: i64,
+    #[diesel(sql_type = BigInt)]
+    total_identified: i64,
+    #[diesel(sql_type = BigInt)]
+    active_identified: i64,
+    #[diesel(sql_type = BigInt)]
+    new_identified: i64,
 }
 
 #[derive(QueryableByName)]
@@ -536,7 +542,10 @@ pub async fn user_stats(
         "SELECT \
            (SELECT count(*) FROM event_users WHERE app_id=$1{membership_sql})::bigint AS total_users, \
            (SELECT count(*) FROM event_users WHERE app_id=$1 AND last_seen>=$2{membership_sql}{up_last_seen})::bigint AS active_in_range, \
-           (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql}{up_first_seen})::bigint AS new_in_range"
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND first_seen>=$2{membership_sql}{up_first_seen})::bigint AS new_in_range, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND identified_at IS NOT NULL{membership_sql})::bigint AS total_identified, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND identified_at IS NOT NULL AND last_seen>=$2{membership_sql}{up_last_seen})::bigint AS active_identified, \
+           (SELECT count(*) FROM event_users WHERE app_id=$1 AND identified_at IS NOT NULL AND first_seen>=$2{membership_sql}{up_first_seen})::bigint AS new_identified"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -564,6 +573,9 @@ pub async fn user_stats(
         total_users: legs.total_users,
         active_in_range: legs.active_in_range,
         new_in_range: legs.new_in_range,
+        total_identified: legs.total_identified,
+        active_identified: legs.active_identified,
+        new_identified: legs.new_identified,
         dau: dau.estimate(),
         wau: wau.estimate(),
         mau: mau.estimate(),

@@ -221,7 +221,7 @@ const BACKEND_REJECTS_ENVIRONMENT_ID: RegExp[] = [
 // handler and narrowing works (`http_release_scoping.rs` drives exactly
 // that) — but the DASHBOARD must never ask it to. This is the list behind the
 // release switcher, and each entry carries the `environment_ids` that have
-// reported it; `AppEnvPicker` reads those to narrow the environment dropdown
+// reported it; the Topbar reads those to narrow the environment dropdown
 // once a release is chosen. Scoping the request to the currently selected
 // environment would pre-filter that answer to the one environment already
 // selected, so picking a release could never reveal that it also reports from

@@ -716,10 +716,10 @@ async fn all_person_ids(h: &mut Harness, sort: &str) -> Vec<String> {
 ///
 /// Unlike [`devices_page_stably_when_last_seen_ties`], this one DOES
 /// discriminate the tiebreak — measured, see the task report's `EXPLAIN`
-/// section. `event_users_app_last_seen_idx` cannot serve this ORDER BY,
-/// because after Task 3 the ordering is applied on the OUTER query, above the
-/// three `ae`/`ee`/`se` LATERALs, so the plan carries a real blocking `Sort`
-/// whose output for tied rows differs between a small and a large `OFFSET`.
+/// section. Since the page-first fix (`persons_page_first.rs`) an unscoped
+/// `last_seen` sort is served by `event_users_app_last_seen_idx` inside the
+/// paging subquery, where the index yields tied rows in heap order — still
+/// not a total order without the tiebreak, so the guard stands.
 #[tokio::test]
 async fn persons_page_stably_when_last_seen_ties() {
     let Some(mut h) = harness().await else { return };
