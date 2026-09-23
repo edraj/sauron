@@ -9,6 +9,7 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
+  import SortableTh from '../lib/components/SortableTh.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
@@ -37,6 +38,9 @@
     parseFilters,
     type Filter,
   } from '../lib/components/filters/filters';
+  import { untrack } from 'svelte';
+  import { sortParam, type SortDir } from '../lib/models/sort';
+  import { cursorGoTo, setCursorSort, type CursorListState } from '../lib/models/list-state';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
@@ -49,11 +53,9 @@
     canGoBack,
     cursorOf,
     emptyPage,
-    goToPage,
     offsetOf,
     pageKey,
     pageNumber,
-    type CursorPage,
   } from '../lib/models/cursor-page';
   import { panelScopeNote } from '../lib/models/panel-scope';
   import type { Issue, IssueStats } from '../lib/models';
@@ -162,17 +164,27 @@
   const staleError = $derived(error !== null && issuesView.hasData);
 
   /**
-   * Which page of the keyset walk is on screen.
+   * Which ordering the walk runs under, and which page of it is on screen.
    *
-   * `$state.raw` because the reducer replaces the object wholesale and never
-   * edits it in place, so the deep proxy would be pure overhead.
+   * One field, not two: a keyset cursor addresses a position within ONE
+   * ordering, so a sort change has to reset the page with it — see
+   * `models/list-state.ts` for why the reducers there are the only way to
+   * move either half. `$state.raw` because those reducers replace the object
+   * wholesale and never edit it in place, so the deep proxy would be pure
+   * overhead.
    *
-   * Moved by a click, or reset by the predicate effect below — never by a
-   * response. `models/cursor-page.ts` explains why that separation is the
-   * whole design, and what breaks without it (a Refresh on page 2 silently
-   * stepping the state to page 3).
+   * Moved by a click (`toPage`, `onsort`), or reset by the predicate effect
+   * below — never by a response. `models/cursor-page.ts` explains why that
+   * separation is the whole design, and what breaks without it (a Refresh on
+   * page 2 silently stepping the state to page 3).
+   *
+   * `last_seen` newest-first is the server's own default, so a fresh visit
+   * sends the same ordering it always did.
    */
-  let page = $state.raw<CursorPage>(emptyPage());
+  let list = $state.raw<CursorListState>({
+    sort: { key: 'last_seen', dir: 'desc' },
+    page: emptyPage(),
+  });
 
   /**
    * The cursor for the NEXT page, read off the envelope that produced the rows
@@ -268,7 +280,7 @@
    * issues` in the caption above an empty table.
    */
   const emptyPastFirstPage = $derived(
-    !loading && !fatalError && issues.length === 0 && canGoBack(page),
+    !loading && !fatalError && issues.length === 0 && canGoBack(list.page),
   );
 
   /**
@@ -389,15 +401,18 @@
    * status change still clears all of them: `ViewCache.invalidate` matches on
    * the raw key string, and every one of these keys starts with the view name.
    */
-  async function load(appId: string, q: string, p: CursorPage, force = false) {
+  async function load(appId: string, q: string, l: CursorListState, force = false) {
     const enc = encodeFilters(filters);
-    const cursor = cursorOf(p);
-    const offset = offsetOf(p);
+    const cursor = cursorOf(l.page);
+    const offset = offsetOf(l.page);
+    const sort = sortParam(l.sort);
     await issuesView.load(
       // `pageKey`, NOT `cursor`: a page reached by a numbered jump carries a
       // null cursor, which is what page 1 carries — keyed on the cursor alone,
       // page 7 would hash to page 1's entry and repaint the first page out of
-      // the cache with no request on the wire to notice.
+      // the cache with no request on the wire to notice. The sort is in the
+      // key for the plainer reason that page 1 by events is not page 1 by
+      // last seen.
       viewKey(
         'issues.list',
         appId,
@@ -405,7 +420,8 @@
         enc,
         q,
         rangeKey(range),
-        pageKey(p),
+        sort,
+        pageKey(l.page),
       ),
       () =>
         listIssues(appId, {
@@ -413,6 +429,7 @@
           query: q || undefined,
           ...toPredicate(range),
           limit: ISSUES_LIMIT,
+          sort,
           cursor,
           offset,
         }),
@@ -426,7 +443,7 @@
    * request would re-run on its own write; this way the effect depends only on
    * the predicate inputs, and paging never enters it.
    */
-  function toPage(p: CursorPage) {
+  function toPage(next: CursorListState) {
     const aid = sessionStore.currentAppId;
     // The walk does not move unless the request can actually be issued. Written
     // the other way round — state first, request only `if (aid)` — a click with
@@ -434,28 +451,46 @@
     // and no way out but a filter change. `AppShell requireApp` makes that
     // unreachable in practice, so this guards a shape rather than a live bug.
     if (!aid) return;
-    page = p;
+    list = next;
     walked = true;
-    void load(aid, appliedSearch, p);
+    void load(aid, appliedSearch, next);
+  }
+
+  /**
+   * The sort-header click handler for the three sortable columns.
+   *
+   * `setCursorSort` resets the walk onto the new ordering — a keyset cursor
+   * only addresses a position within the ordering that minted it, so a sort
+   * change cannot keep the old page — and this reloads directly for the same
+   * reason `toPage` does: the predicate effect below must not depend on
+   * `list` (see its comment), so nothing else will notice this write.
+   */
+  function onsort(key: string, columnDefault: SortDir) {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    const next = setCursorSort(list, key, columnDefault);
+    list = next;
+    walked = false;
+    void load(aid, appliedSearch, next);
   }
 
   /**
    * Move to a numbered page.
    *
-   * `goToPage` refuses any move it cannot make — the target already on screen,
-   * no next cursor to step with, a page below 1 — and says so by handing back
-   * the very object it was given. Testing identity keeps every one of those
-   * rules in the reducer, and skips the reload rather than refetching the page
-   * already on screen.
+   * `cursorGoTo` refuses any move it cannot make — the target already on
+   * screen, no next cursor to step with, a page below 1 — and says so by
+   * handing back the very object it was given. Testing identity keeps every
+   * one of those rules in the reducer, and skips the reload rather than
+   * refetching the page already on screen.
    */
   function onjump(target: number) {
-    const next = goToPage(page, target, nextCursor, ISSUES_LIMIT);
-    if (next !== page) toPage(next);
+    const next = cursorGoTo(list, target, nextCursor, ISSUES_LIMIT);
+    if (next !== list) toPage(next);
   }
 
   /** The empty-state's "Back a page" escape hatch, in terms of the same reducer. */
   function goPrev() {
-    onjump(pageNumber(page) - 1);
+    onjump(pageNumber(list.page) - 1);
   }
 
   async function loadStats(appId: string, win: DateRangeValue, force = false) {
@@ -475,7 +510,7 @@
       // `page` unchanged: Refresh means "this page again, current data", and a
       // refresh that also moved you off the rows you were reading would be a
       // different control.
-      await Promise.all([load(aid, appliedSearch, page, true), loadStats(aid, range, true)]);
+      await Promise.all([load(aid, appliedSearch, list, true), loadStats(aid, range, true)]);
     } finally {
       refreshing = false;
     }
@@ -519,17 +554,21 @@
     // against a different environment or release, which is why touching
     // `scopeKeyWithRelease` above has to reset this too and not merely refetch.
     //
-    // Written but never READ here, and the load takes the fresh page as an
-    // argument rather than reading the state back: an effect that read `page`
-    // would re-run on its own write, which is how this project's last
-    // self-defeating reset effect looped.
-    const first = emptyPage();
-    page = first;
+    // Written but never READ REACTIVELY here, and the load takes the fresh
+    // list as an argument rather than reading the state back: an effect that
+    // depended on `list` would re-run on its own write, which is how this
+    // project's last self-defeating reset effect looped. `list.sort` is read
+    // through `untrack` for exactly that reason — the ordering survives a
+    // predicate change (a reader sorted by events who adds a chip stays sorted
+    // by events), but reading it tracked would make `toPage`/`onsort`'s own
+    // writes re-trigger this effect and reset the move they just made.
+    const next: CursorListState = { sort: untrack(() => list.sort), page: emptyPage() };
+    list = next;
     // The walk is over, so the pager goes with it: page one of a new predicate
     // gets the plain spinner it had before any of this, not a pager hovering
     // above it.
     walked = false;
-    void load(aid, s, first);
+    void load(aid, s, next);
   });
 
   $effect(() => {
@@ -617,7 +656,7 @@
           size="sm"
           onclick={() =>
             sessionStore.currentAppId &&
-            load(sessionStore.currentAppId, appliedSearch, page, true)}
+            load(sessionStore.currentAppId, appliedSearch, list, true)}
         >
           {t('ui.tryAgain')}
         </Button>
@@ -645,7 +684,7 @@
               variant="secondary"
               onclick={() =>
                 sessionStore.currentAppId &&
-                load(sessionStore.currentAppId, appliedSearch, page, true)}
+                load(sessionStore.currentAppId, appliedSearch, list, true)}
             >
               {t('common.retry')}
             </Button>
@@ -686,9 +725,13 @@
             <th class="col-title">{t('issues.column.issue')}</th>
             <th>{t('issues.column.level')}</th>
             <th>{t('common.status')}</th>
-            <th class="num">{t('overview.stat.events')}</th>
-            <th class="num">{t('overview.stat.users')}</th>
-            <th>{t('issues.column.lastSeen')}</th>
+            <!-- Counts and times default to descending: "sort by events"
+                 means noisiest first. Under an environment scope the server
+                 ranks these two by the environment's own counts — the numbers
+                 in the cells — not the app-wide totals. -->
+            <SortableTh key="times_seen" class="num" sort={list.sort} {onsort}>{t('overview.stat.events')}</SortableTh>
+            <SortableTh key="users_seen" class="num" sort={list.sort} {onsort}>{t('overview.stat.users')}</SortableTh>
+            <SortableTh key="last_seen" sort={list.sort} {onsort}>{t('issues.column.lastSeen')}</SortableTh>
           </tr>
         {/snippet}
         {#snippet children()}
@@ -728,7 +771,7 @@
       <CursorPagination
         {total}
         {totalIsCapped}
-        page={pageNumber(page)}
+        page={pageNumber(list.page)}
         limit={ISSUES_LIMIT}
         canNext={nextCursor !== null}
         busy={loading || revalidating}

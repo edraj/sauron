@@ -218,23 +218,28 @@
 </div>
 
 <style>
+  /* `min-height`, not `height`: `between` mode carries two datetime inputs and
+     a zone label, which must be free to wrap on a narrow viewport. On one line
+     it is exactly `--control-h`: 3px inset + 28px controls + 1px border. */
   .timefilter {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     flex-wrap: wrap;
-    padding: 4px 6px;
+    min-height: var(--control-h);
+    padding: 3px 4px;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
   }
   .timefilter select,
   .timefilter input {
+    height: 28px;
     background: var(--surface);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    padding: 4px 6px;
+    padding: 0 6px;
     font-size: 12.5px;
   }
   .static-field,

@@ -88,6 +88,42 @@ pub fn classify(node: &ResolvedNode) -> Cost {
     }
 }
 
+/// Does a `Cost::Scan` verdict for `node` rest on a leaf that is NOT `local`?
+///
+/// `classify` says *whether* a query scans; this says *which leaves* the scan
+/// is attributable to, so a caller that knows one table is cheap to scan (the
+/// `issues` table, whose rows are fingerprints, not events) can skip the
+/// window clamp when every scanning leaf lives there. Free text is never
+/// local — every planner matches it against the widest columns it reaches.
+///
+/// The walk mirrors `classify`'s combination rules leaf for leaf, so a leaf
+/// that `classify` neutralises is not counted here either:
+///
+/// - `And` with an `Indexed` child is `Indexed` overall, so none of its
+///   scanning siblings drive the verdict — they are checked against an
+///   already-bounded candidate set;
+/// - `Or` runs every branch, so a non-local scan in any branch counts;
+/// - `Not` is no worse than its inner node.
+///
+/// Returns `false` for a node that does not scan at all, so the caller must
+/// still check `classify(node) == Cost::Scan` first (or accept that `false`
+/// means "no non-local scan", not "no scan").
+pub fn scan_rests_outside(node: &ResolvedNode, local: &dyn Fn(&ResolvedPredicate) -> bool) -> bool {
+    match node {
+        ResolvedNode::And(v) => {
+            if v.iter().any(|c| classify(c) == Cost::Indexed) {
+                false
+            } else {
+                v.iter().any(|c| scan_rests_outside(c, local))
+            }
+        }
+        ResolvedNode::Or(v) => v.iter().any(|c| scan_rests_outside(c, local)),
+        ResolvedNode::Not(b) => scan_rests_outside(b, local),
+        ResolvedNode::Pred(p) => predicate_cost(p) == Cost::Scan && !local(p),
+        ResolvedNode::Text(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +305,58 @@ mod tests {
             cost("is:unresolved (title:*a* OR culprit:*b*)", Resource::Issues),
             Cost::Indexed
         );
+    }
+
+    // -- `scan_rests_outside` ------------------------------------------------
+
+    /// `title`/`culprit` stand in for "local"; everything else is "outside".
+    fn outside(q: &str, r: Resource) -> bool {
+        let node = resolve(&parse(q).unwrap(), r).unwrap();
+        scan_rests_outside(&node, &|p| matches!(p.dim.name, "title" | "culprit"))
+    }
+
+    #[test]
+    fn a_local_wildcard_alone_does_not_rest_outside() {
+        assert!(!outside("title:*boom*", Resource::Issues));
+        assert!(!outside("culprit:~handler", Resource::Issues));
+    }
+
+    #[test]
+    fn free_text_always_rests_outside() {
+        assert!(outside("boom", Resource::Issues));
+        assert!(outside("title:*boom* boom", Resource::Issues));
+    }
+
+    #[test]
+    fn a_non_local_scan_leaf_rests_outside() {
+        assert!(outside("tag.region:~eu", Resource::Issues));
+        assert!(outside("title:*boom* tag.region:~eu", Resource::Issues));
+        assert!(outside("title:*boom* OR tag.region:~eu", Resource::Issues));
+        assert!(outside("!tag.region:~eu", Resource::Issues));
+    }
+
+    #[test]
+    fn a_bounded_non_local_sibling_is_not_a_scan_and_does_not_count() {
+        // `release:1.4.0` is `Bounded` (an equality bridge), so the only
+        // scanning leaf is the local `title` wildcard — exactly the shape the
+        // release switcher produces by ANDing `release:<x>` into every query.
+        assert!(!outside("title:*boom* release:1.4.0", Resource::Issues));
+        assert!(!outside("title:*boom* !release:1.4.0", Resource::Issues));
+        assert!(!outside("title:*boom* OR release:1.4.0", Resource::Issues));
+    }
+
+    #[test]
+    fn an_indexed_sibling_neutralises_a_non_local_scan_as_classify_does() {
+        // `classify` says `Indexed` for this `And`, so the tag scan never
+        // drives a clamp; the walker must agree rather than over-report.
+        let q = "(is:unresolved tag.region:~eu) OR title:*boom*";
+        assert_eq!(cost(q, Resource::Issues), Cost::Scan);
+        assert!(!outside(q, Resource::Issues));
+    }
+
+    #[test]
+    fn a_query_that_does_not_scan_never_rests_outside() {
+        assert!(!outside("is:unresolved", Resource::Issues));
+        assert!(!outside("release:1.4.0", Resource::Issues));
     }
 }

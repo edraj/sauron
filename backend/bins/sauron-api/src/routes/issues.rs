@@ -31,8 +31,11 @@ pub struct ListQuery {
     /// resolve longest-suffix-first, so `m` means minutes.
     #[param(example = "level:error @release:1.4.2 last_seen:>7d sort=-last_seen")]
     pub query: Option<String>,
-    /// `column` or `-column`. Restricted to keyset-backed orderings — see
-    /// `search::parse_sort`.
+    /// `column` or `-column`: `last_seen` (the default), `first_seen`,
+    /// `times_seen` or `users_seen`. Restricted to keyset-backed orderings —
+    /// see `search::parse_sort`. Under an environment scope the two count
+    /// orderings rank by that environment's own counts, the numbers the rows
+    /// show, not by the app-wide totals.
     pub sort: Option<String>,
     /// Opaque token from the previous page's `next_cursor`.
     pub cursor: Option<String>,
@@ -77,6 +80,27 @@ fn default_limit() -> i64 {
 /// unparameterised request, which is precisely the defect that made
 /// `analytics::events_list` serve 365 days while its default claimed 3650.
 pub(super) const ISSUES_MAX_SINCE_DAYS: i64 = 3650;
+
+/// The planner's clamp for an occurrence query, dropped when the issue is
+/// small enough that the scan is already bounded by the issue itself.
+///
+/// An occurrence query is scoped to one issue, so its candidate set is not
+/// "every partition" but "this issue's rows in the window", walked through
+/// `error_events_issue_idx (issue_id, occurred_at)`. `times_seen` only ever
+/// increments (`repo::upsert_issue`: `times_seen + 1`; purges and tiering
+/// only remove rows), so it is an upper bound on the rows such a scan can
+/// read, and a tighter one than the planner's 30-day window — a hot issue
+/// with a million rows in the last month costs the same clamped or not. The
+/// ceiling and its measurement are `search::SCAN_UNCLAMPED_MAX_ROWS`.
+///
+/// Used by BOTH `events` and `event_stats`, because a total computed over a
+/// different window than the list it captions is a lie; keep it that way.
+fn occurrence_scan_clamp(
+    times_seen: i64,
+    planner: Option<sauron_db::query_plan::prepare::Clamp>,
+) -> Option<sauron_db::query_plan::prepare::Clamp> {
+    super::search::bounded_scan_clamp(Some(times_seen), planner)
+}
 
 fn default_since_days() -> i64 {
     ISSUES_MAX_SINCE_DAYS
@@ -261,11 +285,20 @@ pub async fn list(
         super::search::EnvNameReach::for_perms(&perms),
     )?;
 
-    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
-        .await
-        .map_err(super::search::map_plan_error)?;
-    let (sort_col, descending) =
-        super::search::parse_sort(q.sort.as_deref(), &["last_seen", "first_seen"], "last_seen")?;
+    let prepared = sauron_db::query_plan::prepare::prepare(
+        &node,
+        sauron_query::Resource::Issues,
+        app_id,
+        Utc::now(),
+        &mut conn,
+    )
+    .await
+    .map_err(super::search::map_plan_error)?;
+    let (sort_col, descending) = super::search::parse_sort(
+        q.sort.as_deref(),
+        &["last_seen", "first_seen", "times_seen", "users_seen"],
+        "last_seen",
+    )?;
     // `parse_sort` already refused anything outside the whitelist, so this
     // cannot be `None` — but the two lists are in different modules and an
     // `expect` here would be a panic when they drift. A 400 naming the column
@@ -277,22 +310,21 @@ pub async fn list(
     })?;
     let after = match q.cursor.as_deref() {
         Some(c) => Some(
-            // Literal `true`, not a call through `IssueSort` — there is no
-            // `IssueSort::is_temporal` to call. Unlike `EventSort`/
-            // `OccurrenceSort` (see Task 2's doc comment on those), Issues
-            // sorting has not been widened past `last_seen`/`first_seen`,
-            // both of which `cursor_ts` below always wraps in
-            // `CursorValue::Ts`, so every cursor this route mints or reads is
-            // temporal, unconditionally.
-            sauron_db::query_plan::cursor::decode(c, &sort_col, true)
+            // `sort.cursor_kind()` is what stops a cursor minted under a
+            // timestamp ordering from paging a count ordering (or a forged
+            // `s:`/`t:` payload from paging either): the count sorts carry an
+            // integer, the temporal ones a timestamp.
+            sauron_db::query_plan::cursor::decode(c, &sort_col, sort.cursor_kind())
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?,
         ),
         None => None,
     };
 
-    // `Clamp.field` is the GENERIC name "since" — `prepare` does not know
-    // which resource it ran for, so mapping the window onto this resource's
-    // real column is the caller's job. On Issues that column is `last_seen`.
+    // `Clamp.field` is the GENERIC name "since"; mapping the window onto this
+    // resource's real column is the caller's job. On Issues that column is
+    // `last_seen`. Note `prepare` skips the clamp for an Issues scan confined
+    // to `issues`' own columns (`title:*boom*`), so `clamp` is `None` more
+    // often here than on the occurrence lists — see `prepare.rs`'s nuance note.
     // `resolve_window` owns the tightening rule and, crucially, the matching
     // disclosure: the window reported in `clamped` is the window served.
     let window = super::search::resolve_window(
@@ -336,35 +368,32 @@ pub async fn list(
     // must not be served.
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
-    // The cursor's timestamp is read through `sort`, not off `last_seen`
-    // directly: a cursor carrying `last_seen` while the walk orders by
-    // `first_seen` would skip and repeat whole pages.
-    //
-    // `IssueSort` carries no `cursor_value` (unlike `EventSort`/
-    // `OccurrenceSort` — see Task 2's doc comment on those): Issues sorting is
-    // deliberately not widened past `last_seen`/`first_seen` here, so there is
-    // no nullable-column coalescing rule to centralise yet. `cursor_ts` is
-    // wrapped in `CursorValue::Ts` directly; the `key` is new (it is what lets
-    // `decode` refuse a cursor minted under the other of the two columns).
+    // The cursor's value is read through `sort.cursor_value`, not off
+    // `last_seen` directly: a cursor carrying `last_seen` while the walk
+    // orders by `first_seen` (or `times_seen`) would skip and repeat whole
+    // pages. The `key` is what lets `decode` refuse a cursor minted under
+    // another column.
     //
     // **This mint must stay ABOVE the Phase 2 `apply_issue_env_stats` call
     // below** — see "Position is load bearing, twice over" on that call for
     // the full reasoning; in short, Phase 2 overwrites `last_seen`/
-    // `first_seen` on `rows` with per-environment values, and the keyset walk
-    // above ordered on the STORED ones, so a cursor built from an
-    // already-overwritten row would aim the next page at an unrelated point
-    // in the ordering — skipping rows on some pages and repeating them on
-    // others, the exact defect this slice removed. The sibling occurrences
-    // route (`events` below) states the same "build the cursor before
-    // anything else can rewrite the row" rule at its own mint site, even
-    // though nothing there is load-bearing YET. Whoever widens `IssueSort`
-    // past `last_seen`/`first_seen` and is tempted to move this block: don't,
-    // without moving Phase 2 with it.
+    // `first_seen`/`times_seen`/`users_seen` on `rows` with per-environment
+    // values, and the keyset walk above ordered on the STORED ones, so a
+    // cursor built from an already-overwritten row would aim the next page at
+    // an unrelated point in the ordering — skipping rows on some pages and
+    // repeating them on others, the exact defect this slice removed.
+    //
+    // The one path where the row's counts have ALREADY been rewritten by the
+    // time it reaches here — a count sort under an environment scope,
+    // `repo::search_issues_by_env_count` — is also the one path whose
+    // ordering was computed over those rewritten values, so reading the
+    // cursor off the row is right there too; Phase 2 is skipped for it below
+    // precisely so nothing rewrites the row a second time.
     let next_cursor = has_more.then(|| {
         let last = rows.last().expect("has_more implies a row");
         sauron_db::query_plan::cursor::encode(&sauron_db::query_plan::cursor::Cursor {
             key: sort_col.clone(),
-            value: sauron_db::query_plan::cursor::CursorValue::Ts(sort.cursor_ts(last)),
+            value: sort.cursor_value(last),
             id: last.id,
         })
     });
@@ -396,7 +425,15 @@ pub async fn list(
     // app-wide truth there (and are maintained at ingest, so they can see
     // data `sauron-tier` has since exported out of `error_events`), which
     // makes a second query on the commonest path pure cost.
-    if !matches!(scope.env, sauron_db::scope::EnvFilter::All) {
+    //
+    // Also skipped when the sort ranked by the environment's counts: that
+    // path (`repo::search_issues_by_env_count`) derived and applied these
+    // same values for every candidate before paging, so the rows already
+    // carry them and deriving again would be a second scan for an identical
+    // answer.
+    if !matches!(scope.env, sauron_db::scope::EnvFilter::All)
+        && !sort.ranks_by_env_count(&scope.env)
+    {
         let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
         let stats = repo::issue_env_stats(&mut conn, &scope, &ids, since)
             .await
@@ -639,8 +676,9 @@ pub async fn events(
     // Confirm the issue belongs to this app before returning its events (prevents
     // reading another app's events by passing a foreign issue_id). The WHERE
     // clauses below carry `app_id` too — this is the first of two layers, not
-    // a substitute for the second.
-    repo::get_issue(&mut conn, scope.clone(), issue_id)
+    // a substitute for the second. The row is kept for its `times_seen`,
+    // which bounds the clamp decision below.
+    let issue = repo::get_issue(&mut conn, scope.clone(), issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     // Same reach as the body gate above, from the same predicate: this route's
@@ -689,9 +727,15 @@ pub async fn events(
         super::search::EnvNameReach::for_perms(&perms),
     )?;
 
-    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
-        .await
-        .map_err(super::search::map_plan_error)?;
+    let prepared = sauron_db::query_plan::prepare::prepare(
+        &node,
+        sauron_query::Resource::Occurrences,
+        app_id,
+        Utc::now(),
+        &mut conn,
+    )
+    .await
+    .map_err(super::search::map_plan_error)?;
     let (sort_col, descending) = super::search::parse_sort(
         q.sort.as_deref(),
         &["occurred_at", "distinct_id", "session_id", "device_key"],
@@ -708,21 +752,22 @@ pub async fn events(
             // call: `sort.is_temporal()` is what stops a cursor whose key
             // names a text column (`distinct_id`/`session_id`/`device_key`)
             // from sneaking a `t:` value tag past the key check alone.
-            sauron_db::query_plan::cursor::decode(c, &sort_col, sort.is_temporal())
+            sauron_db::query_plan::cursor::decode(c, &sort_col, sort.cursor_kind())
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?,
         ),
         None => None,
     };
 
-    // `Clamp.field` is the GENERIC name "since" — `prepare` does not know which
-    // resource it ran for. On THIS resource the window column is
-    // `occurred_at`, not Issues' `last_seen`.
+    // `Clamp.field` is the GENERIC name "since". On THIS resource the window
+    // column is `occurred_at`, not Issues' `last_seen`. The clamp itself is
+    // dropped for an issue small enough to scan whole — see
+    // `occurrence_scan_clamp`.
     let window = super::search::resolve_window(
         "occurred_at",
         Utc::now(),
         q.since_days,
         ISSUES_MAX_SINCE_DAYS,
-        prepared.clamp,
+        occurrence_scan_clamp(issue.times_seen, prepared.clamp),
     );
     let since = window.since;
     let limit = q.limit.clamp(1, 100);
@@ -871,8 +916,8 @@ pub async fn event_stats(
     )
     .await?;
     // Same cross-app guard as `events`: never let a foreign issue_id disclose
-    // another app's counts.
-    repo::get_issue(&mut conn, scope.clone(), issue_id)
+    // another app's counts. Kept for `times_seen`, as in `events`.
+    let issue = repo::get_issue(&mut conn, scope.clone(), issue_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     // The sharpest form of the bypass, and the reason this route needed the fix
@@ -911,14 +956,21 @@ pub async fn event_stats(
         reach,
         super::search::EnvNameReach::for_perms(&perms),
     )?;
-    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
-        .await
-        .map_err(super::search::map_plan_error)?;
+    let prepared = sauron_db::query_plan::prepare::prepare(
+        &node,
+        sauron_query::Resource::Occurrences,
+        app_id,
+        Utc::now(),
+        &mut conn,
+    )
+    .await
+    .map_err(super::search::map_plan_error)?;
 
     // Identical window arithmetic to `events`, including the clamp, because a
     // total over a different window is the same lie as a total over a different
-    // predicate. Sharing `resolve_window` is what makes "identical" structural
-    // rather than a promise this comment has to keep on its own. The disclosure
+    // predicate. Sharing `resolve_window` AND `occurrence_scan_clamp` is what
+    // makes "identical" structural rather than a promise this comment has to
+    // keep on its own. The disclosure
     // is dropped, not omitted by oversight: this route answers a bare stats
     // object with nowhere to put a `clamped`, and the list it captions carries
     // the same notice for the same window.
@@ -927,7 +979,7 @@ pub async fn event_stats(
         Utc::now(),
         q.since_days,
         ISSUES_MAX_SINCE_DAYS,
-        prepared.clamp,
+        occurrence_scan_clamp(issue.times_seen, prepared.clamp),
     )
     .since;
 
@@ -1030,4 +1082,41 @@ pub async fn stats(
         super::search::resolve_range("occurred_at", q.from, q.to, q.since_days, Utc::now(), 365)?;
     let series = repo::error_series(&mut conn, scope, win).await?;
     Ok(Json(IssueStats { counts, series }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn planner_clamp() -> Option<sauron_db::query_plan::prepare::Clamp> {
+        Some(sauron_db::query_plan::prepare::Clamp {
+            field: "since",
+            to_days: 30,
+            reason: "test",
+        })
+    }
+
+    #[test]
+    fn a_small_issue_scans_unclamped() {
+        assert!(occurrence_scan_clamp(1, planner_clamp()).is_none());
+        assert!(occurrence_scan_clamp(
+            crate::routes::search::SCAN_UNCLAMPED_MAX_ROWS,
+            planner_clamp()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_issue_past_the_ceiling_keeps_the_planner_clamp() {
+        let c = occurrence_scan_clamp(
+            crate::routes::search::SCAN_UNCLAMPED_MAX_ROWS + 1,
+            planner_clamp(),
+        );
+        assert_eq!(c, planner_clamp());
+    }
+
+    #[test]
+    fn no_planner_clamp_means_no_clamp_whatever_the_size() {
+        assert!(occurrence_scan_clamp(i64::MAX, None).is_none());
+    }
 }

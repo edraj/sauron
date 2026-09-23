@@ -578,6 +578,29 @@ It only ever **tightens** the window you asked for, never widens it, so you can
 always trust that every row returned is inside the range you selected. The
 default is 30 days and an operator can change it with `SEARCH_SCAN_CLAMP_DAYS`.
 
+**One exception, on Exceptions.** A scan that stays on the issues table itself —
+a wildcard or `~` over `title`, `culprit` or `type`, with nothing else in the
+query that reaches the underlying events — is **not** clamped. That table holds
+one row per fingerprint, not one per event, and is never tiered out, so bounding
+it would cost you rows and save nothing. Adding the release switcher or an exact
+`tag.<key>:value` / `screen:` / `release:` term keeps it unclamped (those are
+bounded probes, not scans). A bare word, a `tag.<key>:~sub`, an `extra.*`
+wildcard or `screen:*x*` does reach the events, and the clamp is back.
+
+**And one on an issue's occurrences.** That list is scoped to a single issue,
+so a scan can only ever read that issue's rows. For an issue seen fewer than a
+million times (lifetime `timesSeen`) the clamp is dropped entirely — the issue
+itself is the tighter bound, and a hot issue with a month of rows cost the same
+either way. Past a million the planner's clamp applies as elsewhere, and the
+stats caption above the list always follows the same window as the list.
+
+**And on the sessions list, when the rollups can vouch for it.** Sessions are
+app-wide, so nothing scopes the scan the way an issue does — but the session-day
+rollup knows how many sessions the window holds. If the app's rollups are
+backfilled, the sessions fold is less than two days behind, and the window holds
+at most a million sessions, the clamp is dropped. Any of those failing keeps it:
+an unknown size is treated as large, never as small.
+
 Note the honest gap: `clamped` reports the *planner's* clamp. The Events
 endpoint separately caps `since_days` at 365 whatever you send, and that cap is
 **not** reported here — so a request asking for ten years of events silently
@@ -612,13 +635,24 @@ restricted to orderings that have an index able to page stably:
 
 | List | Sortable |
 |---|---|
-| Exceptions | `last_seen` (default), `first_seen` |
-| Occurrences | `occurred_at` (default) |
-| Events | `occurred_at` (default) |
+| Exceptions | `last_seen` (default), `first_seen`, `times_seen`, `users_seen` |
+| Occurrences | `occurred_at` (default), `distinct_id`, `session_id`, `device_key` |
+| Events | `occurred_at` (default), `name`, `distinct_id`, `session_id` |
+| Transactions | `occurred_at` (default), `duration_ms`, `name`, `op` |
 
 Anything else is a 400 naming what is allowed. More orderings arrive with their
 indexes; serving an unstable sort and letting it duplicate rows is precisely the
 defect cursors were introduced to fix.
+
+**Counts under an environment.** `times_seen` and `users_seen` on an Exceptions
+row are the app-wide totals when no environment is selected, and that
+environment's own counts when one is (see [Environments](Environments) — an
+issue has no environment of its own, so its per-environment figures are derived
+from its occurrences). Sorting by either column follows the numbers you see:
+under an environment the list is ranked by the environment's counts, not by the
+app-wide totals, so the page never reads out of order. That ranking is computed
+over every matching issue in the window before paging, which is why it costs a
+little more than the default `last_seen` walk on a very large app.
 
 **Page size.** `limit` defaults to 50 on Exceptions and Events (max 200) and 30
 on an issue's Occurrences (max 100).
@@ -785,7 +819,8 @@ clamp described above.
 - **Scan** — the value has to be read off every candidate row. Issue `title`,
   occurrence `message`, `stack.*`, `traits.*`, every `~` substring and `*`
   wildcard, and free text. A query that is *all* scan is what triggers the
-  window clamp.
+  window clamp — except on Exceptions when every scanning term is an issues
+  column (see the `clamped` note above).
 
 Some further guarantees that are easy to want and worth stating:
 

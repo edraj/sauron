@@ -154,9 +154,15 @@ pub async fn list(
         super::search::EnvNameReach::for_perms(&perms),
     )?;
 
-    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
-        .await
-        .map_err(super::search::map_plan_error)?;
+    let prepared = sauron_db::query_plan::prepare::prepare(
+        &node,
+        sauron_query::Resource::Transactions,
+        app_id,
+        Utc::now(),
+        &mut conn,
+    )
+    .await
+    .map_err(super::search::map_plan_error)?;
 
     let (sort_col, descending) =
         super::search::parse_sort(q.sort.as_deref(), SORT_FIELDS, "occurred_at")?;
@@ -170,15 +176,14 @@ pub async fn list(
             // `sort.is_temporal()` is passed so a cursor minted under one kind
             // of column cannot be replayed against another — the cursor's key
             // and its value tag are independent fields on the wire.
-            sauron_db::query_plan::cursor::decode(c, &sort_col, sort.is_temporal())
+            sauron_db::query_plan::cursor::decode(c, &sort_col, sort.cursor_kind())
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?,
         ),
         None => None,
     };
 
-    // `Clamp.field` is the GENERIC name "since" — `prepare` does not know which
-    // resource it ran for. On THIS resource the window column is `occurred_at`
-    // (or `received_at`, when the caller asked for it).
+    // `Clamp.field` is the GENERIC name "since". On THIS resource the window
+    // column is `occurred_at` (or `received_at`, when the caller asked for it).
     let window = super::search::resolve_time_filter(
         "occurred_at",
         TIME_FIELDS,

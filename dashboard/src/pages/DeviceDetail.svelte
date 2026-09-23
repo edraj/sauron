@@ -34,6 +34,7 @@
   import { sortRows } from '../lib/models/sort-rows';
   import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import type { DeviceDetail, ErrorEvent, Session } from '../lib/models';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
 
   interface Props {
     params?: { key?: string };
@@ -149,6 +150,7 @@
   {:else if detail && device}
     <header class="detail-head">
       <div class="refresh-slot">
+        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
         <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
       </div>
       <div class="head-main">

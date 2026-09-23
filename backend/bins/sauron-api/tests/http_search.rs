@@ -372,6 +372,61 @@ async fn insert_issue(
     .expect("upsert issue")
 }
 
+/// `insert_issue` with a chosen stored `times_seen`, for the count orderings.
+async fn insert_issue_seen(conn: &mut sauron_db::PgConn, app_id: Uuid, times_seen: i64) -> Uuid {
+    let fingerprint = format!("search-fp-{}", Uuid::new_v4().simple());
+    let seen = Utc::now() - ChronoDuration::hours(2);
+    repo::upsert_issue(
+        conn,
+        NewIssue {
+            app_id,
+            fingerprint: &fingerprint,
+            type_: "Error",
+            title: "search fixture issue",
+            culprit: "search::fixture",
+            level: "error",
+            first_seen: seen,
+            last_seen: seen,
+            times_seen,
+        },
+    )
+    .await
+    .expect("upsert issue")
+}
+
+/// The `field` column of every row in an envelope's `data`, as i64, in order.
+fn counts(v: &Value, field: &str) -> Vec<i64> {
+    v["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("response has no `data` array: {v}"))
+        .iter()
+        .map(|r| {
+            r[field]
+                .as_i64()
+                .unwrap_or_else(|| panic!("row has no i64 `{field}`: {r}"))
+        })
+        .collect()
+}
+
+/// Walk every page of `first_url` by `next_cursor`, concatenating the rows.
+async fn walk(srv: &TestServer, first_url: &str, token: &str) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..50 {
+        let url = match &cursor {
+            Some(c) => format!("{first_url}&cursor={c}"),
+            None => first_url.to_string(),
+        };
+        let page = srv.get_json(&url, token).await;
+        rows.extend(page["data"].as_array().expect("data array").iter().cloned());
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    rows
+}
+
 /// The `id` column of every row in an envelope's `data`, in order.
 fn ids(v: &Value) -> Vec<String> {
     v["data"]
@@ -470,14 +525,258 @@ async fn an_unsupported_sort_is_refused_not_served_unstably() {
     let (app_id, token) = srv
         .seed_app_with_issues(&[("unresolved", "error", 1)])
         .await;
+    // `title` has no `(app_id, title, id)` index; `times_seen` used to be the
+    // probe here until migration 80 gave it one.
     let (status, body) = srv
-        .get_status_and_body(&format!("/v1/apps/{app_id}/issues?sort=times_seen"), &token)
+        .get_status_and_body(&format!("/v1/apps/{app_id}/issues?sort=title"), &token)
         .await;
     assert_eq!(status, 400);
     assert!(
-        body.contains("times_seen"),
+        body.contains("title"),
         "error should name the field: {body}"
     );
+
+    srv.shutdown().await;
+}
+
+/// The two count orderings page stably under `EnvFilter::All`, where they
+/// walk `issues`' stored columns on the migration-80 keyset indexes.
+///
+/// Ties are the whole test: with only five distinct counts across forty
+/// rows, every page boundary lands inside a tie group, so an ordering that
+/// forgot `id` in the tuple would repeat or skip rows exactly there.
+#[tokio::test]
+async fn issues_sort_by_a_count_orders_and_pages() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let (app_id, token) = srv.seed_app("counts").await;
+    {
+        let mut conn = srv.conn().await;
+        for k in 0..40i64 {
+            insert_issue_seen(&mut conn, app_id, (k % 5) + 1).await;
+        }
+        // `users_seen` has no insert path of its own (ingest maintains it from a
+        // HyperLogLog), so it is set directly, distinct from `times_seen` so a
+        // walk sorted by one cannot pass by being sorted by the other.
+        use diesel_async::RunQueryDsl as _;
+        diesel::sql_query("UPDATE issues SET users_seen = 6 - times_seen WHERE app_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(app_id)
+            .execute(&mut conn)
+            .await
+            .expect("set users_seen");
+    }
+    let list = format!("/v1/apps/{app_id}/issues");
+
+    let dedup = |rows: &[Value]| {
+        let mut ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        ids.len()
+    };
+    let column = |rows: &[Value], f: &str| -> Vec<i64> {
+        rows.iter().map(|r| r[f].as_i64().unwrap()).collect()
+    };
+
+    // Descending is the bare spelling.
+    let rows = walk(&srv, &format!("{list}?sort=times_seen&limit=7"), &token).await;
+    assert_eq!(rows.len(), 40, "paging did not reach every row");
+    assert_eq!(dedup(&rows), 40, "a row was returned on two pages");
+    let seen = column(&rows, "times_seen");
+    assert!(
+        seen.windows(2).all(|w| w[0] >= w[1]),
+        "not descending: {seen:?}"
+    );
+    assert_eq!(seen[0], 5);
+    assert_eq!(seen[39], 1);
+
+    let rows = walk(&srv, &format!("{list}?sort=-times_seen&limit=7"), &token).await;
+    assert_eq!(rows.len(), 40);
+    assert_eq!(dedup(&rows), 40);
+    let seen = column(&rows, "times_seen");
+    assert!(
+        seen.windows(2).all(|w| w[0] <= w[1]),
+        "not ascending: {seen:?}"
+    );
+
+    let rows = walk(&srv, &format!("{list}?sort=users_seen&limit=9"), &token).await;
+    assert_eq!(rows.len(), 40);
+    assert_eq!(dedup(&rows), 40);
+    let users = column(&rows, "users_seen");
+    assert!(
+        users.windows(2).all(|w| w[0] >= w[1]),
+        "not descending: {users:?}"
+    );
+    // …and it really was the users column that ordered the walk.
+    let times = column(&rows, "times_seen");
+    assert!(
+        times.windows(2).all(|w| w[0] <= w[1]),
+        "users_seen = 6 - times_seen: {times:?}"
+    );
+
+    // A cursor minted under one count ordering cannot page the other.
+    let first = srv
+        .get_json(&format!("{list}?sort=times_seen&limit=7"), &token)
+        .await;
+    let c = first["next_cursor"]
+        .as_str()
+        .expect("40 rows at limit 7 has a next page");
+    let (status, body) = srv
+        .get_status_and_body(
+            &format!("{list}?sort=users_seen&limit=7&cursor={c}"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("times_seen") && body.contains("users_seen"),
+        "{body}"
+    );
+
+    srv.shutdown().await;
+}
+
+/// Under an environment scope a count ordering ranks by THAT environment's
+/// derived counts — the numbers on the rows — not by the app-wide totals.
+///
+/// The fixture inverts the two: the issue with the largest stored
+/// `times_seen` has the fewest staging occurrences. An implementation that
+/// walked the stored column and merely relabelled the page (the defect the
+/// "Issues sorting is deferred" note recorded) would serve `[A, B, C]` with
+/// the displayed counts reading `1, 2, 3` — visibly out of order.
+#[tokio::test]
+async fn env_scoped_count_sort_ranks_by_the_environments_own_counts() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let fx = srv.seed_two_env_app().await;
+    let list = format!("/v1/apps/{}/issues", fx.app_id);
+    let now = Utc::now();
+
+    // (stored times_seen, staging occurrences). Users are distinct per
+    // occurrence, so the derived `users_seen` equals the occurrence count.
+    let spec: [(&str, i64, i64); 3] = [("a", 1000, 1), ("b", 100, 2), ("c", 10, 3)];
+    let mut id_of = std::collections::HashMap::new();
+    {
+        let mut conn = srv.conn().await;
+        for (label, stored, staging_n) in spec {
+            let fingerprint = format!("rank-fp-{label}-{}", Uuid::new_v4().simple());
+            let issue_id = repo::upsert_issue(
+                &mut conn,
+                NewIssue {
+                    app_id: fx.app_id,
+                    fingerprint: &fingerprint,
+                    type_: "Error",
+                    title: "rank fixture issue",
+                    culprit: "rank::fixture",
+                    level: "error",
+                    first_seen: now - ChronoDuration::hours(5),
+                    last_seen: now - ChronoDuration::minutes(1),
+                    times_seen: stored,
+                },
+            )
+            .await
+            .expect("upsert issue");
+            for j in 0..staging_n {
+                seed_stat_occurrence(
+                    &mut conn,
+                    fx.app_id,
+                    Some(fx.staging),
+                    issue_id,
+                    &fingerprint,
+                    "error",
+                    "rank fixture issue",
+                    "rank::fixture",
+                    &format!("rank-user-{label}-{j}"),
+                    now - ChronoDuration::minutes(10 + j),
+                )
+                .await;
+            }
+            id_of.insert(label, issue_id.to_string());
+        }
+    }
+    let order = |rows: &[Value]| -> Vec<&'static str> {
+        rows.iter()
+            .map(|r| {
+                let id = r["id"].as_str().unwrap();
+                spec.iter()
+                    .find(|(l, _, _)| id_of[l] == id)
+                    .map(|(l, _, _)| *l)
+                    .unwrap()
+            })
+            .collect()
+    };
+
+    // App-wide (owner, no environment): the stored totals order the list.
+    let rows = walk(
+        &srv,
+        &format!("{list}?sort=times_seen&limit=10"),
+        &fx.owner_token,
+    )
+    .await;
+    assert_eq!(order(&rows), ["a", "b", "c"]);
+    assert_eq!(
+        counts(&json!({ "data": rows }), "times_seen"),
+        [1000, 100, 10]
+    );
+
+    // Staging-scoped member: the staging counts order it, and page it.
+    let page1 = srv
+        .get_json(
+            &format!("{list}?sort=times_seen&limit=2"),
+            &fx.staging_token,
+        )
+        .await;
+    assert_eq!(
+        order(page1["data"].as_array().unwrap()),
+        ["c", "b"],
+        "{page1}"
+    );
+    assert_eq!(counts(&page1, "times_seen"), [3, 2]);
+    let c = page1["next_cursor"].as_str().expect("a third row remains");
+    let page2 = srv
+        .get_json(
+            &format!("{list}?sort=times_seen&limit=2&cursor={c}"),
+            &fx.staging_token,
+        )
+        .await;
+    assert_eq!(order(page2["data"].as_array().unwrap()), ["a"], "{page2}");
+    assert_eq!(counts(&page2, "times_seen"), [1]);
+    assert!(page2["next_cursor"].is_null());
+    // `total` still describes the whole staging set.
+    assert_eq!(page1["total"], 3);
+
+    // Ascending, and the users column, rank the same way.
+    let rows = walk(
+        &srv,
+        &format!("{list}?sort=-times_seen&limit=2"),
+        &fx.staging_token,
+    )
+    .await;
+    assert_eq!(order(&rows), ["a", "b", "c"]);
+    let rows = walk(
+        &srv,
+        &format!("{list}?sort=users_seen&limit=2"),
+        &fx.staging_token,
+    )
+    .await;
+    assert_eq!(order(&rows), ["c", "b", "a"]);
+    assert_eq!(counts(&json!({ "data": rows }), "users_seen"), [3, 2, 1]);
+
+    // The owner selecting staging explicitly gets the staging ranking too —
+    // the scope, not the caller's grant, decides.
+    let rows = walk(
+        &srv,
+        &format!(
+            "{list}?sort=times_seen&limit=10&environment_id={}",
+            fx.staging
+        ),
+        &fx.owner_token,
+    )
+    .await;
+    assert_eq!(order(&rows), ["c", "b", "a"]);
 
     srv.shutdown().await;
 }
@@ -3480,10 +3779,10 @@ async fn events_stay_within_the_callers_environment() {
 /// The planner's `clamped` notice, on the field name only this route can
 /// supply — and applied, not merely announced.
 ///
-/// `Clamp.field` is the generic `"since"`: `prepare` does not know which
-/// resource it ran for, so mapping it onto `occurred_at` is the handler's job,
-/// and a handler that echoed `"since"` (or copied Issues' `"last_seen"`) would
-/// still serve correct ROWS. Only an assertion on the envelope catches it.
+/// `Clamp.field` is the generic `"since"`: mapping it onto `occurred_at` is
+/// the handler's job, and a handler that echoed `"since"` (or copied Issues'
+/// `"last_seen"`) would still serve correct ROWS. Only an assertion on the
+/// envelope catches it.
 ///
 /// The row-level half matters more: a `clamped` field that was reported but
 /// never folded into the query's `since` would be a label with no effect.
@@ -3569,6 +3868,192 @@ async fn a_scanning_event_query_is_clamped_to_occurred_at_and_the_clamp_bites() 
          effect: {scanned}"
     );
     assert_eq!(scanned["data"][0]["name"], "clamp_recent", "{scanned}");
+
+    srv.shutdown().await;
+}
+
+/// The Occurrences exception to the planner's clamp: the list is scoped to
+/// one issue, so a scan reads at most that issue's rows, and for an issue
+/// under `search::SCAN_UNCLAMPED_MAX_ROWS` lifetime occurrences the
+/// route drops the clamp — a 100-day-old occurrence is reachable through
+/// `message:*fixture*`. Bumping `times_seen` past the ceiling (the column,
+/// not the rows: the gate reads the counter) brings the clamp back, and it
+/// BITES: the old occurrence drops out. The stats caption must move with the
+/// list, so its total is checked on both sides too.
+#[tokio::test]
+async fn an_occurrence_scan_on_a_small_issue_is_not_clamped_until_the_issue_is_large() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let (app_id, token) = srv.seed_app("occ-clamp").await;
+    let ancient = Utc::now() - ChronoDuration::days(100);
+    let recent = Utc::now() - ChronoDuration::days(2);
+    let issue_id = {
+        let mut conn = srv.conn().await;
+        let issue_id = seed_issue_with_occurrence_columns(
+            &mut conn,
+            app_id,
+            "occ clamp",
+            None,
+            None,
+            None,
+            recent,
+            ancient,
+        )
+        .await;
+        // A second occurrence on the SAME issue, inside the 30-day window.
+        let fp = format!("occ-clamp-fp-{}", Uuid::new_v4().simple());
+        repo::insert_error_event(
+            &mut conn,
+            NewErrorEvent {
+                id: Uuid::new_v4(),
+                app_id,
+                environment_id: None,
+                issue_id,
+                fingerprint: fp,
+                level: "error".into(),
+                message: "occurrence-column fixture".into(),
+                exception_type: "Error".into(),
+                exception_value: "occurrence-column fixture".into(),
+                stacktrace: json!([]),
+                breadcrumbs: json!([]),
+                context: json!({}),
+                tags: json!({}),
+                release: None,
+                distinct_id: None,
+                event_user: None,
+                sdk: None,
+                ip_address: None,
+                occurred_at: recent,
+                session_id: None,
+                device_key: None,
+                screen: None,
+                workflow_id: None,
+                workflow_name: None,
+                stacktrace_symbolicated: None,
+                symbolication_status: "not_applicable".into(),
+                debug_meta: None,
+                contexts: json!({}),
+                extra: json!({}),
+                handled: Some(false),
+                title: None,
+                culprit: None,
+                stacktrace_sha256: None,
+            },
+        )
+        .await
+        .expect("insert second occurrence");
+        issue_id
+    };
+    let list = format!("/v1/apps/{app_id}/issues/{issue_id}/events");
+    let stats = format!("/v1/apps/{app_id}/issues/{issue_id}/events/stats");
+    let query = "query=message:*fixture*&since_days=365";
+
+    // Small issue: the scan is bounded by the issue, no clamp, both rows.
+    let small = srv.get_json(&format!("{list}?{query}"), &token).await;
+    assert!(
+        small["clamped"].is_null(),
+        "a scan over a small issue's occurrences must not be clamped: {small}"
+    );
+    assert_eq!(small["total"], 2, "{small}");
+    let small_stats = srv.get_json(&format!("{stats}?{query}"), &token).await;
+    assert_eq!(
+        small_stats["events"], 2,
+        "caption must match the list: {small_stats}"
+    );
+
+    // Past the ceiling the planner's clamp is back, on `occurred_at`, and the
+    // 100-day-old occurrence is gone from both the list and its caption.
+    {
+        use diesel::{ExpressionMethods, QueryDsl};
+        use diesel_async::RunQueryDsl;
+        use sauron_db::schema::issues;
+        let mut conn = srv.conn().await;
+        diesel::update(issues::table.filter(issues::id.eq(issue_id)))
+            .set(issues::times_seen.eq(5_000_000_i64))
+            .execute(&mut conn)
+            .await
+            .expect("bump times_seen");
+    }
+    let large = srv.get_json(&format!("{list}?{query}"), &token).await;
+    assert_eq!(large["clamped"]["field"], "occurred_at", "{large}");
+    assert_eq!(large["clamped"]["to"], "30d", "{large}");
+    assert_eq!(large["total"], 1, "the clamp must bite: {large}");
+    let large_stats = srv.get_json(&format!("{stats}?{query}"), &token).await;
+    assert_eq!(
+        large_stats["events"], 1,
+        "caption must move with the list: {large_stats}"
+    );
+
+    srv.shutdown().await;
+}
+
+/// The Issues exception to the planner's clamp: a wildcard over `title`
+/// scans the `issues` table, not the tiered `error_events`, so `prepare`
+/// leaves the window alone and an issue last seen 100 days ago is reachable.
+/// The same wildcard beside the release switcher's `?release=` (an equality
+/// bridge, `Bounded`) stays unclamped. Free text still clamps — it matches
+/// the child events' payloads — and the clamp still BITES: the old issue
+/// vanishes from that result, so the contrast proves the window moved rather
+/// than the fixture being unreachable for some other reason.
+#[tokio::test]
+async fn an_issues_title_wildcard_is_not_clamped_but_free_text_still_is() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_search");
+        return;
+    };
+    let (app_id, token) = srv.seed_app("issue-clamp").await;
+    let list = format!("/v1/apps/{app_id}/issues");
+    {
+        let mut conn = srv.conn().await;
+        let ancient = Utc::now() - ChronoDuration::days(100);
+        let recent = Utc::now() - ChronoDuration::days(2);
+        // `insert_issue` titles every row "search fixture issue", so the
+        // wildcard below matches both; only the window tells them apart.
+        insert_issue(&mut conn, app_id, "error", ancient, ancient).await;
+        insert_issue(&mut conn, app_id, "error", recent, recent).await;
+    }
+
+    // Local scan: `title` lives on `issues`. No clamp, both rows.
+    let local = srv
+        .get_json(
+            &format!("{list}?query=title:*fixture*&since_days=365"),
+            &token,
+        )
+        .await;
+    assert!(
+        local["clamped"].is_null(),
+        "a wildcard confined to issues columns must not be clamped: {local}"
+    );
+    assert_eq!(local["total"], 2, "{local}");
+
+    // The release switcher ANDs `release:<x>` in. With `?release=` naming a
+    // release no occurrence carries, EXISTS is false for every issue — the
+    // point is the envelope, not the rows: the bridge is `Bounded` and must
+    // not reinstate the clamp.
+    let with_release = srv
+        .get_json(
+            &format!("{list}?query=title:*fixture*&since_days=365&release=9.9.9"),
+            &token,
+        )
+        .await;
+    assert!(
+        with_release["clamped"].is_null(),
+        "an equality bridge beside a local scan must not reinstate the clamp: {with_release}"
+    );
+
+    // Free text reaches `error_events`, so it is clamped — to `last_seen`,
+    // this resource's window column — and the 100-day-old issue drops out.
+    let scanned = srv
+        .get_json(&format!("{list}?q=fixture&since_days=365"), &token)
+        .await;
+    assert_eq!(scanned["clamped"]["field"], "last_seen", "{scanned}");
+    assert_eq!(scanned["clamped"]["to"], "30d", "{scanned}");
+    assert_eq!(
+        scanned["total"], 1,
+        "the clamp must bite, or the unclamped total above proves nothing: {scanned}"
+    );
 
     srv.shutdown().await;
 }

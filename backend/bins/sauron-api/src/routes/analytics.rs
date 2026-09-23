@@ -619,9 +619,15 @@ pub async fn events_list(
         super::search::EnvNameReach::for_perms(&perms),
     )?;
 
-    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
-        .await
-        .map_err(super::search::map_plan_error)?;
+    let prepared = sauron_db::query_plan::prepare::prepare(
+        &node,
+        sauron_query::Resource::Events,
+        app_id,
+        Utc::now(),
+        &mut conn,
+    )
+    .await
+    .map_err(super::search::map_plan_error)?;
     let (sort_col, descending) = super::search::parse_sort(
         q.sort.as_deref(),
         &["occurred_at", "name", "distinct_id", "session_id"],
@@ -641,14 +647,14 @@ pub async fn events_list(
             // of value. `EventSort` stays the single source of truth for
             // which kind each column needs; `decode` is where it is now
             // enforced, rather than trusting this call site to ask.
-            sauron_db::query_plan::cursor::decode(c, &sort_col, sort.is_temporal())
+            sauron_db::query_plan::cursor::decode(c, &sort_col, sort.cursor_kind())
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?,
         ),
         None => None,
     };
 
-    // `Clamp.field` is the GENERIC name "since" — `prepare` does not know which
-    // resource it ran for. On THIS resource the window column is `occurred_at`.
+    // `Clamp.field` is the GENERIC name "since". On THIS resource the window
+    // column is `occurred_at`.
     //
     // The outer bound is 365 days, not the other two lists' 3650, and that is
     // pre-existing and deliberate: free text here scans `jsonb::text` over the

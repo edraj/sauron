@@ -13,8 +13,9 @@
   import UsersExplorer from '../src/pages/UsersExplorer.svelte';
   import SessionDetail from '../src/pages/SessionDetail.svelte';
   import IssueDetail from '../src/pages/IssueDetail.svelte';
+  import Issues from '../src/pages/Issues.svelte';
 
-  const PAGES = ['sessions', 'users', 'session-detail', 'issue-detail'] as const;
+  const PAGES = ['sessions', 'users', 'session-detail', 'issue-detail', 'issues'] as const;
   type Page = (typeof PAGES)[number];
   let page = $state<Page>(
     ((new URLSearchParams(location.search).get('page') as Page) ?? 'sessions'),
@@ -35,6 +36,8 @@
   <UsersExplorer />
 {:else if page === 'session-detail'}
   <SessionDetail params={{ id: 'sess-harness-01' }} />
+{:else if page === 'issues'}
+  <Issues />
 {:else}
   <IssueDetail params={{ id: 'issue-1' }} />
 {/if}

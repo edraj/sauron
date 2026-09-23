@@ -12,11 +12,11 @@
 //! slices and state maps — unit-tested without Postgres, then exercised
 //! against the real schema by `tests/rollup_equivalence.rs`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, DurationRound, NaiveDate, TimeZone, Utc};
 use diesel::sql_types::{
-    Array, BigInt, Date, Nullable, SmallInt, Text, Timestamptz, Uuid as SqlUuid,
+    Array, BigInt, Bytea, Date, Nullable, SmallInt, Text, Timestamptz, Uuid as SqlUuid,
 };
 use diesel::QueryableByName;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -26,10 +26,10 @@ use super::{
     add_event_top, add_journey_links, add_journey_nodes, add_perf_agg, add_person_days,
     add_screen_stats, add_user_activity, begin_locked, env_key, replace_session_days,
     rollback_quietly, set_watermark, watermark, DayKey, PerfDelta, PersonDayDelta, PersonKey,
-    ScreenDelta, SessionDayRow, UserActivityDelta, OTHER_NAME, SRC_ANALYTICS, SRC_ERRORS,
+    ScreenDelta, SessionDayRow, UserActivityDelta, CHUNK, OTHER_NAME, SRC_ANALYTICS, SRC_ERRORS,
     SRC_SESSIONS, SRC_TRANSACTIONS,
 };
-use crate::sketch::LatencyHistogram;
+use crate::sketch::{Hll, LatencyHistogram};
 
 /// The synthetic screen-view event the mobile SDKs emit.
 const SCREEN_EVENT: &str = "$screen";
@@ -152,8 +152,13 @@ fn hour_of(t: DateTime<Utc>) -> DateTime<Utc> {
 /// `rows` may arrive in any order; the two walks sort their own views. State
 /// maps are read-modify-write — entries the caller loaded from
 /// `rollup_*_state` for the touched keys, mutated here, persisted after.
+///
+/// `identified` is the `(app, distinct_id)` set the caller looked up with
+/// [`load_identified`] for this batch: a person in it enters `hll_identified`
+/// as well as `hll_all`.
 pub(crate) fn fold_analytics_rows(
     rows: &[ARow],
+    identified: &HashSet<(Uuid, String)>,
     sess: &mut HashMap<SessKey, SessState>,
     jour: &mut HashMap<JourKey, JourState>,
     name_cap: usize,
@@ -169,6 +174,9 @@ pub(crate) fn fold_analytics_rows(
         if !r.distinct_id.is_empty() {
             a.hll_all.insert(&r.distinct_id);
             a.hll_analytics.insert(&r.distinct_id);
+            if identified.contains(&(r.app_id, r.distinct_id.clone())) {
+                a.hll_identified.insert(&r.distinct_id);
+            }
             // Same non-empty guard as the journey walk below, for the same
             // reason: '' is not a person, and admitting it would make one
             // shared pseudo-user whose retention curve is meaningless.
@@ -308,7 +316,7 @@ pub(crate) struct ErrorDeltas {
     pub person_days: BTreeMap<PersonKey, PersonDayDelta>,
 }
 
-pub(crate) fn fold_error_rows(rows: &[ERow]) -> ErrorDeltas {
+pub(crate) fn fold_error_rows(rows: &[ERow], identified: &HashSet<(Uuid, String)>) -> ErrorDeltas {
     let mut d = ErrorDeltas::default();
     for r in rows {
         let key: DayKey = (r.app_id, r.environment_id, day_of(r.occurred_at));
@@ -317,6 +325,9 @@ pub(crate) fn fold_error_rows(rows: &[ERow]) -> ErrorDeltas {
         let did = r.distinct_id.as_deref().filter(|s| !s.is_empty());
         if let Some(did) = did {
             a.hll_all.insert(did);
+            if identified.contains(&(r.app_id, did.to_string())) {
+                a.hll_identified.insert(did);
+            }
             d.person_days
                 .entry((key, did.to_string()))
                 .or_default()
@@ -704,7 +715,12 @@ pub async fn fold_analytics(
         jour_keys.dedup();
         let mut sess = load_session_state(conn, &sess_keys).await?;
         let mut jour = load_journey_state(conn, &jour_keys).await?;
-        let mut d = fold_analytics_rows(&rows, &mut sess, &mut jour, name_cap);
+        let identified = load_identified(
+            conn,
+            rows.iter().map(|r| (r.app_id, r.distinct_id.as_str())),
+        )
+        .await?;
+        let mut d = fold_analytics_rows(&rows, &identified, &mut sess, &mut jour, name_cap);
         add_event_top(conn, &d.top).await?;
         add_journey_nodes(conn, &d.nodes).await?;
         add_journey_links(conn, &d.links).await?;
@@ -736,7 +752,13 @@ pub async fn fold_errors(
         }
         let (rows, new_wm, caught_up) = pull_errors(conn, wm, upto).await?;
         let n = rows.len();
-        let mut d = fold_error_rows(&rows);
+        let identified = load_identified(
+            conn,
+            rows.iter()
+                .filter_map(|r| r.distinct_id.as_deref().map(|d| (r.app_id, d))),
+        )
+        .await?;
+        let mut d = fold_error_rows(&rows, &identified);
         add_user_activity(conn, &mut d.activity).await?;
         add_person_days(conn, &d.person_days).await?;
         add_screen_stats(conn, &mut d.screens).await?;
@@ -973,6 +995,147 @@ struct CountRow {
 /// whole; journey/dwell cursors live across the hours, which is exactly the
 /// ordering guarantee the hour loop provides. State is persisted only for
 /// days young enough for the live fold to continue (>= today-2).
+#[derive(QueryableByName)]
+struct IdentifiedKey {
+    #[diesel(sql_type = SqlUuid)]
+    app_id: Uuid,
+    #[diesel(sql_type = Text)]
+    distinct_id: String,
+}
+
+/// Which of these `(app, distinct_id)` pairs are identified RIGHT NOW
+/// (`event_users.identified_at IS NOT NULL`). One `unnest` probe of the
+/// `(app_id, distinct_id)` unique index per fold batch; empty and duplicate
+/// ids are dropped before the round trip.
+pub(crate) async fn load_identified<'a>(
+    conn: &mut AsyncPgConnection,
+    keys: impl Iterator<Item = (Uuid, &'a str)>,
+) -> diesel::QueryResult<HashSet<(Uuid, String)>> {
+    let mut uniq: Vec<(Uuid, &str)> = keys.filter(|(_, d)| !d.is_empty()).collect();
+    uniq.sort_unstable();
+    uniq.dedup();
+    let mut out = HashSet::new();
+    for chunk in uniq.chunks(CHUNK) {
+        let rows: Vec<IdentifiedKey> = diesel::sql_query(
+            "SELECT eu.app_id, eu.distinct_id FROM event_users eu \
+             JOIN unnest($1::uuid[], $2::text[]) AS k(app_id, distinct_id) \
+               ON eu.app_id = k.app_id AND eu.distinct_id = k.distinct_id \
+             WHERE eu.identified_at IS NOT NULL",
+        )
+        .bind::<Array<SqlUuid>, _>(chunk.iter().map(|(a, _)| *a).collect::<Vec<_>>())
+        .bind::<Array<Text>, _>(chunk.iter().map(|(_, d)| d.to_string()).collect::<Vec<_>>())
+        .get_results(conn)
+        .await?;
+        out.extend(rows.into_iter().map(|r| (r.app_id, r.distinct_id)));
+    }
+    Ok(out)
+}
+
+#[derive(QueryableByName)]
+struct IdentifiedPersonDay {
+    #[diesel(sql_type = SqlUuid)]
+    app_id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    env_key: Uuid,
+    #[diesel(sql_type = Text)]
+    distinct_id: String,
+}
+
+/// Rebuild `user_activity_daily.hll_identified` for one day from
+/// `person_days ⋈ event_users.identified_at` — the day's identified people as
+/// of NOW.
+///
+/// Two callers, one function. The unattended backfill runs it for every day
+/// that still has a NULL (pre-migration-79) sketch; the daily maintenance
+/// runs it over the trailing window so an `identify()` that arrives after a
+/// day was folded moves that person from guest to identified within a day,
+/// the same way the exact Audience tiles already read the current flag.
+/// Sourced from `person_days` rather than the raw events: it is one row per
+/// active (person, env, day) instead of one per event, and it exists for
+/// every day the rollups cover. Every row of the day is written, an empty
+/// sketch where nobody identified was active, so NULL keeps meaning unknown.
+/// Own transaction; nothing here touches the fold's advisory lock.
+pub async fn recompute_identified_sketches(
+    conn: &mut AsyncPgConnection,
+    day: NaiveDate,
+) -> diesel::QueryResult<usize> {
+    let people: Vec<IdentifiedPersonDay> = diesel::sql_query(
+        "SELECT p.app_id, \
+                COALESCE(p.environment_id, '00000000-0000-0000-0000-000000000000'::uuid) AS env_key, \
+                p.distinct_id \
+         FROM person_days p \
+         JOIN event_users eu ON eu.app_id = p.app_id AND eu.distinct_id = p.distinct_id \
+         WHERE p.day = $1 AND eu.identified_at IS NOT NULL",
+    )
+    .bind::<Date, _>(day)
+    .get_results(conn)
+    .await?;
+    let mut sketches: HashMap<(Uuid, Uuid), Hll> = HashMap::new();
+    for r in people {
+        sketches
+            .entry((r.app_id, r.env_key))
+            .or_default()
+            .insert(&r.distinct_id);
+    }
+    #[derive(QueryableByName)]
+    struct DayRowKey {
+        #[diesel(sql_type = SqlUuid)]
+        app_id: Uuid,
+        #[diesel(sql_type = SqlUuid)]
+        env_key: Uuid,
+    }
+    let keys: Vec<DayRowKey> = diesel::sql_query(
+        "SELECT app_id, COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid) AS env_key \
+         FROM user_activity_daily WHERE day = $1",
+    )
+    .bind::<Date, _>(day)
+    .get_results(conn)
+    .await?;
+    let mut n = 0;
+    for chunk in keys.chunks(CHUNK) {
+        n += diesel::sql_query(
+            "UPDATE user_activity_daily u SET hll_identified = t.hll, updated_at = now() \
+             FROM unnest($1::uuid[], $2::uuid[], $3::bytea[]) AS t(app_id, env_key, hll) \
+             WHERE u.day = $4 AND u.app_id = t.app_id \
+               AND COALESCE(u.environment_id, '00000000-0000-0000-0000-000000000000'::uuid) = t.env_key",
+        )
+        .bind::<Array<SqlUuid>, _>(chunk.iter().map(|k| k.app_id).collect::<Vec<_>>())
+        .bind::<Array<SqlUuid>, _>(chunk.iter().map(|k| k.env_key).collect::<Vec<_>>())
+        .bind::<Array<Bytea>, _>(
+            chunk
+                .iter()
+                .map(|k| {
+                    sketches
+                        .get(&(k.app_id, k.env_key))
+                        .map(Hll::to_bytes)
+                        .unwrap_or_else(|| Hll::new().to_bytes())
+                })
+                .collect::<Vec<_>>(),
+        )
+        .bind::<Date, _>(day)
+        .execute(conn)
+        .await?;
+    }
+    Ok(n)
+}
+
+/// Days whose `hll_identified` is still NULL, oldest first.
+pub async fn identified_sketch_days_pending(
+    conn: &mut AsyncPgConnection,
+) -> diesel::QueryResult<Vec<NaiveDate>> {
+    #[derive(QueryableByName)]
+    struct DayRow {
+        #[diesel(sql_type = Date)]
+        day: NaiveDate,
+    }
+    let rows: Vec<DayRow> = diesel::sql_query(
+        "SELECT DISTINCT day FROM user_activity_daily WHERE hll_identified IS NULL ORDER BY day",
+    )
+    .get_results(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.day).collect())
+}
+
 pub async fn fold_day_from_raw(
     conn: &mut AsyncPgConnection,
     day: NaiveDate,
@@ -1045,7 +1208,9 @@ async fn fold_day_body(
             .bind::<Timestamptz, _>(received)
             .get_results(conn)
             .await?;
-            let d = fold_analytics_rows(&a, &mut sess, &mut jour, name_cap);
+            let identified =
+                load_identified(conn, a.iter().map(|r| (r.app_id, r.distinct_id.as_str()))).await?;
+            let d = fold_analytics_rows(&a, &identified, &mut sess, &mut jour, name_cap);
             merge_analytics(&mut acc, d);
             let e: Vec<ERow> = diesel::sql_query(
                 "SELECT app_id, environment_id, occurred_at, received_at, screen, distinct_id \
@@ -1057,7 +1222,13 @@ async fn fold_day_body(
             .bind::<Timestamptz, _>(received)
             .get_results(conn)
             .await?;
-            merge_errors(&mut err_acc, fold_error_rows(&e));
+            let identified = load_identified(
+                conn,
+                e.iter()
+                    .filter_map(|r| r.distinct_id.as_deref().map(|d| (r.app_id, d))),
+            )
+            .await?;
+            merge_errors(&mut err_acc, fold_error_rows(&e, &identified));
             let t: Vec<TRow> = diesel::sql_query(
                 "SELECT app_id, environment_id, occurred_at, received_at, name, op, duration_ms, status, http_status \
                  FROM transactions \
@@ -1103,6 +1274,7 @@ fn merge_analytics(acc: &mut AnalyticsDeltas, d: AnalyticsDeltas) {
         e.errors += v.errors;
         e.hll_all.merge(&v.hll_all);
         e.hll_analytics.merge(&v.hll_analytics);
+        e.hll_identified.merge(&v.hll_identified);
     }
     for (k, v) in d.screens {
         let e = acc.screens.entry(k).or_default();
@@ -1119,6 +1291,7 @@ fn merge_errors(acc: &mut ErrorDeltas, d: ErrorDeltas) {
         let e = acc.activity.entry(k).or_default();
         e.errors += v.errors;
         e.hll_all.merge(&v.hll_all);
+        e.hll_identified.merge(&v.hll_identified);
     }
     for (k, v) in d.screens {
         let e = acc.screens.entry(k).or_default();
@@ -1599,6 +1772,45 @@ mod tests {
         }
     }
 
+    /// `hll_identified` holds exactly the people in `identified`; guests never
+    /// enter it, and it is written even when empty so NULL keeps meaning
+    /// "unknown" (pre-migration-79 rows).
+    #[test]
+    fn identified_sketch_admits_only_flagged_people() {
+        let app = Uuid::new_v4();
+        let at = ts("2026-05-01T10:00:00Z");
+        let rows = vec![
+            arow(app, "s1", "alice", "x", None, at),
+            arow(app, "s2", "bob", "x", None, at),
+            arow(app, "s3", "anon_1", "x", None, at),
+            arow(app, "s4", "", "x", None, at),
+        ];
+        let identified: HashSet<(Uuid, String)> =
+            [(app, "alice".to_string()), (app, "bob".to_string())]
+                .into_iter()
+                .collect();
+        let mut sess = HashMap::new();
+        let mut jour = HashMap::new();
+        let d = fold_analytics_rows(&rows, &identified, &mut sess, &mut jour, 100);
+        let a = d.activity.values().next().expect("one day");
+        assert_eq!(a.hll_all.estimate(), 3);
+        assert_eq!(a.hll_identified.estimate(), 2);
+
+        let e = fold_error_rows(
+            &[erow(app, Some("bob"), at), erow(app, Some("anon_2"), at)],
+            &identified,
+        );
+        let a = e.activity.values().next().expect("one day");
+        assert_eq!(a.hll_all.estimate(), 2);
+        assert_eq!(a.hll_identified.estimate(), 1);
+
+        // Nobody identified: still a sketch, never "unknown".
+        let e = fold_error_rows(&[erow(app, Some("anon_2"), at)], &HashSet::new());
+        let a = e.activity.values().next().expect("one day");
+        assert!(a.hll_identified.is_empty());
+        assert!(super::super::hll_bytes(&a.hll_identified).is_some());
+    }
+
     /// One row per (person, day), counting every event that person emitted --
     /// and NOTHING for the anonymous ones. '' would otherwise become a single
     /// giant shared "person" whose retention is meaningless, exactly as the
@@ -1614,7 +1826,7 @@ mod tests {
             arow(app, "s2", "u2", "view", None, ts("2026-08-28T09:00:00Z")),
             arow(app, "s3", "", "view", None, ts("2026-08-28T09:00:00Z")),
         ];
-        let d = fold_analytics_rows(&rows, &mut sess, &mut jour, 100);
+        let d = fold_analytics_rows(&rows, &HashSet::new(), &mut sess, &mut jour, 100);
 
         assert_eq!(
             d.person_days.len(),
@@ -1641,7 +1853,7 @@ mod tests {
             arow(app, "s1", "u1", "view", None, ts("2026-08-27T23:59:00Z")),
             arow(app, "s1", "u1", "view", None, ts("2026-08-28T00:01:00Z")),
         ];
-        let d = fold_analytics_rows(&rows, &mut sess, &mut jour, 100);
+        let d = fold_analytics_rows(&rows, &HashSet::new(), &mut sess, &mut jour, 100);
         assert_eq!(d.person_days.len(), 2, "a day boundary splits the rows");
     }
 
@@ -1651,10 +1863,13 @@ mod tests {
     #[test]
     fn person_days_from_errors_sets_errors_not_events() {
         let app = Uuid::new_v4();
-        let d = fold_error_rows(&[
-            erow(app, Some("u1"), ts("2026-08-28T09:00:00Z")),
-            erow(app, None, ts("2026-08-28T09:00:00Z")),
-        ]);
+        let d = fold_error_rows(
+            &[
+                erow(app, Some("u1"), ts("2026-08-28T09:00:00Z")),
+                erow(app, None, ts("2026-08-28T09:00:00Z")),
+            ],
+            &HashSet::new(),
+        );
 
         let day = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
         let k = ((app, None, day), "u1".to_string());
@@ -1714,7 +1929,7 @@ mod tests {
                 ts("2026-08-25T10:45:10Z"),
             ),
         ];
-        let d = fold_analytics_rows(&rows, &mut sess, &mut jour, 2000);
+        let d = fold_analytics_rows(&rows, &HashSet::new(), &mut sess, &mut jour, 2000);
         let day = ts("2026-08-25T10:00:00Z").date_naive();
         let home = &d.screens[&((app, None, day), "Home".to_string())];
         let cart = &d.screens[&((app, None, day), "Cart".to_string())];
@@ -1742,7 +1957,7 @@ mod tests {
             Some("Home"),
             ts("2026-08-25T10:00:00Z"),
         )];
-        let d1 = fold_analytics_rows(&first, &mut sess, &mut jour, 2000);
+        let d1 = fold_analytics_rows(&first, &HashSet::new(), &mut sess, &mut jour, 2000);
         let day = ts("2026-08-25T10:00:00Z").date_naive();
         assert_eq!(
             d1.screens[&((app, None, day), "Home".to_string())].dwell_ms,
@@ -1761,7 +1976,7 @@ mod tests {
             Some("Home"),
             ts("2026-08-25T10:00:07Z"),
         )];
-        let d2 = fold_analytics_rows(&second, &mut sess, &mut jour, 2000);
+        let d2 = fold_analytics_rows(&second, &HashSet::new(), &mut sess, &mut jour, 2000);
         assert_eq!(
             d2.screens[&((app, None, day), "Home".to_string())].dwell_ms,
             7_000.0
@@ -1786,7 +2001,7 @@ mod tests {
                 )
             })
             .collect();
-        let d1 = fold_analytics_rows(&first, &mut sess, &mut jour, 2000);
+        let d1 = fold_analytics_rows(&first, &HashSet::new(), &mut sess, &mut jour, 2000);
         assert_eq!(d1.nodes[&((app, None, day), 0, "e0".to_string())], 1);
         assert_eq!(
             d1.links[&((app, None, day), 1, "e1".to_string(), "e2".to_string())],
@@ -1805,7 +2020,7 @@ mod tests {
                 )
             })
             .collect();
-        let d2 = fold_analytics_rows(&second, &mut sess, &mut jour, 2000);
+        let d2 = fold_analytics_rows(&second, &HashSet::new(), &mut sess, &mut jour, 2000);
         assert_eq!(d2.nodes[&((app, None, day), 3, "e3".to_string())], 1);
         assert_eq!(
             d2.links[&((app, None, day), 2, "e2".to_string(), "e3".to_string())],
@@ -1829,7 +2044,7 @@ mod tests {
             Some("Home"),
             ts("2026-08-25T10:00:00Z"),
         )];
-        let d = fold_analytics_rows(&rows, &mut sess, &mut jour, 2000);
+        let d = fold_analytics_rows(&rows, &HashSet::new(), &mut sess, &mut jour, 2000);
         let day = ts("2026-08-25T10:00:00Z").date_naive();
         let a = &d.activity[&(app, None, day)];
         assert_eq!(a.events, 1);
@@ -1860,7 +2075,7 @@ mod tests {
                 )
             })
             .collect();
-        let d = fold_analytics_rows(&rows, &mut sess, &mut jour, 4);
+        let d = fold_analytics_rows(&rows, &HashSet::new(), &mut sess, &mut jour, 4);
         let day = ts("2026-08-25T10:00:00Z").date_naive();
         let names: Vec<&String> = d.top.keys().map(|(_, n)| n).collect();
         assert_eq!(names.len(), 4);

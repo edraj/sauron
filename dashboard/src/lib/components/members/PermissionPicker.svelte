@@ -191,6 +191,7 @@
       bind:value={query}
       oninput={handleSearchInput}
       placeholder={t('roles.searchPermissions')}
+      width="280px"
     />
     <span class="count muted">{selectedSet.size} of {TOTAL} selected</span>
   </div>

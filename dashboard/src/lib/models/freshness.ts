@@ -2,8 +2,7 @@
 // the RollupChip component is only wiring around this (house rule: no
 // component-render harness; logic lives here with a co-located test).
 import { t } from '../i18n';
-import { localeStore } from '../i18n/locale.svelte';
-import { formatTime } from '../utils/format';
+import { formatTime, relativeTime } from '../utils/format';
 import type { RollupStatus } from './index';
 
 export interface RollupChipView {
@@ -36,7 +35,7 @@ export function rollupChip(
   const asOf = new Date(status.as_of);
   if (Number.isNaN(asOf.getTime())) return null;
   return {
-    label: t('time.asOf', { time: formatTime(asOf) }),
+    label: updatedLabel(asOf),
     title: `${status.as_of} — ${t('time.approxNote')}`,
     tone: now.getTime() - asOf.getTime() > STALE_AFTER_MS ? 'warning' : 'neutral',
   };
@@ -49,7 +48,7 @@ export function approx(formatted: string, active: boolean): string {
   return active ? `≈${formatted}` : formatted;
 }
 
-/// Past this, the "as of" stamp is emphasised.
+/// Past this, the "Updated" stamp is emphasised.
 ///
 /// SIX HOURS, not the fifteen minutes this started at. A view cache is ALLOWED
 /// to be old — `/active-users` serves up to three hours by design — so a
@@ -78,7 +77,8 @@ export interface ViewFreshnessView {
   source: 'server' | 'local';
 }
 
-/// "as of 14:32" for a cached view, plus whether a refresh is running.
+/// "Updated 14:32:05 (8 minutes ago)" for a cached view, plus whether a refresh
+/// is running.
 ///
 /// The server stamp wins whenever there is one. A cached endpoint can hand the
 /// browser an answer it has held for hours; the browser received that answer
@@ -86,14 +86,15 @@ export interface ViewFreshnessView {
 /// wrong, in the one place the reader is looking to find out how old it is.
 /// The local stamp is the fallback for endpoints computed per request, where it
 /// is the only clock there is and an accurate one.
-/// Hours and minutes, never seconds.
 ///
-/// `formatTime` includes seconds, which is precision nobody reads on a
-/// staleness stamp and which made the chip wide enough to compete with the
-/// buttons beside it. Local rather than a change to `formatTime`, which the
-/// rollup chip and other callers share.
-function hhmm(d: Date): string {
-  return d.toLocaleTimeString(localeStore.tag, { hour: '2-digit', minute: '2-digit' });
+/// ONE wording for every stamp in the product — this one, the rollup chip and
+/// the page subtitles that used to carry their own. There were two ("as of
+/// 04:30" beside "Updated 06:31:49 AM (22 hours ago)") and readers took them
+/// for two different facts. The absolute time is the label and the relative
+/// age the qualifier: "42m ago" alone forces arithmetic, and an absolute time
+/// alone silently goes stale in a tab left open.
+function updatedLabel(at: Date): string {
+  return t('time.updated', { time: formatTime(at), rel: relativeTime(at) });
 }
 
 export function viewFreshness(
@@ -112,7 +113,7 @@ export function viewFreshness(
   if (computedAt) {
     const d = new Date(computedAt);
     // A malformed stamp falls through to the local clock rather than rendering
-    // "as of Invalid Date": a worse timestamp beats a broken one.
+    // "Updated Invalid Date": a worse timestamp beats a broken one.
     if (!Number.isNaN(d.getTime())) {
       at = d;
       source = 'server';
@@ -125,7 +126,7 @@ export function viewFreshness(
   if (at === null) return null;
 
   return {
-    label: t('time.asOf', { time: hhmm(at) }),
+    label: updatedLabel(at),
     title: at.toISOString(),
     updating: revalidating,
     tone: now.getTime() - at.getTime() > staleAfterMs ? 'warning' : 'neutral',

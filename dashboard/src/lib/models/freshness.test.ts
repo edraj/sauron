@@ -199,3 +199,85 @@ describe('envelopeStatus', () => {
     });
   });
 });
+
+/**
+ * Pages whose sections arrive in a cache envelope with a server `computed_at`
+ * MUST feed it to `<Freshness>`. Without it the chip dates the data by when
+ * this browser fetched it, and a header can read "Updated 06:31 (22 hours
+ * ago)" beside "as of 04:30" — two clocks, both presented as the data's age.
+ * Overview shipped exactly that. Source scan, because there is no component
+ * render harness (house rule) and the omission is invisible to every other
+ * gate: both clocks are valid dates.
+ */
+describe('envelope-served pages pass the server stamp to <Freshness>', () => {
+  const PAGES = ['../../pages/Overview.svelte', '../../pages/ActiveUsers.svelte'];
+  const pageSources = import.meta.glob('../../pages/*.svelte', {
+    query: '?raw',
+    import: 'default',
+    eager: true,
+  }) as Record<string, string>;
+
+  it.each(PAGES)('%s', (page) => {
+    const source = pageSources[page];
+    expect(source, `${page} was not found by the glob`).toBeTypeOf('string');
+    const uses = [...source.matchAll(/<Freshness\b([\s\S]*?)\/>/g)];
+    expect(uses.length, `${page} renders no <Freshness>`).toBeGreaterThan(0);
+    for (const [, props] of uses) {
+      expect(props, `${page}: <Freshness> without computedAt`).toMatch(/\bcomputedAt=/);
+    }
+  });
+});
+
+/**
+ * One wording for every stamp: "Updated <time> (<relative>)". Both chips go
+ * through it, so a page can never show "as of" beside "Updated" again.
+ */
+describe('stamp wording', () => {
+  const at = new Date(Date.now() - 8 * 60 * 1000).toISOString();
+  it('viewFreshness says Updated <time> (<relative>)', () => {
+    const v = viewFreshness({ computedAt: at });
+    expect(v?.label).toMatch(/^Updated .+ \(.+\)$/);
+    expect(v?.label).not.toMatch(/as of/i);
+  });
+  it('rollupChip says the same', () => {
+    const c = rollupChip({ ready: true, as_of: at } as never);
+    expect(c?.label).toMatch(/^Updated .+ \(.+\)$/);
+    expect(c?.label).not.toMatch(/as of/i);
+  });
+});
+
+/**
+ * Every page with a Refresh button dates what it shows — exactly one stamp,
+ * from `<Freshness>` or `<RollupChip>`. Pages that render both gate the
+ * fetch-time chip on `!rollupState.ready`, or the header carries two
+ * "Updated" times. Source scan; see the note on the guard above.
+ */
+describe('every refreshable page carries one stamp', () => {
+  const pageSources = import.meta.glob('../../pages/*.svelte', {
+    query: '?raw',
+    import: 'default',
+    eager: true,
+  }) as Record<string, string>;
+  /** No single cached payload to date: N per-project lists, or on-demand runs. */
+  const NO_STAMP = new Set(['../../pages/Projects.svelte', '../../pages/FunnelBuilder.svelte']);
+
+  const refreshable = Object.entries(pageSources).filter(([, src]) => /<RefreshButton\b/.test(src));
+  it('finds the refreshable pages', () => {
+    expect(refreshable.length).toBeGreaterThan(20);
+  });
+  it.each(refreshable.map(([page]) => page))('%s', (page) => {
+    const src = pageSources[page];
+    const fresh = /<Freshness\b/.test(src);
+    const rollup = /<RollupChip\b/.test(src);
+    if (NO_STAMP.has(page)) {
+      expect(fresh || rollup, `${page} is allow-listed but now has a stamp`).toBe(false);
+      return;
+    }
+    expect(fresh || rollup, `${page} has a Refresh button and no stamp`).toBe(true);
+    if (fresh && rollup) {
+      expect(src, `${page} renders both chips without gating <Freshness>`).toMatch(
+        /\{#if !rollupState\.ready\}\s*<Freshness\b/,
+      );
+    }
+  });
+});

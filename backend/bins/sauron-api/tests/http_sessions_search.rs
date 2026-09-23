@@ -312,6 +312,134 @@ impl Drop for TestServer {
 // Tier 1: GET /v1/apps/{app_id}/sessions?query=... with AST JSON & string expr
 // ---------------------------------------------------------------------------
 
+/// The sessions list drops the planner's scan clamp only when the session-day
+/// rollup can bound the scan: gate closed → clamped (the 100-day-old session
+/// is out); gate open with a small count → unclamped (it is back); count past
+/// `search::SCAN_UNCLAMPED_MAX_ROWS` → clamped again. The rollup ROWS are
+/// what is edited, not the sessions, because the gate reads the rollup.
+#[tokio::test]
+async fn a_sessions_scan_is_unclamped_only_when_the_rollup_bounds_it() {
+    let Some(mut server) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_sessions_search");
+        return;
+    };
+    let (app_id, token, _sids) = server.seed_app_with_sessions("scan_clamp").await;
+    let old_start = Utc::now() - Duration::days(100);
+    {
+        let mut conn = server.conn().await;
+        bump_sessions(
+            &mut conn,
+            &[SessionBump {
+                app_id,
+                session_id: format!("sess_old_{}", Uuid::new_v4().simple()),
+                distinct_id: Some("user_omega".to_string()),
+                device_key: None,
+                first_at: old_start,
+                last_at: old_start + Duration::minutes(10),
+                context: json!({}),
+                release: None,
+                environment_id: None,
+                ip: None,
+                events_delta: 1,
+                errors_delta: 0,
+                unhandled_delta: 0,
+            }],
+        )
+        .await
+        .expect("seed old session");
+    }
+    // `distinctId:user_*` is `MatchOp::Like` → `Cost::Scan`, so the planner
+    // clamps it; `since_days=365` is the widest this route serves.
+    let path = format!("/v1/apps/{app_id}/sessions?query=distinctId:user_*&since_days=365");
+
+    // Gate closed: test databases pin the rollup epoch in the future and this
+    // app carries no backfill marker, so the rollup cannot vouch for a bound.
+    let closed = server.get_json(&path, &token).await;
+    assert_eq!(closed["clamped"]["field"], "last_event_at", "{closed}");
+    assert_eq!(closed["clamped"]["to"], "30d", "{closed}");
+    assert_eq!(
+        closed["total"], 3,
+        "the old session must be outside the clamp: {closed}"
+    );
+
+    async fn run(conn: &mut sauron_db::PgConn, sql: String) {
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query(sql)
+            .execute(conn)
+            .await
+            .expect("gate sql");
+    }
+    // Open the gate: backfill marker, fresh watermark, and a small day count
+    // that covers all four sessions.
+    {
+        let mut conn = server.conn().await;
+        run(
+            &mut conn,
+            format!("INSERT INTO rollup_backfill (app_id) VALUES ('{app_id}')"),
+        )
+        .await;
+        run(
+            &mut conn,
+            "UPDATE rollup_watermarks SET watermark = now() WHERE source = 'sessions'".into(),
+        )
+        .await;
+        run(
+            &mut conn,
+            format!(
+                "INSERT INTO session_stats_daily (app_id, environment_id, day, sessions, duration_hist) \
+                 VALUES ('{app_id}', NULL, current_date, 4, '\\x'::bytea)"
+            ),
+        )
+        .await;
+    }
+    let open = server.get_json(&path, &token).await;
+    assert!(
+        open["clamped"].is_null(),
+        "a scan the rollup bounds to 4 rows must not be clamped: {open}"
+    );
+    assert_eq!(
+        open["total"], 4,
+        "the 100-day-old session must be reachable: {open}"
+    );
+
+    // Past the ceiling the clamp is back, and it bites.
+    {
+        let mut conn = server.conn().await;
+        run(
+            &mut conn,
+            format!("UPDATE session_stats_daily SET sessions = 5000000 WHERE app_id = '{app_id}'"),
+        )
+        .await;
+    }
+    let large = server.get_json(&path, &token).await;
+    assert_eq!(large["clamped"]["to"], "30d", "{large}");
+    assert_eq!(large["total"], 3, "{large}");
+
+    // A stale watermark closes the gate again even with a small count: a
+    // frozen fold must never make a hot tenant look small.
+    {
+        let mut conn = server.conn().await;
+        run(
+            &mut conn,
+            format!("UPDATE session_stats_daily SET sessions = 4 WHERE app_id = '{app_id}'"),
+        )
+        .await;
+        run(
+            &mut conn,
+            "UPDATE rollup_watermarks SET watermark = now() - interval '3 days' WHERE source = 'sessions'".into(),
+        )
+        .await;
+    }
+    let stale = server.get_json(&path, &token).await;
+    assert_eq!(
+        stale["clamped"]["to"], "30d",
+        "stale rollup must not vouch: {stale}"
+    );
+    assert_eq!(stale["total"], 3, "{stale}");
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_http_sessions_search_string_query() {
     let Some(mut server) = TestServer::start().await else {

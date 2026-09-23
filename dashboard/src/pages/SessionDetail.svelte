@@ -24,6 +24,7 @@
   import { isNormalizedError } from '../lib/api/client';
   import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
   import type { SessionDetail, Transaction } from '../lib/models';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import {
     NO_TIMELINE_FILTER,
     categoryCounts,
@@ -217,6 +218,7 @@
   {:else if detail && s}
     <header class="detail-head">
       <div class="refresh-slot">
+        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
         <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
       </div>
       <div class="id-row">

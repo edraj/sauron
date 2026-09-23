@@ -29,6 +29,7 @@
   import { sortRows } from '../lib/models/sort-rows';
   import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import type { Journey } from '../lib/models';
+  import { rollupState } from '../lib/stores/rollups.svelte';
 
   const DEPTHS = [2, 3, 4, 5, 6, 7, 8];
 
@@ -193,7 +194,12 @@
         the instant paint is indistinguishable from live data.
       -->
       <RollupChip />
-      <Freshness fetchedAt={journeyView.fetchedAt} revalidating={journeyView.revalidating} />
+      <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
+           watermark IS the data's age and this fetch-time chip would be a
+           second "Updated" beside it with a different time. -->
+      {#if !rollupState.ready}
+        <Freshness fetchedAt={journeyView.fetchedAt} revalidating={journeyView.revalidating} />
+      {/if}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
     </div>
   </div>

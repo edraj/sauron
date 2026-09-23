@@ -922,6 +922,15 @@ export interface UserStats {
   dau: number;
   wau: number;
   mau: number;
+  /**
+   * Identified share of dau/wau/mau; guests are the remainder. `null` when
+   * the server cannot say (a rollup window still holding a day whose
+   * identified sketch predates its backfill) — render as unknown, never as
+   * zero guests.
+   */
+  dau_identified: number | null;
+  wau_identified: number | null;
+  mau_identified: number | null;
   avg_session_ms: number;
   median_session_ms: number;
 }

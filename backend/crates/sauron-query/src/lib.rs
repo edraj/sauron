@@ -21,7 +21,7 @@ pub use catalog::{
     dimensions_for, lookup, tag_dimension, Dimension, IndexClass, Resource, Shorthand, Store,
     ValueType, CATALOG, SHORTHANDS, TAG_DIM,
 };
-pub use cost::{classify, Cost};
+pub use cost::{classify, scan_rests_outside, Cost};
 pub use error::QueryError;
 pub use legacy::from_legacy;
 pub use parse::parse;

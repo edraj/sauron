@@ -122,8 +122,11 @@
     font-size: 12.5px;
     border-radius: var(--radius-sm);
   }
+  /* `min-height` so a md button lines up with the `--control-h` toolbar
+     controls it is most often beside (Export next to Refresh). */
   .btn.md {
-    padding: 9px 15px;
+    min-height: var(--control-h);
+    padding: 8px 15px;
     font-size: 13.5px;
   }
   .btn.lg {

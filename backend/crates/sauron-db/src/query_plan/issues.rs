@@ -414,6 +414,34 @@ pub struct IssuesLower<'a> {
     pub since: DateTime<Utc>,
 }
 
+/// The `Store::Column` dimensions that lower to a predicate on `issues`' OWN
+/// columns — the arms in [`ResourceLower::leaf`] below that never open a
+/// correlated `EXISTS` into `error_events`. Every other column on this
+/// resource (`release`, `screen`, `distinct_id`, `device_key`, `workflow`),
+/// every `Store::Tag` and every `Store::JsonRoot` is a bridge into the tiered
+/// table, as is free text.
+///
+/// `prepare::clamp_for` reads this to decide whether a `Cost::Scan` Issues
+/// query needs its window clamped: a wildcard over `title` reads the issues
+/// table, which holds one row per fingerprint rather than one per event and
+/// is never tiered, so bounding it buys neither cost nor coverage. Pinned to
+/// the dispatch by `local_columns_are_exactly_the_ones_that_never_bridge`.
+pub(crate) const LOCAL_COLUMNS: &[&str] = &[
+    "status",
+    "level",
+    "type",
+    "culprit",
+    "title",
+    "times_seen",
+    "users_seen",
+    "first_seen",
+    "last_seen",
+];
+
+/// Is this predicate answered from `issues` alone? See [`LOCAL_COLUMNS`].
+pub(crate) fn is_local(p: &sauron_query::ResolvedPredicate) -> bool {
+    matches!(p.dim.store, Store::Column(c) if LOCAL_COLUMNS.contains(&c))
+}
 impl ResourceLower for IssuesLower<'_> {
     type Table = issues::table;
 
@@ -2234,5 +2262,48 @@ mod tests {
         let sql = lower_issues_sql("is:resolved boom");
         assert!(sql.contains(r#""issues"."status" = $1"#), "{sql}");
         assert!(sql.contains("AND"), "{sql}");
+    }
+
+    /// `LOCAL_COLUMNS` is a hand-written mirror of the `leaf` dispatch, and
+    /// the clamp skip in `prepare` trusts it. This drives every `Store::Column`
+    /// dimension the catalog declares on Issues through `leaf` and checks the
+    /// SQL: a column listed as local must never open the `error_events`
+    /// bridge, and one not listed must. Adding a bridged column to the list —
+    /// or forgetting a new local one — fails here, not as an unclamped scan
+    /// over every partition in production.
+    #[test]
+    fn local_columns_are_exactly_the_ones_that_never_bridge() {
+        use sauron_query::catalog::{dimensions_for, ValueType};
+        let mut seen = 0;
+        for dim in dimensions_for(Resource::Issues) {
+            let Store::Column(col) = dim.store else {
+                continue;
+            };
+            let value = match dim.ty {
+                ValueType::Enum(opts) => opts[0].to_string(),
+                ValueType::Int => "1".to_string(),
+                ValueType::Timestamp => "-1d".to_string(),
+                _ => "sample".to_string(),
+            };
+            let q = format!("{}:{value}", dim.name);
+            let sql = lower_issues_sql(&q);
+            let bridges = sql.contains("FROM error_events");
+            let local = LOCAL_COLUMNS.contains(&col);
+            assert_ne!(
+                bridges, local,
+                "`{q}` (column `{col}`): bridges={bridges}, listed local={local}: {sql}"
+            );
+            seen += 1;
+        }
+        // Every entry in the list must be a real Issues column, so a typo
+        // cannot silently list nothing.
+        for col in LOCAL_COLUMNS {
+            assert!(
+                dimensions_for(Resource::Issues)
+                    .any(|d| matches!(d.store, Store::Column(c) if c == *col)),
+                "`{col}` is in LOCAL_COLUMNS but is not a Store::Column on Issues"
+            );
+        }
+        assert!(seen >= LOCAL_COLUMNS.len(), "sweep saw only {seen} columns");
     }
 }

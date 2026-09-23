@@ -35,6 +35,7 @@
   import { revokeMemberSessions } from '../lib/api/account';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
   import {
     groupMembers,
     type App,
@@ -464,6 +465,7 @@
       <p class="muted sub">People with access to {sessionStore.currentOrg?.name ?? 'this org'}.</p>
     </div>
     <div class="head-actions">
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
     </div>
   </div>

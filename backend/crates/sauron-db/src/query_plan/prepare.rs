@@ -17,30 +17,29 @@
 //!    with ONE query, rather than one lookup per predicate.
 //! 3. **Classify cost and clamp.** `sauron_query::classify(node)`; a
 //!    `Cost::Scan` query gets a `Clamp` bounding how far back its window may
-//!    reach.
+//!    reach — unless it is an Issues query whose scan never leaves the
+//!    `issues` table (see the nuance note below).
 //!
-//! ## The Issues/tiering nuance, and why it is not implemented here
+//! ## The Issues/tiering nuance
 //!
-//! An Issues query whose predicates all hit `issues`' own columns (e.g. a
-//! `title` wildcard) never reaches `error_events`, which is the only table
-//! the tier worker actually drops rows from — so clamping it is purely a
-//! *cost* safety valve, never a *coverage* necessity. A query with free text
-//! or a tag predicate, by contrast, becomes a correlated subquery into
-//! `error_events` (see `issues.rs`'s `text`/`tag_leaf`) and so is bounded by
-//! the tier worker's hot window regardless of what this module does.
+//! An Issues query whose scanning predicates all hit `issues`' own columns
+//! (e.g. a `title` wildcard) never reaches `error_events`, which is the only
+//! table the tier worker actually drops rows from — so clamping it would be
+//! purely a *cost* safety valve, never a *coverage* necessity, and the cost is
+//! not there either: `issues` holds one row per fingerprint, not one per
+//! event, and an `is:unresolved title:*boom*` query already scans it
+//! unclamped today. A query with free text, a tag predicate, a JSON-root
+//! predicate or a wildcard over a bridged column (`release`, `screen`, …), by
+//! contrast, becomes a correlated subquery into `error_events` and stays
+//! clamped.
 //!
-//! Telling those apart precisely would need to know which `Resource` the
-//! tree was resolved against (a plain `level:error` predicate is an issues
-//! column on `Resource::Issues` but the row itself on `Resource::Occurrences`)
-//! — information `ResolvedPredicate` does not carry and this function's
-//! interface, fixed by the task brief, does not accept. `clamp_for_cost`
-//! therefore clamps every `Cost::Scan` query uniformly, Issues included. That
-//! is the conservative direction to err in: it never under-clamps (never
-//! silently misses a query that reaches a tiered table), it only occasionally
-//! over-clamps a query that would have been safe to run unbounded (a pure
-//! `issues`-column scan). Left as an open item for whoever wires `prepare()`
-//! into a route (S2c, per Task 7's coverage-test note) — that caller knows
-//! its `Resource` and can special-case it there.
+//! Telling those apart needs the `Resource` the tree was resolved against (a
+//! plain `level:error` predicate is an issues column on `Resource::Issues`
+//! but the row itself on `Resource::Occurrences`), which is why `prepare`
+//! takes one. The set of local columns is `issues::LOCAL_COLUMNS`, pinned to
+//! the `leaf` dispatch by a test there; `sauron_query::scan_rests_outside`
+//! does the attribution walk. Every other resource is clamped uniformly,
+//! because on those the scanned row IS the tiered row.
 
 use std::collections::{HashMap, HashSet};
 
@@ -49,7 +48,7 @@ use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
-use sauron_query::{classify, Cost, ResolvedNode, Store, TypedValue};
+use sauron_query::{classify, scan_rests_outside, Cost, ResolvedNode, Resource, Store, TypedValue};
 
 use crate::query_plan::{PlanError, PrepCtx};
 use crate::schema::{app_environments, environments};
@@ -59,10 +58,9 @@ use crate::schema::{app_environments, environments};
 /// tightening of it.
 ///
 /// `field` names the window generically ("since") rather than as a physical
-/// column: `prepare` does not know which `Resource` it was called for (see
-/// the module-level nuance note), so mapping this to a concrete column
-/// (`issues.last_seen` vs `error_events.occurred_at`) is the resource-aware
-/// caller's job, not this one's.
+/// column: mapping it to a concrete column (`issues.last_seen` vs
+/// `error_events.occurred_at`) is the caller's job, since it also owns the
+/// `since_days` ceiling the clamp is merged with (`search::resolve_window`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clamp {
     pub field: &'static str,
@@ -82,6 +80,7 @@ pub struct Prepared {
 /// synchronous `lower()` needs.
 pub async fn prepare(
     node: &ResolvedNode,
+    resource: Resource,
     app_id: Uuid,
     now: DateTime<Utc>,
     conn: &mut AsyncPgConnection,
@@ -104,7 +103,7 @@ pub async fn prepare(
 
     // Job 3 — cost + clamp.
     let cost = classify(node);
-    let clamp = clamp_for_cost(cost);
+    let clamp = clamp_for(node, resource, cost);
 
     Ok(Prepared { ctx, cost, clamp })
 }
@@ -236,19 +235,21 @@ async fn resolve_environments(
 // Job 3 — classify and clamp.
 // ===========================================================================
 
-/// See the module-level nuance note: clamps every `Cost::Scan` query
-/// uniformly, regardless of which resource or table it actually reaches.
-fn clamp_for_cost(cost: Cost) -> Option<Clamp> {
-    if cost == Cost::Scan {
-        Some(Clamp {
-            field: "since",
-            to_days: scan_clamp_days(),
-            reason: "unindexed predicate (a wildcard, substring, or free-text match) \
-                     requires a bounded time window",
-        })
-    } else {
-        None
+/// Clamp every `Cost::Scan` query — except an Issues query whose scanning
+/// leaves all live on the `issues` table (see the module-level nuance note).
+fn clamp_for(node: &ResolvedNode, resource: Resource, cost: Cost) -> Option<Clamp> {
+    if cost != Cost::Scan {
+        return None;
     }
+    if resource == Resource::Issues && !scan_rests_outside(node, &super::issues::is_local) {
+        return None;
+    }
+    Some(Clamp {
+        field: "since",
+        to_days: scan_clamp_days(),
+        reason: "unindexed predicate (a wildcard, substring, or free-text match) \
+                 requires a bounded time window",
+    })
 }
 
 /// Mirrors `sauron_core::config::Config::search_scan_clamp_days` — read
@@ -295,13 +296,60 @@ mod tests {
     /// `is:unresolved`/`title` are Issues-only fields, so this helper fixes
     /// the resource to Issues.
     fn clamp_for(q: &str) -> Option<Clamp> {
-        let node = resolve(&parse(q).unwrap(), Resource::Issues).unwrap();
-        clamp_for_cost(classify(&node))
+        clamp_on(q, Resource::Issues)
+    }
+
+    fn clamp_on(q: &str, r: Resource) -> Option<Clamp> {
+        let node = resolve(&parse(q).unwrap(), r).unwrap();
+        super::clamp_for(&node, r, classify(&node))
     }
 
     #[test]
     fn an_all_scan_query_is_clamped() {
-        assert!(clamp_for("title:*boom*").is_some());
+        assert!(clamp_for("boom").is_some());
+        assert!(clamp_on("message:*boom*", Resource::Occurrences).is_some());
+    }
+
+    // -- The Issues exception ------------------------------------------------
+
+    #[test]
+    fn an_issues_scan_confined_to_issues_columns_is_not_clamped() {
+        // `title`/`culprit`/`type` are `issues` columns: the scan never
+        // reaches the tiered table, so there is nothing to bound.
+        assert!(clamp_for("title:*boom*").is_none());
+        assert!(clamp_for("culprit:~handler").is_none());
+        assert!(clamp_for("title:*boom* type:~Timeout").is_none());
+        assert!(clamp_for("!title:*boom*").is_none());
+    }
+
+    #[test]
+    fn a_bounded_bridge_beside_a_local_scan_does_not_reinstate_the_clamp() {
+        // The release switcher ANDs `release:<x>` into every list query; an
+        // equality bridge is `Bounded`, not a scan, and its EXISTS is bound by
+        // its own `since` bind. The only scanning leaf is still local.
+        assert!(clamp_for("title:*boom* release:1.4.0").is_none());
+        assert!(clamp_for("title:*boom* screen:/checkout").is_none());
+        assert!(clamp_for("title:*boom* tag.region:eu").is_none());
+    }
+
+    #[test]
+    fn an_issues_scan_that_reaches_error_events_is_still_clamped() {
+        // Free text matches the child events' payloads; a tag, JSON-root or
+        // bridged-column wildcard is a substring scan over `error_events`.
+        assert!(clamp_for("boom").is_some());
+        assert!(clamp_for("title:*boom* boom").is_some());
+        assert!(clamp_for("tag.region:~eu").is_some());
+        assert!(clamp_for("extra.token:~sk_live").is_some());
+        assert!(clamp_for("screen:*checkout*").is_some());
+        assert!(clamp_for("title:*boom* OR screen:*checkout*").is_some());
+    }
+
+    #[test]
+    fn the_exception_is_issues_only() {
+        // `message` is a scan-class column on Occurrences, but there the
+        // scanned row IS the tiered row, so the clamp stands.
+        assert!(clamp_on("message:*boom*", Resource::Occurrences).is_some());
+        assert!(clamp_on("tag.region:~eu", Resource::Occurrences).is_some());
     }
 
     #[test]

@@ -3397,20 +3397,32 @@ pub async fn get_issue(
 fn ts_of(c: &crate::query_plan::cursor::Cursor) -> DateTime<Utc> {
     match c.value {
         crate::query_plan::cursor::CursorValue::Ts(ts) => ts,
-        crate::query_plan::cursor::CursorValue::Text(_) => DateTime::<Utc>::UNIX_EPOCH,
+        crate::query_plan::cursor::CursorValue::Text(_)
+        | crate::query_plan::cursor::CursorValue::Int(_) => DateTime::<Utc>::UNIX_EPOCH,
     }
 }
 
 /// Extracts the value a text cursor carries.
 ///
-/// Returns `""` for a `Ts` cursor for the same reason [`ts_of`] returns
+/// Returns `""` for any other kind for the same reason [`ts_of`] returns
 /// `UNIX_EPOCH` for a `Text` one — see its doc comment. `decode` is the
 /// actual guard; this fallback is for a `Cursor` that reached here without
 /// going through it.
 fn text_of(c: &crate::query_plan::cursor::Cursor) -> String {
     match &c.value {
         crate::query_plan::cursor::CursorValue::Text(s) => s.clone(),
-        crate::query_plan::cursor::CursorValue::Ts(_) => String::new(),
+        crate::query_plan::cursor::CursorValue::Ts(_)
+        | crate::query_plan::cursor::CursorValue::Int(_) => String::new(),
+    }
+}
+
+/// Extracts the value an integer cursor carries. `0` for any other kind, on
+/// the same reasoning as [`ts_of`] and [`text_of`].
+fn int_of(c: &crate::query_plan::cursor::Cursor) -> i64 {
+    match &c.value {
+        crate::query_plan::cursor::CursorValue::Int(n) => *n,
+        crate::query_plan::cursor::CursorValue::Ts(_)
+        | crate::query_plan::cursor::CursorValue::Text(_) => 0,
     }
 }
 
@@ -3421,15 +3433,30 @@ fn text_of(c: &crate::query_plan::cursor::Cursor) -> String {
 /// known ordering could only be handled by falling back to a default — i.e.
 /// by silently serving a different sort than was asked for.
 ///
-/// Both variants are backed by an index whose trailing column is `id`
-/// (`issues_app_last_seen_id_idx`, migration 25; `first_seen` falls back to a
-/// sort, which is why only `last_seen` is the default). Keeping `id` as the
-/// tiebreaker in BOTH is what makes each a total order — the property deep
-/// paging depends on.
+/// Every variant is backed by an index whose trailing column is `id`
+/// (`issues_app_last_seen_id_idx`, migration 25; the two count indexes,
+/// migration 80; `first_seen` falls back to a sort, which is why only
+/// `last_seen` is the default). Keeping `id` as the tiebreaker in ALL of them
+/// is what makes each a total order — the property deep paging depends on.
+///
+/// **The two count orderings mean something different under an environment
+/// scope**, and [`IssueSort::ranks_by_env_count`] is where that is decided.
+/// `issues.times_seen`/`users_seen` are app-wide, but under `EnvFilter::One`/
+/// `Subset`/`Unattributed` the row the caller sees carries the environment's
+/// own derived counts (see [`issue_env_stats`]). Walking the stored column
+/// there would order by a number the page does not show — an issue with a
+/// million occurrences elsewhere and one here would head a list whose every
+/// displayed count says otherwise. So under an environment scope those two
+/// sorts rank over the derived counts instead, via
+/// [`search_issues_by_env_count`]. The temporal sorts keep walking the stored
+/// columns (their orderings correlate closely enough that the page reads
+/// right, and they are what the keyset index serves).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueSort {
     LastSeen,
     FirstSeen,
+    TimesSeen,
+    UsersSeen,
 }
 
 impl IssueSort {
@@ -3438,17 +3465,63 @@ impl IssueSort {
         match col {
             "last_seen" => Some(IssueSort::LastSeen),
             "first_seen" => Some(IssueSort::FirstSeen),
+            "times_seen" => Some(IssueSort::TimesSeen),
+            "users_seen" => Some(IssueSort::UsersSeen),
             _ => None,
         }
     }
 
-    /// The timestamp a cursor for this ordering must carry. Reading
-    /// `last_seen` while ordering by `first_seen` would produce a cursor that
-    /// skips or repeats whole pages, so the two are derived from one value.
-    pub fn cursor_ts(self, issue: &Issue) -> DateTime<Utc> {
+    pub fn column(self) -> &'static str {
         match self {
-            IssueSort::LastSeen => issue.last_seen,
-            IssueSort::FirstSeen => issue.first_seen,
+            IssueSort::LastSeen => "last_seen",
+            IssueSort::FirstSeen => "first_seen",
+            IssueSort::TimesSeen => "times_seen",
+            IssueSort::UsersSeen => "users_seen",
+        }
+    }
+
+    /// The two orderings over a count rather than a timestamp.
+    pub fn is_count(self) -> bool {
+        matches!(self, IssueSort::TimesSeen | IssueSort::UsersSeen)
+    }
+
+    /// Whether this sort, under `env`, ranks over the environment's derived
+    /// counts ([`search_issues_by_env_count`]) rather than walking a stored
+    /// column ([`search_issues`]). See the type's doc comment. The route reads
+    /// this too, to skip its own per-page derivation when the rows it got
+    /// back already carry the derived values.
+    pub fn ranks_by_env_count(self, env: &EnvFilter) -> bool {
+        self.is_count() && !matches!(env, EnvFilter::All)
+    }
+
+    /// The kind of value a cursor minted under this ordering carries — what
+    /// `cursor::decode` is handed so a forged payload of another kind cannot
+    /// page this ordering.
+    pub fn cursor_kind(self) -> crate::query_plan::cursor::CursorKind {
+        use crate::query_plan::cursor::CursorKind;
+        if self.is_count() {
+            CursorKind::Integer
+        } else {
+            CursorKind::Timestamp
+        }
+    }
+
+    /// The value a cursor minted under this ordering must carry, read off a
+    /// REAL row. Reading `last_seen` while ordering by `first_seen` would
+    /// produce a cursor that skips or repeats whole pages, so the value and
+    /// the ordering are derived from one place.
+    ///
+    /// For the count sorts under an environment scope the row has ALREADY had
+    /// its derived counts applied by [`search_issues_by_env_count`], which is
+    /// exactly what that path's in-memory keyset compares against — so the
+    /// same read is right on both paths.
+    pub fn cursor_value(self, issue: &Issue) -> crate::query_plan::cursor::CursorValue {
+        use crate::query_plan::cursor::CursorValue;
+        match self {
+            IssueSort::LastSeen => CursorValue::Ts(issue.last_seen),
+            IssueSort::FirstSeen => CursorValue::Ts(issue.first_seen),
+            IssueSort::TimesSeen => CursorValue::Int(issue.times_seen),
+            IssueSort::UsersSeen => CursorValue::Int(issue.users_seen),
         }
     }
 }
@@ -3493,6 +3566,18 @@ impl EventSort {
     /// Whether the cursor for this column carries a timestamp or text.
     pub fn is_temporal(self) -> bool {
         matches!(self, EventSort::OccurredAt)
+    }
+
+    /// What `cursor::decode` is handed — the same fact as `is_temporal`, in
+    /// the three-way form the decoder takes since `IssueSort` gained an
+    /// integer ordering.
+    pub fn cursor_kind(self) -> crate::query_plan::cursor::CursorKind {
+        use crate::query_plan::cursor::CursorKind;
+        if self.is_temporal() {
+            CursorKind::Timestamp
+        } else {
+            CursorKind::Text
+        }
     }
 
     /// The value a cursor minted under this ordering must carry, read off a
@@ -3553,6 +3638,18 @@ impl OccurrenceSort {
     /// Whether the cursor for this column carries a timestamp or text.
     pub fn is_temporal(self) -> bool {
         matches!(self, OccurrenceSort::OccurredAt)
+    }
+
+    /// What `cursor::decode` is handed — the same fact as `is_temporal`, in
+    /// the three-way form the decoder takes since `IssueSort` gained an
+    /// integer ordering.
+    pub fn cursor_kind(self) -> crate::query_plan::cursor::CursorKind {
+        use crate::query_plan::cursor::CursorKind;
+        if self.is_temporal() {
+            CursorKind::Timestamp
+        } else {
+            CursorKind::Text
+        }
     }
 
     /// The value a cursor minted under this ordering must carry, read off a
@@ -3727,6 +3824,14 @@ pub async fn search_issues(
     scope: &ReadScope,
     search: &IssueSearch<'_>,
 ) -> Result<Vec<Issue>, PlanError> {
+    // A count sort under an environment scope is a different question — see
+    // `IssueSort`'s doc comment — and is answered over derived values rather
+    // than by a keyset over `issues`. Dispatched HERE, not only at the route,
+    // so no caller can walk the stored column by forgetting the branch.
+    if search.sort.ranks_by_env_count(&scope.env) {
+        return search_issues_by_env_count(conn, scope, search).await;
+    }
+
     let mut q = issue_search_base(
         scope,
         search.node,
@@ -3739,10 +3844,11 @@ pub async fn search_issues(
     // inserted mid-walk cannot shift a later page onto rows an earlier page
     // already returned, and a tie group larger than one page cannot loop.
     // `last_seen` alone is not total — thousands of issues legitimately share
-    // one `last_seen` — which is the entire reason `id` is in the tuple and
-    // in the index.
+    // one `last_seen`, and counts tie even more often — which is the entire
+    // reason `id` is in the tuple and in every one of the indexes.
     if let Some(c) = &search.after {
         let ts = ts_of(c);
+        let n = int_of(c);
         q = match (search.sort, search.descending) {
             (IssueSort::LastSeen, true) => q.filter(
                 issues::last_seen
@@ -3764,6 +3870,26 @@ pub async fn search_issues(
                     .gt(ts)
                     .or(issues::first_seen.eq(ts).and(issues::id.gt(c.id))),
             ),
+            (IssueSort::TimesSeen, true) => q.filter(
+                issues::times_seen
+                    .lt(n)
+                    .or(issues::times_seen.eq(n).and(issues::id.lt(c.id))),
+            ),
+            (IssueSort::TimesSeen, false) => q.filter(
+                issues::times_seen
+                    .gt(n)
+                    .or(issues::times_seen.eq(n).and(issues::id.gt(c.id))),
+            ),
+            (IssueSort::UsersSeen, true) => q.filter(
+                issues::users_seen
+                    .lt(n)
+                    .or(issues::users_seen.eq(n).and(issues::id.lt(c.id))),
+            ),
+            (IssueSort::UsersSeen, false) => q.filter(
+                issues::users_seen
+                    .gt(n)
+                    .or(issues::users_seen.eq(n).and(issues::id.gt(c.id))),
+            ),
         };
     }
     // The ORDER BY must be the same tuple, in the same direction, as the
@@ -3774,6 +3900,10 @@ pub async fn search_issues(
         (IssueSort::LastSeen, false) => q.order((issues::last_seen.asc(), issues::id.asc())),
         (IssueSort::FirstSeen, true) => q.order((issues::first_seen.desc(), issues::id.desc())),
         (IssueSort::FirstSeen, false) => q.order((issues::first_seen.asc(), issues::id.asc())),
+        (IssueSort::TimesSeen, true) => q.order((issues::times_seen.desc(), issues::id.desc())),
+        (IssueSort::TimesSeen, false) => q.order((issues::times_seen.asc(), issues::id.asc())),
+        (IssueSort::UsersSeen, true) => q.order((issues::users_seen.desc(), issues::id.desc())),
+        (IssueSort::UsersSeen, false) => q.order((issues::users_seen.asc(), issues::id.asc())),
     };
     let mut q = q.select(Issue::as_select()).limit(search.limit + 1);
     if let Some(off) = jump_offset(&search.after, search.offset) {
@@ -3782,6 +3912,137 @@ pub async fn search_issues(
     q.load(conn)
         .await
         .map_err(|e| PlanError::Database(e.to_string()))
+}
+
+/// How many matching issues [`search_issues_by_env_count`] will rank.
+///
+/// The same figure as the route's `COUNT_CAP`: past it the envelope already
+/// reports `total` as "10,000+" and no page is numberable, so ranking a
+/// candidate set larger than the count the caller is shown would spend
+/// aggregate work on rows the pager cannot reach. Candidates are taken newest
+/// `last_seen` first so that, when the cap does bite, it is the stalest
+/// issues that fall outside the ranking rather than an arbitrary set.
+pub const ENV_RANK_CANDIDATES: i64 = 10_000;
+
+/// A count sort under an environment scope: rank by the environment's OWN
+/// counts, then page.
+///
+/// The keyset walk in [`search_issues`] cannot serve this. `issues.times_seen`
+/// and `users_seen` are app-wide, maintained at ingest; the row the caller
+/// sees under `EnvFilter::One`/`Subset`/`Unattributed` carries the counts
+/// [`issue_env_stats`] derives from `error_events` for that environment and
+/// window. Ordering by the stored column and displaying the derived one puts
+/// an issue with a million occurrences elsewhere and one here at the top of a
+/// list whose every visible number says it belongs at the bottom. That is the
+/// defect the earlier "Issues sorting is deferred" note recorded, and the
+/// only honest fix is to rank over the values shown — which is what
+/// [`top_issues`] already does for the Overview, at the cost it documents.
+///
+/// Four statements, in place of one:
+///
+/// 1. **Candidates** — every id the same predicate [`search_issues`] and
+///    [`count_issues`] use, so `total` still describes this exact set. Capped
+///    at [`ENV_RANK_CANDIDATES`], newest first (see the constant).
+/// 2. **Derived counts** — [`issue_env_stats`] over all candidates, one
+///    index-only range scan each. This is the cost of the feature, and it is
+///    bounded by the request's own window: `since` is pushed into the
+///    aggregate, and the route caps windows.
+/// 3. **Rank and page, in memory** — a total order over `(count, id)`, the
+///    same tuple the SQL keyset uses, so a cursor minted here (`Int(count)`,
+///    `id`) addresses a position that survives a re-derivation with the same
+///    inputs. The cursor's count IS the derived count on the last served row
+///    (`IssueSort::cursor_value` reads it off the row after step 4), so
+///    "rows strictly after the cursor" is an in-memory tuple comparison
+///    rather than a SQL predicate. Offset jumps skip in memory too.
+/// 4. **Rows** — one page of `Issue` rows, re-ordered to the ranking and with
+///    the derived values applied ([`apply_issue_env_stats`]), so the caller
+///    gets back exactly what the keyset path would after its own phase 2.
+///
+/// A candidate the aggregate found no row for (the retention/erasure race
+/// `apply_issue_env_stats` documents) ranks as zero and keeps its stored
+/// values on the page — same decision, same reasoning.
+pub async fn search_issues_by_env_count(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    search: &IssueSearch<'_>,
+) -> Result<Vec<Issue>, PlanError> {
+    debug_assert!(search.sort.ranks_by_env_count(&scope.env));
+
+    // 1. Candidates.
+    let ids: Vec<Uuid> = issue_search_base(
+        scope,
+        search.node,
+        search.ctx,
+        search.since,
+        search.text_reach,
+    )?
+    .order((issues::last_seen.desc(), issues::id.desc()))
+    .select(issues::id)
+    .limit(ENV_RANK_CANDIDATES)
+    .load(conn)
+    .await
+    .map_err(|e| PlanError::Database(e.to_string()))?;
+
+    // 2. Derived counts for every candidate.
+    let stats = issue_env_stats(conn, scope, &ids, search.since).await?;
+    let count_of = |id: &Uuid| -> i64 {
+        stats
+            .get(id)
+            .map(|s| match search.sort {
+                IssueSort::TimesSeen => s.times_seen,
+                IssueSort::UsersSeen => s.users_seen,
+                // Unreachable by the dispatch guard; ranking by the stored
+                // count here would be the exact defect this path removes.
+                IssueSort::LastSeen | IssueSort::FirstSeen => 0,
+            })
+            .unwrap_or(0)
+    };
+
+    // 3. Rank and page. `(count, id)` compared as a tuple is the same total
+    //    order the SQL keyset spells as `(col, id) < ROW(?, ?)`.
+    let mut ranked: Vec<(i64, Uuid)> = ids.iter().map(|id| (count_of(id), *id)).collect();
+    if search.descending {
+        ranked.sort_by(|a, b| b.cmp(a));
+    } else {
+        ranked.sort();
+    }
+    if let Some(c) = &search.after {
+        let pos = (int_of(c), c.id);
+        ranked.retain(|r| {
+            if search.descending {
+                *r < pos
+            } else {
+                *r > pos
+            }
+        });
+    }
+    let skip = jump_offset(&search.after, search.offset).unwrap_or(0) as usize;
+    let page_ids: Vec<Uuid> = ranked
+        .iter()
+        .skip(skip)
+        .take(search.limit as usize + 1)
+        .map(|r| r.1)
+        .collect();
+    if page_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 4. The page's rows, in ranked order, carrying the derived values.
+    let mut rows: Vec<Issue> = issues::table
+        .filter(issues::app_id.eq(scope.app_id))
+        .filter(issues::id.eq_any(&page_ids))
+        .select(Issue::as_select())
+        .load(conn)
+        .await
+        .map_err(|e| PlanError::Database(e.to_string()))?;
+    apply_issue_env_stats(&mut rows, &stats);
+    let position: HashMap<Uuid, usize> = page_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+    rows.sort_by_key(|r| position.get(&r.id).copied().unwrap_or(usize::MAX));
+    Ok(rows)
 }
 
 /// `(total, capped)` over the same predicate [`search_issues`] pages.
@@ -4503,6 +4764,18 @@ impl TransactionSort {
     /// what would break it.
     pub fn is_temporal(self) -> bool {
         matches!(self, TransactionSort::OccurredAt)
+    }
+
+    /// What `cursor::decode` is handed — the same fact as `is_temporal`, in
+    /// the three-way form the decoder takes since `IssueSort` gained an
+    /// integer ordering.
+    pub fn cursor_kind(self) -> crate::query_plan::cursor::CursorKind {
+        use crate::query_plan::cursor::CursorKind;
+        if self.is_temporal() {
+            CursorKind::Timestamp
+        } else {
+            CursorKind::Text
+        }
     }
 
     /// The value a cursor minted under this ordering must carry, read off a
@@ -10600,6 +10873,19 @@ pub struct UserStats {
     pub wau: i64,
     #[diesel(sql_type = BigInt)]
     pub mau: i64,
+    /// Identified share of dau/wau/mau; guests are the remainder. Exact on
+    /// the legacy path (a join on `identified_at`), a sketch estimate on the
+    /// rollup path (`user_activity_daily.hll_identified`, migration 79).
+    /// `None` when the rollup window still holds a day whose sketch predates
+    /// migration 79 and has not been recomputed yet — "unknown", never "all
+    /// guests". Reflects the flag as of the last (re)compute; see
+    /// `rollups::fold::recompute_identified_sketches`.
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub dau_identified: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub wau_identified: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub mau_identified: Option<i64>,
     #[diesel(sql_type = Double)]
     pub avg_session_ms: f64,
     #[diesel(sql_type = Double)]
@@ -10689,6 +10975,21 @@ pub async fn user_stats(
               UNION ALL \
               SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= ${b30}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
             ) d30)::bigint AS mau, \
+           (SELECT count(DISTINCT d.distinct_id) FROM ( \
+              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= ${b1}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              UNION ALL \
+              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= ${b1}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+            ) d JOIN event_users eu ON eu.app_id=$1 AND eu.distinct_id = d.distinct_id AND eu.identified_at IS NOT NULL)::bigint AS dau_identified, \
+           (SELECT count(DISTINCT d.distinct_id) FROM ( \
+              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= ${b7}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              UNION ALL \
+              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= ${b7}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+            ) d JOIN event_users eu ON eu.app_id=$1 AND eu.distinct_id = d.distinct_id AND eu.identified_at IS NOT NULL)::bigint AS wau_identified, \
+           (SELECT count(DISTINCT d.distinct_id) FROM ( \
+              SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= ${b30}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+              UNION ALL \
+              SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= ${b30}{env_sql} AND distinct_id IS NOT NULL AND distinct_id <> '' \
+            ) d JOIN event_users eu ON eu.app_id=$1 AND eu.distinct_id = d.distinct_id AND eu.identified_at IS NOT NULL)::bigint AS mau_identified, \
            COALESCE((SELECT avg(EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \
                      FROM sessions WHERE app_id=$1 AND last_event_at>=$2{env_sql}{up_last_event}), 0)::double precision AS avg_session_ms, \
            COALESCE((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (last_event_at - started_at)) * 1000) \
