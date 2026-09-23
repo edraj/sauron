@@ -639,6 +639,74 @@ async fn rollup_reads_match_legacy_reads() {
     let r_useries = repo::active_user_series(&mut conn, scope(), range)
         .await
         .expect("rollup useries");
+
+    // ------------------------------------------------------------------
+    // Identified sketch: NULL = unknown, and the recompute restores it.
+    // A pre-migration-79 row has no `hll_identified`; a window touching one
+    // must say "unknown" (None), never "zero identified", and
+    // `recompute_identified_sketches` — fed from person_days ⋈ the current
+    // flag — must bring the split back to the folded value.
+    // ------------------------------------------------------------------
+    assert!(
+        r_users.mau_identified.is_some(),
+        "freshly folded sketches are known"
+    );
+    exec(
+        &mut conn,
+        "UPDATE user_activity_daily SET hll_identified = NULL",
+    )
+    .await;
+    let unknown = repo::user_stats(&mut conn, scope(), range, now)
+        .await
+        .expect("rollup users, sketch nulled");
+    assert_eq!(
+        unknown.mau_identified, None,
+        "a NULL row in the window = unknown"
+    );
+    assert_eq!(
+        unknown.mau, r_users.mau,
+        "the all-users figure is unaffected"
+    );
+    assert!(
+        rollups::identified_sketch_pending(&mut conn)
+            .await
+            .expect("pending"),
+        "the backfill must see the NULL rows"
+    );
+    for day in fold::identified_sketch_days_pending(&mut conn)
+        .await
+        .expect("days")
+    {
+        fold::recompute_identified_sketches(&mut conn, day)
+            .await
+            .expect("recompute");
+    }
+    assert!(!rollups::identified_sketch_pending(&mut conn)
+        .await
+        .expect("pending"));
+    let restored = repo::user_stats(&mut conn, scope(), range, now)
+        .await
+        .expect("rollup users, recomputed");
+    for (name, a, b) in [
+        (
+            "dau_identified",
+            restored.dau_identified,
+            r_users.dau_identified,
+        ),
+        (
+            "wau_identified",
+            restored.wau_identified,
+            r_users.wau_identified,
+        ),
+        (
+            "mau_identified",
+            restored.mau_identified,
+            r_users.mau_identified,
+        ),
+    ] {
+        let (a, b) = (a.expect("recomputed is known"), b.expect("folded is known"));
+        assert!((a - b).abs() <= 1, "{name} recomputed {a} vs folded {b}");
+    }
     let r_sess = repo::session_stats(&mut conn, scope(), range)
         .await
         .expect("rollup sess");
@@ -784,6 +852,29 @@ async fn rollup_reads_match_legacy_reads() {
         l_users.new_identified, r_users.new_identified,
         "new_identified"
     );
+    for (name, l, r) in [
+        (
+            "dau_identified",
+            l_users.dau_identified,
+            r_users.dau_identified,
+        ),
+        (
+            "wau_identified",
+            l_users.wau_identified,
+            r_users.wau_identified,
+        ),
+        (
+            "mau_identified",
+            l_users.mau_identified,
+            r_users.mau_identified,
+        ),
+    ] {
+        let (l, r) = (
+            l.expect("legacy split is exact"),
+            r.expect("rollup split known"),
+        );
+        assert!((l - r).abs() <= 1, "{name} {l} vs {r}");
+    }
     assert!(
         (l_users.dau - r_users.dau).abs() <= 1,
         "dau {} vs {}",

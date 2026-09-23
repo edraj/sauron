@@ -178,28 +178,59 @@ pub async fn list(
         super::search::EnvNameReach::for_perms(&perms),
     )?;
 
-    let prepared = sauron_db::query_plan::prepare::prepare(&node, app_id, Utc::now(), &mut conn)
-        .await
-        .map_err(super::search::map_plan_error)?;
+    let prepared = sauron_db::query_plan::prepare::prepare(
+        &node,
+        sauron_query::Resource::Sessions,
+        app_id,
+        Utc::now(),
+        &mut conn,
+    )
+    .await
+    .map_err(super::search::map_plan_error)?;
 
     let sort = session_sort_spec(q.sort.as_deref())?;
-    let window = super::search::resolve_time_filter(
-        // `last_event_at`, NOT `started_at`. This list has always filtered on
-        // `last_event_at` (`repo::session_search_base`); the old
-        // `resolve_window("started_at", …)` call named the other column in the
-        // envelope's `clamped.field` while the predicate used this one.
-        // Defaulting to `started_at` here would fix the label by silently
-        // changing which sessions an unparameterised request returns, which is
-        // the larger of the two changes.
-        "last_event_at",
-        TIME_FIELDS,
-        &q.window,
-        Utc::now(),
-        // 30 days, unchanged: `default_days` above used to supply it.
-        default_days(),
-        super::search::MAX_WINDOW_DAYS,
-        prepared.clamp,
-    )?;
+    // `last_event_at`, NOT `started_at`. This list has always filtered on
+    // `last_event_at` (`repo::session_search_base`); the old
+    // `resolve_window("started_at", …)` call named the other column in the
+    // envelope's `clamped.field` while the predicate used this one.
+    // Defaulting to `started_at` here would fix the label by silently
+    // changing which sessions an unparameterised request returns, which is
+    // the larger of the two changes.
+    let resolve = |planner| {
+        super::search::resolve_time_filter(
+            "last_event_at",
+            TIME_FIELDS,
+            &q.window,
+            Utc::now(),
+            // 30 days, unchanged: `default_days` above used to supply it.
+            default_days(),
+            super::search::MAX_WINDOW_DAYS,
+            planner,
+        )
+    };
+    // The planner's clamp is dropped when the session-day rollup bounds the
+    // scan to `search::SCAN_UNCLAMPED_MAX_ROWS` rows over the window the
+    // caller actually asked for (resolved once WITHOUT the clamp, so the
+    // bound covers the window that would be served unclamped). The rollup
+    // answers `None` — clamp stands — when it is not backfilled for this app
+    // or its watermark is stale; see `rollups::read::session_rows_in_window`.
+    let clamp = match prepared.clamp {
+        None => None,
+        Some(planner) => {
+            let asked = resolve(None)?;
+            let bound = sauron_db::rollups::read::session_rows_in_window(
+                &mut conn,
+                &scope,
+                sauron_db::scope::Range {
+                    from: asked.from,
+                    to: asked.to,
+                },
+            )
+            .await?;
+            super::search::bounded_scan_clamp(bound, Some(planner))
+        }
+    };
+    let window = resolve(clamp)?;
     let limit = q.limit.clamp(1, 200);
     let offset = super::clamp_offset(q.offset);
 

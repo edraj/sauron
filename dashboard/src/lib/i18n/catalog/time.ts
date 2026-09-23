@@ -59,7 +59,7 @@ export const time = {
   // Shared by every cached view's freshness chip. `funnels.updating` and
   // `retention.updating` predate this and say the same thing per page.
   'time.updating': { en: 'Updating…', ar: 'جارٍ التحديث…' },
-  'time.asOf': { en: 'as of {time}', ar: 'حتى {time}' },
+  'time.updated': { en: 'Updated {time} ({rel})', ar: 'حُدِّث {time} ({rel})' },
   // Rollup gate closed: the server is building history in the background.
   'time.buildingHistory': {
     en: 'Building history · {done}/{total} days',

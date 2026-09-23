@@ -19,6 +19,7 @@
   import { toastStore } from '../lib/stores/toast.svelte';
   import { appTypeIcon, appTypeLabel } from '../lib/utils/format';
   import type { App } from '../lib/models';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
 
   // Cached view (lib/stores/cached-view.svelte.ts): the app record paints from
   // cache on return rather than blanking to a spinner, then refreshes behind it.
@@ -130,6 +131,7 @@
 <AdminShell>
   <div class="head">
     <div class="head-actions">
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
     </div>
     <h1 class="page-title">{t('settings.title')}</h1>

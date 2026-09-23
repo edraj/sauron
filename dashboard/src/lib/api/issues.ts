@@ -30,9 +30,14 @@ export async function getIssueStats(
 }
 
 /**
- * `sort` accepts `last_seen` (the default) or `first_seen`, `-`-prefixed for
- * ascending. Anything else is a 400 naming what is allowed — the list refuses
- * an ordering with no keyset index behind it rather than paging it unstably.
+ * `sort` accepts `last_seen` (the default), `first_seen`, `times_seen` or
+ * `users_seen`, `-`-prefixed for ascending. Anything else is a 400 naming what
+ * is allowed — the list refuses an ordering with no keyset index behind it
+ * rather than paging it unstably.
+ *
+ * Under an environment scope the two count orderings rank by that
+ * environment's own counts — the numbers the rows carry — not by the app-wide
+ * totals, so the page reads in order whichever scope is selected.
  *
  * `limit` is clamped server-side to 1..200.
  */

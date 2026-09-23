@@ -523,12 +523,6 @@
     }
   }
 
-  const distinctId = $derived(issue?.latest_event?.distinct_id ?? null);
-  const eventUserEmail = $derived(
-    issue?.latest_event?.event_user?.email ??
-      (issue?.latest_event?.context?.user as { email?: string } | undefined)?.email ??
-      null,
-  );
   const latestEvent = $derived(issue?.latest_event ?? null);
   const latestEventType = $derived(latestEvent?.exception_type ?? issue?.type ?? '');
 
@@ -721,9 +715,9 @@
           <!-- No Tags card here. The rail already carries one, and two copies of
                the same six rows on one screen made the reader check whether they
                said different things. The rail's is the survivor because it sits
-               with the other identity facts (release, environment, affected
-               user) instead of below a fold of stack trace and payload; long
-               values stay readable there through `title` tooltips. -->
+               with the other identity facts (release, environment) instead of
+               below a fold of stack trace and payload; long values stay
+               readable there through `title` tooltips. -->
           <div class="data-row">
             <Card title={t('ui.section.contexts')}>
               {#if latestEvent.contexts && Object.keys(latestEvent.contexts).length > 0}
@@ -942,8 +936,10 @@
 
         <!-- The ONLY Tags card. A second, full-width copy used to sit below the
              stack trace; it was removed rather than this one because tags are
-             identity facts and belong beside release/environment/affected user,
-             above the fold. Uses `.side-dl` rather than KeyValueList because
+             identity facts and belong beside release/environment, above the
+             fold. (An "Affected user" card used to follow this one; it was
+             dropped because the Occurrences list below already names the user
+             on every row.) Uses `.side-dl` rather than KeyValueList because
              that component lays out for full width; a long value truncates with
              its full text on the `title`. -->
         {#if latestEvent && tagEntries.length > 0}
@@ -956,19 +952,6 @@
                 </div>
               {/each}
             </dl>
-          </Card>
-        {/if}
-
-        {#if distinctId}
-          <Card title={t('ui.section.affectedUser')}>
-            <button class="person" onclick={() => push(`/persons/${encodeURIComponent(distinctId)}`)}>
-              <span class="p-avatar">{(eventUserEmail ?? distinctId).slice(0, 1).toUpperCase()}</span>
-              <span class="p-meta">
-                <span class="p-id mono">{distinctId}</span>
-                {#if eventUserEmail}<span class="p-email">{eventUserEmail}</span>{/if}
-              </span>
-              <span class="p-arrow"><Icon name="arrow-right" size={14} /></span>
-            </button>
           </Card>
         {/if}
       </aside>
@@ -1154,52 +1137,6 @@
   .screen-link:hover {
     text-decoration: underline;
   }
-  .person {
-    display: flex;
-    align-items: center;
-    gap: 11px;
-    width: 100%;
-    padding: 4px 2px;
-    background: none;
-    border: none;
-    text-align: start;
-  }
-  .person:hover .p-arrow {
-    transform: translateX(3px);
-    color: var(--primary);
-  }
-  .p-avatar {
-    width: 34px;
-    height: 34px;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    background: var(--primary-soft);
-    color: var(--primary);
-    font-weight: 650;
-    flex-shrink: 0;
-  }
-  .p-meta {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-    flex: 1;
-  }
-  .p-id {
-    font-size: 12.5px;
-    font-weight: 560;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .p-email {
-    font-size: 11.5px;
-    color: var(--text-faint);
-  }
-  .p-arrow {
-    color: var(--text-faint);
-    transition: transform 0.14s ease, color 0.14s ease;
-  }
-
   @media (max-width: 900px) {
     .issue-body {
       grid-template-columns: 1fr;

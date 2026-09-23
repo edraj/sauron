@@ -230,6 +230,28 @@ async fn maintenance(pool: &PgPool, cfg: RollupCfg) {
         },
         Err(e) => warn!(error = %e, "rollup consistency check failed"),
     }
+    // Absorb late `identify()` calls: a person identified after a day was
+    // folded is a guest in that day's sketch until it is rebuilt from
+    // `person_days` ⋈ the CURRENT flag. Trailing 30 days = the MAU span, so
+    // every figure the Users page can show is at most a day behind the flag.
+    {
+        let today = chrono::Utc::now().date_naive();
+        let mut rebuilt = 0usize;
+        for back in 0..30 {
+            let day = today - chrono::Duration::days(back);
+            match rollups::fold::recompute_identified_sketches(&mut conn, day).await {
+                Ok(n) => rebuilt += n,
+                Err(e) => {
+                    warn!(%day, error = %e, "identified sketch recompute failed");
+                    break;
+                }
+            }
+        }
+        info!(
+            rows = rebuilt,
+            "identified sketches recomputed for the trailing 30 days"
+        );
+    }
     match rollups::fold::ensure_session_partitions(&mut conn).await {
         Ok(n) if n > 0 => info!(created = n, "session partitions pre-created"),
         Ok(_) => {}

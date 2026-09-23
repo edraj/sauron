@@ -50,6 +50,7 @@
   import { pageSlice } from '../lib/models/paginate';
   import { sortRows } from '../lib/models/sort-rows';
   import type { SortDir } from '../lib/models/sort';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
 
   /** Rows per page. The list arrives whole, so this is a rendering budget only. */
   const PAGE = 25;
@@ -261,6 +262,7 @@
         </p>
       </div>
       <div class="head-actions">
+        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
         <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
       </div>
     </header>

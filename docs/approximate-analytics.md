@@ -27,6 +27,15 @@ views, crash counts, issue `times_seen`, list pages, and every drill-down.
 - **Windows match whole buckets**: a range starting mid-day includes that
   whole UTC day (whole hour for performance charts).
 - **Sessions pages window by session start day** (previously last-activity).
+- **DAU/WAU/MAU's identified/guest split is a second sketch**
+  (`user_activity_daily.hll_identified`): a person counts as identified on a
+  day if `event_users.identified_at` was set when that day's sketch was last
+  (re)computed — the fold adds people identified at fold time, and the daily
+  maintenance recomputes the trailing 30 days from `person_days` so a later
+  `identify()` is absorbed within a day. Guests are `all − identified`. Days
+  folded before the column existed read as **unknown** (the tile says "split
+  building…") until the unattended backfill fills them; they never read as
+  "all guests". Total/Active/New use the exact, current flag.
 
 ## Freshness
 

@@ -25,6 +25,7 @@
   import { sortRows } from '../lib/models/sort-rows';
   import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
   import { groupMembers, type MemberGrant, type Permission, type Role } from '../lib/models';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
 
   // Cached view (lib/stores/cached-view.svelte.ts): the catalogue paints
   // instantly on a revisit, then refreshes behind the existing rows.
@@ -235,6 +236,7 @@
       </p>
     </div>
     <div class="head-actions">
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
       <Button variant="primary" lockedReason={roleManageLock} onclick={openNewRole}>
         {t('roles.new')}

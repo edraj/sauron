@@ -25,6 +25,7 @@
   import KeyValueList from '../lib/components/KeyValueList.svelte';
   import { compactNumber, formatDuration } from '../lib/utils/format';
   import type { ScreenDetail } from '../lib/models';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
 
   interface Props {
     params?: { name?: string };
@@ -143,6 +144,7 @@
   {:else if detail}
     <div class="screen-head">
       <h1 class="page-title mono screen-title">{screenName}</h1>
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
     </div>
 

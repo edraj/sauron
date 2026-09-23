@@ -1,5 +1,5 @@
 <script lang="ts">
-  // "as of HH:mm:ss" freshness chip for rollup-served analytics pages. Owns
+  // "Updated HH:mm:ss (x ago)" freshness chip for rollup-served analytics pages. Owns
   // the /rollups/status poll (on scope change + every 60 s) and publishes
   // readiness to rollupState so pages can ≈-mark their sketch-derived
   // figures. All decisions live in models/freshness.ts (pure, tested).

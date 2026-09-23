@@ -84,3 +84,61 @@ async fn identified_legs_follow_the_identified_flag() {
     drop(conn);
     db.cleanup().await;
 }
+
+#[derive(QueryableByName)]
+struct DauOracle {
+    #[diesel(sql_type = BigInt)]
+    identified: i64,
+}
+
+/// DAU/WAU/MAU's identified share on the legacy (exact) path: distinct ids
+/// active in the span whose `event_users` row is identified.
+async fn dau_oracle(
+    conn: &mut sauron_db::PgConn,
+    app_id: uuid::Uuid,
+    since: chrono::DateTime<chrono::Utc>,
+) -> i64 {
+    diesel::sql_query(
+        "SELECT count(DISTINCT d.distinct_id)::bigint AS identified FROM ( \
+            SELECT distinct_id FROM analytics_events WHERE app_id=$1 AND occurred_at >= $2 AND distinct_id <> '' \
+            UNION ALL \
+            SELECT distinct_id FROM error_events WHERE app_id=$1 AND occurred_at >= $2 AND distinct_id IS NOT NULL AND distinct_id <> '' \
+         ) d JOIN event_users eu ON eu.app_id=$1 AND eu.distinct_id = d.distinct_id AND eu.identified_at IS NOT NULL",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(since)
+    .get_result::<DauOracle>(conn)
+    .await
+    .expect("dau oracle")
+    .identified
+}
+
+#[tokio::test]
+async fn dau_wau_mau_carry_an_identified_share_on_the_legacy_path() {
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut conn = db.conn().await;
+    // Anchored to the fixture's clock so every seeded signal is inside `dau`.
+    let now = ids.pinned_now + chrono::Duration::hours(1);
+    let range = Range::since(now - chrono::Duration::days(3650));
+    let s = repo::user_stats(&mut conn, ReadScope::all(ids.app_id), range, now)
+        .await
+        .expect("user_stats");
+    let d1 = dau_oracle(&mut conn, ids.app_id, now - chrono::Duration::days(1)).await;
+    let d7 = dau_oracle(&mut conn, ids.app_id, now - chrono::Duration::days(7)).await;
+    let d30 = dau_oracle(&mut conn, ids.app_id, now - chrono::Duration::days(30)).await;
+    assert!(s.dau > 0, "fixture must have active people today");
+    assert_eq!(s.dau_identified, Some(d1), "dau_identified");
+    assert_eq!(s.wau_identified, Some(d7), "wau_identified");
+    assert_eq!(s.mau_identified, Some(d30), "mau_identified");
+    assert!(s.dau_identified.unwrap() <= s.dau);
+    assert!(
+        s.dau_identified.unwrap() < s.dau,
+        "fixture must hold an active guest, or the split is untested"
+    );
+    drop(conn);
+    db.cleanup().await;
+}

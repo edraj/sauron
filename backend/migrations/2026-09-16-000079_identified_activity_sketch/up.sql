@@ -1,0 +1,16 @@
+-- Identified-user sketch beside `hll_all`, so DAU/WAU/MAU can be split into
+-- identified people and guests the way the Audience tiles already split
+-- total/active/new.
+--
+-- NULL means UNKNOWN, not empty: every write since this migration stores a
+-- sketch (an empty one when nobody identified was active), and rows written
+-- before it stay NULL until `recompute_identified_sketches` fills them from
+-- `person_days` ⋈ `event_users.identified_at` — the unattended backfill and the
+-- daily maintenance both run it. A read whose window touches a NULL row
+-- reports the split as unknown rather than as zero guests.
+--
+-- Semantics: a person counts as identified on a day if `identified_at` is set
+-- when that day's sketch was last (re)computed. The fold adds people
+-- identified at fold time; maintenance recomputes the trailing window from
+-- `person_days` so a later `identify()` is absorbed within a day.
+ALTER TABLE user_activity_daily ADD COLUMN hll_identified bytea;

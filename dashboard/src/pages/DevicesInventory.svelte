@@ -10,6 +10,7 @@
   import DeviceGroupTable from '../lib/components/devices/DeviceGroupTable.svelte';
   import TimeFilter from '../lib/components/TimeFilter.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
+  import ListToolbar from '../lib/components/ListToolbar.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import { combineFreshness } from '../lib/models/freshness';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
@@ -399,18 +400,19 @@
       <h1 class="page-title">{t('devices.title')}</h1>
       <p class="muted sub">{t('devices.subtitle')}</p>
     </div>
-    <!-- Search first, then the window, then refresh — the same order Sessions
-         and Users put these controls in. This page keeps them in the header
-         because its table starts directly below: there is no analytics section
-         in between for the toolbar to drift away from. -->
-    <div class="controls">
-      <SearchInput
-        bind:value={query}
-        onsearch={onSearch}
-        placeholder={t('devices.search')}
-        width="240px"
-      />
+  </div>
+
+  <!-- The list toolbar: every control that narrows or reloads the table, in
+       the one arrangement all list pages share (`ListToolbar`). It used to sit
+       in the page header beside the title, which no other list page does. -->
+  <ListToolbar>
+    {#snippet searchBox()}
+      <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('devices.search')} />
+    {/snippet}
+    {#snippet timeWindow()}
       <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
+    {/snippet}
+    {#snippet actions()}
       <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
       <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
       <Button
@@ -422,8 +424,8 @@
         <Icon name="download" size={15} />
         {t('explore.exportCsv')}
       </Button>
-    </div>
-  </div>
+    {/snippet}
+  </ListToolbar>
 
   <!--
     Hoisted above the loading/error/empty/loaded chain below, on purpose: a
@@ -511,12 +513,6 @@
   .sub {
     font-size: 13.5px;
     margin-top: 3px;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
   }
   .crumb {
     display: flex;

@@ -278,7 +278,12 @@
         spinner IS the "showing cached data, fetching fresh" hint.
       -->
       <RollupChip />
-      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+      <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
+           watermark IS the data's age and this fetch-time chip would be a
+           second "Updated" beside it with a different time. -->
+      {#if !rollupState.ready}
+        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+      {/if}
       <RefreshButton
         onclick={refresher.run}
         loading={refresher.busy || refreshing || revalidating}

@@ -1,7 +1,24 @@
+<!--
+  The query-language list toolbar: filter chips, the search box and the window.
+
+  Layout is `ListToolbar`'s, not this file's — every list page shares that row
+  so the search box has the same place and the same neighbours everywhere.
+  This component only decides what goes in each slot: "+ Add filter" leads,
+  the query box takes the middle, the range pills follow unless the page
+  brings its own `TimeFilter` through `actions`, and the chips plus the draft
+  editor go on the second line, which `ListToolbar` renders only while there is
+  something on it.
+
+  The chips used to share the first line with the search box, to its left. Each
+  chip added pushed the box sideways and shrank it, and the draft editor —
+  three selects and a text field — did the same while open. Moving them under
+  the row keeps the box where the eye expects it.
+-->
 <script lang="ts">
   import { t } from '../../i18n';
   import type { Snippet } from 'svelte';
   import Icon from '../ui/Icon.svelte';
+  import ListToolbar from '../ListToolbar.svelte';
   import SearchAutocompleteInput from '../search/SearchAutocompleteInput.svelte';
   import DateRange from '../DateRange.svelte';
   import { rangeStore } from '../../stores/range.svelte';
@@ -91,6 +108,8 @@
   let draftTagVal = $state('');
 
   const fieldDef = $derived(fields.find((f) => f.key === draftField));
+  /** Whether the second line has anything to show. */
+  const hasBelow = $derived(filters.length > 0 || adding);
 
   function openAdd() {
     adding = true;
@@ -131,118 +150,206 @@
   }
 </script>
 
-<div class="filterbar">
-  <div class="chips">
-    {#each filters as f, i (i)}
-      <span class="chip">
-        <span class="c-field">{labelFor(f.field)}</span>
-        <span class="c-op">{opLabel(f.op)}</span>
-        <span class="c-val mono">{f.value}</span>
-        <button type="button" class="c-x" aria-label={t('filter.remove')} onclick={() => remove(i)}>
-          <Icon name="x" size={12} />
-        </button>
-      </span>
-    {/each}
+{#snippet leadSlot()}
+  <!-- A toggle, not a one-way opener: pressing it again while the draft is
+       open closes the draft, which is what the second click means. -->
+  <button
+    type="button"
+    class="add"
+    class:active={adding}
+    aria-expanded={adding}
+    onclick={() => (adding ? (adding = false) : openAdd())}
+  >
+    {t('filter.addFilter')}
+  </button>
+{/snippet}
 
-    {#if adding}
-      <span class="draft">
-        <select bind:value={draftField} onchange={onFieldChange} aria-label={t('filter.field')}>
-          {#each fields as f (f.key)}<option value={f.key}>{t(f.labelKey)}</option>{/each}
-        </select>
-        <select bind:value={draftOp} aria-label={t('filter.operator')}>
-          {#each fieldDef?.ops ?? [] as op (op)}<option value={op}>{opLabel(op)}</option>{/each}
-        </select>
-        {#if fieldDef?.type === 'tag'}
-          <input type="text" bind:value={draftTagKey} placeholder={t('filter.placeholder.key')} aria-label={t('filter.tagKey')} class="tag-key" />
-          <span class="tag-eq">=</span>
-          <input type="text" bind:value={draftTagVal} placeholder={t('filter.placeholder.value')} aria-label={t('filter.tagValue')} class="tag-val" />
-        {:else if fieldDef?.type === 'enum'}
-          <select bind:value={draftValue} aria-label={t('filter.value')}>
-            {#each fieldDef?.options ?? [] as opt (opt)}<option value={opt}>{opt}</option>{/each}
-          </select>
-        {:else if fieldDef?.type === 'number'}
-          <!-- Text, not type="number". `bind:value` on a numberlike input
-               writes back a number (or null once cleared) rather than the
-               string `Filter.value` is declared as, which is what let a
-               cleared field commit `times_seen:eq:null`. -->
-          <input type="text" inputmode="numeric" bind:value={draftValue} placeholder={t('filter.placeholder.value')} aria-label={t('filter.value')} />
-        {:else}
-          <input type="text" bind:value={draftValue} placeholder={t('filter.placeholder.value')} aria-label={t('filter.value')} />
-        {/if}
-        <button type="button" class="d-ok" onclick={commit}>{t('filter.add')}</button>
-        <button type="button" class="d-x" aria-label={t('common.cancel')} onclick={() => (adding = false)}>
-          <Icon name="x" size={13} />
-        </button>
-      </span>
-    {:else}
-      <button type="button" class="add" onclick={openAdd}>{t('filter.addFilter')}</button>
-    {/if}
-  </div>
+{#snippet searchSlot()}
+  <SearchAutocompleteInput bind:value={search} appId={appId ?? ''} {context} {error} {onSearch} />
+{/snippet}
 
-  <!--
-    The input sizes itself (`flex: 1; min-width: 260px`). It used to sit in a
-    hardcoded 220px box, which is what clipped long suggestions — and the
-    placeholder was hardcoded too, which is how a page could advertise a
-    prefix its resource does not declare. Both are now the component's job.
-  -->
-  <div class="right">
-    <SearchAutocompleteInput bind:value={search} appId={appId ?? ''} {context} {error} {onSearch} />
-    {#if showRange}
-      <DateRange
-        value={range}
-        onchange={(v) => {
-          range = v;
-          rangeStore.set(v);
-        }}
-        {ranges}
-      />
-    {/if}
-    {@render actions?.()}
-  </div>
-</div>
+{#snippet rangeSlot()}
+  <DateRange
+    value={range}
+    onchange={(v) => {
+      range = v;
+      rangeStore.set(v);
+    }}
+    {ranges}
+  />
+{/snippet}
+
+{#snippet chipsSlot()}
+  {#each filters as f, i (i)}
+    <span class="chip">
+      <span class="c-field">{labelFor(f.field)}</span>
+      <span class="c-op">{opLabel(f.op)}</span>
+      <span class="c-val mono">{f.value}</span>
+      <button type="button" class="c-x" aria-label={t('filter.remove')} onclick={() => remove(i)}>
+        <Icon name="x" size={12} />
+      </button>
+    </span>
+  {/each}
+
+  {#if adding}
+    <!-- A form, so Enter in any of its fields commits the chip the way the Add
+         button does, without a keydown handler on every control. -->
+    <form
+      class="draft"
+      aria-label={t('filter.addFilter')}
+      onsubmit={(e) => {
+        e.preventDefault();
+        commit();
+      }}
+    >
+      <select bind:value={draftField} onchange={onFieldChange} aria-label={t('filter.field')}>
+        {#each fields as f (f.key)}<option value={f.key}>{t(f.labelKey)}</option>{/each}
+      </select>
+      <select bind:value={draftOp} aria-label={t('filter.operator')}>
+        {#each fieldDef?.ops ?? [] as op (op)}<option value={op}>{opLabel(op)}</option>{/each}
+      </select>
+      {#if fieldDef?.type === 'tag'}
+        <input type="text" bind:value={draftTagKey} placeholder={t('filter.placeholder.key')} aria-label={t('filter.tagKey')} class="tag-key" />
+        <span class="tag-eq">=</span>
+        <input type="text" bind:value={draftTagVal} placeholder={t('filter.placeholder.value')} aria-label={t('filter.tagValue')} class="tag-val" />
+      {:else if fieldDef?.type === 'enum'}
+        <select bind:value={draftValue} aria-label={t('filter.value')}>
+          {#each fieldDef?.options ?? [] as opt (opt)}<option value={opt}>{opt}</option>{/each}
+        </select>
+      {:else if fieldDef?.type === 'number'}
+        <!-- Text, not type="number". `bind:value` on a numberlike input
+             writes back a number (or null once cleared) rather than the
+             string `Filter.value` is declared as, which is what let a
+             cleared field commit `times_seen:eq:null`. -->
+        <input type="text" inputmode="numeric" bind:value={draftValue} placeholder={t('filter.placeholder.value')} aria-label={t('filter.value')} />
+      {:else}
+        <input type="text" bind:value={draftValue} placeholder={t('filter.placeholder.value')} aria-label={t('filter.value')} />
+      {/if}
+      <button type="submit" class="d-ok">{t('filter.add')}</button>
+      <button type="button" class="d-x" aria-label={t('common.cancel')} onclick={() => (adding = false)}>
+        <Icon name="x" size={13} />
+      </button>
+    </form>
+  {/if}
+{/snippet}
+
+<ListToolbar
+  lead={leadSlot}
+  searchBox={searchSlot}
+  timeWindow={showRange ? rangeSlot : undefined}
+  {actions}
+  below={hasBelow ? chipsSlot : undefined}
+/>
 
 <style>
-  .filterbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
-    margin-bottom: 16px;
+  /* Same shell as the search box beside it: height, surface, border, radius. */
+  .add {
+    height: var(--control-h);
+    padding: 0 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-muted);
+    font-size: 12.5px;
+    font-weight: 560;
+    white-space: nowrap;
+    transition: color 0.13s ease, border-color 0.13s ease, background 0.13s ease;
   }
-  .chips { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .add:hover {
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+  .add.active {
+    color: var(--primary);
+    background: var(--primary-soft);
+    border-color: var(--primary-border);
+  }
+
   .chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 6px 4px 10px;
-    background: var(--primary-soft); color: var(--primary);
-    border: 1px solid var(--primary-border); border-radius: var(--radius);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 30px;
+    padding: 0 4px 0 10px;
+    background: var(--primary-soft);
+    color: var(--primary);
+    border: 1px solid var(--primary-border);
+    border-radius: var(--radius-sm);
     font-size: 12.5px;
   }
-  .c-op { opacity: 0.75; }
-  .c-x, .d-x {
-    display: inline-flex; align-items: center;
-    background: none; border: none; color: inherit; padding: 2px; opacity: 0.7;
+  .c-field {
+    font-weight: 560;
   }
-  .c-x:hover { opacity: 1; }
+  .c-op {
+    opacity: 0.75;
+  }
+  .c-x,
+  .d-x {
+    display: inline-flex;
+    align-items: center;
+    background: none;
+    border: none;
+    color: inherit;
+    padding: 4px;
+    border-radius: var(--radius-sm);
+    opacity: 0.7;
+  }
+  .c-x:hover,
+  .d-x:hover {
+    opacity: 1;
+    background: var(--primary-soft);
+  }
+
   .draft {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 6px; border: 1px solid var(--border-strong); border-radius: var(--radius);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 30px;
+    padding: 2px 4px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
     background: var(--surface-2);
   }
-  .draft select, .draft input {
-    background: var(--surface); color: var(--text);
-    border: 1px solid var(--border); border-radius: var(--radius-sm);
-    padding: 4px 6px; font-size: 12.5px;
+  .draft select,
+  .draft input {
+    height: 24px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0 6px;
+    font-size: 12.5px;
   }
-  .draft input { width: 130px; }
-  .draft input.tag-key { width: 90px; }
-  .draft input.tag-val { width: 110px; }
-  .tag-eq { opacity: 0.6; }
-  .d-ok, .add {
-    background: var(--surface-2); border: 1px solid var(--border);
-    border-radius: var(--radius-sm); color: var(--text-muted);
-    padding: 5px 10px; font-size: 12.5px; font-weight: 540;
+  .draft input {
+    width: 130px;
   }
-  .add:hover, .d-ok:hover { color: var(--text); border-color: var(--border-strong); }
-  .right { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 320px; justify-content: flex-end; }
+  .draft input.tag-key {
+    width: 90px;
+  }
+  .draft input.tag-val {
+    width: 110px;
+  }
+  .tag-eq {
+    opacity: 0.6;
+  }
+  .d-ok {
+    height: 24px;
+    padding: 0 10px;
+    background: var(--primary);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--primary-contrast);
+    font-size: 12.5px;
+    font-weight: 560;
+  }
+  .d-ok:hover {
+    background: var(--primary-hover);
+  }
+  .d-x {
+    color: var(--text-muted);
+  }
+  .d-x:hover {
+    color: var(--text);
+    background: var(--surface-3);
+  }
 </style>

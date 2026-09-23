@@ -10,6 +10,7 @@
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
+  import ListToolbar from '../lib/components/ListToolbar.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
@@ -122,14 +123,21 @@
   let range = $state<DateRangeValue>(rangeStore.effective(30));
   /** The window in words, under the tiles it applies to. */
   /**
-   * "caption · N identified / M guests" for the three tiles that count
-   * `event_users` rows, which carry the identified flag. DAU/WAU/MAU do not
-   * get one: they are distinct-id counts or day sketches with no per-person
-   * flag, and inventing a split there would be a guess dressed as a number.
+   * Three rows under a people count: the window, then "N identified" and
+   * "M guests". Identified means the `event_users` row has been named by
+   * `identify()` or a matching context user id; guests are the remainder.
+   * `identified` is `null` when the server cannot split (dau/wau/mau on a
+   * rollup window with a day whose identified sketch is not built yet) — say
+   * so rather than show every active person as a guest.
    */
-  function split(caption: string, total: number, identified: number): string {
+  function split(caption: string, total: number, identified: number | null): string[] {
+    if (identified === null) return [caption, t('users.splitUnknown')];
     const guests = Math.max(0, total - identified);
-    return `${caption} · ${compactNumber(identified)} ${t('users.identifiedShort')} / ${compactNumber(guests)} ${t('users.guestsShort')}`;
+    return [
+      caption,
+      `${compactNumber(identified)} ${t('users.identifiedShort')}`,
+      `${compactNumber(guests)} ${t('users.guestsShort')}`,
+    ];
   }
 
   const rangeCaption = $derived(
@@ -337,9 +345,9 @@
         <!-- `stats.dau` has always been in the payload and in the `UserStats`
              model; the tile was simply never rendered, which is why this page
              shows a stickiness ratio whose numerator is invisible. -->
-        <StatTile label="DAU" value={approx(compactNumber(analytics.stats.dau), rollupState.ready)} sub="24h" />
-        <StatTile label="WAU" value={approx(compactNumber(analytics.stats.wau), rollupState.ready)} sub="7-day" />
-        <StatTile label="MAU" value={approx(compactNumber(analytics.stats.mau), rollupState.ready)} sub="30-day" />
+        <StatTile label="DAU" value={approx(compactNumber(analytics.stats.dau), rollupState.ready)} sub={split('24h', analytics.stats.dau, analytics.stats.dau_identified)} />
+        <StatTile label="WAU" value={approx(compactNumber(analytics.stats.wau), rollupState.ready)} sub={split('7-day', analytics.stats.wau, analytics.stats.wau_identified)} />
+        <StatTile label="MAU" value={approx(compactNumber(analytics.stats.mau), rollupState.ready)} sub={split('30-day', analytics.stats.mau, analytics.stats.mau_identified)} />
         <StatTile label={t('users.stat.stickiness')} value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
         <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
         <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), rollupState.ready)} />
@@ -371,12 +379,19 @@
            header the user just clicked. -->
       <p class="muted section-hint">{t('users.onePerDistinctId')}</p>
     </div>
-    <!-- Every control that narrows the TABLE lives in this one row, directly
-         above it: search, window, refresh. They used to be split between the
-         page header and here, which read as two unrelated toolbars and left
-         the search box describing a table two sections further down. -->
-    <div class="controls">
-      <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder={t('users.search')} width="300px" />
+  </div>
+
+  <!-- Every control that narrows the TABLE lives in this one row, directly
+       above it: search, window, refresh — the same `ListToolbar` every list
+       page renders, so the box is where Sessions and Devices put theirs. They
+       used to be split between the page header and here, which read as two
+       unrelated toolbars and left the search box describing a table two
+       sections further down. -->
+  <ListToolbar>
+    {#snippet searchBox()}
+      <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder={t('users.search')} />
+    {/snippet}
+    {#snippet timeWindow()}
       <!-- Governs the TABLE only. The Audience range picker above drives the
            tiles and chart, and the two are deliberately separate windows: this
            one can name a column and a bound the summary endpoints cannot
@@ -394,11 +409,18 @@
           list = setOffsetPage(list, 0);
         }}
       />
+    {/snippet}
+    {#snippet actions()}
       <RollupChip />
-      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+      <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
+           watermark IS the data's age and this fetch-time chip would be a
+           second "Updated" beside it with a different time. -->
+      {#if !rollupState.ready}
+        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+      {/if}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
-    </div>
-  </div>
+    {/snippet}
+  </ListToolbar>
 
   {#if loading && rows.length === 0}
     <Skeleton rows={8} height="48px" label={t('users.loading.users')} />
@@ -536,12 +558,6 @@
     font-size: 13.5px;
     margin-top: 3px;
   }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
   /* Section rhythm. The page runs header -> Audience (tiles + chart) -> People
      (table + pagination). Each section opens with a heading, so the gap ABOVE a
      heading is what separates two sections and must stay clearly larger than
@@ -554,9 +570,6 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    /* Wraps because the People row now carries the whole table toolbar — a
-       300px search box, the window picker and refresh — which does not fit
-       beside the heading on a narrow viewport. */
     flex-wrap: wrap;
     margin: 40px 0 16px;
   }

@@ -28,6 +28,7 @@
     type PersonTimeMode,
   } from '../lib/models/person-timeline';
   import type { AnalyticsEvent, ErrorEvent, PersonProfile } from '../lib/models';
+  import Freshness from '../lib/components/ui/Freshness.svelte';
 
   interface Props {
     params?: { distinctId?: string };
@@ -194,6 +195,7 @@
   {:else if profile}
     <header class="identity">
       <div class="id-actions">
+        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
         <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
       </div>
       <span class="avatar">{initials(distinctId)}</span>

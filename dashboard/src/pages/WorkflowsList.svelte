@@ -11,6 +11,7 @@
   import StatTile from '../lib/components/StatTile.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
+  import ListToolbar from '../lib/components/ListToolbar.svelte';
   import Pagination from '../lib/components/Pagination.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
   import { rangeStore } from '../lib/stores/range.svelte';
@@ -179,9 +180,19 @@
       <h1 class="page-title">{t('workflows.title')}</h1>
       <p class="muted sub">{t('workflows.subtitle')}</p>
     </div>
-    <div class="controls">
+  </div>
+
+  <!-- The list toolbar: every control that narrows or reloads the table, in
+       the one arrangement all list pages share (`ListToolbar`). It used to sit
+       in the page header beside the title, which no other list page does. -->
+  <ListToolbar>
+    {#snippet searchBox()}
+      <SearchInput bind:value={search} onsearch={onSearch} placeholder={t('workflows.search')} />
+    {/snippet}
+    {#snippet timeWindow()}
       <DateRange value={range} onchange={onRange} />
-      <SearchInput bind:value={search} onsearch={onSearch} placeholder={t('workflows.search')} width="240px" />
+    {/snippet}
+    {#snippet actions()}
       <!--
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached rows, fetching fresh" hint, and without it
@@ -189,8 +200,8 @@
       -->
       <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
-    </div>
-  </div>
+    {/snippet}
+  </ListToolbar>
 
   {#if error && rows.length === 0}
     <Card>
@@ -321,12 +332,6 @@
   .sub {
     font-size: 13.5px;
     margin-top: 3px;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
   }
   .num {
     text-align: end;

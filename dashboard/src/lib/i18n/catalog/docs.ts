@@ -371,7 +371,7 @@ export const docs = {
     ar: 'لا يكون الاحتفاظ ذا معنى إلا بقدر الهوية التي خلفه. فإذا عاد زائر حاملًا معرّفًا جديدًا، احتُسب شخصًا جديدًا تمامًا في فوج جديد ولا يمكن أن يظهر أبدًا كمُحتفَظ به — فتتضخم الأفواج اليومية نحو عدد مرات تحميل الصفحة وينهار الاحتفاظ نحو الصفر. تأكّد أن المعرّف المجهول يبقى عبر تحميلات الصفحة، وأن identify() يُستدعى عند تسجيل الدخول بمعرّف المستخدم المعتمد لديك، وبالسلسلة نفسها في كل التطبيقات: فالمطابقة تساوٍ نصّي تام، ولا إصلاح من جانب الخادم.',
   },
   'docs.ret.freshness': {
-    en: 'The grid and lifecycle are served stale-while-revalidate \u2014 under an hour old as-is, between one and three hours as-is while a single background refresh recomputes. The "as of" chip states the age.',
+    en: 'The grid and lifecycle are served stale-while-revalidate \u2014 under an hour old as-is, between one and three hours as-is while a single background refresh recomputes. The "Updated" stamp states the age.',
     ar: 'تُقدَّم الشبكة ودورة الحياة وفق مبدأ "قديم أثناء التحديث" — أقل من ساعة كما هي، وبين ساعة وثلاث ساعات كما هي مع إعادة حساب واحدة في الخلفية. وتوضّح شارة "حتى" العمر.',
   },
   'docs.nav.item.funnels': { en: 'Funnels', ar: 'مسارات التحويل' },

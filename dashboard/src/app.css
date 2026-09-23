@@ -66,6 +66,11 @@
   /* Layout */
   --sidebar-w: 240px;
   --topbar-h: 60px;
+  /* The one height every list-toolbar control shares: both search boxes, the
+     range pills, the TimeFilter, "+ Add filter", Refresh, and a md Button. A
+     toolbar whose controls differ by a few pixels each reads as five separate
+     widgets that happen to be adjacent; at one height it reads as a row. */
+  --control-h: 36px;
   --content-max: 2200px;
 
   color-scheme: dark;

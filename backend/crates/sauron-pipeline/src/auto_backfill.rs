@@ -38,6 +38,7 @@ pub async fn any_pending(conn: &mut sauron_db::PgConn) -> diesel::QueryResult<bo
     Ok(person_env_backfill::backfill_pending(conn).await?
         || device_env_backfill::backfill_pending(conn).await?
         || person_days_backfill::backfill_pending(conn).await?
+        || rollups::identified_sketch_pending(conn).await?
         || rollups::backfill_pending(conn).await?)
 }
 
@@ -115,6 +116,18 @@ async fn run_locked(
         .await?;
         if outcome == BackfillOutcome::Interrupted {
             anyhow::bail!("rollup backfill interrupted");
+        }
+    }
+    // Identified-user sketches (migration 79): rows folded before the column
+    // existed carry NULL and read as "split unknown" until filled from
+    // `person_days` — which the step above guarantees is complete first. One
+    // day per transaction, oldest first; a restart resumes at the next NULL.
+    if rollups::identified_sketch_pending(conn).await? {
+        let days = fold::identified_sketch_days_pending(conn).await?;
+        info!(days = days.len(), "identified sketch backfill: starting");
+        for day in days {
+            let n = fold::recompute_identified_sketches(conn, day).await?;
+            info!(%day, rows = n, "identified sketch backfill: day complete");
         }
     }
     if let Err(e) = rollups::analyze_rollup_tables(conn).await {

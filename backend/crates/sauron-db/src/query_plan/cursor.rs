@@ -31,6 +31,41 @@ use uuid::Uuid;
 pub enum CursorValue {
     Ts(DateTime<Utc>),
     Text(String),
+    /// A count or other integer ordering — `issues.times_seen`/`users_seen`.
+    Int(i64),
+}
+
+/// Which kind of value a sort column's cursor must carry.
+///
+/// Replaces the `expect_temporal: bool` [`decode`] used to take: two kinds fit
+/// a bool, three do not, and a bool that silently lumped integers in with
+/// text would let a forged `s:` payload page an integer ordering. Each sort
+/// enum answers this through its own `cursor_kind()`, so the route never
+/// spells the kind by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    Timestamp,
+    Text,
+    Integer,
+}
+
+impl CursorKind {
+    pub fn of(v: &CursorValue) -> Self {
+        match v {
+            CursorValue::Ts(_) => CursorKind::Timestamp,
+            CursorValue::Text(_) => CursorKind::Text,
+            CursorValue::Int(_) => CursorKind::Integer,
+        }
+    }
+
+    /// The word the mismatch error uses for this kind.
+    pub fn name(self) -> &'static str {
+        match self {
+            CursorKind::Timestamp => "timestamp",
+            CursorKind::Text => "text",
+            CursorKind::Integer => "integer",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +130,7 @@ pub fn encode(c: &Cursor) -> String {
     let (ty, val) = match &c.value {
         CursorValue::Ts(ts) => ("t", ts.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()),
         CursorValue::Text(s) => ("s", s.clone()),
+        CursorValue::Int(n) => ("i", n.to_string()),
     };
     URL_SAFE_NO_PAD.encode(format!("{}|{}|{ty}:{val}", c.key, c.id))
 }
@@ -102,14 +138,13 @@ pub fn encode(c: &Cursor) -> String {
 /// Decode, and refuse a cursor minted under a sort other than `expected_key`
 /// or carrying the wrong KIND of value for it.
 ///
-/// `expect_temporal` is the sort's own `EventSort::is_temporal` /
-/// `OccurrenceSort::is_temporal` (Issues has no textual ordering yet, so its
-/// one call site always passes `true` — see its call site's comment). Taking
-/// it as a parameter, the same way `expected_key` already is, keeps the enum
-/// the single source of truth for which kind each column needs and means a
+/// `expect` is the sort's own `cursor_kind()` (`EventSort`, `OccurrenceSort`,
+/// `TransactionSort`, `IssueSort` — all four expose it). Taking it as a
+/// parameter, the same way `expected_key` already is, keeps the enum the
+/// single source of truth for which kind each column needs and means a
 /// caller cannot serve a page built from a value of the wrong kind just by
 /// forgetting to ask.
-pub fn decode(s: &str, expected_key: &str, expect_temporal: bool) -> Result<Cursor, CursorError> {
+pub fn decode(s: &str, expected_key: &str, expect: CursorKind) -> Result<Cursor, CursorError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(s)
         .map_err(|_| CursorError::Malformed)?;
@@ -134,15 +169,16 @@ pub fn decode(s: &str, expected_key: &str, expect_temporal: bool) -> Result<Curs
                 .with_timezone(&Utc),
         ),
         "s" => CursorValue::Text(raw.to_string()),
+        "i" => CursorValue::Int(raw.parse().map_err(|_| CursorError::Malformed)?),
         _ => return Err(CursorError::Malformed),
     };
 
-    let got_temporal = matches!(value, CursorValue::Ts(_));
-    if got_temporal != expect_temporal {
+    let got = CursorKind::of(&value);
+    if got != expect {
         return Err(CursorError::KindMismatch {
             key: key.to_string(),
-            expected: if expect_temporal { "timestamp" } else { "text" },
-            got: if got_temporal { "timestamp" } else { "text" },
+            expected: expect.name(),
+            got: got.name(),
         });
     }
 
@@ -167,9 +203,82 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_an_integer_cursor() {
+        let c = Cursor {
+            key: "times_seen".into(),
+            value: CursorValue::Int(4210),
+            id: Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap(),
+        };
+        assert_eq!(
+            decode(&encode(&c), "times_seen", CursorKind::Integer).unwrap(),
+            c
+        );
+        // Negative and zero counts never occur, but the encoding must not
+        // depend on that: a cursor is a position, not a validated count.
+        let z = Cursor {
+            value: CursorValue::Int(0),
+            ..c.clone()
+        };
+        assert_eq!(
+            decode(&encode(&z), "times_seen", CursorKind::Integer).unwrap(),
+            z
+        );
+    }
+
+    /// A forged `t:` payload under an integer ordering is refused the same way
+    /// a forged `s:` one is under a timestamp ordering — the kind check is
+    /// three-way, not "temporal or not".
+    #[test]
+    fn an_integer_ordering_refuses_a_timestamp_or_text_payload() {
+        let ts = sample();
+        let s = encode(&Cursor {
+            key: "times_seen".into(),
+            ..ts
+        });
+        let err = decode(&s, "times_seen", CursorKind::Integer).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CursorError::KindMismatch {
+                    expected: "integer",
+                    got: "timestamp",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let text = Cursor {
+            key: "times_seen".into(),
+            value: CursorValue::Text("4210".into()),
+            id: Uuid::nil(),
+        };
+        let err = decode(&encode(&text), "times_seen", CursorKind::Integer).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CursorError::KindMismatch {
+                    expected: "integer",
+                    got: "text",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // And a non-numeric `i:` payload is malformed, not silently zero.
+        let forged = URL_SAFE_NO_PAD.encode(format!("times_seen|{}|i:abc", Uuid::nil()));
+        assert_eq!(
+            decode(&forged, "times_seen", CursorKind::Integer).unwrap_err(),
+            CursorError::Malformed
+        );
+    }
+
+    #[test]
     fn round_trips_a_timestamp_cursor() {
         let c = sample();
-        assert_eq!(decode(&encode(&c), "occurred_at", true).unwrap(), c);
+        assert_eq!(
+            decode(&encode(&c), "occurred_at", CursorKind::Timestamp).unwrap(),
+            c
+        );
     }
 
     #[test]
@@ -182,7 +291,7 @@ mod tests {
         // The delimiter appears INSIDE the value here on purpose: a text
         // cursor that split naively would truncate at the first `|` and page
         // from the wrong position.
-        assert_eq!(decode(&encode(&c), "name", false).unwrap(), c);
+        assert_eq!(decode(&encode(&c), "name", CursorKind::Text).unwrap(), c);
     }
 
     #[test]
@@ -195,7 +304,7 @@ mod tests {
         // check runs, and fails, before the kind check ever would — but it is
         // what a real `name`-vs-`occurred_at` mismatch would carry from the
         // `occurred_at` side, so it is the realistic value to pin.
-        let err = decode(&encode(&sample()), "name", true).unwrap_err();
+        let err = decode(&encode(&sample()), "name", CursorKind::Timestamp).unwrap_err();
         assert_eq!(
             err,
             CursorError::KeyMismatch {
@@ -211,7 +320,10 @@ mod tests {
             value: CursorValue::Ts(Utc.timestamp_micros(1_786_000_000_123_456).unwrap()),
             ..sample()
         };
-        let CursorValue::Ts(ts) = decode(&encode(&c), "occurred_at", true).unwrap().value else {
+        let CursorValue::Ts(ts) = decode(&encode(&c), "occurred_at", CursorKind::Timestamp)
+            .unwrap()
+            .value
+        else {
             panic!("timestamp cursor decoded as text");
         };
         assert_eq!(CursorValue::Ts(ts), c.value);
@@ -226,7 +338,10 @@ mod tests {
             value: CursorValue::Text(String::new()),
             id: sample().id,
         };
-        assert_eq!(decode(&encode(&c), "session_id", false).unwrap(), c);
+        assert_eq!(
+            decode(&encode(&c), "session_id", CursorKind::Text).unwrap(),
+            c
+        );
     }
 
     #[test]
@@ -241,7 +356,7 @@ mod tests {
         // wrong-but-valid position, not a 400.
         let raw = format!("session_id|{}|t:1970-01-01T00:00:00Z", sample().id);
         let s = URL_SAFE_NO_PAD.encode(raw);
-        let err = decode(&s, "session_id", false).unwrap_err();
+        let err = decode(&s, "session_id", CursorKind::Text).unwrap_err();
         assert_eq!(
             err,
             CursorError::KindMismatch {
@@ -272,7 +387,7 @@ mod tests {
         // keeps a malformed one a 400 instead of a panic turned 500.
         for bad in ["", "!!!!", "Zm9v", "e30", "########"] {
             assert!(
-                decode(bad, "occurred_at", true).is_err(),
+                decode(bad, "occurred_at", CursorKind::Timestamp).is_err(),
                 "{bad} should not decode"
             );
         }
@@ -281,7 +396,7 @@ mod tests {
     #[test]
     fn rejects_a_truncated_cursor() {
         let s = encode(&sample());
-        assert!(decode(&s[..s.len() - 3], "occurred_at", true).is_err());
+        assert!(decode(&s[..s.len() - 3], "occurred_at", CursorKind::Timestamp).is_err());
     }
 
     #[test]
@@ -294,7 +409,7 @@ mod tests {
         let raw = format!("occurred_at|{}|x:whatever", sample().id);
         let s = URL_SAFE_NO_PAD.encode(raw);
         assert_eq!(
-            decode(&s, "occurred_at", true).unwrap_err(),
+            decode(&s, "occurred_at", CursorKind::Timestamp).unwrap_err(),
             CursorError::Malformed
         );
     }

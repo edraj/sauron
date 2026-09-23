@@ -6,8 +6,10 @@
   interface Props {
     label: string;
     value: string | number;
-    // Optional secondary line under the value.
-    sub?: string;
+    // Optional secondary line under the value — or several, one per array
+    // entry, each on its own row (the Audience tiles' "window / identified /
+    // guests" triple; one run-on line was unreadable at tile width).
+    sub?: string | string[];
     // Optional trend delta, e.g. "+12%" — colored by `deltaTone`.
     delta?: string;
     deltaTone?: 'up' | 'down' | 'flat';
@@ -46,7 +48,9 @@
   <span class="st-value {tone}">{value}</span>
   <div class="st-foot">
     {#if delta}<span class="st-delta {deltaTone}">{delta}</span>{/if}
-    {#if sub}<span class="st-sub">{sub}</span>{/if}
+    {#if Array.isArray(sub)}
+      <span class="st-sub st-sub-lines">{#each sub as line, i (i)}<span>{line}</span>{/each}</span>
+    {:else if sub}<span class="st-sub">{sub}</span>{/if}
   </div>
   {#if visual}<div class="st-visual">{@render visual()}</div>{/if}
 {/snippet}
@@ -138,6 +142,12 @@
   .st-sub {
     font-size: 12px;
     color: var(--text-faint);
+  }
+  .st-sub-lines {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.35;
+    font-variant-numeric: tabular-nums;
   }
   .st-visual {
     margin-top: 6px;

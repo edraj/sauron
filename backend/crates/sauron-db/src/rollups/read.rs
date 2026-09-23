@@ -495,6 +495,58 @@ struct SessionSums {
     b4: i64,
 }
 
+/// An upper bound on the `sessions` rows a list query over `range` can read
+/// for `scope`, from the session-day rollup — or `None` when the rollup
+/// cannot be trusted to bound anything.
+///
+/// The bound feeds `search::bounded_scan_clamp`, which treats `None` as
+/// "large" and keeps the planner's window clamp, so every uncertainty here
+/// resolves to `None` rather than to an undercount:
+///
+/// - the app must be rollup-ready (`rollups::is_ready`: backfilled, or
+///   created after the epoch), or pre-epoch days are simply absent;
+/// - the `sessions` watermark must be within [`SESSION_BOUND_MAX_LAG`], or a
+///   frozen fold (see the rollup-task's stuck-cycle failure mode) would make
+///   a hot tenant look empty;
+/// - the sum starts one day BEFORE `range.from`: the rollup keys a session by
+///   its started day while the list filters `last_event_at`, and a session
+///   that started late on the previous day can still end inside the window.
+pub async fn session_rows_in_window(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    range: Range,
+) -> QueryResult<Option<i64>> {
+    if !crate::rollups::is_ready(conn, scope.app_id).await? {
+        return Ok(None);
+    }
+    match crate::rollups::as_of(conn, &["sessions"]).await? {
+        Some(wm) if Utc::now() - wm <= SESSION_BOUND_MAX_LAG => {}
+        _ => return Ok(None),
+    }
+    let (lo, hi) = day_bounds(&range);
+    let lo = lo.pred_opt().unwrap_or(lo);
+    let env_sql = scope.env.sql_fragment(4);
+    let q = format!(
+        "SELECT COALESCE(sum(sessions),0)::bigint AS n \
+         FROM session_stats_daily WHERE app_id=$1 AND day>=$2 AND day<=$3{env_sql}"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Date, _>(lo)
+        .bind::<Date, _>(hi);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    let row: CountRow = stmt.get_result(conn).await?;
+    Ok(Some(row.n))
+}
+
+/// How stale the `sessions` rollup watermark may be before
+/// [`session_rows_in_window`] refuses to vouch for a bound. Two days: the
+/// fold runs on an hourly cadence, and the bound only matters for windows
+/// wider than the 30-day clamp, where two missing days are a small fraction
+/// of the rows being counted.
+pub const SESSION_BOUND_MAX_LAG: Duration = Duration::hours(48);
+
 async fn session_sums(
     conn: &mut AsyncPgConnection,
     scope: &ReadScope,
@@ -567,6 +619,36 @@ pub async fn user_stats(
         }
         mau.merge(&h);
     }
+    // The identified twin. `hll_identified` NULL is "unknown" (a row written
+    // before migration 79 and not yet recomputed), and a window that touches
+    // one reports no split at all rather than counting that day's identified
+    // people as zero — which the tile would otherwise show as "all guests".
+    // Per span, not per read: today can be known while day 29 is not.
+    let irows = activity_hlls(
+        conn,
+        scope,
+        today - Duration::days(29),
+        today,
+        "hll_identified",
+    )
+    .await?;
+    let (mut dau_i, mut wau_i, mut mau_i) = (Hll::new(), Hll::new(), Hll::new());
+    let (mut dau_known, mut wau_known, mut mau_known) = (true, true, true);
+    for r in &irows {
+        let known = r.hlls.iter().all(|b| b.is_some());
+        let h = merged_hll(&r.hlls);
+        if r.day == today {
+            dau_known &= known;
+            dau_i.merge(&h);
+        }
+        if r.day > today - Duration::days(7) {
+            wau_known &= known;
+            wau_i.merge(&h);
+        }
+        mau_known &= known;
+        mau_i.merge(&h);
+    }
+    let split = |known: bool, i: &Hll, all: i64| known.then(|| i.estimate().min(all));
 
     let s = session_sums(conn, scope, range).await?;
     Ok(UserStats {
@@ -579,6 +661,9 @@ pub async fn user_stats(
         dau: dau.estimate(),
         wau: wau.estimate(),
         mau: mau.estimate(),
+        dau_identified: split(dau_known, &dau_i, dau.estimate()),
+        wau_identified: split(wau_known, &wau_i, wau.estimate()),
+        mau_identified: split(mau_known, &mau_i, mau.estimate()),
         avg_session_ms: ratio(s.dsum, s.sessions),
         median_session_ms: merged_hist(&s.hists).percentile(0.5),
     })

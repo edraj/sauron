@@ -193,9 +193,73 @@ const ISSUE = {
   updated_at: '2026-08-16T10:00:19.400Z',
 };
 
+/**
+ * The Exceptions list: twelve issues whose three sortable columns disagree with
+ * one another, so a walk ordered by one cannot pass by being ordered by
+ * another. `times_seen` runs 1..12 up the list, `users_seen` runs down it, and
+ * `last_seen` steps by a minute in a third order.
+ */
+const ISSUES = Array.from({ length: 12 }, (_, i) => {
+  const k = i + 1;
+  const lastSeen = new Date(Date.UTC(2026, 8, 23, 8, (k * 7) % 60, 0)).toISOString();
+  return {
+    id: `issue-${String(k).padStart(2, '0')}`,
+    app_id: 'app1',
+    fingerprint: `fp-harness-${k}`,
+    type: k % 3 === 0 ? 'TypeError' : 'DioException',
+    title: `Harness issue ${k}: ${k % 3 === 0 ? 'null is not an object' : 'request failed'}`,
+    culprit: `Module${k}.run (module_${k}.dart)`,
+    level: k % 4 === 0 ? 'fatal' : k % 4 === 1 ? 'warning' : 'error',
+    status: 'unresolved',
+    first_seen: '2026-08-01T08:00:00.000Z',
+    last_seen: lastSeen,
+    times_seen: k * 37,
+    users_seen: (13 - k) * 5,
+    assignee_id: null,
+    created_at: '2026-08-01T08:00:00.000Z',
+    updated_at: lastSeen,
+  };
+});
+
+/** `sort=` as the server reads it: bare is descending, `-` is ascending. */
+function sortIssues(rows, raw) {
+  const spec = (raw ?? 'last_seen').trim() || 'last_seen';
+  const asc = spec.startsWith('-');
+  const key = asc ? spec.slice(1) : spec;
+  const cmp = (a, b) => (a[key] < b[key] ? -1 : a[key] > b[key] ? 1 : a.id < b.id ? -1 : 1);
+  return [...rows].sort((a, b) => (asc ? cmp(a, b) : -cmp(a, b)));
+}
+
+const ISSUE_STATS = {
+  total: 12,
+  unresolved: 12,
+  resolved: 0,
+  ignored: 0,
+  fatal: 3,
+  error: 6,
+  warning: 3,
+  info: 0,
+  series: Array.from({ length: 14 }, (_, i) => ({
+    bucket: `2026-09-${String(i + 10).padStart(2, '0')}T00:00:00Z`,
+    count: 20 + ((i * 7) % 30),
+  })),
+};
+
 /** The sessions schema, so the search box builds its own placeholder and the
     autocomplete has dimensions to offer — the chips must agree with these. */
 const SCHEMAS = {
+  issues: {
+    resource: 'issues',
+    variables: [{ prefix: '@tag', description: 'Developer tags', chainable: true }],
+    dimensions: [
+      { name: 'level', type: 'enum', ops: ['=', '!=', 'in'], options: ['debug', 'info', 'warning', 'error', 'fatal'] },
+      { name: 'status', type: 'enum', ops: ['=', '!='], options: ['unresolved', 'resolved'] },
+      { name: 'type', type: 'string', ops: ['=', '!=', 'contains'] },
+      { name: 'timesSeen', type: 'integer', ops: ['=', '>', '<'], aliases: ['times_seen'] },
+    ],
+    available_tags: [{ key: 'environment', sample_values: ['PROD'] }],
+    available_labels: [],
+  },
   sessions: {
     resource: 'sessions',
     variables: [{ prefix: '@context', description: 'Device/runtime context', chainable: true }],
@@ -347,6 +411,22 @@ function stubApi() {
             ? PERSONS.filter((p) => p.distinct_id.toLowerCase().includes(search))
             : PERSONS;
           return json(res, rows);
+        }
+
+        if (path === '/v1/apps/app1/issues/stats') return json(res, ISSUE_STATS);
+        if (path === '/v1/apps/app1/issues') {
+          // Logged so the SORT on the wire is checkable: a header click that
+          // re-renders the rows without `sort=` reaching this line would be a
+          // client-side reorder of one page presenting itself as the server's.
+          console.log(`[listui-harness] issues ${req.url}`);
+          const rows = sortIssues(ISSUES, params.get('sort'));
+          return json(res, {
+            data: rows,
+            total: rows.length,
+            total_is_capped: false,
+            next_cursor: null,
+            clamped: null,
+          });
         }
 
         if (path === '/v1/apps/app1/issues/issue-1/events/stats') {

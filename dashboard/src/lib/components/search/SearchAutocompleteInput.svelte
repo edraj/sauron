@@ -245,12 +245,18 @@
       a legitimate thing to want, and a control that greys out the moment it
       has been used reads as broken to the next person who clicks it.
     -->
+    <!--
+      The pending colour says "the rows below are not showing what you
+      typed"; the tooltip spells it out. This used to be a line of text under
+      the box as well, which appeared on the first keystroke and pushed every
+      control beside it out of line.
+    -->
     <button
       class="go"
       class:pending
       type="button"
       onclick={submit}
-      title={t('ui.search.submit')}
+      title={pending ? t('ui.search.pending') : t('ui.search.submit')}
     >
       {t('common.search')}
     </button>
@@ -260,8 +266,6 @@
     <p class="msg err" role="alert">{error}</p>
   {:else if schemaError}
     <p class="msg hint">{schemaError} — you can still type a query.</p>
-  {:else if pending}
-    <p class="msg hint">{t('ui.search.pending')}</p>
   {/if}
 
   {#if open && suggestions.length}
@@ -286,24 +290,31 @@
 <style>
   .sac {
     position: relative;
-    flex: 1;
-    min-width: 260px;
+    width: 100%;
   }
+  /* The same shell as `SearchInput`: `--control-h` tall, same surface, border,
+     radius and focus ring. Any drift between the two is visible on the Users
+     page, which renders one, next to Sessions, which renders the other. */
   .shell {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 0 10px;
+    height: var(--control-h);
+    padding-inline: 10px 3px;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    transition: border-color 0.13s ease;
+    transition: border-color 0.13s ease, box-shadow 0.13s ease;
   }
   .shell:focus-within {
     border-color: var(--primary-border);
+    box-shadow: 0 0 0 3px var(--primary-soft);
   }
   .shell.invalid {
     border-color: var(--error);
+  }
+  .shell.invalid:focus-within {
+    box-shadow: 0 0 0 3px var(--error-soft);
   }
   .ic {
     display: inline-flex;
@@ -314,13 +325,14 @@
   input {
     flex: 1;
     min-width: 0;
-    padding: 8px 0;
+    height: 100%;
+    padding: 0;
     background: none;
     border: none;
     color: var(--text);
     outline: none;
     font-family: var(--font-mono);
-    font-size: 12.5px;
+    font-size: 13px;
   }
   input::placeholder {
     color: var(--text-faint);
@@ -333,33 +345,39 @@
     border: none;
     color: var(--text-faint);
     padding: 2px;
+    border-radius: var(--radius-sm);
   }
   .clear:hover {
     color: var(--text);
   }
   .go {
     flex-shrink: 0;
-    margin: 3px -7px 3px 2px;
-    padding: 5px 11px;
+    height: 28px;
+    padding: 0 11px;
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     color: var(--text-muted);
     font-size: 12.5px;
-    font-weight: 540;
+    font-weight: 560;
+    transition: color 0.13s ease, border-color 0.13s ease, background 0.13s ease;
   }
   .go:hover {
     color: var(--text);
     border-color: var(--border-strong);
   }
   .go.pending {
-    background: var(--primary-soft);
-    border-color: var(--primary-border);
-    color: var(--primary);
+    background: var(--primary);
+    border-color: transparent;
+    color: var(--primary-contrast);
+  }
+  .go.pending:hover {
+    background: var(--primary-hover);
   }
   .msg {
-    margin: 4px 2px 0;
-    font-size: 11.5px;
+    margin: 6px 2px 0;
+    font-size: 12px;
+    line-height: 16px;
   }
   .msg.err {
     color: var(--error);

@@ -42,7 +42,7 @@
     OverviewSeriesSection,
   } from '../lib/api/overview';
   import { openOverviewStream } from '../lib/api/overview-stream';
-  import { compactNumber, formatPercent, formatTime, relativeTime } from '../lib/utils/format';
+  import { compactNumber, formatPercent } from '../lib/utils/format';
   import type { Issue, TopEvent } from '../lib/models';
 
   const RANGES = [
@@ -435,11 +435,7 @@
           crosses something they care about, and it silently goes wrong if the
           tab is left open.
         -->
-        {#if computedAt}
-          <span class="stamp" title={computedAt.toISOString()}>
-            · Updated {formatTime(computedAt)} <span class="muted">({relativeTime(computedAt)})</span>
-          </span>
-        {:else if computing}
+        {#if !computedAt && computing}
           <span class="stamp">· Computing…</span>
         {/if}
       </p>
@@ -457,7 +453,18 @@
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached data, fetching fresh" hint.
       -->
-      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
+      <!--
+        The page's ONE stamp. `computedAt` is the oldest server stamp across
+        the five sections; without it the chip would fall back to the browser's
+        fetch time and date hour-old numbers to "just now". The subtitle used to
+        carry a second "Updated" line from the same value and the two were read
+        as two different facts.
+      -->
+      <Freshness
+        computedAt={computedAt?.toISOString() ?? null}
+        fetchedAt={pageFreshness.fetchedAt}
+        revalidating={pageFreshness.revalidating}
+      />
       <RefreshButton
         onclick={refresher.run}
         loading={refresher.busy || refreshing || revalidating}

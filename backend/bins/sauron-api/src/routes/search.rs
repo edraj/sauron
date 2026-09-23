@@ -223,6 +223,42 @@ where
 /// `EVENTS_MAX_SINCE_DAYS`).
 pub const MAX_WINDOW_DAYS: i64 = 365;
 
+/// Largest candidate-row count at which a `Cost::Scan` list query runs
+/// UNclamped by the planner's window, when the route can bound that count
+/// from something it already holds.
+///
+/// The planner clamps a scan to `SEARCH_SCAN_CLAMP_DAYS` because it prices
+/// the query, not the data: it cannot see how many rows the scan will read.
+/// Some routes can. An occurrence list is scoped to one issue whose lifetime
+/// `times_seen` bounds its rows; a sessions list can sum the session-day
+/// rollup over the requested window. When that bound is at or under this
+/// ceiling the scan is already smaller than a clamped scan over a hot
+/// tenant, and the clamp buys nothing but missing rows.
+///
+/// Measured 2026-09-23 on Postgres 16, cold cache, a non-matching
+/// `ILIKE '%zzzz%'` (the worst case: every candidate row is read and
+/// rejected), at exactly this ceiling:
+///
+/// | table          | page   | count  |
+/// |----------------|--------|--------|
+/// | `error_events` | 733 ms | 689 ms |
+/// | `sessions`     | 430 ms | 373 ms |
+///
+/// Ten times this would approach the 30-second request timeout, so the
+/// ceiling is one million and not ten.
+pub const SCAN_UNCLAMPED_MAX_ROWS: i64 = 1_000_000;
+
+/// The planner's clamp, dropped when the route knows the scan reads at most
+/// `candidate_rows` and that is within [`SCAN_UNCLAMPED_MAX_ROWS`]. `None`
+/// rows means the route could not bound it, and the clamp stands — unknown
+/// is treated as large, never as small.
+pub fn bounded_scan_clamp(candidate_rows: Option<i64>, planner: Option<Clamp>) -> Option<Clamp> {
+    match candidate_rows {
+        Some(n) if n <= SCAN_UNCLAMPED_MAX_ROWS => None,
+        _ => planner,
+    }
+}
+
 /// The window a list actually ran over, as the repo layer receives it.
 ///
 /// `from` is never optional and `to` is, and the asymmetry is load bearing:
@@ -2197,5 +2233,40 @@ mod tests {
         assert!(issues.variables.iter().any(|v| v.prefix == "@tag"));
         assert!(issues.variables.iter().any(|v| v.prefix == "@extra"));
         assert!(issues.variables.iter().any(|v| v.prefix == "@context"));
+    }
+
+    // -- bounded_scan_clamp ---------------------------------------------------
+
+    fn planner_clamp() -> Option<Clamp> {
+        Some(Clamp {
+            field: "since",
+            to_days: 30,
+            reason: "test",
+        })
+    }
+
+    #[test]
+    fn a_bounded_small_scan_is_unclamped() {
+        assert!(bounded_scan_clamp(Some(1), planner_clamp()).is_none());
+        assert!(bounded_scan_clamp(Some(SCAN_UNCLAMPED_MAX_ROWS), planner_clamp()).is_none());
+    }
+
+    #[test]
+    fn a_scan_past_the_ceiling_keeps_the_planner_clamp() {
+        assert_eq!(
+            bounded_scan_clamp(Some(SCAN_UNCLAMPED_MAX_ROWS + 1), planner_clamp()),
+            planner_clamp()
+        );
+    }
+
+    #[test]
+    fn an_unknown_bound_is_treated_as_large() {
+        assert_eq!(bounded_scan_clamp(None, planner_clamp()), planner_clamp());
+    }
+
+    #[test]
+    fn no_planner_clamp_means_no_clamp_whatever_the_bound() {
+        assert!(bounded_scan_clamp(None, None).is_none());
+        assert!(bounded_scan_clamp(Some(i64::MAX), None).is_none());
     }
 }

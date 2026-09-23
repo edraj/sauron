@@ -35,8 +35,8 @@
 
 <style>
   .refresh-btn {
-    width: 36px;
-    height: 36px;
+    width: var(--control-h);
+    height: var(--control-h);
     display: grid;
     place-items: center;
     background: var(--surface-2);

@@ -70,7 +70,7 @@ const ADVISORY_LOCK: &str = "SELECT pg_advisory_xact_lock(hashtext('sauron_rollu
 
 /// Rows per upsert statement. Sketch-bearing rows carry ~4.5 KiB each, so the
 /// house INSERT_CHUNK of 1000 keeps a statement under ~5 MiB.
-const CHUNK: usize = 1000;
+pub(crate) const CHUNK: usize = 1000;
 
 #[derive(QueryableByName)]
 struct TsRow {
@@ -256,6 +256,12 @@ pub struct ScreenDelta {
 pub struct UserActivityDelta {
     pub hll_all: Hll,
     pub hll_analytics: Hll,
+    /// People in `hll_all` whose `event_users.identified_at` was set when this
+    /// delta was folded. Always WRITTEN (an empty sketch when nobody), because
+    /// on `user_activity_daily` NULL means "unknown" — a pre-migration-79 row
+    /// — and the read reports the split as unknown for any window touching
+    /// one. See migration 79 and `fold::recompute_identified_sketches`.
+    pub hll_identified: Hll,
     pub events: i64,
     pub errors: i64,
 }
@@ -293,6 +299,24 @@ fn env_key(env: &Option<Uuid>) -> Uuid {
 
 fn opt_hll(h: &Hll) -> Option<Vec<u8>> {
     (!h.is_empty()).then(|| h.to_bytes())
+}
+
+/// Like [`opt_hll`] but ALWAYS a sketch, empty included — for columns where
+/// NULL is reserved to mean "unknown" (`hll_identified`).
+pub(crate) fn hll_bytes(h: &Hll) -> Option<Vec<u8>> {
+    Some(h.to_bytes())
+}
+
+/// Any `user_activity_daily` row still without an identified sketch (NULL =
+/// written before migration 79). Drives the unattended backfill and is the
+/// reader's cue that a window's split may be unknown.
+pub async fn identified_sketch_pending(conn: &mut AsyncPgConnection) -> diesel::QueryResult<bool> {
+    let r: BoolRow = diesel::sql_query(
+        "SELECT EXISTS (SELECT 1 FROM user_activity_daily WHERE hll_identified IS NULL) AS present",
+    )
+    .get_result(conn)
+    .await?;
+    Ok(r.present)
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +507,8 @@ struct ExistingActivity {
     hll_all: Option<Vec<u8>>,
     #[diesel(sql_type = Nullable<Bytea>)]
     hll_analytics: Option<Vec<u8>>,
+    #[diesel(sql_type = Nullable<Bytea>)]
+    hll_identified: Option<Vec<u8>>,
     #[diesel(sql_type = BigInt)]
     events: i64,
     #[diesel(sql_type = BigInt)]
@@ -498,7 +524,7 @@ pub async fn add_user_activity(
     for kchunk in keys.chunks(CHUNK) {
         let existing: Vec<ExistingActivity> = diesel::sql_query(
             "SELECT u.app_id, COALESCE(u.environment_id, '00000000-0000-0000-0000-000000000000'::uuid) AS env_key, \
-                    u.day, u.hll_all, u.hll_analytics, u.events, u.errors \
+                    u.day, u.hll_all, u.hll_analytics, u.hll_identified, u.events, u.errors \
              FROM user_activity_daily u \
              JOIN unnest($1::uuid[], $2::uuid[], $3::date[]) AS k(app_id, env_key, day) \
                ON u.app_id = k.app_id AND u.day = k.day \
@@ -518,6 +544,12 @@ pub async fn add_user_activity(
                 d.hll_all.merge(&Hll::from_opt(ex.hll_all.as_ref()));
                 d.hll_analytics
                     .merge(&Hll::from_opt(ex.hll_analytics.as_ref()));
+                // A NULL (unknown) existing sketch merges as empty and the
+                // write below stores a real one — from this fold on the row is
+                // "known", carrying only the people identified since. The
+                // daily recompute from `person_days` restores the full day.
+                d.hll_identified
+                    .merge(&Hll::from_opt(ex.hll_identified.as_ref()));
             }
         }
     }
@@ -525,12 +557,13 @@ pub async fn add_user_activity(
     for chunk in rows.chunks(CHUNK) {
         diesel::sql_query(
             "INSERT INTO user_activity_daily \
-                 (app_id, environment_id, day, hll_all, hll_analytics, events, errors, updated_at) \
-             SELECT app_id, env, day, hll_all, hll_analytics, events, errors, now() \
-             FROM unnest($1::uuid[], $2::uuid[], $3::date[], $4::bytea[], $5::bytea[], $6::bigint[], $7::bigint[]) \
-                  AS t(app_id, env, day, hll_all, hll_analytics, events, errors) \
+                 (app_id, environment_id, day, hll_all, hll_analytics, hll_identified, events, errors, updated_at) \
+             SELECT app_id, env, day, hll_all, hll_analytics, hll_identified, events, errors, now() \
+             FROM unnest($1::uuid[], $2::uuid[], $3::date[], $4::bytea[], $5::bytea[], $6::bytea[], $7::bigint[], $8::bigint[]) \
+                  AS t(app_id, env, day, hll_all, hll_analytics, hll_identified, events, errors) \
              ON CONFLICT (app_id, day, COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
              DO UPDATE SET hll_all = EXCLUDED.hll_all, hll_analytics = EXCLUDED.hll_analytics, \
+                           hll_identified = EXCLUDED.hll_identified, \
                            events = EXCLUDED.events, errors = EXCLUDED.errors, updated_at = now()",
         )
         .bind::<Array<SqlUuid>, _>(chunk.iter().map(|(k, _)| k.0).collect::<Vec<_>>())
@@ -539,6 +572,9 @@ pub async fn add_user_activity(
         .bind::<Array<Nullable<Bytea>>, _>(chunk.iter().map(|(_, d)| opt_hll(&d.hll_all)).collect::<Vec<_>>())
         .bind::<Array<Nullable<Bytea>>, _>(
             chunk.iter().map(|(_, d)| opt_hll(&d.hll_analytics)).collect::<Vec<_>>(),
+        )
+        .bind::<Array<Nullable<Bytea>>, _>(
+            chunk.iter().map(|(_, d)| hll_bytes(&d.hll_identified)).collect::<Vec<_>>(),
         )
         .bind::<Array<BigInt>, _>(chunk.iter().map(|(_, d)| d.events).collect::<Vec<_>>())
         .bind::<Array<BigInt>, _>(chunk.iter().map(|(_, d)| d.errors).collect::<Vec<_>>())

@@ -67,6 +67,7 @@ export const explore = {
   'users.combinedActive': { en: 'Active users', ar: 'المستخدمون النشطون' },
   'users.identifiedShort': { en: 'identified', ar: 'معروفون' },
   'users.guestsShort': { en: 'guests', ar: 'ضيوف' },
+  'users.splitUnknown': { en: 'split building…', ar: 'جارٍ حساب التقسيم…' },
   'users.stat.total': { en: 'Total users', ar: 'إجمالي المستخدمين' },
   'users.stat.active': { en: 'Active', ar: 'نشطون' },
   'users.stat.new': { en: 'New', ar: 'جدد' },

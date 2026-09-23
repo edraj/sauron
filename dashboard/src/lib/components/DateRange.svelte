@@ -94,22 +94,30 @@
 {/if}
 
 <style>
+  /* `--control-h` tall like every other toolbar control: 3px inset + 28px
+     pills + 1px border. It was 41px, five taller than the Refresh button it
+     sits beside, which is the kind of gap that reads as a mistake without
+     anyone being able to say why. */
   .ranges {
     display: inline-flex;
-    gap: 4px;
-    padding: 4px;
+    align-items: center;
+    gap: 2px;
+    min-height: var(--control-h);
+    padding: 3px;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
   }
   .range {
-    padding: 6px 13px;
+    height: 28px;
+    padding: 0 12px;
     border: none;
     background: transparent;
     color: var(--text-muted);
     font-size: 12.5px;
     font-weight: 560;
     border-radius: var(--radius-sm);
+    transition: color 0.13s ease, background 0.13s ease;
   }
   .range:hover {
     color: var(--text);

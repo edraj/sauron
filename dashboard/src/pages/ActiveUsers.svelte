@@ -21,7 +21,7 @@
   import { viewKey } from '../lib/stores/view-cache';
   import { downloadActiveUsersCsv, getActiveUsers } from '../lib/api/activeUsers';
   import { errorMessage } from '../lib/api/client';
-  import { compactNumber, formatTime, relativeTime } from '../lib/utils/format';
+  import { compactNumber } from '../lib/utils/format';
   import {
     defaultWindow,
     encodeSelection,
@@ -267,17 +267,6 @@
              gets read after the figure has already been believed. -->
         <p class="sub muted">
           {t('activeUsers.subtitle')}
-          <!-- When the numbers were computed, not when they were fetched: the
-               server serves this report from a ~1h serve-stale cache, so an
-               instant paint can carry hour-old numbers — the stamp is the
-               disclosure, same contract as the Overview header's. Absent on
-               reports cached by older server builds, hence the guard. -->
-          {#if report?.computed_at}
-            {@const stamp = new Date(report.computed_at)}
-            <span class="stamp" title={stamp.toISOString()}>
-              · Updated {formatTime(stamp)} <span class="muted">({relativeTime(stamp)})</span>
-            </span>
-          {/if}
         </p>
       </div>
       <div class="controls">
@@ -416,11 +405,6 @@
     font-size: 13.5px;
     margin-top: 3px;
     max-width: 62ch;
-  }
-  /* Same rule as Overview's stamp: the time and its relative qualifier stay
-     on one line; the subtitle still wraps at the space before the "·". */
-  .stamp {
-    white-space: nowrap;
   }
   .controls {
     display: inline-flex;

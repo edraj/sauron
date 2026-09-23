@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * "as of 14:32" for a stale-while-revalidate view.
+   * "Updated 14:32:05 (8 minutes ago)" for a stale-while-revalidate view.
    *
    * Wiring only — every decision lives in `models/freshness.ts` with a
    * co-located test, per the house rule that components carry no logic worth
