@@ -6,6 +6,7 @@ pub mod duck;
 pub mod layout;
 pub mod merge;
 pub mod plan;
+pub mod quarantine;
 
 pub use layout::{
     bucket_bounds, cold_copy_dir, cold_partition_glob, parse_cold_path, partition_suffix,

@@ -139,8 +139,8 @@ export const docsProse = {
     ar: 'يتحقق من تطابق أعداد الصفوف',
   },
   'dp.tiering.watermark': {
-    en: ', advances a watermark, and only then drops the Postgres partition — after a grace lag and a re-count guard, so a late-arriving row is never dropped. On read, a query’s time window is split at the watermark: the hot half (live partitions) and the cold half (Parquet, plus any late arrivals) run concurrently and their per-day partials are summed. Holistic metrics like percentiles stay hot-only.',
-    ar: '، ثم يقدّم علامة مائية، وعندها فقط يُسقط قسم Postgres — بعد مهلة سماح وفحص إعادة عدّ، فلا يُسقط أبدًا صف وصل متأخرًا. وعند القراءة تُقسم نافذة الاستعلام الزمنية عند العلامة المائية: فيُنفَّذ النصف الساخن (الأقسام الحيّة) والنصف البارد (Parquet وما وصل متأخرًا) بالتوازي، وتُجمع نتائجهما الجزئية اليومية. أما المقاييس الكلية كالمئينات فتبقى على الطبقة الساخنة وحدها.',
+    en: ', advances a watermark, and only then drops the Postgres partition — after a grace lag, and only once Parquet is verified to hold every one of its rows by key. A row that arrives late for an already-exported day is appended to Parquet before its partition goes, so it is never dropped. On read, a query’s time window is split at the watermark: the hot half (live partitions) and the cold half (Parquet, plus any late arrivals) run concurrently and their per-day partials are summed. Holistic metrics like percentiles stay hot-only.',
+    ar: '، ثم يقدّم علامة مائية، وعندها فقط يُسقط قسم Postgres — بعد مهلة سماح، وبعد التحقق من أن Parquet يحوي كل صفوفه بالمفتاح. أما الصف الذي يصل متأخرًا ليوم صُدِّر من قبل فيُضاف إلى Parquet قبل إسقاط قسمه، فلا يُسقط أبدًا. وعند القراءة تُقسم نافذة الاستعلام الزمنية عند العلامة المائية: فيُنفَّذ النصف الساخن (الأقسام الحيّة) والنصف البارد (Parquet وما وصل متأخرًا) بالتوازي، وتُجمع نتائجهما الجزئية اليومية. أما المقاييس الكلية كالمئينات فتبقى على الطبقة الساخنة وحدها.',
   },
 
   // --- uptime --------------------------------------------------------------
