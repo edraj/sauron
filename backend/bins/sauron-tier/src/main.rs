@@ -14,11 +14,12 @@ use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
 use sauron_core::Config;
+use sauron_db::repo::DropOutcome;
 use sauron_db::{conn, repo, PgPool};
-use sauron_tier::duck::DuckEngine;
+use sauron_tier::duck::{DuckEngine, Verdict};
 use sauron_tier::{
-    bucket_bounds, cold_copy_dir, cold_partition_glob, partition_suffix, Granularity, TieredTable,
-    TIERED_TABLES,
+    bucket_bounds, cold_copy_dir, cold_partition_glob, partition_suffix, quarantine, Granularity,
+    TieredTable, TIERED_TABLES,
 };
 use uuid::Uuid;
 
@@ -54,7 +55,11 @@ async fn main() -> anyhow::Result<()> {
     let tiering = tokio::spawn(async move {
         loop {
             if let Err(e) = cycle(&pool, &cfg, gran).await {
-                warn!(error = %e, "tier cycle failed; backing off");
+                // `{:#}`, not `%e`: anyhow's Display prints only the outermost
+                // context ("export failed; removed 1 partial file(s)") and drops
+                // the cause — which is how a production export failed for a day
+                // with no reason in the journal.
+                warn!(error = %format_args!("{e:#}"), "tier cycle failed; backing off");
             }
             tokio::time::sleep(Duration::from_secs(cfg.tier_tick_secs)).await;
         }
@@ -133,7 +138,7 @@ async fn cycle(pool: &PgPool, cfg: &Config, gran: Granularity) -> anyhow::Result
 
     for t in TIERED_TABLES {
         if let Err(e) = tier_table(pool, cfg, gran, t, hot_days).await {
-            warn!(table = t.name, error = %e, "tiering table failed");
+            warn!(table = t.name, error = %format_args!("{e:#}"), "tiering table failed");
         }
     }
     Ok(())
@@ -170,8 +175,46 @@ async fn tier_table(
     let cold_dir = cold_copy_dir(&cfg.tier_cold_path, t.name);
     let base_glob = format!("{}/**/*.parquet", cold_dir);
 
+    // 2b. Set aside cold files DuckDB cannot read, BEFORE anything below reads
+    //     the glob. One such file fails every read of the table — a 0-byte file
+    //     from a killed export stopped `error_events` tiering for 18 days on a
+    //     production host, and broke the Storage page with it. See
+    //     `sauron_tier::quarantine` for what is checked and what is never
+    //     touched. Renamed, not deleted.
+    let sweep_dir = std::path::PathBuf::from(&cold_dir);
+    let sweep = tokio::task::spawn_blocking(move || {
+        quarantine::quarantine_unreadable(
+            &sweep_dir,
+            quarantine::MIN_AGE,
+            std::time::SystemTime::now(),
+        )
+    })
+    .await?;
+    for q in &sweep.moved {
+        warn!(
+            table = t.name,
+            file = %q.from.display(),
+            moved_to = %q.to.display(),
+            bytes = q.bytes,
+            reason = q.reason,
+            "set aside an unreadable cold Parquet file"
+        );
+    }
+    for (file, err) in &sweep.failed {
+        warn!(table = t.name, file = %file.display(), error = %err, "could not set aside an unreadable cold Parquet file");
+    }
+
     // 3. Export eligible partitions oldest-first; stop on the first failure so
     //    the watermark never skips a gap.
+    //
+    //    A failed export stops EXPORTING, not the cycle. It used to `?` straight
+    //    out of `tier_table`, skipping the drop step below — which only touches
+    //    partitions already below the watermark and does not depend on this
+    //    loop at all. On a nearly full disk that is a trap: the export fails for
+    //    lack of space, so nothing is dropped, so no space is ever freed. The
+    //    error is kept and returned after the drops, so the cycle still reports
+    //    it as `tiering table failed`.
+    let mut export_err: Option<anyhow::Error> = None;
     let children = repo::list_child_partitions(&mut c, t.name).await?;
     for child in children {
         let Some(start) = parse_suffix_start(&child, t.name) else {
@@ -219,7 +262,7 @@ async fn tier_table(
         //                         stick); skip export, just advance.
         //   already == 0        → fresh export, then verify.
         //   0 < already != pg   → partial/corrupt cold data; do NOT append more.
-        let (already, exported_cold) =
+        let exported =
             tokio::task::spawn_blocking(move || -> anyhow::Result<(i64, Option<i64>)> {
                 let eng = DuckEngine::open()?;
                 let already = eng.count_range(&base_glob_c, rs, re)?;
@@ -231,7 +274,14 @@ async fn tier_table(
                 let cold = eng.count_range(&base_glob_c, rs, re)?;
                 Ok((already, Some(cold)))
             })
-            .await??;
+            .await?;
+        let (already, exported_cold) = match exported {
+            Ok(v) => v,
+            Err(e) => {
+                export_err = Some(e.context(format!("exporting {child}")));
+                break;
+            }
+        };
 
         match exported_cold {
             Some(cold_rows) => {
@@ -248,8 +298,39 @@ async fn tier_table(
                 info!(child = %child, rows = pg_rows, "partition already in cold; advanced watermark");
             }
             None => {
-                warn!(child = %child, pg_rows, already, "partial cold data for range; skipping re-export (manual clear needed)");
-                break;
+                // Cold holds some of this range but not all: an earlier export
+                // whose watermark advance did not happen, plus rows that landed
+                // since. This used to demand a manual clear and `break` — every
+                // later partition of the table stuck behind one late row. The
+                // same key-matched reconcile the drop step uses appends exactly
+                // what cold lacks, never a row it already holds, and refuses the
+                // one shape where appending could duplicate (see
+                // `plan_reconcile`).
+                let pg_url = cfg.database_url.clone();
+                let table = t.name.to_string();
+                let cold_dir_c = cold_dir.clone();
+                let base_glob_c = base_glob.clone();
+                let rec = tokio::task::spawn_blocking(move || {
+                    let eng = DuckEngine::open()?;
+                    eng.reconcile_range(&pg_url, &table, rs, re, &base_glob_c, &cold_dir_c)
+                })
+                .await?;
+                match rec {
+                    Ok(rec) => match rec.verdict {
+                        Verdict::Ready { pg_rows } => {
+                            repo::advance_watermark(&mut c, t.name, range.end).await?;
+                            info!(child = %child, rows = pg_rows, appended = rec.exported, "completed a partial export; advanced watermark");
+                        }
+                        Verdict::Retain(why) => {
+                            warn!(child = %child, pg_rows = rec.pg_rows, cold_rows = rec.cold_rows, missing = rec.missing, reason = %why, "partial cold data for range; not advancing");
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        export_err = Some(e.context(format!("completing the export of {child}")));
+                        break;
+                    }
+                }
             }
         }
     }
@@ -278,24 +359,59 @@ async fn tier_table(
                 }
                 // Late-write safety: a client-supplied occurred_at can route a NEW
                 // row into this already-exported-but-not-yet-dropped partition (the
-                // grace window). Such a row is NOT in Parquet, so dropping would lose
-                // it. Re-count the partition against its cold copy; if it grew, retain
-                // the partition instead of deleting un-exported data ("never delete").
-                let pg_now = repo::count_child_rows(&mut c, &child).await?;
-                let (rs, re) = (range.start, range.end);
+                // grace window, or long after it: an SDK flushing an offline
+                // buffer). Such a row is NOT in Parquet, so dropping would lose it.
+                //
+                // This used to stop there — count, and retain the partition if it
+                // grew — and nothing ever exported the late rows, so a partition
+                // that took one late row was retained FOREVER. On a production
+                // host that was 44 partitions and a full disk. `reconcile_range`
+                // now appends exactly the Postgres rows cold lacks (matched by
+                // primary key) and says whether cold then holds all of them.
+                let pg_url = cfg.database_url.clone();
+                let table = t.name.to_string();
+                let cold_dir_c = cold_dir.clone();
                 let base_glob_c = base_glob.clone();
-                let cold_now = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+                let (rs, re) = (range.start, range.end);
+                let rec = tokio::task::spawn_blocking(move || {
                     let eng = DuckEngine::open()?;
-                    eng.count_range(&base_glob_c, rs, re)
+                    eng.reconcile_range(&pg_url, &table, rs, re, &base_glob_c, &cold_dir_c)
                 })
-                .await??;
-                if pg_now > cold_now {
-                    warn!(child = %child, pg_now, cold_now, "partition grew after export (late arrivals); retaining to avoid data loss");
-                    continue;
+                .await?;
+                // One partition failing (an append that runs out of disk, say)
+                // must not stop the ones after it: those drops are what free the
+                // space. The append already removed its partial files.
+                let rec = match rec {
+                    Ok(rec) => rec,
+                    Err(e) => {
+                        warn!(child = %child, error = %format_args!("{e:#}"), "late-arrival reconcile failed; retaining");
+                        continue;
+                    }
+                };
+                if rec.exported > 0 {
+                    info!(child = %child, exported = rec.exported, "exported late arrivals to Parquet");
                 }
-                repo::detach_and_drop_partition(&mut c, t.name, &child).await?;
-                repo::set_dropped_thru(&mut c, t.name, range.end).await?;
-                info!(child = %child, "dropped Postgres partition (now cold-only)");
+                let expected = match rec.verdict {
+                    Verdict::Ready { pg_rows } => pg_rows,
+                    Verdict::Retain(why) => {
+                        warn!(child = %child, pg_rows = rec.pg_rows, cold_rows = rec.cold_rows, missing = rec.missing, reason = %why, "partition retained");
+                        continue;
+                    }
+                };
+                // The check above ran seconds ago on another connection. The drop
+                // re-counts under its own locks and refuses if anything changed.
+                match repo::drop_partition_if_unchanged(&mut c, t.name, &child, expected).await? {
+                    DropOutcome::Dropped => {
+                        repo::set_dropped_thru(&mut c, t.name, range.end).await?;
+                        info!(child = %child, rows = expected, "dropped Postgres partition (now cold-only)");
+                    }
+                    DropOutcome::Changed { rows } => {
+                        warn!(child = %child, verified = expected, now = rows, "partition changed during the drop; retaining until next cycle");
+                    }
+                    DropOutcome::LockBusy => {
+                        warn!(child = %child, "partition busy; drop deferred to next cycle");
+                    }
+                }
             }
         }
     }
@@ -320,7 +436,10 @@ async fn tier_table(
             info!(swept, "swept unreferenced error_stack_blobs");
         }
     }
-    Ok(())
+    match export_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 // ===========================================================================

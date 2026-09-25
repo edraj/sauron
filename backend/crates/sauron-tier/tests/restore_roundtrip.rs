@@ -19,7 +19,7 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use duckdb::Connection;
-use sauron_tier::duck::DuckEngine;
+use sauron_tier::duck::{DuckEngine, Verdict};
 use uuid::Uuid;
 
 /// A maintenance URL to create/drop a throwaway database on.
@@ -40,30 +40,39 @@ struct Db {
 }
 
 impl Db {
+    /// `None` only when `TEST_DATABASE_URL` is unset. Every other failure —
+    /// the DuckDB `postgres` extension not installing, the server refusing the
+    /// connection, `CREATE DATABASE` failing — PANICS with the reason.
+    ///
+    /// It used to fold all of those into the same `None` as "unset", so the
+    /// test printed "TEST_DATABASE_URL unset — skipping" and passed while the
+    /// variable was set and nothing had run. A green line that executed
+    /// nothing is worse than a red one.
     fn setup() -> Option<Db> {
         let base = maintenance_url()?;
         let name = format!("sauron_restore_{}", Uuid::new_v4().simple());
-        let admin = Connection::open_in_memory().ok()?;
+        let admin = Connection::open_in_memory().expect("open duckdb");
         admin
             .execute_batch("INSTALL postgres; LOAD postgres;")
-            .ok()?;
+            .expect("install/load the DuckDB postgres extension");
         admin
             .execute_batch(&format!("ATTACH '{base}' AS m (TYPE postgres);"))
-            .ok()?;
-        // CREATE DATABASE cannot run inside DuckDB's transaction wrapper, so it
-        // goes through the escape hatch that hands raw SQL to the server.
+            .expect("attach TEST_DATABASE_URL");
+        // CREATE DATABASE cannot run inside a transaction, and `postgres_execute`
+        // opens one by default (DuckDB 1.5 sends `BEGIN TRANSACTION ISOLATION
+        // LEVEL REPEATABLE READ` first), so the wrapper is switched off.
         admin
             .execute_batch(&format!(
-                "CALL postgres_execute('m', 'CREATE DATABASE {name}');"
+                "CALL postgres_execute('m', 'CREATE DATABASE {name}', use_transaction := false);"
             ))
-            .ok()?;
+            .expect("create the throwaway database");
         let url = swap_db(&base, &name);
         Some(Db { admin, name, url })
     }
 
     fn cleanup(self) {
         let _ = self.admin.execute_batch(&format!(
-            "CALL postgres_execute('m', 'DROP DATABASE IF EXISTS {} WITH (FORCE)');",
+            "CALL postgres_execute('m', 'DROP DATABASE IF EXISTS {} WITH (FORCE)', use_transaction := false);",
             self.name
         ));
     }
@@ -85,15 +94,26 @@ fn swap_db(url: &str, db: &str) -> String {
 }
 
 /// A table shaped like the real tiered ones: uuid key, app_id, a timestamptz,
-/// JSONB, a nullable text, and the restore marker.
+/// JSONB, a nullable text, the restore marker, and the stack-pool hash.
+///
+/// `stacktrace_sha256` and `error_stack_blobs` are here because the export
+/// joins them (migration 68's stack pool): an `error_events` export against a
+/// table without them fails with "Table with name error_stack_blobs does not
+/// exist". Nobody noticed, because `Db::setup` used to fold every setup failure
+/// into a silent skip.
 const DDL: &str = "CREATE TABLE error_events ( \
      id UUID PRIMARY KEY, \
      app_id UUID NOT NULL, \
      message TEXT NOT NULL, \
      stacktrace JSONB NOT NULL DEFAULT ''[]''::jsonb, \
+     stacktrace_sha256 BYTEA, \
      release TEXT, \
      occurred_at TIMESTAMPTZ NOT NULL, \
      restored_pin_id UUID )";
+const DDL_BLOBS: &str = "CREATE TABLE error_stack_blobs ( \
+     sha256 BYTEA PRIMARY KEY, \
+     content JSONB NOT NULL, \
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now() )";
 
 fn pg_exec(conn: &Connection, sql: &str) {
     conn.execute_batch(&format!("CALL postgres_execute('pg', '{sql}');"))
@@ -124,6 +144,7 @@ fn cold_parquet_restores_into_postgres_with_the_marker() {
     conn.execute_batch(&format!("ATTACH '{}' AS pg (TYPE postgres);", db.url))
         .unwrap();
     pg_exec(&conn, DDL);
+    pg_exec(&conn, DDL_BLOBS);
 
     // Four rows for our app across two days, plus one for a different app that
     // must never be swept up by an app-scoped restore.
@@ -132,7 +153,7 @@ fn cold_parquet_restores_into_postgres_with_the_marker() {
             &conn,
             &format!(
                 "INSERT INTO error_events (id, app_id, message, stacktrace, release, occurred_at) \
-                 VALUES (''{}'', ''{}'', ''boom {d}-{h}'', ''[{{\"\"f\"\": 1}}]''::jsonb, ''v1'', ''{}'')",
+                 VALUES (''{}'', ''{}'', ''boom {d}-{h}'', ''[{{\"f\": 1}}]''::jsonb, ''v1'', ''{}'')",
                 Uuid::new_v4(),
                 app,
                 t(d, h).to_rfc3339()
@@ -264,4 +285,211 @@ fn restoring_a_range_with_no_cold_data_is_zero_not_an_error() {
         0,
         "must short-circuit before touching Postgres at all"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Late arrivals: `reconcile_range`
+// ---------------------------------------------------------------------------
+//
+// A client-supplied `occurred_at` routes a late event into a partition that
+// was already exported. Before `reconcile_range` nothing ever put such a row
+// into Parquet, so the drop guard retained the partition forever — on a
+// production host, 44 partitions and a full disk. These run the real export,
+// the real append and the real key comparison against Postgres and Parquet.
+
+/// One `error_events` row for `app` at `at`, tagged `message`.
+fn insert_error(conn: &Connection, id: Uuid, app: Uuid, message: &str, at: DateTime<Utc>) {
+    pg_exec(
+        conn,
+        &format!(
+            "INSERT INTO error_events (id, app_id, message, occurred_at) \
+             VALUES (''{id}'', ''{app}'', ''{message}'', ''{}'')",
+            at.to_rfc3339()
+        ),
+    );
+}
+
+/// Rows in cold for `glob` whose message is `message`.
+fn cold_with_message(conn: &Connection, glob: &str, message: &str) -> i64 {
+    scalar_i64(
+        conn,
+        &format!(
+            "SELECT count(*) FROM read_parquet('{glob}', hive_partitioning=true, union_by_name=true) \
+             WHERE message = '{message}'"
+        ),
+    )
+}
+
+/// A fresh database with the error_events schema, a DuckDB connection attached
+/// to it, and an empty cold directory.
+fn late_fixture(db: &Db) -> (Connection, std::path::PathBuf, String, String) {
+    let dir = std::env::temp_dir().join(format!("sauron-late-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cold_dir = format!("{}/error_events", dir.display());
+    let glob = format!("{cold_dir}/**/*.parquet");
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("INSTALL postgres; LOAD postgres; SET TimeZone='UTC';")
+        .unwrap();
+    conn.execute_batch(&format!("ATTACH '{}' AS pg (TYPE postgres);", db.url))
+        .unwrap();
+    pg_exec(&conn, DDL);
+    pg_exec(&conn, DDL_BLOBS);
+    (conn, dir, cold_dir, glob)
+}
+
+#[test]
+fn late_rows_are_appended_once_and_the_range_becomes_droppable() {
+    let Some(db) = Db::setup() else {
+        eprintln!("TEST_DATABASE_URL unset — skipping late-arrival reconcile");
+        return;
+    };
+    let (conn, dir, cold_dir, glob) = late_fixture(&db);
+    let app = Uuid::new_v4();
+    let (from, to) = (t(1, 0), t(2, 0));
+    for h in [8u32, 9, 10, 11] {
+        insert_error(&conn, Uuid::new_v4(), app, "on time", t(1, h));
+    }
+
+    let eng = DuckEngine::open().unwrap();
+    eng.export_from_postgres(&db.url, "error_events", from, to, &cold_dir)
+        .expect("export");
+
+    // Straight after export: nothing missing, droppable at 4 rows.
+    let rec = eng
+        .reconcile_range(&db.url, "error_events", from, to, &glob, &cold_dir)
+        .expect("reconcile");
+    assert_eq!(rec.exported, 0);
+    assert_eq!(rec.verdict, Verdict::Ready { pg_rows: 4 });
+
+    // Two late rows land in the exported day. One carries a POOLED stack trace
+    // (placeholder inline, real trace in `error_stack_blobs`), so the append is
+    // held to the same shaping as the export: the trace must be materialized.
+    insert_error(&conn, Uuid::new_v4(), app, "late", t(1, 20));
+    pg_exec(
+        &conn,
+        "INSERT INTO error_stack_blobs (sha256, content) \
+         VALUES (''\\x01'', ''[{\"function\": \"pooled_frame\"}]''::jsonb)",
+    );
+    pg_exec(
+        &conn,
+        &format!(
+            "INSERT INTO error_events (id, app_id, message, stacktrace, stacktrace_sha256, occurred_at) \
+             VALUES (''{}'', ''{app}'', ''late'', ''[]''::jsonb, ''\\x01'', ''{}'')",
+            Uuid::new_v4(),
+            t(1, 21).to_rfc3339()
+        ),
+    );
+    // And one for the NEXT day, outside the range: it must not be appended.
+    insert_error(&conn, Uuid::new_v4(), app, "late", t(2, 1));
+
+    let rec = eng
+        .reconcile_range(&db.url, "error_events", from, to, &glob, &cold_dir)
+        .expect("reconcile");
+    assert_eq!(
+        rec.exported, 2,
+        "exactly the two late rows in range: {rec:?}"
+    );
+    assert_eq!(rec.missing, 0);
+    assert_eq!(rec.verdict, Verdict::Ready { pg_rows: 6 });
+    assert_eq!(eng.count_range(&glob, from, to).unwrap(), 6);
+    assert_eq!(cold_with_message(&conn, &glob, "late"), 2);
+    assert_eq!(
+        cold_with_message(&conn, &glob, "on time"),
+        4,
+        "no duplicates"
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            &format!(
+                "SELECT count(*) FROM read_parquet('{glob}', hive_partitioning=true, union_by_name=true) \
+                 WHERE CAST(stacktrace AS VARCHAR) LIKE '%pooled_frame%'"
+            )
+        ),
+        1,
+        "a late pooled trace is materialized in cold, like the export does"
+    );
+
+    // Idempotent: a second pass appends nothing.
+    let rec = eng
+        .reconcile_range(&db.url, "error_events", from, to, &glob, &cold_dir)
+        .expect("reconcile");
+    assert_eq!(rec.exported, 0);
+    assert_eq!(rec.verdict, Verdict::Ready { pg_rows: 6 });
+    assert_eq!(eng.count_range(&glob, from, to).unwrap(), 6);
+
+    std::fs::remove_dir_all(&dir).ok();
+    db.cleanup();
+}
+
+/// A range with NO cold rows (the files were lost, or never written) is
+/// exported in full — appending duplicates nothing because nothing is there.
+#[test]
+fn a_range_with_no_cold_rows_is_exported_in_full() {
+    let Some(db) = Db::setup() else {
+        eprintln!("TEST_DATABASE_URL unset — skipping late-arrival reconcile");
+        return;
+    };
+    let (conn, dir, cold_dir, glob) = late_fixture(&db);
+    let app = Uuid::new_v4();
+    let (from, to) = (t(1, 0), t(2, 0));
+    for h in [8u32, 9, 10] {
+        insert_error(&conn, Uuid::new_v4(), app, "orphaned", t(1, h));
+    }
+
+    let eng = DuckEngine::open().unwrap();
+    let rec = eng
+        .reconcile_range(&db.url, "error_events", from, to, &glob, &cold_dir)
+        .expect("reconcile");
+    assert_eq!(rec.exported, 3);
+    assert_eq!(rec.verdict, Verdict::Ready { pg_rows: 3 });
+    assert_eq!(eng.count_range(&glob, from, to).unwrap(), 3);
+
+    std::fs::remove_dir_all(&dir).ok();
+    db.cleanup();
+}
+
+/// Cold holds rows for the range and not one matches Postgres by key — the
+/// shape a broken key comparison would take. Appending would duplicate the
+/// whole range, so the range is refused and cold is left exactly as it was.
+#[test]
+fn a_range_whose_keys_match_nothing_is_refused_not_duplicated() {
+    let Some(db) = Db::setup() else {
+        eprintln!("TEST_DATABASE_URL unset — skipping late-arrival reconcile");
+        return;
+    };
+    let (conn, dir, cold_dir, glob) = late_fixture(&db);
+    let app = Uuid::new_v4();
+    let (from, to) = (t(1, 0), t(2, 0));
+    for h in [8u32, 9, 10] {
+        insert_error(&conn, Uuid::new_v4(), app, "exported", t(1, h));
+    }
+    let eng = DuckEngine::open().unwrap();
+    eng.export_from_postgres(&db.url, "error_events", from, to, &cold_dir)
+        .expect("export");
+    // Replace every hot row with a different one: same count, no key in common.
+    pg_exec(&conn, "DELETE FROM error_events");
+    for h in [8u32, 9, 10] {
+        insert_error(&conn, Uuid::new_v4(), app, "replaced", t(1, h));
+    }
+
+    let rec = eng
+        .reconcile_range(&db.url, "error_events", from, to, &glob, &cold_dir)
+        .expect("reconcile");
+    assert_eq!(rec.exported, 0);
+    let Verdict::Retain(why) = rec.verdict else {
+        panic!(
+            "a total key mismatch must be retained, got {:?}",
+            rec.verdict
+        );
+    };
+    assert!(why.contains("duplicate"), "{why}");
+    assert_eq!(
+        eng.count_range(&glob, from, to).unwrap(),
+        3,
+        "cold untouched"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    db.cleanup();
 }

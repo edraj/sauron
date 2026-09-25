@@ -13302,6 +13302,102 @@ pub async fn detach_and_drop_partition(
     conn.batch_execute(&sql).await
 }
 
+/// What [`drop_partition_if_unchanged`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropOutcome {
+    Dropped,
+    /// The partition held `rows` under the lock, not the verified count: a row
+    /// arrived (or left) after cold was checked. Nothing was dropped.
+    Changed {
+        rows: i64,
+    },
+    /// The locks were not granted within the timeout. Nothing was dropped.
+    LockBusy,
+}
+
+/// How long the drop waits for its locks before giving up for this cycle.
+///
+/// `DETACH` needs ACCESS EXCLUSIVE on the parent, and while it WAITS for that
+/// lock every later query on the table queues behind it — ingest included. The
+/// unbounded wait of [`detach_and_drop_partition`] is how a long dashboard
+/// query turns into an ingest stall. Five seconds bounds that; a busy table
+/// just means the partition goes on a later cycle.
+const DROP_LOCK_TIMEOUT: &str = "5s";
+
+/// Detach and drop a partition, but only if it still holds exactly
+/// `expected_rows` once it is locked.
+///
+/// `expected_rows` is the count at which cold was verified to hold every row
+/// of the partition. Between that check and this drop a late row can still
+/// land — the check runs in DuckDB, seconds earlier, on another connection —
+/// and dropping it would destroy the one copy. So the partition is detached
+/// FIRST, which takes the locks that stop any further write reaching it, and
+/// only then counted. Any difference rolls the whole transaction back, which
+/// re-attaches the partition as though nothing happened.
+///
+/// Detach-then-count rather than lock-the-child-then-detach: an insert takes
+/// the parent's lock before the child's, so locking the child first and then
+/// asking for the parent's inverts that order and can deadlock against a late
+/// insert. The cost of the safe order is that the parent stays locked for the
+/// duration of the count — one scan of an old partition, well under a second
+/// at production sizes, and bounded by `statement_timeout` below.
+pub async fn drop_partition_if_unchanged(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    child: &str,
+    expected_rows: i64,
+) -> QueryResult<DropOutcome> {
+    // `table` and `child` are internal relation names derived from our own
+    // partition suffix, never user input — same as `count_child_rows`.
+    conn.batch_execute("BEGIN").await?;
+    let out: QueryResult<DropOutcome> = async {
+        conn.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '{DROP_LOCK_TIMEOUT}'; SET LOCAL statement_timeout = '60s';"
+        ))
+        .await?;
+        conn.batch_execute(&format!("ALTER TABLE {table} DETACH PARTITION {child}"))
+            .await?;
+        let row: CountRow = diesel::sql_query(format!("SELECT count(*)::bigint AS n FROM {child}"))
+            .get_result(conn)
+            .await?;
+        if row.n != expected_rows {
+            return Ok(DropOutcome::Changed { rows: row.n });
+        }
+        conn.batch_execute(&format!("DROP TABLE {child}")).await?;
+        Ok(DropOutcome::Dropped)
+    }
+    .await;
+    match out {
+        Ok(DropOutcome::Dropped) => {
+            conn.batch_execute("COMMIT").await?;
+            Ok(DropOutcome::Dropped)
+        }
+        Ok(other) => {
+            conn.batch_execute("ROLLBACK").await?;
+            Ok(other)
+        }
+        Err(e) => {
+            let _ = conn.batch_execute("ROLLBACK").await;
+            if is_lock_timeout(&e) {
+                Ok(DropOutcome::LockBusy)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Postgres cancelling a statement for exceeding `lock_timeout` (SQLSTATE
+/// 55P03, "canceling statement due to lock timeout"). Matched on the message
+/// for the same reason `pool::is_statement_timeout` is: diesel does not expose
+/// the SQLSTATE.
+fn is_lock_timeout(err: &diesel::result::Error) -> bool {
+    match err {
+        diesel::result::Error::DatabaseError(_, info) => info.message().contains("lock timeout"),
+        _ => false,
+    }
+}
+
 // ===========================================================================
 // Cross-tier reads (hot side)
 // ===========================================================================

@@ -57,7 +57,9 @@ fn duck_memory_mb() -> u32 {
 
 /// Every `*.parquet` path under `dir`, recursively. Missing directory ⇒ empty
 /// set, which is the correct answer before the very first export.
-fn parquet_files_under(dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+pub(crate) fn parquet_files_under(
+    dir: &std::path::Path,
+) -> std::collections::HashSet<std::path::PathBuf> {
     let mut out = std::collections::HashSet::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
@@ -95,6 +97,77 @@ fn remove_files_added_since(
         .filter(|f| !before.contains(f))
         .filter(|f| std::fs::remove_file(f).is_ok())
         .count()
+}
+
+/// One exported range, compared between Postgres and cold by primary key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeDiff {
+    /// Rows in cold Parquet for the range.
+    pub cold_rows: i64,
+    /// Rows in Postgres for the range.
+    pub pg_rows: i64,
+    /// Postgres rows with no cold row of the same `(id, occurred_at)`.
+    pub missing: i64,
+}
+
+/// What [`DuckEngine::reconcile_range`] should do with a [`RangeDiff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcilePlan {
+    /// Every Postgres row is already in cold; nothing to append.
+    Ready,
+    /// Append the `missing` rows, then check again.
+    ExportMissing,
+    /// Do nothing, for the stated reason.
+    Refuse(String),
+}
+
+/// Decide what to do with a range. Pure, so every branch is unit-tested.
+///
+/// The refusal is the whole safety argument for appending. If cold holds rows
+/// for the range but NOT ONE of them matches a Postgres row by key, the likely
+/// explanation is not "every row arrived late" but "the key comparison is
+/// broken" — a type drift in how `id` or `occurred_at` reads back from
+/// Parquet, say. Appending in that state would duplicate the entire range in
+/// cold, silently, and every cold count would double. So it stops and says so.
+///
+/// Cold holding MORE rows than Postgres (a purge removed rows from the hot
+/// side) is not a refusal: what matters for dropping is that no Postgres row
+/// is missing from cold, and for appending that only missing keys are written.
+pub fn plan_reconcile(d: RangeDiff) -> ReconcilePlan {
+    if d.missing == 0 {
+        return ReconcilePlan::Ready;
+    }
+    if d.cold_rows > 0 && d.missing == d.pg_rows {
+        return ReconcilePlan::Refuse(format!(
+            "none of the {} Postgres row(s) matched any of the {} cold row(s) by key; \
+             refusing to append (it would duplicate the range)",
+            d.pg_rows, d.cold_rows
+        ));
+    }
+    ReconcilePlan::ExportMissing
+}
+
+/// Whether a range's Postgres partition may be dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Cold holds every Postgres row. `pg_rows` is how many there were when
+    /// that was established: the drop must see the SAME count under its lock,
+    /// or a row arrived after the check and the partition has to stay.
+    Ready { pg_rows: i64 },
+    /// Keep the partition, for the stated reason.
+    Retain(String),
+}
+
+/// The outcome of [`DuckEngine::reconcile_range`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reconcile {
+    pub pg_rows: i64,
+    pub cold_rows: i64,
+    /// Postgres rows still without a cold copy after this run.
+    pub missing: i64,
+    /// Rows this run appended to cold.
+    pub exported: i64,
+    pub verdict: Verdict,
 }
 
 impl DuckEngine {
@@ -192,6 +265,76 @@ impl DuckEngine {
         Ok(out)
     }
 
+    /// Attach the Postgres database at `pg_url` as `pg`, read-only. Re-attaches
+    /// if this connection already has one, so a method may call it
+    /// unconditionally.
+    fn attach_pg_readonly(&self, pg_url: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch("INSTALL postgres; LOAD postgres;")?;
+        // ATTACH is idempotent-ish within a connection; detach if re-run.
+        let _ = self.conn.execute_batch("DETACH DATABASE IF EXISTS pg;");
+        self.conn.execute_batch(&format!(
+            "ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY);"
+        ))?;
+        Ok(())
+    }
+
+    /// The rows of `table` in `[start, end)`, shaped for cold storage, with
+    /// `extra` ANDed onto the range predicate. The table is aliased `e`.
+    ///
+    /// Tier 1 (migration 0068): a pooled `error_events` row carries the
+    /// placeholder `[]` inline and its real trace in `error_stack_blobs`. A
+    /// bare `SELECT *` would ship the placeholder plus a dangling hash into
+    /// cold storage — unreadable through the cross-tier router once the hot
+    /// pool row is swept. The export therefore MATERIALIZES the trace
+    /// (COALESCE keeps pre-0068 and pooling-off rows intact) and EXCLUDES the
+    /// hash column, so cold files keep the exact pre-Tier-1 schema and no cold
+    /// reader needs to know pooling ever existed.
+    fn cold_rows_query(
+        table: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        extra: &str,
+    ) -> String {
+        let select = if table == "error_events" {
+            "SELECT e.* EXCLUDE (stacktrace_sha256) \
+                    REPLACE (COALESCE(b.content, e.stacktrace) AS stacktrace), \
+                    year(e.occurred_at) AS year, month(e.occurred_at) AS month \
+             FROM pg.error_events e \
+             LEFT JOIN pg.error_stack_blobs b ON e.stacktrace_sha256 = b.sha256"
+                .to_string()
+        } else {
+            format!(
+                "SELECT e.*, year(e.occurred_at) AS year, month(e.occurred_at) AS month \
+                 FROM pg.{table} e"
+            )
+        };
+        format!(
+            "{select} WHERE e.occurred_at >= TIMESTAMPTZ '{start}' \
+                        AND e.occurred_at < TIMESTAMPTZ '{end}'{extra}",
+            start = start.to_rfc3339(),
+            end = end.to_rfc3339(),
+        )
+    }
+
+    /// `COPY (rows) TO cold_dir`, all-or-nothing: a failed COPY leaves no
+    /// trace. See `remove_files_added_since` for the two kinds of debris and
+    /// why either one breaks the NEXT run rather than just this one.
+    fn copy_to_cold(&self, rows: &str, cold_dir: &str) -> anyhow::Result<()> {
+        let sql = format!(
+            "COPY ({rows}) \
+             TO '{cold_dir}' (FORMAT PARQUET, PARTITION_BY (app_id, year, month), APPEND);"
+        );
+        let cold = std::path::Path::new(cold_dir);
+        let before = parquet_files_under(cold);
+        if let Err(e) = self.conn.execute_batch(&sql) {
+            let removed = remove_files_added_since(cold, &before);
+            return Err(anyhow::Error::new(e)
+                .context(format!("export failed; removed {removed} partial file(s)")));
+        }
+        Ok(())
+    }
+
     /// Copy `[start, end)` of a Postgres table into hive-partitioned Parquet
     /// under `cold_dir`, appending to existing month directories. Uses DuckDB's
     /// postgres extension (needs libpq available at runtime).
@@ -203,54 +346,160 @@ impl DuckEngine {
         end: DateTime<Utc>,
         cold_dir: &str,
     ) -> anyhow::Result<()> {
-        self.conn
-            .execute_batch("INSTALL postgres; LOAD postgres;")?;
-        // ATTACH is idempotent-ish within a connection; detach if re-run.
-        let _ = self.conn.execute_batch("DETACH DATABASE IF EXISTS pg;");
-        self.conn.execute_batch(&format!(
-            "ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY);"
-        ))?;
-        // Tier 1 (migration 0068): a pooled `error_events` row carries the
-        // placeholder `[]` inline and its real trace in `error_stack_blobs`.
-        // A bare `SELECT *` would ship the placeholder plus a dangling hash
-        // into cold storage — unreadable through the cross-tier router once
-        // the hot pool row is swept. The export therefore MATERIALIZES the
-        // trace (COALESCE keeps pre-0068 and pooling-off rows intact) and
-        // EXCLUDES the hash column, so cold files keep the exact pre-Tier-1
-        // schema and no cold reader needs to know pooling ever existed.
-        let select = if table == "error_events" {
-            "SELECT e.* EXCLUDE (stacktrace_sha256) \
-                    REPLACE (COALESCE(b.content, e.stacktrace) AS stacktrace), \
-                    year(e.occurred_at) AS year, month(e.occurred_at) AS month \
-             FROM pg.error_events e \
-             LEFT JOIN pg.error_stack_blobs b ON e.stacktrace_sha256 = b.sha256"
-                .to_string()
-        } else {
-            format!(
-                "SELECT *, year(occurred_at) AS year, month(occurred_at) AS month \
-                 FROM pg.{table}"
-            )
-        };
-        let sql = format!(
-            "COPY ({select} \
-                   WHERE occurred_at >= TIMESTAMPTZ '{start}' AND occurred_at < TIMESTAMPTZ '{end}') \
-             TO '{cold_dir}' (FORMAT PARQUET, PARTITION_BY (app_id, year, month), APPEND);",
-            select = select,
-            start = start.to_rfc3339(),
-            end = end.to_rfc3339(),
-            cold_dir = cold_dir,
-        );
-        // All-or-nothing: a failed COPY must leave no trace. See
-        // `remove_files_added_since` for the two kinds of debris and why either
-        // one breaks the NEXT run rather than just this one.
-        let cold = std::path::Path::new(cold_dir);
-        let before = parquet_files_under(cold);
-        if let Err(e) = self.conn.execute_batch(&sql) {
-            let removed = remove_files_added_since(cold, &before);
-            return Err(anyhow::Error::new(e)
-                .context(format!("export failed; removed {removed} partial file(s)")));
-        }
+        self.attach_pg_readonly(pg_url)?;
+        self.copy_to_cold(&Self::cold_rows_query(table, start, end, ""), cold_dir)?;
         Ok(())
+    }
+
+    /// Bring cold up to date with a Postgres range that was exported before
+    /// and has changed since, and say whether the Postgres copy may now go.
+    ///
+    /// # Why this exists
+    ///
+    /// A client-supplied `occurred_at` routes a late event (an SDK flushing an
+    /// offline buffer, a retry after an ingest outage) into a partition that
+    /// was already exported. The drop guard rightly refused to delete it,
+    /// because that row was not in Parquet — but nothing ever put it there, so
+    /// the partition was retained forever and Postgres never shrank. Measured
+    /// on a production host: 44 partitions stuck this way, a few hundred late
+    /// rows each, and the disk at 100%. Readers split at the watermark and read
+    /// cold below it, so those rows were also invisible to every dashboard.
+    ///
+    /// # How
+    ///
+    /// Rows are matched by their primary key, `(id, occurred_at)` — the same
+    /// key on every tiered table — so this is a set difference, not a count
+    /// comparison. Only the Postgres rows with no cold counterpart are
+    /// appended (`missing`), which makes the step idempotent: run it twice and
+    /// the second run appends nothing.
+    ///
+    /// See [`plan_reconcile`] for the one case it refuses: a range where NOTHING
+    /// in cold matches Postgres by key although cold has rows. That is what a
+    /// broken key comparison looks like, and appending then would duplicate the
+    /// whole range, so it stops instead.
+    pub fn reconcile_range(
+        &self,
+        pg_url: &str,
+        table: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        glob: &str,
+        cold_dir: &str,
+    ) -> anyhow::Result<Reconcile> {
+        self.attach_pg_readonly(pg_url)?;
+        let before = self.range_diff(table, start, end, glob)?;
+        let mut rec = Reconcile {
+            pg_rows: before.pg_rows,
+            cold_rows: before.cold_rows,
+            missing: before.missing,
+            exported: 0,
+            verdict: Verdict::Retain(String::new()),
+        };
+        match plan_reconcile(before) {
+            ReconcilePlan::Ready => {
+                rec.verdict = Verdict::Ready {
+                    pg_rows: before.pg_rows,
+                };
+                return Ok(rec);
+            }
+            ReconcilePlan::Refuse(why) => {
+                rec.verdict = Verdict::Retain(why);
+                return Ok(rec);
+            }
+            ReconcilePlan::ExportMissing => {}
+        }
+
+        // `cold_keys` is the snapshot `range_diff` just took, so the anti-join
+        // here appends exactly the rows that were missing then — plus any that
+        // arrived since, which are missing too. It never appends a row that
+        // cold already holds.
+        let rows = Self::cold_rows_query(
+            table,
+            start,
+            end,
+            " AND NOT EXISTS (SELECT 1 FROM cold_keys k \
+                              WHERE k.id = e.id AND k.occurred_at = e.occurred_at)",
+        );
+        self.copy_to_cold(&rows, cold_dir)?;
+
+        // Re-derive from the files, not from arithmetic: the proof that the
+        // Postgres copy is redundant is that cold now holds every one of its
+        // rows by key.
+        let after = self.range_diff(table, start, end, glob)?;
+        rec.exported = after.cold_rows - before.cold_rows;
+        rec.pg_rows = after.pg_rows;
+        rec.cold_rows = after.cold_rows;
+        rec.missing = after.missing;
+        rec.verdict = if after.missing == 0 {
+            Verdict::Ready {
+                pg_rows: after.pg_rows,
+            }
+        } else {
+            // More late rows landed while the append ran. Not an error: the
+            // next cycle appends those.
+            Verdict::Retain(format!(
+                "{} row(s) arrived during the append; retrying next cycle",
+                after.missing
+            ))
+        };
+        Ok(rec)
+    }
+
+    /// Rows in cold for `[start, end)`, rows in Postgres, and how many of the
+    /// Postgres rows have no cold row with the same `(id, occurred_at)`.
+    ///
+    /// Leaves the cold keys in the temp table `cold_keys` for the caller's
+    /// anti-join. `pg` must already be attached.
+    ///
+    /// `pg_rows` and `missing` come from ONE scan of Postgres, so they describe
+    /// the same snapshot: a late row landing between two separate counts would
+    /// otherwise make the pair inconsistent.
+    fn range_diff(
+        &self,
+        table: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        glob: &str,
+    ) -> anyhow::Result<RangeDiff> {
+        let (s, e) = (start.to_rfc3339(), end.to_rfc3339());
+        // Cast on the way in: the restore path reads `id` back with the same
+        // `CAST(.. AS UUID)`, so this is the representation cold files are
+        // already known to round-trip through.
+        let keys_from = if self.any_files_match(glob)? {
+            format!(
+                "SELECT CAST(id AS UUID) AS id, CAST(occurred_at AS TIMESTAMPTZ) AS occurred_at \
+                 FROM read_parquet('{glob}', hive_partitioning=true, union_by_name=true) \
+                 WHERE occurred_at >= TIMESTAMPTZ '{s}' AND occurred_at < TIMESTAMPTZ '{e}'"
+            )
+        } else {
+            "SELECT CAST(NULL AS UUID) AS id, CAST(NULL AS TIMESTAMPTZ) AS occurred_at \
+             WHERE false"
+                .to_string()
+        };
+        self.conn.execute_batch(&format!(
+            "CREATE OR REPLACE TEMP TABLE cold_keys AS {keys_from};"
+        ))?;
+        let cold_rows: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM cold_keys", [], |r| r.get(0))?;
+        // Distinct keys on the join side: a key duplicated in cold must not
+        // multiply the Postgres row it matches, or `pg_rows` would overcount.
+        let (pg_rows, missing): (i64, i64) = self.conn.query_row(
+            &format!(
+                "SELECT count(*), count(*) FILTER (WHERE k.id IS NULL) \
+                 FROM pg.{table} e \
+                 LEFT JOIN (SELECT DISTINCT id, occurred_at FROM cold_keys) k \
+                   ON k.id = e.id AND k.occurred_at = e.occurred_at \
+                 WHERE e.occurred_at >= TIMESTAMPTZ '{s}' AND e.occurred_at < TIMESTAMPTZ '{e}'"
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(RangeDiff {
+            cold_rows,
+            pg_rows,
+            missing,
+        })
     }
 
     /// Column name + DuckDB-mapped type for one relation, via `DESCRIBE`.
@@ -702,6 +951,61 @@ pub struct ColdKeyCount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diff(cold_rows: i64, pg_rows: i64, missing: i64) -> RangeDiff {
+        RangeDiff {
+            cold_rows,
+            pg_rows,
+            missing,
+        }
+    }
+
+    #[test]
+    fn a_range_with_nothing_missing_is_ready() {
+        assert_eq!(plan_reconcile(diff(500, 500, 0)), ReconcilePlan::Ready);
+        // An empty partition has nothing to lose either.
+        assert_eq!(plan_reconcile(diff(0, 0, 0)), ReconcilePlan::Ready);
+    }
+
+    /// The production case: a few late rows on top of a complete export.
+    #[test]
+    fn late_rows_on_top_of_an_export_are_appended() {
+        assert_eq!(
+            plan_reconcile(diff(51_318, 52_314, 996)),
+            ReconcilePlan::ExportMissing
+        );
+    }
+
+    /// Cold lost its files for the range (or never had them): re-exporting
+    /// the whole range duplicates nothing, because nothing is there.
+    #[test]
+    fn a_range_with_no_cold_rows_is_exported_in_full() {
+        assert_eq!(
+            plan_reconcile(diff(0, 700, 700)),
+            ReconcilePlan::ExportMissing
+        );
+    }
+
+    /// A purge removed hot rows after export: cold is a superset. Still only
+    /// the late rows are missing, so appending them is safe.
+    #[test]
+    fn cold_holding_more_than_postgres_still_appends_only_what_is_missing() {
+        assert_eq!(
+            plan_reconcile(diff(900, 800, 5)),
+            ReconcilePlan::ExportMissing
+        );
+        assert_eq!(plan_reconcile(diff(900, 800, 0)), ReconcilePlan::Ready);
+    }
+
+    /// Nothing in a non-empty cold range matches Postgres by key: the shape of
+    /// a broken key comparison. Appending would duplicate the whole range.
+    #[test]
+    fn a_range_where_no_key_matches_is_refused() {
+        let ReconcilePlan::Refuse(why) = plan_reconcile(diff(500, 500, 500)) else {
+            panic!("a total key mismatch must be refused");
+        };
+        assert!(why.contains("duplicate"), "{why}");
+    }
 
     /// A failed export must leave the cold tier byte-identical to how it found
     /// it -- including files it had already FINISHED for other partition keys,

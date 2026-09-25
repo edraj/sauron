@@ -315,6 +315,8 @@ how often the Redis-side gauges are refreshed; `0` serves the counters alone.
 | Ingest 429 | raise `INGEST_RATE_LIMIT_PER_MIN` in `/etc/sauron/ingest.env`, restart |
 | Redis backlog grows / ingest drains far slower than expected | check for a stale `WORKER_CONCURRENCY=4` left in `/etc/sauron/ingest.env` by an upgrade (`%config(noreplace)`); the tuned default is 8. Nothing logs the effective worker count, so the journal will not tell you — read the file. See section 11 |
 | Tier can't write cold | confirm `/var/lib/sauron/cold` is owned by `sauron` (see `tmpfiles`) |
+| `*.parquet.unreadable` files under `/var/lib/sauron/cold` | `sauron-tier` set aside a cold file that is not valid Parquet (usually 0 bytes, from an export killed mid-write) so it can no longer break every read of its table. The journal logs each one: `journalctl -u sauron-tier \| grep "set aside"`. Such a file was never committed (the watermark only advances after a verified export), so its rows are still in Postgres or in another cold file. Safe to delete once you have looked at it |
+| Disk keeps filling although tiering runs | `journalctl -u sauron-tier \| grep -E "partition retained\|tiering table failed"` — a retained partition names its reason, and a failed table prints the full cause. Partitions that received late events are exported and dropped automatically since the late-arrival fix; before it they were kept forever |
 
 ## 11. Upgrading
 
