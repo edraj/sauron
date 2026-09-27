@@ -88,14 +88,16 @@ try {
 
 ## Configuration
 
-`Sauron.init` takes a `SauronOptions`. Every parameter is named and optional;
-fields stay mutable afterwards, so `SauronOptions(dsn: dsn)..debug = true` also
-works. Every field, in constructor order:
+`Sauron.init` takes a `SauronOptions`. Every parameter is named and optional in
+the constructor, but `Sauron.init` rejects a `dsn` without a `release`. Fields
+stay mutable afterwards, so
+`SauronOptions(dsn: dsn, release: release)..debug = true` also works. Every
+field, in constructor order:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `dsn` | `String?` | `null` | **Required to send anything.** `https://<public_key>@<host>/<environment_id>`. Null, empty or malformed leaves the SDK disabled and every call a no-op. |
-| `release` | `String?` | `null` | Release identifier, e.g. `app@1.4.2+1402`. Stamped on the envelope header. |
+| `release` | `String?` | `null` | **Required whenever `dsn` is set.** Release identifier, e.g. `app@1.4.2+1402`. Trimmed, then stamped on the envelope header. `Sauron.init` throws `ArgumentError` when `dsn` is non-empty and this is null, empty or whitespace-only. |
 | `appVersion` | `String?` | `null` | App version for `context.app`, e.g. `1.4.2`. Developer-supplied — the SDK does not read it from the platform. |
 | `appBuild` | `String?` | `null` | App build number for `context.app`, e.g. `1402`. When this and `appVersion` are both null the `app` block is omitted. |
 | `screen` | `String?` | `null` | Seeds the initial screen name, stamped on events/errors until `setScreen` (or `SauronNavigatorObserver`) changes it. |
@@ -182,6 +184,7 @@ build command and out of the source tree:
 
 ```bash
 flutter build apk \
+  --dart-define=RELEASE=app@1.4.2+1402 \
   --dart-define=APP_VERSION=1.4.2 \
   --dart-define=APP_BUILD=1402
 ```
@@ -189,22 +192,32 @@ flutter build apk \
 ```dart
 SauronOptions(
   dsn: dsn,
+  release: const String.fromEnvironment('RELEASE'),
   appVersion: const String.fromEnvironment('APP_VERSION'),
   appBuild: const String.fromEnvironment('APP_BUILD'),
 );
 ```
+
+A build without `--dart-define=RELEASE` reads `''`, so `Sauron.init` throws
+instead of shipping events with no release.
 
 If you already depend on `package_info_plus` for other reasons, read it from
 there instead — the SDK is happy either way:
 
 ```dart
 final PackageInfo info = await PackageInfo.fromPlatform();
-SauronOptions(dsn: dsn, appVersion: info.version, appBuild: info.buildNumber);
+SauronOptions(
+  dsn: dsn,
+  release: 'app@${info.version}+${info.buildNumber}',
+  appVersion: info.version,
+  appBuild: info.buildNumber,
+);
 ```
 
 Leave both unset and the `app` context block is omitted; nothing else is
-affected. Note `release` is separate — it identifies the build on the envelope
-header and is what the dashboard groups by, so set it regardless.
+affected. Note `release` is separate: it identifies the build on the envelope
+header, it is what the dashboard groups by, and `Sauron.init` requires it
+whenever `dsn` is set.
 
 ### `BeforeSendCallback`
 
@@ -220,6 +233,7 @@ every item type, so guard on the runtime type if you only care about a subset:
 ```dart
 SauronOptions(
   dsn: dsn,
+  release: release,
   beforeSend: (Object item) {
     if (item is! ErrorItem) return item;
     if (item.exception.value.contains('@')) return null; // drop PII
@@ -295,13 +309,17 @@ Returns `Future<void>`. Without `appRunner`, `init` calls
 awaits `bootstrap()` itself — you then call `runApp` yourself and forgo the
 `runZonedGuarded` layer.
 
+Throws `ArgumentError` when `options.dsn` is non-empty and `options.release` is
+null or blank (required as of 1.10.0). With no `dsn` it leaves the SDK disabled
+without throwing.
+
 ```dart
 // With the zone (recommended):
-await Sauron.init(SauronOptions(dsn: dsn),
+await Sauron.init(SauronOptions(dsn: dsn, release: release),
     appRunner: () => runApp(const MyApp()));
 
 // Without it:
-await Sauron.init(SauronOptions(dsn: dsn));
+await Sauron.init(SauronOptions(dsn: dsn, release: release));
 runApp(const MyApp());
 ```
 
@@ -1001,7 +1019,9 @@ four additions:
 
 ```dart
 final SauronClient client = SauronClient(
-  SauronOptions()..dsn = 'https://pk_test@localhost:8081/1',
+  SauronOptions()
+    ..dsn = 'https://pk_test@localhost:8081/1'
+    ..release = 'app@1.4.2+1402',
 );
 await client.bootstrap(queueDirectory: Directory.systemTemp);
 client.track('viewed', screen: 'Home');
@@ -1112,7 +1132,10 @@ single item.
 ```dart
 Future<void> main() async {
   await Sauron.init(
-    SauronOptions(dsn: 'https://pk_test@localhost:8081/1'),
+    SauronOptions(
+      dsn: 'https://pk_test@localhost:8081/1',
+      release: 'app@1.4.2+1402',
+    ),
     appRunner: () => runApp(const MyApp()),
   );
 }
@@ -1135,7 +1158,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();   // ← binding pinned to this zone
   final config = await loadConfig();
   await Sauron.init(
-    SauronOptions(dsn: config.dsn),
+    SauronOptions(dsn: config.dsn, release: config.release),
     appRunner: () => runApp(MyApp(config: config)),   // would be a second zone
   );
 }
@@ -1153,7 +1176,10 @@ already runs after `ensureInitialized()` inside the zone:
 ```dart
 Future<void> main() async {
   await Sauron.init(
-    SauronOptions(dsn: const String.fromEnvironment('SAURON_DSN')),
+    SauronOptions(
+      dsn: const String.fromEnvironment('SAURON_DSN'),
+      release: const String.fromEnvironment('SAURON_RELEASE'),
+    ),
     appRunner: () async {
       final config = await loadConfig();   // binding is up, same zone as runApp
       runApp(MyApp(config: config));
@@ -1403,7 +1429,8 @@ Response policy:
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Nothing arrives, no logs | `dsn` unset/empty, so the SDK is disabled | Pass `dsn:` to `SauronOptions`; check `Sauron.isEnabled`. |
+| Nothing arrives, no logs | `dsn` unset/empty, so the SDK is disabled | Pass `dsn:` (and the `release:` it requires) to `SauronOptions`; check `Sauron.isEnabled`. |
+| `Sauron.init` throws `ArgumentError`: `SauronOptions.release is required when a dsn is set` | `dsn` is set but `release` is null, empty or whitespace-only. It is required as of 1.10.0, so code written against 1.9 or earlier throws here until it passes one | Pass the build you ship: `release: 'app@1.4.2+1402'`. |
 | Nothing arrives, `[Sauron] invalid DSN, SDK disabled` | DSN failed to parse | Use `https://<public_key>@<host>[:port]/<environment_id>`; the environment id is the last path segment. |
 | Requests leave but nothing lands | Your proxy does not expose ingest at `/api/{environment_id}/envelope` on the DSN's host (plus any DSN path prefix) | Route that exact path to the gateway — events otherwise drop silently and look delivered. |
 | Delivery stops permanently mid-session | A `401`/`403` disabled the transport (`Sauron.isEnabled` flips to `false`) | Verify the public key belongs to the project; restart the app after fixing. |

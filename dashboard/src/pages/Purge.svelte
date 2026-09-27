@@ -504,6 +504,12 @@
     gap: 1rem;
     margin-bottom: 1rem;
   }
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
   h1 {
     margin: 0;
     font-size: 1.4rem;
