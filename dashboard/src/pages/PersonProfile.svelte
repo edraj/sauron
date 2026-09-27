@@ -4,6 +4,7 @@
   import { push } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
+  import ViewSection from '../lib/components/ViewSection.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
@@ -18,7 +19,7 @@
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
-  import { getPerson } from '../lib/api/persons';
+  import { getPersonSummary, getPersonTimeline, type PersonTimeline } from '../lib/api/persons';
   import { relativeTime, formatTimestamp, initials } from '../lib/utils/format';
   import { timeFormatStore } from '../lib/stores/time-format.svelte';
   import {
@@ -27,7 +28,7 @@
     personOffsetMs,
     type PersonTimeMode,
   } from '../lib/models/person-timeline';
-  import type { AnalyticsEvent, ErrorEvent, PersonProfile } from '../lib/models';
+  import type { AnalyticsEvent, ErrorEvent, PersonRow } from '../lib/models';
   import Freshness from '../lib/components/ui/Freshness.svelte';
 
   interface Props {
@@ -41,35 +42,51 @@
 
   const distinctId = $derived(decodeURIComponent(params?.distinctId ?? ''));
 
-  // Cached view (lib/stores/cached-view.svelte.ts): a profile you just looked at
-  // paints instantly on return and refreshes behind the render. Re-exposed under
-  // the names the template already used, so the markup is unchanged.
-  const view = new CachedView<PersonProfile>();
+  // Cached views (lib/stores/cached-view.svelte.ts): a profile you just looked
+  // at paints instantly on return and refreshes behind the render.
+  //
+  // TWO of them. The profile row is one lookup; the timeline is two capped
+  // scans of the event tables. The identity header needs neither — it renders
+  // from the id in the URL — so it is on screen before any request returns,
+  // and each block below fills in when its own answer does.
+  //
+  // `PersonRow | null`: `null` is a loaded answer meaning "no profile row", the
+  // anonymous case. `view.hasData` is what tells it from "not loaded yet".
+  const view = new CachedView<PersonRow | null>();
+  const timelineView = new CachedView<PersonTimeline>();
 
-  // `reload()` replays the view's most recent key and fetcher with force,
+  // `reload()` replays each view's most recent key and fetcher with force,
   // which is exactly what Refresh means here — the page's loads are driven by
   // effects, so there is no `load(force)` to call and reconstructing the key
   // by hand would be a second definition of it, free to drift.
   const refresher = pageRefresher(async () => {
-    await view.reload();
+    await Promise.all([view.reload(), timelineView.reload()]);
   });
 
-
-  const profile = $derived(view.data ?? null);
-  const loading = $derived(view.loading);
-  const error = $derived(view.error);
+  const user = $derived(view.data ?? null);
+  const userLoading = $derived(view.loading && !view.hasData);
+  const events = $derived(timelineView.data?.events ?? []);
+  const errors = $derived(timelineView.data?.errors ?? []);
+  const timelineLoading = $derived(timelineView.loading && !timelineView.hasData);
+  const revalidating = $derived(view.revalidating || timelineView.revalidating);
+  // The page as a whole fails only when it has NOTHING to show. One section
+  // failing beside one that loaded is reported inside that section.
+  const error = $derived(
+    !view.hasData && !timelineView.hasData && !view.loading && !timelineView.loading
+      ? (view.error ?? timelineView.error)
+      : null,
+  );
 
   type TimelineItem =
     | { kind: 'event'; at: number; data: AnalyticsEvent }
     | { kind: 'error'; at: number; data: ErrorEvent };
 
   const timeline = $derived.by<TimelineItem[]>(() => {
-    if (!profile) return [];
     const items: TimelineItem[] = [];
-    for (const e of profile.events) {
+    for (const e of events) {
       items.push({ kind: 'event', at: new Date(e.occurred_at).getTime(), data: e });
     }
-    for (const err of profile.errors) {
+    for (const err of errors) {
       items.push({ kind: 'error', at: new Date(err.occurred_at).getTime(), data: err });
     }
     return items.sort((a, b) => b.at - a.at);
@@ -84,11 +101,20 @@
    * "go to the network now".
    */
   async function load(appId: string, id: string, force = false) {
-    await view.load(
-      viewKey('persons.profile', appId, sessionStore.scopeKey, id, LIMIT),
-      () => getPerson(appId, id, LIMIT),
-      force,
-    );
+    // Started together, settled separately. `LIMIT` is in the timeline's key
+    // only: it is the timeline's depth and the profile row has none.
+    await Promise.allSettled([
+      view.load(
+        viewKey('persons.profile', appId, sessionStore.scopeKey, id),
+        () => getPersonSummary(appId, id),
+        force,
+      ),
+      timelineView.load(
+        viewKey('persons.profile.timeline', appId, sessionStore.scopeKey, id, LIMIT),
+        () => getPersonTimeline(appId, id, LIMIT),
+        force,
+      ),
+    ]);
   }
 
   $effect(() => {
@@ -114,22 +140,19 @@
   }
 
   const sessionCount = $derived.by(() => {
-    if (!profile) return 0;
     const ids = new Set<string>();
-    for (const e of profile.events) {
+    for (const e of events) {
       const sid = sessionIdOf(e);
       if (sid) ids.add(sid);
     }
-    for (const e of profile.errors) {
+    for (const e of errors) {
       const sid = sessionIdOf(e);
       if (sid) ids.add(sid);
     }
     return ids.size;
   });
 
-  const hasTraits = $derived(
-    !!profile?.user?.properties && Object.keys(profile.user.properties).length > 0,
-  );
+  const hasTraits = $derived(!!user?.properties && Object.keys(user.properties).length > 0);
 
   /**
    * What the timeline's trailing offsets read against. Deliberately not
@@ -160,10 +183,12 @@
    * record of that period.
    */
   function downloadPersonJson() {
-    if (!profile) return;
+    // Not before both have landed: the file would otherwise claim a person
+    // with no profile, or no history, when neither had been read yet.
+    if (!view.hasData || !timelineView.hasData) return;
     const exportData = {
       distinct_id: distinctId,
-      user: profile.user,
+      user,
       timeline: timeline.map((item) => ({
         kind: item.kind,
         at: new Date(item.at).toISOString(),
@@ -184,28 +209,30 @@
 
   <button class="back" onclick={() => push('/events')}><Icon name="arrow-left" size={14} /> {t('person.backToEvents')}</button>
 
-  {#if loading}
-    <Skeleton rows={6} />
-  {:else if error}
+  {#if error}
     <EmptyState title={t('person.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
         <Button variant="secondary" onclick={() => push('/events')}>{t('common.back')}</Button>
       {/snippet}
     </EmptyState>
-  {:else if profile}
+  {:else}
+    <!-- Rendered from the URL alone, before either request returns: the id is
+         the one thing this page knows for certain the moment it mounts. -->
     <header class="identity">
       <div class="id-actions">
-        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-        <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+        <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+        <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
       </div>
       <span class="avatar">{initials(distinctId)}</span>
       <div class="id-meta">
         <h1 class="id-title mono">{distinctId}</h1>
         <div class="id-sub">
-          {#if profile.user}
+          {#if userLoading}
+            <Skeleton rows={1} height="13px" />
+          {:else if user}
             <span class="muted">
-              {t('explore.column.firstSeen')} <TimeValue value={profile.user.first_seen} /> {t('prose.person.lastSeen')}
-              <TimeValue value={profile.user.last_seen} />
+              {t('explore.column.firstSeen')} <TimeValue value={user.first_seen} /> {t('prose.person.lastSeen')}
+              <TimeValue value={user.last_seen} />
             </span>
           {:else}
             <span class="muted">{t('person.anonymousNote')}</span>
@@ -214,39 +241,52 @@
       </div>
     </header>
 
+    <!-- Two requests feed this row, so its tiles fill in two at a time: the
+         three counts come off the timeline, the two dates off the profile. -->
     <div class="tiles">
       <StatTiles min={140}>
-        <StatTile label={t('explore.column.events')} value={formatNumber(profile.events.length)} />
+        <StatTile
+          label={t('explore.column.events')}
+          value={timelineView.hasData ? formatNumber(events.length) : '—'}
+          loading={timelineLoading}
+        />
         <StatTile
           label={t('explore.column.errors')}
-          value={formatNumber(profile.errors.length)}
-          tone={profile.errors.length > 0 ? 'error' : 'neutral'}
+          value={timelineView.hasData ? formatNumber(errors.length) : '—'}
+          tone={errors.length > 0 ? 'error' : 'neutral'}
+          loading={timelineLoading}
         />
-        <StatTile label={t('explore.column.sessions')} value={sessionCount > 0 ? formatNumber(sessionCount) : '—'} />
+        <StatTile
+          label={t('explore.column.sessions')}
+          value={sessionCount > 0 ? formatNumber(sessionCount) : '—'}
+          loading={timelineLoading}
+        />
         <StatTile
           label={t('explore.column.firstSeen')}
-          value={profile.user
+          loading={userLoading}
+          value={user
             ? timeFormatStore.mode === 'relative'
-              ? relativeTime(profile.user.first_seen)
-              : formatTimestamp(profile.user.first_seen)
+              ? relativeTime(user.first_seen)
+              : formatTimestamp(user.first_seen)
             : '—'}
-          sub={profile.user
+          sub={user
             ? timeFormatStore.mode === 'relative'
-              ? formatTimestamp(profile.user.first_seen)
-              : relativeTime(profile.user.first_seen)
+              ? formatTimestamp(user.first_seen)
+              : relativeTime(user.first_seen)
             : undefined}
         />
         <StatTile
           label={t('explore.column.lastSeen')}
-          value={profile.user
+          loading={userLoading}
+          value={user
             ? timeFormatStore.mode === 'relative'
-              ? relativeTime(profile.user.last_seen)
-              : formatTimestamp(profile.user.last_seen)
+              ? relativeTime(user.last_seen)
+              : formatTimestamp(user.last_seen)
             : '—'}
-          sub={profile.user
+          sub={user
             ? timeFormatStore.mode === 'relative'
-              ? formatTimestamp(profile.user.last_seen)
-              : relativeTime(profile.user.last_seen)
+              ? formatTimestamp(user.last_seen)
+              : relativeTime(user.last_seen)
             : undefined}
         />
       </StatTiles>
@@ -279,6 +319,7 @@
               </Button>
             {/if}
           {/snippet}
+          <ViewSection view={timelineView} rows={8}>
           {#if timeline.length === 0}
             <EmptyState title={t('person.empty.title')} description={t('person.empty.body')} icon="inbox" />
           {:else}
@@ -334,13 +375,16 @@
               {/each}
             </ol>
           {/if}
+          </ViewSection>
         </Card>
       </div>
 
       <aside class="col-side">
         <Card title={t('users.column.traits')}>
-          {#if hasTraits}
-            <JsonTree value={profile.user?.properties} expandTo={2} />
+          {#if userLoading}
+            <Skeleton rows={3} />
+          {:else if hasTraits}
+            <JsonTree value={user?.properties} expandTo={2} />
           {:else}
             <p class="muted empty-traits">{t('person.noTraits')}</p>
           {/if}
@@ -351,7 +395,7 @@
               <span class="muted">{t('person.distinctId')}</span>
               <span class="sm-val mono small">{distinctId}</span>
             </div>
-            {#if !profile.user}
+            {#if view.hasData && !user}
               <div class="sm-row">
                 <span class="muted">{t('person.title')}</span>
                 <span class="sm-val small">{t('person.anonymous')}</span>

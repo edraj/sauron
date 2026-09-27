@@ -497,51 +497,18 @@ pub async fn detail(
     Query(dq): Query<DetailQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<DeviceDetail>, ApiError> {
-    let mut conn = db(&state).await?;
-    // `_with_perms`: `errors` below is whole `ErrorEvent` rows, which carry two
-    // further permission questions — `perm::ISSUE_READ` for the body at all and
-    // `perm::SOURCE_READ` for the de-obfuscated lines inside it. See
-    // `sessions::detail` for the same note.
-    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
-        &mut conn,
+    let device_key = dq.key;
+    let (mut conn, scope, perms, device) = load_device(
+        &state,
         auth.user_id,
         app_id,
-        perm::EVENT_READ,
+        &device_key,
         raw_query.as_deref(),
     )
     .await?;
-    let device_key = dq.key;
-
-    let device = repo::get_device(&mut conn, scope.clone(), &device_key)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-
-    let since = Utc::now() - Duration::days(90);
-    let sessions = repo::list_sessions(
-        &mut conn,
-        scope.clone(),
-        since,
-        50,
-        0,
-        // Pinned here, NOT `sessions::session_sort_spec(None)` — see
-        // [`DEVICE_SESSION_SORT`]. The two consumers of `list_sessions` order
-        // independently on purpose.
-        DEVICE_SESSION_SORT,
-        None,
-        Some(&device_key),
-    )
-    .await?;
-    let mut errors = repo::errors_for_device(&mut conn, scope.clone(), &device_key, 50).await?;
-    crate::symbolicate::gate_source_context(&perms, &mut errors);
-    crate::symbolicate::gate_event_body(&perms, &mut errors);
-    let perf = repo::performance_summary(
-        &mut conn,
-        scope,
-        Range::since(since),
-        None,
-        Some(&device_key),
-    )
-    .await?;
+    let sessions = device_sessions(&mut conn, scope.clone(), &device_key).await?;
+    let errors = device_errors(&mut conn, scope.clone(), &perms, &device_key).await?;
+    let perf = device_perf(&mut conn, scope, &device_key).await?;
 
     Ok(Json(DeviceDetail {
         device,
@@ -549,6 +516,212 @@ pub async fn detail(
         errors,
         perf,
     }))
+}
+
+/// How far back a device page's sessions and performance panels look.
+///
+/// One function so the composite and its sections cannot disagree about the
+/// window.
+fn device_window_start() -> chrono::DateTime<Utc> {
+    Utc::now() - Duration::days(90)
+}
+
+/// Authorize a read of one device and load it, or 404.
+async fn load_device(
+    state: &AppState,
+    user_id: Uuid,
+    app_id: Uuid,
+    device_key: &str,
+    raw_query: Option<&str>,
+) -> Result<
+    (
+        sauron_db::PgConn,
+        sauron_db::scope::ReadScope,
+        std::collections::HashSet<String>,
+        DeviceRow,
+    ),
+    ApiError,
+> {
+    let mut conn = db(state).await?;
+    // `_with_perms`: `errors` below is whole `ErrorEvent` rows, which carry two
+    // further permission questions — `perm::ISSUE_READ` for the body at all and
+    // `perm::SOURCE_READ` for the de-obfuscated lines inside it. See
+    // `sessions::detail` for the same note.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
+        &mut conn,
+        user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query,
+    )
+    .await?;
+    let device = repo::get_device(&mut conn, scope.clone(), device_key)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok((conn, scope, perms, device))
+}
+
+async fn device_sessions(
+    conn: &mut sauron_db::AsyncPgConnection,
+    scope: sauron_db::scope::ReadScope,
+    device_key: &str,
+) -> Result<Vec<Session>, ApiError> {
+    Ok(repo::list_sessions(
+        conn,
+        scope,
+        device_window_start(),
+        50,
+        0,
+        // Pinned here, NOT `sessions::session_sort_spec(None)` — see
+        // [`DEVICE_SESSION_SORT`]. The two consumers of `list_sessions` order
+        // independently on purpose.
+        DEVICE_SESSION_SORT,
+        None,
+        Some(device_key),
+    )
+    .await?)
+}
+
+/// A device's most recent errors, gated for `perms`. Shared by [`detail`] and
+/// [`detail_errors`] so the gates exist once.
+async fn device_errors(
+    conn: &mut sauron_db::AsyncPgConnection,
+    scope: sauron_db::scope::ReadScope,
+    perms: &std::collections::HashSet<String>,
+    device_key: &str,
+) -> Result<Vec<ErrorEvent>, ApiError> {
+    let mut errors = repo::errors_for_device(conn, scope, device_key, 50).await?;
+    crate::symbolicate::gate_source_context(perms, &mut errors);
+    crate::symbolicate::gate_event_body(perms, &mut errors);
+    Ok(errors)
+}
+
+async fn device_perf(
+    conn: &mut sauron_db::AsyncPgConnection,
+    scope: sauron_db::scope::ReadScope,
+    device_key: &str,
+) -> Result<Vec<PerfSummaryRow>, ApiError> {
+    Ok(repo::performance_summary(
+        conn,
+        scope,
+        Range::since(device_window_start()),
+        None,
+        Some(device_key),
+    )
+    .await?)
+}
+
+// --- detail, one section at a time -------------------------------------------
+//
+// See `issues::detail_summary` for the reasoning. The device row is a keyed
+// lookup; its sessions, errors and the p95 aggregate behind the performance
+// table are three separate reads that used to hold the whole page.
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct DeviceSummary {
+    pub device: DeviceRow,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct DeviceSessions {
+    pub sessions: Vec<Session>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct DeviceErrors {
+    pub errors: Vec<ErrorEvent>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct DevicePerf {
+    pub perf: Vec<PerfSummaryRow>,
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/device/summary", tag = "Devices",
+    summary = "Fetch one device, without its sessions, errors or performance",
+    description = "The device row alone. Pair with the `sessions`, `errors` and `perf` sections to fill a detail page in as each lands.",
+    params(("app_id" = Uuid, Path, description = "The app."), DetailQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The device.", body = DeviceSummary),
+              (status = 400, description = "Missing `device_key`.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such device.", body = ErrorResponse)),
+)]
+pub async fn detail_summary(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(dq): Query<DetailQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<DeviceSummary>, ApiError> {
+    let (_conn, _scope, _perms, device) =
+        load_device(&state, auth.user_id, app_id, &dq.key, raw_query.as_deref()).await?;
+    Ok(Json(DeviceSummary { device }))
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/device/sessions", tag = "Devices",
+    summary = "One device's recent sessions",
+    description = "The 50 most recently active sessions in the last 90 days.",
+    params(("app_id" = Uuid, Path, description = "The app."), DetailQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Sessions.", body = DeviceSessions),
+              (status = 400, description = "Missing `device_key`.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such device.", body = ErrorResponse)),
+)]
+pub async fn detail_sessions(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(dq): Query<DetailQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<DeviceSessions>, ApiError> {
+    let (mut conn, scope, _perms, _device) =
+        load_device(&state, auth.user_id, app_id, &dq.key, raw_query.as_deref()).await?;
+    let sessions = device_sessions(&mut conn, scope, &dq.key).await?;
+    Ok(Json(DeviceSessions { sessions }))
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/device/errors", tag = "Devices",
+    summary = "One device's recent errors",
+    description = "The 50 most recent. Error bodies need `issue:read` and de-obfuscated source lines need `source:read`.",
+    params(("app_id" = Uuid, Path, description = "The app."), DetailQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Errors.", body = DeviceErrors),
+              (status = 400, description = "Missing `device_key`.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such device.", body = ErrorResponse)),
+)]
+pub async fn detail_errors(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(dq): Query<DetailQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<DeviceErrors>, ApiError> {
+    let (mut conn, scope, perms, _device) =
+        load_device(&state, auth.user_id, app_id, &dq.key, raw_query.as_deref()).await?;
+    let errors = device_errors(&mut conn, scope, &perms, &dq.key).await?;
+    Ok(Json(DeviceErrors { errors }))
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/device/perf", tag = "Devices",
+    summary = "One device's performance summary",
+    description = "Per-operation latency percentiles over the last 90 days.",
+    params(("app_id" = Uuid, Path, description = "The app."), DetailQuery), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Performance rows.", body = DevicePerf),
+              (status = 400, description = "Missing `device_key`.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such device.", body = ErrorResponse)),
+)]
+pub async fn detail_perf(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Query(dq): Query<DetailQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<DevicePerf>, ApiError> {
+    let (mut conn, scope, _perms, _device) =
+        load_device(&state, auth.user_id, app_id, &dq.key, raw_query.as_deref()).await?;
+    let perf = device_perf(&mut conn, scope, &dq.key).await?;
+    Ok(Json(DevicePerf { perf }))
 }
 
 #[cfg(test)]

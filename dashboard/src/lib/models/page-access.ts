@@ -14,7 +14,13 @@ import { sessionStore, type CanScope } from '../stores/session.svelte';
  */
 export interface PageAccess {
   perm: Permission;
-  level: 'org' | 'project' | 'app';
+  /**
+   * `'reach'` is the odd one out: the permission held on the org OR on any
+   * project or app in it, whichever the switcher is on. For a page whose list
+   * endpoint resolves the caller's reach and returns the slice it covers
+   * (`Reach` in rbac.rs) instead of authorizing at one fixed scope.
+   */
+  level: 'org' | 'project' | 'app' | 'reach';
   title: string;
   /**
    * Set when this page's list endpoint takes `sauron-auth`'s ENV-AWARE read
@@ -121,8 +127,13 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // already computes a `writeLock` and applies it to all three write controls,
   // so the page was built to degrade and only this row disagreed.
   '/admin/source-maps': { perm: 'issue:read', level: 'app', title: 'Source Maps' },
-  // notifications.rs:66,313 use authorize_org.
-  '/admin/alerts': { perm: 'alert:read', level: 'org', title: 'Alerts' },
+  // Every READ in notifications.rs goes through `alert_read_reach`: a member
+  // holding alert:read on one project or app gets the rules narrowed to it and
+  // the channels those rules deliver to. Writes stay on authorize_org, which
+  // Alerts.svelte's `writeLock` mirrors — so a scoped member reads the page
+  // and finds its write controls locked. `page-access.test.ts` reads the
+  // handlers, so this row cannot outlive the helper it was derived from.
+  '/admin/alerts': { perm: 'alert:read', level: 'reach', title: 'Alerts' },
   // admin.rs:30 uses authorize_org.
   '/admin/storage': { perm: 'org:manage', level: 'org', title: 'Storage' },
   '/admin/privacy': { perm: 'pii:read', level: 'app', title: 'Privacy' },
@@ -219,6 +230,7 @@ export function resolvePageAccess(path: string): PageAccess | null {
  */
 export function canAccessPage(access: PageAccess | null): boolean {
   if (!access) return true;
+  if (access.level === 'reach') return sessionStore.canWithinOrg(access.perm);
   if (sessionStore.can(access.perm, { level: access.level })) return true;
   if (!access.envAware) return false;
   const env = sessionStore.currentEnvId;
@@ -227,33 +239,68 @@ export function canAccessPage(access: PageAccess | null): boolean {
   return sessionStore.can(access.perm, { env });
 }
 
+/** A scope wider than the app, which a lock has to name to be understood. */
+export type LockLevel = 'org' | 'project';
+
 /**
- * `null` when the user may act, else the permission they are missing —
- * exactly the shape `Button`'s `lockedReason` prop wants, so a call site reads
- * `lockedReason={lockedBy('issue:write', { app })}` with no ternary and no way
- * to end up with a disabled control that cannot say why.
+ * Why a control is locked: the missing permission, plus — when the check is
+ * made above the app — the level it must be held at, as `alert:write@org`.
+ *
+ * The level is not decoration. `can()` truncates the cascade to the level the
+ * backend authorizes at, so a member holding `alert:write` on one project
+ * correctly fails an org-level check — and a tooltip naming only the
+ * permission then tells them they lack exactly what they were granted.
+ *
+ * A string rather than an object so it stays what every consumer already
+ * treats a lock as: truthy when locked, comparable with `===`, usable as a key.
  */
-export function lockedBy(perm: Permission, scope?: CanScope): Permission | null {
-  return sessionStore.can(perm, scope) ? null : perm;
+export type LockReason = Permission | `${Permission}@${LockLevel}`;
+
+const LOCK_LEVEL_LABELS: Record<LockLevel, string> = {
+  org: 'organization',
+  project: 'project',
+};
+
+function lockReason(perm: Permission, level: PageAccess['level'] | CanScope['level']): LockReason {
+  return level === 'org' || level === 'project' ? `${perm}@${level}` : perm;
 }
 
 /**
- * The permission a nav item is missing, or `null` if the page is reachable —
- * the same contract as [`lockedBy`], so a locked nav entry and a locked button
- * cannot describe the same missing grant two different ways.
+ * `null` when the user may act, else what they are missing — exactly the shape
+ * `Button`'s `lockedReason` prop wants, so a call site reads
+ * `lockedReason={lockedBy('issue:write', { app })}` with no ternary and no way
+ * to end up with a disabled control that cannot say why.
+ */
+export function lockedBy(perm: Permission, scope?: CanScope): LockReason | null {
+  return sessionStore.can(perm, scope) ? null : lockReason(perm, scope?.level);
+}
+
+/**
+ * What a nav item is missing, or `null` if the page is reachable — the same
+ * contract as [`lockedBy`], so a locked nav entry and a locked button cannot
+ * describe the same missing grant two different ways.
  *
  * `null` for an ungated page and for an unknown path, matching
  * `resolvePageAccess`'s deliberate fail-open: a path with no entry is a typo in
  * a link, and there is no permission to name.
  */
-export function pageLockedBy(path: string): Permission | null {
+export function pageLockedBy(path: string): LockReason | null {
   const access = resolvePageAccess(path);
   if (!access) return null;
-  return canAccessPage(access) ? null : access.perm;
+  return canAccessPage(access) ? null : pageLockReason(access);
+}
+
+/** What a page requires, in the form [`lockTitle`] renders. */
+export function pageLockReason(access: PageAccess): LockReason {
+  return lockReason(access.perm, access.level);
 }
 
 /** Tooltip text for a locked control that cannot take a `Button` prop. */
-export function lockTitle(perm: Permission): string {
+export function lockTitle(reason: LockReason): string {
+  const at = reason.lastIndexOf('@');
+  const perm = (at === -1 ? reason : reason.slice(0, at)) as Permission;
+  const level = at === -1 ? null : (reason.slice(at + 1) as LockLevel);
   const label = PERMISSION_LABELS[perm];
-  return label ? `Requires: ${label} (${perm})` : `Requires: ${perm}`;
+  const what = label ? `${label} (${perm})` : perm;
+  return level ? `Requires: ${what} at ${LOCK_LEVEL_LABELS[level]} level` : `Requires: ${what}`;
 }

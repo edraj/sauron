@@ -324,7 +324,38 @@ pub async fn detail(
     Path((app_id, session_id)): Path<(Uuid, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<SessionDetail>, ApiError> {
-    let mut conn = db(&state).await?;
+    let (conn, scope, perms, session) = load_session(
+        &state,
+        auth.user_id,
+        app_id,
+        &session_id,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let timeline = session_timeline(&state, conn, scope, &perms, app_id, &session_id).await?;
+    Ok(Json(SessionDetail { session, timeline }))
+}
+
+/// Authorize a read of one session and load it, or 404.
+///
+/// Shared by [`detail`] and its two sections, so all three resolve scope the
+/// same way and none of them answers for a session the others would refuse.
+async fn load_session(
+    state: &AppState,
+    user_id: Uuid,
+    app_id: Uuid,
+    session_id: &str,
+    raw_query: Option<&str>,
+) -> Result<
+    (
+        sauron_db::PgConn,
+        sauron_db::scope::ReadScope,
+        std::collections::HashSet<String>,
+        Session,
+    ),
+    ApiError,
+> {
+    let mut conn = db(state).await?;
     // `_with_perms` rather than `authorized_read_scope`: the timeline carries
     // whole `ErrorEvent` rows, and two further permissions apply to them —
     // `perm::ISSUE_READ` (an error BODY needs both halves of the pair, and
@@ -334,20 +365,34 @@ pub async fn detail(
     // resolved environment.
     let (scope, perms) = super::scope::authorized_read_scope_with_perms(
         &mut conn,
-        auth.user_id,
+        user_id,
         app_id,
         perm::EVENT_READ,
-        raw_query.as_deref(),
+        raw_query,
     )
     .await?;
-
-    let session = repo::get_session(&mut conn, scope.clone(), &session_id)
+    let session = repo::get_session(&mut conn, scope.clone(), session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    Ok((conn, scope, perms, session))
+}
 
-    let events = repo::events_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
-    let mut errors = repo::errors_for_session(&mut conn, scope.clone(), &session_id, 500).await?;
-    let mut txns = repo::transactions_for_session(&mut conn, scope, &session_id, 500).await?;
+/// A session's events, errors and transactions, merged in time order and gated
+/// for `perms`.
+///
+/// Takes the connection by value: symbolication checks out its own, so this one
+/// is released as soon as the three reads are done.
+async fn session_timeline(
+    state: &AppState,
+    mut conn: sauron_db::PgConn,
+    scope: sauron_db::scope::ReadScope,
+    perms: &std::collections::HashSet<String>,
+    app_id: Uuid,
+    session_id: &str,
+) -> Result<Vec<TimelineItem>, ApiError> {
+    let events = repo::events_for_session(&mut conn, scope.clone(), session_id, 500).await?;
+    let mut errors = repo::errors_for_session(&mut conn, scope.clone(), session_id, 500).await?;
+    let mut txns = repo::transactions_for_session(&mut conn, scope, session_id, 500).await?;
     drop(conn); // release the pooled conn; symbolication checks out its own
 
     // On-read symbolication, as `issues::detail` and `issues::events` do it. An
@@ -361,16 +406,16 @@ pub async fn detail(
     // symbolication decompresses a blob and parses a source map (or walks
     // DWARF), and `gate_event_body` two lines down would throw the frames away
     // for a caller who lacks it.
-    if crate::symbolicate::may_read_event_body(&perms) {
-        crate::symbolicate::symbolicate_events(&state, app_id, &mut errors).await;
+    if crate::symbolicate::may_read_event_body(perms) {
+        crate::symbolicate::symbolicate_events(state, app_id, &mut errors).await;
     }
     // Both gates before the boxed moves into `TimelineItem::Error` below — they
     // work on `[ErrorEvent]`, and once these are inside the enum they are no
     // longer a slice. `gate_source_context` must also stay AFTER the call
     // above: symbolication is what puts the context lines on the response in
     // the first place, so stripping first would strip nothing.
-    crate::symbolicate::gate_source_context(&perms, &mut errors);
-    crate::symbolicate::gate_event_body(&perms, &mut errors);
+    crate::symbolicate::gate_source_context(perms, &mut errors);
+    crate::symbolicate::gate_event_body(perms, &mut errors);
     // Same reason, same placement, different signal: a transaction's `extra`
     // is where request/response bodies land, and this route authorizes on
     // `event:read` — which is exactly the permission `gate_transaction_body`
@@ -378,7 +423,7 @@ pub async fn detail(
     // decoration: the day this route's authorization is widened (or a caller
     // reaches the timeline through a coarser gate), the strip is already in
     // place rather than being the line somebody forgot.
-    crate::symbolicate::gate_transaction_body(&perms, &mut txns);
+    crate::symbolicate::gate_transaction_body(perms, &mut txns);
 
     let mut timeline: Vec<TimelineItem> =
         Vec::with_capacity(events.len() + errors.len() + txns.len());
@@ -402,7 +447,78 @@ pub async fn detail(
     }
     timeline.sort_by_key(|i| i.at());
 
-    Ok(Json(SessionDetail { session, timeline }))
+    Ok(timeline)
+}
+
+// --- detail, one section at a time -------------------------------------------
+//
+// See `issues::detail_summary` for the reasoning. Here the split is starker:
+// the session row is one keyed lookup, and the timeline is up to 1,500 rows
+// plus symbolication.
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct SessionSummary {
+    pub session: Session,
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/sessions/{session_id}/summary", tag = "Sessions",
+    summary = "Fetch one session, without its timeline",
+    description = "The session row alone — a keyed lookup. Pair with the `timeline` section to fill a detail page in as each lands.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("session_id" = String, Path, description = "The session id as reported by the SDK.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The session.", body = SessionSummary), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 404, description = "No such session.", body = ErrorResponse),
+              (status = 410, description = "The session's partition has been tiered to cold storage or dropped.", body = ErrorResponse)),
+)]
+pub async fn detail_summary(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((app_id, session_id)): Path<(Uuid, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<SessionSummary>, ApiError> {
+    let (_conn, _scope, _perms, session) = load_session(
+        &state,
+        auth.user_id,
+        app_id,
+        &session_id,
+        raw_query.as_deref(),
+    )
+    .await?;
+    Ok(Json(SessionSummary { session }))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct SessionTimeline {
+    pub timeline: Vec<TimelineItem>,
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/sessions/{session_id}/timeline", tag = "Sessions",
+    summary = "One session's event timeline",
+    description = "Events, errors and transactions in time order, up to 500 of each. Errors are symbolicated on read; their bodies need `issue:read` and de-obfuscated source lines need `source:read`.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("session_id" = String, Path, description = "The session id as reported by the SDK.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The timeline.", body = SessionTimeline), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 404, description = "No such session.", body = ErrorResponse),
+              (status = 410, description = "The session's partition has been tiered to cold storage or dropped.", body = ErrorResponse)),
+)]
+pub async fn detail_timeline(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((app_id, session_id)): Path<(Uuid, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<SessionTimeline>, ApiError> {
+    let (conn, scope, perms, _session) = load_session(
+        &state,
+        auth.user_id,
+        app_id,
+        &session_id,
+        raw_query.as_deref(),
+    )
+    .await?;
+    let timeline = session_timeline(&state, conn, scope, &perms, app_id, &session_id).await?;
+    Ok(Json(SessionTimeline { timeline }))
 }
 
 #[cfg(test)]

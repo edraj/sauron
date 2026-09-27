@@ -3,7 +3,7 @@
   import Spinner from './Spinner.svelte';
   import Icon from './Icon.svelte';
   import { lockTip } from '../../actions/lock-tip';
-  import type { Permission } from '../../models';
+  import type { LockReason } from '../../models/page-access';
 
   type Variant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'subtle';
   type Size = 'sm' | 'md' | 'lg';
@@ -33,7 +33,7 @@
      * of suppressing the click and any form submission by hand below, since
      * the attribute does neither on its own.
      */
-    lockedReason?: Permission | null;
+    lockedReason?: LockReason | null;
     onclick?: (event: MouseEvent) => void;
     children: Snippet;
   }

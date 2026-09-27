@@ -479,17 +479,49 @@ pub async fn detail(
     Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<IssueDetail>, ApiError> {
-    let mut conn = db(&state).await?;
-    // One ancestry+grant resolution authorizes the read, resolves its scope,
-    // and answers the second permission question at that same scope.
-    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
-        &mut conn,
-        auth.user_id,
-        app_id,
-        perm::ISSUE_READ,
-        raw_query.as_deref(),
-    )
-    .await?;
+    let (mut conn, scope, perms, issue) =
+        load_issue(&state, auth.user_id, app_id, issue_id, raw_query.as_deref()).await?;
+    let latest_event = repo::latest_error_event(&mut conn, scope.clone(), issue_id).await?;
+    let series = issue_series(&mut conn, scope, issue_id).await?;
+    drop(conn); // release the pooled conn; symbolication checks out its own
+    let latest_event = finish_latest_event(&state, app_id, &perms, latest_event).await;
+
+    Ok(Json(IssueDetail {
+        issue,
+        latest_event,
+        series,
+    }))
+}
+
+/// The occurrence series every issue page charts: the last 30 days.
+///
+/// One function so [`detail`] and [`detail_series`] cannot disagree about the
+/// window — which would show one chart on a cold load and another after the
+/// section landed.
+async fn issue_series(
+    conn: &mut sauron_db::AsyncPgConnection,
+    scope: sauron_db::scope::ReadScope,
+    issue_id: Uuid,
+) -> Result<Vec<SeriesPoint>, ApiError> {
+    let since = Utc::now() - Duration::days(30);
+    Ok(repo::issue_occurrence_series(conn, scope, issue_id, Range::since(since)).await?)
+}
+
+/// Symbolicate and gate an issue's latest event for `perms`.
+///
+/// Shared by [`detail`] and [`detail_latest_event`]: the gates are the part of
+/// this route that must never exist in two copies, because the copy that
+/// forgets one serves source lines or an event body to a caller the other
+/// refuses.
+///
+/// Call with the pooled connection already released — symbolication checks out
+/// its own.
+async fn finish_latest_event(
+    state: &AppState,
+    app_id: Uuid,
+    perms: &std::collections::HashSet<String>,
+    mut latest_event: Option<ErrorEvent>,
+) -> Option<ErrorEvent> {
     // Viewing de-obfuscated source code needs source:read; symbol/file/line don't.
     // Evaluated at the resolved environment, not app-wide — an env-scoped
     // caller holds `source:read` (if at all) on their environment.
@@ -498,22 +530,12 @@ pub async fn detail(
     // BODY additionally needs `event:read`. Asked here only to skip work whose
     // product `gate_event_body` would immediately throw away — the gate itself,
     // not this flag, is what withholds it.
-    let include_body = crate::symbolicate::may_read_event_body(&perms);
-
-    let issue = repo::get_issue(&mut conn, scope.clone(), issue_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let mut latest_event = repo::latest_error_event(&mut conn, scope.clone(), issue_id).await?;
-    let since = Utc::now() - Duration::days(30);
-    let series =
-        repo::issue_occurrence_series(&mut conn, scope, issue_id, Range::since(since)).await?;
-    drop(conn); // release the pooled conn; symbolication checks out its own
-
+    let include_body = crate::symbolicate::may_read_event_body(perms);
     if let Some(ev) = latest_event.as_mut() {
         // Symbolication decompresses a blob and parses a source map (or walks
         // DWARF) — pointless for a caller who will receive no frames.
         if include_body {
-            crate::symbolicate::symbolicate_event(&state, app_id, ev).await;
+            crate::symbolicate::symbolicate_event(state, app_id, ev).await;
             if !include_source {
                 crate::symbolicate::strip_source_context(ev);
             }
@@ -521,14 +543,128 @@ pub async fn detail(
         // The occurrence stays (timestamp, release, user, device); its payload
         // does not. Keeping the shell is what lets the issue page still render
         // "last seen on 1.2.3" for a coarse-gated caller.
-        crate::symbolicate::gate_event_body(&perms, std::slice::from_mut(ev));
+        crate::symbolicate::gate_event_body(perms, std::slice::from_mut(ev));
     }
+    latest_event
+}
 
-    Ok(Json(IssueDetail {
-        issue,
-        latest_event,
-        series,
-    }))
+// --- detail, one section at a time -------------------------------------------
+//
+// `detail` above is a keyed lookup followed by two reads that are not: a 30-day
+// series, and the latest event with on-read symbolication. The issue page could
+// paint nothing — not even the title it had just been clicked from — until both
+// returned. These three serve the same data separately, the way the Overview
+// sections do, so the page fills in as each lands.
+//
+// Every section resolves scope and permissions for itself and looks the issue
+// up before answering: a section is its own request, and must not answer `[]`
+// for an issue the composite would have answered 404 for.
+
+/// Authorize a read of one issue and load it, or 404.
+async fn load_issue(
+    state: &AppState,
+    user_id: Uuid,
+    app_id: Uuid,
+    issue_id: Uuid,
+    raw_query: Option<&str>,
+) -> Result<
+    (
+        sauron_db::PgConn,
+        sauron_db::scope::ReadScope,
+        std::collections::HashSet<String>,
+        Issue,
+    ),
+    ApiError,
+> {
+    let mut conn = db(state).await?;
+    // One ancestry+grant resolution authorizes the read, resolves its scope,
+    // and answers the second permission question at that same scope.
+    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
+        &mut conn,
+        user_id,
+        app_id,
+        perm::ISSUE_READ,
+        raw_query,
+    )
+    .await?;
+    let issue = repo::get_issue(&mut conn, scope.clone(), issue_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok((conn, scope, perms, issue))
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/issues/{issue_id}/summary", tag = "Issues",
+    summary = "Fetch one issue, without its latest event or series",
+    description = "The issue record alone — a keyed lookup. Pair with the `latest-event` and `series` sections to fill a detail page in as each lands.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("issue_id" = Uuid, Path, description = "The issue.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The issue.", body = Issue),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such issue.", body = ErrorResponse)),
+)]
+pub async fn detail_summary(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Issue>, ApiError> {
+    let (_conn, _scope, _perms, issue) =
+        load_issue(&state, auth.user_id, app_id, issue_id, raw_query.as_deref()).await?;
+    Ok(Json(issue))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct IssueLatestEvent {
+    /// `null` when the issue has no event in the requested scope.
+    pub latest_event: Option<ErrorEvent>,
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/issues/{issue_id}/latest-event", tag = "Issues",
+    summary = "An issue's most recent event",
+    description = "Symbolicated on read. The event body needs `event:read` and de-obfuscated source lines need `source:read`; without them the occurrence is returned with those parts withheld.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("issue_id" = Uuid, Path, description = "The issue.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The latest event.", body = IssueLatestEvent),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such issue.", body = ErrorResponse)),
+)]
+pub async fn detail_latest_event(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<IssueLatestEvent>, ApiError> {
+    let (mut conn, scope, perms, _issue) =
+        load_issue(&state, auth.user_id, app_id, issue_id, raw_query.as_deref()).await?;
+    let latest_event = repo::latest_error_event(&mut conn, scope, issue_id).await?;
+    drop(conn); // release the pooled conn; symbolication checks out its own
+    let latest_event = finish_latest_event(&state, app_id, &perms, latest_event).await;
+    Ok(Json(IssueLatestEvent { latest_event }))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct IssueSeries {
+    pub series: Vec<SeriesPoint>,
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/issues/{issue_id}/series", tag = "Issues",
+    summary = "An issue's occurrences over the last 30 days",
+    params(("app_id" = Uuid, Path, description = "The app."), ("issue_id" = Uuid, Path, description = "The issue.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "Occurrences per bucket.", body = IssueSeries),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such issue.", body = ErrorResponse)),
+)]
+pub async fn detail_series(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((app_id, issue_id)): Path<(Uuid, Uuid)>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<IssueSeries>, ApiError> {
+    let (mut conn, scope, _perms, _issue) =
+        load_issue(&state, auth.user_id, app_id, issue_id, raw_query.as_deref()).await?;
+    let series = issue_series(&mut conn, scope, issue_id).await?;
+    Ok(Json(IssueSeries { series }))
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

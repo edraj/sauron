@@ -55,7 +55,9 @@ describe('ADMIN_NAV', () => {
 describe('pageLockedBy', () => {
   it('names the missing permission for a page out of reach', () => {
     grantOrg(VIEWER);
-    expect(pageLockedBy('/admin/storage')).toBe('org:manage');
+    // Org-level pages name their level: a member holding the permission on
+    // one project would otherwise be told they lack what they hold.
+    expect(pageLockedBy('/admin/storage')).toBe('org:manage@org');
     expect(pageLockedBy('/admin/alerts')).toBe('alert:read');
     expect(pageLockedBy('/admin/privacy')).toBe('pii:read');
   });
@@ -100,8 +102,8 @@ describe('adminNavLocks', () => {
     const locks = Object.fromEntries(adminNavLocks().map((i) => [i.href, i.locked]));
     expect(locks['/admin/members']).toBe(null);
     expect(locks['/admin/source-maps']).toBe(null);
-    expect(locks['/admin/storage']).toBe('org:manage');
-    expect(locks['/admin/wall-of-shame']).toBe('org:manage');
+    expect(locks['/admin/storage']).toBe('org:manage@org');
+    expect(locks['/admin/wall-of-shame']).toBe('org:manage@org');
   });
 
   it('preserves ADMIN_NAV order', () => {

@@ -5,6 +5,7 @@
   import { push } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
+  import ViewSection from '../lib/components/ViewSection.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -27,8 +28,11 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { lockedBy } from '../lib/models/page-access';
+  import { applyIssueStatus } from '../lib/models/issue-status';
   import {
-    getIssue,
+    getIssueSummary,
+    getIssueLatestEvent,
+    getIssueSeries,
     updateIssueStatus,
     listIssueEvents,
     getIssueEventStats,
@@ -60,28 +64,44 @@
     formatDateTimeSeconds,
     formatDateTimeZone,
   } from '../lib/utils/format';
-  import type { IssueDetail, IssueEventStats, IssueStatus, ErrorEvent } from '../lib/models';
+  import type {
+    Issue,
+    IssueEventStats,
+    IssueStatus,
+    ErrorEvent,
+    SeriesPoint,
+  } from '../lib/models';
 
   interface Props {
     params?: { id?: string };
   }
   let { params }: Props = $props();
 
-  // Cached view (lib/stores/cached-view.svelte.ts): returning to an issue
+  // Cached views (lib/stores/cached-view.svelte.ts): returning to an issue
   // repaints it instantly instead of blanking while the same read runs again.
-  const view = new CachedView<IssueDetail>();
+  //
+  // THREE of them, one per section. The record is a keyed lookup; the series
+  // and the symbolicated latest event are not. Read as one payload they held
+  // the header — the title the reader had just clicked — behind the slowest of
+  // the three. Read apart, each card fills in as its own answer lands and shows
+  // a skeleton until then. The occurrences table below was always separate.
+  const view = new CachedView<Issue>();
+  const seriesView = new CachedView<SeriesPoint[]>();
+  const latestView = new CachedView<ErrorEvent | null>();
 
-  // `reload()` replays the view's most recent key and fetcher with force,
+  // `reload()` replays each view's most recent key and fetcher with force,
   // which is exactly what Refresh means here — the page's loads are driven by
   // effects, so there is no `load(force)` to call and reconstructing the key
   // by hand would be a second definition of it, free to drift.
   const refresher = pageRefresher(async () => {
-    await view.reload();
+    await Promise.all([view.reload(), seriesView.reload(), latestView.reload()]);
   });
 
   const issue = $derived(view.data ?? null);
   const loading = $derived(view.loading);
-  const revalidating = $derived(view.revalidating);
+  const revalidating = $derived(
+    view.revalidating || seriesView.revalidating || latestView.revalidating,
+  );
   /**
    * The issue read failing, or a mutation (resolve / ignore / assign) failing.
    * Separate lifetimes: an action's message must survive a background
@@ -102,14 +122,30 @@
     // `id` AND `scopeKey`: the router reuses this component across
     // `#/issues/A` -> `#/issues/B`, and `scopeKey` carries the environment the
     // interceptor adds to the request but which appears in no argument here.
-    // Two segments only — `GET …/issues/{id}` takes no `release=`, so the
+    // Two segments only — none of these three routes takes `release=`, so the
     // record is the same under every release; the occurrences table below is
     // the part that narrows, and it keys on `scopeKeyWithRelease`.
-    await view.load(
-      viewKey('issue.detail', appId, id, sessionStore.scopeKey),
-      () => getIssue(appId, id),
-      force,
-    );
+    //
+    // Started together and NOT awaited as one: each view settles on its own,
+    // which is the whole point. `allSettled` only so a caller awaiting `load`
+    // resumes once all three have; a failure stays inside its own view.
+    await Promise.allSettled([
+      view.load(
+        viewKey('issue.detail', appId, id, sessionStore.scopeKey),
+        () => getIssueSummary(appId, id),
+        force,
+      ),
+      seriesView.load(
+        viewKey('issue.detail.series', appId, id, sessionStore.scopeKey),
+        () => getIssueSeries(appId, id),
+        force,
+      ),
+      latestView.load(
+        viewKey('issue.detail.latest', appId, id, sessionStore.scopeKey),
+        () => getIssueLatestEvent(appId, id),
+        force,
+      ),
+    ]);
   }
 
   $effect(() => {
@@ -498,15 +534,15 @@
   async function setStatus(next: IssueStatus) {
     const aid = sessionStore.currentAppId;
     const current = issue;
-    if (!current || !aid || updating || current.status === next) return;
-    const previous = current.status;
-    // Optimistic — mutate the reactive $state object in place.
-    current.status = next;
+    if (!current || !aid || updating) return;
     updating = true;
     try {
-      const updated = await updateIssueStatus(aid, current.id, next);
-      current.status = updated.status;
-      current.updated_at = updated.updated_at;
+      // Optimistic, and by REPLACING the record — see `applyIssueStatus` for
+      // why editing `current` in place changed nothing on screen.
+      const changed = await applyIssueStatus(view, next, () =>
+        updateIssueStatus(aid, current.id, next),
+      );
+      if (!changed) return;
       // The Issues list is cached (see lib/stores/view-cache.ts). Without this,
       // resolving an issue here and navigating back shows it as unresolved for
       // the rest of the fresh window, with no request in flight to correct it —
@@ -516,14 +552,13 @@
       viewCache.invalidate('issues.stats');
       toastStore.success(`Issue marked ${next}.`);
     } catch (err) {
-      current.status = previous;
       toastStore.error(errorMessage(err));
     } finally {
       updating = false;
     }
   }
 
-  const latestEvent = $derived(issue?.latest_event ?? null);
+  const latestEvent = $derived(latestView.data ?? null);
   const latestEventType = $derived(latestEvent?.exception_type ?? issue?.type ?? '');
 
   // Tags for the rail summary. Same shaping as KeyValueList so the rail and the
@@ -609,15 +644,22 @@
     {t('issue.backToList')}
   </button>
 
-  {#if loading}
-    <Skeleton rows={6} />
-  {:else if error}
+  <!-- The RECORD decides whether there is a page at all: a 404 or a 403 on it
+       is the whole answer, and rendering cards under it would put skeletons
+       beneath an issue that does not exist. Everything else is a section of a
+       page that does, so each one below waits — and fails — on its own. -->
+  {#if !loading && error}
     <EmptyState title={t('issue.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
         <Button variant="secondary" onclick={() => push('/issues')}>{t('issue.backToList')}</Button>
       {/snippet}
     </EmptyState>
-  {:else if issue}
+  {:else}
+    {#if !issue}
+      <header class="detail-head">
+        <div class="head-main"><Skeleton rows={2} height="18px" /></div>
+      </header>
+    {:else}
     <header class="detail-head">
       <div class="head-main">
         <div class="badges">
@@ -663,14 +705,23 @@
           {/if}
         </div>
     </header>
+    {/if}
 
     <div class="issue-body">
       <div class="col-main">
         <Card title={t('issue.card.eventsOverTime')}>
-          <TimeSeriesChart data={issue.series} height={170} color="var(--error)" />
+          <ViewSection view={seriesView} rows={1} height="170px">
+            <TimeSeriesChart data={seriesView.data ?? []} height={170} color="var(--error)" />
+          </ViewSection>
         </Card>
 
-        {#if latestEvent}
+        {#if !latestView.hasData}
+          <!-- Still out, or failed: `ViewSection` draws whichever it is. Its
+               content slot is never reached on this branch. -->
+          <Card title={t('issue.card.latestEvent')}>
+            <ViewSection view={latestView} rows={8}>{null}</ViewSection>
+          </Card>
+        {:else if latestEvent}
           <Card>
             {#snippet header()}
               <div class="event-head">
@@ -888,6 +939,9 @@
 
       <aside class="rail">
         <Card title={t('issue.card.overview')}>
+          {#if !issue}
+            <Skeleton rows={7} />
+          {:else}
           <dl class="side-dl">
             <div>
               <dt>{t('common.status')}</dt>
@@ -932,6 +986,7 @@
               <dd class="mono fp" title={issue.fingerprint}>{issue.fingerprint.slice(0, 16)}…</dd>
             </div>
           </dl>
+          {/if}
         </Card>
 
         <!-- The ONLY Tags card. A second, full-width copy used to sit below the

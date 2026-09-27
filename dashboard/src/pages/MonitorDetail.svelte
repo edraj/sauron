@@ -1,7 +1,15 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
-  import { getMonitor, getMonitorChecks, updateMonitor, deleteMonitor } from '../lib/api/monitors';
+  import {
+    getMonitorSummary,
+    getMonitorUptime,
+    getMonitorIncidents,
+    getMonitorChecks,
+    updateMonitor,
+    deleteMonitor,
+    type MonitorSummary,
+  } from '../lib/api/monitors';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -9,7 +17,7 @@
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { MONITOR_INTERVALS, formatInterval } from '../lib/constants/monitorIntervals';
-  import type { MonitorDetail, MonitorCheck } from '../lib/models';
+  import type { MonitorDetail, MonitorCheck, MonitorIncident } from '../lib/models';
   import { lockedBy } from '../lib/models/page-access';
   import { lockTip } from '../lib/actions/lock-tip';
   import StatusPill from '../lib/components/ui/StatusPill.svelte';
@@ -21,6 +29,7 @@
   import StatTile from '../lib/components/StatTile.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
+  import ViewSection from '../lib/components/ViewSection.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import CopyButton from '../lib/components/ui/CopyButton.svelte';
@@ -38,21 +47,25 @@
 
   let { params }: { params: { id: string } } = $props();
 
-  // Two cached views, not one: the split is deliberate (see `load`) — the
-  // header renders the moment `detail` lands rather than waiting on 24 h of
-  // check rows, and a failed checks read degrades inside its own card.
-  const detailView = new CachedView<MonitorDetail>();
+  // Four cached views, not one: the split is deliberate (see `load`). The
+  // monitor row says what the monitor IS; three uptime aggregates, an incident
+  // scan and 24 h of check rows say how it has been doing. The header renders
+  // the moment the row lands, and each of the others fills in — or fails —
+  // inside its own block.
+  const detailView = new CachedView<MonitorSummary>();
+  const uptimeView = new CachedView<MonitorDetail['uptime']>();
+  const incidentsView = new CachedView<MonitorIncident[]>();
   const checksView = new CachedView<MonitorCheck[]>();
+  const sections = [detailView, uptimeView, incidentsView, checksView];
 
   // `reload()` replays the view's most recent key and fetcher with force,
   // which is exactly what Refresh means here — the page's loads are driven by
   // effects, so there is no `load(force)` to call and reconstructing the key
   // by hand would be a second definition of it, free to drift.
   const refresher = pageRefresher(async () => {
-    // Both views: the page shows a monitor and its recent checks, and a
-    // refresh that updated only one of them would be misread as the other
-    // having stopped moving.
-    await Promise.all([detailView.reload(), checksView.reload()]);
+    // Every view: a refresh that updated only some of the page would be
+    // misread as the rest having stopped moving.
+    await Promise.all(sections.map((v) => v.reload()));
   });
 
   const detail = $derived(detailView.data ?? null);
@@ -63,7 +76,14 @@
   const checksLoading = $derived(checksView.loading);
   const checksError = $derived(checksView.error);
   const loading = $derived(detailView.loading);
-  const revalidating = $derived(detailView.revalidating || checksView.revalidating);
+  const revalidating = $derived(
+    detailView.revalidating ||
+      uptimeView.revalidating ||
+      incidentsView.revalidating ||
+      checksView.revalidating,
+  );
+  const uptime = $derived(uptimeView.data ?? null);
+  const uptimeLoading = $derived(uptimeView.loading && !uptimeView.hasData);
   /**
    * The monitor read failing, or an action (pause / interval / delete) failing.
    * Kept apart because they have different lifetimes — an action's message must
@@ -161,7 +181,7 @@
     sortRows(recentChecks, monitorCheckAccessor(checkSort.key), checkSort.dir),
   );
   const sortedIncidents = $derived(
-    sortRows(detail?.incidents ?? [], monitorIncidentAccessor(incidentSort.key), incidentSort.dir),
+    sortRows(incidentsView.data ?? [], monitorIncidentAccessor(incidentSort.key), incidentSort.dir),
   );
 
   function onCheckSort(key: string, columnDefault: SortDir) {
@@ -172,28 +192,34 @@
   }
 
   async function load(force = false) {
-    // Both issued together as before (neither feeds the other), but no longer
-    // JOINED: the header, config and actions need only `detail`, so they
-    // render the moment it lands instead of waiting on 24 h of check rows —
-    // and a failed checks read degrades to a message inside its own card
-    // rather than blanking a page whose monitor half arrived fine.
+    // All issued together (none feeds another), and not JOINED: the header,
+    // config and actions need only `detail`, so they render the moment it
+    // lands instead of waiting on the aggregates or 24 h of check rows — and a
+    // failed section degrades to a message inside its own card rather than
+    // blanking a page whose monitor half arrived fine.
     //
-    // `params.id` is in both keys: the router REUSES this component across
+    // `params.id` is in every key: the router REUSES this component across
     // `#/monitors/A` -> `#/monitors/B`, so a key without it would repaint the
     // previous monitor's rows under the new id.
-    const checksDone = checksView.load(
-      viewKey('monitor.checks', params.id, sessionStore.scopeKey),
-      () => getMonitorChecks(params.id, 24),
-      force,
-    );
+    const id = params.id;
+    const scope = sessionStore.scopeKey;
+    const rest = Promise.allSettled([
+      checksView.load(viewKey('monitor.checks', id, scope), () => getMonitorChecks(id, 24), force),
+      uptimeView.load(viewKey('monitor.uptime', id, scope), () => getMonitorUptime(id), force),
+      incidentsView.load(
+        viewKey('monitor.incidents', id, scope),
+        () => getMonitorIncidents(id),
+        force,
+      ),
+    ]);
     await detailView.load(
-      viewKey('monitor.detail', params.id, sessionStore.scopeKey),
-      () => getMonitor(params.id),
+      viewKey('monitor.detail', id, scope),
+      () => getMonitorSummary(id),
       force,
     );
     // Callers (the pause/interval/delete refreshes) await the WHOLE load, so
-    // their "refresh finished" contract still covers both halves.
-    await checksDone;
+    // their "refresh finished" contract still covers every section.
+    await rest;
   }
 
   /**
@@ -297,15 +323,20 @@
     {t('monitors.column.uptime')}
   </button>
 
-  {#if loading}
-    <Skeleton rows={6} />
-  {:else if error && !detail}
+  <!-- The monitor ROW decides whether there is a page at all; every block below
+       is a section of a page that exists, and waits and fails on its own. -->
+  {#if !loading && error && !detail}
     <EmptyState title={t('monitor.notFound')} description={error} icon="triangle-alert">
       {#snippet action()}
         <Button variant="secondary" onclick={() => push('/monitors')}>{t('monitor.backToList')}</Button>
       {/snippet}
     </EmptyState>
-  {:else if detail}
+  {:else}
+    {#if !detail}
+      <header class="detail-head">
+        <div class="head-main"><Skeleton rows={2} height="18px" /></div>
+      </header>
+    {:else}
     <header class="detail-head">
       <div class="head-main">
         <h1 class="mon-title">
@@ -348,6 +379,7 @@
           </Button>
         </div>
     </header>
+    {/if}
 
     {#if error}
       <div class="err-banner" role="alert">
@@ -357,9 +389,29 @@
     {/if}
 
     <StatTiles min={150}>
-      <StatTile label={t('monitors.column.uptime24h')} value={fmtPct(detail.uptime.h24)} tone={pctTone(detail.uptime.h24)} />
-      <StatTile label={t('monitor.stat.uptime7d')} value={fmtPct(detail.uptime.d7)} tone={pctTone(detail.uptime.d7)} />
-      <StatTile label={t('monitor.stat.uptime30d')} value={fmtPct(detail.uptime.d30)} tone={pctTone(detail.uptime.d30)} />
+      <!-- `?? null`: a failed uptime read renders the em dash every tile already
+           uses for "no checks in this window", not a shimmer that never ends. -->
+      <StatTile
+        label={t('monitors.column.uptime24h')}
+        value={fmtPct(uptime?.h24)}
+        tone={pctTone(uptime?.h24 ?? null)}
+        loading={uptimeLoading}
+      />
+      <StatTile
+        label={t('monitor.stat.uptime7d')}
+        value={fmtPct(uptime?.d7)}
+        tone={pctTone(uptime?.d7 ?? null)}
+        loading={uptimeLoading}
+      />
+      <StatTile
+        label={t('monitor.stat.uptime30d')}
+        value={fmtPct(uptime?.d30)}
+        tone={pctTone(uptime?.d30 ?? null)}
+        loading={uptimeLoading}
+      />
+      {#if !detail}
+        <StatTile label={t('monitors.column.interval')} value="" loading />
+      {:else}
         <div class="interval-tile">
           <span class="it-label">{t('monitors.column.interval')}</span>
           <div class="control select" class:busy={savingInterval}>
@@ -383,6 +435,7 @@
             </span>
           </div>
         </div>
+      {/if}
     </StatTiles>
 
     <div class="section">
@@ -462,6 +515,7 @@
 
     <div class="section">
       <Card title={t('monitor.card.incidents')} padding="none">
+        <ViewSection view={incidentsView} rows={4} padded>
         {#if sortedIncidents.length === 0}
           <EmptyState
             title={t('monitor.empty.incidents')}
@@ -505,6 +559,7 @@
             {/snippet}
           </DataTable>
         {/if}
+        </ViewSection>
       </Card>
     </div>
   {/if}

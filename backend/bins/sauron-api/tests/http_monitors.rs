@@ -852,3 +852,80 @@ async fn a_monitor_without_a_probe_body_reports_it_absent() {
 
     server.shutdown().await;
 }
+
+/// The monitor page's sections serve what `GET /v1/monitors/{id}` serves, one
+/// part at a time. Two things to pin: they agree with the composite, and the
+/// summary goes through the SAME redacting serializer — a second route that
+/// serialized the row directly would reopen the leak this file exists for.
+#[tokio::test]
+async fn monitor_sections_agree_with_the_composite_and_stay_redacted() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let fx = seed(&server, "sections").await;
+    let (monitor_id, _, _) = create_monitor(
+        &server,
+        &fx,
+        "prod",
+        Some(WEBHOOK_URL),
+        Some(json!({ "Authorization": PROBE_TOKEN })),
+    )
+    .await;
+
+    let (status, raw, whole) = server
+        .get_raw(&format!("/v1/monitors/{monitor_id}"), &fx.viewer_token)
+        .await;
+    assert_eq!(status, 200, "composite: {raw}");
+
+    let (status, raw, summary) = server
+        .get_raw(
+            &format!("/v1/monitors/{monitor_id}/summary"),
+            &fx.viewer_token,
+        )
+        .await;
+    assert_eq!(status, 200, "summary: {raw}");
+    assert_redacted(&summary["monitor"], &raw, "summary section");
+    assert_eq!(whole["monitor"], summary["monitor"]);
+    assert_eq!(whole["pinned_alert_rules"], summary["pinned_alert_rules"]);
+    assert_eq!(summary["monitor"]["name"], json!("prod"));
+
+    let (status, raw, uptime) = server
+        .get_raw(
+            &format!("/v1/monitors/{monitor_id}/uptime"),
+            &fx.viewer_token,
+        )
+        .await;
+    assert_eq!(status, 200, "uptime: {raw}");
+    assert_eq!(whole["uptime"], uptime["uptime"]);
+    for window in ["h24", "d7", "d30"] {
+        assert!(
+            uptime["uptime"].get(window).is_some(),
+            "uptime must carry `{window}`: {raw}"
+        );
+    }
+
+    for section in ["summary", "uptime"] {
+        let (status, raw, _) = server
+            .get_raw(
+                &format!("/v1/monitors/{}/{section}", Uuid::new_v4()),
+                &fx.owner_token,
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "{section} for a monitor that does not exist: {raw}"
+        );
+        let (status, raw, _) = server
+            .get_raw(
+                &format!("/v1/monitors/{monitor_id}/{section}?environment_id=none"),
+                &fx.owner_token,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "{section}: monitors have no environment dimension: {raw}"
+        );
+    }
+
+    server.shutdown().await;
+}

@@ -3,6 +3,7 @@ import type {
   Monitor,
   MonitorCheck,
   MonitorDetail,
+  MonitorIncident,
   MonitorListItem,
 } from '../models';
 
@@ -27,8 +28,29 @@ export async function createMonitor(projectId: string, body: CreateMonitorBody):
   return data;
 }
 
-export async function getMonitor(id: string): Promise<MonitorDetail> {
-  const { data } = await api.get<MonitorDetail>(`/v1/monitors/${id}`);
+// Sections rather than the composite `GET /v1/monitors/{id}` — see the note on
+// `getIssueSummary` (api/issues.ts). The monitor row says what the monitor IS;
+// three uptime aggregates and an incident scan say how it has been doing, and
+// the first should not wait on the second.
+
+/** The monitor and the alert rules pinned to it. */
+export type MonitorSummary = Pick<MonitorDetail, 'monitor' | 'pinned_alert_rules'>;
+
+export async function getMonitorSummary(id: string): Promise<MonitorSummary> {
+  const { data } = await api.get<MonitorSummary>(`/v1/monitors/${id}/summary`);
+  return data;
+}
+
+export async function getMonitorUptime(id: string): Promise<MonitorDetail['uptime']> {
+  const { data } = await api.get<{ uptime: MonitorDetail['uptime'] }>(
+    `/v1/monitors/${id}/uptime`,
+  );
+  return data.uptime;
+}
+
+/** The monitor's most recent incidents, newest first. */
+export async function getMonitorIncidents(id: string): Promise<MonitorIncident[]> {
+  const { data } = await api.get<MonitorIncident[]>(`/v1/monitors/${id}/incidents`);
   return data;
 }
 

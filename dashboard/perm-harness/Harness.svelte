@@ -6,15 +6,22 @@
   Three grant sets side by side, because the interesting cases differ per role:
   the sidebar only locks for a custom role, while the admin rail locks for every
   preset below Owner.
+
+  The third set is held on a PROJECT, not the org. It is what shows the two
+  things a scope-blind tooltip got wrong: Alerts opens (its reads follow the
+  grant), and every org-level lock names the level — the member already holds
+  `member:read` and `alert:write`, so naming the permission alone told them
+  they lacked what they had been given.
 -->
 <script lang="ts">
   import Sidebar from '../src/lib/components/layout/Sidebar.svelte';
   import Button from '../src/lib/components/ui/Button.svelte';
   import { adminNavLocks } from '../src/lib/models/admin-nav';
+  import { lockedBy } from '../src/lib/models/page-access';
   import { lockTip } from '../src/lib/actions/lock-tip';
   import Icon from '../src/lib/components/ui/Icon.svelte';
   import { sessionStore } from '../src/lib/stores/session.svelte';
-  import type { Permission } from '../src/lib/models';
+  import type { Permission, ScopeType } from '../src/lib/models';
 
   const VIEWER: Permission[] = [
     'issue:read', 'event:read', 'monitor:read', 'app:read',
@@ -24,7 +31,19 @@
   // no preset role produces that, which is exactly the point: custom roles can.
   const NARROW: Permission[] = ['issue:read', 'app:read', 'member:read'];
 
+  // Everything an alerting operator for ONE project would plausibly hold.
+  const PROJECT_ALERTS: Permission[] = [
+    'issue:read', 'event:read', 'app:read', 'project:read',
+    'member:read', 'alert:read', 'alert:write',
+  ];
+
   let perms = $state<Permission[]>(VIEWER);
+  let scope = $state<{ type: ScopeType; id: string }>({ type: 'org', id: 'org1' });
+
+  function use(next: Permission[], type: ScopeType, id: string): void {
+    perms = next;
+    scope = { type, id };
+  }
 
   // The store is seeded directly rather than through load(): this harness
   // verifies rendering, and a real bootstrap would need the whole API.
@@ -36,9 +55,12 @@
     sessionStore.currentEnvId = null;
     sessionStore.access = {
       permissions: perms,
-      grants: [{ scope_type: 'org', scope_id: 'org1', permissions: perms }],
+      grants: [{ scope_type: scope.type, scope_id: scope.id, permissions: perms }],
     };
   });
+
+  // Exactly the expression `Alerts.svelte` uses for its write controls.
+  const alertWriteLock = $derived(lockedBy('alert:write', { level: 'org' }));
 
   let clicks = $state(0);
   let submits = $state(0);
@@ -51,9 +73,19 @@
     <h1>Locked nav &amp; locked actions</h1>
 
     <div class="row">
-      <button id="set-viewer" onclick={() => (perms = VIEWER)}>Viewer grants</button>
-      <button id="set-narrow" onclick={() => (perms = NARROW)}>Narrow custom role</button>
-      <span id="perm-count">{perms.length} permissions</span>
+      <button id="set-viewer" onclick={() => use(VIEWER, 'org', 'org1')}>Viewer grants</button>
+      <button id="set-narrow" onclick={() => use(NARROW, 'org', 'org1')}>Narrow custom role</button>
+      <button id="set-project" onclick={() => use(PROJECT_ALERTS, 'project', 'proj1')}>
+        Alerting role on one project
+      </button>
+      <span id="perm-count">{perms.length} permissions on {scope.type}</span>
+    </div>
+
+    <h2>Org-level write, held on a project</h2>
+    <div class="row">
+      <Button id="alert-write" variant="primary" lockedReason={alertWriteLock} onclick={() => clicks++}>
+        New alert rule
+      </Button>
     </div>
 
     <h2>Buttons</h2>

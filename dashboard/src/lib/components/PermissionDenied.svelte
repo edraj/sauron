@@ -10,8 +10,13 @@
 <script lang="ts">
   import EmptyState from './ui/EmptyState.svelte';
   import Button from './ui/Button.svelte';
-  import { PERMISSION_LABELS } from '../models/permissions';
-  import { PAGE_ACCESS, canAccessPage, type PageAccess } from '../models/page-access';
+  import {
+    PAGE_ACCESS,
+    canAccessPage,
+    lockTitle,
+    pageLockReason,
+    type PageAccess,
+  } from '../models/page-access';
 
   interface Props {
     access: PageAccess;
@@ -19,11 +24,9 @@
 
   let { access }: Props = $props();
 
-  const requirement = $derived(
-    PERMISSION_LABELS[access.perm]
-      ? `${PERMISSION_LABELS[access.perm]} (${access.perm})`
-      : access.perm,
-  );
+  // Through `lockTitle`, so the page and the nav item that led here describe
+  // the requirement identically — including the level it must be held at.
+  const requirement = $derived(lockTitle(pageLockReason(access)));
 
   // The first page the user can actually reach, in PAGE_ACCESS declaration
   // order. '/account' and '/docs' carry a null requirement precisely so this
@@ -38,7 +41,7 @@
 <EmptyState
   icon="lock"
   title="You don't have access to {access.title}"
-  description="Requires: {requirement}. Ask an organization owner for access."
+  description="{requirement}. Ask an organization owner for access."
 >
   {#snippet action()}
     <Button variant="primary" href="#{fallback[0]}">Back to {fallbackTitle}</Button>

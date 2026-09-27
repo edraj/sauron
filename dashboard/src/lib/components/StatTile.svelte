@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { t } from '../i18n';
 
   type Tone = 'neutral' | 'primary' | 'success' | 'warning' | 'error' | 'info';
 
@@ -28,6 +29,18 @@
     wide?: boolean;
     // Makes the whole tile a link target.
     href?: string;
+    /**
+     * The value has not arrived yet: draw a placeholder where it will sit.
+     *
+     * The LABEL still renders, which is the point of doing this per tile rather
+     * than swapping the whole row for one skeleton — the reader sees which
+     * numbers are coming, and a row whose tiles are fed by different requests
+     * can fill in one tile at a time without the others jumping.
+     *
+     * `value` is ignored while this is set, so a caller can pass whatever it
+     * has (a `0`, a `—`) without it flashing up as though it were the answer.
+     */
+    loading?: boolean;
   }
 
   let {
@@ -40,18 +53,26 @@
     visual,
     wide = false,
     href,
+    loading = false,
   }: Props = $props();
 </script>
 
 {#snippet body()}
   <span class="st-label">{label}</span>
-  <span class="st-value {tone}">{value}</span>
-  <div class="st-foot">
-    {#if delta}<span class="st-delta {deltaTone}">{delta}</span>{/if}
-    {#if Array.isArray(sub)}
-      <span class="st-sub st-sub-lines">{#each sub as line, i (i)}<span>{line}</span>{/each}</span>
-    {:else if sub}<span class="st-sub">{sub}</span>{/if}
-  </div>
+  {#if loading}
+    <!-- Sized to the value's own line box (26px × 1.15), so the tile is the
+         same height loading as loaded and the row below it does not move. -->
+    <span class="st-value st-pending" aria-busy="true" aria-label={t('common.loading')}></span>
+    <div class="st-foot"></div>
+  {:else}
+    <span class="st-value {tone}">{value}</span>
+    <div class="st-foot">
+      {#if delta}<span class="st-delta {deltaTone}">{delta}</span>{/if}
+      {#if Array.isArray(sub)}
+        <span class="st-sub st-sub-lines">{#each sub as line, i (i)}<span>{line}</span>{/each}</span>
+      {:else if sub}<span class="st-sub">{sub}</span>{/if}
+    </div>
+  {/if}
   {#if visual}<div class="st-visual">{@render visual()}</div>{/if}
 {/snippet}
 
@@ -104,6 +125,36 @@
     letter-spacing: -0.02em;
     line-height: 1.15;
     font-variant-numeric: tabular-nums;
+  }
+  /* The same shimmer as `ui/Skeleton.svelte`, at the value's size. Not that
+     component itself: it is a live region, and a row of five tiles would
+     announce "Loading" five times. */
+  .st-pending {
+    display: block;
+    height: 30px;
+    width: 60%;
+    border-radius: 4px;
+    background: linear-gradient(
+      90deg,
+      var(--border, #2a2a2a) 25%,
+      var(--surface-2, #333) 50%,
+      var(--border, #2a2a2a) 75%
+    );
+    background-size: 200% 100%;
+    animation: st-shimmer 1.4s ease-in-out infinite;
+  }
+  @keyframes st-shimmer {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .st-pending {
+      animation: none;
+    }
   }
   .st-value.primary {
     color: var(--primary);

@@ -14197,6 +14197,26 @@ pub async fn list_channels_for_org(
         .await
 }
 
+/// The channels of `org_id` among `ids`, in the same order as
+/// [`list_channels_for_org`].
+///
+/// `org_id` is filtered as well as the ids, so a caller cannot widen the result
+/// by passing an id from another org.
+pub async fn list_channels_by_ids(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    ids: &[Uuid],
+) -> QueryResult<Vec<NotificationChannel>> {
+    notification_channels::table
+        .filter(notification_channels::org_id.eq(org_id))
+        .filter(notification_channels::id.eq_any(ids))
+        .order(notification_channels::created_at.desc())
+        .limit(500)
+        .select(NotificationChannel::as_select())
+        .load(conn)
+        .await
+}
+
 pub async fn get_channel(
     conn: &mut AsyncPgConnection,
     id: Uuid,
@@ -14363,6 +14383,41 @@ pub async fn list_alert_rules_for_org(
 ) -> QueryResult<Vec<AlertRule>> {
     alert_rules::table
         .filter(alert_rules::org_id.eq(org_id))
+        .order(alert_rules::created_at.desc())
+        .limit(500)
+        .select(AlertRule::as_select())
+        .load(conn)
+        .await
+}
+
+/// An org's rules narrowed to the given projects or apps — what a caller
+/// holding `alert:read` BELOW org scope may list.
+///
+/// A rule matches when it is narrowed to one of `app_ids`, or when its
+/// `project_id` is one of `project_ids`. The second arm deliberately includes
+/// rules narrowed to an app INSIDE such a project (`check_rule_scope` stores
+/// the app's project alongside it): a project grant cascades to its apps
+/// everywhere else, and it does here.
+///
+/// An un-narrowed rule (both columns NULL) never matches. It is the widest rule
+/// in the org, not a rule about nothing, so only org scope reads it.
+///
+/// Filtered in SQL rather than after [`list_alert_rules_for_org`], whose
+/// `LIMIT 500` is applied org-wide: filtering its output would hand a scoped
+/// reader a short list in any org with more rules than that.
+pub async fn list_alert_rules_in_scope(
+    conn: &mut AsyncPgConnection,
+    org_id: Uuid,
+    project_ids: &[Uuid],
+    app_ids: &[Uuid],
+) -> QueryResult<Vec<AlertRule>> {
+    alert_rules::table
+        .filter(alert_rules::org_id.eq(org_id))
+        .filter(
+            alert_rules::app_id
+                .eq_any(app_ids)
+                .or(alert_rules::project_id.eq_any(project_ids)),
+        )
         .order(alert_rules::created_at.desc())
         .limit(500)
         .select(AlertRule::as_select())

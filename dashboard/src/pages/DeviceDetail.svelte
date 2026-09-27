@@ -7,6 +7,7 @@
   import { rowHref, rowNav } from '../lib/utils/row-link';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
+  import ViewSection from '../lib/components/ViewSection.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -22,7 +23,12 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
-  import { getDevice } from '../lib/api/devices';
+  import {
+    getDeviceSummary,
+    getDeviceSessions,
+    getDeviceErrors,
+    getDevicePerf,
+  } from '../lib/api/devices';
   import { relativeTime, formatTimestamp, formatDuration, durationBetween } from '../lib/utils/format';
   import { timeFormatStore } from '../lib/stores/time-format.svelte';
   import {
@@ -33,7 +39,7 @@
   } from '../lib/models/device-detail-sort';
   import { sortRows } from '../lib/models/sort-rows';
   import { toggleSort, type SortDir, type SortState } from '../lib/models/sort';
-  import type { DeviceDetail, ErrorEvent, Session } from '../lib/models';
+  import type { DeviceRow, ErrorEvent, PerfSummaryRow, Session } from '../lib/models';
   import Freshness from '../lib/components/ui/Freshness.svelte';
 
   interface Props {
@@ -51,13 +57,29 @@
   // `revalidating` now IS surfaced: the page grew a RefreshButton, and a
   // refresh that spun nothing while the payload swapped underneath read as the
   // click having done nothing.
-  const view = new CachedView<DeviceDetail>();
+  //
+  // FOUR views. The device row is a keyed lookup; its sessions, its errors and
+  // the p95 aggregate behind the performance table are three separate reads,
+  // and as one payload the slowest of them held the header. Read apart, the
+  // page says what the device IS at once and each card fills in on its own.
+  const view = new CachedView<DeviceRow>();
+  const sessionsView = new CachedView<Session[]>();
+  const errorsView = new CachedView<ErrorEvent[]>();
+  const perfView = new CachedView<PerfSummaryRow[]>();
+  const sections = [view, sessionsView, errorsView, perfView];
 
-  const refresher = pageRefresher(() => view.reload());
+  const refresher = pageRefresher(async () => {
+    await Promise.all(sections.map((v) => v.reload()));
+  });
 
-  const detail = $derived(view.data ?? null);
   const loading = $derived(view.loading);
   const error = $derived(view.error);
+  const revalidating = $derived(
+    view.revalidating ||
+      sessionsView.revalidating ||
+      errorsView.revalidating ||
+      perfView.revalidating,
+  );
 
   // `scopeKey` belongs in the key: it carries the selected environment, which the
   // axios interceptor adds to the request but which appears in none of these
@@ -65,12 +87,32 @@
   //
   // `force` bypasses the fresh-window short-circuit, for a call site that means
   // "go to the network now".
+  //
+  // Started together, settled separately — see the note on the four views.
   async function load(appId: string, key: string, force = false) {
-    await view.load(
-      viewKey('devices.detail', appId, sessionStore.scopeKey, key),
-      () => getDevice(appId, key),
-      force,
-    );
+    const scope = sessionStore.scopeKey;
+    await Promise.allSettled([
+      view.load(
+        viewKey('devices.detail', appId, scope, key),
+        () => getDeviceSummary(appId, key),
+        force,
+      ),
+      sessionsView.load(
+        viewKey('devices.detail.sessions', appId, scope, key),
+        () => getDeviceSessions(appId, key),
+        force,
+      ),
+      errorsView.load(
+        viewKey('devices.detail.errors', appId, scope, key),
+        () => getDeviceErrors(appId, key),
+        force,
+      ),
+      perfView.load(
+        viewKey('devices.detail.perf', appId, scope, key),
+        () => getDevicePerf(appId, key),
+        force,
+      ),
+    ]);
   }
 
   $effect(() => {
@@ -82,7 +124,7 @@
     if (aid && key) void load(aid, key);
   });
 
-  const device = $derived(detail?.device ?? null);
+  const device = $derived(view.data ?? null);
   const title = $derived.by(() => {
     if (!device) return deviceKey;
     const label = [device.family, device.model].filter(Boolean).join(' ').trim();
@@ -114,10 +156,10 @@
   // every later reader and the ordering would survive into the next visit to
   // this device. No runes machinery prevents that — only copying does.
   const sortedSessions = $derived(
-    sortRows(detail?.sessions ?? [], deviceSessionAccessor(sessionSort.key), sessionSort.dir),
+    sortRows(sessionsView.data ?? [], deviceSessionAccessor(sessionSort.key), sessionSort.dir),
   );
   const sortedPerf = $derived(
-    sortRows(detail?.perf ?? [], devicePerfAccessor(perfSort.key), perfSort.dir),
+    sortRows(perfView.data ?? [], devicePerfAccessor(perfSort.key), perfSort.dir),
   );
 
   function onSessionSort(key: string, columnDefault: SortDir) {
@@ -139,52 +181,83 @@
     {t('devices.title')}
   </button>
 
-  {#if loading}
-    <Skeleton rows={6} />
-  {:else if error}
+  <!-- The device ROW decides whether there is a page at all; every card below
+       is a section of a page that exists, and waits and fails on its own. -->
+  {#if !loading && error}
     <EmptyState title={t('device.notFound')} description={error} icon="triangle-alert">
       {#snippet action()}
         <Button variant="secondary" onclick={() => push('/devices')}>{t('device.backToList')}</Button>
       {/snippet}
     </EmptyState>
-  {:else if detail && device}
+  {:else}
+    <!-- The title and the key come from the URL until the row lands, so the
+         heading is on screen before any request returns. -->
     <header class="detail-head">
       <div class="refresh-slot">
-        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-        <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+        <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+        <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
       </div>
       <div class="head-main">
         <h1 class="dev-title">{title}</h1>
         <div class="key-row">
-          <span class="key mono">{device.device_key}</span>
-          <CopyButton value={device.device_key} size="sm" label={t('device.copyKey')} />
+          <span class="key mono">{deviceKey}</span>
+          <CopyButton value={deviceKey} size="sm" label={t('device.copyKey')} />
         </div>
       </div>
     </header>
 
+    <!-- The first tile counts the sessions list; the other four read the row. -->
     <StatTiles min={150}>
-      <StatTile label={t('explore.column.sessions')} value={formatNumber(detail.sessions.length)} />
-      <StatTile label={t('explore.column.events')} value={formatNumber(device.events_count)} />
+      <StatTile
+        label={t('explore.column.sessions')}
+        value={sessionsView.data ? formatNumber(sessionsView.data.length) : '—'}
+        loading={sessionsView.loading && !sessionsView.hasData}
+      />
+      <StatTile
+        label={t('explore.column.events')}
+        value={formatNumber(device?.events_count ?? 0)}
+        loading={!device}
+      />
       <StatTile
         label={t('explore.column.errors')}
-        value={formatNumber(device.errors_count)}
-        tone={device.errors_count > 0 ? 'error' : 'neutral'}
+        value={formatNumber(device?.errors_count ?? 0)}
+        tone={(device?.errors_count ?? 0) > 0 ? 'error' : 'neutral'}
+        loading={!device}
       />
       <StatTile
         label={t('explore.column.firstSeen')}
-        value={timeFormatStore.mode === 'relative' ? relativeTime(device.first_seen) : formatTimestamp(device.first_seen)}
-        sub={timeFormatStore.mode === 'relative' ? formatTimestamp(device.first_seen) : relativeTime(device.first_seen)}
+        loading={!device}
+        value={!device
+          ? ''
+          : timeFormatStore.mode === 'relative'
+            ? relativeTime(device.first_seen)
+            : formatTimestamp(device.first_seen)}
+        sub={!device
+          ? undefined
+          : timeFormatStore.mode === 'relative'
+            ? formatTimestamp(device.first_seen)
+            : relativeTime(device.first_seen)}
       />
       <StatTile
         label={t('explore.column.lastSeen')}
-        value={timeFormatStore.mode === 'relative' ? relativeTime(device.last_seen) : formatTimestamp(device.last_seen)}
-        sub={timeFormatStore.mode === 'relative' ? formatTimestamp(device.last_seen) : relativeTime(device.last_seen)}
+        loading={!device}
+        value={!device
+          ? ''
+          : timeFormatStore.mode === 'relative'
+            ? relativeTime(device.last_seen)
+            : formatTimestamp(device.last_seen)}
+        sub={!device
+          ? undefined
+          : timeFormatStore.mode === 'relative'
+            ? formatTimestamp(device.last_seen)
+            : relativeTime(device.last_seen)}
       />
     </StatTiles>
 
     <div class="grid">
       <div class="col-main">
         <Card title={t('device.card.sessions')} padding="none">
+          <ViewSection view={sessionsView} rows={5} padded>
           {#if sortedSessions.length === 0}
             <p class="empty-note muted">{t('device.empty.sessions')}</p>
           {:else}
@@ -230,9 +303,11 @@
               {/each}
             </DataTable>
           {/if}
+          </ViewSection>
         </Card>
 
         <Card title={t('device.card.performance')} padding="none">
+          <ViewSection view={perfView} rows={5} padded>
           {#if sortedPerf.length === 0}
             <p class="empty-note muted">{t('device.empty.performance')}</p>
           {:else}
@@ -261,11 +336,15 @@
               {/each}
             </DataTable>
           {/if}
+          </ViewSection>
         </Card>
       </div>
 
       <aside class="col-side">
         <Card title={t('device.card.hardware')}>
+          {#if !device}
+            <Skeleton rows={7} />
+          {:else}
           <dl class="kv">
             <div class="kv-row"><dt>{t('device.field.family')}</dt><dd>{device.family ?? '—'}</dd></div>
             <div class="kv-row"><dt>{t('device.field.model')}</dt><dd>{device.model ?? '—'}</dd></div>
@@ -289,14 +368,16 @@
               </dd>
             </div>
           </dl>
+          {/if}
         </Card>
 
         <Card title={t('device.card.crashes')}>
-          {#if detail.errors.length === 0}
+          <ViewSection view={errorsView} rows={4}>
+          {#if (errorsView.data ?? []).length === 0}
             <p class="empty-note muted">{t('device.empty.crashes')}</p>
           {:else}
             <ul class="crashes">
-              {#each detail.errors as e (e.id)}
+              {#each errorsView.data ?? [] as e (e.id)}
                 <li>
                   <a class="crash" href={`#/issues/${e.issue_id}`}>
                     <div class="crash-top">
@@ -309,6 +390,7 @@
               {/each}
             </ul>
           {/if}
+          </ViewSection>
         </Card>
       </aside>
     </div>

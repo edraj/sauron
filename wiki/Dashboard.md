@@ -316,6 +316,29 @@ The **Environment filter** is offered on every rule. A **Level filter** appears
 on the four issue and error triggers, and a **Search filter** on the two that
 count error events — `Error count crosses threshold` and `Error spike`.
 
+#### Who can see the page
+
+Reading follows the grant; changing anything needs the whole organization.
+
+| `alert:read` held on | Rules shown | Channels shown | History shown |
+| --- | --- | --- | --- |
+| the organization | every rule | every channel | rules whose data you can read |
+| a project | rules narrowed to that project or to an app in it | the channels those rules deliver to | the same rules, where you can also read their data |
+| an app | rules narrowed to that app | the channels those rules deliver to | the same rules, where you can also read their data |
+| an environment | none — the page stays locked | — | — |
+
+Two things follow from that table. An un-narrowed rule covers every app in the
+organization, so only an organization-level grant shows it. And history has a
+second condition whatever the scope: an alert's title repeats the issue title or
+the probed monitor target, so a row is served only to a member who can read that
+signal directly (`issue:read`, `event:read` or `monitor:read`, depending on the
+trigger).
+
+Creating, editing and deleting rules and channels needs `alert:write` **on the
+organization**. A member holding it on a project sees the controls locked, and
+the lock says so: *Requires: Create and edit alert rules and channels
+(alert:write) at organization level*.
+
 #### The search filter
 
 The Search filter is the same query language as the Exceptions page — see

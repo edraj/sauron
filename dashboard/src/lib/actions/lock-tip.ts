@@ -1,5 +1,4 @@
-import type { Permission } from '../models';
-import { lockTitle } from '../models/page-access';
+import { lockTitle, type LockReason } from '../models/page-access';
 
 /**
  * Marks a control as locked by a missing permission: announces it, explains it,
@@ -29,7 +28,7 @@ import { lockTitle } from '../models/page-access';
  * Pass `null` when the user may act: the action then does nothing at all, so a
  * call site passes its lock straight through with no ternary.
  */
-export function lockTip(node: HTMLElement, reason: Permission | null) {
+export function lockTip(node: HTMLElement, reason: LockReason | null) {
   let bubble: HTMLDivElement | null = null;
   let current = reason;
 
@@ -94,7 +93,7 @@ export function lockTip(node: HTMLElement, reason: Permission | null) {
     e.stopImmediatePropagation();
   }
 
-  function apply(next: Permission | null): void {
+  function apply(next: LockReason | null): void {
     current = next;
     if (next) {
       node.setAttribute('aria-disabled', 'true');
@@ -114,7 +113,7 @@ export function lockTip(node: HTMLElement, reason: Permission | null) {
   node.addEventListener('blur', hide);
 
   return {
-    update(next: Permission | null) {
+    update(next: LockReason | null) {
       apply(next);
     },
     destroy() {

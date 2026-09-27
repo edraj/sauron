@@ -3,7 +3,6 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { push } from 'svelte-spa-router';
-  import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
@@ -133,15 +132,17 @@
     {t('screens.title')}
   </button>
 
-  {#if loading && !detail}
-    <Skeleton rows={6} />
-  {:else if error}
+  <!-- Only the stat tiles wait on the stats request. The heading is the name
+       in the URL, and the four lists below fetch on demand and never depended
+       on it — so neither is held behind it any more. -->
+  {#if error && !(loading && !detail)}
     <EmptyState title={t('screen.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
         <Button variant="secondary" onclick={() => push('/screens')}>{t('screen.backToList')}</Button>
       {/snippet}
     </EmptyState>
-  {:else if detail}
+  {:else if loading || detail}
+    {@const stats = detail?.stats}
     <div class="screen-head">
       <h1 class="page-title mono screen-title">{screenName}</h1>
       <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
@@ -149,16 +150,38 @@
     </div>
 
     <StatTiles min={150}>
-      <StatTile label={t('screens.column.views')} value={compactNumber(detail.stats.views)} tone="primary" />
-      <StatTile label={t('users.title')} value={compactNumber(detail.stats.users)} />
-      <StatTile label={t('explore.column.events')} value={compactNumber(detail.stats.events)} />
+      <StatTile
+        label={t('screens.column.views')}
+        value={stats ? compactNumber(stats.views) : ''}
+        tone="primary"
+        loading={!stats}
+      />
+      <StatTile
+        label={t('users.title')}
+        value={stats ? compactNumber(stats.users) : ''}
+        loading={!stats}
+      />
+      <StatTile
+        label={t('explore.column.events')}
+        value={stats ? compactNumber(stats.events) : ''}
+        loading={!stats}
+      />
       <StatTile
         label={t('screens.column.exceptions')}
-        value={compactNumber(detail.stats.exceptions)}
-        tone={detail.stats.exceptions > 0 ? 'error' : 'neutral'}
+        value={stats ? compactNumber(stats.exceptions) : ''}
+        tone={stats && stats.exceptions > 0 ? 'error' : 'neutral'}
+        loading={!stats}
       />
-      <StatTile label={t('screens.column.avgDwell')} value={formatDuration(detail.stats.avg_dwell_ms)} />
-      <StatTile label={t('screen.stat.totalDwell')} value={formatDuration(detail.stats.total_dwell_ms)} />
+      <StatTile
+        label={t('screens.column.avgDwell')}
+        value={stats ? formatDuration(stats.avg_dwell_ms) : ''}
+        loading={!stats}
+      />
+      <StatTile
+        label={t('screen.stat.totalDwell')}
+        value={stats ? formatDuration(stats.total_dwell_ms) : ''}
+        loading={!stats}
+      />
     </StatTiles>
 
     {#key sectionKey}

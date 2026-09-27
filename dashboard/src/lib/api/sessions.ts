@@ -3,7 +3,7 @@ import { lastDays, toParams, type DateRangeValue } from '../models/date-range';
 /** The window this read defaults to when a caller passes none — unchanged. */
 const DEFAULT_WINDOW: DateRangeValue = lastDays(30);
 
-import type { Session, SessionDetail, SessionsAnalytics } from '../models';
+import type { Session, SessionsAnalytics, TimelineItem } from '../models';
 import type { SearchParams, SearchEnvelope } from './search';
 
 export interface ListSessionsParams extends SearchParams {
@@ -65,11 +65,27 @@ export async function listSessions(
   return data;
 }
 
-export async function getSession(appId: string, sessionId: string): Promise<SessionDetail> {
-  const { data } = await api.get<SessionDetail>(
-    `/v1/apps/${appId}/sessions/${encodeURIComponent(sessionId)}`,
+// Two sections rather than the composite `GET …/sessions/{id}` — see the note
+// on `getIssueSummary` (api/issues.ts). The split is starkest here: the session
+// row is one keyed lookup, the timeline up to 1,500 rows plus symbolication.
+
+/** The session row alone — what the header, the stat tiles and Context render. */
+export async function getSessionSummary(appId: string, sessionId: string): Promise<Session> {
+  const { data } = await api.get<{ session: Session }>(
+    `/v1/apps/${appId}/sessions/${encodeURIComponent(sessionId)}/summary`,
   );
-  return data;
+  return data.session;
+}
+
+/** The session's events, errors and transactions, in time order. */
+export async function getSessionTimeline(
+  appId: string,
+  sessionId: string,
+): Promise<TimelineItem[]> {
+  const { data } = await api.get<{ timeline: TimelineItem[] }>(
+    `/v1/apps/${appId}/sessions/${encodeURIComponent(sessionId)}/timeline`,
+  );
+  return data.timeline;
 }
 
 export async function getSessionAnalytics(

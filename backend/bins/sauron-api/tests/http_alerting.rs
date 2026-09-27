@@ -2236,3 +2236,495 @@ async fn deleting_a_monitor_discloses_and_cascades_its_pinned_alert_rule() {
 
     server.shutdown().await;
 }
+
+// --- scoped alert:read ------------------------------------------------------
+//
+// Reads used to be org-only: `list_rules`, `list_channels` and `list_history`
+// all called `authorize_org`, so a member granted `alert:read` on one project
+// or app — a grant the scope tree happily creates — got 403 from every one of
+// them and a locked Alerts page. They now see the slice their grant covers.
+//
+// What must NOT change: an org-scoped reader still sees everything; writes stay
+// org-only; and history keeps its second gate (read access to the rule's
+// target), so `alert:read` on a project never serves an issue title on its own.
+
+/// Mint a user holding exactly the given `(permissions, scope_type, scope_id)`
+/// grants — no org-scoped alerting role, unlike [`user_with_read_at`].
+async fn user_with_grants(
+    server: &TestServer,
+    org_id: Uuid,
+    label: &str,
+    grants: &[(&[&str], &str, Uuid)],
+) -> String {
+    let mut conn = server.conn().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let email = format!("{label}-{suffix}@example.com");
+    let hash = sauron_auth::hash_password(PASSWORD).expect("hash password");
+    let user = repo::create_user(&mut conn, &email, &hash, label)
+        .await
+        .expect("create user");
+    for (i, (perms, scope_type, scope_id)) in grants.iter().enumerate() {
+        let role = repo::create_role(
+            &mut conn,
+            org_id,
+            &format!("{label} role {i} {suffix}"),
+            "scoped test role",
+            json!(perms),
+        )
+        .await
+        .expect("create role");
+        repo::create_grant(
+            &mut conn,
+            NewRoleGrant {
+                org_id,
+                user_id: user.id,
+                role_id: role.id,
+                scope_type: scope_type.to_string(),
+                scope_id: *scope_id,
+            },
+        )
+        .await
+        .expect("create grant");
+    }
+    drop(conn);
+    server.login(&email, PASSWORD).await
+}
+
+/// Four rules spanning every narrowing, each with its own channel, plus one
+/// channel nothing uses.
+struct ScopedFixture {
+    fx: Fixture,
+    rule_project_a: String,
+    rule_app_a: String,
+    rule_project_b: String,
+    rule_org: String,
+    ch_project_a: Uuid,
+    ch_app_a: Uuid,
+    ch_project_b: Uuid,
+    ch_org: Uuid,
+    ch_unused: Uuid,
+}
+
+async fn seed_scoped(server: &TestServer, label: &str) -> ScopedFixture {
+    let fx = seed(server, label).await;
+    let mut channels = Vec::new();
+    for name in [
+        "ch-project-a",
+        "ch-app-a",
+        "ch-project-b",
+        "ch-org",
+        "ch-unused",
+    ] {
+        channels.push(
+            create_channel(
+                server,
+                &fx,
+                json!({
+                    "name": name,
+                    "kind": "telegram",
+                    "config": { "chat_id": format!("chat-{name}") },
+                    "secret": { "bot_token": "123456:TELEGRAM_TOKEN_DO_NOT_LEAK" },
+                }),
+            )
+            .await,
+        );
+    }
+    let rule_project_a = create_rule_as_owner(
+        server,
+        &fx,
+        json!({ "name": "rule-project-a", "trigger_type": "issue_new",
+                "project_id": fx.project_a, "channel_ids": [channels[0]] }),
+    )
+    .await;
+    let rule_app_a = create_rule_as_owner(
+        server,
+        &fx,
+        json!({ "name": "rule-app-a", "trigger_type": "issue_new",
+                "app_id": fx.app_a, "channel_ids": [channels[1]] }),
+    )
+    .await;
+    let rule_project_b = create_rule_as_owner(
+        server,
+        &fx,
+        json!({ "name": "rule-project-b", "trigger_type": "issue_new",
+                "project_id": fx.project_b, "channel_ids": [channels[2]] }),
+    )
+    .await;
+    let rule_org = create_rule_as_owner(
+        server,
+        &fx,
+        json!({ "name": "rule-org", "trigger_type": "issue_new",
+                "channel_ids": [channels[3]] }),
+    )
+    .await;
+    ScopedFixture {
+        fx,
+        rule_project_a,
+        rule_app_a,
+        rule_project_b,
+        rule_org,
+        ch_project_a: channels[0],
+        ch_app_a: channels[1],
+        ch_project_b: channels[2],
+        ch_org: channels[3],
+        ch_unused: channels[4],
+    }
+}
+
+/// The `name` of every object in a list response, sorted.
+async fn listed_names(server: &TestServer, path: &str, token: &str) -> Vec<String> {
+    let (status, text, v) = server.get_raw(path, token).await;
+    assert_eq!(status, 200, "GET {path}: {text}");
+    let mut names: Vec<String> = v
+        .as_array()
+        .unwrap_or_else(|| panic!("GET {path} is not an array: {text}"))
+        .iter()
+        .map(|r| r["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn a_project_scoped_alert_reader_sees_only_the_rules_in_that_project() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let s = seed_scoped(&server, "scoped-project").await;
+    let org = s.fx.org_id;
+    let token = user_with_grants(
+        &server,
+        org,
+        "project-reader",
+        &[(&[perm::ALERT_READ], "project", s.fx.project_a)],
+    )
+    .await;
+
+    // The project-wide rule AND the rule narrowed to an app inside the project:
+    // a project grant cascades to its apps everywhere else in the product.
+    assert_eq!(
+        listed_names(&server, &format!("/v1/orgs/{org}/alert-rules"), &token).await,
+        vec!["rule-app-a", "rule-project-a"],
+    );
+
+    for (rule, expected) in [
+        (&s.rule_project_a, 200),
+        (&s.rule_app_a, 200),
+        (&s.rule_project_b, 403),
+        // The un-narrowed rule is the WIDEST rule, not a rule about nothing.
+        (&s.rule_org, 403),
+    ] {
+        let (status, text, _) = server
+            .get_raw(&format!("/v1/alert-rules/{rule}"), &token)
+            .await;
+        assert_eq!(status, expected, "GET rule {rule}: {text}");
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_app_scoped_alert_reader_sees_only_rules_narrowed_to_that_app() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let s = seed_scoped(&server, "scoped-app").await;
+    let org = s.fx.org_id;
+    let token = user_with_grants(
+        &server,
+        org,
+        "app-reader",
+        &[(&[perm::ALERT_READ], "app", s.fx.app_a)],
+    )
+    .await;
+
+    // NOT the project-wide rule: it covers sibling apps this member has no
+    // grant on, so it is wider than what they hold.
+    assert_eq!(
+        listed_names(&server, &format!("/v1/orgs/{org}/alert-rules"), &token).await,
+        vec!["rule-app-a"],
+    );
+    let (status, text, _) = server
+        .get_raw(&format!("/v1/alert-rules/{}", s.rule_project_a), &token)
+        .await;
+    assert_eq!(status, 403, "project-wide rule: {text}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_scoped_alert_reader_sees_only_the_channels_their_rules_deliver_to() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let s = seed_scoped(&server, "scoped-channels").await;
+    let org = s.fx.org_id;
+    let token = user_with_grants(
+        &server,
+        org,
+        "channel-reader",
+        &[(&[perm::ALERT_READ], "project", s.fx.project_a)],
+    )
+    .await;
+
+    let path = format!("/v1/orgs/{org}/notification-channels");
+    assert_eq!(
+        listed_names(&server, &path, &token).await,
+        vec!["ch-app-a", "ch-project-a"],
+        "channels are org-wide objects: a scoped reader gets the ones their own \
+         rules use, never the org's whole destination list"
+    );
+    let (_, text, _) = server.get_raw(&path, &token).await;
+    assert!(
+        !text.contains("TELEGRAM_TOKEN_DO_NOT_LEAK"),
+        "secrets stay redacted for a scoped reader too: {text}"
+    );
+
+    for (channel, expected) in [
+        (s.ch_project_a, 200),
+        (s.ch_app_a, 200),
+        (s.ch_project_b, 403),
+        (s.ch_org, 403),
+        (s.ch_unused, 403),
+    ] {
+        let (status, text, _) = server
+            .get_raw(&format!("/v1/notification-channels/{channel}"), &token)
+            .await;
+        assert_eq!(status, expected, "GET channel {channel}: {text}");
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn scoped_history_needs_both_the_alert_grant_and_read_on_the_target() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let s = seed_scoped(&server, "scoped-history").await;
+    let org = s.fx.org_id;
+    for (rule, title) in [
+        (&s.rule_project_a, "A: boom"),
+        (&s.rule_project_b, "B: secret boom"),
+        (&s.rule_org, "org: secret boom"),
+    ] {
+        seed_history(
+            &server,
+            org,
+            Some(rule.parse().expect("rule id")),
+            "issue_new",
+            title,
+        )
+        .await;
+    }
+    seed_history(&server, org, None, "issue_new", "orphan: secret boom").await;
+
+    // alert:read + issue:read, both on project A.
+    let reader = user_with_grants(
+        &server,
+        org,
+        "history-reader",
+        &[(
+            &[perm::ALERT_READ, perm::ISSUE_READ],
+            "project",
+            s.fx.project_a,
+        )],
+    )
+    .await;
+    assert_eq!(
+        history_titles(&server, org, &reader).await,
+        vec!["A: boom".to_string()],
+    );
+
+    // alert:read on project A, but issue:read ORG-wide. The wide read grant
+    // must not widen the alerting grant: rules outside project A — and orphans,
+    // which belong to no project at all — stay out of reach.
+    let wide_reader = user_with_grants(
+        &server,
+        org,
+        "history-wide-reader",
+        &[
+            (&[perm::ALERT_READ], "project", s.fx.project_a),
+            (&[perm::ISSUE_READ], "org", org),
+        ],
+    )
+    .await;
+    assert_eq!(
+        history_titles(&server, org, &wide_reader).await,
+        vec!["A: boom".to_string()],
+    );
+
+    // alert:read alone: the page opens, and no issue title is served.
+    let blind = user_with_grants(
+        &server,
+        org,
+        "history-blind",
+        &[(&[perm::ALERT_READ], "project", s.fx.project_a)],
+    )
+    .await;
+    assert_eq!(
+        history_titles(&server, org, &blind).await,
+        Vec::<String>::new()
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_org_scoped_alert_reader_still_sees_every_rule_and_channel() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let s = seed_scoped(&server, "scoped-org").await;
+    let org = s.fx.org_id;
+    let token = user_with_grants(
+        &server,
+        org,
+        "org-reader",
+        &[(&[perm::ALERT_READ], "org", org)],
+    )
+    .await;
+
+    assert_eq!(
+        listed_names(&server, &format!("/v1/orgs/{org}/alert-rules"), &token).await,
+        vec!["rule-app-a", "rule-org", "rule-project-a", "rule-project-b"],
+    );
+    assert_eq!(
+        listed_names(
+            &server,
+            &format!("/v1/orgs/{org}/notification-channels"),
+            &token
+        )
+        .await,
+        vec![
+            "ch-app-a",
+            "ch-org",
+            "ch-project-a",
+            "ch-project-b",
+            "ch-unused"
+        ],
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn alert_reads_are_still_refused_without_a_usable_alert_grant() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let s = seed_scoped(&server, "scoped-denied").await;
+    let org = s.fx.org_id;
+
+    // Reads telemetry, holds no alerting permission at all.
+    let no_alerts = user_with_grants(
+        &server,
+        org,
+        "no-alerts",
+        &[(&[perm::ISSUE_READ], "org", org)],
+    )
+    .await;
+
+    // Holds alert:read, but on an ENVIRONMENT. Rules narrow by project and app
+    // and have no environment dimension, so an environment grant covers no
+    // rule. `role_grants.scope_id` carries no foreign key, so any id stands in
+    // for an enrollment here — what is under test is the scope TYPE.
+    let env_alerts = user_with_grants(
+        &server,
+        org,
+        "env-alerts",
+        &[(&[perm::ALERT_READ], "env", Uuid::new_v4())],
+    )
+    .await;
+    let callers = [
+        ("no alert grant", no_alerts),
+        ("environment-scoped alert grant", env_alerts),
+    ];
+
+    for (who, token) in &callers {
+        for path in [
+            format!("/v1/orgs/{org}/alert-rules"),
+            format!("/v1/orgs/{org}/notification-channels"),
+            format!("/v1/orgs/{org}/alert-events"),
+            format!("/v1/alert-rules/{}", s.rule_project_a),
+            format!("/v1/notification-channels/{}", s.ch_project_a),
+        ] {
+            let (status, text, _) = server.get_raw(&path, token).await;
+            assert_eq!(status, 403, "{who}: GET {path}: {text}");
+        }
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn alert_writes_stay_org_scoped() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let s = seed_scoped(&server, "scoped-writes").await;
+    let org = s.fx.org_id;
+    // Everything a scoped member could plausibly hold — on project A only.
+    let token = user_with_grants(
+        &server,
+        org,
+        "project-writer",
+        &[(
+            &[
+                perm::ALERT_READ,
+                perm::ALERT_WRITE,
+                perm::ISSUE_READ,
+                perm::EVENT_READ,
+            ],
+            "project",
+            s.fx.project_a,
+        )],
+    )
+    .await;
+    let before = rule_count(&server, org).await;
+
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{org}/alert-rules"),
+            Some(&token),
+            json!({ "name": "mine", "trigger_type": "issue_new", "project_id": s.fx.project_a }),
+        )
+        .await;
+    assert_eq!(status, 403, "create rule: {text}");
+
+    let (status, text, _) = server
+        .patch_raw(
+            &format!("/v1/alert-rules/{}", s.rule_project_a),
+            &token,
+            json!({ "enabled": false }),
+        )
+        .await;
+    assert_eq!(status, 403, "edit a rule they can read: {text}");
+
+    let (status, text, _) = server
+        .delete_raw(&format!("/v1/alert-rules/{}", s.rule_project_a), &token)
+        .await;
+    assert_eq!(status, 403, "delete a rule they can read: {text}");
+
+    let (status, text, _) = server
+        .patch_raw(
+            &format!("/v1/notification-channels/{}", s.ch_project_a),
+            &token,
+            json!({ "name": "renamed" }),
+        )
+        .await;
+    assert_eq!(status, 403, "edit a channel they can read: {text}");
+
+    let (status, text, _) = server
+        .post_raw(
+            &format!("/v1/orgs/{org}/notification-channels"),
+            Some(&token),
+            json!({ "name": "mine", "kind": "telegram", "config": { "chat_id": "1" },
+                    "secret": { "bot_token": "1:x" } }),
+        )
+        .await;
+    assert_eq!(status, 403, "create channel: {text}");
+
+    assert_eq!(rule_count(&server, org).await, before);
+    server.shutdown().await;
+}

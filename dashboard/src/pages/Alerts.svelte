@@ -100,8 +100,10 @@
   let notice = $state<string | null>(null);
 
   const orgId = $derived(sessionStore.currentOrgId);
-  // notifications.rs:113,187,260,272,443,522,580 all use `authorize_org`, so a
-  // project- or app-scoped `alert:write` grant cannot satisfy any of them.
+  // Every WRITE in notifications.rs uses `authorize_org`, so a project- or
+  // app-scoped `alert:write` grant cannot satisfy any of them. Reads are
+  // different: they follow the member's reach (`alert_read_reach`), which is
+  // why a scoped member can open this page and finds these controls locked.
   const writeLock = $derived(lockedBy('alert:write', { level: 'org' }));
   // The Alerts page has no project selector of its own — it reuses the
   // session's, same as Monitors.svelte. Monitor pinning is unavailable

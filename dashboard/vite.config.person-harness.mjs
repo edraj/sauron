@@ -18,7 +18,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
  * matches the import specifier before resolution, so it silently misses the
  * relative imports and the real client goes to the :8090 pin in the committed
  * `static/config.js`. Answering the request instead keeps axios, the
- * interceptors, `CachedView`, `getPerson` and the whole page as the real code,
+ * interceptors, `CachedView`, the API client and the whole page as the real code,
  * with only the server on the far end canned.
  */
 const ORG = { id: 'org1', name: 'Harness Org', slug: 'harness', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' };
@@ -92,6 +92,30 @@ const EMPTY_PROFILE = (distinctId) => ({
   errors: [],
 });
 
+/**
+ * `?slow=<ms>` on the PAGE url holds the heavy section back by that long.
+ *
+ * Read off the request's `Referer`, because the page's own query string never
+ * reaches an API call. It is what makes progressive rendering checkable at
+ * all: against a local stub every section answers in a millisecond and the
+ * skeletons are on screen for one frame, so "the header paints before the
+ * timeline" cannot be told from "the page paints at once".
+ */
+function slowMs(req) {
+  try {
+    const ms = Number(new URL(req.headers.referer ?? '').searchParams.get('slow'));
+    return Number.isFinite(ms) && ms > 0 ? Math.min(ms, 30000) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Answer after `ms`. The light section never waits; only a heavy one does. */
+function later(ms, fn) {
+  if (ms > 0) setTimeout(fn, ms);
+  else fn();
+}
+
 function json(res, body) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'no-store');
@@ -132,10 +156,20 @@ function stubApi() {
         if (path === '/v1/projects/proj1/apps') return json(res, [APP]);
         if (path === '/v1/apps/app1/environments') return json(res, []);
 
-        const person = path?.match(/^\/v1\/apps\/app1\/persons\/(.+)$/);
+        // The page reads two sections, not the composite: the profile row, and
+        // the timeline — see `getPersonSummary` in `lib/api/persons.ts`.
+        const person = path?.match(/^\/v1\/apps\/app1\/persons\/(.+)\/(summary|timeline)$/);
         if (person) {
           const distinctId = decodeURIComponent(person[1]);
-          return json(res, distinctId.startsWith('quiet') ? EMPTY_PROFILE(distinctId) : personProfile(distinctId));
+          const profile = distinctId.startsWith('quiet')
+            ? EMPTY_PROFILE(distinctId)
+            : personProfile(distinctId);
+          if (person[2] === 'summary') {
+            return json(res, { distinct_id: profile.distinct_id, user: profile.user });
+          }
+          return later(slowMs(req), () =>
+            json(res, { events: profile.events, errors: profile.errors }),
+          );
         }
 
         // Anything else the shell asks for on boot. Logged rather than silently
