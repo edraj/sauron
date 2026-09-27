@@ -2,6 +2,49 @@
 
 All notable changes to `@edraj/sauron-browser` are documented here.
 
+## 1.8.0
+
+### Added
+
+- **Script-tag builds.** Two self-contained files for pages with no bundler —
+  a Google Tag Manager Custom HTML tag, a CMS footer — each defining one
+  global, `window.Sauron`, with the same API as the module:
+
+  - `dist/sauron.min.js`: ES2020, minified, with a source map. jsDelivr and
+    unpkg serve it for the bare package URL, so
+    `https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.8.0` is a working
+    `<script src>`.
+  - `dist/sauron.es5.min.js`: ES5 syntax, for pasting inline into a host that
+    rejects anything newer, such as a GTM Custom HTML tag. This is ES5 syntax,
+    not an ES5 runtime: it still needs `Promise`, `fetch`, `URL`,
+    `TextEncoder` and `globalThis`, so Internet Explorer is still unsupported.
+
+  `Sauron` is the only global either file creates. Loading a file twice (a tag
+  that fires on every history change) keeps the first copy, and calling
+  `init()` on it again re-initializes cleanly. The gzip fallback is bundled
+  as `gzipSync` alone, not all of `fflate`, which halves the file.
+  See "Script tag & Google Tag Manager" in the README.
+
+- **A GTM loader that queues calls made before the file loads.** The README's
+  loader snippet puts a stand-in `window.Sauron` in place and loads
+  `dist/sauron.min.js` asynchronously. Any tag that fires after it can call
+  `Sauron.track(...)` and the rest straight away: calls made before the file
+  arrives are queued in `Sauron.q` and replayed when it loads, `init()` first
+  and then the rest in the order they were made. A queued call that throws is
+  re-thrown asynchronously, so it still shows up as an uncaught error, and the
+  calls behind it still run. Before the file loads, calls return `undefined`,
+  the getters (`getScreen`, `getWorkflow`, `getClient`) don't exist yet, and
+  anything queued is timestamped when it replays.
+
+  The loader also queues the page's uncaught errors and unhandled rejections
+  from the moment the tag runs until the file arrives, up to 100 queue
+  entries. They are reported on load through the same code path as the SDK's
+  own `window.onerror` / `onunhandledrejection` handlers (same mechanism,
+  `handled: false`), and the loader stops listening once those handlers are
+  installed, so an error is never reported twice.
+
+The ESM/CJS entry points are unchanged.
+
 ## 1.7.0
 
 ### Changed

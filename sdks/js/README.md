@@ -14,7 +14,9 @@ process — an API server, a worker, a CLI — use the server SDK
 - Batches, gzips, retries with jitter, and parks failed envelopes in a
   `localStorage` queue that drains on the next page load or `online` event.
 - One runtime dependency (`fflate`, lazily imported only as a gzip fallback).
-- Ships ESM + CJS + type declarations, `sideEffects: false`, tree-shakeable.
+- Ships ESM + CJS + type declarations, `sideEffects: false`, tree-shakeable —
+  plus a `<script>` build that defines `window.Sauron`, and an ES5 variant of it
+  for Google Tag Manager.
 
 ## Install
 
@@ -24,6 +26,8 @@ npm install @edraj/sauron-browser
 
 Node >= 18 is required for the build/test tooling (`engines.node`). The shipped
 bundle targets ES2020 and needs no polyfills in evergreen browsers.
+
+No bundler? See [Script tag & Google Tag Manager](#script-tag--google-tag-manager).
 
 ## Quick start
 
@@ -51,15 +55,145 @@ await Sauron.flush(2000);
 Uncaught errors and unhandled rejections need no code at all — `init()` installs
 the global handlers.
 
+## Script tag & Google Tag Manager
+
+For a page with no build step, such as a Google Tag Manager Custom HTML tag or a
+CMS footer, the package ships two self-contained files. Each defines one global,
+`window.Sauron`, holding everything the module exports (`Sauron.init`,
+`Sauron.track`, `Sauron.captureException`, …, `Sauron.SDK_VERSION`):
+
+| File | Syntax | For |
+| --- | --- | --- |
+| `dist/sauron.min.js` | ES2020 | Loading from a CDN with `<script src>`. |
+| `dist/sauron.es5.min.js` | ES5 | Pasting inline into a host that only accepts ES5. GTM Custom HTML tags reject arrow functions, classes and `const`. |
+
+**From the CDN.** jsDelivr and unpkg serve every published version:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.8.0/dist/sauron.min.js"></script>
+<script>
+  Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42', release: 'web@1.4.2' });
+</script>
+```
+
+Pin the exact version. An exact-version URL never changes, while `@1` moves to
+each new release the next time the CDN refreshes it.
+
+To make the browser refuse a file that was altered on the CDN, add Subresource
+Integrity: `integrity="sha384-…"` and `crossorigin="anonymous"` on the tag (in
+the GTM snippet below, `script.integrity` and `script.crossOrigin`). It needs an
+exact-version URL. Get the hash of a published file with:
+
+```bash
+curl -s https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.8.0/dist/sauron.min.js | openssl dgst -sha384 -binary | openssl base64 -A
+```
+
+**In Google Tag Manager**, create a Custom HTML tag fired by the
+*Initialization - All Pages* trigger: once per page, as early as GTM allows
+(errors thrown before the tag runs are not captured). Either load the CDN file
+from it with this loader:
+
+<!-- test/global-bundle.test.ts runs this snippet against the built file. -->
+```html
+<script>
+  (function (w, d, src, options) {
+    var s = w.Sauron;
+    if (!s) {
+      // A stand-in until the file loads: each call is queued in s.q, and the
+      // SDK replays the queue when it arrives.
+      s = w.Sauron = { q: [] };
+      ('init captureException captureMessage track trackTransaction identify ' +
+        'addBreadcrumb setUser reset setTag setTags setContext setExtra ' +
+        'setScreen startWorkflow endWorkflow cancelWorkflow flush close')
+        .split(' ')
+        .forEach(function (name) {
+          s[name] = function () {
+            s.q.push([name, Array.prototype.slice.call(arguments)]);
+          };
+        });
+      // Uncaught errors and unhandled rejections are queued too (up to 100
+      // entries), until the SDK's own handlers take over.
+      var onError = function (event) {
+        if (w.Sauron !== s) {
+          w.removeEventListener('error', onError);
+          w.removeEventListener('unhandledrejection', onError);
+        } else if (s.q.length < 100) {
+          s.q.push(['$' + event.type, [event]]);
+        }
+      };
+      w.addEventListener('error', onError);
+      w.addEventListener('unhandledrejection', onError);
+      var script = d.createElement('script');
+      script.async = true;
+      script.src = src;
+      d.head.appendChild(script);
+    }
+    s.init(options);
+  })(window, document, 'https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.8.0/dist/sauron.min.js', {
+    dsn: 'https://pk_test@ingest.example.com/42',
+    release: 'web@1.4.2'
+  });
+</script>
+```
+
+GTM only checks the code inside the tag, which is ES5 here. The file it loads
+can be ES2020.
+
+Or, with no CDN, paste the whole of `dist/sauron.es5.min.js` into the tag:
+
+```html
+<script>
+  /* paste the contents of dist/sauron.es5.min.js here */
+</script>
+<script>
+  Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42', release: 'web@1.4.2' });
+</script>
+```
+
+The pasted file counts against the container's size limit (GTM caps a container
+at 200 KB). The loader tag is about 1.5 KB.
+
+**Calling it from other tags.** Any tag that fires after the Sauron tag can call
+the SDK directly:
+
+```html
+<script>
+  Sauron.track('purchase', { value: {{Order Value}} });
+</script>
+```
+
+With the loader, a call made before the file has arrived is queued and replayed
+when it loads: `init()` first, then the rest in the order they were made. Until
+then, those calls return `undefined` (no `flush()` promise, no
+`startWorkflow()` result), and `getScreen()`, `getWorkflow()` and `getClient()`
+do not exist yet.
+
+The loader also queues the page's uncaught errors and unhandled rejections,
+from the moment the tag runs until the file arrives (up to 100 queue entries).
+The SDK reports them when it loads, as its own handlers would have, and its
+handlers take over from there.
+
+Anything queued is timestamped when it replays, not when it happened. A tag
+that fires before the Sauron tag, such as a *Consent Initialization* tag, finds
+no `window.Sauron` at all, so guard it: `if (window.Sauron) …`.
+
+- The ES5 file is ES5 *syntax*, not an ES5 runtime. It still needs `Promise`,
+  `fetch`, `URL`, `TextEncoder` and `globalThis`, so it does not make the SDK
+  run in Internet Explorer.
+- Loading either file twice (a tag that also fires on history changes) keeps the
+  first copy. Calling `init()` again re-initializes it cleanly.
+- Neither file creates any global other than `Sauron`.
+
 ## Configuration
 
-`init(options)` takes an `InitOptions` object. Only `dsn` is required; anything
-missing falls back to the default below (resolved in `resolveOptions()`).
+`init(options)` takes an `InitOptions` object. `dsn` and `release` are required;
+anything else missing falls back to the default below (resolved in
+`resolveOptions()`).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `dsn` | `string` | — **(required)** | `https://<public_key>@<host>/<environment_id>`. A non-string or empty value throws `Error`; a malformed URL throws `DsnError`. |
-| `release` | `string` | `null` | Stamped on `header.release`; the part after the last `@` also becomes `context.app.version` (`web@1.4.2` → `1.4.2`). |
+| `release` | `string` | — **(required)** | The app version this build reports as. Trimmed, then stamped on `header.release`; the part after the last `@` also becomes `context.app.version` (`web@1.4.2` → `1.4.2`). A missing, non-string, empty or whitespace-only value throws `Error`. |
 | `sampleRate` | `number` | `1` | Fraction of **error items** sent, clamped into `[0, 1]`. Applies to `captureException`, `captureMessage` and the global handlers only — events, identifies and transactions are never sampled. |
 | `maxBreadcrumbs` | `number` | `50` | Ring-buffer size; oldest entries are evicted first. Negative values are treated as `0`, which disables breadcrumbs entirely. |
 | `beforeSend` | `(item: EnvelopeItem, hint?: Hint) => EnvelopeItem \| null` | `undefined` | Runs on **every** item type just before the transport. Return `null` to drop. If it throws, the original item is sent and a warning is logged in `debug` mode. |
@@ -1015,7 +1149,7 @@ import type { EnvelopeItem, Hint, InitOptions } from '@edraj/sauron-browser';
 
 const beforeSend = (item: EnvelopeItem, hint?: Hint): EnvelopeItem | null =>
   item.type === 'error' ? item : null;
-const options: InitOptions = { dsn: '...', beforeSend };
+const options: InitOptions = { dsn: '...', release: 'web@1.4.2', beforeSend };
 ```
 
 ## Automatic instrumentation
@@ -1126,19 +1260,23 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 - `"sideEffects": false` — bundlers may drop unused exports. Importing the
   package does nothing on its own; instrumentation is installed by `init()`.
 - Built with tsup, target `es2020`, with source maps and generated declarations.
-- No UMD/IIFE build is shipped, so a plain `<script src="...">` global tag is
-  not supported. On a CDN, use a module script against an ESM-serving CDN:
+- `dist/sauron.min.js` and `dist/sauron.es5.min.js` are self-contained IIFE
+  builds that define `window.Sauron` — see
+  [Script tag & Google Tag Manager](#script-tag--google-tag-manager). They are
+  built by `scripts/build-global.mjs` (esbuild, plus SWC for the ES5 file), not
+  tsup, and are not reachable through `exports`: load them by URL.
+- A module script against an ESM-serving CDN also works:
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.7.0';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.8.0';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42', release: 'web@1.4.2' });
 </script>
 ```
 
 - The only runtime dependency is `fflate`, imported dynamically and only when
   the platform lacks `CompressionStream`. Bundlers will emit it as a separate
-  async chunk.
+  async chunk. The script-tag builds inline only its `gzipSync`.
 - Initialize as early as possible — errors thrown before `init()` are not
   captured.
 
@@ -1219,6 +1357,7 @@ the next page load.
 | Nothing arrives | `init()` was never called, or was called after the failing code ran. | Call `init()` first, as early in the page as possible. |
 | `[sauron] client disabled` in the console, or `isEnabled()` unexpectedly `false` mid-session | The gateway returned 401/403 — wrong, revoked or foreign-project public key. `isEnabled()` flips to `false` automatically; nothing else changes. | Fix the DSN key/project; re-`init()` after correcting. |
 | `DsnError` thrown at `init()` | Malformed DSN: bad protocol, missing public key, a password component, or a missing environment-id path segment. | Use `https://<public_key>@<host>/<environment_id>`. |
+| `init()` throws `` [sauron] init() requires a `release` `` | `release` is missing, not a string, or blank. It is required as of v1.7.0, so code written against 1.6 or earlier throws here until it passes one. | Pass the app version this build reports as: `init({ dsn, release: 'web@1.4.2' })`. |
 | Only some errors show up | `sampleRate` below 1 (errors and messages are sampled; events, identifies and transactions are not). | Set `sampleRate: 1`. |
 | Errors arrive with no breadcrumbs | `maxBreadcrumbs: 0`, or `beforeBreadcrumb` returned `null`. | Raise `maxBreadcrumbs`; check the hook. |
 | Items disappear silently | `beforeSend` returned `null`, or it threw (the original is then sent and a warning logged). | Enable `debug: true` and read the `[sauron]` logs. |
@@ -1235,7 +1374,8 @@ npm install
 npm run typecheck    # tsc --noEmit
 npm test             # vitest run
 npm run test:watch   # vitest
-npm run build        # tsup -> dist/ (esm + cjs + d.ts + sourcemaps)
+npm run build        # tsup -> dist/ (esm + cjs + d.ts + sourcemaps),
+                     # then scripts/build-global.mjs -> the two script-tag files
 npm run dev          # tsup --watch
 ```
 

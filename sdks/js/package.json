@@ -1,6 +1,6 @@
 {
   "name": "@edraj/sauron-browser",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "Sauron browser SDK: automatic error reporting + product analytics for the web.",
   "homepage": "https://github.com/edraj/sauron/tree/main/sdks/js#readme",
   "repository": {
@@ -16,6 +16,8 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "unpkg": "dist/sauron.min.js",
+  "jsdelivr": "dist/sauron.min.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -32,7 +34,7 @@
     "COPYING"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/build-global.mjs",
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -43,6 +45,9 @@
     "fflate": "^0.8.2"
   },
   "devDependencies": {
+    "@swc/core": "^1.16.2",
+    "acorn": "^8.18.0",
+    "esbuild": "^0.27.7",
     "tsup": "^8.5.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"

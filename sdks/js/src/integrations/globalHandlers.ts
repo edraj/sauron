@@ -16,6 +16,31 @@ export function installGlobalHandlers(): void {
   installOnUnhandledRejection(win);
 }
 
+/**
+ * Capture what `window.onerror` reports. Also how the script-tag build replays
+ * an error the GTM loader queued before the SDK loaded (`src/global.ts`).
+ */
+export function captureOnError(
+  message: Event | string,
+  source?: string,
+  lineno?: number,
+  colno?: number,
+  error?: unknown,
+): void {
+  if (!getClient()) return;
+  const err = error ?? syntheticError(message, source, lineno, colno);
+  captureException(err, { mechanism: { type: 'onerror', handled: false }, level: 'error' });
+}
+
+/** Capture an unhandled rejection's reason; the counterpart of {@link captureOnError}. */
+export function captureRejection(reason: unknown): void {
+  if (!getClient()) return;
+  captureException(reason, {
+    mechanism: { type: 'onunhandledrejection', handled: false },
+    level: 'error',
+  });
+}
+
 function installOnError(win: typeof globalThis & { onerror?: OnErrorEventHandler }): void {
   const previous = win.onerror;
   if (isWrapped(previous)) return;
@@ -28,10 +53,7 @@ function installOnError(win: typeof globalThis & { onerror?: OnErrorEventHandler
     colno?: number,
     error?: unknown,
   ): boolean {
-    if (getClient()) {
-      const err = error ?? syntheticError(message, source, lineno, colno);
-      captureException(err, { mechanism: { type: 'onerror', handled: false }, level: 'error' });
-    }
+    captureOnError(message, source, lineno, colno, error);
     if (typeof previous === 'function') {
       return Boolean(
         previous.call(this, message, source, lineno, colno, error as Error | undefined),
@@ -58,14 +80,7 @@ function installOnUnhandledRejection(
     this: unknown,
     event: PromiseRejectionEvent,
   ): unknown {
-    if (getClient()) {
-      const reason =
-        event && typeof event === 'object' && 'reason' in event ? event.reason : event;
-      captureException(reason, {
-        mechanism: { type: 'onunhandledrejection', handled: false },
-        level: 'error',
-      });
-    }
+    captureRejection(event && typeof event === 'object' && 'reason' in event ? event.reason : event);
     if (typeof previous === 'function') {
       return previous.call(this, event);
     }
