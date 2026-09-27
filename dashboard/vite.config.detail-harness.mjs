@@ -52,6 +52,9 @@ const ISSUE = {
   updated_at: ago(2 * HOUR),
 };
 
+/** What the record route serves; replaced by a `PATCH` of the status. */
+let issue = ISSUE;
+
 const SERIES = Array.from({ length: 30 }, (_, i) => ({
   bucket: ago((29 - i) * DAY),
   count: Math.round(40 + 35 * Math.sin(i / 3) + (i % 7 === 0 ? 60 : 0)),
@@ -238,7 +241,32 @@ function stubApi() {
         if (path === '/v1/apps/app1/environments') return json(res, []);
 
         // --- issue: the record is light, the other two are not ---------------
-        if (path === '/v1/apps/app1/issues/issue-1/summary') return json(res, ISSUE);
+        if (path === '/v1/apps/app1/issues/issue-1/summary') return json(res, issue);
+        // Triage. STATEFUL on purpose: the page refetches the record after a
+        // write, and a stub that kept answering `unresolved` would undo the
+        // change on screen and read as the write having failed.
+        // `?fail=status` answers 500, which is how the rollback gets checked.
+        if (path === '/v1/apps/app1/issues/issue-1' && req.method === 'PATCH') {
+          let raw = '';
+          req.on('data', (chunk) => (raw += chunk));
+          req.on('end', () => {
+            if (pageParam(req, 'fail') === 'status') {
+              return json(res, { error: { code: 'internal', message: 'the status write failed (harness)' } }, 500);
+            }
+            let status;
+            try {
+              status = JSON.parse(raw).status;
+            } catch {
+              status = undefined;
+            }
+            if (!['unresolved', 'resolved', 'ignored'].includes(status)) {
+              return json(res, { error: { code: 'bad_request', message: 'status must be unresolved, resolved, or ignored' } }, 400);
+            }
+            issue = { ...issue, status, updated_at: new Date().toISOString() };
+            json(res, issue);
+          });
+          return;
+        }
         if (path === '/v1/apps/app1/issues/issue-1/series') {
           return heavy(req, res, 'series', { series: SERIES });
         }

@@ -28,6 +28,7 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { lockedBy } from '../lib/models/page-access';
+  import { applyIssueStatus } from '../lib/models/issue-status';
   import {
     getIssueSummary,
     getIssueLatestEvent,
@@ -533,15 +534,15 @@
   async function setStatus(next: IssueStatus) {
     const aid = sessionStore.currentAppId;
     const current = issue;
-    if (!current || !aid || updating || current.status === next) return;
-    const previous = current.status;
-    // Optimistic — mutate the reactive $state object in place.
-    current.status = next;
+    if (!current || !aid || updating) return;
     updating = true;
     try {
-      const updated = await updateIssueStatus(aid, current.id, next);
-      current.status = updated.status;
-      current.updated_at = updated.updated_at;
+      // Optimistic, and by REPLACING the record — see `applyIssueStatus` for
+      // why editing `current` in place changed nothing on screen.
+      const changed = await applyIssueStatus(view, next, () =>
+        updateIssueStatus(aid, current.id, next),
+      );
+      if (!changed) return;
       // The Issues list is cached (see lib/stores/view-cache.ts). Without this,
       // resolving an issue here and navigating back shows it as unresolved for
       // the rest of the fresh window, with no request in flight to correct it —
@@ -551,7 +552,6 @@
       viewCache.invalidate('issues.stats');
       toastStore.success(`Issue marked ${next}.`);
     } catch (err) {
-      current.status = previous;
       toastStore.error(errorMessage(err));
     } finally {
       updating = false;

@@ -6,6 +6,7 @@
     ?page=issue | device | monitor     which page to mount
     ?slow=<ms>                          hold every HEAVY section back this long
     ?fail=<section>                     make one section answer 500
+                                        (`status` fails the Resolve/Ignore write)
 
   Against a local stub every section lands within a millisecond of the others,
   the skeletons are on screen for a single frame, and a page that waits for
