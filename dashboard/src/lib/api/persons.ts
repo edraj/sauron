@@ -1,6 +1,6 @@
 import { api } from './client';
 import { overFetched, type ListPage } from '../models/list-state';
-import type { PersonProfile, PersonRow } from '../models';
+import type { AnalyticsEvent, ErrorEvent, PersonRow } from '../models';
 
 export interface ListPersonsParams {
   /** Rows to RENDER; the request asks for one more. See `listPersons`. */
@@ -49,13 +49,38 @@ export async function listPersons(
   return overFetched(data, params.limit);
 }
 
-export async function getPerson(
+// Two sections rather than the composite `GET …/persons/{id}` — see the note
+// on `getIssueSummary` (api/issues.ts).
+
+/**
+ * The profile row alone, or `null` when this `distinct_id` has none in scope.
+ *
+ * `null` is an answer, not a failure: the backend serves a person who exists
+ * only as a `distinct_id` on events, and the page renders them from the URL.
+ */
+export async function getPersonSummary(
+  appId: string,
+  distinctId: string,
+): Promise<PersonRow | null> {
+  const { data } = await api.get<{ distinct_id: string; user: PersonRow | null }>(
+    `/v1/apps/${appId}/persons/${encodeURIComponent(distinctId)}/summary`,
+  );
+  return data.user;
+}
+
+export interface PersonTimeline {
+  events: AnalyticsEvent[];
+  errors: ErrorEvent[];
+}
+
+/** The person's most recent `limit` events and `limit` errors. */
+export async function getPersonTimeline(
   appId: string,
   distinctId: string,
   limit = 50,
-): Promise<PersonProfile> {
-  const { data } = await api.get<PersonProfile>(
-    `/v1/apps/${appId}/persons/${encodeURIComponent(distinctId)}`,
+): Promise<PersonTimeline> {
+  const { data } = await api.get<PersonTimeline>(
+    `/v1/apps/${appId}/persons/${encodeURIComponent(distinctId)}/timeline`,
     { params: { limit } },
   );
   return data;

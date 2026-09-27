@@ -1,6 +1,12 @@
 import { api } from './client';
 import { overFetched, type ListPage } from '../models/list-state';
-import type { DeviceRow, DeviceGroupRow, DeviceDetail } from '../models';
+import type {
+  DeviceRow,
+  DeviceGroupRow,
+  ErrorEvent,
+  PerfSummaryRow,
+  Session,
+} from '../models';
 
 export interface ListDevicesParams {
   /**
@@ -78,9 +84,38 @@ export async function listDeviceGroups(
 }
 
 // device_key is passed as a query param — keys can contain `/` and spaces.
-export async function getDevice(appId: string, deviceKey: string): Promise<DeviceDetail> {
-  const { data } = await api.get<DeviceDetail>(`/v1/apps/${appId}/device`, {
+// Four sections rather than the composite `GET …/device` — see the note on
+// `getIssueSummary` (api/issues.ts). The key travels as a query parameter on
+// all of them, as it does on the composite: device keys contain `/` and spaces.
+
+/** The device row alone — what the header, the stat tiles and Hardware render. */
+export async function getDeviceSummary(appId: string, deviceKey: string): Promise<DeviceRow> {
+  const { data } = await api.get<{ device: DeviceRow }>(`/v1/apps/${appId}/device/summary`, {
     params: { key: deviceKey },
   });
-  return data;
+  return data.device;
+}
+
+/** The device's 50 most recently active sessions in the last 90 days. */
+export async function getDeviceSessions(appId: string, deviceKey: string): Promise<Session[]> {
+  const { data } = await api.get<{ sessions: Session[] }>(`/v1/apps/${appId}/device/sessions`, {
+    params: { key: deviceKey },
+  });
+  return data.sessions;
+}
+
+/** The device's 50 most recent errors. */
+export async function getDeviceErrors(appId: string, deviceKey: string): Promise<ErrorEvent[]> {
+  const { data } = await api.get<{ errors: ErrorEvent[] }>(`/v1/apps/${appId}/device/errors`, {
+    params: { key: deviceKey },
+  });
+  return data.errors;
+}
+
+/** Per-operation latency for the device over the last 90 days. */
+export async function getDevicePerf(appId: string, deviceKey: string): Promise<PerfSummaryRow[]> {
+  const { data } = await api.get<{ perf: PerfSummaryRow[] }>(`/v1/apps/${appId}/device/perf`, {
+    params: { key: deviceKey },
+  });
+  return data.perf;
 }

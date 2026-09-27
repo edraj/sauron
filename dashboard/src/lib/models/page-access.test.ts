@@ -6,7 +6,15 @@ import fs from 'node:fs';
 // executes vitest provides this builtin regardless.
 import path from 'node:path';
 import { ALL_PERMISSIONS } from './permissions';
-import { PAGE_ACCESS, resolvePageAccess, findPageAccessKey, lockTitle, canAccessPage } from './page-access';
+import {
+  PAGE_ACCESS,
+  resolvePageAccess,
+  findPageAccessKey,
+  lockTitle,
+  lockedBy,
+  pageLockedBy,
+  canAccessPage,
+} from './page-access';
 import { sessionStore } from '../stores/session.svelte';
 import type { Permission } from './index';
 
@@ -220,11 +228,17 @@ describe('resolvePageAccess', () => {
   });
 
   it('gates org-only pages at org level', () => {
-    // These three call authorize_org server-side (orgs.rs:160, admin.rs:30,
-    // notifications.rs:66), which no project- or app-scoped grant can satisfy.
+    // These call authorize_org server-side (orgs.rs:160, admin.rs:30), which
+    // no project- or app-scoped grant can satisfy.
     expect(resolvePageAccess('/admin/members')?.level).toBe('org');
     expect(resolvePageAccess('/admin/storage')?.level).toBe('org');
-    expect(resolvePageAccess('/admin/alerts')?.level).toBe('org');
+  });
+
+  it('gates the alerts page on reach, not on the org', () => {
+    // notifications.rs reads go through `alert_read_reach`: alert:read on the
+    // org OR on any project or app in it. Asserted against the backend source
+    // below, so the row cannot outlive the helper it was derived from.
+    expect(resolvePageAccess('/admin/alerts')?.level).toBe('reach');
   });
 
   it('gates project-scoped pages at project level', () => {
@@ -238,6 +252,16 @@ describe('lockTitle', () => {
     const title = lockTitle('issue:write');
     expect(title).toContain('Resolve, assign, and comment on issues');
     expect(title).toContain('issue:write');
+  });
+
+  // A member who HOLDS the permission on one project reads "Requires:
+  // alert:write" as a bug in the product. The level is the missing half.
+  it('names the scope a permission must be held at when that is wider than the app', () => {
+    expect(lockTitle('alert:write@org')).toBe(
+      'Requires: Create and edit alert rules and channels (alert:write) at organization level',
+    );
+    expect(lockTitle('monitor:read@project')).toContain('(monitor:read) at project level');
+    expect(lockTitle('issue:write')).not.toContain(' level');
   });
 
   it('falls back to the bare permission when no label exists', () => {
@@ -442,5 +466,136 @@ describe('source maps page gate', () => {
   // whole page on the write permission replaced a readable page with a wall.
   it('requires only the permission its list endpoint requires', () => {
     expect(PAGE_ACCESS['/admin/source-maps']?.perm).toBe('issue:read');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lock reasons carry their level.
+//
+// `can()` truncates the cascade to the level the backend authorizes at, so a
+// project-scoped grant correctly fails an org-level check. The tooltip used to
+// name only the permission — which the member already held.
+// ---------------------------------------------------------------------------
+describe('lock reasons name their level', () => {
+  beforeEach(() => {
+    sessionStore.currentOrgId = 'org-1';
+    sessionStore.currentProjectId = 'proj-1';
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.currentEnvId = null;
+    sessionStore.access = {
+      permissions: [],
+      grants: [
+        {
+          scope_type: 'project',
+          scope_id: 'proj-1',
+          permissions: ['alert:read', 'alert:write', 'member:read'],
+        },
+      ],
+    };
+  });
+
+  it('lockedBy appends the level for an org- or project-level check', () => {
+    expect(lockedBy('alert:write', { level: 'org' })).toBe('alert:write@org');
+    expect(lockedBy('monitor:write', { level: 'project' })).toBe('monitor:write@project');
+    expect(lockedBy('issue:write')).toBe('issue:write');
+    expect(lockedBy('alert:write', { level: 'project' })).toBe(null);
+  });
+
+  it('pageLockedBy appends the level for an org- or project-level page', () => {
+    expect(pageLockedBy('/admin/members')).toBe('member:read@org');
+    expect(pageLockedBy('/monitors')).toBe('monitor:read@project');
+    expect(pageLockedBy('/issues')).toBe('issue:read');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The alerts page follows the grant.
+//
+// Mirrors `alert_read_reach` (notifications.rs): alert:read on the org, or on
+// any project or app in it. NOT the current selection — the page is org-wide
+// and lists rules for every project the member holds, whichever one the
+// switcher happens to be on.
+// ---------------------------------------------------------------------------
+describe('alerts page gate', () => {
+  const ALERTS = PAGE_ACCESS['/admin/alerts'];
+
+  function grant(scope_type: 'org' | 'project' | 'app' | 'env', scope_id: string): void {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type, scope_id, permissions: ['alert:read'] }],
+    };
+  }
+
+  beforeEach(() => {
+    sessionStore.currentOrgId = 'org-1';
+    sessionStore.currentProjectId = 'proj-1';
+    sessionStore.currentAppId = 'app-1';
+    sessionStore.currentEnvId = null;
+  });
+
+  it('admits an org-scoped grant', () => {
+    grant('org', 'org-1');
+    expect(canAccessPage(ALERTS)).toBe(true);
+  });
+
+  it('admits a project- or app-scoped grant, including one off the current selection', () => {
+    for (const [type, id] of [
+      ['project', 'proj-1'],
+      ['project', 'proj-2'],
+      ['app', 'app-1'],
+      ['app', 'app-9'],
+    ] as const) {
+      grant(type, id);
+      expect(canAccessPage(ALERTS), `${type} ${id}`).toBe(true);
+    }
+  });
+
+  // Rules narrow by project and app and have no environment dimension, so the
+  // server refuses an environment grant outright.
+  it('refuses an environment-scoped grant', () => {
+    grant('env', 'env-1');
+    for (const env of [null, 'env-1', 'none']) {
+      sessionStore.currentEnvId = env;
+      expect(canAccessPage(ALERTS), `env=${env}`).toBe(false);
+    }
+  });
+
+  it('refuses a grant on another org', () => {
+    grant('org', 'org-2');
+    expect(canAccessPage(ALERTS)).toBe(false);
+  });
+
+  it('refuses a member with no alert:read at all, and names the permission alone', () => {
+    sessionStore.access = {
+      permissions: [],
+      grants: [{ scope_type: 'org', scope_id: 'org-1', permissions: ['issue:read'] }],
+    };
+    expect(canAccessPage(ALERTS)).toBe(false);
+    // No level suffix: any scope would do, so there is no level to ask for.
+    expect(pageLockedBy('/admin/alerts')).toBe('alert:read');
+  });
+
+  it('matches what the backend read path actually does', () => {
+    const src = fs.readFileSync(
+      path.resolve(
+        path.dirname(new URL(import.meta.url).pathname),
+        '../../../../backend/bins/sauron-api/src/routes/notifications.rs',
+      ),
+      'utf-8',
+    );
+    for (const handler of ['list_channels', 'list_rules', 'list_history', 'get_rule', 'get_channel']) {
+      const start = src.indexOf(`pub async fn ${handler}(`);
+      expect(start, `${handler} not found in notifications.rs`).toBeGreaterThan(-1);
+      // To the function's own closing brace, not to the next `pub async fn`:
+      // private helpers sit between the handlers, and the write-side ones
+      // call `authorize_org` by design.
+      const end = src.indexOf('\n}\n', start);
+      expect(end, `${handler} has no closing brace`).toBeGreaterThan(-1);
+      const body = src.slice(start, end);
+      expect(body, `${handler} must resolve reach`).toContain('alert_read_reach(');
+      expect(body, `${handler} must not fall back to the org-only check`).not.toContain(
+        'authorize_org(',
+      );
+    }
   });
 });

@@ -689,6 +689,22 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{app_id}/issues/{issue_id}",
             get(routes::issues::detail).patch(routes::issues::update),
         )
+        // The same data as the route above, addressable one section at a
+        // time, so the issue page paints its header off a keyed lookup instead
+        // of waiting on the series and a symbolicated event. The composite
+        // stays for API callers that want it whole.
+        .route(
+            "/v1/apps/{app_id}/issues/{issue_id}/summary",
+            get(routes::issues::detail_summary),
+        )
+        .route(
+            "/v1/apps/{app_id}/issues/{issue_id}/latest-event",
+            get(routes::issues::detail_latest_event),
+        )
+        .route(
+            "/v1/apps/{app_id}/issues/{issue_id}/series",
+            get(routes::issues::detail_series),
+        )
         .route(
             "/v1/apps/{app_id}/issues/{issue_id}/events",
             get(routes::issues::events),
@@ -717,6 +733,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/apps/{app_id}/persons/{distinct_id}",
             get(routes::analytics::person),
+        )
+        .route(
+            "/v1/apps/{app_id}/persons/{distinct_id}/summary",
+            get(routes::analytics::person_summary),
+        )
+        .route(
+            "/v1/apps/{app_id}/persons/{distinct_id}/timeline",
+            get(routes::analytics::person_timeline_section),
         )
         .route(
             "/v1/apps/{app_id}/overview",
@@ -817,6 +841,14 @@ async fn main() -> anyhow::Result<()> {
             get(routes::sessions::detail),
         )
         .route(
+            "/v1/apps/{app_id}/sessions/{session_id}/summary",
+            get(routes::sessions::detail_summary),
+        )
+        .route(
+            "/v1/apps/{app_id}/sessions/{session_id}/timeline",
+            get(routes::sessions::detail_timeline),
+        )
+        .route(
             "/v1/apps/{app_id}/sessions/{session_id}/workflows",
             get(routes::workflows::session_spans),
         )
@@ -827,6 +859,22 @@ async fn main() -> anyhow::Result<()> {
             get(routes::devices::groups),
         )
         .route("/v1/apps/{app_id}/device", get(routes::devices::detail))
+        .route(
+            "/v1/apps/{app_id}/device/summary",
+            get(routes::devices::detail_summary),
+        )
+        .route(
+            "/v1/apps/{app_id}/device/sessions",
+            get(routes::devices::detail_sessions),
+        )
+        .route(
+            "/v1/apps/{app_id}/device/errors",
+            get(routes::devices::detail_errors),
+        )
+        .route(
+            "/v1/apps/{app_id}/device/perf",
+            get(routes::devices::detail_perf),
+        )
         // --- row counts for the offset-paged lists ---
         //
         // Separate routes rather than a `total` on each list response: these
@@ -924,6 +972,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/monitors/{monitor_id}/incidents",
             get(routes::monitors::incidents),
+        )
+        .route(
+            "/v1/monitors/{monitor_id}/summary",
+            get(routes::monitors::detail_summary),
+        )
+        .route(
+            "/v1/monitors/{monitor_id}/uptime",
+            get(routes::monitors::detail_uptime),
         )
         // --- combined active users (project-scoped) ---
         .route(

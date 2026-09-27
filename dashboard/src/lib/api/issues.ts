@@ -9,8 +9,8 @@ import {
 import type {
   ErrorEvent,
   Issue,
-  IssueDetail,
   IssueEventStats,
+  SeriesPoint,
   IssueStats,
   IssueStatus,
 } from '../models';
@@ -58,9 +58,36 @@ export async function listIssues(
   return data;
 }
 
-export async function getIssue(appId: string, issueId: string): Promise<IssueDetail> {
-  const { data } = await api.get<IssueDetail>(`/v1/apps/${appId}/issues/${issueId}`);
+// The issue page reads three sections rather than the composite
+// `GET …/issues/{id}`: the record is a keyed lookup, while the series and the
+// symbolicated latest event are not, and one request for all three held the
+// header back until the slowest had finished. The backend keeps the composite
+// for API callers and pins the sections equal to it
+// (`issue_detail_sections_agree_with_the_composite_route`).
+
+/** The issue record alone — what the header and the overview rail render. */
+export async function getIssueSummary(appId: string, issueId: string): Promise<Issue> {
+  const { data } = await api.get<Issue>(`/v1/apps/${appId}/issues/${issueId}/summary`);
   return data;
+}
+
+/** The issue's most recent event, symbolicated; `null` when it has none in scope. */
+export async function getIssueLatestEvent(
+  appId: string,
+  issueId: string,
+): Promise<ErrorEvent | null> {
+  const { data } = await api.get<{ latest_event: ErrorEvent | null }>(
+    `/v1/apps/${appId}/issues/${issueId}/latest-event`,
+  );
+  return data.latest_event;
+}
+
+/** Occurrences per bucket over the last 30 days. */
+export async function getIssueSeries(appId: string, issueId: string): Promise<SeriesPoint[]> {
+  const { data } = await api.get<{ series: SeriesPoint[] }>(
+    `/v1/apps/${appId}/issues/${issueId}/series`,
+  );
+  return data.series;
 }
 
 export async function updateIssueStatus(

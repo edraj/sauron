@@ -1,6 +1,11 @@
 //! Alerting administration: notification channels, alert rules, delivery
-//! history, and channel test-sends. Org-scoped, gated by `alert:read` /
-//! `alert:write`. Channel secrets are encrypted at rest and never returned.
+//! history, and channel test-sends, gated by `alert:read` / `alert:write`.
+//! Channel secrets are encrypted at rest and never returned.
+//!
+//! **Writes are org-scoped; reads follow the grant.** Every mutation calls
+//! `authorize_org`. Reads go through [`alert_read_reach`], so a member holding
+//! `alert:read` on one project or app sees the rules narrowed to it and the
+//! channels those rules deliver to, rather than a 403.
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -11,8 +16,9 @@ use uuid::Uuid;
 use sauron_alerts::channel::{self, ChannelKind};
 use sauron_alerts::rule::{self, TriggerType};
 use sauron_alerts::{AlertContext, Severity};
+use sauron_auth::rbac::{grants_from_rows, reach_for};
 use sauron_auth::{authorize_app, authorize_org, authorize_project, perm, AuthUser};
-use sauron_db::models::{NewAlertRule, NewNotificationChannel, NotificationChannel};
+use sauron_db::models::{AlertRule, NewAlertRule, NewNotificationChannel, NotificationChannel};
 use sauron_db::repo;
 
 use super::db;
@@ -140,12 +146,88 @@ fn parse_secret(secret: &Value) -> Result<Option<String>, ApiError> {
     }
 }
 
+// --- read reach -------------------------------------------------------------
+
+/// How much of an org's alerting configuration a caller may READ.
+///
+/// `authorize_org` is the wrong question for a listing: a grant narrower than
+/// the org can never satisfy it, so a member granted `alert:read` on one
+/// project — a grant the scope tree creates without complaint — was refused by
+/// every read here and found the Alerts page locked. Same shape, and same
+/// remedy, as `projects::list` and [`sauron_auth::rbac::Reach`].
+///
+/// This decides which RULES and CHANNELS are visible. It does not decide what
+/// history is: that keeps its second gate, read access to the rule's target
+/// (see [`visible_history_keys`]).
+enum AlertReach {
+    /// `alert:read` at org scope: everything, as before.
+    Org,
+    /// `alert:read` on these projects and apps only.
+    Scoped {
+        projects: Vec<Uuid>,
+        apps: Vec<Uuid>,
+    },
+}
+
+impl AlertReach {
+    /// Whether `rule` is inside this reach. Must agree with
+    /// `repo::list_alert_rules_in_scope`, which is the same predicate in SQL.
+    fn covers(&self, rule: &AlertRule) -> bool {
+        match self {
+            AlertReach::Org => true,
+            AlertReach::Scoped { projects, apps } => {
+                rule.app_id.is_some_and(|a| apps.contains(&a))
+                    || rule.project_id.is_some_and(|p| projects.contains(&p))
+            }
+        }
+    }
+
+    /// The rules of `org_id` inside this reach.
+    async fn rules(
+        &self,
+        conn: &mut sauron_db::AsyncPgConnection,
+        org_id: Uuid,
+    ) -> Result<Vec<AlertRule>, ApiError> {
+        Ok(match self {
+            AlertReach::Org => repo::list_alert_rules_for_org(conn, org_id).await?,
+            AlertReach::Scoped { projects, apps } => {
+                repo::list_alert_rules_in_scope(conn, org_id, projects, apps).await?
+            }
+        })
+    }
+}
+
+/// Resolve the caller's `alert:read` reach in `org_id`, or refuse.
+///
+/// An ENVIRONMENT grant confers nothing here. Rules narrow by project and app
+/// and have no environment dimension, so there is no rule an environment grant
+/// could be said to cover — the same reason `authorize_rule_target` uses
+/// `authorize_app` and never `authorize_app_reachable`.
+async fn alert_read_reach(
+    conn: &mut sauron_db::AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+) -> Result<AlertReach, ApiError> {
+    let grants = grants_from_rows(repo::user_grants_in_org(conn, user_id, org_id).await?);
+    let reach = reach_for(&grants, perm::ALERT_READ);
+    if reach.org {
+        return Ok(AlertReach::Org);
+    }
+    if reach.projects.is_empty() && reach.apps.is_empty() {
+        return Err(sauron_auth::AuthError::Forbidden.into());
+    }
+    Ok(AlertReach::Scoped {
+        projects: reach.projects,
+        apps: reach.apps,
+    })
+}
+
 // --- channels ---------------------------------------------------------------
 
 #[utoipa::path(
     get, path = "/v1/orgs/{org_id}/notification-channels", tag = "Notifications",
     summary = "List notification channels",
-    description = "Channel secrets (webhook URLs, tokens) are stored encrypted and never returned.",
+    description = "Channel secrets (webhook URLs, tokens) are stored encrypted and never returned. A caller holding `alert:read` below org scope receives only the channels that rules within their reach deliver to.",
     params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
     responses((status = 200, description = "Channels.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
 )]
@@ -157,8 +239,27 @@ pub async fn list_channels(
 ) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
-    authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_READ).await?;
-    let rows = repo::list_channels_for_org(&mut conn, org_id).await?;
+    let reach = alert_read_reach(&mut conn, auth.user_id, org_id).await?;
+    let rows = match reach {
+        AlertReach::Org => repo::list_channels_for_org(&mut conn, org_id).await?,
+        // Channels are org-wide objects with no scope of their own, so a scoped
+        // reader gets the ones their own rules deliver to — enough to read a
+        // rule's destinations, without the org's whole destination list.
+        AlertReach::Scoped { .. } => {
+            let rule_ids: Vec<Uuid> = reach
+                .rules(&mut conn, org_id)
+                .await?
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            let channel_ids: Vec<Uuid> = repo::rule_channel_ids_for_rules(&mut conn, &rule_ids)
+                .await?
+                .into_values()
+                .flatten()
+                .collect();
+            repo::list_channels_by_ids(&mut conn, org_id, &channel_ids).await?
+        }
+    };
     Ok(Json(json!(rows
         .iter()
         .map(|ch| channel_view(&state.alerts.cipher, ch))
@@ -299,8 +400,19 @@ pub async fn get_channel(
     Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
-    let (_conn, ch) =
-        load_channel_authorized(&state, auth.user_id, channel_id, perm::ALERT_READ).await?;
+    let mut conn = db(&state).await?;
+    let ch = repo::get_channel(&mut conn, channel_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let reach = alert_read_reach(&mut conn, auth.user_id, ch.org_id).await?;
+    // Same rule as `list_channels`: below org scope a channel is readable
+    // through a rule that delivers to it, and not otherwise.
+    if let AlertReach::Scoped { .. } = reach {
+        let rules = repo::rules_using_channel(&mut conn, channel_id).await?;
+        if !rules.iter().any(|r| reach.covers(r)) {
+            return Err(sauron_auth::AuthError::Forbidden.into());
+        }
+    }
     Ok(Json(channel_view(&state.alerts.cipher, &ch)))
 }
 
@@ -616,6 +728,7 @@ async fn rule_view(
 #[utoipa::path(
     get, path = "/v1/orgs/{org_id}/alert-rules", tag = "Notifications",
     summary = "List alert rules",
+    description = "Reach-filtered: `alert:read` on the org lists every rule; held on a project or app it lists the rules narrowed to that project (including its apps) or that app. An un-narrowed rule is visible at org scope only.",
     params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
     responses((status = 200, description = "Alert rules.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
 )]
@@ -627,8 +740,8 @@ pub async fn list_rules(
 ) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = db(&state).await?;
-    authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_READ).await?;
-    let rules = repo::list_alert_rules_for_org(&mut conn, org_id).await?;
+    let reach = alert_read_reach(&mut conn, auth.user_id, org_id).await?;
+    let rules = reach.rules(&mut conn, org_id).await?;
     // One grouped lookup for the page rather than `rule_view` per rule, which
     // was a query each — a 200-rule org issued 201 queries per page load.
     let rule_ids: Vec<Uuid> = rules.iter().map(|r| r.id).collect();
@@ -1129,8 +1242,16 @@ pub async fn get_rule(
     Query(env): Query<super::scope::RejectEnvQuery>,
 ) -> Result<Json<Value>, ApiError> {
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
-    let (mut conn, rule) =
-        load_rule_authorized(&state, auth.user_id, rule_id, perm::ALERT_READ).await?;
+    let mut conn = db(&state).await?;
+    let rule = repo::get_alert_rule(&mut conn, rule_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if !alert_read_reach(&mut conn, auth.user_id, rule.org_id)
+        .await?
+        .covers(&rule)
+    {
+        return Err(sauron_auth::AuthError::Forbidden.into());
+    }
     Ok(Json(rule_view(&mut conn, &rule).await?))
 }
 
@@ -1335,7 +1456,7 @@ pub struct HistoryQuery {
 #[utoipa::path(
     get, path = "/v1/orgs/{org_id}/alert-events", tag = "Notifications",
     summary = "Alert delivery history",
-    description = "Which alerts fired, when, and whether delivery succeeded — the record to check when someone says they never got paged.",
+    description = "Which alerts fired, when, and whether delivery succeeded — the record to check when someone says they never got paged. Rows are limited to rules within the caller's `alert:read` reach whose target they can also read.",
     params(("org_id" = Uuid, Path, description = "The organization."), HistoryQuery), security(("bearerAuth" = [])),
     responses((status = 200, description = "Alert events.", body = serde_json::Value),
               (status = 400, description = "Malformed filter or cursor.", body = ErrorResponse), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse)),
@@ -1352,9 +1473,9 @@ pub async fn list_history(
     // it: a row's `title`/`body` hold the same issue title or probed monitor
     // target that `authorize_rule_target` refuses to let an unauthorized caller
     // route anywhere, and this table is where those strings come to rest.
-    authorize_org(&mut conn, auth.user_id, org_id, perm::ALERT_READ).await?;
+    let reach = alert_read_reach(&mut conn, auth.user_id, org_id).await?;
     let (visible_rule_ids, orphan_triggers) =
-        visible_history_keys(&mut conn, auth.user_id, org_id).await?;
+        visible_history_keys(&mut conn, auth.user_id, org_id, &reach).await?;
     let rows = repo::list_alert_events_visible(
         &mut conn,
         org_id,
@@ -1387,10 +1508,14 @@ async fn visible_history_keys(
     conn: &mut sauron_db::AsyncPgConnection,
     user_id: Uuid,
     org_id: Uuid,
+    reach: &AlertReach,
 ) -> Result<(Vec<Uuid>, Vec<String>), ApiError> {
     use std::collections::HashMap;
 
-    let rules = repo::list_alert_rules_for_org(conn, org_id).await?;
+    // Only the rules the caller's `alert:read` covers are candidates at all;
+    // the target check below then narrows them further. Two gates, both
+    // required: a wide `issue:read` must not widen a narrow alerting grant.
+    let rules = reach.rules(conn, org_id).await?;
     let mut memo: HashMap<(Option<Uuid>, Option<Uuid>, &'static str), bool> = HashMap::new();
     let mut visible = Vec::new();
     for r in &rules {
@@ -1439,6 +1564,12 @@ async fn visible_history_keys(
     // map onto three permissions, so this is three queries rather than eight for
     // an answer that cannot differ within a permission.
     let mut orphan_triggers = Vec::new();
+    // An orphan is judged at the widest scope on BOTH gates. Its rule is gone,
+    // so nothing says which project it covered, and a caller whose alerting
+    // grant is narrower than the org cannot be shown to have covered it.
+    if let AlertReach::Scoped { .. } = reach {
+        return Ok((visible, orphan_triggers));
+    }
     let mut org_perm: HashMap<&'static str, bool> = HashMap::new();
     for t in TriggerType::ALL {
         let perm_needed = rule_read_permission(t);

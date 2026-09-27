@@ -2170,6 +2170,12 @@ fn build_request_path(template: &str, app_id: Uuid) -> String {
     // handlers require `from`/`to` with no defaults.
     let extra_query: Option<&str> = match template {
         "/v1/apps/{app_id}/device" => Some("key=task-14-route-enum-device"),
+        // The device-detail sections take the same required `key`, for the
+        // same reason the screen sections below take `name`.
+        "/v1/apps/{app_id}/device/summary"
+        | "/v1/apps/{app_id}/device/sessions"
+        | "/v1/apps/{app_id}/device/errors"
+        | "/v1/apps/{app_id}/device/perf" => Some("key=task-14-route-enum-device"),
         "/v1/apps/{app_id}/screens/detail" => Some("name=task-14-route-enum-screen"),
         // The four screen-detail sections take their target screen as a
         // required `name` query param, exactly like `screens/detail` above.
@@ -4309,6 +4315,438 @@ async fn the_device_detail_sessions_panel_stays_ordered_by_last_event_at() {
          list's `started_at DESC` default would return {:?}",
         vec![late, early]
     );
+
+    srv.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Detail pages, one section at a time.
+//
+// Each detail route (`issues/{id}`, `sessions/{id}`, `persons/{id}`, `device`)
+// is a composite: the record itself — one keyed lookup — followed by the heavy
+// reads the page hangs below it (a 30-day series, a symbolicated event, a
+// 1,500-row timeline, a p95 aggregate). The dashboard could paint nothing until
+// the slowest of them returned.
+//
+// The section routes serve the same data separately, exactly as the Overview
+// split above does, and carry the same two risks: DRIFT (two handlers computing
+// what one used to) and a section that skips a gate the composite applies.
+// ---------------------------------------------------------------------------
+
+/// One session's worth of activity attributed to `env`: the `sessions` row, an
+/// identified person, an analytics event and an error event, all sharing
+/// `session_id`, `distinct_id` and `device_key`.
+async fn seed_session_activity(
+    conn: &mut sauron_db::PgConn,
+    app_id: Uuid,
+    env: Uuid,
+    session_id: &str,
+    distinct_id: &str,
+    device_key: &str,
+) {
+    let now = Utc::now();
+    repo::bump_session(
+        conn,
+        app_id,
+        session_id,
+        Some(distinct_id),
+        Some(device_key),
+        now,
+        &json!({}),
+        None,
+        Some(env),
+        None,
+        1,
+        1,
+        0,
+    )
+    .await
+    .expect("bump_session");
+    repo::upsert_event_user(conn, app_id, distinct_id, &json!({ "plan": "pro" }))
+        .await
+        .expect("upsert event user");
+    repo::insert_analytics_event(
+        conn,
+        NewAnalyticsEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: Some(env),
+            name: "detail-sections.event".to_string(),
+            distinct_id: distinct_id.to_string(),
+            properties: json!({}),
+            context: json!({}),
+            session_id: Some(session_id.to_string()),
+            release: None,
+            ip_address: None,
+            occurred_at: now,
+            device_key: Some(device_key.to_string()),
+            screen: None,
+            workflow_id: None,
+            workflow_name: None,
+            tags: json!({}),
+            contexts: json!({}),
+            extra: json!({}),
+        },
+    )
+    .await
+    .expect("insert analytics event");
+
+    let fingerprint = format!("detail-sections-{}", Uuid::new_v4().simple());
+    let issue_id = repo::upsert_issue(
+        conn,
+        NewIssue {
+            app_id,
+            fingerprint: &fingerprint,
+            type_: "Error",
+            title: "detail sections fixture issue",
+            culprit: "detail_sections::fixture",
+            level: "error",
+            first_seen: now,
+            last_seen: now,
+            times_seen: 1,
+        },
+    )
+    .await
+    .expect("upsert issue");
+    repo::insert_error_event(
+        conn,
+        NewErrorEvent {
+            id: Uuid::new_v4(),
+            app_id,
+            environment_id: Some(env),
+            issue_id,
+            fingerprint,
+            level: "error".into(),
+            message: "detail sections fixture error".into(),
+            exception_type: "FixtureError".into(),
+            exception_value: "seeded".into(),
+            stacktrace: json!([]),
+            breadcrumbs: json!([]),
+            context: json!({}),
+            tags: json!({}),
+            release: None,
+            distinct_id: Some(distinct_id.to_string()),
+            event_user: None,
+            sdk: None,
+            ip_address: None,
+            occurred_at: now,
+            session_id: Some(session_id.to_string()),
+            device_key: Some(device_key.to_string()),
+            screen: None,
+            workflow_id: None,
+            workflow_name: None,
+            stacktrace_symbolicated: Some(json!([{
+                "function": "detailSectionsFixture",
+                "filename": "src/fixture.rs",
+                "lineno": 42,
+                "colno": 5,
+                "context_line": FIXTURE_CONTEXT_LINE,
+                "pre_context": ["fn detail_sections_fixture() {"],
+                "post_context": ["}"],
+                "context_start_line": 41,
+            }])),
+            symbolication_status: "symbolicated".into(),
+            debug_meta: None,
+            contexts: json!({}),
+            extra: json!({}),
+            handled: Some(true),
+            title: None,
+            culprit: None,
+            stacktrace_sha256: None,
+        },
+    )
+    .await
+    .expect("insert error event");
+}
+
+/// `arr` is a non-empty JSON array — the guard that keeps an equality between
+/// two responses from passing on two empty ones.
+fn assert_non_empty(v: &serde_json::Value, what: &str) {
+    assert!(
+        v.as_array().is_some_and(|a| !a.is_empty()),
+        "{what} must be a non-empty array, else agreeing with it proves nothing: {v}"
+    );
+}
+
+#[tokio::test]
+async fn issue_detail_sections_agree_with_the_composite_route() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let base = format!("/v1/apps/{}/issues/{}", f.app_id, f.granted_issue_id);
+
+    let whole = srv.get_json(&base, &f.owner_token).await;
+    let summary = srv
+        .get_json(&format!("{base}/summary"), &f.owner_token)
+        .await;
+    let latest = srv
+        .get_json(&format!("{base}/latest-event"), &f.owner_token)
+        .await;
+    let series = srv
+        .get_json(&format!("{base}/series"), &f.owner_token)
+        .await;
+
+    // The composite flattens the issue beside its two heavy fields, so the
+    // summary is the composite minus exactly those.
+    let mut expected_summary = whole.clone();
+    let obj = expected_summary
+        .as_object_mut()
+        .expect("issue detail is an object");
+    obj.remove("latest_event");
+    obj.remove("series");
+    assert_eq!(expected_summary, summary, "summary must not drift");
+    assert_eq!(whole["latest_event"], latest["latest_event"]);
+    assert_eq!(whole["series"], series["series"]);
+
+    assert_eq!(
+        summary["id"].as_str(),
+        Some(f.granted_issue_id.to_string().as_str())
+    );
+    assert!(
+        latest["latest_event"].is_object(),
+        "fixture seeds an error: {latest}"
+    );
+    assert_non_empty(&series["series"], "the issue series");
+
+    srv.shutdown().await;
+}
+
+/// Each section is its own request, so each resolves scope and permissions on
+/// its own — the same rule `every_overview_section_is_env_scoped_independently`
+/// pins. The three failure modes a section could introduce: serving an issue
+/// from an environment the caller was not granted, serving source lines to a
+/// caller without `source:read`, and answering for an issue that does not exist.
+#[tokio::test]
+async fn every_issue_section_applies_the_gates_of_the_composite_route() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+    let env = f.granted_env;
+
+    for section in ["summary", "latest-event", "series"] {
+        let granted = format!(
+            "/v1/apps/{app}/issues/{}/{section}?environment_id={env}",
+            f.granted_issue_id
+        );
+        assert_eq!(
+            srv.get_status(&granted, &f.member_token).await,
+            200,
+            "{section}: an env-scoped member reads their own environment's issue"
+        );
+        // The other issue has no event in the granted environment, so a scoped
+        // read of it finds nothing — exactly what the composite answers.
+        let other = format!(
+            "/v1/apps/{app}/issues/{}/{section}?environment_id={env}",
+            f.other_issue_id
+        );
+        let composite = format!(
+            "/v1/apps/{app}/issues/{}?environment_id={env}",
+            f.other_issue_id
+        );
+        assert_eq!(
+            srv.get_status(&other, &f.member_token).await,
+            srv.get_status(&composite, &f.member_token).await,
+            "{section}: must answer like the composite for an out-of-scope issue"
+        );
+        assert_eq!(
+            srv.get_status(&other, &f.member_token).await,
+            404,
+            "{section}: out-of-scope issue"
+        );
+        // App-wide, which an env-scoped grant cannot read at all.
+        let unscoped = format!("/v1/apps/{app}/issues/{}/{section}", f.granted_issue_id);
+        assert_eq!(
+            srv.get_status(&unscoped, &f.member_token).await,
+            srv.get_status(
+                &format!("/v1/apps/{app}/issues/{}", f.granted_issue_id),
+                &f.member_token
+            )
+            .await,
+            "{section}: must answer like the composite with no environment named"
+        );
+        let missing = format!("/v1/apps/{app}/issues/{}/{section}", Uuid::new_v4());
+        assert_eq!(
+            srv.get_status(&missing, &f.owner_token).await,
+            404,
+            "{section}: no such issue"
+        );
+    }
+
+    // `source:read` is the one gate that lives inside a single section.
+    let path = format!(
+        "/v1/apps/{app}/issues/{}/latest-event?environment_id={env}",
+        f.granted_issue_id
+    );
+    let (_, without) = srv.get_status_and_body(&path, &f.member_token).await;
+    let (_, with) = srv.get_status_and_body(&path, &f.source_member_token).await;
+    assert!(
+        !without.contains(FIXTURE_CONTEXT_LINE),
+        "source lines must be withheld without source:read: {without}"
+    );
+    assert!(
+        with.contains(FIXTURE_CONTEXT_LINE),
+        "…and served with it, or the assertion above is vacuous: {with}"
+    );
+
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_person_and_device_sections_agree_with_their_composite_routes() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let session_id = format!("sections-session-{suffix}");
+    let distinct_id = format!("sections-person-{suffix}");
+    {
+        let mut conn = srv.conn().await;
+        seed_session_activity(
+            &mut conn,
+            app,
+            f.granted_env,
+            &session_id,
+            &distinct_id,
+            &f.device_key,
+        )
+        .await;
+    }
+    let t = &f.owner_token;
+
+    // --- session -----------------------------------------------------------
+    let base = format!("/v1/apps/{app}/sessions/{session_id}");
+    let whole = srv.get_json(&base, t).await;
+    let summary = srv.get_json(&format!("{base}/summary"), t).await;
+    let timeline = srv.get_json(&format!("{base}/timeline"), t).await;
+    assert_eq!(whole["session"], summary["session"]);
+    assert_eq!(whole["timeline"], timeline["timeline"]);
+    assert_eq!(
+        summary["session"]["session_id"].as_str(),
+        Some(&*session_id)
+    );
+    assert_non_empty(&timeline["timeline"], "the session timeline");
+    let kinds: Vec<&str> = timeline["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["kind"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"event") && kinds.contains(&"error"),
+        "the timeline must carry both seeded kinds: {kinds:?}"
+    );
+
+    // --- person ------------------------------------------------------------
+    let base = format!("/v1/apps/{app}/persons/{distinct_id}");
+    let whole = srv.get_json(&format!("{base}?limit=100"), t).await;
+    let summary = srv.get_json(&format!("{base}/summary"), t).await;
+    let timeline = srv.get_json(&format!("{base}/timeline?limit=100"), t).await;
+    assert_eq!(whole["distinct_id"], summary["distinct_id"]);
+    assert_eq!(whole["user"], summary["user"]);
+    assert_eq!(whole["events"], timeline["events"]);
+    assert_eq!(whole["errors"], timeline["errors"]);
+    assert!(summary["user"].is_object(), "fixture seeds the person");
+    assert_non_empty(&timeline["events"], "the person's events");
+    assert_non_empty(&timeline["errors"], "the person's errors");
+
+    // --- device ------------------------------------------------------------
+    let key = &f.device_key;
+    let whole = srv
+        .get_json(&format!("/v1/apps/{app}/device?key={key}"), t)
+        .await;
+    for (section, field) in [
+        ("summary", "device"),
+        ("sessions", "sessions"),
+        ("errors", "errors"),
+        ("perf", "perf"),
+    ] {
+        let part = srv
+            .get_json(&format!("/v1/apps/{app}/device/{section}?key={key}"), t)
+            .await;
+        assert_eq!(whole[field], part[field], "device {section} must not drift");
+    }
+    assert_eq!(whole["device"]["device_key"].as_str(), Some(key.as_str()));
+    assert_non_empty(&whole["sessions"], "the device's sessions");
+    assert_non_empty(&whole["errors"], "the device's errors");
+
+    // --- a section for something that does not exist is a 404, not `[]` -----
+    for path in [
+        format!("/v1/apps/{app}/sessions/nope-{suffix}/summary"),
+        format!("/v1/apps/{app}/sessions/nope-{suffix}/timeline"),
+        format!("/v1/apps/{app}/device/summary?key=nope-{suffix}"),
+        format!("/v1/apps/{app}/device/sessions?key=nope-{suffix}"),
+        format!("/v1/apps/{app}/device/errors?key=nope-{suffix}"),
+        format!("/v1/apps/{app}/device/perf?key=nope-{suffix}"),
+    ] {
+        assert_eq!(srv.get_status(&path, t).await, 404, "{path}");
+    }
+
+    srv.shutdown().await;
+}
+
+/// The error rows in a timeline are whole `ErrorEvent`s, so the section serving
+/// them carries the body and source gates the composite applies — and an
+/// env-scoped member must be confined by it exactly as by the composite.
+#[tokio::test]
+async fn timeline_sections_apply_the_gates_of_their_composite_routes() {
+    let Some(mut srv) = TestServer::start().await else {
+        return;
+    };
+    let f = srv.seed_env_scoped_fixture().await;
+    let app = f.app_id;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let session_id = format!("sections-session-{suffix}");
+    let distinct_id = format!("sections-person-{suffix}");
+    {
+        let mut conn = srv.conn().await;
+        seed_session_activity(
+            &mut conn,
+            app,
+            f.granted_env,
+            &session_id,
+            &distinct_id,
+            &f.device_key,
+        )
+        .await;
+    }
+    let env = f.granted_env;
+    let other = f.other_env;
+
+    for path in [
+        format!("/v1/apps/{app}/sessions/{session_id}/timeline"),
+        format!("/v1/apps/{app}/persons/{distinct_id}/timeline"),
+        format!("/v1/apps/{app}/device/errors?key={}", f.device_key),
+    ] {
+        let scoped = with_environment_id(&path, &env.to_string());
+        let (status, without) = srv.get_status_and_body(&scoped, &f.member_token).await;
+        assert_eq!(status, 200, "{scoped}: {without}");
+        let (_, with) = srv
+            .get_status_and_body(&scoped, &f.source_member_token)
+            .await;
+        assert!(
+            !without.contains(FIXTURE_CONTEXT_LINE),
+            "{path}: source lines must be withheld without source:read"
+        );
+        assert!(
+            with.contains(FIXTURE_CONTEXT_LINE),
+            "{path}: …and served with it, or the assertion above is vacuous: {with}"
+        );
+        // Not their environment.
+        assert_eq!(
+            srv.get_status(
+                &with_environment_id(&path, &other.to_string()),
+                &f.member_token
+            )
+            .await,
+            403,
+            "{path}: an environment the member was not granted"
+        );
+    }
 
     srv.shutdown().await;
 }

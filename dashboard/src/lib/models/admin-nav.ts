@@ -1,6 +1,5 @@
 import type { IconName } from '../components/ui/Icon.svelte';
-import type { Permission } from './index';
-import { canAccessPage, pageLockedBy, resolvePageAccess } from './page-access';
+import { canAccessPage, pageLockedBy, resolvePageAccess, type LockReason } from './page-access';
 
 export interface AdminNavItem {
   href: string;
@@ -32,8 +31,8 @@ export const ADMIN_NAV: AdminNavItem[] = [
 
 /** An admin child plus the permission keeping it locked, if any. */
 export interface LockedAdminNavItem extends AdminNavItem {
-  /** `null` when the member may open it, else the permission they lack. */
-  locked: Permission | null;
+  /** `null` when the member may open it, else what they lack. */
+  locked: LockReason | null;
 }
 
 /**

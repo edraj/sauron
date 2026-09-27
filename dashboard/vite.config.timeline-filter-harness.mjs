@@ -19,7 +19,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
  * import specifier before resolution, so it misses the relative imports and the
  * real client goes to the :8090 pin in the committed `static/config.js`.
  * Answering the request keeps axios, the interceptors, `CachedView`,
- * `getSession` and the page itself as the real code.
+ * the API client and the page itself as the real code.
  */
 const ORG = { id: 'org1', name: 'Harness Org', slug: 'harness', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' };
 const PROJECT = { id: 'proj1', org_id: 'org1', name: 'Harness Project', slug: 'harness', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' };
@@ -112,6 +112,30 @@ function sessionRow(timeline) {
   };
 }
 
+/**
+ * `?slow=<ms>` on the PAGE url holds the heavy section back by that long.
+ *
+ * Read off the request's `Referer`, because the page's own query string never
+ * reaches an API call. It is what makes progressive rendering checkable at
+ * all: against a local stub every section answers in a millisecond and the
+ * skeletons are on screen for one frame, so "the header paints before the
+ * timeline" cannot be told from "the page paints at once".
+ */
+function slowMs(req) {
+  try {
+    const ms = Number(new URL(req.headers.referer ?? '').searchParams.get('slow'));
+    return Number.isFinite(ms) && ms > 0 ? Math.min(ms, 30000) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Answer after `ms`. The light section never waits; only a heavy one does. */
+function later(ms, fn) {
+  if (ms > 0) setTimeout(fn, ms);
+  else fn();
+}
+
 function json(res, body) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'no-store');
@@ -147,11 +171,14 @@ function stubApi() {
         if (path === '/v1/projects/proj1/apps') return json(res, [APP]);
         if (path === '/v1/apps/app1/environments') return json(res, []);
 
-        const session = path?.match(/^\/v1\/apps\/app1\/sessions\/(.+)$/);
+        // The page reads two sections, not the composite: the session row, and
+        // its timeline — see `getSessionSummary` in `lib/api/sessions.ts`.
+        const session = path?.match(/^\/v1\/apps\/app1\/sessions\/(.+)\/(summary|timeline)$/);
         if (session) {
           const key = decodeURIComponent(session[1]);
           const timeline = FIXTURES[key] ?? FIXTURES.full;
-          return json(res, { session: sessionRow(timeline), timeline });
+          if (session[2] === 'summary') return json(res, { session: sessionRow(timeline) });
+          return later(slowMs(req), () => json(res, { timeline }));
         }
 
         // Logged rather than silently answered, so a fixture this harness forgot

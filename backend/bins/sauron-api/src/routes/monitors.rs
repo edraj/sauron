@@ -253,9 +253,7 @@ pub async fn detail(
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let (mut conn, m) =
         load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
-    let uptime_24h = repo::uptime_pct(&mut conn, monitor_id, 24).await?;
-    let uptime_7d = repo::uptime_pct(&mut conn, monitor_id, 24 * 7).await?;
-    let uptime_30d = repo::uptime_pct(&mut conn, monitor_id, 24 * 30).await?;
+    let uptime = monitor_uptime(&mut conn, monitor_id).await?;
     let incidents = repo::list_incidents(&mut conn, monitor_id, 20).await?;
     // Surfaced so the dashboard can warn about it in the delete confirmation
     // *before* the delete happens — the delete response itself is too late
@@ -263,10 +261,71 @@ pub async fn detail(
     let pinned_alert_rules = repo::count_alert_rules_for_monitor(&mut conn, monitor_id).await?;
     Ok(Json(json!({
         "monitor": monitor_view(&m),
-        "uptime": { "h24": uptime_24h, "d7": uptime_7d, "d30": uptime_30d },
+        "uptime": uptime,
         "incidents": incidents,
         "pinned_alert_rules": pinned_alert_rules,
     })))
+}
+
+/// Uptime over the three windows the monitor page shows. Shared by [`detail`]
+/// and [`detail_uptime`] so the windows cannot drift apart.
+async fn monitor_uptime(
+    conn: &mut sauron_db::AsyncPgConnection,
+    monitor_id: Uuid,
+) -> Result<Value, ApiError> {
+    let uptime_24h = repo::uptime_pct(conn, monitor_id, 24).await?;
+    let uptime_7d = repo::uptime_pct(conn, monitor_id, 24 * 7).await?;
+    let uptime_30d = repo::uptime_pct(conn, monitor_id, 24 * 30).await?;
+    Ok(json!({ "h24": uptime_24h, "d7": uptime_7d, "d30": uptime_30d }))
+}
+
+// --- detail, one section at a time -------------------------------------------
+//
+// `detail` above is the monitor row followed by three uptime aggregates and an
+// incident scan. These serve the row and the aggregates separately, so the
+// page can show what it is before it shows how it has been doing. Incidents
+// already have a route of their own (`incidents`, below).
+
+#[utoipa::path(
+    get, path = "/v1/monitors/{monitor_id}/summary", tag = "Monitors",
+    summary = "Fetch a monitor, without its uptime or incidents",
+    description = "The monitor's configuration and current status, plus how many alert rules are pinned to it. Pair with the `uptime`, `incidents` and `checks` routes to fill a detail page in as each lands.",
+    params(("monitor_id" = Uuid, Path, description = "The monitor.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The monitor.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such monitor.", body = ErrorResponse)),
+)]
+pub async fn detail_summary(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(monitor_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
+) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
+    let (mut conn, m) =
+        load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
+    let pinned_alert_rules = repo::count_alert_rules_for_monitor(&mut conn, monitor_id).await?;
+    Ok(Json(json!({
+        "monitor": monitor_view(&m),
+        "pinned_alert_rules": pinned_alert_rules,
+    })))
+}
+
+#[utoipa::path(
+    get, path = "/v1/monitors/{monitor_id}/uptime", tag = "Monitors",
+    summary = "A monitor's uptime over 24 hours, 7 days and 30 days",
+    params(("monitor_id" = Uuid, Path, description = "The monitor.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "Uptime percentages.", body = serde_json::Value), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 404, description = "No such monitor.", body = ErrorResponse)),
+)]
+pub async fn detail_uptime(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(monitor_id): Path<Uuid>,
+    Query(env): Query<super::scope::RejectEnvQuery>,
+) -> Result<Json<Value>, ApiError> {
+    super::scope::reject_environment_id(env.environment_id.as_deref())?;
+    let (mut conn, _m) =
+        load_authorized(&state, auth.user_id, monitor_id, perm::MONITOR_READ).await?;
+    let uptime = monitor_uptime(&mut conn, monitor_id).await?;
+    Ok(Json(json!({ "uptime": uptime })))
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

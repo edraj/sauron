@@ -6,6 +6,7 @@
   import { push } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
+  import ViewSection from '../lib/components/ViewSection.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
@@ -20,10 +21,10 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
-  import { getSession } from '../lib/api/sessions';
+  import { getSessionSummary, getSessionTimeline } from '../lib/api/sessions';
   import { isNormalizedError } from '../lib/api/client';
   import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
-  import type { SessionDetail, Transaction } from '../lib/models';
+  import type { Session, TimelineItem, Transaction } from '../lib/models';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import {
     NO_TIMELINE_FILTER,
@@ -55,9 +56,9 @@
    * navigated away from is discarded like any other stale response, instead of
    * flipping a page-level flag over the session now on screen.
    */
-  async function fetchSession(appId: string, id: string): Promise<SessionDetail | null> {
+  async function fetchSession(appId: string, id: string): Promise<Session | null> {
     try {
-      return await getSession(appId, id);
+      return await getSessionSummary(appId, id);
     } catch (err) {
       if (isNormalizedError(err) && err.status === 404) return null;
       throw err;
@@ -72,15 +73,23 @@
   // `revalidating` now IS surfaced: the page grew a RefreshButton, and a
   // refresh that spun nothing while the payload swapped underneath read as the
   // click having done nothing.
-  const view = new CachedView<SessionDetail | null>();
+  //
+  // TWO views. The session row is one keyed lookup; its timeline is up to 1,500
+  // rows plus symbolication. Read as one payload, the header and the stat tiles
+  // — all of which come from the row — waited on the timeline. Read apart, the
+  // page says what the session IS at once and the timeline card shows a
+  // skeleton until its own answer lands.
+  const view = new CachedView<Session | null>();
+  const timelineView = new CachedView<TimelineItem[]>();
 
-  const refresher = pageRefresher(() => view.reload());
+  const refresher = pageRefresher(async () => {
+    await Promise.all([view.reload(), timelineView.reload()]);
+  });
 
-  const detail = $derived(view.data ?? null);
   const loading = $derived(view.loading);
   const error = $derived(view.error);
   // "Loaded, and what loaded was nothing." `hasData` is what separates that from
-  // "nothing loaded yet", since both leave `detail` null.
+  // "nothing loaded yet", since both leave `s` null.
   const notFound = $derived(view.hasData && view.data === null);
 
   // `scopeKey` belongs in the key: it carries the selected environment, which the
@@ -89,12 +98,21 @@
   //
   // `force` bypasses the fresh-window short-circuit: the Retry button means "go to
   // the network now", and honouring the cache there makes the control look broken.
+  //
+  // Started together, settled separately — see the note on the two views above.
   async function load(appId: string, id: string, force = false) {
-    await view.load(
-      viewKey('sessions.detail', appId, sessionStore.scopeKey, id),
-      () => fetchSession(appId, id),
-      force,
-    );
+    await Promise.allSettled([
+      view.load(
+        viewKey('sessions.detail', appId, sessionStore.scopeKey, id),
+        () => fetchSession(appId, id),
+        force,
+      ),
+      timelineView.load(
+        viewKey('sessions.detail.timeline', appId, sessionStore.scopeKey, id),
+        () => getSessionTimeline(appId, id),
+        force,
+      ),
+    ]);
   }
 
   $effect(() => {
@@ -129,7 +147,10 @@
    */
   let timelineFilter = $state<TimelineFilter>(NO_TIMELINE_FILTER);
 
-  const timeline = $derived(detail?.timeline ?? []);
+  const timeline = $derived(timelineView.data ?? []);
+  // The card has rows to show only once BOTH have landed: the timeline for the
+  // rows, the session for the instant their offsets are measured from.
+  const timelineReady = $derived(timelineView.hasData && view.data != null);
   // Counts read the FULL timeline: a chip whose number moved when you toggled a
   // different chip could not be read as "how many of these this session has".
   const timelineCounts = $derived(categoryCounts(timeline));
@@ -137,7 +158,7 @@
   const visibleTimeline = $derived(filterTimeline(timeline, timelineFilter));
   const timelineFiltered = $derived(isTimelineFiltered(timelineFilter));
 
-  const s = $derived(detail?.session ?? null);
+  const s = $derived(view.data ?? null);
   const durationMs = $derived(s ? durationBetween(s.started_at, s.last_event_at) : 0);
   const hasContext = $derived(
     !!s && !!s.context && typeof s.context === 'object' && Object.keys(s.context).length > 0,
@@ -147,7 +168,7 @@
   let sliceStartTime = $state<'occurred_at' | 'received_at'>('occurred_at');
 
   const slicedTimeline = $derived.by(() => {
-    if (!detail || sliceStack.length === 0) return [];
+    if (sliceStack.length === 0) return [];
     const currentSlice = sliceStack[sliceStack.length - 1];
     
     const startMs = new Date(sliceStartTime === 'occurred_at' ? currentSlice.occurred_at : currentSlice.received_at).getTime();
@@ -155,7 +176,7 @@
       ? new Date(currentSlice.finished_at).getTime()
       : new Date(currentSlice.occurred_at).getTime() + currentSlice.duration_ms;
 
-    return detail.timeline.filter(item => {
+    return timeline.filter(item => {
       const itemMs = new Date(item.at).getTime();
       const inRange = itemMs >= startMs && itemMs <= endMs;
       if (!inRange) return false;
@@ -173,10 +194,12 @@
   }
 
   function downloadSessionJson() {
-    if (!detail || !s) return;
+    // Not before the timeline has landed: an export of the session with an
+    // empty `timeline` would read as a session in which nothing happened.
+    if (!s || !timelineView.hasData) return;
     const exportData = {
       session: s,
-      timeline: detail.timeline
+      timeline,
     };
     const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -192,9 +215,10 @@
 
   <button class="back" onclick={() => push('/sessions')}><Icon name="arrow-left" size={14} /> {t('explore.column.sessions')}</button>
 
-  {#if loading}
-    <Skeleton rows={6} />
-  {:else if notFound}
+  <!-- The session ROW decides whether there is a page at all (not found, or a
+       failed read); the timeline is a section of a page that exists, and waits
+       and fails inside its own card. -->
+  {#if notFound}
     <EmptyState
       title={t('session.notFound.title')}
       description={t('session.notFound.body')}
@@ -204,7 +228,7 @@
         <Button variant="secondary" onclick={() => push('/sessions')}>{t('session.backToList')}</Button>
       {/snippet}
     </EmptyState>
-  {:else if error}
+  {:else if !loading && error}
     <EmptyState title={t('session.error.load')} description={error} icon="triangle-alert">
       {#snippet action()}
         <Button
@@ -215,11 +239,21 @@
         </Button>
       {/snippet}
     </EmptyState>
-  {:else if detail && s}
+  {:else}
+    {#if !s}
+      <header class="detail-head"><Skeleton rows={2} height="18px" /></header>
+      <Skeleton rows={1} height="64px" />
+    {:else}
     <header class="detail-head">
       <div class="refresh-slot">
-        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-        <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+        <Freshness
+          fetchedAt={view.fetchedAt}
+          revalidating={view.revalidating || timelineView.revalidating}
+        />
+        <RefreshButton
+          onclick={refresher.run}
+          loading={refresher.busy || view.revalidating || timelineView.revalidating}
+        />
       </div>
       <div class="id-row">
         <h1 class="session-id mono">{s.session_id}</h1>
@@ -255,6 +289,7 @@
       />
       <StatTile label={t('explore.column.started')} value={formatDateTime(s.started_at)} />
     </StatTiles>
+    {/if}
 
     <div class="grid">
       <div class="col-main">
@@ -264,6 +299,7 @@
               variant="ghost"
               size="sm"
               title={t('session.downloadTitle')}
+              disabled={!timelineReady}
               onclick={downloadSessionJson}
             >
               <Icon name="download" size={14} />
@@ -284,28 +320,34 @@
           <!-- Hidden for an empty session: with every count at zero the strip
                is four disabled chips over a timeline that already says it has
                nothing in it. -->
-          {#if timeline.length > 0}
-            <TimelineFilters
-              counts={timelineCounts}
-              ops={timelineOps}
-              filter={timelineFilter}
-              onchange={(next) => (timelineFilter = next)}
-            />
-          {/if}
-          <Timeline
-            items={visibleTimeline}
-            startedAt={s.started_at}
-            {timeMode}
-            onslice={pushSlice}
-            emptyLabel={timelineFiltered
-              ? 'No entries match the selected filters.'
-              : undefined}
-          />
+          <ViewSection view={timelineView} rows={8} waiting={!s}>
+            {#if s}
+              {#if timeline.length > 0}
+                <TimelineFilters
+                  counts={timelineCounts}
+                  ops={timelineOps}
+                  filter={timelineFilter}
+                  onchange={(next) => (timelineFilter = next)}
+                />
+              {/if}
+              <Timeline
+                items={visibleTimeline}
+                startedAt={s.started_at}
+                {timeMode}
+                onslice={pushSlice}
+                emptyLabel={timelineFiltered
+                  ? 'No entries match the selected filters.'
+                  : undefined}
+              />
+            {/if}
+          </ViewSection>
         </Card>
       </div>
       <aside class="col-side">
         <Card title={t('session.card.context')}>
-          {#if hasContext}
+          {#if !s}
+            <Skeleton rows={4} />
+          {:else if hasContext}
             <div class="ctx"><JsonTree value={s.context} expandTo={1} /></div>
           {:else}
             <p class="muted empty-ctx">{t('session.noContext')}</p>

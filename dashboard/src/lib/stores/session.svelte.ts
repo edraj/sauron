@@ -273,6 +273,35 @@ class SessionStore {
     );
   }
 
+  /**
+   * Whether `perm` is held on the current org, or on ANY project or app in it.
+   *
+   * For a page that is org-wide and reach-filtered rather than tied to the
+   * selection: its list endpoint returns the slice the caller's grants cover
+   * (`Reach` in rbac.rs), so a grant on a project the switcher is not on still
+   * opens it. `can()` cannot ask this — it only ever consults the selected
+   * project and app.
+   *
+   * Project and app grants are not compared against an id: `access` is loaded
+   * per org (`getAccess(orgId)`), so every one of them already belongs to the
+   * current org. The org arm IS compared, so a stale `access` from the org just
+   * switched away from cannot open the page.
+   *
+   * Environment grants are ignored. No reach-filtered page reads by
+   * environment; `canAtAnyEnv` is the env-aware pages' counterpart.
+   */
+  canWithinOrg(perm: Permission): boolean {
+    if (!this.access) return false;
+    const org = this.currentOrgId;
+    return this.access.grants.some(
+      (g) =>
+        g.permissions.includes(perm) &&
+        ((g.scope_type === 'org' && g.scope_id === org) ||
+          g.scope_type === 'project' ||
+          g.scope_type === 'app'),
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Loading
   // -------------------------------------------------------------------------

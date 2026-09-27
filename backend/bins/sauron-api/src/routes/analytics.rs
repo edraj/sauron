@@ -159,27 +159,11 @@ pub async fn person(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<PersonProfile>, ApiError> {
     let mut conn = db(&state).await?;
-    // `_with_perms`: `errors` below is whole `ErrorEvent` rows (up to `limit`,
-    // which clamps at 200), which carry two further permission questions —
-    // `perm::ISSUE_READ` for the body at all and `perm::SOURCE_READ` for the
-    // de-obfuscated lines inside it. The body gate matters most here: these
-    // rows are already keyed to one identified person, so their payloads are
-    // that person's crash data. See `sessions::detail` for the same note.
-    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
-        &mut conn,
-        auth.user_id,
-        app_id,
-        perm::EVENT_READ,
-        raw_query.as_deref(),
-    )
-    .await?;
+    let (scope, perms) = authorize_person_read(&mut conn, auth.user_id, app_id, &raw_query).await?;
     let limit = q.limit.clamp(1, 200);
 
     let user = repo::get_event_user(&mut conn, scope.clone(), &distinct_id).await?;
-    let events = repo::events_for_person(&mut conn, scope.clone(), &distinct_id, limit).await?;
-    let mut errors = repo::error_events_for_person(&mut conn, scope, &distinct_id, limit).await?;
-    crate::symbolicate::gate_source_context(&perms, &mut errors);
-    crate::symbolicate::gate_event_body(&perms, &mut errors);
+    let (events, errors) = person_timeline(&mut conn, scope, &perms, &distinct_id, limit).await?;
 
     Ok(Json(PersonProfile {
         distinct_id,
@@ -187,6 +171,117 @@ pub async fn person(
         events,
         errors,
     }))
+}
+
+/// Resolve scope and permissions for a read of one person.
+async fn authorize_person_read(
+    conn: &mut sauron_db::AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    raw_query: &Option<String>,
+) -> Result<
+    (
+        sauron_db::scope::ReadScope,
+        std::collections::HashSet<String>,
+    ),
+    ApiError,
+> {
+    // `_with_perms`: `errors` below is whole `ErrorEvent` rows (up to `limit`,
+    // which clamps at 200), which carry two further permission questions —
+    // `perm::ISSUE_READ` for the body at all and `perm::SOURCE_READ` for the
+    // de-obfuscated lines inside it. The body gate matters most here: these
+    // rows are already keyed to one identified person, so their payloads are
+    // that person's crash data. See `sessions::detail` for the same note.
+    super::scope::authorized_read_scope_with_perms(
+        conn,
+        user_id,
+        app_id,
+        perm::EVENT_READ,
+        raw_query.as_deref(),
+    )
+    .await
+}
+
+/// One person's most recent events and errors, the errors gated for `perms`.
+///
+/// Shared by [`person`] and [`person_timeline_section`] so the gates exist once.
+async fn person_timeline(
+    conn: &mut sauron_db::AsyncPgConnection,
+    scope: sauron_db::scope::ReadScope,
+    perms: &std::collections::HashSet<String>,
+    distinct_id: &str,
+    limit: i64,
+) -> Result<(Vec<AnalyticsEvent>, Vec<ErrorEvent>), ApiError> {
+    let events = repo::events_for_person(conn, scope.clone(), distinct_id, limit).await?;
+    let mut errors = repo::error_events_for_person(conn, scope, distinct_id, limit).await?;
+    crate::symbolicate::gate_source_context(perms, &mut errors);
+    crate::symbolicate::gate_event_body(perms, &mut errors);
+    Ok((events, errors))
+}
+
+// --- person, one section at a time -------------------------------------------
+//
+// See `issues::detail_summary` for the reasoning. Unlike an issue or a session,
+// a person with no `event_users` row is NOT a 404 on the composite route — it
+// answers `user: null` with whatever events carry that `distinct_id` — so the
+// sections keep that: neither refuses an id the composite would have served.
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct PersonSummary {
+    pub distinct_id: String,
+    /// `null` when no profile row exists for this `distinct_id` in scope.
+    pub user: Option<PersonRow>,
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/persons/{distinct_id}/summary", tag = "Analytics",
+    summary = "One person's profile, without their timeline",
+    description = "The profile row alone. Pair with the `timeline` section to fill a detail page in as each lands.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("distinct_id" = String, Path, description = "The person's distinct id.")),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The profile.", body = PersonSummary), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
+pub async fn person_summary(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((app_id, distinct_id)): Path<(Uuid, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<PersonSummary>, ApiError> {
+    let mut conn = db(&state).await?;
+    let (scope, _perms) =
+        authorize_person_read(&mut conn, auth.user_id, app_id, &raw_query).await?;
+    let user = repo::get_event_user(&mut conn, scope, &distinct_id).await?;
+    Ok(Json(PersonSummary { distinct_id, user }))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct PersonTimeline {
+    pub events: Vec<AnalyticsEvent>,
+    pub errors: Vec<ErrorEvent>,
+}
+
+#[utoipa::path(
+    get, path = "/v1/apps/{app_id}/persons/{distinct_id}/timeline", tag = "Analytics",
+    summary = "One person's recent events and errors",
+    description = "The most recent `limit` of each. Error bodies need `issue:read` and de-obfuscated source lines need `source:read`.",
+    params(("app_id" = Uuid, Path, description = "The app."), ("distinct_id" = String, Path, description = "The person's distinct id."), PersonQuery),
+    security(("bearerAuth" = [])),
+    responses((status = 200, description = "The timeline.", body = PersonTimeline), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse),
+              (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
+)]
+pub async fn person_timeline_section(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path((app_id, distinct_id)): Path<(Uuid, String)>,
+    Query(q): Query<PersonQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<PersonTimeline>, ApiError> {
+    let mut conn = db(&state).await?;
+    let (scope, perms) = authorize_person_read(&mut conn, auth.user_id, app_id, &raw_query).await?;
+    let limit = q.limit.clamp(1, 200);
+    let (events, errors) = person_timeline(&mut conn, scope, &perms, &distinct_id, limit).await?;
+    Ok(Json(PersonTimeline { events, errors }))
 }
 
 // ---------------------------------------------------------------------------
