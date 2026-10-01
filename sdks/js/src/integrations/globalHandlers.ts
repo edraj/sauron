@@ -102,8 +102,9 @@ function syntheticError(
 ): Error {
   const msg = typeof message === 'string' ? message : 'Unknown error';
   const err = new Error(msg);
-  if (source) {
-    err.stack = `Error: ${msg}\n    at ${source}:${lineno ?? 0}:${colno ?? 0}`;
-  }
+  // Always overwrite the stack: the one `new Error` recorded is this SDK's
+  // handler, not the page. With no source (a cross-origin "Script error.")
+  // there is no frame to report at all.
+  err.stack = source ? `Error: ${msg}\n    at ${source}:${lineno ?? 0}:${colno ?? 0}` : `Error: ${msg}`;
   return err;
 }

@@ -1,4 +1,12 @@
-//! GNU build-id extraction from an uploaded ELF.
+//! Build-id extraction from an uploaded Dart symbols file: the GNU build-id
+//! note of an ELF (Android, Linux), or the `LC_UUID` of a Mach-O (iOS, macOS).
+//!
+//! Flutter builds Apple targets with `gen_snapshot --snapshot_kind=
+//! app-aot-macho-dylib`, so there `--split-debug-info` writes the `.symbols`
+//! file as a Mach-O dSYM companion carrying no GNU note at all. The VM prints
+//! the image's `LC_UUID` as the trace's `build_id:` in plain lowercase hex, and
+//! Dart's own decoder (`package:native_stack_traces`) matches a Mach-O debug
+//! file on that same form — so it is what [`build_id_hex`] returns for one.
 //!
 //! Dart symbol artifacts match on `debug_id` alone (`arch` is accepted but
 //! ignored — see `engine.rs`), and that id is the ELF's build-id. Requiring the
@@ -38,7 +46,8 @@
 //! bounded before it happens, so there is no OOM-abort route around it.
 
 use object::read::elf::{FileHeader, ProgramHeader, SectionHeader};
-use object::{elf, Endian, Endianness, FileKind};
+use object::read::macho::MachHeader;
+use object::{elf, macho, Endian, Endianness, FileKind};
 
 use crate::content::SymbolError;
 
@@ -104,7 +113,8 @@ const MAX_BUILD_ID_BYTES: usize = 64;
 /// ELF64 (GNU/Linux uses 32-bit note headers in both).
 const NOTE_HEADER_LEN: usize = 12;
 
-/// Lowercase hex of the ELF's GNU build-id note.
+/// Lowercase hex of the file's build-id: an ELF's GNU build-id note, or a
+/// Mach-O's `LC_UUID` (see the module docs).
 pub fn build_id_hex(elf: &[u8]) -> Result<String, SymbolError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_id_inner(elf)))
         .unwrap_or_else(|_| Err(SymbolError::Corrupt("panic while reading build-id".into())))
@@ -114,10 +124,43 @@ fn build_id_inner(elf: &[u8]) -> Result<String, SymbolError> {
     match FileKind::parse(elf).map_err(|e| SymbolError::Corrupt(format!("elf parse: {e}")))? {
         FileKind::Elf32 => scan::<elf::FileHeader32<Endianness>>(elf),
         FileKind::Elf64 => scan::<elf::FileHeader64<Endianness>>(elf),
+        FileKind::MachO32 => mach_uuid::<macho::MachHeader32<Endianness>>(elf),
+        FileKind::MachO64 => mach_uuid::<macho::MachHeader64<Endianness>>(elf),
         other => Err(SymbolError::Corrupt(format!(
-            "not an ELF file (detected {other:?}) — pass debug_id explicitly"
+            "not an ELF or Mach-O file (detected {other:?}) — pass debug_id explicitly"
         ))),
     }
+}
+
+/// The `LC_UUID` of a thin Mach-O, as lowercase hex.
+///
+/// Each load command consumes at least its 8-byte header out of a table that
+/// must fit inside the file, so the walk is already bounded by the input size;
+/// [`MAX_HEADERS`] caps it well below that, as for ELF headers. A real dSYM has
+/// about a dozen commands.
+fn mach_uuid<Mach: MachHeader<Endian = Endianness>>(data: &[u8]) -> Result<String, SymbolError> {
+    let header =
+        Mach::parse(data, 0).map_err(|e| SymbolError::Corrupt(format!("mach-o header: {e}")))?;
+    let endian = header
+        .endian()
+        .map_err(|e| SymbolError::Corrupt(format!("mach-o endian: {e}")))?;
+    let mut commands = header
+        .load_commands(endian, data, 0)
+        .map_err(|e| SymbolError::Corrupt(format!("mach-o load commands: {e}")))?;
+    for _ in 0..MAX_HEADERS {
+        let Some(command) = commands
+            .next()
+            .map_err(|e| SymbolError::Corrupt(format!("mach-o load commands: {e}")))?
+        else {
+            break;
+        };
+        if let Ok(Some(uuid)) = command.uuid() {
+            return Ok(crate::content::hex(&uuid.uuid));
+        }
+    }
+    Err(SymbolError::Corrupt(
+        "no LC_UUID load command in this Mach-O file — pass debug_id explicitly".into(),
+    ))
 }
 
 /// Walk the file's notes under [`Budget`] and return the build-id as hex.
@@ -635,5 +678,90 @@ mod tests {
             }
         }
         buf
+    }
+
+    // --- Mach-O (iOS / macOS) ---------------------------------------------
+    //
+    // Flutter builds Apple targets with `gen_snapshot --snapshot_kind=
+    // app-aot-macho-dylib`, so `--split-debug-info` writes
+    // `app.ios-arm64.symbols` as a Mach-O dSYM companion, not an ELF, and it has
+    // no GNU note at all. The VM's trace header prints that image's LC_UUID as
+    // `build_id:` — plain lowercase hex, no dashes — which is also the form
+    // Dart's own decoder (`package:native_stack_traces`, `UuidCommand.uuidString`)
+    // compares against. Before this, every iOS symbols upload without an
+    // explicit `debug_id` was a 400.
+
+    /// The LC_UUID of a real `app.ios.symbols` dSYM that `gen_snapshot` (Dart
+    /// 3.12.2) wrote with `--snapshot_kind=app-aot-macho-dylib`; the `App`
+    /// dylib from the same run carries the identical UUID.
+    const DSYM_UUID: [u8; 16] = [
+        0xb1, 0x85, 0x15, 0x45, 0x28, 0x12, 0x00, 0xaa, 0xdd, 0x4a, 0xbb, 0xa6, 0xf9, 0x42, 0x38,
+        0x36,
+    ];
+
+    fn le32(v: u32) -> [u8; 4] {
+        v.to_le_bytes()
+    }
+
+    /// A thin little-endian arm64 `MH_DSYM` carrying `cmds` in order.
+    fn macho64(cmds: &[Vec<u8>]) -> Vec<u8> {
+        let sizeofcmds: usize = cmds.iter().map(Vec::len).sum();
+        let mut buf = Vec::new();
+        buf.extend(le32(0xfeed_facf)); // MH_MAGIC_64
+        buf.extend(le32(0x0100_000c)); // CPU_TYPE_ARM64
+        buf.extend(le32(0)); // cpusubtype
+        buf.extend(le32(0xa)); // MH_DSYM
+        buf.extend(le32(cmds.len() as u32)); // ncmds
+        buf.extend(le32(sizeofcmds as u32));
+        buf.extend(le32(0)); // flags
+        buf.extend(le32(0)); // reserved
+        for c in cmds {
+            buf.extend(c);
+        }
+        buf
+    }
+
+    fn lc_uuid(uuid: [u8; 16]) -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend(le32(0x1b)); // LC_UUID
+        c.extend(le32(24));
+        c.extend(uuid);
+        c
+    }
+
+    fn lc_source_version() -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend(le32(0x2a)); // LC_SOURCE_VERSION
+        c.extend(le32(16));
+        c.extend(0u64.to_le_bytes());
+        c
+    }
+
+    #[test]
+    fn a_mach_o_dsym_yields_its_lc_uuid_as_the_vm_prints_it() {
+        // An unrelated command first, so the walk has to step over one.
+        let dsym = macho64(&[lc_source_version(), lc_uuid(DSYM_UUID)]);
+        assert_eq!(
+            build_id_hex(&dsym).unwrap(),
+            "b1851545281200aadd4abba6f9423836"
+        );
+    }
+
+    #[test]
+    fn a_mach_o_without_an_lc_uuid_errors_by_name() {
+        let err = build_id_hex(&macho64(&[lc_source_version()]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("LC_UUID"),
+            "expected the no-uuid error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_mach_o_load_command_table_errors() {
+        let mut dsym = macho64(&[lc_uuid(DSYM_UUID)]);
+        dsym.truncate(dsym.len() - 8);
+        assert!(build_id_hex(&dsym).is_err());
     }
 }

@@ -15,8 +15,10 @@
  * the queue is replayed.
  */
 
+import { captureException } from './api/capture.js';
 import * as api from './index.js';
 import { captureOnError, captureRejection } from './integrations/globalHandlers.js';
+import type { Hint } from './types.js';
 
 const root = self as unknown as { Sauron?: { init?: unknown; q?: unknown } };
 const existing = root.Sauron;
@@ -63,6 +65,10 @@ function run(entry: unknown): void {
       captureOnError(event.message, event.filename, event.lineno, event.colno, event.error);
     } else if (name === '$unhandledrejection') {
       captureRejection((args[0] as PromiseRejectionEvent).reason);
+    } else if (name === 'captureException') {
+      // Not the public one: that records its call site as the stack of a
+      // stackless value, and here the call site is this replay loop.
+      captureException(args[0], args[1] as Hint | undefined);
     } else {
       const fn = (api as unknown as Record<string, unknown>)[name];
       if (typeof fn === 'function') fn(...args);

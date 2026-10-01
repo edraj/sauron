@@ -82,14 +82,15 @@ export function platformFor(form: Pick<UploadForm, 'kind' | 'dartPlatform'>): Ar
 /** `accept` for the file input; `undefined` means unrestricted. */
 export function fileAccept(kind: ArtifactKind): string | undefined {
   if (kind === 'dart_obfuscation_map') return '.json,application/json';
-  // Unrestricted for `dart_symbols`: the file is an ELF and its name varies by
-  // toolchain (`app.android-arm64.symbols`, `app.ios-arm64.symbols`, …).
+  // Unrestricted for `dart_symbols`: the file is an ELF (Android) or a Mach-O
+  // dSYM (iOS/macOS), and its name varies by toolchain
+  // (`app.android-arm64.symbols`, `app.ios-arm64.symbols`, …).
   return kind === 'dart_symbols' ? undefined : '.map,application/json';
 }
 
 export function fileLabel(kind: ArtifactKind): string {
   if (kind === 'dart_obfuscation_map') return 'Obfuscation map (JSON)';
-  return kind === 'dart_symbols' ? 'Symbol file (ELF)' : 'Source map (.map)';
+  return kind === 'dart_symbols' ? 'Symbol file (.symbols)' : 'Source map (.map)';
 }
 
 export function formTitle(kind: ArtifactKind): string {

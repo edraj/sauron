@@ -10,12 +10,11 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 csv = { workspace = true }
 flate2 = { workspace = true }
-# `use_pem` on top of the workspace's `rust_crypto`: both store credentials
-# arrive as PEM text — Google's service-account `private_key` (RSA, for RS256)
-# and Apple's `.p8` (EC, for ES256) — and the workspace pins
-# `default-features = false`, which drops PEM parsing. The API's own JWTs use
-# HMAC secrets and are unaffected.
-jsonwebtoken = { workspace = true, features = ["use_pem"] }
+# `pem`: both store credentials arrive as PEM text — Google's service-account
+# `private_key` (RSA, for RS256) and Apple's `.p8` (EC, for ES256) — and PEM
+# parsing is off unless a crate asks for it. The API's own JWTs use HMAC secrets
+# and are unaffected.
+sauron-jwt = { workspace = true, features = ["pem"] }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

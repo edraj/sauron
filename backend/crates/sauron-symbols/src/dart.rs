@@ -1,9 +1,11 @@
 //! Dart (Flutter AOT) symbolication.
 //!
-//! Flutter's `--split-debug-info` emits an ELF containing DWARF for each build
-//! (Android *and* iOS — the file format is the same). We resolve a stack frame's
-//! DSO-relative virtual address to the original function/file/line via DWARF,
-//! exactly as `flutter symbolize` / `addr2line` would.
+//! Flutter's `--split-debug-info` emits a file containing DWARF for each build:
+//! an ELF on Android, a Mach-O dSYM companion on iOS/macOS (Flutter builds Apple
+//! targets with `app-aot-macho-dylib`). `object` reads both and maps the DWARF
+//! section names, so the resolver is the same. We resolve a stack frame's
+//! address to the original function/file/line via DWARF, exactly as
+//! `flutter symbolize` / `addr2line` would.
 //!
 //! v1 builds the DWARF context per call (no in-process context cache — Dart
 //! error volume is low and the ELF bytes are still served from the blob cache).
@@ -12,10 +14,98 @@
 
 use std::borrow::Cow;
 
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, ObjectSymbol};
 
 use crate::content::SymbolError;
+use crate::dart_trace::{DartFrameRef, DartTrace, InstructionsSection};
 use crate::js::ResolvedLoc;
+
+/// The root loading unit's id. Only it is covered by a build's main debug file;
+/// every deferred unit ships its own (`package:native_stack_traces`'s
+/// `rootLoadingUnitId`).
+const ROOT_LOADING_UNIT: u32 = 1;
+
+/// Resolve every frame of a parsed trace against the debug file. Same slot
+/// contract as [`resolve`]: one slot per frame, in order.
+///
+/// Each frame's address is chosen the way Dart's own decoder,
+/// `package:native_stack_traces`, chooses it — the trace's
+/// `<instructions symbol>+0x<offset>` added to where the debug file puts that
+/// symbol, before `virt`. The offset is the only address the running image and
+/// the debug file agree on regardless of layout. `virt` and `abs - dso_base`
+/// are only right when the loaded image is laid out exactly like the debug
+/// file: true of an ELF snapshot (Android), false of an assembly-built one,
+/// whose frames carry no `virt` and whose load-base fallback resolved to
+/// unrelated functions with full confidence. Those two remain the fallback for
+/// a file without the instruction symbols.
+///
+/// Frames from a deferred loading unit are never looked up: their addresses
+/// belong to that unit's own debug file.
+pub fn resolve_trace(elf: &[u8], trace: &DartTrace) -> Result<Vec<Vec<ResolvedLoc>>, SymbolError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let file = parse(elf)?;
+        let vm = symbol_address(&file, InstructionsSection::Vm);
+        let isolate = symbol_address(&file, InstructionsSection::Isolate);
+        let addrs: Vec<Option<u64>> = trace
+            .frames
+            .iter()
+            .map(|f| frame_address(f, trace.dso_base, vm, isolate))
+            .collect();
+        lookup(&file, &addrs)
+    }))
+    .unwrap_or_else(|_| Err(SymbolError::Corrupt("panic while parsing ELF/DWARF".into())))
+}
+
+/// Whether an uploaded Dart symbols file carries DWARF at all.
+///
+/// `Some(false)` for a file that parses as an object file but has no
+/// `.debug_info` (`__debug_info` in a Mach-O). In practice that is the app
+/// binary — `libapp.so` on Android, `App` on iOS — whose build-id is identical
+/// to its `.symbols` file's, so nothing else about the upload looks wrong.
+/// `None` when the file does not parse: judging those stays with the upload
+/// route's explicit-`debug_id` escape hatch.
+pub fn has_debug_info(file: &[u8]) -> Option<bool> {
+    std::panic::catch_unwind(|| {
+        let file = object::File::parse(file).ok()?;
+        Some(
+            file.section_by_name(".debug_info")
+                .is_some_and(|s| s.size() > 0),
+        )
+    })
+    .ok()
+    .flatten()
+}
+
+fn frame_address(
+    frame: &DartFrameRef,
+    dso_base: Option<u64>,
+    vm: Option<u64>,
+    isolate: Option<u64>,
+) -> Option<u64> {
+    if frame.unit.is_some_and(|u| u != ROOT_LOADING_UNIT) {
+        return None;
+    }
+    if let Some((section, offset)) = frame.symbol_offset {
+        let start = match section {
+            InstructionsSection::Vm => vm,
+            InstructionsSection::Isolate => isolate,
+        };
+        if let Some(start) = start {
+            return start.checked_add(offset);
+        }
+    }
+    frame.lookup_addr(dso_base)
+}
+
+/// Where the debug file puts an instruction section's start symbol. Dart writes
+/// it to the static symbol table and, in an ELF, the dynamic one too.
+fn symbol_address(file: &object::File<'_>, section: InstructionsSection) -> Option<u64> {
+    let name = section.symbol();
+    file.symbols()
+        .chain(file.dynamic_symbols())
+        .find(|s| s.name() == Ok(name))
+        .map(|s| s.address())
+}
 
 /// Resolve each frame's DSO-relative virtual address against the ELF's DWARF.
 /// Returns exactly one slot per input slot, in the same order — callers pair the
@@ -39,9 +129,17 @@ pub fn resolve(elf: &[u8], addrs: &[Option<u64>]) -> Result<Vec<Vec<ResolvedLoc>
 }
 
 fn resolve_inner(elf: &[u8], addrs: &[Option<u64>]) -> Result<Vec<Vec<ResolvedLoc>>, SymbolError> {
-    let file =
-        object::File::parse(elf).map_err(|e| SymbolError::Corrupt(format!("elf parse: {e}")))?;
+    lookup(&parse(elf)?, addrs)
+}
 
+fn parse(elf: &[u8]) -> Result<object::File<'_>, SymbolError> {
+    object::File::parse(elf).map_err(|e| SymbolError::Corrupt(format!("elf parse: {e}")))
+}
+
+fn lookup(
+    file: &object::File<'_>,
+    addrs: &[Option<u64>],
+) -> Result<Vec<Vec<ResolvedLoc>>, SymbolError> {
     let endian = if file.is_little_endian() {
         gimli::RunTimeEndian::Little
     } else {
@@ -173,6 +271,18 @@ mod tests {
         assert_eq!(out[1][0].name.as_deref(), Some("compute_total"));
         assert!(out[2].is_empty());
         assert_eq!(out[3][0].name.as_deref(), Some("helper_add"));
+    }
+
+    /// `sample.elf` put through `strip --strip-debug`: the same build-id note
+    /// and no DWARF — exactly how a Flutter app's `libapp.so` relates to its
+    /// `--split-debug-info` `.symbols` file.
+    const STRIPPED_ELF: &[u8] = include_bytes!("../tests/fixtures/sample_stripped.elf");
+
+    #[test]
+    fn debug_info_presence_is_only_claimed_for_files_that_parse() {
+        assert_eq!(has_debug_info(ELF), Some(true));
+        assert_eq!(has_debug_info(STRIPPED_ELF), Some(false));
+        assert_eq!(has_debug_info(b"not an elf"), None);
     }
 
     #[test]

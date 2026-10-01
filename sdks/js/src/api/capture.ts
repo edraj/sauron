@@ -55,9 +55,29 @@ function extractError(err: unknown): ExtractedError {
   return { type: typeof err, value: String(err), stacktrace: [] };
 }
 
-/** Build an error item from a thrown value plus the current breadcrumb trail. */
-export function buildErrorItem(err: unknown, breadcrumbs: Breadcrumb[], hint?: Hint): ErrorItem {
+/** Whether `err` carries a stack of its own (a real or error-like object with one). */
+export function hasOwnStack(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && typeof (err as { stack?: unknown }).stack === 'string';
+}
+
+/**
+ * Build an error item from a thrown value plus the current breadcrumb trail.
+ *
+ * `callSite` is an `Error` made in the public `captureException` for a value
+ * with no stack of its own (a string, a plain object): its frames, minus that
+ * function's own, say where the capture happened — the only location there is.
+ */
+export function buildErrorItem(
+  err: unknown,
+  breadcrumbs: Breadcrumb[],
+  hint?: Hint,
+  callSite?: Error,
+): ErrorItem {
   const extracted = extractError(err);
+  if (extracted.stacktrace.length === 0 && callSite) {
+    // Crash-last order: the last frame is the function that made `callSite`.
+    extracted.stacktrace = parseError(callSite).slice(0, -1);
+  }
   const mechanism = (hint?.mechanism as Mechanism | undefined) ?? DEFAULT_MECHANISM;
   const level = (hint?.level as Level | undefined) ?? 'error';
   const fingerprint = (hint?.fingerprint as string[] | null | undefined) ?? null;
@@ -83,13 +103,17 @@ export function buildErrorItem(err: unknown, breadcrumbs: Breadcrumb[], hint?: H
   return item;
 }
 
-/** Capture an exception (or any thrown value) as an error item. */
-export function captureException(err: unknown, hint?: Hint): void {
+/**
+ * Capture an exception (or any thrown value) as an error item. See
+ * {@link buildErrorItem} for `callSite`; the global handlers and the GTM
+ * replay pass none, as their call site is the SDK, not the page.
+ */
+export function captureException(err: unknown, hint?: Hint, callSite?: Error): void {
   const client = getClient();
   if (!client) return;
   const breadcrumbs = client.getScope().getBreadcrumbs();
   const fullHint: Hint = { ...hint, originalException: err };
-  const item = buildErrorItem(err, breadcrumbs, fullHint);
+  const item = buildErrorItem(err, breadcrumbs, fullHint, callSite);
   client.captureItem(item, fullHint);
 }
 

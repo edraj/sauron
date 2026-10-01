@@ -81,8 +81,8 @@ export const prose = {
     ar: 'ليس فيها أسماء معاد تسميتها لعكسها. تسرد هذه القائمة ما جرى رفعه، لا تخمينًا لكيفية بنائك.',
   },
   'prose.sourcemaps.debugId.a': {
-    en: "The debug id is read out of the file's own build-id note — nothing to paste. Flutter emits these with",
-    ar: 'يُقرأ معرّف التنقيح من ملاحظة معرّف البناء داخل الملف نفسه — فلا شيء تلصقه. ويُصدِر Flutter هذه الملفات عبر',
+    en: "The debug id is read out of the file itself (its build-id note, or its UUID for iOS/macOS) — nothing to paste. Flutter emits these with",
+    ar: 'يُقرأ معرّف التنقيح من الملف نفسه (ملاحظة معرّف البناء، أو معرّف UUID في iOS/macOS) — فلا شيء تلصقه. ويُصدِر Flutter هذه الملفات عبر',
   },
   'prose.sourcemaps.sameId.a': { en: 'Use the', ar: 'استخدم' },
   'prose.sourcemaps.sameId.b': {

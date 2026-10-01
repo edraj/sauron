@@ -279,7 +279,7 @@ flutter build apk --release \
 ```
 
 Upload the symbols first — its response reports the `derived_debug_id`, read out
-of the ELF's build-id note — then upload the map under **that same id**:
+of the file itself — then upload the map under **that same id**:
 
 ```bash
 sauron-symcli upload-dart \
@@ -292,6 +292,19 @@ sauron-symcli upload-obfuscation-map \
   --platform android --debug-id <derived_debug_id from above> \
   build/obfuscation.json
 ```
+
+Upload **every** `app.android-*.symbols` file the build wrote, not just one:
+`flutter build apk` and `appbundle` emit one per ABI (`arm`, `arm64`, `x64`),
+each with its own build id, and a crash only matches the file for the ABI the
+phone actually ran — `arm64` on nearly every current device. Upload the
+`.symbols` files, never `libapp.so`: it carries the same build id but no debug
+info, and the server refuses it.
+
+For iOS, build with `flutter build ipa` and the same three flags, then upload
+`build/symbols/app.ios-arm64.symbols` with `--platform ios --arch arm64`. On
+Apple targets that file is a Mach-O dSYM rather than an ELF, and the derived id
+is its UUID — the same value the app prints as `build_id` in a crash — so the
+steps are otherwise identical.
 
 The map carries nothing identifying inside it — it is a flat JSON array of
 `[original, obfuscated]` pairs — so that shared id is the *only* thing tying it

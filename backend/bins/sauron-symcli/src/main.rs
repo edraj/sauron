@@ -157,7 +157,10 @@ USAGE:
       --release <r> --name <minified-path> [--dist <d>] <file.map>
 
   sauron-symcli upload-dart --api <url> --token <jwt> --app <uuid> \\
-      --platform <android|ios> --arch <arm64|...> --debug-id <build-id> app.symbols
+      --platform <android|ios> --arch <arm64|...> [--debug-id <build-id>] app.symbols
+
+      The debug id is read from the file when omitted: the ELF build-id note on
+      Android, the dSYM's UUID on iOS/macOS. The response reports it.
 
   sauron-symcli upload-obfuscation-map --api <url> --token <jwt> --app <uuid> \\
       --platform <android|ios> --debug-id <build-id> map.json

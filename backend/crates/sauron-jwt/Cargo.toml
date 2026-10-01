@@ -1,0 +1,28 @@
+[package]
+name = "sauron-jwt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# PEM parsing for asymmetric keys. Off unless asked for, as `use_pem` was under
+# the workspace pin: only `sauron-store` is handed its keys as PEM text, and the
+# API's own tokens are signed with an HMAC secret.
+pem = ["jsonwebtoken/use_pem"]
+
+[dependencies]
+jsonwebtoken = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+serde_json = { workspace = true }
+# The crate, depending on itself, with `pem` on. It reads oddly and does one
+# thing: the PEM tests are gated on the feature, and without this line
+# `cargo test -p sauron-jwt` compiles them out and reports a pass. They would
+# run only under `--workspace`, where `sauron-store` happens to turn the
+# feature on. Dev-dependency features never reach a normal build.
+sauron-jwt = { path = ".", features = ["pem"] }

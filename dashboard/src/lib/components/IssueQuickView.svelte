@@ -179,56 +179,69 @@
         </div>
       {/if}
 
+      <!-- Every payload section folds (native `<details>`, open by default),
+           and Contexts / Additional data stack full-width like the detail
+           page's cards instead of splitting one row — their values run long. -->
       {#if hasStack}
-        <section class="qv-section">
-          <div class="qv-section-head">
+        <details class="qv-section" open>
+          <summary class="qv-section-head">
+            <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
             <span class="section-label">{t('ui.section.stacktrace')}</span>
             <SymbolicationBadge
               status={error.symbolication_status}
               isDart={error.debug_meta?.raw_stacktrace != null}
             />
-          </div>
+          </summary>
           <StacktraceView
             frames={error.stacktrace ?? []}
             symbolicated={error.stacktrace_symbolicated}
             rawTrace={error.debug_meta?.raw_stacktrace}
           />
-        </section>
+        </details>
       {/if}
 
       {#if hasTags}
-        <section class="qv-section">
-          <span class="section-label">{t('ui.section.tags')}</span>
+        <details class="qv-section" open>
+          <summary class="qv-section-head">
+            <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
+            <span class="section-label">{t('ui.section.tags')}</span>
+          </summary>
           <div class="qv-tags">
             {#each Object.entries(error.tags ?? {}) as [k, v] (k)}
               <Badge tone="neutral" size="sm">{k}: {String(v)}</Badge>
             {/each}
           </div>
-        </section>
+        </details>
       {/if}
 
       {#if hasContext}
-        <section class="qv-section">
-          <span class="section-label">{t('ui.section.context')}</span>
+        <details class="qv-section" open>
+          <summary class="qv-section-head">
+            <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
+            <span class="section-label">{t('ui.section.context')}</span>
+          </summary>
           <KeyValueList data={error.context} emptyLabel="No context" />
-        </section>
+        </details>
       {/if}
 
-      {#if hasContexts || hasExtra}
-        <div class="qv-row">
-          {#if hasContexts}
-            <section class="qv-section">
-              <span class="section-label">{t('ui.section.contexts')}</span>
-              <JsonTree value={error.contexts} name="contexts" expandTo={2} />
-            </section>
-          {/if}
-          {#if hasExtra}
-            <section class="qv-section">
-              <span class="section-label">{t('ui.section.extra')}</span>
-              <JsonTree value={error.extra} name="extra" expandTo={2} />
-            </section>
-          {/if}
-        </div>
+      {#if hasContexts}
+        <details class="qv-section" open>
+          <summary class="qv-section-head">
+            <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
+            <span class="section-label">{t('ui.section.contexts')}</span>
+          </summary>
+          <JsonTree value={error.contexts} name="contexts" expandTo={2} />
+        </details>
+      {/if}
+
+      {#if hasExtra}
+        <details class="qv-section" open>
+          <summary class="qv-section-head">
+            <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
+            <span class="section-label">{t('ui.section.extra')}</span>
+          </summary>
+          <JsonTree value={error.extra} name="extra" expandTo={2} />
+        </details>
       {/if}
     </div>
   {/if}
@@ -343,15 +356,32 @@
     color: var(--text-muted);
   }
   .qv-section {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
     min-width: 0;
+  }
+  .qv-section[open] > .qv-section-head {
+    margin-bottom: 8px;
   }
   .qv-section-head {
     display: flex;
     align-items: center;
     gap: 8px;
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+  }
+  .qv-section-head::-webkit-details-marker {
+    display: none;
+  }
+  .qv-chev {
+    display: inline-flex;
+    margin-inline-end: -4px;
+    color: var(--text-muted);
+  }
+  .qv-section:not([open]) .qv-chev {
+    transform: rotate(-90deg);
+  }
+  :global([dir='rtl']) .qv-section:not([open]) .qv-chev {
+    transform: rotate(90deg);
   }
   .section-label {
     font-size: 11px;
@@ -364,16 +394,6 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
-  }
-  .qv-row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 18px;
-  }
-  @media (max-width: 720px) {
-    .qv-row {
-      grid-template-columns: 1fr;
-    }
   }
   .faint {
     color: var(--text-faint);
