@@ -70,7 +70,7 @@ CMS footer, the package ships two self-contained files. Each defines one global,
 **From the CDN.** jsDelivr and unpkg serve every published version:
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.8.0/dist/sauron.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.0/dist/sauron.min.js"></script>
 <script>
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42', release: 'web@1.4.2' });
 </script>
@@ -85,7 +85,7 @@ the GTM snippet below, `script.integrity` and `script.crossOrigin`). It needs an
 exact-version URL. Get the hash of a published file with:
 
 ```bash
-curl -s https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.8.0/dist/sauron.min.js | openssl dgst -sha384 -binary | openssl base64 -A
+curl -s https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.0/dist/sauron.min.js | openssl dgst -sha384 -binary | openssl base64 -A
 ```
 
 **In Google Tag Manager**, create a Custom HTML tag fired by the
@@ -129,7 +129,7 @@ from it with this loader:
       d.head.appendChild(script);
     }
     s.init(options);
-  })(window, document, 'https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.8.0/dist/sauron.min.js', {
+  })(window, document, 'https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.0/dist/sauron.min.js', {
     dsn: 'https://pk_test@ingest.example.com/42',
     release: 'web@1.4.2'
   });
@@ -355,7 +355,7 @@ function captureException(err: unknown, hint?: Hint): void
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `err` | `unknown` | — (required) | An `Error`, an error-like object (`name` + string `message`), a string, any object, or a primitive. Non-errors are reduced to `{type, value}` with an empty stack trace. |
+| `err` | `unknown` | — (required) | An `Error`, an error-like object (`name` + string `message`), a string, any object, or a primitive. Non-errors are reduced to `{type, value}`. A value with no `stack` of its own gets the stack of the `captureException` call instead, so the report still says where it came from. |
 | `hint` | `Hint` | `undefined` | Per-call overrides, also forwarded to `beforeSend`. |
 
 Recognized `hint` keys:
@@ -1269,7 +1269,7 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.8.0';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.9.0';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42', release: 'web@1.4.2' });
 </script>
 ```
@@ -1358,6 +1358,7 @@ the next page load.
 | `[sauron] client disabled` in the console, or `isEnabled()` unexpectedly `false` mid-session | The gateway returned 401/403 — wrong, revoked or foreign-project public key. `isEnabled()` flips to `false` automatically; nothing else changes. | Fix the DSN key/project; re-`init()` after correcting. |
 | `DsnError` thrown at `init()` | Malformed DSN: bad protocol, missing public key, a password component, or a missing environment-id path segment. | Use `https://<public_key>@<host>/<environment_id>`. |
 | `init()` throws `` [sauron] init() requires a `release` `` | `release` is missing, not a string, or blank. It is required as of v1.7.0, so code written against 1.6 or earlier throws here until it passes one. | Pass the app version this build reports as: `init({ dsn, release: 'web@1.4.2' })`. |
+| Some errors have no stack trace | A stack comes from an `Error` object's `stack`. There is none for a `captureMessage`, for an uncaught `throw` or promise rejection of a non-`Error` (`reject('x')`, `reject()`, `reject(response)`), or for `Script error.`: an error in a script from another origin, whose details the browser hides. | Throw and reject `new Error(...)`. For another origin's scripts, add `crossorigin="anonymous"` to the `<script>` and have its server send `Access-Control-Allow-Origin`. |
 | Only some errors show up | `sampleRate` below 1 (errors and messages are sampled; events, identifies and transactions are not). | Set `sampleRate: 1`. |
 | Errors arrive with no breadcrumbs | `maxBreadcrumbs: 0`, or `beforeBreadcrumb` returned `null`. | Raise `maxBreadcrumbs`; check the hook. |
 | Items disappear silently | `beforeSend` returned `null`, or it threw (the original is then sent and a warning logged). | Enable `debug: true` and read the `[sauron]` logs. |

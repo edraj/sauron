@@ -26,6 +26,40 @@ pub struct DartFrameRef {
     pub index: u32,
     pub abs: Option<u64>,
     pub virt: Option<u64>,
+    /// The frame's `<instructions symbol>+0x<offset>` suffix: the pc as an
+    /// offset into the VM or isolate instructions. Unlike `abs`/`virt` it does
+    /// not depend on how the image was laid out, so it is the one address that
+    /// means the same thing in the running app and in the debug file.
+    pub symbol_offset: Option<(InstructionsSection, u64)>,
+    /// `unit N` — the deferred loading unit the frame belongs to. Absent for
+    /// the root unit, which is the only one a build's main debug file covers.
+    pub unit: Option<u32>,
+}
+
+/// Which of the snapshot's two instruction sections a
+/// [`DartFrameRef::symbol_offset`] counts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionsSection {
+    Vm,
+    Isolate,
+}
+
+impl InstructionsSection {
+    /// The symbol that marks the section's start, in the trace and in the
+    /// debug file alike (ELF and Mach-O use the same raw name).
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Vm => "_kDartVmSnapshotInstructions",
+            Self::Isolate => "_kDartIsolateSnapshotInstructions",
+        }
+    }
+
+    fn parse_suffix(tok: &str) -> Option<(Self, u64)> {
+        [Self::Isolate, Self::Vm].into_iter().find_map(|section| {
+            let offset = tok.strip_prefix(section.symbol())?.strip_prefix('+')?;
+            Some((section, parse_hex(offset)?))
+        })
+    }
 }
 
 impl DartFrameRef {
@@ -102,6 +136,8 @@ fn parse_frame(line: &str) -> DartFrameRef {
     let mut index = 0;
     let mut abs = None;
     let mut virt = None;
+    let mut symbol_offset = None;
+    let mut unit = None;
 
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let mut i = 0;
@@ -115,11 +151,22 @@ fn parse_frame(line: &str) -> DartFrameRef {
         } else if tok == "virt" {
             virt = tokens.get(i + 1).and_then(|s| parse_hex(s));
             i += 1;
+        } else if tok == "unit" {
+            unit = tokens.get(i + 1).and_then(|s| s.parse().ok());
+            i += 1;
+        } else if let Some(so) = InstructionsSection::parse_suffix(tok) {
+            symbol_offset = Some(so);
         }
         i += 1;
     }
 
-    DartFrameRef { index, abs, virt }
+    DartFrameRef {
+        index,
+        abs,
+        virt,
+        symbol_offset,
+        unit,
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +226,8 @@ isolate_instructions: 7b9c38da80, vm_instructions: 7b9c377000\n\
             index: 0,
             abs: Some(0x7f0000001560),
             virt: None,
+            symbol_offset: None,
+            unit: None,
         };
         assert_eq!(f.lookup_addr(Some(0x7f0000000000)), Some(0x1560));
         assert_eq!(f.lookup_addr(None), None);
@@ -217,6 +266,33 @@ isolate_instructions: 7b9c38da80, vm_instructions: 7b9c377000\n\
         // 0x7b9c4bc9b7 - 0x7b9c2b7000 = 0x2059b7, the address that resolves to
         // probes.dart:24 in the verification run.
         assert_eq!(t.frames[0].lookup_addr(t.dso_base), Some(0x2059b7));
+    }
+
+    /// The symbol+offset suffix and the deferred-unit marker, in the shapes the
+    /// VM prints them (see `package:native_stack_traces`'s `_traceLineRE`).
+    #[test]
+    fn parses_instructions_symbol_offsets_and_units() {
+        let t = parse(
+            "    #00 abs 000075f17833027b unit 2 virt 00000000001af27b _kDartIsolateSnapshotInstructions+0x1a127b\n\
+             #01 abs 0000000000000001 _kDartVmSnapshotInstructions+0x10\n\
+             #02 abs 0000000000000002 <unknown>\n\
+             #03 abs 0000000000000003 _kDartIsolateSnapshotInstructions+0xzz\n",
+        );
+        assert_eq!(t.frames.len(), 4);
+        assert_eq!(t.frames[0].unit, Some(2));
+        assert_eq!(t.frames[0].virt, Some(0x1af27b));
+        assert_eq!(
+            t.frames[0].symbol_offset,
+            Some((InstructionsSection::Isolate, 0x1a127b))
+        );
+        assert_eq!(t.frames[1].unit, None);
+        assert_eq!(
+            t.frames[1].symbol_offset,
+            Some((InstructionsSection::Vm, 0x10))
+        );
+        assert_eq!(t.frames[2].symbol_offset, None);
+        // Malformed offsets are dropped, not guessed at.
+        assert_eq!(t.frames[3].symbol_offset, None);
     }
 
     #[test]

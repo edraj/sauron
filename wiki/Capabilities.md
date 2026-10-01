@@ -94,7 +94,7 @@ version" — a page that quotes one is quoting that SDK only.
 
 | SDK | Package | Registry | This repo |
 |---|---|---|---|
-| Browser | `@edraj/sauron-browser` | [npm](https://www.npmjs.com/package/@edraj/sauron-browser) | 1.8.0 |
+| Browser | `@edraj/sauron-browser` | [npm](https://www.npmjs.com/package/@edraj/sauron-browser) | 1.9.0 |
 | Flutter | `sauron_flutter` | [pub.dev](https://pub.dev/packages/sauron_flutter) | 1.10.1 |
 | Node | `@edraj/sauron-node` | [npm](https://www.npmjs.com/package/@edraj/sauron-node) | 1.6.0 |
 | Python | `sauron-sdk` | [PyPI](https://pypi.org/project/sauron-sdk/) | 1.6.0 |

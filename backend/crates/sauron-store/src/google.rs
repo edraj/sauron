@@ -177,10 +177,10 @@ async fn access_token(client: &reqwest::Client, sa: &ServiceAccount) -> anyhow::
         exp: now + 3600,
         iat: now,
     };
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
+    let key = sauron_jwt::EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
         .context("service-account private_key is not a valid RSA PEM")?;
-    let assertion = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+    let assertion = sauron_jwt::encode(
+        &sauron_jwt::Header::new(sauron_jwt::Algorithm::RS256),
         &claims,
         &key,
     )?;

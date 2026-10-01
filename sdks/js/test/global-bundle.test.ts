@@ -114,16 +114,17 @@ function browserPage() {
   /**
    * An uncaught error, delivered as a browser does: to the `onerror` property
    * handler, then to every `error` listener. `errorSrc` builds the thrown value
-   * inside the page; a cross-origin script's error arrives with none.
+   * inside the page; a cross-origin script's error arrives with none, and no
+   * location either.
    */
   function pageError(errorSrc: string, message?: string): void {
     const error = p.run(errorSrc) as Error | null;
     const event = {
       type: 'error',
       message: message ?? `Uncaught ${String(error)}`,
-      filename: 'https://shop.example/app.js',
-      lineno: 3,
-      colno: 7,
+      filename: error ? 'https://shop.example/app.js' : '',
+      lineno: error ? 3 : 0,
+      colno: error ? 7 : 0,
       error,
     };
     const onerror = p.sandbox.onerror as OnErrorEventHandlerNonNull | undefined;
@@ -324,6 +325,27 @@ describe.each(FILES)('%s', (file) => {
       ['Error', 'after load', 'onerror', false, 'pro'],
     ]);
     expect(errors[0].exception.stacktrace.length).toBeGreaterThan(0);
+  });
+
+  it('gives a stackless capture its call site, but only when there is one', async () => {
+    // Minification and the ES5 rewrite must not change which frame is dropped.
+    const p = browserPage();
+    p.run(LOADER);
+    p.run("Sauron.captureException('queued before load')"); // replayed: no call site
+    p.run(code[file]);
+    p.run("function checkoutFails() { Sauron.captureException('payment failed'); } checkoutFails();");
+    p.pageError('null', 'Script error.');
+    const stacks = Object.fromEntries(
+      (await items(p))
+        .filter((item) => item.type === 'error')
+        .map(({ exception }) => [
+          exception.value,
+          exception.stacktrace.map((frame: { function: string | null }) => frame.function),
+        ]),
+    );
+    expect(stacks['queued before load']).toEqual([]);
+    expect(stacks['payment failed'][stacks['payment failed'].length - 1]).toBe('checkoutFails');
+    expect(stacks['Script error.']).toEqual([]);
   });
 
   it('replays init() ahead of the calls queued before it', async () => {

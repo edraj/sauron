@@ -316,18 +316,13 @@ impl Symbolicator {
             return (dart_passthrough(&trace), Status::NoArtifacts);
         };
 
-        // One slot per frame, `None` where the frame's address cannot be
-        // determined — never a stand-in address. `dart::resolve` keeps the slot
-        // and returns it empty, so the positional pairing below still lines frame
-        // i up with frame i's own result and the frame falls through to
-        // `dart_unresolved` at its original position, still showing its raw `abs`
-        // when the trace gave one.
-        let addrs: Vec<Option<u64>> = trace
-            .frames
-            .iter()
-            .map(|f| f.lookup_addr(trace.dso_base))
-            .collect();
-        let resolved = match crate::dart::resolve(&elf, &addrs) {
+        // One slot per frame, empty where the frame's address cannot be
+        // determined — never a stand-in address — so the positional pairing
+        // below still lines frame i up with frame i's own result and the frame
+        // falls through to `dart_unresolved` at its original position, still
+        // showing its raw `abs` when the trace gave one. Which address each
+        // frame is looked up at is `dart::resolve_trace`'s call.
+        let resolved = match crate::dart::resolve_trace(&elf, &trace) {
             Ok(r) => r,
             Err(_) => return (dart_passthrough(&trace), Status::NoArtifacts),
         };
@@ -336,7 +331,7 @@ impl Symbolicator {
         debug_assert_eq!(
             resolved.len(),
             trace.frames.len(),
-            "dart::resolve must return one slot per frame"
+            "dart::resolve_trace must return one slot per frame"
         );
 
         let mut out = Vec::with_capacity(trace.frames.len());
@@ -903,6 +898,72 @@ isolate_dso_base: 7b9c2b7000, vm_dso_base: 7b9c2b7000\n\
             Status::Partial,
             "some frames resolved and one did not"
         );
+    }
+
+    /// `tests/fixtures/sample_dart_layout.c`: a debug file laid out the way a
+    /// Dart one is, with the instruction symbols marking where the code trace
+    /// offsets count from. `nm`: `_kDartVmSnapshotInstructions` 0x400446,
+    /// `_kDartIsolateSnapshotInstructions` 0x400447 (= `load_user`, line 9),
+    /// `save_order` 0x400456 = isolate+0xf (line 10).
+    fn dart_layout_elf() -> DartMem {
+        DartMem {
+            elf: include_bytes!("../tests/fixtures/sample_dart_layout.elf").to_vec(),
+        }
+    }
+
+    /// Frames with no ` virt …` from an image whose layout is not the debug
+    /// file's. That is every frame of an assembly-built snapshot — how Flutter
+    /// built iOS before `app-aot-macho-dylib`, and what the Crashlytics plugin's
+    /// own fixtures show. Here the loader put the isolate instructions 0xf lower,
+    /// relative to the image base, than the debug file does, so
+    /// `abs - isolate_dso_base` = 0x400447 lands squarely on `load_user`: a
+    /// confident wrong frame with `symbolicated: true`.
+    ///
+    /// Measured on a real assembly snapshot (`gen_snapshot
+    /// --snapshot_kind=app-aot-assembly`, gcc-linked, run under
+    /// `dartaotruntime`): the load-base fallback turned `probeA`/`caller`/`main`
+    /// into `_Uri._initializeText`, `_HttpHeaders._add` and friends. The trace's
+    /// own `<instructions symbol>+0x…` is layout-independent, and it is what
+    /// Dart's `package:native_stack_traces` decoder resolves first.
+    #[tokio::test]
+    async fn dart_frames_resolve_by_instructions_symbol_offset_not_the_load_base() {
+        let trace = "\
+build_id: 'x'\n\
+isolate_dso_base: 7f0000000000, vm_dso_base: 7f0000000000\n\
+isolate_instructions: 7f0000400438, vm_instructions: 7f0000400437\n\
+    #00 abs 00007f0000400447 _kDartIsolateSnapshotInstructions+0xf\n\
+    #01 abs 00007f0000400438 _kDartVmSnapshotInstructions+0x1\n";
+        let s = Symbolicator::new(4 << 20);
+        let (out, status) = s
+            .symbolicate_dart(&dart_layout_elf(), trace, Some("x"), None)
+            .await;
+        assert_eq!(status, Status::Symbolicated);
+        assert_eq!(out.len(), 2);
+        // Stored crash-last: #01, then #00.
+        assert_eq!(out[0].function.as_deref(), Some("load_user"));
+        assert_eq!(out[0].lineno, Some(9));
+        assert_eq!(out[1].function.as_deref(), Some("save_order"));
+        assert_eq!(out[1].lineno, Some(10));
+    }
+
+    /// A frame from a deferred loading unit (`unit N`, N > 1) lives in that
+    /// unit's own snapshot, with its own build id and its own debug file. Its
+    /// `virt` means nothing in the root unit's file, so looking it up there
+    /// returns whatever function happens to sit at that address — `save_order`,
+    /// in this fixture.
+    #[tokio::test]
+    async fn dart_deferred_unit_frames_are_not_resolved_against_the_root_file() {
+        let trace = "\
+build_id: 'x'\n\
+isolate_dso_base: 7f0000000000, vm_dso_base: 7f0000000000\n\
+    #00 abs 00007f1000400456 unit 2 virt 0000000000400456 <unknown>\n";
+        let s = Symbolicator::new(4 << 20);
+        let (out, status) = s
+            .symbolicate_dart(&dart_layout_elf(), trace, Some("x"), None)
+            .await;
+        assert_eq!(out.len(), 1, "the frame must still be reported");
+        assert!(!out[0].symbolicated, "got {:?}", out[0]);
+        assert_eq!(status, Status::NoArtifacts);
     }
 
     #[tokio::test]

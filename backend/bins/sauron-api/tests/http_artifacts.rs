@@ -589,6 +589,58 @@ async fn a_dart_symbols_body_that_is_not_an_elf_is_rejected_with_400() {
     h.shutdown().await;
 }
 
+/// `sample.elf` put through `strip --strip-debug`: same build-id note, no DWARF.
+const STRIPPED_ELF: &[u8] =
+    include_bytes!("../../../crates/sauron-symbols/tests/fixtures/sample_stripped.elf");
+
+/// An ELF with no DWARF — in practice the app binary `libapp.so`, whose
+/// build-id is IDENTICAL to its `.symbols` file's — is refused. Accepting it
+/// was worse than useless: every frame stayed unresolved, the artifact list
+/// showed the right debug id, and because uploads dedupe on that id, the
+/// correct `.symbols` file uploaded afterwards came back `deduped: true` and
+/// was never stored. An explicit `debug_id` does not bypass this: the file
+/// parsed, so the server knows it cannot symbolicate anything.
+#[tokio::test]
+async fn a_dart_symbols_elf_without_dwarf_is_refused_even_with_an_explicit_id() {
+    let Some(mut h) = TestServer::start().await else {
+        eprintln!("TEST_DATABASE_URL / TEST_REDIS_URL unset — skipping http_artifacts");
+        return;
+    };
+    let f = h.seed_artifacts_fixture().await;
+
+    for query in [
+        "kind=dart_symbols&platform=android&arch=arm64".to_string(),
+        format!("kind=dart_symbols&platform=android&debug_id={SAMPLE_ELF_BUILD_ID}"),
+    ] {
+        let (status, body) = h.upload(f.app_id, &f.token, &query, STRIPPED_ELF).await;
+        assert_eq!(status, 400, "{query}: {body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("libapp.so") && message.contains(".symbols"),
+            "{query}: the 400 must say which file to upload instead: {body}"
+        );
+    }
+    assert_eq!(
+        h.list(f.app_id, &f.token).await.as_array().map(Vec::len),
+        Some(0),
+        "nothing may be stored"
+    );
+
+    // And the real file for the same build is still accepted afterwards.
+    let (status, body) = h
+        .upload(
+            f.app_id,
+            &f.token,
+            "kind=dart_symbols&platform=android&arch=arm64",
+            SAMPLE_ELF,
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["debug_id"], SAMPLE_ELF_BUILD_ID);
+
+    h.shutdown().await;
+}
+
 /// 5. Regression guard: the JS path must be byte-identical to before. A
 ///    `js_sourcemap` is matched on (release, name, content), never on
 ///    `debug_id`, and it is not an ELF — deriving anything for it would at best

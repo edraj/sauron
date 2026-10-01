@@ -2,6 +2,39 @@
 
 All notable changes to `@edraj/sauron-browser` are documented here.
 
+## 1.9.0
+
+### Changed
+
+- **`captureException` of a value with no stack records where it was called.**
+  `captureException('payment failed')` or `captureException({ status: 404 })`
+  used to arrive with an empty stack trace, since there is no `Error` to read
+  one from. It now carries the stack of the `captureException` call, minus the
+  SDK's own frame. Uncaught throws and unhandled rejections of non-`Error`
+  values still have no stack: the browser never provides one. Neither does a
+  call replayed by the GTM loader, whose call site is gone by the time the file
+  loads.
+
+### Fixed
+
+- **A cross-origin `Script error.` no longer reports the SDK's own frames as
+  its stack trace.** The browser gives such an error no message, location or
+  stack, so the SDK builds a stand-in `Error`. It kept that object's native
+  stack, which is Sauron's own handler, so these errors showed a trace of SDK
+  internals (marked "in app" when the SDK is bundled into the app). They now
+  arrive with no frames.
+
+### Upgrade note: issue grouping
+
+The server groups an error with frames by its type and top frames, and one
+with none by its type and message. Both changes move errors from one rule to
+the other:
+
+- A stackless `captureException` value now groups by its call site, not its
+  message. Different messages captured from the same place merge into one
+  issue. Pass `fingerprint` to keep them apart.
+- `Script error.` issues start over under a new group once this version ships.
+
 ## 1.8.0
 
 ### Added

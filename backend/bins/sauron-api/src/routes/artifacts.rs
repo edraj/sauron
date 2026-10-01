@@ -251,6 +251,30 @@ pub async fn upload(
     } else {
         None
     };
+    // A file that parses but carries no DWARF can never resolve a frame. In
+    // practice it is the app binary (`libapp.so`, or `App` on iOS), whose
+    // build-id is the SAME as its `.symbols` file's — so accepting it was worse
+    // than a no-op: the artifact list showed the right id, and because uploads
+    // dedupe on that id, the correct file uploaded afterwards came back
+    // `deduped: true` and was never stored. Refused even with an explicit id:
+    // the file parsed, so there is nothing left to take on trust. Files that do
+    // not parse are not judged here (see the escape hatch above).
+    if p.kind == "dart_symbols" {
+        let file = body.clone();
+        let has_dwarf =
+            tokio::task::spawn_blocking(move || sauron_symbols::dart::has_debug_info(&file))
+                .await
+                .map_err(|e| ApiError::Internal(format!("debug-info task failed: {e}")))?;
+        if has_dwarf == Some(false) {
+            return Err(ApiError::BadRequest(
+                "this dart_symbols file has no DWARF debug info, so it cannot symbolicate \
+                 anything; it looks like the app binary (libapp.so, or App on iOS). Upload \
+                 the app.<platform>-<arch>.symbols file that --split-debug-info wrote instead"
+                    .into(),
+            ));
+        }
+    }
+
     // Explicit wins — but both go in the response, so a typo shows up as a
     // visible disagreement at upload time instead of as `no_artifacts` later.
     let debug_id = debug_id.or_else(|| derived_debug_id.clone());

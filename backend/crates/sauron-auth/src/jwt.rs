@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use sauron_jwt::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -157,7 +157,7 @@ mod tests {
         // Sessions live across a deploy. A token issued by the previous build
         // has no `must_change_password` field at all; without #[serde(default)]
         // every logged-in user is signed out the moment this ships.
-        use jsonwebtoken::{encode, EncodingKey, Header};
+        use sauron_jwt::{encode, EncodingKey, Header};
         #[derive(serde::Serialize)]
         struct LegacyClaims {
             sub: String,

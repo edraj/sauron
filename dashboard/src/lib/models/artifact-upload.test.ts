@@ -153,7 +153,7 @@ describe('the Dart symbols path', () => {
     // (app.android-arm64.symbols, app.ios-arm64.symbols, …), so any filter
     // would hide the very files this form exists to take.
     expect(fileAccept('dart_symbols')).toBeUndefined();
-    expect(fileLabel('dart_symbols')).toBe('Symbol file (ELF)');
+    expect(fileLabel('dart_symbols')).toBe('Symbol file (.symbols)');
     expect(formTitle('dart_symbols')).toBe('Upload Dart symbols');
   });
 

@@ -12,7 +12,11 @@
  */
 
 import { addBreadcrumb as addBreadcrumbApi, type BreadcrumbInput } from './api/breadcrumbs.js';
-import { captureException as captureExceptionApi, captureMessage as captureMessageApi } from './api/capture.js';
+import {
+  captureException as captureExceptionApi,
+  captureMessage as captureMessageApi,
+  hasOwnStack,
+} from './api/capture.js';
 import {
   cancelWorkflow as cancelWorkflowApi,
   endWorkflow as endWorkflowApi,
@@ -41,9 +45,14 @@ export function init(options: InitOptions): SauronClient {
   return initClient(options);
 }
 
-/** Capture an exception (or any thrown value). */
+/**
+ * Capture an exception (or any thrown value). A value with no stack of its own
+ * — `captureException('payment failed')` — gets the stack of this call instead.
+ */
 export function captureException(err: unknown, hint?: Hint): void {
-  captureExceptionApi(err, hint);
+  // Made here, directly, so its top frame is this function and nothing else
+  // of the SDK's: buildErrorItem drops exactly that one frame.
+  captureExceptionApi(err, hint, hasOwnStack(err) ? undefined : new Error());
 }
 
 /** Capture a plain message at the given `level` (default `info`). */

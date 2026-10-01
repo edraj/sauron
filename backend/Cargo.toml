@@ -25,6 +25,7 @@ sauron-mail = { path = "crates/sauron-mail" }
 sauron-inspector = { path = "crates/sauron-inspector" }
 sauron-store = { path = "crates/sauron-store" }
 sauron-purge = { path = "crates/sauron-purge" }
+sauron-jwt = { path = "crates/sauron-jwt" }
 
 # --- async runtime / http ---
 # Scoped tokio features (was "full") — only what the workspace actually uses:
@@ -108,7 +109,20 @@ scoped-futures = "0.1"
 redis = { version = "1", features = ["tokio-comp", "connection-manager", "streams"] }
 
 # --- auth / crypto ---
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# NO crypto backend feature, and that is the point. `jsonwebtoken` offers two:
+# `rust_crypto` depends on the `rsa` crate, which carries RUSTSEC-2023-0071 with
+# no fixed release, and `aws_lc_rs` compiles a C library the packaging is built
+# to avoid (see the BuildRequires note in packaging/rpm/sauron.spec). The
+# cryptography comes from `sauron-jwt` instead, which backs the library with
+# ring. Depend on `sauron-jwt`, never on this directly: with no backend feature
+# a direct call panics, and adding `rust_crypto` back to stop the panic puts
+# `rsa` back in every binary.
+jsonwebtoken = { version = "10", default-features = false }
+# Already resolved transitively — it is rustls's crypto provider, so it is in
+# every binary that speaks TLS — and taken as a direct dependency for
+# `sauron-jwt`. Kept on the version Cargo.lock already holds rather than
+# introducing a second one.
+ring = "0.17"
 argon2 = { version = "0.5", features = ["std"] }
 getrandom = "0.3"
 sha2 = "0.11"

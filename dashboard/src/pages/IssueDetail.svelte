@@ -715,21 +715,25 @@
           </ViewSection>
         </Card>
 
+        <!-- Latest event, Contexts and Additional data are full-width and
+             collapsible: the payload trees run wide (long `extra` strings
+             wrapped to two lines in a half-width column) and a reader after
+             the occurrence table below should be able to fold them away. -->
         {#if !latestView.hasData}
           <!-- Still out, or failed: `ViewSection` draws whichever it is. Its
                content slot is never reached on this branch. -->
-          <Card title={t('issue.card.latestEvent')}>
+          <Card title={t('issue.card.latestEvent')} collapsible>
             <ViewSection view={latestView} rows={8}>{null}</ViewSection>
           </Card>
         {:else if latestEvent}
-          <Card>
+          <Card collapsible>
             {#snippet header()}
-              <div class="event-head">
-                <h3 class="card-title-inline">{t('issue.card.latestEvent')}</h3>
+              <span class="event-head">
+                <span class="card-title-inline">{t('issue.card.latestEvent')}</span>
                 {#if !metaRedundant}
                   <span class="event-meta mono">{eventMeta}</span>
                 {/if}
-              </div>
+              </span>
             {/snippet}
             <div class="event-body">
               <div class="section">
@@ -757,7 +761,7 @@
             </div>
           </Card>
         {:else}
-          <Card title={t('issue.card.latestEvent')}>
+          <Card title={t('issue.card.latestEvent')} collapsible>
             <p class="muted">{t('issue.empty.payload')}</p>
           </Card>
         {/if}
@@ -769,23 +773,21 @@
                with the other identity facts (release, environment) instead of
                below a fold of stack trace and payload; long values stay
                readable there through `title` tooltips. -->
-          <div class="data-row">
-            <Card title={t('ui.section.contexts')}>
-              {#if latestEvent.contexts && Object.keys(latestEvent.contexts).length > 0}
-                <JsonTree value={latestEvent.contexts} name="contexts" expandTo={2} />
-              {:else}
-                <span class="faint">{t('issue.empty.contexts')}</span>
-              {/if}
-            </Card>
+          <Card title={t('ui.section.contexts')} collapsible>
+            {#if latestEvent.contexts && Object.keys(latestEvent.contexts).length > 0}
+              <JsonTree value={latestEvent.contexts} name="contexts" expandTo={2} />
+            {:else}
+              <span class="faint">{t('issue.empty.contexts')}</span>
+            {/if}
+          </Card>
 
-            <Card title={t('ui.section.extra')}>
-              {#if latestEvent.extra && Object.keys(latestEvent.extra).length > 0}
-                <JsonTree value={latestEvent.extra} name="extra" expandTo={2} />
-              {:else}
-                <span class="faint">{t('issue.empty.extra')}</span>
-              {/if}
-            </Card>
-          </div>
+          <Card title={t('ui.section.extra')} collapsible>
+            {#if latestEvent.extra && Object.keys(latestEvent.extra).length > 0}
+              <JsonTree value={latestEvent.extra} name="extra" expandTo={2} />
+            {:else}
+              <span class="faint">{t('issue.empty.extra')}</span>
+            {/if}
+          </Card>
         {/if}
 
         <Card title={t('issues.occurrences')}>
@@ -1087,17 +1089,6 @@
     min-width: 0;
   }
   /* Contexts + Additional data sit side by side under the latest-event card. */
-  .data-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 18px;
-    align-items: start;
-  }
-  @media (max-width: 640px) {
-    .data-row {
-      grid-template-columns: 1fr;
-    }
-  }
   .rail {
     display: flex;
     flex-direction: column;

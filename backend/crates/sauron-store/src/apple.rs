@@ -196,11 +196,11 @@ fn bearer(ids: &AppleIdentifiers, p8_pem: &str) -> anyhow::Result<String> {
         exp: now + 900,
         aud: "appstoreconnect-v1",
     };
-    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    let mut header = sauron_jwt::Header::new(sauron_jwt::Algorithm::ES256);
     header.kid = Some(ids.key_id.clone());
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(p8_pem.as_bytes())
+    let key = sauron_jwt::EncodingKey::from_ec_pem(p8_pem.as_bytes())
         .context("stored Apple credential is not a valid .p8 EC private key")?;
-    Ok(jsonwebtoken::encode(&header, &claims, &key)?)
+    Ok(sauron_jwt::encode(&header, &claims, &key)?)
 }
 
 #[derive(Deserialize)]
