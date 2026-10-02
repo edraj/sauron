@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use sauron_core::Config;
 use sauron_db::repo::DropOutcome;
 use sauron_db::{conn, repo, PgPool};
+use sauron_tier::disk::Pressure;
 use sauron_tier::duck::{DuckEngine, Verdict};
 use sauron_tier::{
     bucket_bounds, cold_copy_dir, cold_partition_glob, partition_suffix, quarantine, Granularity,
@@ -30,6 +31,24 @@ async fn main() -> anyhow::Result<()> {
     let pool = sauron_db::build_pool(&cfg.database_url, 4)?;
     let gran = Granularity::from_str_or(&cfg.tier_granularity, Granularity::Day);
     info!(hot_days = cfg.tier_hot_days, granularity = ?gran, "sauron-tier started");
+
+    // Exports are written to a staging directory and only moved into cold
+    // storage once complete (see `DuckEngine::copy_to_cold`). Anything still
+    // there now was left by a process that died mid-export, was never visible
+    // to a reader, and is safe to delete. Done before the first cycle, which
+    // is the only writer.
+    match sauron_tier::duck::clear_staging(&cfg.tier_cold_path) {
+        Ok(0) => {}
+        Ok(n) => info!(
+            removed = n,
+            "removed uncommitted exports left by a previous process"
+        ),
+        Err(e) => warn!(error = %e, "could not clear the export staging directory"),
+    }
+
+    // Set on SIGTERM. The tiering loop checks it between partitions, so a
+    // stop waits for the export in progress instead of killing it.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
     // Two independent loops, not one. Tiering runs hourly by default; a restore
     // is a human waiting on a button and needs a seconds-scale poll. Folding the
@@ -52,30 +71,83 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move { purge::purge_loop(pool, cfg).await })
     };
 
-    let tiering = tokio::spawn(async move {
-        loop {
-            if let Err(e) = cycle(&pool, &cfg, gran).await {
-                // `{:#}`, not `%e`: anyhow's Display prints only the outermost
-                // context ("export failed; removed 1 partial file(s)") and drops
-                // the cause — which is how a production export failed for a day
-                // with no reason in the journal.
-                warn!(error = %format_args!("{e:#}"), "tier cycle failed; backing off");
-            }
-            tokio::time::sleep(Duration::from_secs(cfg.tier_tick_secs)).await;
-        }
-    });
+    let mut tiering = tokio::spawn(async move { tier_loop(pool, cfg, gran, stop_rx).await });
 
-    // No loop returns. If any task dies the process should too, rather than
-    // silently continuing with part of its job undone.
+    // No loop returns on its own. If any task dies the process should too,
+    // rather than silently continuing with part of its job undone.
+    //
+    // A stop request is the one orderly exit. Only the tiering loop is waited
+    // for: it is the one writing files that readers trust. A restore or purge
+    // in flight runs inside Postgres transactions, which roll back cleanly
+    // when the process exits.
     tokio::select! {
         r = restore => warn!(?r, "restore loop exited"),
-        r = tiering => warn!(?r, "tiering loop exited"),
+        r = &mut tiering => warn!(?r, "tiering loop exited"),
         r = purging => warn!(?r, "purge loop exited"),
+        () = shutdown_signal() => {
+            info!("stop requested; finishing the partition in progress");
+            let _ = stop_tx.send(true);
+            match tiering.await {
+                Ok(()) => info!("tiering stopped cleanly"),
+                Err(e) => warn!(error = %e, "tiering task failed while stopping"),
+            }
+        }
     }
     Ok(())
 }
 
-async fn cycle(pool: &PgPool, cfg: &Config, gran: Granularity) -> anyhow::Result<()> {
+/// Resolves on SIGTERM (what systemd sends on stop and restart) or Ctrl-C.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C stops gracefully");
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+async fn tier_loop(
+    pool: PgPool,
+    cfg: Config,
+    gran: Granularity,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if let Err(e) = cycle(&pool, &cfg, gran, &stop).await {
+            // `{:#}`, not `%e`: anyhow's Display prints only the outermost
+            // context ("export failed; removed 1 partial file(s)") and drops
+            // the cause — which is how a production export failed for a day
+            // with no reason in the journal.
+            warn!(error = %format_args!("{e:#}"), "tier cycle failed; backing off");
+        }
+        if *stop.borrow() {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(cfg.tier_tick_secs)) => {}
+            _ = stop.changed() => return,
+        }
+    }
+}
+
+/// How many days behind its rotation age a table's watermark may fall before
+/// every cycle warns about it. One day of slack covers a cycle that runs just
+/// before midnight UTC and the rollup interlock holding the newest partition.
+const TIER_LAG_WARN_DAYS: i64 = 2;
+
+async fn cycle(
+    pool: &PgPool,
+    cfg: &Config,
+    gran: Granularity,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     // Resolve the rotation age once per cycle, not once per process. The value is
     // operator-tunable at runtime (`runtime_settings['tier.hot_days']`), so a
     // process-start read would mean a change only took effect on restart — and
@@ -136,20 +208,144 @@ async fn cycle(pool: &PgPool, cfg: &Config, gran: Granularity) -> anyhow::Result
         );
     }
 
+    let (hot_days, drop_lag_hours) = disk_adjusted(cfg, hot_days);
+
     for t in TIERED_TABLES {
-        if let Err(e) = tier_table(pool, cfg, gran, t, hot_days).await {
+        if *stop.borrow() {
+            break;
+        }
+        let result = tier_table(pool, cfg, gran, t, hot_days, drop_lag_hours, stop).await;
+        record_health(pool, t.name, &result).await;
+        if let Err(e) = &result {
             warn!(table = t.name, error = %format_args!("{e:#}"), "tiering table failed");
         }
+        warn_if_behind(pool, gran, t.name, hot_days).await;
     }
     Ok(())
 }
 
+/// The rotation age and drop lag for this cycle, after looking at free space
+/// on the cold-storage filesystem (usually also the Postgres disk).
+///
+/// Below `tier_disk_emergency_pct` free, the cycle tiers on
+/// `tier_emergency_hot_days` and skips the drop lag. Every safety check on a
+/// drop still applies -- the cold copy is verified by key first and pinned
+/// ranges are kept -- so the only thing traded away is how long a partition
+/// sits in both tiers. That is the right trade when the alternative is
+/// Postgres aborting on a full disk.
+fn disk_adjusted(cfg: &Config, hot_days: i64) -> (i64, i64) {
+    let normal = (hot_days, cfg.tier_drop_lag_hours);
+    // The cold directory does not exist before the first export; its nearest
+    // existing ancestor is on the same filesystem in every sane layout.
+    let path = std::path::Path::new(&cfg.tier_cold_path);
+    let probe = path.ancestors().find(|p| p.exists()).unwrap_or(path);
+    let reading = match sauron_tier::disk::usage(probe) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(path = %probe.display(), error = %e, "cannot read free disk space");
+            return normal;
+        }
+    };
+    let free_pct = reading.free_pct();
+    let free_mb = reading.free_bytes / (1024 * 1024);
+    match sauron_tier::disk::classify(
+        free_pct,
+        cfg.tier_disk_warn_pct,
+        cfg.tier_disk_emergency_pct,
+    ) {
+        Pressure::Normal => normal,
+        Pressure::Low => {
+            warn!(
+                path = %probe.display(),
+                free_pct,
+                free_mb,
+                threshold_pct = cfg.tier_disk_warn_pct,
+                "disk space is low on the cold-storage filesystem"
+            );
+            normal
+        }
+        Pressure::Critical => {
+            let emergency = cfg.tier_emergency_hot_days.max(1).min(hot_days);
+            warn!(
+                path = %probe.display(),
+                free_pct,
+                free_mb,
+                threshold_pct = cfg.tier_disk_emergency_pct,
+                hot_days = emergency,
+                "disk space is critical; tiering in emergency mode this cycle (shorter rotation age, no drop lag)"
+            );
+            (emergency, 0)
+        }
+    }
+}
+
+/// Persist how `table`'s turn in this cycle went (see migration 000081).
+/// Best effort: failing to record health must not fail the cycle.
+async fn record_health(pool: &PgPool, table: &str, result: &anyhow::Result<()>) {
+    let now = Utc::now();
+    let mut c = match conn(pool).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(table, error = %e, "cannot record tiering health");
+            return;
+        }
+    };
+    let recorded = match result {
+        Ok(()) => repo::record_tiering_success(&mut c, table, now)
+            .await
+            .map(|_| ()),
+        Err(e) => match repo::record_tiering_failure(&mut c, table, now, &format!("{e:#}")).await {
+            Ok(n) if n >= 3 => {
+                warn!(
+                    table,
+                    consecutive_failures = n,
+                    "tiering has failed repeatedly for this table"
+                );
+                Ok(())
+            }
+            other => other.map(|_| ()),
+        },
+    };
+    if let Err(e) = recorded {
+        warn!(table, error = %e, "cannot record tiering health");
+    }
+}
+
+/// Warn when `table`'s watermark has fallen more than [`TIER_LAG_WARN_DAYS`]
+/// behind where the rotation age says it should be.
+///
+/// This is the signal that was missing when one table's tiering stopped for
+/// weeks: every cycle "worked" for the other tables, and the stalled one
+/// filled the disk without anything saying it had stopped moving.
+async fn warn_if_behind(pool: &PgPool, gran: Granularity, table: &str, hot_days: i64) {
+    let Ok(mut c) = conn(pool).await else {
+        return;
+    };
+    let Ok(Some(wm)) = repo::get_watermark(&mut c, table).await else {
+        return;
+    };
+    let expected = bucket_bounds(Utc::now() - chrono::Duration::days(hot_days), gran).start;
+    let behind = expected - wm;
+    if behind >= chrono::Duration::days(TIER_LAG_WARN_DAYS) {
+        warn!(
+            table,
+            watermark = %wm,
+            expected = %expected,
+            behind_days = behind.num_days(),
+            "tiering is behind: partitions past the rotation age are still in Postgres"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn tier_table(
     pool: &PgPool,
     cfg: &Config,
     gran: Granularity,
     t: &TieredTable,
     hot_days: i64,
+    drop_lag_hours: i64,
+    stop: &tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     let mut c = conn(pool).await?;
@@ -162,13 +358,26 @@ async fn tier_table(
     // in a just-exported-and-dropped partition.
     let wm_at_cycle_start = repo::get_watermark(&mut c, t.name).await?;
 
-    // 1. Pre-create partitions for now .. now + partition_ahead buckets.
-    let mut b = bucket_bounds(now, gran);
-    for _ in 0..cfg.tier_partition_ahead {
-        repo::create_range_partition(&mut c, t.name, &partition_suffix(b.start), b.start, b.end)
+    // 1. Pre-create partitions for now .. now + partition_ahead buckets. A
+    //    failure here (a full disk refuses CREATE TABLE) must not skip the
+    //    drops below, so it is kept and returned at the end like an export
+    //    error.
+    let precreated: anyhow::Result<()> = async {
+        let mut b = bucket_bounds(now, gran);
+        for _ in 0..cfg.tier_partition_ahead {
+            repo::create_range_partition(
+                &mut c,
+                t.name,
+                &partition_suffix(b.start),
+                b.start,
+                b.end,
+            )
             .await?;
-        b = bucket_bounds(b.end, gran);
+            b = bucket_bounds(b.end, gran);
+        }
+        Ok(())
     }
+    .await;
 
     // 2. Eligibility cutoff: partitions whose END <= (now - hot_days) may tier.
     let cutoff = now - chrono::Duration::days(hot_days);
@@ -207,140 +416,32 @@ async fn tier_table(
     // 3. Export eligible partitions oldest-first; stop on the first failure so
     //    the watermark never skips a gap.
     //
-    //    A failed export stops EXPORTING, not the cycle. It used to `?` straight
-    //    out of `tier_table`, skipping the drop step below — which only touches
-    //    partitions already below the watermark and does not depend on this
-    //    loop at all. On a nearly full disk that is a trap: the export fails for
-    //    lack of space, so nothing is dropped, so no space is ever freed. The
-    //    error is kept and returned after the drops, so the cycle still reports
-    //    it as `tiering table failed`.
-    let mut export_err: Option<anyhow::Error> = None;
-    let children = repo::list_child_partitions(&mut c, t.name).await?;
-    for child in children {
-        let Some(start) = parse_suffix_start(&child, t.name) else {
-            continue;
-        };
-        let range = bucket_bounds(start, gran);
-        if range.end > cutoff {
-            continue; // still hot
-        }
-        // Rollup interlock: never export a partition the fold has not fully
-        // passed. The rollups are what keep aggregates answerable after the
-        // raw rows leave Postgres, so exporting ahead of the watermark would
-        // tier out rows that never reached them. Trivially satisfied in
-        // steady state (fold lag ~1 min vs day-old exports) — enforced, not
-        // assumed, because a stopped ingest process is exactly the state in
-        // which both "fold is behind" and "partitions keep aging" hold.
-        match sauron_db::rollups::as_of(&mut c, &sauron_db::rollups::EVENT_SOURCES).await? {
-            Some(ro_wm) if range.end <= ro_wm => {}
-            ro => {
-                tracing::info!(
-                    table = t.name, partition = %child, rollup_watermark = ?ro,
-                    "tier: partition retained until the rollup fold passes it"
-                );
-                continue;
-            }
-        }
-        let wm = repo::get_watermark(&mut c, t.name).await?;
-        if let Some(w) = wm {
-            if range.start < w {
-                continue; // already exported
-            }
-        }
-        let pg_rows = repo::count_child_rows(&mut c, &child).await?;
-
-        let pg_url = cfg.database_url.clone();
-        let table = t.name.to_string();
-        let cold_dir_c = cold_dir.clone();
-        let base_glob_c = base_glob.clone();
-        let (rs, re) = (range.start, range.end);
-        let pg_rows_c = pg_rows;
-        // Idempotency pre-check: only export when cold has NOTHING for this range.
-        // `APPEND` is not idempotent, so re-exporting a range that already has data
-        // would duplicate rows. `already`: rows already in cold for [rs, re).
-        //   already == pg_rows  → already exported (a prior watermark-advance didn't
-        //                         stick); skip export, just advance.
-        //   already == 0        → fresh export, then verify.
-        //   0 < already != pg   → partial/corrupt cold data; do NOT append more.
-        let exported =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<(i64, Option<i64>)> {
-                let eng = DuckEngine::open()?;
-                let already = eng.count_range(&base_glob_c, rs, re)?;
-                if already != 0 || pg_rows_c == 0 {
-                    // Already present, partial, or nothing to export — decided by caller.
-                    return Ok((already, None));
-                }
-                eng.export_from_postgres(&pg_url, &table, rs, re, &cold_dir_c)?;
-                let cold = eng.count_range(&base_glob_c, rs, re)?;
-                Ok((already, Some(cold)))
-            })
-            .await?;
-        let (already, exported_cold) = match exported {
-            Ok(v) => v,
-            Err(e) => {
-                export_err = Some(e.context(format!("exporting {child}")));
-                break;
-            }
-        };
-
-        match exported_cold {
-            Some(cold_rows) => {
-                if cold_rows != pg_rows {
-                    warn!(child = %child, pg_rows, cold_rows, "count mismatch after export; leaving partition for retry");
-                    break;
-                }
-                repo::advance_watermark(&mut c, t.name, range.end).await?;
-                info!(child = %child, rows = pg_rows, "exported partition to Parquet");
-            }
-            None if already == pg_rows => {
-                // Rows already durable in cold from a prior attempt — idempotent advance.
-                repo::advance_watermark(&mut c, t.name, range.end).await?;
-                info!(child = %child, rows = pg_rows, "partition already in cold; advanced watermark");
-            }
-            None => {
-                // Cold holds some of this range but not all: an earlier export
-                // whose watermark advance did not happen, plus rows that landed
-                // since. This used to demand a manual clear and `break` — every
-                // later partition of the table stuck behind one late row. The
-                // same key-matched reconcile the drop step uses appends exactly
-                // what cold lacks, never a row it already holds, and refuses the
-                // one shape where appending could duplicate (see
-                // `plan_reconcile`).
-                let pg_url = cfg.database_url.clone();
-                let table = t.name.to_string();
-                let cold_dir_c = cold_dir.clone();
-                let base_glob_c = base_glob.clone();
-                let rec = tokio::task::spawn_blocking(move || {
-                    let eng = DuckEngine::open()?;
-                    eng.reconcile_range(&pg_url, &table, rs, re, &base_glob_c, &cold_dir_c)
-                })
-                .await?;
-                match rec {
-                    Ok(rec) => match rec.verdict {
-                        Verdict::Ready { pg_rows } => {
-                            repo::advance_watermark(&mut c, t.name, range.end).await?;
-                            info!(child = %child, rows = pg_rows, appended = rec.exported, "completed a partial export; advanced watermark");
-                        }
-                        Verdict::Retain(why) => {
-                            warn!(child = %child, pg_rows = rec.pg_rows, cold_rows = rec.cold_rows, missing = rec.missing, reason = %why, "partial cold data for range; not advancing");
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        export_err = Some(e.context(format!("completing the export of {child}")));
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    //    A failure here stops EXPORTING, not the cycle: it ends this block, and
+    //    the drop step below still runs. Drops only touch partitions already
+    //    below the watermark and do not depend on this loop at all, and on a
+    //    nearly full disk they are what frees space, so nothing in here may
+    //    skip them -- not an export error, and not a failed watermark read or
+    //    row count either. The error is returned after the drops, so the cycle
+    //    still reports it.
+    //
+    //    A count mismatch or a refused reconcile is an error too. Both used to
+    //    stop the loop silently, which is how a table can stall for weeks
+    //    while every cycle looks clean.
+    let exported = export_eligible(&mut c, cfg, gran, t, cutoff, &cold_dir, &base_glob, stop).await;
 
     // 4. Drop partitions at/below the PRE-CYCLE watermark AND past the drop lag.
     //    Using wm_at_cycle_start (not a fresh read) guarantees a partition exported
     //    THIS cycle waits until a later cycle to be dropped (the grace window).
     if let Some(w) = wm_at_cycle_start {
-        let lag = chrono::Duration::hours(cfg.tier_drop_lag_hours);
+        let lag = chrono::Duration::hours(drop_lag_hours);
         for child in repo::list_child_partitions(&mut c, t.name).await? {
+            if *stop.borrow() {
+                info!(
+                    table = t.name,
+                    "shutdown requested; leaving remaining drops to the next run"
+                );
+                break;
+            }
             let Some(start) = parse_suffix_start(&child, t.name) else {
                 continue;
             };
@@ -436,10 +537,159 @@ async fn tier_table(
             info!(swept, "swept unreferenced error_stack_blobs");
         }
     }
-    match export_err {
-        Some(e) => Err(e),
-        None => Ok(()),
+    match (precreated, exported) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(e.context("pre-creating partitions")),
+        (Ok(()), Err(e)) => Err(e),
+        (Err(pre), Err(e)) => {
+            Err(e.context(format!("also failed pre-creating partitions: {pre:#}")))
+        }
     }
+}
+
+/// Step 3 of [`tier_table`]: export eligible partitions oldest-first, stopping
+/// at the first failure so the watermark never skips a gap. See the comment at
+/// the call site for why every failure is returned rather than `?`-ed out of
+/// `tier_table`.
+#[allow(clippy::too_many_arguments)]
+async fn export_eligible(
+    c: &mut sauron_db::PgConn,
+    cfg: &Config,
+    gran: Granularity,
+    t: &TieredTable,
+    cutoff: DateTime<Utc>,
+    cold_dir: &str,
+    base_glob: &str,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let children = repo::list_child_partitions(c, t.name).await?;
+    for child in children {
+        if *stop.borrow() {
+            info!(
+                table = t.name,
+                "shutdown requested; not starting another export"
+            );
+            break;
+        }
+        let Some(start) = parse_suffix_start(&child, t.name) else {
+            continue;
+        };
+        let range = bucket_bounds(start, gran);
+        if range.end > cutoff {
+            continue; // still hot
+        }
+        // Rollup interlock: never export a partition the fold has not fully
+        // passed. The rollups are what keep aggregates answerable after the
+        // raw rows leave Postgres, so exporting ahead of the watermark would
+        // tier out rows that never reached them. Trivially satisfied in
+        // steady state (fold lag ~1 min vs day-old exports) — enforced, not
+        // assumed, because a stopped ingest process is exactly the state in
+        // which both "fold is behind" and "partitions keep aging" hold.
+        match sauron_db::rollups::as_of(c, &sauron_db::rollups::EVENT_SOURCES).await? {
+            Some(ro_wm) if range.end <= ro_wm => {}
+            ro => {
+                tracing::info!(
+                    table = t.name, partition = %child, rollup_watermark = ?ro,
+                    "tier: partition retained until the rollup fold passes it"
+                );
+                continue;
+            }
+        }
+        let wm = repo::get_watermark(c, t.name).await?;
+        if let Some(w) = wm {
+            if range.start < w {
+                continue; // already exported
+            }
+        }
+        let pg_rows = repo::count_child_rows(c, &child).await?;
+
+        let pg_url = cfg.database_url.clone();
+        let table = t.name.to_string();
+        let cold_dir_c = cold_dir.to_string();
+        let base_glob_c = base_glob.to_string();
+        let (rs, re) = (range.start, range.end);
+        let pg_rows_c = pg_rows;
+        // Idempotency pre-check: only export when cold has NOTHING for this range.
+        // `APPEND` is not idempotent, so re-exporting a range that already has data
+        // would duplicate rows. `already`: rows already in cold for [rs, re).
+        //   already == pg_rows  → already exported (a prior watermark-advance didn't
+        //                         stick); skip export, just advance.
+        //   already == 0        → fresh export, then verify.
+        //   0 < already != pg   → partial/corrupt cold data; do NOT append more.
+        let exported =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(i64, Option<i64>)> {
+                let eng = DuckEngine::open()?;
+                let already = eng.count_range(&base_glob_c, rs, re)?;
+                if already != 0 || pg_rows_c == 0 {
+                    // Already present, partial, or nothing to export — decided by caller.
+                    return Ok((already, None));
+                }
+                eng.export_from_postgres(&pg_url, &table, rs, re, &cold_dir_c)?;
+                let cold = eng.count_range(&base_glob_c, rs, re)?;
+                Ok((already, Some(cold)))
+            })
+            .await?;
+        let (already, exported_cold) = match exported {
+            Ok(v) => v,
+            Err(e) => return Err(e.context(format!("exporting {child}"))),
+        };
+
+        match exported_cold {
+            Some(cold_rows) => {
+                if cold_rows != pg_rows {
+                    anyhow::bail!(
+                        "count mismatch after exporting {child}: {pg_rows} row(s) in Postgres, \
+                         {cold_rows} in cold; leaving the partition for retry"
+                    );
+                }
+                repo::advance_watermark(c, t.name, range.end).await?;
+                info!(child = %child, rows = pg_rows, "exported partition to Parquet");
+            }
+            None if already == pg_rows => {
+                // Rows already durable in cold from a prior attempt — idempotent advance.
+                repo::advance_watermark(c, t.name, range.end).await?;
+                info!(child = %child, rows = pg_rows, "partition already in cold; advanced watermark");
+            }
+            None => {
+                // Cold holds some of this range but not all: an earlier export
+                // whose watermark advance did not happen, plus rows that landed
+                // since. This used to demand a manual clear and `break` — every
+                // later partition of the table stuck behind one late row. The
+                // same key-matched reconcile the drop step uses appends exactly
+                // what cold lacks, never a row it already holds, and refuses the
+                // one shape where appending could duplicate (see
+                // `plan_reconcile`).
+                let pg_url = cfg.database_url.clone();
+                let table = t.name.to_string();
+                let cold_dir_c = cold_dir.to_string();
+                let base_glob_c = base_glob.to_string();
+                let rec = tokio::task::spawn_blocking(move || {
+                    let eng = DuckEngine::open()?;
+                    eng.reconcile_range(&pg_url, &table, rs, re, &base_glob_c, &cold_dir_c)
+                })
+                .await?;
+                match rec {
+                    Ok(rec) => match rec.verdict {
+                        Verdict::Ready { pg_rows } => {
+                            repo::advance_watermark(c, t.name, range.end).await?;
+                            info!(child = %child, rows = pg_rows, appended = rec.exported, "completed a partial export; advanced watermark");
+                        }
+                        Verdict::Retain(why) => {
+                            anyhow::bail!(
+                                "partial cold data for {child} ({} in Postgres, {} in cold, \
+                                 {} missing); not advancing: {why}",
+                                rec.pg_rows,
+                                rec.cold_rows,
+                                rec.missing
+                            );
+                        }
+                    },
+                    Err(e) => return Err(e.context(format!("completing the export of {child}"))),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -467,7 +717,7 @@ async fn restore_loop(pool: PgPool, cfg: Config) {
             // queue of restores drains back to back.
             Ok(true) => continue,
             Ok(false) => {}
-            Err(e) => warn!(error = %e, "restore job failed"),
+            Err(e) => warn!(error = %format_args!("{e:#}"), "restore job failed"),
         }
         tokio::time::sleep(Duration::from_secs(cfg.restore_poll_secs)).await;
     }
@@ -665,7 +915,7 @@ async fn run_one_restore(pool: &PgPool, cfg: &Config, worker_id: &str) -> anyhow
             // orphan those rows.
             repo::finish_restore_job(&mut c, job.id, worker_id, "failed", 0, &e.to_string())
                 .await?;
-            warn!(job = %job.id, error = %e, "restore failed");
+            warn!(job = %job.id, error = %format_args!("{e:#}"), "restore failed");
         }
     }
     Ok(true)

@@ -34,6 +34,10 @@ EnvironmentFile=-/etc/sauron/tier.env
 WorkingDirectory=/var/lib/sauron
 ExecStart=/usr/bin/sauron-tier
 Restart=on-failure
+# On stop (including the restart an RPM upgrade triggers) the worker finishes
+# the partition it is exporting before exiting, instead of dying mid-write.
+# A day of a wide table can take minutes; give it room before SIGKILL.
+TimeoutStopSec=15min
 RestartSec=2
 
 NoNewPrivileges=true

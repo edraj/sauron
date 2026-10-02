@@ -18,6 +18,7 @@ uuid.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+libc.workspace = true
 # Unbundled: links the system/vendored libduckdb (DUCKDB_LIB_DIR / ld.so path).
 # Parquet + the postgres scanner are provided by the official prebuilt lib at
 # runtime, so no duckdb crate feature (json/parquet) is needed here.

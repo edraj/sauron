@@ -544,6 +544,22 @@
         <StatTile label={t('activeUsers.stat.apps')} value={rep.apps.length} />
       </StatTiles>
 
+      <!-- A table whose tiering keeps failing grows Postgres without bound
+           while every other table tiers normally; on a production host that
+           went unnoticed for weeks and filled the disk. Say so at the top. -->
+      {#each (rep.tiering ?? []).filter((h) => h.consecutive_failures > 0) as h (h.table_name)}
+        <div class="err-banner" role="alert">
+          <Icon name="triangle-alert" size={15} />
+          <span>
+            {t('storage.tiering.failing', {
+              table: h.table_name,
+              n: h.consecutive_failures,
+              error: h.last_error ?? '',
+            })}
+          </span>
+        </div>
+      {/each}
+
       <div class="section">
         <Card title={t('storage.card.rotation')}>
           {#if policyLoadError}

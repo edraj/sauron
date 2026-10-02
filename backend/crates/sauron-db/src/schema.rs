@@ -588,6 +588,17 @@ diesel::table! {
 }
 
 diesel::table! {
+    tiering_health (table_name) {
+        table_name -> Text,
+        last_cycle_at -> Timestamptz,
+        last_success_at -> Nullable<Timestamptz>,
+        consecutive_failures -> Int4,
+        last_error -> Nullable<Text>,
+        last_error_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
     notification_channels (id) {
         id -> Uuid,
         org_id -> Uuid,
@@ -1134,6 +1145,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     monitor_checks,
     monitor_incidents,
     tiering_state,
+    tiering_health,
     symbol_blobs,
     symbol_artifacts,
     notification_channels,

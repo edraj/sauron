@@ -76,6 +76,11 @@ pub fn partition_suffix(start: DateTime<Utc>) -> String {
     )
 }
 
+/// Directory under the cold root where exports are written before they are
+/// committed. Not a table name, so no `<cold>/<table>/**` glob reaches it and
+/// [`parse_cold_path`] rejects anything under it.
+pub const STAGING_DIR: &str = ".staging";
+
 /// Directory DuckDB writes the cold Parquet under (hive-partitioned inside).
 pub fn cold_copy_dir(base: &str, table: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), table)
@@ -105,7 +110,7 @@ pub struct ColdFileKey {
 pub fn parse_cold_path(rel: &str) -> Option<ColdFileKey> {
     let rel = rel.trim_start_matches('/');
     let table = rel.split('/').next()?.to_string();
-    if table.is_empty() {
+    if table.is_empty() || table == STAGING_DIR {
         return None;
     }
     let app_seg = rel.split('/').find(|s| s.starts_with("app_id="))?;
@@ -148,6 +153,15 @@ mod cold_path_tests {
             parse_cold_path("error_events/app_id=not-a-uuid/x.parquet"),
             None
         );
+    }
+
+    /// An export in flight is not cold data yet: nothing under the staging
+    /// directory may be counted or read as belonging to a table.
+    #[test]
+    fn rejects_staged_files() {
+        let app = Uuid::new_v4();
+        let rel = format!(".staging/error_events-x/app_id={app}/year=2026/month=5/x.parquet");
+        assert_eq!(parse_cold_path(&rel), None);
     }
 }
 

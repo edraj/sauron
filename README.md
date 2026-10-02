@@ -426,6 +426,10 @@ queue.
 | `TIER_DROP_LAG_HOURS` | Grace period between exporting a partition and dropping it from Postgres. | `24` | tier |
 | `TIER_TICK_SECS` | Tiering loop cadence. | `3600` | tier |
 | `TIER_PARTITION_AHEAD` | How many future partitions to pre-create. | `7` | tier |
+| `TIER_DISK_WARN_PCT` | Free space (percent of the `TIER_COLD_PATH` filesystem) below which every tier cycle logs a low-disk warning. | `15` | tier |
+| `TIER_DISK_EMERGENCY_PCT` | Free space below which a tier cycle runs in emergency mode: rotation age drops to `TIER_EMERGENCY_HOT_DAYS` and the drop lag is skipped. Drops still require every row to be in Parquet. `0` disables it. | `10` | tier |
+| `TIER_EMERGENCY_HOT_DAYS` | Rotation age used in emergency mode, when shorter than the normal one. Never below 1. | `3` | tier |
+| `DUCKDB_MAX_TEMP_MB` | Cap on how much DuckDB may spill to its temp directory. DuckDB's own default is 90% of free space on that disk; with a cap, an oversized export fails and is retried in one-hour windows instead of filling the disk. | `10240` | tier, api |
 
 ### Search & query planner
 
