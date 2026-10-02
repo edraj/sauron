@@ -47,7 +47,11 @@ pub async fn storage(
     // silently accepted-and-ignored.
     super::scope::reject_environment_id(env.environment_id.as_deref())?;
     let mut conn = crate::routes::db(&state).await?;
-    let org_ids = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ORG_MANAGE).await?;
+    let held_org = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ORG_MANAGE).await?;
+    let held_role = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ROLE_MANAGE).await?;
+    let mut org_set: std::collections::HashSet<_> = held_org.into_iter().collect();
+    org_set.extend(held_role);
+    let org_ids: Vec<_> = org_set.into_iter().collect();
     // Part of the cache key, NOT just a statistic — see below.
     let deployment_orgs = repo::org_count(&mut conn).await?;
     drop(conn);
@@ -172,7 +176,10 @@ pub(crate) async fn require_deployment_admin(
     auth: &AuthUser,
 ) -> Result<(), ApiError> {
     let mut conn = crate::routes::db(state).await?;
-    let held = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ORG_MANAGE).await?;
+    let held_org = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ORG_MANAGE).await?;
+    let held_role = repo::orgs_with_permission(&mut conn, auth.user_id, perm::ROLE_MANAGE).await?;
+    let mut held: std::collections::HashSet<_> = held_org.into_iter().collect();
+    held.extend(held_role);
     let total = repo::count_all_orgs(&mut conn).await?;
     drop(conn);
     if total == 0 || (held.len() as i64) < total {

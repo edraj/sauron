@@ -460,8 +460,13 @@ pub async fn list_jobs(
 ) -> Result<Json<PurgeCatalog>, ApiError> {
     require_deployment_admin(&state, &auth).await?;
     let mut conn = crate::routes::db(&state).await?;
-    let org_ids =
+    let held_org =
         repo::orgs_with_permission(&mut conn, auth.user_id, sauron_auth::perm::ORG_MANAGE).await?;
+    let held_role =
+        repo::orgs_with_permission(&mut conn, auth.user_id, sauron_auth::perm::ROLE_MANAGE).await?;
+    let mut org_set: std::collections::HashSet<_> = held_org.into_iter().collect();
+    org_set.extend(held_role);
+    let org_ids: Vec<_> = org_set.into_iter().collect();
     let jobs = purge_repo::list_purge_jobs(&mut conn, &org_ids, 100).await?;
     drop(conn);
 
