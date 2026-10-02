@@ -33,4 +33,5 @@ paths = [
   # standards themselves, used as known-answer tests. Only these vectors live in
   # this file; the tests that use them are in tests.rs, still scanned.
   '''backend/crates/sauron-jwt/src/tests/rfc_examples\.rs$''',
+  '''^\.superpowers/''',
 ]
