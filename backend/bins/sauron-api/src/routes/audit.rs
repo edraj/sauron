@@ -154,9 +154,13 @@ pub async fn list(
 ) -> Result<Json<AuditResponse>, ApiError> {
     let mut conn = crate::routes::db(&state).await?;
 
-    // The gate. `authorize_org` 403s when the caller holds no org-scoped
-    // `org:manage` here, so passing another tenant's org_id cannot read it.
-    authorize_org(&mut conn, auth.user_id, q.org_id, perm::ORG_MANAGE).await?;
+    // The gate. Accepts org:manage (Owner) or role:manage (Admin).
+    if authorize_org(&mut conn, auth.user_id, q.org_id, perm::ORG_MANAGE)
+        .await
+        .is_err()
+    {
+        authorize_org(&mut conn, auth.user_id, q.org_id, perm::ROLE_MANAGE).await?;
+    }
 
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
@@ -263,9 +267,13 @@ pub async fn export_csv(
     Query(q): Query<AuditQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     let mut conn = crate::routes::db(&state).await?;
-    // Same gate as `list`, resolved the same way. A CSV route that forgot this
-    // would be an unauthenticated dump of the whole trail.
-    authorize_org(&mut conn, auth.user_id, q.org_id, perm::ORG_MANAGE).await?;
+    // Same gate as `list`: accepts org:manage (Owner) or role:manage (Admin).
+    if authorize_org(&mut conn, auth.user_id, q.org_id, perm::ORG_MANAGE)
+        .await
+        .is_err()
+    {
+        authorize_org(&mut conn, auth.user_id, q.org_id, perm::ROLE_MANAGE).await?;
+    }
 
     let include_auth = q.include_auth.unwrap_or(false)
         || q.entity_type.as_deref() == Some(crate::audit::entity::AUTH);

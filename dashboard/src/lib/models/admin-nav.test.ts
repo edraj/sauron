@@ -57,7 +57,7 @@ describe('pageLockedBy', () => {
     grantOrg(VIEWER);
     // Org-level pages name their level: a member holding the permission on
     // one project would otherwise be told they lack what they hold.
-    expect(pageLockedBy('/admin/storage')).toBe('org:manage@org');
+    expect(pageLockedBy('/admin/storage')).toBe('role:manage@org');
     expect(pageLockedBy('/admin/alerts')).toBe('alert:read');
     expect(pageLockedBy('/admin/privacy')).toBe('pii:read');
   });
@@ -102,8 +102,8 @@ describe('adminNavLocks', () => {
     const locks = Object.fromEntries(adminNavLocks().map((i) => [i.href, i.locked]));
     expect(locks['/admin/members']).toBe(null);
     expect(locks['/admin/source-maps']).toBe(null);
-    expect(locks['/admin/storage']).toBe('org:manage@org');
-    expect(locks['/admin/wall-of-shame']).toBe('org:manage@org');
+    expect(locks['/admin/storage']).toBe('role:manage@org');
+    expect(locks['/admin/wall-of-shame']).toBe('role:manage@org');
   });
 
   it('preserves ADMIN_NAV order', () => {
@@ -111,9 +111,10 @@ describe('adminNavLocks', () => {
     expect(adminNavLocks().map((i) => i.href)).toEqual(ADMIN_NAV.map((i) => i.href));
   });
 
-  // The whole point of locking: an Admin cannot open four of the twelve pages
-  // today and nothing tells them the pages exist. Now they are listed.
-  it('shows an Admin the four org:manage pages they cannot open', () => {
+  // The whole point of locking: an Admin can now open storage/purge pages
+  // because they hold role:manage. Only pages gated on org:manage that Admin
+  // doesn't hold would still be locked.
+  it('shows an Admin no locked pages because they now hold role:manage', () => {
     grantOrg([
       'member:read', 'member:manage', 'role:manage', 'project:read',
       'app:read', 'env:read', 'alert:read', 'pii:read', 'issue:read',
@@ -121,12 +122,7 @@ describe('adminNavLocks', () => {
     const locked = adminNavLocks()
       .filter((i) => i.locked !== null)
       .map((i) => i.href);
-    expect(locked).toEqual([
-      '/admin/storage',
-      '/admin/wall-of-shame',
-      '/admin/ingest-failures',
-      '/admin/purge',
-    ]);
+    expect(locked).toEqual([]);
   });
 });
 
