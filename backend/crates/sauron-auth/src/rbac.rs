@@ -166,37 +166,7 @@ pub const OWNER: PresetRole = PresetRole {
 pub const ADMIN: PresetRole = PresetRole {
     name: "Admin",
     description: "Manage projects, apps, members and roles",
-    permissions: &[
-        perm::ISSUE_READ,
-        perm::ISSUE_WRITE,
-        perm::EVENT_READ,
-        perm::FUNNEL_WRITE,
-        perm::ARTIFACT_WRITE,
-        perm::SOURCE_READ,
-        perm::MONITOR_READ,
-        perm::MONITOR_WRITE,
-        perm::APP_READ,
-        perm::APP_CREATE,
-        perm::APP_UPDATE,
-        perm::APP_DELETE,
-        perm::ENV_READ,
-        perm::ENV_CREATE,
-        perm::ENV_UPDATE,
-        perm::ENV_DELETE,
-        perm::ENV_ROTATE_KEY,
-        perm::PROJECT_READ,
-        perm::PROJECT_CREATE,
-        perm::PROJECT_UPDATE,
-        perm::PROJECT_DELETE,
-        perm::MEMBER_READ,
-        perm::MEMBER_MANAGE,
-        perm::MEMBER_CREDENTIAL,
-        perm::ROLE_MANAGE,
-        perm::ALERT_READ,
-        perm::ALERT_WRITE,
-        perm::PII_READ,
-        perm::PII_MANAGE,
-    ],
+    permissions: &perm::ALL,
 };
 
 pub const DEVELOPER: PresetRole = PresetRole {
@@ -873,13 +843,10 @@ mod tests {
     }
 
     #[test]
-    fn admin_is_all_except_org_manage() {
-        assert!(!ADMIN.permissions.contains(&perm::ORG_MANAGE));
-        assert_eq!(ADMIN.permissions.len(), 29);
+    fn admin_has_all_permissions() {
+        assert_eq!(ADMIN.permissions.len(), 30);
         for p in perm::ALL {
-            if p != perm::ORG_MANAGE {
-                assert!(ADMIN.permissions.contains(&p), "Admin missing {p}");
-            }
+            assert!(ADMIN.permissions.contains(&p), "Admin missing {p}");
         }
     }
 
