@@ -107,6 +107,17 @@ pub struct Config {
     pub tier_drop_lag_hours: i64,
     pub tier_tick_secs: u64,
     pub tier_partition_ahead: i64,
+    /// Free space (percent of the cold-storage filesystem) below which each
+    /// tier cycle logs a low-disk warning. `TIER_DISK_WARN_PCT`, default 15.
+    pub tier_disk_warn_pct: u8,
+    /// Free space below which the tier worker enters emergency mode for that
+    /// cycle: the rotation age drops to `tier_emergency_hot_days` and the drop
+    /// lag is skipped, so verified partitions leave Postgres sooner.
+    /// `TIER_DISK_EMERGENCY_PCT`, default 10; `0` disables emergency mode.
+    pub tier_disk_emergency_pct: u8,
+    /// Rotation age used in emergency mode, if lower than the normal one.
+    /// `TIER_EMERGENCY_HOT_DAYS`, default 3, never below 1.
+    pub tier_emergency_hot_days: i64,
     /// Days of raw `sessions` rows to keep; `0` (the default) keeps them
     /// forever. Enforced by dropping whole day partitions — sessions have no
     /// cold copy, the session-day rollups are the surviving record. Non-zero
@@ -360,6 +371,9 @@ impl std::fmt::Debug for Config {
             .field("restore_poll_secs", &self.restore_poll_secs)
             .field("restore_lease_secs", &self.restore_lease_secs)
             .field("tier_partition_ahead", &self.tier_partition_ahead)
+            .field("tier_disk_warn_pct", &self.tier_disk_warn_pct)
+            .field("tier_disk_emergency_pct", &self.tier_disk_emergency_pct)
+            .field("tier_emergency_hot_days", &self.tier_emergency_hot_days)
             .field("session_retention_days", &self.session_retention_days)
             .field("search_scan_clamp_days", &self.search_scan_clamp_days)
             .field("symbols_cache_mb", &self.symbols_cache_mb)
@@ -881,6 +895,9 @@ impl Config {
             tier_drop_lag_hours: parse("TIER_DROP_LAG_HOURS", 24),
             tier_tick_secs: parse("TIER_TICK_SECS", 3600),
             tier_partition_ahead: parse("TIER_PARTITION_AHEAD", 7),
+            tier_disk_warn_pct: parse("TIER_DISK_WARN_PCT", 15),
+            tier_disk_emergency_pct: parse("TIER_DISK_EMERGENCY_PCT", 10),
+            tier_emergency_hot_days: parse("TIER_EMERGENCY_HOT_DAYS", 3),
             session_retention_days: parse("SESSION_RETENTION_DAYS", 0),
             restore_poll_secs: parse("RESTORE_POLL_SECS", 5),
             restore_lease_secs: parse("RESTORE_LEASE_SECS", 300),
@@ -1440,6 +1457,9 @@ mod tests {
             tier_drop_lag_hours: 24,
             tier_tick_secs: 3600,
             tier_partition_ahead: 7,
+            tier_disk_warn_pct: 15,
+            tier_disk_emergency_pct: 10,
+            tier_emergency_hot_days: 3,
             session_retention_days: 0,
             restore_poll_secs: 5,
             restore_lease_secs: 300,

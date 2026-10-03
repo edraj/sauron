@@ -3184,6 +3184,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "duckdb",
+ "libc",
  "thiserror",
  "tracing",
  "uuid",

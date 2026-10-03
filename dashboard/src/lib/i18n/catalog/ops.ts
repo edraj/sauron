@@ -184,6 +184,10 @@ export const ops = {
   'storage.card.restore': { en: 'Restore from cold', ar: 'الاستعادة من الطبقة الباردة' },
   'storage.stat.tables': { en: 'Tables', ar: 'الجداول' },
   'storage.stat.cold': { en: 'Cold (Parquet)', ar: 'باردة (Parquet)' },
+  'storage.tiering.failing': {
+    en: 'Cold-tier rotation for {table} has failed {n} cycle(s) in a row, so its data is staying in Postgres. Last error: {error}',
+    ar: 'فشل تدوير الطبقة الباردة للجدول {table} في {n} دورة متتالية، لذا تبقى بياناته في Postgres. آخر خطأ: {error}',
+  },
   'storage.column.table': { en: 'Table', ar: 'الجدول' },
   'storage.column.size': { en: 'Size', ar: 'الحجم' },
   'storage.column.hotRows': { en: 'Hot rows', ar: 'صفوف ساخنة' },

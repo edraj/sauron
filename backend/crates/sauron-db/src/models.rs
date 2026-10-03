@@ -1643,6 +1643,21 @@ pub struct TierPin {
     pub reason: Option<String>,
 }
 
+/// How a tiered table's most recent tier cycle went. See migration 000081.
+///
+/// `Deserialize` because it travels inside the cached admin storage report.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, Deserialize, utoipa::ToSchema)]
+#[diesel(table_name = tiering_health)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct TieringHealth {
+    pub table_name: String,
+    pub last_cycle_at: DateTime<Utc>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: i32,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<DateTime<Utc>>,
+}
+
 /// One cold-data restore, from request to completion.
 ///
 /// Carries the claim/heartbeat/attempts trio so the executor survives a crash:

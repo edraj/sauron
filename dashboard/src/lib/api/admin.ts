@@ -58,9 +58,26 @@ export interface DatabaseInfo {
   tables: TableSize[];
 }
 
+/** How one tiered table's most recent tier cycle went. */
+export interface TieringHealth {
+  table_name: string;
+  last_cycle_at: string;
+  last_success_at?: string | null;
+  /** Cycles in a row that failed; 0 once one succeeds. */
+  consecutive_failures: number;
+  /** The most recent failure's full cause chain, kept after a recovery. */
+  last_error?: string | null;
+  last_error_at?: string | null;
+}
+
 export interface StorageReport {
   database: DatabaseInfo;
   apps: AppStorage[];
+  /**
+   * Per tiered table. Empty unless the caller manages every org: tiering is
+   * deployment-wide. Absent from reports cached before the field existed.
+   */
+  tiering?: TieringHealth[];
 }
 
 /**

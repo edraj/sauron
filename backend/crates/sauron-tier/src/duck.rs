@@ -55,6 +55,32 @@ fn duck_memory_mb() -> u32 {
     parse_memory_mb(std::env::var(DUCK_MEMORY_MB_ENV).ok().as_deref())
 }
 
+/// Environment variable capping how much DuckDB may spill to its temp
+/// directory, in MB.
+///
+/// DuckDB's own default is 90% of the free space on the temp directory's
+/// filesystem, which on a typical install is the same disk as Postgres. An
+/// export that spills that much fills the disk and takes Postgres down with
+/// it. With a cap, the export fails instead, which the windowed retry in
+/// [`DuckEngine::export_from_postgres`] is there to absorb.
+const DUCK_MAX_TEMP_MB_ENV: &str = "DUCKDB_MAX_TEMP_MB";
+
+/// Spill cap when the variable is unset or unusable.
+const DUCK_MAX_TEMP_MB_DEFAULT: u32 = 10_240;
+
+/// Parse a spill cap, falling back to [`DUCK_MAX_TEMP_MB_DEFAULT`]. Same rules
+/// as [`parse_memory_mb`]: anything unusable falls back rather than erroring.
+fn parse_max_temp_mb(raw: Option<&str>) -> u32 {
+    raw.map(str::trim)
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DUCK_MAX_TEMP_MB_DEFAULT)
+}
+
+fn duck_max_temp_mb() -> u32 {
+    parse_max_temp_mb(std::env::var(DUCK_MAX_TEMP_MB_ENV).ok().as_deref())
+}
+
 /// Every `*.parquet` path under `dir`, recursively. Missing directory ⇒ empty
 /// set, which is the correct answer before the very first export.
 pub(crate) fn parquet_files_under(
@@ -75,28 +101,117 @@ pub(crate) fn parquet_files_under(
     out
 }
 
-/// Delete every `*.parquet` under `dir` that was not in `before`. Returns how
-/// many were removed.
+/// Sub-range size for an export retried after the single-pass COPY failed.
+/// See [`DuckEngine::export_from_postgres`].
+pub const EXPORT_FALLBACK_WINDOW: chrono::Duration = chrono::Duration::hours(1);
+
+/// `[start, end)` cut into consecutive `step`-sized windows; the last one is
+/// shorter when `step` does not divide the range. Empty when `start >= end`.
+pub fn split_range(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    step: chrono::Duration,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let mut out = Vec::new();
+    if step <= chrono::Duration::zero() {
+        if start < end {
+            out.push((start, end));
+        }
+        return out;
+    }
+    let mut s = start;
+    while s < end {
+        let e = (s + step).min(end);
+        out.push((s, e));
+        s = e;
+    }
+    out
+}
+
+/// A fresh, uniquely named staging directory for one export into `cold_dir`
+/// (`<cold>/<table>`): `<cold>/.staging/<table>-<uuid>`.
 ///
-/// Called only when a `COPY` failed, which makes the export all-or-nothing.
-/// Two distinct kinds of debris need this. A killed `COPY` leaves a TRUNCATED
-/// file (observed: 0 bytes), and DuckDB refuses to read the whole glob
-/// afterwards -- `Invalid Input Error: ... too small to be a Parquet file` --
-/// so one dead file poisons every cold read for that app, not just the failed
-/// range. It also leaves any files it had already finished for other
-/// `PARTITION_BY` keys; those are individually valid but uncommitted, since the
-/// watermark never advanced, and leaving them lands the next attempt in the
-/// `0 < already != pg_rows` branch that refuses to re-export and demands a
-/// manual clear. Removing both restores the exact pre-export state.
-fn remove_files_added_since(
-    dir: &std::path::Path,
-    before: &std::collections::HashSet<std::path::PathBuf>,
-) -> usize {
-    parquet_files_under(dir)
-        .into_iter()
-        .filter(|f| !before.contains(f))
-        .filter(|f| std::fs::remove_file(f).is_ok())
-        .count()
+/// Beside the table directories rather than inside one, so it matches no
+/// reader's `<cold>/<table>/**` glob, and on the same filesystem as `cold_dir`,
+/// so the commit can be a `rename`.
+fn staging_dir_for(cold_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let (Some(root), Some(table)) = (cold_dir.parent(), cold_dir.file_name()) else {
+        anyhow::bail!("cold directory {} has no parent", cold_dir.display());
+    };
+    Ok(root.join(crate::layout::STAGING_DIR).join(format!(
+        "{}-{}",
+        table.to_string_lossy(),
+        Uuid::new_v4()
+    )))
+}
+
+/// Move every staged `*.parquet` to the same relative path under `cold_dir`.
+///
+/// If any move fails, the ones already made are removed again and the error is
+/// returned, so a failed commit leaves `cold_dir` as it found it.
+fn commit_staged(stage: &std::path::Path, cold_dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut staged: Vec<_> = parquet_files_under(stage).into_iter().collect();
+    staged.sort();
+    let mut committed: Vec<std::path::PathBuf> = Vec::with_capacity(staged.len());
+    let outcome = (|| -> anyhow::Result<()> {
+        for src in &staged {
+            let rel = src
+                .strip_prefix(stage)
+                .context("staged file outside the stage")?;
+            let dest = cold_dir.join(rel);
+            if dest.exists() {
+                anyhow::bail!(
+                    "refusing to overwrite existing cold file {}",
+                    dest.display()
+                );
+            }
+            if let Some(dir) = dest.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+            }
+            std::fs::rename(src, &dest)
+                .with_context(|| format!("moving {} into cold storage", src.display()))?;
+            committed.push(dest);
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        for f in &committed {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+    outcome.with_context(|| {
+        format!(
+            "committing the export failed; rolled back {} file(s)",
+            committed.len()
+        )
+    })
+}
+
+/// Remove everything under `<cold_base>/.staging`. Returns how many entries
+/// were removed.
+///
+/// Called once at startup, before any export: anything there was left by a
+/// process that died before it could commit or clean up, and was never
+/// visible to a reader, so deleting it loses nothing.
+pub fn clear_staging(cold_base: &str) -> std::io::Result<usize> {
+    let root = std::path::Path::new(cold_base).join(crate::layout::STAGING_DIR);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// One exported range, compared between Postgres and cold by primary key.
@@ -190,8 +305,9 @@ impl DuckEngine {
         // affect queries that name an `ORDER BY` of their own.
         conn.execute_batch(&format!(
             "SET memory_limit='{}MB'; SET threads=4; SET TimeZone='UTC'; \
-             SET preserve_insertion_order=false;",
-            duck_memory_mb()
+             SET preserve_insertion_order=false; SET max_temp_directory_size='{}MB';",
+            duck_memory_mb(),
+            duck_max_temp_mb()
         ))?;
         Ok(Self {
             conn,
@@ -317,20 +433,51 @@ impl DuckEngine {
         )
     }
 
-    /// `COPY (rows) TO cold_dir`, all-or-nothing: a failed COPY leaves no
-    /// trace. See `remove_files_added_since` for the two kinds of debris and
-    /// why either one breaks the NEXT run rather than just this one.
-    fn copy_to_cold(&self, rows: &str, cold_dir: &str) -> anyhow::Result<()> {
-        let sql = format!(
-            "COPY ({rows}) \
-             TO '{cold_dir}' (FORMAT PARQUET, PARTITION_BY (app_id, year, month), APPEND);"
-        );
+    /// `COPY` each of `queries` into a private staging directory, then move the
+    /// finished files into `cold_dir`. All-or-nothing, including when the
+    /// process is killed.
+    ///
+    /// Writing straight into `cold_dir` was only all-or-nothing when the COPY
+    /// returned an error: a process killed mid-COPY (an RPM upgrade restarting
+    /// the unit, say) never reached the cleanup and left a truncated file
+    /// inside every reader's glob, which stopped that table's tiering until
+    /// someone noticed. Staged files are outside every `<cold>/<table>/**`
+    /// glob, so a kill at any point during the COPY leaves nothing a reader
+    /// can see, and [`clear_staging`] removes the leftovers at the next start.
+    ///
+    /// The commit is one `rename` per finished file, on the same filesystem.
+    /// Each rename is atomic, so a reader sees a whole file or no file. If a
+    /// rename fails partway, the files already moved are taken back out, so
+    /// the range is exactly as it was; a kill partway through the renames
+    /// leaves only complete files, which the export's key-matched reconcile
+    /// already knows how to finish.
+    fn copy_to_cold(&self, queries: &[String], cold_dir: &str) -> anyhow::Result<()> {
         let cold = std::path::Path::new(cold_dir);
-        let before = parquet_files_under(cold);
-        if let Err(e) = self.conn.execute_batch(&sql) {
-            let removed = remove_files_added_since(cold, &before);
-            return Err(anyhow::Error::new(e)
-                .context(format!("export failed; removed {removed} partial file(s)")));
+        let stage = staging_dir_for(cold)?;
+        std::fs::create_dir_all(&stage)
+            .with_context(|| format!("creating staging directory {}", stage.display()))?;
+        let result = self
+            .copy_to_stage(queries, &stage)
+            .and_then(|()| commit_staged(&stage, cold));
+        // Whatever happened, the staging directory is spent: on success it is
+        // empty, on failure it holds files that must not be committed.
+        let _ = std::fs::remove_dir_all(&stage);
+        result
+    }
+
+    fn copy_to_stage(&self, queries: &[String], stage: &std::path::Path) -> anyhow::Result<()> {
+        // `APPEND` even though the directory starts empty: it makes DuckDB name
+        // every file uniquely, which is what lets several COPYs share one stage
+        // and what keeps the commit from colliding with files already in cold.
+        for rows in queries {
+            let sql = format!(
+                "COPY ({rows}) \
+                 TO '{}' (FORMAT PARQUET, PARTITION_BY (app_id, year, month), APPEND);",
+                stage.display()
+            );
+            self.conn
+                .execute_batch(&sql)
+                .context("export failed; nothing was committed to cold storage")?;
         }
         Ok(())
     }
@@ -338,6 +485,13 @@ impl DuckEngine {
     /// Copy `[start, end)` of a Postgres table into hive-partitioned Parquet
     /// under `cold_dir`, appending to existing month directories. Uses DuckDB's
     /// postgres extension (needs libpq available at runtime).
+    ///
+    /// The range is first exported as one COPY. If that fails, it is exported
+    /// again as [`EXPORT_FALLBACK_WINDOW`]-sized sub-ranges in one staged
+    /// commit. A whole day of a wide table (`error_events` with its stack
+    /// traces) can exhaust DuckDB's memory ceiling, and a COPY that keeps
+    /// failing stalls the table's tiering for good; a sub-range holds a
+    /// fraction of the rows, at the cost of more, smaller files.
     pub fn export_from_postgres(
         &self,
         pg_url: &str,
@@ -347,8 +501,28 @@ impl DuckEngine {
         cold_dir: &str,
     ) -> anyhow::Result<()> {
         self.attach_pg_readonly(pg_url)?;
-        self.copy_to_cold(&Self::cold_rows_query(table, start, end, ""), cold_dir)?;
-        Ok(())
+        let whole = [Self::cold_rows_query(table, start, end, "")];
+        let Err(whole_err) = self.copy_to_cold(&whole, cold_dir) else {
+            return Ok(());
+        };
+        let windows = split_range(start, end, EXPORT_FALLBACK_WINDOW);
+        if windows.len() < 2 {
+            return Err(whole_err);
+        }
+        tracing::warn!(
+            table,
+            %start,
+            error = %format_args!("{whole_err:#}"),
+            windows = windows.len(),
+            "exporting the range in one pass failed; retrying in smaller windows"
+        );
+        let queries: Vec<String> = windows
+            .iter()
+            .map(|(s, e)| Self::cold_rows_query(table, *s, *e, ""))
+            .collect();
+        self.copy_to_cold(&queries, cold_dir).with_context(|| {
+            format!("windowed export also failed (the single pass failed with: {whole_err:#})")
+        })
     }
 
     /// Bring cold up to date with a Postgres range that was exported before
@@ -420,7 +594,7 @@ impl DuckEngine {
             " AND NOT EXISTS (SELECT 1 FROM cold_keys k \
                               WHERE k.id = e.id AND k.occurred_at = e.occurred_at)",
         );
-        self.copy_to_cold(&rows, cold_dir)?;
+        self.copy_to_cold(&[rows], cold_dir)?;
 
         // Re-derive from the files, not from arithmetic: the proof that the
         // Postgres copy is redundant is that cold now holds every one of its
@@ -1007,36 +1181,140 @@ mod tests {
         assert!(why.contains("duplicate"), "{why}");
     }
 
-    /// A failed export must leave the cold tier byte-identical to how it found
-    /// it -- including files it had already FINISHED for other partition keys,
-    /// which are valid Parquet but uncommitted (the watermark never advanced).
+    /// Rows for two apps, shaped like an export: `PARTITION_BY (app_id, year,
+    /// month)` needs those three columns.
+    const TWO_APPS: &str = "SELECT * FROM (VALUES ('a', 2026, 8, 1), ('a', 2026, 8, 2), \
+                            ('b', 2026, 8, 3)) t(app_id, year, month, n)";
+
+    fn cold_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sauron-tier-{tag}-{}", Uuid::new_v4()))
+    }
+
+    fn staged_leftovers(root: &std::path::Path) -> usize {
+        parquet_files_under(&root.join(crate::layout::STAGING_DIR)).len()
+    }
+
     #[test]
-    fn a_failed_export_removes_only_what_it_added() {
-        let root = std::env::temp_dir().join(format!("sauron-tier-cleanup-{}", Uuid::new_v4()));
-        let keep = root.join("app_id=a/year=2026/month=8");
-        std::fs::create_dir_all(&keep).unwrap();
-        std::fs::write(keep.join("committed.parquet"), b"PAR1old").unwrap();
-        std::fs::write(keep.join("notes.txt"), b"not parquet").unwrap();
+    fn a_successful_export_lands_every_file_in_cold_and_nothing_in_staging() {
+        let root = cold_root("stage-ok");
+        let cold = root.join("error_events");
+        let eng = DuckEngine::open().unwrap();
 
-        let before = parquet_files_under(&root);
-        assert_eq!(before.len(), 1, "only the committed file exists yet");
+        eng.copy_to_cold(&[TWO_APPS.to_string()], cold.to_str().unwrap())
+            .unwrap();
 
-        // What a killed COPY leaves: a truncated file here, a finished-but-
-        // uncommitted one under a different partition key.
-        std::fs::write(keep.join("truncated.parquet"), b"").unwrap();
-        let other = root.join("app_id=b/year=2026/month=8");
-        std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("finished.parquet"), b"PAR1whole").unwrap();
-
-        assert_eq!(remove_files_added_since(&root, &before), 2);
-
-        let after = parquet_files_under(&root);
-        assert_eq!(after, before, "pre-export state restored exactly");
-        assert!(keep.join("committed.parquet").exists());
-        // Non-parquet files are none of this function's business.
-        assert!(keep.join("notes.txt").exists());
-
+        let glob = format!("{}/**/*.parquet", cold.display());
+        assert_eq!(eng.count_parquet_rows(&glob).unwrap(), 3);
+        assert!(cold.join("app_id=a/year=2026/month=8").is_dir());
+        assert!(cold.join("app_id=b/year=2026/month=8").is_dir());
+        assert_eq!(staged_leftovers(&root), 0);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The whole point of staging: an export that fails partway, after some
+    /// of its files were already finished, leaves cold exactly as it was.
+    #[test]
+    fn a_failed_export_commits_nothing() {
+        let root = cold_root("stage-fail");
+        let cold = root.join("error_events");
+        let eng = DuckEngine::open().unwrap();
+        eng.copy_to_cold(&[TWO_APPS.to_string()], cold.to_str().unwrap())
+            .unwrap();
+        let before = parquet_files_under(&cold);
+
+        // The first COPY succeeds and writes files; the second fails.
+        let failing = "SELECT app_id, year, month, \
+                       CASE WHEN n = 3 THEN error('boom') ELSE n END AS n \
+                       FROM (VALUES ('c', 2026, 9, 1), ('d', 2026, 9, 3)) t(app_id, year, month, n)";
+        let err = eng
+            .copy_to_cold(
+                &[TWO_APPS.to_string(), failing.to_string()],
+                cold.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nothing was committed"),
+            "{err:#}"
+        );
+
+        assert_eq!(parquet_files_under(&cold), before, "cold untouched");
+        assert_eq!(staged_leftovers(&root), 0, "stage cleaned up");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A commit that cannot finish takes back the files it already moved.
+    #[test]
+    fn a_failed_commit_rolls_back_what_it_moved() {
+        let root = cold_root("commit-fail");
+        let cold = root.join("error_events");
+        let stage = root.join(".staging/error_events-x");
+        for (dir, name) in [
+            ("app_id=a/year=2026/month=8", "1.parquet"),
+            ("app_id=b/year=2026/month=8", "2.parquet"),
+        ] {
+            std::fs::create_dir_all(stage.join(dir)).unwrap();
+            std::fs::write(stage.join(dir).join(name), b"PAR1").unwrap();
+        }
+        // The second file's destination is taken, so its move must refuse.
+        let taken = cold.join("app_id=b/year=2026/month=8");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("2.parquet"), b"existing").unwrap();
+
+        let err = commit_staged(&stage, &cold).unwrap_err();
+        assert!(format!("{err:#}").contains("rolled back 1 file"), "{err:#}");
+        assert!(!cold.join("app_id=a/year=2026/month=8/1.parquet").exists());
+        assert_eq!(std::fs::read(taken.join("2.parquet")).unwrap(), b"existing");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn clearing_staging_removes_leftovers_and_tolerates_absence() {
+        let root = cold_root("clear");
+        assert_eq!(clear_staging(root.to_str().unwrap()).unwrap(), 0);
+
+        let dead = root.join(".staging/error_events-dead/app_id=a/year=2026/month=8");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("truncated.parquet"), b"").unwrap();
+        let cold_file = root.join("error_events/app_id=a/year=2026/month=8/x.parquet");
+        std::fs::create_dir_all(cold_file.parent().unwrap()).unwrap();
+        std::fs::write(&cold_file, b"PAR1").unwrap();
+
+        assert_eq!(clear_staging(root.to_str().unwrap()).unwrap(), 1);
+        assert_eq!(staged_leftovers(&root), 0);
+        assert!(cold_file.exists(), "committed cold data is never touched");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ranges_split_into_whole_windows_with_a_short_tail() {
+        let s = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 9, 18, 0, 0, 0).unwrap();
+        let day = split_range(s, s + chrono::Duration::days(1), chrono::Duration::hours(1));
+        assert_eq!(day.len(), 24);
+        assert_eq!(day[0], (s, s + chrono::Duration::hours(1)));
+        assert_eq!(day[23].1, s + chrono::Duration::days(1));
+        assert!(day.windows(2).all(|w| w[0].1 == w[1].0), "contiguous");
+
+        let tail = split_range(
+            s,
+            s + chrono::Duration::minutes(90),
+            chrono::Duration::hours(1),
+        );
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[1].1 - tail[1].0, chrono::Duration::minutes(30));
+
+        assert!(split_range(s, s, chrono::Duration::hours(1)).is_empty());
+        assert_eq!(
+            split_range(s, s + chrono::Duration::hours(2), chrono::Duration::zero()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn spill_cap_falls_back_on_anything_unusable() {
+        assert_eq!(parse_max_temp_mb(None), DUCK_MAX_TEMP_MB_DEFAULT);
+        assert_eq!(parse_max_temp_mb(Some(" 4096 ")), 4096);
+        assert_eq!(parse_max_temp_mb(Some("10GB")), DUCK_MAX_TEMP_MB_DEFAULT);
+        assert_eq!(parse_max_temp_mb(Some("0")), DUCK_MAX_TEMP_MB_DEFAULT);
     }
 
     #[test]

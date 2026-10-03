@@ -12407,6 +12407,69 @@ pub async fn set_dropped_thru(
     Ok(())
 }
 
+/// Record that a tier cycle finished `table` without an error.
+pub async fn record_tiering_success(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    at: DateTime<Utc>,
+) -> QueryResult<()> {
+    diesel::insert_into(tiering_health::table)
+        .values((
+            tiering_health::table_name.eq(table),
+            tiering_health::last_cycle_at.eq(at),
+            tiering_health::last_success_at.eq(Some(at)),
+            tiering_health::consecutive_failures.eq(0),
+        ))
+        .on_conflict(tiering_health::table_name)
+        .do_update()
+        .set((
+            tiering_health::last_cycle_at.eq(at),
+            tiering_health::last_success_at.eq(Some(at)),
+            tiering_health::consecutive_failures.eq(0),
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Record that a tier cycle failed `table` with `error` (the full cause
+/// chain), and return how many cycles in a row have now failed.
+pub async fn record_tiering_failure(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    at: DateTime<Utc>,
+    error: &str,
+) -> QueryResult<i32> {
+    diesel::insert_into(tiering_health::table)
+        .values((
+            tiering_health::table_name.eq(table),
+            tiering_health::last_cycle_at.eq(at),
+            tiering_health::consecutive_failures.eq(1),
+            tiering_health::last_error.eq(Some(error)),
+            tiering_health::last_error_at.eq(Some(at)),
+        ))
+        .on_conflict(tiering_health::table_name)
+        .do_update()
+        .set((
+            tiering_health::last_cycle_at.eq(at),
+            tiering_health::consecutive_failures.eq(tiering_health::consecutive_failures + 1),
+            tiering_health::last_error.eq(Some(error)),
+            tiering_health::last_error_at.eq(Some(at)),
+        ))
+        .returning(tiering_health::consecutive_failures)
+        .get_result(conn)
+        .await
+}
+
+/// Every tiered table's health row, by table name.
+pub async fn list_tiering_health(conn: &mut AsyncPgConnection) -> QueryResult<Vec<TieringHealth>> {
+    tiering_health::table
+        .select(TieringHealth::as_select())
+        .order(tiering_health::table_name)
+        .load(conn)
+        .await
+}
+
 // ===========================================================================
 // Runtime settings (operator-tunable, no restart)
 // ===========================================================================

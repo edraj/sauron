@@ -261,7 +261,20 @@ async fn maintenance(pool: &PgPool, cfg: RollupCfg) {
         .await
     {
         Err(e) => warn!(error = %e, "session retention: settings probe failed; skipping this pass"),
-        Ok(0) => {}
+        Ok(0) => {
+            // Keep-forever is the shipped default, and `sessions` is one of the
+            // largest tables and the one tiering never moves out of Postgres.
+            // Say so once per process, so a disk that fills up because of it
+            // has an explanation in the journal.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(
+                    "session retention is off: raw sessions are kept in Postgres forever; \
+                     set SESSION_RETENTION_DAYS or the sessions.retention_days runtime setting"
+                );
+            }
+        }
         Ok(days) => match rollups::fold::enforce_session_retention(&mut conn, days).await {
             Ok(0) => {}
             Ok(n) => info!(

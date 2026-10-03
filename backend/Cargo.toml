@@ -178,6 +178,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 
+# --- system ---
+# `statvfs` for the tier worker's disk-pressure check. Already in the lock
+# graph through tokio/mio; named directly so the one FFI call is explicit.
+libc = "0.2"
+
 [profile.dev]
 debug = 1
 

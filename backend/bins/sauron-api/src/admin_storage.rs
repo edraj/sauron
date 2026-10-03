@@ -33,6 +33,12 @@ const MAX_COLD_FILES_PER_APP: usize = 200;
 pub struct StorageReport {
     pub database: DatabaseInfo,
     pub apps: Vec<AppStorage>,
+    /// How each tiered table's last tier cycle went. Empty unless the caller
+    /// manages every org: tiering is deployment-wide, and a failing table's
+    /// error text can name data from any tenant. `default` so a report cached
+    /// before this field existed still deserializes.
+    #[serde(default)]
+    pub tiering: Vec<sauron_db::models::TieringHealth>,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -134,6 +140,11 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
         // tenant whose volume physical sizes could disclose, and the report can
         // show real bytes instead of an apportioned share.
         let full_scope = scope_orgs.len() as i64 >= repo::org_count(&mut c).await?;
+        let tiering = if full_scope {
+            repo::list_tiering_health(&mut c).await?
+        } else {
+            Vec::new()
+        };
 
         // Physical size per table, keyed by name. This is the number that
         // reconciles with `pg_database_size`; the old rows × pg_stats.avg_width
@@ -208,6 +219,7 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
             apps,
             hot,
             share,
+            tiering,
         ))
     };
 
@@ -237,7 +249,7 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
     });
 
     let (pg_res, cold_res, walk_res) = tokio::join!(pg, cold_counts, walked);
-    let (total_bytes, physical_bytes, full_scope, tables, apps, hot, share) = pg_res?;
+    let (total_bytes, physical_bytes, full_scope, tables, apps, hot, share, tiering) = pg_res?;
     let cold_counts = cold_res??;
     let walked = walk_res??;
 
@@ -333,6 +345,7 @@ pub async fn collect_storage(state: &AppState, org_ids: &[Uuid]) -> anyhow::Resu
             tables,
         },
         apps: apps_out,
+        tiering,
     })
 }
 
