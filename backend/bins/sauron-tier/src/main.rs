@@ -125,7 +125,9 @@ async fn tier_loop(
             // context ("export failed; removed 1 partial file(s)") and drops
             // the cause — which is how a production export failed for a day
             // with no reason in the journal.
-            warn!(error = %format_args!("{e:#}"), "tier cycle failed; backing off");
+            // Scrubbed: a DuckDB connect failure quotes the connection string.
+            let error = sauron_tier::duck::redact_pg_secrets(&format!("{e:#}"), &cfg.database_url);
+            warn!(%error, "tier cycle failed; backing off");
         }
         if *stop.borrow() {
             return;
@@ -215,9 +217,12 @@ async fn cycle(
             break;
         }
         let result = tier_table(pool, cfg, gran, t, hot_days, drop_lag_hours, stop).await;
-        record_health(pool, t.name, &result).await;
+        record_health(pool, &cfg.database_url, t.name, &result).await;
         if let Err(e) = &result {
-            warn!(table = t.name, error = %format_args!("{e:#}"), "tiering table failed");
+            // Scrubbed like `last_error`: a DuckDB connect failure quotes the
+            // whole connection string, and the journal is no place for it.
+            let error = sauron_tier::duck::redact_pg_secrets(&format!("{e:#}"), &cfg.database_url);
+            warn!(table = t.name, %error, "tiering table failed");
         }
         warn_if_behind(pool, gran, t.name, hot_days).await;
     }
@@ -281,7 +286,11 @@ fn disk_adjusted(cfg: &Config, hot_days: i64) -> (i64, i64) {
 
 /// Persist how `table`'s turn in this cycle went (see migration 000081).
 /// Best effort: failing to record health must not fail the cycle.
-async fn record_health(pool: &PgPool, table: &str, result: &anyhow::Result<()>) {
+///
+/// The error is stored with passwords scrubbed: `last_error` is shown on the
+/// Storage page and cached in Redis, and a DuckDB connect failure quotes the
+/// whole `pg_url` (see `redact_pg_secrets`).
+async fn record_health(pool: &PgPool, pg_url: &str, table: &str, result: &anyhow::Result<()>) {
     let now = Utc::now();
     let mut c = match conn(pool).await {
         Ok(c) => c,
@@ -294,17 +303,20 @@ async fn record_health(pool: &PgPool, table: &str, result: &anyhow::Result<()>) 
         Ok(()) => repo::record_tiering_success(&mut c, table, now)
             .await
             .map(|_| ()),
-        Err(e) => match repo::record_tiering_failure(&mut c, table, now, &format!("{e:#}")).await {
-            Ok(n) if n >= 3 => {
-                warn!(
-                    table,
-                    consecutive_failures = n,
-                    "tiering has failed repeatedly for this table"
-                );
-                Ok(())
+        Err(e) => {
+            let error = sauron_tier::duck::redact_pg_secrets(&format!("{e:#}"), pg_url);
+            match repo::record_tiering_failure(&mut c, table, now, &error).await {
+                Ok(n) if n >= 3 => {
+                    warn!(
+                        table,
+                        consecutive_failures = n,
+                        "tiering has failed repeatedly for this table"
+                    );
+                    Ok(())
+                }
+                other => other.map(|_| ()),
             }
-            other => other.map(|_| ()),
-        },
+        }
     };
     if let Err(e) = recorded {
         warn!(table, error = %e, "cannot record tiering health");
@@ -485,7 +497,11 @@ async fn tier_table(
                 let rec = match rec {
                     Ok(rec) => rec,
                     Err(e) => {
-                        warn!(child = %child, error = %format_args!("{e:#}"), "late-arrival reconcile failed; retaining");
+                        let error = sauron_tier::duck::redact_pg_secrets(
+                            &format!("{e:#}"),
+                            &cfg.database_url,
+                        );
+                        warn!(child = %child, %error, "late-arrival reconcile failed; retaining");
                         continue;
                     }
                 };
@@ -717,7 +733,11 @@ async fn restore_loop(pool: PgPool, cfg: Config) {
             // queue of restores drains back to back.
             Ok(true) => continue,
             Ok(false) => {}
-            Err(e) => warn!(error = %format_args!("{e:#}"), "restore job failed"),
+            Err(e) => {
+                let error =
+                    sauron_tier::duck::redact_pg_secrets(&format!("{e:#}"), &cfg.database_url);
+                warn!(%error, "restore job failed");
+            }
         }
         tokio::time::sleep(Duration::from_secs(cfg.restore_poll_secs)).await;
     }
@@ -915,7 +935,8 @@ async fn run_one_restore(pool: &PgPool, cfg: &Config, worker_id: &str) -> anyhow
             // orphan those rows.
             repo::finish_restore_job(&mut c, job.id, worker_id, "failed", 0, &e.to_string())
                 .await?;
-            warn!(job = %job.id, error = %format_args!("{e:#}"), "restore failed");
+            let error = sauron_tier::duck::redact_pg_secrets(&format!("{e:#}"), &cfg.database_url);
+            warn!(job = %job.id, %error, "restore failed");
         }
     }
     Ok(true)
