@@ -913,17 +913,21 @@ async fn run_one_restore(pool: &PgPool, cfg: &Config, worker_id: &str) -> anyhow
                                 0
                             }
                         };
+                    // Scrubbed before it is stored or logged: the job's
+                    // error is shown to whoever asked for the restore.
+                    let error =
+                        sauron_tier::duck::redact_pg_secrets(&e.to_string(), &cfg.database_url);
                     repo::finish_restore_job(
                         &mut c,
                         job.id,
                         worker_id,
                         "failed",
                         0,
-                        &format!("repair failed: {e}"),
+                        &format!("repair failed: {error}"),
                     )
                     .await?;
                     warn!(
-                        job = %job.id, error = %e, removed,
+                        job = %job.id, %error, removed,
                         "restore repair failed; discarded partial output, job failed"
                     );
                 }
@@ -933,8 +937,11 @@ async fn run_one_restore(pool: &PgPool, cfg: &Config, worker_id: &str) -> anyhow
             // Leave the pin: the next attempt reuses it and deletes whatever this
             // attempt wrote before the failure. Dropping the pin here would
             // orphan those rows.
-            repo::finish_restore_job(&mut c, job.id, worker_id, "failed", 0, &e.to_string())
-                .await?;
+            //
+            // Both texts are scrubbed: a DuckDB connect failure quotes the whole
+            // connection string, and the stored one is shown in the dashboard.
+            let stored = sauron_tier::duck::redact_pg_secrets(&e.to_string(), &cfg.database_url);
+            repo::finish_restore_job(&mut c, job.id, worker_id, "failed", 0, &stored).await?;
             let error = sauron_tier::duck::redact_pg_secrets(&format!("{e:#}"), &cfg.database_url);
             warn!(job = %job.id, %error, "restore failed");
         }

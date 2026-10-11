@@ -70,7 +70,7 @@ CMS footer, the package ships two self-contained files. Each defines one global,
 **From the CDN.** jsDelivr and unpkg serve every published version:
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.0/dist/sauron.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.2/dist/sauron.min.js"></script>
 <script>
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42', release: 'web@1.4.2' });
 </script>
@@ -85,7 +85,7 @@ the GTM snippet below, `script.integrity` and `script.crossOrigin`). It needs an
 exact-version URL. Get the hash of a published file with:
 
 ```bash
-curl -s https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.0/dist/sauron.min.js | openssl dgst -sha384 -binary | openssl base64 -A
+curl -s https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.2/dist/sauron.min.js | openssl dgst -sha384 -binary | openssl base64 -A
 ```
 
 **In Google Tag Manager**, create a Custom HTML tag fired by the
@@ -129,7 +129,7 @@ from it with this loader:
       d.head.appendChild(script);
     }
     s.init(options);
-  })(window, document, 'https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.0/dist/sauron.min.js', {
+  })(window, document, 'https://cdn.jsdelivr.net/npm/@edraj/sauron-browser@1.9.2/dist/sauron.min.js', {
     dsn: 'https://pk_test@ingest.example.com/42',
     release: 'web@1.4.2'
   });
@@ -1269,7 +1269,7 @@ Sauron.track('upgraded', {}, { tags: { tier: 'trial' } });
 
 ```html
 <script type="module">
-  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.9.0';
+  import { Sauron } from 'https://esm.sh/@edraj/sauron-browser@1.9.2';
   Sauron.init({ dsn: 'https://pk_test@ingest.example.com/42', release: 'web@1.4.2' });
 </script>
 ```
