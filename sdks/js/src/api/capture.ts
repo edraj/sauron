@@ -61,6 +61,18 @@ export function hasOwnStack(err: unknown): boolean {
 }
 
 /**
+ * Coerce a hint's `fingerprint` to the wire's `string[] | null`. `Hint` is an
+ * untyped bag, so `{ fingerprint: '/en/products' }` compiles — and a bare string
+ * where the backend wants a sequence 400s the WHOLE envelope (`invalid_envelope`),
+ * dropping every other item in the batch with it.
+ */
+export function normalizeFingerprint(raw: unknown): string[] | null {
+  if (typeof raw === 'string') return [raw];
+  if (Array.isArray(raw)) return raw.map((part) => (typeof part === 'string' ? part : safeStringify(part)));
+  return null;
+}
+
+/**
  * Build an error item from a thrown value plus the current breadcrumb trail.
  *
  * `callSite` is an `Error` made in the public `captureException` for a value
@@ -80,7 +92,7 @@ export function buildErrorItem(
   }
   const mechanism = (hint?.mechanism as Mechanism | undefined) ?? DEFAULT_MECHANISM;
   const level = (hint?.level as Level | undefined) ?? 'error';
-  const fingerprint = (hint?.fingerprint as string[] | null | undefined) ?? null;
+  const fingerprint = normalizeFingerprint(hint?.fingerprint);
 
   const exception: ExceptionValue = {
     type: extracted.type,
@@ -142,7 +154,7 @@ export function captureMessage(message: string, level: Level = 'info', hint?: Hi
     level,
     message,
     breadcrumbs,
-    fingerprint: (hint?.fingerprint as string[] | null | undefined) ?? null,
+    fingerprint: normalizeFingerprint(hint?.fingerprint),
     session_id: getSessionId(),
     screen: getScreen(),
   };

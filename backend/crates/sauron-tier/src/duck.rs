@@ -81,6 +81,118 @@ fn duck_max_temp_mb() -> u32 {
     parse_max_temp_mb(std::env::var(DUCK_MAX_TEMP_MB_ENV).ok().as_deref())
 }
 
+/// What a scrubbed password is replaced with.
+const REDACTED: &str = "***";
+
+/// `msg` with every Postgres password taken out.
+///
+/// DuckDB's postgres extension echoes the whole connection string when it
+/// cannot connect -- `Unable to connect to Postgres at
+/// "postgresql://user:PASSWORD@host/db": ...` -- and not only from `ATTACH`:
+/// it opens pooled connections lazily, so a `COPY` can fail the same way.
+/// An export error ends up in `tiering_health.last_error` and on the Storage
+/// page, so it goes through this first.
+///
+/// Literal occurrences of `pg_url`'s own password go first, whatever text
+/// surrounds them (a password with an unescaped `@` defeats any parse). Then
+/// any URL userinfo password and any `password=` keyword, for a connection
+/// string this process did not build.
+pub fn redact_pg_secrets(msg: &str, pg_url: &str) -> String {
+    let mut out = msg.to_string();
+    for pw in pg_passwords(pg_url) {
+        out = out.replace(pw, REDACTED);
+    }
+    redact_password_keywords(&redact_url_passwords(&out))
+}
+
+/// The password(s) in a connection string: the URL userinfo password and/or a
+/// `password=` keyword (libpq key/value form, or a URL query parameter).
+fn pg_passwords(pg_url: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    if let Some(scheme_end) = pg_url.find("://") {
+        let rest = &pg_url[scheme_end + 3..];
+        let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+        if let Some(at) = authority.rfind('@') {
+            if let Some((_, pw)) = authority[..at].split_once(':') {
+                out.push(pw);
+            }
+        }
+    }
+    let lower = pg_url.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("password=") {
+        let start = from + i + "password=".len();
+        let (s, e) = keyword_value_span(pg_url, start);
+        out.push(&pg_url[s..e]);
+        from = e.max(start);
+    }
+    out.retain(|pw| !pw.is_empty() && *pw != REDACTED);
+    out
+}
+
+/// `[start, end)` of a keyword value beginning at `start`: up to the matching
+/// quote when quoted, else up to whitespace, a quote, `&` or `,`.
+fn keyword_value_span(s: &str, start: usize) -> (usize, usize) {
+    let rest = &s[start..];
+    if let Some(q) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') {
+        let body = start + 1;
+        let end = s[body..].find(q).map_or(s.len(), |i| body + i);
+        return (body, end);
+    }
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '&' | ','))
+        .map_or(s.len(), |i| start + i);
+    (start, end)
+}
+
+/// Mask the password in every `scheme://user:password@` in `s`.
+fn redact_url_passwords(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let span = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\''))
+            .unwrap_or(tail.len());
+        let authority = &tail[..span];
+        match authority.rfind('@').and_then(|at| {
+            let user_pw = &authority[..at];
+            user_pw.find(':').map(|colon| (colon, at))
+        }) {
+            Some((colon, at)) if colon + 1 < at => {
+                out.push_str(&authority[..=colon]);
+                out.push_str(REDACTED);
+                out.push_str(&authority[at..]);
+            }
+            _ => out.push_str(authority),
+        }
+        rest = &tail[span..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Mask the value of every `password=` keyword in `s`, case-insensitively.
+fn redact_password_keywords(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("password=") {
+        let start = from + i + "password=".len();
+        let (vs, ve) = keyword_value_span(s, start);
+        out.push_str(&s[copied..vs]);
+        if ve > vs {
+            out.push_str(REDACTED);
+        }
+        copied = ve;
+        from = ve.max(start);
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
 /// Every `*.parquet` path under `dir`, recursively. Missing directory ⇒ empty
 /// set, which is the correct answer before the very first export.
 pub(crate) fn parquet_files_under(
@@ -1315,6 +1427,65 @@ mod tests {
         assert_eq!(parse_max_temp_mb(Some(" 4096 ")), 4096);
         assert_eq!(parse_max_temp_mb(Some("10GB")), DUCK_MAX_TEMP_MB_DEFAULT);
         assert_eq!(parse_max_temp_mb(Some("0")), DUCK_MAX_TEMP_MB_DEFAULT);
+    }
+
+    /// The message DuckDB 1.4 actually produces when the postgres extension
+    /// cannot connect, wrapped the way the tier worker wraps it.
+    #[test]
+    fn a_connect_failure_loses_its_password() {
+        let url = "postgresql://sauron:S3cretPW@db.internal:5432/sauron";
+        let msg = format!(
+            "exporting error_events_2026_08_15: IO Error: Unable to connect to Postgres at \
+             \"{url}\": connection to server at \"db.internal\", port 5432 failed: Connection refused"
+        );
+        let out = redact_pg_secrets(&msg, url);
+        assert!(!out.contains("S3cretPW"), "{out}");
+        assert!(
+            out.contains("\"postgresql://sauron:***@db.internal:5432/sauron\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("Connection refused"),
+            "the cause survives: {out}"
+        );
+    }
+
+    #[test]
+    fn the_configured_password_goes_wherever_it_appears() {
+        // An unescaped `@` in the password breaks any URL parse; the literal
+        // pass still catches it, and in text that is not a URL at all.
+        let url = "postgres://u:p@ss:w0rd@h/db";
+        let out = redact_pg_secrets("at postgres://u:p@ss:w0rd@h/db and p@ss:w0rd alone", url);
+        assert!(!out.contains("p@ss:w0rd"), "{out}");
+    }
+
+    #[test]
+    fn foreign_dsns_and_keyword_passwords_are_masked_too() {
+        let url = "postgres://sauron:mine@h/db";
+        let out = redact_pg_secrets(
+            "a postgres://other:theirs@replica/db and host=x password=kv1 user=y \
+             and password='quoted pw' and ?sslmode=require&PASSWORD=q1&x=1",
+            url,
+        );
+        for secret in ["theirs", "kv1", "quoted pw", "q1"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("postgres://other:***@replica/db"), "{out}");
+        assert!(out.contains("user=y"), "{out}");
+        assert!(out.contains("&x=1"), "{out}");
+    }
+
+    #[test]
+    fn text_without_secrets_is_unchanged() {
+        let url = "postgres://sauron@localhost/sauron"; // no password at all
+        for msg in [
+            "count mismatch after exporting error_events_2026_08_15: 10 vs 9",
+            "see https://example.com/docs and user@host",
+            "postgres://sauron@localhost/sauron refused",
+            "",
+        ] {
+            assert_eq!(redact_pg_secrets(msg, url), msg);
+        }
     }
 
     #[test]

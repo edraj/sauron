@@ -117,7 +117,10 @@ pub struct ErrorItem {
     #[serde(default)]
     pub extra: serde_json::Value,
     /// Client-supplied fingerprint override (honored verbatim when present).
-    #[serde(default)]
+    /// A bare string is accepted as a one-part fingerprint: JS callers pass
+    /// `{ fingerprint: '/en/products' }` through an untyped hint, and a strict
+    /// `Vec` 400'd the whole envelope, dropping every other item in the batch.
+    #[serde(default, deserialize_with = "de_fingerprint")]
     pub fingerprint: Option<Vec<String>>,
     /// Optional per-item user override (falls back to envelope context user).
     #[serde(default)]
@@ -569,6 +572,21 @@ pub const MAX_CLOCK_LAG: chrono::Duration = chrono::Duration::days(30);
 /// know to be true — and for the dominant past-direction failure (clock still
 /// at the epoch until NTP sync, then a quick flush) it is also very nearly
 /// the event's real time.
+/// `null` / string / string-array → `Option<Vec<String>>`; see [`ErrorItem::fingerprint`].
+fn de_fingerprint<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => None,
+        Some(OneOrMany::One(s)) => Some(vec![s]),
+        Some(OneOrMany::Many(v)) => Some(v),
+    })
+}
+
 fn clamp_one(ts: &mut DateTime<Utc>, received_at: DateTime<Utc>) -> bool {
     if *ts > received_at + MAX_CLOCK_SKEW || *ts < received_at - MAX_CLOCK_LAG {
         *ts = received_at;
@@ -946,6 +964,26 @@ mod tests {
     /// The same bytes as [`super::GOLDEN_ENVELOPE`], which the ingest
     /// OpenAPI document publishes as its worked example.
     const GOLDEN: &str = super::GOLDEN_ENVELOPE;
+
+    #[test]
+    fn fingerprint_accepts_string_or_array() {
+        let fp = |v: &str| {
+            let item: ErrorItem =
+                serde_json::from_str(&format!(r#"{{"fingerprint":{v}}}"#)).unwrap();
+            item.fingerprint
+        };
+        assert_eq!(
+            fp(r#""/en/products""#),
+            Some(vec!["/en/products".to_string()])
+        );
+        assert_eq!(
+            fp(r#"["a","b"]"#),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(fp("null"), None);
+        let item: ErrorItem = serde_json::from_str("{}").unwrap();
+        assert_eq!(item.fingerprint, None);
+    }
 
     #[test]
     fn deserializes_golden_envelope() {

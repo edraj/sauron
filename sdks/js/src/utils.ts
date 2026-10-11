@@ -2,7 +2,7 @@
 
 /** SDK identity, embedded in every envelope header. */
 export const SDK_NAME = 'sauron.javascript';
-export const SDK_VERSION = '1.9.0';
+export const SDK_VERSION = '1.9.2';
 
 /** The ambient global, regardless of environment (window / self / global). */
 export function getGlobal(): typeof globalThis {
@@ -48,16 +48,23 @@ export function nowIso(): string {
 /**
  * `JSON.stringify` that never throws: strips circular references, functions and
  * coerces bigint to string. Returns `"{}"` on catastrophic failure.
+ *
+ * Only true cycles (an object nested inside itself) become `"[Circular]"`. An
+ * object merely referenced twice — e.g. the same breadcrumbs shared by two
+ * events in one envelope — is serialised in full each time.
  */
 export function safeStringify(value: unknown): string {
-  const seen = new WeakSet<object>();
+  // Ancestors of the value being visited. JSON.stringify calls the replacer
+  // with `this` = the holder, so unwinding to the holder drops finished siblings.
+  const ancestors: object[] = [];
   try {
-    return JSON.stringify(value, (_key, val) => {
+    return JSON.stringify(value, function (this: unknown, _key, val) {
       if (typeof val === 'bigint') return val.toString();
       if (typeof val === 'function') return undefined;
+      while (ancestors.length > 0 && ancestors[ancestors.length - 1] !== this) ancestors.pop();
       if (typeof val === 'object' && val !== null) {
-        if (seen.has(val)) return '[Circular]';
-        seen.add(val);
+        if (ancestors.includes(val)) return '[Circular]';
+        ancestors.push(val);
       }
       return val;
     });

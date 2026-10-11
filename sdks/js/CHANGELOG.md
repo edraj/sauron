@@ -2,6 +2,27 @@
 
 All notable changes to `@edraj/sauron-browser` are documented here.
 
+## 1.9.2
+
+### Fixed
+
+- **A string `fingerprint` no longer drops the batch.** `captureException(err,
+  { fingerprint: '/en/products' })` compiled (the hint is untyped) but sent a
+  string where the server expects an array, and it rejected the whole envelope
+  (`invalid type: string "/en/products", expected a sequence`). A bare string is
+  now wrapped as a one-part fingerprint; non-string parts are stringified.
+
+## 1.9.1
+
+### Fixed
+
+- **Batched errors no longer lose their breadcrumbs as `"[Circular]"`.** When
+  two errors were sent in the same envelope they shared the same breadcrumb
+  objects, and the serialiser treated every repeated object as a cycle. The
+  second error's breadcrumbs went out as the string `"[Circular]"` and the
+  server rejected the whole envelope (`invalid type: string "[Circular]",
+  expected struct Breadcrumb`). Only true cycles are replaced now.
+
 ## 1.9.0
 
 ### Changed
