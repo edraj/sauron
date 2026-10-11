@@ -968,11 +968,18 @@ mod tests {
     #[test]
     fn fingerprint_accepts_string_or_array() {
         let fp = |v: &str| {
-            let item: ErrorItem = serde_json::from_str(&format!(r#"{{"fingerprint":{v}}}"#)).unwrap();
+            let item: ErrorItem =
+                serde_json::from_str(&format!(r#"{{"fingerprint":{v}}}"#)).unwrap();
             item.fingerprint
         };
-        assert_eq!(fp(r#""/en/products""#), Some(vec!["/en/products".to_string()]));
-        assert_eq!(fp(r#"["a","b"]"#), Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            fp(r#""/en/products""#),
+            Some(vec!["/en/products".to_string()])
+        );
+        assert_eq!(
+            fp(r#"["a","b"]"#),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
         assert_eq!(fp("null"), None);
         let item: ErrorItem = serde_json::from_str("{}").unwrap();
         assert_eq!(item.fingerprint, None);
