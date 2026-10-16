@@ -247,7 +247,7 @@ jobs:
           name: prebuilt-${{ matrix.target }}
           path: prebuilt
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   # ---------------------------------------------------------------------------
   # Package the precompiled artifacts. No toolchain here — just rpm-build, so it
@@ -318,6 +318,7 @@ jobs:
             rpmbuild/RPMS/**/*.rpm
             rpmbuild/SRPMS/*.rpm
           if-no-files-found: error
+          retention-days: 1
 
   # ---------------------------------------------------------------------------
   # The Debian-family counterpart of `package`. Same shape: no toolchain, just
@@ -400,6 +401,7 @@ jobs:
           name: debs-${{ matrix.target }}
           path: debbuild/*.deb
           if-no-files-found: error
+          retention-days: 1
 
   sbom:
     # CycloneDX SBOM of the Rust workspace, read from backend/Cargo.lock. The
@@ -483,6 +485,7 @@ jobs:
           name: sbom
           path: sauron-*.cdx.json
           if-no-files-found: error
+          retention-days: 1
 
   release:
     name: publish GitHub release
