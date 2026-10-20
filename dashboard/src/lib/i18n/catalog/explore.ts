@@ -79,6 +79,42 @@ export const explore = {
   'users.loading.users': { en: 'Loading users', ar: 'جارٍ تحميل المستخدمين' },
   'users.loading.stats': { en: 'Loading audience stats', ar: 'جارٍ تحميل إحصاءات الجمهور' },
   'users.loading.chart': { en: 'Loading activity chart', ar: 'جارٍ تحميل مخطط النشاط' },
+  // The "Used it / Currently on it" toggle, shown beside the people list only
+  // while the Topbar release switcher has a release picked
+  // (`models/release-users.ts`).
+  'users.releaseMode.label': {
+    en: 'Which people on this release',
+    ar: 'أيّ الأشخاص على هذا الإصدار',
+  },
+  'users.releaseMode.used': { en: 'Used it', ar: 'استخدموه' },
+  'users.releaseMode.usedTitle': {
+    en: 'Everyone with any activity on this release',
+    ar: 'كل من له أي نشاط على هذا الإصدار',
+  },
+  'users.releaseMode.current': { en: 'Currently on it', ar: 'عليه حاليًا' },
+  'users.releaseMode.currentTitle': {
+    en: 'Only people whose most recent activity is on this release',
+    ar: 'فقط الأشخاص الذين كان آخر نشاط لهم على هذا الإصدار',
+  },
+  // The 503 `release_rollup_pending` answer: the app's per-release tables are
+  // still being backfilled by the unattended background job. Not an error.
+  'users.releasePending.title': {
+    en: 'Release stats are still building',
+    ar: 'إحصاءات الإصدار قيد الإنشاء',
+  },
+  'users.releasePending.body': {
+    en: 'Per-release user numbers for this app are being backfilled in the background and become available automatically when it finishes. Check again in a few minutes, or clear the release switcher to see all releases.',
+    ar: 'يجري احتساب أرقام المستخدمين لكل إصدار في هذا التطبيق في الخلفية، وتصبح متاحة تلقائيًا عند اكتمال ذلك. تحقّق مجددًا بعد بضع دقائق، أو امسح مبدّل الإصدار لعرض كل الإصدارات.',
+  },
+  'users.releasePending.checkAgain': { en: 'Check again', ar: 'تحقّق مجددًا' },
+  // The people list is empty under a picked release. The release-blind copy
+  // ("users appear once your SDK identifies people") would be false here: the
+  // app has users, just none on this release in this window.
+  'users.empty.releaseTitle': { en: 'No users on this release', ar: 'لا يوجد مستخدمون على هذا الإصدار' },
+  'users.empty.releaseBody': {
+    en: 'Nobody in this window matches the selected release. Widen the window, or pick another release.',
+    ar: 'لا أحد ضمن هذه الفترة يطابق الإصدار المحدد. وسّع الفترة، أو اختر إصدارًا آخر.',
+  },
 
   // --- person profile ------------------------------------------------------
   'person.title': { en: 'Profile', ar: 'الملف الشخصي' },

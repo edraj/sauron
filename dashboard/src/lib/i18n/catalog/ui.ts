@@ -29,7 +29,9 @@ export const ui = {
   // env-scoped telemetry page, release-aware or not. On a release-AWARE page
   // the list beside the charts really does narrow, so a bare "this page does
   // not filter by release" would be false there; on a release-BLIND page
-  // there is no list that narrows, and the sentence still reads true. See
+  // there is no list that narrows, and the sentence still reads true. The one
+  // page where it would be false — Users, whose charts and totals follow the
+  // release too — never shows it (`FULLY_RELEASE_AWARE`). See
   // `showsReleaseNote` / `RELEASE_AWARE` in `models/shell.ts`.
   'ui.release.showingAll': {
     en: 'Charts and totals include all releases; only lists follow the release switcher.',

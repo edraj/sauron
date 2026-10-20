@@ -973,6 +973,36 @@ pub async fn fold_rollups(
     .execute(conn)
     .await?;
 
+    // The release twin of `env_fold` (migration 82): the alias's per-release
+    // rows move to the person, colliding keys summed and spans widened — the
+    // same additive arm the write path uses. No span capture here; that rides
+    // on `event_user_environments` above, alone.
+    diesel::sql_query(format!(
+        "WITH moved AS ( \
+             DELETE FROM person_releases \
+              WHERE app_id = $1 AND distinct_id = $2 \
+             RETURNING environment_id, release, first_seen, last_seen, \
+                       events_count, errors_count, sessions_count) \
+         INSERT INTO person_releases \
+             (app_id, environment_id, release, distinct_id, first_seen, last_seen, \
+              events_count, errors_count, sessions_count) \
+         SELECT $1, environment_id, release, $3, first_seen, last_seen, \
+                events_count, errors_count, sessions_count FROM moved \
+         ON CONFLICT (app_id, release, distinct_id, COALESCE(environment_id, {NIL})) \
+         DO UPDATE SET \
+             first_seen     = LEAST(person_releases.first_seen, EXCLUDED.first_seen), \
+             last_seen      = GREATEST(person_releases.last_seen, EXCLUDED.last_seen), \
+             events_count   = person_releases.events_count   + EXCLUDED.events_count, \
+             errors_count   = person_releases.errors_count   + EXCLUDED.errors_count, \
+             sessions_count = person_releases.sessions_count + EXCLUDED.sessions_count, \
+             updated_at     = now()"
+    ))
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(alias)
+    .bind::<Text, _>(person)
+    .execute(conn)
+    .await?;
+
     // `properties` is concatenated ANON-FIRST so the person's identify() traits
     // win: jsonb `||` lets the right-hand side override. identified_at and
     // identified_source are left untouched — the surviving row is already

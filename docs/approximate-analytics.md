@@ -36,6 +36,22 @@ views, crash counts, issue `times_seen`, list pages, and every drill-down.
   folded before the column existed read as **unknown** (the tile says "split
   building…") until the unattended backfill fills them; they never read as
   "all guests". Total/Active/New use the exact, current flag.
+- **Users page with a release picked** (migration 82) reads release-keyed
+  twins: `person_releases` (exact Total/Active/New, where first/last seen are
+  the person's first/last signal ON that release), `user_activity_release_daily`
+  (DAU/WAU/MAU and the chart, sketches as above) and
+  `session_stats_release_daily` (session duration, by the LATEST release the
+  session reported — the session row's own `release`, which ingest overwrites
+  with each newer non-null value; the persons list's per-release session
+  count instead credits the release the session was CREATED under, so the two
+  disagree only for a session that spans an app update). Two differences from
+  the unfiltered page: the release
+  identified/guest split is the flag **as of fold time only** — the nightly
+  recompute reads `person_days`, which has no release, so a later `identify()`
+  is not re-applied per release; and per-release history covers what Postgres
+  still holds — days the tier worker has already moved to Parquet are not
+  re-folded per release. Counters on `person_releases` carry the same accepted
+  drift as `event_user_environments`.
 
 ## Freshness
 
@@ -109,3 +125,12 @@ would only report false drift.
   counts are printed ("normalised N rows") and are 0 on a re-run.
   `first_seen_at`/`last_seen_at` are `MIN`/`MAX` of `received_at`, the same
   clock the live pipeline stamps — not `occurred_at`.
+- The release-scoped Users page (migration 82) has **no fallback**: until an
+  app's `release_rollup_backfill` marker exists (or the app was created after
+  the migration), `/users/summary`, `/persons` and `/counts/persons` answer
+  503 `release_rollup_pending` for `?release=` and the page says "Release
+  stats are still building". `sauron-ingest` fills it unattended
+  (`ROLLUP_AUTO_BACKFILL`, after the event-rollup backfill — it reads that
+  table's day list); `sauron-migrate backfill-release-users` runs it by hand
+  and refuses until `backfill-rollups` is done. Day-by-day and resumable,
+  then one transaction per app.

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AxiosError } from 'axios';
-import { normalizeError, unwrapBlobErrorBody } from './client';
+import { errorCode, normalizeError, unwrapBlobErrorBody } from './client';
 
 function blobError(status: number, envelope: unknown): AxiosError {
   const blob = new Blob([JSON.stringify(envelope)], { type: 'application/json' });
@@ -60,5 +60,33 @@ describe('unwrapBlobErrorBody', () => {
   it('is a no-op when there is no response at all', async () => {
     const err = new AxiosError('Network Error', 'ERR_NETWORK');
     await expect(unwrapBlobErrorBody(err)).resolves.toBeUndefined();
+  });
+});
+
+describe('errorCode', () => {
+  it("reads the envelope's code off a server answer", () => {
+    const err = new AxiosError(
+      'Request failed with status code 503',
+      'ERR_BAD_RESPONSE',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      {} as any,
+      undefined,
+      {
+        status: 503,
+        statusText: 'Service Unavailable',
+        data: { error: { code: 'release_rollup_pending', message: 'still building' } },
+        headers: {},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        config: {} as any,
+      },
+    );
+    // The 503 alone is an outage; the code is what says "still backfilling".
+    expect(errorCode(normalizeError(err))).toBe('release_rollup_pending');
+  });
+
+  it('is null for anything that is not a normalized error', () => {
+    expect(errorCode(new Error('boom'))).toBeNull();
+    expect(errorCode('nope')).toBeNull();
+    expect(errorCode(undefined)).toBeNull();
   });
 });

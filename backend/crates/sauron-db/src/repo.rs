@@ -6929,6 +6929,52 @@ pub async fn bump_person_env(
     .await
 }
 
+/// Single-row twin of [`crate::batch::bump_person_releases`], for the
+/// unbatched `process::rollup` path. Same conflict arm — if one changes, both
+/// change; the pipeline equivalence test diffs `person_releases` between the
+/// two paths.
+#[allow(clippy::too_many_arguments)]
+pub async fn bump_person_release(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    distinct_id: &str,
+    environment_id: Option<Uuid>,
+    release: Option<&str>,
+    at: DateTime<Utc>,
+    events_delta: i64,
+    errors_delta: i64,
+    sessions_delta: i64,
+) -> QueryResult<usize> {
+    if distinct_id.is_empty() {
+        return Ok(0);
+    }
+    diesel::sql_query(
+        "INSERT INTO person_releases \
+           (app_id, environment_id, release, distinct_id, first_seen, last_seen, \
+            events_count, errors_count, sessions_count) \
+         VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8) \
+         ON CONFLICT (app_id, release, distinct_id, \
+                      COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+         DO UPDATE SET \
+            first_seen = LEAST(person_releases.first_seen, EXCLUDED.first_seen), \
+            last_seen = GREATEST(person_releases.last_seen, EXCLUDED.last_seen), \
+            events_count = person_releases.events_count + EXCLUDED.events_count, \
+            errors_count = person_releases.errors_count + EXCLUDED.errors_count, \
+            sessions_count = person_releases.sessions_count + EXCLUDED.sessions_count, \
+            updated_at = now()",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Nullable<SqlUuid>, _>(environment_id)
+    .bind::<Text, _>(crate::batch::release_key(release))
+    .bind::<Text, _>(distinct_id.to_string())
+    .bind::<Timestamptz, _>(at)
+    .bind::<BigInt, _>(events_delta)
+    .bind::<BigInt, _>(errors_delta)
+    .bind::<BigInt, _>(sessions_delta)
+    .execute(conn)
+    .await
+}
+
 /// Single-row twin of [`crate::batch::bump_device_envs`], for the unbatched
 /// `process::rollup` path.
 ///
@@ -20451,16 +20497,16 @@ pub async fn sample_tag_keys(
 
 /// One-column result for the bounded counts below.
 #[derive(Debug, QueryableByName)]
-struct BoundedCount {
+pub(crate) struct BoundedCount {
     #[diesel(sql_type = BigInt)]
-    total: i64,
+    pub(crate) total: i64,
 }
 
 /// `cap + 1` rows were asked for; fold that into `(total, capped)`.
 ///
 /// `cap + 1` is the sentinel that separates "exactly cap" from "more than cap"
 /// without counting the rest — the same trick `count_issues` uses.
-fn capped(n: i64, cap: i64) -> (i64, bool) {
+pub(crate) fn capped(n: i64, cap: i64) -> (i64, bool) {
     if n > cap {
         (cap, true)
     } else {

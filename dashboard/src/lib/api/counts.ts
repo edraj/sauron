@@ -1,5 +1,6 @@
 import { api } from './client';
 import { toParams, type DateRangeValue } from '../models/date-range';
+import type { ReleaseMode } from '../models/release-users';
 
 /**
  * Row counts for the four offset-paged lists that have no total of their own.
@@ -83,9 +84,19 @@ export async function countWorkflows(
   return data;
 }
 
-export async function countPersons(appId: string, opts: CountParams = {}): Promise<CountEnvelope> {
+/**
+ * `releaseMode` mirrors `listPersons`'s `release_mode`, and for the same reason
+ * as everything else here: the count has to describe the list it captions, so
+ * under a picked release a `current` list needs a `current` count. Pass it
+ * only while a release is picked (see `models/release-users.ts`).
+ */
+export async function countPersons(
+  appId: string,
+  opts: CountParams & { releaseMode?: ReleaseMode } = {},
+): Promise<CountEnvelope> {
   const p = withPredicate(new URLSearchParams(), opts);
   if (opts.search) p.set('search', opts.search);
+  if (opts.releaseMode) p.set('release_mode', opts.releaseMode);
   const { data } = await api.get<CountEnvelope>(`/v1/apps/${appId}/counts/persons?${p}`);
   return data;
 }

@@ -2,7 +2,7 @@
 //! caller never silently gets an unfiltered answer. Mirrors the
 //! `environment_id` fail-loud rule (`routes/scope.rs`'s
 //! `reject_environment_id`), but as one middleware instead of a call per
-//! handler, because the accepting set is five routes and the rejecting set is
+//! handler, because the accepting set is a handful of routes and the rejecting set is
 //! every other read.
 //!
 //! Writes are out of scope on purpose — `release` on a non-`GET` is the
@@ -38,6 +38,9 @@ pub const RELEASE_ACCEPTING_PATHS: &[&str] = &[
     "/v1/apps/{app_id}/events/list",
     "/v1/apps/{app_id}/sessions",
     "/v1/apps/{app_id}/transactions",
+    "/v1/apps/{app_id}/users/summary",
+    "/v1/apps/{app_id}/persons",
+    "/v1/apps/{app_id}/counts/persons",
 ];
 
 /// Does `path` (a concrete request path) match `template` (as registered with

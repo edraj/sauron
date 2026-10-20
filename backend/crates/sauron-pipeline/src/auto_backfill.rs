@@ -20,7 +20,9 @@
 //!   rollups (seconds — they clear the Users and Devices pages), then
 //!   person-days (retention), then the day-by-day event rollup (minutes to an
 //!   hour on a long history), which is resumable: an interruption resumes from
-//!   the first unfinished day on the next pass.
+//!   the first unfinished day on the next pass; then the release-scoped Users
+//!   tables (migration 82), also day-resumable, which need the event rollup's
+//!   day list.
 //!
 //! `ROLLUP_AUTO_BACKFILL=0` disables it for operators who prefer the manual
 //! runbook; the `sauron-migrate backfill-*` commands remain and are safe to
@@ -39,7 +41,8 @@ pub async fn any_pending(conn: &mut sauron_db::PgConn) -> diesel::QueryResult<bo
         || device_env_backfill::backfill_pending(conn).await?
         || person_days_backfill::backfill_pending(conn).await?
         || rollups::identified_sketch_pending(conn).await?
-        || rollups::backfill_pending(conn).await?)
+        || rollups::backfill_pending(conn).await?
+        || rollups::release::backfill_pending(conn).await?)
 }
 
 /// Spawn one backfill pass; returns immediately. The pass itself logs and
@@ -128,6 +131,20 @@ async fn run_locked(
         for day in days {
             let n = fold::recompute_identified_sketches(conn, day).await?;
             info!(%day, rows = n, "identified sketch backfill: day complete");
+        }
+    }
+    // Release-scoped Users tables (migration 82). Last: its day list is read
+    // off the event rollups, which the backfill above must have completed —
+    // and the release switcher on /users has no fallback, so this is the gate
+    // that page waits on. Resumable per day.
+    if rollups::release::backfill_pending(conn).await? {
+        let outcome = rollups::release::backfill_all(conn, |day| {
+            info!(%day, "release users backfill: day complete");
+            true
+        })
+        .await?;
+        if outcome == rollups::release::BackfillOutcome::Interrupted {
+            anyhow::bail!("release users backfill interrupted");
         }
     }
     if let Err(e) = rollups::analyze_rollup_tables(conn).await {

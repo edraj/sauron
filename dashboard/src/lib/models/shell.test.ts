@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { PAGE_ACCESS } from './page-access';
-import { RELEASE_AWARE, SHELL_FLAGS, resolveShell, showsReleaseNote } from './shell';
+import {
+  FULLY_RELEASE_AWARE,
+  RELEASE_AWARE,
+  SHELL_FLAGS,
+  resolveShell,
+  showsReleaseNote,
+} from './shell';
 
 describe('SHELL_FLAGS ↔ PAGE_ACCESS parity', () => {
   /**
@@ -67,12 +73,37 @@ describe('RELEASE_AWARE ↔ PAGE_ACCESS parity', () => {
     }
   });
 
-  it('exactly the four searched list pages are release-aware', () => {
+  it('exactly the four searched list pages and Users are release-aware', () => {
     const aware = Object.entries(RELEASE_AWARE)
       .filter(([, v]) => v)
       .map(([k]) => k)
       .sort();
-    expect(aware).toEqual(['/events', '/issues', '/sessions', '/transactions'].sort());
+    expect(aware).toEqual(['/events', '/issues', '/sessions', '/transactions', '/users'].sort());
+  });
+
+  it('the person detail page stays release-blind (one person is one person)', () => {
+    expect(RELEASE_AWARE['/persons']).toBe(false);
+  });
+});
+
+describe('FULLY_RELEASE_AWARE', () => {
+  /**
+   * A page whose charts and totals follow the release necessarily keys on it,
+   * and only an envAware telemetry page has charts and totals to speak of. A
+   * stray entry would silently suppress the note on a page whose aggregates
+   * still include every release — the exact mis-read the note prevents.
+   */
+  it('is a subset of the release-aware, envAware PAGE_ACCESS keys', () => {
+    expect(FULLY_RELEASE_AWARE.size).toBeGreaterThan(0);
+    for (const key of FULLY_RELEASE_AWARE) {
+      expect(key in PAGE_ACCESS, `'${key}' is not a PAGE_ACCESS key`).toBe(true);
+      expect(RELEASE_AWARE[key], `'${key}' is not RELEASE_AWARE`).toBe(true);
+      expect(PAGE_ACCESS[key]?.envAware, `'${key}' is not envAware`).toBe(true);
+    }
+  });
+
+  it('is exactly Users today', () => {
+    expect([...FULLY_RELEASE_AWARE].sort()).toEqual(['/users']);
   });
 });
 
@@ -92,6 +123,20 @@ describe('showsReleaseNote', () => {
     expect(showsReleaseNote('/issues')).toBe(true);
     expect(showsReleaseNote('/issues/abc')).toBe(true);
     expect(showsReleaseNote('/sessions')).toBe(true);
+  });
+
+  /**
+   * Users is the one page where the sentence is false: its tiles, chart, list
+   * and count all read release-keyed rollups, so "charts and totals include
+   * all releases" would contradict every number under it.
+   */
+  it('hides on Users, where the charts and totals follow the release too', () => {
+    expect(showsReleaseNote('/users')).toBe(false);
+    expect(showsReleaseNote('/users?time_field=first_seen')).toBe(false);
+    // The person detail page is NOT part of that: its own widgets ignore the
+    // switcher, so it keeps the note like every other envAware page.
+    expect(PAGE_ACCESS['/persons']?.envAware).toBe(true);
+    expect(showsReleaseNote('/persons/bob')).toBe(true);
   });
 
   it('hides on pages with no telemetry at all', () => {
@@ -114,16 +159,18 @@ describe('showsReleaseNote', () => {
   /**
    * Every page the note shows on must be a `PAGE_ACCESS` row that is
    * `envAware` — it reads env-scoped telemetry, so it has charts/totals a
-   * release could plausibly have narrowed and didn't. `RELEASE_AWARE` is
-   * deliberately NOT part of this gate any more (see `showsReleaseNote`).
-   * Catches a rewrite that stops reading the one table it gates on.
+   * release could plausibly have narrowed and didn't — and must not be one
+   * whose charts and totals DO follow the release. `RELEASE_AWARE` is
+   * deliberately NOT part of this gate (see `showsReleaseNote`). Catches a
+   * rewrite that stops reading the tables it gates on.
    */
-  it('every page the note shows on is envAware', () => {
+  it('every page the note shows on is envAware and not fully release-aware', () => {
     let shown = 0;
     for (const key of Object.keys(PAGE_ACCESS)) {
       if (showsReleaseNote(key)) {
         shown += 1;
         expect(PAGE_ACCESS[key]?.envAware, `${key} is not envAware`).toBe(true);
+        expect(FULLY_RELEASE_AWARE.has(key), `${key} is fully release-aware`).toBe(false);
       }
     }
     // Guards against the sweep passing vacuously if the note stopped showing
@@ -133,16 +180,21 @@ describe('showsReleaseNote', () => {
 
   /**
    * The converse direction: every envAware page gets the note, release-aware
-   * or not. Without this, re-adding a `RELEASE_AWARE` exclusion would still
-   * satisfy the sweep above.
+   * or not, unless it is fully release-aware. Without this, re-adding a
+   * blanket `RELEASE_AWARE` exclusion would still satisfy the sweep above.
    */
-  it('shows on EVERY envAware page, including the release-aware ones', () => {
-    const awareAndEnvAware = Object.keys(PAGE_ACCESS).filter(
-      (k) => PAGE_ACCESS[k]?.envAware === true && RELEASE_AWARE[k] === true,
+  it('shows on EVERY envAware page except the fully release-aware ones', () => {
+    const listOnlyAware = Object.keys(PAGE_ACCESS).filter(
+      (k) =>
+        PAGE_ACCESS[k]?.envAware === true &&
+        RELEASE_AWARE[k] === true &&
+        !FULLY_RELEASE_AWARE.has(k),
     );
-    expect(awareAndEnvAware.length).toBeGreaterThan(0);
+    // The release-aware LIST pages must still be in the sweep — they are the
+    // ones a blanket exclusion would wrongly silence.
+    expect(listOnlyAware.length).toBeGreaterThan(0);
     for (const key of Object.keys(PAGE_ACCESS)) {
-      if (PAGE_ACCESS[key]?.envAware === true) {
+      if (PAGE_ACCESS[key]?.envAware === true && !FULLY_RELEASE_AWARE.has(key)) {
         expect(showsReleaseNote(key), `${key} is envAware but shows no note`).toBe(true);
       }
     }

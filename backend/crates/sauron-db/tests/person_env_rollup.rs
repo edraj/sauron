@@ -452,6 +452,8 @@ async fn write_rows_credits_a_session_once_across_batches() {
                 touch_users: &[],
                 identified: &[],
                 person_envs: std::slice::from_ref(&person),
+                person_releases: &[],
+                session_start_releases: &Default::default(),
                 device_envs: &[],
             },
         )

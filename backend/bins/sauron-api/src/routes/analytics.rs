@@ -379,8 +379,12 @@ pub struct PersonsQuery {
     /// A column name from [`PERSON_SORTS`], optionally `-`-prefixed to ascend.
     /// Absent means `last_seen` descending.
     pub sort: Option<String>,
-    // See `RangeQuery`'s comment: `environment_id` comes from `RawQuery`, not
-    // this struct.
+    /// With `?release=`: `used` (default) lists everyone with a signal on the
+    /// release; `current` only people whose most recent signal is on it.
+    /// Ignored without `release`.
+    pub release_mode: Option<String>,
+    // See `RangeQuery`'s comment: `environment_id` and `release` come from
+    // `RawQuery`, not this struct.
 }
 
 fn default_persons_list_limit() -> i64 {
@@ -433,6 +437,7 @@ pub async fn persons_list(
     .await?;
     let search = q.search.as_deref().filter(|s| !s.is_empty());
     let sort = person_sort_spec(q.sort.as_deref())?;
+    let release = release_key(raw_query.as_deref())?;
     let window = super::search::resolve_time_filter(
         "last_seen",
         PERSON_TIME_FIELDS,
@@ -443,6 +448,29 @@ pub async fn persons_list(
         // No planner clamp: this list is not query-planner wired.
         None,
     )?;
+    let window = repo::TimeWindow {
+        column: window.column,
+        from: window.from,
+        to: window.to,
+    };
+    if let Some(release) = release.as_deref() {
+        let mode = release_mode(q.release_mode.as_deref())?;
+        require_release_ready(&mut conn, app_id).await?;
+        return Ok(Json(
+            sauron_db::rollups::release::list_persons(
+                &mut conn,
+                &scope,
+                release,
+                mode,
+                search,
+                q.limit.clamp(1, 200),
+                super::clamp_offset(q.offset),
+                sort,
+                window,
+            )
+            .await?,
+        ));
+    }
     Ok(Json(
         repo::list_persons(
             &mut conn,
@@ -451,11 +479,7 @@ pub async fn persons_list(
             q.limit.clamp(1, 200),
             super::clamp_offset(q.offset),
             sort,
-            repo::TimeWindow {
-                column: window.column,
-                from: window.from,
-                to: window.to,
-            },
+            window,
         )
         .await?,
     ))
@@ -503,6 +527,7 @@ pub async fn persons_count(
     .await?;
     let search = q.search.as_deref().filter(|s| !s.is_empty());
     let sort = person_sort_spec(q.sort.as_deref())?;
+    let release = release_key(raw_query.as_deref())?;
     let window = super::search::resolve_time_filter(
         "last_seen",
         PERSON_TIME_FIELDS,
@@ -513,19 +538,36 @@ pub async fn persons_count(
         // No planner clamp: this list is not query-planner wired.
         None,
     )?;
-    let (total, total_is_capped) = repo::count_persons(
-        &mut conn,
-        scope,
-        search,
-        sort,
-        repo::TimeWindow {
-            column: window.column,
-            from: window.from,
-            to: window.to,
-        },
-        super::search::COUNT_CAP,
-    )
-    .await?;
+    let window = repo::TimeWindow {
+        column: window.column,
+        from: window.from,
+        to: window.to,
+    };
+    let (total, total_is_capped) = if let Some(release) = release.as_deref() {
+        let mode = release_mode(q.release_mode.as_deref())?;
+        require_release_ready(&mut conn, app_id).await?;
+        sauron_db::rollups::release::count_persons(
+            &mut conn,
+            &scope,
+            release,
+            mode,
+            search,
+            sort,
+            window,
+            super::search::COUNT_CAP,
+        )
+        .await?
+    } else {
+        repo::count_persons(
+            &mut conn,
+            scope,
+            search,
+            sort,
+            window,
+            super::search::COUNT_CAP,
+        )
+        .await?
+    };
     Ok(Json(super::search::CountEnvelope {
         total,
         total_is_capped,
@@ -1489,6 +1531,48 @@ pub async fn rollups_refresh(
 // Audience analytics — GET /users/summary.
 // ---------------------------------------------------------------------------
 
+/// The `person_releases` key for `?release=`: `None` without one (the
+/// release-blind reads run unchanged), `Some("")` for `none` (Unknown).
+fn release_key(raw_query: Option<&str>) -> Result<Option<String>, ApiError> {
+    use sauron_query::ReleaseFilter;
+    Ok(
+        match super::scope::parse_release(super::scope::raw_release(raw_query).as_deref())? {
+            ReleaseFilter::All => None,
+            ReleaseFilter::Unknown => Some(String::new()),
+            ReleaseFilter::One(r) => Some(r),
+        },
+    )
+}
+
+/// 503 unless this app's release-scoped Users tables are ready. There is no
+/// raw fallback on purpose — that shape is the 30 s timeout the tables exist
+/// to avoid — so the dashboard shows "still building" instead.
+async fn require_release_ready(conn: &mut sauron_db::PgConn, app_id: Uuid) -> Result<(), ApiError> {
+    if sauron_db::rollups::release::is_ready(conn, app_id).await? {
+        return Ok(());
+    }
+    Err(ApiError::Unavailable(
+        "release_rollup_pending",
+        "release-scoped user stats for this app are still being backfilled; \
+         they appear automatically once the ingest service's history backfill \
+         finishes (or run `sauron-migrate backfill-release-users`)"
+            .into(),
+    ))
+}
+
+/// `release_mode`, parsed only once a `release` is present — without one the
+/// parameter is documented as ignored, so it must not be able to 400.
+fn release_mode(raw: Option<&str>) -> Result<sauron_db::rollups::release::ReleaseMode, ApiError> {
+    use sauron_db::rollups::release::ReleaseMode;
+    match raw {
+        None | Some("used") => Ok(ReleaseMode::Used),
+        Some("current") => Ok(ReleaseMode::Current),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "release_mode must be `used` or `current`, got `{other}`"
+        ))),
+    }
+}
+
 /// DAU / MAU, guarding division by zero. Pure.
 pub fn stickiness(dau: i64, mau: i64) -> f64 {
     if mau > 0 {
@@ -1512,7 +1596,12 @@ pub struct UsersAnalytics {
 \
 Adding `?environment_id=` narrows this to one environment **enrollment** id \
 (not a catalogue id). Env-scoped variants run a different query shape, which is \
-why they can time out where the unscoped call does not.",
+why they can time out where the unscoped call does not.\
+\
+Adding `?release=` (`none` = no release attributed) scopes every number to that \
+release: users who sent a signal on it and their first/last seen ON it; session \
+duration over sessions whose latest reported release is it. Answers 503 \
+`release_rollup_pending` until the app's release tables are backfilled.",
     params(("app_id" = Uuid, Path, description = "The app."), RangeQuery), security(("bearerAuth" = [])),
     responses((status = 200, description = "User totals.", body = UsersAnalytics), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse), (status = 403, description = "No grant covers this scope.", body = ErrorResponse), (status = 503, description = "Query exceeded its time budget, or a required rollup has not been backfilled. The message names which.", body = ErrorResponse)),
 )]
@@ -1532,11 +1621,24 @@ pub async fn users_summary(
         raw_query.as_deref(),
     )
     .await?;
+    let release = release_key(raw_query.as_deref())?;
     let now = Utc::now();
     let since = now - Duration::days(q.since_days.clamp(1, 365));
 
-    let stats = repo::user_stats(&mut conn, scope.clone(), Range::since(since), now).await?;
-    let series = repo::active_user_series(&mut conn, scope, Range::since(since)).await?;
+    let (stats, series) = if let Some(release) = release.as_deref() {
+        require_release_ready(&mut conn, app_id).await?;
+        use sauron_db::rollups::release as rel;
+        let range = Range::since(since);
+        (
+            rel::user_stats(&mut conn, &scope, release, range, now).await?,
+            rel::active_user_series(&mut conn, &scope, release, range).await?,
+        )
+    } else {
+        (
+            repo::user_stats(&mut conn, scope.clone(), Range::since(since), now).await?,
+            repo::active_user_series(&mut conn, scope, Range::since(since)).await?,
+        )
+    };
     let stickiness = stickiness(stats.dau, stats.mau);
 
     Ok(Json(UsersAnalytics {

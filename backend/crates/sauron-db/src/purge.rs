@@ -183,7 +183,12 @@ fn rollup_companions(kind: PurgeKind) -> &'static [&'static str] {
         // call site documents — nothing here runs in an explicit transaction, so
         // a separate statement is a window in which the person is gone and their
         // daily activity is not.
-        PurgeKind::Persons => &["event_user_environments", "identities", "person_days"],
+        PurgeKind::Persons => &[
+            "event_user_environments",
+            "identities",
+            "person_days",
+            "person_releases",
+        ],
         _ => &[],
     }
 }
@@ -1078,6 +1083,40 @@ async fn recompute_person(
               UNION ALL \
               SELECT 1 FROM transactions x WHERE x.app_id = $1 \
                 AND x.distinct_id = $2 AND x.environment_id IS NOT DISTINCT FROM e.environment_id)",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(key)
+    .execute(conn)
+    .await?;
+
+    // Per-release counters (migration 82), re-derived from the surviving raw
+    // rows like `person_days` above: delete, then insert. A recompute rather
+    // than an UPDATE-in-place because a release the person no longer has any
+    // row on must lose its row, and the two statements already cover that.
+    // `''` is the table's Unknown-release key.
+    diesel::sql_query("DELETE FROM person_releases WHERE app_id = $1 AND distinct_id = $2")
+        .bind::<SqlUuid, _>(app_id)
+        .bind::<Text, _>(key)
+        .execute(conn)
+        .await?;
+    diesel::sql_query(
+        "INSERT INTO person_releases \
+           (app_id, environment_id, release, distinct_id, first_seen, last_seen, \
+            events_count, errors_count, sessions_count) \
+         SELECT $1, environment_id, COALESCE(release, ''), $2, min(occurred_at), max(occurred_at), \
+                count(*) FILTER (WHERE src = 'a')::bigint, \
+                count(*) FILTER (WHERE src = 'e')::bigint, \
+                count(DISTINCT NULLIF(session_id, ''))::bigint \
+         FROM ( \
+           SELECT environment_id, release, occurred_at, session_id, 'a' AS src \
+             FROM analytics_events WHERE app_id = $1 AND distinct_id = $2 \
+           UNION ALL \
+           SELECT environment_id, release, occurred_at, session_id, 'e' \
+             FROM error_events WHERE app_id = $1 AND distinct_id = $2 \
+           UNION ALL \
+           SELECT environment_id, release, occurred_at, session_id, 't' \
+             FROM transactions WHERE app_id = $1 AND distinct_id = $2 \
+         ) u GROUP BY environment_id, COALESCE(release, '')",
     )
     .bind::<SqlUuid, _>(app_id)
     .bind::<Text, _>(key)

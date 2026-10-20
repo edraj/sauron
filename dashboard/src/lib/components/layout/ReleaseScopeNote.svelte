@@ -9,7 +9,9 @@
    * page (`PAGE_ACCESS[key].envAware === true`). That includes the
    * `RELEASE_AWARE` list pages, whose side widgets are aggregate even though
    * their list narrows; it keeps the note off pages with no telemetry at all
-   * (admin, account, docs) with no per-page wiring to forget.
+   * (admin, account, docs) and off the `FULLY_RELEASE_AWARE` pages (Users),
+   * whose charts and totals follow the release too, with no per-page wiring
+   * to forget.
    *
    * Reads the route the same way `AppShell` itself does (`location` from
    * `svelte-spa-router`, aliased to avoid shadowing `window.location`) rather
